@@ -8,8 +8,8 @@ DATA_DIR = BASE_DIR / "data"
 
 # API Keys
 CLAUDE_API_KEY = "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"
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")  # Add your token here or in .env
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # Add your chat ID here or in .env
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7978931435:AAGdqdfcbK-GT8Q_BEw7dvmISkN9035FzZQ")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7910666732")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")  # Optional: add NewsAPI key
 
 # Trading Parameters
