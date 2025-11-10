@@ -37,10 +37,13 @@ def run_dashboard(enhanced=True):
     ])
 
 
-def generate_signal(stock: str = config.DEFAULT_STOCK, timeframe: str = "4hour"):
+def generate_signal(stock: str = config.DEFAULT_STOCK, timeframe: str = None):
     """Generate and display a single trading signal."""
     print(f"\n{'='*70}")
-    print(f"Generating signal for {stock} ({timeframe})...")
+    if timeframe:
+        print(f"Generating signal for {stock} (using {timeframe})...")
+    else:
+        print(f"Generating signal for {stock} (auto-selecting best channel)...")
     print(f"{'='*70}\n")
 
     try:
@@ -61,7 +64,7 @@ def generate_signal(stock: str = config.DEFAULT_STOCK, timeframe: str = "4hour")
 
 
 async def monitor_and_alert(stock: str = config.DEFAULT_STOCK,
-                           timeframe: str = "4hour",
+                           timeframe: str = None,
                            interval_minutes: int = 60):
     """
     Continuously monitor stock and send alerts for high-confidence signals.
@@ -237,9 +240,9 @@ def main():
 
     parser.add_argument(
         "--timeframe",
-        default="4hour",
-        choices=["1hour", "4hour", "daily"],
-        help="Primary timeframe for analysis (default: 4hour)"
+        default=None,
+        choices=["1hour", "2hour", "3hour", "4hour", "daily", "weekly", None],
+        help="Primary timeframe for analysis (default: auto-select best channel)"
     )
 
     parser.add_argument(

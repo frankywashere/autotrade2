@@ -25,6 +25,8 @@ class TradingSignal:
     predicted_high: float
     predicted_low: float
     channel_stability: float
+    best_channel_timeframe: str  # Which timeframe has the best channel
+    best_channel_data: ChannelData  # The actual best channel data
 
     # RSI data
     rsi_confluence: Dict
@@ -51,6 +53,7 @@ class TradingSignal:
             "predicted_high": self.predicted_high,
             "predicted_low": self.predicted_low,
             "channel_stability": self.channel_stability,
+            "best_channel_timeframe": self.best_channel_timeframe,
             "rsi_confluence": self.rsi_confluence,
             "primary_rsi": self.primary_rsi,
             "news_sentiment": self.news_sentiment,
@@ -81,12 +84,14 @@ class SignalGenerator:
         self.last_signal: Optional[TradingSignal] = None
         self.signal_history: List[TradingSignal] = []
 
-    def generate_signal(self, primary_timeframe: str = "4hour") -> TradingSignal:
+    def generate_signal(self, primary_timeframe: Optional[str] = None) -> TradingSignal:
         """
         Generate trading signal based on all analysis.
+        Automatically selects the most stable channel across all timeframes.
 
         Args:
-            primary_timeframe: Primary timeframe for signal generation
+            primary_timeframe: Optional - if provided, uses this timeframe.
+                             Otherwise auto-selects best channel by stability.
 
         Returns:
             TradingSignal object
@@ -95,21 +100,30 @@ class SignalGenerator:
         data_dict = self.data_handler.get_all_timeframes()
         current_price = self.data_handler.get_latest_price()
 
-        # Analyze channels
+        # Analyze channels across ALL timeframes
         channels = self.channel_calc.analyze_multiple_timeframes(data_dict)
-        primary_channel = channels.get(primary_timeframe)
 
-        if not primary_channel:
-            raise ValueError(f"Could not generate channel for {primary_timeframe}")
+        # Find the BEST channel (highest stability score)
+        if primary_timeframe and primary_timeframe in channels:
+            # Use specified timeframe if provided
+            best_timeframe = primary_timeframe
+            best_channel = channels[primary_timeframe]
+        else:
+            # Auto-select best channel by stability
+            best_timeframe = max(channels.keys(), key=lambda tf: channels[tf].stability_score)
+            best_channel = channels[best_timeframe]
+
+        print(f"\n🎯 Selected Channel: {best_timeframe} (Stability: {best_channel.stability_score:.1f}/100)")
+        print(f"   R²={best_channel.r_squared:.3f}, Ping-pongs={best_channel.ping_pongs}, Predicted High=${best_channel.predicted_high:.2f}")
 
         # Get channel position
         channel_position = self.channel_calc.get_channel_position(
-            current_price, primary_channel
+            current_price, best_channel
         )
 
-        # Analyze RSI
+        # Analyze RSI (use same timeframe as best channel for consistency)
         rsi_dict = self.rsi_calc.analyze_multiple_timeframes(data_dict)
-        rsi_confluence = self.rsi_calc.get_confluence_score(rsi_dict, primary_timeframe)
+        rsi_confluence = self.rsi_calc.get_confluence_score(rsi_dict, best_timeframe)
 
         # Analyze news
         stock_context = f"{self.stock} is trading at ${current_price:.2f}, " \
@@ -122,12 +136,12 @@ class SignalGenerator:
 
         # Generate signal
         signal_type, confidence, reasoning = self._calculate_signal(
-            channel_position, primary_channel, rsi_confluence, news_sentiment
+            channel_position, best_channel, rsi_confluence, news_sentiment
         )
 
         # Calculate entry/target/stop
         entry, target, stop = self._calculate_levels(
-            signal_type, current_price, primary_channel, channel_position
+            signal_type, current_price, best_channel, channel_position
         )
 
         # Create signal object
@@ -138,9 +152,11 @@ class SignalGenerator:
             confidence_score=confidence,
             current_price=current_price,
             channel_position=channel_position,
-            predicted_high=primary_channel.predicted_high,
-            predicted_low=primary_channel.predicted_low,
-            channel_stability=primary_channel.stability_score,
+            predicted_high=best_channel.predicted_high,
+            predicted_low=best_channel.predicted_low,
+            channel_stability=best_channel.stability_score,
+            best_channel_timeframe=best_timeframe,
+            best_channel_data=best_channel,
             rsi_confluence=rsi_confluence,
             primary_rsi=rsi_confluence['primary_rsi'],
             news_sentiment=news_sentiment,
@@ -290,10 +306,12 @@ CURRENT MARKET:
   Channel Position: {signal.channel_position['zone']} ({signal.channel_position['position']*100:.1f}%)
   Primary RSI: {signal.primary_rsi:.1f}
 
-PREDICTIONS:
+BEST CHANNEL ({signal.best_channel_timeframe}):
   Predicted High: ${signal.predicted_high:.2f} (+{((signal.predicted_high/signal.current_price)-1)*100:.2f}%)
   Predicted Low:  ${signal.predicted_low:.2f} ({((signal.predicted_low/signal.current_price)-1)*100:.2f}%)
-  Channel Stability: {signal.channel_stability:.1f}/100
+  Stability Score: {signal.channel_stability:.1f}/100
+  Ping-Pongs: {signal.best_channel_data.ping_pongs}
+  R-Squared: {signal.best_channel_data.r_squared:.3f}
 
 RSI CONFLUENCE:
   Score: {signal.rsi_confluence['score']:.1f}/100

@@ -92,11 +92,8 @@ def monitor_in_background(stock, interval_minutes):
 # Sidebar
 st.sidebar.header("⚙️ Settings")
 stock = st.sidebar.selectbox("Stock", config.STOCKS, index=0)
-timeframe = st.sidebar.selectbox(
-    "Primary Timeframe",
-    ["1hour", "4hour", "daily"],
-    index=1
-)
+
+st.sidebar.info("📊 Chart shows best channel (auto-selected by stability)")
 
 st.sidebar.markdown("---")
 
@@ -219,15 +216,27 @@ if st.session_state.monitoring:
 # Main content area
 col1, col2 = st.columns([2, 1])
 
-with col1:
-    st.header("Price Chart with Linear Regression Channels")
+# Generate signal first to get best channel
+try:
+    with st.spinner("Generating signal..."):
+        signal = components['signal_gen'].generate_signal()
+        best_timeframe = signal.best_channel_timeframe
+        best_channel = signal.best_channel_data
+except Exception as e:
+    st.error(f"Error generating signal: {e}")
+    best_timeframe = "4hour"  # Fallback
+    best_channel = None
 
-    # Get data for selected timeframe
-    df = data_dict[timeframe]
+with col1:
+    st.header(f"Price Chart - Best Channel: {best_timeframe.upper()}")
+    st.caption(f"Stability: {signal.channel_stability:.1f}/100 | Ping-pongs: {best_channel.ping_pongs} | R²: {best_channel.r_squared:.3f}")
+
+    # Get data for BEST timeframe (not user-selected)
+    df = data_dict[best_timeframe]
     current_price = df['close'].iloc[-1]
 
-    # Calculate channel
-    channel = components['channel_calc'].calculate_channel(df)
+    # Use the best channel (already calculated in signal)
+    channel = best_channel
 
     # Create candlestick chart with channels
     fig = make_subplots(
@@ -235,7 +244,7 @@ with col1:
         shared_xaxes=True,
         vertical_spacing=0.05,
         row_heights=[0.7, 0.3],
-        subplot_titles=(f"{stock} - {timeframe}", "RSI")
+        subplot_titles=(f"{stock} - {best_timeframe}", "RSI")
     )
 
     # Candlestick
@@ -315,21 +324,8 @@ with col1:
 with col2:
     st.header("Current Signal")
 
-    # Use last signal from monitoring if available and fresh
-    if (st.session_state.last_signal and
-        st.session_state.last_signal.stock == stock and
-        (datetime.now() - st.session_state.last_signal.timestamp) < timedelta(minutes=monitor_interval)):
-        signal = st.session_state.last_signal
-        st.caption("📍 From auto-monitoring")
-    else:
-        # Generate new signal
-        try:
-            with st.spinner("Analyzing..."):
-                signal = components['signal_gen'].generate_signal(timeframe)
-                st.caption("📍 Fresh analysis")
-        except Exception as e:
-            st.error(f"Error generating signal: {e}")
-            signal = None
+    # Signal was already generated above for best channel
+    st.caption(f"📍 Using best channel: {best_timeframe}")
 
     if signal:
         # Display signal
@@ -348,9 +344,15 @@ with col2:
             st.success("🔔 This would trigger an alert!")
 
         # Channel info
-        st.subheader("Channel Analysis")
+        st.subheader(f"Best Channel: {signal.best_channel_timeframe.upper()}")
         st.metric("Position", signal.channel_position['zone'])
         st.metric("Stability", f"{signal.channel_stability:.0f}/100")
+
+        col_meta1, col_meta2 = st.columns(2)
+        with col_meta1:
+            st.metric("Ping-Pongs", signal.best_channel_data.ping_pongs)
+        with col_meta2:
+            st.metric("R-Squared", f"{signal.best_channel_data.r_squared:.3f}")
 
         col_a, col_b = st.columns(2)
         with col_a:
