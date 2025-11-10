@@ -36,13 +36,16 @@ class LinearRegressionChannel:
         """
         self.std_dev = std_dev
 
-    def calculate_channel(self, df: pd.DataFrame, lookback_bars: Optional[int] = None) -> ChannelData:
+    def calculate_channel(self, df: pd.DataFrame, lookback_bars: Optional[int] = None,
+                         timeframe: str = "4hour") -> ChannelData:
         """
         Calculate linear regression channel for given data.
+        Predicts high/low for next 24 hours.
 
         Args:
             df: DataFrame with OHLC data
             lookback_bars: Number of bars to look back (None = all data)
+            timeframe: Timeframe for calculating 24-hour prediction
 
         Returns:
             ChannelData object with channel information
@@ -81,11 +84,28 @@ class LinearRegressionChannel:
         # Calculate stability score (0-100)
         stability_score = self._calculate_stability(r_squared, ping_pongs, n)
 
-        # Predict next values (extend one period forward)
-        next_x = n
-        predicted_center = slope * next_x + intercept
-        predicted_upper = predicted_center + (self.std_dev * residual_std)
-        predicted_lower = predicted_center - (self.std_dev * residual_std)
+        # Predict 24-hour range (not just next bar)
+        # Calculate how many bars = 24 hours for this timeframe
+        bars_per_24h = {
+            '1hour': 24,
+            '2hour': 12,
+            '3hour': 8,
+            '4hour': 6,
+            'daily': 1,
+            'weekly': 1  # Weekly can't predict 24h, use 1 bar
+        }
+        forecast_bars = bars_per_24h.get(timeframe, 1)
+
+        # Project channel forward for next 24 hours
+        future_x = np.arange(n, n + forecast_bars)
+        future_center = slope * future_x + intercept
+        future_upper = future_center + (self.std_dev * residual_std)
+        future_lower = future_center - (self.std_dev * residual_std)
+
+        # 24-hour predicted high/low is the range over this period
+        predicted_high = np.max(future_upper)
+        predicted_low = np.min(future_lower)
+        predicted_center = future_center[-1]  # End of 24h period
 
         return ChannelData(
             slope=slope,
@@ -97,8 +117,8 @@ class LinearRegressionChannel:
             r_squared=r_squared,
             ping_pongs=ping_pongs,
             stability_score=stability_score,
-            predicted_high=predicted_upper,
-            predicted_low=predicted_lower,
+            predicted_high=predicted_high,
+            predicted_low=predicted_low,
             predicted_center=predicted_center
         )
 
@@ -238,7 +258,7 @@ class LinearRegressionChannel:
                 lookback = None  # Use all data for daily/weekly
 
             try:
-                channel = self.calculate_channel(df, lookback)
+                channel = self.calculate_channel(df, lookback, timeframe)
                 results[timeframe] = channel
             except Exception as e:
                 print(f"Error calculating channel for {timeframe}: {e}")

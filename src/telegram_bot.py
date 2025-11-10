@@ -73,10 +73,10 @@ class TelegramAlertBot:
 • Channel: {signal.channel_position['zone']} ({signal.channel_position['position']*100:.0f}%)
 • RSI: {signal.primary_rsi:.1f}
 
-🎯 <b>PREDICTIONS</b>
-• High: ${signal.predicted_high:.2f} (+{((signal.predicted_high/signal.current_price)-1)*100:.1f}%)
-• Low: ${signal.predicted_low:.2f} ({((signal.predicted_low/signal.current_price)-1)*100:.1f}%)
-• Stability: {signal.channel_stability:.0f}/100
+🎯 <b>24-HOUR FORECAST</b> ({signal.best_channel_timeframe} channel)
+• Expected High: ${signal.predicted_high:.2f} (+{((signal.predicted_high/signal.current_price)-1)*100:.1f}%)
+• Expected Low: ${signal.predicted_low:.2f} ({((signal.predicted_low/signal.current_price)-1)*100:.1f}%)
+• Channel Stability: {signal.channel_stability:.0f}/100
 """
 
         if signal.signal_type != "neutral":

@@ -372,11 +372,14 @@ with col2:
         with col_meta2:
             st.metric("R-Squared", f"{signal.best_channel_data.r_squared:.3f}")
 
+        st.subheader("24-Hour Forecast")
         col_a, col_b = st.columns(2)
         with col_a:
-            st.metric("Predicted High", f"${signal.predicted_high:.2f}")
+            st.metric("Expected High", f"${signal.predicted_high:.2f}",
+                     delta=f"+{((signal.predicted_high/signal.current_price)-1)*100:.1f}%")
         with col_b:
-            st.metric("Predicted Low", f"${signal.predicted_low:.2f}")
+            st.metric("Expected Low", f"${signal.predicted_low:.2f}",
+                     delta=f"{((signal.predicted_low/signal.current_price)-1)*100:.1f}%")
 
         # RSI info
         st.subheader("RSI Analysis")

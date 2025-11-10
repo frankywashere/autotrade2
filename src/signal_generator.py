@@ -360,10 +360,10 @@ CURRENT MARKET:
   Channel Position: {signal.channel_position['zone']} ({signal.channel_position['position']*100:.1f}%)
   Primary RSI: {signal.primary_rsi:.1f}
 
-BEST CHANNEL ({signal.best_channel_timeframe}):
-  Predicted High: ${signal.predicted_high:.2f} (+{((signal.predicted_high/signal.current_price)-1)*100:.2f}%)
-  Predicted Low:  ${signal.predicted_low:.2f} ({((signal.predicted_low/signal.current_price)-1)*100:.2f}%)
-  Stability Score: {signal.channel_stability:.1f}/100
+24-HOUR PREDICTION (using {signal.best_channel_timeframe} channel):
+  Expected High: ${signal.predicted_high:.2f} (+{((signal.predicted_high/signal.current_price)-1)*100:.2f}%)
+  Expected Low:  ${signal.predicted_low:.2f} ({((signal.predicted_low/signal.current_price)-1)*100:.2f}%)
+  Channel Stability: {signal.channel_stability:.1f}/100
   Ping-Pongs: {signal.best_channel_data.ping_pongs}
   R-Squared: {signal.best_channel_data.r_squared:.3f}
 
