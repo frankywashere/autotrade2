@@ -110,14 +110,19 @@ class SignalGenerator:
             channel_position, channel, rsi_confluence, news_sentiment
         )
 
-        # Calculate composite score:
-        # 40% Channel stability
-        # 40% Signal confidence
-        # 20% RSI confluence
+        # Calculate composite score (MAXIMUM CONFIDENCE approach):
+        # 70% Signal Confidence (highest confidence in the 24h prediction)
+        # 25% RSI Confluence (multi-timeframe alignment for prediction reliability)
+        # 5% Channel Stability (minimum quality bar)
+        #
+        # Aggressively prioritizes channels with:
+        # - Strongest trade opportunity confidence
+        # - Best RSI confluence for reliable predictions
+        # - De-emphasizes stability (only basic filter)
         composite_score = (
-            channel.stability_score * 0.4 +
-            confidence * 0.4 +
-            rsi_confluence['score'] * 0.2
+            confidence * 0.70 +
+            rsi_confluence['score'] * 0.25 +
+            channel.stability_score * 0.05
         )
 
         return {
@@ -169,20 +174,23 @@ class SignalGenerator:
             print(f"\n🎯 Using Specified Timeframe: {primary_timeframe}")
         else:
             # Evaluate ALL timeframes
-            print(f"\n🔍 Evaluating all timeframes...")
+            print(f"\n🔍 Evaluating all timeframes (70% Confidence + 25% RSI + 5% Stability)...")
             evaluations = []
             for tf, channel in channels.items():
                 eval_result = self._evaluate_timeframe(tf, channel, current_price, rsi_dict, news_sentiment)
                 evaluations.append(eval_result)
                 print(f"   {tf:8s}: Composite={eval_result['composite_score']:5.1f} "
-                      f"(Stability={channel.stability_score:5.1f}, "
-                      f"Confidence={eval_result['confidence']:5.1f}, "
-                      f"RSI={eval_result['rsi_confluence']['score']:5.1f})")
+                      f"[Conf={eval_result['confidence']:5.1f} "
+                      f"RSI={eval_result['rsi_confluence']['score']:5.1f} "
+                      f"Stab={channel.stability_score:5.1f}]")
 
             # Pick the best by composite score
             best_evaluation = max(evaluations, key=lambda x: x['composite_score'])
-            print(f"\n🎯 Selected: {best_evaluation['timeframe']} "
-                  f"(Composite Score: {best_evaluation['composite_score']:.1f}/100)")
+            print(f"\n🎯 SELECTED: {best_evaluation['timeframe'].upper()} "
+                  f"(Composite: {best_evaluation['composite_score']:.1f}/100)")
+            print(f"   Confidence: {best_evaluation['confidence']:.1f} | "
+                  f"RSI: {best_evaluation['rsi_confluence']['score']:.1f} | "
+                  f"Stability: {best_evaluation['channel'].stability_score:.1f}")
 
         # Extract best results
         best_timeframe = best_evaluation['timeframe']
