@@ -84,14 +84,64 @@ class SignalGenerator:
         self.last_signal: Optional[TradingSignal] = None
         self.signal_history: List[TradingSignal] = []
 
+    def _evaluate_timeframe(self, timeframe: str, channel: ChannelData, current_price: float,
+                           rsi_dict: Dict, news_sentiment: Dict) -> Dict:
+        """
+        Evaluate a single timeframe and return its score.
+
+        Args:
+            timeframe: Timeframe to evaluate
+            channel: Channel data for this timeframe
+            current_price: Current price
+            rsi_dict: RSI data for all timeframes
+            news_sentiment: News sentiment data
+
+        Returns:
+            Dictionary with evaluation results
+        """
+        # Get channel position
+        channel_position = self.channel_calc.get_channel_position(current_price, channel)
+
+        # Get RSI confluence for this timeframe
+        rsi_confluence = self.rsi_calc.get_confluence_score(rsi_dict, timeframe)
+
+        # Calculate signal for this timeframe
+        signal_type, confidence, reasoning = self._calculate_signal(
+            channel_position, channel, rsi_confluence, news_sentiment
+        )
+
+        # Calculate composite score:
+        # 40% Channel stability
+        # 40% Signal confidence
+        # 20% RSI confluence
+        composite_score = (
+            channel.stability_score * 0.4 +
+            confidence * 0.4 +
+            rsi_confluence['score'] * 0.2
+        )
+
+        return {
+            'timeframe': timeframe,
+            'channel': channel,
+            'channel_position': channel_position,
+            'rsi_confluence': rsi_confluence,
+            'signal_type': signal_type,
+            'confidence': confidence,
+            'reasoning': reasoning,
+            'composite_score': composite_score
+        }
+
     def generate_signal(self, primary_timeframe: Optional[str] = None) -> TradingSignal:
         """
         Generate trading signal based on all analysis.
-        Automatically selects the most stable channel across all timeframes.
+        Automatically selects the best timeframe by composite score of:
+        - Channel stability (40%)
+        - Signal confidence (40%)
+        - RSI confluence (20%)
 
         Args:
             primary_timeframe: Optional - if provided, uses this timeframe.
-                             Otherwise auto-selects best channel by stability.
+                             Otherwise auto-selects best by composite score.
 
         Returns:
             TradingSignal object
@@ -100,44 +150,48 @@ class SignalGenerator:
         data_dict = self.data_handler.get_all_timeframes()
         current_price = self.data_handler.get_latest_price()
 
-        # Analyze channels across ALL timeframes
+        # Analyze channels and RSI across ALL timeframes
         channels = self.channel_calc.analyze_multiple_timeframes(data_dict)
-
-        # Find the BEST channel (highest stability score)
-        if primary_timeframe and primary_timeframe in channels:
-            # Use specified timeframe if provided
-            best_timeframe = primary_timeframe
-            best_channel = channels[primary_timeframe]
-        else:
-            # Auto-select best channel by stability
-            best_timeframe = max(channels.keys(), key=lambda tf: channels[tf].stability_score)
-            best_channel = channels[best_timeframe]
-
-        print(f"\n🎯 Selected Channel: {best_timeframe} (Stability: {best_channel.stability_score:.1f}/100)")
-        print(f"   R²={best_channel.r_squared:.3f}, Ping-pongs={best_channel.ping_pongs}, Predicted High=${best_channel.predicted_high:.2f}")
-
-        # Get channel position
-        channel_position = self.channel_calc.get_channel_position(
-            current_price, best_channel
-        )
-
-        # Analyze RSI (use same timeframe as best channel for consistency)
         rsi_dict = self.rsi_calc.analyze_multiple_timeframes(data_dict)
-        rsi_confluence = self.rsi_calc.get_confluence_score(rsi_dict, best_timeframe)
 
-        # Analyze news
-        stock_context = f"{self.stock} is trading at ${current_price:.2f}, " \
-                       f"in the {channel_position['zone']} of the channel, " \
-                       f"with RSI at {rsi_confluence['primary_rsi']:.1f}"
-
+        # Analyze news (same for all timeframes)
         self.news_analyzer.fetch_news(hours_back=24)
-        self.news_analyzer.analyze_all_news(stock_context)
+        self.news_analyzer.analyze_all_news(f"{self.stock} at ${current_price:.2f}")
         news_sentiment = self.news_analyzer.get_overall_sentiment()
 
-        # Generate signal
-        signal_type, confidence, reasoning = self._calculate_signal(
-            channel_position, best_channel, rsi_confluence, news_sentiment
-        )
+        if primary_timeframe and primary_timeframe in channels:
+            # Use specified timeframe if provided
+            evaluation = self._evaluate_timeframe(
+                primary_timeframe, channels[primary_timeframe],
+                current_price, rsi_dict, news_sentiment
+            )
+            best_evaluation = evaluation
+            print(f"\n🎯 Using Specified Timeframe: {primary_timeframe}")
+        else:
+            # Evaluate ALL timeframes
+            print(f"\n🔍 Evaluating all timeframes...")
+            evaluations = []
+            for tf, channel in channels.items():
+                eval_result = self._evaluate_timeframe(tf, channel, current_price, rsi_dict, news_sentiment)
+                evaluations.append(eval_result)
+                print(f"   {tf:8s}: Composite={eval_result['composite_score']:5.1f} "
+                      f"(Stability={channel.stability_score:5.1f}, "
+                      f"Confidence={eval_result['confidence']:5.1f}, "
+                      f"RSI={eval_result['rsi_confluence']['score']:5.1f})")
+
+            # Pick the best by composite score
+            best_evaluation = max(evaluations, key=lambda x: x['composite_score'])
+            print(f"\n🎯 Selected: {best_evaluation['timeframe']} "
+                  f"(Composite Score: {best_evaluation['composite_score']:.1f}/100)")
+
+        # Extract best results
+        best_timeframe = best_evaluation['timeframe']
+        best_channel = best_evaluation['channel']
+        channel_position = best_evaluation['channel_position']
+        rsi_confluence = best_evaluation['rsi_confluence']
+        signal_type = best_evaluation['signal_type']
+        confidence = best_evaluation['confidence']
+        reasoning = best_evaluation['reasoning']
 
         # Calculate entry/target/stop
         entry, target, stop = self._calculate_levels(

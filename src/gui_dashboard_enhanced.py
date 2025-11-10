@@ -232,11 +232,29 @@ with col1:
     st.caption(f"Stability: {signal.channel_stability:.1f}/100 | Ping-pongs: {best_channel.ping_pongs} | R²: {best_channel.r_squared:.3f}")
 
     # Get data for BEST timeframe (not user-selected)
-    df = data_dict[best_timeframe]
-    current_price = df['close'].iloc[-1]
+    df_full = data_dict[best_timeframe]
+    current_price = df_full['close'].iloc[-1]
+
+    # Zoom chart to relevant window based on timeframe
+    zoom_bars = {
+        '1hour': 168,    # 7 days
+        '2hour': 168,    # 14 days
+        '3hour': 168,    # 21 days
+        '4hour': 126,    # 21 days
+        'daily': 90,     # 90 days
+        'weekly': 52     # 52 weeks
+    }
+    bars_to_show = zoom_bars.get(best_timeframe, 100)
+    df = df_full.iloc[-bars_to_show:] if len(df_full) > bars_to_show else df_full
 
     # Use the best channel (already calculated in signal)
     channel = best_channel
+
+    # Slice channel lines to match zoomed data
+    start_idx = len(df_full) - len(df)
+    channel_upper_zoomed = channel.upper_line[start_idx:]
+    channel_center_zoomed = channel.center_line[start_idx:]
+    channel_lower_zoomed = channel.lower_line[start_idx:]
 
     # Create candlestick chart with channels
     fig = make_subplots(
@@ -244,7 +262,7 @@ with col1:
         shared_xaxes=True,
         vertical_spacing=0.05,
         row_heights=[0.7, 0.3],
-        subplot_titles=(f"{stock} - {best_timeframe}", "RSI")
+        subplot_titles=(f"{stock} - {best_timeframe} (last {len(df)} bars)", "RSI")
     )
 
     # Candlestick
@@ -260,13 +278,13 @@ with col1:
         row=1, col=1
     )
 
-    # Channel lines
+    # Channel lines (zoomed to match visible data)
     fig.add_trace(
         go.Scatter(
             x=df.index,
-            y=channel.upper_line,
+            y=channel_upper_zoomed,
             name="Upper Channel",
-            line=dict(color='red', dash='dash')
+            line=dict(color='red', dash='dash', width=2)
         ),
         row=1, col=1
     )
@@ -274,9 +292,9 @@ with col1:
     fig.add_trace(
         go.Scatter(
             x=df.index,
-            y=channel.center_line,
+            y=channel_center_zoomed,
             name="Center Line",
-            line=dict(color='blue', dash='dot')
+            line=dict(color='blue', dash='dot', width=2)
         ),
         row=1, col=1
     )
@@ -284,9 +302,9 @@ with col1:
     fig.add_trace(
         go.Scatter(
             x=df.index,
-            y=channel.lower_line,
+            y=channel_lower_zoomed,
             name="Lower Channel",
-            line=dict(color='green', dash='dash')
+            line=dict(color='green', dash='dash', width=2)
         ),
         row=1, col=1
     )
