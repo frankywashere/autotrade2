@@ -133,7 +133,8 @@ class RSICalculator:
             Dictionary with confluence information
         """
         if primary_timeframe not in rsi_dict:
-            return {"score": 0, "signal": "neutral", "details": "Primary timeframe not available"}
+            return {"score": 0, "signal": "neutral", "details": "Primary timeframe not available",
+                   "primary_rsi": 50.0, "confirming_timeframes": [], "timeframes": {}}
 
         primary_rsi = rsi_dict[primary_timeframe]
         signal = primary_rsi.signal
@@ -143,6 +144,8 @@ class RSICalculator:
                 "score": 0,
                 "signal": "neutral",
                 "details": "Primary RSI is neutral",
+                "primary_rsi": primary_rsi.value,
+                "confirming_timeframes": [],
                 "timeframes": {}
             }
 

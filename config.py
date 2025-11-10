@@ -19,10 +19,10 @@ STOCKS = ["TSLA", "SPY"]
 # Timeframes for analysis
 TIMEFRAMES = {
     "1min": "1T",
-    "1hour": "1H",
-    "2hour": "2H",
-    "3hour": "3H",
-    "4hour": "4H",
+    "1hour": "1h",
+    "2hour": "2h",
+    "3hour": "3h",
+    "4hour": "4h",
     "daily": "1D",
     "weekly": "1W"
 }
