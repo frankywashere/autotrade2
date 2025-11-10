@@ -1,11 +1,14 @@
-"""GUI dashboard using Streamlit."""
+"""Enhanced GUI dashboard with integrated monitoring using Streamlit."""
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
 import os
+import threading
+import time
+import asyncio
 
 # Add parent directory to path for config
 parent_dir = os.path.dirname(os.path.dirname(__file__))
@@ -17,6 +20,7 @@ from src.linear_regression import LinearRegressionChannel
 from src.rsi_calculator import RSICalculator
 from src.news_analyzer import NewsAnalyzer
 from src.signal_generator import SignalGenerator
+from src.telegram_bot import TelegramAlertBot
 
 
 # Page config
@@ -30,8 +34,63 @@ st.set_page_config(
 st.title("📈 Linear Regression Channel Trading System")
 
 
+# Initialize session state for monitoring
+if 'monitoring' not in st.session_state:
+    st.session_state.monitoring = False
+if 'monitor_thread' not in st.session_state:
+    st.session_state.monitor_thread = None
+if 'last_signal' not in st.session_state:
+    st.session_state.last_signal = None
+if 'monitor_logs' not in st.session_state:
+    st.session_state.monitor_logs = []
+
+
+# Monitoring function
+def monitor_in_background(stock, interval_minutes):
+    """Background monitoring function."""
+    generator = SignalGenerator(stock)
+    telegram_bot = TelegramAlertBot()
+    last_signal_type = None
+
+    # Test Telegram connection
+    asyncio.run(telegram_bot.test_connection())
+
+    while st.session_state.monitoring:
+        try:
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            log_entry = f"[{timestamp}] Checking {stock}..."
+
+            # Generate signal
+            signal = generator.generate_signal("4hour")
+
+            log_entry += f" Signal: {signal.signal_type.upper()} | Confidence: {signal.confidence_score:.1f}/100"
+
+            # Update session state with latest signal
+            st.session_state.last_signal = signal
+
+            # Send alert if high confidence and signal changed
+            if (signal.confidence_score >= config.MIN_CONFLUENCE_SCORE and
+                signal.signal_type != "neutral" and
+                signal.signal_type != last_signal_type):
+
+                log_entry += f" 🚨 HIGH CONFIDENCE ALERT SENT!"
+                asyncio.run(telegram_bot.send_signal_alert(signal))
+                last_signal_type = signal.signal_type
+
+            # Add to logs (keep last 10)
+            st.session_state.monitor_logs.append(log_entry)
+            if len(st.session_state.monitor_logs) > 10:
+                st.session_state.monitor_logs.pop(0)
+
+        except Exception as e:
+            st.session_state.monitor_logs.append(f"[{timestamp}] Error: {e}")
+
+        # Sleep for interval
+        time.sleep(interval_minutes * 60)
+
+
 # Sidebar
-st.sidebar.header("Settings")
+st.sidebar.header("⚙️ Settings")
 stock = st.sidebar.selectbox("Stock", config.STOCKS, index=0)
 timeframe = st.sidebar.selectbox(
     "Primary Timeframe",
@@ -39,7 +98,50 @@ timeframe = st.sidebar.selectbox(
     index=1
 )
 
-refresh_button = st.sidebar.button("🔄 Refresh Data")
+st.sidebar.markdown("---")
+
+# Monitoring controls
+st.sidebar.header("🔔 Auto-Monitoring")
+st.sidebar.info("Enable to send Telegram alerts automatically")
+
+monitor_interval = st.sidebar.slider("Check Interval (minutes)", 15, 120, 60, 5)
+
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    if st.button("▶️ Start Monitor", disabled=st.session_state.monitoring):
+        st.session_state.monitoring = True
+        # Start background thread
+        thread = threading.Thread(
+            target=monitor_in_background,
+            args=(stock, monitor_interval),
+            daemon=True
+        )
+        thread.start()
+        st.session_state.monitor_thread = thread
+        st.success("Monitoring started!")
+
+with col2:
+    if st.button("⏹️ Stop Monitor", disabled=not st.session_state.monitoring):
+        st.session_state.monitoring = False
+        st.session_state.monitor_thread = None
+        st.success("Monitoring stopped!")
+
+# Show monitoring status
+if st.session_state.monitoring:
+    st.sidebar.success(f"✅ Monitoring Active ({monitor_interval} min)")
+else:
+    st.sidebar.warning("⏸️ Monitoring Inactive")
+
+# Show monitor logs
+if st.session_state.monitor_logs:
+    st.sidebar.markdown("---")
+    st.sidebar.header("📜 Monitor Logs")
+    for log in st.session_state.monitor_logs[-5:]:  # Show last 5
+        st.sidebar.text(log)
+
+st.sidebar.markdown("---")
+
+refresh_button = st.sidebar.button("🔄 Refresh Dashboard")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### System Status")
@@ -76,6 +178,13 @@ try:
 except Exception as e:
     st.error(f"Error loading data: {e}")
     st.stop()
+
+
+# Alert notification at top if monitoring
+if st.session_state.monitoring:
+    alert_col1, alert_col2, alert_col3 = st.columns([1, 2, 1])
+    with alert_col2:
+        st.info(f"🔔 **Auto-Monitoring Active** - Checking every {monitor_interval} minutes | Alerts at confidence ≥ {config.MIN_CONFLUENCE_SCORE}")
 
 
 # Main content area
@@ -177,11 +286,23 @@ with col1:
 with col2:
     st.header("Current Signal")
 
-    # Generate signal
-    try:
-        with st.spinner("Analyzing..."):
-            signal = components['signal_gen'].generate_signal(timeframe)
+    # Use last signal from monitoring if available and fresh
+    if (st.session_state.last_signal and
+        st.session_state.last_signal.stock == stock and
+        (datetime.now() - st.session_state.last_signal.timestamp) < timedelta(minutes=monitor_interval)):
+        signal = st.session_state.last_signal
+        st.caption("📍 From auto-monitoring")
+    else:
+        # Generate new signal
+        try:
+            with st.spinner("Analyzing..."):
+                signal = components['signal_gen'].generate_signal(timeframe)
+                st.caption("📍 Fresh analysis")
+        except Exception as e:
+            st.error(f"Error generating signal: {e}")
+            signal = None
 
+    if signal:
         # Display signal
         if signal.signal_type == "buy":
             st.success(f"🟢 BUY SIGNAL")
@@ -193,11 +314,14 @@ with col2:
         st.metric("Confidence Score", f"{signal.confidence_score:.1f}/100")
         st.metric("Current Price", f"${signal.current_price:.2f}")
 
+        # Show if alert would be sent
+        if signal.confidence_score >= config.MIN_CONFLUENCE_SCORE and signal.signal_type != "neutral":
+            st.success("🔔 This would trigger an alert!")
+
         # Channel info
         st.subheader("Channel Analysis")
         st.metric("Position", signal.channel_position['zone'])
         st.metric("Stability", f"{signal.channel_stability:.0f}/100")
-        st.metric("Ping-Pongs", f"{signal.rsi_confluence.get('confirming_timeframes', [])}")
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -223,9 +347,6 @@ with col2:
         # Reasoning
         st.subheader("Reasoning")
         st.info(signal.reasoning)
-
-    except Exception as e:
-        st.error(f"Error generating signal: {e}")
 
 
 # Multi-timeframe RSI
@@ -300,5 +421,6 @@ except Exception as e:
 
 # Footer
 st.markdown("---")
-st.markdown(f"*Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
-st.markdown("*Data updates every 5 minutes. Use Refresh button for immediate update.*")
+monitoring_status = "🟢 Monitoring Active" if st.session_state.monitoring else "🔴 Monitoring Inactive"
+st.markdown(f"*Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {monitoring_status}*")
+st.markdown("*Dashboard updates on refresh. Auto-monitoring runs in background when enabled.*")

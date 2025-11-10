@@ -22,13 +22,17 @@ from src.telegram_bot import TelegramAlertBot
 import config
 
 
-def run_dashboard():
+def run_dashboard(enhanced=True):
     """Launch the Streamlit dashboard."""
     import subprocess
     print("Launching Streamlit dashboard...")
+
+    # Use enhanced dashboard with integrated monitoring
+    dashboard_file = "src/gui_dashboard_enhanced.py" if enhanced else "src/gui_dashboard.py"
+
     subprocess.run([
         "streamlit", "run",
-        "src/gui_dashboard.py",
+        dashboard_file,
         "--server.port", str(config.DASHBOARD_PORT)
     ])
 
