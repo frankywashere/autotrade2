@@ -146,6 +146,35 @@ refresh_button = st.sidebar.button("🔄 Refresh Dashboard")
 st.sidebar.markdown("---")
 st.sidebar.markdown("### System Status")
 
+# Show data freshness
+try:
+    if 'components' in locals() and components and 'data_handler' in components:
+        handler = components['data_handler']
+        if hasattr(handler, 'data_freshness') and handler.data_freshness:
+            freshness = handler.data_freshness
+            status_colors = {
+                'live': '🟢',
+                'recent': '🟡',
+                'stale': '🟠',
+                'outdated': '🔴'
+            }
+            status_icon = status_colors.get(freshness['status'], '⚪')
+
+            if freshness['is_live']:
+                st.sidebar.success(f"{status_icon} Data: LIVE")
+            elif freshness['status'] == 'recent':
+                st.sidebar.info(f"{status_icon} Data: Recent")
+            else:
+                st.sidebar.warning(f"{status_icon} Data: {freshness['status'].title()}")
+
+            st.sidebar.caption(f"Age: {freshness['message']}")
+        else:
+            st.sidebar.info("📊 Historical data only")
+except:
+    pass
+
+st.sidebar.markdown("---")
+
 
 # Cache data for performance
 @st.cache_data(ttl=300)  # Cache for 5 minutes

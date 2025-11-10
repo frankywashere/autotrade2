@@ -48,3 +48,7 @@ MIN_CONFLUENCE_SCORE = 60  # Minimum score to trigger alert (0-100)
 # GUI Settings
 CHART_UPDATE_SECONDS = 60
 DASHBOARD_PORT = 8501  # For Streamlit
+
+# Live Data Settings
+USE_LIVE_DATA = True  # Merge CSV with live data from yfinance
+LIVE_DATA_DAYS_BACK = 7  # Number of days of live data to fetch (max 7 for 1-min)

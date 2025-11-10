@@ -8,20 +8,23 @@ import config
 class DataHandler:
     """Handles loading and resampling of stock data."""
 
-    def __init__(self, stock: str = config.DEFAULT_STOCK):
+    def __init__(self, stock: str = config.DEFAULT_STOCK, use_live_data: Optional[bool] = None):
         """
         Initialize data handler.
 
         Args:
             stock: Stock symbol (e.g., 'TSLA', 'SPY')
+            use_live_data: If True, merge CSV with live data from yfinance (defaults to config.USE_LIVE_DATA)
         """
         self.stock = stock
+        self.use_live_data = use_live_data if use_live_data is not None else config.USE_LIVE_DATA
         self.data_1min: Optional[pd.DataFrame] = None
         self.resampled_data: Dict[str, pd.DataFrame] = {}
+        self.data_freshness: Optional[dict] = None
 
     def load_1min_data(self) -> pd.DataFrame:
         """
-        Load 1-minute data from CSV file.
+        Load 1-minute data from CSV file, optionally merging with live data.
 
         Returns:
             DataFrame with 1-minute OHLCV data
@@ -42,10 +45,29 @@ class DataHandler:
             if col not in df.columns:
                 raise ValueError(f"Missing required column: {col}")
 
-        self.data_1min = df
-        print(f"Loaded {len(df)} rows of 1-minute data for {self.stock}")
-        print(f"Date range: {df.index.min()} to {df.index.max()}")
+        print(f"Loaded {len(df)} rows of historical data for {self.stock}")
+        print(f"Historical range: {df.index.min()} to {df.index.max()}")
 
+        # Merge with live data if enabled
+        if self.use_live_data:
+            try:
+                from live_data_fetcher import LiveDataFetcher
+                fetcher = LiveDataFetcher(self.stock)
+
+                # Merge historical + live
+                df = fetcher.merge_with_historical(df, days_back=config.LIVE_DATA_DAYS_BACK)
+
+                # Get data freshness
+                self.data_freshness = fetcher.get_data_freshness(df.index.max())
+
+                print(f"\n📊 Data Status: {self.data_freshness['status'].upper()}")
+                print(f"   {self.data_freshness['message']}")
+
+            except Exception as e:
+                print(f"Warning: Could not fetch live data: {e}")
+                print("Continuing with historical data only...")
+
+        self.data_1min = df
         return df
 
     def resample_data(self, timeframe: str) -> pd.DataFrame:
