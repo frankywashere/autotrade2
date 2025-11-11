@@ -56,6 +56,26 @@ def get_memory_usage():
     process = psutil.Process(os.getpid())
     return process.memory_info().rss / 1024 / 1024
 
+
+def log_gpu_memory_usage(device):
+    """Log GPU memory usage if enabled"""
+    if not config.LOG_GPU_MEMORY:
+        return ""
+
+    if device.type == 'mps':
+        # For MPS, show system memory (unified memory architecture)
+        mem = psutil.virtual_memory()
+        used_gb = mem.used / 1024**3
+        total_gb = mem.total / 1024**3
+        return f" | Mem: {used_gb:.1f}/{total_gb:.1f}GB"
+    elif device.type == 'cuda':
+        # For CUDA, show GPU memory
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        reserved = torch.cuda.memory_reserved(device) / 1024**3
+        return f" | GPU: {allocated:.1f}/{reserved:.1f}GB"
+    else:
+        return ""
+
 def load_and_prepare_data(spy_file, tsla_file, start_year, end_year,
                           tsla_events_file=None, macro_api_key=None):
     """
@@ -195,7 +215,15 @@ def self_supervised_pretrain(model, X, epochs=10, batch_size=32, lr=0.001, devic
                                  list(pretrainer.reconstruction_head.parameters()), lr=lr)
 
     dataset = TradingDataset(X, torch.zeros(len(X), 2))  # Dummy y for pretraining
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=config.PIN_MEMORY,
+        persistent_workers=config.PERSISTENT_WORKERS if config.NUM_WORKERS > 0 else False,
+        prefetch_factor=config.PREFETCH_FACTOR if config.NUM_WORKERS > 0 else None
+    )
     num_batches = len(dataloader)
 
     pretrain_losses = []
@@ -269,8 +297,24 @@ def train_supervised(model, X, y, events_embeddings, epochs=50, batch_size=32,
     train_dataset = TradingDataset(X_train, y_train, events_train)
     val_dataset = TradingDataset(X_val, y_val, events_val)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=config.PIN_MEMORY,
+        persistent_workers=config.PERSISTENT_WORKERS if config.NUM_WORKERS > 0 else False,
+        prefetch_factor=config.PREFETCH_FACTOR if config.NUM_WORKERS > 0 else None
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=max(1, config.NUM_WORKERS // 2),  # Use fewer workers for validation
+        pin_memory=config.PIN_MEMORY,
+        persistent_workers=config.PERSISTENT_WORKERS if config.NUM_WORKERS > 0 else False,
+        prefetch_factor=config.PREFETCH_FACTOR if config.NUM_WORKERS > 0 else None
+    )
 
     num_train_batches = len(train_loader)
     num_val_batches = len(val_loader)
@@ -279,6 +323,14 @@ def train_supervised(model, X, y, events_embeddings, epochs=50, batch_size=32,
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+
+    # Mixed precision training (Automatic Mixed Precision)
+    use_amp = config.USE_MIXED_PRECISION and device.type in ['cuda', 'mps']
+    scaler = torch.amp.GradScaler(device.type) if use_amp else None
+    if use_amp:
+        print(f"  ✓ Mixed precision training enabled (AMP with {device.type.upper()})")
+    else:
+        print(f"  ✓ Full precision training (FP32)")
 
     best_val_loss = float('inf')
     best_epoch = 0
@@ -314,17 +366,28 @@ def train_supervised(model, X, y, events_embeddings, epochs=50, batch_size=32,
 
             optimizer.zero_grad()
 
-            predictions, _ = model.forward(batch_x)
-            loss = criterion(predictions, batch_y)
+            # Use automatic mixed precision if enabled
+            if use_amp:
+                with torch.amp.autocast(device_type=device.type):
+                    predictions, _ = model.forward(batch_x)
+                    loss = criterion(predictions, batch_y)
 
-            loss.backward()
-            optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                predictions, _ = model.forward(batch_x)
+                loss = criterion(predictions, batch_y)
+
+                loss.backward()
+                optimizer.step()
 
             train_loss += loss.item()
             train_batches += 1
 
-            # Update progress bar with current loss
-            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            # Update progress bar with current loss and memory
+            mem_info = log_gpu_memory_usage(device)
+            train_pbar.set_postfix_str(f"loss: {loss.item():.4f}{mem_info}")
 
         avg_train_loss = train_loss / train_batches
 
@@ -342,8 +405,15 @@ def train_supervised(model, X, y, events_embeddings, epochs=50, batch_size=32,
                 batch_x = batch_x.to(device)
                 batch_y = batch_y.to(device)
 
-                predictions, _ = model.forward(batch_x)
-                loss = criterion(predictions, batch_y)
+                # Use mixed precision for validation too
+                if use_amp:
+                    with torch.amp.autocast(device_type=device.type):
+                        predictions, _ = model.forward(batch_x)
+                        loss = criterion(predictions, batch_y)
+                else:
+                    predictions, _ = model.forward(batch_x)
+                    loss = criterion(predictions, batch_y)
+
                 val_loss += loss.item()
                 val_batches += 1
 
@@ -432,13 +502,6 @@ def main():
     parser.add_argument('--output', type=str, default='models/lnn_model.pth',
                        help='Output model path (default: models/lnn_model.pth)')
 
-    # Device arguments
-    parser.add_argument('--device', type=str, default=None,
-                       choices=['cpu', 'cuda', 'mps'],
-                       help='Force specific device (default: interactive selection)')
-    parser.add_argument('--auto_device', action='store_true',
-                       help='Auto-select best device without prompting')
-
     args = parser.parse_args()
 
     # Print header with system info
@@ -453,28 +516,19 @@ def main():
     print(f"🖥️  System memory: {psutil.virtual_memory().available / 1024**3:.1f} GB available")
     print("=" * 70)
 
-    # Device selection
+    # Auto-select device: MPS if available, else CUDA, else CPU
     device_manager = DeviceManager()
 
-    if args.device:
-        # Force specific device
-        device = torch.device(args.device)
-        print(f"\n🖥️  Using forced device: {device}")
-        if device.type == 'mps':
-            device_manager.setup_mps_environment()
-    elif args.auto_device:
-        # Auto-select best device
-        device = device_manager.select_device_auto(verbose=True)
-        if device.type == 'mps':
-            device_manager.setup_mps_environment()
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+        device_manager.setup_mps_environment()
+        print(f"\n🖥️  Device: MPS (Apple Silicon GPU)")
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"\n🖥️  Device: CUDA (NVIDIA GPU)")
     else:
-        # Interactive selection
-        device = device_manager.select_device_interactive()
-        if device.type == 'mps':
-            device_manager.setup_mps_environment()
-
-    # Print device summary
-    device_manager.print_device_summary(device)
+        device = torch.device('cpu')
+        print(f"\n🖥️  Device: CPU")
 
     total_start = time.time()
 

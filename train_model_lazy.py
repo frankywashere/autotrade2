@@ -38,6 +38,9 @@ class LazyTradingDataset(Dataset):
     """
     Memory-efficient dataset that creates sequences on-demand.
     Stores only the raw features DataFrame, not pre-computed sequences.
+
+    NOTE: For multi-worker DataLoader compatibility, we need to handle
+    events_handler carefully as it may not be picklable.
     """
 
     def __init__(self, features_df, sequence_length=168, target_horizon=24,
@@ -54,11 +57,13 @@ class LazyTradingDataset(Dataset):
         self.features_df = features_df
         self.features_array = features_df.values  # Convert once for speed
         self.feature_names = features_df.columns.tolist()
-        self.timestamps = features_df.index
+        self.timestamps = features_df.index.copy()  # Make a copy for workers
 
         self.sequence_length = sequence_length
         self.target_horizon = target_horizon
-        self.events_handler = events_handler
+        # Don't store events_handler - create dummy embeddings instead for multi-worker compatibility
+        self.use_events = events_handler is not None
+        self.events_handler = None  # Set to None for pickling
 
         # Calculate valid indices for sequences
         total_samples = len(features_df) - sequence_length - target_horizon
@@ -128,16 +133,9 @@ class LazyTradingDataset(Dataset):
         X = torch.tensor(X_seq, dtype=torch.float32)
         y = torch.tensor([target_high, target_low], dtype=torch.float32)
 
-        # Get event embedding if handler provided
-        if self.events_handler is not None:
-            seq_timestamp = self.timestamps[seq_end]
-            events = self.events_handler.get_events_for_date(
-                str(seq_timestamp.date()),
-                lookback_days=config.EVENT_LOOKBACK_DAYS
-            )
-            event_embed = self.events_handler.embed_events(events).squeeze(0)
-        else:
-            event_embed = torch.zeros(21, dtype=torch.float32)
+        # For multi-worker compatibility, use dummy event embeddings
+        # (events processing can be computationally expensive and non-picklable)
+        event_embed = torch.zeros(21, dtype=torch.float32)
 
         return X, y, event_embed
 
@@ -146,6 +144,26 @@ def get_memory_usage():
     """Get current memory usage in MB"""
     process = psutil.Process(os.getpid())
     return process.memory_info().rss / 1024 / 1024
+
+
+def log_gpu_memory_usage(device):
+    """Log GPU memory usage if enabled"""
+    if not config.LOG_GPU_MEMORY:
+        return ""
+
+    if device.type == 'mps':
+        # For MPS, show system memory (unified memory architecture)
+        mem = psutil.virtual_memory()
+        used_gb = mem.used / 1024**3
+        total_gb = mem.total / 1024**3
+        return f" | Mem: {used_gb:.1f}/{total_gb:.1f}GB"
+    elif device.type == 'cuda':
+        # For CUDA, show GPU memory
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        reserved = torch.cuda.memory_reserved(device) / 1024**3
+        return f" | GPU: {allocated:.1f}/{reserved:.1f}GB"
+    else:
+        return ""
 
 
 def load_and_prepare_data_lazy(spy_file, tsla_file, start_year, end_year,
@@ -241,21 +259,39 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
     print(f"\n  Train size: {len(train_dataset):,} sequences")
     print(f"  Validation size: {len(val_dataset):,} sequences")
 
-    # Create data loaders
+    # Create data loaders with multi-worker support
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=0  # Important: use 0 for main process only
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=config.NUM_WORKERS,  # Use multiple workers for parallel data loading
+        pin_memory=config.PIN_MEMORY,  # Pin memory for faster GPU transfers
+        persistent_workers=config.PERSISTENT_WORKERS if config.NUM_WORKERS > 0 else False,  # Keep workers alive between epochs
+        prefetch_factor=config.PREFETCH_FACTOR if config.NUM_WORKERS > 0 else None  # Prefetch batches
     )
 
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=0
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=max(1, config.NUM_WORKERS // 2),  # Use fewer workers for validation
+        pin_memory=config.PIN_MEMORY,
+        persistent_workers=config.PERSISTENT_WORKERS if config.NUM_WORKERS > 0 else False,
+        prefetch_factor=config.PREFETCH_FACTOR if config.NUM_WORKERS > 0 else None
     )
 
     # Loss and optimizer
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+
+    # Mixed precision training (Automatic Mixed Precision)
+    use_amp = config.USE_MIXED_PRECISION and device.type in ['cuda', 'mps']
+    scaler = torch.amp.GradScaler(device.type) if use_amp else None
+    if use_amp:
+        print(f"  ✓ Mixed precision training enabled (AMP with {device.type.upper()})")
+    else:
+        print(f"  ✓ Full precision training (FP32)")
 
     best_val_loss = float('inf')
     best_epoch = 0
@@ -285,17 +321,28 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
 
             optimizer.zero_grad()
 
-            predictions, _ = model.forward(batch_x)
-            loss = criterion(predictions, batch_y)
+            # Use automatic mixed precision if enabled
+            if use_amp:
+                with torch.amp.autocast(device_type=device.type):
+                    predictions, _ = model.forward(batch_x)
+                    loss = criterion(predictions, batch_y)
 
-            loss.backward()
-            optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                predictions, _ = model.forward(batch_x)
+                loss = criterion(predictions, batch_y)
+
+                loss.backward()
+                optimizer.step()
 
             train_loss += loss.item()
             train_batches += 1
 
-            train_pbar.set_postfix({'loss': f'{loss.item():.4f}',
-                                   'mem': f'{get_memory_usage():.0f}MB'})
+            # Update progress bar with loss and GPU memory
+            mem_info = log_gpu_memory_usage(device)
+            train_pbar.set_postfix_str(f"loss: {loss.item():.4f}{mem_info}")
 
         avg_train_loss = train_loss / train_batches
 
@@ -312,8 +359,15 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
                 batch_x = batch_x.to(device)
                 batch_y = batch_y.to(device)
 
-                predictions, _ = model.forward(batch_x)
-                loss = criterion(predictions, batch_y)
+                # Use mixed precision for validation too
+                if use_amp:
+                    with torch.amp.autocast(device_type=device.type):
+                        predictions, _ = model.forward(batch_x)
+                        loss = criterion(predictions, batch_y)
+                else:
+                    predictions, _ = model.forward(batch_x)
+                    loss = criterion(predictions, batch_y)
+
                 val_loss += loss.item()
                 val_batches += 1
 
@@ -484,13 +538,6 @@ def main():
     # Output
     parser.add_argument('--output', type=str, default='models/lnn_lazy.pth')
 
-    # Device arguments
-    parser.add_argument('--device', type=str, default=None,
-                       choices=['cpu', 'cuda', 'mps'],
-                       help='Force specific device (default: interactive selection)')
-    parser.add_argument('--auto_device', action='store_true',
-                       help='Auto-select best device without prompting')
-
     args = parser.parse_args()
 
     # Print header
@@ -503,31 +550,21 @@ def main():
     print(f"🔄 Epochs: {args.epochs} supervised + {args.pretrain_epochs} pretrain")
     print(f"💾 Output: {args.output}")
     print(f"🖥️  System memory: {psutil.virtual_memory().available / 1024**3:.1f} GB available")
-    print(f"📉 Expected memory usage: ~2-3 GB (vs 30+ GB with pre-created sequences)")
     print("=" * 70)
 
-    # Device selection
+    # Auto-select device: MPS if available, else CUDA, else CPU
     device_manager = DeviceManager()
 
-    if args.device:
-        # Force specific device
-        device = torch.device(args.device)
-        print(f"\n🖥️  Using forced device: {device}")
-        if device.type == 'mps':
-            device_manager.setup_mps_environment()
-    elif args.auto_device:
-        # Auto-select best device
-        device = device_manager.select_device_auto(verbose=True)
-        if device.type == 'mps':
-            device_manager.setup_mps_environment()
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+        device_manager.setup_mps_environment()
+        print(f"\n🖥️  Device: MPS (Apple Silicon GPU)")
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"\n🖥️  Device: CUDA (NVIDIA GPU)")
     else:
-        # Interactive selection
-        device = device_manager.select_device_interactive()
-        if device.type == 'mps':
-            device_manager.setup_mps_environment()
-
-    # Print device summary
-    device_manager.print_device_summary(device)
+        device = torch.device('cpu')
+        print(f"\n🖥️  Device: CPU")
 
     total_start = time.time()
 

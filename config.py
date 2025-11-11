@@ -59,11 +59,11 @@ LIVE_DATA_DAYS_BACK = 7  # Number of days of live data to fetch (max 7 for 1-min
 
 # Model Settings
 ML_MODEL_TYPE = "LNN"  # LNN, LSTM, or Transformer
-LNN_HIDDEN_SIZE = 128
-LNN_NUM_LAYERS = 2
+LNN_HIDDEN_SIZE = 128  # Back to original - was getting slower
+LNN_NUM_LAYERS = 2  # Back to original - was getting slower
 LNN_LEARNING_RATE = 0.001
-ML_BATCH_SIZE = 16  # Reduced for memory efficiency
-ML_SEQUENCE_LENGTH = 84  # Half week (3.5 days) - reduced for memory
+ML_BATCH_SIZE = 2048  # Keep large batch size - this is the key optimization
+ML_SEQUENCE_LENGTH = 168  # Full week (7 days) - optimized for available memory (was 84)
 
 # Training Settings
 ML_TRAIN_START_YEAR = 2015
@@ -120,3 +120,14 @@ CUDA_MEMORY_FRACTION = 0.9  # Use 90% of GPU memory for CUDA
 # Performance Settings
 BENCHMARK_ON_STARTUP = False  # Run device benchmark on training start
 LOG_DEVICE_OPERATIONS = False  # Log device transfer operations (debugging)
+
+# Data Loading Optimization
+NUM_WORKERS = 8  # Increased back to 8 - larger batches need more CPU prep
+PIN_MEMORY = False  # MPS doesn't support pin_memory, set to False to avoid warnings
+PERSISTENT_WORKERS = True  # Keep workers alive between epochs
+PREFETCH_FACTOR = 3  # Number of batches to prefetch per worker
+
+# Training Optimization
+USE_MIXED_PRECISION = True  # Enable automatic mixed precision (AMP) for faster training
+GRADIENT_ACCUMULATION_STEPS = 1  # Simulate larger batch sizes (1 = disabled)
+LOG_GPU_MEMORY = True  # Log GPU/memory usage during training
