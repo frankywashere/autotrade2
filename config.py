@@ -62,8 +62,8 @@ ML_MODEL_TYPE = "LNN"  # LNN, LSTM, or Transformer
 LNN_HIDDEN_SIZE = 128
 LNN_NUM_LAYERS = 2
 LNN_LEARNING_RATE = 0.001
-ML_BATCH_SIZE = 32
-ML_SEQUENCE_LENGTH = 168  # 1 week of hourly bars
+ML_BATCH_SIZE = 16  # Reduced for memory efficiency
+ML_SEQUENCE_LENGTH = 84  # Half week (3.5 days) - reduced for memory
 
 # Training Settings
 ML_TRAIN_START_YEAR = 2015
