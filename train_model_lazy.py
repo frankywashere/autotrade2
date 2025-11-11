@@ -31,6 +31,7 @@ from src.ml.features import TradingFeatureExtractor
 from src.ml.features_lazy import TradingFeatureExtractorWithProgress
 from src.ml.events import CombinedEventsHandler
 from src.ml.model import LNNTradingModel, LSTMTradingModel, SelfSupervisedPretrainer
+from src.ml.device_manager import DeviceManager
 
 
 class LazyTradingDataset(Dataset):
@@ -209,13 +210,14 @@ def load_and_prepare_data_lazy(spy_file, tsla_file, start_year, end_year,
 
 def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_size=32,
                          lr=0.001, validation_split=0.1, sequence_length=168,
-                         target_horizon=24):
+                         target_horizon=24, device=torch.device('cpu')):
     """
     Supervised training using lazy sequence loading.
     """
     print("\n" + "=" * 70)
     print("🎯 SUPERVISED TRAINING (Memory-Efficient)")
     print("=" * 70)
+    print(f"  Device: {device}")
     start_time = time.time()
 
     print(f"  Total data points: {len(features_df):,}")
@@ -277,6 +279,10 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
         train_pbar = tqdm(train_loader, desc=f"    Training", unit="batch", leave=False)
 
         for batch_x, batch_y, batch_events in train_pbar:
+            # Move batches to device
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+
             optimizer.zero_grad()
 
             predictions, _ = model.forward(batch_x)
@@ -302,6 +308,10 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
 
         with torch.no_grad():
             for batch_x, batch_y, batch_events in val_pbar:
+                # Move batches to device
+                batch_x = batch_x.to(device)
+                batch_y = batch_y.to(device)
+
                 predictions, _ = model.forward(batch_x)
                 loss = criterion(predictions, batch_y)
                 val_loss += loss.item()
@@ -356,7 +366,8 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
 
 
 def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
-                                  batch_size=32, lr=0.001, sequence_length=168):
+                                  batch_size=32, lr=0.001, sequence_length=168,
+                                  device=torch.device('cpu')):
     """
     Self-supervised pretraining using lazy loading.
     """
@@ -364,6 +375,7 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
     print("🔧 SELF-SUPERVISED PRETRAINING (Memory-Efficient)")
     print("=" * 70)
     print(f"  Learning to understand patterns via masked reconstruction")
+    print(f"  Device: {device}")
     print(f"  Mask ratio: 15% | Learning rate: {lr}")
 
     pretrainer = SelfSupervisedPretrainer(model, mask_ratio=0.15)
@@ -408,6 +420,9 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
                          bar_format="{l_bar}{bar:20}{r_bar}")
 
         for batch_x, _, _ in batch_pbar:
+            # Move batch to device
+            batch_x = batch_x.to(device)
+
             loss = pretrainer.pretrain_step(batch_x, optimizer)
             total_loss += loss
             batch_count += 1
@@ -469,6 +484,13 @@ def main():
     # Output
     parser.add_argument('--output', type=str, default='models/lnn_lazy.pth')
 
+    # Device arguments
+    parser.add_argument('--device', type=str, default=None,
+                       choices=['cpu', 'cuda', 'mps'],
+                       help='Force specific device (default: interactive selection)')
+    parser.add_argument('--auto_device', action='store_true',
+                       help='Auto-select best device without prompting')
+
     args = parser.parse_args()
 
     # Print header
@@ -483,6 +505,29 @@ def main():
     print(f"🖥️  System memory: {psutil.virtual_memory().available / 1024**3:.1f} GB available")
     print(f"📉 Expected memory usage: ~2-3 GB (vs 30+ GB with pre-created sequences)")
     print("=" * 70)
+
+    # Device selection
+    device_manager = DeviceManager()
+
+    if args.device:
+        # Force specific device
+        device = torch.device(args.device)
+        print(f"\n🖥️  Using forced device: {device}")
+        if device.type == 'mps':
+            device_manager.setup_mps_environment()
+    elif args.auto_device:
+        # Auto-select best device
+        device = device_manager.select_device_auto(verbose=True)
+        if device.type == 'mps':
+            device_manager.setup_mps_environment()
+    else:
+        # Interactive selection
+        device = device_manager.select_device_interactive()
+        if device.type == 'mps':
+            device_manager.setup_mps_environment()
+
+    # Print device summary
+    device_manager.print_device_summary(device)
 
     total_start = time.time()
 
@@ -506,6 +551,10 @@ def main():
     else:
         model = LSTMTradingModel(input_size, args.hidden_size)
 
+    # Move model to device
+    model = device_manager.move_to_device(model, device, verbose=True)
+    print(f"  ✓ Model moved to {device}")
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Model type: {args.model_type}")
     print(f"  Input features: {input_size}")
@@ -521,7 +570,8 @@ def main():
             epochs=args.pretrain_epochs,
             batch_size=args.batch_size,
             lr=args.lr,
-            sequence_length=config.ML_SEQUENCE_LENGTH
+            sequence_length=config.ML_SEQUENCE_LENGTH,
+            device=device
         )
 
     # 4. Supervised training
@@ -532,7 +582,8 @@ def main():
         lr=args.lr,
         validation_split=config.ML_VALIDATION_SPLIT,
         sequence_length=config.ML_SEQUENCE_LENGTH,
-        target_horizon=config.PREDICTION_HORIZON_HOURS
+        target_horizon=config.PREDICTION_HORIZON_HOURS,
+        device=device
     )
 
     # 5. Save model
@@ -553,7 +604,9 @@ def main():
         'training_date': datetime.now().isoformat(),
         'feature_names': feature_extractor.get_feature_names(),
         'training_mode': 'lazy_loading',
-        'peak_memory_mb': get_memory_usage()
+        'peak_memory_mb': get_memory_usage(),
+        'device': str(device),
+        'device_type': device.type
     }
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)

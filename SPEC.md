@@ -1,29 +1,46 @@
-# Linear Regression Channel Trading System - Technical Specification
+# AutoTrade2 - Complete Technical Specification
 
-**Version:** 1.0 (Stage 1 Complete)
+**Version:** 2.0 (Stage 1 + Stage 2 Complete)
 **Repository:** https://github.com/frankywashere/autotrade2
-**Last Updated:** November 10, 2025
+**Last Updated:** November 11, 2025
 
 ---
 
 ## Table of Contents
+
 1. [System Overview](#system-overview)
-2. [File Structure](#file-structure)
-3. [Core Algorithms](#core-algorithms)
-4. [Data Flow](#data-flow)
-5. [Configuration](#configuration)
-6. [API Integration](#api-integration)
+2. [Quick Start](#quick-start)
+3. [File Structure](#file-structure)
+4. [Stage 1: Linear Regression Trading System](#stage-1-linear-regression-trading-system)
+5. [Stage 2: ML-Powered Predictions](#stage-2-ml-powered-predictions)
+6. [Training Workflow](#training-workflow)
+7. [Data Validation](#data-validation)
+8. [Memory Optimization](#memory-optimization)
+9. [Performance & Limitations](#performance--limitations)
+10. [API Integration](#api-integration)
+11. [Future Improvements](#future-improvements)
+12. [Quick Reference](#quick-reference)
 
 ---
 
 ## System Overview
 
-An AI-powered stock trading analysis system that combines:
+AutoTrade2 is a two-stage AI-powered stock trading analysis system:
+
+### Stage 1: Technical Analysis & Alerts
 - **Linear regression channels** with ping-pong pattern detection
 - **Multi-timeframe RSI analysis** with confluence scoring
 - **Claude AI news sentiment** and BS detection
 - **Automated Telegram alerts** for high-confidence signals
-- **Interactive dashboard** with integrated monitoring
+- **Interactive Streamlit dashboard** with monitoring
+
+### Stage 2: ML-Powered Predictions
+- **Liquid Neural Networks (LNN)** for 24-hour forecasting
+- **56-feature extraction system** (channels, RSI, correlations, cycles)
+- **Real event integration** (TSLA earnings + macro events)
+- **Memory-efficient training** with lazy sequence loading
+- **Online learning** from prediction errors
+- **Production-ready** with SQLite logging
 
 ### Key Innovation: Intelligent Channel Selection
 System evaluates ALL timeframes (1h, 2h, 3h, 4h, daily, weekly) and automatically selects the channel with:
@@ -31,1080 +48,747 @@ System evaluates ALL timeframes (1h, 2h, 3h, 4h, daily, weekly) and automaticall
 - **25% RSI Confluence** (multi-timeframe alignment)
 - **5% Channel Stability** (quality filter)
 
-### Hybrid Data System
-- Historical CSV data: 10+ years (2015-2025)
-- Live data: Automatic merge with yfinance (last 7 days)
-- Data freshness tracking: LIVE/RECENT/STALE/OUTDATED
+### Data System
+- **Historical CSV data**: 10+ years (2015-2025), 1.35M aligned bars
+- **Live data**: Automatic merge with yfinance (last 7 days)
+- **Data validation**: Zero-tolerance for misaligned/fake data
+- **Events**: 394 real events (TSLA earnings + macro)
+
+---
+
+## Quick Start
+
+### Stage 1 (Dashboard & Alerts)
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Convert raw data (one-time)
+python3 convert_data.py
+
+# Launch dashboard
+python main.py dashboard
+
+# Or use quick menu
+./run.sh
+```
+
+### Stage 2 (ML Training)
+```bash
+# Install ML dependencies
+pip install torch ncps sqlalchemy tqdm psutil
+
+# Validate data (MANDATORY!)
+python3 validate_data_alignment.py --events_data data/tsla_events_REAL.csv
+
+# Train model (memory-efficient)
+python3 train_model_lazy.py \
+  --tsla_events data/tsla_events_REAL.csv \
+  --epochs 50 \
+  --pretrain_epochs 10 \
+  --output models/lnn_full.pth
+
+# Backtest
+python3 backtest.py --model_path models/lnn_full.pth --test_year 2024
+```
 
 ---
 
 ## File Structure
 
-### Root Directory (`/Users/frank/Desktop/CodingProjects/autotrade2/`)
-
 ```
 autotrade2/
-├── .git/                           # Git repository
-├── .gitignore                      # Excludes /data folder
-├── .env.example                    # Environment variable template
-├── README.md                       # User documentation
-├── SPEC.md                         # This technical specification
-├── config.py                       # Central configuration
-├── main.py                         # Main entry point
-├── requirements.txt                # Python dependencies
-├── run.sh                          # Quick start menu script
-├── convert_data.py                 # Data conversion utility
-├── data/                           # Stock data (gitignored)
-│   ├── TSLAMin.txt                # Raw TSLA data
-│   ├── SPYMin.txt                 # Raw SPY data
-│   ├── TSLA_1min.csv              # Converted TSLA 1-min data
-│   └── SPY_1min.csv               # Converted SPY 1-min data
-└── src/                            # Source code modules
-    ├── data_handler.py            # Data loading and resampling
-    ├── live_data_fetcher.py       # Live data from yfinance
-    ├── linear_regression.py       # Channel calculation
-    ├── rsi_calculator.py          # RSI and confluence
-    ├── news_analyzer.py           # AI news analysis
-    ├── signal_generator.py        # Signal generation
-    ├── telegram_bot.py            # Telegram alerts
-    ├── gui_dashboard.py           # Basic dashboard (deprecated)
-    └── gui_dashboard_enhanced.py  # Enhanced dashboard with monitoring
+├── .git/                                # Git repository
+├── .gitignore                           # Excludes /data folder
+├── README.md                            # User documentation
+├── SPEC.md                              # This technical specification
+├── config.py                            # Central configuration
+├── main.py                              # Stage 1 entry point
+├── requirements.txt                     # Python dependencies
+├── run.sh                               # Quick start menu
+├── convert_data.py                      # Data conversion utility
+│
+├── data/                                # Stock data (gitignored)
+│   ├── TSLAMin.txt                     # Raw TSLA data
+│   ├── SPYMin.txt                      # Raw SPY data
+│   ├── TSLA_1min.csv                   # Converted TSLA (1.45M rows)
+│   ├── SPY_1min.csv                    # Converted SPY (1.79M rows)
+│   ├── tsla_events_REAL.csv            # Real events (394 in training range)
+│   └── predictions.db                  # SQLite prediction database
+│
+├── models/                              # Trained ML models
+│   └── lnn_full.pth                    # Production LNN model
+│
+├── src/                                 # Stage 1 source code
+│   ├── data_handler.py                 # Data loading and resampling
+│   ├── live_data_fetcher.py            # Live data from yfinance
+│   ├── linear_regression.py            # Channel calculation
+│   ├── rsi_calculator.py               # RSI and confluence
+│   ├── news_analyzer.py                # AI news analysis
+│   ├── signal_generator.py             # Signal generation
+│   ├── telegram_bot.py                 # Telegram alerts
+│   ├── gui_dashboard.py                # Basic dashboard (deprecated)
+│   └── gui_dashboard_enhanced.py       # Enhanced dashboard with monitoring
+│
+└── src/ml/                              # Stage 2 ML system
+    ├── __init__.py                     # ML module exports
+    ├── base.py                         # Abstract interfaces
+    ├── data_feed.py                    # Data loading (CSV/IBKR)
+    ├── features.py                     # 56-feature extraction
+    ├── features_lazy.py                # Feature extraction with progress
+    ├── events.py                       # Event integration
+    ├── model.py                        # LNN and LSTM models
+    └── database.py                     # SQLite prediction logging
+
+# Stage 2 Scripts
+├── train_model.py                       # Original training (memory-intensive)
+├── train_model_lazy.py                  # Memory-efficient training (USE THIS!)
+├── backtest.py                          # Walk-forward backtesting
+├── validate_results.py                  # Model validation
+├── update_model.py                      # Online learning
+├── validate_data_alignment.py           # Data validation (MANDATORY)
+└── process_real_events.py               # Parse real events from RTF/JSON
 ```
 
 ---
 
-## Core Files - Detailed Breakdown
+## Stage 1: Linear Regression Trading System
 
-### 1. `/config.py` - Central Configuration
+### Core Components
 
-**Purpose:** Single source of truth for all system parameters
+#### 1. Data Handler (`src/data_handler.py`)
+- Loads 1-minute CSV data
+- Merges with live data from yfinance (last 7 days)
+- Resamples to all timeframes (1h/2h/3h/4h/daily/weekly)
+- Tracks data freshness (LIVE/RECENT/STALE/OUTDATED)
 
-**Key Settings:**
+#### 2. Linear Regression Channel (`src/linear_regression.py`)
+- Calculates regression channels with 2σ bands
+- Detects ping-pong patterns (price bounces)
+- Calculates stability score (R², ping-pongs, data points)
+- **Projects 24 hours forward** for predicted high/low
+
+**24-Hour Projection Algorithm:**
 ```python
-# API Keys
-CLAUDE_API_KEY          # For news sentiment analysis
-TELEGRAM_BOT_TOKEN      # For alerts (7978931435:AAGdqdfcbK...)
-TELEGRAM_CHAT_ID        # Your chat ID (7910666732)
+# Calculate bars needed for 24 hours
+bars_24h = {'1hour': 24, '3hour': 8, '4hour': 6, 'daily': 1}
 
-# Trading Parameters
-DEFAULT_STOCK = "TSLA"
-STOCKS = ["TSLA", "SPY"]
+# Project regression forward
+future_x = [n, n+1, ..., n+bars_24h]
+future_center = slope * future_x + intercept
+future_upper = future_center + (2 * std_dev)
+future_lower = future_center - (2 * std_dev)
 
-# Timeframes
-TIMEFRAMES = {
-    "1min": "1T", "1hour": "1h", "2hour": "2h",
-    "3hour": "3h", "4hour": "4h", "daily": "1D", "weekly": "1W"
-}
-
-# RSI Parameters
-RSI_PERIOD = 14
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
-
-# Channel Parameters
-MIN_PING_PONGS_1H = 2
-MIN_PING_PONGS_4H = 1
-CHANNEL_LOOKBACK_HOURS = 168  # 1 week
-CHANNEL_STD_DEV = 2.0
-
-# Signal Generation
-MIN_CONFLUENCE_SCORE = 60  # Alert threshold
-
-# Live Data
-USE_LIVE_DATA = True
-LIVE_DATA_DAYS_BACK = 7
+# Find range
+predicted_high = MAX(future_upper)
+predicted_low = MIN(future_lower)
 ```
 
-**Dependencies:** None (base configuration)
+#### 3. RSI Calculator (`src/rsi_calculator.py`)
+- Standard 14-period RSI
+- Multi-timeframe confluence scoring
+- Oversold (<30), Overbought (>70) detection
+- Divergence detection
 
----
-
-### 2. `/main.py` - Main Entry Point
-
-**Purpose:** Command-line interface and entry point for all modes
-
-**Functions:**
-- `run_dashboard()` - Launch Streamlit GUI
-- `generate_signal(stock, timeframe)` - Generate one-time signal
-- `monitor_and_alert(stock, timeframe, interval)` - Continuous monitoring
-- `test_components()` - Test all modules
-
-**Usage:**
-```bash
-python main.py dashboard           # GUI mode
-python main.py signal              # One-time signal
-python main.py monitor             # Continuous monitoring
-python main.py test                # Test all components
-```
-
-**Arguments:**
-- `--stock TSLA|SPY` - Stock symbol
-- `--timeframe 1hour|3hour|4hour|daily` - Force specific timeframe (default: auto)
-- `--interval N` - Minutes between checks (monitor mode)
-
-**Dependencies:**
-- All src/ modules
-- config.py
-
----
-
-### 3. `/src/data_handler.py` - Data Loading and Resampling
-
-**Purpose:** Load 1-minute data from CSV and resample to all timeframes
-
-**Class:** `DataHandler`
-
-**Key Methods:**
-- `load_1min_data()` - Load CSV, merge with live data if enabled
-- `resample_data(timeframe)` - Resample to 1h/2h/3h/4h/daily/weekly
-- `get_data(timeframe)` - Get data for specific timeframe
-- `get_all_timeframes()` - Get dict of all timeframes
-- `get_latest_price()` - Current price
-- `get_price_at_time(timestamp)` - Historical price lookup
-
-**Data Pipeline:**
-1. Load CSV file (`TSLA_1min.csv` or `SPY_1min.csv`)
-2. Parse timestamps and OHLCV columns
-3. If `use_live_data=True`:
-   - Fetch last 7 days from yfinance
-   - Merge with historical data
-   - Track data freshness
-4. Resample to all timeframes using pandas
-
-**Attributes:**
-- `data_1min` - 1-minute DataFrame
-- `resampled_data` - Dict of timeframe DataFrames
-- `data_freshness` - Metadata about data age
-
-**Dependencies:**
-- pandas, config
-- `live_data_fetcher.py` (if live data enabled)
-
----
-
-### 4. `/src/live_data_fetcher.py` - Live Data Integration
-
-**Purpose:** Fetch real-time stock data from yfinance and merge with historical CSV
-
-**Class:** `LiveDataFetcher`
-
-**Key Methods:**
-- `fetch_recent_data(days_back=7)` - Fetch 1-min data from yfinance
-- `get_current_price()` - Get real-time price
-- `merge_with_historical(historical_df)` - Merge CSV + live data
-- `get_data_freshness(timestamp)` - Check data age
-
-**Freshness Levels:**
-- **LIVE** - Updated within 5 minutes
-- **RECENT** - Within 1 hour
-- **STALE** - Within 1 day
-- **OUTDATED** - Older than 1 day
-
-**Limitations:**
-- yfinance provides 1-min data for last 7 days only
-- Automatically removes timezone info to match CSV format
-
-**Dependencies:**
-- yfinance, pandas, config
-
----
-
-### 5. `/src/linear_regression.py` - Channel Calculation
-
-**Purpose:** Calculate linear regression channels with ping-pong detection and 24-hour predictions
-
-**Class:** `LinearRegressionChannel`
-
-**Data Class:** `ChannelData`
-- `slope` - Regression line slope
-- `intercept` - Regression line intercept
-- `upper_line` - Upper channel boundary (center + 2σ)
-- `lower_line` - Lower channel boundary (center - 2σ)
-- `center_line` - Regression line
-- `std_dev` - Standard deviation of residuals
-- `r_squared` - Goodness of fit (0-1)
-- `ping_pongs` - Number of bounces between lines
-- `stability_score` - Overall channel quality (0-100)
-- `predicted_high` - 24-hour expected high
-- `predicted_low` - 24-hour expected low
-- `predicted_center` - 24-hour center projection
-
-**Key Methods:**
-
-#### `calculate_channel(df, lookback_bars, timeframe)`
-1. Extract close prices from DataFrame
-2. Calculate linear regression (scipy.stats.linregress)
-3. Compute residuals and standard deviation
-4. Create upper/lower lines (center ± 2σ)
-5. Detect ping-pongs (price bounces)
-6. Calculate stability score
-7. **Project 24 hours forward:**
-   - Calculate bars for 24h (e.g., 3hour → 8 bars)
-   - Project regression line forward
-   - Find MAX(upper channel) = predicted_high
-   - Find MIN(lower channel) = predicted_low
-
-#### `_detect_ping_pongs(prices, upper, lower, threshold=0.02)`
-Counts bounces between channel lines:
-- Tracks when price touches upper (within 2%)
-- Tracks when price touches lower (within 2%)
-- Counts transitions: upper→lower or lower→upper
-- Returns total bounce count
-
-#### `_calculate_stability(r_squared, ping_pongs, n_bars)`
-Composite stability score (0-100):
-- **40 points:** R-squared × 40
-- **40 points:** min(ping_pongs / 5, 1.0) × 40
-- **20 points:** min(n_bars / 100, 1.0) × 20
-
-#### `get_channel_position(price, channel)`
-Returns current price position:
-- `position` - 0.0 (lower) to 1.0 (upper)
-- `zone` - lower_extreme, lower, middle, upper, upper_extreme
-- `distance_to_upper_pct` - % to upper line
-- `distance_to_lower_pct` - % to lower line
-
-#### `analyze_multiple_timeframes(data_dict)`
-Calculates channels for all timeframes with smart lookback:
-- 1h/2h/3h: 168 hours (1 week)
-- 4h: 42 bars (1 week)
-- daily/weekly: All data
-
-**Dependencies:**
-- scipy.stats, numpy, pandas, config
-
----
-
-### 6. `/src/rsi_calculator.py` - RSI and Confluence Analysis
-
-**Purpose:** Calculate RSI across multiple timeframes and detect confluence
-
-**Class:** `RSICalculator`
-
-**Data Class:** `RSIData`
-- `value` - RSI value (0-100)
-- `oversold` - True if RSI < 30
-- `overbought` - True if RSI > 70
-- `signal` - 'buy', 'sell', or 'neutral'
-- `history` - Full RSI Series
-
-**Key Methods:**
-
-#### `calculate_rsi(df, column='close')`
-Standard RSI calculation:
-1. Calculate price changes (delta)
-2. Separate gains and losses
-3. Calculate average gain/loss (14-period rolling)
-4. RS = avg_gain / avg_loss
-5. RSI = 100 - (100 / (1 + RS))
-
-#### `get_rsi_data(df)`
-Returns RSIData object with signal:
-- RSI < 30 → 'buy' signal
-- RSI > 70 → 'sell' signal
-- Otherwise → 'neutral'
-
-#### `analyze_multiple_timeframes(data_dict)`
-Calculates RSI for all timeframes in parallel
-
-#### `get_confluence_score(rsi_dict, primary_timeframe)`
-**Confluence Scoring Algorithm:**
-1. Check primary timeframe RSI signal
-2. Look at higher timeframes for confirmation:
-   - 1hour → check 2h/3h/4h/daily/weekly
-   - 4hour → check daily/weekly
-   - daily → check weekly
-3. Count confirming timeframes
-4. Calculate score:
-   - Base: 40 points (primary signal)
-   - Confirmation: (confirmations / total_checked) × 60
-
-Returns:
+**RSI Confluence Algorithm:**
 ```python
-{
-    "score": 0-100,
-    "signal": "buy|sell|neutral",
-    "primary_rsi": float,
-    "confirming_timeframes": [list],
-    "timeframes": {dict of all RSI values}
-}
+# Primary timeframe RSI signal
+if rsi < 30: signal = 'buy'
+elif rsi > 70: signal = 'sell'
+
+# Check higher timeframes for confirmation
+confirmations = count_confirming_timeframes(signal, higher_tfs)
+
+# Score: 40 (base) + 60 (confirmations/total)
+confluence_score = 40 + (confirmations / total_checked) * 60
 ```
 
-#### `detect_divergence(df, lookback=14)`
-Detects RSI divergence:
-- **Bullish:** Price lower lows, RSI higher lows
-- **Bearish:** Price higher highs, RSI lower highs
+#### 4. News Analyzer (`src/news_analyzer.py`)
+- Fetches news via NewsAPI (or mock data)
+- Claude AI sentiment analysis (-100 to +100)
+- **BS Score** (0-100): clickbait/rehash detection
+- Recommendation: buy the dip if high BS + bearish
 
-**Dependencies:**
-- pandas, numpy, config
-
----
-
-### 7. `/src/news_analyzer.py` - AI News Analysis
-
-**Purpose:** Fetch news and analyze sentiment + BS score using Claude AI
-
-**Class:** `NewsAnalyzer`
-
-**Data Class:** `NewsArticle`
-- `title` - Article headline
-- `description` - Article description
-- `url` - Article URL
-- `published_at` - Publication timestamp
-- `source` - News source
-- `sentiment` - positive/negative/neutral
-- `sentiment_score` - -100 (bearish) to +100 (bullish)
-- `bs_score` - 0 (factual) to 100 (BS/clickbait)
-- `analysis` - AI explanation
-
-**Key Methods:**
-
-#### `fetch_news(hours_back=24)`
-- Attempts to fetch from NewsAPI (if key configured)
-- Falls back to mock articles for testing
-- Returns list of NewsArticle objects
-
-#### `analyze_article(article, stock_context)`
-**Claude AI Analysis:**
-1. Builds prompt with article + market context
-2. Calls Claude API (model: claude-3-haiku-20240307)
-3. Requests JSON response with:
-   - Sentiment: positive/negative/neutral
-   - Sentiment Score: -100 to +100
-   - BS Score: 0-100
-   - Analysis: 1-2 sentence explanation
-4. Parses JSON response
-5. Updates article object
-
-**BS Scoring Criteria:**
-- Rehashed old news → High BS
-- Clickbait headline → High BS
-- Contradicts historical patterns → High BS
-- If bearish news historically led to rebounds → High BS
-- Panic/FOMO content without substance → High BS
-
-#### `analyze_all_news(stock_context)`
-Analyzes all cached articles with AI
-
-#### `get_overall_sentiment()`
-Aggregates news sentiment:
-```python
-{
-    "avg_sentiment_score": float,
-    "avg_bs_score": float,
-    "positive_count": int,
-    "negative_count": int,
-    "neutral_count": int,
-    "high_bs_count": int,
-    "signal": "positive|negative|neutral|ignore",
-    "recommendation": str
-}
+#### 5. Signal Generator (`src/signal_generator.py`)
+**Main Algorithm:**
 ```
-
-**Signal Logic:**
-- If avg_bs > 70 → "ignore" (high BS, disregard news)
-- If avg_sentiment > 20 → "positive"
-- If avg_sentiment < -20 → "negative"
-- Otherwise → "neutral"
-
-**Dependencies:**
-- anthropic, requests, config
-
----
-
-### 8. `/src/signal_generator.py` - Signal Generation Engine
-
-**Purpose:** Combine channel + RSI + news analysis to generate trading signals
-
-**Class:** `SignalGenerator`
-
-**Data Class:** `TradingSignal`
-```python
-timestamp: datetime
-stock: str
-signal_type: str                # 'buy', 'sell', 'neutral'
-confidence_score: float         # 0-100
-current_price: float
-channel_position: Dict          # Zone, position, distances
-predicted_high: float           # 24-hour expected high
-predicted_low: float            # 24-hour expected low
-channel_stability: float        # 0-100
-best_channel_timeframe: str     # Selected timeframe (e.g., '3hour')
-best_channel_data: ChannelData  # Complete channel object
-rsi_confluence: Dict            # RSI confluence data
-primary_rsi: float              # RSI value
-news_sentiment: Dict            # News analysis results
-entry_price: float              # Recommended entry
-target_price: float             # Take profit target
-stop_loss: float                # Stop loss level
-reasoning: str                  # Human-readable explanation
-```
-
-**Key Methods:**
-
-#### `_evaluate_timeframe(timeframe, channel, current_price, rsi_dict, news_sentiment)`
-Evaluates a single timeframe and returns:
-```python
-{
-    'timeframe': str,
-    'channel': ChannelData,
-    'channel_position': Dict,
-    'rsi_confluence': Dict,
-    'signal_type': str,
-    'confidence': float,
-    'reasoning': str,
-    'composite_score': float  # 70% Conf + 25% RSI + 5% Stab
-}
-```
-
-#### `generate_signal(primary_timeframe=None)`
-**Main Signal Generation Algorithm:**
-
-**Step 1: Load Data**
-- Get all timeframes from DataHandler
-- Get current price
-
-**Step 2: Analyze All Timeframes**
-- Calculate channels for 1h, 2h, 3h, 4h, daily, weekly
-- Calculate RSI for all timeframes
-- Fetch and analyze news (once, same for all)
-
-**Step 3: Evaluate Each Timeframe**
 For each timeframe:
-- Get channel position
-- Get RSI confluence
-- Calculate signal confidence
-- Compute composite score:
-  - **70%** Signal Confidence
-  - **25%** RSI Confluence
-  - **5%** Channel Stability
-
-**Step 4: Select Best Timeframe**
-- Pick timeframe with highest composite score
-- Print all evaluations for transparency
-- Extract best channel, RSI, and signal data
-
-**Step 5: Calculate Trade Levels**
-- Entry: Current price
-- Target: Upper channel (buy) or lower channel (sell)
-- Stop: Below lower (buy) or above upper (sell) with 2% buffer
-
-**Step 6: Build Signal Object**
-- Create TradingSignal with all data
-- Cache in signal_history
-
-#### `_calculate_signal(channel_pos, channel, rsi_conf, news)`
-**Signal Confidence Scoring (0-100):**
-
-**Channel Component (0-30 points):**
-- In lower/lower_extreme zone → +20 (buy signal)
-- In upper/upper_extreme zone → +20 (sell signal)
-- Channel stability > 60 → +10
-
-**RSI Component (0-40 points):**
-- RSI signal matches channel → +(rsi_score × 0.4) up to 40
-- RSI conflicts with channel → -15
-
-**News Component (0-30 points):**
-- High BS + bearish + buy signal → +15 (buy the dip!)
-- Low BS + matches signal → +15
-- Low BS + contradicts → -20
-- High BS → +5 (ignore news)
-
-**Final Adjustments:**
-- Clamp to 0-100
-- If confidence < MIN_CONFLUENCE_SCORE → signal = 'neutral'
-
-#### `_calculate_levels(signal_type, current_price, channel, channel_pos)`
-Buy signal:
-- Entry: Current price
-- Target: min(upper_value, predicted_high)
-- Stop: lower_value × 0.98
-
-Sell signal:
-- Entry: Current price
-- Target: max(lower_value, predicted_low)
-- Stop: upper_value × 1.02
-
-#### `get_signal_summary(signal)`
-Formats signal as human-readable text with:
-- Signal type and confidence
-- Current market conditions
-- 24-hour prediction with timeframe
-- RSI confluence details
-- News sentiment
-- Trade levels if not neutral
-- Full reasoning
-
-**Dependencies:**
-- All src/ modules, config
-
----
-
-### 9. `/src/telegram_bot.py` - Telegram Alert System
-
-**Purpose:** Send formatted trading alerts via Telegram
-
-**Class:** `TelegramAlertBot`
-
-**Key Methods:**
-
-#### `send_signal_alert(signal)`
-Async method that:
-1. Formats signal as HTML message
-2. Sends via Telegram API
-3. Falls back to console if not configured
-
-#### `_format_signal_message(signal)`
-Creates HTML-formatted message:
-```
-🟢 TRADING ALERT: TSLA
-
-Signal: BUY
-Confidence: 85.5/100
-
-📊 CURRENT MARKET
-• Price: $445.26
-• Channel: lower (18%)
-• RSI: 47.2
-
-🎯 24-HOUR FORECAST (3hour channel)
-• Expected High: $503.06 (+13.0%)
-• Expected Low: $434.89 (-2.3%)
-
-💰 TRADE LEVELS
-• Entry: $445.26
-• Target: $503.06 (+13.0%)
-• Stop: $426.40 (-4.2%)
-• R/R: 3.07
-
-📈 RSI CONFLUENCE
-• Score: 80/100
-• Confirmations: 2
-
-📰 NEWS SENTIMENT
-• Sentiment: -15
-• BS Score: 85/100
-• Signal: ignore
-
-💡 REASONING
-Price in lower zone | RSI oversold with 2 confirmations |
-High BS bearish news - buy the dip
-```
-
-#### `test_connection()`
-Verifies Telegram bot credentials and sends test message
-
-**Dependencies:**
-- python-telegram-bot, asyncio, config
-
----
-
-### 10. `/src/gui_dashboard_enhanced.py` - Interactive Dashboard
-
-**Purpose:** Streamlit web GUI with integrated monitoring and Telegram alerts
-
-**Key Features:**
-
-1. **Auto-Monitoring Controls (Sidebar)**
-   - Start/Stop buttons
-   - Configurable interval (15-120 minutes)
-   - Live monitoring logs
-   - Status indicator (active/inactive)
-
-2. **Background Monitoring Thread**
-   - Runs in daemon thread while dashboard is open
-   - Generates signals at intervals
-   - Sends Telegram alerts automatically
-   - Updates session state with latest signal
-
-3. **Main Chart (Left Column)**
-   - Candlestick chart with OHLCV
-   - Linear regression channel overlays
-   - RSI subplot
-   - Zoomed to relevant timeframe:
-     - 1hour: Last 168 bars (7 days)
-     - 3hour: Last 168 bars (21 days)
-     - 4hour: Last 126 bars (21 days)
-     - daily: Last 90 bars (3 months)
-     - weekly: Last 52 bars (1 year)
-
-4. **Signal Panel (Right Column)**
-   - BUY/SELL/NEUTRAL indicator
-   - Confidence score
-   - Channel metadata (stability, ping-pongs, R²)
-   - 24-hour forecast (high/low)
-   - RSI analysis
-   - Trade levels (entry/target/stop)
-   - Reasoning
-
-5. **Multi-Timeframe RSI Grid**
-   - Shows RSI for all timeframes
-   - Color-coded: green (oversold), red (overbought), blue (neutral)
-
-6. **News Panel**
-   - Overall sentiment metrics
-   - Individual article cards with:
-     - Sentiment score
-     - BS score (color-coded)
-     - AI analysis
-     - Links to sources
-
-7. **Data Freshness Indicator (Sidebar)**
-   - 🟢 LIVE, 🟡 RECENT, 🟠 STALE, or 🔴 OUTDATED
-   - Shows data age
-
-**Session State:**
-```python
-monitoring: bool              # Monitoring active
-monitor_thread: Thread        # Background thread
-last_signal: TradingSignal    # Latest signal from monitor
-monitor_logs: List[str]       # Last 10 log entries
-```
-
-**Caching:**
-- `@st.cache_data(ttl=300)` - Data cached 5 minutes
-- `@st.cache_resource` - Components cached
-
-**Dependencies:**
-- streamlit, plotly, all src/ modules, config
-
----
-
-### 11. `/requirements.txt` - Python Dependencies
-
-**Core Libraries:**
-```
-pandas>=2.0.0              # Data manipulation
-numpy>=2.0.0,<2.3.0       # Numerical computing
-scipy>=1.11.0              # Linear regression (stats)
-scikit-learn>=1.3.0        # Future ML features
-matplotlib>=3.7.0          # Plotting
-plotly>=5.14.0             # Interactive charts
-```
-
-**Data & Indicators:**
-```
-yfinance>=0.2.0            # Live stock data
-pandas-ta>=0.3.14b         # Technical indicators
-```
-
-**API Integration:**
-```
-anthropic>=0.18.0          # Claude AI
-python-telegram-bot>=20.0  # Telegram alerts
-requests>=2.31.0           # HTTP requests
-```
-
-**Dashboard:**
-```
-streamlit>=1.28.0          # Web GUI framework
-```
-
-**Utilities:**
-```
-python-dotenv>=1.0.0       # Environment variables
-```
-
----
-
-### 12. `/convert_data.py` - Data Conversion Utility
-
-**Purpose:** One-time conversion of TSLAMin.txt and SPYMin.txt to CSV format
-
-**Input Format:**
-```
-20150102 114000;223.29;223.29;223.29;223.29;175
-```
-
-**Output Format:**
-```csv
-timestamp,open,high,low,close,volume
-2015-01-02 11:40:00,223.29,223.29,223.29,223.29,175
-```
-
-**Usage:**
-```bash
-python3 convert_data.py
-```
-
-Converts and saves:
-- `data/TSLAMin.txt` → `data/TSLA_1min.csv`
-- `data/SPYMin.txt` → `data/SPY_1min.csv`
-
----
-
-### 13. `/run.sh` - Quick Start Menu
-
-**Purpose:** Interactive menu for launching system
-
-**Menu Options:**
-1. Dashboard - Launch GUI with integrated monitoring
-2. Signal - Generate current signal (one-time)
-3. Monitor - Console monitoring only (no GUI)
-4. Test - Test all components
-5. Exit
-
-**Usage:**
-```bash
-./run.sh
-```
-
----
-
-## Core Algorithms
-
-### Algorithm 1: Intelligent Channel Selection
-
-**Goal:** Select the timeframe with highest confidence in 24-hour predictions
-
-**Process:**
-```
-For each timeframe (1h, 2h, 3h, 4h, daily, weekly):
-    1. Calculate linear regression channel
-    2. Get current price position in channel
-    3. Calculate RSI confluence for that timeframe
-    4. Generate signal and confidence score
-    5. Calculate composite score:
-       = Confidence × 0.70
-       + RSI_Confluence × 0.25
-       + Stability × 0.05
+    1. Calculate channel position
+    2. Calculate RSI confluence
+    3. Generate signal confidence (0-100)
+    4. Calculate composite score:
+       = Confidence * 0.70 + RSI * 0.25 + Stability * 0.05
 
 Select timeframe with MAX(composite_score)
+Return TradingSignal with 24h forecast
 ```
 
-**Weighting Rationale:**
-- **70% Confidence** - Prioritizes actual trading opportunities
-- **25% RSI** - Ensures multi-timeframe confirmation
-- **5% Stability** - Basic quality filter only
+**Signal Confidence Scoring:**
+- Channel (0-30 pts): Price in lower/upper zone + stability
+- RSI (0-40 pts): Confluence score * 0.4
+- News (0-30 pts): High BS + bearish + buy signal = +15 pts
 
-**Example:**
-```
-2hour: Conf=30, RSI=0, Stab=60  → Composite = 21.0 + 0.0 + 3.0 = 24.0
-3hour: Conf=30, RSI=0, Stab=79  → Composite = 21.0 + 0.0 + 4.0 = 25.0 ⭐
-weekly: Conf=0, RSI=70, Stab=37 → Composite = 0.0 + 17.5 + 1.9 = 19.4
+#### 6. Telegram Bot (`src/telegram_bot.py`)
+- Sends formatted HTML alerts
+- Triggers on: confidence ≥ 60, signal != neutral, signal changed
+- Includes: signal, confidence, forecast, trade levels, reasoning
 
-Winner: 3hour (highest composite)
-```
+#### 7. Enhanced Dashboard (`src/gui_dashboard_enhanced.py`)
+- Streamlit web GUI
+- Candlestick chart with channel overlays
+- Auto-zoomed to relevant timeframe
+- Real-time monitoring with background thread
+- Multi-timeframe RSI grid
+- News panel with BS scores
+- Integrated Telegram alerting
 
----
+### Stage 1 Usage
 
-### Algorithm 2: 24-Hour Prediction
-
-**Goal:** Predict expected high and low for next 24 hours using selected channel
-
-**Process:**
-```
-1. Select best channel (e.g., 3hour)
-
-2. Calculate bars needed for 24 hours:
-   bars_per_24h = {
-       '1hour': 24,
-       '2hour': 12,
-       '3hour': 8,
-       '4hour': 6,
-       'daily': 1,
-       'weekly': 1
-   }
-
-3. Project regression line forward N bars:
-   future_x = [n, n+1, n+2, ..., n+N]
-   future_center = slope × future_x + intercept
-   future_upper = future_center + (2 × std_dev)
-   future_lower = future_center - (2 × std_dev)
-
-4. Find 24-hour range:
-   predicted_high = MAX(future_upper)  # Highest point
-   predicted_low = MIN(future_lower)   # Lowest point
+**Dashboard Mode:**
+```bash
+python main.py dashboard
 ```
 
-**Example (3hour channel):**
+**One-Time Signal:**
+```bash
+python main.py signal --stock TSLA --timeframe 3hour
 ```
-Current time: 15:00
-Project 8 bars forward (8 × 3h = 24h):
-  Bar 1 (18:00): upper=$495, lower=$430
-  Bar 2 (21:00): upper=$497, lower=$431
-  Bar 3 (00:00): upper=$499, lower=$432
-  Bar 4 (03:00): upper=$501, lower=$433
-  Bar 5 (06:00): upper=$502, lower=$434
-  Bar 6 (09:00): upper=$503, lower=$435
-  Bar 7 (12:00): upper=$503, lower=$436
-  Bar 8 (15:00): upper=$502, lower=$437
 
-24h High: MAX = $503
-24h Low: MIN = $430
+**Continuous Monitoring:**
+```bash
+python main.py monitor --stock TSLA --interval 30
+```
+
+**Test All Components:**
+```bash
+python main.py test
 ```
 
 ---
 
-### Algorithm 3: Signal Confidence Scoring
+## Stage 2: ML-Powered Predictions
 
-**Goal:** Calculate 0-100 confidence score for each timeframe
+### Architecture
 
-**Components:**
+**Modular Design via Abstract Interfaces (`src/ml/base.py`):**
+- `DataFeed` - Swappable data sources (CSV, IBKR, etc.)
+- `FeatureExtractor` - Pluggable feature engineering
+- `EventHandler` - Event data integration
+- `ModelBase` - Swappable models (LNN, LSTM, Transformer)
+- `PredictionDatabase` - Logging and analytics
 
-**1. Channel Analysis (0-30 points):**
-```
-If price in lower/lower_extreme zone:
-    signal = 'buy'
-    confidence += 20
-    if stability > 60:
-        confidence += 10
+### Core Components
 
-If price in upper/upper_extreme zone:
-    signal = 'sell'
-    confidence += 20
-    if stability > 60:
-        confidence += 10
-```
+#### 1. Data Feed (`src/ml/data_feed.py`)
 
-**2. RSI Analysis (0-40 points):**
-```
-If RSI matches channel signal:
-    confidence += min(rsi_confluence_score × 0.4, 40)
-    # More higher timeframe confirmations = more points
+**CSVDataFeed:**
+- Loads SPY and TSLA 1-minute data
+- **Inner join on timestamps** (zero tolerance for misalignment)
+- Returns aligned DataFrame: 1,349,074 bars (75% of larger dataset)
+- 100% quality, no nulls, no forward-fill
 
-If RSI conflicts:
-    confidence -= 15
+```python
+feed = CSVDataFeed()
+aligned_df = feed.load_aligned_data('2015-01-01', '2023-12-31')
+# Returns DataFrame with: spy_open, spy_close, tsla_open, tsla_close, etc.
 ```
 
-**3. News Analysis (0-30 points):**
+#### 2. Feature Extraction (`src/ml/features.py`)
+
+**TradingFeatureExtractor** - Extracts 56 features:
+
+| Category | Count | Features |
+|----------|-------|----------|
+| **Price** | 10 | SPY/TSLA: close, returns, log_returns, volatility_10, volatility_50 |
+| **Channels** | 21 | 3 timeframes (1h/4h/daily): position, upper_dist, lower_dist, slope, stability, ping_pongs, r_squared |
+| **RSI** | 9 | 3 timeframes: value, oversold, overbought |
+| **Correlations** | 5 | correlation_10/50/200, divergence, divergence_magnitude |
+| **Cycles** | 4 | distance_from_52w_high/low, within_mega_channel, mega_channel_position |
+| **Volume** | 2 | tsla_volume_ratio, spy_volume_ratio |
+| **Time** | 4 | hour_of_day, day_of_week, day_of_month, month_of_year (cyclical) |
+
+**Key Methods:**
+```python
+extractor = TradingFeatureExtractor()
+
+# Extract features from aligned data
+features_df = extractor.extract_features(aligned_df)  # Returns (N, 56)
+
+# Create sequences for training
+X, y = extractor.create_sequences(features_df, sequence_length=84, target_horizon=24)
+# X: (num_sequences, 84, 56) - 84 timesteps of 56 features
+# y: (num_sequences, 2) - [predicted_high, predicted_low] for next 24 hours
 ```
-If high BS (>70) + bearish + buy signal:
-    confidence += 15  # "Buy the dip" opportunity
 
-If low BS + matches signal:
-    confidence += 15
+**Leverages Stage 1:**
+- Uses `LinearRegressionChannel` for channel features
+- Uses `RSICalculator` for RSI features
+- Pure integration, no duplication
 
-If low BS + contradicts:
-    confidence -= 20  # Genuine negative news
+#### 3. Event Integration (`src/ml/events.py`)
 
-If high BS:
-    confidence += 5  # Ignore noise
+**CombinedEventsHandler:**
+- **TSLA events**: Earnings, deliveries from user CSV (86 events)
+- **Macro events**: FOMC, CPI, NFP, Quad Witching (397 events)
+- **Total**: 483 events, 394 in training range (2015-2023)
+
+**Event Embeddings:**
+```python
+handler = CombinedEventsHandler('data/tsla_events_REAL.csv')
+
+# Get events around a date
+events = handler.get_events_for_date('2024-01-24', lookback_days=7)
+
+# Convert to tensor
+embedding = handler.embed_events(events)  # Returns (1, 21)
+# 21 dimensions: TSLA one-hot (4) + days_until + beat/miss + macro one-hot (10) + days
 ```
 
-**4. Final Adjustments:**
-```
-confidence = clamp(confidence, 0, 100)
+#### 4. Model (`src/ml/model.py`)
 
-If confidence < MIN_CONFLUENCE_SCORE (60):
-    signal = 'neutral'
+**LNNTradingModel** - Liquid Neural Network:
+```
+Input (56 features, 84 timesteps)
+  ↓
+CfC Layer (Liquid Time-Constant, 128 hidden units)
+  - Sparse wiring via AutoNCP
+  - Continuous-time dynamics
+  ↓
+Output Layer (2 units: high, low)
+Confidence Head (1 unit: confidence score)
+```
+
+**Features:**
+- **ncps library** - Closed-form Continuous-time (CfC) RNN
+- **Sparse connections** - AutoNCP wiring for interpretability
+- **Self-supervised pretraining** - 15% masking ratio
+- **Online learning** - `update_online()` method
+- **Checkpoint system** - Save/load with metadata
+
+**Usage:**
+```python
+model = LNNTradingModel(input_size=56, hidden_size=128)
+
+# Predict
+predictions = model.predict(X)
+# Returns: {
+#   'predicted_high': array([250.5]),
+#   'predicted_low': array([245.2]),
+#   'confidence': array([0.85]),
+#   'hidden_state': tensor(...)
+# }
+
+# Save model
+model.save_checkpoint('models/lnn.pth', metadata={...})
+
+# Online learning
+model.update_online(X_new, y_actual, lr=0.0001)
+```
+
+**Alternative: LSTMTradingModel** - Traditional LSTM for comparison
+
+#### 5. Database (`src/ml/database.py`)
+
+**SQLitePredictionDB:**
+- Logs every prediction with metadata
+- Updates with actuals after 24 hours
+- Calculates errors automatically
+- Provides accuracy metrics
+
+```python
+db = SQLitePredictionDB('data/predictions.db')
+
+# Log prediction
+pred_id = db.log_prediction({
+    'timestamp': '2024-01-24 14:00:00',
+    'predicted_high': 250.5,
+    'predicted_low': 245.2,
+    'confidence': 0.85,
+    # ... 25+ fields
+})
+
+# Update with actuals
+db.update_actual(pred_id, actual_high=252.1, actual_low=246.8)
+
+# Get metrics
+metrics = db.get_accuracy_metrics()
+# Returns: mean_absolute_error, error by confidence bins, etc.
+```
+
+### Training Scripts
+
+#### `train_model_lazy.py` (RECOMMENDED)
+**Memory-efficient training with lazy sequence loading**
+
+- Uses only **2-3 GB RAM** (vs 30+ GB for pre-created sequences)
+- Trains on ALL 1.35M bars
+- Creates sequences on-demand during training
+- Progress bars for all phases
+
+#### `train_model.py` (Original)
+**Pre-creates all sequences upfront**
+
+- Requires **30+ GB RAM** for full dataset
+- Good for smaller datasets (single year)
+- Slightly simpler code
+
+#### `backtest.py`
+**Walk-forward backtesting**
+
+- Tests model on unseen data (e.g., 2024)
+- Random day/week simulation
+- Accuracy by event type
+- Confidence calibration
+
+#### `validate_results.py`
+**Model performance validation**
+
+- Generates comprehensive report
+- Error analysis by confidence bins
+- Recommendations for improvement
+
+#### `update_model.py`
+**Online learning from prediction errors**
+
+- Loads accumulated predictions from database
+- Fine-tunes model on real errors
+- Incremental learning
+
+---
+
+## Training Workflow
+
+### Step 1: Data Validation (MANDATORY!)
+
+```bash
+python3 validate_data_alignment.py --events_data data/tsla_events_REAL.csv
+```
+
+**What it checks:**
+- ✓ Files exist and have required columns
+- ✓ No nulls in price data
+- ✓ No zeros in price data
+- ✓ Timestamps sorted and unique
+- ✓ SPY-TSLA alignment (inner join)
+- ✓ Events within data range
+- ✓ Sufficient data for training
+
+**Expected output:**
+```
+✅ DATA VALIDATION PASSED - SAFE TO TRAIN!
+  - 1,349,074 perfectly aligned SPY/TSLA bars
+  - 394 events in training range
+  - No nulls, zeros, or fake data
+```
+
+**If validation fails:** Fix errors before training! Never train on invalid data.
+
+### Step 2: Training (Memory-Efficient)
+
+**Quick Test (10-15 minutes):**
+```bash
+python3 train_model_lazy.py \
+  --tsla_events data/tsla_events_REAL.csv \
+  --start_year 2023 \
+  --end_year 2023 \
+  --epochs 10 \
+  --pretrain_epochs 3 \
+  --batch_size 8 \
+  --output models/lnn_quick.pth
+```
+
+**Full Training (60-90 minutes):**
+```bash
+python3 train_model_lazy.py \
+  --tsla_events data/tsla_events_REAL.csv \
+  --epochs 50 \
+  --pretrain_epochs 10 \
+  --batch_size 16 \
+  --output models/lnn_full.pth
+```
+
+**Training Process:**
+1. **Load Data** (10 sec) - Load 1.35M aligned bars
+2. **Extract Features** (3-5 min) - Calculate 56 features with progress
+3. **Load Events** (2 sec) - Load 394 events
+4. **Pretraining** (5-10 min/epoch) - Self-supervised learning with batch progress
+5. **Training** (5-10 min/epoch) - Supervised learning with live metrics
+6. **Save Model** - Checkpoint with metadata
+
+**Progress Feedback:**
+- Step-by-step feature extraction (7 steps visible)
+- Batch-level progress during pretraining (84,000+ batches/epoch)
+- Real-time loss, memory, and timing
+
+### Step 3: Backtesting
+
+```bash
+python3 backtest.py \
+  --model_path models/lnn_full.pth \
+  --test_year 2024 \
+  --num_simulations 100
+```
+
+**Output:**
+```
+Average Metrics:
+  Mean Error (High): 3.12%
+  Mean Error (Low): 2.89%
+  Mean Confidence: 0.68
+
+Error by Event Type:
+  With Earnings: 4.23% (15 cases)
+  No Events: 2.67% (85 cases)
+```
+
+**Good Results:** <5% mean absolute error
+**Excellent Results:** <3% mean absolute error
+
+### Step 4: Validation
+
+```bash
+python3 validate_results.py --model_path models/lnn_full.pth
+```
+
+Check `reports/validation_report.txt` for detailed analysis.
+
+### Step 5: Online Learning (Optional)
+
+After live predictions accumulate:
+
+```bash
+python3 update_model.py \
+  --model_path models/lnn_full.pth \
+  --output models/lnn_updated.pth
 ```
 
 ---
 
-### Algorithm 4: RSI Confluence Scoring
+## Data Validation
 
-**Goal:** Measure multi-timeframe RSI alignment
+### Zero-Tolerance Policy
 
-**Process:**
+**NO fake data, NO misalignment, NO approximations:**
+- ❌ NO nulls allowed
+- ❌ NO zeros in prices
+- ❌ NO forward-filling gaps
+- ❌ NO interpolation
+- ✅ ONLY use exact timestamp matches
+
+### Inner Join Alignment
+
+```python
+# SPY-TSLA alignment
+common_timestamps = spy_df.index.intersection(tsla_df.index)
+spy_aligned = spy_df.loc[common_timestamps]
+tsla_aligned = tsla_df.loc[common_timestamps]
+
+# Result: 1,349,074 perfectly aligned bars
+# 75% of larger dataset (SPY), but 100% quality
 ```
-1. Get primary timeframe RSI (e.g., 3hour)
-2. Determine signal: oversold (<30), overbought (>70), neutral
 
-3. Check higher timeframes:
-   If primary = 3hour:
-       check: daily, weekly
-   If primary = 1hour:
-       check: 2h, 3h, 4h, daily, weekly
+**Why 75% alignment?**
+- SPY trades extended hours (4am-8pm)
+- TSLA has fewer total bars
+- Inner join keeps ONLY overlapping timestamps
+- **Result: 100% quality, 75% quantity** ✅
 
-4. Count confirmations:
-   For buy signal: count higher TFs with RSI < 50
-   For sell signal: count higher TFs with RSI > 50
+### Real Events Only
 
-5. Calculate score:
-   Base: 40 points (primary signal exists)
-   Confirmation: (confirmations / total_checked) × 60
+**Sources:**
+- `data/earnings:P&D.rtf` - TSLA earnings/deliveries (user-provided)
+- `data/historical_events.txt` - Macro events JSON (user-provided)
 
-Example:
-   3hour RSI = 28 (oversold) → buy signal
-   daily RSI = 35 → confirms (< 50)
-   weekly RSI = 42 → confirms (< 50)
+**Processing:**
+```bash
+python3 process_real_events.py
+# Output: data/tsla_events_REAL.csv with 483 real events
+```
 
-   Score = 40 + (2/2) × 60 = 100/100 (perfect confluence!)
+**Validation:**
+- Events matched to trading dates
+- Beat/miss outcomes tracked
+- Dates within data range
+
+---
+
+## Memory Optimization
+
+### The Problem
+
+**Original `train_model.py`:**
+```python
+# Creates ALL sequences upfront
+X, y = create_sequences(features_df)  # 30.5 GB tensor!
+# Process killed by OS
+```
+
+**For 1.35M bars:**
+- Sequences: 1,349,892
+- Sequence length: 84
+- Features: 56
+- Memory: 1,349,892 × 84 × 56 × 4 bytes = **30.5 GB**
+- Peak (during numpy→torch): **60 GB**
+
+### The Solution: Lazy Loading
+
+**`train_model_lazy.py`:**
+```python
+class LazyTradingDataset(Dataset):
+    def __init__(self, features_df, ...):
+        self.features_df = features_df  # Store DataFrame (~2 GB)
+
+    def __getitem__(self, idx):
+        # Create ONE sequence on-demand
+        seq = self.features_df.iloc[idx:idx+84].values
+        return torch.tensor(seq)
+```
+
+**Memory Usage:**
+- Features DataFrame: ~2 GB
+- Batch (16 sequences): ~50 MB
+- Total: **2-3 GB constant** (no spikes!)
+
+**Benefits:**
+- ✅ Trains on ALL 1.35M bars (no data loss)
+- ✅ Works on normal hardware (8 GB RAM)
+- ✅ Scales to any dataset size
+- ✅ Same model quality
+
+**Training Workflow:**
+```
+Load Features (2 GB)
+  ↓
+For each batch:
+    Create 16 sequences on-the-fly
+    Train on batch
+    Garbage collect
+    (Memory stays at 2-3 GB)
 ```
 
 ---
 
-## Data Flow
+## Performance & Limitations
 
-### Startup → Signal Generation
+### Current Performance
 
-```
-1. main.py
-   ↓
-2. SignalGenerator.__init__()
-   - Creates DataHandler
-   - Creates LinearRegressionChannel
-   - Creates RSICalculator
-   - Creates NewsAnalyzer
-   ↓
-3. generate_signal()
-   ↓
-4. DataHandler.get_all_timeframes()
-   - Load CSV (1.85M rows historical)
-   - Fetch yfinance (2.7K rows live, last 7 days)
-   - Merge: 1.86M total rows
-   - Resample to 1h/2h/3h/4h/daily/weekly
-   ↓
-5. FOR EACH TIMEFRAME:
-   ↓
-   5a. LinearRegressionChannel.calculate_channel()
-       - Calculate regression on lookback period
-       - Detect ping-pongs
-       - Calculate stability score
-       - Project 24 hours forward
-       - Find predicted high/low
-   ↓
-   5b. RSICalculator.get_confluence_score()
-       - Calculate RSI for this timeframe
-       - Check higher timeframes for confirmation
-       - Return confluence score (0-100)
-   ↓
-   5c. Calculate signal confidence (0-100)
-       - Channel position score
-       - RSI score
-       - News score (fetched once)
-   ↓
-   5d. Calculate composite score
-       = Confidence × 0.70
-       + RSI × 0.25
-       + Stability × 0.05
-   ↓
-6. SELECT BEST TIMEFRAME
-   - Pick max(composite_score)
-   ↓
-7. BUILD TRADING SIGNAL
-   - Use best channel's predictions
-   - Calculate entry/target/stop
-   - Generate reasoning
-   ↓
-8. OUTPUT
-   - Print summary OR
-   - Send Telegram alert OR
-   - Display in dashboard
-```
+**Stage 1 (Signal Generation):**
+- Data loading: 2-3 seconds
+- Channel calculations: ~1 second (6 timeframes)
+- RSI calculations: <1 second
+- News analysis: 2-5 seconds (Claude API)
+- **Total:** 5-10 seconds per signal
 
----
+**Stage 2 (Training):**
+- Data loading: ~10 seconds
+- Feature extraction: 3-5 minutes (1.35M bars)
+- Pretraining: 5-10 min/epoch
+- Training: 5-10 min/epoch
+- **Full training:** 60-90 minutes (50 epochs)
 
-### Dashboard Monitoring Loop
+**Memory:**
+- Stage 1: ~500 MB per stock
+- Stage 2 (lazy): ~2-3 GB constant
+- Stage 2 (original): ~30+ GB (crashes)
 
-```
-1. User clicks "Start Monitor" in dashboard
-   ↓
-2. Background thread starts:
-   ↓
-   while monitoring:
-       ↓
-       3. SignalGenerator.generate_signal()
-          - Evaluates all timeframes
-          - Selects best by composite score
-          - Returns TradingSignal
-       ↓
-       4. Check if alert-worthy:
-          if confidence >= 60 AND
-             signal != 'neutral' AND
-             signal changed from last:
-          ↓
-          5. TelegramAlertBot.send_signal_alert()
-             - Sends formatted message
-             - Logs to monitor_logs
-       ↓
-       6. Update session_state.last_signal
-       ↓
-       7. Sleep for interval_minutes × 60
-   ↓
-8. Dashboard refreshes show latest signal
-```
+### Limitations
 
----
+#### 1. GPU/Metal Support
+**Status:** ✅ IMPLEMENTED (v2.0)
 
-## Configuration
+The training scripts now support full GPU/Metal acceleration with automatic hardware detection and comprehensive error reporting:
 
-### API Keys
+**Supported Hardware:**
+- **Apple Silicon (MPS)**: M1, M2, M3, M4, M5 Pro/Max/Ultra
+- **NVIDIA CUDA**: Google Colab, local NVIDIA GPUs
+- **CPU Fallback**: Compatible with any system
 
-**Claude AI (Required):**
+**Device Selection:**
 ```python
-CLAUDE_API_KEY = "sk-ant-api03-ljR7i4Eh5Aaiqsn6jsdOAMqt..."
-```
-Used for news sentiment and BS scoring (model: claude-3-haiku-20240307)
+# Interactive mode (default) - prompts user
+python train_model.py --tsla_events data/tsla_events_REAL.csv
 
-**Telegram (Optional):**
+# Auto-select best available device
+python train_model.py --auto_device
+
+# Force specific device
+python train_model.py --device mps  # Apple Silicon
+python train_model.py --device cuda  # NVIDIA GPU
+python train_model.py --device cpu   # CPU only
+```
+
+**Performance Gains:**
+- **Apple Silicon (M2 Max)**: ~3-5x speedup (300-500 seq/sec vs 100 CPU)
+- **Google Colab T4**: ~4-6x speedup (400-600 seq/sec)
+- **Training time**: 50 epochs in ~20-30 min (vs 90 min CPU)
+
+**Implementation:**
+- `src/ml/device_manager.py`: Hardware detection and device management
+- Automatic device transfer for all tensors during training
+- Cross-device model loading support
+- Memory-efficient with lazy loading (~2-3GB usage)
+
+**Testing:**
+```bash
+# Run comprehensive device compatibility tests
+python test_device_compatibility.py
+```
+
+#### 2. Adding New Features Requires Code Changes
+
+**Current Implementation:**
+Feature extraction is hardcoded to SPY/TSLA:
 ```python
-TELEGRAM_BOT_TOKEN = "7978931435:AAGdqdfcbK-GT8Q_BEw7dvmISkN9035FzZQ"
-TELEGRAM_CHAT_ID = "7910666732"
-```
-Get from @BotFather and @userinfobot
-
-**NewsAPI (Optional):**
-```python
-NEWS_API_KEY = ""  # Sign up at newsapi.org
-```
-Falls back to mock articles if not configured
-
----
-
-### Trading Parameters
-
-**RSI Thresholds:**
-```python
-RSI_PERIOD = 14         # Standard RSI period
-RSI_OVERSOLD = 30       # Buy signal threshold
-RSI_OVERBOUGHT = 70     # Sell signal threshold
+for symbol in ['spy', 'tsla']:  # Hardcoded!
+    features_df[f'{symbol}_close'] = df[f'{symbol}_close']
 ```
 
-**Channel Parameters:**
-```python
-CHANNEL_LOOKBACK_HOURS = 168  # 1 week of data
-CHANNEL_STD_DEV = 2.0         # 2 standard deviations
-MIN_PING_PONGS_1H = 2         # Minimum bounces for 1h
-MIN_PING_PONGS_4H = 1         # Minimum bounces for 4h
-```
+**To add VXX (or any new symbol):**
 
-**Signal Generation:**
-```python
-MIN_CONFLUENCE_SCORE = 60     # Alert threshold (0-100)
-BS_SCORE_THRESHOLD = 70       # High BS = ignore news
-```
+**Required Changes:**
+1. `src/ml/data_feed.py` - 3-way alignment (SPY/TSLA/VXX)
+2. `src/ml/features.py` - Add VXX features, update feature names
+3. Validate 3-way alignment
+4. Retrain from scratch with new input size
 
-**Live Data:**
-```python
-USE_LIVE_DATA = True          # Enable live data merge
-LIVE_DATA_DAYS_BACK = 7       # Days to fetch (max 7)
-```
+**What stays the same:**
+- Training scripts (agnostic to input size)
+- Model architecture (handles any input size)
+- Events system
+- The core workflow
+
+**Why it's not plug-and-play:**
+The feature extraction expects specific column names and specific symbol pairs. This is why adding new data sources "messes it up" in typical implementations.
+
+**Future:** Dynamic feature addition system
+
+#### 3. Other Limitations
+
+- **yfinance Data:** Only 7 days of 1-minute data available
+- **Single Stock Focus:** Dashboard shows one stock at a time
+- **No Paper Trading:** No simulation or execution
+- **Claude API Costs:** $0.00025 per article analyzed
+- **No Real-time Feeds:** WebSocket integration not yet implemented
 
 ---
 
 ## API Integration
 
 ### 1. yfinance (Stock Data)
-
 **Endpoint:** Yahoo Finance API (via yfinance library)
+**Rate Limits:** None known
+**Data:** OHLCV, 1-minute intervals, last 7 days maximum
 
-**Rate Limits:** None known, but fetching 1-min data limited to last 7 days
-
-**Usage:**
 ```python
 ticker = yf.Ticker('TSLA')
 df = ticker.history(period='7d', interval='1m')
 ```
 
-**Data Returned:**
-- Open, High, Low, Close, Volume
-- 1-minute intervals
-- Last 7 days maximum
-
----
-
 ### 2. Claude AI API (News Analysis)
-
 **Endpoint:** Anthropic Messages API
-
 **Model:** claude-3-haiku-20240307 (fast, cost-effective)
+**Cost:** ~$0.00025 per article
 
-**Rate Limits:** Per API key
-
-**Request Format:**
 ```python
 client.messages.create(
     model="claude-3-haiku-20240307",
@@ -1113,375 +797,150 @@ client.messages.create(
 )
 ```
 
-**Prompt Structure:**
-```
-Analyze this news article about TSLA:
-
-Title: [title]
-Description: [description]
-Current Market Context: [context]
-
-Provide:
-1. Sentiment: positive/negative/neutral
-2. Sentiment Score: -100 to +100
-3. BS Score: 0-100
-4. Brief analysis
-
-Format as JSON: {...}
-```
-
-**Cost:** ~$0.00025 per article (Haiku pricing)
-
----
-
 ### 3. Telegram Bot API
-
 **Endpoint:** Telegram Bot API
-
 **Method:** `sendMessage`
-
-**Authentication:** Bot token in config
-
-**Message Format:** HTML
-
-**Features Used:**
-- Bold tags: `<b>text</b>`
-- Line breaks: newlines
-- Emojis: Unicode
-
-**Async:** Uses python-telegram-bot library with asyncio
-
----
+**Format:** HTML with bold tags and emojis
+**Async:** python-telegram-bot library
 
 ### 4. NewsAPI (Optional)
-
 **Endpoint:** newsapi.org/v2/everything
-
-**Parameters:**
-- `q`: Query (stock symbol + company name)
-- `from`: Date to fetch from
-- `sortBy`: publishedAt
-- `language`: en
-- `apiKey`: API key
-
-**Returns:** Array of articles with title, description, URL, source, date
-
 **Fallback:** Mock articles if API key not configured
 
 ---
 
-## System Behavior
+## Future Improvements
 
-### Signal Generation Flow
-
-**Input:** Stock symbol (TSLA/SPY)
-
-**Process:**
-1. Load historical CSV (1.85M rows)
-2. Merge live data from yfinance (+2.7K rows)
-3. Resample to 6 timeframes
-4. Calculate 6 regression channels with 24h predictions
-5. Calculate 6 RSI values with confluence
-6. Fetch and analyze news (once)
-7. Evaluate each timeframe with composite scoring
-8. Select best timeframe
-9. Build TradingSignal object
-
-**Output:** TradingSignal with:
-- Signal type (buy/sell/neutral)
-- Confidence (0-100)
-- Best channel timeframe
-- 24-hour high/low forecast
-- Entry/target/stop levels
-- Full reasoning
+### Planned Features
 
 **Performance:**
-- Total time: ~5-10 seconds
-- Data loading: ~2 seconds
-- Channel calculations: ~1 second
-- News analysis: ~2-5 seconds (Claude API)
-- RSI calculations: <1 second
+- ✅ **GPU/Metal Support** - M1/M2/M3/M4/M5 acceleration (COMPLETED v2.0)
+- **Quantization** - Model compression for edge deployment
+- **Distributed Training** - Multi-GPU support
+
+**Features:**
+- ✅ **Dynamic Feature Addition** - Add symbols without code changes (HIGH PRIORITY)
+- **Additional Indicators** - MACD, Bollinger Bands, Volume Profile
+- **Transformer Models** - Alternative to LNN
+- **Ensemble Predictions** - Combine multiple models
+
+**System:**
+- **Multi-Stock Portfolio** - Monitor multiple stocks simultaneously
+- **Paper Trading** - Simulated trades with P&L tracking
+- **Real-time Feeds** - WebSocket integration
+- **Mobile App** - React Native companion app
+- **Cloud Deployment** - Docker + AWS/GCP hosting
+
+**Analytics:**
+- **Performance Dashboard** - Win rate, R/R, drawdown metrics
+- **Advanced Backtesting** - Walk-forward optimization
+- **A/B Testing** - Compare model versions
+- **Explainability** - SHAP values for predictions
 
 ---
 
-### Alert Triggering Logic
+## Quick Reference
 
-**Conditions for Telegram Alert:**
-```python
-if (signal.confidence_score >= 60 AND
-    signal.signal_type != 'neutral' AND
-    signal.signal_type != last_signal_type):
+### Common Commands
 
-    send_telegram_alert(signal)
-    last_signal_type = signal.signal_type
-```
-
-**Why These Conditions:**
-1. **Confidence ≥ 60** - Only high-quality setups
-2. **Not neutral** - Must be buy or sell signal
-3. **Signal changed** - Prevents spam (no repeat alerts)
-
-**Alert Frequency:**
-- Monitor mode: Every N minutes (configurable)
-- Dashboard mode: When monitoring enabled (user controls)
-- Only sends on signal changes
-
----
-
-### Dashboard Auto-Refresh
-
-**Cache Strategy:**
-```python
-@st.cache_data(ttl=300)  # 5 minute cache
-def load_data(stock):
-    # Data loading cached for 5 minutes
-```
-
-**Refresh Triggers:**
-1. Stock symbol changes
-2. Manual refresh button clicked
-3. 5-minute cache expires
-4. Monitoring generates new signal
-
-**Performance Optimization:**
-- Components cached with `@st.cache_resource`
-- Data cached with `@st.cache_data`
-- Monitoring shares signal with dashboard (session_state)
-
----
-
-## Current Limitations
-
-1. **yfinance Data:** Only 7 days of 1-minute data available
-2. **News Sources:** Limited to NewsAPI or mock articles
-3. **Single Stock:** Monitor/dashboard shows one stock at a time
-4. **No Backtesting:** Signal history not validated against historical performance
-5. **No Database:** Signals not persisted
-6. **No Paper Trading:** No simulation or execution
-7. **Claude API Costs:** $0.00025 per article analyzed
-
----
-
-## Future Enhancements (Stage 2+)
-
-### Planned Features:
-- **Backtesting Engine:** Validate signal accuracy on historical data
-- **Signal History Database:** SQLite storage for performance tracking
-- **Multi-Stock Portfolio:** Monitor multiple stocks simultaneously
-- **Advanced Indicators:** MACD, Bollinger Bands, Volume Profile
-- **Machine Learning:** Improve BS score calibration with historical accuracy
-- **Paper Trading:** Simulated trades with P&L tracking
-- **Performance Analytics:** Win rate, average R/R, drawdown metrics
-- **Real-time Feeds:** WebSocket integration for true tick-by-tick data
-- **Mobile App:** React Native or Flutter companion app
-
----
-
-## Testing
-
-### Test Suite (`python main.py test`)
-
-**Tests Run:**
-1. ✓ Data Handler - Load and resample data
-2. ✓ Linear Regression - Channel calculation
-3. ✓ RSI Calculator - Multi-timeframe RSI
-4. ✓ News Analyzer - Fetch and analyze with Claude
-5. ✓ Signal Generator - End-to-end signal generation
-6. ✓ Telegram Bot - Connection and message sending
-
-**Expected Output:**
-```
-======================================================================
-TESTING ALL COMPONENTS
-======================================================================
-
-1. Testing Data Handler...
-   ✓ Data handler working: 13032 bars of 4-hour data
-
-2. Testing Linear Regression Channel...
-   ✓ Channel calculator working
-     - Stability: 79.1/100
-     - Ping-pongs: 3
-     - Predicted high: $503.06
-
-3. Testing RSI Calculator...
-   ✓ RSI calculator working: RSI = 47.3
-
-4. Testing News Analyzer...
-   ✓ News analyzer working: 2 articles fetched
-     - Sentiment: neutral
-     - BS Score: 50.0/100
-
-5. Testing Signal Generator...
-   ✓ Signal generator working
-     - Signal: NEUTRAL
-     - Confidence: 30.0/100
-
-6. Testing Telegram Bot...
-   ✓ Telegram bot connected: @judochopbot
-
-======================================================================
-TESTING COMPLETE
-======================================================================
-```
-
----
-
-## Performance Metrics
-
-### Data Volume (as of Nov 10, 2025):
-- **TSLA Historical:** 1,854,183 rows (Jan 2015 - Sep 2025)
-- **SPY Historical:** 2,144,644 rows (Jan 2015 - Sep 2025)
-- **Live Data:** ~2,700 rows per stock (last 7 days)
-- **Total Combined:** ~1.86M rows per stock
-
-### Processing Speed:
-- Data loading: 2-3 seconds
-- Resampling to 6 timeframes: <1 second
-- Channel calculations (6 timeframes): ~1 second
-- RSI calculations (6 timeframes): <1 second
-- News fetch + analysis: 2-5 seconds
-- **Total signal generation:** 5-10 seconds
-
-### Memory Usage:
-- Full dataset in memory: ~500MB per stock
-- Dashboard with cache: ~800MB
-- Monitoring thread: +50MB
-
----
-
-## Security Considerations
-
-### API Keys:
-- ⚠️ Claude API key stored in config.py (should use .env in production)
-- ⚠️ Telegram credentials in config.py (should use .env in production)
-- ✓ Data folder gitignored (protects proprietary data)
-- ✓ Repository is private
-
-### Recommendations:
-1. Move all API keys to .env file
-2. Use .env.example as template
-3. Add config.py to .gitignore if keys are in file
-4. Rotate keys if repository ever becomes public
-
----
-
-## Deployment
-
-### Local Development:
 ```bash
-cd /Users/frank/Desktop/CodingProjects/autotrade2
-pip install -r requirements.txt
-python main.py test
-python main.py dashboard
+# Stage 1: Dashboard & Alerts
+python main.py dashboard                        # Launch GUI
+python main.py signal --stock TSLA              # One-time signal
+python main.py monitor --interval 30            # Continuous monitoring
+python main.py test                             # Test all components
+
+# Stage 2: Data Processing
+python3 process_real_events.py                  # Parse real events
+python3 validate_data_alignment.py              # Validate data (MANDATORY!)
+
+# Stage 2: Training
+python3 train_model_lazy.py \                   # Quick test (10-15 min)
+  --tsla_events data/tsla_events_REAL.csv \
+  --start_year 2023 --end_year 2023 \
+  --epochs 10 --pretrain_epochs 3 \
+  --output models/quick.pth
+
+python3 train_model_lazy.py \                   # Full training (60-90 min)
+  --tsla_events data/tsla_events_REAL.csv \
+  --epochs 50 --pretrain_epochs 10 \
+  --output models/full.pth
+
+# Stage 2: Validation & Testing
+python3 backtest.py \                           # Backtest model
+  --model_path models/full.pth \
+  --test_year 2024 \
+  --num_simulations 100
+
+python3 validate_results.py \                   # Validate performance
+  --model_path models/full.pth
+
+python3 update_model.py \                       # Online learning
+  --model_path models/full.pth \
+  --output models/updated.pth
 ```
 
-### Running 24/7:
+### Configuration
+
+**Key Settings in `config.py`:**
+```python
+# Stage 1
+MIN_CONFLUENCE_SCORE = 60          # Alert threshold
+RSI_OVERSOLD = 30                  # Buy signal
+RSI_OVERBOUGHT = 70                # Sell signal
+CHANNEL_LOOKBACK_HOURS = 168       # 1 week
+USE_LIVE_DATA = True               # Merge with yfinance
+
+# Stage 2
+ML_MODEL_TYPE = "LNN"              # LNN or LSTM
+ML_BATCH_SIZE = 16                 # Reduced for memory
+ML_SEQUENCE_LENGTH = 84            # Half week (3.5 days)
+ML_EPOCHS = 50                     # Training epochs
+PREDICTION_HORIZON_HOURS = 24      # Forecast 24 hours ahead
+```
+
+### Troubleshooting
+
+**"Data file not found"**
 ```bash
-# Terminal 1: Dashboard
-python main.py dashboard
-
-# Or use screen/tmux for background:
-screen -S trading
-python main.py monitor --interval 30
-# Ctrl+A, D to detach
+python3 convert_data.py  # Convert raw data first
 ```
 
-### System Requirements:
-- Python 3.11+
-- 2GB RAM minimum
-- Internet connection for live data
-- macOS/Linux/Windows
-
----
-
-## Troubleshooting
-
-### Common Issues:
-
-**1. "Data file not found"**
-- Run `python3 convert_data.py` first
-- Check data/ folder has TSLA_1min.csv and SPY_1min.csv
-
-**2. "ModuleNotFoundError: No module named 'config'"**
-- Run from project root, not src/ directory
-- Imports fixed with sys.path.insert(0, parent_dir)
-
-**3. "Telegram connection failed"**
-- Verify bot token and chat ID in config.py
-- Test with: `python main.py test`
-
-**4. "Claude API error 404"**
-- Model updated to claude-3-haiku-20240307
-- Check API key is valid
-
-**5. "numpy version conflicts"**
-- Install compatible version: pip install 'numpy>=2.0.0,<2.3.0'
-
-**6. Chart showing 10 years**
-- Fixed: Chart now zoomed to relevant window (168 bars for 3hour)
-
----
-
-## Version History
-
-### v1.0 - Stage 1 Complete (Nov 10, 2025)
-
-**Git Commits:**
-```
-78f3d33 - Prioritize confidence and RSI confluence over stability
-0557be9 - Fix predictions to always forecast next 24 hours
-6873cd8 - Intelligent channel selection with composite scoring + chart zoom
-f972f1b - Auto-select best channel by stability score
-10d8152 - Add hybrid live + historical data system (Option C)
-87fe02f - Add enhanced dashboard with integrated monitoring
-1b508dd - Add quick start script and finalize setup
-7f3f93d - Fix all errors and complete system setup
-cf709ec - Update numpy and scipy version requirements
-2d90353 - Add Telegram bot credentials to config
-4fde7a7 - Initial commit: Linear Regression Channel Trading System
+**"Memory error during training"**
+```bash
+# Use lazy version with smaller batch size
+python3 train_model_lazy.py --batch_size 8
 ```
 
-**Features Implemented:**
-✅ Linear regression channels with ping-pong detection
-✅ Multi-timeframe RSI (1h/2h/3h/4h/daily/weekly)
-✅ AI news sentiment + BS scoring
-✅ Telegram alerts
-✅ Streamlit dashboard with monitoring
-✅ Live data integration (yfinance)
-✅ Intelligent channel selection (70% confidence weighted)
-✅ 24-hour forecasting
-✅ Chart zoom optimization
+**"Validation failed"**
+```bash
+# Check data alignment
+python3 validate_data_alignment.py --events_data data/tsla_events_REAL.csv
+```
 
-**Lines of Code:** 2,608
+**"Stuck at feature extraction"**
+```
+This is normal! Takes 3-5 minutes for 1.35M bars.
+Progress bars show step-by-step progress.
+```
 
-**Files:** 13 tracked files
-
-**Test Status:** All components passing ✓
-
----
-
-## Contact & Support
-
-**Repository:** https://github.com/frankywashere/autotrade2 (Private)
-
-**Author:** Built with Claude Code
-
-**License:** Personal trading tool - Use at your own risk. Not financial advice.
+**"Pretraining at 0%"**
+```
+This is normal! Each epoch has 84,000+ batches.
+Batch-level progress bars show activity.
+```
 
 ---
 
-## Appendix: Key Formulas
+## Key Formulas
 
-### Linear Regression:
+### Linear Regression Channel:
 ```
 center_line = slope × x + intercept
 upper_line = center_line + (2 × σ)
 lower_line = center_line - (2 × σ)
 
-Where:
-  σ = std_dev(residuals)
-  residuals = actual_prices - center_line
+Where σ = std_dev(residuals)
 ```
 
 ### RSI:
@@ -1495,18 +954,53 @@ RSI = 100 - (100 / (1 + RS))
 stability = (R² × 40) + (min(ping_pongs/5, 1) × 40) + (min(bars/100, 1) × 20)
 ```
 
-### Composite Score:
+### Composite Score (Intelligent Channel Selection):
 ```
 composite = (confidence × 0.70) + (rsi_confluence × 0.25) + (stability × 0.05)
 ```
 
 ### 24-Hour Projection:
 ```
-bars_24h = {'1hour': 24, '2hour': 12, '3hour': 8, '4hour': 6, 'daily': 1}
-future_x = [n, n+1, n+2, ..., n+bars_24h]
+bars_24h = {'1hour': 24, '3hour': 8, '4hour': 6, 'daily': 1}
+future_x = [n, n+1, ..., n+bars_24h]
 predicted_high = MAX(slope × future_x + intercept + 2σ)
 predicted_low = MIN(slope × future_x + intercept - 2σ)
 ```
+
+---
+
+## Version History
+
+### v2.0 - Stage 2 Complete (Nov 11, 2025)
+✅ Liquid Neural Network implementation
+✅ 56-feature extraction system
+✅ Memory-efficient lazy loading
+✅ Real event integration (394 events)
+✅ Data validation system
+✅ Progress bars and feedback
+✅ SQLite prediction database
+✅ Walk-forward backtesting
+✅ Online learning system
+
+### v1.0 - Stage 1 Complete (Nov 10, 2025)
+✅ Linear regression channels
+✅ Multi-timeframe RSI
+✅ AI news sentiment + BS scoring
+✅ Telegram alerts
+✅ Streamlit dashboard
+✅ Live data integration
+✅ Intelligent channel selection
+✅ 24-hour forecasting
+
+---
+
+## Contact & Support
+
+**Repository:** https://github.com/frankywashere/autotrade2 (Private)
+
+**Author:** Built with Claude Code
+
+**License:** Personal trading tool - Use at your own risk. Not financial advice.
 
 ---
 

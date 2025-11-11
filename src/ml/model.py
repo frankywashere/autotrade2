@@ -92,6 +92,12 @@ class LNNTradingModel(nn.Module, ModelBase):
         Returns:
             dict with predictions, confidence, and probabilities
         """
+        # Ensure input is on same device as model
+        device = next(self.parameters()).device
+        x = x.to(device)
+        if h is not None:
+            h = h.to(device)
+
         self.eval()
         with torch.no_grad():
             predictions, hidden = self.forward(x, h)
@@ -138,9 +144,22 @@ class LNNTradingModel(nn.Module, ModelBase):
         torch.save(checkpoint, path)
         print(f"Model checkpoint saved to {path}")
 
-    def load_checkpoint(self, path: str) -> Dict:
-        """Load model checkpoint and return metadata"""
-        checkpoint = torch.load(path, map_location=torch.device('cpu'))
+    def load_checkpoint(self, path: str, device: Optional[torch.device] = None) -> Dict:
+        """Load model checkpoint and return metadata
+
+        Args:
+            path: Path to checkpoint file
+            device: Optional device to load model to (defaults to current device or CPU)
+        """
+        if device is None:
+            # Try to use current device if model is already on one
+            try:
+                device = next(self.parameters()).device
+            except:
+                device = torch.device('cpu')
+
+        # Load checkpoint with proper device mapping
+        checkpoint = torch.load(path, map_location=device)
 
         # Verify architecture matches
         assert checkpoint['input_size'] == self.input_size, "Input size mismatch"
@@ -151,7 +170,14 @@ class LNNTradingModel(nn.Module, ModelBase):
         if 'optimizer_state_dict' in checkpoint and self.optimizer:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
+        # Move model to device
+        self.to(device)
+
+        # Log device information
+        saved_device = checkpoint.get('metadata', {}).get('device', 'unknown')
         print(f"Model checkpoint loaded from {path}")
+        print(f"  Saved on: {saved_device}")
+        print(f"  Loaded to: {device}")
 
         return checkpoint.get('metadata', {})
 
@@ -283,6 +309,12 @@ class LSTMTradingModel(nn.Module, ModelBase):
 
     def predict(self, x: torch.Tensor, h: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Dict[str, Any]:
         """Generate predictions"""
+        # Ensure input is on same device as model
+        device = next(self.parameters()).device
+        x = x.to(device)
+        if h is not None:
+            h = (h[0].to(device), h[1].to(device))
+
         self.eval()
         with torch.no_grad():
             predictions, hidden = self.forward(x, h)
@@ -325,13 +357,35 @@ class LSTMTradingModel(nn.Module, ModelBase):
 
         torch.save(checkpoint, path)
 
-    def load_checkpoint(self, path: str) -> Dict:
-        """Load model checkpoint"""
-        checkpoint = torch.load(path, map_location=torch.device('cpu'))
+    def load_checkpoint(self, path: str, device: Optional[torch.device] = None) -> Dict:
+        """Load model checkpoint
+
+        Args:
+            path: Path to checkpoint file
+            device: Optional device to load model to (defaults to current device or CPU)
+        """
+        if device is None:
+            # Try to use current device if model is already on one
+            try:
+                device = next(self.parameters()).device
+            except:
+                device = torch.device('cpu')
+
+        # Load checkpoint with proper device mapping
+        checkpoint = torch.load(path, map_location=device)
         self.load_state_dict(checkpoint['model_state_dict'])
 
         if 'optimizer_state_dict' in checkpoint and self.optimizer:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        # Move model to device
+        self.to(device)
+
+        # Log device information
+        saved_device = checkpoint.get('metadata', {}).get('device', 'unknown')
+        print(f"Model checkpoint loaded from {path}")
+        print(f"  Saved on: {saved_device}")
+        print(f"  Loaded to: {device}")
 
         return checkpoint.get('metadata', {})
 

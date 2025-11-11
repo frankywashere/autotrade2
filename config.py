@@ -102,3 +102,21 @@ ONLINE_LEARNING_UPDATE_FREQUENCY = "daily"  # daily or weekly
 # Backtesting
 BACKTEST_NUM_SIMULATIONS = 100  # Random days/weeks to test
 BACKTEST_RANDOM_SEED = 42
+
+# ======================================================================
+# DEVICE/GPU CONFIGURATION
+# ======================================================================
+
+# Device Selection
+AUTO_SELECT_DEVICE = False  # Auto-select best device (CUDA > MPS > CPU)
+FORCE_DEVICE = None  # Force specific device: 'cpu', 'cuda', 'mps', or None
+INTERACTIVE_DEVICE_SELECTION = True  # Show interactive device selection menu
+
+# Memory Management
+ENABLE_MPS_FALLBACK = True  # Allow MPS to fallback to CPU for unsupported ops
+MPS_MAX_MEMORY_MB = None  # Limit MPS memory usage (None = unlimited)
+CUDA_MEMORY_FRACTION = 0.9  # Use 90% of GPU memory for CUDA
+
+# Performance Settings
+BENCHMARK_ON_STARTUP = False  # Run device benchmark on training start
+LOG_DEVICE_OPERATIONS = False  # Log device transfer operations (debugging)
