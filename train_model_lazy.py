@@ -32,6 +32,7 @@ from src.ml.features_lazy import TradingFeatureExtractorWithProgress
 from src.ml.events import CombinedEventsHandler
 from src.ml.model import LNNTradingModel, LSTMTradingModel, SelfSupervisedPretrainer
 from src.ml.device_manager import DeviceManager
+from src.ml.interactive_params import InteractiveParameterSelector, create_argparse_from_params
 
 
 class LazyTradingDataset(Dataset):
@@ -491,7 +492,21 @@ def main():
     parser.add_argument('--auto_device', action='store_true',
                        help='Auto-select best device without prompting')
 
+    # Interactive mode
+    parser.add_argument('--interactive', action='store_true',
+                       help='Enable interactive parameter selection mode')
+
     args = parser.parse_args()
+
+    # Interactive mode
+    if args.interactive:
+        print("\n" + "=" * 70)
+        print("🎛️  LAUNCHING INTERACTIVE MODE")
+        print("=" * 70)
+        selector = InteractiveParameterSelector(mode='lazy')
+        params = selector.run()
+        args = create_argparse_from_params(params, args)
+        print("\n✓ Configuration complete! Starting training...\n")
 
     # Print header
     print("\n" + "=" * 70)

@@ -1,6 +1,6 @@
 # AutoTrade2 - Complete Technical Specification
 
-**Version:** 2.0 (Stage 1 + Stage 2 Complete)
+**Version:** 2.1 (Interactive Parameter Selection + GPU/Metal Support)
 **Repository:** https://github.com/frankywashere/autotrade2
 **Last Updated:** November 11, 2025
 
@@ -76,12 +76,15 @@ python main.py dashboard
 ### Stage 2 (ML Training)
 ```bash
 # Install ML dependencies
-pip install torch ncps sqlalchemy tqdm psutil
+pip install torch ncps sqlalchemy tqdm psutil inquirerpy
 
 # Validate data (MANDATORY!)
 python3 validate_data_alignment.py --events_data data/tsla_events_REAL.csv
 
-# Train model (memory-efficient)
+# Train model - Interactive mode (RECOMMENDED)
+python3 train_model_lazy.py --interactive
+
+# Or train with command-line args
 python3 train_model_lazy.py \
   --tsla_events data/tsla_events_REAL.csv \
   --epochs 50 \
@@ -104,7 +107,7 @@ autotrade2/
 ├── SPEC.md                              # This technical specification
 ├── config.py                            # Central configuration
 ├── main.py                              # Stage 1 entry point
-├── requirements.txt                     # Python dependencies
+├── requirements.txt                     # Python dependencies (includes inquirerpy)
 ├── run.sh                               # Quick start menu
 ├── convert_data.py                      # Data conversion utility
 │
@@ -138,7 +141,10 @@ autotrade2/
     ├── features_lazy.py                # Feature extraction with progress
     ├── events.py                       # Event integration
     ├── model.py                        # LNN and LSTM models
-    └── database.py                     # SQLite prediction logging
+    ├── database.py                     # SQLite prediction logging
+    ├── device_manager.py               # GPU/Metal hardware detection
+    ├── interactive_params.py           # Parameter selection (main)
+    └── interactive_params_arrow.py     # Arrow-key navigation system
 
 # Stage 2 Scripts
 ├── train_model.py                       # Original training (memory-intensive)
@@ -457,6 +463,60 @@ metrics = db.get_accuracy_metrics()
 ---
 
 ## Training Workflow
+
+### Step 0: Interactive Parameter Selection (NEW in v2.1)
+
+Both training scripts now support an **interactive parameter selection system** with arrow-key navigation for easy configuration:
+
+```bash
+# Launch interactive mode
+python3 train_model_lazy.py --interactive
+```
+
+**Three Selection Modes:**
+1. **Quick Start** - Use defaults with auto-detected device (fastest)
+2. **Arrow-Key Navigation** - Visual menu with ↑/↓ navigation (recommended)
+3. **Number-Based Menu** - Type parameter numbers to select (legacy)
+
+**Arrow-Key Navigation Features:**
+- Navigate all 21 parameters with ↑/↓ arrow keys
+- Press Enter to edit the highlighted parameter
+- Visual pointer (`❯`) shows current selection
+- Modified parameters marked with `*`
+- Organized in 6 categories:
+  - 📁 **Data Files**: SPY/TSLA data paths, events file, macro API key
+  - 📅 **Training Period**: Start/end years
+  - 🧠 **Model Architecture**: Model type, hidden size, layers, sequence length
+  - ⚙️ **Training Parameters**: Epochs, batch size, learning rate, validation split
+  - 📊 **Feature Flags**: Channel, RSI, correlation, event features
+  - 🖥️ **Compute Device**: CPU/CUDA/MPS with auto-detection
+
+**RAM-Aware Batch Size Suggestions:**
+```
+💡 Batch size suggestions (based on 16.0 GB available RAM):
+   Conservative : 128 (safe, slower)
+   Balanced     : 256 (recommended)
+   Aggressive   : 512 (fast, may OOM)
+```
+
+**Parameter-Specific Editors:**
+- **Numbers**: Input with validation ranges (e.g., hidden_size: 32-1024)
+- **Years**: Range-validated (2010-2024)
+- **Booleans**: Yes/No confirmation
+- **Device**: List selector showing available devices
+- **Batch Size**: Special menu with RAM-based suggestions
+- **Macro API**: Note that local macro data exists without API key
+
+**Implementation:**
+- `src/ml/interactive_params_arrow.py` - Arrow-key navigation system (InquirerPy-based)
+- `src/ml/interactive_params.py` - Mode selection and routing
+- `src/ml/device_manager.py` - Hardware detection for device selection
+- Graceful fallback to number-based menu if InquirerPy not installed
+
+**Dependencies:**
+```bash
+pip install inquirerpy  # For arrow-key navigation
+```
 
 ### Step 1: Data Validation (MANDATORY!)
 
@@ -971,7 +1031,17 @@ predicted_low = MIN(slope × future_x + intercept - 2σ)
 
 ## Version History
 
-### v2.0 - Stage 2 Complete (Nov 11, 2025)
+### v2.1 - Interactive Parameter Selection (Nov 11, 2025)
+✅ Arrow-key navigation menu for parameter configuration
+✅ Interactive parameter selection with 3 modes (quick start, arrow-key, number-based)
+✅ RAM-aware batch size suggestions based on available memory
+✅ Parameter-specific editors with validation
+✅ Visual menu with 21 parameters in 6 categories
+✅ Auto-device detection and selection
+✅ Graceful fallback to number-based menu
+✅ InquirerPy integration for terminal UI
+
+### v2.0 - Stage 2 Complete + GPU/Metal Support (Nov 11, 2025)
 ✅ Liquid Neural Network implementation
 ✅ 56-feature extraction system
 ✅ Memory-efficient lazy loading
@@ -981,6 +1051,9 @@ predicted_low = MIN(slope × future_x + intercept - 2σ)
 ✅ SQLite prediction database
 ✅ Walk-forward backtesting
 ✅ Online learning system
+✅ GPU/Metal acceleration (M1-M5, CUDA)
+✅ Device manager with hardware detection
+✅ Cross-device model loading
 
 ### v1.0 - Stage 1 Complete (Nov 10, 2025)
 ✅ Linear regression channels

@@ -471,3 +471,15 @@ class DeviceManager:
             print(f"Memory: {mem_info['total_gb']:.1f} GB total, {mem_info['free_gb']:.1f} GB available")
 
         print(f"{'='*70}\n")
+
+    @staticmethod
+    def get_system_ram_gb() -> float:
+        """Get total system RAM in GB"""
+        import psutil
+        return psutil.virtual_memory().total / 1024**3
+
+    @staticmethod
+    def get_available_ram_gb() -> float:
+        """Get available system RAM in GB"""
+        import psutil
+        return psutil.virtual_memory().available / 1024**3
