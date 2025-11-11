@@ -215,12 +215,16 @@ class SelfSupervisedPretrainer:
     Uses masking and reconstruction tasks
     """
 
-    def __init__(self, model: LNNTradingModel, mask_ratio: float = 0.15):
+    def __init__(self, model: nn.Module, mask_ratio: float = 0.15):
         self.model = model
         self.mask_ratio = mask_ratio
 
-        # Reconstruction head
+        # Reconstruction head - ensure it's on the same device as the model
         self.reconstruction_head = nn.Linear(model.output_size, model.input_size)
+
+        # Move reconstruction head to same device as model
+        device = next(model.parameters()).device
+        self.reconstruction_head = self.reconstruction_head.to(device)
 
     def mask_sequences(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -229,8 +233,8 @@ class SelfSupervisedPretrainer:
         """
         batch_size, seq_len, feature_dim = x.shape
 
-        # Create mask (1 = keep, 0 = mask)
-        mask = torch.rand(batch_size, seq_len, feature_dim) > self.mask_ratio
+        # Create mask (1 = keep, 0 = mask) - ensure it's on same device as input
+        mask = torch.rand(batch_size, seq_len, feature_dim, device=x.device) > self.mask_ratio
 
         masked_x = x.clone()
         masked_x[~mask] = 0  # Zero out masked positions
