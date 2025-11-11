@@ -52,3 +52,53 @@ DASHBOARD_PORT = 8501  # For Streamlit
 # Live Data Settings
 USE_LIVE_DATA = True  # Merge CSV with live data from yfinance
 LIVE_DATA_DAYS_BACK = 7  # Number of days of live data to fetch (max 7 for 1-min)
+
+# ======================================================================
+# STAGE 2: ML MODEL CONFIGURATION
+# ======================================================================
+
+# Model Settings
+ML_MODEL_TYPE = "LNN"  # LNN, LSTM, or Transformer
+LNN_HIDDEN_SIZE = 128
+LNN_NUM_LAYERS = 2
+LNN_LEARNING_RATE = 0.001
+ML_BATCH_SIZE = 32
+ML_SEQUENCE_LENGTH = 168  # 1 week of hourly bars
+
+# Training Settings
+ML_TRAIN_START_YEAR = 2015
+ML_TRAIN_END_YEAR = 2023  # Train on 2015-2023
+ML_TEST_YEAR = 2024  # Backtest on 2024
+ML_EPOCHS = 50
+ML_VALIDATION_SPLIT = 0.1
+
+# Feature Settings
+USE_CHANNEL_FEATURES = True
+USE_RSI_FEATURES = True
+USE_CORRELATION_FEATURES = True
+USE_EVENT_FEATURES = True
+USE_NEWS_FEATURES = True
+
+# Event Settings
+TSLA_EVENTS_FILE = DATA_DIR / "tsla_events.csv"  # User-provided earnings/deliveries
+MACRO_EVENTS_API_KEY = os.getenv("MACRO_API_KEY", "")  # For FRED/economic calendar
+EVENT_LOOKBACK_DAYS = 7  # Days before/after event to analyze
+EVENT_LOOKAHEAD_DAYS = 7
+
+# Prediction Settings
+PREDICTION_HORIZON_HOURS = 24  # Forecast 24 hours ahead
+PREDICTION_CONFIDENCE_THRESHOLD = 0.7  # Min confidence for alerts
+PREDICTION_UPDATE_INTERVAL_HOURS = 4  # Recalculate every 4 hours
+
+# Database Settings
+ML_DB_PATH = DATA_DIR / "predictions.db"
+ML_DB_TYPE = "sqlite"  # sqlite or postgresql
+
+# Online Learning
+ONLINE_LEARNING_ENABLED = True
+ONLINE_LEARNING_LR = 0.0001  # Lower LR for stability
+ONLINE_LEARNING_UPDATE_FREQUENCY = "daily"  # daily or weekly
+
+# Backtesting
+BACKTEST_NUM_SIMULATIONS = 100  # Random days/weeks to test
+BACKTEST_RANDOM_SEED = 42
