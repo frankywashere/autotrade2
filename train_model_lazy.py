@@ -879,9 +879,37 @@ def main():
             train_all_models_interactive(args)
             return  # Exit after training all models
         else:
-            # Normal single-model interactive
+            # Single model: Ask for timeframe first
+            print("\n" + "=" * 70)
+            print("SELECT TIMEFRAME")
+            print("=" * 70)
+            print("\nAvailable timeframes:")
+            timeframes = ['15min', '1hour', '4hour', 'daily']
+            for i, tf in enumerate(timeframes, 1):
+                descriptions = {
+                    '15min': '50 hours lookback, 6 hours prediction',
+                    '1hour': '8 days lookback, 24 hours prediction',
+                    '4hour': '33 days lookback, 4 days prediction',
+                    'daily': '9 months lookback, 24 days prediction'
+                }
+                print(f"  {i}. {tf:<10} - {descriptions[tf]}")
+
+            tf_choice = input("\nSelect timeframe [1-4]: ").strip()
+            timeframe_map = {'1': '15min', '2': '1hour', '3': '4hour', '4': 'daily'}
+            selected_timeframe = timeframe_map.get(tf_choice, '15min')
+
+            print(f"\n✓ Selected: {selected_timeframe}")
+            print(f"  Data files will be set to: data/SPY_{selected_timeframe}.csv, data/TSLA_{selected_timeframe}.csv")
+
+            # Normal single-model interactive with pre-selected timeframe
             selector = InteractiveParameterSelector(mode='lazy')
             params = selector.run()
+
+            # Override timeframe with user's choice
+            params['input_timeframe'] = selected_timeframe
+            params['spy_data'] = f'data/SPY_{selected_timeframe}.csv'
+            params['tsla_data'] = f'data/TSLA_{selected_timeframe}.csv'
+
             args = create_argparse_from_params(params, args)
             print("\n✓ Configuration complete! Starting training...\n")
 
