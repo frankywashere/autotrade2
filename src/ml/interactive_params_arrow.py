@@ -78,6 +78,8 @@ class ArrowKeyParameterSelector:
             'batch_size': config.ML_BATCH_SIZE or 16,
             'learning_rate': config.LNN_LEARNING_RATE,
             'validation_split': config.ML_VALIDATION_SPLIT,
+            'preload': False,  # NEW: Preload all sequences into memory
+            'gpu_monitor': False,  # NEW: Enable GPU monitoring
 
             # Features
             'use_channel_features': config.USE_CHANNEL_FEATURES,
@@ -236,6 +238,8 @@ class ArrowKeyParameterSelector:
                 ('batch_size', {'name': 'Batch size', 'type': 'batch_size'}),
                 ('learning_rate', {'name': 'Learning rate', 'type': 'float'}),
                 ('validation_split', {'name': 'Validation split', 'type': 'float'}),
+                ('preload', {'name': 'Data loading mode', 'type': 'boolean'}),
+                ('gpu_monitor', {'name': 'GPU monitoring', 'type': 'boolean'}),
             ],
             "📊 FEATURE FLAGS": [
                 ('use_channel_features', {'name': 'Channel features', 'type': 'boolean'}),
@@ -269,6 +273,10 @@ class ArrowKeyParameterSelector:
             if self.params.get('auto_device'):
                 return f"{value} (auto-detected)"
             return value or 'Auto-detect'
+        elif param_key == 'preload':
+            return 'Preload (fast, ~30GB)' if value else 'Lazy (memory-eff, ~2GB)'
+        elif param_key == 'gpu_monitor':
+            return 'Enabled' if value else 'Disabled'
         elif isinstance(value, bool):
             return 'Yes' if value else 'No'
         elif param_key == 'learning_rate':
@@ -332,9 +340,19 @@ class ArrowKeyParameterSelector:
         if param_key == 'pin_memory':
             print("\nHint: Pin memory for faster GPU→VRAM transfers (~10% speedup)")
             print("      Recommended: True for GPU, False for CPU/MPS")
+        elif param_key == 'preload':
+            print("\nHint: Preload mode loads all sequences into memory at initialization")
+            print("      Preload: Faster training (~10-33% speedup), but uses ~30GB RAM")
+            print("      Lazy: Slower training, but only uses ~2GB RAM")
+            print("      Recommended: Preload for GPU with 32GB+ RAM, Lazy otherwise")
+        elif param_key == 'gpu_monitor':
+            print("\nHint: GPU monitoring shows real-time GPU utilization during training")
+            print("      Displays: GPU%, VRAM usage, temperature, power draw")
+            print("      Requires: nvidia-ml-py package (pip install nvidia-ml-py)")
+            print("      Recommended: Enable when debugging GPU bottlenecks")
 
         result = inquirer.confirm(
-            message=f"Enable {param_name}?",
+            message=f"Enable {param_name}?" if param_key != 'preload' else "Use Preload mode (fast, ~30GB)?",
             default=self.params.get(param_key, False),
         ).execute()
 

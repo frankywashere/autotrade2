@@ -183,6 +183,13 @@ class LazyTradingDataset(Dataset):
         self.feature_names = features_df.columns.tolist()
         self.timestamps = features_df.index
 
+        # Cache column index to avoid repeated lookups (performance optimization)
+        try:
+            self.close_idx = self.feature_names.index('tsla_close')
+        except ValueError:
+            # Fallback if tsla_close not found
+            self.close_idx = 0
+
         self.sequence_length = sequence_length
         self.target_horizon = target_horizon
         self.events_handler = events_handler
@@ -232,15 +239,8 @@ class LazyTradingDataset(Dataset):
         target_start = seq_end
         target_end = seq_end + self.target_horizon
 
-        # Find tsla_close column index
-        try:
-            close_idx = self.feature_names.index('tsla_close')
-        except ValueError:
-            # Fallback if tsla_close not found
-            close_idx = 0
-
-        # Get future prices
-        future_prices = self.features_array[target_start:target_end, close_idx]
+        # Get future prices using cached column index
+        future_prices = self.features_array[target_start:target_end, self.close_idx]
 
         # Calculate high and low
         if len(future_prices) > 0:
@@ -248,7 +248,7 @@ class LazyTradingDataset(Dataset):
             target_low = np.min(future_prices)
         else:
             # Edge case: use last available price
-            target_high = self.features_array[target_start - 1, close_idx]
+            target_high = self.features_array[target_start - 1, self.close_idx]
             target_low = target_high
 
         # Convert to tensors
@@ -267,6 +267,165 @@ class LazyTradingDataset(Dataset):
             event_embed = torch.zeros(21, dtype=torch.float32)
 
         return X, y, event_embed
+
+
+class PreloadTradingDataset(Dataset):
+    """
+    High-performance dataset that pre-generates all sequences at initialization.
+    Uses more memory (~30GB) but provides faster training by eliminating
+    on-the-fly sequence generation.
+    """
+
+    def __init__(self, features_df, sequence_length=168, target_horizon=24,
+                 events_handler=None, validation_split=0.0, is_validation=False):
+        """
+        Args:
+            features_df: DataFrame with extracted features
+            sequence_length: Number of timesteps per sequence
+            target_horizon: Number of hours to predict ahead
+            events_handler: Optional events handler for embeddings
+            validation_split: Fraction for validation (0.0-1.0)
+            is_validation: Whether this is the validation set
+        """
+        self.features_df = features_df
+        self.features_array = features_df.values  # Convert once for speed
+        self.feature_names = features_df.columns.tolist()
+        self.timestamps = features_df.index
+
+        # Cache column index to avoid repeated lookups (performance optimization)
+        try:
+            self.close_idx = self.feature_names.index('tsla_close')
+        except ValueError:
+            # Fallback if tsla_close not found
+            self.close_idx = 0
+
+        self.sequence_length = sequence_length
+        self.target_horizon = target_horizon
+        self.events_handler = events_handler
+
+        # Calculate valid indices for sequences
+        total_samples = len(features_df) - sequence_length - target_horizon
+
+        if total_samples <= 0:
+            raise ValueError(f"Not enough data. Need at least {sequence_length + target_horizon} bars")
+
+        # Split train/validation
+        if validation_split > 0:
+            val_size = int(total_samples * validation_split)
+            train_size = total_samples - val_size
+
+            if is_validation:
+                self.start_idx = train_size
+                self.num_samples = val_size
+            else:
+                self.start_idx = 0
+                self.num_samples = train_size
+        else:
+            self.start_idx = 0
+            self.num_samples = total_samples
+
+        print(f"  Dataset: {self.num_samples:,} sequences (preloading into memory...)")
+
+        # Pre-generate all sequences
+        start_time = time.time()
+        self.X_sequences = []
+        self.y_targets = []
+        self.event_embeddings = [] if events_handler is not None else None
+
+        # Use tqdm for progress bar during preloading
+        from tqdm import tqdm
+        for i in tqdm(range(self.num_samples), desc="  Preloading sequences", unit="seq"):
+            actual_idx = self.start_idx + i
+
+            # Extract input sequence (X)
+            seq_start = actual_idx
+            seq_end = actual_idx + self.sequence_length
+            X_seq = self.features_array[seq_start:seq_end]
+
+            # Extract targets (y)
+            target_start = seq_end
+            target_end = seq_end + self.target_horizon
+            future_prices = self.features_array[target_start:target_end, self.close_idx]
+
+            # Calculate high and low
+            if len(future_prices) > 0:
+                target_high = np.max(future_prices)
+                target_low = np.min(future_prices)
+            else:
+                target_high = self.features_array[target_start - 1, self.close_idx]
+                target_low = target_high
+
+            # Store as tensors
+            self.X_sequences.append(torch.tensor(X_seq, dtype=torch.float32))
+            self.y_targets.append(torch.tensor([target_high, target_low], dtype=torch.float32))
+
+            # Get event embedding if handler provided
+            if self.events_handler is not None:
+                # Get timestamp for event embedding
+                timestamp = self.timestamps[seq_end - 1]
+                embedding = self.events_handler.get_embedding_for_timestamp(
+                    timestamp,
+                    lookback_hours=self.sequence_length,
+                    horizon_hours=self.target_horizon
+                )
+                self.event_embeddings.append(torch.tensor(embedding, dtype=torch.float32))
+
+        elapsed = time.time() - start_time
+        mem_usage = get_memory_usage()
+        print(f"  Preloading complete: {elapsed:.1f}s, Memory: {mem_usage:.1f} MB")
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        """
+        Return pre-generated sequence.
+        Much faster than lazy loading since no computation needed.
+        """
+        X = self.X_sequences[idx]
+        y = self.y_targets[idx]
+
+        if self.event_embeddings is not None:
+            event_embedding = self.event_embeddings[idx]
+            return X, y, event_embedding
+        else:
+            return X, y
+
+
+def create_trading_dataset(features_df, sequence_length=168, target_horizon=24,
+                          events_handler=None, validation_split=0.0, is_validation=False,
+                          preload=False):
+    """
+    Factory function to create the appropriate dataset type.
+
+    Args:
+        features_df: DataFrame with extracted features
+        sequence_length: Number of timesteps per sequence
+        target_horizon: Number of hours to predict ahead
+        events_handler: Optional events handler for embeddings
+        validation_split: Fraction for validation (0.0-1.0)
+        is_validation: Whether this is the validation set
+        preload: If True, use PreloadTradingDataset (faster, more memory)
+                If False, use LazyTradingDataset (slower, less memory)
+
+    Returns:
+        Dataset instance (either LazyTradingDataset or PreloadTradingDataset)
+    """
+    dataset_class = PreloadTradingDataset if preload else LazyTradingDataset
+
+    if preload:
+        print("  📈 Using PRELOAD mode (faster training, ~30GB memory)")
+    else:
+        print("  💾 Using LAZY mode (memory efficient, ~2GB memory)")
+
+    return dataset_class(
+        features_df=features_df,
+        sequence_length=sequence_length,
+        target_horizon=target_horizon,
+        events_handler=events_handler,
+        validation_split=validation_split,
+        is_validation=is_validation
+    )
 
 
 def get_memory_usage():
@@ -339,7 +498,7 @@ def load_and_prepare_data_lazy(spy_file, tsla_file, start_year, end_year,
 def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_size=32,
                          lr=0.001, validation_split=0.1, sequence_length=168,
                          target_horizon=24, device=torch.device('cpu'),
-                         num_workers=0, pin_memory=False, gpu_monitor=False):
+                         num_workers=0, pin_memory=False, gpu_monitor=False, preload=False):
     """
     Supervised training using lazy sequence loading.
 
@@ -364,15 +523,17 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
     if monitor:
         print(f"  GPU monitoring: enabled")
 
-    # Create lazy datasets
-    train_dataset = LazyTradingDataset(
+    # Create datasets using factory function
+    train_dataset = create_trading_dataset(
         features_df, sequence_length, target_horizon,
-        events_handler, validation_split, is_validation=False
+        events_handler, validation_split, is_validation=False,
+        preload=preload
     )
 
-    val_dataset = LazyTradingDataset(
+    val_dataset = create_trading_dataset(
         features_df, sequence_length, target_horizon,
-        events_handler, validation_split, is_validation=True
+        events_handler, validation_split, is_validation=True,
+        preload=preload
     )
 
     print(f"\n  Train size: {len(train_dataset):,} sequences")
@@ -530,7 +691,7 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
 def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
                                   batch_size=32, lr=0.001, sequence_length=168,
                                   device=torch.device('cpu'), num_workers=0, pin_memory=False,
-                                  gpu_monitor=False):
+                                  gpu_monitor=False, preload=False):
     """
     Self-supervised pretraining using lazy loading.
 
@@ -555,10 +716,10 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
         lr=lr
     )
 
-    # Create lazy dataset for pretraining
-    pretrain_dataset = LazyTradingDataset(
+    # Create dataset for pretraining using factory function
+    pretrain_dataset = create_trading_dataset(
         features_df, sequence_length, target_horizon=24,
-        events_handler=events_handler
+        events_handler=events_handler, preload=preload
     )
 
     dataloader = DataLoader(
@@ -841,7 +1002,8 @@ def run_training_pipeline(args):
             device=device,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            gpu_monitor=args.gpu_monitor
+            gpu_monitor=args.gpu_monitor,
+            preload=args.preload
         )
 
     # 4. Supervised training
@@ -856,7 +1018,8 @@ def run_training_pipeline(args):
         device=device,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        gpu_monitor=args.gpu_monitor
+        gpu_monitor=args.gpu_monitor,
+        preload=args.preload
     )
 
     # 5. Save model
@@ -1077,6 +1240,8 @@ def main():
                        help='Pin memory for faster GPU transfers (default: auto-detect based on device)')
     parser.add_argument('--gpu_monitor', action='store_true',
                        help='Enable real-time GPU utilization monitoring (requires nvidia-ml-py)')
+    parser.add_argument('--preload', action='store_true',
+                       help='Preload all sequences into memory for faster training (~30GB RAM)')
 
     # Interactive mode
     parser.add_argument('--interactive', action='store_true',
