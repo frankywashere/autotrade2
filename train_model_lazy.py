@@ -33,6 +33,7 @@ from src.ml.events import CombinedEventsHandler
 from src.ml.model import LNNTradingModel, LSTMTradingModel, SelfSupervisedPretrainer
 from src.ml.device_manager import DeviceManager
 from src.ml.interactive_params import InteractiveParameterSelector, create_argparse_from_params
+from src.ml.gpu_monitor import GPUMonitor
 
 
 def validate_required_files(input_timeframe, events_file=None, verbose=True):
@@ -338,9 +339,12 @@ def load_and_prepare_data_lazy(spy_file, tsla_file, start_year, end_year,
 def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_size=32,
                          lr=0.001, validation_split=0.1, sequence_length=168,
                          target_horizon=24, device=torch.device('cpu'),
-                         num_workers=0, pin_memory=False):
+                         num_workers=0, pin_memory=False, gpu_monitor=False):
     """
     Supervised training using lazy sequence loading.
+
+    Args:
+        gpu_monitor: If True, display real-time GPU utilization metrics
     """
     print("\n" + "=" * 70)
     print("🎯 SUPERVISED TRAINING (Memory-Efficient)")
@@ -354,6 +358,11 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
     print(f"  Batch size: {batch_size}")
     print(f"  Initial learning rate: {lr}")
     print(f"  Memory usage: {get_memory_usage():.1f} MB")
+
+    # Initialize GPU monitor if requested
+    monitor = GPUMonitor(device) if gpu_monitor and device.type == 'cuda' else None
+    if monitor:
+        print(f"  GPU monitoring: enabled")
 
     # Create lazy datasets
     train_dataset = LazyTradingDataset(
@@ -426,8 +435,11 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
             train_loss += loss.item()
             train_batches += 1
 
-            train_pbar.set_postfix({'loss': f'{loss.item():.4f}',
-                                   'mem': f'{get_memory_usage():.0f}MB'})
+            # Update progress bar with loss, memory, and optional GPU metrics
+            postfix = {'loss': f'{loss.item():.4f}', 'mem': f'{get_memory_usage():.0f}MB'}
+            if monitor:
+                postfix.update(monitor.get_compact_metrics())
+            train_pbar.set_postfix(postfix)
 
         avg_train_loss = train_loss / train_batches
 
@@ -449,7 +461,11 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
                 val_loss += loss.item()
                 val_batches += 1
 
-                val_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                # Update validation progress bar with optional GPU metrics
+                postfix = {'loss': f'{loss.item():.4f}'}
+                if monitor:
+                    postfix.update(monitor.get_compact_metrics())
+                val_pbar.set_postfix(postfix)
 
         avg_val_loss = val_loss / val_batches
 
@@ -488,10 +504,17 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
         if new_lr < old_lr:
             status += " ⚡ LR reduced"
 
+        # Print epoch summary with optional GPU details
         print(f"  Epoch {epoch + 1:3d}/{epochs}: "
               f"Train={avg_train_loss:.4f} | Val={avg_val_loss:.4f} | "
               f"LR={new_lr:.1e} | Mem={get_memory_usage():.0f}MB | "
               f"Time={epoch_time:.1f}s{status}")
+
+        # Show detailed GPU metrics if monitoring enabled
+        if monitor:
+            gpu_details = monitor.format_detailed()
+            if gpu_details:
+                print(f"    {gpu_details}")
 
     # Training complete
     elapsed = time.time() - start_time
@@ -506,9 +529,13 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
 
 def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
                                   batch_size=32, lr=0.001, sequence_length=168,
-                                  device=torch.device('cpu'), num_workers=0, pin_memory=False):
+                                  device=torch.device('cpu'), num_workers=0, pin_memory=False,
+                                  gpu_monitor=False):
     """
     Self-supervised pretraining using lazy loading.
+
+    Args:
+        gpu_monitor: If True, display real-time GPU utilization metrics
     """
     print("\n" + "=" * 70)
     print("🔧 SELF-SUPERVISED PRETRAINING (Memory-Efficient)")
@@ -516,6 +543,11 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
     print(f"  Learning to understand patterns via masked reconstruction")
     print(f"  Device: {device}")
     print(f"  Mask ratio: 15% | Learning rate: {lr}")
+
+    # Initialize GPU monitor if requested
+    monitor = GPUMonitor(device) if gpu_monitor and device.type == 'cuda' else None
+    if monitor:
+        print(f"  GPU monitoring: enabled")
 
     pretrainer = SelfSupervisedPretrainer(model, mask_ratio=0.15)
     optimizer = torch.optim.Adam(
@@ -571,11 +603,14 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
             # Update batch progress bar every 100 batches
             if batch_count % 100 == 0:
                 current_avg = total_loss / batch_count
-                batch_pbar.set_postfix({
+                postfix = {
                     'loss': f'{loss:.4f}',
                     'avg': f'{current_avg:.4f}',
                     'mem': f'{get_memory_usage():.0f}MB'
-                })
+                }
+                if monitor:
+                    postfix.update(monitor.get_compact_metrics())
+                batch_pbar.set_postfix(postfix)
 
         avg_loss = total_loss / batch_count
         pretrain_losses.append(avg_loss)
@@ -597,6 +632,12 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
 
         print(f"    Epoch {epoch + 1}/{epochs}: Loss={avg_loss:.4f} | "
               f"Time={epoch_time:.1f}s | Mem={get_memory_usage():.0f}MB")
+
+        # Show detailed GPU metrics if monitoring enabled
+        if monitor:
+            gpu_details = monitor.format_detailed()
+            if gpu_details:
+                print(f"      {gpu_details}")
 
     elapsed = time.time() - pretrain_start
     print(f"\n  " + "-" * 65)
@@ -799,7 +840,8 @@ def run_training_pipeline(args):
             sequence_length=args.sequence_length,
             device=device,
             num_workers=num_workers,
-            pin_memory=pin_memory
+            pin_memory=pin_memory,
+            gpu_monitor=args.gpu_monitor
         )
 
     # 4. Supervised training
@@ -813,7 +855,8 @@ def run_training_pipeline(args):
         target_horizon=args.prediction_horizon,
         device=device,
         num_workers=num_workers,
-        pin_memory=pin_memory
+        pin_memory=pin_memory,
+        gpu_monitor=args.gpu_monitor
     )
 
     # 5. Save model
@@ -1032,6 +1075,8 @@ def main():
                        help='Number of data loading workers (default: auto-detect based on device)')
     parser.add_argument('--pin_memory', type=lambda x: x.lower() == 'true', default=None,
                        help='Pin memory for faster GPU transfers (default: auto-detect based on device)')
+    parser.add_argument('--gpu_monitor', action='store_true',
+                       help='Enable real-time GPU utilization monitoring (requires nvidia-ml-py)')
 
     # Interactive mode
     parser.add_argument('--interactive', action='store_true',
