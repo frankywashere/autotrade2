@@ -699,20 +699,36 @@ def run_training_pipeline(args):
     print(f"  Current memory: {get_memory_usage():.1f} MB")
 
     # GPU optimization: Auto-detect num_workers and pin_memory based on device
+    # Detect system capabilities for smart defaults
+    vram_gb = None
+    cpu_count = os.cpu_count() or 4
+
+    if device.type == 'cuda':
+        try:
+            vram_bytes = torch.cuda.get_device_properties(device).total_memory
+            vram_gb = vram_bytes / (1024**3)
+        except:
+            vram_gb = None
+
     if args.num_workers is None:
-        # Auto-detect num_workers based on device and CPU cores
+        # Smart auto-detection based on device and system capabilities
         if device.type == 'cuda':
-            # For CUDA: Use 6 workers for powerful multi-core CPUs
-            # Optimal: 1-2 CPU cores per worker, up to 6-8 workers
-            cpu_count = os.cpu_count() or 4
-            if cpu_count >= 12:  # Xeon/Threadripper class
-                num_workers = 6
-            elif cpu_count >= 8:  # High-end desktop
-                num_workers = 4
-            else:  # Entry-level
+            # For CUDA: Use more workers for powerful CPUs
+            # Balance: ~2-4 CPU cores per worker, max 8 workers
+            import platform
+            if platform.system() == 'Darwin':
+                # macOS: Conservative due to file descriptor limits
                 num_workers = 2
+            else:
+                # Linux/Windows: Scale with CPU count
+                if cpu_count >= 16:
+                    num_workers = 6  # Powerful CPU (16+ cores)
+                elif cpu_count >= 8:
+                    num_workers = 4  # Mid-range CPU (8-15 cores)
+                else:
+                    num_workers = 2  # Lower-end CPU (<8 cores)
         else:
-            # CPU/MPS: Use 0 workers (data loading on main thread)
+            # CPU/MPS: Use main thread only
             num_workers = 0
         workers_source = "auto-detected"
     else:
@@ -726,15 +742,6 @@ def run_training_pipeline(args):
     else:
         pin_memory = args.pin_memory
         pin_source = "user-specified"
-
-    # Detect VRAM for CUDA devices (for informational display)
-    vram_gb = None
-    if device.type == 'cuda':
-        try:
-            vram_bytes = torch.cuda.get_device_properties(device).total_memory
-            vram_gb = vram_bytes / (1024**3)
-        except:
-            vram_gb = None
 
     # macOS warning for high num_workers
     import platform
@@ -751,27 +758,30 @@ def run_training_pipeline(args):
     # Display GPU optimization settings
     if device.type == 'cuda':
         print(f"\n  🚀 GPU optimizations enabled:")
+        print(f"     - Device: {torch.cuda.get_device_name(device)}")
         if vram_gb:
             print(f"     - VRAM: {vram_gb:.1f} GB")
+        print(f"     - CPU cores: {cpu_count}")
         print(f"     - num_workers: {num_workers} ({workers_source}, parallel data loading)")
         print(f"     - pin_memory: {pin_memory} ({pin_source}, faster GPU transfers)")
 
-        # Provide batch size recommendations based on VRAM
-        if vram_gb:
-            if vram_gb >= 40:  # A40/A100 class
-                recommended_batch = "256-512"
-            elif vram_gb >= 24:  # RTX 3090/4090 class
-                recommended_batch = "128-256"
-            elif vram_gb >= 16:  # RTX 4070 Ti class
-                recommended_batch = "64-128"
-            elif vram_gb >= 8:  # RTX 3060/4060 class
-                recommended_batch = "32-64"
-            else:  # Low VRAM
-                recommended_batch = "16-32"
-            print(f"     💡 Optimal batch_size for {vram_gb:.0f}GB VRAM: {recommended_batch}")
-            print(f"     💡 Current batch_size: {args.batch_size}")
+        # Smart performance tips based on VRAM
+        if vram_gb and vram_gb >= 40:
+            # A40/A100-class GPU
+            optimal_batch = "256-512"
+            optimal_workers = "6-8"
+        elif vram_gb and vram_gb >= 16:
+            # RTX 3090/4090-class GPU
+            optimal_batch = "128-256"
+            optimal_workers = "4-6"
         else:
-            print(f"     💡 Tip: For high-VRAM GPUs (40GB+), use --batch_size 256-512")
+            # Lower-end GPU
+            optimal_batch = "64-128"
+            optimal_workers = "2-4"
+
+        print(f"     💡 Optimal settings for your GPU:")
+        print(f"        --batch_size {optimal_batch}")
+        print(f"        --num_workers {optimal_workers}")
     else:
         print(f"\n  ℹ️  CPU/MPS mode:")
         print(f"     - num_workers: {num_workers} ({workers_source})")
