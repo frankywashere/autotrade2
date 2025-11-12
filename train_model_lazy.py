@@ -247,12 +247,14 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers,
+        persistent_workers=(num_workers > 0),  # Reuse workers to prevent file descriptor leaks
         pin_memory=pin_memory
     )
 
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers,
+        persistent_workers=(num_workers > 0),  # Reuse workers to prevent file descriptor leaks
         pin_memory=pin_memory
     )
 
@@ -343,6 +345,13 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
             'mem': f'{get_memory_usage():.0f}MB'
         })
 
+        # Periodic cleanup to prevent memory/file descriptor accumulation
+        if (epoch + 1) % 10 == 0:
+            import gc
+            gc.collect()  # Force garbage collection
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()  # Clear CUDA cache
+
         # Print epoch summary
         status = ""
         if avg_val_loss < best_val_loss:
@@ -397,6 +406,7 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
     dataloader = DataLoader(
         pretrain_dataset, batch_size=batch_size, shuffle=True,
         num_workers=num_workers,
+        persistent_workers=(num_workers > 0),  # Reuse workers to prevent file descriptor leaks
         pin_memory=pin_memory
     )
 
@@ -451,6 +461,13 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
             'time': f'{epoch_time:.1f}s',
             'mem': f'{get_memory_usage():.0f}MB'
         })
+
+        # Periodic cleanup to prevent memory/file descriptor accumulation
+        if (epoch + 1) % 5 == 0:  # More frequent for pretraining since it's shorter
+            import gc
+            gc.collect()  # Force garbage collection
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()  # Clear CUDA cache
 
         print(f"    Epoch {epoch + 1}/{epochs}: Loss={avg_loss:.4f} | "
               f"Time={epoch_time:.1f}s | Mem={get_memory_usage():.0f}MB")
@@ -566,6 +583,18 @@ def run_training_pipeline(args):
     else:
         pin_memory = args.pin_memory
         pin_source = "user-specified"
+
+    # macOS warning for high num_workers
+    import platform
+    if platform.system() == 'Darwin' and num_workers > 4:
+        print(f"\n  ⚠️  macOS File Limit Warning:")
+        print(f"     - You selected num_workers={num_workers}")
+        print(f"     - macOS has a default limit of 256 open files")
+        print(f"     - This may cause 'Too many open files' errors after 15-20 epochs")
+        print(f"     - Solutions:")
+        print(f"       1. Run: ulimit -n 4096 (before training)")
+        print(f"       2. Or use num_workers=0-4")
+        print(f"     - persistent_workers=True is enabled to help mitigate this")
 
     # Display GPU optimization settings
     if device.type == 'cuda':

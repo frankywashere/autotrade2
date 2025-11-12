@@ -485,7 +485,7 @@ class InteractiveParameterSelector:
             "🚀 GPU OPTIMIZATION": [
                 ('num_workers', {
                     'name': 'Data loading workers',
-                    'hint': 'CPU threads (0=main only, 2=recommended for GPU)',
+                    'hint': 'CPU threads (0=main, 2=GPU recommended, macOS: 0-4 or run "ulimit -n 4096" for >4)',
                     'default': 0
                 }),
                 ('pin_memory', {
