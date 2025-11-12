@@ -150,7 +150,8 @@ def get_memory_usage():
 
 
 def load_and_prepare_data_lazy(spy_file, tsla_file, start_year, end_year,
-                               tsla_events_file=None, macro_api_key=None):
+                               tsla_events_file=None, macro_api_key=None,
+                               timeframe='1min'):
     """
     Load and prepare data WITHOUT pre-creating sequences.
     Returns features DataFrame and events handler for lazy loading.
@@ -165,7 +166,7 @@ def load_and_prepare_data_lazy(spy_file, tsla_file, start_year, end_year,
     print(f"\n▶ Step 1/3: Loading SPY and TSLA data ({start_year} to {end_year})...")
     print(f"  Memory: {get_memory_usage():.1f} MB")
 
-    data_feed = CSVDataFeed()
+    data_feed = CSVDataFeed(timeframe=timeframe)
     start_date = f"{start_year}-01-01"
     end_date = f"{end_year}-12-31"
 
@@ -173,7 +174,7 @@ def load_and_prepare_data_lazy(spy_file, tsla_file, start_year, end_year,
         aligned_df = data_feed.load_aligned_data(start_date, end_date)
         pbar.update(2)
 
-    print(f"  ✓ Loaded {len(aligned_df):,} aligned 1-minute bars")
+    print(f"  ✓ Loaded {len(aligned_df):,} aligned {timeframe} bars")
     print(f"  ✓ Date range: {aligned_df.index[0]} to {aligned_df.index[-1]}")
 
     # 2. Extract features
@@ -539,7 +540,8 @@ def run_training_pipeline(args):
     features_df, events_handler, feature_extractor = load_and_prepare_data_lazy(
         args.spy_data, args.tsla_data,
         args.start_year, args.end_year,
-        args.tsla_events, args.macro_api_key
+        args.tsla_events, args.macro_api_key,
+        args.input_timeframe
     )
 
     # 2. Create model
