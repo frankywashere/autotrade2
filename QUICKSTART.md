@@ -48,20 +48,45 @@ python3 scripts/create_multiscale_csvs.py
 
 ## Step 2: Train Sub-Models (4 Specialized LNNs)
 
-**Option A: Train all 4 models in parallel** (if you have GPU)
+**Option A: Bash script** (EASIEST - runs all 4 sequentially)
 
 ```bash
-# Run all 4 in parallel (GPU recommended)
-python train_model_lazy.py --input_timeframe 15min --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_15min.pth &
-python train_model_lazy.py --input_timeframe 1hour --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_1hour.pth &
-python train_model_lazy.py --input_timeframe 4hour --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_4hour.pth &
-python train_model_lazy.py --input_timeframe daily --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_daily.pth &
-wait
+./train_all_models.sh
 ```
 
-**Time: ~15-25 minutes each on T4 GPU (can run in parallel)**
+**What it does:**
+- Trains all 4 models (15min, 1hour, 4hour, daily) automatically
+- Uses defaults: epochs=50, batch_size=128, sequence_length=200, device=cuda
+- **Time: ~60-100 minutes on T4 GPU (sequential)**
 
-**Option B: Train one at a time** (if limited resources)
+**Customize:**
+```bash
+EPOCHS=100 BATCH_SIZE=256 DEVICE=mps ./train_all_models.sh
+```
+
+**Option B: Interactive "Train All 4"** (menu-based, fully functional)
+
+```bash
+python train_model_lazy.py --interactive
+```
+
+Then:
+1. **Select training mode: 2** (All 4 models)
+2. **Configure parameters once** via interactive menu:
+   - Sequence length: 200 (or customize)
+   - Epochs: 50 (or customize)
+   - Batch size: 128 for GPU
+   - Device: cuda
+   - (All 24 parameters)
+3. **Confirm** configuration
+4. **All 4 models train automatically** (15min → 1hour → 4hour → daily)
+5. **Each model saves with correct metadata** (timeframe + your settings)
+
+**Time: ~60-100 minutes on GPU (sequential)**
+
+**Metadata verified:** All your settings (epochs, batch_size, sequence_length, etc.) flow correctly to all 4 models!
+
+**Option C: Manual CLI** (full control, one at a time)
 
 ```bash
 # 15-minute model
@@ -77,36 +102,36 @@ python train_model_lazy.py --input_timeframe 4hour --sequence_length 200 --epoch
 python train_model_lazy.py --input_timeframe daily --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_daily.pth
 ```
 
-**Option C: Interactive mode** (menu-based configuration)
-
-```bash
-python train_model_lazy.py --interactive
-```
-
-Then select:
-- Parameter 1: Input timeframe → Choose: 15min, 1hour, 4hour, or daily
-- Parameter 9: Sequence length → Keep default 200
-- Parameter 11: Batch size → Set 128 for GPU
-- Parameter 21: Device → Select cuda
-- Run training, then repeat for other timeframes
+**Recommendation: Use Option A (bash script) for simplicity!**
 
 ---
 
 ## Step 3: Collect Predictions (Backtest Sub-Models)
 
+**Option A: Auto-backtest all models** (EASIEST)
+
 ```bash
-# Backtest each model to populate predictions database
+python backtest_all_models.py --test_year 2023 --num_simulations 500
+```
+
+**What it does:**
+- Auto-finds all trained models in models/ directory
+- Backtests each sequentially
+- Logs predictions + actuals to `data/predictions.db`
+- Shows comparison summary at end
+- **Time: ~30-60 minutes total**
+
+**Option B: Manual (one-by-one)**
+
+```bash
+# Backtest each model individually
 python backtest.py --model_path models/lnn_15min.pth --test_year 2023 --num_simulations 500
 python backtest.py --model_path models/lnn_1hour.pth --test_year 2023 --num_simulations 500
 python backtest.py --model_path models/lnn_4hour.pth --test_year 2023 --num_simulations 500
 python backtest.py --model_path models/lnn_daily.pth --test_year 2023 --num_simulations 500
 ```
 
-**What it does:**
-- Runs each model on random dates in 2023
-- Logs predictions + actuals to `data/predictions.db`
-- Needed for training Meta-LNN coach
-- **Time: ~30-60 minutes total**
+**Recommendation: Use Option A (auto-backtest script)!**
 
 ---
 
@@ -194,21 +219,28 @@ Run backtests to collect predictions (Step 3)
 
 ---
 
-## Quick Commands Summary
+## Quick Commands Summary (EASIEST METHOD)
 
 ```bash
-# Full pipeline (copy-paste ready)
-python scripts/create_multiscale_csvs.py
-python train_model_lazy.py --input_timeframe 15min --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_15min.pth
-python train_model_lazy.py --input_timeframe 1hour --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_1hour.pth
-python train_model_lazy.py --input_timeframe 4hour --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_4hour.pth
-python train_model_lazy.py --input_timeframe daily --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_daily.pth
-python backtest.py --model_path models/lnn_15min.pth --test_year 2023 --num_simulations 500
-python backtest.py --model_path models/lnn_1hour.pth --test_year 2023 --num_simulations 500
-python backtest.py --model_path models/lnn_4hour.pth --test_year 2023 --num_simulations 500
-python backtest.py --model_path models/lnn_daily.pth --test_year 2023 --num_simulations 500
-python train_meta_lnn.py --mode backtest_no_news --epochs 100 --output models/meta_lnn.pth
+# Full pipeline using helper scripts (copy-paste ready)
+
+# Step 1: Generate CSVs
+python3 scripts/create_multiscale_csvs.py
+
+# Step 2: Train all 4 models
+./train_all_models.sh
+
+# Step 3: Backtest all models
+python3 backtest_all_models.py --test_year 2023 --num_simulations 500
+
+# Step 4: Train Meta-LNN coach
+python3 train_meta_lnn.py --mode backtest_no_news --epochs 100 --output models/meta_lnn.pth
+
+# Step 5: Validate on 2024
+python3 backtest_all_models.py --test_year 2024 --num_simulations 100
 ```
+
+**Total time: ~2-3 hours end-to-end on T4 GPU**
 
 ---
 

@@ -24,13 +24,14 @@ class CSVDataFeed(DataFeed):
     Aligns SPY and TSLA by timestamp using inner join
     """
 
-    def __init__(self, data_dir: str = None):
+    def __init__(self, data_dir: str = None, timeframe: str = '1min'):
         self.data_dir = data_dir or config.DATA_DIR
+        self.timeframe = timeframe
         self.cache = {}
 
     def load_data(self, symbol: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
-        """Load historical 1-minute data from CSV"""
-        csv_path = Path(self.data_dir) / f"{symbol}_1min.csv"
+        """Load historical data from CSV for specified timeframe"""
+        csv_path = Path(self.data_dir) / f"{symbol}_{self.timeframe}.csv"
 
         if not csv_path.exists():
             raise FileNotFoundError(f"Data file not found: {csv_path}")

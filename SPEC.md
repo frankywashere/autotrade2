@@ -401,6 +401,7 @@ embedding = handler.embed_events(events)  # Returns (1, 21)
 Input (135 features, 200 timesteps)  ← Multi-scale features, uniform sequence length
   ↓
 CfC Layer (Liquid Time-Constant, 128 hidden units)
+  - Single layer only (CfC doesn't support stacking)
   - Sparse wiring via AutoNCP
   - Continuous-time dynamics
   - Emphasizes recent bars, integrates historical context
@@ -408,6 +409,8 @@ CfC Layer (Liquid Time-Constant, 128 hidden units)
 Output Layer (2 units: high, low)
 Confidence Head (1 unit: confidence score)
 ```
+
+**Note:** The `num_layers` parameter in the menu **only affects LSTM**, not LNN. LNN always uses 1 CfC layer by design (the library doesn't support layer stacking). If you select LSTM as model_type, then num_layers will create stacked LSTM layers.
 
 **4 Specialized Models (Each is an LNN):**
 - **LNN_15min**: Trained on 15-minute data (200 bars = 50 hours)
@@ -484,28 +487,72 @@ metrics = db.get_accuracy_metrics()
 
 ### Training Scripts
 
-#### `train_model_lazy.py` (RECOMMENDED)
-**Memory-efficient training with lazy sequence loading**
+#### `train_model_lazy.py`
+**Memory-efficient multi-scale training**
 
-- Uses only **2-3 GB RAM** (vs 30+ GB for pre-created sequences)
-- Trains on ALL 1.35M bars
-- Creates sequences on-demand during training
+- Uses only **2-3 GB RAM** per model (lazy sequence loading)
+- Supports all 11 timeframes via `--input_timeframe`
+- Interactive mode with "Train All 4" option
+- Stores timeframe + sequence_length in model metadata
 - Progress bars for all phases
 
-#### `train_model.py` (Original)
-**Pre-creates all sequences upfront**
+```bash
+# Single model
+python train_model_lazy.py --input_timeframe 15min --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_15min.pth
 
-- Requires **30+ GB RAM** for full dataset
-- Good for smaller datasets (single year)
-- Slightly simpler code
+# Interactive (with multi-model option)
+python train_model_lazy.py --interactive
+```
+
+#### `train_all_models.sh`
+**Bash helper to train all 4 models sequentially**
+
+- Configurable via environment variables
+- Single command to train all models with same config
+- Shows progress for each model
+
+```bash
+# Use defaults (epochs=50, batch_size=128, device=cuda)
+./train_all_models.sh
+
+# Or customize
+EPOCHS=100 BATCH_SIZE=256 DEVICE=mps ./train_all_models.sh
+```
 
 #### `backtest.py`
-**Walk-forward backtesting**
+**Walk-forward backtesting with metadata support**
 
+- **Now reads model metadata** (input_timeframe, sequence_length)
+- Automatically loads correct CSV files based on model's timeframe
 - Tests model on unseen data (e.g., 2024)
 - Random day/week simulation
-- Accuracy by event type
-- Confidence calibration
+- Logs predictions to database with model_timeframe tag
+
+```bash
+python backtest.py --model_path models/lnn_15min.pth --test_year 2024 --num_simulations 100
+```
+
+#### `backtest_all_models.py`
+**Auto-backtest all trained models**
+
+- Finds all models in models/ directory
+- Runs backtests sequentially
+- Shows combined comparison summary
+
+```bash
+python backtest_all_models.py --test_year 2023 --num_simulations 500
+```
+
+#### `train_meta_lnn.py`
+**Train Meta-LNN coach**
+
+- Loads predictions from database
+- Purged K-fold CV (prevents leakage)
+- Trains adaptive combination model
+
+```bash
+python train_meta_lnn.py --mode backtest_no_news --epochs 100 --output models/meta_lnn.pth
+```
 
 #### `validate_results.py`
 **Model performance validation**
@@ -779,27 +826,52 @@ python backtest.py --model_path models/lnn_15min.pth --test_year 2024 --num_simu
 
 ### Interactive Parameter Selection (Optional)
 
-Both training scripts support an **interactive parameter selection system** with arrow-key navigation:
+The training script supports an **interactive parameter selection system** with arrow-key navigation:
 
 ```bash
 # Launch interactive mode
 python3 train_model_lazy.py --interactive
 ```
 
-**Three Selection Modes:**
+**Multi-Model Training Option:**
+When launching interactive mode, you'll be asked:
+```
+Training mode:
+  1. Single model (choose one timeframe)
+  2. All 4 models (15min, 1hour, 4hour, daily) - runs sequentially
+```
+
+**Select Option 2 to:**
+- Configure parameters ONCE (epochs, batch_size, sequence_length, device, etc.)
+- Train all 4 models automatically (15min → 1hour → 4hour → daily)
+- Each model gets same user settings (epochs, batch_size, etc.) but different timeframe
+- Metadata correctly saved with each model's timeframe + user settings
+- Total time: ~60-100 minutes on GPU (sequential)
+
+**Metadata Flow (Verified):**
+- All 24 parameters you configure flow to ALL 4 models
+- Only input_timeframe differs (15min, 1hour, 4hour, daily)
+- Each model checkpoint contains correct metadata:
+  - `input_timeframe`: Different for each ('15min', '1hour', etc.)
+  - `sequence_length`: Same for all (your setting, e.g., 200)
+  - `epochs`: Same for all (your setting, e.g., 50)
+  - `batch_size`: Same for all (your setting, e.g., 128)
+  - All other settings: Same for all (your configured values)
+
+**Three Selection Modes (for single-model):**
 1. **Quick Start** - Use defaults with auto-detected device (fastest)
 2. **Arrow-Key Navigation** - Visual menu with ↑/↓ navigation (recommended)
 3. **Number-Based Menu** - Type parameter numbers to select (legacy)
 
 **Arrow-Key Navigation Features:**
-- Navigate all 23 parameters with ↑/↓ arrow keys
+- Navigate all 24 parameters with ↑/↓ arrow keys
 - Press Enter to edit the highlighted parameter
 - Visual pointer (`❯`) shows current selection
 - Modified parameters marked with `*`
 - Organized in 7 categories:
   - 📁 **Data Files**: SPY/TSLA data paths, events file, macro API key
   - 📅 **Training Period**: Start/end years
-  - 🧠 **Model Architecture**: Model type, hidden size, layers, sequence length
+  - 🧠 **Model Architecture**: Model type, hidden size, layers (LSTM only), sequence length
   - ⚙️ **Training Parameters**: Epochs, batch size, learning rate, validation split
   - 📊 **Feature Flags**: Channel, RSI, correlation, event features
   - 🖥️ **Compute Device**: CPU/CUDA/MPS with auto-detection

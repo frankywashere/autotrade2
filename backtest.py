@@ -50,6 +50,8 @@ def load_model(model_path):
 
     print(f"Model loaded: {model_type}, {sum(p.numel() for p in model.parameters()):,} parameters")
     print(f"Trained on: {metadata.get('train_start_year')}-{metadata.get('train_end_year')}")
+    print(f"Input timeframe: {metadata.get('input_timeframe', '1min')}")
+    print(f"Sequence length: {metadata.get('sequence_length', config.ML_SEQUENCE_LENGTH)}")
 
     return model, metadata
 
@@ -81,11 +83,22 @@ def select_random_dates(test_year, num_simulations, seed=None):
     return selected_dates
 
 
-def run_simulation(date, model, feature_extractor, data_feed, events_handler, db, ensemble=None, mode='backtest_no_news'):
+def run_simulation(date, model, feature_extractor, data_feed, events_handler, db, ensemble=None, mode='backtest_no_news', metadata=None):
     """
     Run a single backtest simulation for a specific date
+
+    Args:
+        metadata: Model metadata containing input_timeframe and sequence_length
+
     Returns: (prediction_dict, actual_dict, error_dict)
     """
+    # Get model configuration from metadata
+    if metadata is None:
+        metadata = {}
+
+    input_timeframe = metadata.get('input_timeframe', '1min')
+    sequence_length = metadata.get('sequence_length', config.ML_SEQUENCE_LENGTH)
+
     # 1. Load historical context (e.g., 1 week before the date)
     context_days = 7
     start_context = date - timedelta(days=context_days)
@@ -97,15 +110,15 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
             end_context.strftime('%Y-%m-%d')
         )
 
-        if len(aligned_df) < config.ML_SEQUENCE_LENGTH:
-            print(f"   ⚠ Insufficient data for {date.strftime('%Y-%m-%d')}, skipping...")
+        if len(aligned_df) < sequence_length:
+            print(f"   ⚠ Insufficient data for {date.strftime('%Y-%m-%d')}, need {sequence_length} bars, skipping...")
             return None
 
         # 2. Extract features
         features_df = feature_extractor.extract_features(aligned_df)
 
-        # Get last sequence
-        sequence = features_df.tail(config.ML_SEQUENCE_LENGTH).values
+        # Get last sequence (use model's sequence_length from metadata)
+        sequence = features_df.tail(sequence_length).values
         sequence_tensor = torch.tensor([sequence], dtype=torch.float32)  # (1, seq_len, features)
 
         # 3. Get events for this date
@@ -272,7 +285,11 @@ def main():
 
     # 2. Initialize components
     print("\nInitializing components...")
-    data_feed = CSVDataFeed()
+
+    # Get timeframe from metadata (for correct CSV loading)
+    input_timeframe = metadata.get('input_timeframe', '1min')
+
+    data_feed = CSVDataFeed(timeframe=input_timeframe)  # Load correct timeframe CSVs
     feature_extractor = TradingFeatureExtractor()
     events_handler = CombinedEventsHandler()
     db = SQLitePredictionDB(args.db_path)
@@ -292,7 +309,7 @@ def main():
         print(f"\n[{i}/{len(test_dates)}] Simulating {date.strftime('%Y-%m-%d')}...")
 
         result = run_simulation(date, model, feature_extractor, data_feed, events_handler, db,
-                               ensemble=ensemble, mode=args.mode)
+                               ensemble=ensemble, mode=args.mode, metadata=metadata)
 
         if result:
             results.append(result)

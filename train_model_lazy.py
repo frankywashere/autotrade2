@@ -465,80 +465,27 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
             print(f"  ✓ Loss reduction: {improvement:.1f}%")
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Memory-efficient ML training with lazy loading')
+def run_training_pipeline(args):
+    """
+    Run complete training pipeline with given arguments.
 
-    # Data arguments
-    parser.add_argument('--input_timeframe', type=str, default='1min',
-                       choices=['1min', '5min', '15min', '30min', '1hour', '2hour', '3hour', '4hour', 'daily', 'weekly', 'monthly', '3month'],
-                       help='Timeframe for input data (default: 1min)')
-    parser.add_argument('--spy_data', type=str, default=None,
-                       help='SPY data file (default: data/SPY_{timeframe}.csv)')
-    parser.add_argument('--tsla_data', type=str, default=None,
-                       help='TSLA data file (default: data/TSLA_{timeframe}.csv)')
-    parser.add_argument('--tsla_events', type=str, default='data/tsla_events_REAL.csv')
-    parser.add_argument('--macro_api_key', type=str, default=None)
+    This function contains all the training logic extracted from main()
+    so it can be called multiple times (e.g., for multi-model training).
 
-    # Training arguments
-    parser.add_argument('--start_year', type=int, default=config.ML_TRAIN_START_YEAR)
-    parser.add_argument('--end_year', type=int, default=config.ML_TRAIN_END_YEAR)
-    parser.add_argument('--epochs', type=int, default=config.ML_EPOCHS)
-    parser.add_argument('--batch_size', type=int, default=config.ML_BATCH_SIZE)
-    parser.add_argument('--lr', type=float, default=config.LNN_LEARNING_RATE)
-    parser.add_argument('--pretrain_epochs', type=int, default=10)
-    parser.add_argument('--sequence_length', type=int, default=config.ML_SEQUENCE_LENGTH,
-                       help='Number of bars to look back (default: 200, uniform across all timeframes)')
+    Args:
+        args: Argparse namespace with all training configuration
 
-    # Model arguments
-    parser.add_argument('--model_type', type=str, default=config.ML_MODEL_TYPE)
-    parser.add_argument('--hidden_size', type=int, default=config.LNN_HIDDEN_SIZE)
-
-    # Output
-    parser.add_argument('--output', type=str, default='models/lnn_lazy.pth')
-
-    # Device arguments
-    parser.add_argument('--device', type=str, default=None,
-                       choices=['cpu', 'cuda', 'mps'],
-                       help='Force specific device (default: interactive selection)')
-    parser.add_argument('--auto_device', action='store_true',
-                       help='Auto-select best device without prompting')
-
-    # GPU optimization arguments
-    parser.add_argument('--num_workers', type=int, default=None,
-                       help='Number of data loading workers (default: auto-detect based on device)')
-    parser.add_argument('--pin_memory', type=lambda x: x.lower() == 'true', default=None,
-                       help='Pin memory for faster GPU transfers (default: auto-detect based on device)')
-
-    # Interactive mode
-    parser.add_argument('--interactive', action='store_true',
-                       help='Enable interactive parameter selection mode')
-
-    args = parser.parse_args()
-
-    # Set default data paths based on timeframe if not explicitly provided
-    if args.spy_data is None:
-        args.spy_data = f'data/SPY_{args.input_timeframe}.csv'
-    if args.tsla_data is None:
-        args.tsla_data = f'data/TSLA_{args.input_timeframe}.csv'
-
-    # Interactive mode
-    if args.interactive:
-        print("\n" + "=" * 70)
-        print("🎛️  LAUNCHING INTERACTIVE MODE")
-        print("=" * 70)
-        selector = InteractiveParameterSelector(mode='lazy')
-        params = selector.run()
-        args = create_argparse_from_params(params, args)
-        print("\n✓ Configuration complete! Starting training...\n")
-
+    Returns:
+        dict with training results (losses, model_path, etc.)
+    """
     # Print header
     print("\n" + "=" * 70)
     print("🚀 MEMORY-EFFICIENT TRAINING (Lazy Loading)")
     print("=" * 70)
     print(f"📅 Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"🤖 Model: {args.model_type}")
-    print(f"⏱️  Input Timeframe: {args.input_timeframe}")  # NEW: Show timeframe
-    print(f"📏 Sequence Length: {args.sequence_length} bars")  # NEW: Show sequence length
+    print(f"⏱️  Input Timeframe: {args.input_timeframe}")
+    print(f"📏 Sequence Length: {args.sequence_length} bars")
     print(f"📊 Training period: {args.start_year}-{args.end_year}")
     print(f"🔄 Epochs: {args.epochs} supervised + {args.pretrain_epochs} pretrain")
     print(f"💾 Output: {args.output}")
@@ -671,8 +618,8 @@ def main():
         'model_type': args.model_type,
         'input_size': input_size,
         'hidden_size': args.hidden_size,
-        'input_timeframe': args.input_timeframe,  # NEW: Track which timeframe this model was trained on
-        'sequence_length': args.sequence_length,  # NEW: Track sequence length
+        'input_timeframe': args.input_timeframe,
+        'sequence_length': args.sequence_length,
         'train_start_year': args.start_year,
         'train_end_year': args.end_year,
         'epochs': args.epochs,
@@ -693,9 +640,6 @@ def main():
     # Print final summary
     total_time = time.time() - total_start
     print(f"  ✓ Model saved to: {args.output}")
-    print(f"  ✓ Training time: {total_time/60:.1f} minutes")
-    print(f"  ✓ Peak memory usage: {get_memory_usage():.1f} MB")
-    print(f"  ✓ Final validation loss: {val_losses[-1]:.4f}")
 
     print("\n" + "=" * 70)
     print("✅ TRAINING COMPLETE!")
@@ -707,6 +651,193 @@ def main():
     print(f"   1. Run backtesting: python backtest.py --model_path {args.output}")
     print(f"   2. Validate results: python validate_results.py --model_path {args.output}")
     print("=" * 70)
+
+    return {
+        'success': True,
+        'model_path': args.output,
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'total_time': total_time
+    }
+
+
+def train_all_models_interactive(base_args):
+    """
+    Train all 4 timeframe models sequentially with shared configuration.
+
+    User configures parameters once, then all 4 models (15min, 1hour, 4hour, daily)
+    are trained with the same settings but different input timeframes.
+    """
+    import copy
+
+    print("\n" + "=" * 70)
+    print("TRAINING ALL 4 MODELS")
+    print("=" * 70)
+    print("\nYou'll configure parameters once, then all 4 models will train:")
+    print("  1. LNN_15min (200 bars = 50 hours)")
+    print("  2. LNN_1hour (200 bars = 8 days)")
+    print("  3. LNN_4hour (200 bars = 33 days)")
+    print("  4. LNN_daily (200 bars = 9 months)")
+    print("\nModels will train SEQUENTIALLY (not parallel).")
+    print("Estimated total time: ~60-100 minutes on T4 GPU")
+    print()
+
+    # Get configuration from user (ONE TIME)
+    selector = InteractiveParameterSelector(mode='lazy')
+    base_params = selector.run()
+
+    # Timeframes to train
+    timeframes = ['15min', '1hour', '4hour', 'daily']
+
+    # Track results
+    results = []
+
+    # Train each model
+    for i, tf in enumerate(timeframes, 1):
+        print("\n\n" + "=" * 70)
+        print(f"TRAINING MODEL {i}/4: {tf.upper()}")
+        print("=" * 70)
+
+        # Create params for this timeframe
+        params = copy.deepcopy(base_params)
+
+        # Override timeframe-specific settings
+        params['input_timeframe'] = tf
+        params['spy_data'] = f'data/SPY_{tf}.csv'
+        params['tsla_data'] = f'data/TSLA_{tf}.csv'
+
+        # Create args for this model
+        model_args = copy.deepcopy(base_args)
+        model_args = create_argparse_from_params(params, model_args)
+        model_args.output = f'models/lnn_{tf}.pth'
+
+        # Ensure data paths are set
+        model_args.spy_data = f'data/SPY_{tf}.csv'
+        model_args.tsla_data = f'data/TSLA_{tf}.csv'
+        model_args.input_timeframe = tf
+
+        print(f"\n📁 Training on: {model_args.tsla_data}")
+        print(f"💾 Output: {model_args.output}")
+        print()
+
+        # Run full training pipeline for this model
+        try:
+            result = run_training_pipeline(model_args)
+            results.append(result)
+            print(f"\n✓ Model {i}/4 complete: {model_args.output}")
+
+        except Exception as e:
+            print(f"\n❌ Error training {tf} model: {e}")
+            import traceback
+            traceback.print_exc()
+
+            cont = input("\nContinue with next model? [y/N]: ").strip().lower()
+            if cont != 'y':
+                print("Stopped.")
+                break
+
+    print("\n\n" + "=" * 70)
+    print("✅ MULTI-MODEL TRAINING COMPLETE")
+    print("=" * 70)
+    print(f"\nTrained {len(results)}/{len(timeframes)} models:")
+    for i, tf in enumerate(timeframes):
+        model_path = Path(f'models/lnn_{tf}.pth')
+        if model_path.exists():
+            if i < len(results) and results[i]['success']:
+                time_min = results[i]['total_time'] / 60
+                print(f"  ✓ {model_path} ({time_min:.1f} min)")
+            else:
+                print(f"  ✓ {model_path}")
+        else:
+            print(f"  ✗ {model_path} (not found)")
+
+    print("\n📈 Next steps:")
+    print("   1. Backtest all models: python backtest_all_models.py --test_year 2023 --num_simulations 500")
+    print("   2. Train Meta-LNN: python train_meta_lnn.py --mode backtest_no_news")
+    print("=" * 70)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Memory-efficient ML training with lazy loading')
+
+    # Data arguments
+    parser.add_argument('--input_timeframe', type=str, default='1min',
+                       choices=['1min', '5min', '15min', '30min', '1hour', '2hour', '3hour', '4hour', 'daily', 'weekly', 'monthly', '3month'],
+                       help='Timeframe for input data (default: 1min)')
+    parser.add_argument('--spy_data', type=str, default=None,
+                       help='SPY data file (default: data/SPY_{timeframe}.csv)')
+    parser.add_argument('--tsla_data', type=str, default=None,
+                       help='TSLA data file (default: data/TSLA_{timeframe}.csv)')
+    parser.add_argument('--tsla_events', type=str, default='data/tsla_events_REAL.csv')
+    parser.add_argument('--macro_api_key', type=str, default=None)
+
+    # Training arguments
+    parser.add_argument('--start_year', type=int, default=config.ML_TRAIN_START_YEAR)
+    parser.add_argument('--end_year', type=int, default=config.ML_TRAIN_END_YEAR)
+    parser.add_argument('--epochs', type=int, default=config.ML_EPOCHS)
+    parser.add_argument('--batch_size', type=int, default=config.ML_BATCH_SIZE)
+    parser.add_argument('--lr', type=float, default=config.LNN_LEARNING_RATE)
+    parser.add_argument('--pretrain_epochs', type=int, default=10)
+    parser.add_argument('--sequence_length', type=int, default=config.ML_SEQUENCE_LENGTH,
+                       help='Number of bars to look back (default: 200, uniform across all timeframes)')
+
+    # Model arguments
+    parser.add_argument('--model_type', type=str, default=config.ML_MODEL_TYPE)
+    parser.add_argument('--hidden_size', type=int, default=config.LNN_HIDDEN_SIZE)
+
+    # Output
+    parser.add_argument('--output', type=str, default='models/lnn_lazy.pth')
+
+    # Device arguments
+    parser.add_argument('--device', type=str, default=None,
+                       choices=['cpu', 'cuda', 'mps'],
+                       help='Force specific device (default: interactive selection)')
+    parser.add_argument('--auto_device', action='store_true',
+                       help='Auto-select best device without prompting')
+
+    # GPU optimization arguments
+    parser.add_argument('--num_workers', type=int, default=None,
+                       help='Number of data loading workers (default: auto-detect based on device)')
+    parser.add_argument('--pin_memory', type=lambda x: x.lower() == 'true', default=None,
+                       help='Pin memory for faster GPU transfers (default: auto-detect based on device)')
+
+    # Interactive mode
+    parser.add_argument('--interactive', action='store_true',
+                       help='Enable interactive parameter selection mode')
+
+    args = parser.parse_args()
+
+    # Set default data paths based on timeframe if not explicitly provided
+    if args.spy_data is None:
+        args.spy_data = f'data/SPY_{args.input_timeframe}.csv'
+    if args.tsla_data is None:
+        args.tsla_data = f'data/TSLA_{args.input_timeframe}.csv'
+
+    # Interactive mode
+    if args.interactive:
+        print("\n" + "=" * 70)
+        print("🎛️  LAUNCHING INTERACTIVE MODE")
+        print("=" * 70)
+
+        # Ask: Single model or all 4?
+        print("\nTraining mode:")
+        print("  1. Single model (choose one timeframe)")
+        print("  2. All 4 models (15min, 1hour, 4hour, daily) - runs sequentially")
+        mode_choice = input("\nChoice [1-2]: ").strip()
+
+        if mode_choice == '2':
+            # Train all 4 models with shared config
+            train_all_models_interactive(args)
+            return  # Exit after training all models
+        else:
+            # Normal single-model interactive
+            selector = InteractiveParameterSelector(mode='lazy')
+            params = selector.run()
+            args = create_argparse_from_params(params, args)
+            print("\n✓ Configuration complete! Starting training...\n")
+
+    # Run training pipeline
+    run_training_pipeline(args)
 
 
 if __name__ == '__main__':
