@@ -52,6 +52,8 @@ def load_model(model_path):
     print(f"Trained on: {metadata.get('train_start_year')}-{metadata.get('train_end_year')}")
     print(f"Input timeframe: {metadata.get('input_timeframe', '1min')}")
     print(f"Sequence length: {metadata.get('sequence_length', config.ML_SEQUENCE_LENGTH)}")
+    print(f"Prediction horizon: {metadata.get('prediction_horizon', config.PREDICTION_HORIZON_HOURS)} bars")
+    print(f"Prediction mode: {metadata.get('prediction_mode', 'uniform_bars')}")
 
     return model, metadata
 
@@ -98,6 +100,32 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
 
     input_timeframe = metadata.get('input_timeframe', '1min')
     sequence_length = metadata.get('sequence_length', config.ML_SEQUENCE_LENGTH)
+    prediction_horizon_bars = metadata.get('prediction_horizon', config.PREDICTION_HORIZON_HOURS)
+    prediction_mode = metadata.get('prediction_mode', 'uniform_bars')
+
+    # Define timeframe to minutes conversion
+    timeframe_minutes = {
+        '1min': 1,
+        '5min': 5,
+        '15min': 15,
+        '30min': 30,
+        '1hour': 60,
+        '2hour': 120,
+        '3hour': 180,
+        '4hour': 240,
+        'daily': 1440,  # 24 * 60
+        'weekly': 10080,  # 7 * 24 * 60
+        'monthly': 43200,  # 30 * 24 * 60 (approximation)
+        '3month': 129600  # 90 * 24 * 60 (approximation)
+    }
+
+    # Convert prediction horizon bars to actual time
+    minutes_per_bar = timeframe_minutes.get(input_timeframe, 60)
+    prediction_horizon_minutes = prediction_horizon_bars * minutes_per_bar
+    prediction_horizon_hours = prediction_horizon_minutes / 60
+
+    # Log the actual prediction window
+    print(f"  Prediction window: {prediction_horizon_bars} bars = {prediction_horizon_hours:.1f} hours")
 
     # 1. Load historical context (e.g., 1 week before the date)
     context_days = 7
@@ -153,9 +181,9 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
             predictions['news_enabled'] = False
             predictions['model_timeframe'] = 'single'
 
-        # 5. Get actuals (load next 24 hours after date)
+        # 5. Get actuals (load data for prediction window after date)
         target_start = date
-        target_end = date + timedelta(hours=config.PREDICTION_HORIZON_HOURS)
+        target_end = date + timedelta(minutes=prediction_horizon_minutes)
 
         actual_df = data_feed.load_aligned_data(
             target_start.strftime('%Y-%m-%d'),

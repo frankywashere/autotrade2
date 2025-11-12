@@ -84,6 +84,7 @@ class ArrowKeyParameterSelector:
             'use_rsi_features': config.USE_RSI_FEATURES,
             'use_correlation_features': config.USE_CORRELATION_FEATURES,
             'use_event_features': config.USE_EVENT_FEATURES,
+            'prediction_horizon_mode': 'uniform_bars',  # NEW: uniform_bars or uniform_time
             'prediction_horizon_hours': config.PREDICTION_HORIZON_HOURS,
 
             # Device
@@ -243,6 +244,7 @@ class ArrowKeyParameterSelector:
                 ('use_rsi_features', {'name': 'RSI features', 'type': 'boolean'}),
                 ('use_correlation_features', {'name': 'Correlation features', 'type': 'boolean'}),
                 ('use_event_features', {'name': 'Event features', 'type': 'boolean'}),
+                ('prediction_horizon_mode', {'name': 'Prediction mode', 'type': 'prediction_mode'}),
                 ('prediction_horizon_hours', {'name': 'Prediction horizon (hrs)', 'type': 'number'}),
             ],
             "🖥️ COMPUTE DEVICE": [
@@ -258,6 +260,13 @@ class ArrowKeyParameterSelector:
         """Format parameter value for display."""
         if param_key == 'macro_api_key':
             return 'Not set (local data available)' if not value else 'Set'
+        elif param_key == 'prediction_horizon_mode':
+            if value == 'uniform_bars':
+                return 'Uniform bars'
+            elif value == 'uniform_time':
+                return 'Uniform time (24h)'
+            else:
+                return str(value)
         elif param_key == 'device':
             if self.params.get('auto_device'):
                 return f"{value} (auto-detected)"
@@ -298,6 +307,8 @@ class ArrowKeyParameterSelector:
                 self._edit_timeframe(param_key, param_name)
             elif param_type == 'device':
                 self._edit_device(param_key, param_name)
+            elif param_type == 'prediction_mode':
+                self._edit_prediction_mode(param_key, param_name)
             elif param_type == 'batch_size':
                 self._edit_batch_size(param_key, param_name)
             elif param_type == 'year':
@@ -395,6 +406,40 @@ class ArrowKeyParameterSelector:
             self.params['auto_device'] = False
             self.modified_params.add('device')
             print(f"✓ Device set to: {result}")
+
+    def _edit_prediction_mode(self, param_key: str, param_name: str):
+        """Edit prediction horizon mode selection."""
+        modes = [
+            Choice(value='uniform_bars', name='uniform_bars - Same bar count for all models'),
+            Choice(value='uniform_time', name='uniform_time - Same time window (24h) for all models')
+        ]
+
+        print("\n" + "─" * 60)
+        print("Prediction Horizon Mode:")
+        print("\n1. Uniform Bars (current behavior):")
+        print("   All models use same bar count (e.g., 24 bars)")
+        print("   - 15min: 24 bars = 6 hours ahead")
+        print("   - 1hour: 24 bars = 24 hours ahead")
+        print("   - 4hour: 24 bars = 96 hours ahead")
+        print("   - daily: 24 bars = 24 days ahead")
+        print("\n2. Uniform Time:")
+        print("   All models predict same time window (24 hours)")
+        print("   - 15min: 96 bars")
+        print("   - 1hour: 24 bars")
+        print("   - 4hour: 6 bars")
+        print("   - daily: 1 bar")
+        print("\nPress ESC to cancel")
+
+        result = inquirer.select(
+            message="Select prediction horizon mode:",
+            choices=modes,
+            default=self.params.get('prediction_horizon_mode', 'uniform_bars')
+        ).execute()
+
+        if result:
+            self.params['prediction_horizon_mode'] = result
+            self.modified_params.add('prediction_horizon_mode')
+            print(f"✓ Prediction mode set to: {result}")
 
     def _edit_batch_size(self, param_key: str, param_name: str):
         """Edit batch size with RAM-based suggestions."""

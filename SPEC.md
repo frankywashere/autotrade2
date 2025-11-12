@@ -1,8 +1,8 @@
 # AutoTrade2 - Complete Technical Specification
 
-**Version:** 3.0 (Multi-Scale LNN + Meta-LNN Coach)
+**Version:** 3.1 (Multi-Scale LNN + Meta-LNN Coach + Dual Prediction Modes)
 **Repository:** https://github.com/frankywashere/autotrade2
-**Last Updated:** November 11, 2025
+**Last Updated:** November 12, 2025
 
 ---
 
@@ -869,7 +869,12 @@ target_low = np.min(future_prices)   # Min price in next N bars
 
 **Model learns:** "Given last 200 bars, what will be the high/low in NEXT 24 bars?"
 
-### Actual Time Windows by Timeframe
+### Prediction Modes (NEW in v3.1)
+
+The system now supports two prediction modes:
+
+#### 1. **Uniform Bars Mode** (Default)
+All models use the same number of bars (e.g., 24), resulting in different time windows.
 
 **With prediction_horizon=24 (default):**
 
@@ -880,14 +885,48 @@ target_low = np.min(future_prices)   # Min price in next N bars
 | 4hour | 24 bars | 4 days |
 | Daily | 24 bars | 24 DAYS (not hours!) |
 
-**With prediction_horizon=48:**
+**Philosophy:** Each model learns at its natural temporal scale. LNNs handle temporal relationships through multi-scale features.
+
+#### 2. **Uniform Time Mode**
+All models predict the same absolute time window (24 hours), using different bar counts.
+
+**For 24-hour prediction:**
 
 | Model Timeframe | Bars Ahead | Actual Time Window |
 |-----------------|------------|-------------------|
-| 15min | 48 bars | 12 hours |
-| 1hour | 48 bars | 48 hours (2 days) |
-| 4hour | 48 bars | 8 days |
-| Daily | 48 bars | 48 days (~1.5 months) |
+| 15min | 96 bars | 24 hours |
+| 1hour | 24 bars | 24 hours |
+| 4hour | 6 bars | 24 hours |
+| Daily | 1 bar | 24 hours |
+
+**Philosophy:** All models solve the same problem from different perspectives. Meta-LNN learns which timeframe is most accurate.
+
+#### Selecting Prediction Mode
+
+**Interactive Menu:**
+```
+╔════════════════════════════════════════════════╗
+║ Prediction Horizon Mode                        ║
+╠════════════════════════════════════════════════╣
+║ [1] Uniform Bars (same bar count for all)      ║
+║ [2] Uniform Time (24 hours for all models)     ║
+╚════════════════════════════════════════════════╝
+```
+
+**Command Line:**
+```bash
+# Uniform bars mode (default)
+python train_model_lazy.py --prediction_mode uniform_bars --prediction_horizon 24
+
+# Uniform time mode (24 hours for all)
+python train_model_lazy.py --prediction_mode uniform_time --prediction_horizon 24
+```
+
+**Multi-Model Training:**
+- Selected mode automatically applies to all 4 models
+- In uniform_time mode, prediction_horizon is automatically adjusted per timeframe
+- Metadata stores both prediction_horizon and prediction_mode
+- Backtesting correctly interprets based on saved mode
 
 ### Customizing Per Model
 
