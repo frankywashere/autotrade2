@@ -126,6 +126,8 @@ class InteractiveParameterSelector:
             'batch_size': config.ML_BATCH_SIZE or 16,
             'learning_rate': config.LNN_LEARNING_RATE,
             'validation_split': config.ML_VALIDATION_SPLIT,
+            'preload': False,  # NEW: Preload all sequences into memory
+            'gpu_monitor': False,  # NEW: Enable GPU monitoring
 
             # Features
             'use_channel_features': config.USE_CHANNEL_FEATURES,
@@ -310,11 +312,11 @@ class InteractiveParameterSelector:
                 self.modified_params = set()
             elif selection == 'all':
                 # Modify all parameters
-                param_indices = list(range(1, 24))
+                param_indices = list(range(1, 25))
                 self._modify_selected_params(param_indices)
             else:
                 # Parse and modify selected parameters
-                param_indices = self._parse_selection(selection, 23)
+                param_indices = self._parse_selection(selection, 24)
                 if param_indices:
                     self._modify_selected_params(param_indices)
                 else:
@@ -439,6 +441,18 @@ class InteractiveParameterSelector:
                     'name': 'Validation split',
                     'hint': 'Fraction for validation',
                     'default': config.ML_VALIDATION_SPLIT
+                }),
+                ('preload', {
+                    'name': 'Data loading mode',
+                    'type': 'bool',
+                    'hint': 'Preload: faster but ~30GB RAM, Lazy: slower but ~2GB RAM',
+                    'default': False
+                }),
+                ('gpu_monitor', {
+                    'name': 'GPU monitoring',
+                    'type': 'bool',
+                    'hint': 'Real-time GPU utilization (requires nvidia-ml-py)',
+                    'default': False
                 }),
             ],
             "📊 FEATURE FLAGS": [
@@ -643,9 +657,16 @@ class InteractiveParameterSelector:
                 self.modified_params.add('device')
 
         elif param_key in ['use_channel_features', 'use_rsi_features',
-                           'use_correlation_features', 'use_event_features', 'pin_memory']:
+                           'use_correlation_features', 'use_event_features', 'pin_memory',
+                           'preload', 'gpu_monitor']:
             # Boolean parameters
-            value = input("Enable? [y/n]: ").strip().lower()
+            if param_key == 'preload':
+                value = input("Use preload mode (faster, ~30GB RAM)? [y/n]: ").strip().lower()
+            elif param_key == 'gpu_monitor':
+                value = input("Enable GPU monitoring? [y/n]: ").strip().lower()
+            else:
+                value = input("Enable? [y/n]: ").strip().lower()
+
             if value in ['y', 'yes', '1', 'true']:
                 self.params[param_key] = True
                 self.modified_params.add(param_key)
@@ -1221,6 +1242,8 @@ class InteractiveParameterSelector:
             ('Batch size', 'batch_size'),
             ('Learning rate', 'learning_rate'),
             ('Device', 'device'),
+            ('Data loading', 'preload'),  # NEW
+            ('GPU monitoring', 'gpu_monitor'),  # NEW
             ('Training years', None),  # Special case
         ]
 
@@ -1230,7 +1253,13 @@ class InteractiveParameterSelector:
                 value = f"{self.params['start_year']}-{self.params['end_year']}"
                 status = "Modified" if 'start_year' in self.modified_params else "Default"
             else:
-                value = str(self.params[param_key])
+                # Special handling for boolean parameters
+                if param_key == 'preload':
+                    value = "Preload (fast)" if self.params[param_key] else "Lazy (memory-eff)"
+                elif param_key == 'gpu_monitor':
+                    value = "Enabled" if self.params[param_key] else "Disabled"
+                else:
+                    value = str(self.params[param_key])
                 status = "Modified" if param_key in self.modified_params else "Default"
 
             # Truncate long values
