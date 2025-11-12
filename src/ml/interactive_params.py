@@ -464,7 +464,7 @@ class InteractiveParameterSelector:
                 }),
                 ('prediction_horizon_hours', {
                     'name': 'Prediction horizon',
-                    'hint': 'Hours ahead to predict',
+                    'hint': 'BARS ahead to predict (15min: 24 bars=6hrs, 1hour: 24 bars=24hrs, daily: 24 bars=24 days)',
                     'default': config.PREDICTION_HORIZON_HOURS
                 }),
             ],
@@ -1265,6 +1265,7 @@ def create_argparse_from_params(params: Dict[str, Any], args: argparse.Namespace
         'model_type': 'model_type',
         'hidden_size': 'hidden_size',
         'sequence_length': 'sequence_length',  # Multi-scale parameter
+        'prediction_horizon_hours': 'prediction_horizon',  # Note: Actually BARS not hours!
         'epochs': 'epochs',
         'pretrain_epochs': 'pretrain_epochs',
         'batch_size': 'batch_size',

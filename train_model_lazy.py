@@ -603,7 +603,7 @@ def run_training_pipeline(args):
         lr=args.lr,
         validation_split=config.ML_VALIDATION_SPLIT,
         sequence_length=args.sequence_length,
-        target_horizon=config.PREDICTION_HORIZON_HOURS,
+        target_horizon=args.prediction_horizon,
         device=device,
         num_workers=num_workers,
         pin_memory=pin_memory
@@ -620,6 +620,7 @@ def run_training_pipeline(args):
         'hidden_size': args.hidden_size,
         'input_timeframe': args.input_timeframe,
         'sequence_length': args.sequence_length,
+        'prediction_horizon': args.prediction_horizon,
         'train_start_year': args.start_year,
         'train_end_year': args.end_year,
         'epochs': args.epochs,
@@ -780,6 +781,8 @@ def main():
     parser.add_argument('--pretrain_epochs', type=int, default=10)
     parser.add_argument('--sequence_length', type=int, default=config.ML_SEQUENCE_LENGTH,
                        help='Number of bars to look back (default: 200, uniform across all timeframes)')
+    parser.add_argument('--prediction_horizon', type=int, default=config.PREDICTION_HORIZON_HOURS,
+                       help='Number of BARS ahead to predict (default: 24 bars, NOT hours!)')
 
     # Model arguments
     parser.add_argument('--model_type', type=str, default=config.ML_MODEL_TYPE)
