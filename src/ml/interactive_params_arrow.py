@@ -216,9 +216,7 @@ class ArrowKeyParameterSelector:
         """Get categorized parameter catalog."""
         return {
             "📁 DATA FILES": [
-                ('input_timeframe', {'name': 'Input timeframe', 'type': 'timeframe'}),
-                ('spy_data', {'name': 'SPY data file', 'type': 'file'}),
-                ('tsla_data', {'name': 'TSLA data file', 'type': 'file'}),
+                # input_timeframe, spy_data, tsla_data are hidden (pre-selected or overridden)
                 ('tsla_events', {'name': 'TSLA events file', 'type': 'file'}),
                 ('macro_api_key', {'name': 'Macro API key', 'type': 'api_key'}),
             ],
