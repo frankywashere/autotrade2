@@ -118,6 +118,7 @@ class InteractiveParameterSelector:
             'use_rsi_features': config.USE_RSI_FEATURES,
             'use_correlation_features': config.USE_CORRELATION_FEATURES,
             'use_event_features': config.USE_EVENT_FEATURES,
+            'prediction_horizon_mode': 'uniform_bars',  # NEW: uniform_bars or uniform_time
             'prediction_horizon_hours': config.PREDICTION_HORIZON_HOURS,
 
             # Device
@@ -462,6 +463,12 @@ class InteractiveParameterSelector:
                     'hint': 'Earnings, macro events',
                     'default': config.USE_EVENT_FEATURES
                 }),
+                ('prediction_horizon_mode', {
+                    'name': 'Prediction horizon mode',
+                    'type': 'choice',
+                    'hint': 'Uniform bars (same bar count) or uniform time (24h for all)',
+                    'default': 'uniform_bars'
+                }),
                 ('prediction_horizon_hours', {
                     'name': 'Prediction horizon',
                     'hint': 'BARS ahead to predict (15min: 24 bars=6hrs, 1hour: 24 bars=24hrs, daily: 24 bars=24 days)',
@@ -569,6 +576,47 @@ class InteractiveParameterSelector:
             print(f"✓ Timeframe set to: {selected_tf}")
             print(f"  Auto-updated: spy_data = {self.params['spy_data']}")
             print(f"  Auto-updated: tsla_data = {self.params['tsla_data']}")
+
+        elif param_key == 'prediction_horizon_mode':
+            # Prediction horizon mode selection
+            modes = ['uniform_bars', 'uniform_time']
+            mode_descriptions = {
+                'uniform_bars': 'Same bar count for all models (e.g., 24 bars)',
+                'uniform_time': 'Same time window for all models (e.g., 24 hours)'
+            }
+
+            print("\nPrediction Horizon Mode:")
+            print("=" * 60)
+            for i, mode in enumerate(modes, 1):
+                current = " [CURRENT]" if mode == self.params.get('prediction_horizon_mode') else ""
+                print(f"  {i}. {mode}{current}")
+                print(f"     {mode_descriptions[mode]}")
+                if mode == 'uniform_bars':
+                    print("     Example: 24 bars means:")
+                    print("       - 15min: 6 hours ahead")
+                    print("       - 1hour: 24 hours ahead")
+                    print("       - 4hour: 96 hours ahead")
+                    print("       - daily: 24 days ahead")
+                else:  # uniform_time
+                    print("     Example: 24 hours means:")
+                    print("       - 15min: 96 bars")
+                    print("       - 1hour: 24 bars")
+                    print("       - 4hour: 6 bars")
+                    print("       - daily: 1 bar")
+                print()
+
+            value = input(f"Enter mode number [1-2]: ").strip()
+
+            if value == '1':
+                self.params['prediction_horizon_mode'] = 'uniform_bars'
+                self.modified_params.add('prediction_horizon_mode')
+                print(f"✓ Prediction horizon mode set to: uniform_bars")
+            elif value == '2':
+                self.params['prediction_horizon_mode'] = 'uniform_time'
+                self.modified_params.add('prediction_horizon_mode')
+                print(f"✓ Prediction horizon mode set to: uniform_time")
+            else:
+                print("Invalid selection. Keeping current value.")
 
         elif param_key == 'macro_api_key':
             print("\nNote: Local macro economic data is available in data/ directory.")
@@ -1265,6 +1313,7 @@ def create_argparse_from_params(params: Dict[str, Any], args: argparse.Namespace
         'model_type': 'model_type',
         'hidden_size': 'hidden_size',
         'sequence_length': 'sequence_length',  # Multi-scale parameter
+        'prediction_horizon_mode': 'prediction_mode',  # NEW: uniform_bars or uniform_time
         'prediction_horizon_hours': 'prediction_horizon',  # Note: Actually BARS not hours!
         'epochs': 'epochs',
         'pretrain_epochs': 'pretrain_epochs',

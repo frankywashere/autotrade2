@@ -621,6 +621,7 @@ def run_training_pipeline(args):
         'input_timeframe': args.input_timeframe,
         'sequence_length': args.sequence_length,
         'prediction_horizon': args.prediction_horizon,
+        'prediction_mode': args.prediction_mode,
         'train_start_year': args.start_year,
         'train_end_year': args.end_year,
         'epochs': args.epochs,
@@ -707,6 +708,19 @@ def train_all_models_interactive(base_args):
         params['spy_data'] = f'data/SPY_{tf}.csv'
         params['tsla_data'] = f'data/TSLA_{tf}.csv'
 
+        # Handle prediction mode
+        if base_params.get('prediction_horizon_mode') == 'uniform_time':
+            # For uniform time mode (24 hours), adjust bars per timeframe
+            bars_for_24h = {
+                '15min': 96,  # 96 * 15min = 24 hours
+                '1hour': 24,  # 24 * 1h = 24 hours
+                '4hour': 6,   # 6 * 4h = 24 hours
+                'daily': 1    # 1 * 24h = 24 hours
+            }
+            params['prediction_horizon_hours'] = bars_for_24h.get(tf, 24)
+            print(f"  📊 Uniform time mode: Using {params['prediction_horizon_hours']} bars for 24-hour prediction")
+        # else: uniform_bars mode - use the same value for all models (already set)
+
         # Create args for this model
         model_args = copy.deepcopy(base_args)
         model_args = create_argparse_from_params(params, model_args)
@@ -783,6 +797,9 @@ def main():
                        help='Number of bars to look back (default: 200, uniform across all timeframes)')
     parser.add_argument('--prediction_horizon', type=int, default=config.PREDICTION_HORIZON_HOURS,
                        help='Number of BARS ahead to predict (default: 24 bars, NOT hours!)')
+    parser.add_argument('--prediction_mode', type=str, default='uniform_bars',
+                       choices=['uniform_bars', 'uniform_time'],
+                       help='Prediction mode: uniform_bars (same bar count) or uniform_time (24h for all)')
 
     # Model arguments
     parser.add_argument('--model_type', type=str, default=config.ML_MODEL_TYPE)
