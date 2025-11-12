@@ -35,6 +35,131 @@ from src.ml.device_manager import DeviceManager
 from src.ml.interactive_params import InteractiveParameterSelector, create_argparse_from_params
 
 
+def validate_required_files(input_timeframe, events_file=None, verbose=True):
+    """
+    Validate that required CSV files exist before training.
+
+    Args:
+        input_timeframe: Timeframe string (e.g., '15min', '1hour', '4hour', 'daily')
+        events_file: Optional path to events file
+        verbose: If True, print file information
+
+    Returns:
+        bool: True if all required files exist, False otherwise
+    """
+    missing_files = []
+    found_files = []
+
+    # Build file paths
+    spy_file = Path(config.DATA_DIR) / f"SPY_{input_timeframe}.csv"
+    tsla_file = Path(config.DATA_DIR) / f"TSLA_{input_timeframe}.csv"
+
+    # Check SPY file
+    if spy_file.exists():
+        size_mb = spy_file.stat().st_size / (1024 * 1024)
+        found_files.append(f"  ✓ Found {spy_file} ({size_mb:.1f} MB)")
+    else:
+        missing_files.append(f"  ✗ SPY data: {spy_file}")
+
+    # Check TSLA file
+    if tsla_file.exists():
+        size_mb = tsla_file.stat().st_size / (1024 * 1024)
+        found_files.append(f"  ✓ Found {tsla_file} ({size_mb:.1f} MB)")
+    else:
+        missing_files.append(f"  ✗ TSLA data: {tsla_file}")
+
+    # Check events file if provided
+    if events_file:
+        events_path = Path(events_file)
+        if events_path.exists():
+            # Count lines to estimate events
+            with open(events_path, 'r') as f:
+                event_count = sum(1 for line in f) - 1  # Subtract header
+            found_files.append(f"  ✓ Found {events_file} ({event_count} events)")
+        else:
+            missing_files.append(f"  ✗ Events file: {events_file}")
+
+    # Report results
+    if missing_files:
+        if verbose:
+            print("\n" + "=" * 70)
+            print("❌ MISSING REQUIRED FILES")
+            print("=" * 70)
+            print("\nThe following data files are required but not found:\n")
+            for file in missing_files:
+                print(file)
+            print("\nTo create timeframe CSV files, run:")
+            print("  python scripts/create_multiscale_csvs.py")
+            print("\nFor events file, check:")
+            print("  data/tsla_events_REAL.csv")
+            print("=" * 70 + "\n")
+        return False
+
+    # All files found
+    if verbose and found_files:
+        print("\n📁 Validated data files:")
+        for file in found_files:
+            print(file)
+        print()
+
+    return True
+
+
+def validate_all_timeframes(events_file=None):
+    """
+    Validate CSV files exist for all 4 timeframes used in multi-model training.
+
+    Returns:
+        bool: True if all files exist, False if any are missing
+    """
+    timeframes = ['15min', '1hour', '4hour', 'daily']
+    all_valid = True
+
+    print("\n" + "=" * 70)
+    print("📁 VALIDATING MULTI-TIMEFRAME DATA FILES")
+    print("=" * 70)
+
+    for tf in timeframes:
+        print(f"\nChecking {tf} timeframe:")
+        if not validate_required_files(tf, events_file=None, verbose=False):
+            spy_file = Path(config.DATA_DIR) / f"SPY_{tf}.csv"
+            tsla_file = Path(config.DATA_DIR) / f"TSLA_{tf}.csv"
+            if not spy_file.exists():
+                print(f"  ✗ Missing: {spy_file}")
+            if not tsla_file.exists():
+                print(f"  ✗ Missing: {tsla_file}")
+            all_valid = False
+        else:
+            spy_file = Path(config.DATA_DIR) / f"SPY_{tf}.csv"
+            tsla_file = Path(config.DATA_DIR) / f"TSLA_{tf}.csv"
+            spy_size = spy_file.stat().st_size / (1024 * 1024)
+            tsla_size = tsla_file.stat().st_size / (1024 * 1024)
+            print(f"  ✓ SPY_{tf}.csv ({spy_size:.1f} MB)")
+            print(f"  ✓ TSLA_{tf}.csv ({tsla_size:.1f} MB)")
+
+    # Check events file
+    if events_file:
+        events_path = Path(events_file)
+        if events_path.exists():
+            with open(events_path, 'r') as f:
+                event_count = sum(1 for line in f) - 1
+            print(f"\n✓ Events file: {events_file} ({event_count} events)")
+        else:
+            print(f"\n✗ Missing events file: {events_file}")
+            all_valid = False
+
+    if not all_valid:
+        print("\n" + "=" * 70)
+        print("❌ Some required files are missing!")
+        print("Run: python scripts/create_multiscale_csvs.py")
+        print("=" * 70 + "\n")
+        return False
+
+    print("\n✅ All required files validated successfully!")
+    print("=" * 70 + "\n")
+    return True
+
+
 class LazyTradingDataset(Dataset):
     """
     Memory-efficient dataset that creates sequences on-demand.
@@ -496,6 +621,10 @@ def run_training_pipeline(args):
     Returns:
         dict with training results (losses, model_path, etc.)
     """
+    # Validate required files exist before any setup
+    if not validate_required_files(args.input_timeframe, args.tsla_events):
+        sys.exit(1)
+
     # Print header
     print("\n" + "=" * 70)
     print("🚀 MEMORY-EFFICIENT TRAINING (Lazy Loading)")
@@ -714,6 +843,11 @@ def train_all_models_interactive(base_args):
     print("\nModels will train SEQUENTIALLY (not parallel).")
     print("Estimated total time: ~60-100 minutes on T4 GPU")
     print()
+
+    # Validate all timeframe files exist before configuration
+    if not validate_all_timeframes(base_args.tsla_events):
+        print("\n⚠️  Cannot proceed with multi-model training until all files exist.")
+        sys.exit(1)
 
     # Get configuration from user (ONE TIME)
     selector = InteractiveParameterSelector(mode='lazy')
