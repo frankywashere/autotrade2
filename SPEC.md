@@ -1,6 +1,6 @@
 # AutoTrade2 - Complete Technical Specification
 
-**Version:** 3.1 (Multi-Scale LNN + Meta-LNN Coach + Dual Prediction Modes)
+**Version:** 3.2 (Multi-Scale LNN + Meta-LNN Coach + Dual Prediction Modes + Fixed Timeframe Loading)
 **Repository:** https://github.com/frankywashere/autotrade2
 **Last Updated:** November 12, 2025
 
@@ -844,6 +844,48 @@ Model 2 (1hour):
 **Validation:**
 - backtest.py warns if metadata seems incompatible
 - Checks feature_dim matches extractor output
+
+### Multi-Timeframe CSV Loading (v3.2 Fix)
+
+**CRITICAL BUG FIX:** Prior to v3.2, all models trained on `TSLA_1min.csv` regardless of `--input_timeframe` parameter.
+
+**How It Now Works:**
+
+`load_and_prepare_data_lazy()` now receives the `timeframe` parameter and passes it to CSVDataFeed:
+
+```python
+# train_model_lazy.py line 154
+def load_and_prepare_data_lazy(..., timeframe='1min'):
+    ...
+    data_feed = CSVDataFeed(timeframe=timeframe)  # ← Uses correct timeframe
+    aligned_df = data_feed.load_aligned_data(start_date, end_date)
+```
+
+**CSV Selection Logic:**
+
+- `CSVDataFeed(timeframe='15min')` → loads `data/SPY_15min.csv` + `data/TSLA_15min.csv`
+- `CSVDataFeed(timeframe='1hour')` → loads `data/SPY_1hour.csv` + `data/TSLA_1hour.csv`
+- `CSVDataFeed(timeframe='4hour')` → loads `data/SPY_4hour.csv` + `data/TSLA_4hour.csv`
+- `CSVDataFeed(timeframe='daily')` → loads `data/SPY_daily.csv` + `data/TSLA_daily.csv`
+
+**Path Construction (data_feed.py line 34):**
+```python
+csv_path = Path(self.data_dir) / f"{symbol}_{self.timeframe}.csv"
+```
+
+**Verification During Training:**
+
+Print statement now shows correct timeframe:
+```
+✓ Loaded 123,456 aligned 15min bars
+```
+(not hardcoded "1-minute bars")
+
+**Impact:**
+- Each model now trains on its designated multi-timeframe CSV
+- True multi-scale architecture finally functional
+- Models learn different temporal patterns as designed
+- **All models trained before v3.2 are invalid and should be retrained**
 
 ---
 

@@ -354,22 +354,7 @@ class InteractiveParameterSelector:
         """Get categorized parameter catalog."""
         return {
             "📁 DATA FILES": [
-                ('input_timeframe', {
-                    'name': 'Input timeframe',
-                    'type': 'choice',
-                    'hint': 'Timeframe for multi-scale training',
-                    'default': '1min'
-                }),
-                ('spy_data', {
-                    'name': 'SPY data file',
-                    'hint': 'Historical SPY data (auto-set by timeframe)',
-                    'default': 'data/SPY_1min.csv'
-                }),
-                ('tsla_data', {
-                    'name': 'TSLA data file',
-                    'hint': 'Historical TSLA data (auto-set by timeframe)',
-                    'default': 'data/TSLA_1min.csv'
-                }),
+                # input_timeframe, spy_data, tsla_data are hidden (pre-selected or overridden)
                 ('tsla_events', {
                     'name': 'TSLA events file',
                     'hint': 'Earnings, deliveries, major events',
