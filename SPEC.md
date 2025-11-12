@@ -107,22 +107,54 @@ autotrade2/
 ├── .gitignore                           # Excludes /data folder
 ├── README.md                            # User documentation
 ├── SPEC.md                              # This technical specification
-├── config.py                            # Central configuration
+├── QUICKSTART.md                        # Step-by-step command guide
+├── config.py                            # Central configuration (all tunable parameters)
 ├── main.py                              # Stage 1 entry point
-├── requirements.txt                     # Python dependencies (includes inquirerpy)
+├── requirements.txt                     # Python dependencies (torch, ncps, transformers, etc.)
 ├── run.sh                               # Quick start menu
 ├── convert_data.py                      # Data conversion utility
 │
 ├── data/                                # Stock data (gitignored)
-│   ├── TSLAMin.txt                     # Raw TSLA data
-│   ├── SPYMin.txt                      # Raw SPY data
-│   ├── TSLA_1min.csv                   # Converted TSLA (1.45M rows)
-│   ├── SPY_1min.csv                    # Converted SPY (1.79M rows)
-│   ├── tsla_events_REAL.csv            # Real events (394 in training range)
-│   └── predictions.db                  # SQLite prediction database
+│   ├── TSLAMin.txt                     # Raw TSLA data (original format)
+│   ├── SPYMin.txt                      # Raw SPY data (original format)
+│   ├── TSLA_1min.csv                   # Converted TSLA 1-minute (1.45M rows, ~93MB)
+│   ├── SPY_1min.csv                    # Converted SPY 1-minute (1.79M rows, ~109MB)
+│   ├── TSLA_5min.csv                   # Generated 5-minute TSLA bars
+│   ├── TSLA_15min.csv                  # Generated 15-minute TSLA bars
+│   ├── TSLA_30min.csv                  # Generated 30-minute TSLA bars
+│   ├── TSLA_1hour.csv                  # Generated 1-hour TSLA bars
+│   ├── TSLA_2hour.csv                  # Generated 2-hour TSLA bars
+│   ├── TSLA_3hour.csv                  # Generated 3-hour TSLA bars
+│   ├── TSLA_4hour.csv                  # Generated 4-hour TSLA bars
+│   ├── TSLA_daily.csv                  # Generated daily TSLA bars
+│   ├── TSLA_weekly.csv                 # Generated weekly TSLA bars
+│   ├── TSLA_monthly.csv                # Generated monthly TSLA bars
+│   ├── TSLA_3month.csv                 # Generated 3-month TSLA bars
+│   ├── SPY_5min.csv                    # Generated 5-minute SPY bars
+│   ├── SPY_15min.csv                   # Generated 15-minute SPY bars
+│   ├── SPY_30min.csv                   # Generated 30-minute SPY bars
+│   ├── SPY_1hour.csv                   # Generated 1-hour SPY bars
+│   ├── SPY_2hour.csv                   # Generated 2-hour SPY bars
+│   ├── SPY_3hour.csv                   # Generated 3-hour SPY bars
+│   ├── SPY_4hour.csv                   # Generated 4-hour SPY bars
+│   ├── SPY_daily.csv                   # Generated daily SPY bars
+│   ├── SPY_weekly.csv                  # Generated weekly SPY bars
+│   ├── SPY_monthly.csv                 # Generated monthly SPY bars
+│   ├── SPY_3month.csv                  # Generated 3-month SPY bars
+│   │                                   # (22 generated files, ~500MB total)
+│   ├── tsla_events_REAL.csv            # Real events: earnings, deliveries (394 events)
+│   ├── predictions.db                  # SQLite prediction database
+│   └── news.db                         # SQLite news cache (optional, for live mode)
 │
 ├── models/                              # Trained ML models
-│   └── lnn_full.pth                    # Production LNN model
+│   ├── lnn_15min.pth                   # 15-minute timeframe LNN (~1.4MB)
+│   ├── lnn_1hour.pth                   # 1-hour timeframe LNN (~1.4MB)
+│   ├── lnn_4hour.pth                   # 4-hour timeframe LNN (~1.4MB)
+│   ├── lnn_daily.pth                   # Daily timeframe LNN (~1.4MB)
+│   └── meta_lnn.pth                    # Meta-LNN coach (~0.6MB)
+│
+├── scripts/                             # Helper scripts
+│   └── create_multiscale_csvs.py       # Generate multi-scale CSVs from 1-min data
 │
 ├── src/                                 # Stage 1 source code
 │   ├── data_handler.py                 # Data loading and resampling
@@ -137,25 +169,39 @@ autotrade2/
 │
 └── src/ml/                              # Stage 2 ML system
     ├── __init__.py                     # ML module exports
-    ├── base.py                         # Abstract interfaces
-    ├── data_feed.py                    # Data loading (CSV/IBKR)
-    ├── features.py                     # 56-feature extraction
-    ├── features_lazy.py                # Feature extraction with progress
-    ├── events.py                       # Event integration
-    ├── model.py                        # LNN and LSTM models
-    ├── database.py                     # SQLite prediction logging
+    ├── base.py                         # Abstract interfaces (DataFeed, ModelBase, etc.)
+    ├── data_feed.py                    # Data loading (CSVDataFeed, YFinanceDataFeed)
+    ├── features.py                     # 135-feature extraction (11 timeframes)
+    ├── features_lazy.py                # Feature extraction with progress bars
+    ├── events.py                       # Event integration (earnings, macro)
+    ├── model.py                        # LNN and LSTM model implementations
+    ├── meta_models.py                  # Meta-LNN coach, market state features
+    ├── ensemble.py                     # Multi-scale ensemble orchestrator
+    ├── news_encoder.py                 # LFM2-based news headline encoding
+    ├── fetch_news.py                   # News fetching (Google News RSS, Finnhub)
+    ├── database.py                     # SQLite prediction logging (15 ensemble fields)
     ├── device_manager.py               # GPU/Metal hardware detection
-    ├── interactive_params.py           # Parameter selection (main)
-    └── interactive_params_arrow.py     # Arrow-key navigation system
+    ├── interactive_params.py           # Parameter selection system (24 params)
+    └── interactive_params_arrow.py     # Arrow-key navigation UI
 
-# Stage 2 Scripts
-├── train_model.py                       # Original training (memory-intensive)
-├── train_model_lazy.py                  # Memory-efficient training (USE THIS!)
-├── backtest.py                          # Walk-forward backtesting
-├── validate_results.py                  # Model validation
-├── update_model.py                      # Online learning
-├── validate_data_alignment.py           # Data validation (MANDATORY)
+# Stage 2 Training Scripts
+├── train_model_lazy.py                  # Multi-scale LNN training (primary)
+├── train_meta_lnn.py                    # Meta-LNN coach training
+├── train_all_models.sh                  # Bash helper: train all 4 models sequentially
+├── backtest.py                          # Walk-forward backtesting (reads metadata)
+├── backtest_all_models.py               # Batch backtest all models
+├── validate_results.py                  # Model validation reports
+├── update_model.py                      # Online learning from errors
+├── validate_data_alignment.py           # Data validation (zero-tolerance checking)
 └── process_real_events.py               # Parse real events from RTF/JSON
+
+# Test Scripts (for development/validation)
+├── test_multiscale_features.py          # Test 135-feature extraction
+├── test_meta_lnn.py                     # Test Meta-LNN architecture
+├── test_news_system.py                  # Test news fetching/encoding
+├── test_multiscale_system.py            # Comprehensive test suite
+├── test_interactive_train_all.py        # Test "Train All 4" metadata flow
+└── (10+ other test scripts)
 ```
 
 ---
@@ -474,7 +520,9 @@ pred_id = db.log_prediction({
     'predicted_high': 250.5,
     'predicted_low': 245.2,
     'confidence': 0.85,
-    # ... 25+ fields
+    'model_timeframe': '15min',  # Which model made prediction
+    'is_ensemble': False,
+    # ... 30+ fields
 })
 
 # Update with actuals
@@ -483,6 +531,68 @@ db.update_actual(pred_id, actual_high=252.1, actual_low=246.8)
 # Get metrics
 metrics = db.get_accuracy_metrics()
 # Returns: mean_absolute_error, error by confidence bins, etc.
+```
+
+**Database Schema (predictions table):**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INTEGER | Primary key |
+| timestamp | DATETIME | When prediction was made |
+| target_timestamp | DATETIME | When prediction is for |
+| symbol | STRING | Stock symbol (TSLA) |
+| timeframe | STRING | Prediction window (24h) |
+| **model_timeframe** | STRING | Which model: '15min', '1hour', 'ensemble', etc. |
+| **is_ensemble** | BOOLEAN | True if Meta-LNN prediction |
+| **news_enabled** | BOOLEAN | True if news was used |
+| predicted_high | FLOAT | Predicted high price |
+| predicted_low | FLOAT | Predicted low price |
+| predicted_center | FLOAT | Mid-point |
+| predicted_range | FLOAT | High - Low |
+| confidence | FLOAT | Model confidence (0-1) |
+| actual_high | FLOAT | Actual high (filled later) |
+| actual_low | FLOAT | Actual low (filled later) |
+| actual_center | FLOAT | Actual mid-point |
+| has_actuals | BOOLEAN | Whether actuals are filled |
+| error_high | FLOAT | Prediction error (%) |
+| error_low | FLOAT | Prediction error (%) |
+| absolute_error | FLOAT | Average error |
+| channel_position | FLOAT | Channel context |
+| rsi_value | FLOAT | RSI context |
+| spy_correlation | FLOAT | Correlation context |
+| has_earnings | BOOLEAN | Earnings event |
+| has_macro_event | BOOLEAN | Macro event (FOMC/CPI/NFP) |
+| event_type | STRING | Event type |
+| **sub_pred_15min_high** | FLOAT | 15min model prediction |
+| **sub_pred_15min_low** | FLOAT | 15min model prediction |
+| **sub_pred_15min_conf** | FLOAT | 15min model confidence |
+| **sub_pred_1hour_high** | FLOAT | 1hour model prediction |
+| **sub_pred_1hour_low** | FLOAT | 1hour model prediction |
+| **sub_pred_1hour_conf** | FLOAT | 1hour model confidence |
+| **sub_pred_4hour_high** | FLOAT | 4hour model prediction |
+| **sub_pred_4hour_low** | FLOAT | 4hour model prediction |
+| **sub_pred_4hour_conf** | FLOAT | 4hour model confidence |
+| **sub_pred_daily_high** | FLOAT | daily model prediction |
+| **sub_pred_daily_low** | FLOAT | daily model prediction |
+| **sub_pred_daily_conf** | FLOAT | daily model confidence |
+| model_version | STRING | Model version |
+| feature_dim | INTEGER | Number of features |
+
+**Total: 40+ fields** (boldface = ensemble-specific fields added in v3.0)
+
+**News Database Schema (news.db):**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INTEGER | Primary key |
+| timestamp | TEXT | When article published |
+| title | TEXT | Headline |
+| source | TEXT | News source (Reuters, Bloomberg, etc.) |
+| url | TEXT | Article URL |
+| query_type | TEXT | 'TSLA' or 'MARKET' |
+| created_at | TEXT | When fetched |
+
+Indexed on timestamp and query_type for fast retrieval.
 ```
 
 ### Training Scripts
@@ -623,6 +733,198 @@ Bar at 2024-01-15 10:30:
 | **Multi-scale (4 models)** | **200** | **135** | **~2GB** | **~8GB** |
 
 **Savings: 3x less memory, can train on consumer GPUs**
+
+---
+
+## Metadata System
+
+### How Metadata Flows Through the Pipeline
+
+**Critical for multi-scale**: Each model checkpoint contains metadata about how it was trained. This allows backtest.py to automatically use the correct data and configuration.
+
+###Step 1: Training Saves Metadata
+
+When you train a model:
+```bash
+python train_model_lazy.py --input_timeframe 15min --sequence_length 200 --epochs 50 --batch_size 128 --output models/lnn_15min.pth
+```
+
+**Metadata saved in lnn_15min.pth:**
+```python
+{
+    'model_type': 'LNN',
+    'input_size': 135,                    # Number of features
+    'hidden_size': 128,
+    'input_timeframe': '15min',           # ← CRITICAL: Which CSV was used
+    'sequence_length': 200,               # ← CRITICAL: Bars to look back
+    'train_start_year': 2015,
+    'train_end_year': 2023,
+    'epochs': 50,
+    'pretrain_epochs': 10,
+    'final_train_loss': 0.0234,
+    'final_val_loss': 0.0289,
+    'training_date': '2024-11-12T10:30:00',
+    'feature_names': ['spy_close', 'tsla_close', ...],  # All 135 feature names
+    'training_mode': 'lazy_loading',
+    'peak_memory_mb': 2456.7,
+    'device': 'cuda:0',
+    'device_type': 'cuda'
+}
+```
+
+### Step 2: Backtest Reads Metadata
+
+When you backtest:
+```bash
+python backtest.py --model_path models/lnn_15min.pth --test_year 2024
+```
+
+**backtest.py automatically:**
+1. Loads checkpoint: `torch.load('models/lnn_15min.pth')`
+2. Extracts metadata: `metadata = checkpoint['metadata']`
+3. Reads config:
+   - `input_timeframe = metadata['input_timeframe']`  # '15min'
+   - `sequence_length = metadata['sequence_length']`  # 200
+4. **Loads correct CSVs:**
+   - `CSVDataFeed(timeframe='15min')`  # Loads TSLA_15min.csv, SPY_15min.csv
+5. **Uses correct sequence length:**
+   - `sequence = features_df.tail(200).values`  # Not hardcoded 84!
+
+**This ensures backtest uses EXACT same data/config as training!**
+
+### Step 3: Metadata in Predictions Database
+
+Each prediction logged to predictions.db includes:
+- `model_timeframe`: '15min', '1hour', '4hour', 'daily', or 'ensemble'
+- Allows querying: "Show me all 15min model predictions"
+- Enables comparison: "Which timeframe is most accurate?"
+
+### Interactive "Train All 4" Metadata Flow
+
+When using interactive multi-model training:
+
+```
+User configures once:
+  epochs: 50
+  batch_size: 128
+  sequence_length: 200
+  device: cuda
+  (all 24 parameters)
+    ↓
+Trains 4 models sequentially:
+    ↓
+Model 1 (15min):
+  metadata['input_timeframe'] = '15min'
+  metadata['sequence_length'] = 200      ← User's setting
+  metadata['epochs'] = 50                ← User's setting
+  metadata['batch_size'] = 128           ← User's setting
+  Saved to: models/lnn_15min.pth
+    ↓
+Model 2 (1hour):
+  metadata['input_timeframe'] = '1hour'  ← CHANGED
+  metadata['sequence_length'] = 200      ← Same (user setting)
+  metadata['epochs'] = 50                ← Same (user setting)
+  Saved to: models/lnn_1hour.pth
+    ↓
+(Repeat for 4hour, daily)
+```
+
+**Result:** 4 model files, each with correct timeframe + shared user settings.
+
+### Metadata Compatibility
+
+**Forward compatibility:**
+- Future versions can add new metadata fields
+- Old models still load (missing fields use defaults)
+
+**Backward compatibility:**
+- Models without input_timeframe default to '1min'
+- Models without sequence_length use config.ML_SEQUENCE_LENGTH
+
+**Validation:**
+- backtest.py warns if metadata seems incompatible
+- Checks feature_dim matches extractor output
+
+---
+
+## Prediction Horizon (Critical Parameter)
+
+### Understanding prediction_horizon
+
+**IMPORTANT:** Despite the parameter name `prediction_horizon_hours`, this is measured in **BARS, NOT HOURS!**
+
+The model predicts the high/low prices over the next N bars (where N = prediction_horizon).
+
+### How It Works
+
+```python
+# Training creates targets (train_model_lazy.py line 107)
+target_start = seq_end
+target_end = seq_end + target_horizon  # target_horizon BARS ahead
+
+future_prices = features_array[target_start:target_end, close_idx]
+target_high = np.max(future_prices)  # Max price in next N bars
+target_low = np.min(future_prices)   # Min price in next N bars
+```
+
+**Model learns:** "Given last 200 bars, what will be the high/low in NEXT 24 bars?"
+
+### Actual Time Windows by Timeframe
+
+**With prediction_horizon=24 (default):**
+
+| Model Timeframe | Bars Ahead | Actual Time Window |
+|-----------------|------------|-------------------|
+| 15min | 24 bars | 6 hours |
+| 1hour | 24 bars | 24 hours (1 day) ✓ |
+| 4hour | 24 bars | 4 days |
+| Daily | 24 bars | 24 DAYS (not hours!) |
+
+**With prediction_horizon=48:**
+
+| Model Timeframe | Bars Ahead | Actual Time Window |
+|-----------------|------------|-------------------|
+| 15min | 48 bars | 12 hours |
+| 1hour | 48 bars | 48 hours (2 days) |
+| 4hour | 48 bars | 8 days |
+| Daily | 48 bars | 48 days (~1.5 months) |
+
+### Customizing Per Model
+
+**You can now set different horizons per model:**
+
+```bash
+# Short-term intraday (6 hours out)
+python train_model_lazy.py --input_timeframe 15min --prediction_horizon 24 ...
+
+# Medium-term (2 days out)
+python train_model_lazy.py --input_timeframe 1hour --prediction_horizon 48 ...
+
+# Long-term swing (2 weeks out)
+python train_model_lazy.py --input_timeframe 4hour --prediction_horizon 84 ...
+
+# Very long-term (2 months out)
+python train_model_lazy.py --input_timeframe daily --prediction_horizon 42 ...
+```
+
+### Recommendations
+
+**By Timeframe:**
+- **15min model:** prediction_horizon=24 (6 hours) - Intraday trading
+- **1hour model:** prediction_horizon=24-48 (1-2 days) - Swing entries
+- **4hour model:** prediction_horizon=42-84 (7-14 days) - Swing exits
+- **Daily model:** prediction_horizon=21-63 (3 weeks - 3 months) - Position trading
+
+**Trade-offs:**
+- ✅ Shorter horizon: More accurate, easier to predict
+- ✅ Longer horizon: More strategic, captures bigger moves
+- ⚠️ Too short: Noise dominates
+- ⚠️ Too long: Prediction becomes too uncertain
+
+**In Interactive Menu:**
+- Parameter shown as "Prediction horizon (hours)"
+- **Actually means BARS**
+- Hint clarifies: "24 bars = 6hrs(15min), 24hrs(1hour), 24 days(daily)"
 
 ---
 
