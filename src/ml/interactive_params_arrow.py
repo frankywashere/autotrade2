@@ -440,10 +440,13 @@ class ArrowKeyParameterSelector:
             print(f"✓ Prediction mode set to: {result}")
 
     def _edit_batch_size(self, param_key: str, param_name: str):
-        """Edit batch size with RAM-based suggestions."""
+        """Edit batch size with memory-based suggestions (VRAM for CUDA, RAM otherwise)."""
         suggestions = self._get_batch_size_suggestions()
 
-        print(f"\n💡 RAM-based suggestions ({self.params.get('_available_ram_gb', 4.0):.1f} GB available):")
+        memory_source = suggestions.get('memory_source', 'RAM')
+        memory_gb = suggestions.get('memory_gb', self.params.get('_available_ram_gb', 4.0))
+
+        print(f"\n💡 {memory_source}-based suggestions ({memory_gb:.1f} GB available):")
 
         choices = [
             Choice(
@@ -680,16 +683,27 @@ class ArrowKeyParameterSelector:
             print(f"✓ {param_name} set to: {result}")
 
     def _get_batch_size_suggestions(self) -> Dict[str, int]:
-        """Get batch size suggestions based on available RAM."""
+        """Get batch size suggestions based on available memory (VRAM for CUDA, RAM otherwise)."""
+        import torch
         device_type = self.params.get('device', 'cpu')
         available_ram = self.params.get('_available_ram_gb', 4.0)
+
+        # Detect VRAM for CUDA devices
+        vram_gb = None
+        if device_type == 'cuda':
+            try:
+                vram_bytes = torch.cuda.get_device_properties(0).total_memory
+                vram_gb = vram_bytes / (1024**3)
+            except:
+                vram_gb = None
 
         return calculate_optimal_batch_size(
             device_type=device_type,
             available_ram_gb=available_ram,
             sequence_length=self.params.get('sequence_length', 84),
             num_features=50,  # Approximate
-            hidden_size=self.params.get('hidden_size', 128)
+            hidden_size=self.params.get('hidden_size', 128),
+            vram_gb=vram_gb
         )
 
     def _auto_select_device(self):

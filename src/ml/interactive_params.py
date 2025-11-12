@@ -23,31 +23,17 @@ def calculate_optimal_batch_size(
     available_ram_gb: float,
     sequence_length: int = 84,
     num_features: int = 50,
-    hidden_size: int = 128
+    hidden_size: int = 128,
+    vram_gb: float = None
 ) -> Dict[str, int]:
     """
     Calculate optimal batch size based on system resources.
 
-    For CUDA devices, attempts to detect VRAM and use that for calculations.
-    Falls back to system RAM if VRAM detection fails.
+    For CUDA devices, uses VRAM if available, otherwise falls back to RAM.
+    For CPU/MPS devices, uses system RAM.
 
     Returns dict with conservative, balanced, and aggressive options.
     """
-    # For CUDA, try to detect actual VRAM
-    memory_gb = available_ram_gb
-    memory_source = "RAM"
-
-    if device_type == 'cuda':
-        try:
-            import torch
-            if torch.cuda.is_available():
-                vram_bytes = torch.cuda.get_device_properties(0).total_memory
-                vram_gb = vram_bytes / (1024**3)
-                memory_gb = vram_gb
-                memory_source = "VRAM"
-        except:
-            pass  # Fall back to system RAM
-
     # Estimate memory per sample (in MB)
     # Formula: sequence_length × features × 4 bytes × gradient factor
     bytes_per_sample = sequence_length * num_features * 4 * 3  # 3x for model + gradients + optimizer
@@ -57,32 +43,32 @@ def calculate_optimal_batch_size(
     if hidden_size > 256:
         mb_per_sample *= 1.5
 
-    # Safety factors based on device type
-    safety_factors = {
-        'cpu': 0.3,   # Use 30% of available RAM
-        'mps': 0.4,   # Use 40% (unified memory)
-        'cuda': 0.7,  # Use 70% (dedicated VRAM, increased from 0.6)
-    }
-    safety_factor = safety_factors.get(device_type, 0.3)
+    # For CUDA: Use VRAM if available (more accurate), otherwise use RAM
+    if device_type == 'cuda' and vram_gb is not None:
+        memory_gb = vram_gb
+        safety_factor = 0.7  # Can use more of dedicated VRAM
+        memory_source = "VRAM"
+    else:
+        memory_gb = available_ram_gb
+        # Safety factors based on device type
+        safety_factors = {
+            'cpu': 0.3,   # Use 30% of available RAM
+            'mps': 0.4,   # Use 40% (unified memory)
+            'cuda': 0.6,  # Use 60% if VRAM unknown
+        }
+        safety_factor = safety_factors.get(device_type, 0.3)
+        memory_source = "RAM"
 
     # Calculate max safe batch size
     usable_memory_mb = memory_gb * 1024 * safety_factor
     max_batch_size = int(usable_memory_mb / mb_per_sample)
 
     # Create tiered suggestions
-    # For high-VRAM GPUs (40GB+), allow much larger batches
-    if device_type == 'cuda' and memory_gb >= 40:
-        suggestions = {
-            'conservative': max(128, min(max_batch_size // 4, 256)),
-            'balanced': max(256, min(int(max_batch_size * 0.5), 512)),
-            'aggressive': max(512, min(max_batch_size, 1024))
-        }
-    else:
-        suggestions = {
-            'conservative': max(8, min(max_batch_size // 2, 128)),
-            'balanced': max(16, min(int(max_batch_size * 0.75), 256)),
-            'aggressive': max(32, min(max_batch_size, 512))
-        }
+    suggestions = {
+        'conservative': max(8, min(max_batch_size // 2, 128)),
+        'balanced': max(16, min(int(max_batch_size * 0.75), 256)),
+        'aggressive': max(32, min(max_batch_size, 512))
+    }
 
     # Round to nearest power of 2 for efficiency
     for key in suggestions:
@@ -91,8 +77,8 @@ def calculate_optimal_batch_size(
 
     suggestions['memory_per_sample_mb'] = mb_per_sample
     suggestions['max_safe'] = max_batch_size
-    suggestions['memory_gb'] = memory_gb
     suggestions['memory_source'] = memory_source
+    suggestions['memory_gb'] = memory_gb
 
     return suggestions
 
@@ -755,25 +741,39 @@ class InteractiveParameterSelector:
                 self.modified_params.add(param_key)
 
     def _show_batch_size_suggestions(self):
-        """Show batch size suggestions based on RAM."""
+        """Show batch size suggestions based on available memory."""
         suggestions = self._get_batch_size_suggestions()
 
-        print(f"\n💡 Batch size suggestions (based on {self.params.get('_available_ram_gb', 4.0):.1f} GB available RAM):")
+        memory_source = suggestions.get('memory_source', 'RAM')
+        memory_gb = suggestions.get('memory_gb', self.params.get('_available_ram_gb', 4.0))
+
+        print(f"\n💡 Batch size suggestions (based on {memory_gb:.1f} GB {memory_source}):")
         print(f"   Conservative : {suggestions['conservative']} (safe, slower)")
         print(f"   Balanced     : {suggestions['balanced']} (recommended)")
         print(f"   Aggressive   : {suggestions['aggressive']} (fast, may OOM)")
 
     def _get_batch_size_suggestions(self) -> Dict[str, int]:
         """Get batch size suggestions."""
+        import torch
         device_type = self.params.get('device', 'cpu')
         available_ram = self.params.get('_available_ram_gb', 4.0)
+
+        # Detect VRAM for CUDA devices
+        vram_gb = None
+        if device_type == 'cuda':
+            try:
+                vram_bytes = torch.cuda.get_device_properties(0).total_memory
+                vram_gb = vram_bytes / (1024**3)
+            except:
+                vram_gb = None
 
         return calculate_optimal_batch_size(
             device_type=device_type,
             available_ram_gb=available_ram,
             sequence_length=self.params.get('sequence_length', 84),
             num_features=50,  # Approximate
-            hidden_size=self.params.get('hidden_size', 128)
+            hidden_size=self.params.get('hidden_size', 128),
+            vram_gb=vram_gb
         )
 
     def _auto_select_device(self):
@@ -1021,9 +1021,7 @@ class InteractiveParameterSelector:
         # Batch size with auto-calculation
         print(f"\n3. Batch size")
         print(f"   Current: {self.params['batch_size']}")
-        memory_gb = batch_suggestions.get('memory_gb', available_ram)
-        memory_source = batch_suggestions.get('memory_source', 'RAM')
-        print(f"\n   🤖 AUTO-CALCULATED SUGGESTIONS (based on {memory_gb:.1f} GB {memory_source}):")
+        print(f"\n   🤖 AUTO-CALCULATED SUGGESTIONS (based on {available_ram:.1f} GB available RAM):")
         print(f"      Conservative: {batch_suggestions['conservative']} (safest)")
         print(f"      Balanced: {batch_suggestions['balanced']} (recommended)")
         print(f"      Aggressive: {batch_suggestions['aggressive']} (fastest)")
