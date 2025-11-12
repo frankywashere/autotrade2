@@ -89,6 +89,10 @@ class ArrowKeyParameterSelector:
             'device': None,  # Will be auto-detected
             'auto_device': False,
 
+            # GPU optimization
+            'num_workers': 0,  # CPU threads for data loading
+            'pin_memory': False,  # Pin memory for GPU transfers
+
             # System info (populated during detection)
             '_system_ram_gb': 8.0,
             '_available_ram_gb': 4.0,
@@ -241,6 +245,10 @@ class ArrowKeyParameterSelector:
             ],
             "🖥️ COMPUTE DEVICE": [
                 ('device', {'name': 'Device', 'type': 'device'}),
+            ],
+            "🚀 GPU OPTIMIZATION": [
+                ('num_workers', {'name': 'Data loading workers', 'type': 'number'}),
+                ('pin_memory', {'name': 'Pin memory', 'type': 'boolean'}),
             ]
         }
 
@@ -307,6 +315,11 @@ class ArrowKeyParameterSelector:
 
     def _edit_boolean(self, param_key: str, param_name: str):
         """Edit boolean parameter."""
+        # Add hints for certain parameters
+        if param_key == 'pin_memory':
+            print("\nHint: Pin memory for faster GPU→VRAM transfers (~10% speedup)")
+            print("      Recommended: True for GPU, False for CPU/MPS")
+
         result = inquirer.confirm(
             message=f"Enable {param_name}?",
             default=self.params.get(param_key, False),
@@ -382,23 +395,25 @@ class ArrowKeyParameterSelector:
                 """Validate batch size input."""
                 try:
                     val = int(val_str) if val_str else 16
-                    return 8 <= val <= 1024
+                    return 8 <= val <= 8192
                 except (ValueError, TypeError):
                     return False
 
             result = inquirer.number(
-                message="Enter custom batch size (8-1024):",
+                message="Enter custom batch size (8-8192):",
                 min_allowed=8,
-                max_allowed=1024,
+                max_allowed=8192,
                 default=self.params.get('batch_size', 16),
                 validate=validate_batch_size,
-                invalid_message="Batch size must be between 8 and 1024",
+                invalid_message="Batch size must be between 8 and 8192",
             ).execute()
 
         if result and result != self.params.get('batch_size'):
             self.params['batch_size'] = int(result)
             self.modified_params.add('batch_size')
             print(f"✓ Batch size set to: {result}")
+            if int(result) > 1024:
+                print(f"⚠️  Warning: Large batch size ({result}) - ensure your GPU has enough VRAM!")
 
     def _edit_year(self, param_key: str, param_name: str):
         """Edit year parameter."""
@@ -444,6 +459,7 @@ class ArrowKeyParameterSelector:
             'epochs': (1, 1000, "Full passes through data"),
             'pretrain_epochs': (0, 100, "Self-supervised pretraining epochs"),
             'prediction_horizon_hours': (1, 168, "Hours ahead to predict"),
+            'num_workers': (0, 8, "CPU threads for data loading (0=main only, 2=recommended for GPU)"),
         }
 
         min_val, max_val, hint = ranges.get(param_key, (1, 1000, ""))

@@ -122,6 +122,10 @@ class InteractiveParameterSelector:
             # Device
             'device': None,  # Will be set during selection
             'auto_device': False,
+
+            # GPU optimization
+            'num_workers': 0,  # CPU threads for data loading
+            'pin_memory': False,  # Pin memory for GPU transfers
         }
 
     def run(self) -> Dict[str, Any]:
@@ -290,11 +294,11 @@ class InteractiveParameterSelector:
                 self.modified_params = set()
             elif selection == 'all':
                 # Modify all parameters
-                param_indices = list(range(1, 22))
+                param_indices = list(range(1, 24))
                 self._modify_selected_params(param_indices)
             else:
                 # Parse and modify selected parameters
-                param_indices = self._parse_selection(selection, 21)
+                param_indices = self._parse_selection(selection, 23)
                 if param_indices:
                     self._modify_selected_params(param_indices)
                 else:
@@ -463,6 +467,18 @@ class InteractiveParameterSelector:
                     'hint': 'cpu/cuda/mps or auto-detect',
                     'default': None
                 }),
+            ],
+            "🚀 GPU OPTIMIZATION": [
+                ('num_workers', {
+                    'name': 'Data loading workers',
+                    'hint': 'CPU threads (0=main only, 2=recommended for GPU)',
+                    'default': 0
+                }),
+                ('pin_memory', {
+                    'name': 'Pin memory',
+                    'hint': 'Faster GPU transfers (~10% speedup)',
+                    'default': False
+                }),
             ]
         }
 
@@ -538,7 +554,7 @@ class InteractiveParameterSelector:
                 self.modified_params.add('device')
 
         elif param_key in ['use_channel_features', 'use_rsi_features',
-                           'use_correlation_features', 'use_event_features']:
+                           'use_correlation_features', 'use_event_features', 'pin_memory']:
             # Boolean parameters
             value = input("Enable? [y/n]: ").strip().lower()
             if value in ['y', 'yes', '1', 'true']:
@@ -576,25 +592,29 @@ class InteractiveParameterSelector:
             else:
                 try:
                     batch_size = int(value)
-                    if 1 <= batch_size <= 1024:
+                    if 8 <= batch_size <= 8192:
                         self.params[param_key] = batch_size
                         self.modified_params.add(param_key)
+                        if batch_size > 1024:
+                            print(f"⚠️  Warning: Large batch size ({batch_size}) - ensure your GPU has enough VRAM!")
                     else:
-                        print("Invalid batch size. Keeping current value.")
+                        print("Invalid batch size (must be 8-8192). Keeping current value.")
                 except ValueError:
                     print("Invalid input. Keeping current value.")
 
         elif param_key in ['hidden_size', 'num_layers', 'sequence_length',
-                          'epochs', 'pretrain_epochs', 'prediction_horizon_hours']:
+                          'epochs', 'pretrain_epochs', 'prediction_horizon_hours', 'num_workers']:
             # Integer parameters
             value = input(f"Enter value: ").strip()
             try:
                 int_value = int(value)
-                if int_value > 0:
+                # num_workers can be 0, others must be > 0
+                min_val = 0 if param_key == 'num_workers' else 1
+                if int_value >= min_val:
                     self.params[param_key] = int_value
                     self.modified_params.add(param_key)
                 else:
-                    print("Value must be positive. Keeping current value.")
+                    print(f"Value must be >= {min_val}. Keeping current value.")
             except ValueError:
                 print("Invalid input. Keeping current value.")
 
@@ -928,14 +948,16 @@ class InteractiveParameterSelector:
         elif choice == '4':
             while True:
                 try:
-                    batch_size = int(input("   Custom batch size [8-1024]: ").strip())
-                    if 8 <= batch_size <= 1024:
+                    batch_size = int(input("   Custom batch size [8-8192]: ").strip())
+                    if 8 <= batch_size <= 8192:
                         self.params['batch_size'] = batch_size
                         self.modified_params.add('batch_size')
                         print(f"   ✓ Batch size set to {batch_size}")
+                        if batch_size > 1024:
+                            print(f"   ⚠️  Warning: Large batch size ({batch_size}) - ensure your GPU has enough VRAM!")
                         break
                     else:
-                        print("   Please enter a value between 8 and 1024")
+                        print("   Please enter a value between 8 and 8192")
                 except ValueError:
                     print("   Please enter a valid number")
         else:
@@ -1206,6 +1228,8 @@ def create_argparse_from_params(params: Dict[str, Any], args: argparse.Namespace
         'validation_split': None,  # Not in argparse, handled in config
         'device': 'device',
         'auto_device': 'auto_device',
+        'num_workers': 'num_workers',  # GPU optimization parameter
+        'pin_memory': 'pin_memory',  # GPU optimization parameter
     }
 
     # Update args with selected parameters

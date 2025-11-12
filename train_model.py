@@ -179,7 +179,8 @@ def load_and_prepare_data(spy_file, tsla_file, start_year, end_year,
     return X, y, events_embeddings, feature_extractor
 
 
-def self_supervised_pretrain(model, X, epochs=10, batch_size=32, lr=0.001, device=torch.device('cpu')):
+def self_supervised_pretrain(model, X, epochs=10, batch_size=32, lr=0.001, device=torch.device('cpu'),
+                            num_workers=0, pin_memory=False):
     """
     Self-supervised pretraining using masking and reconstruction
     """
@@ -196,7 +197,8 @@ def self_supervised_pretrain(model, X, epochs=10, batch_size=32, lr=0.001, devic
                                  list(pretrainer.reconstruction_head.parameters()), lr=lr)
 
     dataset = TradingDataset(X, torch.zeros(len(X), 2))  # Dummy y for pretraining
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                           num_workers=num_workers, pin_memory=pin_memory)
     num_batches = len(dataloader)
 
     pretrain_losses = []
@@ -243,7 +245,8 @@ def self_supervised_pretrain(model, X, epochs=10, batch_size=32, lr=0.001, devic
 
 
 def train_supervised(model, X, y, events_embeddings, epochs=50, batch_size=32,
-                     lr=0.001, validation_split=0.1, device=torch.device('cpu')):
+                     lr=0.001, validation_split=0.1, device=torch.device('cpu'),
+                     num_workers=0, pin_memory=False):
     """
     Supervised training on high/low predictions
     """
@@ -270,8 +273,14 @@ def train_supervised(model, X, y, events_embeddings, epochs=50, batch_size=32,
     train_dataset = TradingDataset(X_train, y_train, events_train)
     val_dataset = TradingDataset(X_val, y_val, events_val)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=pin_memory
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin_memory
+    )
 
     num_train_batches = len(train_loader)
     num_val_batches = len(val_loader)
@@ -440,6 +449,12 @@ def main():
     parser.add_argument('--auto_device', action='store_true',
                        help='Auto-select best device without prompting')
 
+    # GPU optimization arguments
+    parser.add_argument('--num_workers', type=int, default=None,
+                       help='Number of data loading workers (default: auto-detect based on device)')
+    parser.add_argument('--pin_memory', type=lambda x: x.lower() == 'true', default=None,
+                       help='Pin memory for faster GPU transfers (default: auto-detect based on device)')
+
     # Interactive mode
     parser.add_argument('--interactive', action='store_true',
                        help='Enable interactive parameter selection mode')
@@ -528,16 +543,48 @@ def main():
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Model size: {total_params * 4 / 1024**2:.2f} MB")
 
+    # GPU optimization: Auto-detect num_workers and pin_memory based on device
+    if args.num_workers is None:
+        num_workers = 2 if device.type == 'cuda' else 0
+        workers_source = "auto-detected"
+    else:
+        num_workers = args.num_workers
+        workers_source = "user-specified"
+
+    if args.pin_memory is None:
+        pin_memory = (device.type == 'cuda')
+        pin_source = "auto-detected"
+    else:
+        pin_memory = args.pin_memory
+        pin_source = "user-specified"
+
+    # Display GPU optimization settings
+    if device.type == 'cuda':
+        print(f"\n  🚀 GPU optimizations enabled:")
+        print(f"     - num_workers: {num_workers} ({workers_source}, parallel data loading)")
+        print(f"     - pin_memory: {pin_memory} ({pin_source}, faster GPU transfers)")
+        if num_workers != 2 and workers_source == "user-specified":
+            print(f"     ⚠️  Note: Default for CUDA is 2 workers, you selected {num_workers}")
+        print(f"     💡 Tip: Use --batch_size 128 for maximum GPU performance!")
+    else:
+        print(f"\n  ℹ️  CPU/MPS mode:")
+        print(f"     - num_workers: {num_workers} ({workers_source})")
+        print(f"     - pin_memory: {pin_memory} ({pin_source})")
+        if num_workers > 0 and device.type == 'mps':
+            print(f"     ⚠️  Warning: num_workers>0 may cause issues on MPS, consider using 0")
+
     # 3. Self-supervised pretraining
     if args.pretrain_epochs > 0:
         self_supervised_pretrain(model, X, epochs=args.pretrain_epochs,
-                                batch_size=args.batch_size, lr=args.lr, device=device)
+                                batch_size=args.batch_size, lr=args.lr, device=device,
+                                num_workers=num_workers, pin_memory=pin_memory)
 
     # 4. Supervised training
     train_losses, val_losses = train_supervised(
         model, X, y, events_embeddings,
         epochs=args.epochs, batch_size=args.batch_size,
-        lr=args.lr, validation_split=config.ML_VALIDATION_SPLIT, device=device
+        lr=args.lr, validation_split=config.ML_VALIDATION_SPLIT, device=device,
+        num_workers=num_workers, pin_memory=pin_memory
     )
 
     # 5. Save model

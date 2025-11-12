@@ -211,7 +211,8 @@ def load_and_prepare_data_lazy(spy_file, tsla_file, start_year, end_year,
 
 def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_size=32,
                          lr=0.001, validation_split=0.1, sequence_length=168,
-                         target_horizon=24, device=torch.device('cpu')):
+                         target_horizon=24, device=torch.device('cpu'),
+                         num_workers=0, pin_memory=False):
     """
     Supervised training using lazy sequence loading.
     """
@@ -245,12 +246,14 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
     # Create data loaders
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=0  # Important: use 0 for main process only
+        num_workers=num_workers,
+        pin_memory=pin_memory
     )
 
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=0
+        num_workers=num_workers,
+        pin_memory=pin_memory
     )
 
     # Loss and optimizer
@@ -368,7 +371,7 @@ def train_supervised_lazy(model, features_df, events_handler, epochs=50, batch_s
 
 def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
                                   batch_size=32, lr=0.001, sequence_length=168,
-                                  device=torch.device('cpu')):
+                                  device=torch.device('cpu'), num_workers=0, pin_memory=False):
     """
     Self-supervised pretraining using lazy loading.
     """
@@ -393,7 +396,8 @@ def self_supervised_pretrain_lazy(model, features_df, events_handler, epochs=10,
 
     dataloader = DataLoader(
         pretrain_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=0
+        num_workers=num_workers,
+        pin_memory=pin_memory
     )
 
     num_batches_per_epoch = len(dataloader)
@@ -492,6 +496,12 @@ def main():
     parser.add_argument('--auto_device', action='store_true',
                        help='Auto-select best device without prompting')
 
+    # GPU optimization arguments
+    parser.add_argument('--num_workers', type=int, default=None,
+                       help='Number of data loading workers (default: auto-detect based on device)')
+    parser.add_argument('--pin_memory', type=lambda x: x.lower() == 'true', default=None,
+                       help='Pin memory for faster GPU transfers (default: auto-detect based on device)')
+
     # Interactive mode
     parser.add_argument('--interactive', action='store_true',
                        help='Enable interactive parameter selection mode')
@@ -578,6 +588,38 @@ def main():
     print(f"  Model size: {total_params * 4 / 1024**2:.2f} MB")
     print(f"  Current memory: {get_memory_usage():.1f} MB")
 
+    # GPU optimization: Auto-detect num_workers and pin_memory based on device
+    if args.num_workers is None:
+        # Auto-detect: Use 2 workers for CUDA, 0 for CPU/MPS
+        num_workers = 2 if device.type == 'cuda' else 0
+        workers_source = "auto-detected"
+    else:
+        num_workers = args.num_workers
+        workers_source = "user-specified"
+
+    if args.pin_memory is None:
+        # Auto-detect: Enable for CUDA, disable for CPU/MPS
+        pin_memory = (device.type == 'cuda')
+        pin_source = "auto-detected"
+    else:
+        pin_memory = args.pin_memory
+        pin_source = "user-specified"
+
+    # Display GPU optimization settings
+    if device.type == 'cuda':
+        print(f"\n  🚀 GPU optimizations enabled:")
+        print(f"     - num_workers: {num_workers} ({workers_source}, parallel data loading)")
+        print(f"     - pin_memory: {pin_memory} ({pin_source}, faster GPU transfers)")
+        if num_workers != 2 and workers_source == "user-specified":
+            print(f"     ⚠️  Note: Default for CUDA is 2 workers, you selected {num_workers}")
+        print(f"     💡 Tip: Use --batch_size 128 for maximum GPU performance!")
+    else:
+        print(f"\n  ℹ️  CPU/MPS mode:")
+        print(f"     - num_workers: {num_workers} ({workers_source})")
+        print(f"     - pin_memory: {pin_memory} ({pin_source})")
+        if num_workers > 0 and device.type == 'mps':
+            print(f"     ⚠️  Warning: num_workers>0 may cause issues on MPS, consider using 0")
+
     # 3. Self-supervised pretraining (optional)
     if args.pretrain_epochs > 0:
         self_supervised_pretrain_lazy(
@@ -586,7 +628,9 @@ def main():
             batch_size=args.batch_size,
             lr=args.lr,
             sequence_length=config.ML_SEQUENCE_LENGTH,
-            device=device
+            device=device,
+            num_workers=num_workers,
+            pin_memory=pin_memory
         )
 
     # 4. Supervised training
@@ -598,7 +642,9 @@ def main():
         validation_split=config.ML_VALIDATION_SPLIT,
         sequence_length=config.ML_SEQUENCE_LENGTH,
         target_horizon=config.PREDICTION_HORIZON_HOURS,
-        device=device
+        device=device,
+        num_workers=num_workers,
+        pin_memory=pin_memory
     )
 
     # 5. Save model

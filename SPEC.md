@@ -479,17 +479,18 @@ python3 train_model_lazy.py --interactive
 3. **Number-Based Menu** - Type parameter numbers to select (legacy)
 
 **Arrow-Key Navigation Features:**
-- Navigate all 21 parameters with ↑/↓ arrow keys
+- Navigate all 23 parameters with ↑/↓ arrow keys
 - Press Enter to edit the highlighted parameter
 - Visual pointer (`❯`) shows current selection
 - Modified parameters marked with `*`
-- Organized in 6 categories:
+- Organized in 7 categories:
   - 📁 **Data Files**: SPY/TSLA data paths, events file, macro API key
   - 📅 **Training Period**: Start/end years
   - 🧠 **Model Architecture**: Model type, hidden size, layers, sequence length
   - ⚙️ **Training Parameters**: Epochs, batch size, learning rate, validation split
   - 📊 **Feature Flags**: Channel, RSI, correlation, event features
   - 🖥️ **Compute Device**: CPU/CUDA/MPS with auto-detection
+  - 🚀 **GPU Optimization**: num_workers, pin_memory (auto-optimizes for GPU)
 
 **RAM-Aware Batch Size Suggestions:**
 ```
