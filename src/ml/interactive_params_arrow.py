@@ -56,6 +56,7 @@ class ArrowKeyParameterSelector:
         """Get default parameters from config."""
         return {
             # Data parameters
+            'input_timeframe': '1min',  # NEW: Timeframe for multi-scale training
             'spy_data': 'data/SPY_1min.csv',
             'tsla_data': 'data/TSLA_1min.csv',
             'tsla_events': 'data/tsla_events_REAL.csv',
@@ -214,6 +215,7 @@ class ArrowKeyParameterSelector:
         """Get categorized parameter catalog."""
         return {
             "📁 DATA FILES": [
+                ('input_timeframe', {'name': 'Input timeframe', 'type': 'timeframe'}),
                 ('spy_data', {'name': 'SPY data file', 'type': 'file'}),
                 ('tsla_data', {'name': 'TSLA data file', 'type': 'file'}),
                 ('tsla_events', {'name': 'TSLA events file', 'type': 'file'}),
@@ -292,6 +294,8 @@ class ArrowKeyParameterSelector:
         try:
             if param_type == 'boolean':
                 self._edit_boolean(param_key, param_name)
+            elif param_type == 'timeframe':
+                self._edit_timeframe(param_key, param_name)
             elif param_type == 'device':
                 self._edit_device(param_key, param_name)
             elif param_type == 'batch_size':
@@ -329,6 +333,37 @@ class ArrowKeyParameterSelector:
             self.params[param_key] = result
             self.modified_params.add(param_key)
             print(f"✓ {param_name} set to: {'Yes' if result else 'No'}")
+
+    def _edit_timeframe(self, param_key: str, param_name: str):
+        """Edit timeframe selection for multi-scale training."""
+        timeframes = ['1min', '5min', '15min', '30min', '1hour', '2hour', '3hour', '4hour', 'daily', 'weekly', 'monthly', '3month']
+
+        print("\nHint: Select which timeframe CSV to train on (multi-scale training)")
+        print("      Each timeframe model specializes in different temporal patterns")
+
+        choices = []
+        for tf in timeframes:
+            if tf == self.params.get('input_timeframe'):
+                choices.append(Choice(value=tf, name=f"{tf} (current)"))
+            else:
+                choices.append(Choice(value=tf, name=tf))
+
+        result = inquirer.select(
+            message="Select input timeframe:",
+            choices=choices,
+            default=self.params.get('input_timeframe', '1min'),
+        ).execute()
+
+        if result and result != self.params.get('input_timeframe'):
+            self.params['input_timeframe'] = result
+            self.modified_params.add('input_timeframe')
+
+            # Auto-update data file paths
+            self.params['spy_data'] = f'data/SPY_{result}.csv'
+            self.params['tsla_data'] = f'data/TSLA_{result}.csv'
+
+            print(f"✓ Timeframe set to: {result}")
+            print(f"  Auto-updated data paths for {result} CSVs")
 
     def _edit_device(self, param_key: str, param_name: str):
         """Edit device selection."""
@@ -455,7 +490,7 @@ class ArrowKeyParameterSelector:
         ranges = {
             'hidden_size': (32, 1024, "Complexity: 64=simple, 512=complex patterns"),
             'num_layers': (1, 10, "Network depth"),
-            'sequence_length': (20, 500, "Minutes of history per prediction"),
+            'sequence_length': (20, 5000, "Bars of history per prediction (depends on timeframe)"),
             'epochs': (1, 1000, "Full passes through data"),
             'pretrain_epochs': (0, 100, "Self-supervised pretraining epochs"),
             'prediction_horizon_hours': (1, 168, "Hours ahead to predict"),

@@ -47,7 +47,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             ])
 
         # Channel features (multi-timeframe for TSLA)
-        for tf in ['1h', '4h', 'daily']:
+        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             features.extend([
                 f'channel_{tf}_position',  # 0-1 position in channel
                 f'channel_{tf}_upper_dist',  # Distance to upper
@@ -59,7 +59,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             ])
 
         # RSI features (multi-timeframe for TSLA)
-        for tf in ['1h', '4h', 'daily']:
+        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             features.extend([
                 f'rsi_{tf}',
                 f'rsi_{tf}_oversold',  # Binary
@@ -164,9 +164,17 @@ class TradingFeatureExtractor(FeatureExtractor):
         """
         # Resample to different timeframes
         timeframes = {
+            '5min': '5T',
+            '15min': '15T',
+            '30min': '30T',
             '1h': '1h',
+            '2h': '2h',
+            '3h': '3h',
             '4h': '4h',
-            'daily': '1D'
+            'daily': '1D',
+            'weekly': '1W',
+            'monthly': '1M',
+            '3month': '3M'
         }
 
         for tf_name, tf_rule in timeframes.items():
@@ -217,9 +225,17 @@ class TradingFeatureExtractor(FeatureExtractor):
         Uses existing RSICalculator from Stage 1
         """
         timeframes = {
+            '5min': '5T',
+            '15min': '15T',
+            '30min': '30T',
             '1h': '1h',
+            '2h': '2h',
+            '3h': '3h',
             '4h': '4h',
-            'daily': '1D'
+            'daily': '1D',
+            'weekly': '1W',
+            'monthly': '1M',
+            '3month': '3M'
         }
 
         for tf_name, tf_rule in timeframes.items():

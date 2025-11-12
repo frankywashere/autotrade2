@@ -469,8 +469,13 @@ def main():
     parser = argparse.ArgumentParser(description='Memory-efficient ML training with lazy loading')
 
     # Data arguments
-    parser.add_argument('--spy_data', type=str, default='data/SPY_1min.csv')
-    parser.add_argument('--tsla_data', type=str, default='data/TSLA_1min.csv')
+    parser.add_argument('--input_timeframe', type=str, default='1min',
+                       choices=['1min', '5min', '15min', '30min', '1hour', '2hour', '3hour', '4hour', 'daily', 'weekly', 'monthly', '3month'],
+                       help='Timeframe for input data (default: 1min)')
+    parser.add_argument('--spy_data', type=str, default=None,
+                       help='SPY data file (default: data/SPY_{timeframe}.csv)')
+    parser.add_argument('--tsla_data', type=str, default=None,
+                       help='TSLA data file (default: data/TSLA_{timeframe}.csv)')
     parser.add_argument('--tsla_events', type=str, default='data/tsla_events_REAL.csv')
     parser.add_argument('--macro_api_key', type=str, default=None)
 
@@ -481,6 +486,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=config.ML_BATCH_SIZE)
     parser.add_argument('--lr', type=float, default=config.LNN_LEARNING_RATE)
     parser.add_argument('--pretrain_epochs', type=int, default=10)
+    parser.add_argument('--sequence_length', type=int, default=config.ML_SEQUENCE_LENGTH,
+                       help='Number of bars to look back (default: 200, uniform across all timeframes)')
 
     # Model arguments
     parser.add_argument('--model_type', type=str, default=config.ML_MODEL_TYPE)
@@ -508,6 +515,12 @@ def main():
 
     args = parser.parse_args()
 
+    # Set default data paths based on timeframe if not explicitly provided
+    if args.spy_data is None:
+        args.spy_data = f'data/SPY_{args.input_timeframe}.csv'
+    if args.tsla_data is None:
+        args.tsla_data = f'data/TSLA_{args.input_timeframe}.csv'
+
     # Interactive mode
     if args.interactive:
         print("\n" + "=" * 70)
@@ -524,6 +537,8 @@ def main():
     print("=" * 70)
     print(f"📅 Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"🤖 Model: {args.model_type}")
+    print(f"⏱️  Input Timeframe: {args.input_timeframe}")  # NEW: Show timeframe
+    print(f"📏 Sequence Length: {args.sequence_length} bars")  # NEW: Show sequence length
     print(f"📊 Training period: {args.start_year}-{args.end_year}")
     print(f"🔄 Epochs: {args.epochs} supervised + {args.pretrain_epochs} pretrain")
     print(f"💾 Output: {args.output}")
@@ -627,7 +642,7 @@ def main():
             epochs=args.pretrain_epochs,
             batch_size=args.batch_size,
             lr=args.lr,
-            sequence_length=config.ML_SEQUENCE_LENGTH,
+            sequence_length=args.sequence_length,
             device=device,
             num_workers=num_workers,
             pin_memory=pin_memory
@@ -640,7 +655,7 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         validation_split=config.ML_VALIDATION_SPLIT,
-        sequence_length=config.ML_SEQUENCE_LENGTH,
+        sequence_length=args.sequence_length,
         target_horizon=config.PREDICTION_HORIZON_HOURS,
         device=device,
         num_workers=num_workers,
@@ -656,6 +671,8 @@ def main():
         'model_type': args.model_type,
         'input_size': input_size,
         'hidden_size': args.hidden_size,
+        'input_timeframe': args.input_timeframe,  # NEW: Track which timeframe this model was trained on
+        'sequence_length': args.sequence_length,  # NEW: Track sequence length
         'train_start_year': args.start_year,
         'train_end_year': args.end_year,
         'epochs': args.epochs,

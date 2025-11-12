@@ -38,6 +38,11 @@ class Prediction(Base):
     symbol = Column(String(10), nullable=False, index=True)
     timeframe = Column(String(10), nullable=False, index=True)
 
+    # Multi-scale ensemble fields
+    model_timeframe = Column(String(20), nullable=True, index=True)  # e.g., '15min', '1hour', 'ensemble'
+    is_ensemble = Column(Boolean, default=False, index=True)
+    news_enabled = Column(Boolean, default=False)
+
     # Predictions
     predicted_high = Column(Float, nullable=False)
     predicted_low = Column(Float, nullable=False)
@@ -66,6 +71,20 @@ class Prediction(Base):
     has_earnings = Column(Boolean, default=False)
     has_macro_event = Column(Boolean, default=False)
     event_type = Column(String(50), nullable=True)
+
+    # Sub-model predictions (for ensemble analysis)
+    sub_pred_15min_high = Column(Float, nullable=True)
+    sub_pred_15min_low = Column(Float, nullable=True)
+    sub_pred_15min_conf = Column(Float, nullable=True)
+    sub_pred_1hour_high = Column(Float, nullable=True)
+    sub_pred_1hour_low = Column(Float, nullable=True)
+    sub_pred_1hour_conf = Column(Float, nullable=True)
+    sub_pred_4hour_high = Column(Float, nullable=True)
+    sub_pred_4hour_low = Column(Float, nullable=True)
+    sub_pred_4hour_conf = Column(Float, nullable=True)
+    sub_pred_daily_high = Column(Float, nullable=True)
+    sub_pred_daily_low = Column(Float, nullable=True)
+    sub_pred_daily_conf = Column(Float, nullable=True)
 
     # Model metadata
     model_version = Column(String(50), nullable=True)

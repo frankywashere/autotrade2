@@ -90,6 +90,7 @@ class InteractiveParameterSelector:
         """Get default parameters from config and standard defaults."""
         return {
             # Data parameters
+            'input_timeframe': '1min',  # NEW: Timeframe for training
             'spy_data': 'data/SPY_1min.csv',
             'tsla_data': 'data/TSLA_1min.csv',
             'tsla_events': 'data/tsla_events_REAL.csv',
@@ -352,14 +353,20 @@ class InteractiveParameterSelector:
         """Get categorized parameter catalog."""
         return {
             "📁 DATA FILES": [
+                ('input_timeframe', {
+                    'name': 'Input timeframe',
+                    'type': 'choice',
+                    'hint': 'Timeframe for multi-scale training',
+                    'default': '1min'
+                }),
                 ('spy_data', {
                     'name': 'SPY data file',
-                    'hint': 'Historical SPY 1-minute data',
+                    'hint': 'Historical SPY data (auto-set by timeframe)',
                     'default': 'data/SPY_1min.csv'
                 }),
                 ('tsla_data', {
                     'name': 'TSLA data file',
-                    'hint': 'Historical TSLA 1-minute data',
+                    'hint': 'Historical TSLA data (auto-set by timeframe)',
                     'default': 'data/TSLA_1min.csv'
                 }),
                 ('tsla_events', {
@@ -528,7 +535,42 @@ class InteractiveParameterSelector:
             print(f"Hint: {info['hint']}")
 
         # Special handling for different parameter types
-        if param_key == 'macro_api_key':
+        if param_key == 'input_timeframe':
+            # Timeframe selection (new for multi-scale)
+            timeframes = ['1min', '5min', '15min', '30min', '1hour', '2hour', '3hour', '4hour', 'daily', 'weekly', 'monthly', '3month']
+            print("\nAvailable timeframes:")
+            for i, tf in enumerate(timeframes, 1):
+                current = " (current)" if tf == self.params.get('input_timeframe') else ""
+                print(f"  {i}. {tf}{current}")
+
+            value = input(f"Enter timeframe number [1-{len(timeframes)}] or name: ").strip()
+
+            # Handle numeric or name input
+            if value.isdigit():
+                idx = int(value) - 1
+                if 0 <= idx < len(timeframes):
+                    selected_tf = timeframes[idx]
+                else:
+                    print("Invalid selection. Keeping current value.")
+                    return
+            elif value in timeframes:
+                selected_tf = value
+            else:
+                print("Invalid selection. Keeping current value.")
+                return
+
+            # Update timeframe
+            self.params['input_timeframe'] = selected_tf
+            self.modified_params.add('input_timeframe')
+
+            # Auto-update data file paths
+            self.params['spy_data'] = f'data/SPY_{selected_tf}.csv'
+            self.params['tsla_data'] = f'data/TSLA_{selected_tf}.csv'
+            print(f"✓ Timeframe set to: {selected_tf}")
+            print(f"  Auto-updated: spy_data = {self.params['spy_data']}")
+            print(f"  Auto-updated: tsla_data = {self.params['tsla_data']}")
+
+        elif param_key == 'macro_api_key':
             print("\nNote: Local macro economic data is available in data/ directory.")
             print("You can use the local data without an API key.")
             value = input("Enter API key (or press Enter to skip): ").strip()
@@ -1213,6 +1255,7 @@ def create_argparse_from_params(params: Dict[str, Any], args: argparse.Namespace
     """
     # Map interactive params to argparse attributes
     mapping = {
+        'input_timeframe': 'input_timeframe',  # Multi-scale training parameter
         'spy_data': 'spy_data',
         'tsla_data': 'tsla_data',
         'tsla_events': 'tsla_events',
@@ -1221,6 +1264,7 @@ def create_argparse_from_params(params: Dict[str, Any], args: argparse.Namespace
         'end_year': 'end_year',
         'model_type': 'model_type',
         'hidden_size': 'hidden_size',
+        'sequence_length': 'sequence_length',  # Multi-scale parameter
         'epochs': 'epochs',
         'pretrain_epochs': 'pretrain_epochs',
         'batch_size': 'batch_size',

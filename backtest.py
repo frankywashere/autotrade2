@@ -81,7 +81,7 @@ def select_random_dates(test_year, num_simulations, seed=None):
     return selected_dates
 
 
-def run_simulation(date, model, feature_extractor, data_feed, events_handler, db):
+def run_simulation(date, model, feature_extractor, data_feed, events_handler, db, ensemble=None, mode='backtest_no_news'):
     """
     Run a single backtest simulation for a specific date
     Returns: (prediction_dict, actual_dict, error_dict)
@@ -116,13 +116,29 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
                        for e in events)
 
         # 4. Make prediction
-        predictions = model.predict(sequence_tensor)
+        if ensemble is not None:
+            # Ensemble mode: Use multi-scale ensemble
+            # TODO: For now, use simplified approach - full ensemble integration
+            # requires loading data at multiple timeframes
+            # For backtest purposes, we'll use single model approach until
+            # ensemble data pipeline is complete
+            print("   ⚠ Ensemble mode not yet integrated with backtest pipeline")
+            print("   Use single-model mode for now: python backtest.py --model_path models/lnn_15min.pth")
+            return None
+        else:
+            # Single model prediction
+            predictions = model.predict(sequence_tensor)
 
-        pred_high = predictions['predicted_high'][0]
-        pred_low = predictions['predicted_low'][0]
-        pred_center = predictions['predicted_center'][0]
-        pred_range = predictions['predicted_range'][0]
-        confidence = predictions['confidence'][0]
+            pred_high = predictions['predicted_high'][0]
+            pred_low = predictions['predicted_low'][0]
+            pred_center = predictions['predicted_center'][0]
+            pred_range = predictions['predicted_range'][0]
+            confidence = predictions['confidence'][0]
+
+            # Add model metadata to predictions dict
+            predictions['is_ensemble'] = False
+            predictions['news_enabled'] = False
+            predictions['model_timeframe'] = 'single'
 
         # 5. Get actuals (load next 24 hours after date)
         target_start = date
@@ -162,8 +178,19 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
             'has_macro_event': has_macro,
             'event_type': events[0].get('event_type') if events else None,
             'model_version': 'backtest_v1',
-            'feature_dim': feature_extractor.get_feature_dim()
+            'feature_dim': feature_extractor.get_feature_dim(),
+            # Multi-scale ensemble fields (populated if ensemble mode)
+            'model_timeframe': prediction.get('model_timeframe', 'single'),
+            'is_ensemble': prediction.get('is_ensemble', False),
+            'news_enabled': prediction.get('news_enabled', False),
         }
+
+        # Add sub-predictions if ensemble
+        if prediction.get('sub_predictions'):
+            for tf, sub_pred in prediction['sub_predictions'].items():
+                prediction_record[f'sub_pred_{tf}_high'] = float(sub_pred['predicted_high'])
+                prediction_record[f'sub_pred_{tf}_low'] = float(sub_pred['predicted_low'])
+                prediction_record[f'sub_pred_{tf}_conf'] = float(sub_pred['confidence'])
 
         pred_id = db.log_prediction(prediction_record)
         db.update_actual(pred_id, float(actual_high), float(actual_low))
@@ -190,8 +217,13 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
 def main():
     parser = argparse.ArgumentParser(description='Backtest Stage 2 ML model')
 
-    parser.add_argument('--model_path', type=str, required=True,
-                       help='Path to trained model checkpoint')
+    parser.add_argument('--model_path', type=str, default=None,
+                       help='Path to trained model checkpoint (for single-model mode)')
+    parser.add_argument('--ensemble', action='store_true',
+                       help='Use multi-scale ensemble mode')
+    parser.add_argument('--mode', type=str, default='backtest_no_news',
+                       choices=['backtest_no_news', 'live_with_news'],
+                       help='Prediction mode (default: backtest_no_news)')
     parser.add_argument('--test_year', type=int, default=config.ML_TEST_YEAR,
                        help='Year to backtest on (default: 2024)')
     parser.add_argument('--num_simulations', type=int, default=config.BACKTEST_NUM_SIMULATIONS,
@@ -203,17 +235,40 @@ def main():
 
     args = parser.parse_args()
 
+    # Validate arguments
+    if not args.ensemble and args.model_path is None:
+        parser.error("--model_path required when not using --ensemble mode")
+
     print("\n" + "=" * 70)
     print("STAGE 2: MODEL BACKTESTING")
     print("=" * 70)
     print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Model: {args.model_path}")
+    print(f"Mode: {'ENSEMBLE' if args.ensemble else 'SINGLE MODEL'}")
+    if not args.ensemble:
+        print(f"Model: {args.model_path}")
     print(f"Test year: {args.test_year}")
     print(f"Simulations: {args.num_simulations}")
+    print(f"News mode: {args.mode}")
     print("=" * 70)
 
-    # 1. Load model
-    model, metadata = load_model(args.model_path)
+    # 1. Load model(s)
+    if args.ensemble:
+        # Load ensemble system
+        from src.ml.ensemble import load_ensemble
+
+        print("\nLoading multi-scale ensemble...")
+        ensemble = load_ensemble(
+            mode=args.mode,
+            device='cpu',  # Can be made configurable
+            models_dir='models',
+            events_csv='data/tsla_events_REAL.csv'
+        )
+        model = None
+        metadata = {'model_type': 'ensemble', 'mode': args.mode}
+    else:
+        # Load single model
+        model, metadata = load_model(args.model_path)
+        ensemble = None
 
     # 2. Initialize components
     print("\nInitializing components...")
@@ -236,7 +291,8 @@ def main():
     for i, date in enumerate(test_dates, 1):
         print(f"\n[{i}/{len(test_dates)}] Simulating {date.strftime('%Y-%m-%d')}...")
 
-        result = run_simulation(date, model, feature_extractor, data_feed, events_handler, db)
+        result = run_simulation(date, model, feature_extractor, data_feed, events_handler, db,
+                               ensemble=ensemble, mode=args.mode)
 
         if result:
             results.append(result)

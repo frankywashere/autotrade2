@@ -1,6 +1,6 @@
 # AutoTrade2 - Complete Technical Specification
 
-**Version:** 2.1 (Interactive Parameter Selection + GPU/Metal Support)
+**Version:** 3.0 (Multi-Scale LNN + Meta-LNN Coach)
 **Repository:** https://github.com/frankywashere/autotrade2
 **Last Updated:** November 11, 2025
 
@@ -12,14 +12,16 @@
 2. [Quick Start](#quick-start)
 3. [File Structure](#file-structure)
 4. [Stage 1: Linear Regression Trading System](#stage-1-linear-regression-trading-system)
-5. [Stage 2: ML-Powered Predictions](#stage-2-ml-powered-predictions)
-6. [Training Workflow](#training-workflow)
-7. [Data Validation](#data-validation)
-8. [Memory Optimization](#memory-optimization)
-9. [Performance & Limitations](#performance--limitations)
-10. [API Integration](#api-integration)
-11. [Future Improvements](#future-improvements)
-12. [Quick Reference](#quick-reference)
+5. [Stage 2: Multi-Scale LNN System](#stage-2-multi-scale-lnn-system)
+6. [Multi-Scale Architecture](#multi-scale-architecture)
+7. [Meta-LNN Coach](#meta-lnn-coach)
+8. [News Infrastructure](#news-infrastructure)
+9. [Training Workflow](#training-workflow)
+10. [Data Validation](#data-validation)
+11. [Memory Optimization & GPU](#memory-optimization--gpu)
+12. [Performance & Limitations](#performance--limitations)
+13. [API Integration](#api-integration)
+14. [Quick Reference](#quick-reference)
 
 ---
 
@@ -34,13 +36,14 @@ AutoTrade2 is a two-stage AI-powered stock trading analysis system:
 - **Automated Telegram alerts** for high-confidence signals
 - **Interactive Streamlit dashboard** with monitoring
 
-### Stage 2: ML-Powered Predictions
-- **Liquid Neural Networks (LNN)** for 24-hour forecasting
-- **56-feature extraction system** (channels, RSI, correlations, cycles)
-- **Real event integration** (TSLA earnings + macro events)
-- **Memory-efficient training** with lazy sequence loading
-- **Online learning** from prediction errors
-- **Production-ready** with SQLite logging
+### Stage 2: Multi-Scale LNN System
+- **Multi-scale architecture**: 4 specialized LNN models (15min, 1hour, 4hour, daily)
+- **Meta-LNN coach**: Adaptive combination based on market regime + news
+- **135-feature extraction**: 11 timeframes × (7 channel + 3 RSI) + 25 base features
+- **Real event integration**: TSLA earnings + macro events embedded in all models
+- **Memory-efficient**: Lazy loading, ~2GB per model
+- **News-ready**: LFM2-based headline encoding (optional)
+- **Production-ready**: Ensemble prediction with SQLite logging
 
 ### Key Innovation: Intelligent Channel Selection
 System evaluates ALL timeframes (1h, 2h, 3h, 4h, daily, weekly) and automatically selects the channel with:
@@ -58,42 +61,41 @@ System evaluates ALL timeframes (1h, 2h, 3h, 4h, daily, weekly) and automaticall
 
 ## Quick Start
 
+**For detailed step-by-step commands, see [QUICKSTART.md](QUICKSTART.md)**
+
 ### Stage 1 (Dashboard & Alerts)
 ```bash
-# Install dependencies
+pip install -r requirements.txt
+python3 convert_data.py  # One-time data conversion
+python main.py dashboard  # Launch Streamlit dashboard
+```
+
+### Stage 2 (Multi-Scale LNN Training)
+```bash
+# Install all dependencies
 pip install -r requirements.txt
 
-# Convert raw data (one-time)
-python3 convert_data.py
+# Generate multi-scale CSVs (one-time)
+python scripts/create_multiscale_csvs.py
 
-# Launch dashboard
-python main.py dashboard
+# Train 4 specialized LNN models
+python train_model_lazy.py --input_timeframe 15min --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_15min.pth
+python train_model_lazy.py --input_timeframe 1hour --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_1hour.pth
+python train_model_lazy.py --input_timeframe 4hour --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_4hour.pth
+python train_model_lazy.py --input_timeframe daily --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_daily.pth
 
-# Or use quick menu
-./run.sh
+# Collect predictions
+python backtest.py --model_path models/lnn_15min.pth --test_year 2023 --num_simulations 500
+# (Repeat for other models...)
+
+# Train Meta-LNN coach
+python train_meta_lnn.py --mode backtest_no_news --epochs 100 --output models/meta_lnn.pth
+
+# Validate on 2024 holdout
+python backtest.py --model_path models/lnn_15min.pth --test_year 2024
 ```
 
-### Stage 2 (ML Training)
-```bash
-# Install ML dependencies
-pip install torch ncps sqlalchemy tqdm psutil inquirerpy
-
-# Validate data (MANDATORY!)
-python3 validate_data_alignment.py --events_data data/tsla_events_REAL.csv
-
-# Train model - Interactive mode (RECOMMENDED)
-python3 train_model_lazy.py --interactive
-
-# Or train with command-line args
-python3 train_model_lazy.py \
-  --tsla_events data/tsla_events_REAL.csv \
-  --epochs 50 \
-  --pretrain_epochs 10 \
-  --output models/lnn_full.pth
-
-# Backtest
-python3 backtest.py --model_path models/lnn_full.pth --test_year 2024
-```
+**See [QUICKSTART.md](QUICKSTART.md) for complete command list.**
 
 ---
 
@@ -272,9 +274,35 @@ python main.py test
 
 ---
 
-## Stage 2: ML-Powered Predictions
+## Stage 2: Multi-Scale LNN System
 
-### Architecture
+### Architecture Overview
+
+**Multi-Scale Approach:**
+Stage 2 uses an ensemble of 4 specialized Liquid Neural Networks, each trained on a different timeframe, combined by a Meta-LNN "coach" that learns adaptive weighting based on market conditions.
+
+```
+TSLA_1min.csv + SPY_1min.csv (1.35M bars)
+    ↓
+Resample to multiple timeframes
+    ├─ TSLA_15min.csv, SPY_15min.csv
+    ├─ TSLA_1hour.csv, SPY_1hour.csv
+    ├─ TSLA_4hour.csv, SPY_4hour.csv
+    └─ TSLA_daily.csv, SPY_daily.csv
+    ↓
+Train 4 Specialized LNN Models (in parallel)
+    ├─ LNN_15min → Learns 2-day intraday patterns
+    ├─ LNN_1hour → Learns 8-day weekly patterns
+    ├─ LNN_4hour → Learns 33-day swing patterns
+    └─ LNN_daily → Learns 9-month seasonal patterns
+    ↓
+Each outputs: [predicted_high, predicted_low, confidence]
+    ↓
+Meta-LNN Coach
+    ├─ Inputs: 4 predictions + 12 market-state features + 768 news embedding
+    ├─ Learns: "Trust 15min during volatility, daily during trends"
+    └─ Outputs: [final_high, final_low, final_confidence]
+```
 
 **Modular Design via Abstract Interfaces (`src/ml/base.py`):**
 - `DataFeed` - Swappable data sources (CSV, IBKR, etc.)
@@ -301,34 +329,50 @@ aligned_df = feed.load_aligned_data('2015-01-01', '2023-12-31')
 
 #### 2. Feature Extraction (`src/ml/features.py`)
 
-**TradingFeatureExtractor** - Extracts 56 features:
+**TradingFeatureExtractor** - Extracts 135 features across 11 timeframes:
 
 | Category | Count | Features |
 |----------|-------|----------|
 | **Price** | 10 | SPY/TSLA: close, returns, log_returns, volatility_10, volatility_50 |
-| **Channels** | 21 | 3 timeframes (1h/4h/daily): position, upper_dist, lower_dist, slope, stability, ping_pongs, r_squared |
-| **RSI** | 9 | 3 timeframes: value, oversold, overbought |
+| **Channels** | 77 | **11 timeframes** (5min/15min/30min/1h/2h/3h/4h/daily/weekly/monthly/3month): position, upper_dist, lower_dist, slope, stability, ping_pongs, r_squared |
+| **RSI** | 33 | **11 timeframes**: value, oversold, overbought |
 | **Correlations** | 5 | correlation_10/50/200, divergence, divergence_magnitude |
 | **Cycles** | 4 | distance_from_52w_high/low, within_mega_channel, mega_channel_position |
 | **Volume** | 2 | tsla_volume_ratio, spy_volume_ratio |
 | **Time** | 4 | hour_of_day, day_of_week, day_of_month, month_of_year (cyclical) |
+| **Total** | **135** | Multi-scale temporal context at every bar |
+
+**11 Timeframes for Channels & RSI:**
+```
+5min, 15min, 30min,        ← Intraday patterns
+1h, 2h, 3h, 4h,            ← Hourly swing patterns
+daily, weekly,              ← Daily/weekly trends
+monthly, 3month             ← Long-term cycles
+```
 
 **Key Methods:**
 ```python
 extractor = TradingFeatureExtractor()
 
 # Extract features from aligned data
-features_df = extractor.extract_features(aligned_df)  # Returns (N, 56)
+features_df = extractor.extract_features(aligned_df)  # Returns (N, 135)
 
-# Create sequences for training
-X, y = extractor.create_sequences(features_df, sequence_length=84, target_horizon=24)
-# X: (num_sequences, 84, 56) - 84 timesteps of 56 features
-# y: (num_sequences, 2) - [predicted_high, predicted_low] for next 24 hours
+# Create sequences for training (lazy loading)
+dataset = LazyTradingDataset(features_df, sequence_length=200, target_horizon=24)
+# Sequences created on-demand: (200, 135) per sample
+# Targets: [predicted_high, predicted_low] for next 24 hours
 ```
 
+**Multi-Scale Feature Calculation:**
+- Resamples 1-minute data to each timeframe on-the-fly
+- Calculates linear regression channel per timeframe
+- Calculates RSI per timeframe
+- Broadcasts features back to all 1-minute bars
+- Each bar contains context from ALL timeframes simultaneously
+
 **Leverages Stage 1:**
-- Uses `LinearRegressionChannel` for channel features
-- Uses `RSICalculator` for RSI features
+- Uses `LinearRegressionChannel` for all 11 timeframe channels
+- Uses `RSICalculator` for all 11 timeframe RSI values
 - Pure integration, no duplication
 
 #### 3. Event Integration (`src/ml/events.py`)
@@ -350,33 +394,50 @@ embedding = handler.embed_events(events)  # Returns (1, 21)
 # 21 dimensions: TSLA one-hot (4) + days_until + beat/miss + macro one-hot (10) + days
 ```
 
-#### 4. Model (`src/ml/model.py`)
+#### 4. Sub-Models (`src/ml/model.py`)
 
-**LNNTradingModel** - Liquid Neural Network:
+**LNNTradingModel** - Liquid Neural Network (used for each timeframe):
 ```
-Input (56 features, 84 timesteps)
+Input (135 features, 200 timesteps)  ← Multi-scale features, uniform sequence length
   ↓
 CfC Layer (Liquid Time-Constant, 128 hidden units)
   - Sparse wiring via AutoNCP
   - Continuous-time dynamics
+  - Emphasizes recent bars, integrates historical context
   ↓
 Output Layer (2 units: high, low)
 Confidence Head (1 unit: confidence score)
 ```
 
+**4 Specialized Models (Each is an LNN):**
+- **LNN_15min**: Trained on 15-minute data (200 bars = 50 hours)
+- **LNN_1hour**: Trained on 1-hour data (200 bars = 8 days)
+- **LNN_4hour**: Trained on 4-hour data (200 bars = 33 days)
+- **LNN_daily**: Trained on daily data (200 bars = 9 months)
+
+**Each sub-model:**
+- Input size: 135 features (all 11 timeframes for multi-scale context)
+- Hidden size: 128 units
+- Sequence length: 200 bars (uniform across all models)
+- Outputs: [predicted_high, predicted_low, confidence]
+
 **Features:**
 - **ncps library** - Closed-form Continuous-time (CfC) RNN
 - **Sparse connections** - AutoNCP wiring for interpretability
 - **Self-supervised pretraining** - 15% masking ratio
-- **Online learning** - `update_online()` method
-- **Checkpoint system** - Save/load with metadata
+- **Event integration** - TSLA earnings + macro events embedded
+- **Checkpoint system** - Save/load with timeframe metadata
 
 **Usage:**
 ```python
-model = LNNTradingModel(input_size=56, hidden_size=128)
+# Each sub-model trains independently
+model_15min = LNNTradingModel(input_size=135, hidden_size=128)
+model_1hour = LNNTradingModel(input_size=135, hidden_size=128)
+# etc.
 
-# Predict
-predictions = model.predict(X)
+# Each predicts independently
+pred_15min = model_15min.predict(X_15min)
+pred_1hour = model_1hour.predict(X_1hour)
 # Returns: {
 #   'predicted_high': array([250.5]),
 #   'predicted_low': array([245.2]),
@@ -462,11 +523,263 @@ metrics = db.get_accuracy_metrics()
 
 ---
 
+## Multi-Scale Architecture
+
+### Why Multi-Scale?
+
+**Problem with single-model approach:**
+- To see monthly patterns on 1-min data: need sequence_length=50,000+ bars
+- Memory explosion: 50,000 × 135 features × 4 bytes × batch_size = ~3.4GB per batch
+- Training impractical on consumer hardware
+
+**Multi-scale solution:**
+- Train separate models on different timeframe CSVs
+- Each model: sequence_length=200 bars (uniform, manageable)
+- Each specializes in its temporal scale
+- Combine predictions via Meta-LNN coach
+
+### Temporal Coverage
+
+| Model | Input Data | Sequence | Time Span | Specialization |
+|-------|------------|----------|-----------|----------------|
+| LNN_15min | TSLA_15min.csv | 200 bars | 50 hours (2 days) | Intraday volatility, gaps, reversals |
+| LNN_1hour | TSLA_1hour.csv | 200 bars | 200 hours (8 days) | Weekly cycles, earnings momentum |
+| LNN_4hour | TSLA_4hour.csv | 200 bars | 800 hours (33 days) | Swing patterns, multi-week trends |
+| LNN_daily | TSLA_daily.csv | 200 bars | 200 days (9 months) | Seasonal effects, market cycles |
+
+### Multi-Scale Features
+
+**Key Insight:** All models receive 135 features per bar, calculated across 11 timeframes.
+
+Even the 15min model sees:
+```python
+Bar at 2024-01-15 10:30:
+  - channel_5min_position: 0.65     ← Where in 5-min channel
+  - channel_15min_position: 0.73    ← Where in 15-min channel (native)
+  - channel_1h_position: 0.81       ← Where in 1-hour channel
+  - channel_4h_position: 0.45       ← Where in 4-hour channel
+  - channel_daily_position: 0.82    ← Where in daily channel
+  - channel_weekly_position: 0.58   ← Where in weekly channel
+  - channel_monthly_position: 0.71  ← Where in monthly channel
+  ... (135 features total with ALL timeframe context)
+```
+
+**This provides cross-timeframe context:**
+- 15min model learns: "When daily channel oversold + 1h channel breaking up → bounce likely"
+- 4hour model learns: "When weekly trend down but daily RSI extreme → short-term reversal"
+
+### Memory Efficiency
+
+| Approach | Sequence | Features | Memory per Model | Total Memory |
+|----------|----------|----------|------------------|--------------|
+| Single model (long seq) | 50,000 | 135 | ~25GB | ~25GB |
+| **Multi-scale (4 models)** | **200** | **135** | **~2GB** | **~8GB** |
+
+**Savings: 3x less memory, can train on consumer GPUs**
+
+---
+
+## Meta-LNN Coach
+
+### Purpose
+
+The Meta-LNN "coach" learns to adaptively combine predictions from the 4 sub-models based on:
+- Current market regime (volatility, jumps, events)
+- Time of day / week (market microstructure)
+- Optionally: News sentiment (LFM2-encoded headlines)
+
+### Architecture (`src/ml/meta_models.py`)
+
+```
+Inputs:
+  ├─ Sub-predictions: [4 models × 3 values] = 12 features
+  │    ├─ 15min: [high, low, confidence]
+  │    ├─ 1hour: [high, low, confidence]
+  │    ├─ 4hour: [high, low, confidence]
+  │    └─ daily: [high, low, confidence]
+  │
+  ├─ Market state: 12 features
+  │    ├─ Realized volatility (5m, 30m, 1d)
+  │    ├─ Overnight return absolute
+  │    ├─ Intraday jump flag (|ret| > 3σ)
+  │    ├─ Volatility z-score
+  │    ├─ Time of day (sin/cos)
+  │    ├─ Event proximity (earnings, macro)
+  │    ├─ SPY correlation regime
+  │    └─ VIX level
+  │
+  ├─ News embedding: 768 features (LFM2-350M, optional)
+  └─ News mask: 1 feature (news available flag)
+
+  Total input: 12 + 12 + 768 + 1 = 793 features
+    ↓
+Liquid Neural Network (64 hidden units)
+  ├─ CfC layer with AutoNCP wiring
+  ├─ Learns adaptive combination weights
+  └─ ~160K parameters (tiny!)
+    ↓
+Output heads:
+  ├─ fc_high: Predicted high
+  ├─ fc_low: Predicted low
+  └─ fc_conf: Final confidence
+```
+
+### Training
+
+**Data source:** `data/predictions.db` (collected from Step 3 backtests)
+
+**Training approach:**
+- Purged K-fold CV (5 folds, 7-day embargo)
+- Prevents temporal leakage
+- Huber loss for prices (robust to outliers)
+- MSE for confidence calibration
+
+**Two modes:**
+1. **backtest_no_news** (default): News disabled (zeros), pure numeric learning
+2. **live_with_news** (future): News enabled, requires LFM2
+
+### What Meta-LNN Learns
+
+Example learned behaviors:
+- "During high volatility (rv_5m > 0.02) → weight 15min higher (0.5 vs 0.15)"
+- "During trending markets (vol_zscore < -1) → weight daily higher (0.6 vs 0.2)"
+- "Around earnings (has_earnings_soon=1) → boost 1hour (captures momentum)"
+- "With news spike (news_mask=1) → dynamically adjust based on sentiment"
+
+**Not fixed rules - learned from data!**
+
+---
+
+## News Infrastructure
+
+### Overview
+
+Optional news integration using Liquid AI's LFM2 foundation model for headline encoding.
+
+**Two operational modes:**
+1. **backtest_no_news**: News disabled (for backtesting without news data)
+2. **live_with_news**: News enabled (for live trading with real-time headlines)
+
+### Components
+
+#### 1. News Fetching (`src/ml/fetch_news.py`)
+
+**Sources:**
+- Google News RSS (no API key required)
+- Finnhub API (optional, requires key)
+
+**Queries:**
+```python
+TSLA_QUERY = "Tesla OR TSLA OR Cybertruck OR Giga OR FSD OR Autopilot..."
+MARKET_QUERY = "FOMC OR Fed OR CPI OR NFP OR yields OR VIX OR S&P 500..."
+```
+
+**Filtering:**
+- Whitelist: Reuters, Bloomberg, WSJ, FT, CNBC, MarketWatch, etc.
+- Exclude: Reviews, coupons, rumors, promotional content
+
+**Storage:** `data/news.db` with leak-safe timestamps
+
+#### 2. News Encoding (`src/ml/news_encoder.py`)
+
+**NewsEncoder class:**
+- Uses LFM2-350M as frozen encoder (~1.5GB download)
+- Encodes top-10 headlines into 768-dim embedding
+- Mode-aware: Returns zeros in backtest mode
+
+```python
+encoder = NewsEncoder(mode='backtest_no_news')  # or 'live_with_news'
+news_vec, news_mask = encoder.encode_headlines(headlines, timestamp)
+# Returns: (768,) tensor and 0/1 mask
+```
+
+#### 3. Modality Dropout
+
+During Meta-LNN training:
+- 40% probability of zeroing out news_vec
+- Forces model to handle both with-news and no-news states
+- Prevents over-reliance on news signal
+- Robust to missing news in production
+
+### News Retrieval (Live Mode)
+
+```python
+# Fetch news for 2-hour window before prediction
+news_articles = get_news_window(
+    timestamp=current_time,
+    lookback_minutes=120,
+    query_types=['TSLA', 'MARKET']
+)
+
+# Returns top-k TSLA + top-k MARKET headlines (k=5 each)
+# Encoded by LFM2 → 768-dim embedding → Fed to Meta-LNN
+```
+
+### Future Enhancements
+
+- **FinBERT sentiment**: Add sentiment scores alongside LFM2 embeddings
+- **News gate**: Learn dynamic weighting of news vs. numeric features
+- **Multi-source ensemble**: Combine Google News, Finnhub, Twitter (if available)
+
+---
+
 ## Training Workflow
 
-### Step 0: Interactive Parameter Selection (NEW in v2.1)
+### Quick Training Guide
 
-Both training scripts now support an **interactive parameter selection system** with arrow-key navigation for easy configuration:
+For step-by-step commands, see **[QUICKSTART.md](QUICKSTART.md)** - Simple command guide without explanations.
+
+### Step 0: Generate Multi-Scale CSVs (One-Time)
+
+```bash
+python scripts/create_multiscale_csvs.py
+```
+
+Resamples 1-minute data to 11 timeframes. Output: ~22 CSV files, ~500MB.
+
+### Step 1: Train Sub-Models (4 Specialized LNNs)
+
+```bash
+# Train all 4 models (can run in parallel on GPU)
+python train_model_lazy.py --input_timeframe 15min --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_15min.pth
+python train_model_lazy.py --input_timeframe 1hour --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_1hour.pth
+python train_model_lazy.py --input_timeframe 4hour --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_4hour.pth
+python train_model_lazy.py --input_timeframe daily --sequence_length 200 --epochs 50 --batch_size 128 --device cuda --output models/lnn_daily.pth
+```
+
+**Time:** ~15-25 minutes per model on T4 GPU
+
+### Step 2: Collect Predictions (Backtest)
+
+```bash
+# Run backtests to populate predictions.db
+python backtest.py --model_path models/lnn_15min.pth --test_year 2023 --num_simulations 500
+python backtest.py --model_path models/lnn_1hour.pth --test_year 2023 --num_simulations 500
+python backtest.py --model_path models/lnn_4hour.pth --test_year 2023 --num_simulations 500
+python backtest.py --model_path models/lnn_daily.pth --test_year 2023 --num_simulations 500
+```
+
+**Time:** ~30-60 minutes total
+
+### Step 3: Train Meta-LNN Coach
+
+```bash
+python train_meta_lnn.py --mode backtest_no_news --epochs 100 --output models/meta_lnn.pth
+```
+
+**Time:** ~10-15 minutes
+
+### Step 4: Validate on Holdout (2024)
+
+```bash
+# Test individual models
+python backtest.py --model_path models/lnn_15min.pth --test_year 2024 --num_simulations 100
+# Compare accuracies to find best model/ensemble
+```
+
+### Interactive Parameter Selection (Optional)
+
+Both training scripts support an **interactive parameter selection system** with arrow-key navigation:
 
 ```bash
 # Launch interactive mode
