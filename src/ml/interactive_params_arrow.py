@@ -486,6 +486,7 @@ class ArrowKeyParameterSelector:
                 default=self.params.get('batch_size', 16),
                 validate=validate_batch_size,
                 invalid_message="Batch size must be between 8 and 8192",
+                keybindings={"up": [], "down": []},  # Disable arrow increment/decrement
             ).execute()
 
         if result and result != self.params.get('batch_size'):
@@ -522,6 +523,7 @@ class ArrowKeyParameterSelector:
             default=self.params.get(param_key, 2018),
             validate=validate_year,
             invalid_message=f"Year must be between {min_year} and {max_year}",
+            keybindings={"up": [], "down": []},  # Disable arrow increment/decrement
         ).execute()
 
         if result and result != self.params.get(param_key):
@@ -561,6 +563,7 @@ class ArrowKeyParameterSelector:
             default=self.params.get(param_key, min_val),
             validate=validate_number,
             invalid_message=f"Value must be between {min_val} and {max_val}",
+            keybindings={"up": [], "down": []},  # Disable arrow increment/decrement
         ).execute()
 
         if result and result != self.params.get(param_key):
