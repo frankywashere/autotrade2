@@ -479,17 +479,14 @@ class ArrowKeyParameterSelector:
                 except (ValueError, TypeError):
                     return False
 
-            result = inquirer.number(
+            result = inquirer.text(
                 message="Enter custom batch size (8-8192):",
-                min_allowed=8,
-                max_allowed=8192,
-                default=self.params.get('batch_size', 16),
+                default=str(self.params.get('batch_size', 16)),
                 validate=validate_batch_size,
                 invalid_message="Batch size must be between 8 and 8192",
-                keybindings={"up": [], "down": []},  # Disable arrow increment/decrement
             ).execute()
 
-        if result and result != self.params.get('batch_size'):
+        if result and int(result) != self.params.get('batch_size'):
             self.params['batch_size'] = int(result)
             self.modified_params.add('batch_size')
             print(f"✓ Batch size set to: {result}")
@@ -516,17 +513,14 @@ class ArrowKeyParameterSelector:
             except (ValueError, TypeError):
                 return False
 
-        result = inquirer.number(
+        result = inquirer.text(
             message=f"Enter {param_name.lower()} ({min_year}-{max_year}):",
-            min_allowed=min_year,
-            max_allowed=max_year,
-            default=self.params.get(param_key, 2018),
+            default=str(self.params.get(param_key, 2018)),
             validate=validate_year,
             invalid_message=f"Year must be between {min_year} and {max_year}",
-            keybindings={"up": [], "down": []},  # Disable arrow increment/decrement
         ).execute()
 
-        if result and result != self.params.get(param_key):
+        if result and int(result) != self.params.get(param_key):
             self.params[param_key] = int(result)
             self.modified_params.add(param_key)
             print(f"✓ {param_name} set to: {result}")
@@ -556,17 +550,14 @@ class ArrowKeyParameterSelector:
             except (ValueError, TypeError):
                 return False
 
-        result = inquirer.number(
+        result = inquirer.text(
             message=f"Enter {param_name.lower()} ({min_val}-{max_val}):",
-            min_allowed=min_val,
-            max_allowed=max_val,
-            default=self.params.get(param_key, min_val),
+            default=str(self.params.get(param_key, min_val)),
             validate=validate_number,
             invalid_message=f"Value must be between {min_val} and {max_val}",
-            keybindings={"up": [], "down": []},  # Disable arrow increment/decrement
         ).execute()
 
-        if result and result != self.params.get(param_key):
+        if result and int(result) != self.params.get(param_key):
             self.params[param_key] = int(result)
             self.modified_params.add(param_key)
             print(f"✓ {param_name} set to: {result}")
