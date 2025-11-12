@@ -539,7 +539,7 @@ class ArrowKeyParameterSelector:
             'epochs': (1, 1000, "Full passes through data"),
             'pretrain_epochs': (0, 100, "Self-supervised pretraining epochs"),
             'prediction_horizon_hours': (1, 168, "Hours ahead to predict"),
-            'num_workers': (0, 8, "CPU threads for data loading (0=main only, 2=recommended for GPU)"),
+            'num_workers': (0, 8, "CPU threads (0=main, 2=GPU rec., macOS: 0-4 or run 'ulimit -n 4096' for >4)"),
         }
 
         min_val, max_val, hint = ranges.get(param_key, (1, 1000, ""))
