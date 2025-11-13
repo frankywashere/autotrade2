@@ -1366,6 +1366,8 @@ def create_argparse_from_params(params: Dict[str, Any], args: argparse.Namespace
         'auto_device': 'auto_device',
         'num_workers': 'num_workers',  # GPU optimization parameter
         'pin_memory': 'pin_memory',  # GPU optimization parameter
+        'preload': 'preload',  # NEW: Data loading mode (preload vs lazy)
+        'gpu_monitor': 'gpu_monitor',  # NEW: GPU monitoring flag
     }
 
     # Update args with selected parameters
