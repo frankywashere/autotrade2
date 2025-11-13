@@ -361,14 +361,13 @@ class PreloadTradingDataset(Dataset):
 
             # Get event embedding if handler provided
             if self.events_handler is not None:
-                # Get timestamp for event embedding
-                timestamp = self.timestamps[seq_end - 1]
-                embedding = self.events_handler.get_embedding_for_timestamp(
-                    timestamp,
-                    lookback_hours=self.sequence_length,
-                    horizon_hours=self.target_horizon
+                seq_timestamp = self.timestamps[seq_end]
+                events = self.events_handler.get_events_for_date(
+                    str(seq_timestamp.date()),
+                    lookback_days=config.EVENT_LOOKBACK_DAYS
                 )
-                self.event_embeddings.append(torch.tensor(embedding, dtype=torch.float32))
+                event_embed = self.events_handler.embed_events(events).squeeze(0)
+                self.event_embeddings.append(event_embed)
 
         elapsed = time.time() - start_time
         mem_usage = get_memory_usage()
