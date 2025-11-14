@@ -124,22 +124,42 @@ class LiveDataLoader:
 
     def _fetch_yfinance_data(self) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
         """
-        Fetch last 7 days of data from yfinance.
+        Fetch data from yfinance (optimized by timeframe).
+
+        yfinance limits:
+        - 1min: 7 days
+        - 15min: 60 days
+        - 1hour: 730 days (2 years!)
+        - daily: unlimited
 
         Returns:
             (tsla_df, spy_df) or (None, None) if failed
         """
         try:
+            # Determine optimal period and interval based on our timeframe
+            if self.timeframe == '1min':
+                period = '7d'
+                interval = '1m'
+            elif self.timeframe in ['5min', '15min', '30min']:
+                period = '60d'  # yfinance allows 60 days for these intervals
+                interval = '15m'  # Fetch at 15min, resample if needed
+            elif self.timeframe in ['1hour', '2hour', '3hour', '4hour']:
+                period = '730d'  # 2 years available for hourly data!
+                interval = '1h'  # Fetch at 1hour, resample if needed
+            else:  # daily, weekly, etc
+                period = 'max'
+                interval = '1d'
+
             # Fetch TSLA
             tsla = yf.Ticker('TSLA')
-            tsla_df = tsla.history(period='7d', interval='1m')
+            tsla_df = tsla.history(period=period, interval=interval)
 
             if len(tsla_df) == 0:
                 return None, None
 
             # Fetch SPY
             spy = yf.Ticker('SPY')
-            spy_df = spy.history(period='7d', interval='1m')
+            spy_df = spy.history(period=period, interval=interval)
 
             if len(spy_df) == 0:
                 return None, None
@@ -148,10 +168,18 @@ class LiveDataLoader:
             tsla_df = self._format_yfinance_df(tsla_df, 'tsla')
             spy_df = self._format_yfinance_df(spy_df, 'spy')
 
-            # Resample if needed (yfinance gives 1min, we might need 15min/1hour/etc)
-            if self.timeframe != '1min':
-                tsla_df = self._resample_to_timeframe(tsla_df)
-                spy_df = self._resample_to_timeframe(spy_df)
+            # Resample if needed (e.g., if we fetched 1h but need 4h)
+            if interval != self.timeframe:
+                # Only resample if target timeframe is different from fetched interval
+                needs_resample = (
+                    (self.timeframe == '5min' and interval == '15m') or
+                    (self.timeframe == '30min' and interval == '15m') or
+                    (self.timeframe in ['2hour', '3hour', '4hour'] and interval == '1h')
+                )
+
+                if needs_resample:
+                    tsla_df = self._resample_to_timeframe(tsla_df)
+                    spy_df = self._resample_to_timeframe(spy_df)
 
             return tsla_df, spy_df
 
@@ -162,6 +190,11 @@ class LiveDataLoader:
     def _format_yfinance_df(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
         """Format yfinance DataFrame to match CSV format."""
         df = df.copy()
+
+        # Remove timezone to match CSV format (CSV is tz-naive)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
         df.columns = [c.lower() for c in df.columns]
         df = df.rename(columns={
             'open': f'{symbol}_open',
@@ -176,9 +209,9 @@ class LiveDataLoader:
     def _resample_to_timeframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """Resample 1min data to target timeframe."""
         timeframe_rules = {
-            '5min': '5T',
-            '15min': '15T',
-            '30min': '30T',
+            '5min': '5min',
+            '15min': '15min',
+            '30min': '30min',
             '1hour': '1h',
             '2hour': '2h',
             '3hour': '3h',
