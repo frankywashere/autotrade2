@@ -33,6 +33,7 @@ class Prediction(Base):
     timestamp = Column(DateTime, nullable=False, index=True)
     prediction_timestamp = Column(DateTime, nullable=False)
     target_timestamp = Column(DateTime, nullable=False)  # When prediction is for
+    simulation_date = Column(DateTime, nullable=True, index=True)  # Historical date being backtested (for alignment)
 
     # Symbol and timeframe
     symbol = Column(String(10), nullable=False, index=True)
@@ -43,12 +44,15 @@ class Prediction(Base):
     is_ensemble = Column(Boolean, default=False, index=True)
     news_enabled = Column(Boolean, default=False)
 
-    # Predictions
-    predicted_high = Column(Float, nullable=False)
-    predicted_low = Column(Float, nullable=False)
+    # Predictions (now in percentage terms)
+    predicted_high = Column(Float, nullable=False)  # % change from current price
+    predicted_low = Column(Float, nullable=False)   # % change from current price
     predicted_center = Column(Float, nullable=False)
     predicted_range = Column(Float, nullable=False)
     confidence = Column(Float, nullable=False)
+
+    # Current price (needed for percentage → absolute conversion)
+    current_price = Column(Float, nullable=True)
 
     # Actuals (filled in later)
     actual_high = Column(Float, nullable=True)
@@ -126,6 +130,7 @@ class SQLitePredictionDB(PredictionDatabase):
             timestamp=datetime.now(),
             prediction_timestamp=prediction.get('prediction_timestamp', datetime.now()),
             target_timestamp=prediction['target_timestamp'],
+            simulation_date=prediction.get('simulation_date'),  # Historical date being backtested
             symbol=prediction.get('symbol', 'TSLA'),
             timeframe=prediction.get('timeframe', '1h'),
             predicted_high=float(prediction['predicted_high']),
@@ -133,6 +138,7 @@ class SQLitePredictionDB(PredictionDatabase):
             predicted_center=float(prediction['predicted_center']),
             predicted_range=float(prediction['predicted_range']),
             confidence=float(prediction['confidence']),
+            current_price=prediction.get('current_price'),
             channel_position=prediction.get('channel_position'),
             rsi_value=prediction.get('rsi_value'),
             spy_correlation=prediction.get('spy_correlation'),
@@ -140,7 +146,10 @@ class SQLitePredictionDB(PredictionDatabase):
             has_macro_event=prediction.get('has_macro_event', False),
             event_type=prediction.get('event_type'),
             model_version=prediction.get('model_version'),
-            feature_dim=prediction.get('feature_dim')
+            feature_dim=prediction.get('feature_dim'),
+            model_timeframe=prediction.get('model_timeframe'),
+            is_ensemble=prediction.get('is_ensemble', False),
+            news_enabled=prediction.get('news_enabled', False)
         )
 
         self.session.add(pred_record)
@@ -177,16 +186,26 @@ class SQLitePredictionDB(PredictionDatabase):
         if not pred:
             raise ValueError(f"Prediction {prediction_id} not found")
 
+        # Validate current_price exists (needed for error calculation)
+        if pred.current_price is None:
+            raise ValueError(f"Prediction {prediction_id} has current_price=None! Bug in log_prediction() - not extracting current_price from prediction dict")
+
         # Update actuals
         pred.actual_high = actual_high
         pred.actual_low = actual_low
         pred.actual_center = (actual_high + actual_low) / 2
         pred.has_actuals = True
 
-        # Calculate errors (percentage errors)
-        pred.error_high = abs(pred.predicted_high - actual_high) / actual_high * 100
-        pred.error_low = abs(pred.predicted_low - actual_low) / actual_low * 100
-        pred.error_center = abs(pred.predicted_center - pred.actual_center) / pred.actual_center * 100
+        # Calculate errors (compare percentage predictions to percentage actuals)
+        # Convert actual prices to percentage changes from current price
+        actual_high_pct = (actual_high - pred.current_price) / pred.current_price * 100
+        actual_low_pct = (actual_low - pred.current_price) / pred.current_price * 100
+        actual_center_pct = (pred.actual_center - pred.current_price) / pred.current_price * 100
+
+        # Errors are now in percentage points (e.g., predicted +2.5% but actual was +3.2% = 0.7pp error)
+        pred.error_high = abs(pred.predicted_high - actual_high_pct)
+        pred.error_low = abs(pred.predicted_low - actual_low_pct)
+        pred.error_center = abs(pred.predicted_center - actual_center_pct)
         pred.absolute_error = (pred.error_high + pred.error_low) / 2
 
         self.session.commit()
@@ -222,6 +241,18 @@ class SQLitePredictionDB(PredictionDatabase):
         errors_low = [p.error_low for p in predictions]
         errors_abs = [p.absolute_error for p in predictions]
         confidences = [p.confidence for p in predictions]
+
+        # Check for None values (indicates bugs in current_price or update_actual)
+        none_count_high = sum(1 for e in errors_high if e is None)
+        none_count_low = sum(1 for e in errors_low if e is None)
+        none_count_abs = sum(1 for e in errors_abs if e is None)
+
+        if none_count_abs > 0:
+            raise ValueError(
+                f"Found {none_count_abs}/{len(predictions)} predictions with None errors! "
+                f"({none_count_high} high, {none_count_low} low). "
+                f"This indicates current_price was not stored. Check log_prediction() extraction."
+            )
 
         metrics = {
             'num_predictions': len(predictions),
