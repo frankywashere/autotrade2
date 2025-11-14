@@ -37,21 +37,16 @@ from src.ml.model import LNNTradingModel, LSTMTradingModel
 import requests  # For Telegram API
 
 
-# Global state
-if 'prediction_cache' not in st.session_state:
-    st.session_state.prediction_cache = PredictionCache()
+# Global state (for background thread - can't use st.session_state in threads)
+GLOBAL_PREDICTION_CACHE = PredictionCache()
+GLOBAL_MODELS = {}
+GLOBAL_TELEGRAM_TOKEN = None
+GLOBAL_TELEGRAM_CHAT_ID = None
+GLOBAL_SCHEDULER_RUNNING = False
 
-if 'models' not in st.session_state:
-    st.session_state.models = {}
-
-if 'telegram_token' not in st.session_state:
-    st.session_state.telegram_token = None
-
-if 'telegram_chat_id' not in st.session_state:
-    st.session_state.telegram_chat_id = None
-
-if 'scheduler_running' not in st.session_state:
-    st.session_state.scheduler_running = False
+# Streamlit session state (for UI state only)
+if 'last_refresh' not in st.session_state:
+    st.session_state.last_refresh = datetime.now()
 
 
 def send_telegram_message(token: str, chat_id: str, message: str) -> bool:
@@ -247,8 +242,12 @@ def send_telegram_alert(prediction: Dict, token: str, chat_id: str):
 def prediction_scheduler_thread(selected_models, alert_threshold):
     """
     Background thread that runs predictions at correct bar times.
+    Uses global variables (not st.session_state) for thread safety.
     """
-    st.session_state.scheduler_running = True
+    global GLOBAL_SCHEDULER_RUNNING, GLOBAL_PREDICTION_CACHE, GLOBAL_MODELS
+    global GLOBAL_TELEGRAM_TOKEN, GLOBAL_TELEGRAM_CHAT_ID
+
+    GLOBAL_SCHEDULER_RUNNING = True
 
     data_loaders = {}
     feature_extractor = TradingFeatureExtractor()
@@ -256,22 +255,22 @@ def prediction_scheduler_thread(selected_models, alert_threshold):
 
     # Load Telegram config if configured
     token, chat_id = load_telegram_config()
-    st.session_state.telegram_token = token
-    st.session_state.telegram_chat_id = chat_id
+    GLOBAL_TELEGRAM_TOKEN = token
+    GLOBAL_TELEGRAM_CHAT_ID = chat_id
 
-    while st.session_state.scheduler_running:
+    while GLOBAL_SCHEDULER_RUNNING:
         try:
             for model_name in selected_models:
                 # Check if we should update this model
-                if should_update_prediction(model_name, st.session_state.prediction_cache):
+                if should_update_prediction(model_name, GLOBAL_PREDICTION_CACHE):
                     # Load model if not already loaded
-                    if model_name not in st.session_state.models:
+                    if model_name not in GLOBAL_MODELS:
                         model, metadata = load_model(model_name)
                         if model:
-                            st.session_state.models[model_name] = {'model': model, 'metadata': metadata}
+                            GLOBAL_MODELS[model_name] = {'model': model, 'metadata': metadata}
 
-                    if model_name in st.session_state.models:
-                        model_info = st.session_state.models[model_name]
+                    if model_name in GLOBAL_MODELS:
+                        model_info = GLOBAL_MODELS[model_name]
 
                         # Create data loader for this timeframe if needed
                         timeframe = model_info['metadata']['input_timeframe']
@@ -288,8 +287,8 @@ def prediction_scheduler_thread(selected_models, alert_threshold):
                         )
 
                         if prediction:
-                            # Cache the prediction
-                            st.session_state.prediction_cache.set(model_name, prediction)
+                            # Cache the prediction (use global for thread safety)
+                            GLOBAL_PREDICTION_CACHE.set(model_name, prediction)
 
                             # Log to database
                             try:
@@ -379,11 +378,12 @@ def main():
         st.rerun()
 
     if st.sidebar.button("🗑️ Clear Cache"):
-        st.session_state.prediction_cache.invalidate_all()
+        GLOBAL_PREDICTION_CACHE.invalidate_all()
         st.success("Cache cleared!")
 
     # Start prediction scheduler if not running
-    if not st.session_state.scheduler_running and len(selected_models) > 0:
+    global GLOBAL_SCHEDULER_RUNNING
+    if not GLOBAL_SCHEDULER_RUNNING and len(selected_models) > 0:
         thread = threading.Thread(
             target=prediction_scheduler_thread,
             args=(selected_models, alert_threshold),
@@ -448,19 +448,19 @@ def render_model_prediction(model_name: str, alert_threshold: float):
     st.subheader(f"🔮 {model_name.upper()} Model")
 
     # Get cached prediction
-    cached = st.session_state.prediction_cache.get(model_name)
+    cached = GLOBAL_PREDICTION_CACHE.get(model_name)
 
     if cached is None:
         # No prediction yet - trigger one
         with st.spinner(f"Loading {model_name} model and making initial prediction..."):
             # Load model
-            if model_name not in st.session_state.models:
+            if model_name not in GLOBAL_MODELS:
                 model, metadata = load_model(model_name)
                 if model:
-                    st.session_state.models[model_name] = {'model': model, 'metadata': metadata}
+                    GLOBAL_MODELS[model_name] = {'model': model, 'metadata': metadata}
 
-            if model_name in st.session_state.models:
-                model_info = st.session_state.models[model_name]
+            if model_name in GLOBAL_MODELS:
+                model_info = GLOBAL_MODELS[model_name]
                 timeframe = model_info['metadata']['input_timeframe']
                 data_loader = LiveDataLoader(timeframe=timeframe)
                 feature_extractor = TradingFeatureExtractor()
@@ -474,7 +474,7 @@ def render_model_prediction(model_name: str, alert_threshold: float):
                 )
 
                 if prediction:
-                    st.session_state.prediction_cache.set(model_name, prediction)
+                    GLOBAL_PREDICTION_CACHE.set(model_name, prediction)
                     cached = prediction
                 else:
                     st.error(f"Error: {error}")
@@ -504,7 +504,7 @@ def render_model_prediction(model_name: str, alert_threshold: float):
 
     with col3:
         # Countdown to next update
-        seconds_until = st.session_state.prediction_cache.get_time_until_update(model_name)
+        seconds_until = GLOBAL_PREDICTION_CACHE.get_time_until_update(model_name)
         if seconds_until:
             minutes = int(seconds_until // 60)
             secs = int(seconds_until % 60)
