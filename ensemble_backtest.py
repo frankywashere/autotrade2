@@ -117,11 +117,16 @@ def run_ensemble_simulation(
         data_dict = {}
         context_days = calculate_minimum_context_days(min_bars_per_timeframe=20)
 
+        # Load model metadata directly from checkpoint files
+        model_metadata = {}
+        for tf in ['15min', '1hour', '4hour', 'daily']:
+            ckpt = torch.load(f'models/lnn_{tf}.pth', weights_only=False)
+            model_metadata[tf] = ckpt['metadata']
+
         for tf in ['15min', '1hour', '4hour', 'daily']:
             try:
-                # Get this sub-model's sequence length
-                sub_metadata = ensemble.sub_model_metadata[tf]
-                seq_len = sub_metadata['sequence_length']
+                # Get this sub-model's sequence length from metadata
+                seq_len = model_metadata[tf]['sequence_length']
 
                 # Load data
                 context_start = date - timedelta(days=context_days)
