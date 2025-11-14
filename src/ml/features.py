@@ -129,60 +129,73 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def extract_features(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
         """
-        Extract all features from aligned SPY-TSLA data
+        Extract all 245 features from aligned SPY-TSLA data (OPTIMIZED v3.4).
+
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
+
+        Returns DataFrame with 245 columns:
+        - 10 price features
+        - 154 channel features (77 TSLA + 77 SPY)
+        - 66 RSI features (33 TSLA + 33 SPY)
+        - 5 correlation features
+        - 4 cycle features
+        - 2 volume features
+        - 4 time features
         """
-        features_df = pd.DataFrame(index=df.index)
+        # Extract each category (each returns its own DataFrame)
+        price_df = self._extract_price_features(df)
+        channel_df = self._extract_channel_features(df)
+        rsi_df = self._extract_rsi_features(df)
+        correlation_df = self._extract_correlation_features(df)
+        cycle_df = self._extract_cycle_features(df)
+        volume_df = self._extract_volume_features(df)
+        time_df = self._extract_time_features(df)
 
-        # 1. Price features
-        features_df = self._extract_price_features(df, features_df)
+        # Concat all at once (FAST! No DataFrame fragmentation)
+        features_df = pd.concat([
+            price_df,
+            channel_df,
+            rsi_df,
+            correlation_df,
+            cycle_df,
+            volume_df,
+            time_df
+        ], axis=1)
 
-        # 2. Channel features
-        features_df = self._extract_channel_features(df, features_df)
-
-        # 3. RSI features
-        features_df = self._extract_rsi_features(df, features_df)
-
-        # 4. Correlation features
-        features_df = self._extract_correlation_features(df, features_df)
-
-        # 5. Cycle features
-        features_df = self._extract_cycle_features(df, features_df)
-
-        # 6. Volume features
-        features_df = self._extract_volume_features(df, features_df)
-
-        # 7. Time features
-        features_df = self._extract_time_features(df, features_df)
-
-        # Drop any NaN rows (from rolling calculations)
+        # Fill NaNs
         features_df = features_df.bfill().fillna(0)
 
         return features_df
 
-    def _extract_price_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
-        """Extract basic price features"""
+    def _extract_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract basic price features. Returns DataFrame with 10 columns."""
+        price_features = {}
+
         for symbol in ['spy', 'tsla']:
             close_col = f'{symbol}_close'
-            features_df[close_col] = df[close_col]
+            price_features[close_col] = df[close_col]
 
             # Returns
-            features_df[f'{symbol}_returns'] = df[close_col].pct_change()
-            features_df[f'{symbol}_log_returns'] = np.log(df[close_col] / df[close_col].shift(1))
+            returns = df[close_col].pct_change()
+            price_features[f'{symbol}_returns'] = returns
+            price_features[f'{symbol}_log_returns'] = np.log(df[close_col] / df[close_col].shift(1))
 
             # Volatility (rolling std of returns)
-            features_df[f'{symbol}_volatility_10'] = features_df[f'{symbol}_returns'].rolling(10).std()
-            features_df[f'{symbol}_volatility_50'] = features_df[f'{symbol}_returns'].rolling(50).std()
+            price_features[f'{symbol}_volatility_10'] = returns.rolling(10).std()
+            price_features[f'{symbol}_volatility_50'] = returns.rolling(50).std()
 
-        return features_df
+        return pd.DataFrame(price_features, index=df.index)
 
-    def _extract_channel_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
+    def _extract_channel_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Extract linear regression channel features for multiple timeframes
+        Extract linear regression channel features for multiple timeframes.
         NOW PROCESSES BOTH TSLA AND SPY (v3.4)
-        Uses existing LinearRegressionChannel from Stage 1
+        Returns DataFrame with 154 columns (77 TSLA + 77 SPY).
         """
+        channel_features = {}
+        num_rows = len(df)
+
         # Resample to different timeframes
         timeframes = {
             '5min': '5min',
@@ -213,44 +226,46 @@ class TradingFeatureExtractor(FeatureExtractor):
                     'volume': 'sum'
                 }).dropna()
 
+                prefix = f'{symbol}_channel'
+
                 if len(resampled) < 20:
-                    # Not enough data for this timeframe
+                    # Not enough data - fill with zeros
+                    for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'stability', 'ping_pongs', 'r_squared']:
+                        channel_features[f'{prefix}_{tf_name}_{feat}'] = np.zeros(num_rows)
                     continue
 
                 # Calculate channel
-                lookback = min(168, len(resampled) - 1)  # 1 week or max available
+                lookback = min(168, len(resampled) - 1)
                 try:
                     channel = self.channel_calc.calculate_channel(resampled, lookback, tf_name)
-
-                    # Get current position in channel
                     current_price = resampled['close'].iloc[-1]
                     position_data = self.channel_calc.get_channel_position(current_price, channel)
 
-                    # Add features (broadcast to all rows in original df)
-                    # Use symbol prefix for consistent naming
-                    prefix = f'{symbol}_channel'
-                    features_df[f'{prefix}_{tf_name}_position'] = position_data['position']
-                    features_df[f'{prefix}_{tf_name}_upper_dist'] = position_data['distance_to_upper_pct']
-                    features_df[f'{prefix}_{tf_name}_lower_dist'] = position_data['distance_to_lower_pct']
-                    features_df[f'{prefix}_{tf_name}_slope'] = channel.slope
-                    features_df[f'{prefix}_{tf_name}_stability'] = channel.stability_score
-                    features_df[f'{prefix}_{tf_name}_ping_pongs'] = channel.ping_pongs
-                    features_df[f'{prefix}_{tf_name}_r_squared'] = channel.r_squared
+                    # Store features (broadcast scalar to all rows)
+                    channel_features[f'{prefix}_{tf_name}_position'] = np.full(num_rows, position_data['position'])
+                    channel_features[f'{prefix}_{tf_name}_upper_dist'] = np.full(num_rows, position_data['distance_to_upper_pct'])
+                    channel_features[f'{prefix}_{tf_name}_lower_dist'] = np.full(num_rows, position_data['distance_to_lower_pct'])
+                    channel_features[f'{prefix}_{tf_name}_slope'] = np.full(num_rows, channel.slope)
+                    channel_features[f'{prefix}_{tf_name}_stability'] = np.full(num_rows, channel.stability_score)
+                    channel_features[f'{prefix}_{tf_name}_ping_pongs'] = np.full(num_rows, channel.ping_pongs)
+                    channel_features[f'{prefix}_{tf_name}_r_squared'] = np.full(num_rows, channel.r_squared)
 
                 except Exception as e:
                     # Fill with zeros if calculation fails
-                    prefix = f'{symbol}_channel'
                     for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'stability', 'ping_pongs', 'r_squared']:
-                        features_df[f'{prefix}_{tf_name}_{feat}'] = 0.0
+                        channel_features[f'{prefix}_{tf_name}_{feat}'] = np.zeros(num_rows)
 
-        return features_df
+        return pd.DataFrame(channel_features, index=df.index)
 
-    def _extract_rsi_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
+    def _extract_rsi_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Extract RSI features for multiple timeframes
+        Extract RSI features for multiple timeframes.
         NOW PROCESSES BOTH TSLA AND SPY (v3.4)
-        Uses existing RSICalculator from Stage 1
+        Returns DataFrame with 66 columns (33 TSLA + 33 SPY).
         """
+        rsi_features = {}
+        num_rows = len(df)
+
         timeframes = {
             '5min': '5min',
             '15min': '15min',
@@ -280,96 +295,93 @@ class TradingFeatureExtractor(FeatureExtractor):
                     'volume': 'sum'
                 }).dropna()
 
+                prefix = f'{symbol}_rsi'
+
                 if len(resampled) < 20:
+                    # Not enough data - fill with defaults
+                    rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, 50.0)
+                    rsi_features[f'{prefix}_{tf_name}_oversold'] = np.zeros(num_rows)
+                    rsi_features[f'{prefix}_{tf_name}_overbought'] = np.zeros(num_rows)
                     continue
 
                 try:
                     rsi_data = self.rsi_calc.get_rsi_data(resampled)
-
-                    # Add features with symbol prefix for consistent naming
-                    prefix = f'{symbol}_rsi'
                     rsi_value = rsi_data.value if rsi_data.value is not None else 50.0
-                    features_df[f'{prefix}_{tf_name}'] = rsi_value
-                    features_df[f'{prefix}_{tf_name}_oversold'] = 1.0 if rsi_data.oversold else 0.0
-                    features_df[f'{prefix}_{tf_name}_overbought'] = 1.0 if rsi_data.overbought else 0.0
+
+                    # Store features (broadcast scalar to all rows)
+                    rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, rsi_value)
+                    rsi_features[f'{prefix}_{tf_name}_oversold'] = np.full(num_rows, 1.0 if rsi_data.oversold else 0.0)
+                    rsi_features[f'{prefix}_{tf_name}_overbought'] = np.full(num_rows, 1.0 if rsi_data.overbought else 0.0)
 
                 except Exception:
-                    prefix = f'{symbol}_rsi'
-                    features_df[f'{prefix}_{tf_name}'] = 50.0
-                    features_df[f'{prefix}_{tf_name}_oversold'] = 0.0
-                    features_df[f'{prefix}_{tf_name}_overbought'] = 0.0
+                    # Fill with defaults
+                    rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, 50.0)
+                    rsi_features[f'{prefix}_{tf_name}_oversold'] = np.zeros(num_rows)
+                    rsi_features[f'{prefix}_{tf_name}_overbought'] = np.zeros(num_rows)
 
-        return features_df
+        return pd.DataFrame(rsi_features, index=df.index)
 
-    def _extract_correlation_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
-        """Extract SPY-TSLA correlation and divergence features"""
+    def _extract_correlation_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract SPY-TSLA correlation and divergence features. Returns DataFrame with 5 columns."""
         spy_returns = df['spy_close'].pct_change()
         tsla_returns = df['tsla_close'].pct_change()
 
-        # Rolling correlations
-        features_df['correlation_10'] = spy_returns.rolling(10).corr(tsla_returns)
-        features_df['correlation_50'] = spy_returns.rolling(50).corr(tsla_returns)
-        features_df['correlation_200'] = spy_returns.rolling(200).corr(tsla_returns)
+        correlation_features = {
+            'correlation_10': spy_returns.rolling(10).corr(tsla_returns),
+            'correlation_50': spy_returns.rolling(50).corr(tsla_returns),
+            'correlation_200': spy_returns.rolling(200).corr(tsla_returns),
+            'divergence': (((spy_returns > 0) & (tsla_returns < 0)) |
+                          ((spy_returns < 0) & (tsla_returns > 0))).astype(float),
+            'divergence_magnitude': abs(spy_returns - tsla_returns)
+        }
 
-        # Divergence: when SPY and TSLA move in opposite directions
-        features_df['divergence'] = ((spy_returns > 0) & (tsla_returns < 0)) | \
-                                     ((spy_returns < 0) & (tsla_returns > 0))
-        features_df['divergence'] = features_df['divergence'].astype(float)
+        return pd.DataFrame(correlation_features, index=df.index)
 
-        # Divergence magnitude
-        features_df['divergence_magnitude'] = abs(spy_returns - tsla_returns)
-
-        return features_df
-
-    def _extract_cycle_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
-        """Extract larger cycle features (52-week highs/lows, mega channels)"""
-        # 52-week (252 trading days) high/low for TSLA
+    def _extract_cycle_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract larger cycle features (52-week highs/lows, mega channels). Returns DataFrame with 4 columns."""
         tsla_close = df['tsla_close']
         high_52w = tsla_close.rolling(252, min_periods=50).max()
         low_52w = tsla_close.rolling(252, min_periods=50).min()
 
-        features_df['distance_from_52w_high'] = (high_52w - tsla_close) / high_52w
-        features_df['distance_from_52w_low'] = (tsla_close - low_52w) / low_52w
+        cycle_features = {
+            'distance_from_52w_high': (high_52w - tsla_close) / high_52w,
+            'distance_from_52w_low': (tsla_close - low_52w) / low_52w
+        }
 
         # Mega channel: 3-4 year channels
-        # Calculate if we're in a mega channel (simplified: check if current price is within 2 std of 3-year trend)
         if len(df) > 756:  # 3 years of daily data (approx)
-            lookback = min(1008, len(df))  # 4 years or max available
+            lookback = min(1008, len(df))
             mega_high = tsla_close.rolling(lookback, min_periods=252).max()
             mega_low = tsla_close.rolling(lookback, min_periods=252).min()
 
-            features_df['within_mega_channel'] = ((tsla_close >= mega_low * 0.9) &
-                                                   (tsla_close <= mega_high * 1.1)).astype(float)
-
-            # Position in mega channel (0-1)
-            features_df['mega_channel_position'] = (tsla_close - mega_low) / (mega_high - mega_low + 1e-8)
+            cycle_features['within_mega_channel'] = ((tsla_close >= mega_low * 0.9) &
+                                                      (tsla_close <= mega_high * 1.1)).astype(float)
+            cycle_features['mega_channel_position'] = (tsla_close - mega_low) / (mega_high - mega_low + 1e-8)
         else:
-            features_df['within_mega_channel'] = 0.0
-            features_df['mega_channel_position'] = 0.5
+            cycle_features['within_mega_channel'] = np.zeros(len(df))
+            cycle_features['mega_channel_position'] = np.full(len(df), 0.5)
 
-        return features_df
+        return pd.DataFrame(cycle_features, index=df.index)
 
-    def _extract_volume_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
-        """Extract volume-based features"""
-        # Volume ratios (current vs average)
-        features_df['tsla_volume_ratio'] = df['tsla_volume'] / df['tsla_volume'].rolling(20, min_periods=1).mean()
-        features_df['spy_volume_ratio'] = df['spy_volume'] / df['spy_volume'].rolling(20, min_periods=1).mean()
+    def _extract_volume_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract volume-based features. Returns DataFrame with 2 columns."""
+        volume_features = {
+            'tsla_volume_ratio': df['tsla_volume'] / df['tsla_volume'].rolling(20, min_periods=1).mean(),
+            'spy_volume_ratio': df['spy_volume'] / df['spy_volume'].rolling(20, min_periods=1).mean()
+        }
 
-        return features_df
+        return pd.DataFrame(volume_features, index=df.index)
 
-    def _extract_time_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
-        """Extract time-based features"""
-        # Cyclical encoding of time - batch all columns at once to avoid DataFrame fragmentation
-        time_features = pd.DataFrame({
+    def _extract_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract time-based features. Returns DataFrame with 4 columns."""
+        time_features = {
             'hour_of_day': df.index.hour / 24.0,
             'day_of_week': df.index.dayofweek / 7.0,
             'day_of_month': df.index.day / 31.0,
             'month_of_year': df.index.month / 12.0
-        }, index=df.index)
+        }
 
-        features_df = pd.concat([features_df, time_features], axis=1)
-
-        return features_df
+        return pd.DataFrame(time_features, index=df.index)
 
     def create_sequences(self, features_df: pd.DataFrame, sequence_length: int = 168,
                         target_horizon: int = 24) -> Tuple[torch.Tensor, torch.Tensor]:
