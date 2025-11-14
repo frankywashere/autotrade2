@@ -2195,10 +2195,22 @@ client.messages.create(
 - **Distributed Training** - Multi-GPU support
 
 **Features:**
-- ✅ **Dynamic Feature Addition** - Add symbols without code changes (HIGH PRIORITY)
+- ✅ **SPY Features** - Multi-scale channels + RSI for market context (COMPLETED v3.4)
+- **Explicit Regime Change Detection** (v3.5 - HIGH PRIORITY):
+  - Channel breakout/breakdown signals (slope sign changes, band breaks)
+  - RSI crossover signals (oversold/overbought transitions)
+  - Channel regime transitions (bull → sideways, sideways → bear, etc.)
+  - Estimated: +44 binary features (11 timeframes × 2 symbols × 2 signals)
+- **SPY-TSLA Alignment Signals** (v3.5 - HIGH PRIORITY):
+  - Dual bottom/top detection (both symbols bottomed/topped together)
+  - Dual oversold/overbought (both RSI extremes aligned)
+  - Channel correlation (how aligned are positions: -1 to +1)
+  - RSI correlation (how aligned is momentum)
+  - Multi-timeframe confluence (when 1h, 4h, daily all show dual bottom)
+  - **Key insight:** When SPY bottoms (low channel + low RSI) AND TSLA bottoms (low channel + low RSI) = strong reversal signal
+  - Estimated: +30 features → **Total: 245 + 44 + 30 = 319 features**
 - **Additional Indicators** - MACD, Bollinger Bands, Volume Profile
 - **Transformer Models** - Alternative to LNN
-- **Ensemble Predictions** - Combine multiple models
 
 **System:**
 - **Multi-Stock Portfolio** - Monitor multiple stocks simultaneously
@@ -2365,7 +2377,23 @@ predicted_low = MIN(slope × future_x + intercept - 2σ)
 - Memory per model: ~2GB → ~3.6GB (lazy mode)
 - Memory for preload: ~30GB → ~55GB
 - Training time: +10-20% slower due to more features
-- Prediction accuracy: TBD (comparing 135 vs 245 on 2024 holdout)
+- **Prediction accuracy (2024 holdout, 10 test samples):**
+  - 15min: 1.4% → 0.99% error (30% improvement! ✅)
+  - 1hour: 2.25% → 1.41% error (37% improvement! ✅)
+  - 4hour: 3.5% → 2.21% error (37% improvement! ✅)
+  - daily: 10.89% → 11.96% error (8% worse)
+  - **SPY features significantly improved short/medium timeframe models**
+
+**Ensemble Findings (PRELIMINARY - Test Models Only):**
+- Meta-LNN trained on only 10 samples (not production): 2.95% error (worse than individual models)
+- Low confidence (0.16) indicates insufficient training data
+- **NOTE:** These are test results with minimal training data
+- **TODO:** Run full production workflow to properly evaluate ensemble:
+  1. Backtest all 4 models on 2023 (500 simulations) for Meta-LNN training data
+  2. Train Meta-LNN on 500 aligned predictions
+  3. Validate ensemble on 2024 (100 simulations)
+  4. Compare properly-trained ensemble vs best individual model (15min: 0.99%)
+- **Current recommendation:** Use 15min model alone (0.99% error) until production ensemble validated
 
 ### v2.1 - Interactive Parameter Selection (Nov 11, 2025)
 ✅ Arrow-key navigation menu for parameter configuration
