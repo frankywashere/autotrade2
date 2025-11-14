@@ -24,7 +24,7 @@ from src.ml.model import LNNTradingModel, LSTMTradingModel
 from src.ml.meta_models import MetaLNN, MetaLNNWithModalityDropout, MetaFTTransformer, calculate_market_state
 from src.ml.news_encoder import NewsEncoder
 from src.ml.fetch_news import get_news_window
-from src.ml.events import EventsHandler
+from src.ml.events import CombinedEventsHandler
 
 
 class MultiScaleEnsemble:
@@ -46,7 +46,7 @@ class MultiScaleEnsemble:
                  meta_model_path: str,
                  mode: str = 'backtest_no_news',
                  device: str = 'cpu',
-                 events_handler: Optional[EventsHandler] = None):
+                 events_handler: Optional[CombinedEventsHandler] = None):
         """
         Initialize multi-scale ensemble.
 
@@ -56,7 +56,7 @@ class MultiScaleEnsemble:
             meta_model_path: Path to meta-model checkpoint
             mode: 'backtest_no_news' or 'live_with_news'
             device: 'cpu', 'cuda', or 'mps'
-            events_handler: EventsHandler instance (for market state features)
+            events_handler: CombinedEventsHandler instance (for market state features)
         """
         self.mode = mode
         self.device = torch.device(device)
@@ -74,7 +74,7 @@ class MultiScaleEnsemble:
         for timeframe, model_path in model_paths.items():
             print(f"  Loading {timeframe} model from {model_path}...")
             try:
-                checkpoint = torch.load(model_path, map_location=self.device)
+                checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
 
                 # Extract model config
                 model_type = checkpoint.get('model_type', 'LNN')
@@ -106,7 +106,7 @@ class MultiScaleEnsemble:
         # Load meta-model
         print(f"\nLoading meta-model from {meta_model_path}...")
         try:
-            meta_checkpoint = torch.load(meta_model_path, map_location=self.device)
+            meta_checkpoint = torch.load(meta_model_path, map_location=self.device, weights_only=False)
 
             meta_model_type = meta_checkpoint.get('model_type', 'meta_lnn')
             num_submodels = len(self.sub_models)
@@ -298,7 +298,7 @@ def load_ensemble(mode: str = 'backtest_no_news',
     # Load events handler
     events_handler = None
     if events_csv:
-        events_handler = EventsHandler(events_csv)
+        events_handler = CombinedEventsHandler(events_csv)
 
     # Create ensemble
     ensemble = MultiScaleEnsemble(
