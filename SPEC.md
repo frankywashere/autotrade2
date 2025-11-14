@@ -40,9 +40,9 @@ AutoTrade2 is a two-stage AI-powered stock trading analysis system:
 ### Stage 2: Multi-Scale LNN System
 - **Multi-scale architecture**: 4 specialized LNN models (15min, 1hour, 4hour, daily)
 - **Meta-LNN coach**: Adaptive combination based on market regime + news
-- **135-feature extraction**: 11 timeframes × (7 channel + 3 RSI) + 25 base features
+- **245-feature extraction**: 11 timeframes × (7 channel + 3 RSI) for TSLA + SPY + 25 base features
 - **Real event integration**: TSLA earnings + macro events embedded in all models
-- **Dual loading modes**: Lazy (~2GB, memory-efficient) or Preload (~30GB, 10-33% faster)
+- **Dual loading modes**: Lazy (~3.6GB, memory-efficient) or Preload (~55GB, 10-33% faster)
 - **GPU monitoring**: Real-time GPU utilization, VRAM, temperature, power metrics
 - **Performance optimized**: Cached column lookups, ~100x faster data access
 - **News-ready**: LFM2-based headline encoding (optional)
@@ -174,7 +174,7 @@ autotrade2/
     ├── __init__.py                     # ML module exports
     ├── base.py                         # Abstract interfaces (DataFeed, ModelBase, etc.)
     ├── data_feed.py                    # Data loading (CSVDataFeed, YFinanceDataFeed)
-    ├── features.py                     # 135-feature extraction (11 timeframes)
+    ├── features.py                     # 245-feature extraction (11 timeframes, TSLA+SPY)
     ├── features_lazy.py                # Feature extraction with progress bars
     ├── events.py                       # Event integration (earnings, macro)
     ├── model.py                        # LNN and LSTM model implementations
@@ -199,7 +199,7 @@ autotrade2/
 └── process_real_events.py               # Parse real events from RTF/JSON
 
 # Test Scripts (for development/validation)
-├── test_multiscale_features.py          # Test 135-feature extraction
+├── test_multiscale_features.py          # Test 245-feature extraction (TSLA+SPY)
 ├── test_meta_lnn.py                     # Test Meta-LNN architecture
 ├── test_news_system.py                  # Test news fetching/encoding
 ├── test_multiscale_system.py            # Comprehensive test suite
@@ -419,18 +419,20 @@ aligned_df = feed.load_aligned_data('2015-01-01', '2023-12-31')
 
 #### 2. Feature Extraction (`src/ml/features.py`)
 
-**TradingFeatureExtractor** - Extracts 135 features across 11 timeframes:
+**TradingFeatureExtractor** - Extracts 245 features across 11 timeframes (TSLA + SPY):
 
 | Category | Count | Features |
 |----------|-------|----------|
 | **Price** | 10 | SPY/TSLA: close, returns, log_returns, volatility_10, volatility_50 |
-| **Channels** | 77 | **11 timeframes** (5min/15min/30min/1h/2h/3h/4h/daily/weekly/monthly/3month): position, upper_dist, lower_dist, slope, stability, ping_pongs, r_squared |
-| **RSI** | 33 | **11 timeframes**: value, oversold, overbought |
+| **TSLA Channels** | 77 | **11 timeframes** (5min/15min/30min/1h/2h/3h/4h/daily/weekly/monthly/3month): position, upper_dist, lower_dist, slope, stability, ping_pongs, r_squared |
+| **SPY Channels** | 77 | **11 timeframes** (5min/15min/30min/1h/2h/3h/4h/daily/weekly/monthly/3month): position, upper_dist, lower_dist, slope, stability, ping_pongs, r_squared |
+| **TSLA RSI** | 33 | **11 timeframes**: value, oversold, overbought |
+| **SPY RSI** | 33 | **11 timeframes**: value, oversold, overbought |
 | **Correlations** | 5 | correlation_10/50/200, divergence, divergence_magnitude |
 | **Cycles** | 4 | distance_from_52w_high/low, within_mega_channel, mega_channel_position |
 | **Volume** | 2 | tsla_volume_ratio, spy_volume_ratio |
 | **Time** | 4 | hour_of_day, day_of_week, day_of_month, month_of_year (cyclical) |
-| **Total** | **135** | Multi-scale temporal context at every bar |
+| **Total** | **245** | Multi-scale temporal context for both TSLA and SPY at every bar |
 
 **11 Timeframes for Channels & RSI:**
 ```
@@ -445,7 +447,7 @@ monthly, 3month             ← Long-term cycles
 extractor = TradingFeatureExtractor()
 
 # Extract features from aligned data
-features_df = extractor.extract_features(aligned_df)  # Returns (N, 135)
+features_df = extractor.extract_features(aligned_df)  # Returns (N, 245)
 
 # Create sequences for training
 # Two modes available: LazyTradingDataset (default) or PreloadTradingDataset (--preload)
@@ -455,7 +457,7 @@ dataset = create_trading_dataset(
     target_horizon=24,
     preload=False  # Set to True for faster training with more RAM
 )
-# Sequences: (200, 135) per sample
+# Sequences: (200, 245) per sample
 # Targets: [predicted_high, predicted_low] for next 24 hours
 ```
 
@@ -516,7 +518,7 @@ embedding = handler.embed_events(events)  # Returns (1, 21)
 
 **LNNTradingModel** - Liquid Neural Network (used for each timeframe):
 ```
-Input (135 features, 200 timesteps)  ← Multi-scale features, uniform sequence length
+Input (245 features, 200 timesteps)  ← Multi-scale features (TSLA+SPY), uniform sequence length
   ↓
 CfC Layer (Liquid Time-Constant, 128 hidden units)
   - Single layer only (CfC doesn't support stacking)
@@ -537,7 +539,7 @@ Confidence Head (1 unit: confidence score)
 - **LNN_daily**: Trained on daily data (200 bars = 9 months)
 
 **Each sub-model:**
-- Input size: 135 features (all 11 timeframes for multi-scale context)
+- Input size: 245 features (all 11 timeframes for TSLA + SPY multi-scale context)
 - Hidden size: 128 units
 - Sequence length: 200 bars (uniform across all models)
 - Outputs: [predicted_high, predicted_low, confidence]
@@ -552,8 +554,8 @@ Confidence Head (1 unit: confidence score)
 **Usage:**
 ```python
 # Each sub-model trains independently
-model_15min = LNNTradingModel(input_size=135, hidden_size=128)
-model_1hour = LNNTradingModel(input_size=135, hidden_size=128)
+model_15min = LNNTradingModel(input_size=245, hidden_size=128)
+model_1hour = LNNTradingModel(input_size=245, hidden_size=128)
 # etc.
 
 # Each predicts independently
@@ -719,7 +721,7 @@ python backtest.py --model_path models/lnn_15min.pth --test_year 2024 --num_simu
 
 **Context Window & Feature Extraction:**
 
-Backtest.py automatically calculates the minimum historical context needed to extract all 135 features:
+Backtest.py automatically calculates the minimum historical context needed to extract all 245 features:
 
 ```python
 # Dynamic context calculation
@@ -792,7 +794,7 @@ python train_meta_lnn.py --mode backtest_no_news --epochs 100 --output models/me
 
 **Problem with single-model approach:**
 - To see monthly patterns on 1-min data: need sequence_length=50,000+ bars
-- Memory explosion: 50,000 × 135 features × 4 bytes × batch_size = ~3.4GB per batch
+- Memory explosion: 50,000 × 245 features × 4 bytes × batch_size = ~6.2GB per batch
 - Training impractical on consumer hardware
 
 **Multi-scale solution:**
@@ -812,31 +814,34 @@ python train_meta_lnn.py --mode backtest_no_news --epochs 100 --output models/me
 
 ### Multi-Scale Features
 
-**Key Insight:** All models receive 135 features per bar, calculated across 11 timeframes.
+**Key Insight:** All models receive 245 features per bar, calculated across 11 timeframes for BOTH TSLA and SPY.
 
 Even the 15min model sees:
 ```python
 Bar at 2024-01-15 10:30:
-  - channel_5min_position: 0.65     ← Where in 5-min channel
-  - channel_15min_position: 0.73    ← Where in 15-min channel (native)
-  - channel_1h_position: 0.81       ← Where in 1-hour channel
-  - channel_4h_position: 0.45       ← Where in 4-hour channel
-  - channel_daily_position: 0.82    ← Where in daily channel
-  - channel_weekly_position: 0.58   ← Where in weekly channel
-  - channel_monthly_position: 0.71  ← Where in monthly channel
-  ... (135 features total with ALL timeframe context)
+  # TSLA context
+  - tsla_channel_5min_position: 0.65     ← Where TSLA is in 5-min channel
+  - tsla_channel_15min_position: 0.73    ← Where TSLA is in 15-min channel (native)
+  - tsla_channel_1h_position: 0.81       ← Where TSLA is in 1-hour channel
+  - tsla_rsi_daily: 45.2                 ← TSLA daily RSI
+
+  # SPY context (NEW in v3.4)
+  - spy_channel_5min_position: 0.52      ← Where SPY is in 5-min channel
+  - spy_channel_daily_position: 0.38     ← Where SPY is in daily channel
+  - spy_rsi_daily: 52.8                  ← SPY daily RSI
+  ... (245 features total with TSLA+SPY timeframe context)
 ```
 
-**This provides cross-timeframe context:**
-- 15min model learns: "When daily channel oversold + 1h channel breaking up → bounce likely"
-- 4hour model learns: "When weekly trend down but daily RSI extreme → short-term reversal"
+**This provides cross-asset AND cross-timeframe context:**
+- 15min model learns: "When TSLA daily channel oversold + SPY daily RSI neutral + 1h breaking up → TSLA bounce likely"
+- 4hour model learns: "When SPY weekly trend down AND TSLA daily RSI extreme → TSLA short-term reversal despite market weakness"
 
 ### Memory Efficiency
 
 | Approach | Sequence | Features | Memory per Model | Total Memory |
 |----------|----------|----------|------------------|--------------|
-| Single model (long seq) | 50,000 | 135 | ~25GB | ~25GB |
-| **Multi-scale (4 models)** | **200** | **135** | **~2GB** | **~8GB** |
+| Single model (long seq) | 50,000 | 245 | ~46GB | ~46GB |
+| **Multi-scale (4 models)** | **200** | **245** | **~3.6GB** | **~14.5GB** |
 
 **Savings: 3x less memory, can train on consumer GPUs**
 
@@ -859,7 +864,7 @@ python train_model_lazy.py --input_timeframe 15min --sequence_length 200 --epoch
 ```python
 {
     'model_type': 'LNN',
-    'input_size': 135,                    # Number of features
+    'input_size': 245,                    # Number of features (v3.4: TSLA+SPY)
     'hidden_size': 128,
     'input_timeframe': '15min',           # ← CRITICAL: Which CSV was used
     'sequence_length': 200,               # ← CRITICAL: Bars to look back
@@ -869,8 +874,8 @@ python train_model_lazy.py --input_timeframe 15min --sequence_length 200 --epoch
     'pretrain_epochs': 10,
     'final_train_loss': 0.0234,
     'final_val_loss': 0.0289,
-    'training_date': '2024-11-12T10:30:00',
-    'feature_names': ['spy_close', 'tsla_close', ...],  # All 135 feature names
+    'training_date': '2024-11-13T15:30:00',
+    'feature_names': ['spy_close', 'tsla_close', 'tsla_channel_5min_position', ...],  # All 245 feature names
     'training_mode': 'lazy_loading',
     'peak_memory_mb': 2456.7,
     'device': 'cuda:0',
@@ -1750,12 +1755,12 @@ Comprehensive metadata storage in model checkpoints (train_model_lazy.py lines 8
 ```python
 metadata = {
     'model_type': 'LNN',
-    'input_size': 135,
+    'input_size': 245,
     'input_timeframe': '15min',      # Which CSV was used for training
     'sequence_length': 200,          # Bars to look back
     'prediction_horizon': 24,        # Bars to predict forward
     'prediction_mode': 'uniform_bars',
-    'feature_names': ['spy_close', 'tsla_close', ...],  # All 135 names
+    'feature_names': ['spy_close', 'tsla_close', 'tsla_channel_5min_position', ...],  # All 245 names
     'train_start_year': 2015,
     'train_end_year': 2023,
     # ... 20+ other fields
@@ -1792,8 +1797,8 @@ sequence = features_df.tail(sequence_length).values
 ### 7. Lazy vs Preload Modes (Memory-Speed Tradeoff)
 
 **The Problem:**
-Training on 1.35M bars × 135 features required:
-- Pre-generating all sequences: **30.5 GB** → OOM crashes
+Training on 1.35M bars × 245 features requires:
+- Pre-generating all sequences: **55.4 GB** → OOM crashes on most systems
 - Needed memory-efficient solution without sacrificing model quality
 
 **Solutions:**
@@ -1896,7 +1901,7 @@ print(f"GPU: {utilization.gpu}% util, {memory_info.used/1e9:.1f}/{memory_info.to
 ### 9. Dynamic Feature System (Future-Proof Design)
 
 **Discovery:**
-Despite having 135 features hardcoded in documentation, **no code actually hardcodes 135!**
+Despite having feature counts in documentation, **no code actually hardcodes them!**
 
 **Evidence:**
 ```python
@@ -1913,7 +1918,7 @@ def __init__(self, input_size, hidden_size):
 ```
 
 **Implication:**
-Adding features (135 → 245) only requires changing `features.py`. All other code automatically adapts!
+Adding features (135 → 245 in v3.4) only required changing `features.py`. All other code automatically adapted!
 
 **Key Insight:** Design for extensibility from the start. Avoid magic numbers; derive from source of truth.
 
@@ -2341,6 +2346,26 @@ predicted_low = MIN(slope × future_x + intercept - 2σ)
 ---
 
 ## Version History
+
+### v3.4 - SPY Features + Critical Architecture Learnings (Nov 13, 2025)
+✅ Added 110 SPY features: 77 channels + 33 RSI across 11 timeframes
+✅ Feature count: 135 → 245 (TSLA + SPY multi-scale context)
+✅ Renamed TSLA features for consistency: `channel_*` → `tsla_channel_*`, `rsi_*` → `tsla_rsi_*`
+✅ Documented 9 critical architecture learnings from production deployment
+✅ Added simulation_date column for multi-model alignment
+✅ Implemented 7-point validation system for backtesting
+✅ Documented metadata flow and dynamic feature system
+
+**BREAKING CHANGES:**
+- All v3.3 and earlier models incompatible (feature count + naming changes)
+- Must retrain all models with new 245-feature extractor
+- Old models archived to `models/archive_v3.3_135features/`
+
+**Performance Impact:**
+- Memory per model: ~2GB → ~3.6GB (lazy mode)
+- Memory for preload: ~30GB → ~55GB
+- Training time: +10-20% slower due to more features
+- Prediction accuracy: TBD (comparing 135 vs 245 on 2024 holdout)
 
 ### v2.1 - Interactive Parameter Selection (Nov 11, 2025)
 ✅ Arrow-key navigation menu for parameter configuration
