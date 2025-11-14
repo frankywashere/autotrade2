@@ -105,8 +105,15 @@ def prepare_update_data(error_df, data_feed, feature_extractor):
             # Get sequence
             sequence = features_df.tail(config.ML_SEQUENCE_LENGTH).values
 
-            # Target: use actual values from database
-            target = [row['actual_high'], row['actual_low']]
+            # Target: convert actual prices to percentage changes
+            # Get current price (last price in sequence)
+            current_price = aligned_df['tsla_close'].iloc[-1]
+
+            # Convert actual prices to percentage changes from current price
+            actual_high_pct = (row['actual_high'] - current_price) / current_price * 100
+            actual_low_pct = (row['actual_low'] - current_price) / current_price * 100
+
+            target = [actual_high_pct, actual_low_pct]
 
             X_update.append(sequence)
             y_update.append(target)

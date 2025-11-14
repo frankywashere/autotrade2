@@ -352,6 +352,47 @@ Meta-LNN Coach
     └─ Outputs: [final_high, final_low, final_confidence]
 ```
 
+### Prediction Format
+
+**All models predict percentage changes, not absolute prices:**
+
+```python
+# Training targets (created from actual prices):
+current_price = 250.00
+actual_high = 255.00  # $255
+actual_low = 245.00   # $245
+
+# Converted to percentages for training:
+target_high = (255.00 - 250.00) / 250.00 * 100 = +2.0%   ← Percentage change
+target_low = (245.00 - 250.00) / 250.00 * 100 = -2.0%    ← Percentage change
+
+# Model learns to predict: [+2.0, -2.0] (percentages)
+```
+
+**Why percentage-based?**
+- Normalized loss scale (±10% vs ±$250 absolute prices)
+- Consistent across different price levels
+- 30,000x training loss improvement over absolute prices
+- MSE loss properly calibrated: targets range from -10% to +10%
+
+**Converting back to absolute prices:**
+```python
+from src.ml.model import percentage_to_absolute
+
+# After model predicts percentages:
+pred_high_pct = 2.5   # Model predicts +2.5%
+pred_low_pct = -1.5   # Model predicts -1.5%
+current_price = 250.0
+
+# Convert to absolute prices:
+pred_high = percentage_to_absolute(pred_high_pct, current_price)  # $256.25
+pred_low = percentage_to_absolute(pred_low_pct, current_price)    # $246.25
+
+# Stored in database:
+pred_high_pct (2.5), pred_low_pct (-1.5), current_price (250.0)
+# Can always reconstruct: pred_high = 250 * (1 + 2.5/100) = $256.25
+```
+
 **Modular Design via Abstract Interfaces (`src/ml/base.py`):**
 - `DataFeed` - Swappable data sources (CSV, IBKR, etc.)
 - `FeatureExtractor` - Pluggable feature engineering
@@ -673,6 +714,37 @@ EPOCHS=100 BATCH_SIZE=256 DEVICE=mps ./train_all_models.sh
 
 ```bash
 python backtest.py --model_path models/lnn_15min.pth --test_year 2024 --num_simulations 100
+```
+
+**Context Window & Feature Extraction:**
+
+Backtest.py automatically calculates the minimum historical context needed to extract all 135 features:
+
+```python
+# Dynamic context calculation
+context_days = max(
+    int((sequence_length / bars_per_trading_day) * 1.5) + 10,  # For model sequence
+    calculate_minimum_context_days()  # For feature extraction
+)
+```
+
+**Why this matters:**
+- Model extracts features from 11 timeframes (1min, 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly, 3month)
+- Each timeframe needs ≥20 bars for meaningful channel calculations (see `features.py:193`)
+- The longest timeframe (3month) requires ~1848 calendar days (~5 years) to have 20+ bars
+- If insufficient data → features are missing → model input size mismatch → ERROR
+
+**Example context calculation:**
+```
+Input: 1hour model with sequence_length=200
+- For model sequence: 200 bars / 6.5 bars_per_day * 1.5 buffer = ~46 days
+- For features (3month): 20 bars * 66 trading_days/bar * 1.4 ratio = ~1848 days
+- Use maximum: context_days = 1848
+
+Loading 2024-01-02:
+[2018-09-03]────────────────────────────[2024-01-02] (1848 days back)
+    ↑                                        ↑
+  5 years of features                    Test date
 ```
 
 #### `backtest_all_models.py`

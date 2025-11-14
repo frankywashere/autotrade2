@@ -235,21 +235,27 @@ class LazyTradingDataset(Dataset):
         # Get sequence features
         X_seq = self.features_array[seq_start:seq_end]
 
-        # Extract targets (y) - high and low in next target_horizon
+        # Extract targets (y) - high and low in next target_horizon as PERCENTAGES
         target_start = seq_end
         target_end = seq_end + self.target_horizon
+
+        # Get current price (last price in sequence)
+        current_price = self.features_array[seq_end - 1, self.close_idx]
 
         # Get future prices using cached column index
         future_prices = self.features_array[target_start:target_end, self.close_idx]
 
-        # Calculate high and low
+        # Calculate high and low as percentage changes from current price
         if len(future_prices) > 0:
-            target_high = np.max(future_prices)
-            target_low = np.min(future_prices)
+            future_high = np.max(future_prices)
+            future_low = np.min(future_prices)
+            # Convert to percentage changes: (price - current) / current * 100
+            target_high = (future_high - current_price) / current_price * 100
+            target_low = (future_low - current_price) / current_price * 100
         else:
-            # Edge case: use last available price
-            target_high = self.features_array[target_start - 1, self.close_idx]
-            target_low = target_high
+            # Edge case: no future data
+            target_high = 0.0
+            target_low = 0.0
 
         # Convert to tensors
         X = torch.tensor(X_seq, dtype=torch.float32)
@@ -342,18 +348,26 @@ class PreloadTradingDataset(Dataset):
             seq_end = actual_idx + self.sequence_length
             X_seq = self.features_array[seq_start:seq_end]
 
-            # Extract targets (y)
+            # Extract targets (y) - as PERCENTAGES
             target_start = seq_end
             target_end = seq_end + self.target_horizon
+
+            # Get current price (last price in sequence)
+            current_price = self.features_array[seq_end - 1, self.close_idx]
+
             future_prices = self.features_array[target_start:target_end, self.close_idx]
 
-            # Calculate high and low
+            # Calculate high and low as percentage changes from current price
             if len(future_prices) > 0:
-                target_high = np.max(future_prices)
-                target_low = np.min(future_prices)
+                future_high = np.max(future_prices)
+                future_low = np.min(future_prices)
+                # Convert to percentage changes: (price - current) / current * 100
+                target_high = (future_high - current_price) / current_price * 100
+                target_low = (future_low - current_price) / current_price * 100
             else:
-                target_high = self.features_array[target_start - 1, self.close_idx]
-                target_low = target_high
+                # Edge case: no future data
+                target_high = 0.0
+                target_low = 0.0
 
             # Store as tensors
             self.X_sequences.append(torch.tensor(X_seq, dtype=torch.float32))
