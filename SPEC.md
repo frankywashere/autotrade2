@@ -2151,6 +2151,59 @@ The ncps library's CfC doesn't support layer stacking. LNN always uses exactly 1
 
 ---
 
+### 9. Missing Calculated Fields in Database Logging
+
+**Symptom:**
+```
+Error logging to DB: 'predicted_center'
+Error logging to DB: 'predicted_range'
+```
+
+**Root Cause:**
+Database schema requires calculated fields that are easy to forget when creating prediction dictionaries:
+
+```python
+# Incomplete (causes error):
+prediction = {
+    'predicted_high': 1.5,
+    'predicted_low': -0.8,
+    # Missing: predicted_center, predicted_range
+}
+
+db.log_prediction(prediction)  # ✗ KeyError!
+```
+
+**Database schema requires** (database.py lines 40-43):
+- `predicted_high` ✓ (from model)
+- `predicted_low` ✓ (from model)
+- `predicted_center` ← Must calculate: (high + low) / 2
+- `predicted_range` ← Must calculate: high - low
+- `confidence` ✓ (from model)
+
+**Solution:**
+```python
+# Complete:
+pred_high = 1.5
+pred_low = -0.8
+
+prediction = {
+    'predicted_high': pred_high,
+    'predicted_low': pred_low,
+    'predicted_center': (pred_high + pred_low) / 2,  # CALCULATE
+    'predicted_range': pred_high - pred_low,         # CALCULATE
+    'confidence': 0.85
+}
+```
+
+**Prevention:** Always calculate center and range when creating predictions, not just extracting raw model outputs.
+
+**Affected files:**
+- ml_dashboard.py ✅ FIXED
+- backtest.py ✅ (already has this)
+- ensemble_backtest.py (check if needed)
+
+---
+
 ### Summary Table
 
 | Pitfall | Impact | Detection | Fix Location |
@@ -2163,6 +2216,7 @@ The ncps library's CfC doesn't support layer stacking. LNN always uses exactly 1
 | Slow tensor creation | Performance warning | UserWarning | ml_dashboard.py ✅ FIXED |
 | num_layers ignored | Wasted effort | Compare model sizes | Document only (library limitation) |
 | Data leakage | Poor ensemble | Ensemble underperforms | Workflow documentation ✅ FIXED |
+| Missing calculated fields | DB logging fails | KeyError in logs | ml_dashboard.py ✅ FIXED |
 
 ---
 
