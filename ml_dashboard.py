@@ -168,6 +168,131 @@ def make_prediction(model_name: str, model, metadata, data_loader: LiveDataLoade
         return None, str(e)
 
 
+def calculate_minimum_context_days(min_bars_per_timeframe=20):
+    """
+    Calculate minimum historical lookback needed for complete feature extraction.
+    Longest timeframe (3month) requires ~1848 days for 20 bars.
+    """
+    # 3month timeframe needs the most context
+    return 1911  # ~5 years for safe 3month channel features
+
+
+def load_ensemble_for_dashboard():
+    """Load ensemble system (4 sub-models + Meta-LNN coach)."""
+    try:
+        # Check all required models exist
+        required_models = {
+            '15min': 'models/lnn_15min.pth',
+            '1hour': 'models/lnn_1hour.pth',
+            '4hour': 'models/lnn_4hour.pth',
+            'daily': 'models/lnn_daily.pth',
+            'meta': 'models/meta_lnn.pth'
+        }
+
+        for name, path in required_models.items():
+            if not Path(path).exists():
+                return None, f"Missing {name} model: {path}"
+
+        # Load ensemble
+        from src.ml.ensemble import load_ensemble
+
+        ensemble = load_ensemble(
+            mode='backtest_no_news',
+            device='cpu',
+            models_dir='models',
+            events_csv='data/tsla_events_REAL.csv'
+        )
+
+        return ensemble, None
+
+    except Exception as e:
+        return None, f"Error loading ensemble: {e}"
+
+
+def make_ensemble_prediction(ensemble, feature_extractor):
+    """
+    Make ensemble prediction using all 4 timeframe models + Meta-LNN.
+
+    Returns:
+        (prediction_dict, error_message)
+    """
+    try:
+        # Step 1: Load model metadata for sequence lengths
+        model_metadata = {}
+        for tf in ['15min', '1hour', '4hour', 'daily']:
+            ckpt = torch.load(f'models/lnn_{tf}.pth', weights_only=False)
+            model_metadata[tf] = ckpt['metadata']
+
+        # Step 2: Create data loaders for all timeframes
+        data_feeds = {
+            '15min': LiveDataLoader(timeframe='15min'),
+            '1hour': LiveDataLoader(timeframe='1hour'),
+            '4hour': LiveDataLoader(timeframe='4hour'),
+            'daily': LiveDataLoader(timeframe='daily')
+        }
+
+        # Step 3: Load data at all 4 timeframes
+        data_dict = {}
+        context_days = calculate_minimum_context_days(min_bars_per_timeframe=20)
+
+        for tf in ['15min', '1hour', '4hour', 'daily']:
+            seq_len = model_metadata[tf]['sequence_length']
+
+            # Load live data
+            aligned_df, status = data_feeds[tf].load_live_data(lookback_days=context_days)
+
+            if len(aligned_df) < seq_len:
+                return None, f"Insufficient data for {tf}: {len(aligned_df)}/{seq_len} bars"
+
+            # Extract features
+            features_df = feature_extractor.extract_features(aligned_df)
+
+            if len(features_df) < seq_len:
+                return None, f"Insufficient features for {tf}: {len(features_df)}/{seq_len}"
+
+            # Create input tensor
+            sequence = features_df.tail(seq_len).values
+            data_dict[tf] = torch.tensor(sequence, dtype=torch.float32)
+
+        # Step 4: Get current price and market state
+        main_df, _ = data_feeds['1hour'].load_live_data(lookback_days=context_days)
+        main_features = feature_extractor.extract_features(main_df)
+        current_price = float(main_features.iloc[-1]['tsla_close'])
+        current_idx = len(main_features) - 1
+
+        # Step 5: Get ensemble prediction
+        predictions = ensemble.predict(
+            data=data_dict,
+            features_df=main_features,
+            current_idx=current_idx,
+            timestamp=datetime.now()
+        )
+
+        # Step 6: Format result
+        from src.ml.model import percentage_to_absolute
+
+        result = {
+            'model': 'ensemble',
+            'timestamp': datetime.now(),
+            'data_status': 'LIVE',
+            'current_price': current_price,
+            'predicted_high_pct': float(predictions['predicted_high']),
+            'predicted_low_pct': float(predictions['predicted_low']),
+            'predicted_high_price': float(percentage_to_absolute(predictions['predicted_high'], current_price)),
+            'predicted_low_price': float(percentage_to_absolute(predictions['predicted_low'], current_price)),
+            'confidence': float(predictions['confidence']),
+            'sub_predictions': predictions.get('sub_predictions', {}),
+            'prediction_window': '24 hours'
+        }
+
+        return result, None
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, str(e)
+
+
 def should_update_prediction(model_name: str, cache: PredictionCache) -> bool:
     """Check if it's time to update this model's prediction."""
     now = datetime.now()
@@ -186,6 +311,9 @@ def should_update_prediction(model_name: str, cache: PredictionCache) -> bool:
         return now.hour % 4 == 0 and now.minute == 0
     elif model_name == 'daily':
         return now.hour == 16 and now.minute == 0
+    elif model_name == 'ensemble':
+        # Ensemble updates hourly (same as 1-hour model)
+        return now.minute == 0
     else:
         return False
 
@@ -263,55 +391,87 @@ def prediction_scheduler_thread(selected_models, alert_threshold):
             for model_name in selected_models:
                 # Check if we should update this model
                 if should_update_prediction(model_name, GLOBAL_PREDICTION_CACHE):
-                    # Load model if not already loaded
-                    if model_name not in GLOBAL_MODELS:
-                        model, metadata = load_model(model_name)
-                        if model:
-                            GLOBAL_MODELS[model_name] = {'model': model, 'metadata': metadata}
 
-                    if model_name in GLOBAL_MODELS:
-                        model_info = GLOBAL_MODELS[model_name]
+                    if model_name == 'ensemble':
+                        # Special handling for ensemble
+                        # Load ensemble if not already loaded
+                        if 'ensemble' not in GLOBAL_MODELS:
+                            ensemble, error = load_ensemble_for_dashboard()
+                            if ensemble:
+                                GLOBAL_MODELS['ensemble'] = ensemble
+                                print(f"✓ Loaded ensemble for background predictions")
+                            else:
+                                print(f"✗ Failed to load ensemble: {error}")
+                                continue
 
-                        # Create data loader for this timeframe if needed
-                        timeframe = model_info['metadata']['input_timeframe']
-                        if timeframe not in data_loaders:
-                            data_loaders[timeframe] = LiveDataLoader(timeframe=timeframe)
+                        # Make ensemble prediction
+                        ensemble = GLOBAL_MODELS['ensemble']
+                        prediction, error = make_ensemble_prediction(ensemble, feature_extractor)
 
-                        # Make prediction
-                        prediction, error = make_prediction(
-                            model_name,
-                            model_info['model'],
-                            model_info['metadata'],
-                            data_loaders[timeframe],
-                            feature_extractor
-                        )
+                    else:
+                        # Regular model handling
+                        # Load model if not already loaded
+                        if model_name not in GLOBAL_MODELS:
+                            model, metadata = load_model(model_name)
+                            if model:
+                                GLOBAL_MODELS[model_name] = {'model': model, 'metadata': metadata}
 
-                        if prediction:
-                            # Cache the prediction (use global for thread safety)
-                            GLOBAL_PREDICTION_CACHE.set(model_name, prediction)
+                        if model_name in GLOBAL_MODELS:
+                            model_info = GLOBAL_MODELS[model_name]
 
-                            # Log to database
-                            try:
-                                db.log_prediction({
-                                    'prediction_timestamp': prediction['timestamp'],
-                                    'target_timestamp': prediction['timestamp'] + timedelta(hours=24),
-                                    'simulation_date': None,  # Live prediction
-                                    'symbol': 'TSLA',
-                                    'timeframe': '24h',
-                                    'model_timeframe': model_name,
-                                    'is_ensemble': False,
-                                    'predicted_high': prediction['predicted_high_pct'],
-                                    'predicted_low': prediction['predicted_low_pct'],
-                                    'confidence': prediction['confidence'],
-                                    'current_price': prediction['current_price'],
-                                    'feature_dim': 245
-                                })
-                            except Exception as e:
-                                print(f"Error logging to DB: {e}")
+                            # Create data loader for this timeframe if needed
+                            timeframe = model_info['metadata']['input_timeframe']
+                            if timeframe not in data_loaders:
+                                data_loaders[timeframe] = LiveDataLoader(timeframe=timeframe)
 
-                            # Send alert if high confidence
-                            if token and chat_id and prediction['confidence'] > alert_threshold:
-                                send_telegram_alert(prediction, token, chat_id)
+                            # Make prediction
+                            prediction, error = make_prediction(
+                                model_name,
+                                model_info['model'],
+                                model_info['metadata'],
+                                data_loaders[timeframe],
+                                feature_extractor
+                            )
+                        else:
+                            prediction = None
+                            error = "Model not loaded"
+
+                    # Cache and log prediction (works for both ensemble and regular models)
+                    if prediction:
+                        # Cache the prediction (use global for thread safety)
+                        GLOBAL_PREDICTION_CACHE.set(model_name, prediction)
+
+                        # Log to database
+                        try:
+                            log_data = {
+                                'prediction_timestamp': prediction['timestamp'],
+                                'target_timestamp': prediction['timestamp'] + timedelta(hours=24),
+                                'simulation_date': None,  # Live prediction
+                                'symbol': 'TSLA',
+                                'timeframe': '24h',
+                                'model_timeframe': model_name,
+                                'is_ensemble': (model_name == 'ensemble'),
+                                'predicted_high': prediction['predicted_high_pct'],
+                                'predicted_low': prediction['predicted_low_pct'],
+                                'confidence': prediction['confidence'],
+                                'current_price': prediction['current_price'],
+                                'feature_dim': 245
+                            }
+
+                            # Add sub-predictions if ensemble
+                            if model_name == 'ensemble' and 'sub_predictions' in prediction:
+                                for tf, sp in prediction['sub_predictions'].items():
+                                    log_data[f'sub_pred_{tf}_high'] = float(sp['predicted_high'])
+                                    log_data[f'sub_pred_{tf}_low'] = float(sp['predicted_low'])
+                                    log_data[f'sub_pred_{tf}_conf'] = float(sp['confidence'])
+
+                            db.log_prediction(log_data)
+                        except Exception as e:
+                            print(f"Error logging to DB: {e}")
+
+                        # Send alert if high confidence
+                        if token and chat_id and prediction['confidence'] > alert_threshold:
+                            send_telegram_alert(prediction, token, chat_id)
 
             # Sleep for 1 minute before next check
             time.sleep(60)
@@ -443,8 +603,109 @@ def main():
         st.rerun()
 
 
+def render_ensemble_prediction(alert_threshold: float):
+    """Render ensemble prediction card with sub-model breakdown."""
+    st.subheader("🔮 ENSEMBLE Model (Meta-LNN Coach)")
+
+    # Get cached prediction
+    cached = GLOBAL_PREDICTION_CACHE.get('ensemble')
+
+    if cached is None:
+        # No prediction yet - trigger one
+        with st.spinner("Loading ensemble (4 models + Meta-LNN coach) and making prediction..."):
+            # Load ensemble if not already loaded
+            if 'ensemble' not in GLOBAL_MODELS:
+                ensemble, error = load_ensemble_for_dashboard()
+                if ensemble:
+                    GLOBAL_MODELS['ensemble'] = ensemble
+                else:
+                    st.error(f"Failed to load ensemble: {error}")
+                    return
+
+            ensemble = GLOBAL_MODELS['ensemble']
+            feature_extractor = TradingFeatureExtractor()
+
+            # Make ensemble prediction
+            prediction, error = make_ensemble_prediction(ensemble, feature_extractor)
+
+            if prediction:
+                GLOBAL_PREDICTION_CACHE.set('ensemble', prediction)
+                cached = prediction
+            else:
+                st.error(f"Error: {error}")
+                return
+
+    # Display main ensemble prediction
+    col1, col2, col3 = st.columns([2, 2, 1])
+
+    with col1:
+        st.markdown(f"**Predicted High:** ${cached['predicted_high_price']:.2f} ({cached['predicted_high_pct']:+.1f}%)")
+        st.markdown(f"**Predicted Low:** ${cached['predicted_low_price']:.2f} ({cached['predicted_low_pct']:+.1f}%)")
+
+    with col2:
+        conf_pct = cached['confidence'] * 100
+        st.markdown(f"**Confidence:** {conf_pct:.0f}%")
+
+        # Confidence bar
+        if conf_pct > 75:
+            st.progress(conf_pct / 100, "🟢 High")
+        elif conf_pct > 50:
+            st.progress(conf_pct / 100, "🟡 Medium")
+        else:
+            st.progress(conf_pct / 100, "🔴 Low")
+
+    with col3:
+        # Countdown to next update
+        seconds_until = GLOBAL_PREDICTION_CACHE.get_time_until_update('ensemble')
+        if seconds_until:
+            minutes = int(seconds_until // 60)
+            secs = int(seconds_until % 60)
+            st.markdown(f"**Next update:**")
+            st.markdown(f"`{minutes:02d}:{secs:02d}`")
+
+    # Additional info
+    st.caption(f"Last updated: {cached['timestamp'].strftime('%H:%M:%S')} | "
+               f"Data: {cached['data_status']} | "
+               f"Window: {cached['prediction_window']}")
+
+    # Show sub-predictions breakdown
+    with st.expander("📊 View Sub-Model Predictions"):
+        sub_preds = cached.get('sub_predictions', {})
+
+        if sub_preds:
+            st.markdown("**Individual model predictions that went into ensemble:**")
+
+            for tf in ['15min', '1hour', '4hour', 'daily']:
+                if tf in sub_preds:
+                    sp = sub_preds[tf]
+                    col1, col2, col3 = st.columns([1, 2, 1])
+
+                    with col1:
+                        st.markdown(f"**{tf}:**")
+
+                    with col2:
+                        st.markdown(f"High: {sp['predicted_high']:+.2f}%, Low: {sp['predicted_low']:+.2f}%")
+
+                    with col3:
+                        st.markdown(f"Conf: {sp['confidence']:.2f}")
+        else:
+            st.info("No sub-predictions available")
+
+    # Alert indicator
+    if cached['confidence'] > alert_threshold:
+        st.success(f"✅ Alert sent (confidence > {alert_threshold:.0%})")
+
+    st.markdown("---")
+
+
 def render_model_prediction(model_name: str, alert_threshold: float):
     """Render prediction card for one model."""
+
+    # Route ensemble to special renderer
+    if model_name == 'ensemble':
+        render_ensemble_prediction(alert_threshold)
+        return
+
     st.subheader(f"🔮 {model_name.upper()} Model")
 
     # Get cached prediction
