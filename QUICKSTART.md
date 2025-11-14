@@ -170,6 +170,65 @@ sqlite3 data/predictions.db "SELECT model_timeframe, AVG(absolute_error) FROM pr
 
 ---
 
+## Step 6: Test Ensemble (Meta-LNN Coach)
+
+```bash
+# Test ensemble on 2024 holdout
+python3 ensemble_backtest.py --test_year 2024 --num_simulations 50
+```
+
+**What it does:**
+- Tests Meta-LNN coach combining all 4 models
+- Compares ensemble vs best individual model
+- Logs to database with model_timeframe='ensemble'
+- **Time: ~15-20 minutes**
+
+**Analyze ensemble vs individual:**
+```bash
+sqlite3 data/predictions.db "
+  SELECT
+    model_timeframe,
+    COUNT(*) as n,
+    ROUND(AVG(absolute_error), 2) as error
+  FROM predictions
+  WHERE simulation_date >= '2024-01-01'
+  GROUP BY model_timeframe
+  ORDER BY error ASC
+"
+```
+
+---
+
+## Step 7: Deploy Live Trading System
+
+```bash
+# Launch ML dashboard (all-in-one: predictions + alerts + monitoring)
+streamlit run ml_dashboard.py
+```
+
+**What it does:**
+- Opens browser dashboard at http://localhost:8501
+- Select models to display (checkboxes in sidebar)
+- Fetches live data via yfinance
+- Makes predictions at correct bar-close times:
+  * 15min: Updates every 15 minutes (:00, :15, :30, :45)
+  * 1hour: Updates hourly (top of hour)
+  * 4hour: Updates every 4 hours
+  * daily: Updates at market close (4pm ET)
+  * ensemble: Updates hourly
+- Sends Telegram alerts for high-confidence predictions
+- Shows countdown timers to next update
+- Displays recent 30-day performance
+
+**Optional: Setup actuals updater (cron job)**
+```bash
+crontab -e
+# Add this line:
+0 * * * * cd /path/to/autotrade2 && /path/to/myenv/bin/python3 update_live_actuals.py
+```
+
+---
+
 ## Optional: Enable News Mode (Future)
 
 ### Install transformers:

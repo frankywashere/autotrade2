@@ -129,9 +129,9 @@ def make_prediction(model_name: str, model, metadata, data_loader: LiveDataLoade
         if len(features_df) < sequence_length:
             return None, f"Insufficient features: {len(features_df)}/{sequence_length}"
 
-        # Create input sequence
+        # Create input sequence (numpy first for performance)
         sequence = features_df.tail(sequence_length).values
-        sequence_tensor = torch.tensor([sequence], dtype=torch.float32)
+        sequence_tensor = torch.from_numpy(sequence).unsqueeze(0).float()
 
         # Get current price
         current_price = features_df.iloc[-1]['tsla_close']
