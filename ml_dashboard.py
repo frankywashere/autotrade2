@@ -33,7 +33,7 @@ from src.ml.prediction_cache import PredictionCache
 from src.ml.features import TradingFeatureExtractor
 from src.ml.database import SQLitePredictionDB
 from src.ml.model import LNNTradingModel, LSTMTradingModel
-from src.telegram_bot import TelegramBot
+import requests  # For Telegram API
 
 
 # Global state
@@ -43,11 +43,30 @@ if 'prediction_cache' not in st.session_state:
 if 'models' not in st.session_state:
     st.session_state.models = {}
 
-if 'telegram_bot' not in st.session_state:
-    st.session_state.telegram_bot = None
+if 'telegram_token' not in st.session_state:
+    st.session_state.telegram_token = None
+
+if 'telegram_chat_id' not in st.session_state:
+    st.session_state.telegram_chat_id = None
 
 if 'scheduler_running' not in st.session_state:
     st.session_state.scheduler_running = False
+
+
+def send_telegram_message(token: str, chat_id: str, message: str) -> bool:
+    """Simple Telegram message sender."""
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = {
+            'chat_id': chat_id,
+            'text': message,
+            'parse_mode': 'HTML'
+        }
+        response = requests.post(url, data=data, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Telegram error: {e}")
+        return False
 
 
 def load_telegram_config():
@@ -175,7 +194,7 @@ def should_update_prediction(model_name: str, cache: PredictionCache) -> bool:
         return False
 
 
-def send_telegram_alert(prediction: Dict, telegram_bot):
+def send_telegram_alert(prediction: Dict, token: str, chat_id: str):
     """Send Telegram alert for high-confidence prediction."""
     try:
         model = prediction['model']
@@ -198,8 +217,7 @@ def send_telegram_alert(prediction: Dict, telegram_bot):
             signal = "NEUTRAL"
             emoji = "➡️"
 
-        message = f"""
-🤖 <b>AutoTrade2 ML Prediction</b>
+        message = f"""🤖 <b>AutoTrade2 ML Prediction</b>
 
 <b>Model:</b> {model} (0.99% avg error)
 <b>Time:</b> {prediction['timestamp'].strftime('%Y-%m-%d %H:%M ET')}
@@ -216,14 +234,12 @@ def send_telegram_alert(prediction: Dict, telegram_bot):
 <b>Bias:</b> {center:+.1f}% center
 
 <i>Powered by 245-feature LNN
-(SPY+TSLA multi-scale analysis)</i>
-"""
+(SPY+TSLA multi-scale analysis)</i>"""
 
-        telegram_bot.send_message(message)
-        return True
+        return send_telegram_message(token, chat_id, message)
 
     except Exception as e:
-        st.warning(f"Telegram alert failed: {e}")
+        print(f"Telegram alert failed: {e}")
         return False
 
 
@@ -237,13 +253,10 @@ def prediction_scheduler_thread(selected_models, alert_threshold):
     feature_extractor = TradingFeatureExtractor()
     db = SQLitePredictionDB()
 
-    # Load Telegram bot if configured
+    # Load Telegram config if configured
     token, chat_id = load_telegram_config()
-    if token and chat_id:
-        telegram_bot = TelegramBot(token, chat_id)
-        st.session_state.telegram_bot = telegram_bot
-    else:
-        telegram_bot = None
+    st.session_state.telegram_token = token
+    st.session_state.telegram_chat_id = chat_id
 
     while st.session_state.scheduler_running:
         try:
@@ -297,8 +310,8 @@ def prediction_scheduler_thread(selected_models, alert_threshold):
                                 print(f"Error logging to DB: {e}")
 
                             # Send alert if high confidence
-                            if telegram_bot and prediction['confidence'] > alert_threshold:
-                                send_telegram_alert(prediction, telegram_bot)
+                            if token and chat_id and prediction['confidence'] > alert_threshold:
+                                send_telegram_alert(prediction, token, chat_id)
 
             # Sleep for 1 minute before next check
             time.sleep(60)
