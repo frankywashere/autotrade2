@@ -427,3 +427,53 @@ def create_model(model_type: str = None, input_size: int = 50,
         return LSTMTradingModel(input_size, hidden_size, **kwargs)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+
+
+# Helper functions for percentage ↔ absolute price conversion
+def percentage_to_absolute(pred_pct: float, current_price: float) -> float:
+    """
+    Convert percentage prediction to absolute price.
+
+    Args:
+        pred_pct: Predicted change in percentage (e.g., +2.5 or -1.3)
+        current_price: Current price at prediction time (e.g., $250.00)
+
+    Returns:
+        Predicted absolute price (e.g., $256.25 or $246.75)
+    """
+    return current_price * (1 + pred_pct / 100)
+
+
+def absolute_to_percentage(pred_absolute: float, current_price: float) -> float:
+    """
+    Convert absolute price prediction to percentage change.
+
+    Args:
+        pred_absolute: Predicted absolute price (e.g., $256.25)
+        current_price: Current price at prediction time (e.g., $250.00)
+
+    Returns:
+        Predicted change in percentage (e.g., +2.5)
+    """
+    return (pred_absolute - current_price) / current_price * 100
+
+
+def convert_predictions_to_absolute(predictions: dict, current_price: float) -> dict:
+    """
+    Convert prediction dict from percentages to absolute prices.
+
+    Args:
+        predictions: Dict with keys like 'predicted_high', 'predicted_low', 'predicted_center'
+        current_price: Current price for conversion
+
+    Returns:
+        New dict with predictions converted to absolute prices
+    """
+    result = predictions.copy()
+
+    for key in ['predicted_high', 'predicted_low', 'predicted_center']:
+        if key in result:
+            result[f'{key}_pct'] = result[key]  # Keep original percentage
+            result[key] = percentage_to_absolute(result[key], current_price)
+
+    return result

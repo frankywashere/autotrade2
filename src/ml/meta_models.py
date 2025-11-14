@@ -395,16 +395,19 @@ def meta_loss(pred_high, pred_low, pred_conf, y_high, y_low, confidence_target=N
     Returns:
         Total loss (scalar)
     """
-    # Huber loss for prices (delta=1.0 is ~1% for prices around 100)
-    loss_high = F.huber_loss(pred_high, y_high, delta=1.0)
-    loss_low = F.huber_loss(pred_low, y_low, delta=1.0)
+    # Huber loss for percentages
+    # delta=0.5 means errors >0.5 percentage points are treated as linear (robust to outliers)
+    # Typical prediction range: -10% to +10%, so delta=0.5pp is reasonable
+    loss_high = F.huber_loss(pred_high, y_high, delta=0.5)
+    loss_low = F.huber_loss(pred_low, y_low, delta=0.5)
 
     # Confidence calibration
     if confidence_target is None:
         # Derive confidence target from prediction accuracy
-        # If prediction was good, confidence should be high
-        high_accuracy = 1.0 - torch.abs(pred_high - y_high) / (y_high + 1e-6)
-        low_accuracy = 1.0 - torch.abs(pred_low - y_low) / (y_low + 1e-6)
+        # Predictions and targets are now in percentage terms, so normalize differently
+        # Assuming typical range of ±10%, we divide error by a reasonable scale
+        high_accuracy = torch.exp(-torch.abs(pred_high - y_high) / 2.0)  # Exponential decay
+        low_accuracy = torch.exp(-torch.abs(pred_low - y_low) / 2.0)
         confidence_target = (high_accuracy + low_accuracy) / 2.0
         confidence_target = torch.clamp(confidence_target, 0.0, 1.0)
 

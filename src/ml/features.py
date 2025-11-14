@@ -328,11 +328,15 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def _extract_time_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
         """Extract time-based features"""
-        # Cyclical encoding of time
-        features_df['hour_of_day'] = df.index.hour / 24.0
-        features_df['day_of_week'] = df.index.dayofweek / 7.0
-        features_df['day_of_month'] = df.index.day / 31.0
-        features_df['month_of_year'] = df.index.month / 12.0
+        # Cyclical encoding of time - batch all columns at once to avoid DataFrame fragmentation
+        time_features = pd.DataFrame({
+            'hour_of_day': df.index.hour / 24.0,
+            'day_of_week': df.index.dayofweek / 7.0,
+            'day_of_month': df.index.day / 31.0,
+            'month_of_year': df.index.month / 12.0
+        }, index=df.index)
+
+        features_df = pd.concat([features_df, time_features], axis=1)
 
         return features_df
 

@@ -226,11 +226,15 @@ class MultiScaleEnsemble:
                 subpreds, market_state, news_vec, news_mask
             )
 
+        # Get current price for percentage → absolute conversion
+        current_price = float(features_df['tsla_close'].iloc[current_idx])
+
         # Return results
         return {
             'predicted_high': float(pred_high[0].cpu()),
             'predicted_low': float(pred_low[0].cpu()),
             'confidence': float(pred_conf[0].cpu()),
+            'current_price': current_price,  # Needed for percentage → absolute conversion
             'sub_predictions': sub_predictions,  # For logging and analysis
             'mode': self.mode,
             'news_enabled': self.mode == 'live_with_news' and news_mask[0, 0].item() > 0
