@@ -42,29 +42,31 @@ def test_multiscale_features():
 
     print(f"\n✓ Expected timeframes: {len(expected_timeframes)}")
 
-    # Check for each timeframe
+    # Check for each timeframe (NOW CHECKS BOTH TSLA AND SPY)
     print("\nChecking timeframe coverage:")
 
     for tf in expected_timeframes:
-        # Check channel features
-        channel_features = [
-            f'channel_{tf}_position',
-            f'channel_{tf}_upper_dist',
-            f'channel_{tf}_lower_dist',
-            f'channel_{tf}_slope',
-            f'channel_{tf}_stability',
-            f'channel_{tf}_ping_pongs',
-            f'channel_{tf}_r_squared'
-        ]
+        # Check TSLA and SPY features
+        all_tf_features = []
 
-        # Check RSI features
-        rsi_features = [
-            f'rsi_{tf}',
-            f'rsi_{tf}_oversold',
-            f'rsi_{tf}_overbought'
-        ]
+        for symbol in ['tsla', 'spy']:
+            # Channel features
+            all_tf_features.extend([
+                f'{symbol}_channel_{tf}_position',
+                f'{symbol}_channel_{tf}_upper_dist',
+                f'{symbol}_channel_{tf}_lower_dist',
+                f'{symbol}_channel_{tf}_slope',
+                f'{symbol}_channel_{tf}_stability',
+                f'{symbol}_channel_{tf}_ping_pongs',
+                f'{symbol}_channel_{tf}_r_squared'
+            ])
 
-        all_tf_features = channel_features + rsi_features
+            # RSI features
+            all_tf_features.extend([
+                f'{symbol}_rsi_{tf}',
+                f'{symbol}_rsi_{tf}_oversold',
+                f'{symbol}_rsi_{tf}_overbought'
+            ])
 
         # Count how many are present
         found = sum(1 for f in all_tf_features if f in feature_names)
@@ -76,45 +78,61 @@ def test_multiscale_features():
         else:
             status = "❌"
 
-        print(f"  {status} {tf:10s}: {found}/{len(all_tf_features)} features")
+        print(f"  {status} {tf:10s}: {found}/{len(all_tf_features)} features (TSLA+SPY)")
 
     # Calculate feature breakdown
     print("\n" + "=" * 70)
-    print("FEATURE BREAKDOWN")
+    print("FEATURE BREAKDOWN (v3.4 - WITH SPY FEATURES)")
     print("=" * 70)
 
-    # Count by category
+    # Count by category (new naming with symbol prefixes)
     base_features = [f for f in feature_names if not any(
-        f.startswith(prefix) for prefix in ['channel_', 'rsi_']
+        f.startswith(prefix) for prefix in ['tsla_channel_', 'spy_channel_', 'tsla_rsi_', 'spy_rsi_']
     )]
-    channel_features = [f for f in feature_names if f.startswith('channel_')]
-    rsi_features = [f for f in feature_names if f.startswith('rsi_')]
+    tsla_channel_features = [f for f in feature_names if f.startswith('tsla_channel_')]
+    spy_channel_features = [f for f in feature_names if f.startswith('spy_channel_')]
+    tsla_rsi_features = [f for f in feature_names if f.startswith('tsla_rsi_')]
+    spy_rsi_features = [f for f in feature_names if f.startswith('spy_rsi_')]
 
     print(f"\n  Base features: {len(base_features)}")
-    print(f"  Channel features: {len(channel_features)} (7 per timeframe × {len(channel_features)//7} timeframes)")
-    print(f"  RSI features: {len(rsi_features)} (3 per timeframe × {len(rsi_features)//3} timeframes)")
-    print(f"\n  Total: {len(feature_names)}")
+    print(f"  TSLA Channel features: {len(tsla_channel_features)} (7 per timeframe × {len(tsla_channel_features)//7} timeframes)")
+    print(f"  SPY Channel features: {len(spy_channel_features)} (7 per timeframe × {len(spy_channel_features)//7} timeframes)")
+    print(f"  TSLA RSI features: {len(tsla_rsi_features)} (3 per timeframe × {len(tsla_rsi_features)//3} timeframes)")
+    print(f"  SPY RSI features: {len(spy_rsi_features)} (3 per timeframe × {len(spy_rsi_features)//3} timeframes)")
+    print(f"\n  Total: {len(feature_names)} (expected: 245)")
 
-    # Success criteria
+    # Success criteria (v3.4 - updated for 245 features)
     print("\n" + "=" * 70)
     print("VALIDATION")
     print("=" * 70)
 
-    if feature_dim >= 130:
-        print(f"✅ SUCCESS: Feature dimension is {feature_dim} (expected ~136)")
+    if feature_dim >= 240:
+        print(f"✅ SUCCESS: Feature dimension is {feature_dim} (expected 245)")
     else:
-        print(f"❌ FAILURE: Feature dimension is {feature_dim} (expected ~136)")
+        print(f"❌ FAILURE: Feature dimension is {feature_dim} (expected 245, got {feature_dim})")
 
-    channel_timeframes = len(set(f.split('_')[1] for f in channel_features if '_' in f))
-    rsi_timeframes = len(set(f.split('_')[1] for f in rsi_features if '_' in f))
+    # Check TSLA and SPY channel/RSI timeframes separately
+    tsla_channel_timeframes = len(set(f.split('_')[2] for f in tsla_channel_features if f.count('_') >= 2))
+    spy_channel_timeframes = len(set(f.split('_')[2] for f in spy_channel_features if f.count('_') >= 2))
+    tsla_rsi_timeframes = len(set(f.split('_')[2] for f in tsla_rsi_features if f.count('_') >= 2))
+    spy_rsi_timeframes = len(set(f.split('_')[2] for f in spy_rsi_features if f.count('_') >= 2))
 
-    if channel_timeframes == 11 and rsi_timeframes == 11:
-        print(f"✅ SUCCESS: All 11 timeframes present in features")
+    # Check that both TSLA and SPY have all 11 timeframes
+    all_timeframes_ok = (tsla_channel_timeframes == 11 and spy_channel_timeframes == 11 and
+                        tsla_rsi_timeframes == 11 and spy_rsi_timeframes == 11)
+
+    if all_timeframes_ok:
+        print(f"✅ SUCCESS: All 11 timeframes present for both TSLA and SPY")
     else:
-        print(f"❌ FAILURE: Only {min(channel_timeframes, rsi_timeframes)} timeframes found (expected 11)")
+        print(f"❌ FAILURE: Timeframe coverage incomplete")
+        print(f"   TSLA channels: {tsla_channel_timeframes}/11, SPY channels: {spy_channel_timeframes}/11")
+        print(f"   TSLA RSI: {tsla_rsi_timeframes}/11, SPY RSI: {spy_rsi_timeframes}/11")
 
     print("\n" + "=" * 70)
-    print("Feature count increased from 56 → 136 for multi-scale learning!")
+    print("Feature count progression:")
+    print("  v1.0: 56 features (basic)")
+    print("  v2.0-v3.3: 135 features (multi-scale TSLA only)")
+    print("  v3.4: 245 features (multi-scale TSLA + SPY) ✨")
     print("=" * 70)
     print()
 

@@ -46,24 +46,44 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'{symbol}_volatility_50',
             ])
 
-        # Channel features (multi-timeframe for TSLA)
+        # TSLA Channel features (multi-timeframe) - RENAMED for consistency
         for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             features.extend([
-                f'channel_{tf}_position',  # 0-1 position in channel
-                f'channel_{tf}_upper_dist',  # Distance to upper
-                f'channel_{tf}_lower_dist',  # Distance to lower
-                f'channel_{tf}_slope',
-                f'channel_{tf}_stability',
-                f'channel_{tf}_ping_pongs',
-                f'channel_{tf}_r_squared',
+                f'tsla_channel_{tf}_position',  # 0-1 position in channel
+                f'tsla_channel_{tf}_upper_dist',  # Distance to upper
+                f'tsla_channel_{tf}_lower_dist',  # Distance to lower
+                f'tsla_channel_{tf}_slope',
+                f'tsla_channel_{tf}_stability',
+                f'tsla_channel_{tf}_ping_pongs',
+                f'tsla_channel_{tf}_r_squared',
             ])
 
-        # RSI features (multi-timeframe for TSLA)
+        # SPY Channel features (multi-timeframe) - NEW in v3.4
         for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             features.extend([
-                f'rsi_{tf}',
-                f'rsi_{tf}_oversold',  # Binary
-                f'rsi_{tf}_overbought',  # Binary
+                f'spy_channel_{tf}_position',  # 0-1 position in channel
+                f'spy_channel_{tf}_upper_dist',  # Distance to upper
+                f'spy_channel_{tf}_lower_dist',  # Distance to lower
+                f'spy_channel_{tf}_slope',
+                f'spy_channel_{tf}_stability',
+                f'spy_channel_{tf}_ping_pongs',
+                f'spy_channel_{tf}_r_squared',
+            ])
+
+        # TSLA RSI features (multi-timeframe) - RENAMED for consistency
+        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
+            features.extend([
+                f'tsla_rsi_{tf}',
+                f'tsla_rsi_{tf}_oversold',  # Binary
+                f'tsla_rsi_{tf}_overbought',  # Binary
+            ])
+
+        # SPY RSI features (multi-timeframe) - NEW in v3.4
+        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
+            features.extend([
+                f'spy_rsi_{tf}',
+                f'spy_rsi_{tf}_oversold',  # Binary
+                f'spy_rsi_{tf}_overbought',  # Binary
             ])
 
         # SPY-TSLA correlation features
@@ -160,6 +180,7 @@ class TradingFeatureExtractor(FeatureExtractor):
     def _extract_channel_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
         """
         Extract linear regression channel features for multiple timeframes
+        NOW PROCESSES BOTH TSLA AND SPY (v3.4)
         Uses existing LinearRegressionChannel from Stage 1
         """
         # Resample to different timeframes
@@ -177,51 +198,57 @@ class TradingFeatureExtractor(FeatureExtractor):
             '3month': '3M'
         }
 
-        for tf_name, tf_rule in timeframes.items():
-            # Resample TSLA data
-            tsla_df = df[[c for c in df.columns if c.startswith('tsla_')]].copy()
-            tsla_df.columns = [c.replace('tsla_', '') for c in tsla_df.columns]
+        # Process both TSLA and SPY
+        for symbol in ['tsla', 'spy']:
+            for tf_name, tf_rule in timeframes.items():
+                # Resample symbol data
+                symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
+                symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
 
-            resampled = tsla_df.resample(tf_rule).agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum'
-            }).dropna()
+                resampled = symbol_df.resample(tf_rule).agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum'
+                }).dropna()
 
-            if len(resampled) < 20:
-                # Not enough data for this timeframe
-                continue
+                if len(resampled) < 20:
+                    # Not enough data for this timeframe
+                    continue
 
-            # Calculate channel
-            lookback = min(168, len(resampled) - 1)  # 1 week or max available
-            try:
-                channel = self.channel_calc.calculate_channel(resampled, lookback, tf_name)
+                # Calculate channel
+                lookback = min(168, len(resampled) - 1)  # 1 week or max available
+                try:
+                    channel = self.channel_calc.calculate_channel(resampled, lookback, tf_name)
 
-                # Get current position in channel
-                current_price = resampled['close'].iloc[-1]
-                position_data = self.channel_calc.get_channel_position(current_price, channel)
+                    # Get current position in channel
+                    current_price = resampled['close'].iloc[-1]
+                    position_data = self.channel_calc.get_channel_position(current_price, channel)
 
-                # Add features (broadcast to all rows in original df)
-                features_df[f'channel_{tf_name}_position'] = position_data['position']
-                features_df[f'channel_{tf_name}_upper_dist'] = position_data['distance_to_upper_pct']
-                features_df[f'channel_{tf_name}_lower_dist'] = position_data['distance_to_lower_pct']
-                features_df[f'channel_{tf_name}_slope'] = channel.slope
-                features_df[f'channel_{tf_name}_stability'] = channel.stability_score
-                features_df[f'channel_{tf_name}_ping_pongs'] = channel.ping_pongs
-                features_df[f'channel_{tf_name}_r_squared'] = channel.r_squared
+                    # Add features (broadcast to all rows in original df)
+                    # Use symbol prefix for consistent naming
+                    prefix = f'{symbol}_channel'
+                    features_df[f'{prefix}_{tf_name}_position'] = position_data['position']
+                    features_df[f'{prefix}_{tf_name}_upper_dist'] = position_data['distance_to_upper_pct']
+                    features_df[f'{prefix}_{tf_name}_lower_dist'] = position_data['distance_to_lower_pct']
+                    features_df[f'{prefix}_{tf_name}_slope'] = channel.slope
+                    features_df[f'{prefix}_{tf_name}_stability'] = channel.stability_score
+                    features_df[f'{prefix}_{tf_name}_ping_pongs'] = channel.ping_pongs
+                    features_df[f'{prefix}_{tf_name}_r_squared'] = channel.r_squared
 
-            except Exception as e:
-                # Fill with zeros if calculation fails
-                for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'stability', 'ping_pongs', 'r_squared']:
-                    features_df[f'channel_{tf_name}_{feat}'] = 0.0
+                except Exception as e:
+                    # Fill with zeros if calculation fails
+                    prefix = f'{symbol}_channel'
+                    for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'stability', 'ping_pongs', 'r_squared']:
+                        features_df[f'{prefix}_{tf_name}_{feat}'] = 0.0
 
         return features_df
 
     def _extract_rsi_features(self, df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
         """
         Extract RSI features for multiple timeframes
+        NOW PROCESSES BOTH TSLA AND SPY (v3.4)
         Uses existing RSICalculator from Stage 1
         """
         timeframes = {
@@ -238,35 +265,39 @@ class TradingFeatureExtractor(FeatureExtractor):
             '3month': '3M'
         }
 
-        for tf_name, tf_rule in timeframes.items():
-            # Resample TSLA data
-            tsla_df = df[[c for c in df.columns if c.startswith('tsla_')]].copy()
-            tsla_df.columns = [c.replace('tsla_', '') for c in tsla_df.columns]
+        # Process both TSLA and SPY
+        for symbol in ['tsla', 'spy']:
+            for tf_name, tf_rule in timeframes.items():
+                # Resample symbol data
+                symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
+                symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
 
-            resampled = tsla_df.resample(tf_rule).agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum'
-            }).dropna()
+                resampled = symbol_df.resample(tf_rule).agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum'
+                }).dropna()
 
-            if len(resampled) < 20:
-                continue
+                if len(resampled) < 20:
+                    continue
 
-            try:
-                rsi_data = self.rsi_calc.get_rsi_data(resampled)
+                try:
+                    rsi_data = self.rsi_calc.get_rsi_data(resampled)
 
-                # Add features
-                rsi_value = rsi_data.value if rsi_data.value is not None else 50.0
-                features_df[f'rsi_{tf_name}'] = rsi_value
-                features_df[f'rsi_{tf_name}_oversold'] = 1.0 if rsi_data.oversold else 0.0
-                features_df[f'rsi_{tf_name}_overbought'] = 1.0 if rsi_data.overbought else 0.0
+                    # Add features with symbol prefix for consistent naming
+                    prefix = f'{symbol}_rsi'
+                    rsi_value = rsi_data.value if rsi_data.value is not None else 50.0
+                    features_df[f'{prefix}_{tf_name}'] = rsi_value
+                    features_df[f'{prefix}_{tf_name}_oversold'] = 1.0 if rsi_data.oversold else 0.0
+                    features_df[f'{prefix}_{tf_name}_overbought'] = 1.0 if rsi_data.overbought else 0.0
 
-            except Exception:
-                features_df[f'rsi_{tf_name}'] = 50.0
-                features_df[f'rsi_{tf_name}_oversold'] = 0.0
-                features_df[f'rsi_{tf_name}_overbought'] = 0.0
+                except Exception:
+                    prefix = f'{symbol}_rsi'
+                    features_df[f'{prefix}_{tf_name}'] = 50.0
+                    features_df[f'{prefix}_{tf_name}_oversold'] = 0.0
+                    features_df[f'{prefix}_{tf_name}_overbought'] = 0.0
 
         return features_df
 
