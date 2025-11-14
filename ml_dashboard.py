@@ -140,20 +140,20 @@ def make_prediction(model_name: str, model, metadata, data_loader: LiveDataLoade
         with torch.no_grad():
             predictions = model.predict(sequence_tensor)
 
-        pred_high = predictions['predicted_high'][0]
-        pred_low = predictions['predicted_low'][0]
-        confidence = predictions['confidence'][0]
+        pred_high = float(predictions['predicted_high'][0])
+        pred_low = float(predictions['predicted_low'][0])
+        confidence = float(predictions['confidence'][0])
 
         # Convert to absolute prices
         from src.ml.model import percentage_to_absolute
-        pred_high_price = percentage_to_absolute(pred_high, current_price)
-        pred_low_price = percentage_to_absolute(pred_low, current_price)
+        pred_high_price = float(percentage_to_absolute(pred_high, current_price))
+        pred_low_price = float(percentage_to_absolute(pred_low, current_price))
 
         result = {
             'model': model_name,
             'timestamp': datetime.now(),
             'data_status': data_status,
-            'current_price': current_price,
+            'current_price': float(current_price),
             'predicted_high_pct': pred_high,
             'predicted_low_pct': pred_low,
             'predicted_high_price': pred_high_price,
