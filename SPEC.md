@@ -18,11 +18,12 @@
 8. [News Infrastructure](#news-infrastructure)
 9. [Training Workflow](#training-workflow)
 10. [Critical Architecture Learnings](#critical-architecture-learnings)
-11. [Data Validation](#data-validation)
-12. [Memory Optimization & GPU](#memory-optimization--gpu)
-13. [Performance & Limitations](#performance--limitations)
-14. [API Integration](#api-integration)
-15. [Quick Reference](#quick-reference)
+11. [Common Pitfalls & Solutions](#common-pitfalls--solutions)
+12. [Data Validation](#data-validation)
+13. [Memory Optimization & GPU](#memory-optimization--gpu)
+14. [Performance & Limitations](#performance--limitations)
+15. [API Integration](#api-integration)
+16. [Quick Reference](#quick-reference)
 
 ---
 
@@ -1937,6 +1938,231 @@ Adding features (135 → 245 in v3.4) only required changing `features.py`. All 
 | Lazy vs Preload | Memory-speed tradeoff | train_model_lazy.py:462-477 |
 | GPU monitoring | Identifies bottlenecks | train_model_lazy.py:535-538, 614-616 |
 | Dynamic features | Easy extension (135→245) | features.py:108, train_model_lazy.py:896 |
+
+---
+
+## Common Pitfalls & Solutions
+
+**This section documents common mistakes and their fixes to avoid during development and retraining.**
+
+### 1. Overfitting from Excessive Training ⚠️
+
+**Symptom:**
+- Test models (2 epochs): 0.99% error
+- Production models (50 epochs): 1.26% error
+- More training = worse performance
+
+**Root Cause:**
+```python
+# train_model_lazy.py has NO early stopping
+for epoch in range(epochs):
+    # ... training ...
+    if avg_val_loss < best_val_loss:
+        best_epoch = epoch  # Tracks best, but keeps training!
+
+# Saves LAST epoch, not best epoch
+torch.save({...}, output_path)  # Might be overfitted!
+```
+
+**Solution:**
+- Implement early stopping (save best validation epoch)
+- Use moderate hidden_size (64-128, not 256+)
+- Stop training if validation doesn't improve for 10 epochs
+- Monitor train/val loss gap (if train << val, you're overfitting)
+
+**Best Practices:**
+- hidden_size: 128 (sweet spot)
+- epochs: 30-50 with early stopping
+- Validation split: 20% (not 10%)
+- Watch for validation loss increasing while training loss decreases
+
+---
+
+### 2. DataFrame Fragmentation (Fixed in v3.4) ✅
+
+**Symptom:**
+```
+PerformanceWarning: DataFrame is highly fragmented
+```
+
+**Root Cause:**
+- 245 individual column assignments: `features_df[col] = value`
+- Each creates new memory fragment
+- 10-20% performance penalty
+
+**Solution (v3.4):**
+```python
+# OLD (slow):
+features_df['col1'] = value1
+features_df['col2'] = value2  # 245 times!
+
+# NEW (fast):
+all_features = {}
+all_features['col1'] = value1
+all_features['col2'] = value2
+features_df = pd.DataFrame(all_features)  # One operation!
+```
+
+**Result:** 20-30% faster feature extraction, no warnings.
+
+---
+
+### 3. Column Naming Mismatches (CSV vs yfinance)
+
+**Symptom:**
+- Dimension mismatch: expecting 245 features, getting 185
+- Missing weekly/monthly/3month features
+- Matrix multiplication errors
+
+**Root Cause:**
+```python
+# CSV data:   ['open', 'high', 'low', ...]  # No prefix
+# yfinance:   ['tsla_open', 'tsla_high', ...]  # With prefix
+# Merged:     Mixed columns, NaN values, missing features
+```
+
+**Solution:**
+```python
+# live_data_loader.py _load_csv()
+df = df.rename(columns={
+    'open': f'{symbol}_open',  # Add prefix to CSV
+    'high': f'{symbol}_high',
+    ...
+})
+```
+
+**Prevention:** Always use consistent column naming across all data sources.
+
+---
+
+### 4. Timezone Issues in Live Data
+
+**Symptom:**
+- "Cannot subtract tz-naive and tz-aware datetime"
+- Negative data age (-59 minutes)
+- Comparison errors
+
+**Root Cause:**
+- yfinance returns timezone-aware timestamps (US/Eastern)
+- CSV data has timezone-naive timestamps
+- Arithmetic between them fails
+
+**Solution:**
+```python
+# _format_yfinance_df()
+if df.index.tz is not None:
+    df.index = df.index.tz_localize(None)  # Strip timezone
+```
+
+**Prevention:** Standardize on timezone-naive timestamps throughout system.
+
+---
+
+### 5. Deprecated Pandas Syntax
+
+**Symptom:**
+```
+FutureWarning: 'T' is deprecated, use 'min' instead
+FutureWarning: 'M' is deprecated, use 'ME' instead
+```
+
+**Root Cause:**
+- Old pandas syntax: '5T', '15T', '1M', '3M'
+- Pandas 2.x deprecated these abbreviations
+
+**Solution:**
+```python
+# Correct syntax:
+'5min'   # Not '5T'
+'15min'  # Not '15T'
+'1ME'    # Not '1M' (Month End)
+'3ME'    # Not '3M'
+```
+
+**Prevention:** Use full time strings, not abbreviations.
+
+---
+
+### 6. Tensor Creation from Lists
+
+**Symptom:**
+```
+UserWarning: Creating tensor from list of numpy.ndarrays is extremely slow
+```
+
+**Root Cause:**
+```python
+sequence = features_df.tail(200).values  # numpy array
+sequence_tensor = torch.tensor([sequence])  # Wraps in list first (slow!)
+```
+
+**Solution:**
+```python
+# Fast way:
+sequence_tensor = torch.from_numpy(sequence).unsqueeze(0).float()
+```
+
+**Prevention:** Always convert numpy → torch directly, don't wrap in lists.
+
+---
+
+### 7. num_layers Parameter Does Nothing for LNN
+
+**Symptom:**
+- Increasing num_layers doesn't change model performance
+- Model size unchanged
+
+**Root Cause:**
+```python
+# model.py line 43 - CfC layer creation
+self.lnn = CfC(input_size, self.wiring)  # NO num_layers parameter!
+```
+
+The ncps library's CfC doesn't support layer stacking. LNN always uses exactly 1 layer.
+
+**Solution:**
+- **For LNN:** Only change hidden_size (this controls capacity)
+- **For LSTM:** num_layers does work (stacks layers)
+
+**Prevention:** Document parameter effects clearly, understand library limitations.
+
+---
+
+### 8. Training/Validation Data Leakage
+
+**Symptom:**
+- Meta-LNN performs poorly despite training
+- Ensemble worse than individual models
+
+**Root Cause:**
+- Training Meta-LNN on 2024 data (the test set)
+- Then validating on same 2024 data
+- Model has "seen the answers"
+
+**Solution (CORRECT workflow):**
+```bash
+1. Train sub-models on 2015-2023
+2. Backtest sub-models on 2023 → Meta-LNN training data
+3. Train Meta-LNN on 2023 predictions
+4. Validate everything on 2024 (never seen before)
+```
+
+**Prevention:** Strict train/test separation. Never validate on training data.
+
+---
+
+### Summary Table
+
+| Pitfall | Impact | Detection | Fix Location |
+|---------|--------|-----------|--------------|
+| Overfitting | Worse accuracy | Test vs prod comparison | train_model_lazy.py (add early stopping) |
+| DataFrame fragmentation | 20% slower | PerformanceWarning | features.py (use pd.concat) ✅ FIXED v3.4 |
+| Column naming mismatch | Dimension errors | Matrix multiplication fails | live_data_loader.py ✅ FIXED v3.4 |
+| Timezone issues | Comparison errors | Negative data age | live_data_loader.py ✅ FIXED v3.4 |
+| Deprecated pandas syntax | FutureWarnings | Warnings in output | features.py ✅ FIXED v3.4 |
+| Slow tensor creation | Performance warning | UserWarning | ml_dashboard.py ✅ FIXED |
+| num_layers ignored | Wasted effort | Compare model sizes | Document only (library limitation) |
+| Data leakage | Poor ensemble | Ensemble underperforms | Workflow documentation ✅ FIXED |
 
 ---
 
