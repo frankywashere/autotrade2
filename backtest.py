@@ -17,6 +17,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import random
 import sys
+import traceback
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -27,6 +28,204 @@ from src.ml.features import TradingFeatureExtractor
 from src.ml.events import CombinedEventsHandler
 from src.ml.model import LNNTradingModel, LSTMTradingModel
 from src.ml.database import SQLitePredictionDB
+
+
+def calculate_minimum_context_days(min_bars_per_timeframe=20):
+    """
+    Calculate minimum context days needed to extract all features.
+
+    Feature extraction resamples to multiple timeframes:
+    1min, 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly, 3month
+
+    Each timeframe needs min_bars_per_timeframe bars for channel calculations
+    (see src/ml/features.py:193 for the 20-bar minimum).
+
+    The longest timeframe (3month) determines the minimum data requirement,
+    since we need 20+ bars of 3-month data to calculate meaningful features.
+
+    Args:
+        min_bars_per_timeframe: Minimum bars needed per timeframe (default: 20)
+
+    Returns:
+        Minimum calendar days needed (includes weekend/holiday buffer)
+
+    Example:
+        If 3month = 66 trading days, and we need 20 bars:
+        20 bars × 66 days/bar × 1.4 buffer = 1848 calendar days ≈ 5 years
+    """
+    # Trading days per timeframe (approximate, assuming 252 trading days/year)
+    trading_days_per_timeframe = {
+        '3month': 66,      # ~1/6 year = 66 trading days
+        'monthly': 22,     # ~1/12 year = 22 trading days
+        'weekly': 5,       # 1 week = 5 trading days
+        'daily': 1,
+        '4hour': 0.25,
+        '3hour': 0.167,
+        '2hour': 0.111,
+        '1hour': 0.056,
+        '30min': 0.028,
+        '15min': 0.014,
+        '5min': 0.0028,
+        '1min': 0.00056,
+    }
+
+    # Find the longest timeframe (3month = 66 trading days)
+    longest_tf_trading_days = max(trading_days_per_timeframe.values())
+
+    # Calculate minimum trading days needed
+    min_trading_days = min_bars_per_timeframe * longest_tf_trading_days
+
+    # Convert to calendar days (multiply by 1.4 to account for weekends/holidays)
+    # 252 trading days per year, 365 calendar days per year
+    # 365/252 ≈ 1.45, so use 1.4 as conservative estimate
+    calendar_to_trading_ratio = 365 / 252
+    min_calendar_days = int(min_trading_days * calendar_to_trading_ratio)
+
+    return min_calendar_days
+
+
+def get_safe_date_range(test_year, data_start_date, data_end_date):
+    """
+    Calculate safe date range for backtesting based on data availability.
+
+    Safe dates must have:
+    - Sufficient historical data (5 years back for 3month feature extraction)
+    - Sufficient future data (30 days forward for prediction actuals)
+
+    Args:
+        test_year: Year to test (e.g., 2024)
+        data_start_date: Earliest date in dataset (datetime)
+        data_end_date: Latest date in dataset (datetime)
+
+    Returns:
+        (safe_start, safe_end): Tuple of datetime objects
+    """
+    # Calculate minimum context needed for feature extraction
+    context_days = calculate_minimum_context_days(min_bars_per_timeframe=20)
+
+    # Conservative buffer for prediction window (longest model needs ~24 days)
+    prediction_buffer_days = 30
+
+    # Calculate absolute safe boundaries
+    absolute_safe_start = data_start_date + timedelta(days=context_days)
+    absolute_safe_end = data_end_date - timedelta(days=prediction_buffer_days)
+
+    # Intersect with requested test year
+    test_year_start = datetime(test_year, 1, 1)
+    test_year_end = datetime(test_year, 12, 31)
+
+    safe_start = max(absolute_safe_start, test_year_start)
+    safe_end = min(absolute_safe_end, test_year_end)
+
+    return safe_start, safe_end
+
+
+def validate_date_has_data(date, data_feed, metadata, feature_extractor=None, verbose=False):
+    """
+    Pre-validate that a date has sufficient aligned data for backtesting.
+
+    Tests ALL 7 failure points that run_simulation() checks:
+    1. Historical bar count
+    2. Feature extraction success
+    3. Features length after extraction
+    4. Current price extraction
+    5. Future data availability
+    6. Actuals column existence
+    7. Actuals NaN check
+
+    Args:
+        date: Date to validate (datetime)
+        data_feed: CSVDataFeed instance
+        metadata: Model metadata dict with sequence_length, input_timeframe, prediction_horizon
+        feature_extractor: TradingFeatureExtractor instance (required for full validation)
+        verbose: If True, print detailed validation info
+
+    Returns:
+        (success: bool, failure_reason: str)
+    """
+    try:
+        # Extract model configuration
+        sequence_length = metadata.get('sequence_length', config.ML_SEQUENCE_LENGTH)
+        input_timeframe = metadata.get('input_timeframe', '1min')
+        prediction_horizon_bars = metadata.get('prediction_horizon', config.PREDICTION_HORIZON_HOURS)
+
+        # === TEST 1: Historical bar count ===
+        context_days = calculate_minimum_context_days(min_bars_per_timeframe=20)
+        context_days = max(context_days, 7)
+
+        start_context = date - timedelta(days=context_days)
+        end_context = date
+
+        historical_df = data_feed.load_aligned_data(
+            start_context.strftime('%Y-%m-%d'),
+            end_context.strftime('%Y-%m-%d')
+        )
+
+        if len(historical_df) < sequence_length:
+            return False, f"insufficient_historical_bars ({len(historical_df)}/{sequence_length})"
+
+        # === TEST 2 & 3: Feature extraction ===
+        if feature_extractor is not None:
+            try:
+                features_df = feature_extractor.extract_features(historical_df)
+
+                if len(features_df) < sequence_length:
+                    return False, f"insufficient_features_after_extraction ({len(features_df)}/{sequence_length})"
+
+            except Exception as e:
+                return False, f"feature_extraction_error: {str(e)[:50]}"
+
+        # === TEST 4: Current price extraction ===
+        if 'tsla_close' not in historical_df.columns:
+            return False, "tsla_close_column_missing"
+
+        try:
+            cp_raw = historical_df['tsla_close'].iloc[-1]
+            cp_float = float(cp_raw)
+            if np.isnan(cp_float) or cp_float <= 0:
+                return False, "current_price_invalid"
+        except Exception:
+            return False, "current_price_extraction_error"
+
+        # === TEST 5: Future data availability ===
+        timeframe_minutes = {
+            '1min': 1, '5min': 5, '15min': 15, '30min': 30,
+            '1hour': 60, '2hour': 120, '3hour': 180, '4hour': 240,
+            'daily': 1440, 'weekly': 10080, 'monthly': 43200, '3month': 129600
+        }
+
+        minutes_per_bar = timeframe_minutes.get(input_timeframe, 60)
+        prediction_horizon_minutes = prediction_horizon_bars * minutes_per_bar
+
+        future_start = date
+        future_end = date + timedelta(minutes=prediction_horizon_minutes)
+
+        future_df = data_feed.load_aligned_data(
+            future_start.strftime('%Y-%m-%d'),
+            future_end.strftime('%Y-%m-%d')
+        )
+
+        if len(future_df) == 0:
+            return False, "no_future_data"
+
+        # === TEST 6 & 7: Actuals calculation ===
+        if 'tsla_close' not in future_df.columns:
+            return False, "tsla_close_missing_in_future"
+
+        try:
+            actual_high = future_df['tsla_close'].max()
+            actual_low = future_df['tsla_close'].min()
+
+            if pd.isna(actual_high) or pd.isna(actual_low):
+                return False, "actuals_are_nan"
+        except Exception:
+            return False, "actuals_calculation_error"
+
+        # All checks passed!
+        return True, "valid"
+
+    except Exception as e:
+        return False, f"unexpected_error: {str(e)[:50]}"
 
 
 def load_model(model_path):
@@ -58,31 +257,107 @@ def load_model(model_path):
     return model, metadata
 
 
-def select_random_dates(test_year, num_simulations, seed=None):
+def select_random_dates(test_year, num_simulations, seed=None, data_feed=None, metadata=None, validate=True):
     """
-    Select random dates throughout the test year for simulation
-    Ensures dates are trading days (Monday-Friday)
+    Select random dates throughout the test year for simulation with two-phase validation.
+
+    Phase 1: Safe date range filtering (calendar time availability)
+    Phase 2: Pre-validation of aligned bar count (optional but recommended)
+
+    Args:
+        test_year: Year to test (e.g., 2024)
+        num_simulations: Number of dates to select
+        seed: Random seed for reproducibility
+        data_feed: CSVDataFeed instance (required if validate=True)
+        metadata: Model metadata dict (required if validate=True)
+        validate: If True, pre-validate each date for sufficient aligned data
+
+    Returns:
+        List of validated datetime objects (sorted)
     """
     if seed:
         random.seed(seed)
 
-    start_date = datetime(test_year, 1, 1)
-    end_date = datetime(test_year, 12, 31)
+    # Phase 1: Calculate safe date range based on data availability
+    # Hardcoded data boundaries from CSV inspection
+    data_start_date = datetime(2015, 1, 2)
+    data_end_date = datetime(2025, 9, 27)
 
-    # Generate all potential dates
-    all_dates = []
-    current = start_date
-    while current <= end_date:
-        # Only include weekdays (Monday=0 to Friday=4)
-        if current.weekday() < 5:
-            all_dates.append(current)
+    safe_start, safe_end = get_safe_date_range(test_year, data_start_date, data_end_date)
+
+    print(f"\n📅 Date selection:")
+    print(f"  Test year: {test_year}")
+    print(f"  Safe range: {safe_start.strftime('%Y-%m-%d')} to {safe_end.strftime('%Y-%m-%d')}")
+    print(f"  Validation: {'Enabled' if validate else 'Disabled'}")
+
+    if safe_start > safe_end:
+        print(f"\n⚠️  WARNING: No safe dates available for {test_year}!")
+        print(f"  Data range: {data_start_date.strftime('%Y-%m-%d')} to {data_end_date.strftime('%Y-%m-%d')}")
+        print(f"  Try an earlier year (e.g., 2023)")
+        return []
+
+    # Generate candidate pool from safe range (weekdays only)
+    candidate_dates = []
+    current = safe_start
+    while current <= safe_end:
+        if current.weekday() < 5:  # Monday-Friday
+            candidate_dates.append(current)
         current += timedelta(days=1)
 
-    # Randomly select dates
-    selected_dates = random.sample(all_dates, min(num_simulations, len(all_dates)))
-    selected_dates.sort()
+    print(f"  Candidate pool: {len(candidate_dates)} weekdays")
 
-    return selected_dates
+    # Phase 2: Pre-validation (optional but recommended)
+    if validate and data_feed is not None and metadata is not None:
+        print(f"  Validating candidates...")
+
+        validated_dates = []
+        attempts = 0
+        max_attempts = min(num_simulations * 3, len(candidate_dates))  # Try up to 3x or pool size
+
+        # Shuffle candidates to test random order
+        random.shuffle(candidate_dates)
+
+        for candidate in candidate_dates:
+            if len(validated_dates) >= num_simulations:
+                break
+
+            if attempts >= max_attempts:
+                print(f"  ⚠️  Reached max attempts ({max_attempts}), stopping validation")
+                break
+
+            attempts += 1
+
+            # Pre-validate this date
+            is_valid, reason = validate_date_has_data(candidate, data_feed, metadata)
+            if is_valid:
+                validated_dates.append(candidate)
+
+                # Progress feedback every 10 valid dates
+                if len(validated_dates) % 10 == 0:
+                    print(f"    Validated {len(validated_dates)}/{num_simulations} dates...")
+
+        validated_dates.sort()
+
+        success_rate = (len(validated_dates) / attempts * 100) if attempts > 0 else 0
+        print(f"  ✓ Validated {len(validated_dates)}/{num_simulations} dates ({success_rate:.1f}% success rate)")
+
+        if len(validated_dates) < num_simulations:
+            print(f"  ⚠️  WARNING: Only found {len(validated_dates)} valid dates (requested {num_simulations})")
+            print(f"  Consider: (1) Using earlier test_year, (2) Reducing num_simulations")
+
+        return validated_dates
+
+    else:
+        # No validation - just randomly sample from candidate pool
+        if not validate:
+            print(f"  ⚠️  Validation disabled - dates may fail during backtesting")
+
+        selected_dates = random.sample(candidate_dates, min(num_simulations, len(candidate_dates)))
+        selected_dates.sort()
+
+        print(f"  ✓ Selected {len(selected_dates)} dates (unvalidated)")
+
+        return selected_dates
 
 
 def run_simulation(date, model, feature_extractor, data_feed, events_handler, db, ensemble=None, mode='backtest_no_news', metadata=None):
@@ -127,8 +402,41 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
     # Log the actual prediction window
     print(f"  Prediction window: {prediction_horizon_bars} bars = {prediction_horizon_hours:.1f} hours")
 
-    # 1. Load historical context (e.g., 1 week before the date)
-    context_days = 7
+    # 1. Calculate required lookback dynamically based on model metadata
+    # Need enough calendar days to get sequence_length bars, accounting for:
+    # - Market hours (6.5 hours/day for US stocks)
+    # - Weekends (no trading Saturday/Sunday)
+    # - Holidays (various market closures)
+
+    bars_per_trading_day = {
+        '1min': 390,      # 6.5 hours × 60 minutes
+        '5min': 78,       # 6.5 hours × 12 (5-min bars per hour)
+        '15min': 26,      # 6.5 hours × 4
+        '30min': 13,      # 6.5 hours × 2
+        '1hour': 6.5,
+        '2hour': 3.25,
+        '3hour': 2.17,
+        '4hour': 1.625,
+        'daily': 1,
+        'weekly': 0.2,    # ~1 bar per week
+        'monthly': 0.05,  # ~1 bar per month
+        '3month': 0.017   # ~1 bar per 3 months
+    }.get(input_timeframe, 6.5)
+
+    # Calculate calendar days needed
+    # Use the longer of:
+    # 1. Days needed for the model's sequence (based on input timeframe)
+    # 2. Days needed to extract all features (requires 20+ bars of each timeframe including 3month)
+    sequence_context_days = int((sequence_length / bars_per_trading_day) * 1.5) + 10
+    feature_context_days = calculate_minimum_context_days(min_bars_per_timeframe=20)
+
+    context_days = max(sequence_context_days, feature_context_days)
+
+    # Sanity check: ensure at least 7 days
+    context_days = max(context_days, 7)
+
+    print(f"  Loading {context_days} calendar days to get {sequence_length} bars of {input_timeframe} data...")
+
     start_context = date - timedelta(days=context_days)
     end_context = date
 
@@ -148,6 +456,26 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
         # Get last sequence (use model's sequence_length from metadata)
         sequence = features_df.tail(sequence_length).values
         sequence_tensor = torch.tensor([sequence], dtype=torch.float32)  # (1, seq_len, features)
+
+        # Get current price (last bar in sequence)
+        current_price = None
+        try:
+            if 'tsla_close' in aligned_df.columns and len(aligned_df) > 0:
+                cp_raw = aligned_df['tsla_close'].iloc[-1]
+
+                # Convert to Python float
+                if cp_raw is not None:
+                    cp_float = float(cp_raw)
+                    if not np.isnan(cp_float) and cp_float > 0:
+                        current_price = cp_float
+
+            if current_price is None:
+                print(f"   ⚠ Could not extract valid current price from data")
+                return None
+
+        except Exception as e:
+            print(f"   ⚠ Error getting current price: {e}")
+            return None
 
         # 3. Get events for this date
         events = events_handler.get_events_for_date(date.strftime('%Y-%m-%d'))
@@ -179,7 +507,7 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
             # Add model metadata to predictions dict
             predictions['is_ensemble'] = False
             predictions['news_enabled'] = False
-            predictions['model_timeframe'] = 'single'
+            predictions['model_timeframe'] = input_timeframe  # Use extracted timeframe instead of hardcoded 'single'
 
         # 5. Get actuals (load data for prediction window after date)
         target_start = date
@@ -194,47 +522,85 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
             print(f"   ⚠ No actual data for {date.strftime('%Y-%m-%d')}, skipping...")
             return None
 
+        # Check if tsla_close column exists and has data
+        if 'tsla_close' not in actual_df.columns:
+            print(f"   ⚠ tsla_close column not found in actual_df")
+            return None
+
         actual_high = actual_df['tsla_close'].max()
         actual_low = actual_df['tsla_close'].min()
+
+        # Check for NaN in actuals
+        if pd.isna(actual_high) or pd.isna(actual_low):
+            print(f"   ⚠ actual_high or actual_low is NaN: high={actual_high}, low={actual_low}")
+            return None
         actual_center = (actual_high + actual_low) / 2
 
-        # 6. Calculate errors
-        error_high = abs(pred_high - actual_high) / actual_high * 100
-        error_low = abs(pred_low - actual_low) / actual_low * 100
-        error_center = abs(pred_center - actual_center) / actual_center * 100
+        # 6. Convert actuals to percentage changes and calculate errors
+        # Predictions are already in percentage terms, so convert actuals to match
+        # Debug: Check values before calculation
+        if current_price is None or pd.isna(current_price):
+            print(f"   ⚠ current_price is invalid: {current_price}")
+            print(f"      actual_high={actual_high}, actual_low={actual_low}")
+            return None
+
+        actual_high_pct = (actual_high - current_price) / current_price * 100
+        actual_low_pct = (actual_low - current_price) / current_price * 100
+        actual_center_pct = (actual_center - current_price) / current_price * 100
+
+        # Errors are in percentage points (e.g., predicted +2.5%, actual +3.2% = 0.7pp error)
+        error_high = abs(pred_high - actual_high_pct)
+        error_low = abs(pred_low - actual_low_pct)
+        error_center = abs(pred_center - actual_center_pct)
         avg_error = (error_high + error_low) / 2
 
         # 7. Log to database
         prediction_record = {
             'prediction_timestamp': datetime.now(),
             'target_timestamp': target_end,
+            'simulation_date': date,  # Historical date being backtested (for multi-model alignment)
             'symbol': 'TSLA',
             'timeframe': '24h',
-            'predicted_high': float(pred_high),
-            'predicted_low': float(pred_low),
+            'predicted_high': float(pred_high),  # Now in percentage terms
+            'predicted_low': float(pred_low),    # Now in percentage terms
             'predicted_center': float(pred_center),
             'predicted_range': float(pred_range),
             'confidence': float(confidence),
+            'current_price': float(current_price),  # Needed for percentage → absolute conversion
             'has_earnings': has_earnings,
             'has_macro_event': has_macro,
             'event_type': events[0].get('event_type') if events else None,
             'model_version': 'backtest_v1',
             'feature_dim': feature_extractor.get_feature_dim(),
             # Multi-scale ensemble fields (populated if ensemble mode)
-            'model_timeframe': prediction.get('model_timeframe', 'single'),
-            'is_ensemble': prediction.get('is_ensemble', False),
-            'news_enabled': prediction.get('news_enabled', False),
+            'model_timeframe': predictions.get('model_timeframe', 'single'),
+            'is_ensemble': predictions.get('is_ensemble', False),
+            'news_enabled': predictions.get('news_enabled', False),
         }
 
         # Add sub-predictions if ensemble
-        if prediction.get('sub_predictions'):
-            for tf, sub_pred in prediction['sub_predictions'].items():
+        if predictions.get('sub_predictions'):
+            for tf, sub_pred in predictions['sub_predictions'].items():
                 prediction_record[f'sub_pred_{tf}_high'] = float(sub_pred['predicted_high'])
                 prediction_record[f'sub_pred_{tf}_low'] = float(sub_pred['predicted_low'])
                 prediction_record[f'sub_pred_{tf}_conf'] = float(sub_pred['confidence'])
 
+        # Defensive check: ensure current_price is a valid number before storing
+        if current_price is None or not isinstance(current_price, (int, float)):
+            print(f"   ⚠ Current price is invalid type: {type(current_price)} = {current_price}, skipping prediction")
+            return None
+
+        if np.isnan(current_price) or current_price <= 0:
+            print(f"   ⚠ Current price is invalid value: {current_price}, skipping prediction")
+            return None
+
         pred_id = db.log_prediction(prediction_record)
-        db.update_actual(pred_id, float(actual_high), float(actual_low))
+
+        # Only update actuals if we have a valid current_price
+        try:
+            db.update_actual(pred_id, float(actual_high), float(actual_low))
+        except Exception as e:
+            print(f"   ⚠ Error updating actuals: {e}")
 
         return {
             'date': date,
@@ -252,6 +618,7 @@ def run_simulation(date, model, feature_extractor, data_feed, events_handler, db
 
     except Exception as e:
         print(f"   ✗ Error in simulation for {date.strftime('%Y-%m-%d')}: {e}")
+        traceback.print_exc()
         return None
 
 
@@ -273,6 +640,8 @@ def main():
                        help='Path to prediction database')
     parser.add_argument('--seed', type=int, default=config.BACKTEST_RANDOM_SEED,
                        help='Random seed for reproducibility')
+    parser.add_argument('--dates_file', type=str, default=None,
+                       help='Path to file containing predefined dates (one per line, YYYY-MM-DD format)')
 
     args = parser.parse_args()
 
@@ -322,10 +691,44 @@ def main():
     events_handler = CombinedEventsHandler()
     db = SQLitePredictionDB(args.db_path)
 
-    # 3. Select random dates
-    print(f"\nSelecting {args.num_simulations} random dates in {args.test_year}...")
-    test_dates = select_random_dates(args.test_year, args.num_simulations, args.seed)
-    print(f"Date range: {test_dates[0].strftime('%Y-%m-%d')} to {test_dates[-1].strftime('%Y-%m-%d')}")
+    # 3. Select or load test dates
+    if args.dates_file:
+        # Load predefined dates from file
+        print(f"\n📅 Loading predefined dates from: {args.dates_file}")
+        try:
+            with open(args.dates_file, 'r') as f:
+                date_strings = [line.strip() for line in f if line.strip()]
+
+            test_dates = [datetime.strptime(d, '%Y-%m-%d') for d in date_strings]
+            test_dates.sort()
+
+            print(f"✓ Loaded {len(test_dates)} dates from file")
+            print(f"  Date range: {test_dates[0].strftime('%Y-%m-%d')} to {test_dates[-1].strftime('%Y-%m-%d')}")
+
+        except FileNotFoundError:
+            print(f"\n❌ Dates file not found: {args.dates_file}")
+            return
+        except Exception as e:
+            print(f"\n❌ Error loading dates file: {e}")
+            return
+    else:
+        # Select random dates with two-phase validation
+        test_dates = select_random_dates(
+            args.test_year,
+            args.num_simulations,
+            args.seed,
+            data_feed=data_feed,
+            metadata=metadata,
+            validate=True  # Enable pre-validation for guaranteed success
+        )
+
+        if len(test_dates) == 0:
+            print("\n❌ No valid dates found for backtesting!")
+            print("   Try: (1) Earlier test year, (2) Fewer simulations, (3) Check data files")
+            return
+
+        print(f"\n✓ Selected {len(test_dates)} validated dates")
+        print(f"  Date range: {test_dates[0].strftime('%Y-%m-%d')} to {test_dates[-1].strftime('%Y-%m-%d')}")
 
     # 4. Run simulations
     print("\n" + "=" * 70)

@@ -39,7 +39,7 @@ from src.ml.meta_models import (
     calculate_market_state,
     meta_loss
 )
-from src.ml.events import EventsHandler
+from src.ml.events import CombinedEventsHandler
 import config
 
 
@@ -54,7 +54,7 @@ class MetaTrainingDataset(Dataset):
     def __init__(self,
                  predictions_df: pd.DataFrame,
                  features_df: pd.DataFrame,
-                 events_handler: EventsHandler,
+                 events_handler: CombinedEventsHandler,
                  mode='backtest_no_news',
                  news_vec_dim=768):
         """
@@ -128,9 +128,18 @@ class MetaTrainingDataset(Dataset):
             news_vec = torch.zeros(self.news_vec_dim, dtype=torch.float32)
             news_mask = torch.tensor([0.0], dtype=torch.float32)
 
-        # Targets
-        y_high = torch.tensor([row['actual_high']], dtype=torch.float32)
-        y_low = torch.tensor([row['actual_low']], dtype=torch.float32)
+        # Targets (convert actual prices to percentages)
+        # Predictions are already in percentage terms, so targets must be too
+        actual_high = row['actual_high']
+        actual_low = row['actual_low']
+        current_price = row.get('current_price', row.get('tsla_close', 250.0))  # Fallback to reasonable default
+
+        # Convert to percentage changes from current price
+        actual_high_pct = (actual_high - current_price) / current_price * 100
+        actual_low_pct = (actual_low - current_price) / current_price * 100
+
+        y_high = torch.tensor([actual_high_pct], dtype=torch.float32)
+        y_low = torch.tensor([actual_low_pct], dtype=torch.float32)
 
         return subpreds, market_state, news_vec, news_mask, y_high, y_low
 
@@ -195,6 +204,8 @@ def load_predictions_from_db(db_path: str,
     query = """
         SELECT
             timestamp,
+            target_timestamp,
+            simulation_date,
             model_timeframe,
             predicted_high,
             predicted_low,
@@ -205,10 +216,11 @@ def load_predictions_from_db(db_path: str,
         WHERE actual_high IS NOT NULL
           AND actual_low IS NOT NULL
           AND model_timeframe IN ({})
-        ORDER BY timestamp
+          AND simulation_date IS NOT NULL
+        ORDER BY simulation_date
     """.format(','.join(['?'] * len(timeframes)))
 
-    df = pd.read_sql(query, conn, params=timeframes, parse_dates=['timestamp'])
+    df = pd.read_sql(query, conn, params=timeframes, parse_dates=['timestamp', 'target_timestamp', 'simulation_date'])
     conn.close()
 
     if len(df) == 0:
@@ -216,11 +228,14 @@ def load_predictions_from_db(db_path: str,
 
     print(f"Loaded {len(df)} prediction records from database")
     print(f"  Timeframes: {df['model_timeframe'].unique()}")
-    print(f"  Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+    print(f"  Simulation date range: {df['simulation_date'].min()} to {df['simulation_date'].max()}")
 
-    # Pivot to wide format
+    # Use simulation_date for alignment (all models tested same historical date)
+    df['sim_date'] = df['simulation_date'].dt.normalize()
+
+    # Pivot to wide format by sim_date (groups all models that tested the same historical date)
     pivot_df = df.pivot_table(
-        index='timestamp',
+        index='sim_date',
         columns='model_timeframe',
         values=['predicted_high', 'predicted_low', 'confidence'],
         aggfunc='first'  # Use first if duplicates (shouldn't happen)
@@ -230,8 +245,9 @@ def load_predictions_from_db(db_path: str,
     pivot_df.columns = [f'{col[1]}_{col[0].replace("predicted_", "")}' for col in pivot_df.columns]
 
     # Add actuals (same across all timeframes, use any one)
-    actuals_df = df[df['model_timeframe'] == timeframes[0]][['timestamp', 'actual_high', 'actual_low']]
-    actuals_df = actuals_df.set_index('timestamp')
+    actuals_df = df[df['model_timeframe'] == timeframes[0]][['sim_date', 'actual_high', 'actual_low']]
+    actuals_df = actuals_df.set_index('sim_date')
+    actuals_df = actuals_df[~actuals_df.index.duplicated(keep='first')]  # Keep first if multiple on same date
 
     pivot_df = pivot_df.join(actuals_df, how='inner')
 
@@ -402,7 +418,7 @@ def main():
 
     # Load events
     print("\nLoading events...")
-    events_handler = EventsHandler(args.events_csv)
+    events_handler = CombinedEventsHandler(args.events_csv)
 
     # Create dataset
     print("\nCreating dataset...")
