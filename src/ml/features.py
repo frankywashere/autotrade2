@@ -185,17 +185,17 @@ class TradingFeatureExtractor(FeatureExtractor):
         """
         # Resample to different timeframes
         timeframes = {
-            '5min': '5T',
-            '15min': '15T',
-            '30min': '30T',
+            '5min': '5min',
+            '15min': '15min',
+            '30min': '30min',
             '1h': '1h',
             '2h': '2h',
             '3h': '3h',
             '4h': '4h',
             'daily': '1D',
             'weekly': '1W',
-            'monthly': '1M',
-            '3month': '3M'
+            'monthly': '1ME',
+            '3month': '3ME'
         }
 
         # Process both TSLA and SPY
@@ -252,17 +252,17 @@ class TradingFeatureExtractor(FeatureExtractor):
         Uses existing RSICalculator from Stage 1
         """
         timeframes = {
-            '5min': '5T',
-            '15min': '15T',
-            '30min': '30T',
+            '5min': '5min',
+            '15min': '15min',
+            '30min': '30min',
             '1h': '1h',
             '2h': '2h',
             '3h': '3h',
             '4h': '4h',
             'daily': '1D',
             'weekly': '1W',
-            'monthly': '1M',
-            '3month': '3M'
+            'monthly': '1ME',
+            '3month': '3ME'
         }
 
         # Process both TSLA and SPY

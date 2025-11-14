@@ -64,8 +64,8 @@ class LiveDataLoader:
 
         # Step 1: Load historical CSV data
         try:
-            tsla_hist = self._load_csv(self.tsla_csv, start_date, end_date)
-            spy_hist = self._load_csv(self.spy_csv, start_date, end_date)
+            tsla_hist = self._load_csv(self.tsla_csv, start_date, end_date, 'tsla')
+            spy_hist = self._load_csv(self.spy_csv, start_date, end_date, 'spy')
 
             print(f"   ✓ Historical: TSLA={len(tsla_hist)} bars, SPY={len(spy_hist)} bars")
         except Exception as e:
@@ -114,13 +114,24 @@ class LiveDataLoader:
 
         return aligned_df, data_status
 
-    def _load_csv(self, csv_path: Path, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    def _load_csv(self, csv_path: Path, start_date: datetime, end_date: datetime, symbol: str) -> pd.DataFrame:
         """Load historical CSV and filter by date range."""
         df = pd.read_csv(csv_path, index_col='timestamp', parse_dates=True)
 
         # Filter by date range
         mask = (df.index >= start_date) & (df.index <= end_date)
-        return df[mask]
+        df = df[mask]
+
+        # Add symbol prefix to columns to match yfinance format
+        df = df.rename(columns={
+            'open': f'{symbol}_open',
+            'high': f'{symbol}_high',
+            'low': f'{symbol}_low',
+            'close': f'{symbol}_close',
+            'volume': f'{symbol}_volume'
+        })
+
+        return df
 
     def _fetch_yfinance_data(self) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
         """
