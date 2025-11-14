@@ -144,10 +144,15 @@ def make_prediction(model_name: str, model, metadata, data_loader: LiveDataLoade
         pred_low = float(predictions['predicted_low'][0])
         confidence = float(predictions['confidence'][0])
 
+        # Calculate center and range
+        pred_center = (pred_high + pred_low) / 2
+        pred_range = pred_high - pred_low
+
         # Convert to absolute prices
         from src.ml.model import percentage_to_absolute
         pred_high_price = float(percentage_to_absolute(pred_high, current_price))
         pred_low_price = float(percentage_to_absolute(pred_low, current_price))
+        pred_center_price = float(percentage_to_absolute(pred_center, current_price))
 
         result = {
             'model': model_name,
@@ -156,8 +161,11 @@ def make_prediction(model_name: str, model, metadata, data_loader: LiveDataLoade
             'current_price': float(current_price),
             'predicted_high_pct': pred_high,
             'predicted_low_pct': pred_low,
+            'predicted_center_pct': pred_center,
+            'predicted_range_pct': pred_range,
             'predicted_high_price': pred_high_price,
             'predicted_low_price': pred_low_price,
+            'predicted_center_price': pred_center_price,
             'confidence': confidence,
             'prediction_window': '24 hours'
         }
@@ -271,15 +279,23 @@ def make_ensemble_prediction(ensemble, feature_extractor):
         # Step 6: Format result
         from src.ml.model import percentage_to_absolute
 
+        pred_high = float(predictions['predicted_high'])
+        pred_low = float(predictions['predicted_low'])
+        pred_center = (pred_high + pred_low) / 2
+        pred_range = pred_high - pred_low
+
         result = {
             'model': 'ensemble',
             'timestamp': datetime.now(),
             'data_status': 'LIVE',
             'current_price': current_price,
-            'predicted_high_pct': float(predictions['predicted_high']),
-            'predicted_low_pct': float(predictions['predicted_low']),
-            'predicted_high_price': float(percentage_to_absolute(predictions['predicted_high'], current_price)),
-            'predicted_low_price': float(percentage_to_absolute(predictions['predicted_low'], current_price)),
+            'predicted_high_pct': pred_high,
+            'predicted_low_pct': pred_low,
+            'predicted_center_pct': pred_center,
+            'predicted_range_pct': pred_range,
+            'predicted_high_price': float(percentage_to_absolute(pred_high, current_price)),
+            'predicted_low_price': float(percentage_to_absolute(pred_low, current_price)),
+            'predicted_center_price': float(percentage_to_absolute(pred_center, current_price)),
             'confidence': float(predictions['confidence']),
             'sub_predictions': predictions.get('sub_predictions', {}),
             'prediction_window': '24 hours'
@@ -453,6 +469,8 @@ def prediction_scheduler_thread(selected_models, alert_threshold):
                                 'is_ensemble': (model_name == 'ensemble'),
                                 'predicted_high': prediction['predicted_high_pct'],
                                 'predicted_low': prediction['predicted_low_pct'],
+                                'predicted_center': prediction['predicted_center_pct'],
+                                'predicted_range': prediction['predicted_range_pct'],
                                 'confidence': prediction['confidence'],
                                 'current_price': prediction['current_price'],
                                 'feature_dim': 245
