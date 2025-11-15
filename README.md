@@ -57,7 +57,7 @@ extractor = TradingFeatureExtractor()
 # Fetch live data (automatically handles yfinance 7-day limit)
 df = feed.fetch_for_prediction()
 
-# Extract features (same 309 features as training)
+# Extract features (same 313 features as training)
 features_df = extractor.extract_features(df)
 
 # Predict
@@ -94,14 +94,11 @@ print(f"Confidence: {pred['confidence']:.2f}")
 
 ## 📚 Documentation
 
-**Start Here:**
-- [`COMPLETE_SYSTEM_STATUS.md`](COMPLETE_SYSTEM_STATUS.md) - Full system overview, what the model learns
-- [`QUICKSTART.md`](QUICKSTART.md) - Detailed usage guide, commands, examples
+**📖 Complete Documentation (2 files):**
+- **[`QUICKSTART.md`](QUICKSTART.md)** - Get started in 5 minutes! Installation, training, predictions
+- **[`SPEC.md`](SPEC.md)** - Complete technical specification with executive summary
 
-**Technical Reference:**
-- [`HIERARCHICAL_SPEC.md`](HIERARCHICAL_SPEC.md) - Complete technical specification
-
-**Testing:**
+**🧪 Testing:**
 - `python test_hybrid_features.py` - Verify hybrid live integration
 - `python scripts/validate_channels.py` - Verify channel quality
 
@@ -109,13 +106,14 @@ print(f"Confidence: {pred['confidence']:.2f}")
 
 ## 🏗️ System Architecture
 
-### Features (309 Total)
+### Features (313 Total)
 - **10** price features (close, returns, volatility)
 - **154** channel features (11 timeframes × 7 metrics × 2 stocks)
 - **66** RSI features (11 timeframes × 3 metrics × 2 stocks)
 - **5** correlation features
 - **4** cycle features (52-week highs/lows)
 - **2** volume features
+- **4** time features
 - **54** breakdown/enhancement features
 - **14** binary flags
 

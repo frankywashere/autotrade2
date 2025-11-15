@@ -1,572 +1,476 @@
-# Quick Start Guide - Hierarchical Trading System
+# AutoTrade2 v3.5 - Quick Start Guide
 
-**System Status:** 🟢 Production Ready (November 2024)
-
-This guide covers everything you need to train, validate, and deploy the hierarchical trading system.
+**Get up and running in 5 minutes!**
 
 ---
 
-## 📋 Table of Contents
+## Prerequisites
 
-1. [Installation](#installation)
-2. [Training the Model](#training-the-model)
-3. [Validation & Testing](#validation--testing)
-4. [Live Predictions](#live-predictions)
-5. [Cache Management](#cache-management)
-6. [Advanced Usage](#advanced-usage)
-7. [Troubleshooting](#troubleshooting)
-
----
-
-## 🔧 Installation
-
-### Prerequisites
 - Python 3.10+
-- 8GB+ RAM
-- GPU recommended (but not required - M1/M2 Mac works great!)
+- 8GB+ RAM (16GB recommended for M1/M2 Mac)
+- GPU recommended (CUDA/MPS) but not required
 
-### Setup
+---
+
+## Installation
+
 ```bash
-# Clone repository (if not already done)
+# Clone repository
 cd /path/to/autotrade2
 
 # Create virtual environment
 python3 -m venv myenv
-source myenv/bin/activate  # On Windows: myenv\Scripts\activate
+source myenv/bin/activate  # On Mac/Linux
+# myenv\Scripts\activate   # On Windows
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
-### Verify Installation
-```bash
-python -c "import torch; print(f'PyTorch: {torch.__version__}')"
-python -c "from src.ml.hierarchical_model import HierarchicalLNN; print('✓ Model imports')"
-```
+**Key Dependencies:**
+- PyTorch 2.0+ (with CUDA/MPS support)
+- ncps (Liquid Neural Networks)
+- pandas, numpy, yfinance
+- InquirerPy (interactive menus)
 
 ---
 
-## 🎓 Training the Model
+## Quick Training
 
-### Interactive Mode (Recommended)
+### Option 1: Interactive Mode (Recommended)
+
 ```bash
 python train_hierarchical.py --interactive
 ```
 
-**Interactive menus guide you through:**
-1. Device selection (CUDA/MPS/CPU)
-2. Capacity selection (128/256/512 neurons)
-3. Training parameters (epochs, batch size)
-4. Model output location
+**Interactive menu will guide you through:**
+1. Device selection (CUDA/MPS/CPU auto-detected)
+2. Training years (default: 2015-2022)
+3. Cache management (use existing or regenerate)
+4. Model capacity (192/256/384/512 neurons)
+5. Batch size and learning rate
+6. Number of epochs and early stopping
 
-**First Run Timeline:**
+**Example session:**
 ```
-1. Loading data... (10-20 seconds)
-2. Extracting features... (30-60 MINUTES - builds cache)
-   🔄 Calculating ROLLING channels...
-   💾 Saving to cache
-3. Creating datasets... (10 seconds)
-4. Training... (5-10 minutes for 50 epochs on M1/M2)
-5. Saving model... ✓
+? Select compute device: Apple Silicon GPU (MPS) - Fast 🍎 [Detected]
+? Training data start year: 2015
+? Training data end year: 2022
 
-Total: ~40-70 minutes
+📂 Feature Cache Found:
+   💾 Size: 487.3 MB
+   📅 Created: 2024-11-14 15:32:41
+   📊 Version: v3.5
+
+? Use existing cache or regenerate features? Use cache (fast - loads in ~5 seconds) ⭐
+
+? Model capacity: Standard (256 total, 128 output) - Recommended ⭐
+? Number of epochs: 100
+? Batch size: 64
+? Learning rate: 0.001
+
+? Start training with these settings? Yes
+
+✅ Training started...
 ```
 
-**Subsequent Runs (Cache Exists):**
-```
-1. Loading data... (10-20 seconds)
-2. Extracting features... (2-5 SECONDS - loads from cache!)
-3. Creating datasets... (10 seconds)
-4. Training... (5-10 minutes)
-5. Saving model... ✓
+### Option 2: Command Line
 
-Total: ~6-11 minutes (much faster!)
-```
-
-### Command-Line Mode
 ```bash
 python train_hierarchical.py \
   --epochs 100 \
   --batch_size 64 \
-  --device auto \
+  --device mps \
+  --sequence_length 200 \
+  --prediction_horizon 24 \
   --train_start_year 2015 \
   --train_end_year 2022 \
+  --val_split 0.1 \
+  --lr 0.001 \
   --output models/hierarchical_lnn.pth
 ```
 
-**Training Time Estimates:**
-- **M1/M2 Mac (MPS):** 3-5 seconds/epoch → 5-8 minutes for 100 epochs
-- **RTX 3090 (CUDA):** 1-2 seconds/epoch → 2-3 minutes for 100 epochs
-- **CPU:** 15-30 seconds/epoch → 25-50 minutes for 100 epochs
+### What to Expect
 
----
+**First Training Run:**
+```
+1. Loading 1-min data...
+   Loaded 1150051 bars (2015-01-02 to 2022-12-31)
 
-## ✅ Validation & Testing
+2. Extracting features...
+   Feature extraction:  14%|████▌  | 1/7 [00:00<00:00]
+   🔄 Calculating ROLLING channels (30-60 mins first time)...
+   📊 Processing 22 calculations (11 timeframes × 2 stocks)
+   ⏱️  Estimated time: ~55 minutes
+   
+   Rolling channels (SPY + TSLA):   5%|▌  | 1/22 [02:34<48:23]
+      TSLA 5min:  41%|████▏  | 8,234/20,000 [00:45<01:02, 189 bars/s]
+   
+   ✓ Extracted 313 features
 
-### 1. Validate Channel Detection (Before Training)
+3. Creating datasets...
+   Train: 1034546 samples, Val: 115051 samples
 
-**Check if rolling channels are working correctly:**
-```bash
-python scripts/validate_channels.py --timeframe 1h --year 2023
+4. Creating model...
+   HierarchicalLNN: 2.8M parameters
+
+5. Training...
+   Training Progress:   2%|█▌  | 2/100 [04:41<3:50:12]
+   
+   Epoch 2/100
+   ----------------------------------------------------------------------
+     Epoch 2 [Train]: 100%|████| 1234/1234 [02:14<00:00, loss=0.0198]
+     Validating: 100%|████| 137/137 [00:12<00:00, loss=0.0187]
+     ✓ New best model (val_loss: 0.0187)
+
+TRAINING COMPLETE
+Best val loss: 0.0187
+Model saved to: models/hierarchical_lnn.pth
 ```
 
-**What to Look For:**
+**Subsequent Runs (cache exists):**
 ```
-1h Channel Metrics:
-  R-Squared (Goodness of Fit):
-    Mean: 0.612    ✓ Good average
-    Median: 0.658
-    Min: 0.08      ✓ MUST VARY! (if constant = bug!)
-    Max: 0.95      ✓ MUST VARY!
-
-  Ping-Pongs:
-    Mean: 4.3      ✓ Channels are validated
-    Median: 4
-    Min: 0         ✓ MUST VARY!
-    Max: 15        ✓ MUST VARY!
-
-✅ VERDICT: Channels are SOLID and DYNAMIC
-```
-
-**⚠️ Red Flags:**
-- If r² is CONSTANT (e.g., all values = 0.057) → Channels are still static (BUG!)
-- If r² mean < 0.3 → Channels are weak for this timeframe
-- Expected: r² should vary showing channel formation/breakdown
-
-**Test Other Timeframes:**
-```bash
-python scripts/validate_channels.py --timeframe 4h --year 2023
-python scripts/validate_channels.py --timeframe daily --year 2022
-```
-
-**Output:** Saves `channel_quality_{timeframe}.png` with distribution plots
-
----
-
-### 2. Test Hybrid Live Integration
-
-**Verify live predictions can fetch and extract features:**
-```bash
-python test_hybrid_features.py
-```
-
-**Expected Output:**
-```
-✅ HYBRID FEATURE EXTRACTION TEST PASSED!
-
-Summary:
-  - Live data fetched: 2730 bars (1-min)
-  - Multi-resolution data:
-      • 1min: 2730 bars (7 days)
-      • 1hour: 3494 bars (2 years!)
-      • daily: 3871 bars (15 years!)
-  - Features extracted: 309 features
-  - Multi-resolution mode: WORKING ✓
-  - Channel features: VALID ✓
-    • tsla_channel_4h_r_squared: 0.7637 (strong!)
-  - RSI features: VALID ✓
-    • tsla_rsi_1h: 27.33 (oversold)
+2. Extracting features...
+   Loading cache: 100%|██████| 1/1 [00:03<00:00]
+   ✓ Loaded channel features from cache
+   ✓ Extracted 313 features
+   
+[Training proceeds as above, ~5-10 minutes total]
 ```
 
 ---
 
-### 3. Analyze Feature Importance (After Training)
+## Making Predictions
 
-**See which features the model learned to trust:**
-```bash
-python scripts/analyze_feature_importance.py --model_path models/hierarchical_lnn.pth
-```
-
-**What It Shows:**
-- Top 20 most important features
-- Importance by category (channels, RSI, volume, etc.)
-- Which timeframes matter most
-- Whether model trusts your trading concepts
-
-**Example Output:**
-```
-TOP 20 MOST IMPORTANT FEATURES:
- 1. tsla_channel_1h_position        ████████ 0.034521
- 2. tsla_rsi_1h                     ███████  0.028934
- 3. spy_correlation_10              ██████   0.024512
- 4. tsla_channel_4h_r_squared       ██████   0.022134
- 5. tsla_channel_1h_upper_dist      █████    0.019823
-
-Importance by Category:
-   Channel Features: 0.2841  ← Model TRUSTS channels!
-   RSI Features: 0.2134      ← Model TRUSTS RSI!
-   Correlation: 0.1523       ← Learns SPY relationship
-   Volume: 0.0834
-```
-
-**Output File:** `feature_importance_report.txt`
-
----
-
-## 🚀 Live Predictions
-
-### Simple Prediction (One-Time)
+### Live Prediction Script
 
 ```python
 from src.ml.live_data_feed import HybridLiveDataFeed
 from src.ml.hierarchical_model import load_hierarchical_model
 from src.ml.features import TradingFeatureExtractor
-import torch
-
-# Initialize (one-time setup)
-feed = HybridLiveDataFeed(symbols=['TSLA', 'SPY'])
-model = load_hierarchical_model('models/hierarchical_lnn.pth', device='mps')
-extractor = TradingFeatureExtractor()
-
-# Fetch live data
-print("Fetching live data...")
-df = feed.fetch_for_prediction()
-# Downloads:
-#   - 1-min: 7 days (~2,730 bars)
-#   - 1-hour: 2 years (~3,494 bars)
-#   - Daily: Max history (~3,871+ bars)
-
-# Extract features (same 309 as training)
-print("Extracting features...")
-features_df = extractor.extract_features(df)
-
-# Prepare for prediction (last 200 bars)
-x = torch.tensor(features_df.values[-200:], dtype=torch.float32).unsqueeze(0)
-
-# Predict
-with torch.no_grad():
-    pred = model.predict(x)
-
-print(f"\n📊 Live Prediction:")
-print(f"  Predicted High: {pred['predicted_high']:.2f}%")
-print(f"  Predicted Low: {pred['predicted_low']:.2f}%")
-print(f"  Confidence: {pred['confidence']:.2f}")
-print(f"  Fusion Weights: {pred['fusion_weights']}")  # [fast, medium, slow]
-```
-
----
-
-### Continuous Prediction Loop
-
-```python
-import time
 from datetime import datetime
 
-# Initialize once
+# Load components
 feed = HybridLiveDataFeed(symbols=['TSLA', 'SPY'])
-model = load_hierarchical_model('models/hierarchical_lnn.pth', device='mps')
+model = load_hierarchical_model('models/hierarchical_lnn.pth')
 extractor = TradingFeatureExtractor()
 
-print("🔄 Starting continuous prediction loop...")
-print("   Press Ctrl+C to stop\n")
+# Fetch live data (downloads 1-min, 1-hour, daily)
+print("📡 Fetching live data...")
+df = feed.fetch_for_prediction()
 
-while True:
-    try:
-        # Fetch latest data
-        df = feed.fetch_for_prediction()
+# Extract features (uses multi-resolution data automatically)
+print("🔧 Extracting features...")
+features = extractor.extract_features(df, use_cache=True)
 
-        # Extract features
-        features_df = extractor.extract_features(df)
+# Make prediction
+print("🔮 Making prediction...")
+pred = model.predict(features[-200:])  # Last 200 bars
 
-        # Predict
-        x = torch.tensor(features_df.values[-200:], dtype=torch.float32).unsqueeze(0)
-        pred = model.predict(x)
+# Display results
+print(f"\n{'='*60}")
+print(f"PREDICTION @ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+print(f"{'='*60}")
+print(f"Predicted High:    {pred['predicted_high']:+.2f}%")
+print(f"Predicted Low:     {pred['predicted_low']:+.2f}%")
+print(f"Predicted Center:  {pred['predicted_center']:+.2f}%")
+print(f"Predicted Range:   {pred['predicted_range']:.2f}%")
+print(f"Confidence:        {pred['confidence']:.1%}")
+print(f"Volatility:        {pred['predicted_volatility']:.2f}%")
+print(f"\nFusion Weights:")
+print(f"  Fast:   {pred['fusion_weights']['fast']:.2f}")
+print(f"  Medium: {pred['fusion_weights']['medium']:.2f}")
+print(f"  Slow:   {pred['fusion_weights']['slow']:.2f}")
+print(f"{'='*60}")
+```
 
-        # Display
-        print(f"{datetime.now().strftime('%H:%M:%S')} | "
-              f"High: {pred['predicted_high']:+.2f}% | "
-              f"Low: {pred['predicted_low']:+.2f}% | "
-              f"Conf: {pred['confidence']:.2f}")
+**Example Output:**
+```
+📡 Fetching live data...
+   ✓ 1-min: 2700 bars
+   ✓ 1-hour: 3494 bars
+   ✓ Daily: 3871 bars
 
-        # Your trading logic here...
-        if pred['confidence'] > 0.75:
-            print(f"   🔥 HIGH CONFIDENCE SETUP!")
-            # Execute trade, send alert, etc.
+🔧 Extracting features...
+   Loading cache: 100%|██████| 1/1 [00:03<00:00]
+   ✓ Extracted 313 features
 
-        # Wait 1 minute
-        time.sleep(60)
+🔮 Making prediction...
 
-    except KeyboardInterrupt:
-        print("\n\n✋ Stopped by user")
-        break
-    except Exception as e:
-        print(f"\n⚠️  Error: {e}")
-        time.sleep(60)  # Wait and retry
+============================================================
+PREDICTION @ 2024-11-14 15:30
+============================================================
+Predicted High:    +2.85%
+Predicted Low:     -0.62%
+Predicted Center:  +1.12%
+Predicted Range:   3.47%
+Confidence:        82.3%
+Volatility:        2.10%
+
+Fusion Weights:
+  Fast:   0.35
+  Medium: 0.48
+  Slow:   0.17
+============================================================
 ```
 
 ---
 
-## 💾 Cache Management
+## Cache Management
 
 ### Understanding the Cache
 
-**The cache stores pre-computed rolling channels to dramatically speed up feature extraction.**
+**What's cached:** Rolling channel calculations (30-60 mins first time)  
+**Cache location:** `data/feature_cache/rolling_channels_v3.5_*.pkl`  
+**Cache size:** ~500MB per date range  
 
-#### First Run (No Cache):
+### Cache Operations
+
 ```bash
-python train_hierarchical.py --interactive
-
-# Output:
-2. Extracting features...
-   🔄 Calculating ROLLING channels (this will take ~30-60 mins first time)...
-   💡 Results will be cached for instant loading next time
-
-   Rolling channels: 100%|████████| 22/22 [45:23<00:00]
-   💾 Saving to cache: rolling_channels_20150102_20221231_1150051.pkl
-
-   ✓ Extracted 309 features (TOTAL TIME: ~45 minutes)
-```
-
-#### Subsequent Runs (Cache Exists):
-```bash
-python train_hierarchical.py --interactive
-
-# Output:
-2. Extracting features...
-   ✓ Loading channel features from cache: rolling_channels_20150102_20221231_1150051.pkl
-   ✓ Extracted 309 features (TOTAL TIME: ~3 seconds!)
-```
-
-### Cache Location & Structure
-
-```
-data/feature_cache/
-├── rolling_channels_20150102_20221231_1150051.pkl  (~500MB)
-├── rolling_channels_20230101_20231231_198995.pkl   (~200MB)
-└── rolling_channels_20251106_20251114_2730.pkl     (~50MB - live data)
-```
-
-**Cache filename format:** `rolling_channels_{start_date}_{end_date}_{num_bars}.pkl`
-
-### Cache Management Commands
-
-**View cache:**
-```bash
+# View cache files
 ls -lh data/feature_cache/
+
+# Clear old caches (free disk space)
+rm data/feature_cache/rolling_channels_v*.pkl
+
+# Force regenerate cache (interactive mode)
+python train_hierarchical.py --interactive
+# Select "Regenerate cache" when prompted
+
+# Force regenerate cache (command line)
+# Delete cache file manually, then run training
 ```
 
-**Clear all caches (forces recalculation):**
-```bash
-rm -rf data/feature_cache/
-```
+### When to Regenerate Cache
 
-**Clear specific cache:**
-```bash
-rm data/feature_cache/rolling_channels_20150102_20221231_1150051.pkl
-```
-
-**When to clear cache:**
-- ✅ Data source changed (new CSV files)
-- ✅ Channel calculation logic modified
-- ✅ Debugging feature extraction issues
-- ❌ Just retraining with different epochs/batch size (keep cache!)
-
-### Cache Benefits
-
-| Aspect | First Run | Cached Run |
-|--------|-----------|------------|
-| Feature extraction time | 30-60 minutes | 2-5 seconds |
-| Total training time | 40-70 minutes | 6-11 minutes |
-| Disk space used | +500MB cache | 500MB cache |
-| Can change model params? | Yes | Yes ✓ |
-| Can change epochs? | Yes | Yes ✓ |
-
-**💡 Pro Tip:** After first successful training, feature extraction is instant! Experiment freely with different model architectures, epochs, batch sizes without re-computing features.
+1. **Version change:** Feature calculation logic updated (FEATURE_VERSION bump)
+2. **Data change:** Using different date range
+3. **Corruption:** Cache file corrupted or incomplete
+4. **Testing:** Want to verify fresh calculation
 
 ---
 
-## 🔧 Advanced Usage
+## Validation & Testing
 
-### Online Learning (Continual Improvement)
+### Validate Rolling Channels
 
-```python
-from src.ml.online_learner import OnlineLearner
-from src.ml.hierarchical_model import load_hierarchical_model
-
-# Initialize
-model = load_hierarchical_model('models/hierarchical_lnn.pth')
-learner = OnlineLearner(model, learning_rate=0.0001)
-
-# Make prediction with tracking
-pred, pred_id = learner.predict_with_tracking(
-    x,
-    current_price=245.50,
-    timestamp=datetime.now()
-)
-
-print(f"Prediction ID: {pred_id}")
-print(f"Predicted High: {pred['predicted_high']:.2f}%")
-
-# 30 minutes later... validate and update model
-actual_high = 2.5  # Actual high was +2.5%
-actual_low = -0.8  # Actual low was -0.8%
-
-learner.validate_and_update(pred_id, actual_high, actual_low)
-print("✓ Model updated with actual results")
-```
-
----
-
-### High-Confidence Trade Tracking
-
-```python
-from src.ml.trade_tracker import TradeTracker
-
-# Initialize tracker
-tracker = TradeTracker(
-    confidence_threshold=0.75,
-    db_path='data/trades.db'
-)
-
-# Log high-confidence trade
-if pred['confidence'] > 0.75:
-    trade_id = tracker.log_trade(
-        timestamp=datetime.now(),
-        model_type='hierarchical',
-        confidence=pred['confidence'],
-        predicted_high=pred['predicted_high'],
-        predicted_low=pred['predicted_low'],
-        current_price=245.50,
-        features_dict=features.to_dict(),
-        layer_weights=pred['fusion_weights']
-    )
-
-    print(f"✓ Logged trade {trade_id}")
-
-    # Later, update with actuals
-    tracker.update_actual(trade_id, actual_high=2.5, actual_low=-0.8)
-
-# Get performance stats
-stats = tracker.get_stats()
-print(f"High-Confidence Trades:")
-print(f"  Win Rate: {stats['win_rate']:.1f}%")
-print(f"  Total Trades: {stats['total_trades']}")
-print(f"  Avg Confidence: {stats['avg_confidence']:.2f}")
-```
-
----
-
-## ❓ Troubleshooting
-
-### Issue: "Channels are all constant (r² doesn't vary)"
-
-**Symptom:**
 ```bash
 python scripts/validate_channels.py --timeframe 1h --year 2023
 
-# Output shows:
-R-Squared: Mean: 0.057, Min: 0.057, Max: 0.057  ← ALL SAME!
+# Expected output:
+# ✅ Rolling channels working correctly
+# - r² varies: 0.08 → 0.95 (dynamic, not static)
+# - Ping-pongs vary: 0 → 15
+# - Position varies: -1.2 → 1.3
 ```
 
-**Cause:** Rolling channel detection not working (static channels)
-
-**Fix:**
-1. Check you're using latest `features.py` (should have `_calculate_rolling_channels()`)
-2. Clear cache and retrain:
-   ```bash
-   rm -rf data/feature_cache/
-   python train_hierarchical.py --interactive
-   ```
-3. Verify fix worked:
-   ```bash
-   python scripts/validate_channels.py --timeframe 1h --year 2023
-   # Should now show: Min: 0.08, Max: 0.95 (VARIES!)
-   ```
-
----
-
-### Issue: "Live predictions fail with insufficient data"
-
-**Symptom:**
-```python
-features_df = extractor.extract_features(df)
-# KeyError or insufficient data errors
-```
-
-**Cause:** Not using HybridLiveDataFeed (using old data feed)
-
-**Fix:**
-```python
-# ❌ OLD (doesn't work for live):
-from src.ml.data_feed import CSVDataFeed
-feed = CSVDataFeed()
-
-# ✅ NEW (works for live):
-from src.ml.live_data_feed import HybridLiveDataFeed
-feed = HybridLiveDataFeed(symbols=['TSLA', 'SPY'])
-```
-
----
-
-### Issue: "Feature extraction takes 60 minutes every time"
-
-**Symptom:** Cache not being used
-
-**Causes & Fixes:**
-1. **Data range changing:** If you change date ranges, cache won't match
-   - Solution: Use consistent date ranges, cache will build per range
-
-2. **Cache cleared:** Someone deleted `data/feature_cache/`
-   - Solution: Let it rebuild (one-time 60 mins)
-
-3. **Different data:** Training on 2015-2022, then 2016-2023
-   - Solution: Normal - different data = different cache file
-
-**Verify cache is working:**
-```bash
-# First run
-python train_hierarchical.py --interactive
-# Should show: "🔄 Calculating ROLLING channels..."
-
-# Second run (immediately after)
-python train_hierarchical.py --interactive
-# Should show: "✓ Loading channel features from cache" (instant!)
-```
-
----
-
-### Issue: "Out of memory during training"
-
-**Solutions:**
-1. **Reduce batch size:**
-   ```bash
-   python train_hierarchical.py --batch_size 32  # Instead of 64
-   ```
-
-2. **Use smaller capacity:**
-   ```bash
-   # In interactive mode, choose 128 neurons instead of 256/512
-   ```
-
-3. **Use CPU instead of GPU:**
-   ```bash
-   python train_hierarchical.py --device cpu
-   ```
-
-4. **Reduce lookback window:**
-   - Edit `train_hierarchical.py`: change `lookback=200` to `lookback=100`
-
----
-
-## 📚 Next Steps
-
-**After successful training:**
-
-1. ✅ **Validate channels work** → `python scripts/validate_channels.py`
-2. ✅ **Analyze feature importance** → `python scripts/analyze_feature_importance.py`
-3. ✅ **Test live integration** → `python test_hybrid_features.py`
-4. ✅ **Run backtest** (if available)
-5. ✅ **Paper trade** before live deployment
-
-**For more details:**
-- [`README.md`](README.md) - System overview
-- [`HIERARCHICAL_SPEC.md`](HIERARCHICAL_SPEC.md) - Complete technical specification
-- [`COMPLETE_SYSTEM_STATUS.md`](COMPLETE_SYSTEM_STATUS.md) - Final status and what the model learns
-
----
-
-**You're ready to train! 🚀**
+### Test Hybrid Live Integration
 
 ```bash
+python test_hybrid_features.py
+
+# Expected output:
+# ✅ HYBRID FEATURE EXTRACTION TEST PASSED!
+# - Multi-resolution data: 1min (2730), 1hour (3494), daily (3871)
+# - Features extracted: 313
+# - Channel features: VALID ✓
+# - RSI features: VALID ✓
+```
+
+### Validate Features
+
+```bash
+python validate_features.py
+
+# Checks:
+# - Feature count (313)
+# - No NaN/Inf values
+# - Reasonable ranges
+# - Column names match spec
+```
+
+---
+
+## Common Commands
+
+### Training
+
+```bash
+# Standard training (2015-2022)
+python train_hierarchical.py --interactive
+
+# Custom date range
+python train_hierarchical.py \
+  --train_start_year 2018 \
+  --train_end_year 2023 \
+  --epochs 50
+
+# CPU-only training
+python train_hierarchical.py --device cpu --batch_size 32
+
+# Resume from checkpoint
+python train_hierarchical.py --resume models/hierarchical_lnn.pth
+```
+
+### Prediction
+
+```bash
+# Single prediction
+python predict.py --model models/hierarchical_lnn.pth
+
+# Continuous predictions (every 30 mins)
+python predict_loop.py --interval 30
+
+# Backtest on historical data
+python backtest.py \
+  --model models/hierarchical_lnn.pth \
+  --start_date 2023-01-01 \
+  --end_date 2023-12-31
+```
+
+### Analysis
+
+```bash
+# View training history
+python scripts/plot_training_history.py models/hierarchical_lnn.pth
+
+# Analyze feature importance
+python scripts/analyze_feature_importance.py models/hierarchical_lnn.pth
+
+# Check high-confidence trades
+python scripts/view_trades.py --min_confidence 0.75
+```
+
+---
+
+## Troubleshooting
+
+### Issue: "Out of memory" during training
+
+**Solution:**
+```bash
+# Reduce batch size
+python train_hierarchical.py --batch_size 32  # or 16
+
+# Use CPU instead of GPU
+python train_hierarchical.py --device cpu
+
+# Disable preload mode
+python train_hierarchical.py --preload false
+```
+
+### Issue: "Cache file too small, regenerating..."
+
+**Cause:** Corrupted or incomplete cache  
+**Solution:** Let it regenerate automatically (wait 30-60 mins)
+
+### Issue: First run takes very long
+
+**Expected!** Rolling channel calculation takes 30-60 minutes first time.  
+**Solution:** Be patient. Subsequent runs will be instant (2-5 seconds).
+
+### Issue: "Dimension mismatch" error
+
+**Cause:** Old model file incompatible with new code  
+**Solution:**
+```bash
+# Delete old model
+rm models/hierarchical_lnn.pth
+
+# Retrain from scratch
 python train_hierarchical.py --interactive
 ```
+
+### Issue: Progress bars look wrong
+
+**Cause:** Terminal doesn't support ANSI colors  
+**Solution:** Use `--no-progress` flag (if available) or ignore visual artifacts
+
+---
+
+## Performance Tips
+
+### For Faster Training
+
+1. **Use GPU:** MPS (Mac) or CUDA (NVIDIA) >> CPU
+2. **Increase batch size:** 64-128 (if memory allows)
+3. **Use cache:** Don't regenerate unless necessary
+4. **Reduce epochs:** 50-100 is often enough
+
+### For Better Accuracy
+
+1. **More training data:** 2015-2022 (7+ years)
+2. **Longer sequences:** 200-300 bars
+3. **Higher capacity:** 384 or 512 total neurons
+4. **More epochs:** 100-200 with early stopping
+
+### For Live Predictions
+
+1. **Pre-warm cache:** Run training once to build cache
+2. **Keep model loaded:** Don't reload for each prediction
+3. **Use multi-resolution:** HybridLiveDataFeed handles it automatically
+
+---
+
+## File Structure
+
+```
+autotrade2/
+├── src/ml/
+│   ├── features.py              # 313-feature extraction
+│   ├── hierarchical_model.py    # Model architecture
+│   ├── hierarchical_dataset.py  # Dataset preparation
+│   ├── online_learner.py        # Online learning
+│   ├── trade_tracker.py         # Trade logging
+│   ├── live_data_feed.py        # Hybrid data fetching
+│   └── prediction_scheduler.py  # Adaptive scheduling
+├── train_hierarchical.py        # Training script
+├── predict.py                   # Single prediction
+├── test_hybrid_features.py      # Live integration test
+├── scripts/
+│   ├── validate_channels.py     # Channel validation
+│   └── analyze_feature_importance.py
+├── data/
+│   ├── SPY_1min.csv            # Historical SPY data
+│   ├── TSLA_1min.csv           # Historical TSLA data
+│   └── feature_cache/          # Cached rolling channels
+├── models/
+│   └── hierarchical_lnn.pth    # Trained model
+├── config/
+│   └── hierarchical_config.yaml # Configuration
+├── SPEC.md                      # Complete specification
+└── QUICKSTART.md                # This guide
+```
+
+---
+
+## Next Steps
+
+1. ✅ **Train your first model:** `python train_hierarchical.py --interactive`
+2. ✅ **Make a prediction:** Create prediction script using example above
+3. ✅ **Explore features:** Run `validate_features.py` to see all 313 features
+4. ✅ **Read spec:** See `SPEC.md` for complete technical details
+
+---
+
+## Resources
+
+- **Technical Specification:** `SPEC.md`
+- **Code Documentation:** Inline comments in source files
+- **Test Scripts:** `test_*.py` and `scripts/validate_*.py`
+- **Configuration:** `config/hierarchical_config.yaml`
+
+---
+
+## Getting Help
+
+1. **Check logs:** Look for error messages in console output
+2. **Validate setup:** Run test scripts to verify installation
+3. **Read spec:** `SPEC.md` has detailed technical information
+4. **Check code:** All functions have docstrings
+
+---
+
+**Status:** 🟢 Ready to train and predict!
+
+**Estimated time to first prediction:** 35-70 minutes (first run) or 6-11 minutes (cached)
