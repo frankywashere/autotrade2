@@ -851,7 +851,7 @@ Before merging GPU acceleration:
 ### Phase 4: Documentation (30 mins)
 1. Update SPEC.md with GPU acceleration section
 2. Update QUICKSTART.md with GPU usage examples
-3. Update README.md feature list
+3. Update SPEC.md feature list
 
 ---
 
