@@ -39,7 +39,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
     def __init__(
         self,
-        input_size: int = 309,  # Updated to actual feature count
+        input_size: int = 467,  # v3.7: Multi-threshold ping-pongs + normalized slope + direction flags
         hidden_size: int = 128,
         internal_neurons_ratio: float = 2.0,  # Total neurons = hidden_size × ratio
         device: str = 'cpu',

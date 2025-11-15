@@ -22,7 +22,7 @@ from .base import FeatureExtractor
 from .channel_features import ChannelFeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.6"  # Added multi-threshold ping-pongs (313 → 379 features)
+FEATURE_VERSION = "v3.7"  # Added normalized slope + direction flags (379 → 467 features)
 
 
 def _check_gpu_available() -> tuple:
@@ -67,34 +67,42 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'{symbol}_volatility_50',
             ])
 
-        # TSLA Channel features (multi-timeframe) - RENAMED for consistency
+        # TSLA Channel features (multi-timeframe) - v3.7 with normalized slope + direction flags
         for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             features.extend([
                 f'tsla_channel_{tf}_position',  # 0-1 position in channel
                 f'tsla_channel_{tf}_upper_dist',  # Distance to upper
                 f'tsla_channel_{tf}_lower_dist',  # Distance to lower
-                f'tsla_channel_{tf}_slope',
+                f'tsla_channel_{tf}_slope',  # Raw slope ($/bar)
+                f'tsla_channel_{tf}_slope_pct',  # Normalized slope (% per bar)
                 f'tsla_channel_{tf}_stability',
                 f'tsla_channel_{tf}_ping_pongs',  # 2% threshold (default)
                 f'tsla_channel_{tf}_ping_pongs_0_5pct',  # 0.5% threshold (strict)
                 f'tsla_channel_{tf}_ping_pongs_1_0pct',  # 1.0% threshold
                 f'tsla_channel_{tf}_ping_pongs_3_0pct',  # 3.0% threshold (loose)
                 f'tsla_channel_{tf}_r_squared',
+                f'tsla_channel_{tf}_is_bull',  # Bull channel (>0.1% per bar)
+                f'tsla_channel_{tf}_is_bear',  # Bear channel (<-0.1% per bar)
+                f'tsla_channel_{tf}_is_sideways',  # Sideways channel (±0.1% per bar)
             ])
 
-        # SPY Channel features (multi-timeframe) - NEW in v3.4
+        # SPY Channel features (multi-timeframe) - v3.7 with normalized slope + direction flags
         for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             features.extend([
                 f'spy_channel_{tf}_position',  # 0-1 position in channel
                 f'spy_channel_{tf}_upper_dist',  # Distance to upper
                 f'spy_channel_{tf}_lower_dist',  # Distance to lower
-                f'spy_channel_{tf}_slope',
+                f'spy_channel_{tf}_slope',  # Raw slope ($/bar)
+                f'spy_channel_{tf}_slope_pct',  # Normalized slope (% per bar)
                 f'spy_channel_{tf}_stability',
                 f'spy_channel_{tf}_ping_pongs',  # 2% threshold (default)
                 f'spy_channel_{tf}_ping_pongs_0_5pct',  # 0.5% threshold (strict)
                 f'spy_channel_{tf}_ping_pongs_1_0pct',  # 1.0% threshold
                 f'spy_channel_{tf}_ping_pongs_3_0pct',  # 3.0% threshold (loose)
                 f'spy_channel_{tf}_r_squared',
+                f'spy_channel_{tf}_is_bull',  # Bull channel (>0.1% per bar)
+                f'spy_channel_{tf}_is_bear',  # Bear channel (<-0.1% per bar)
+                f'spy_channel_{tf}_is_sideways',  # Sideways channel (±0.1% per bar)
             ])
 
         # TSLA RSI features (multi-timeframe) - RENAMED for consistency
@@ -183,7 +191,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, **kwargs) -> pd.DataFrame:
         """
-        Extract all 379 features from aligned SPY-TSLA data (v3.6 - Hierarchical Multi-Task with Multi-Threshold Ping-Pongs).
+        Extract all 467 features from aligned SPY-TSLA data (v3.7 - Hierarchical Multi-Task with Multi-Threshold Ping-Pongs + Normalized Slope + Direction Flags).
 
         Args:
             df: DataFrame with SPY and TSLA OHLCV columns
@@ -201,11 +209,12 @@ class TradingFeatureExtractor(FeatureExtractor):
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
 
-        Returns DataFrame with 379 columns:
+        Returns DataFrame with 467 columns:
         - 10 price features
-        - 220 channel features (110 TSLA + 110 SPY) - includes multi-threshold ping-pongs
-          - Per timeframe (11): position, upper_dist, lower_dist, slope, stability, r_squared
+        - 308 channel features (154 TSLA + 154 SPY)
+          - Per timeframe (11): position, upper_dist, lower_dist, slope, slope_pct, stability, r_squared
           - Ping-pongs (4 thresholds): ping_pongs (2%), ping_pongs_0_5pct, ping_pongs_1_0pct, ping_pongs_3_0pct
+          - Direction flags (3): is_bull, is_bear, is_sideways
         - 66 RSI features (33 TSLA + 33 SPY)
         - 5 correlation features
         - 4 cycle features
@@ -515,18 +524,22 @@ class TradingFeatureExtractor(FeatureExtractor):
         """
         num_original_rows = len(original_index)
 
-        # Initialize result arrays (including multi-threshold ping-pongs)
+        # Initialize result arrays (including multi-threshold ping-pongs, normalized slope, direction flags)
         results = {
             'position': np.zeros(num_original_rows),
             'upper_dist': np.zeros(num_original_rows),
             'lower_dist': np.zeros(num_original_rows),
-            'slope': np.zeros(num_original_rows),
+            'slope': np.zeros(num_original_rows),  # Raw slope ($/bar)
+            'slope_pct': np.zeros(num_original_rows),  # Normalized slope (% per bar)
             'stability': np.zeros(num_original_rows),
             'ping_pongs': np.zeros(num_original_rows),  # Default 2% threshold
             'ping_pongs_0_5pct': np.zeros(num_original_rows),  # 0.5% threshold
             'ping_pongs_1_0pct': np.zeros(num_original_rows),  # 1.0% threshold
             'ping_pongs_3_0pct': np.zeros(num_original_rows),  # 3.0% threshold
-            'r_squared': np.zeros(num_original_rows)
+            'r_squared': np.zeros(num_original_rows),
+            'is_bull': np.zeros(num_original_rows),  # Uptrending channel (>0.1% per bar)
+            'is_bear': np.zeros(num_original_rows),  # Downtrending channel (<-0.1% per bar)
+            'is_sideways': np.zeros(num_original_rows)  # Ranging channel (±0.1% per bar)
         }
 
         # Calculate channel at each timestamp with progress bar
@@ -570,7 +583,18 @@ class TradingFeatureExtractor(FeatureExtractor):
                 results['position'][mask] = position_data['position']
                 results['upper_dist'][mask] = position_data['distance_to_upper_pct']
                 results['lower_dist'][mask] = position_data['distance_to_lower_pct']
-                results['slope'][mask] = channel.slope
+                results['slope'][mask] = channel.slope  # Raw slope ($/bar)
+
+                # Normalized slope (percentage per bar - comparable across timeframes)
+                slope_pct = (channel.slope / current_price) * 100 if current_price > 0 else 0.0
+                results['slope_pct'][mask] = slope_pct
+
+                # Direction flags (based on normalized slope)
+                # Threshold: ±0.1% per bar to distinguish from noise
+                results['is_bull'][mask] = float(slope_pct > 0.1)  # Bull: >0.1% per bar
+                results['is_bear'][mask] = float(slope_pct < -0.1)  # Bear: <-0.1% per bar
+                results['is_sideways'][mask] = float(abs(slope_pct) <= 0.1)  # Sideways: ±0.1% per bar
+
                 results['stability'][mask] = channel.stability_score
                 results['ping_pongs'][mask] = channel.ping_pongs  # 2% threshold (default)
                 results['ping_pongs_0_5pct'][mask] = multi_pp[0.005]  # 0.5% threshold
@@ -769,18 +793,22 @@ class TradingFeatureExtractor(FeatureExtractor):
         num_original_rows = len(original_index)
         prices = resampled_df['close'].values
 
-        # Initialize result arrays (including multi-threshold ping-pongs)
+        # Initialize result arrays (including multi-threshold ping-pongs, normalized slope, direction flags)
         results = {
             'position': np.zeros(num_original_rows),
             'upper_dist': np.zeros(num_original_rows),
             'lower_dist': np.zeros(num_original_rows),
-            'slope': np.zeros(num_original_rows),
+            'slope': np.zeros(num_original_rows),  # Raw slope ($/bar)
+            'slope_pct': np.zeros(num_original_rows),  # Normalized slope (% per bar)
             'stability': np.zeros(num_original_rows),
             'ping_pongs': np.zeros(num_original_rows),  # Default 2% threshold
             'ping_pongs_0_5pct': np.zeros(num_original_rows),  # 0.5% threshold
             'ping_pongs_1_0pct': np.zeros(num_original_rows),  # 1.0% threshold
             'ping_pongs_3_0pct': np.zeros(num_original_rows),  # 3.0% threshold
-            'r_squared': np.zeros(num_original_rows)
+            'r_squared': np.zeros(num_original_rows),
+            'is_bull': np.zeros(num_original_rows),  # Uptrending channel
+            'is_bear': np.zeros(num_original_rows),  # Downtrending channel
+            'is_sideways': np.zeros(num_original_rows)  # Ranging channel
         }
 
         # Convert to PyTorch tensor
@@ -875,7 +903,17 @@ class TradingFeatureExtractor(FeatureExtractor):
 
                         # Store results
                         results['position'][mask] = position
-                        results['slope'][mask] = slopes_cpu[batch_i]
+                        results['slope'][mask] = slopes_cpu[batch_i]  # Raw slope ($/bar)
+
+                        # Normalized slope (percentage per bar - comparable across timeframes)
+                        slope_pct = (slopes_cpu[batch_i] / current_price) * 100 if current_price > 0 else 0.0
+                        results['slope_pct'][mask] = slope_pct
+
+                        # Direction flags (based on normalized slope)
+                        results['is_bull'][mask] = float(slope_pct > 0.1)  # Bull: >0.1% per bar
+                        results['is_bear'][mask] = float(slope_pct < -0.1)  # Bear: <-0.1% per bar
+                        results['is_sideways'][mask] = float(abs(slope_pct) <= 0.1)  # Sideways: ±0.1%
+
                         results['r_squared'][mask] = r_squared_cpu[batch_i]
                         results['ping_pongs'][mask] = ping_pongs  # 2% threshold
                         results['ping_pongs_0_5pct'][mask] = ping_pongs_multi[0.005]

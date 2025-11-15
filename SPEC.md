@@ -10,7 +10,7 @@
 
 AutoTrade2 is an advanced machine learning trading system that predicts TSLA price movements using a hierarchical liquid neural network (LNN) architecture with continuous online learning. Unlike traditional static models, this system learns from its mistakes in real-time, adapting to changing market conditions while discovering complex multi-timeframe patterns automatically.
 
-**Core Innovation:** Dynamic rolling channel detection across 11 timeframes (5-minute to 3-month), combined with multi-timeframe RSI analysis and SPY-TSLA correlation tracking. A 3-layer hierarchical neural network (Fast → Medium → Slow) processes **379 features** (including multi-threshold ping-pongs for automatic threshold learning) to generate **6 prediction outputs**, with an adaptive fusion layer that learns which timeframe to trust based on recent accuracy.
+**Core Innovation:** Dynamic rolling channel detection across 11 timeframes (5-minute to 3-month), combined with multi-timeframe RSI analysis and SPY-TSLA correlation tracking. A 3-layer hierarchical neural network (Fast → Medium → Slow) processes **467 features** (including multi-threshold ping-pongs, normalized slopes, and automatic bull/bear/sideways detection) to generate **6 prediction outputs**, with an adaptive fusion layer that learns which timeframe to trust based on recent accuracy.
 
 **Key Capabilities:**
 - Predicts next 30-200 minute price movements (high, low, center, range, confidence, volatility)
@@ -19,18 +19,18 @@ AutoTrade2 is an advanced machine learning trading system that predicts TSLA pri
 - Tracks high-confidence trades with full rationale and context
 - Handles live data limitations through hybrid multi-resolution fetching
 
-**Current Status:** Core implementation complete and tested. Rolling channel detection verified, hybrid live integration functional, 379-feature extraction with multi-threshold ping-pongs working. Multi-task learning bug fixed. GPU acceleration implemented. **Ready for production training and deployment.**
+**Current Status:** Core implementation complete and tested. Rolling channel detection verified, hybrid live integration functional, 467-feature extraction with multi-threshold ping-pongs, normalized slopes, and automatic direction detection working. Multi-task learning bug fixed. GPU acceleration implemented. **Ready for production training and deployment.**
 
 ---
 
 ## Quick Reference
 
-- **Features:** 379 (10 price + 220 channels with multi-threshold ping-pongs + 66 RSI + 83 other)
+- **Features:** 467 (10 price + 308 channels with multi-threshold ping-pongs + normalized slope + direction flags + 66 RSI + 83 other)
 - **Architecture:** 3-layer Hierarchical LNN (~2.8M parameters)
 - **Predictions:** 6 outputs (high, low, center, range, confidence, volatility)
 - **Training Time:** First run 35-70 mins, subsequent runs 6-11 mins
 - **Memory:** 2-4 GB RAM
-- **Version:** v3.6
+- **Version:** v3.7
 - **Status:** 🟢 Production Ready
 
 ---
@@ -91,16 +91,18 @@ ONLINE LEARNER → TRADE TRACKER
 
 ---
 
-## 2. Feature System (379 Features)
+## 2. Feature System (467 Features)
 
 ### Feature Breakdown
 
 | Category | Count | Description |
 |----------|-------|-------------|
 | **Price** | 10 | SPY & TSLA: close, returns, log_returns, volatility |
-| **Channels** | 220 | Rolling channels (11 TFs × 2 stocks × 10 metrics) |
+| **Channels** | 308 | Rolling channels (11 TFs × 2 stocks × 14 metrics) |
 |  | | - Base: position, upper_dist, lower_dist, slope, stability, r² |
+|  | | - Normalized: slope_pct (% per bar) |
 |  | | - Multi-threshold ping-pongs: 2%, 0.5%, 1%, 3% |
+|  | | - Direction flags: is_bull, is_bear, is_sideways |
 | **RSI** | 66 | Multi-TF RSI (11 TFs × 2 stocks × 3 metrics) |
 | **Correlation** | 5 | SPY-TSLA correlation & divergence |
 | **Cycle** | 4 | 52-week highs/lows, mega channel |
@@ -108,7 +110,7 @@ ONLINE LEARNER → TRADE TRACKER
 | **Time** | 4 | Hour, day, month, year |
 | **Breakdown** | 54 | Volume surge, RSI divergence, alignment |
 | **Binary Flags** | 14 | Day flags, volatility, in-channel flags |
-| **TOTAL** | **379** | +66 from multi-threshold ping-pongs |
+| **TOTAL** | **467** | v3.7: +66 ping-pongs + 22 normalized slopes + 66 direction flags |
 
 ### Multi-Threshold Ping-Pong Learning (v3.6 Feature)
 
@@ -138,6 +140,47 @@ it's a weaker channel (price isn't precisely bouncing)"
 ```
 
 **Added features:** 11 timeframes × 2 stocks × 3 new thresholds = **66 new features**
+
+### Normalized Slope + Direction Detection (v3.7 Feature)
+
+**Innovation:** Channel slope is now provided in two forms:
+
+1. **Raw Slope** (`slope`): Absolute price change per bar ($/bar)
+   - Used internally for calculations
+   - Not comparable across timeframes ($0.50/bar means different things for 5min vs daily)
+
+2. **Normalized Slope** (`slope_pct`): Percentage change per bar (% per bar)
+   - **Comparable across ALL timeframes**
+   - 5min slope_pct = +0.2% per bar = same interpretation as daily slope_pct = +0.2% per bar
+   - Model can learn: "ANY positive slope_pct = bullish" regardless of timeframe
+
+3. **Direction Flags** (Binary):
+   - `is_bull`: slope_pct > 0.1% per bar (uptrending channel)
+   - `is_bear`: slope_pct < -0.1% per bar (downtrending channel)
+   - `is_sideways`: |slope_pct| ≤ 0.1% per bar (ranging channel)
+
+**Why this matters:**
+The model can now learn directional patterns explicitly:
+- Bull channel + high ping-pongs → "Buy dips in uptrend"
+- Bear channel + high ping-pongs → "Sell rallies in downtrend"
+- Sideways + high ping-pongs → "Trade both directions in range"
+
+**Example:**
+```
+TSLA 4h channel:
+- slope = +0.50 (raw)
+- slope_pct = +0.2% per bar (normalized)
+- is_bull = 1 (yes, >0.1% per bar)
+- is_bear = 0
+- is_sideways = 0
+- ping_pongs_2pct = 8
+
+Model learns: "Bull channel + 8 bounces = strong uptrend, buy dips"
+```
+
+**Added features:**
+- Normalized slopes: 11 timeframes × 2 stocks = **22 new features**
+- Direction flags: 11 timeframes × 2 stocks × 3 flags = **66 new features**
 
 ### Critical: Rolling Dynamic Channels
 
