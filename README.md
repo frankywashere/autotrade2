@@ -57,7 +57,7 @@ extractor = TradingFeatureExtractor()
 # Fetch live data (automatically handles yfinance 7-day limit)
 df = feed.fetch_for_prediction()
 
-# Extract features (same 313 features as training)
+# Extract features (same 379 features as training)
 features_df = extractor.extract_features(df)
 
 # Predict
@@ -106,9 +106,10 @@ print(f"Confidence: {pred['confidence']:.2f}")
 
 ## 🏗️ System Architecture
 
-### Features (313 Total)
+### Features (379 Total)
 - **10** price features (close, returns, volatility)
-- **154** channel features (11 timeframes × 7 metrics × 2 stocks)
+- **220** channel features (11 timeframes × 10 metrics × 2 stocks)
+  - Includes multi-threshold ping-pongs (0.5%, 1%, 2%, 3%)
 - **66** RSI features (11 timeframes × 3 metrics × 2 stocks)
 - **5** correlation features
 - **4** cycle features (52-week highs/lows)
@@ -182,7 +183,7 @@ python test_hybrid_features.py
 - Handles yfinance 7-day 1-min limit automatically
 
 ### Feature Engineering
-- `src/ml/features.py` - Rolling channel detection + all 309 features
+- `src/ml/features.py` - Rolling channel detection + all 379 features (multi-threshold ping-pongs)
 - `src/linear_regression.py` - Channel calculation (linear regression)
 
 ### Model

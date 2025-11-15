@@ -10,7 +10,7 @@
 
 AutoTrade2 is an advanced machine learning trading system that predicts TSLA price movements using a hierarchical liquid neural network (LNN) architecture with continuous online learning. Unlike traditional static models, this system learns from its mistakes in real-time, adapting to changing market conditions while discovering complex multi-timeframe patterns automatically.
 
-**Core Innovation:** Dynamic rolling channel detection across 11 timeframes (5-minute to 3-month), combined with multi-timeframe RSI analysis and SPY-TSLA correlation tracking. A 3-layer hierarchical neural network (Fast → Medium → Slow) processes **313 features** to generate **6 prediction outputs**, with an adaptive fusion layer that learns which timeframe to trust based on recent accuracy.
+**Core Innovation:** Dynamic rolling channel detection across 11 timeframes (5-minute to 3-month), combined with multi-timeframe RSI analysis and SPY-TSLA correlation tracking. A 3-layer hierarchical neural network (Fast → Medium → Slow) processes **379 features** (including multi-threshold ping-pongs for automatic threshold learning) to generate **6 prediction outputs**, with an adaptive fusion layer that learns which timeframe to trust based on recent accuracy.
 
 **Key Capabilities:**
 - Predicts next 30-200 minute price movements (high, low, center, range, confidence, volatility)
@@ -19,17 +19,18 @@ AutoTrade2 is an advanced machine learning trading system that predicts TSLA pri
 - Tracks high-confidence trades with full rationale and context
 - Handles live data limitations through hybrid multi-resolution fetching
 
-**Current Status:** Core implementation complete and tested. Rolling channel detection verified, hybrid live integration functional, 313-feature extraction working. Multi-task learning bug fixed. **Ready for production training and deployment.**
+**Current Status:** Core implementation complete and tested. Rolling channel detection verified, hybrid live integration functional, 379-feature extraction with multi-threshold ping-pongs working. Multi-task learning bug fixed. GPU acceleration implemented. **Ready for production training and deployment.**
 
 ---
 
 ## Quick Reference
 
-- **Features:** 313 (10 price + 154 channels + 66 RSI + 83 other)
+- **Features:** 379 (10 price + 220 channels with multi-threshold ping-pongs + 66 RSI + 83 other)
 - **Architecture:** 3-layer Hierarchical LNN (~2.8M parameters)
 - **Predictions:** 6 outputs (high, low, center, range, confidence, volatility)
 - **Training Time:** First run 35-70 mins, subsequent runs 6-11 mins
 - **Memory:** 2-4 GB RAM
+- **Version:** v3.6
 - **Status:** 🟢 Production Ready
 
 ---
@@ -90,14 +91,16 @@ ONLINE LEARNER → TRADE TRACKER
 
 ---
 
-## 2. Feature System (313 Features)
+## 2. Feature System (379 Features)
 
 ### Feature Breakdown
 
 | Category | Count | Description |
 |----------|-------|-------------|
 | **Price** | 10 | SPY & TSLA: close, returns, log_returns, volatility |
-| **Channels** | 154 | Rolling channels (11 TFs × 2 stocks × 7 metrics) |
+| **Channels** | 220 | Rolling channels (11 TFs × 2 stocks × 10 metrics) |
+|  | | - Base: position, upper_dist, lower_dist, slope, stability, r² |
+|  | | - Multi-threshold ping-pongs: 2%, 0.5%, 1%, 3% |
 | **RSI** | 66 | Multi-TF RSI (11 TFs × 2 stocks × 3 metrics) |
 | **Correlation** | 5 | SPY-TSLA correlation & divergence |
 | **Cycle** | 4 | 52-week highs/lows, mega channel |
@@ -105,7 +108,36 @@ ONLINE LEARNER → TRADE TRACKER
 | **Time** | 4 | Hour, day, month, year |
 | **Breakdown** | 54 | Volume surge, RSI divergence, alignment |
 | **Binary Flags** | 14 | Day flags, volatility, in-channel flags |
-| **TOTAL** | **313** | |
+| **TOTAL** | **379** | +66 from multi-threshold ping-pongs |
+
+### Multi-Threshold Ping-Pong Learning (v3.6 Feature)
+
+**Innovation:** Instead of using a fixed 2% threshold for detecting channel bounces, the system extracts ping-pong counts at 4 different thresholds:
+
+- **0.5%** (strict): Price must get very close to bounds
+- **1.0%** (medium): Moderate proximity required
+- **2.0%** (default): Standard threshold
+- **3.0%** (loose): Counts touches further from bounds
+
+**Why this matters:**
+The model **automatically learns** which threshold is most predictive for each situation:
+- Volatile TSLA 5min channels → Model might trust 3% threshold
+- Stable SPY daily channels → Model might trust 0.5% threshold
+- Mixed signals → Model combines multiple thresholds
+
+**Example:**
+```
+Same TSLA 1h channel:
+- ping_pongs_0_5pct = 4 (strict counting)
+- ping_pongs_1_0pct = 6 (medium)
+- ping_pongs_2_0pct = 8 (default)
+- ping_pongs_3_0pct = 10 (loose counting)
+
+Model learns: "When ping_pongs_0_5pct=4 but ping_pongs_2_0pct=8,
+it's a weaker channel (price isn't precisely bouncing)"
+```
+
+**Added features:** 11 timeframes × 2 stocks × 3 new thresholds = **66 new features**
 
 ### Critical: Rolling Dynamic Channels
 

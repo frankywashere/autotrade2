@@ -162,6 +162,54 @@ class LinearRegressionChannel:
 
         return bounces
 
+    def _detect_ping_pongs_multi_threshold(
+        self,
+        prices: np.ndarray,
+        upper: np.ndarray,
+        lower: np.ndarray,
+        thresholds: list = [0.005, 0.01, 0.02, 0.03]
+    ) -> dict:
+        """
+        Detect bounces at multiple thresholds simultaneously (efficient single-pass).
+
+        Args:
+            prices: Price array
+            upper: Upper channel line
+            lower: Lower channel line
+            thresholds: List of percentage thresholds to test
+
+        Returns:
+            Dict mapping threshold to ping-pong count
+            Example: {0.005: 4, 0.01: 6, 0.02: 8, 0.03: 10}
+        """
+        results = {threshold: 0 for threshold in thresholds}
+        last_touch = {threshold: None for threshold in thresholds}
+
+        for i in range(len(prices)):
+            price = prices[i]
+            upper_val = upper[i]
+            lower_val = lower[i]
+
+            # Calculate distances as percentage
+            upper_dist = abs(price - upper_val) / upper_val
+            lower_dist = abs(price - lower_val) / lower_val
+
+            # Check each threshold
+            for threshold in thresholds:
+                # Check if price touches upper line at this threshold
+                if upper_dist <= threshold:
+                    if last_touch[threshold] == 'lower':
+                        results[threshold] += 1
+                    last_touch[threshold] = 'upper'
+
+                # Check if price touches lower line at this threshold
+                elif lower_dist <= threshold:
+                    if last_touch[threshold] == 'upper':
+                        results[threshold] += 1
+                    last_touch[threshold] = 'lower'
+
+        return results
+
     def _calculate_stability(self, r_squared: float, ping_pongs: int, n_bars: int) -> float:
         """
         Calculate channel stability score (0-100).
