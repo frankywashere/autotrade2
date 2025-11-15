@@ -49,6 +49,9 @@ class TSLAEventsHandler(EventHandler):
         df = pd.read_csv(self.events_file)
         df['date'] = pd.to_datetime(df['date'])
 
+        # Check CSV coverage (warn if outdated)
+        self._check_csv_coverage(df)
+
         # Filter by date range
         if start_date:
             df = df[df['date'] >= pd.to_datetime(start_date)]
@@ -57,6 +60,32 @@ class TSLAEventsHandler(EventHandler):
 
         self.events_df = df
         return df
+
+    def _check_csv_coverage(self, df: pd.DataFrame):
+        """Warn if CSV coverage is ending soon (within 90 days)"""
+        if df.empty:
+            return
+
+        from datetime import datetime
+        max_event_date = df['date'].max()
+        current_date = datetime.now()
+
+        days_remaining = (max_event_date - current_date).days
+
+        if days_remaining < 90:  # Less than 3 months coverage
+            print(f"\n{'='*70}")
+            print(f"  ⚠️  EVENT DATA COVERAGE WARNING")
+            print(f"{'='*70}")
+            print(f"  Event CSV coverage ends: {max_event_date.strftime('%Y-%m-%d')}")
+            print(f"  Days remaining: {days_remaining} days")
+            print(f"\n  Action Required:")
+            print(f"  1. Update {Path(self.events_file).name} with {max_event_date.year + 1} events")
+            print(f"  2. Add upcoming TSLA earnings dates (check investor relations)")
+            print(f"  3. Add {max_event_date.year + 1} FOMC schedule (check federalreserve.gov)")
+            print(f"  4. See SPEC.md 'Event Data Maintenance' section for instructions")
+            print(f"{'='*70}\n")
+        elif days_remaining < 180:  # 3-6 months
+            print(f"ℹ️  Event CSV coverage until {max_event_date.strftime('%Y-%m-%d')} ({days_remaining} days remaining)")
 
     def get_events_for_date(self, date: str, lookback_days: int = 7) -> List[Dict]:
         """

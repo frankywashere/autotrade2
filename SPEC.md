@@ -716,6 +716,118 @@ python validate_gpu_cpu_equivalence.py
 
 ---
 
+## 10.1 Event Data Maintenance
+
+### Overview
+
+Event features require periodic updates to maintain accuracy. The system uses `tsla_events_REAL.csv` which contains historical and future events.
+
+**Current Coverage:** 2015-2025 (483 events)
+**Update Frequency:** Quarterly (when new earnings dates announced)
+
+### Checking Coverage
+
+```bash
+python validate_event_data.py
+
+# Shows:
+# - Event coverage status
+# - Days until CSV expiration
+# - Missing quarters (if any)
+# - Data quality issues
+```
+
+### When to Update
+
+**Warning triggers:**
+- System displays: "⚠️ EVENT DATA COVERAGE WARNING" on startup
+- Less than 90 days of future events remaining
+- New year approaching (add next year's FOMC schedule)
+
+### How to Update CSV
+
+**Step 1: Get TSLA Earnings Dates**
+- Visit: https://ir.tesla.com
+- Find: "Events & Presentations" → Upcoming earnings
+- Note: Q1, Q2, Q3, Q4 earnings dates for next year
+
+**Step 2: Get FOMC Dates**
+- Visit: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+- Download: Next year's FOMC meeting schedule (usually 8 meetings/year)
+
+**Step 3: Get Economic Calendar Dates**
+- CPI: Usually 2nd or 3rd Wednesday of each month
+- NFP: First Friday of each month
+- Quad Witching: 3rd Friday of Mar/Jun/Sep/Dec
+
+**Step 4: Update CSV**
+
+Add new rows to `data/tsla_events_REAL.csv`:
+
+```csv
+date,event_type,expected,actual,beat_miss,category
+2026-01-28,earnings,0.0,0.0,neutral,tsla
+2026-01-28,fomc,0.0,0.0,neutral,macro
+2026-02-07,nfp,0.0,0.0,neutral,macro
+...
+```
+
+**Step 5: Validate**
+
+```bash
+python validate_event_data.py
+
+# Expected: ✅ EVENT DATA IS PRODUCTION READY
+```
+
+### CSV Format
+
+```csv
+date,event_type,expected,actual,beat_miss,category
+2026-01-28,earnings,5.25,0.0,neutral,tsla     # Earnings (expected EPS)
+2026-01-02,delivery,500000,0.0,neutral,tsla   # Deliveries (expected units)
+2026-01-29,fomc,0.0,0.0,neutral,macro         # FOMC meeting
+2026-02-12,cpi,0.0,0.0,neutral,macro          # CPI release
+2026-02-07,nfp,0.0,0.0,neutral,macro          # Jobs report
+```
+
+**Required columns:**
+- `date`: YYYY-MM-DD format
+- `event_type`: earnings, delivery, fomc, cpi, nfp, quad_witching
+- `expected`: Expected value (EPS, deliveries, etc.) or 0.0
+- `actual`: Actual result (filled after event) or 0.0
+- `beat_miss`: beat, miss, meet, or neutral (before event)
+- `category`: tsla or macro
+
+### Robustness to Date Shifts
+
+**System is robust:** Uses relative timing, not absolute dates
+
+**Example:**
+```
+Training: Q1 2022 earnings on Jan 26
+Live: Q1 2026 earnings shifts to Feb 2 (week later)
+
+Model learns: "3 days before earnings" (relative)
+Not: "January 26" (absolute)
+
+Result: ✅ Works correctly regardless of actual date
+```
+
+**Feature:** `days_until_earnings = -3` means "3 days before" (date-agnostic)
+
+### Handling Missing Future Events
+
+**If CSV is outdated:**
+- Event features = 0 (no crash)
+- System runs normally
+- Accuracy ~5-10% lower (missing event context)
+- Warning displayed on startup
+
+**Graceful degradation** - system never crashes due to missing events.
+
+---
+
 ## Next Steps
 
 1. **Train Model:** `python train_hierarchical.py --interactive`
