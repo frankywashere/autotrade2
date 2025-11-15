@@ -419,6 +419,55 @@ def interactive_setup(args):
         print(f"   ⚠️  First run will take ~45 minutes to generate rolling channels")
         print(f"   💡 Subsequent runs will load instantly from cache")
 
+    # GPU Acceleration option (ALWAYS shown)
+    print()
+
+    # Check if GPU is available
+    gpu_available = torch.cuda.is_available() or torch.backends.mps.is_available()
+    if torch.cuda.is_available():
+        gpu_type = 'CUDA'
+        gpu_name = torch.cuda.get_device_name(0)
+    elif torch.backends.mps.is_available():
+        gpu_type = 'MPS'
+        gpu_name = 'Apple Silicon'
+    else:
+        gpu_type = None
+        gpu_name = 'Not Available'
+
+    # Determine if cache will be used
+    will_use_cache = not getattr(args, 'regenerate_cache', True)
+
+    if gpu_available:
+        print(f"⚡ GPU Acceleration Available: {gpu_name} ({gpu_type})")
+
+        if will_use_cache:
+            # Cache will be loaded - GPU won't be used this run
+            message = "Use GPU acceleration for feature extraction? (Note: Cache will be loaded this run, GPU only applies if cache regenerates)"
+        else:
+            # Will calculate features - GPU will be used
+            message = "Use GPU acceleration for feature extraction? (Speeds up calculation: ~45 mins → ~3 mins)"
+
+        args.use_gpu_features = inquirer.select(
+            message=message,
+            choices=[
+                Choice(True, f"Yes - Use {gpu_type} GPU (10-20x faster for calculation) ⚡"),
+                Choice(False, "No - Use CPU (reliable, compatible) 💾")
+            ],
+            default=True  # Default to GPU if available
+        ).execute()
+
+        if args.use_gpu_features:
+            if will_use_cache:
+                print(f"   ℹ️  GPU selected (will be used if cache needs regeneration)")
+            else:
+                print(f"   ⚡ GPU will accelerate feature calculation (~3 minutes instead of ~45 minutes)")
+        else:
+            print(f"   💾 CPU will be used for feature calculation")
+    else:
+        # No GPU available
+        args.use_gpu_features = False
+        print(f"⚡ GPU Acceleration: Not Available (CPU will be used)")
+
     # Model parameters
     print()
 
@@ -654,7 +703,10 @@ def main():
 
     # Use cache unless regenerate_cache flag is set (from interactive menu)
     use_cache = not getattr(args, 'regenerate_cache', False)
-    features_df = extractor.extract_features(df, use_cache=use_cache)
+
+    # Use GPU if enabled (from interactive menu or auto-detect)
+    use_gpu = getattr(args, 'use_gpu_features', 'auto')
+    features_df = extractor.extract_features(df, use_cache=use_cache, use_gpu=use_gpu)
 
     print(f"   Extracted {len(features_df.columns)} features")
     print(f"   Feature names: {extractor.get_feature_names()[:5]}... (showing first 5)")
