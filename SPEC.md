@@ -94,7 +94,7 @@ ONLINE LEARNER → TRADE TRACKER
 
 ---
 
-## 2. Feature System (469 Features)
+## 2. Feature System (473 Features)
 
 ### Feature Breakdown
 
@@ -113,7 +113,8 @@ ONLINE LEARNER → TRADE TRACKER
 | **Time** | 4 | Hour, day, month, year |
 | **Breakdown** | 54 | Volume surge, RSI divergence, alignment |
 | **Binary Flags** | 14 | Day flags, volatility, in-channel flags |
-| **TOTAL** | **469** | v3.8: +66 ping-pongs + 22 normalized slopes + 66 direction flags + 2 normalized prices |
+| **Event Features** | 4 | is_earnings_week, days_until_earnings, days_until_fomc, is_high_impact_event (v3.9) |
+| **TOTAL** | **473** | v3.9: +66 ping-pongs + 22 slopes + 66 direction + 2 norm prices + 4 events |
 
 ### Multi-Threshold Ping-Pong Learning (v3.6 Feature)
 
