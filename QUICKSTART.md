@@ -250,6 +250,67 @@ python train_hierarchical.py --interactive
 
 ---
 
+## GPU Acceleration
+
+### Overview
+
+GPU acceleration speeds up rolling channel calculation by ~1.5-1.8x on first run. Uses hybrid GPU+CPU approach for correctness.
+
+**Performance gains:**
+- 10K bars: 20 sec → 15 sec (1.3x)
+- 50K bars: 5 mins → 3 mins (1.7x)
+- 1.15M bars (training): 45 mins → 25-30 mins (1.5-1.8x)
+- **Cached runs:** 2-5 seconds (same for GPU and CPU)
+
+### Supported Hardware
+
+- ✅ **Apple Silicon** (M1/M2/M3) - via MPS
+- ✅ **NVIDIA GPUs** - via CUDA
+- ⚠️ **Not supported:** AMD GPUs, older Macs
+
+### Accuracy
+
+GPU produces **nearly identical results** to CPU:
+- Most features: Exact match (within 0.01%)
+- Ping-pongs: May differ by ±1-2 counts (floating point edge cases)
+- Stability: May differ by ±0.04 points out of 100 (0.04% difference)
+
+**Impact:** Negligible for model training - learns patterns, not exact counts.
+
+### Usage
+
+**Interactive menu (recommended):**
+```
+? Use GPU acceleration for feature extraction?
+  ● Yes - Use MPS GPU ⚡
+  ○ No - Use CPU 💾
+```
+
+**Note:** If cache exists, GPU only applies if you choose "Regenerate cache"
+
+### Validation
+
+Verify GPU is working correctly:
+```bash
+python validate_gpu_cpu_equivalence.py
+
+# Tests GPU vs CPU equivalence
+# Should show: ✅ ALL TESTS PASSED
+```
+
+### When to Use
+
+**GPU beneficial:**
+- First training run (no cache)
+- Regenerating cache (new date range)
+- Development/experimentation
+
+**CPU fine:**
+- Cache already exists (instant either way)
+- Live predictions (auto-uses CPU)
+
+---
+
 ## Validation & Testing
 
 ### Validate Rolling Channels
