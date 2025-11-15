@@ -110,7 +110,7 @@ trade_tracking:
 
 # ===== FEATURE ENGINEERING =====
 features:
-  total_features: 313
+  total_features: 467  # v3.7: Multi-threshold ping-pongs + normalized slope + direction flags
 
   # Binary flags
   binary_flags_enabled: true
@@ -124,7 +124,7 @@ features:
 
 # ===== MODEL ARCHITECTURE =====
 model:
-  input_size: 309                     # Actual feature count
+  input_size: 467                     # Actual feature count (v3.7)
   hidden_size: 128                    # Output neurons per layer
   internal_neurons_ratio: 2.0         # Total neurons = hidden_size × ratio (e.g., 256 total)
   downsample_fast_to_medium: 5        # 1min → 5min
