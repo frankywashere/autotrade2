@@ -9,6 +9,7 @@ import torch
 from typing import Dict, List, Tuple
 from pathlib import Path
 import sys
+from tqdm import tqdm
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent.parent
@@ -182,8 +183,6 @@ class TradingFeatureExtractor(FeatureExtractor):
         - 54 breakdown/channel enhancement features
         - 14 binary feature flags (NO LEAKAGE - is_monday, is_friday, is_volatile_now, is_earnings_week, in_channel flags)
         """
-        from tqdm import tqdm
-
         # Extract multi-resolution data if present (for live mode) and remove from attrs to prevent deep copy recursion
         multi_res_data = df.attrs.pop('multi_resolution', None)
 
@@ -269,7 +268,6 @@ class TradingFeatureExtractor(FeatureExtractor):
             df: OHLCV DataFrame
             use_cache: If True, load from cache or save to cache (recommended)
         """
-        from tqdm import tqdm
         import hashlib
         import pickle
 
@@ -457,8 +455,13 @@ class TradingFeatureExtractor(FeatureExtractor):
             'r_squared': np.zeros(num_original_rows)
         }
 
-        # Calculate channel at each timestamp
-        for i in range(lookback, len(resampled_df)):
+        # Calculate channel at each timestamp with progress bar
+        bar_range = range(lookback, len(resampled_df))
+        bar_progress = tqdm(bar_range, desc=f"      {symbol.upper()} {tf_name}",
+                            leave=False, position=2, ncols=100,
+                            disable=len(bar_range) < 100)  # Skip progress bar for short timeframes
+
+        for i in bar_progress:
             try:
                 # Rolling window
                 window = resampled_df.iloc[i-lookback:i]
