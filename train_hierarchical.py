@@ -495,13 +495,14 @@ def interactive_setup(args):
         max_allowed=1000
     ).execute())
 
-    # Device-specific max batch sizes (prevent OOM)
+    # Device-specific max batch sizes
+    # Note: 512 may cause OOM on systems with <16GB RAM/VRAM
     max_batch_sizes = {
-        'cuda': 256,    # NVIDIA has lots of VRAM
-        'mps': 128,     # Apple Silicon - conservative to avoid OOM
-        'cpu': 64       # CPU limited
+        'cuda': 512,    # Increased max for modern GPUs
+        'mps': 512,     # Increased max for M2 Max/Ultra with high RAM
+        'cpu': 512      # Increased max (requires 32GB+ RAM)
     }
-    max_batch_size = max_batch_sizes.get(args.device, 64)
+    max_batch_size = max_batch_sizes.get(args.device, 512)
 
     args.batch_size = int(inquirer.number(
         message=f"Batch size (recommended: {recommended_batch}, max for {args.device.upper()}: {max_batch_size}):",

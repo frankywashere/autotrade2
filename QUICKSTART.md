@@ -535,3 +535,28 @@ autotrade2/
 **Status:** 🟢 Ready to train and predict!
 
 **Estimated time to first prediction:** 35-70 minutes (first run) or 6-11 minutes (cached)
+
+
+  How to Add Delivery Dates
+
+  Open the file and add rows like this:
+
+  date,event_type,expected,actual,beat_miss,category
+  2026-01-02,delivery,500000,0.0,neutral,tsla
+  2026-04-02,delivery,520000,0.0,neutral,tsla
+  2026-07-02,delivery,540000,0.0,neutral,tsla
+  2026-10-02,delivery,560000,0.0,neutral,tsla
+
+  ---
+  Format Explanation
+
+  | Column     | What to Put                        | Example    |
+  |------------|------------------------------------|------------|
+  | date       | YYYY-MM-DD format                  | 2026-01-02 |
+  | event_type | Always "delivery"                  | delivery   |
+  | expected   | Expected deliveries (estimate)     | 500000     |
+  | actual     | Leave as 0.0 (fill after report)   | 0.0        |
+  | beat_miss  | Leave as "neutral" (before report) | neutral    |
+  | category   | Always "tsla"                      | tsla       |
+
+
