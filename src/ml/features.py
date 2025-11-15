@@ -22,7 +22,7 @@ from .base import FeatureExtractor
 from .channel_features import ChannelFeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.5"
+FEATURE_VERSION = "v3.6"  # Added multi-threshold ping-pongs (313 → 379 features)
 
 
 def _check_gpu_available() -> tuple:
@@ -75,7 +75,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'tsla_channel_{tf}_lower_dist',  # Distance to lower
                 f'tsla_channel_{tf}_slope',
                 f'tsla_channel_{tf}_stability',
-                f'tsla_channel_{tf}_ping_pongs',
+                f'tsla_channel_{tf}_ping_pongs',  # 2% threshold (default)
+                f'tsla_channel_{tf}_ping_pongs_0_5pct',  # 0.5% threshold (strict)
+                f'tsla_channel_{tf}_ping_pongs_1_0pct',  # 1.0% threshold
+                f'tsla_channel_{tf}_ping_pongs_3_0pct',  # 3.0% threshold (loose)
                 f'tsla_channel_{tf}_r_squared',
             ])
 
@@ -87,7 +90,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'spy_channel_{tf}_lower_dist',  # Distance to lower
                 f'spy_channel_{tf}_slope',
                 f'spy_channel_{tf}_stability',
-                f'spy_channel_{tf}_ping_pongs',
+                f'spy_channel_{tf}_ping_pongs',  # 2% threshold (default)
+                f'spy_channel_{tf}_ping_pongs_0_5pct',  # 0.5% threshold (strict)
+                f'spy_channel_{tf}_ping_pongs_1_0pct',  # 1.0% threshold
+                f'spy_channel_{tf}_ping_pongs_3_0pct',  # 3.0% threshold (loose)
                 f'spy_channel_{tf}_r_squared',
             ])
 
@@ -177,7 +183,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, **kwargs) -> pd.DataFrame:
         """
-        Extract all 313 features from aligned SPY-TSLA data (v3.5 - Hierarchical Multi-Task).
+        Extract all 379 features from aligned SPY-TSLA data (v3.6 - Hierarchical Multi-Task with Multi-Threshold Ping-Pongs).
 
         Args:
             df: DataFrame with SPY and TSLA OHLCV columns
@@ -195,9 +201,11 @@ class TradingFeatureExtractor(FeatureExtractor):
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
 
-        Returns DataFrame with 313 columns:
+        Returns DataFrame with 379 columns:
         - 10 price features
-        - 154 channel features (77 TSLA + 77 SPY)
+        - 220 channel features (110 TSLA + 110 SPY) - includes multi-threshold ping-pongs
+          - Per timeframe (11): position, upper_dist, lower_dist, slope, stability, r_squared
+          - Ping-pongs (4 thresholds): ping_pongs (2%), ping_pongs_0_5pct, ping_pongs_1_0pct, ping_pongs_3_0pct
         - 66 RSI features (33 TSLA + 33 SPY)
         - 5 correlation features
         - 4 cycle features
@@ -507,14 +515,17 @@ class TradingFeatureExtractor(FeatureExtractor):
         """
         num_original_rows = len(original_index)
 
-        # Initialize result arrays
+        # Initialize result arrays (including multi-threshold ping-pongs)
         results = {
             'position': np.zeros(num_original_rows),
             'upper_dist': np.zeros(num_original_rows),
             'lower_dist': np.zeros(num_original_rows),
             'slope': np.zeros(num_original_rows),
             'stability': np.zeros(num_original_rows),
-            'ping_pongs': np.zeros(num_original_rows),
+            'ping_pongs': np.zeros(num_original_rows),  # Default 2% threshold
+            'ping_pongs_0_5pct': np.zeros(num_original_rows),  # 0.5% threshold
+            'ping_pongs_1_0pct': np.zeros(num_original_rows),  # 1.0% threshold
+            'ping_pongs_3_0pct': np.zeros(num_original_rows),  # 3.0% threshold
             'r_squared': np.zeros(num_original_rows)
         }
 
@@ -534,6 +545,15 @@ class TradingFeatureExtractor(FeatureExtractor):
                 current_price = resampled_df['close'].iloc[i]
                 position_data = self.channel_calc.get_channel_position(current_price, channel)
 
+                # Calculate multi-threshold ping-pongs
+                window_prices = window['close'].values
+                multi_pp = self.channel_calc._detect_ping_pongs_multi_threshold(
+                    window_prices,
+                    channel.upper_line,
+                    channel.lower_line,
+                    thresholds=[0.005, 0.01, 0.02, 0.03]
+                )
+
                 # Map resampled timestamp to original 1-min index
                 timestamp = resampled_df.index[i]
 
@@ -552,12 +572,66 @@ class TradingFeatureExtractor(FeatureExtractor):
                 results['lower_dist'][mask] = position_data['distance_to_lower_pct']
                 results['slope'][mask] = channel.slope
                 results['stability'][mask] = channel.stability_score
-                results['ping_pongs'][mask] = channel.ping_pongs
+                results['ping_pongs'][mask] = channel.ping_pongs  # 2% threshold (default)
+                results['ping_pongs_0_5pct'][mask] = multi_pp[0.005]  # 0.5% threshold
+                results['ping_pongs_1_0pct'][mask] = multi_pp[0.01]   # 1.0% threshold
+                results['ping_pongs_3_0pct'][mask] = multi_pp[0.03]   # 3.0% threshold
                 results['r_squared'][mask] = channel.r_squared
 
             except Exception as e:
                 # If calculation fails, leave as zeros
                 continue
+
+        return results
+
+    def _calculate_ping_pongs_cpu_multi_threshold(
+        self,
+        prices: np.ndarray,
+        pred_prices: np.ndarray,
+        residual_std: float,
+        thresholds: list = [0.005, 0.01, 0.02, 0.03]
+    ) -> dict:
+        """
+        Ping-pong counting at multiple thresholds (efficient single-pass).
+
+        Args:
+            prices: Actual prices for one window
+            pred_prices: Predicted prices (regression line) for one window
+            residual_std: Standard deviation of residuals
+            thresholds: List of percentage thresholds
+
+        Returns:
+            Dict mapping threshold to bounce count
+        """
+        # Calculate channel bounds
+        upper = pred_prices + (2.0 * residual_std)
+        lower = pred_prices - (2.0 * residual_std)
+
+        results = {threshold: 0 for threshold in thresholds}
+        last_touch = {threshold: None for threshold in thresholds}
+
+        for i in range(len(prices)):
+            price = prices[i]
+            upper_val = upper[i]
+            lower_val = lower[i]
+
+            # Calculate distances as percentage
+            upper_dist = abs(price - upper_val) / upper_val
+            lower_dist = abs(price - lower_val) / lower_val
+
+            # Check each threshold
+            for threshold in thresholds:
+                # Check if price touches upper line
+                if upper_dist <= threshold:
+                    if last_touch[threshold] == 'lower':
+                        results[threshold] += 1
+                    last_touch[threshold] = 'upper'
+
+                # Check if price touches lower line
+                elif lower_dist <= threshold:
+                    if last_touch[threshold] == 'upper':
+                        results[threshold] += 1
+                    last_touch[threshold] = 'lower'
 
         return results
 
@@ -695,14 +769,17 @@ class TradingFeatureExtractor(FeatureExtractor):
         num_original_rows = len(original_index)
         prices = resampled_df['close'].values
 
-        # Initialize result arrays
+        # Initialize result arrays (including multi-threshold ping-pongs)
         results = {
             'position': np.zeros(num_original_rows),
             'upper_dist': np.zeros(num_original_rows),
             'lower_dist': np.zeros(num_original_rows),
             'slope': np.zeros(num_original_rows),
             'stability': np.zeros(num_original_rows),
-            'ping_pongs': np.zeros(num_original_rows),
+            'ping_pongs': np.zeros(num_original_rows),  # Default 2% threshold
+            'ping_pongs_0_5pct': np.zeros(num_original_rows),  # 0.5% threshold
+            'ping_pongs_1_0pct': np.zeros(num_original_rows),  # 1.0% threshold
+            'ping_pongs_3_0pct': np.zeros(num_original_rows),  # 3.0% threshold
             'r_squared': np.zeros(num_original_rows)
         }
 
@@ -760,10 +837,12 @@ class TradingFeatureExtractor(FeatureExtractor):
                         residuals = actual_prices - pred_prices
                         residual_std = np.std(residuals) if len(residuals) > 0 else 1.0
 
-                        # Calculate ping-pongs on CPU (exact LinearRegressionChannel algorithm)
-                        ping_pongs = self._calculate_ping_pongs_cpu(
-                            actual_prices, pred_prices, residual_std
+                        # Calculate ping-pongs at multiple thresholds
+                        ping_pongs_multi = self._calculate_ping_pongs_cpu_multi_threshold(
+                            actual_prices, pred_prices, residual_std,
+                            thresholds=[0.005, 0.01, 0.02, 0.03]
                         )
+                        ping_pongs = ping_pongs_multi[0.02]  # Default 2% for stability calc
 
                         # Calculate channel bounds
                         upper_line = pred_price + (2.0 * residual_std)
@@ -798,7 +877,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                         results['position'][mask] = position
                         results['slope'][mask] = slopes_cpu[batch_i]
                         results['r_squared'][mask] = r_squared_cpu[batch_i]
-                        results['ping_pongs'][mask] = ping_pongs
+                        results['ping_pongs'][mask] = ping_pongs  # 2% threshold
+                        results['ping_pongs_0_5pct'][mask] = ping_pongs_multi[0.005]
+                        results['ping_pongs_1_0pct'][mask] = ping_pongs_multi[0.01]
+                        results['ping_pongs_3_0pct'][mask] = ping_pongs_multi[0.03]
                         results['stability'][mask] = stability
                         results['upper_dist'][mask] = upper_dist
                         results['lower_dist'][mask] = lower_dist
