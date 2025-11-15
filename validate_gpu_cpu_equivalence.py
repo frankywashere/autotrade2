@@ -152,6 +152,148 @@ def test_sample_data(year, num_bars, sample_name="Test"):
     }
 
 
+def test_cache_equivalence(year=2022, num_bars=50000):
+    """
+    Test that GPU and CPU create equivalent cache files.
+
+    Tests:
+    1. GPU creates cache → loads correctly
+    2. CPU creates cache → loads correctly
+    3. Both caches produce same results
+    4. Cache files have similar sizes
+    """
+    print(f"\n{'-'*70}")
+    print(f"  Test 4: Cache Creation Equivalence ({year}, {num_bars:,} bars)")
+    print(f"{'-'*70}")
+
+    # Load data
+    print(f"  📁 Loading test data...")
+    data_feed = CSVDataFeed(timeframe='1min')
+    df = data_feed.load_aligned_data(
+        start_date=f'{year}-01-01',
+        end_date=f'{year}-12-31'
+    )
+
+    # Sample subset
+    if len(df) > num_bars:
+        start_idx = (len(df) - num_bars) // 2
+        df = df.iloc[start_idx:start_idx + num_bars].copy()
+
+    print(f"     Sample: {len(df):,} bars ({df.index[0]} to {df.index[-1]})")
+
+    # Test GPU cache creation
+    print(f"\n  ⚡ Creating cache with GPU...")
+    extractor_gpu = TradingFeatureExtractor()
+    gpu_features_fresh = extractor_gpu.extract_features(
+        df, use_cache=True, use_gpu=True, cache_suffix='GPU_TEST'
+    )
+
+    # Check GPU cache file was created
+    cache_dir = Path('data/feature_cache')
+    gpu_cache_files = list(cache_dir.glob('rolling_channels_*_GPU_TEST.pkl'))
+    if gpu_cache_files:
+        gpu_cache_size = gpu_cache_files[0].stat().st_size / (1024 * 1024)
+        print(f"     ✓ GPU cache created: {gpu_cache_files[0].name} ({gpu_cache_size:.1f} MB)")
+    else:
+        print(f"     ❌ GPU cache NOT created!")
+        return None
+
+    # Load from GPU cache
+    print(f"  📂 Loading from GPU cache...")
+    extractor_gpu2 = TradingFeatureExtractor()
+    gpu_features_cached = extractor_gpu2.extract_features(
+        df, use_cache=True, use_gpu=False, cache_suffix='GPU_TEST'
+    )
+    print(f"     ✓ GPU cache loaded successfully")
+
+    # Test CPU cache creation
+    print(f"\n  💾 Creating cache with CPU...")
+    extractor_cpu = TradingFeatureExtractor()
+    cpu_features_fresh = extractor_cpu.extract_features(
+        df, use_cache=True, use_gpu=False, cache_suffix='CPU_TEST'
+    )
+
+    # Check CPU cache file was created
+    cpu_cache_files = list(cache_dir.glob('rolling_channels_*_CPU_TEST.pkl'))
+    if cpu_cache_files:
+        cpu_cache_size = cpu_cache_files[0].stat().st_size / (1024 * 1024)
+        print(f"     ✓ CPU cache created: {cpu_cache_files[0].name} ({cpu_cache_size:.1f} MB)")
+    else:
+        print(f"     ❌ CPU cache NOT created!")
+        return None
+
+    # Load from CPU cache
+    print(f"  📂 Loading from CPU cache...")
+    extractor_cpu2 = TradingFeatureExtractor()
+    cpu_features_cached = extractor_cpu2.extract_features(
+        df, use_cache=True, use_gpu=False, cache_suffix='CPU_TEST'
+    )
+    print(f"     ✓ CPU cache loaded successfully")
+
+    # Compare results
+    print(f"\n  🔍 Comparing cache equivalence...")
+
+    channel_features = [c for c in cpu_features_fresh.columns if 'channel' in c]
+
+    # Test A: GPU fresh vs CPU fresh
+    test_a_passed = True
+    for feat in channel_features[:10]:
+        passed, max_diff, _, _ = compare_features(cpu_features_fresh, gpu_features_fresh, feat)
+        if not passed:
+            test_a_passed = False
+            break
+
+    # Test B: GPU cached vs CPU cached
+    test_b_passed = True
+    for feat in channel_features[:10]:
+        passed, max_diff, _, _ = compare_features(cpu_features_cached, gpu_features_cached, feat)
+        if not passed:
+            test_b_passed = False
+            break
+
+    # Test C: GPU fresh vs GPU cached (round-trip)
+    test_c_passed = True
+    for feat in channel_features[:10]:
+        passed, max_diff, _, _ = compare_features(gpu_features_fresh, gpu_features_cached, feat)
+        if not passed:
+            test_c_passed = False
+            break
+
+    # Test D: CPU fresh vs CPU cached (round-trip)
+    test_d_passed = True
+    for feat in channel_features[:10]:
+        passed, max_diff, _, _ = compare_features(cpu_features_fresh, cpu_features_cached, feat)
+        if not passed:
+            test_d_passed = False
+            break
+
+    # Print results
+    print(f"\n     Results:")
+    print(f"       {'✅' if test_a_passed else '❌'} GPU calc vs CPU calc: {'MATCH' if test_a_passed else 'DIFFER'}")
+    print(f"       {'✅' if test_b_passed else '❌'} GPU cached vs CPU cached: {'MATCH' if test_b_passed else 'DIFFER'}")
+    print(f"       {'✅' if test_c_passed else '❌'} GPU round-trip (save/load): {'OK' if test_c_passed else 'FAIL'}")
+    print(f"       {'✅' if test_d_passed else '❌'} CPU round-trip (save/load): {'OK' if test_d_passed else 'FAIL'}")
+    print(f"       {'✅' if abs(gpu_cache_size - cpu_cache_size) < 1.0 else '⚠️'} Cache sizes: GPU {gpu_cache_size:.1f} MB vs CPU {cpu_cache_size:.1f} MB")
+
+    all_passed = test_a_passed and test_b_passed and test_c_passed and test_d_passed
+
+    # Cleanup test caches
+    print(f"\n  🧹 Cleaning up test caches...")
+    for test_cache in cache_dir.glob('rolling_channels_*_GPU_TEST.pkl'):
+        test_cache.unlink()
+        print(f"     Deleted {test_cache.name}")
+    for test_cache in cache_dir.glob('rolling_channels_*_CPU_TEST.pkl'):
+        test_cache.unlink()
+        print(f"     Deleted {test_cache.name}")
+
+    return {
+        'passed': all_passed,
+        'cache_test': True,
+        'gpu_cache_size': gpu_cache_size,
+        'cpu_cache_size': cpu_cache_size
+    }
+
+
 def main():
     """Run GPU vs CPU equivalence tests"""
 
@@ -183,7 +325,7 @@ def main():
         return 1
 
     # Run tests on multiple samples
-    print_header("Running Equivalence Tests (3 Samples)")
+    print_header("Running Calculation Equivalence Tests (3 Samples)")
 
     test_results = []
 
@@ -215,6 +357,12 @@ def main():
         if result:
             test_results.append(("Large (100K bars)", result))
 
+        # Test 4: Cache creation equivalence
+        print_header("Running Cache Creation Equivalence Test")
+        cache_result = test_cache_equivalence(year=2022, num_bars=50000)
+        if cache_result:
+            test_results.append(("Cache Creation", cache_result))
+
     except KeyboardInterrupt:
         print(f"\n\n⚠️  Test interrupted by user")
         return 1
@@ -239,55 +387,71 @@ def main():
     for test_name, result in test_results:
         status = "✅ PASS" if result['passed'] else "❌ FAIL"
         print(f"  {status}  {test_name}")
-        print(f"         Features tested: {result['num_features']}")
-        if result['failures'] > 0:
-            print(f"         ❌ Failures: {result['failures']} features exceed tolerance")
-            print(f"         Top failures:")
-            for feat, max_diff, mean_diff in result['failure_details']:
-                print(f"            {feat}: max_diff={max_diff:.2e}, mean={mean_diff:.2e}")
-        if result['warnings'] > 0:
-            print(f"         ⚠️  Warnings: {result['warnings']} features have small diffs (OK)")
 
-    # Detailed feature-by-feature comparison (from last test)
-    if test_results:
-        print_header("DETAILED FEATURE COMPARISON (Last Test)")
-
-        last_result = test_results[-1][1]
-        cpu_features = last_result['cpu_features']
-        gpu_features = last_result['gpu_features']
-
-        # Get channel features
-        channel_cols = [c for c in cpu_features.columns if 'channel' in c]
-
-        print(f"\n📊 Channel Features ({len(channel_cols)} total):")
-        print(f"{'Feature':<45} {'Max Diff':<12} {'Mean Diff':<12} {'Status':<8}")
-        print(f"{'-'*70}")
-
-        # Show first 20 features
-        for col in channel_cols[:20]:
-            passed, max_diff, mean_diff, _ = compare_features(cpu_features, gpu_features, col)
-            status = "✓" if passed else "✗"
-            print(f"{col:<45} {max_diff:<12.2e} {mean_diff:<12.2e} {status:<8}")
-
-        if len(channel_cols) > 20:
-            print(f"\n... and {len(channel_cols) - 20} more channel features")
-
-        # Calculate overall statistics
-        all_diffs = []
-        for col in channel_cols:
-            _, max_diff, mean_diff, _ = compare_features(cpu_features, gpu_features, col)
-            all_diffs.append(max_diff)
-
-        print(f"\n📈 Overall Statistics:")
-        print(f"   Maximum difference (worst case): {max(all_diffs):.2e}")
-        print(f"   Average maximum difference: {np.mean(all_diffs):.2e}")
-        print(f"   Median maximum difference: {np.median(all_diffs):.2e}")
-        print(f"   Tolerance threshold: 1.00e-04")
-
-        if max(all_diffs) < 1e-4:
-            print(f"\n   ✅ Results are EQUIVALENT (all within tolerance)")
+        # Cache test has different structure
+        if result.get('cache_test'):
+            print(f"         GPU cache: {result['gpu_cache_size']:.1f} MB")
+            print(f"         CPU cache: {result['cpu_cache_size']:.1f} MB")
+            print(f"         Both caches created and load correctly")
         else:
-            print(f"\n   ❌ Results DIFFER (some exceed tolerance)")
+            print(f"         Features tested: {result['num_features']}")
+            if result['failures'] > 0:
+                print(f"         ❌ Failures: {result['failures']} features exceed tolerance")
+                print(f"         Top failures:")
+                for feat, max_diff, mean_diff in result['failure_details']:
+                    print(f"            {feat}: max_diff={max_diff:.2e}, mean={mean_diff:.2e}")
+            if result['warnings'] > 0:
+                print(f"         ⚠️  Warnings: {result['warnings']} features have small diffs (OK)")
+
+    # Detailed feature-by-feature comparison (from last non-cache test)
+    if test_results:
+        print_header("DETAILED FEATURE COMPARISON")
+
+        # Find last test that has feature data (not cache test)
+        detail_result = None
+        for test_name, result in reversed(test_results):
+            if 'cpu_features' in result and 'gpu_features' in result:
+                detail_result = result
+                break
+
+        if not detail_result:
+            print(f"\n  No detailed comparison available (cache test only)")
+        else:
+            cpu_features = detail_result['cpu_features']
+            gpu_features = detail_result['gpu_features']
+
+            # Get channel features
+            channel_cols = [c for c in cpu_features.columns if 'channel' in c]
+
+            print(f"\n📊 Channel Features ({len(channel_cols)} total):")
+            print(f"{'Feature':<45} {'Max Diff':<12} {'Mean Diff':<12} {'Status':<8}")
+            print(f"{'-'*70}")
+
+            # Show first 20 features
+            for col in channel_cols[:20]:
+                passed, max_diff, mean_diff, _ = compare_features(cpu_features, gpu_features, col)
+                status = "✓" if passed else "✗"
+                print(f"{col:<45} {max_diff:<12.2e} {mean_diff:<12.2e} {status:<8}")
+
+            if len(channel_cols) > 20:
+                print(f"\n... and {len(channel_cols) - 20} more channel features")
+
+            # Calculate overall statistics
+            all_diffs = []
+            for col in channel_cols:
+                _, max_diff, mean_diff, _ = compare_features(cpu_features, gpu_features, col)
+                all_diffs.append(max_diff)
+
+            print(f"\n📈 Overall Statistics:")
+            print(f"   Maximum difference (worst case): {max(all_diffs):.2e}")
+            print(f"   Average maximum difference: {np.mean(all_diffs):.2e}")
+            print(f"   Median maximum difference: {np.median(all_diffs):.2e}")
+            print(f"   Tolerance threshold: 1.00e-04")
+
+            if max(all_diffs) < 1e-4:
+                print(f"\n   ✅ Results are EQUIVALENT (all within tolerance)")
+            else:
+                print(f"\n   ❌ Results DIFFER (some exceed tolerance)")
 
     # Final verdict
     print_header("FINAL VERDICT")

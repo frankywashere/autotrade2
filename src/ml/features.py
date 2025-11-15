@@ -175,7 +175,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', **kwargs) -> pd.DataFrame:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, **kwargs) -> pd.DataFrame:
         """
         Extract all 313 features from aligned SPY-TSLA data (v3.5 - Hierarchical Multi-Task).
 
@@ -186,6 +186,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                 - 'auto': Use GPU only if data size > 50,000 bars (smart default)
                 - True: Force GPU (if available, otherwise fallback to CPU)
                 - False/'never': Always use CPU
+            cache_suffix: Optional suffix for cache filename (for testing GPU/CPU separately)
+                - None (default): Normal cache filename
+                - 'GPU_TEST': Appends to cache name for GPU testing
+                - 'CPU_TEST': Appends to cache name for CPU testing
             **kwargs: Additional arguments (reserved for future use)
 
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
@@ -236,7 +240,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             price_df = self._extract_price_features(df)
             pbar.update(1)
 
-            channel_df = self._extract_channel_features(df, multi_res_data=multi_res_data, use_cache=use_cache, use_gpu=use_gpu_resolved)
+            channel_df = self._extract_channel_features(df, multi_res_data=multi_res_data, use_cache=use_cache, use_gpu=use_gpu_resolved, cache_suffix=cache_suffix)
             pbar.update(1)
 
             rsi_df = self._extract_rsi_features(df, multi_res_data=multi_res_data)
@@ -298,7 +302,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         return pd.DataFrame(price_features, index=df.index)
 
-    def _extract_channel_features(self, df: pd.DataFrame, use_cache: bool = True, multi_res_data: dict = None, use_gpu: bool = False) -> pd.DataFrame:
+    def _extract_channel_features(self, df: pd.DataFrame, use_cache: bool = True, multi_res_data: dict = None, use_gpu: bool = False, cache_suffix: str = None) -> pd.DataFrame:
         """
         Extract ROLLING linear regression channel features for multiple timeframes.
 
@@ -312,6 +316,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             df: OHLCV DataFrame
             use_cache: If True, load from cache or save to cache (recommended)
             use_gpu: If True, use GPU acceleration (10-20x faster for large datasets)
+            cache_suffix: Optional suffix for cache filename (for testing, e.g., 'GPU_TEST')
         """
         import hashlib
         import pickle
@@ -323,7 +328,12 @@ class TradingFeatureExtractor(FeatureExtractor):
 
             # Create cache key from version + data range (version ensures cache invalidation when logic changes)
             cache_key = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}"
-            cache_file = cache_dir / f'rolling_channels_{cache_key}.pkl'
+
+            # Add suffix if provided (for testing GPU/CPU separately)
+            if cache_suffix:
+                cache_file = cache_dir / f'rolling_channels_{cache_key}_{cache_suffix}.pkl'
+            else:
+                cache_file = cache_dir / f'rolling_channels_{cache_key}.pkl'
 
             if cache_file.exists():
                 try:
