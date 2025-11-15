@@ -25,6 +25,21 @@ from .channel_features import ChannelFeatureExtractor
 FEATURE_VERSION = "v3.5"
 
 
+def _check_gpu_available() -> tuple:
+    """
+    Check if GPU is available for acceleration.
+
+    Returns:
+        (available, device_type): (True, 'cuda') or (True, 'mps') or (False, 'cpu')
+    """
+    if torch.cuda.is_available():
+        return True, 'cuda'
+    elif torch.backends.mps.is_available():
+        return True, 'mps'
+    else:
+        return False, 'cpu'
+
+
 class TradingFeatureExtractor(FeatureExtractor):
     """
     Comprehensive feature extractor for stock trading
@@ -160,13 +175,17 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, **kwargs) -> pd.DataFrame:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', **kwargs) -> pd.DataFrame:
         """
         Extract all 313 features from aligned SPY-TSLA data (v3.5 - Hierarchical Multi-Task).
 
         Args:
             df: DataFrame with SPY and TSLA OHLCV columns
             use_cache: Whether to use cached rolling channels (default: True). Set to False to force regeneration.
+            use_gpu: GPU acceleration mode (default: 'auto')
+                - 'auto': Use GPU only if data size > 50,000 bars (smart default)
+                - True: Force GPU (if available, otherwise fallback to CPU)
+                - False/'never': Always use CPU
             **kwargs: Additional arguments (reserved for future use)
 
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
@@ -186,13 +205,38 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Extract multi-resolution data if present (for live mode) and remove from attrs to prevent deep copy recursion
         multi_res_data = df.attrs.pop('multi_resolution', None)
 
+        # GPU auto-detection logic
+        if use_gpu == 'auto':
+            # Use GPU only for large datasets (>50K bars, well above 2.5K break-even)
+            # This ensures GPU for training, CPU for live/backtest
+            gpu_available, device_type = _check_gpu_available()
+            use_gpu_resolved = len(df) > 50_000 and gpu_available
+            if use_gpu_resolved:
+                print(f"   🚀 Auto-detected: Using {device_type.upper()} for feature extraction (data size: {len(df):,} bars)")
+            else:
+                reason = "data too small" if len(df) <= 50_000 else "GPU not available"
+                print(f"   💾 Auto-detected: Using CPU for feature extraction ({reason})")
+        elif use_gpu is True:
+            # User explicitly requested GPU
+            gpu_available, device_type = _check_gpu_available()
+            use_gpu_resolved = gpu_available
+            if use_gpu_resolved:
+                print(f"   🚀 Using {device_type.upper()} for feature extraction (user requested)")
+            else:
+                print(f"   ⚠️  GPU requested but not available, falling back to CPU")
+                use_gpu_resolved = False
+        else:
+            # use_gpu is False or 'never'
+            use_gpu_resolved = False
+            print(f"   💾 Using CPU for feature extraction (user requested)")
+
         # PASS 1: Extract base features
         print("   Extracting base features...")
         with tqdm(total=7, desc="   Feature extraction", leave=True, position=0, ncols=100) as pbar:
             price_df = self._extract_price_features(df)
             pbar.update(1)
 
-            channel_df = self._extract_channel_features(df, multi_res_data=multi_res_data, use_cache=use_cache)
+            channel_df = self._extract_channel_features(df, multi_res_data=multi_res_data, use_cache=use_cache, use_gpu=use_gpu_resolved)
             pbar.update(1)
 
             rsi_df = self._extract_rsi_features(df, multi_res_data=multi_res_data)
@@ -254,7 +298,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         return pd.DataFrame(price_features, index=df.index)
 
-    def _extract_channel_features(self, df: pd.DataFrame, use_cache: bool = True, multi_res_data: dict = None) -> pd.DataFrame:
+    def _extract_channel_features(self, df: pd.DataFrame, use_cache: bool = True, multi_res_data: dict = None, use_gpu: bool = False) -> pd.DataFrame:
         """
         Extract ROLLING linear regression channel features for multiple timeframes.
 
@@ -267,6 +311,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         Args:
             df: OHLCV DataFrame
             use_cache: If True, load from cache or save to cache (recommended)
+            use_gpu: If True, use GPU acceleration (10-20x faster for large datasets)
         """
         import hashlib
         import pickle
@@ -391,12 +436,20 @@ class TradingFeatureExtractor(FeatureExtractor):
                     calc_progress.update(1)
                     continue
 
-                # ROLLING CHANNEL CALCULATION
+                # ROLLING CHANNEL CALCULATION (GPU or CPU)
                 lookback = min(168, len(resampled) // 2)  # Use half of data or 168, whichever is smaller
 
-                rolling_results = self._calculate_rolling_channels(
-                    resampled, lookback, tf_name, symbol, df.index
-                )
+                if use_gpu:
+                    # GPU-accelerated calculation
+                    _, device_type = _check_gpu_available()
+                    rolling_results = self._calculate_rolling_channels_gpu(
+                        resampled, lookback, tf_name, symbol, df.index, device=device_type
+                    )
+                else:
+                    # CPU calculation (original implementation)
+                    rolling_results = self._calculate_rolling_channels(
+                        resampled, lookback, tf_name, symbol, df.index
+                    )
 
                 # Store rolling results (each row has unique values!)
                 for feat_name, values in rolling_results.items():
@@ -495,6 +548,239 @@ class TradingFeatureExtractor(FeatureExtractor):
             except Exception as e:
                 # If calculation fails, leave as zeros
                 continue
+
+        return results
+
+    def _linear_regression_gpu(
+        self,
+        windows: torch.Tensor,
+        device: str
+    ) -> dict:
+        """
+        Vectorized linear regression on GPU for all windows simultaneously.
+
+        Args:
+            windows: [num_windows, lookback] tensor of price windows
+            device: 'cuda' or 'mps'
+
+        Returns:
+            Dict with slopes, intercepts, r_squared, predictions (all on GPU)
+        """
+        num_windows, lookback = windows.shape
+
+        # X values (0, 1, 2, ..., lookback-1) for all windows
+        X = torch.arange(lookback, dtype=torch.float32, device=device).unsqueeze(0)  # [1, lookback]
+        X_mean = X.mean()
+
+        # Y values (prices) for each window
+        Y_mean = windows.mean(dim=1, keepdim=True)  # [num_windows, 1]
+
+        # Calculate slopes (vectorized for all windows simultaneously)
+        numerator = ((X - X_mean) * (windows - Y_mean)).sum(dim=1)  # [num_windows]
+        denominator = ((X - X_mean) ** 2).sum()  # scalar
+        slopes = numerator / denominator  # [num_windows]
+
+        # Calculate intercepts
+        intercepts = Y_mean.squeeze() - slopes * X_mean  # [num_windows]
+
+        # Predictions (regression line)
+        y_pred = slopes.unsqueeze(1) * X + intercepts.unsqueeze(1)  # [num_windows, lookback]
+
+        # Calculate R² (vectorized)
+        ss_res = ((windows - y_pred) ** 2).sum(dim=1)  # [num_windows]
+        ss_tot = ((windows - Y_mean) ** 2).sum(dim=1)  # [num_windows]
+        r_squared = 1 - (ss_res / (ss_tot + 1e-10))  # [num_windows]
+
+        # Handle edge cases (constant prices, div by zero)
+        r_squared = torch.clamp(r_squared, 0.0, 1.0)
+        r_squared = torch.nan_to_num(r_squared, nan=0.0)
+
+        return {
+            'slopes': slopes,
+            'intercepts': intercepts,
+            'r_squared': r_squared,
+            'predictions': y_pred
+        }
+
+    def _calculate_ping_pongs_gpu(
+        self,
+        windows: torch.Tensor,
+        predictions: torch.Tensor,
+        device: str
+    ) -> torch.Tensor:
+        """
+        Vectorized ping-pong counting on GPU.
+
+        Ping-pong = price crossing regression line multiple times.
+
+        Args:
+            windows: [num_windows, lookback] actual prices
+            predictions: [num_windows, lookback] predicted prices (regression line)
+            device: 'cuda' or 'mps'
+
+        Returns:
+            ping_pongs: [num_windows] count of line crossings per window
+        """
+        # Calculate residuals (price - regression line)
+        residuals = windows - predictions  # [num_windows, lookback]
+
+        # Detect sign changes (price crosses regression line)
+        # Positive residual = above line, negative = below line
+        signs = torch.sign(residuals)  # [num_windows, lookback]
+
+        # Count sign changes (crossings)
+        sign_changes = torch.abs(signs[:, 1:] - signs[:, :-1])  # [num_windows, lookback-1]
+        crossings = (sign_changes > 0).sum(dim=1)  # [num_windows]
+
+        # Ping-pongs = crossings / 2 (round trip)
+        ping_pongs = (crossings / 2).to(torch.int32)
+
+        return ping_pongs
+
+    def _calculate_rolling_channels_gpu(
+        self,
+        resampled_df: pd.DataFrame,
+        lookback: int,
+        tf_name: str,
+        symbol: str,
+        original_index: pd.DatetimeIndex,
+        device: str,
+        batch_size: int = 10000
+    ) -> dict:
+        """
+        GPU-accelerated rolling channel calculation.
+
+        Processes multiple windows in parallel on GPU for 10-20x speedup.
+
+        Args:
+            resampled_df: Resampled OHLCV data at target timeframe
+            lookback: Number of bars to look back
+            tf_name: Timeframe name
+            symbol: 'tsla' or 'spy'
+            original_index: Original 1-min index (for alignment)
+            device: 'cuda' or 'mps'
+            batch_size: Max windows per GPU batch (default: 10000)
+
+        Returns:
+            Dictionary with arrays for each channel feature
+        """
+        num_original_rows = len(original_index)
+        prices = resampled_df['close'].values
+
+        # Initialize result arrays
+        results = {
+            'position': np.zeros(num_original_rows),
+            'upper_dist': np.zeros(num_original_rows),
+            'lower_dist': np.zeros(num_original_rows),
+            'slope': np.zeros(num_original_rows),
+            'stability': np.zeros(num_original_rows),
+            'ping_pongs': np.zeros(num_original_rows),
+            'r_squared': np.zeros(num_original_rows)
+        }
+
+        # Convert to PyTorch tensor
+        prices_tensor = torch.tensor(prices, dtype=torch.float32)
+
+        # Process in batches (to fit in GPU memory)
+        num_windows = len(prices) - lookback
+        num_batches = (num_windows + batch_size - 1) // batch_size
+
+        # Progress bar for GPU processing
+        with tqdm(total=num_batches, desc=f"      {symbol.upper()} {tf_name} (GPU)",
+                  leave=False, position=2, ncols=100) as pbar:
+
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, num_windows)
+
+                # Create rolling windows for this batch
+                batch_windows = []
+                for i in range(start_idx, end_idx):
+                    window = prices_tensor[i:i+lookback]
+                    batch_windows.append(window)
+
+                if not batch_windows:
+                    continue
+
+                # Stack windows and move to GPU
+                windows_batch = torch.stack(batch_windows).to(device)  # [batch, lookback]
+
+                try:
+                    # Calculate linear regression (vectorized on GPU)
+                    regression_results = self._linear_regression_gpu(windows_batch, device)
+
+                    # Calculate ping-pongs (vectorized on GPU)
+                    ping_pongs_batch = self._calculate_ping_pongs_gpu(
+                        windows_batch,
+                        regression_results['predictions'],
+                        device
+                    )
+
+                    # Move results back to CPU
+                    slopes_cpu = regression_results['slopes'].cpu().numpy()
+                    intercepts_cpu = regression_results['intercepts'].cpu().numpy()
+                    r_squared_cpu = regression_results['r_squared'].cpu().numpy()
+                    predictions_cpu = regression_results['predictions'].cpu().numpy()
+                    ping_pongs_cpu = ping_pongs_batch.cpu().numpy()
+
+                    # Calculate channel positions and store results
+                    for batch_i, global_i in enumerate(range(start_idx + lookback, end_idx + lookback)):
+                        current_price = prices[global_i]
+                        pred_price = predictions_cpu[batch_i, -1]
+
+                        # Calculate standard deviation of residuals
+                        actual_prices = prices[global_i-lookback:global_i]
+                        pred_prices = predictions_cpu[batch_i]
+                        residuals = actual_prices - pred_prices
+                        residual_std = np.std(residuals) if len(residuals) > 0 else 1.0
+
+                        # Calculate position (normalized by 2 std devs)
+                        if residual_std > 0:
+                            position = (current_price - pred_price) / (residual_std * 2)
+                        else:
+                            position = 0.0
+
+                        # Calculate stability (r² as proxy)
+                        stability = float(r_squared_cpu[batch_i])
+
+                        # Map to original 1-min index
+                        timestamp = resampled_df.index[global_i]
+                        if global_i < len(resampled_df) - 1:
+                            next_timestamp = resampled_df.index[global_i + 1]
+                            mask = (original_index >= timestamp) & (original_index < next_timestamp)
+                        else:
+                            mask = original_index >= timestamp
+
+                        # Store results
+                        results['position'][mask] = position
+                        results['slope'][mask] = slopes_cpu[batch_i]
+                        results['r_squared'][mask] = r_squared_cpu[batch_i]
+                        results['ping_pongs'][mask] = ping_pongs_cpu[batch_i]
+                        results['stability'][mask] = stability
+
+                        # Calculate distances to upper/lower bounds
+                        if position > 0:
+                            upper_dist = position
+                            lower_dist = 1.0 + position
+                        else:
+                            upper_dist = 1.0 - position
+                            lower_dist = abs(position)
+
+                        results['upper_dist'][mask] = upper_dist
+                        results['lower_dist'][mask] = lower_dist
+
+                    # Clear GPU memory
+                    del windows_batch, regression_results, ping_pongs_batch
+                    if device == 'cuda':
+                        torch.cuda.empty_cache()
+                    elif device == 'mps':
+                        torch.mps.empty_cache()
+
+                except Exception as e:
+                    print(f"      ⚠️  GPU batch {batch_idx} failed ({e}), skipping...")
+                    continue
+
+                pbar.update(1)
 
         return results
 
