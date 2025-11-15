@@ -744,7 +744,77 @@ python validate_event_data.py
 - Less than 90 days of future events remaining
 - New year approaching (add next year's FOMC schedule)
 
-### How to Update CSV
+### How to Update (Option 1: API-Based - Recommended)
+
+**Automatic update using free APIs:**
+
+**Step 1: Get Free API Keys (One-Time Setup)**
+
+```bash
+# Alpha Vantage (for TSLA earnings)
+# Visit: https://www.alphavantage.co/support/#api-key
+# Get free key, 25 calls/day limit
+
+# FRED (for FOMC, CPI, NFP)
+# Visit: https://fred.stlouisfed.org/docs/api/api_key.html
+# Get free key, unlimited calls
+```
+
+**Step 2: Configure API Keys**
+
+Option A - Environment variables (temporary):
+```bash
+export ALPHA_VANTAGE_API_KEY="your_key_here"
+export FRED_API_KEY="your_key_here"
+```
+
+Option B - Config file (permanent):
+```bash
+# Edit config/api_keys.json
+{
+  "alpha_vantage": {
+    "api_key": "your_key_here"
+  },
+  "fred": {
+    "api_key": "your_key_here"
+  }
+}
+```
+
+**Step 3: Run Update Script**
+
+```bash
+# Preview changes (dry run)
+python update_events_from_api.py --dry-run
+
+# Update CSV with 2026 events
+python update_events_from_api.py
+
+# Fetch specific year
+python update_events_from_api.py --year 2026
+```
+
+**Step 4: Validate**
+
+```bash
+python validate_event_data.py
+# Should show: ✅ EVENT DATA IS PRODUCTION READY
+```
+
+**What gets fetched:**
+- TSLA earnings (Alpha Vantage): Next 12 months
+- FOMC meetings (FRED): Via Federal Funds Rate series
+- CPI releases (FRED): Historical + generated future
+- NFP reports (FRED): Historical + generated future
+- Quad Witching: Calculated (3rd Friday Mar/Jun/Sep/Dec)
+
+**Caching:** API responses cached for 30-90 days (avoid rate limits)
+
+---
+
+### How to Update (Option 2: Manual CSV Editing)
+
+**If you prefer manual updates or don't want API keys:**
 
 **Step 1: Get TSLA Earnings Dates**
 - Visit: https://ir.tesla.com

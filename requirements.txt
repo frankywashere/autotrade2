@@ -16,4 +16,6 @@ ncps
 pyyaml
 tqdm
 matplotlib
+fredapi
+beautifulsoup4
 
