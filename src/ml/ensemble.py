@@ -25,6 +25,7 @@ from src.ml.meta_models import MetaLNN, MetaLNNWithModalityDropout, MetaFTTransf
 from src.ml.news_encoder import NewsEncoder
 from src.ml.fetch_news import get_news_window
 from src.ml.events import CombinedEventsHandler
+from src.ml.hierarchical_model import load_hierarchical_model
 
 
 class MultiScaleEnsemble:
@@ -43,17 +44,18 @@ class MultiScaleEnsemble:
 
     def __init__(self,
                  model_paths: Dict[str, str],
-                 meta_model_path: str,
+                 meta_model_path: str = None,
                  mode: str = 'backtest_no_news',
                  device: str = 'cpu',
                  events_handler: Optional[CombinedEventsHandler] = None):
         """
-        Initialize multi-scale ensemble.
+        Initialize multi-scale ensemble OR hierarchical model.
 
         Args:
             model_paths: Dict mapping timeframe → model path
-                         e.g., {'15min': 'models/lnn_15min.pth', '1hour': ...}
-            meta_model_path: Path to meta-model checkpoint
+                         For ensemble: {'15min': 'models/lnn_15min.pth', '1hour': ...}
+                         For hierarchical: {'hierarchical': 'models/hierarchical_lnn.pth'}
+            meta_model_path: Path to meta-model checkpoint (ensemble only, optional for hierarchical)
             mode: 'backtest_no_news' or 'live_with_news'
             device: 'cpu', 'cuda', or 'mps'
             events_handler: CombinedEventsHandler instance (for market state features)
@@ -62,6 +64,18 @@ class MultiScaleEnsemble:
         self.device = torch.device(device)
         self.events_handler = events_handler
 
+        # Check if hierarchical mode
+        self.is_hierarchical = 'hierarchical' in model_paths
+
+        if self.is_hierarchical:
+            # HIERARCHICAL MODE
+            print("=" * 70)
+            print("HIERARCHICAL LNN MODE")
+            print("=" * 70)
+            self._init_hierarchical(model_paths['hierarchical'])
+            return
+
+        # ENSEMBLE MODE (original behavior)
         # Validate inputs
         if len(model_paths) < 2:
             raise ValueError("Need at least 2 sub-models for ensemble")
@@ -146,26 +160,70 @@ class MultiScaleEnsemble:
         print(f"  Device: {device}")
         print()
 
+    def _init_hierarchical(self, model_path: str):
+        """
+        Initialize hierarchical LNN model.
+
+        Args:
+            model_path: Path to hierarchical model checkpoint
+        """
+        print(f"Loading hierarchical model from {model_path}...")
+
+        try:
+            # Load hierarchical model
+            self.hierarchical_model = load_hierarchical_model(model_path, str(self.device))
+            self.hierarchical_model.eval()
+
+            print(f"  ✓ Loaded HierarchicalLNN model")
+            print(f"  ✓ Input size: 299 features")
+            print(f"  ✓ Hidden size: 128")
+            print(f"  ✓ Layers: Fast (1-min) → Medium (5-min) → Slow (1-hour)")
+
+        except Exception as e:
+            print(f"  ✗ Error loading hierarchical model: {e}")
+            raise
+
+        # Load news encoder (if live mode)
+        if self.mode == 'live_with_news':
+            print("\nLoading news encoder (LFM2)...")
+            self.news_encoder = NewsEncoder(mode='live_with_news', device=str(self.device))
+        else:
+            self.news_encoder = NewsEncoder(mode='backtest_no_news', device=str(self.device))
+
+        print("\n" + "=" * 70)
+        print("✅ HIERARCHICAL LNN INITIALIZED")
+        print("=" * 70)
+        print(f"  Mode: {self.mode}")
+        print(f"  Model type: Hierarchical LNN (3-layer)")
+        print(f"  Device: {self.device}")
+        print()
+
     def predict(self,
                 data: Dict[str, torch.Tensor],
                 features_df: pd.DataFrame,
                 current_idx: int,
                 timestamp: Optional[datetime] = None) -> Dict:
         """
-        Make ensemble prediction.
+        Make prediction (ensemble or hierarchical).
 
         Args:
             data: Dict mapping timeframe → input tensor
-                  e.g., {'15min': tensor([seq_len, features]), '1hour': ...}
+                  For ensemble: {'15min': tensor([seq_len, features]), '1hour': ...}
+                  For hierarchical: {'1min': tensor([200, 299])}
             features_df: Market data DataFrame for calculating market state
             current_idx: Current index in features_df
             timestamp: Current timestamp (for news retrieval)
 
         Returns:
             Dictionary with:
-            - predicted_high, predicted_low, confidence: Final ensemble prediction
-            - sub_predictions: Dict of each sub-model's prediction
+            - predicted_high, predicted_low, confidence: Final prediction
+            - sub_predictions: Dict of sub-model predictions (ensemble) or layer predictions (hierarchical)
         """
+        # HIERARCHICAL MODE
+        if self.is_hierarchical:
+            return self._predict_hierarchical(data, features_df, current_idx, timestamp)
+
+        # ENSEMBLE MODE (original behavior)
         # Get predictions from all sub-models
         sub_predictions = {}
         subpreds_list = []
@@ -237,6 +295,89 @@ class MultiScaleEnsemble:
             'current_price': current_price,  # Needed for percentage → absolute conversion
             'sub_predictions': sub_predictions,  # For logging and analysis
             'mode': self.mode,
+            'news_enabled': self.mode == 'live_with_news' and news_mask[0, 0].item() > 0
+        }
+
+    def _predict_hierarchical(self,
+                              data: Dict[str, torch.Tensor],
+                              features_df: pd.DataFrame,
+                              current_idx: int,
+                              timestamp: Optional[datetime] = None) -> Dict:
+        """
+        Make hierarchical prediction.
+
+        Args:
+            data: Dict with '1min' key containing [200, 299] tensor
+            features_df: Features DataFrame
+            current_idx: Current index
+            timestamp: Optional timestamp
+
+        Returns:
+            Prediction dict with layer-specific predictions
+        """
+        # Get 1-min data
+        if '1min' not in data:
+            raise ValueError("Hierarchical mode requires '1min' key in data dict")
+
+        x = data['1min'].unsqueeze(0).to(self.device)  # [1, 200, 299]
+
+        # Calculate market state
+        market_state = calculate_market_state(
+            features_df,
+            current_idx,
+            self.events_handler
+        )
+        market_state = market_state.unsqueeze(0).to(self.device)  # [1, 12]
+
+        # Get news embeddings (if live mode)
+        if self.mode == 'live_with_news' and timestamp is not None:
+            news_articles = get_news_window(timestamp, lookback_minutes=120)
+            headlines = [article['title'] for article in news_articles]
+            news_vec, news_mask = self.news_encoder.encode_headlines(headlines, timestamp)
+            news_vec = news_vec.unsqueeze(0).to(self.device)  # [1, 768]
+            news_mask = torch.tensor([[news_mask]], dtype=torch.float32).to(self.device)  # [1, 1]
+        else:
+            news_vec = torch.zeros(1, 768, dtype=torch.float32).to(self.device)
+            news_mask = torch.zeros(1, 1, dtype=torch.float32).to(self.device)
+
+        # Hierarchical prediction
+        with torch.no_grad():
+            pred_dict = self.hierarchical_model.predict(
+                x, market_state, news_vec, news_mask
+            )
+
+        # Get current price
+        current_price = float(features_df['tsla_close'].iloc[current_idx])
+
+        # Extract layer predictions for logging
+        layer_predictions = {
+            'fast': {
+                'predicted_high': pred_dict['fast_pred_high'],
+                'predicted_low': pred_dict['fast_pred_low'],
+                'confidence': pred_dict['fast_pred_conf']
+            },
+            'medium': {
+                'predicted_high': pred_dict['medium_pred_high'],
+                'predicted_low': pred_dict['medium_pred_low'],
+                'confidence': pred_dict['medium_pred_conf']
+            },
+            'slow': {
+                'predicted_high': pred_dict['slow_pred_high'],
+                'predicted_low': pred_dict['slow_pred_low'],
+                'confidence': pred_dict['slow_pred_conf']
+            }
+        }
+
+        # Return in ensemble-compatible format
+        return {
+            'predicted_high': pred_dict['predicted_high'],
+            'predicted_low': pred_dict['predicted_low'],
+            'confidence': pred_dict['confidence'],
+            'current_price': current_price,
+            'sub_predictions': layer_predictions,  # Layer predictions instead of timeframe predictions
+            'fusion_weights': pred_dict['fusion_weights'],
+            'mode': self.mode,
+            'model_type': 'hierarchical',
             'news_enabled': self.mode == 'live_with_news' and news_mask[0, 0].item() > 0
         }
 

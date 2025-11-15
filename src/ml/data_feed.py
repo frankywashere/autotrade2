@@ -10,6 +10,7 @@ from typing import Dict, Any, List
 from .base import DataFeed
 import sys
 import os
+from tqdm import tqdm
 
 # Add parent directory to path for imports
 parent_dir = Path(__file__).parent.parent.parent
@@ -117,10 +118,22 @@ class CSVDataFeed(DataFeed):
         Load SPY and TSLA data aligned by timestamp
         Returns single DataFrame with both symbols
         """
-        spy_df = self.load_data('SPY', start_date, end_date)
-        tsla_df = self.load_data('TSLA', start_date, end_date)
+        # Progress bar for data loading steps
+        with tqdm(total=3, desc="   Loading data", ncols=100, leave=False) as pbar:
+            # Load SPY
+            pbar.set_description("   Loading SPY")
+            spy_df = self.load_data('SPY', start_date, end_date)
+            pbar.update(1)
 
-        spy_aligned, tsla_aligned = self.align_symbols(spy_df, tsla_df)
+            # Load TSLA
+            pbar.set_description("   Loading TSLA")
+            tsla_df = self.load_data('TSLA', start_date, end_date)
+            pbar.update(1)
+
+            # Align symbols
+            pbar.set_description("   Aligning data")
+            spy_aligned, tsla_aligned = self.align_symbols(spy_df, tsla_df)
+            pbar.update(1)
 
         # Merge into single DataFrame
         aligned_df = pd.concat([spy_aligned, tsla_aligned], axis=1)
