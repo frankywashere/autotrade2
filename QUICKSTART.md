@@ -106,7 +106,7 @@ python train_hierarchical.py \
    Rolling channels (SPY + TSLA):   5%|▌  | 1/22 [02:34<48:23]
       TSLA 5min:  41%|████▏  | 8,234/20,000 [00:45<01:02, 189 bars/s]
    
-   ✓ Extracted 313 features
+   ✓ Extracted 379 features
 
 3. Creating datasets...
    Train: 1034546 samples, Val: 115051 samples
@@ -133,7 +133,7 @@ Model saved to: models/hierarchical_lnn.pth
 2. Extracting features...
    Loading cache: 100%|██████| 1/1 [00:03<00:00]
    ✓ Loaded channel features from cache
-   ✓ Extracted 313 features
+   ✓ Extracted 379 features
    
 [Training proceeds as above, ~5-10 minutes total]
 ```
@@ -193,7 +193,7 @@ print(f"{'='*60}")
 
 🔧 Extracting features...
    Loading cache: 100%|██████| 1/1 [00:03<00:00]
-   ✓ Extracted 313 features
+   ✓ Extracted 379 features
 
 🔮 Making prediction...
 
@@ -509,7 +509,7 @@ autotrade2/
 
 1. ✅ **Train your first model:** `python train_hierarchical.py --interactive`
 2. ✅ **Make a prediction:** Create prediction script using example above
-3. ✅ **Explore features:** Run `validate_features.py` to see all 313 features
+3. ✅ **Explore features:** Run `validate_features.py` to see all 379 features
 4. ✅ **Read spec:** See `SPEC.md` for complete technical details
 
 ---
