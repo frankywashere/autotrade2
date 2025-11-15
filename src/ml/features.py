@@ -616,34 +616,62 @@ class TradingFeatureExtractor(FeatureExtractor):
         self,
         windows: torch.Tensor,
         predictions: torch.Tensor,
-        device: str
+        device: str,
+        threshold: float = 0.02
     ) -> torch.Tensor:
         """
-        Vectorized ping-pong counting on GPU.
+        Ping-pong counting on GPU (matching LinearRegressionChannel._detect_ping_pongs).
 
-        Ping-pong = price crossing regression line multiple times.
+        Ping-pong = price bouncing between UPPER and LOWER channel bounds.
 
         Args:
             windows: [num_windows, lookback] actual prices
             predictions: [num_windows, lookback] predicted prices (regression line)
             device: 'cuda' or 'mps'
+            threshold: Percentage threshold for detecting touch (2% default)
 
         Returns:
-            ping_pongs: [num_windows] count of line crossings per window
+            ping_pongs: [num_windows] count of bounces per window
         """
-        # Calculate residuals (price - regression line)
+        num_windows, lookback = windows.shape
+
+        # Calculate residuals and standard deviation
         residuals = windows - predictions  # [num_windows, lookback]
+        residual_std = residuals.std(dim=1, keepdim=True)  # [num_windows, 1]
 
-        # Detect sign changes (price crosses regression line)
-        # Positive residual = above line, negative = below line
-        signs = torch.sign(residuals)  # [num_windows, lookback]
+        # Calculate upper and lower bounds (matching CHANNEL_STD_DEV = 2.0)
+        upper_bounds = predictions + (2.0 * residual_std)  # [num_windows, lookback]
+        lower_bounds = predictions - (2.0 * residual_std)  # [num_windows, lookback]
 
-        # Count sign changes (crossings)
-        sign_changes = torch.abs(signs[:, 1:] - signs[:, :-1])  # [num_windows, lookback-1]
-        crossings = (sign_changes > 0).sum(dim=1)  # [num_windows]
+        # Detect touches (within threshold % of bounds)
+        upper_dist_pct = torch.abs(windows - upper_bounds) / upper_bounds  # [num_windows, lookback]
+        lower_dist_pct = torch.abs(windows - lower_bounds) / lower_bounds  # [num_windows, lookback]
 
-        # Ping-pongs = crossings / 2 (round trip)
-        ping_pongs = (crossings / 2).to(torch.int32)
+        upper_touches = upper_dist_pct <= threshold  # [num_windows, lookback]
+        lower_touches = lower_dist_pct <= threshold  # [num_windows, lookback]
+
+        # Count bounces (requires state tracking per window)
+        # This must be sequential to track last_touch state
+        ping_pongs = torch.zeros(num_windows, dtype=torch.int32, device=device)
+
+        for w in range(num_windows):
+            bounces = 0
+            last_touch = None
+
+            for t in range(lookback):
+                # Check if price touches upper line
+                if upper_touches[w, t].item():
+                    if last_touch == 'lower':
+                        bounces += 1
+                    last_touch = 'upper'
+
+                # Check if price touches lower line
+                elif lower_touches[w, t].item():
+                    if last_touch == 'upper':
+                        bounces += 1
+                    last_touch = 'lower'
+
+            ping_pongs[w] = bounces
 
         return ping_pongs
 
@@ -744,14 +772,25 @@ class TradingFeatureExtractor(FeatureExtractor):
                         residuals = actual_prices - pred_prices
                         residual_std = np.std(residuals) if len(residuals) > 0 else 1.0
 
-                        # Calculate position (normalized by 2 std devs)
-                        if residual_std > 0:
-                            position = (current_price - pred_price) / (residual_std * 2)
-                        else:
-                            position = 0.0
+                        # Calculate channel bounds (matching LinearRegressionChannel)
+                        # Upper/lower lines are ± 2 standard deviations from regression line (config.CHANNEL_STD_DEV = 2.0)
+                        upper_line = pred_price + (2.0 * residual_std)
+                        lower_line = pred_price - (2.0 * residual_std)
 
-                        # Calculate stability (r² as proxy)
-                        stability = float(r_squared_cpu[batch_i])
+                        # Calculate position (matching get_channel_position formula)
+                        # 0.0 = at lower line, 0.5 = at center, 1.0 = at upper line
+                        channel_height = upper_line - lower_line
+                        if channel_height > 0:
+                            position = (current_price - lower_line) / channel_height
+                        else:
+                            position = 0.5
+
+                        # Calculate stability (matching _calculate_stability formula)
+                        # Composite score: r²(40) + ping_pongs(40) + length(20) = 0-100
+                        r2_score = r_squared_cpu[batch_i] * 40
+                        pp_score = min(ping_pongs_cpu[batch_i] / 5.0, 1.0) * 40
+                        length_score = min(lookback / 100.0, 1.0) * 20
+                        stability = r2_score + pp_score + length_score
 
                         # Map to original 1-min index
                         timestamp = resampled_df.index[global_i]
@@ -768,13 +807,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                         results['ping_pongs'][mask] = ping_pongs_cpu[batch_i]
                         results['stability'][mask] = stability
 
-                        # Calculate distances to upper/lower bounds
-                        if position > 0:
-                            upper_dist = position
-                            lower_dist = 1.0 + position
-                        else:
-                            upper_dist = 1.0 - position
-                            lower_dist = abs(position)
+                        # Calculate distances to upper/lower bounds (matching get_channel_position formula)
+                        # Distance as percentage relative to current price
+                        upper_dist = ((upper_line - current_price) / current_price) * 100
+                        lower_dist = ((current_price - lower_line) / current_price) * 100
 
                         results['upper_dist'][mask] = upper_dist
                         results['lower_dist'][mask] = lower_dist
