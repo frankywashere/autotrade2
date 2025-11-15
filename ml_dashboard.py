@@ -876,5 +876,65 @@ def render_recent_performance():
         st.warning(f"Could not load performance metrics: {e}")
 
 
+def check_api_keys():
+    """
+    Check for optional API keys on startup (runs in terminal before Streamlit).
+
+    These are for auto-updating event data (earnings, FOMC).
+    Not required for operation - system works without them.
+    """
+    import os
+
+    print("\n" + "="*70)
+    print("  AutoTrade2 - API Key Configuration Check")
+    print("="*70)
+
+    keys_configured = True
+
+    # Check Alpha Vantage (for TSLA earnings)
+    if not os.getenv("ALPHA_VANTAGE_API_KEY"):
+        print("\n📋 Alpha Vantage API Key (Optional - for auto-updating TSLA earnings)")
+        print("   Purpose: Fetch future TSLA earnings dates automatically")
+        print("   Get free key: https://www.alphavantage.co/support/#api-key")
+        print("   Or: Set environment variable ALPHA_VANTAGE_API_KEY")
+        key = input("\n   Enter Alpha Vantage API key (or press Enter to skip): ").strip()
+        if key:
+            os.environ['ALPHA_VANTAGE_API_KEY'] = key
+            print("   ✓ Alpha Vantage key configured for this session")
+        else:
+            keys_configured = False
+            print("   ⚠️  Skipped - will use existing CSV data only")
+
+    else:
+        print("\n✅ Alpha Vantage API key found")
+
+    # Check FRED (for FOMC, CPI, NFP)
+    if not os.getenv("FRED_API_KEY"):
+        print("\n📋 FRED API Key (Optional - for auto-updating macro events)")
+        print("   Purpose: Fetch future FOMC, CPI, NFP dates automatically")
+        print("   Get free key: https://fred.stlouisfed.org/docs/api/api_key.html")
+        print("   Or: Set environment variable FRED_API_KEY")
+        key = input("\n   Enter FRED API key (or press Enter to skip): ").strip()
+        if key:
+            os.environ['FRED_API_KEY'] = key
+            print("   ✓ FRED key configured for this session")
+        else:
+            keys_configured = False
+            print("   ⚠️  Skipped - will use existing CSV data only")
+    else:
+        print("\n✅ FRED API key found")
+
+    if not keys_configured:
+        print("\n" + "="*70)
+        print("  ℹ️  API keys are optional - system will work without them")
+        print("  ℹ️  To update event data, run: python update_events_from_api.py")
+        print("  ℹ️  Or manually update data/tsla_events_REAL.csv")
+        print("="*70)
+
+    print("\n🚀 Starting AutoTrade2 Dashboard...\n")
+    time.sleep(1)  # Brief pause so user sees the messages
+
+
 if __name__ == '__main__':
-    main()
+    check_api_keys()  # Prompt for API keys in terminal (before Streamlit starts)
+    main()            # Start Streamlit dashboard

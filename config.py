@@ -11,6 +11,8 @@ CLAUDE_API_KEY = "sk-ant-api03-ljR7i4Eh5Aaiqsn6jsdOAMqt-FFlGEdHJsXNxffz-DOr4tTEp
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7978931435:AAGdqdfcbK-GT8Q_BEw7dvmISkN9035FzZQ")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7910666732")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")  # Optional: add NewsAPI key
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")  # For earnings calendar (free: https://www.alphavantage.co/support/#api-key)
+FRED_API_KEY = os.getenv("FRED_API_KEY", "")  # For economic data (free: https://fred.stlouisfed.org/docs/api/api_key.html)
 
 # Trading Parameters
 DEFAULT_STOCK = "TSLA"

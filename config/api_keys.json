@@ -2,6 +2,16 @@
   "telegram": {
     "bot_token": "7978931435:AAGdqdfcbK-GT8Q_BEw7dvmISkN9035FzZQ",
     "chat_id": "7910666732"
+  },
+  "alpha_vantage": {
+    "api_key": "",
+    "note": "Free key from https://www.alphavantage.co/support/#api-key",
+    "purpose": "Fetch TSLA earnings calendar automatically"
+  },
+  "fred": {
+    "api_key": "",
+    "note": "Free key from https://fred.stlouisfed.org/docs/api/api_key.html",
+    "purpose": "Fetch FOMC, CPI, NFP dates automatically"
   }
 }
 
