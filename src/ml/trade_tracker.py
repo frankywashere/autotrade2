@@ -87,7 +87,8 @@ class TradeTracker:
                 -- Channel Context
                 channel_timeframe VARCHAR(10),
                 channel_position FLOAT,  -- -1 (bottom) to +1 (top)
-                channel_slope FLOAT,
+                channel_slope FLOAT,  -- Raw slope ($/bar)
+                channel_slope_pct FLOAT,  -- Normalized slope (% per bar) - v3.7
                 ping_pong_count INT,
                 time_in_channel INT,
 
@@ -212,6 +213,7 @@ class TradeTracker:
         channel_timeframe = '1h'
         channel_position = features_dict.get(f'tsla_channel_position_norm_{channel_timeframe}', 0.0)
         channel_slope = features_dict.get(f'tsla_channel_{channel_timeframe}_slope', 0.0)
+        channel_slope_pct = features_dict.get(f'tsla_channel_{channel_timeframe}_slope_pct', 0.0)  # v3.7
         ping_pongs = features_dict.get(f'tsla_channel_{channel_timeframe}_ping_pongs', 0)
         time_in_channel = features_dict.get(f'tsla_time_in_channel_{channel_timeframe}', 0)
 
@@ -237,7 +239,7 @@ class TradeTracker:
 
         # Generate trade rationale
         rationale = self._generate_rationale(
-            channel_position, predicted_high, predicted_low,
+            channel_position, channel_slope_pct, predicted_high, predicted_low,
             rsi_15min, rsi_1hour, rsi_4hour, rsi_daily,
             spy_correlation, spy_channel_pos, rsi_confluence,
             spy_tsla_aligned, ping_pongs
@@ -283,20 +285,20 @@ class TradeTracker:
                 predicted_high, predicted_low, current_price,
                 predicted_high_price, predicted_low_price,
                 rationale,
-                channel_timeframe, channel_position, channel_slope,
+                channel_timeframe, channel_position, channel_slope, channel_slope_pct,
                 ping_pong_count, time_in_channel,
                 rsi_15min, rsi_1hour, rsi_4hour, rsi_daily, rsi_confluence,
                 spy_correlation, spy_channel_position, spy_rsi, spy_tsla_aligned,
                 fast_layer_weight, medium_layer_weight, slow_layer_weight,
                 stop_price, stop_pct, max_hold_time_minutes,
                 validation_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             timestamp, model_type, confidence, self.confidence_threshold,
             predicted_high, predicted_low, current_price,
             predicted_high_price, predicted_low_price,
             json.dumps(rationale),
-            channel_timeframe, channel_position, channel_slope,
+            channel_timeframe, channel_position, channel_slope, channel_slope_pct,
             int(ping_pongs), int(time_in_channel),
             rsi_15min, rsi_1hour, rsi_4hour, rsi_daily, rsi_confluence,
             spy_correlation, spy_channel_pos, spy_rsi, spy_tsla_aligned,
@@ -313,6 +315,7 @@ class TradeTracker:
     def _generate_rationale(
         self,
         channel_pos: float,
+        channel_slope_pct: float,  # v3.7: Added for channel direction context
         pred_high: float,
         pred_low: float,
         rsi_15min: float,
@@ -332,6 +335,16 @@ class TradeTracker:
             'reasons': [],
             'risk_level': 'medium'
         }
+
+        # Channel direction context (v3.7)
+        if abs(channel_slope_pct) > 0.2:  # Strong trend
+            direction = "bullish" if channel_slope_pct > 0 else "bearish"
+            rationale['reasons'].append(f'Strong {direction} channel ({channel_slope_pct:+.2f}% per bar)')
+        elif abs(channel_slope_pct) > 0.1:  # Moderate trend
+            direction = "bullish" if channel_slope_pct > 0 else "bearish"
+            rationale['reasons'].append(f'Moderate {direction} channel ({channel_slope_pct:+.2f}% per bar)')
+        else:  # Sideways
+            rationale['reasons'].append(f'Sideways channel ({channel_slope_pct:+.2f}% per bar)')
 
         # Determine setup type based on channel position
         if channel_pos < -0.5:
