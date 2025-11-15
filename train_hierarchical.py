@@ -374,6 +374,50 @@ def interactive_setup(args):
         max_allowed=2024
     ).execute())
 
+    # Check for feature cache
+    print()
+    from src.ml.features import FEATURE_VERSION
+    from datetime import datetime as dt
+
+    cache_dir = Path('data/feature_cache')
+    cache_dir.mkdir(exist_ok=True)
+
+    # Look for cache files matching this date range (don't know exact length yet)
+    cache_pattern = f"rolling_channels_{FEATURE_VERSION}_{args.train_start_year}0101_{args.train_end_year}1231_*.pkl"
+    cache_files = list(cache_dir.glob(cache_pattern))
+
+    if cache_files:
+        # Found existing cache
+        cache_file = cache_files[0]
+        size_mb = cache_file.stat().st_size / (1024 * 1024)
+        created = dt.fromtimestamp(cache_file.stat().st_mtime)
+
+        print("📂 Feature Cache Found:")
+        print(f"   💾 Size: {size_mb:.1f} MB")
+        print(f"   📅 Created: {created.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   📊 Version: {FEATURE_VERSION}")
+        print()
+
+        args.regenerate_cache = inquirer.select(
+            message="Use existing cache or regenerate features?",
+            choices=[
+                Choice(value=False, name="Use cache (fast - loads in ~5 seconds) ⭐"),
+                Choice(value=True, name="Regenerate cache (slow - takes ~45 minutes)")
+            ],
+            default=False
+        ).execute()
+
+        if args.regenerate_cache:
+            print(f"   ⚠️  Cache will be regenerated (~45 minutes)")
+        else:
+            print(f"   ✓ Will use existing cache")
+    else:
+        # No cache found
+        args.regenerate_cache = True
+        print("📂 No Feature Cache Found:")
+        print(f"   ⚠️  First run will take ~45 minutes to generate rolling channels")
+        print(f"   💡 Subsequent runs will load instantly from cache")
+
     # Model parameters
     print()
 
@@ -606,7 +650,10 @@ def main():
     # Extract features
     print("\n2. Extracting features...")
     extractor = TradingFeatureExtractor()
-    features_df = extractor.extract_features(df)
+
+    # Use cache unless regenerate_cache flag is set (from interactive menu)
+    use_cache = not getattr(args, 'regenerate_cache', False)
+    features_df = extractor.extract_features(df, use_cache=use_cache)
 
     print(f"   Extracted {len(features_df.columns)} features")
     print(f"   Feature names: {extractor.get_feature_names()[:5]}... (showing first 5)")

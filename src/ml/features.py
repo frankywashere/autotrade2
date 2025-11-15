@@ -20,6 +20,9 @@ from src.rsi_calculator import RSICalculator
 from .base import FeatureExtractor
 from .channel_features import ChannelFeatureExtractor
 
+# Feature cache version - increment when calculation logic changes
+FEATURE_VERSION = "v3.5"
+
 
 class TradingFeatureExtractor(FeatureExtractor):
     """
@@ -156,9 +159,14 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, **kwargs) -> pd.DataFrame:
         """
         Extract all 313 features from aligned SPY-TSLA data (v3.5 - Hierarchical Multi-Task).
+
+        Args:
+            df: DataFrame with SPY and TSLA OHLCV columns
+            use_cache: Whether to use cached rolling channels (default: True). Set to False to force regeneration.
+            **kwargs: Additional arguments (reserved for future use)
 
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
@@ -181,11 +189,11 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # PASS 1: Extract base features
         print("   Extracting base features...")
-        with tqdm(total=7, desc="   Feature extraction", leave=False) as pbar:
+        with tqdm(total=7, desc="   Feature extraction", leave=True, position=0, ncols=100) as pbar:
             price_df = self._extract_price_features(df)
             pbar.update(1)
 
-            channel_df = self._extract_channel_features(df, multi_res_data=multi_res_data)
+            channel_df = self._extract_channel_features(df, multi_res_data=multi_res_data, use_cache=use_cache)
             pbar.update(1)
 
             rsi_df = self._extract_rsi_features(df, multi_res_data=multi_res_data)
@@ -270,27 +278,46 @@ class TradingFeatureExtractor(FeatureExtractor):
             cache_dir = Path('data/feature_cache')
             cache_dir.mkdir(exist_ok=True)
 
-            # Create cache key from data range
-            cache_key = f"{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}"
+            # Create cache key from version + data range (version ensures cache invalidation when logic changes)
+            cache_key = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}"
             cache_file = cache_dir / f'rolling_channels_{cache_key}.pkl'
 
             if cache_file.exists():
-                with tqdm(total=1, desc=f"   Loading cache", leave=False, ncols=100) as pbar:
-                    with open(cache_file, 'rb') as f:
-                        result = pickle.load(f)
-                    pbar.update(1)
-                print(f"   ✓ Loaded channel features from cache: {cache_file.name}")
-                return result
+                try:
+                    # Validate cache file before loading
+                    file_size = cache_file.stat().st_size
+
+                    if file_size < 1000:  # Less than 1KB is too small
+                        print(f"   ⚠️  Cache file too small ({file_size} bytes), regenerating...")
+                        cache_file.unlink()
+                    else:
+                        # Load cache with progress bar
+                        with tqdm(total=1, desc=f"   Loading cache", leave=False, position=1, ncols=100) as pbar:
+                            with open(cache_file, 'rb') as f:
+                                result = pickle.load(f)
+                            pbar.update(1)
+
+                        # Validate loaded data
+                        expected_cols = 154  # 77 features × 2 stocks (TSLA + SPY)
+                        if len(result.columns) != expected_cols:
+                            print(f"   ⚠️  Cache has {len(result.columns)} columns, expected {expected_cols}")
+                            print(f"   ⚠️  Regenerating cache...")
+                        elif len(result) != len(df):
+                            print(f"   ⚠️  Cache has {len(result)} rows, expected {len(df)}")
+                            print(f"   ⚠️  Regenerating cache...")
+                        else:
+                            # Cache is valid!
+                            print(f"   ✓ Loaded channel features from cache: {cache_file.name}")
+                            return result
+
+                except Exception as e:
+                    print(f"   ⚠️  Cache load failed ({type(e).__name__}: {e}), regenerating...")
+                    if cache_file.exists():
+                        cache_file.unlink()
 
         # No cache - calculate rolling channels
         # Check if multi-resolution data was provided (live mode)
         is_live_mode = multi_res_data is not None
-
-        if is_live_mode:
-            print(f"   🔄 Extracting channel features in LIVE mode (using multi-resolution data)...")
-        else:
-            print(f"   🔄 Calculating ROLLING channels (this will take ~30-60 mins first time)...")
-            print(f"   💡 Results will be cached for instant loading next time")
 
         channel_features = {}
         num_rows = len(df)
@@ -312,7 +339,18 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Process both TSLA and SPY
         total_calcs = len(timeframes) * 2  # 11 timeframes × 2 stocks
-        calc_progress = tqdm(total=total_calcs, desc="   Rolling channels", ncols=100)
+
+        # Print status messages with detailed info
+        if is_live_mode:
+            print(f"   🔄 Extracting channel features in LIVE mode (using multi-resolution data)...")
+            print(f"   📊 Processing {total_calcs} calculations (11 timeframes × 2 stocks: SPY + TSLA)")
+        else:
+            print(f"   🔄 Calculating ROLLING channels (this will take ~30-60 mins first time)...")
+            print(f"   📊 Processing {total_calcs} calculations (11 timeframes × 2 stocks: SPY + TSLA)")
+            print(f"   ⏱️  Estimated time: ~{total_calcs * 2.5:.0f} minutes")
+            print(f"   💡 Results will be cached for instant loading next time")
+
+        calc_progress = tqdm(total=total_calcs, desc="   Rolling channels (SPY + TSLA)", ncols=100, leave=False, position=1)
 
         for symbol in ['tsla', 'spy']:
             for tf_name, tf_rule in timeframes.items():
@@ -372,11 +410,16 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         result_df = pd.DataFrame(channel_features, index=df.index)
 
-        # Save to cache
+        # Save to cache (atomic write to prevent corruption)
         if use_cache:
             print(f"   💾 Saving to cache: {cache_file.name}")
-            with open(cache_file, 'wb') as f:
+            # Write to temp file first (atomic operation)
+            temp_file = cache_file.with_suffix('.pkl.tmp')
+            with open(temp_file, 'wb') as f:
                 pickle.dump(result_df, f)
+            # Atomic rename (ensures no corruption even if interrupted)
+            temp_file.rename(cache_file)
+            print(f"   ✓ Cache saved successfully")
 
         return result_df
 
