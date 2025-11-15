@@ -25,6 +25,7 @@ from datetime import datetime
 import json
 import platform
 from typing import Dict, Tuple
+from tqdm import tqdm
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent
