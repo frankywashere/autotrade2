@@ -138,7 +138,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
             self.hit_target_head = nn.Sequential(
                 nn.Linear(64, 32),
                 nn.ReLU(),
-                nn.Linear(64, 1),
+                nn.Linear(32, 1),
                 nn.Sigmoid()
             )
 
