@@ -22,7 +22,7 @@ from .base import FeatureExtractor
 from .channel_features import ChannelFeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.8"  # Added normalized prices (467 → 469 features)
+FEATURE_VERSION = "v3.9"  # Added event-driven volatility features (469 → 473 features)
 
 
 def _check_gpu_available() -> tuple:
@@ -173,7 +173,16 @@ class TradingFeatureExtractor(FeatureExtractor):
             features.append(f'spy_channel_position_norm_{tf}')
 
         # Binary feature flags (Phase 4)
-        features.extend(['is_monday', 'is_friday', 'is_volatile_now', 'is_earnings_week'])
+        # Binary flags and event features (v3.9)
+        features.extend([
+            'is_monday',
+            'is_friday',
+            'is_volatile_now',
+            'is_earnings_week',          # v3.9: Within ±7 days of earnings/delivery
+            'days_until_earnings',       # v3.9: -7 to +7 days (0 = day of)
+            'days_until_fomc',           # v3.9: -7 to +7 days (0 = day of)
+            'is_high_impact_event'       # v3.9: Earnings/FOMC/Delivery within 3 days
+        ])
 
         # In-channel binary flags
         for tf in ['1h', '4h', 'daily']:
@@ -190,9 +199,9 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, **kwargs) -> pd.DataFrame:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, **kwargs) -> pd.DataFrame:
         """
-        Extract all 469 features from aligned SPY-TSLA data (v3.8 - Hierarchical Multi-Task with Multi-Threshold Ping-Pongs + Normalized Slope + Direction Flags + Normalized Prices).
+        Extract all 473 features from aligned SPY-TSLA data (v3.9 - With Event-Driven Volatility Features).
 
         Args:
             df: DataFrame with SPY and TSLA OHLCV columns
@@ -205,12 +214,15 @@ class TradingFeatureExtractor(FeatureExtractor):
                 - None (default): Normal cache filename
                 - 'GPU_TEST': Appends to cache name for GPU testing
                 - 'CPU_TEST': Appends to cache name for CPU testing
+            events_handler: Optional CombinedEventsHandler for event-driven features (v3.9)
+                - If provided: Enables earnings/FOMC proximity features
+                - If None: Event features will be zeros (backward compatible)
             **kwargs: Additional arguments (reserved for future use)
 
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
 
-        Returns DataFrame with 469 columns:
+        Returns DataFrame with 473 columns:
         - 12 price features (6 per stock: close, close_norm, returns, log_returns, volatility_10, volatility_50)
         - 308 channel features (154 TSLA + 154 SPY)
           - Per timeframe (11): position, upper_dist, lower_dist, slope, slope_pct, stability, r_squared
@@ -222,7 +234,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         - 2 volume features
         - 4 time features
         - 54 breakdown/channel enhancement features
-        - 14 binary feature flags (NO LEAKAGE - is_monday, is_friday, is_volatile_now, is_earnings_week, in_channel flags)
+        - 14 binary feature flags (is_monday, is_friday, is_volatile_now, in_channel flags)
+        - 4 event features (v3.9): is_earnings_week, days_until_earnings, days_until_fomc, is_high_impact_event
         """
         # Extract multi-resolution data if present (for live mode) and remove from attrs to prevent deep copy recursion
         multi_res_data = df.attrs.pop('multi_resolution', None)
@@ -287,9 +300,9 @@ class TradingFeatureExtractor(FeatureExtractor):
             time_df
         ], axis=1)
 
-        # PASS 2: Extract breakdown features (needs base features)
+        # PASS 2: Extract breakdown features (needs base features + optional events)
         with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100) as pbar:
-            breakdown_df = self._extract_breakdown_features(base_features_df, df)
+            breakdown_df = self._extract_breakdown_features(base_features_df, df, events_handler)
             pbar.update(1)
 
         # Final concat
@@ -1096,15 +1109,17 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def _extract_breakdown_features(
         self,
-        features_df: pd.DataFrame,  # Base features already extracted (has tsla_volatility_10, etc.)
-        raw_df: pd.DataFrame        # Original OHLCV data (for index.dayofweek)
+        features_df: pd.DataFrame,  # Base features already extracted
+        raw_df: pd.DataFrame,       # Original OHLCV data (for index.dayofweek)
+        events_handler=None          # Optional event handler for earnings/FOMC features (v3.9)
     ) -> pd.DataFrame:
         """
-        Extract channel breakdown and enhancement features. Returns DataFrame with 68 columns.
+        Extract channel breakdown and enhancement features. Returns DataFrame with 68 columns (v3.9: +4 event features = 72).
 
         Args:
-            features_df: Base features DataFrame (245 features already extracted)
+            features_df: Base features DataFrame
             raw_df: Original OHLCV DataFrame (for timestamp index)
+            events_handler: Optional CombinedEventsHandler for event-driven features
 
         Features:
         - Volume surge indicator
@@ -1114,6 +1129,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         - Time in channel (bars since last break)
         - Normalized channel position (-1 to +1)
         - Binary flags (day of week, volatility, in_channel)
+        - Event proximity (v3.9): is_earnings_week, days_until_earnings, days_until_fomc, is_high_impact_event
         """
         breakdown_features = {}
         num_rows = len(features_df)
@@ -1232,14 +1248,63 @@ class TradingFeatureExtractor(FeatureExtractor):
                     # Fallback to zeros if not found
                     breakdown_features[f'{symbol}_in_channel_{tf_name}'] = np.zeros(num_rows)
 
-        # Earnings proximity (scheduled dates are public - NO LEAKAGE)
-        # Note: Would need events_handler passed in for full implementation
-        # For now, placeholder
-        breakdown_features['is_earnings_week'] = np.zeros(num_rows)  # TODO: Implement with events
+        # Event proximity features (v3.9) - scheduled dates are public (NO LEAKAGE)
+        if events_handler is not None:
+            # Initialize event feature arrays
+            is_earnings_week = np.zeros(num_rows)
+            days_until_earnings = np.zeros(num_rows)
+            days_until_fomc = np.zeros(num_rows)
+            is_high_impact_event = np.zeros(num_rows)
+
+            # Extract events for each timestamp
+            for idx in range(num_rows):
+                timestamp = raw_df.index[idx]
+                date_str = timestamp.strftime('%Y-%m-%d')
+
+                try:
+                    # Get events within ±7 days
+                    events = events_handler.get_events_for_date(date_str, lookback_days=7)
+
+                    if events:
+                        # Find closest earnings event
+                        earnings_events = [e for e in events if e['event_type'] in ['earnings', 'delivery']]
+                        if earnings_events:
+                            # Get closest earnings
+                            closest_earnings = min(earnings_events, key=lambda e: abs(e['days_until']))
+                            days_until_earnings[idx] = closest_earnings['days_until']
+                            is_earnings_week[idx] = float(abs(closest_earnings['days_until']) <= 7)
+
+                        # Find closest FOMC event
+                        fomc_events = [e for e in events if e['event_type'] == 'fomc']
+                        if fomc_events:
+                            closest_fomc = min(fomc_events, key=lambda e: abs(e['days_until']))
+                            days_until_fomc[idx] = closest_fomc['days_until']
+
+                        # High impact = earnings/FOMC within 3 days
+                        high_impact_events = [e for e in events
+                                             if e['event_type'] in ['earnings', 'fomc', 'delivery']
+                                             and abs(e['days_until']) <= 3]
+                        is_high_impact_event[idx] = float(len(high_impact_events) > 0)
+
+                except Exception:
+                    # If event lookup fails, leave as zeros
+                    continue
+
+            # Store event features
+            breakdown_features['is_earnings_week'] = is_earnings_week
+            breakdown_features['days_until_earnings'] = days_until_earnings
+            breakdown_features['days_until_fomc'] = days_until_fomc
+            breakdown_features['is_high_impact_event'] = is_high_impact_event
+        else:
+            # Backward compatibility: If no events_handler, use zeros
+            breakdown_features['is_earnings_week'] = np.zeros(num_rows)
+            breakdown_features['days_until_earnings'] = np.zeros(num_rows)
+            breakdown_features['days_until_fomc'] = np.zeros(num_rows)
+            breakdown_features['is_high_impact_event'] = np.zeros(num_rows)
 
         # Debug: Check breakdown feature count
         num_breakdown = len(breakdown_features)
-        expected_breakdown = 64  # 10 indicators + 22 time_in_channel + 22 positions + 10 binary
+        expected_breakdown = 68  # 64 original + 4 event features (v3.9)
         if num_breakdown != expected_breakdown:
             print(f"   ⚠️  Breakdown features: {num_breakdown} (expected {expected_breakdown})")
             print(f"   Missing/Extra: {num_breakdown - expected_breakdown} features")

@@ -10,7 +10,7 @@
 
 AutoTrade2 is an advanced machine learning trading system that predicts TSLA price movements using a hierarchical liquid neural network (LNN) architecture with continuous online learning. Unlike traditional static models, this system learns from its mistakes in real-time, adapting to changing market conditions while discovering complex multi-timeframe patterns automatically.
 
-**Core Innovation:** Dynamic rolling channel detection across 11 timeframes (5-minute to 3-month), combined with multi-timeframe RSI analysis and SPY-TSLA correlation tracking. A 3-layer hierarchical neural network (Fast → Medium → Slow) processes **469 features** (including multi-threshold ping-pongs, normalized slopes, and automatic bull/bear/sideways detection) to generate **6 prediction outputs**, with an adaptive fusion layer that learns which timeframe to trust based on recent accuracy.
+**Core Innovation:** Dynamic rolling channel detection across 11 timeframes (5-minute to 3-month), combined with multi-timeframe RSI analysis and SPY-TSLA correlation tracking. A 3-layer hierarchical neural network (Fast → Medium → Slow) processes **473 features** (including multi-threshold ping-pongs, normalized slopes, and automatic bull/bear/sideways detection) to generate **6 prediction outputs**, with an adaptive fusion layer that learns which timeframe to trust based on recent accuracy.
 
 **Key Capabilities:**
 - Predicts next 30-200 minute price movements (high, low, center, range, confidence, volatility)
@@ -27,10 +27,10 @@ AutoTrade2 is an advanced machine learning trading system that predicts TSLA pri
 
 - **Features:** 469 (12 price + 308 channels with multi-threshold ping-pongs + normalized slope + direction flags + 66 RSI + 83 other)
 - **Architecture:** 3-layer Hierarchical LNN (~2.8M parameters)
-- **Predictions:** 6 outputs (high, low, center, range, confidence, volatility)
+- **Predictions:** 5 primary outputs (high, low, confidence) + 2 derived (center, range) + 4 multi-task (hit_band, hit_target, expected_return, overshoot)
 - **Training Time:** First run 35-70 mins, subsequent runs 6-11 mins
 - **Memory:** 2-4 GB RAM
-- **Version:** v3.8
+- **Version:** v3.9
 - **Status:** 🟢 Production Ready
 
 ---
@@ -71,10 +71,13 @@ HIERARCHICAL LNN (3 layers)
   ├─ Slow Layer (daily scale)
   └─ Adaptive Fusion (learned weights)
   ↓
-MULTI-TASK HEADS (6 outputs)
-  ├─ Predicted High % | Predicted Low %
-  ├─ Predicted Center % | Predicted Range %
-  └─ Confidence Score | Predicted Volatility
+FUSION OUTPUTS (3 primary + 2 derived)
+  ├─ Predicted High % | Predicted Low % | Confidence
+  └─ Derived: Center = (high+low)/2, Range = high-low
+  ↓
+MULTI-TASK AUXILIARY HEADS (4 outputs, optional)
+  ├─ Hit Band (will price stay in band?) | Hit Target (target before stop?)
+  └─ Expected Return (profit %) | Overshoot (how far beyond band)
   ↓
 ONLINE LEARNER → TRADE TRACKER
 ```
@@ -227,14 +230,21 @@ ADAPTIVE FUSION
   Learnable weights: [w_fast, w_medium, w_slow]
   → fusion_hidden[128]
   ↓
-  
-MULTI-TASK HEADS (6 tasks)
-  ├─ predicted_high_head: Linear(128 → 64 → 1)
-  ├─ predicted_low_head: Linear(128 → 64 → 1)
-  ├─ predicted_center_head: Linear(128 → 64 → 1)
-  ├─ predicted_range_head: Linear(128 → 64 → 1)
-  ├─ confidence_head: Linear(128 → 64 → 1) + Sigmoid
-  └─ volatility_head: Linear(128 → 64 → 1) + Softplus
+
+FUSION OUTPUTS (3 neural heads)
+  ├─ fusion_fc_high: Linear(128 → 64 → 1) → predicted_high
+  ├─ fusion_fc_low: Linear(128 → 64 → 1) → predicted_low
+  └─ fusion_fc_conf: Linear(128 → 64 → 1) + Sigmoid → confidence
+
+DERIVED (post-processing, not neural heads)
+  ├─ predicted_center = (predicted_high + predicted_low) / 2
+  └─ predicted_range = predicted_high - predicted_low
+
+MULTI-TASK AUXILIARY HEADS (4 optional heads)
+  ├─ hit_band_head: Linear(64 → 32 → 1) + Sigmoid
+  ├─ hit_target_head: Linear(64 → 32 → 1) + Sigmoid
+  ├─ expected_return_head: Linear(64 → 1)
+  └─ overshoot_head: Linear(64 → 1)
 ```
 
 ### Parameters
@@ -321,7 +331,7 @@ The neural network automatically discovers these patterns from training data (no
    - Bear channel (is_bear=1) + 6 bounces → sell rallies, cover near bottom
    - Sideways (is_sideways=1) + 10 bounces → fade extremes, trade both directions
 
-**You never program these rules!** The 256+ neurons in each layer discover optimal patterns automatically from the 469 features! 🧠
+**You never program these rules!** The 256+ neurons in each layer discover optimal patterns automatically from the 473 features! 🧠
 
 ---
 
@@ -663,7 +673,7 @@ python validate_gpu_cpu_equivalence.py
 
 ### ✅ Implemented & Tested
 
-- **Feature Extraction:** 469 features, rolling channels, caching (✅)
+- **Feature Extraction:** 473 features, rolling channels, caching (✅)
 - **Model Architecture:** 3-layer hierarchical LNN, 6 multi-task heads (✅)
 - **Multi-Task Learning:** Dimension bug fixed, all 6 tasks working (✅)
 - **Online Learning:** Prediction tracking, error-based updates (✅)
