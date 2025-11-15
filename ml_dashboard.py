@@ -799,6 +799,35 @@ def render_model_prediction(model_name: str, alert_threshold: float):
     if cached['confidence'] > alert_threshold:
         st.success(f"✅ Alert sent (confidence > {alert_threshold:.0%})")
 
+    # Channel context (v3.8)
+    with st.expander("📊 Channel Context (1H Timeframe)"):
+        # Extract channel metrics from cached features if available
+        features_dict = cached.get('features_dict', {})
+
+        channel_slope_pct = features_dict.get('tsla_channel_1h_slope_pct', 0.0)
+        channel_position = features_dict.get('tsla_channel_1h_position', 0.5)
+        ping_pongs = features_dict.get('tsla_channel_1h_ping_pongs', 0)
+        r_squared = features_dict.get('tsla_channel_1h_r_squared', 0.0)
+
+        # Direction indicator
+        if abs(channel_slope_pct) > 0.2:
+            emoji = "📈" if channel_slope_pct > 0 else "📉"
+            strength = "Strong"
+        elif abs(channel_slope_pct) > 0.1:
+            emoji = "↗️" if channel_slope_pct > 0 else "↘️"
+            strength = "Moderate"
+        else:
+            emoji = "➡️"
+            strength = "Sideways"
+
+        direction_text = "Bullish" if channel_slope_pct > 0 else "Bearish" if channel_slope_pct < 0 else "Ranging"
+
+        st.markdown(f"{emoji} **{strength} {direction_text} Channel**")
+        st.markdown(f"- Slope: `{channel_slope_pct:+.2f}% per bar`")
+        st.markdown(f"- Position in channel: `{channel_position:.2f}` (0=bottom, 1=top)")
+        st.markdown(f"- Ping-pongs: `{ping_pongs}` bounces")
+        st.markdown(f"- Channel quality (R²): `{r_squared:.3f}`")
+
     st.markdown("---")
 
 

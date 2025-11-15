@@ -22,7 +22,7 @@ from .base import FeatureExtractor
 from .channel_features import ChannelFeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.7"  # Added normalized slope + direction flags (379 → 467 features)
+FEATURE_VERSION = "v3.8"  # Added normalized prices (467 → 469 features)
 
 
 def _check_gpu_available() -> tuple:
@@ -57,10 +57,11 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Build list of all feature names"""
         features = []
 
-        # Price features (both SPY and TSLA)
+        # Price features (both SPY and TSLA) - v3.8: +2 normalized prices
         for symbol in ['spy', 'tsla']:
             features.extend([
                 f'{symbol}_close',
+                f'{symbol}_close_norm',  # v3.8: Position in 252-bar (yearly) range
                 f'{symbol}_returns',
                 f'{symbol}_log_returns',
                 f'{symbol}_volatility_10',
@@ -191,7 +192,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, **kwargs) -> pd.DataFrame:
         """
-        Extract all 467 features from aligned SPY-TSLA data (v3.7 - Hierarchical Multi-Task with Multi-Threshold Ping-Pongs + Normalized Slope + Direction Flags).
+        Extract all 469 features from aligned SPY-TSLA data (v3.8 - Hierarchical Multi-Task with Multi-Threshold Ping-Pongs + Normalized Slope + Direction Flags + Normalized Prices).
 
         Args:
             df: DataFrame with SPY and TSLA OHLCV columns
@@ -209,8 +210,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
 
-        Returns DataFrame with 467 columns:
-        - 10 price features
+        Returns DataFrame with 469 columns:
+        - 12 price features (6 per stock: close, close_norm, returns, log_returns, volatility_10, volatility_50)
         - 308 channel features (154 TSLA + 154 SPY)
           - Per timeframe (11): position, upper_dist, lower_dist, slope, slope_pct, stability, r_squared
           - Ping-pongs (4 thresholds): ping_pongs (2%), ping_pongs_0_5pct, ping_pongs_1_0pct, ping_pongs_3_0pct
@@ -301,12 +302,19 @@ class TradingFeatureExtractor(FeatureExtractor):
         return features_df
 
     def _extract_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Extract basic price features. Returns DataFrame with 10 columns."""
+        """Extract basic price features. Returns DataFrame with 12 columns (v3.8: +2 normalized prices)."""
         price_features = {}
 
         for symbol in ['spy', 'tsla']:
             close_col = f'{symbol}_close'
             price_features[close_col] = df[close_col]
+
+            # Normalized price (position in 252-bar/1-year range) - v3.8
+            # 0 = at yearly low, 1 = at yearly high, 0.5 = middle
+            rolling_min = df[close_col].rolling(window=252, min_periods=20).min()
+            rolling_max = df[close_col].rolling(window=252, min_periods=20).max()
+            price_range = rolling_max - rolling_min
+            price_features[f'{symbol}_close_norm'] = ((df[close_col] - rolling_min) / price_range).fillna(0.5)
 
             # Returns
             returns = df[close_col].pct_change()

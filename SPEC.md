@@ -10,7 +10,7 @@
 
 AutoTrade2 is an advanced machine learning trading system that predicts TSLA price movements using a hierarchical liquid neural network (LNN) architecture with continuous online learning. Unlike traditional static models, this system learns from its mistakes in real-time, adapting to changing market conditions while discovering complex multi-timeframe patterns automatically.
 
-**Core Innovation:** Dynamic rolling channel detection across 11 timeframes (5-minute to 3-month), combined with multi-timeframe RSI analysis and SPY-TSLA correlation tracking. A 3-layer hierarchical neural network (Fast → Medium → Slow) processes **467 features** (including multi-threshold ping-pongs, normalized slopes, and automatic bull/bear/sideways detection) to generate **6 prediction outputs**, with an adaptive fusion layer that learns which timeframe to trust based on recent accuracy.
+**Core Innovation:** Dynamic rolling channel detection across 11 timeframes (5-minute to 3-month), combined with multi-timeframe RSI analysis and SPY-TSLA correlation tracking. A 3-layer hierarchical neural network (Fast → Medium → Slow) processes **469 features** (including multi-threshold ping-pongs, normalized slopes, and automatic bull/bear/sideways detection) to generate **6 prediction outputs**, with an adaptive fusion layer that learns which timeframe to trust based on recent accuracy.
 
 **Key Capabilities:**
 - Predicts next 30-200 minute price movements (high, low, center, range, confidence, volatility)
@@ -25,12 +25,12 @@ AutoTrade2 is an advanced machine learning trading system that predicts TSLA pri
 
 ## Quick Reference
 
-- **Features:** 467 (10 price + 308 channels with multi-threshold ping-pongs + normalized slope + direction flags + 66 RSI + 83 other)
+- **Features:** 469 (12 price + 308 channels with multi-threshold ping-pongs + normalized slope + direction flags + 66 RSI + 83 other)
 - **Architecture:** 3-layer Hierarchical LNN (~2.8M parameters)
 - **Predictions:** 6 outputs (high, low, center, range, confidence, volatility)
 - **Training Time:** First run 35-70 mins, subsequent runs 6-11 mins
 - **Memory:** 2-4 GB RAM
-- **Version:** v3.7
+- **Version:** v3.8
 - **Status:** 🟢 Production Ready
 
 ---
@@ -91,13 +91,13 @@ ONLINE LEARNER → TRADE TRACKER
 
 ---
 
-## 2. Feature System (467 Features)
+## 2. Feature System (469 Features)
 
 ### Feature Breakdown
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| **Price** | 10 | SPY & TSLA: close, returns, log_returns, volatility |
+| **Price** | 12 | SPY & TSLA: close, close_norm (v3.8), returns, log_returns, volatility |
 | **Channels** | 308 | Rolling channels (11 TFs × 2 stocks × 14 metrics) |
 |  | | - Base: position, upper_dist, lower_dist, slope, stability, r² |
 |  | | - Normalized: slope_pct (% per bar) |
@@ -110,7 +110,7 @@ ONLINE LEARNER → TRADE TRACKER
 | **Time** | 4 | Hour, day, month, year |
 | **Breakdown** | 54 | Volume surge, RSI divergence, alignment |
 | **Binary Flags** | 14 | Day flags, volatility, in-channel flags |
-| **TOTAL** | **467** | v3.7: +66 ping-pongs + 22 normalized slopes + 66 direction flags |
+| **TOTAL** | **469** | v3.8: +66 ping-pongs + 22 normalized slopes + 66 direction flags + 2 normalized prices |
 
 ### Multi-Threshold Ping-Pong Learning (v3.6 Feature)
 
