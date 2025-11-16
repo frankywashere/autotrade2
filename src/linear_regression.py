@@ -22,6 +22,7 @@ class ChannelData:
     predicted_high: float
     predicted_low: float
     predicted_center: float
+    actual_duration: int = 0  # v3.11: Actual bars where channel holds (dynamic)
 
 
 class LinearRegressionChannel:
@@ -119,8 +120,62 @@ class LinearRegressionChannel:
             stability_score=stability_score,
             predicted_high=predicted_high,
             predicted_low=predicted_low,
-            predicted_center=predicted_center
+            predicted_center=predicted_center,
+            actual_duration=lookback_bars if lookback_bars else n  # Record actual window used
         )
+
+    def find_optimal_channel_window(
+        self,
+        df: pd.DataFrame,
+        timeframe: str = "1h",
+        max_lookback: int = 168,
+        min_ping_pongs: int = 3
+    ) -> Optional[ChannelData]:
+        """
+        Find the optimal lookback window that produces a valid channel.
+
+        Tests multiple windows from longest to shortest, returns the best channel
+        with at least min_ping_pongs bounces.
+
+        Args:
+            df: DataFrame with OHLC data
+            timeframe: Timeframe name (for prediction)
+            max_lookback: Maximum bars to consider
+            min_ping_pongs: Minimum ping-pongs required (default: 3)
+
+        Returns:
+            ChannelData for best window, or None if no valid channel found
+        """
+        # Candidate windows to test (from longest to shortest for stability)
+        candidates = [168, 120, 90, 60, 45, 30]
+        candidates = [c for c in candidates if c <= max_lookback and c <= len(df)]
+
+        if not candidates:
+            return None
+
+        best_channel = None
+        best_score = 0
+
+        for lookback in candidates:
+            # Calculate channel for this window
+            window = df.tail(lookback)
+            channel = self.calculate_channel(window, lookback, timeframe)
+
+            # Require minimum ping-pongs (real channels bounce!)
+            if channel.ping_pongs < min_ping_pongs:
+                continue
+
+            # Score = R² (70%) + normalized ping-pongs (30%)
+            # Higher R² = better fit, more ping-pongs = more confirmations
+            ping_pong_score = min(channel.ping_pongs / 10.0, 1.0)  # Normalize to 0-1
+            composite_score = (channel.r_squared * 0.7) + (ping_pong_score * 0.3)
+
+            # Track best
+            if composite_score > best_score:
+                best_channel = channel
+                best_score = composite_score
+
+        return best_channel  # None if no valid channel found
 
     def _detect_ping_pongs(self, prices: np.ndarray, upper: np.ndarray, lower: np.ndarray,
                           threshold: float = 0.02) -> int:

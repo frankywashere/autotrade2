@@ -22,7 +22,7 @@ from .base import FeatureExtractor
 from .channel_features import ChannelFeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.10"  # Expanded event window to ±14 days (was ±7)
+FEATURE_VERSION = "v3.11"  # Dynamic channel duration detection (473 → 495 features)
 
 
 def _check_gpu_available() -> tuple:
@@ -85,6 +85,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'tsla_channel_{tf}_is_bull',  # Bull channel (>0.1% per bar)
                 f'tsla_channel_{tf}_is_bear',  # Bear channel (<-0.1% per bar)
                 f'tsla_channel_{tf}_is_sideways',  # Sideways channel (±0.1% per bar)
+                f'tsla_channel_{tf}_duration',  # v3.11: How many bars channel actually holds
             ])
 
         # SPY Channel features (multi-timeframe) - v3.7 with normalized slope + direction flags
@@ -104,6 +105,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'spy_channel_{tf}_is_bull',  # Bull channel (>0.1% per bar)
                 f'spy_channel_{tf}_is_bear',  # Bear channel (<-0.1% per bar)
                 f'spy_channel_{tf}_is_sideways',  # Sideways channel (±0.1% per bar)
+                f'spy_channel_{tf}_duration',  # v3.11: How many bars channel actually holds
             ])
 
         # TSLA RSI features (multi-timeframe) - RENAMED for consistency
@@ -201,7 +203,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, **kwargs) -> pd.DataFrame:
         """
-        Extract all 473 features from aligned SPY-TSLA data (v3.9 - With Event-Driven Volatility Features).
+        Extract all 495 features from aligned SPY-TSLA data (v3.11 - With Dynamic Channel Duration Detection).
 
         Args:
             df: DataFrame with SPY and TSLA OHLCV columns
@@ -222,12 +224,13 @@ class TradingFeatureExtractor(FeatureExtractor):
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
 
-        Returns DataFrame with 473 columns:
+        Returns DataFrame with 495 columns:
         - 12 price features (6 per stock: close, close_norm, returns, log_returns, volatility_10, volatility_50)
-        - 308 channel features (154 TSLA + 154 SPY)
-          - Per timeframe (11): position, upper_dist, lower_dist, slope, slope_pct, stability, r_squared
+        - 330 channel features (165 TSLA + 165 SPY) - v3.11: +22 duration features
+          - Per timeframe (11): position, upper_dist, lower_dist, slope, slope_pct, stability, r_squared, duration
           - Ping-pongs (4 thresholds): ping_pongs (2%), ping_pongs_0_5pct, ping_pongs_1_0pct, ping_pongs_3_0pct
           - Direction flags (3): is_bull, is_bear, is_sideways
+          - Total: 15 metrics per timeframe (was 14)
         - 66 RSI features (33 TSLA + 33 SPY)
         - 5 correlation features
         - 4 cycle features
@@ -560,7 +563,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             'r_squared': np.zeros(num_original_rows),
             'is_bull': np.zeros(num_original_rows),  # Uptrending channel (>0.1% per bar)
             'is_bear': np.zeros(num_original_rows),  # Downtrending channel (<-0.1% per bar)
-            'is_sideways': np.zeros(num_original_rows)  # Ranging channel (±0.1% per bar)
+            'is_sideways': np.zeros(num_original_rows),  # Ranging channel (±0.1% per bar)
+            'duration': np.zeros(num_original_rows)  # v3.11: Actual bars where channel holds
         }
 
         # Calculate channel at each timestamp with progress bar
@@ -571,16 +575,32 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         for i in bar_progress:
             try:
-                # Rolling window
-                window = resampled_df.iloc[i-lookback:i]
+                # Get available data up to this point
+                available_window = resampled_df.iloc[:i]
 
-                # Calculate channel for this window
-                channel = self.channel_calc.calculate_channel(window, lookback, tf_name)
+                # Find optimal channel window (v3.11: dynamic duration detection)
+                # Tests multiple lookbacks, requires minimum 3 ping-pongs
+                channel = self.channel_calc.find_optimal_channel_window(
+                    available_window,
+                    timeframe=tf_name,
+                    max_lookback=lookback,
+                    min_ping_pongs=3
+                )
+
+                # If no valid channel found, use zeros for all metrics
+                if channel is None:
+                    # No channel exists (all windows had <3 ping-pongs or poor R²)
+                    # Skip this timestamp or use zeros
+                    continue
+
                 current_price = resampled_df['close'].iloc[i]
                 position_data = self.channel_calc.get_channel_position(current_price, channel)
 
+                # Get the actual window used for this channel
+                actual_window = resampled_df.iloc[i-channel.actual_duration:i]
+
                 # Calculate multi-threshold ping-pongs
-                window_prices = window['close'].values
+                window_prices = actual_window['close'].values
                 multi_pp = self.channel_calc._detect_ping_pongs_multi_threshold(
                     window_prices,
                     channel.upper_line,
@@ -622,6 +642,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 results['ping_pongs_1_0pct'][mask] = multi_pp[0.01]   # 1.0% threshold
                 results['ping_pongs_3_0pct'][mask] = multi_pp[0.03]   # 3.0% threshold
                 results['r_squared'][mask] = channel.r_squared
+                results['duration'][mask] = channel.actual_duration  # v3.11: How many bars channel holds
 
             except Exception as e:
                 # If calculation fails, leave as zeros
@@ -829,7 +850,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             'r_squared': np.zeros(num_original_rows),
             'is_bull': np.zeros(num_original_rows),  # Uptrending channel
             'is_bear': np.zeros(num_original_rows),  # Downtrending channel
-            'is_sideways': np.zeros(num_original_rows)  # Ranging channel
+            'is_sideways': np.zeros(num_original_rows),  # Ranging channel
+            'duration': np.zeros(num_original_rows)  # v3.11: Channel duration (fixed lookback for GPU)
         }
 
         # Convert to PyTorch tensor
@@ -943,6 +965,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                         results['stability'][mask] = stability
                         results['upper_dist'][mask] = upper_dist
                         results['lower_dist'][mask] = lower_dist
+                        results['duration'][mask] = lookback  # v3.11: GPU uses fixed lookback
 
                     # Clear GPU memory
                     del windows_batch, regression_results
