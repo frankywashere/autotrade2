@@ -114,8 +114,8 @@ def create_channel_chart(price_df, features_dict, timeframe='1h', lookback=168):
         plotly figure
     """
     # Get last N bars
-    recent_prices = price_df['tsla_close'].tail(lookback)
-    dates = recent_prices.index
+    recent_prices = price_df['tsla_close'].tail(lookback).values  # Convert to numpy array
+    dates = price_df['tsla_close'].tail(lookback).index  # Separate index
 
     # Get channel features
     position = features_dict.get(f'tsla_channel_{timeframe}_position', 0.5)
@@ -124,7 +124,7 @@ def create_channel_chart(price_df, features_dict, timeframe='1h', lookback=168):
     ping_pongs = features_dict.get(f'tsla_channel_{timeframe}_ping_pongs', 0)
 
     # Reconstruct channel lines (simplified - linear trend)
-    current_price = recent_prices.iloc[-1]
+    current_price = recent_prices[-1]  # Last element of numpy array
 
     # Calculate slope in $/bar from slope_pct
     slope_per_bar = (slope_pct / 100) * current_price
