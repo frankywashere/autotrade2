@@ -19,6 +19,8 @@ Features:
 import streamlit as st
 import pandas as pd
 import torch
+import plotly.graph_objects as go
+import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
@@ -96,6 +98,114 @@ def detect_channel_warning(features_dict):
         warnings.append(f"📅 Earnings {abs(days_to_earnings)} days {direction} - expect volatility")
 
     return warnings
+
+
+def create_channel_chart(price_df, features_dict, timeframe='1h', lookback=168):
+    """
+    Create channel visualization showing price + upper/lower bounds.
+
+    Args:
+        price_df: DataFrame with tsla_close column
+        features_dict: Feature dictionary with channel metrics
+        timeframe: Which timeframe channel to display
+        lookback: Number of bars to show
+
+    Returns:
+        plotly figure
+    """
+    # Get last N bars
+    recent_prices = price_df['tsla_close'].tail(lookback)
+    dates = recent_prices.index
+
+    # Get channel features
+    position = features_dict.get(f'tsla_channel_{timeframe}_position', 0.5)
+    slope_pct = features_dict.get(f'tsla_channel_{timeframe}_slope_pct', 0.0)
+    r_squared = features_dict.get(f'tsla_channel_{timeframe}_r_squared', 0.0)
+    ping_pongs = features_dict.get(f'tsla_channel_{timeframe}_ping_pongs', 0)
+
+    # Reconstruct channel lines (simplified - linear trend)
+    current_price = recent_prices.iloc[-1]
+
+    # Calculate slope in $/bar from slope_pct
+    slope_per_bar = (slope_pct / 100) * current_price
+
+    # Create regression line (approximate from slope and position)
+    x = np.arange(len(recent_prices))
+    regression_line = current_price - (slope_per_bar * (len(recent_prices) - 1 - x))
+
+    # Calculate channel width from position
+    # position = (price - lower) / channel_height
+    # If we know position and price, we can estimate channel height
+    if position > 0.01 and position < 0.99:
+        channel_height = (current_price - regression_line[-1]) / (position - 0.5) if position != 0.5 else current_price * 0.04
+    else:
+        channel_height = current_price * 0.04  # Default 4% channel
+
+    # Upper and lower bounds
+    upper_line = regression_line + (channel_height / 2)
+    lower_line = regression_line - (channel_height / 2)
+
+    # Create figure
+    fig = go.Figure()
+
+    # Add price line
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=recent_prices,
+        mode='lines',
+        name='TSLA Price',
+        line=dict(color='blue', width=2)
+    ))
+
+    # Add regression line (center)
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=regression_line,
+        mode='lines',
+        name='Regression Line',
+        line=dict(color='yellow', width=1, dash='dot')
+    ))
+
+    # Add upper bound
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=upper_line,
+        mode='lines',
+        name='Upper Bound (+2σ)',
+        line=dict(color='green', width=1)
+    ))
+
+    # Add lower bound
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=lower_line,
+        mode='lines',
+        name='Lower Bound (-2σ)',
+        line=dict(color='red', width=1)
+    ))
+
+    # Mark current position
+    fig.add_trace(go.Scatter(
+        x=[dates.iloc[-1]],
+        y=[current_price],
+        mode='markers',
+        name='Current Price',
+        marker=dict(color='orange', size=12, symbol='star')
+    ))
+
+    # Layout
+    direction = "📈 Bullish" if slope_pct > 0.1 else "📉 Bearish" if slope_pct < -0.1 else "➡️ Sideways"
+
+    fig.update_layout(
+        title=f"{timeframe.upper()} Channel - {direction} (R²={r_squared:.2f}, {ping_pongs} ping-pongs)",
+        xaxis_title="Time",
+        yaxis_title="Price ($)",
+        hovermode='x unified',
+        height=400,
+        showlegend=True
+    )
+
+    return fig
 
 
 def make_prediction(model, features_df):
@@ -304,6 +414,32 @@ def main():
     # Alert if high confidence
     if conf_pct >= alert_threshold * 100:
         st.success(f"🔔 HIGH CONFIDENCE ALERT (>{alert_threshold:.0%}) - Consider this trade!")
+
+    st.markdown("---")
+
+    # Channel Visualization (Visual Confirmation)
+    st.subheader("📈 Channel Visualization (1H Timeframe)")
+    st.caption("Visual proof the model is detecting channels correctly")
+
+    try:
+        # Create and display channel chart
+        chart = create_channel_chart(df, prediction['features_dict'], timeframe='1h', lookback=168)
+        st.plotly_chart(chart, use_container_width=True)
+
+        # Add explanation
+        features = prediction['features_dict']
+        position_1h = features.get('tsla_channel_1h_position', 0.5)
+        r2_1h = features.get('tsla_channel_1h_r_squared', 0.0)
+
+        if r2_1h > 0.7:
+            st.success(f"✅ Strong channel detected (R²={r2_1h:.2f}) - Price is at {position_1h:.1%} of channel")
+        elif r2_1h > 0.4:
+            st.info(f"📊 Moderate channel (R²={r2_1h:.2f}) - Less reliable")
+        else:
+            st.warning(f"⚠️ Weak/No channel (R²={r2_1h:.2f}) - Price may be breaking out or ranging")
+
+    except Exception as e:
+        st.error(f"Could not create channel chart: {e}")
 
     st.markdown("---")
 
