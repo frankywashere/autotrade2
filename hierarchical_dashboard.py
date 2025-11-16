@@ -417,29 +417,89 @@ def main():
 
     st.markdown("---")
 
-    # Channel Visualization (Visual Confirmation)
-    st.subheader("📈 Channel Visualization (1H Timeframe)")
-    st.caption("Visual proof the model is detecting channels correctly")
+    # Multi-Timeframe Channel Visualization
+    st.subheader("📈 Channel Analysis - All Timeframes")
+    st.caption("Visual proof of channel detection across multiple timeframes")
 
-    try:
-        # Create and display channel chart
-        chart = create_channel_chart(df, prediction['features_dict'], timeframe='1h', lookback=168)
-        st.plotly_chart(chart, use_container_width=True)
+    # Find best channel (highest R²)
+    timeframes_to_check = ['5min', '15min', '1h', '4h', 'daily']
+    channel_quality = []
 
-        # Add explanation
-        features = prediction['features_dict']
-        position_1h = features.get('tsla_channel_1h_position', 0.5)
-        r2_1h = features.get('tsla_channel_1h_r_squared', 0.0)
+    features = prediction['features_dict']
+    for tf in timeframes_to_check:
+        r2 = features.get(f'tsla_channel_{tf}_r_squared', 0.0)
+        channel_quality.append((tf, r2))
 
-        if r2_1h > 0.7:
-            st.success(f"✅ Strong channel detected (R²={r2_1h:.2f}) - Price is at {position_1h:.1%} of channel")
-        elif r2_1h > 0.4:
-            st.info(f"📊 Moderate channel (R²={r2_1h:.2f}) - Less reliable")
-        else:
-            st.warning(f"⚠️ Weak/No channel (R²={r2_1h:.2f}) - Price may be breaking out or ranging")
+    # Sort by R² (descending)
+    channel_quality.sort(key=lambda x: x[1], reverse=True)
+    best_tf, best_r2 = channel_quality[0]
 
-    except Exception as e:
-        st.error(f"Could not create channel chart: {e}")
+    # Show best channel first
+    if best_r2 > 0.3:
+        st.success(f"🎯 BEST CHANNEL: {best_tf.upper()} (R²={best_r2:.2f}) - Showing first")
+    else:
+        st.warning(f"⚠️ ALL CHANNELS WEAK - Best is {best_tf.upper()} (R²={best_r2:.2f})")
+
+    # Create tabs for different timeframes
+    tabs = st.tabs(["🏆 Best", "⚡ 5min", "📊 15min", "🔄 1H", "📈 4H", "📅 Daily"])
+
+    timeframes_display = [best_tf, '5min', '15min', '1h', '4h', 'daily']
+
+    for tab, tf in zip(tabs, timeframes_display):
+        with tab:
+            try:
+                # Show channel for this timeframe
+                r2 = features.get(f'tsla_channel_{tf}_r_squared', 0.0)
+                position = features.get(f'tsla_channel_{tf}_position', 0.5)
+                slope_pct = features.get(f'tsla_channel_{tf}_slope_pct', 0.0)
+                ping_pongs = features.get(f'tsla_channel_{tf}_ping_pongs', 0)
+
+                # Determine lookback (how many bars to show)
+                lookback_map = {
+                    '5min': 100,
+                    '15min': 96,  # ~24 hours
+                    '1h': 168,    # ~1 week
+                    '4h': 180,    # ~1 month
+                    'daily': 90   # ~3 months
+                }
+                lookback = lookback_map.get(tf, 168)
+
+                # Create chart
+                chart = create_channel_chart(df, features, timeframe=tf, lookback=min(lookback, len(df)))
+                st.plotly_chart(chart, use_container_width=True)
+
+                # Quality assessment
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    if r2 > 0.7:
+                        st.metric("Channel Quality", "🟢 Strong", f"R²={r2:.2f}")
+                    elif r2 > 0.4:
+                        st.metric("Channel Quality", "🟡 Moderate", f"R²={r2:.2f}")
+                    else:
+                        st.metric("Channel Quality", "🔴 Weak", f"R²={r2:.2f}")
+
+                with col2:
+                    direction = "📈 Bull" if slope_pct > 0.1 else "📉 Bear" if slope_pct < -0.1 else "➡️ Side"
+                    st.metric("Direction", direction, f"{slope_pct:+.2f}%/bar")
+
+                with col3:
+                    pos_label = "Top" if position > 0.7 else "Bottom" if position < 0.3 else "Middle"
+                    st.metric("Position", pos_label, f"{position:.2f}")
+
+                with col4:
+                    st.metric("Ping-Pongs", f"{ping_pongs}", "bounces")
+
+                # Interpretation
+                if r2 > 0.7 and ping_pongs >= 5:
+                    st.success(f"✅ Excellent {tf} channel - High confidence for trading")
+                elif r2 > 0.5:
+                    st.info(f"📊 Decent {tf} channel - Use with confirmation")
+                else:
+                    st.warning(f"⚠️ Weak {tf} channel - Not reliable for trading")
+
+            except Exception as e:
+                st.error(f"Could not create {tf} chart: {e}")
 
     st.markdown("---")
 
