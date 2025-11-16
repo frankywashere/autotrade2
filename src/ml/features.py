@@ -481,8 +481,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                 prefix = f'{symbol}_channel'
 
                 if len(resampled) < 20:
-                    # Not enough data - fill with zeros
-                    for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'stability', 'ping_pongs', 'r_squared']:
+                    # Not enough data - fill with zeros for ALL channel features
+                    for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'slope_pct', 'stability',
+                                 'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
+                                 'r_squared', 'is_bull', 'is_bear', 'is_sideways', 'duration']:
                         channel_features[f'{prefix}_{tf_name}_{feat}'] = np.zeros(num_rows)
                     calc_progress.update(1)
                     continue
