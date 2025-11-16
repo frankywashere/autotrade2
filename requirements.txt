@@ -18,4 +18,5 @@ tqdm
 matplotlib
 fredapi
 beautifulsoup4
+plotly
 
