@@ -171,13 +171,8 @@ def main():
     # Sidebar config
     st.sidebar.header("⚙️ Configuration")
 
-    auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
-    if auto_refresh:
-        refresh_interval = st.sidebar.slider("Refresh (seconds)", 10, 300, 60)
-        st.empty()  # Placeholder for auto-refresh
-        import time
-        time.sleep(refresh_interval)
-        st.rerun()
+    # Auto-refresh disabled for now (will add proper implementation)
+    # auto_refresh = st.sidebar.checkbox("Auto-refresh", value=False)
 
     alert_threshold = st.sidebar.slider("Alert Threshold", 0.0, 1.0, 0.75, 0.05)
 
@@ -188,11 +183,17 @@ def main():
     st.sidebar.caption(f"Last refresh: {datetime.now().strftime('%H:%M:%S')}")
 
     # Load model
-    with st.spinner("Loading hierarchical model..."):
-        model = load_hierarchical()
+    try:
+        with st.spinner("Loading hierarchical model..."):
+            model = load_hierarchical()
+    except Exception as e:
+        st.error(f"❌ Failed to load model: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        st.stop()
 
     st.sidebar.success(f"✅ Model loaded")
-    st.sidebar.caption(f"Parameters: ~{model.total_params/1e6:.1f}M")
+    st.sidebar.caption(f"Model: Hierarchical LNN v3.10")
 
     # Load data and extract features
     with st.spinner("Fetching live data and extracting features..."):
