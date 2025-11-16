@@ -175,10 +175,15 @@ class TradingFeatureExtractor(FeatureExtractor):
             features.append(f'spy_channel_position_norm_{tf}')
 
         # Binary feature flags (Phase 4)
-        # Binary flags and event features (v3.9)
+        # Binary flags and event features (v3.11: +5 missing flags)
         features.extend([
             'is_monday',
+            'is_tuesday',                # v3.11: Added missing weekday
+            'is_wednesday',              # v3.11: Added missing weekday
+            'is_thursday',               # v3.11: Added missing weekday
             'is_friday',
+            'is_first_hour',             # v3.11: Market open hour (9:30-10:30 ET)
+            'is_last_hour',              # v3.11: Power hour (15:00-16:00 ET)
             'is_volatile_now',
             'is_earnings_week',          # v3.10: Within ±14 days of earnings/delivery
             'days_until_earnings',       # v3.10: -14 to +14 days (0 = day of)
@@ -1248,7 +1253,15 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Day of week flags (known at prediction time - OK) - Use raw_df index
         breakdown_features['is_monday'] = (raw_df.index.dayofweek == 0).astype(float)
+        breakdown_features['is_tuesday'] = (raw_df.index.dayofweek == 1).astype(float)  # v3.11
+        breakdown_features['is_wednesday'] = (raw_df.index.dayofweek == 2).astype(float)  # v3.11
+        breakdown_features['is_thursday'] = (raw_df.index.dayofweek == 3).astype(float)  # v3.11
         breakdown_features['is_friday'] = (raw_df.index.dayofweek == 4).astype(float)
+
+        # Market timing flags (v3.11) - First/last hour effects
+        hour = raw_df.index.hour
+        breakdown_features['is_first_hour'] = ((hour >= 9) & (hour < 11)).astype(float)  # 9:30-10:30 ET open
+        breakdown_features['is_last_hour'] = ((hour >= 15) & (hour < 16)).astype(float)  # 15:00-16:00 ET power hour
 
         # Volatility regime (uses PAST volatility only - NO LEAKAGE) - Use features_df
         current_vol_10 = features_df['tsla_volatility_10']  # From base features
@@ -1330,7 +1343,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Debug: Check breakdown feature count
         num_breakdown = len(breakdown_features)
-        expected_breakdown = 68  # 64 original + 4 event features (v3.9)
+        expected_breakdown = 73  # 64 original + 4 event features + 5 binary flags (v3.11)
         if num_breakdown != expected_breakdown:
             print(f"   ⚠️  Breakdown features: {num_breakdown} (expected {expected_breakdown})")
             print(f"   Missing/Extra: {num_breakdown - expected_breakdown} features")
