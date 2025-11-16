@@ -32,6 +32,7 @@ from src.ml.hierarchical_model import load_hierarchical_model
 from src.ml.features import TradingFeatureExtractor
 from src.ml.data_feed import CSVDataFeed
 from src.ml.events import CombinedEventsHandler
+from src.linear_regression import LinearRegressionChannel
 import config
 
 
@@ -104,46 +105,59 @@ def create_channel_chart(price_df, features_dict, timeframe='1h', lookback=168):
     """
     Create channel visualization showing price + upper/lower bounds.
 
+    RECALCULATES channel using same method as feature extraction for accuracy.
+
     Args:
         price_df: DataFrame with tsla_close column
-        features_dict: Feature dictionary with channel metrics
+        features_dict: Feature dictionary with channel metrics (for display only)
         timeframe: Which timeframe channel to display
         lookback: Number of bars to show
 
     Returns:
         plotly figure
     """
-    # Get last N bars
-    recent_prices = price_df['tsla_close'].tail(lookback).values  # Convert to numpy array
-    dates = price_df['tsla_close'].tail(lookback).index  # Separate index
-
-    # Get channel features
-    position = features_dict.get(f'tsla_channel_{timeframe}_position', 0.5)
-    slope_pct = features_dict.get(f'tsla_channel_{timeframe}_slope_pct', 0.0)
+    # Get channel metrics from features (for display)
     r_squared = features_dict.get(f'tsla_channel_{timeframe}_r_squared', 0.0)
     ping_pongs = features_dict.get(f'tsla_channel_{timeframe}_ping_pongs', 0)
+    slope_pct = features_dict.get(f'tsla_channel_{timeframe}_slope_pct', 0.0)
 
-    # Reconstruct channel lines (simplified - linear trend)
-    current_price = recent_prices[-1]  # Last element of numpy array
+    # Resample price data to target timeframe
+    timeframe_rules = {
+        '5min': '5min', '15min': '15min', '30min': '30min',
+        '1h': '1h', '2h': '2h', '3h': '3h', '4h': '4h',
+        'daily': '1D', 'weekly': '1W'
+    }
 
-    # Calculate slope in $/bar from slope_pct
-    slope_per_bar = (slope_pct / 100) * current_price
+    tf_rule = timeframe_rules.get(timeframe, '1h')
 
-    # Create regression line (approximate from slope and position)
-    x = np.arange(len(recent_prices))
-    regression_line = current_price - (slope_per_bar * (len(recent_prices) - 1 - x))
+    # Prepare data for resampling
+    tsla_df = price_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close', 'tsla_volume']].copy()
+    tsla_df.columns = ['open', 'high', 'low', 'close', 'volume']
 
-    # Calculate channel width from position
-    # position = (price - lower) / channel_height
-    # If we know position and price, we can estimate channel height
-    if position > 0.01 and position < 0.99:
-        channel_height = (current_price - regression_line[-1]) / (position - 0.5) if position != 0.5 else current_price * 0.04
-    else:
-        channel_height = current_price * 0.04  # Default 4% channel
+    # Resample to target timeframe
+    resampled = tsla_df.resample(tf_rule).agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }).dropna()
 
-    # Upper and lower bounds
-    upper_line = regression_line + (channel_height / 2)
-    lower_line = regression_line - (channel_height / 2)
+    # Use last N bars
+    window = resampled.tail(lookback)
+
+    # RECALCULATE channel using same method as feature extraction
+    channel_calc = LinearRegressionChannel()
+    channel = channel_calc.calculate_channel(window, min(lookback, len(window)), timeframe)
+
+    # Get actual channel lines
+    upper_line = channel.upper_line
+    lower_line = channel.lower_line
+    center_line = channel.center_line
+    dates = window.index
+
+    # Get prices from window
+    prices = window['close'].values
 
     # Create figure
     fig = go.Figure()
@@ -151,7 +165,7 @@ def create_channel_chart(price_df, features_dict, timeframe='1h', lookback=168):
     # Add price line
     fig.add_trace(go.Scatter(
         x=dates,
-        y=recent_prices,
+        y=prices,
         mode='lines',
         name='TSLA Price',
         line=dict(color='blue', width=2)
@@ -160,7 +174,7 @@ def create_channel_chart(price_df, features_dict, timeframe='1h', lookback=168):
     # Add regression line (center)
     fig.add_trace(go.Scatter(
         x=dates,
-        y=regression_line,
+        y=center_line,
         mode='lines',
         name='Regression Line',
         line=dict(color='yellow', width=1, dash='dot')
@@ -186,8 +200,8 @@ def create_channel_chart(price_df, features_dict, timeframe='1h', lookback=168):
 
     # Mark current position
     fig.add_trace(go.Scatter(
-        x=[dates[-1]],  # DatetimeIndex uses [-1] not .iloc[-1]
-        y=[current_price],
+        x=[dates[-1]],
+        y=[prices[-1]],
         mode='markers',
         name='Current Price',
         marker=dict(color='orange', size=12, symbol='star')
