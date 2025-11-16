@@ -230,6 +230,14 @@ def make_prediction(model, features_df):
     if len(features_df) < sequence_length:
         return None, f"Need {sequence_length} bars, have {len(features_df)}"
 
+    # Check feature count compatibility
+    expected_features = model.input_size
+    actual_features = features_df.shape[1]
+
+    if expected_features != actual_features:
+        return None, (f"Model expects {expected_features} features, but system extracts {actual_features}. "
+                     f"Please retrain model with: python train_hierarchical.py --interactive")
+
     sequence = features_df.tail(sequence_length).values
     x_tensor = torch.tensor(sequence, dtype=torch.float32).unsqueeze(0)
 
@@ -394,6 +402,13 @@ def main():
     # Calculate target prices
     pred_high = best['predicted_high']
     pred_low = best['predicted_low']
+
+    # Validate model outputs (untrained models may output nonsense)
+    if pred_high < pred_low:
+        st.error(f"⚠️ MODEL OUTPUT INVALID: High ({pred_high:+.2f}%) < Low ({pred_low:+.2f}%)")
+        st.warning(f"🔧 Model needs more training! Current: 1 epoch. Recommended: 100 epochs.")
+        st.caption("With only 1 epoch, model hasn't learned constraints. Retrain with more epochs.")
+
     target_high_price = current_price * (1 + pred_high / 100)
     target_low_price = current_price * (1 + pred_low / 100)
 
@@ -436,7 +451,7 @@ def main():
     st.caption("Visual proof of channel detection across multiple timeframes")
 
     # Find best VALID channel (R² AND ping-pongs >= 3)
-    timeframes_to_check = ['5min', '15min', '1h', '4h', 'daily']
+    timeframes_to_check = ['5min', '15min', '1h', '4h', 'daily', 'weekly', 'monthly']
     channel_quality = []
 
     features = prediction['features_dict']
@@ -467,9 +482,9 @@ def main():
         best_tf = '1h'  # Default fallback
 
     # Create tabs for different timeframes
-    tabs = st.tabs(["🏆 Best", "⚡ 5min", "📊 15min", "🔄 1H", "📈 4H", "📅 Daily"])
+    tabs = st.tabs(["🏆 Best", "⚡ 5min", "📊 15min", "🔄 1H", "📈 4H", "📅 Daily", "📆 Weekly", "📊 Monthly"])
 
-    timeframes_display = [best_tf, '5min', '15min', '1h', '4h', 'daily']
+    timeframes_display = [best_tf, '5min', '15min', '1h', '4h', 'daily', 'weekly', 'monthly']
 
     for tab_idx, (tab, tf) in enumerate(zip(tabs, timeframes_display)):
         with tab:
@@ -483,10 +498,12 @@ def main():
                 # Determine lookback (how many bars to show)
                 lookback_map = {
                     '5min': 100,
-                    '15min': 96,  # ~24 hours
-                    '1h': 168,    # ~1 week
-                    '4h': 180,    # ~1 month
-                    'daily': 90   # ~3 months
+                    '15min': 96,   # ~24 hours
+                    '1h': 168,     # ~1 week
+                    '4h': 180,     # ~1 month
+                    'daily': 90,   # ~3 months
+                    'weekly': 52,  # ~1 year
+                    'monthly': 24  # ~2 years
                 }
                 lookback = lookback_map.get(tf, 168)
 
@@ -603,10 +620,19 @@ def main():
 
         if is_event_week:
             if days_to_earnings != 0:
-                when = f"{abs(int(days_to_earnings))} days {'before' if days_to_earnings < 0 else 'after'}"
+                days = int(days_to_earnings)
+                if days == 0:
+                    when = "TODAY (Earnings Day!)"
+                else:
+                    when = f"{abs(days)} days {'before' if days < 0 else 'after'}"
                 st.warning(f"📊 Earnings: {when} - Expect increased volatility")
+
             if days_to_fomc != 0:
-                when = f"{abs(int(days_to_fomc))} days {'before' if days_to_fomc < 0 else 'after'}"
+                days = int(days_to_fomc)
+                if days == 0:
+                    when = "TODAY (FOMC Meeting!)"
+                else:
+                    when = f"{abs(days)} days {'before' if days < 0 else 'after'}"
                 st.info(f"🏦 FOMC: {when}")
         else:
             st.success("✅ No major events in next 14 days")
