@@ -381,5 +381,5 @@ def main():
     st.caption(f"Model: Hierarchical LNN v3.10 | Features: 473 | Parameters: ~2.8M")
 
 
-if __name__ == '__main__':
-    main()
+# Run main app (Streamlit executes script directly)
+main()
