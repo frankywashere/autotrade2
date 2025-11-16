@@ -4,6 +4,25 @@
 
 ---
 
+# Create virtual environment
+python3 -m venv myenv
+source myenv/bin/activate  # On Mac/Linux
+# myenv\Scripts\activate   # On Windows
+
+
+
+# Install dependencies
+pip install -r requirements.txt
+
+python train_hierarchical.py --interactive
+
+python backtest_hierarchical.py --model models/hierarchical_lnn.pth --year 2023
+
+streamlit run hierarchical_dashboard.py
+
+
+
+
 ## Prerequisites
 
 - Python 3.10+
@@ -18,13 +37,8 @@
 # Clone repository
 cd /path/to/autotrade2
 
-# Create virtual environment
-python3 -m venv myenv
-source myenv/bin/activate  # On Mac/Linux
-# myenv\Scripts\activate   # On Windows
 
-# Install dependencies
-pip install -r requirements.txt
+
 ```
 
 **Key Dependencies:**
