@@ -435,31 +435,43 @@ def main():
     st.subheader("📈 Channel Analysis - All Timeframes")
     st.caption("Visual proof of channel detection across multiple timeframes")
 
-    # Find best channel (highest R²)
+    # Find best VALID channel (R² AND ping-pongs >= 3)
     timeframes_to_check = ['5min', '15min', '1h', '4h', 'daily']
     channel_quality = []
 
     features = prediction['features_dict']
     for tf in timeframes_to_check:
         r2 = features.get(f'tsla_channel_{tf}_r_squared', 0.0)
-        channel_quality.append((tf, r2))
+        pp = features.get(f'tsla_channel_{tf}_ping_pongs', 0)
 
-    # Sort by R² (descending)
-    channel_quality.sort(key=lambda x: x[1], reverse=True)
-    best_tf, best_r2 = channel_quality[0]
+        # Only consider channels with at least 3 ping-pongs (real channels bounce!)
+        if pp >= 3:
+            channel_quality.append((tf, r2, pp))
 
-    # Show best channel first
-    if best_r2 > 0.3:
-        st.success(f"🎯 BEST CHANNEL: {best_tf.upper()} (R²={best_r2:.2f}) - Showing first")
+    if channel_quality:
+        # Sort by R² (descending)
+        channel_quality.sort(key=lambda x: x[1], reverse=True)
+        best_tf, best_r2, best_pp = channel_quality[0]
+
+        # Show best channel first
+        if best_r2 > 0.7:
+            st.success(f"🎯 BEST CHANNEL: {best_tf.upper()} (R²={best_r2:.2f}, {best_pp} ping-pongs) ✓")
+        elif best_r2 > 0.4:
+            st.info(f"📊 BEST CHANNEL: {best_tf.upper()} (R²={best_r2:.2f}, {best_pp} ping-pongs)")
+        else:
+            st.warning(f"⚠️ BEST CHANNEL: {best_tf.upper()} (R²={best_r2:.2f}, {best_pp} ping-pongs) - Weak")
     else:
-        st.warning(f"⚠️ ALL CHANNELS WEAK - Best is {best_tf.upper()} (R²={best_r2:.2f})")
+        # NO valid channels found
+        st.error("❌ NO VALID CHANNELS - All timeframes have <3 ping-pongs")
+        st.caption("Price may be in breakout/breakdown mode or trending without bounces")
+        best_tf = '1h'  # Default fallback
 
     # Create tabs for different timeframes
     tabs = st.tabs(["🏆 Best", "⚡ 5min", "📊 15min", "🔄 1H", "📈 4H", "📅 Daily"])
 
     timeframes_display = [best_tf, '5min', '15min', '1h', '4h', 'daily']
 
-    for tab, tf in zip(tabs, timeframes_display):
+    for tab_idx, (tab, tf) in enumerate(zip(tabs, timeframes_display)):
         with tab:
             try:
                 # Show channel for this timeframe
@@ -480,7 +492,7 @@ def main():
 
                 # Create chart
                 chart = create_channel_chart(df, features, timeframe=tf, lookback=min(lookback, len(df)))
-                st.plotly_chart(chart, use_container_width=True, key=f"channel_chart_{tf}")
+                st.plotly_chart(chart, use_container_width=True, key=f"channel_chart_{tab_idx}_{tf}")
 
                 # Quality assessment
                 col1, col2, col3, col4 = st.columns(4)
@@ -504,13 +516,18 @@ def main():
                 with col4:
                     st.metric("Ping-Pongs", f"{ping_pongs}", "bounces")
 
-                # Interpretation
-                if r2 > 0.7 and ping_pongs >= 5:
+                # Interpretation with ping-pong validation
+                if ping_pongs < 3:
+                    st.error(f"❌ NOT A VALID CHANNEL - Only {ping_pongs} ping-pongs (need 3+)")
+                    st.caption("Real channels require multiple bounces. This is just a trend line.")
+                elif r2 > 0.7 and ping_pongs >= 5:
                     st.success(f"✅ Excellent {tf} channel - High confidence for trading")
-                elif r2 > 0.5:
+                elif r2 > 0.5 and ping_pongs >= 3:
                     st.info(f"📊 Decent {tf} channel - Use with confirmation")
+                elif ping_pongs >= 3:
+                    st.warning(f"⚠️ Weak {tf} channel - Has {ping_pongs} bounces but low R²")
                 else:
-                    st.warning(f"⚠️ Weak {tf} channel - Not reliable for trading")
+                    st.warning(f"⚠️ Insufficient data for {tf} channel")
 
             except Exception as e:
                 st.error(f"Could not create {tf} chart: {e}")
