@@ -217,6 +217,38 @@ def load_ensemble_for_dashboard():
         return None, f"Error loading ensemble: {e}"
 
 
+def load_hierarchical_for_dashboard():
+    """Load hierarchical LNN system (single 3-layer model)."""
+    try:
+        # Check model exists
+        model_path = Path('models/hierarchical_lnn.pth')
+        if not model_path.exists():
+            return None, f"Missing hierarchical model: {model_path}"
+
+        # Load via ensemble wrapper (ensemble.py already supports hierarchical mode!)
+        from src.ml.ensemble import MultiScaleEnsemble
+        from src.ml.events import CombinedEventsHandler
+
+        # Create events handler
+        events_handler = CombinedEventsHandler('data/tsla_events_REAL.csv')
+
+        # Load hierarchical model via ensemble interface
+        hierarchical_ensemble = MultiScaleEnsemble(
+            model_paths={'hierarchical': str(model_path)},
+            meta_model_path=None,  # Not needed for hierarchical
+            mode='backtest_no_news',
+            device='cpu',
+            events_handler=events_handler
+        )
+
+        return hierarchical_ensemble, None
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, f"Error loading hierarchical model: {e}"
+
+
 def make_ensemble_prediction(ensemble, feature_extractor):
     """
     Make ensemble prediction using all 4 timeframe models + Meta-LNN.
@@ -309,6 +341,81 @@ def make_ensemble_prediction(ensemble, feature_extractor):
         return None, str(e)
 
 
+def make_hierarchical_prediction(hierarchical_ensemble, feature_extractor):
+    """
+    Make hierarchical LNN prediction using 1-min data.
+
+    Returns:
+        (prediction_dict, error_message)
+    """
+    try:
+        # Step 1: Load 1-min data
+        data_feed = LiveDataLoader(timeframe='1min')
+        context_days = calculate_minimum_context_days(min_bars_per_timeframe=20)
+
+        aligned_df, status = data_feed.load_live_data(lookback_days=context_days)
+
+        # Step 2: Extract features (473 features with events)
+        features_df = feature_extractor.extract_features(aligned_df)
+
+        # Step 3: Get sequence (200 1-min bars)
+        sequence_length = 200
+        if len(features_df) < sequence_length:
+            return None, f"Insufficient data: {len(features_df)}/{sequence_length} bars"
+
+        sequence = features_df.tail(sequence_length).values
+        x_tensor = torch.tensor(sequence, dtype=torch.float32)
+
+        # Step 4: Prepare data dict (hierarchical expects {'1min': tensor})
+        data_dict = {'1min': x_tensor}
+
+        # Step 5: Get current index and price
+        current_idx = len(features_df) - 1
+        current_price = float(features_df.iloc[-1]['tsla_close'])
+
+        # Step 6: Call hierarchical ensemble predict
+        predictions = hierarchical_ensemble.predict(
+            data=data_dict,
+            features_df=features_df,
+            current_idx=current_idx,
+            timestamp=datetime.now()
+        )
+
+        # Step 7: Format result for dashboard
+        from src.ml.model import percentage_to_absolute
+
+        pred_high = float(predictions['predicted_high'])
+        pred_low = float(predictions['predicted_low'])
+        pred_center = (pred_high + pred_low) / 2
+        pred_range = pred_high - pred_low
+
+        result = {
+            'model': 'hierarchical',
+            'timestamp': datetime.now(),
+            'data_status': status,
+            'current_price': current_price,
+            'predicted_high_pct': pred_high,
+            'predicted_low_pct': pred_low,
+            'predicted_center_pct': pred_center,
+            'predicted_range_pct': pred_range,
+            'predicted_high_price': float(percentage_to_absolute(pred_high, current_price)),
+            'predicted_low_price': float(percentage_to_absolute(pred_low, current_price)),
+            'predicted_center_price': float(percentage_to_absolute(pred_center, current_price)),
+            'confidence': float(predictions['confidence']),
+            'sub_predictions': predictions.get('sub_predictions', {}),  # Layer predictions
+            'fusion_weights': predictions.get('fusion_weights', {}),
+            'features_dict': features_df.iloc[-1].to_dict(),  # For channel context
+            'prediction_window': '30 minutes'
+        }
+
+        return result, None
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, str(e)
+
+
 def should_update_prediction(model_name: str, cache: PredictionCache) -> bool:
     """Check if it's time to update this model's prediction."""
     now = datetime.now()
@@ -330,6 +437,9 @@ def should_update_prediction(model_name: str, cache: PredictionCache) -> bool:
     elif model_name == 'ensemble':
         # Ensemble updates hourly (same as 1-hour model)
         return now.minute == 0
+    elif model_name == 'hierarchical':
+        # Hierarchical updates every 30 minutes (fast layer schedule)
+        return now.minute % 30 == 0
     else:
         return False
 
@@ -423,6 +533,22 @@ def prediction_scheduler_thread(selected_models, alert_threshold):
                         # Make ensemble prediction
                         ensemble = GLOBAL_MODELS['ensemble']
                         prediction, error = make_ensemble_prediction(ensemble, feature_extractor)
+
+                    elif model_name == 'hierarchical':
+                        # Special handling for hierarchical
+                        # Load hierarchical if not already loaded
+                        if 'hierarchical' not in GLOBAL_MODELS:
+                            hierarchical_ensemble, error = load_hierarchical_for_dashboard()
+                            if hierarchical_ensemble:
+                                GLOBAL_MODELS['hierarchical'] = hierarchical_ensemble
+                                print(f"✓ Loaded hierarchical model for background predictions")
+                            else:
+                                print(f"✗ Failed to load hierarchical: {error}")
+                                continue
+
+                        # Make hierarchical prediction
+                        hierarchical_ensemble = GLOBAL_MODELS['hierarchical']
+                        prediction, error = make_hierarchical_prediction(hierarchical_ensemble, feature_extractor)
 
                     else:
                         # Regular model handling
@@ -518,7 +644,8 @@ def main():
     model_1hour = st.sidebar.checkbox("1hour Model (1.41% error)", value=True)
     model_4hour = st.sidebar.checkbox("4hour Model (2.21% error)", value=False)
     model_daily = st.sidebar.checkbox("Daily Model (11.96% error)", value=False)
-    model_ensemble = st.sidebar.checkbox("Ensemble (preliminary)", value=False)
+    model_ensemble = st.sidebar.checkbox("Ensemble (4 models + Meta-LNN)", value=False)
+    model_hierarchical = st.sidebar.checkbox("Hierarchical LNN (3-layer: Fast/Medium/Slow) ⭐", value=False)
 
     selected_models = []
     if model_15min:
@@ -531,6 +658,8 @@ def main():
         selected_models.append('daily')
     if model_ensemble:
         selected_models.append('ensemble')
+    if model_hierarchical:
+        selected_models.append('hierarchical')
 
     # Alert settings
     st.sidebar.subheader("Alerts")
@@ -716,12 +845,125 @@ def render_ensemble_prediction(alert_threshold: float):
     st.markdown("---")
 
 
+def render_hierarchical_prediction(alert_threshold: float):
+    """Render hierarchical LNN prediction card with layer breakdown."""
+    st.subheader("🔮 HIERARCHICAL LNN (3-Layer: Fast/Medium/Slow)")
+
+    # Get cached prediction
+    cached = GLOBAL_PREDICTION_CACHE.get('hierarchical')
+
+    if cached is None:
+        st.info("⏳ Waiting for first prediction... (updates every 30 min)")
+        return
+
+    # Display main prediction
+    col1, col2, col3 = st.columns([2, 2, 1])
+
+    with col1:
+        st.markdown(f"**Predicted High:** ${cached['predicted_high_price']:.2f} ({cached['predicted_high_pct']:+.1f}%)")
+        st.markdown(f"**Predicted Low:** ${cached['predicted_low_price']:.2f} ({cached['predicted_low_pct']:+.1f}%)")
+
+    with col2:
+        conf_pct = cached['confidence'] * 100
+        st.markdown(f"**Confidence:** {conf_pct:.0f}%")
+
+        if conf_pct > 75:
+            st.progress(conf_pct / 100, "🟢 High")
+        elif conf_pct > 50:
+            st.progress(conf_pct / 100, "🟡 Medium")
+        else:
+            st.progress(conf_pct / 100, "🔴 Low")
+
+    with col3:
+        seconds_until = GLOBAL_PREDICTION_CACHE.get_time_until_update('hierarchical')
+        if seconds_until:
+            minutes = int(seconds_until // 60)
+            secs = int(seconds_until % 60)
+            st.markdown(f"**Next update:**")
+            st.markdown(f"`{minutes:02d}:{secs:02d}`")
+
+    st.caption(f"Last updated: {cached['timestamp'].strftime('%H:%M:%S')} | "
+               f"Data: {cached['data_status']} | "
+               f"Window: {cached['prediction_window']}")
+
+    # Alert indicator
+    if cached['confidence'] > alert_threshold:
+        st.success(f"✅ Alert sent (confidence > {alert_threshold:.0%})")
+
+    # Show layer predictions breakdown
+    with st.expander("📊 Layer Predictions (Fast/Medium/Slow)"):
+        layer_preds = cached.get('sub_predictions', {})
+
+        if layer_preds:
+            st.markdown("**Individual layer predictions:**")
+
+            for layer in ['fast', 'medium', 'slow']:
+                if layer in layer_preds:
+                    lp = layer_preds[layer]
+                    col1, col2, col3 = st.columns([1, 2, 1])
+
+                    with col1:
+                        emoji = "⚡" if layer == 'fast' else "🔄" if layer == 'medium' else "🐢"
+                        st.markdown(f"**{emoji} {layer.capitalize()}:**")
+
+                    with col2:
+                        st.markdown(f"High: {lp['predicted_high']:+.2f}%, Low: {lp['predicted_low']:+.2f}%")
+
+                    with col3:
+                        st.markdown(f"Conf: {lp['confidence']:.2f}")
+
+            # Show fusion weights
+            fusion_weights = cached.get('fusion_weights', {})
+            if fusion_weights and len(fusion_weights) == 3:
+                st.markdown("\n**Fusion weights (how much each layer contributes):**")
+                st.markdown(f"- ⚡ Fast: {fusion_weights[0]:.1%}")
+                st.markdown(f"- 🔄 Medium: {fusion_weights[1]:.1%}")
+                st.markdown(f"- 🐢 Slow: {fusion_weights[2]:.1%}")
+        else:
+            st.info("No layer predictions available")
+
+    # Channel context (already added in earlier commit)
+    with st.expander("📊 Channel Context (1H Timeframe)"):
+        features_dict = cached.get('features_dict', {})
+
+        channel_slope_pct = features_dict.get('tsla_channel_1h_slope_pct', 0.0)
+        channel_position = features_dict.get('tsla_channel_1h_position', 0.5)
+        ping_pongs = features_dict.get('tsla_channel_1h_ping_pongs', 0)
+        r_squared = features_dict.get('tsla_channel_1h_r_squared', 0.0)
+
+        # Direction indicator
+        if abs(channel_slope_pct) > 0.2:
+            emoji = "📈" if channel_slope_pct > 0 else "📉"
+            strength = "Strong"
+        elif abs(channel_slope_pct) > 0.1:
+            emoji = "↗️" if channel_slope_pct > 0 else "↘️"
+            strength = "Moderate"
+        else:
+            emoji = "➡️"
+            strength = "Sideways"
+
+        direction_text = "Bullish" if channel_slope_pct > 0 else "Bearish" if channel_slope_pct < 0 else "Ranging"
+
+        st.markdown(f"{emoji} **{strength} {direction_text} Channel**")
+        st.markdown(f"- Slope: `{channel_slope_pct:+.2f}% per bar`")
+        st.markdown(f"- Position in channel: `{channel_position:.2f}` (0=bottom, 1=top)")
+        st.markdown(f"- Ping-pongs: `{ping_pongs}` bounces")
+        st.markdown(f"- Channel quality (R²): `{r_squared:.3f}`")
+
+    st.markdown("---")
+
+
 def render_model_prediction(model_name: str, alert_threshold: float):
     """Render prediction card for one model."""
 
     # Route ensemble to special renderer
     if model_name == 'ensemble':
         render_ensemble_prediction(alert_threshold)
+        return
+
+    # Route hierarchical to special renderer
+    if model_name == 'hierarchical':
+        render_hierarchical_prediction(alert_threshold)
         return
 
     st.subheader(f"🔮 {model_name.upper()} Model")
