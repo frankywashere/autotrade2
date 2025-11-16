@@ -22,7 +22,7 @@ from .base import FeatureExtractor
 from .channel_features import ChannelFeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.9"  # Added event-driven volatility features (469 → 473 features)
+FEATURE_VERSION = "v3.10"  # Expanded event window to ±14 days (was ±7)
 
 
 def _check_gpu_available() -> tuple:
@@ -178,10 +178,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             'is_monday',
             'is_friday',
             'is_volatile_now',
-            'is_earnings_week',          # v3.9: Within ±7 days of earnings/delivery
-            'days_until_earnings',       # v3.9: -7 to +7 days (0 = day of)
-            'days_until_fomc',           # v3.9: -7 to +7 days (0 = day of)
-            'is_high_impact_event'       # v3.9: Earnings/FOMC/Delivery within 3 days
+            'is_earnings_week',          # v3.10: Within ±14 days of earnings/delivery
+            'days_until_earnings',       # v3.10: -14 to +14 days (0 = day of)
+            'days_until_fomc',           # v3.10: -14 to +14 days (0 = day of)
+            'is_high_impact_event'       # v3.10: Earnings/FOMC/Delivery within 3 days
         ])
 
         # In-channel binary flags
@@ -1262,8 +1262,9 @@ class TradingFeatureExtractor(FeatureExtractor):
                 date_str = timestamp.strftime('%Y-%m-%d')
 
                 try:
-                    # Get events within ±7 days
-                    events = events_handler.get_events_for_date(date_str, lookback_days=7)
+                    # Get events within configured window (±14 days by default)
+                    import config as cfg
+                    events = events_handler.get_events_for_date(date_str, lookback_days=cfg.EVENT_LOOKBACK_DAYS)
 
                     if events:
                         # Find closest earnings event
@@ -1272,7 +1273,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                             # Get closest earnings
                             closest_earnings = min(earnings_events, key=lambda e: abs(e['days_until']))
                             days_until_earnings[idx] = closest_earnings['days_until']
-                            is_earnings_week[idx] = float(abs(closest_earnings['days_until']) <= 7)
+                            is_earnings_week[idx] = float(abs(closest_earnings['days_until']) <= cfg.EVENT_LOOKBACK_DAYS)
 
                         # Find closest FOMC event
                         fomc_events = [e for e in events if e['event_type'] == 'fomc']
