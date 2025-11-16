@@ -186,7 +186,7 @@ def create_channel_chart(price_df, features_dict, timeframe='1h', lookback=168):
 
     # Mark current position
     fig.add_trace(go.Scatter(
-        x=[dates.iloc[-1]],
+        x=[dates[-1]],  # DatetimeIndex uses [-1] not .iloc[-1]
         y=[current_price],
         mode='markers',
         name='Current Price',
