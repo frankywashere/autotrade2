@@ -84,8 +84,8 @@ USE_NEWS_FEATURES = True
 # Event Settings
 TSLA_EVENTS_FILE = DATA_DIR / "tsla_events_REAL.csv"  # Complete earnings/deliveries + macro events (483 events, 2015-2025)
 MACRO_EVENTS_API_KEY = os.getenv("MACRO_API_KEY", "")  # For FRED/economic calendar
-EVENT_LOOKBACK_DAYS = 7  # Days before/after event to analyze
-EVENT_LOOKAHEAD_DAYS = 7
+EVENT_LOOKBACK_DAYS = 14  # Days before/after event to analyze (expanded for better pattern detection)
+EVENT_LOOKAHEAD_DAYS = 14
 
 # Prediction Settings
 PREDICTION_HORIZON_HOURS = 24  # Forecast 24 hours ahead

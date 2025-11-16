@@ -1,0 +1,38 @@
+{
+  "train_losses": [
+    0.8599880483814722
+  ],
+  "val_losses": [
+    1.4979090509290414
+  ],
+  "val_errors": [
+    0.3373504170406622
+  ],
+  "best_val_loss": 1.4979090509290414,
+  "total_epochs": 1,
+  "args": {
+    "input_timeframe": "1min",
+    "sequence_length": 200,
+    "prediction_horizon": 24,
+    "train_start_year": 2015,
+    "train_end_year": 2022,
+    "val_split": 0.1,
+    "hidden_size": 128,
+    "internal_neurons_ratio": 2.0,
+    "downsample_fast_to_medium": 5,
+    "downsample_medium_to_slow": 12,
+    "epochs": 1,
+    "batch_size": 128,
+    "lr": 0.001,
+    "patience": 10,
+    "preload": false,
+    "device": "mps",
+    "num_workers": 2,
+    "output": "models/hierarchical_lnn.pth",
+    "config": "config/hierarchical_config.yaml",
+    "multi_task": true,
+    "interactive": true,
+    "regenerate_cache": true,
+    "use_gpu_features": false
+  }
+}
