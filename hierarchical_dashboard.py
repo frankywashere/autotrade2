@@ -196,30 +196,38 @@ def main():
     st.sidebar.caption(f"Model: Hierarchical LNN v3.10")
 
     # Load data and extract features
-    with st.spinner("Fetching live data and extracting features..."):
-        # Load 1-min data
-        data_feed = CSVDataFeed(timeframe='1min')
-        df = data_feed.load_aligned_data(
-            start_date=(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
-            end_date=datetime.now().strftime('%Y-%m-%d')
-        )
+    try:
+        with st.spinner("Fetching live data from yfinance..."):
+            # Use HybridLiveDataFeed for live predictions
+            from src.ml.live_data_feed import HybridLiveDataFeed
 
-        if len(df) < 200:
-            st.error(f"❌ Insufficient data: {len(df)} bars (need 200)")
-            st.stop()
+            feed = HybridLiveDataFeed(symbols=['TSLA', 'SPY'])
+            df = feed.fetch_for_prediction()  # Gets 7 days of 1-min data
 
-        # Extract features
-        extractor = TradingFeatureExtractor()
+            if len(df) < 200:
+                st.error(f"❌ Insufficient data: {len(df)} bars (need 200)")
+                st.info("Market may be closed or data unavailable")
+                st.stop()
 
-        # Create events handler
-        try:
-            events_handler = CombinedEventsHandler()
-        except:
-            events_handler = None
+        with st.spinner("Extracting 473 features..."):
+            # Extract features
+            extractor = TradingFeatureExtractor()
 
-        features_df = extractor.extract_features(df, use_cache=True, events_handler=events_handler)
+            # Create events handler
+            try:
+                events_handler = CombinedEventsHandler()
+            except:
+                events_handler = None
 
-        current_price = float(features_df.iloc[-1]['tsla_close'])
+            features_df = extractor.extract_features(df, use_cache=True, events_handler=events_handler)
+
+            current_price = float(features_df.iloc[-1]['tsla_close'])
+
+    except Exception as e:
+        st.error(f"❌ Data loading failed: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        st.stop()
 
     st.sidebar.info(f"💰 Current: ${current_price:.2f}")
     st.sidebar.caption(f"Data: {len(features_df):,} bars")
