@@ -188,10 +188,21 @@ class CSVDataFeed(DataFeed):
         # Merge into single DataFrame
         aligned_df = pd.concat([spy_aligned, tsla_aligned], axis=1)
 
-        # Final validation of merged data
         print("  🔍 Validating merged data...")
-        if not self.validate_data(aligned_df):
-            raise ValueError("Merged data validation failed - check terminal output above for details")
+
+        # Extract and validate SPY subset
+        spy_cols = [c for c in aligned_df.columns if c.startswith('spy_')]
+        spy_data = aligned_df[spy_cols].copy()
+        spy_data.columns = [c.replace('spy_', '') for c in spy_data.columns]
+        if not self.validate_data(spy_data):
+            raise ValueError("SPY merged data validation failed - check terminal output above")
+
+        # Extract and validate TSLA subset
+        tsla_cols = [c for c in aligned_df.columns if c.startswith('tsla_')]
+        tsla_data = aligned_df[tsla_cols].copy()
+        tsla_data.columns = [c.replace('tsla_', '') for c in tsla_data.columns]
+        if not self.validate_data(tsla_data):
+            raise ValueError("TSLA merged data validation failed - check terminal output above")
 
         return aligned_df
 
