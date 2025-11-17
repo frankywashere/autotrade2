@@ -639,10 +639,12 @@ class TradingFeatureExtractor(FeatureExtractor):
             'duration': np.zeros(num_original_rows)  # v3.11: Actual bars where channel holds
         }
 
-        # Calculate channel at each timestamp (no inner progress bar to avoid conflicts)
+        # Calculate channel at each timestamp
         bar_range = range(lookback, len(resampled_df))
+        progress_desc = f"      CPU: {symbol} {tf_name}"
+        bar_range_tqdm = tqdm(bar_range, desc=progress_desc, leave=False, position=2, ncols=80, ascii=True)
 
-        for i in bar_range:
+        for i in bar_range_tqdm:
             try:
                 # Get available data up to this point
                 available_window = resampled_df.iloc[:i]
@@ -938,8 +940,10 @@ class TradingFeatureExtractor(FeatureExtractor):
         num_windows = len(prices) - lookback
         num_batches = (num_windows + batch_size - 1) // batch_size
 
-        # GPU processing (no progress bar to avoid conflicts)
-        for batch_idx in range(num_batches):
+        # GPU processing
+        progress_desc = f"      GPU: {symbol} {tf_name}"
+        batch_range = tqdm(range(num_batches), desc=progress_desc, leave=False, position=2, ncols=80, ascii=True)
+        for batch_idx in batch_range:
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, num_windows)
 
