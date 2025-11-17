@@ -10,6 +10,8 @@ from typing import Dict, List, Tuple
 from pathlib import Path
 import sys
 from tqdm import tqdm
+from joblib import Parallel, delayed
+import multiprocessing as mp
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent.parent
@@ -22,7 +24,7 @@ from .base import FeatureExtractor
 from .channel_features import ChannelFeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.11"  # Dynamic channel duration detection (473 → 495 features)
+FEATURE_VERSION = "v3.12"  # Added joblib parallelization for channel calculations
 
 
 def _check_gpu_available() -> tuple:
@@ -507,80 +509,136 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   ⏱️  Estimated time: ~{total_calcs * 2.5:.0f} minutes")
             print(f"   💡 Results will be cached for instant loading next time")
 
-        calc_progress = tqdm(total=total_calcs, desc="   Rolling channels (SPY + TSLA)", ncols=80, leave=False, position=1, ascii=True)
+        # Determine whether to use parallel processing
+        n_cores = mp.cpu_count()
+        # Check config setting and other conditions
+        parallel_enabled = config.PARALLEL_CHANNEL_CALC if hasattr(config, 'PARALLEL_CHANNEL_CALC') else True
+        use_parallel = parallel_enabled and not use_gpu and n_cores > 2 and total_calcs >= 8 and not is_live_mode  # Don't parallelize live mode
 
-        for symbol in ['tsla', 'spy']:
-            for tf_name, tf_rule in timeframes.items():
-                # HYBRID DATA SELECTION: Use appropriate resolution for live mode
+        if use_parallel:
+            # Use joblib for parallel processing
+            n_jobs = min(n_cores - 1, 8, total_calcs)  # Use up to 8 cores, leave 1 free
+            print(f"   🚀 Using {n_jobs} CPU cores for parallel channel calculation")
+
+            # Build task list
+            tasks = []
+            for symbol in ['tsla', 'spy']:
+                # Get symbol data once
                 if is_live_mode:
-                    # Live mode: Get data from appropriate resolution
-                    if tf_name in ['5min', '15min', '30min']:
-                        # Use 1-min data (sufficient history)
-                        source_data = multi_res_data['1min']
-                    elif tf_name in ['1h', '2h', '3h', '4h']:
-                        # Use hourly data (2 years of history)
-                        source_data = multi_res_data['1hour']
-                    else:  # daily, weekly, monthly, 3month
-                        # Use daily data (max history)
-                        source_data = multi_res_data['daily']
-
-                    # Extract symbol columns
-                    symbol_df = source_data[[c for c in source_data.columns if c.startswith(f'{symbol}_')]].copy()
+                    # Handle live mode data sources
+                    symbol_data_dict = {}
+                    for tf_name in timeframes.keys():
+                        if tf_name in ['5min', '15min', '30min']:
+                            source_data = multi_res_data['1min']
+                        elif tf_name in ['1h', '2h', '3h', '4h']:
+                            source_data = multi_res_data['1hour']
+                        else:
+                            source_data = multi_res_data['daily']
+                        symbol_data_dict[tf_name] = source_data[[c for c in source_data.columns if c.startswith(f'{symbol}_')]].copy()
                 else:
-                    # Training mode: Use input dataframe
-                    symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
+                    # Training mode: use same data for all timeframes
+                    symbol_df_base = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
+                    symbol_df_base.columns = [c.replace(f'{symbol}_', '') for c in symbol_df_base.columns]
 
-                symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
+                for tf_name, tf_rule in timeframes.items():
+                    if is_live_mode:
+                        symbol_df = symbol_data_dict[tf_name].copy()
+                        symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
+                    else:
+                        symbol_df = symbol_df_base.copy()
 
-                # Resample to target timeframe
-                resampled = symbol_df.resample(tf_rule).agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'volume': 'sum'
-                }).dropna()
+                    base_lookback = min(168, len(df) // 2)
+                    tasks.append((symbol, tf_name, tf_rule, symbol_df, base_lookback, df.index, is_live_mode))
 
-                prefix = f'{symbol}_channel'
+            # Execute in parallel with progress bar
+            print(f"   Processing {len(tasks)} channel calculations in parallel...")
+            results = Parallel(n_jobs=n_jobs, backend='loky', verbose=10)(
+                delayed(self._calculate_single_channel_task)(task) for task in tasks
+            )
 
-                if len(resampled) < 20:
-                    # Not enough data - fill with zeros for ALL channel features
-                    for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'slope_pct', 'stability',
-                                 'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
-                                 'r_squared', 'is_bull', 'is_bear', 'is_sideways', 'duration']:
-                        channel_features[f'{prefix}_{tf_name}_{feat}'] = np.zeros(num_rows)
+            # Aggregate results
+            channel_features = {}
+            for symbol, tf_name, task_results in results:
+                channel_features.update(task_results)
+
+        else:
+            # Original sequential processing (for GPU mode or small datasets)
+            calc_progress = tqdm(total=total_calcs, desc="   Rolling channels (SPY + TSLA)", ncols=80, leave=False, position=1, ascii=True)
+
+            channel_features = {}  # Initialize for sequential mode
+
+            for symbol in ['tsla', 'spy']:
+                for tf_name, tf_rule in timeframes.items():
+                    # HYBRID DATA SELECTION: Use appropriate resolution for live mode
+                    if is_live_mode:
+                        # Live mode: Get data from appropriate resolution
+                        if tf_name in ['5min', '15min', '30min']:
+                            # Use 1-min data (sufficient history)
+                            source_data = multi_res_data['1min']
+                        elif tf_name in ['1h', '2h', '3h', '4h']:
+                            # Use hourly data (2 years of history)
+                            source_data = multi_res_data['1hour']
+                        else:  # daily, weekly, monthly, 3month
+                            # Use daily data (max history)
+                            source_data = multi_res_data['daily']
+
+                        # Extract symbol columns
+                        symbol_df = source_data[[c for c in source_data.columns if c.startswith(f'{symbol}_')]].copy()
+                    else:
+                        # Training mode: Use input dataframe
+                        symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
+
+                    symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
+
+                    # Resample to target timeframe
+                    resampled = symbol_df.resample(tf_rule).agg({
+                        'open': 'first',
+                        'high': 'max',
+                        'low': 'min',
+                        'close': 'last',
+                        'volume': 'sum'
+                    }).dropna()
+
+                    prefix = f'{symbol}_channel'
+
+                    if len(resampled) < 20:
+                        # Not enough data - fill with zeros for ALL channel features
+                        for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'slope_pct', 'stability',
+                                     'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
+                                     'r_squared', 'is_bull', 'is_bear', 'is_sideways', 'duration']:
+                            channel_features[f'{prefix}_{tf_name}_{feat}'] = np.zeros(num_rows)
+                        calc_progress.update(1)
+                        continue
+
+                    # ROLLING CHANNEL CALCULATION (GPU or CPU)
+                    # Use dynamic window sizing based on volatility
+                    base_lookback = min(168, len(resampled) // 2)
+                    if use_gpu:
+                        # GPU: use fixed base lookback for batching efficiency
+                        lookback = base_lookback
+                    else:
+                        # CPU: calculate dynamic lookback per timestamp
+                        lookback = base_lookback  # Will be overridden per timestamp  # Use half of data or 168, whichever is smaller
+
+                    if use_gpu:
+                        # GPU-accelerated calculation
+                        _, device_type = _check_gpu_available()
+                        rolling_results = self._calculate_rolling_channels_gpu(
+                            resampled, lookback, tf_name, symbol, df.index, device=device_type
+                        )
+                    else:
+                        # CPU calculation (original implementation)
+                        rolling_results = self._calculate_rolling_channels(
+                            resampled, lookback, tf_name, symbol, df.index
+                        )
+
+                    # Store rolling results (each row has unique values!)
+                    for feat_name, values in rolling_results.items():
+                        channel_features[f'{prefix}_{tf_name}_{feat_name}'] = values
+
                     calc_progress.update(1)
-                    continue
 
-                # ROLLING CHANNEL CALCULATION (GPU or CPU)
-                # Use dynamic window sizing based on volatility
-                base_lookback = min(168, len(resampled) // 2)
-                if use_gpu:
-                    # GPU: use fixed base lookback for batching efficiency
-                    lookback = base_lookback
-                else:
-                    # CPU: calculate dynamic lookback per timestamp
-                    lookback = base_lookback  # Will be overridden per timestamp  # Use half of data or 168, whichever is smaller
-
-                if use_gpu:
-                    # GPU-accelerated calculation
-                    _, device_type = _check_gpu_available()
-                    rolling_results = self._calculate_rolling_channels_gpu(
-                        resampled, lookback, tf_name, symbol, df.index, device=device_type
-                    )
-                else:
-                    # CPU calculation (original implementation)
-                    rolling_results = self._calculate_rolling_channels(
-                        resampled, lookback, tf_name, symbol, df.index
-                    )
-
-                # Store rolling results (each row has unique values!)
-                for feat_name, values in rolling_results.items():
-                    channel_features[f'{prefix}_{tf_name}_{feat_name}'] = values
-
-                calc_progress.update(1)
-
-        calc_progress.close()
+            calc_progress.close()
 
         result_df = pd.DataFrame(channel_features, index=df.index)
 
@@ -596,6 +654,53 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   ✓ Cache saved successfully")
 
         return result_df
+
+    def _calculate_single_channel_task(self, args):
+        """
+        Calculate channels for a single (symbol, timeframe) pair.
+        This is the parallelizable unit of work for joblib.
+
+        Args:
+            args: Tuple of (symbol, tf_name, tf_rule, symbol_df, lookback, original_index, is_live_mode)
+
+        Returns:
+            Tuple of (symbol, tf_name, results_dict)
+        """
+        symbol, tf_name, tf_rule, symbol_df, lookback, original_index, is_live_mode = args
+
+        # Resample to target timeframe
+        resampled = symbol_df.resample(tf_rule).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+
+        prefix = f'{symbol}_channel'
+        num_rows = len(original_index)
+
+        # Handle insufficient data
+        if len(resampled) < 20:
+            # Not enough data - fill with zeros for ALL channel features
+            results = {}
+            for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'slope_pct', 'stability',
+                         'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
+                         'r_squared', 'is_bull', 'is_bear', 'is_sideways', 'duration']:
+                results[f'{prefix}_{tf_name}_{feat}'] = np.zeros(num_rows)
+            return (symbol, tf_name, results)
+
+        # Calculate rolling channels (CPU only for parallel mode)
+        rolling_results = self._calculate_rolling_channels(
+            resampled, lookback, tf_name, symbol, original_index
+        )
+
+        # Format results
+        results = {}
+        for feat_name, values in rolling_results.items():
+            results[f'{prefix}_{tf_name}_{feat_name}'] = values
+
+        return (symbol, tf_name, results)
 
     def _calculate_rolling_channels(
         self,

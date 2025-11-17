@@ -522,6 +522,47 @@ def interactive_setup(args):
         args.use_gpu_features = False
         print(f"⚡ GPU Acceleration: Not Available (CPU will be used)")
 
+    # Parallel Processing option (for CPU mode)
+    print()
+    import multiprocessing as mp
+    n_cores = mp.cpu_count()
+
+    # Only show parallel option if:
+    # 1. Not using GPU (GPU and parallel are incompatible)
+    # 2. Have more than 2 cores
+    # 3. Will be calculating features (not just loading cache)
+    show_parallel = not args.use_gpu_features and n_cores > 2 and not will_use_cache
+
+    if show_parallel:
+        print(f"🚀 Parallel Processing Available: {n_cores} CPU cores detected")
+
+        args.use_parallel = inquirer.select(
+            message="Use parallel processing for channel calculations? (CPU mode)",
+            choices=[
+                Choice(True, f"Yes - Use up to {min(n_cores-1, 8)} cores (5-8x faster) 🚀"),
+                Choice(False, "No - Sequential processing (uses less memory) 💾")
+            ],
+            default=True
+        ).execute()
+
+        if args.use_parallel:
+            cores_to_use = min(n_cores - 1, 8)
+            print(f"   ✓ Will use {cores_to_use} CPU cores for parallel channel calculation")
+            print(f"   ℹ️  Expected speedup: ~{cores_to_use-1}x to {cores_to_use}x faster")
+        else:
+            print(f"   💾 Will use sequential processing (single core)")
+    else:
+        args.use_parallel = False
+        if args.use_gpu_features:
+            # GPU mode - parallel not compatible
+            pass  # GPU already selected, no message needed
+        elif will_use_cache:
+            # Will load from cache - no calculation needed
+            pass  # Cache loading, no message needed
+        else:
+            # Less than 3 cores
+            print(f"🚀 Parallel Processing: Not available (only {n_cores} cores detected)")
+
     # Model parameters
     print()
 
@@ -795,6 +836,12 @@ def main():
 
     # Use GPU if enabled (from interactive menu or auto-detect)
     use_gpu = getattr(args, 'use_gpu_features', 'auto')
+
+    # Set parallel processing option in config if specified
+    if hasattr(args, 'use_parallel'):
+        import config
+        config.PARALLEL_CHANNEL_CALC = args.use_parallel
+
     features_df, continuation_df = extractor.extract_features(
         df,
         use_cache=use_cache,
