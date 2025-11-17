@@ -639,13 +639,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             'duration': np.zeros(num_original_rows)  # v3.11: Actual bars where channel holds
         }
 
-        # Calculate channel at each timestamp with progress bar
+        # Calculate channel at each timestamp (no inner progress bar to avoid conflicts)
         bar_range = range(lookback, len(resampled_df))
-        bar_progress = tqdm(bar_range, desc=f"      {symbol.upper()} {tf_name}",
-                            leave=False, position=2, ncols=100,
-                            disable=len(bar_range) < 100)  # Skip progress bar for short timeframes
 
-        for i in bar_progress:
+        for i in bar_range:
             try:
                 # Get available data up to this point
                 available_window = resampled_df.iloc[:i]
@@ -941,11 +938,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         num_windows = len(prices) - lookback
         num_batches = (num_windows + batch_size - 1) // batch_size
 
-        # Progress bar for GPU processing
-        with tqdm(total=num_batches, desc=f"      {symbol.upper()} {tf_name} (GPU)",
-                  leave=False, position=2, ncols=100) as pbar:
-
-            for batch_idx in range(num_batches):
+        # GPU processing (no progress bar to avoid conflicts)
+        for batch_idx in range(num_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, num_windows)
 
@@ -1057,8 +1051,6 @@ class TradingFeatureExtractor(FeatureExtractor):
                 except Exception as e:
                     print(f"      ⚠️  GPU batch {batch_idx} failed ({e}), skipping...")
                     continue
-
-                pbar.update(1)
 
         return results
 
