@@ -28,34 +28,49 @@ class HierarchicalDataset(Dataset):
     Lazy loading dataset for hierarchical training.
 
     Loads 1-min data on-demand, caches column indices for performance.
+    Now includes raw OHLC data and continuation prediction labels.
     """
 
     def __init__(
         self,
         features_df: pd.DataFrame,
+        raw_ohlc_df: pd.DataFrame = None,
+        continuation_labels_df: pd.DataFrame = None,
         sequence_length: int = 200,
         prediction_horizon: int = 24,
         mode: str = 'uniform_bars',
-        cache_indices: bool = True
+        cache_indices: bool = True,
+        include_continuation: bool = False
     ):
         """
         Initialize dataset.
 
         Args:
-            features_df: Features dataframe with 299 columns
+            features_df: Features dataframe with 495+ columns
+            raw_ohlc_df: Raw OHLC data for input sequences
+            continuation_labels_df: DataFrame with continuation labels
             sequence_length: Input sequence length (200 1-min bars)
             prediction_horizon: How many bars ahead to predict (24 = 24 minutes)
             mode: 'uniform_bars' (fixed # bars ahead)
             cache_indices: Cache column lookups for speed
+            include_continuation: Whether to include continuation prediction targets
         """
         self.features_df = features_df
+        self.raw_ohlc_df = raw_ohlc_df
+        self.continuation_labels_df = continuation_labels_df
         self.sequence_length = sequence_length
         self.prediction_horizon = prediction_horizon
         self.mode = mode
+        self.include_continuation = include_continuation
 
         # Convert to numpy for speed
         self.features_array = features_df.values
         self.timestamps = features_df.index.values
+
+        if raw_ohlc_df is not None:
+            self.raw_ohlc_array = raw_ohlc_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
+        else:
+            self.raw_ohlc_array = None
 
         # Cache column indices (CRITICAL for performance)
         if cache_indices:
@@ -174,8 +189,27 @@ class HierarchicalDataset(Dataset):
             'hit_band': torch.tensor(hit_band_label, dtype=torch.float32),
             'hit_target': torch.tensor(hit_target_label, dtype=torch.float32),
             'expected_return': torch.tensor(expected_return_label, dtype=torch.float32),
-            'overshoot': torch.tensor(overshoot_label, dtype=torch.float32)
+            'overshoot': torch.tensor(overshoot_label, dtype=torch.float32),
+            'continuation_duration': torch.tensor(0.0, dtype=torch.float32),  # Placeholder
+            'continuation_gain': torch.tensor(0.0, dtype=torch.float32),     # Placeholder
+            'continuation_confidence': torch.tensor(0.5, dtype=torch.float32) # Placeholder
         }
+
+        # Add continuation prediction targets if enabled
+        if self.include_continuation and self.continuation_labels_df is not None:
+            try:
+                # Find continuation label for this timestamp
+                ts = pd.Timestamp(self.timestamps[seq_end - 1])
+                cont_row = self.continuation_labels_df[self.continuation_labels_df['timestamp'] == ts]
+                if not cont_row.empty:
+                    targets['continuation_duration'] = torch.tensor(cont_row['duration_hours'].iloc[0], dtype=torch.float32)
+                    targets['continuation_gain'] = torch.tensor(cont_row['projected_gain'].iloc[0], dtype=torch.float32)
+                    targets['continuation_confidence'] = torch.tensor(cont_row['confidence'].iloc[0], dtype=torch.float32)
+            except:
+                # Fallback values
+                targets['continuation_duration'] = torch.tensor(0.0, dtype=torch.float32)
+                targets['continuation_gain'] = torch.tensor(0.0, dtype=torch.float32)
+                targets['continuation_confidence'] = torch.tensor(0.5, dtype=torch.float32)
 
         return x_tensor, targets
 
@@ -281,6 +315,8 @@ class PreloadHierarchicalDataset(Dataset):
     def __init__(
         self,
         features_df: pd.DataFrame,
+        raw_ohlc_df: pd.DataFrame = None,
+        continuation_labels_df: pd.DataFrame = None,
         sequence_length: int = 200,
         prediction_horizon: int = 24,
         mode: str = 'uniform_bars'
@@ -295,10 +331,13 @@ class PreloadHierarchicalDataset(Dataset):
         # Create lazy dataset first
         lazy_dataset = HierarchicalDataset(
             features_df,
+            raw_ohlc_df,
+            continuation_labels_df,
             sequence_length,
             prediction_horizon,
             mode,
-            cache_indices=True
+            cache_indices=True,
+            include_continuation=continuation_labels_df is not None
         )
 
         # Preload all samples
@@ -312,7 +351,10 @@ class PreloadHierarchicalDataset(Dataset):
             'hit_band': torch.zeros(num_samples, dtype=torch.float32),
             'hit_target': torch.zeros(num_samples, dtype=torch.float32),
             'expected_return': torch.zeros(num_samples, dtype=torch.float32),
-            'overshoot': torch.zeros(num_samples, dtype=torch.float32)
+            'overshoot': torch.zeros(num_samples, dtype=torch.float32),
+            'continuation_duration': torch.zeros(num_samples, dtype=torch.float32),
+            'continuation_gain': torch.zeros(num_samples, dtype=torch.float32),
+            'continuation_confidence': torch.zeros(num_samples, dtype=torch.float32)
         }
 
         print(f"Loading {num_samples} sequences...")
@@ -343,11 +385,14 @@ class PreloadHierarchicalDataset(Dataset):
 
 def create_hierarchical_dataset(
     features_df: pd.DataFrame,
+    raw_ohlc_df: pd.DataFrame = None,
+    continuation_labels_df: pd.DataFrame = None,
     sequence_length: int = 200,
     prediction_horizon: int = 24,
     mode: str = 'uniform_bars',
     preload: bool = False,
-    validation_split: Optional[float] = None
+    validation_split: Optional[float] = None,
+    include_continuation: bool = False
 ) -> Tuple[Dataset, Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -373,19 +418,38 @@ def create_hierarchical_dataset(
 
         print(f"Split data: {len(train_df)} train, {len(val_df)} val")
 
+        # Split continuation labels if provided
+        train_continuation_df = None
+        val_continuation_df = None
+        if continuation_labels_df is not None:
+            # Split continuation labels by timestamp
+            split_timestamp = train_df.index[-1]
+            train_continuation_df = continuation_labels_df[
+                continuation_labels_df['timestamp'] <= split_timestamp
+            ].copy()
+            val_continuation_df = continuation_labels_df[
+                continuation_labels_df['timestamp'] > split_timestamp
+            ].copy()
+
         if preload:
             train_dataset = PreloadHierarchicalDataset(
-                train_df, sequence_length, prediction_horizon, mode
+                train_df, raw_ohlc_df, train_continuation_df,
+                sequence_length, prediction_horizon, mode
             )
             val_dataset = PreloadHierarchicalDataset(
-                val_df, sequence_length, prediction_horizon, mode
+                val_df, raw_ohlc_df, val_continuation_df,
+                sequence_length, prediction_horizon, mode
             )
         else:
             train_dataset = HierarchicalDataset(
-                train_df, sequence_length, prediction_horizon, mode
+                train_df, raw_ohlc_df, train_continuation_df,
+                sequence_length, prediction_horizon, mode,
+                include_continuation=include_continuation
             )
             val_dataset = HierarchicalDataset(
-                val_df, sequence_length, prediction_horizon, mode
+                val_df, raw_ohlc_df, val_continuation_df,
+                sequence_length, prediction_horizon, mode,
+                include_continuation=include_continuation
             )
 
         return train_dataset, val_dataset
@@ -393,11 +457,14 @@ def create_hierarchical_dataset(
         # No validation split
         if preload:
             dataset = PreloadHierarchicalDataset(
-                features_df, sequence_length, prediction_horizon, mode
+                features_df, raw_ohlc_df, continuation_labels_df,
+                sequence_length, prediction_horizon, mode
             )
         else:
             dataset = HierarchicalDataset(
-                features_df, sequence_length, prediction_horizon, mode
+                features_df, raw_ohlc_df, continuation_labels_df,
+                sequence_length, prediction_horizon, mode,
+                include_continuation=include_continuation
             )
 
         return dataset, None
@@ -424,7 +491,7 @@ def test_hierarchical_dataset():
 
     # Extract features
     extractor = TradingFeatureExtractor()
-    features_df = extractor.extract_features(df)
+    features_df, _ = extractor.extract_features(df)
 
     print(f"Extracted {len(features_df.columns)} features")
 

@@ -206,7 +206,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, **kwargs) -> pd.DataFrame:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, **kwargs) -> tuple:
         """
         Extract all 495 features from aligned SPY-TSLA data (v3.11 - With Dynamic Channel Duration Detection).
 
@@ -224,12 +224,15 @@ class TradingFeatureExtractor(FeatureExtractor):
             events_handler: Optional CombinedEventsHandler for event-driven features (v3.9)
                 - If provided: Enables earnings/FOMC proximity features
                 - If None: Event features will be zeros (backward compatible)
+            continuation: Whether to generate continuation prediction labels (default: False)
             **kwargs: Additional arguments (reserved for future use)
 
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
 
-        Returns DataFrame with 495 columns:
+        Returns tuple of (features_df, continuation_df):
+        - features_df: DataFrame with 495 columns
+        - continuation_df: DataFrame with continuation labels (or None if continuation=False)
         - 12 price features (6 per stock: close, close_norm, returns, log_returns, volatility_10, volatility_50)
         - 330 channel features (165 TSLA + 165 SPY) - v3.11: +22 duration features
           - Per timeframe (11): position, upper_dist, lower_dist, slope, slope_pct, stability, r_squared, duration
@@ -275,7 +278,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # PASS 1: Extract base features
         print("   Extracting base features...")
-        with tqdm(total=7, desc="   Feature extraction", leave=True, position=0, ncols=100) as pbar:
+        with tqdm(total=7, desc="   Feature extraction", leave=True, position=0, ncols=80, ascii=True) as pbar:
             price_df = self._extract_price_features(df)
             pbar.update(1)
 
@@ -309,18 +312,26 @@ class TradingFeatureExtractor(FeatureExtractor):
         ], axis=1)
 
         # PASS 2: Extract breakdown features (needs base features + optional events)
-        with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100) as pbar:
+        with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=80, ascii=True) as pbar:
             breakdown_df = self._extract_breakdown_features(base_features_df, df, events_handler)
             pbar.update(1)
 
         # Final concat
         features_df = pd.concat([base_features_df, breakdown_df], axis=1)
 
+        # Generate continuation labels if requested
+        continuation_df = None
+        if continuation:
+            print("   Generating continuation labels...")
+            timestamps = df.index.tolist()
+            continuation_df = self.generate_continuation_labels(df, timestamps, prediction_horizon=24)
+            print(f"   ✓ Generated {len(continuation_df)} continuation labels")
+
         # Fill NaNs
         features_df = features_df.bfill().fillna(0)
 
         print(f"   ✓ Extracted {len(features_df.columns)} features")
-        return features_df
+        return features_df, continuation_df
 
     def _extract_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Extract basic price features. Returns DataFrame with 12 columns (v3.8: +2 normalized prices)."""
@@ -347,6 +358,53 @@ class TradingFeatureExtractor(FeatureExtractor):
             price_features[f'{symbol}_volatility_50'] = returns.rolling(50).std()
 
         return pd.DataFrame(price_features, index=df.index)
+
+    def _calculate_dynamic_window(self, prices: pd.Series, base_window: int = 168, min_window: int = 30, max_window: int = 300) -> int:
+        """
+        Calculate dynamic window size based on volatility.
+
+        Args:
+            prices: Price series
+            base_window: Base window size (default 168 bars)
+            min_window: Minimum window size
+            max_window: Maximum window size
+
+        Returns:
+            Adjusted window size based on ATR volatility
+        """
+        if len(prices) < 20:
+            return min_window
+
+        # Calculate ATR (Average True Range) as volatility measure
+        high = prices.rolling(2).max()
+        low = prices.rolling(2).min()
+        close_prev = prices.shift(1)
+
+        tr = pd.concat([
+            high - low,
+            (high - close_prev).abs(),
+            (low - close_prev).abs()
+        ], axis=1).max(axis=1)
+
+        atr = tr.rolling(14).mean()
+
+        # Get current ATR
+        current_atr = atr.iloc[-1] if not atr.empty else prices.std()
+
+        # Calculate average ATR over recent period
+        avg_atr = atr.tail(50).mean() if len(atr) > 50 else atr.mean()
+
+        if pd.isna(avg_atr) or avg_atr == 0:
+            return base_window
+
+        # Adjust window: higher volatility = shorter window, lower volatility = longer window
+        volatility_ratio = current_atr / avg_atr
+
+        # Scale window inversely with volatility (clamp between min/max)
+        adjusted_window = int(base_window / volatility_ratio)
+        adjusted_window = max(min_window, min(max_window, adjusted_window))
+
+        return adjusted_window
 
     def _extract_channel_features(self, df: pd.DataFrame, use_cache: bool = True, multi_res_data: dict = None, use_gpu: bool = False, cache_suffix: str = None) -> pd.DataFrame:
         """
@@ -391,7 +449,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                         cache_file.unlink()
                     else:
                         # Load cache with progress bar
-                        with tqdm(total=1, desc=f"   Loading cache", leave=False, position=1, ncols=100) as pbar:
+                        with tqdm(total=1, desc=f"   Loading cache", leave=False, position=1, ncols=80, ascii=True) as pbar:
                             with open(cache_file, 'rb') as f:
                                 result = pickle.load(f)
                             pbar.update(1)
@@ -449,7 +507,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   ⏱️  Estimated time: ~{total_calcs * 2.5:.0f} minutes")
             print(f"   💡 Results will be cached for instant loading next time")
 
-        calc_progress = tqdm(total=total_calcs, desc="   Rolling channels (SPY + TSLA)", ncols=100, leave=False, position=1)
+        calc_progress = tqdm(total=total_calcs, desc="   Rolling channels (SPY + TSLA)", ncols=80, leave=False, position=1, ascii=True)
 
         for symbol in ['tsla', 'spy']:
             for tf_name, tf_rule in timeframes.items():
@@ -495,7 +553,14 @@ class TradingFeatureExtractor(FeatureExtractor):
                     continue
 
                 # ROLLING CHANNEL CALCULATION (GPU or CPU)
-                lookback = min(168, len(resampled) // 2)  # Use half of data or 168, whichever is smaller
+                # Use dynamic window sizing based on volatility
+                base_lookback = min(168, len(resampled) // 2)
+                if use_gpu:
+                    # GPU: use fixed base lookback for batching efficiency
+                    lookback = base_lookback
+                else:
+                    # CPU: calculate dynamic lookback per timestamp
+                    lookback = base_lookback  # Will be overridden per timestamp  # Use half of data or 168, whichever is smaller
 
                 if use_gpu:
                     # GPU-accelerated calculation
@@ -585,12 +650,20 @@ class TradingFeatureExtractor(FeatureExtractor):
                 # Get available data up to this point
                 available_window = resampled_df.iloc[:i]
 
+                # Calculate dynamic lookback based on volatility
+                dynamic_lookback = self._calculate_dynamic_window(
+                    available_window['close'],
+                    base_window=min(168, len(available_window) // 2),
+                    min_window=30,
+                    max_window=min(300, len(available_window) // 2)
+                )
+
                 # Find optimal channel window (v3.11: dynamic duration detection)
                 # Tests multiple lookbacks, requires minimum 3 ping-pongs
                 channel = self.channel_calc.find_optimal_channel_window(
                     available_window,
                     timeframe=tf_name,
-                    max_lookback=lookback,
+                    max_lookback=dynamic_lookback,
                     min_ping_pongs=3
                 )
 
@@ -1343,7 +1416,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Debug: Check breakdown feature count
         num_breakdown = len(breakdown_features)
-        expected_breakdown = 73  # 64 original + 4 event features + 5 binary flags (v3.11)
+        expected_breakdown = 72  # 60 original + 12 total flags/events (v3.11)
         if num_breakdown != expected_breakdown:
             print(f"   ⚠️  Breakdown features: {num_breakdown} (expected {expected_breakdown})")
             print(f"   Missing/Extra: {num_breakdown - expected_breakdown} features")
@@ -1351,6 +1424,324 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   ✓ Breakdown features: {num_breakdown} (correct)")
 
         return pd.DataFrame(breakdown_features, index=raw_df.index)
+
+    def test_continuation_labels(self, df: pd.DataFrame) -> None:
+        """Test continuation label generation on sample data."""
+        print("Testing continuation label generation...")
+
+        # Sample timestamps
+        timestamps = df.index[:10]  # First 10 timestamps
+
+        # Generate labels
+        labels_df = self.generate_continuation_labels(df, timestamps, prediction_horizon=24)
+        return labels_df
+
+        print(f"Generated {len(labels_df)} continuation labels")
+        if not labels_df.empty:
+            print("Sample labels:")
+            for _, row in labels_df.head(3).iterrows():
+                print(f"  {row['timestamp']}: {row['label']}")
+
+        print("✓ Continuation label test completed")
+
+    def validate_continuation_data_availability(self, df: pd.DataFrame, timestamps: list) -> dict:
+        """
+        Validate how many timestamps have sufficient data for continuation analysis.
+
+        Returns dict with validation results.
+        """
+        validation_results = {
+            'total_timestamps': len(timestamps),
+            'sufficient_raw_data': 0,
+            'insufficient_raw_data': 0,
+            'data_distribution': []
+        }
+
+        print("  🔍 Validating continuation data availability...")
+
+        with tqdm(total=len(timestamps), desc="    Data validation",
+                  unit="timestamps", ncols=100, position=2, leave=False) as pbar:
+
+            for i, ts in enumerate(timestamps):
+                try:
+                    current_idx = df.index.get_loc(ts)
+
+                    # Check raw data availability
+                    one_h_available = min(120, current_idx)  # How much 1h data we could get
+                    four_h_available = min(480, current_idx)  # How much 4h data we could get
+
+                    has_sufficient = (one_h_available >= 60 and four_h_available >= 120)
+
+                    if has_sufficient:
+                        validation_results['sufficient_raw_data'] += 1
+                    else:
+                        validation_results['insufficient_raw_data'] += 1
+
+                    # Track distribution for analysis (sample every 100th for memory efficiency)
+                    if i % 100 == 0:
+                        validation_results['data_distribution'].append({
+                            'timestamp': ts,
+                            'available_1h': one_h_available,
+                            'available_4h': four_h_available,
+                            'sufficient': has_sufficient
+                        })
+
+                except Exception as e:
+                    validation_results['insufficient_raw_data'] += 1
+
+                pbar.update(1)
+
+        # Summary
+        sufficient_pct = (validation_results['sufficient_raw_data'] / validation_results['total_timestamps']) * 100
+        print(f"  ✅ Data validation complete:")
+        print(f"     Sufficient data: {validation_results['sufficient_raw_data']}/{validation_results['total_timestamps']} ({sufficient_pct:.1f}%)")
+        print(f"     Insufficient data: {validation_results['insufficient_raw_data']}/{validation_results['total_timestamps']}")
+
+        return validation_results
+
+    def generate_continuation_labels(self, df: pd.DataFrame, timestamps: list, prediction_horizon: int = 24, debug: bool = False) -> pd.DataFrame:
+        """
+        Generate continuation prediction labels using multi-timeframe analysis.
+
+        Implements the pseudo-code logic:
+        - Pull 1h and 4h OHLC chunks
+        - Calculate RSI for both timeframes
+        - Check slope alignment
+        - Apply continuation scoring
+        - Look ahead for actual duration/gain
+
+        Args:
+            df: Full OHLC DataFrame (5-min bars)
+            timestamps: List of timestamps to process
+            prediction_horizon: How many bars ahead to look for continuation
+            debug: Enable debug logging for troubleshooting
+
+        Returns:
+            DataFrame with continuation labels
+        """
+        labels = []
+        skip_reasons = {
+            'insufficient_raw_data': 0,
+            'insufficient_resampled_data': 0,
+            'channel_fit_failed': 0,
+            'scoring_failed': 0,
+            'other_errors': 0
+        }
+
+        # Progress bar for continuation label generation
+        with tqdm(total=len(timestamps), desc="    Continuation labels",
+                  unit="timestamps", ncols=80, position=3, leave=False, ascii=True) as pbar:
+
+            for i, ts in enumerate(timestamps):
+                try:
+                    # Get current index and price
+                    current_idx = df.index.get_loc(ts)
+                    current_price = df.loc[ts, 'tsla_close']
+
+                    # Step 1: Pull multi-timeframe OHLC chunks
+                    # 1h chunk: 120 bars back (120 * 5min = 10 hours) - DOUBLED for better dynamic windowing
+                    one_h_start = max(0, current_idx - 120)
+                    one_h_chunk = df.iloc[one_h_start:current_idx+1].copy()
+
+                    # 4h chunk: 480 bars back (480 * 5min = 40 hours) - DOUBLED for better dynamic windowing
+                    four_h_start = max(0, current_idx - 480)
+                    four_h_chunk = df.iloc[four_h_start:current_idx+1].copy()
+
+                    # DEBUG: Log data availability for first few timestamps
+                    if debug and i < 5:
+                        print(f"  TS {ts}: 1h_chunk={len(one_h_chunk)}, 4h_chunk={len(four_h_chunk)}")
+
+                    # Resample to 1h and 4h timeframes
+                    one_h_ohlc = one_h_chunk.resample('1h').agg({
+                        'tsla_open': 'first',
+                        'tsla_high': 'max',
+                        'tsla_low': 'min',
+                        'tsla_close': 'last'
+                    }).dropna()
+
+                    four_h_ohlc = four_h_chunk.resample('4h').agg({
+                        'tsla_open': 'first',
+                        'tsla_high': 'max',
+                        'tsla_low': 'min',
+                        'tsla_close': 'last'
+                    }).dropna()
+
+                    # Rename columns to generic OHLC names IMMEDIATELY after resampling
+                    # RSI and channel calculators expect 'close', not 'tsla_close'
+                    one_h_ohlc.columns = [c.replace('tsla_', '') for c in one_h_ohlc.columns]
+                    four_h_ohlc.columns = [c.replace('tsla_', '') for c in four_h_ohlc.columns]
+
+                    # DEBUG: Verify column renaming worked
+                    if debug and i < 3:
+                        print(f"  DEBUG: 1h columns after rename: {one_h_ohlc.columns.tolist()}")
+                        print(f"  DEBUG: 4h columns after rename: {four_h_ohlc.columns.tolist()}")
+
+                    if len(one_h_ohlc) < 3 or len(four_h_ohlc) < 2:
+                        skip_reasons['insufficient_resampled_data'] += 1
+                        if debug and skip_reasons['insufficient_resampled_data'] < 3:
+                            print(f"  SKIP {ts}: Insufficient resampled data ({len(one_h_ohlc)} 1h, {len(four_h_ohlc)} 4h)")
+                        pbar.update(1)
+                        continue
+
+                    # Resample to 1h and 4h timeframes
+                    one_h_ohlc = one_h_chunk.resample('1h').agg({
+                        'tsla_open': 'first',
+                        'tsla_high': 'max',
+                        'tsla_low': 'min',
+                        'tsla_close': 'last'
+                    }).dropna()
+
+                    four_h_ohlc = four_h_chunk.resample('4h').agg({
+                        'tsla_open': 'first',
+                        'tsla_high': 'max',
+                        'tsla_low': 'min',
+                        'tsla_close': 'last'
+                    }).dropna()
+
+                    if len(one_h_ohlc) < 3 or len(four_h_ohlc) < 2:
+                        pbar.update(1)
+                        continue
+
+                    # Step 2: Compute RSI for both timeframes
+                    rsi_1h = self.rsi_calc.get_rsi_data(one_h_ohlc).value or 50.0
+                    rsi_4h = self.rsi_calc.get_rsi_data(four_h_ohlc).value or 50.0
+
+                    # Step 3: Fit channels and get slopes
+                    channel_1h = self.channel_calc.find_optimal_channel_window(
+                        one_h_ohlc, timeframe='1h', max_lookback=min(30, len(one_h_ohlc)//2), min_ping_pongs=2
+                    )
+
+                    channel_4h = self.channel_calc.find_optimal_channel_window(
+                        four_h_ohlc, timeframe='4h', max_lookback=min(60, len(four_h_ohlc)//2), min_ping_pongs=2
+                    )
+
+                    # Get slopes (default to 0 if no channel found)
+                    slope_1h = channel_1h.slope if channel_1h else 0.0
+                    slope_4h = channel_4h.slope if channel_4h else 0.0
+
+                    # Check if channel fitting failed
+                    if channel_1h is None or channel_4h is None:
+                        skip_reasons['channel_fit_failed'] += 1
+                        if debug and skip_reasons['channel_fit_failed'] < 3:
+                            print(f"  SKIP {ts}: Channel fitting failed")
+                        pbar.update(1)
+                        continue
+
+                    # Step 4: Apply continuation scoring logic
+                    score = 0
+
+                    # +1 for low RSI on short frame (room to run upward)
+                    if rsi_1h < 40:
+                        score += 1
+
+                    # +1 for low RSI on long frame (broader support)
+                    if rsi_4h < 40:
+                        score += 1
+
+                    # +1 if slopes align (both bull or both bear)
+                    slope_1h_direction = 1 if slope_1h > 0.0001 else (-1 if slope_1h < -0.0001 else 0)
+                    slope_4h_direction = 1 if slope_4h > 0.0001 else (-1 if slope_4h < -0.0001 else 0)
+
+                    if slope_1h_direction == slope_4h_direction and slope_1h_direction != 0:
+                        score += 1
+                    elif slope_1h_direction != slope_4h_direction and slope_1h_direction != 0 and slope_4h_direction != 0:
+                        # Conflict: e.g., 1h bull vs 4h bear
+                        score -= 1
+
+                    # -1 if overbought on higher frame (break likely)
+                    if rsi_4h > 70:
+                        score -= 1
+
+                    # Step 5: Look ahead for actual duration/gain
+                    future_end = min(current_idx + prediction_horizon, len(df) - 1)
+                    future_prices = df.iloc[current_idx:future_end+1]['tsla_close'].values
+
+                    if len(future_prices) < 2:
+                        pbar.update(1)
+                        continue
+
+                    # Calculate actual continuation metrics
+                    future_high = np.max(future_prices)
+                    future_low = np.min(future_prices)
+                    max_gain = (future_high - current_price) / current_price * 100
+
+                    # Find break point (first time price moves >2% from entry)
+                    break_threshold = current_price * 1.02  # +2%
+                    break_indices = np.where(future_prices >= break_threshold)[0]
+
+                    if len(break_indices) > 0:
+                        break_idx = break_indices[0]
+                        actual_duration_hours = break_idx * 5 / 60  # 5-min bars to hours
+                        continues = True
+                        label = f"continues {actual_duration_hours:.1f}h, +{max_gain:.1f}%"
+                    else:
+                        # No break within horizon
+                        actual_duration_hours = len(future_prices) * 5 / 60
+                        continues = True
+                        label = f"continues {actual_duration_hours:.1f}h, +{max_gain:.1f}%"
+
+                    # If score <= 1, mark as breaking soon regardless
+                    if score <= 1:
+                        skip_reasons['scoring_failed'] += 1
+                        continues = False
+                        early_break_hours = min(actual_duration_hours * 0.5, 1.0)  # Assume breaks in half the time
+                        label = f"breaks in {early_break_hours:.1f}h"
+
+                        if debug and skip_reasons['scoring_failed'] < 3:
+                            print(f"  SKIP {ts}: Scoring failed (score={score})")
+                        pbar.update(1)
+                        continue
+
+                    # Calculate confidence based on score
+                    confidence = min(max(abs(score) * 0.2, 0.1), 0.9)
+
+                    labels.append({
+                        'timestamp': ts,
+                        'label': label,
+                        'continues': float(continues),
+                        'duration_hours': actual_duration_hours,
+                        'projected_gain': max_gain if continues else 0.0,
+                        'confidence': confidence,
+                        'score': score,
+                        'rsi_1h': rsi_1h,
+                        'rsi_4h': rsi_4h,
+                        'slope_1h': slope_1h,
+                        'slope_4h': slope_4h
+                    })
+
+                    # Update progress bar with current stats
+                    processed = len(labels)
+                    success_rate = processed / (i + 1) * 100
+                    pbar.set_postfix({
+                        'processed': f'{processed}/{len(timestamps)}',
+                        'success_rate': f'{success_rate:.1f}%'
+                    })
+
+                except Exception as e:
+                    skip_reasons['other_errors'] += 1
+                    if debug and skip_reasons['other_errors'] < 3:
+                        print(f"  ERROR {ts}: {str(e)}")
+                    # Still update progress on errors
+                    processed = len(labels)
+                    success_rate = processed / (i + 1) * 100 if i > 0 else 0
+                    pbar.set_postfix({
+                        'processed': f'{processed}/{len(timestamps)}',
+                        'success_rate': f'{success_rate:.1f}%'
+                    })
+
+                pbar.update(1)
+
+        # Final debug summary
+        if debug:
+            total_skipped = sum(skip_reasons.values())
+            print(f"  DEBUG: Generated {len(labels)} labels, skipped {total_skipped}")
+            for reason, count in skip_reasons.items():
+                if count > 0:
+                    print(f"    {reason}: {count}")
+
+        return pd.DataFrame(labels)
+
+        return pd.DataFrame(labels)
 
     def create_sequences(self, features_df: pd.DataFrame, sequence_length: int = 168,
                         target_horizon: int = 24) -> Tuple[torch.Tensor, torch.Tensor]:
