@@ -183,6 +183,15 @@ class HierarchicalDataset(Dataset):
         # Convert to tensors
         x_tensor = torch.tensor(x, dtype=torch.float32)
 
+        # Calculate adaptive targets
+        actual_max_idx = future_prices.idxmax()
+        bars_to_peak = (actual_max_idx - future_prices.index[0]).total_seconds() / 60  # minutes → bars
+
+        # Simple adaptive targets (can be enhanced with channel bounds calculation)
+        adaptive_price_change = target_high_pct if target_high_pct > abs(target_low_pct) else target_low_pct
+        adaptive_horizon_log = torch.log(torch.tensor(bars_to_peak / 24 + 1e-6))  # Normalized log
+        adaptive_confidence = 1.0 if bars_to_peak > 48 else 0.5  # Simple confidence
+
         targets = {
             'high': torch.tensor(target_high_pct, dtype=torch.float32),
             'low': torch.tensor(target_low_pct, dtype=torch.float32),
@@ -192,7 +201,10 @@ class HierarchicalDataset(Dataset):
             'overshoot': torch.tensor(overshoot_label, dtype=torch.float32),
             'continuation_duration': torch.tensor(0.0, dtype=torch.float32),  # Placeholder
             'continuation_gain': torch.tensor(0.0, dtype=torch.float32),     # Placeholder
-            'continuation_confidence': torch.tensor(0.5, dtype=torch.float32) # Placeholder
+            'continuation_confidence': torch.tensor(0.5, dtype=torch.float32), # Placeholder
+            'price_change_pct': torch.tensor(adaptive_price_change, dtype=torch.float32),
+            'horizon_bars_log': adaptive_horizon_log,
+            'adaptive_confidence': torch.tensor(adaptive_confidence, dtype=torch.float32)
         }
 
         # Add continuation prediction targets if enabled

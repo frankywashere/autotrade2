@@ -409,36 +409,80 @@ def main():
         st.warning(f"🔧 Model needs more training! Current: 1 epoch. Recommended: 100 epochs.")
         st.caption("With only 1 epoch, model hasn't learned constraints. Retrain with more epochs.")
 
-    target_high_price = current_price * (1 + pred_high / 100)
-    target_low_price = current_price * (1 + pred_low / 100)
+    # Use adaptive projection if available, otherwise fallback to traditional
+    if 'multi_task' in prediction and 'price_change_pct' in prediction['multi_task']:
+        # Adaptive projection mode
+        adaptive_data = prediction['multi_task']
+        price_change_pct = adaptive_data['price_change_pct'].item()
+        horizon_bars = adaptive_data['horizon_bars'].item()
+        adaptive_confidence = adaptive_data['adaptive_confidence'].item()
+        dominant_layer = adaptive_data.get('dominant_layer', best['layer'])
 
-    # Time estimate
-    time_desc, _ = estimate_time_to_target(best['layer'])
+        # Calculate target prices using adaptive projection
+        target_price = current_price * (1 + price_change_pct / 100)
 
-    # Main prediction
-    col1, col2 = st.columns(2)
+        # Convert horizon to readable format
+        horizon_hours = horizon_bars / 12  # 1-min bars to hours
+        if horizon_hours < 24:
+            time_desc = f"{horizon_hours:.1f} hours"
+        else:
+            time_desc = f"{horizon_hours/24:.1f} days"
 
-    with col1:
-        st.metric(
-            label=f"📈 Predicted High (in {time_desc})",
-            value=f"${target_high_price:.2f}",
-            delta=f"{pred_high:+.2f}%"
-        )
+        # Main prediction - Adaptive
+        col1, col2 = st.columns(2)
 
-    with col2:
-        st.metric(
-            label=f"📉 Predicted Low (in {time_desc})",
-            value=f"${target_low_price:.2f}",
-            delta=f"{pred_low:+.2f}%"
-        )
+        with col1:
+            st.metric(
+                label=f"🎯 Adaptive Projection ({dominant_layer.upper()})",
+                value=f"${target_price:.2f}",
+                delta=f"{price_change_pct:+.2f}%"
+            )
+
+        with col2:
+            st.metric(
+                label=f"⏱️ Time Horizon",
+                value=time_desc,
+                delta=f"{adaptive_confidence:.0%} confidence"
+            )
+
+        # Adaptive explanation
+        direction = "📈 UPWARD" if price_change_pct > 0 else "📉 DOWNWARD"
+        st.info(f"💡 **Adaptive Projection:** Price expected to move **{direction}** by **{abs(price_change_pct):.2f}%** "
+                f"within **{time_desc}** ({adaptive_confidence:.0%} confidence). "
+                f"Dominant layer: **{dominant_layer.upper()}**")
+
+    else:
+        # Fallback to traditional prediction
+        target_high_price = current_price * (1 + pred_high / 100)
+        target_low_price = current_price * (1 + pred_low / 100)
+
+        # Time estimate
+        time_desc, _ = estimate_time_to_target(best['layer'])
+
+        # Main prediction - Traditional
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.metric(
+                label=f"📈 Predicted High (in {time_desc})",
+                value=f"${target_high_price:.2f}",
+                delta=f"{pred_high:+.2f}%"
+            )
+
+        with col2:
+            st.metric(
+                label=f"📉 Predicted Low (in {time_desc})",
+                value=f"${target_low_price:.2f}",
+                delta=f"{pred_low:+.2f}%"
+            )
+
+        # Traditional explanation
+        st.info(f"💡 **Setup:** Price will likely reach **${target_high_price:.2f}** ({pred_high:+.2f}%) "
+                f"in the next **{time_desc}**, with downside risk to ${target_low_price:.2f} ({pred_low:+.2f}%)")
 
     # Warnings
     if warnings:
         st.warning("\n\n".join(warnings))
-
-    # Explanation
-    st.info(f"💡 **Setup:** Price will likely reach **${target_high_price:.2f}** ({pred_high:+.2f}%) "
-            f"in the next **{time_desc}**, with downside risk to ${target_low_price:.2f} ({pred_low:+.2f}%)")
 
     # Alert if high confidence
     if conf_pct >= alert_threshold * 100:

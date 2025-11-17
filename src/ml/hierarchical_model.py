@@ -158,6 +158,15 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 nn.Sigmoid()
             )
 
+            # Adaptive Projection: Dynamic timescale selection and horizon prediction
+            self.adaptive_projection = nn.Sequential(
+                nn.Linear(self.hidden_size * 3 + 3, 256),  # 3 layers' hidden + 3 confs
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Linear(128, 3)  # [price_change_pct, horizon_bars_log, confidence]
+            )
+
         # Move to device
         self.to(device)
 
@@ -359,6 +368,26 @@ class HierarchicalLNN(nn.Module, ModelBase):
             continuation_gain_pred = self.continuation_gain_head(fusion_hidden)  # [batch, 1]
             continuation_confidence_pred = self.continuation_confidence_head(fusion_hidden)  # [batch, 1]
 
+            # Adaptive Projection: Dynamic timescale selection and horizon prediction
+            fusion_input = torch.cat([
+                fast_hidden, medium_hidden, slow_hidden,
+                fast_pred_conf, medium_pred_conf, slow_pred_conf
+            ], dim=-1)
+
+            proj = self.adaptive_projection(fusion_input)
+            price_change_pct = proj[:, 0]
+            horizon_bars_log = proj[:, 1]
+            adaptive_confidence = torch.sigmoid(proj[:, 2])
+
+            horizon_bars = torch.exp(horizon_bars_log) * 24  # Base = 24 bars, can grow
+            horizon_bars = torch.clamp(horizon_bars, 24, 2016)  # Max ~2 weeks (1-min bars)
+
+            # Determine dominant layer
+            layer_weights = torch.stack([fast_pred_conf, medium_pred_conf, slow_pred_conf], dim=1)
+            dominant_layer_idx = torch.argmax(layer_weights, dim=1)
+            layer_map = {0: "fast", 1: "medium", 2: "slow"}
+            dominant_layer = [layer_map[i.item()] for i in dominant_layer_idx]
+
             # Store in hidden_states
             hidden_states['multi_task'] = {
                 'hit_band': hit_band_pred,
@@ -367,7 +396,11 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 'overshoot': overshoot_pred,
                 'continuation_duration': continuation_duration_pred,
                 'continuation_gain': continuation_gain_pred,
-                'continuation_confidence': continuation_confidence_pred
+                'continuation_confidence': continuation_confidence_pred,
+                'price_change_pct': price_change_pct,
+                'horizon_bars': horizon_bars,
+                'adaptive_confidence': adaptive_confidence,
+                'dominant_layer': dominant_layer
             }
 
         return predictions, hidden_states
