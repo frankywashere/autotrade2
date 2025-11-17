@@ -129,7 +129,10 @@ def train_epoch(
             'overshoot': 0.3,
             'continuation_duration': 0.5,
             'continuation_gain': 0.5,
-            'continuation_confidence': 0.3
+            'continuation_confidence': 0.3,
+            'price_change_pct': 0.4,
+            'horizon_bars_log': 0.3,
+            'adaptive_confidence': 0.2
         }
 
     model.train()
@@ -154,6 +157,9 @@ def train_epoch(
             target_continuation_duration = targets_dict['continuation_duration'].to(device)
             target_continuation_gain = targets_dict['continuation_gain'].to(device)
             target_continuation_confidence = targets_dict['continuation_confidence'].to(device)
+            target_price_change_pct = targets_dict['price_change_pct'].to(device)
+            target_horizon_bars_log = targets_dict['horizon_bars_log'].to(device)
+            target_adaptive_confidence = targets_dict['adaptive_confidence'].to(device)
 
         # Forward pass
         predictions, hidden_states = model.forward(x)
@@ -221,6 +227,25 @@ def train_epoch(
                 target_continuation_confidence
             )
             loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
+
+            # Adaptive projection losses
+            loss_price_change = criterion(
+                mt['price_change_pct'].squeeze(),
+                target_price_change_pct
+            )
+            loss += loss_weights['price_change_pct'] * loss_price_change
+
+            loss_horizon_log = criterion(
+                mt['horizon_bars_log'].squeeze(),
+                target_horizon_bars_log
+            )
+            loss += loss_weights['horizon_bars_log'] * loss_horizon_log
+
+            loss_adaptive_confidence = F.binary_cross_entropy(
+                mt['adaptive_confidence'].squeeze(),
+                target_adaptive_confidence
+            )
+            loss += loss_weights['adaptive_confidence'] * loss_adaptive_confidence
 
         # Backward pass
         optimizer.zero_grad()
