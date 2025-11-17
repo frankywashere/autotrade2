@@ -35,6 +35,13 @@ from src.ml.events import CombinedEventsHandler
 from src.linear_regression import LinearRegressionChannel
 import config
 
+# Layer mapping for adaptive projection display
+layer_map = {
+    0: "Fast (intraday ripples: hours)",
+    1: "Medium (swings: days)",
+    2: "Slow (tides: weeks+)"
+}
+
 
 # Page config
 st.set_page_config(
@@ -612,22 +619,42 @@ def main():
                 st.markdown(f"- Risk: ${low_price:.2f} ({opp['predicted_low']:+.2f}%)")
                 st.markdown("")
 
-    # Fusion Weights (How model is weighting each layer)
-    with st.expander("⚖️ Fusion Weights (Layer Trust Levels)"):
-        weights = prediction['fusion_weights']
+    # Layer Interplay & Confidence Debate
+    with st.expander("🧠 Layer Interplay & Confidence Debate"):
+        # Get adaptive projection data if available
+        multi_task = prediction.get('multi_task', {})
+        dominant_layer = multi_task.get('dominant_layer', 1)  # Default to medium
+        weights = prediction.get('fusion_weights', [0.33, 0.33, 0.33])
 
-        col1, col2, col3 = st.columns(3)
+        # Adaptive projection data
+        change_pct = multi_task.get('price_change_pct', 0.0)
+        horizon_bars = multi_task.get('horizon_bars', 576.0)  # Default ~1 day
+        adaptive_conf = multi_task.get('adaptive_confidence', 0.8)
 
-        with col1:
-            st.metric("⚡ Fast Layer", f"{weights[0]:.1%}")
-        with col2:
-            st.metric("🔄 Medium Layer", f"{weights[1]:.1%}")
-        with col3:
-            st.metric("🐢 Slow Layer", f"{weights[2]:.1%}")
+        # Convert horizon to readable format
+        horizon_days = horizon_bars / 1440  # 1-min bars to days (24h=1440 bars)
+        if horizon_days < 1:
+            time_desc = f"{horizon_days*24:.1f} hours"
+        else:
+            time_desc = f"{horizon_days:.1f} days"
 
-        max_weight_idx = weights.index(max(weights))
-        layer_names = ['Fast', 'Medium', 'Slow']
-        st.caption(f"Model is currently trusting **{layer_names[max_weight_idx]}** layer most ({weights[max_weight_idx]:.1%})")
+        # Dominant layer display
+        dominant_name = layer_map.get(dominant_layer, "Medium (swings: days)")
+        st.markdown(f"**Dominant Layer: {dominant_name}** (Overall Confidence: {adaptive_conf:.0%})")
+
+        # Fusion weights with explanations
+        st.markdown("**Fusion Weights (how much each layer influences the prediction):**")
+        st.markdown(f"- **Fast**: {weights[0]*100:.1f}% (Short-term volatility check—e.g., high 1h RSI warns of quick breaks)")
+        st.markdown(f"- **Medium**: {weights[1]*100:.1f}% (Swing confirmation—e.g., 4h channel alignment boosts hold time)")
+        st.markdown(f"- **Slow**: {weights[2]*100:.1f}% (Macro tide support—e.g., weekly RSI low allows multi-day rides)")
+
+        # Adaptive projection display
+        if abs(change_pct) > 0.1:  # Only show if meaningful projection
+            direction = "📈 UPWARD" if change_pct > 0 else "📉 DOWNWARD"
+            st.markdown(f"**Projected Move:** {direction} by **{abs(change_pct):.2f}%** within **{time_desc}**")
+            st.caption("Horizon adapts based on layer consensus—short if RSI risks detected, long with multi-frame confirmation.")
+        else:
+            st.caption("No significant directional bias detected - layers in disagreement.")
 
     # Channel Context
     with st.expander("📊 Channel Analysis"):
