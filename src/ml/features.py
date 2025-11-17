@@ -494,17 +494,17 @@ class TradingFeatureExtractor(FeatureExtractor):
             '3month': '3ME'
         }
 
-        # Process both TSLA and SPY
-        total_calcs = len(timeframes) * 2  # 11 timeframes × 2 stocks
+        # Process both TSLA and SPY (progress by symbol, not timeframe)
+        total_calcs = 2  # 2 symbols
 
         # Print status messages with detailed info
         if is_live_mode:
             print(f"   🔄 Extracting channel features in LIVE mode (using multi-resolution data)...")
-            print(f"   📊 Processing {total_calcs} calculations (11 timeframes × 2 stocks: SPY + TSLA)")
+            print(f"   📊 Processing {total_calcs} symbols (TSLA + SPY, 11 timeframes each)")
         else:
             print(f"   🔄 Calculating ROLLING channels (this will take ~30-60 mins first time)...")
-            print(f"   📊 Processing {total_calcs} calculations (11 timeframes × 2 stocks: SPY + TSLA)")
-            print(f"   ⏱️  Estimated time: ~{total_calcs * 2.5:.0f} minutes")
+            print(f"   📊 Processing {total_calcs} symbols (TSLA + SPY, 11 timeframes each)")
+            print(f"   ⏱️  Estimated time: ~{total_calcs * 27.5:.0f} minutes (per symbol)")
             print(f"   💡 Results will be cached for instant loading next time")
 
         calc_progress = tqdm(total=total_calcs, desc="   Rolling channels (SPY + TSLA)", ncols=80, leave=False, position=1, ascii=True)
@@ -578,7 +578,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                 for feat_name, values in rolling_results.items():
                     channel_features[f'{prefix}_{tf_name}_{feat_name}'] = values
 
-                calc_progress.update(1)
+            # Update progress after completing all timeframes for this symbol
+            calc_progress.update(len(timeframes))
 
         calc_progress.close()
 
