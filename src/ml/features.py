@@ -1579,25 +1579,6 @@ class TradingFeatureExtractor(FeatureExtractor):
                         pbar.update(1)
                         continue
 
-                    # Resample to 1h and 4h timeframes
-                    one_h_ohlc = one_h_chunk.resample('1h').agg({
-                        'tsla_open': 'first',
-                        'tsla_high': 'max',
-                        'tsla_low': 'min',
-                        'tsla_close': 'last'
-                    }).dropna()
-
-                    four_h_ohlc = four_h_chunk.resample('4h').agg({
-                        'tsla_open': 'first',
-                        'tsla_high': 'max',
-                        'tsla_low': 'min',
-                        'tsla_close': 'last'
-                    }).dropna()
-
-                    if len(one_h_ohlc) < 3 or len(four_h_ohlc) < 2:
-                        pbar.update(1)
-                        continue
-
                     # Step 2: Compute RSI for both timeframes
                     rsi_1h = self.rsi_calc.get_rsi_data(one_h_ohlc).value or 50.0
                     rsi_4h = self.rsi_calc.get_rsi_data(four_h_ohlc).value or 50.0
