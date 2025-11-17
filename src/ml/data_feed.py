@@ -119,7 +119,7 @@ class CSVDataFeed(DataFeed):
         Returns single DataFrame with both symbols
         """
         # Progress bar for data loading steps
-        with tqdm(total=3, desc="   Loading data", ncols=100, leave=False) as pbar:
+        with tqdm(total=3, desc="   Loading data", ncols=80, leave=False, ascii=True) as pbar:
             # Load SPY
             pbar.set_description("   Loading SPY")
             spy_df = self.load_data('SPY', start_date, end_date)

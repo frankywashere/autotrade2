@@ -148,6 +148,16 @@ class HierarchicalLNN(nn.Module, ModelBase):
             # Overshoot: How far price overshoots band (Regression)
             self.overshoot_head = nn.Linear(64, 1)
 
+            # Continuation: Channel continuation duration and gain (Regression)
+            self.continuation_duration_head = nn.Linear(64, 1)
+            self.continuation_gain_head = nn.Linear(64, 1)
+            self.continuation_confidence_head = nn.Sequential(
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+                nn.Sigmoid()
+            )
+
         # Move to device
         self.to(device)
 
@@ -344,12 +354,20 @@ class HierarchicalLNN(nn.Module, ModelBase):
             expected_return_pred = self.expected_return_head(fusion_hidden)  # [batch, 1]
             overshoot_pred = self.overshoot_head(fusion_hidden)  # [batch, 1]
 
+            # Continuation predictions
+            continuation_duration_pred = self.continuation_duration_head(fusion_hidden)  # [batch, 1]
+            continuation_gain_pred = self.continuation_gain_head(fusion_hidden)  # [batch, 1]
+            continuation_confidence_pred = self.continuation_confidence_head(fusion_hidden)  # [batch, 1]
+
             # Store in hidden_states
             hidden_states['multi_task'] = {
                 'hit_band': hit_band_pred,
                 'hit_target': hit_target_pred,
                 'expected_return': expected_return_pred,
-                'overshoot': overshoot_pred
+                'overshoot': overshoot_pred,
+                'continuation_duration': continuation_duration_pred,
+                'continuation_gain': continuation_gain_pred,
+                'continuation_confidence': continuation_confidence_pred
             }
 
         return predictions, hidden_states

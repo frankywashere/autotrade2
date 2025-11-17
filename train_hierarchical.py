@@ -15,12 +15,14 @@ Features:
 """
 
 import argparse
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 import sys
+import os
 from datetime import datetime
 import json
 import platform
@@ -124,14 +126,17 @@ def train_epoch(
             'hit_band': 0.5,
             'hit_target': 0.5,
             'expected_return': 0.3,
-            'overshoot': 0.3
+            'overshoot': 0.3,
+            'continuation_duration': 0.5,
+            'continuation_gain': 0.5,
+            'continuation_confidence': 0.3
         }
 
     model.train()
     total_loss = 0.0
 
     # Progress bar for batches
-    pbar = tqdm(dataloader, desc=f"  Epoch {epoch+1} [Train]", leave=True, ncols=100)
+    pbar = tqdm(dataloader, desc=f"  Epoch {epoch+1} [Train]", leave=False, ncols=80)
 
     for batch_idx, (x, targets_dict) in enumerate(pbar):
         # Move to device
@@ -146,6 +151,9 @@ def train_epoch(
             target_hit_target = targets_dict['hit_target'].to(device)
             target_expected_return = targets_dict['expected_return'].to(device)
             target_overshoot = targets_dict['overshoot'].to(device)
+            target_continuation_duration = targets_dict['continuation_duration'].to(device)
+            target_continuation_gain = targets_dict['continuation_gain'].to(device)
+            target_continuation_confidence = targets_dict['continuation_confidence'].to(device)
 
         # Forward pass
         predictions, hidden_states = model.forward(x)
@@ -192,6 +200,27 @@ def train_epoch(
                 target_overshoot
             )
             loss += loss_weights['overshoot'] * loss_overshoot
+
+            # Continuation duration (regression)
+            loss_continuation_duration = criterion(
+                mt['continuation_duration'].squeeze(),
+                target_continuation_duration
+            )
+            loss += loss_weights['continuation_duration'] * loss_continuation_duration
+
+            # Continuation gain (regression)
+            loss_continuation_gain = criterion(
+                mt['continuation_gain'].squeeze(),
+                target_continuation_gain
+            )
+            loss += loss_weights['continuation_gain'] * loss_continuation_gain
+
+            # Continuation confidence (binary classification)
+            loss_continuation_confidence = F.binary_cross_entropy(
+                mt['continuation_confidence'].squeeze(),
+                target_continuation_confidence
+            )
+            loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
 
         # Backward pass
         optimizer.zero_grad()
@@ -687,40 +716,89 @@ def main():
     print(f"🎭 Multi-task: {'Enabled' if args.multi_task else 'Disabled'}")
     print("=" * 70)
 
-    # Load data
+    # Clear terminal for clean progress bar display
+    os.system('clear')
+
+    # Load data with historical buffer for continuation analysis
     print("\n1. Loading 1-min data...")
     data_feed = CSVDataFeed(timeframe=args.input_timeframe)
 
+    # Load with 2-year historical buffer for continuation analysis
+    # This ensures timestamps have sufficient lookback history
+    historical_buffer_years = 2
+    load_start_year = max(2010, args.train_start_year - historical_buffer_years)  # Don't go before 2010
+
     df = data_feed.load_aligned_data(
-        start_date=f'{args.train_start_year}-01-01',
+        start_date=f'{load_start_year}-01-01',
         end_date=f'{args.train_end_year}-12-31'
     )
 
     print(f"   Loaded {len(df)} bars ({df.index[0]} to {df.index[-1]})")
+    print(f"   Historical buffer: {historical_buffer_years} years (for continuation analysis)")
 
-    # Extract features
-    print("\n2. Extracting features...")
+    # Slice data to user's selected training range (after loading historical buffer)
+    training_start = pd.to_datetime(f'{args.train_start_year}-01-01')
+    training_end = pd.to_datetime(f'{args.train_end_year}-12-31')
+
+    # Keep full dataset for feature extraction (needs historical context)
+    # But create sliced version for timestamps used in continuation analysis
+    df_sliced = df[(df.index >= training_start) & (df.index <= training_end)].copy()
+    print(f"   Training slice: {len(df_sliced)} bars ({df_sliced.index[0]} to {df_sliced.index[-1]})")
+
+    # Extract features and continuation labels
+    print("\n2. Extracting features and continuation labels...")
     extractor = TradingFeatureExtractor()
+
+    # Validate data availability first
+    print("  Pre-validating continuation data...")
+    timestamps = df_sliced.index.tolist()
+    validation = extractor.validate_continuation_data_availability(df, timestamps)
+
+    if validation['sufficient_raw_data'] == 0:
+        print("  ⚠️  WARNING: No timestamps have sufficient data for continuation analysis!")
+        print("     This will result in 0 continuation labels.")
+        print("     Consider using a dataset with more historical data.")
+        print("     Enabling debug mode for detailed analysis...")
+        debug_mode = True
+    else:
+        sufficient_pct = (validation['sufficient_raw_data'] / validation['total_timestamps']) * 100
+        print(f"  📊 {sufficient_pct:.1f}% of timestamps have sufficient continuation data")
+        debug_mode = False
 
     # Use cache unless regenerate_cache flag is set (from interactive menu)
     use_cache = not getattr(args, 'regenerate_cache', False)
 
     # Use GPU if enabled (from interactive menu or auto-detect)
     use_gpu = getattr(args, 'use_gpu_features', 'auto')
-    features_df = extractor.extract_features(df, use_cache=use_cache, use_gpu=use_gpu)
+    features_df, continuation_df = extractor.extract_features(
+        df,
+        use_cache=use_cache,
+        use_gpu=use_gpu,
+        continuation=True
+    )
+
+    # If we got 0 labels and didn't enable debug, enable it now for diagnosis
+    if len(continuation_df) == 0 and not debug_mode:
+        print("  ⚠️  Got 0 continuation labels. Re-running with debug mode enabled...")
+        debug_mode = True
+        continuation_df = extractor.generate_continuation_labels(df, timestamps, prediction_horizon=24, debug=debug_mode)
 
     print(f"   Extracted {len(features_df.columns)} features")
+    print(f"   Generated {len(continuation_df) if continuation_df is not None else 0} continuation labels")
     print(f"   Feature names: {extractor.get_feature_names()[:5]}... (showing first 5)")
 
     # Create datasets
     print("\n3. Creating datasets...")
     train_dataset, val_dataset = create_hierarchical_dataset(
         features_df,
+        raw_ohlc_df=df,
+        continuation_labels_df=continuation_df,
         sequence_length=args.sequence_length,
         prediction_horizon=args.prediction_horizon,
         mode='uniform_bars',
         preload=args.preload,
-        validation_split=args.val_split
+        validation_split=args.val_split,
+        include_continuation=True
     )
 
     print(f"   Train samples: {len(train_dataset)}")
@@ -781,11 +859,11 @@ def main():
     val_errors = []
 
     # Outer progress bar for overall training
-    epoch_pbar = tqdm(range(args.epochs), desc="Training Progress", ncols=120, position=0)
+    epoch_pbar = tqdm(range(args.epochs), desc="Training Progress", ncols=80, position=0, ascii=True)
 
     for epoch in epoch_pbar:
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
-        print("-" * 70)
+        tqdm.write(f"\nEpoch {epoch + 1}/{args.epochs}")
+        tqdm.write("-" * 70)
 
         # Train (with loss_weights for multi-task)
         train_loss = train_epoch(
@@ -793,7 +871,7 @@ def main():
         )
         train_losses.append(train_loss)
 
-        print(f"  Train Loss: {train_loss:.4f}")
+        tqdm.write(f"  Train Loss: {train_loss:.4f}")
 
         # Validate
         if val_loader:
@@ -801,7 +879,7 @@ def main():
             val_losses.append(val_loss)
             val_errors.append(val_error)
 
-            print(f"  Val Loss: {val_loss:.4f}, Val Error: {val_error:.4f}%")
+            tqdm.write(f"  Val Loss: {val_loss:.4f}, Val Error: {val_error:.4f}%")
 
             # Early stopping
             if val_loss < best_val_loss:
@@ -809,7 +887,7 @@ def main():
                 patience_counter = 0
 
                 # Save best model
-                print(f"  ✓ New best model (val_loss: {val_loss:.4f})")
+                tqdm.write(f"  ✓ New best model (val_loss: {val_loss:.4f})")
 
                 metadata = {
                     'model_type': 'HierarchicalLNN',
@@ -835,32 +913,17 @@ def main():
                 model.save_checkpoint(args.output, metadata)
             else:
                 patience_counter += 1
-                print(f"  Patience: {patience_counter}/{args.patience}")
+                tqdm.write(f"  Patience: {patience_counter}/{args.patience}")
 
                 if patience_counter >= args.patience:
-                    print(f"\n  Early stopping triggered!")
+                    tqdm.write(f"\n  Early stopping triggered!")
                     break
-
-            # Update outer progress bar with current metrics
-            epoch_pbar.set_postfix({
-                'train': f'{train_loss:.4f}',
-                'val': f'{val_loss:.4f}',
-                'best': f'{best_val_loss:.4f}',
-                'patience': f'{patience_counter}/{args.patience}'
-            })
-        else:
-            # No validation - just show train loss
-            epoch_pbar.set_postfix({
-                'train': f'{train_loss:.4f}'
-            })
 
     # Training complete
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")
     print("=" * 70)
     print(f"Best val loss: {best_val_loss:.4f}")
-    print(f"Model saved to: {args.output}")
-    print(f"Total epochs: {epoch + 1}")
 
     # Save training history
     history_path = Path(args.output).parent / 'hierarchical_training_history.json'
