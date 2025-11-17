@@ -1525,8 +1525,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         }
 
         # Progress bar for continuation label generation
-        with tqdm(total=len(timestamps), desc="    Continuation labels",
-                  unit="timestamps", ncols=80, position=3, leave=False, ascii=True) as pbar:
+        with tqdm(total=len(timestamps), desc="   Continuation labels",
+                  unit="timestamps", ncols=80, position=1, leave=False, ascii=True) as pbar:
 
             for i, ts in enumerate(timestamps):
                 try:

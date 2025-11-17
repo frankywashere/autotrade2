@@ -636,7 +636,7 @@ def main():
     parser.add_argument('--sequence_length', type=int, default=200,
                         help='Input sequence length (number of 1-min bars)')
     parser.add_argument('--prediction_horizon', type=int, default=24,
-                        help='Prediction horizon in bars (24 = 24 minutes)')
+                        help='Base prediction horizon in bars (24 = 24 minutes) - model adapts dynamically')
     parser.add_argument('--train_start_year', type=int, default=2015,
                         help='Training data start year')
     parser.add_argument('--train_end_year', type=int, default=2022,
@@ -734,7 +734,7 @@ def main():
         print(f"   RAM: {hw_info.get('total_ram_gb', 0):.0f} GB")
     print(f"📅 Training: {args.train_start_year}-{args.train_end_year}")
     print(f"📊 Sequence: {args.sequence_length} bars ({args.sequence_length} minutes)")
-    print(f"🎯 Horizon: {args.prediction_horizon} bars ({args.prediction_horizon} minutes)")
+    print(f"🎯 Horizon: Adaptive (base {args.prediction_horizon} bars, model adjusts dynamically)")
     print(f"🔢 Batch size: {args.batch_size}")
     print(f"🔄 Epochs: {args.epochs}")
     print(f"💾 Data mode: {'Preload' if args.preload else 'Lazy'}")
