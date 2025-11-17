@@ -30,6 +30,56 @@ class CSVDataFeed(DataFeed):
         self.timeframe = timeframe
         self.cache = {}
 
+    def validate_data(self, df: pd.DataFrame) -> bool:
+        """
+        Validate DataFrame has required columns and reasonable data.
+        Provides detailed terminal output for debugging failures.
+        """
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+
+        # Check for required columns
+        if not all(col in df.columns for col in required_cols):
+            missing = [col for col in required_cols if col not in df.columns]
+            print(f"❌ Validation failed: Missing columns {missing}")
+            print(f"   Available columns: {df.columns.tolist()}")
+            return False
+
+        # Check for nulls
+        if df[required_cols].isnull().any().any():
+            null_counts = df[required_cols].isnull().sum()
+            print("❌ Validation failed: Null values in required columns")
+            print(f"   Null counts: {null_counts.to_dict()}")
+            return False
+
+        # Check for zeros in price columns
+        price_cols = ['open', 'high', 'low', 'close']
+        zero_mask = (df[price_cols] == 0).any(axis=1)
+        if zero_mask.any():
+            zero_count = zero_mask.sum()
+            print(f"❌ Validation failed: Zero values in price columns ({zero_count} rows)")
+            print(f"   First few zero rows: {df[zero_mask].head(3).index.tolist()}")
+            return False
+
+        # Check if timestamps are sorted
+        if not df.index.is_monotonic_increasing:
+            print("❌ Validation failed: Timestamps not sorted")
+            print("   Consider sorting data by timestamp before validation")
+            return False
+
+        # Check for reasonable data ranges
+        if (df['high'] < df['low']).any():
+            bad_count = (df['high'] < df['low']).sum()
+            print(f"❌ Validation failed: High < Low in {bad_count} rows")
+            return False
+
+        if (df['close'] < df['low']).any() or (df['close'] > df['high']).any():
+            bad_count = ((df['close'] < df['low']) | (df['close'] > df['high'])).sum()
+            print(f"❌ Validation failed: Close outside High/Low range in {bad_count} rows")
+            return False
+
+        print("✅ Data validation passed")
+        return True
+
     def load_data(self, symbol: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
         """Load historical data from CSV for specified timeframe"""
         csv_path = Path(self.data_dir) / f"{symbol}_{self.timeframe}.csv"
@@ -137,6 +187,11 @@ class CSVDataFeed(DataFeed):
 
         # Merge into single DataFrame
         aligned_df = pd.concat([spy_aligned, tsla_aligned], axis=1)
+
+        # Final validation of merged data
+        print("  🔍 Validating merged data...")
+        if not self.validate_data(aligned_df):
+            raise ValueError("Merged data validation failed - check terminal output above for details")
 
         return aligned_df
 
