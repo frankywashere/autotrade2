@@ -550,11 +550,18 @@ class TradingFeatureExtractor(FeatureExtractor):
                     base_lookback = min(168, len(df) // 2)
                     tasks.append((symbol, tf_name, tf_rule, symbol_df, base_lookback, df.index, is_live_mode))
 
-            # Execute in parallel with progress bar
+            # Execute in parallel with clean progress bar
+            print(f"   🚀 Using {n_jobs} CPU cores for parallel channel calculation")
             print(f"   Processing {len(tasks)} channel calculations in parallel...")
-            results = Parallel(n_jobs=n_jobs, backend='loky', verbose=10)(
-                delayed(self._calculate_single_channel_task)(task) for task in tasks
-            )
+
+            # Use tqdm to track task completion
+            with tqdm(total=len(tasks), desc="   Channel tasks", ncols=80, position=1, leave=False, ascii=True) as pbar:
+                results = []
+                for result in Parallel(n_jobs=n_jobs, backend=config.PARALLEL_BACKEND, verbose=config.PARALLEL_VERBOSE, return_as='generator')(
+                    delayed(self._calculate_single_channel_task)(task) for task in tasks
+                ):
+                    results.append(result)
+                    pbar.update(1)
 
             # Aggregate results
             channel_features = {}
@@ -629,7 +636,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                     else:
                         # CPU calculation (original implementation)
                         rolling_results = self._calculate_rolling_channels(
-                            resampled, lookback, tf_name, symbol, df.index
+                            resampled, lookback, tf_name, symbol, df.index,
+                            show_progress=True  # Show progress bar in sequential mode
                         )
 
                     # Store rolling results (each row has unique values!)
@@ -692,7 +700,8 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Calculate rolling channels (CPU only for parallel mode)
         rolling_results = self._calculate_rolling_channels(
-            resampled, lookback, tf_name, symbol, original_index
+            resampled, lookback, tf_name, symbol, original_index,
+            show_progress=False  # Disable progress bar in parallel mode
         )
 
         # Format results
@@ -708,7 +717,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         lookback: int,
         tf_name: str,
         symbol: str,
-        original_index: pd.DatetimeIndex
+        original_index: pd.DatetimeIndex,
+        show_progress: bool = True
     ) -> dict:
         """
         Calculate channels at each timestamp using rolling window.
@@ -719,6 +729,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             tf_name: Timeframe name
             symbol: 'tsla' or 'spy'
             original_index: Original 1-min index (for alignment)
+            show_progress: Whether to show progress bar (False for parallel mode)
 
         Returns:
             Dictionary with arrays for each channel feature
@@ -746,10 +757,15 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Calculate channel at each timestamp
         bar_range = range(lookback, len(resampled_df))
-        progress_desc = f"      CPU: {symbol} {tf_name}"
-        bar_range_tqdm = tqdm(bar_range, desc=progress_desc, leave=False, position=2, ncols=80, ascii=True)
 
-        for i in bar_range_tqdm:
+        # Only show progress bar in sequential mode
+        if show_progress:
+            progress_desc = f"      CPU: {symbol} {tf_name}"
+            bar_range_iter = tqdm(bar_range, desc=progress_desc, leave=False, position=2, ncols=80, ascii=True)
+        else:
+            bar_range_iter = bar_range
+
+        for i in bar_range_iter:
             try:
                 # Get available data up to this point
                 available_window = resampled_df.iloc[:i]
@@ -1567,11 +1583,12 @@ class TradingFeatureExtractor(FeatureExtractor):
                 try:
                     current_idx = df.index.get_loc(ts)
 
-                    # Check raw data availability
-                    one_h_available = min(120, current_idx)  # How much 1h data we could get
-                    four_h_available = min(480, current_idx)  # How much 4h data we could get
+                    # Check raw data availability with config values
+                    one_h_available = min(config.CONTINUATION_LOOKBACK_1H, current_idx)  # How much 1h data we could get
+                    four_h_available = min(config.CONTINUATION_LOOKBACK_4H, current_idx)  # How much 4h data we could get
 
-                    has_sufficient = (one_h_available >= 60 and four_h_available >= 120)
+                    # Require at least 120 bars for 1h and 480 for 4h (minimum for basic analysis)
+                    has_sufficient = (one_h_available >= 120 and four_h_available >= 480)
 
                     if has_sufficient:
                         validation_results['sufficient_raw_data'] += 1
@@ -1640,12 +1657,14 @@ class TradingFeatureExtractor(FeatureExtractor):
                     current_price = df.loc[ts, 'tsla_close']
 
                     # Step 1: Pull multi-timeframe OHLC chunks
-                    # 1h chunk: 120 bars back (120 * 5min = 10 hours) - DOUBLED for better dynamic windowing
-                    one_h_start = max(0, current_idx - 120)
+                    # 1h chunk: Use config value (default 1512 bars = ~3 months)
+                    one_h_lookback = min(current_idx, config.CONTINUATION_LOOKBACK_1H)
+                    one_h_start = max(0, current_idx - one_h_lookback)
                     one_h_chunk = df.iloc[one_h_start:current_idx+1].copy()
 
-                    # 4h chunk: 480 bars back (480 * 5min = 40 hours) - DOUBLED for better dynamic windowing
-                    four_h_start = max(0, current_idx - 480)
+                    # 4h chunk: Use config value (default 6048 bars = ~1 year)
+                    four_h_lookback = min(current_idx, config.CONTINUATION_LOOKBACK_4H)
+                    four_h_start = max(0, current_idx - four_h_lookback)
                     four_h_chunk = df.iloc[four_h_start:current_idx+1].copy()
 
                     # DEBUG: Log data availability for first few timestamps
@@ -1688,13 +1707,13 @@ class TradingFeatureExtractor(FeatureExtractor):
                     rsi_1h = self.rsi_calc.get_rsi_data(one_h_ohlc).value or 50.0
                     rsi_4h = self.rsi_calc.get_rsi_data(four_h_ohlc).value or 50.0
 
-                    # Step 3: Fit channels and get slopes
+                    # Step 3: Fit channels and get slopes (allow using more data)
                     channel_1h = self.channel_calc.find_optimal_channel_window(
-                        one_h_ohlc, timeframe='1h', max_lookback=min(30, len(one_h_ohlc)//2), min_ping_pongs=2
+                        one_h_ohlc, timeframe='1h', max_lookback=min(60, max(5, len(one_h_ohlc)-2)), min_ping_pongs=2
                     )
 
                     channel_4h = self.channel_calc.find_optimal_channel_window(
-                        four_h_ohlc, timeframe='4h', max_lookback=min(60, len(four_h_ohlc)//2), min_ping_pongs=2
+                        four_h_ohlc, timeframe='4h', max_lookback=min(120, max(10, len(four_h_ohlc)-2)), min_ping_pongs=2
                     )
 
                     # Get slopes (default to 0 if no channel found)

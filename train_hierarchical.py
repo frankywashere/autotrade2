@@ -38,6 +38,7 @@ from src.ml.hierarchical_dataset import create_hierarchical_dataset
 from src.ml.features import TradingFeatureExtractor
 from src.ml.data_feed import CSVDataFeed
 import yaml
+import config as project_config
 
 
 def get_hardware_info():
@@ -810,6 +811,34 @@ def main():
     # But create sliced version for timestamps used in continuation analysis
     df_sliced = df[(df.index >= training_start) & (df.index <= training_end)].copy()
     print(f"   Training slice: {len(df_sliced)} bars ({df_sliced.index[0]} to {df_sliced.index[-1]})")
+
+    # Smart lookback buffer system: Check if warmup period adjustment is needed
+    if project_config.SKIP_WARMUP_PERIOD:
+        # Calculate where first training timestamp sits in full dataset
+        first_training_idx = df.index.get_loc(df_sliced.index[0])
+
+        # Check if we have enough historical data before first training timestamp
+        if first_training_idx < project_config.MIN_LOOKBACK_BARS:
+            # Need to skip warmup period
+            warmup_end_idx = project_config.MIN_LOOKBACK_BARS
+            effective_start = df.index[warmup_end_idx]
+
+            print(f"\n   ⚠️  Adjusting training range for data quality:")
+            print(f"      Requested start: {df_sliced.index[0]}")
+            print(f"      Data file starts: {df.index[0]}")
+            print(f"      Minimum lookback required: {project_config.MIN_LOOKBACK_BARS} bars (~{project_config.MIN_LOOKBACK_MONTHS} months)")
+            print(f"      Effective training start: {effective_start}")
+
+            # Skip the warmup period
+            original_length = len(df_sliced)
+            df_sliced = df_sliced[df_sliced.index >= effective_start].copy()
+            warmup_skipped = original_length - len(df_sliced)
+
+            print(f"      Skipped {warmup_skipped} warmup bars ({warmup_skipped/78:.1f} trading days)")
+            print(f"      Remaining training data: {len(df_sliced)} bars ({df_sliced.index[0]} to {df_sliced.index[-1]})")
+            print(f"      ✓ All training samples will have complete {project_config.MIN_LOOKBACK_MONTHS}-month feature history")
+        else:
+            print(f"   ✓ Sufficient historical data available ({first_training_idx} bars before training start)")
 
     # Extract features and continuation labels
     print("\n2. Extracting features and continuation labels...")
