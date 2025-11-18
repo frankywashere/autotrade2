@@ -138,12 +138,12 @@ PARALLEL_VERBOSE = 0           # joblib verbosity level (0=silent, 10=progress, 
 # ======================================================================
 
 # Feature extraction minimum lookback requirements
-MIN_LOOKBACK_BARS = 5148       # For 3-month channel features (~66 trading days)
+MIN_LOOKBACK_BARS = 25740      # For 3-month channel features at 1-min bars (66 trading days × 390 bars/day)
 MIN_LOOKBACK_MONTHS = 3        # Approximate calendar months
 
-# Continuation analysis lookback requirements
-CONTINUATION_LOOKBACK_1H = 1512  # 3 months for 1h analysis (instead of 120 bars/10 hours)
-CONTINUATION_LOOKBACK_4H = 6048  # 1 year for 4h analysis (instead of 480 bars/40 hours)
+# Continuation analysis lookback requirements (in 1-min bars)
+CONTINUATION_LOOKBACK_1H = 25740   # 3 months at 1-min bars (66 trading days × 390 bars/day)
+CONTINUATION_LOOKBACK_4H = 98280   # 1 year at 1-min bars (252 trading days × 390 bars/day)
 
 # Training dataset warmup settings
 SKIP_WARMUP_PERIOD = True      # Automatically exclude insufficient-history timestamps
