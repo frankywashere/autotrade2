@@ -184,8 +184,8 @@ class HierarchicalDataset(Dataset):
         x_tensor = torch.tensor(x, dtype=torch.float32)
 
         # Calculate adaptive targets
-        actual_max_idx = future_prices.idxmax()
-        bars_to_peak = (actual_max_idx - future_prices.index[0]).total_seconds() / 60  # minutes → bars
+        actual_max_idx = future_prices.argmax()
+        bars_to_peak = actual_max_idx  # Index directly represents bars into the future
 
         # Simple adaptive targets (can be enhanced with channel bounds calculation)
         adaptive_price_change = target_high_pct if target_high_pct > abs(target_low_pct) else target_low_pct
