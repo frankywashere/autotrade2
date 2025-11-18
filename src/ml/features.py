@@ -557,10 +557,20 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   🚀 Using {n_jobs if n_jobs > 0 else 'all'} CPU cores for parallel channel calculation")
             print(f"   Processing {len(tasks)} channel calculations in parallel...")
 
-            # Run parallel with optimized memory usage
-            results = Parallel(n_jobs=n_jobs, backend='loky', prefer="processes", verbose=10)(
-                delayed(self._compute_channel_memory_efficient)(task) for task in tasks
-            )
+            # Run parallel with clean progress bar
+            results = []
+            for result in tqdm(
+                Parallel(n_jobs=n_jobs, backend='loky', prefer="processes", verbose=0)(  # verbose=0 = no joblib spam
+                    delayed(self._compute_channel_memory_efficient)(task) for task in tasks
+                ),
+                total=len(tasks),
+                desc="   🔄 Channels",
+                unit="tf",          # shows "tf" for timeframe (e.g., 15/22 tf)
+                ncols=100,
+                ascii=True,
+                bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}"  # clean look even on small terminals
+            ):
+                results.append(result)
 
             # Merge results back into DataFrame format
             channel_features = pd.DataFrame(index=df.index)
