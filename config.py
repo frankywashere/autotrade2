@@ -131,7 +131,7 @@ LOG_DEVICE_OPERATIONS = False  # Log device transfer operations (debugging)
 PARALLEL_CHANNEL_CALC = True  # Use joblib for parallel channel calculations
 MAX_PARALLEL_WORKERS = 8      # Maximum CPU cores to use (0 = use all available)
 PARALLEL_BACKEND = 'loky'     # joblib backend: 'loky' (process), 'threading', 'multiprocessing'
-PARALLEL_VERBOSE = 10          # joblib verbosity level (0=silent, 10=progress, 50=debug) - enables diagnostic output
+PARALLEL_VERBOSE = 0           # joblib verbosity level (0=silent, 10=progress, 50=debug) - using tqdm instead
 
 # ======================================================================
 # HISTORICAL LOOKBACK CONFIGURATION

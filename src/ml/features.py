@@ -557,26 +557,38 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   🚀 Using {n_jobs if n_jobs > 0 else 'all'} CPU cores for parallel channel calculation")
             print(f"   Processing {len(tasks)} channel calculations in parallel...")
 
-            # Run parallel with clean progress bar
-            results = []
-            for result in tqdm(
-                Parallel(n_jobs=n_jobs, backend='loky', prefer="processes", verbose=0)(  # verbose=0 = no joblib spam
-                    delayed(self._compute_channel_memory_efficient)(task) for task in tasks
-                ),
-                total=len(tasks),
-                desc="   🔄 Channels",
-                unit="tf",          # shows "tf" for timeframe (e.g., 15/22 tf)
-                ncols=100,
-                ascii=True,
-                bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}"  # clean look even on small terminals
-            ):
-                results.append(result)
+            import contextlib
+            import joblib
 
-            # Merge results back into DataFrame format
-            channel_features = pd.DataFrame(index=df.index)
+            @contextlib.contextmanager
+            def tqdm_joblib(tqdm_object):
+                """Patch joblib to report progress to tqdm bar"""
+                class TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
+                    def __call__(self, *args, **kwargs):
+                        tqdm_object.update(n=self.batch_size)
+                        return super().__call__(*args, **kwargs)
+
+                old_batch_callback = joblib.parallel.BatchCompletionCallBack
+                joblib.parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
+                try:
+                    yield tqdm_object
+                finally:
+                    joblib.parallel.BatchCompletionCallBack = old_batch_callback
+                    tqdm_object.close()
+
+            # Professional-grade real-time progress monitoring
+            with tqdm(total=len(tasks), desc="   🔄 Channels", unit="tf", ncols=100, mininterval=0.5, bar_format="{l_bar}{bar:30}{r_bar}") as pbar:
+                with tqdm_joblib(pbar):
+                    results = Parallel(n_jobs=-1, backend='loky', prefer="processes", verbose=0)(
+                        delayed(self._compute_channel_memory_efficient)(task) for task in tasks
+                    )
+
+            # Merge results back into DataFrame format – ZERO fragmentation
+            all_channel_data = {}
             for result_dict in results:
-                for col_name, array in result_dict.items():
-                    channel_features[col_name] = array
+                all_channel_data.update(result_dict)
+
+            channel_features = pd.DataFrame(all_channel_data, index=df.index)
 
         else:
             # Original sequential processing (for GPU mode or small datasets)
