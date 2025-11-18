@@ -834,7 +834,7 @@ def main():
             df_sliced = df_sliced[df_sliced.index >= effective_start].copy()
             warmup_skipped = original_length - len(df_sliced)
 
-            print(f"      Skipped {warmup_skipped} warmup bars ({warmup_skipped/78:.1f} trading days)")
+            print(f"      Skipped {warmup_skipped} warmup bars ({warmup_skipped/390:.1f} trading days)")
             print(f"      Remaining training data: {len(df_sliced)} bars ({df_sliced.index[0]} to {df_sliced.index[-1]})")
             print(f"      ✓ All training samples will have complete {project_config.MIN_LOOKBACK_MONTHS}-month feature history")
         else:

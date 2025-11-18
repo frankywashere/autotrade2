@@ -550,17 +550,21 @@ class TradingFeatureExtractor(FeatureExtractor):
                     base_lookback = min(168, len(df) // 2)
                     tasks.append((symbol, tf_name, tf_rule, symbol_df, base_lookback, df.index, is_live_mode))
 
-            # Execute in parallel with clean progress bar
+            # Execute in parallel with single progress bar
             print(f"   🚀 Using {n_jobs} CPU cores for parallel channel calculation")
             print(f"   Processing {len(tasks)} channel calculations in parallel...")
 
-            # Use tqdm to track task completion
-            with tqdm(total=len(tasks), desc="   Channel tasks", ncols=80, position=1, leave=False, ascii=True) as pbar:
+            # Single progress bar that works with parallel processing
+            with tqdm(total=len(tasks), desc="   Channel tasks", ncols=100, position=1, leave=False, ascii=True) as pbar:
                 results = []
-                for result in Parallel(n_jobs=n_jobs, backend=config.PARALLEL_BACKEND, verbose=config.PARALLEL_VERBOSE, return_as='generator')(
+                for result in Parallel(n_jobs=n_jobs, backend=config.PARALLEL_BACKEND,
+                                      verbose=config.PARALLEL_VERBOSE, return_as='generator')(
                     delayed(self._calculate_single_channel_task)(task) for task in tasks
                 ):
+                    symbol, tf_name, task_results = result
                     results.append(result)
+                    # Show which task just completed
+                    pbar.set_postfix_str(f"Completed: {symbol.upper()} {tf_name}")
                     pbar.update(1)
 
             # Aggregate results
@@ -1206,62 +1210,67 @@ class TradingFeatureExtractor(FeatureExtractor):
             '3month': '3ME'
         }
 
-        # Process both TSLA and SPY
-        for symbol in ['tsla', 'spy']:
-            for tf_name, tf_rule in timeframes.items():
-                # HYBRID DATA SELECTION: Use appropriate resolution for live mode
-                if is_live_mode:
-                    # Live mode: Get data from appropriate resolution
-                    if tf_name in ['5min', '15min', '30min']:
-                        # Use 1-min data (sufficient history)
-                        source_data = multi_res_data['1min']
-                    elif tf_name in ['1h', '2h', '3h', '4h']:
-                        # Use hourly data (2 years of history)
-                        source_data = multi_res_data['1hour']
-                    else:  # daily, weekly, monthly, 3month
-                        # Use daily data (max history)
-                        source_data = multi_res_data['daily']
+        total_calcs = len(timeframes) * 2
+        with tqdm(total=total_calcs, desc="   RSI features (SPY+TSLA)", ncols=80, leave=False, position=1, ascii=True) as pbar:
+            # Process both TSLA and SPY
+            for symbol in ['tsla', 'spy']:
+                for tf_name, tf_rule in timeframes.items():
+                    # HYBRID DATA SELECTION: Use appropriate resolution for live mode
+                    if is_live_mode:
+                        # Live mode: Get data from appropriate resolution
+                        if tf_name in ['5min', '15min', '30min']:
+                            # Use 1-min data (sufficient history)
+                            source_data = multi_res_data['1min']
+                        elif tf_name in ['1h', '2h', '3h', '4h']:
+                            # Use hourly data (2 years of history)
+                            source_data = multi_res_data['1hour']
+                        else:  # daily, weekly, monthly, 3month
+                            # Use daily data (max history)
+                            source_data = multi_res_data['daily']
 
-                    # Extract symbol columns
-                    symbol_df = source_data[[c for c in source_data.columns if c.startswith(f'{symbol}_')]].copy()
-                else:
-                    # Training mode: Use input dataframe
-                    symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
+                        # Extract symbol columns
+                        symbol_df = source_data[[c for c in source_data.columns if c.startswith(f'{symbol}_')]].copy()
+                    else:
+                        # Training mode: Use input dataframe
+                        symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
 
-                symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
+                    symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
 
-                # Resample to target timeframe
-                resampled = symbol_df.resample(tf_rule).agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'volume': 'sum'
-                }).dropna()
+                    # Resample to target timeframe
+                    resampled = symbol_df.resample(tf_rule).agg({
+                        'open': 'first',
+                        'high': 'max',
+                        'low': 'min',
+                        'close': 'last',
+                        'volume': 'sum'
+                    }).dropna()
 
-                prefix = f'{symbol}_rsi'
+                    prefix = f'{symbol}_rsi'
 
-                if len(resampled) < 20:
-                    # Not enough data - fill with defaults
-                    rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, 50.0)
-                    rsi_features[f'{prefix}_{tf_name}_oversold'] = np.zeros(num_rows)
-                    rsi_features[f'{prefix}_{tf_name}_overbought'] = np.zeros(num_rows)
-                    continue
+                    if len(resampled) < 20:
+                        # Not enough data - fill with defaults
+                        rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, 50.0)
+                        rsi_features[f'{prefix}_{tf_name}_oversold'] = np.zeros(num_rows)
+                        rsi_features[f'{prefix}_{tf_name}_overbought'] = np.zeros(num_rows)
+                        pbar.update(1)
+                        continue
 
-                try:
-                    rsi_data = self.rsi_calc.get_rsi_data(resampled)
-                    rsi_value = rsi_data.value if rsi_data.value is not None else 50.0
+                    try:
+                        rsi_data = self.rsi_calc.get_rsi_data(resampled)
+                        rsi_value = rsi_data.value if rsi_data.value is not None else 50.0
 
-                    # Store features (broadcast scalar to all rows)
-                    rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, rsi_value)
-                    rsi_features[f'{prefix}_{tf_name}_oversold'] = np.full(num_rows, 1.0 if rsi_data.oversold else 0.0)
-                    rsi_features[f'{prefix}_{tf_name}_overbought'] = np.full(num_rows, 1.0 if rsi_data.overbought else 0.0)
+                        # Store features (broadcast scalar to all rows)
+                        rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, rsi_value)
+                        rsi_features[f'{prefix}_{tf_name}_oversold'] = np.full(num_rows, 1.0 if rsi_data.oversold else 0.0)
+                        rsi_features[f'{prefix}_{tf_name}_overbought'] = np.full(num_rows, 1.0 if rsi_data.overbought else 0.0)
 
-                except Exception:
-                    # Fill with defaults
-                    rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, 50.0)
-                    rsi_features[f'{prefix}_{tf_name}_oversold'] = np.zeros(num_rows)
-                    rsi_features[f'{prefix}_{tf_name}_overbought'] = np.zeros(num_rows)
+                    except Exception:
+                        # Fill with defaults
+                        rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, 50.0)
+                        rsi_features[f'{prefix}_{tf_name}_oversold'] = np.zeros(num_rows)
+                        rsi_features[f'{prefix}_{tf_name}_overbought'] = np.zeros(num_rows)
+                    
+                    pbar.update(1)
 
         return pd.DataFrame(rsi_features, index=df.index)
 
@@ -1485,7 +1494,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             is_high_impact_event = np.zeros(num_rows)
 
             # Extract events for each timestamp
-            for idx in range(num_rows):
+            event_pbar = tqdm(range(num_rows), desc="      Event features", leave=False, position=2, ncols=80, ascii=True)
+            for idx in event_pbar:
                 timestamp = raw_df.index[idx]
                 date_str = timestamp.strftime('%Y-%m-%d')
 
