@@ -864,12 +864,26 @@ def main():
     use_cache = not getattr(args, 'regenerate_cache', False)
 
     # Use GPU if enabled (from interactive menu or auto-detect)
-    use_gpu = getattr(args, 'use_gpu_features', 'auto')
+    # If --device cpu was specified, force CPU for features too
+    if hasattr(args, 'device') and args.device == 'cpu':
+        use_gpu = False
+    else:
+        use_gpu = args.use_gpu_features if hasattr(args, 'use_gpu_features') else 'auto'
+
 
     # Set parallel processing option in config if specified
     if hasattr(args, 'use_parallel'):
         import config
         config.PARALLEL_CHANNEL_CALC = args.use_parallel
+    else:
+        # If not in interactive mode and parallel isn't set, enable it by default for CPU
+        if use_gpu == False:  # Only enable parallel if we're definitely using CPU
+            import multiprocessing as mp
+            if mp.cpu_count() > 2:
+                import config
+                args.use_parallel = True
+                config.PARALLEL_CHANNEL_CALC = True
+                print("   🚀 Auto-enabling parallel processing for CPU mode")
 
     features_df, continuation_df = extractor.extract_features(
         df,
