@@ -19,4 +19,6 @@ matplotlib
 fredapi
 beautifulsoup4
 plotly
+rich
+joblib
 

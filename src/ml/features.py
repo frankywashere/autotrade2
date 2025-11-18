@@ -21,7 +21,6 @@ import config
 from src.linear_regression import LinearRegressionChannel
 from src.rsi_calculator import RSICalculator
 from .base import FeatureExtractor
-from .channel_features import ChannelFeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
 FEATURE_VERSION = "v3.12"  # Added joblib parallelization for channel calculations
@@ -51,7 +50,6 @@ class TradingFeatureExtractor(FeatureExtractor):
     def __init__(self):
         self.channel_calc = LinearRegressionChannel()
         self.rsi_calc = RSICalculator()
-        self.channel_features_calc = ChannelFeatureExtractor()
         self.feature_names = []
         self._build_feature_names()
 
@@ -280,7 +278,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # PASS 1: Extract base features
         print("   Extracting base features...")
-        with tqdm(total=7, desc="   Feature extraction", leave=True, position=0, ncols=80, ascii=True) as pbar:
+        with tqdm(total=7, desc="   Feature extraction", leave=True, ncols=100, ascii=True, mininterval=0.5) as pbar:
             price_df = self._extract_price_features(df)
             pbar.update(1)
 
@@ -314,7 +312,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         ], axis=1)
 
         # PASS 2: Extract breakdown features (needs base features + optional events)
-        with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=80, ascii=True) as pbar:
+        with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100, ascii=True, mininterval=0.5) as pbar:
             breakdown_df = self._extract_breakdown_features(base_features_df, df, events_handler)
             pbar.update(1)
 
@@ -451,7 +449,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                         cache_file.unlink()
                     else:
                         # Load cache with progress bar
-                        with tqdm(total=1, desc=f"   Loading cache", leave=False, position=1, ncols=80, ascii=True) as pbar:
+                        with tqdm(total=1, desc=f"   Loading cache", leave=False, ncols=100, ascii=True, mininterval=0.5) as pbar:
                             with open(cache_file, 'rb') as f:
                                 result = pickle.load(f)
                             pbar.update(1)
@@ -511,34 +509,57 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Determine whether to use parallel processing
         n_cores = mp.cpu_count()
+        is_live_mode = multi_res_data is not None  # Live mode uses multi-resolution data
         # Check config setting and other conditions
         parallel_enabled = config.PARALLEL_CHANNEL_CALC if hasattr(config, 'PARALLEL_CHANNEL_CALC') else True
+
         use_parallel = parallel_enabled and not use_gpu and n_cores > 2 and total_calcs >= 8 and not is_live_mode  # Don't parallelize live mode
+
+        # Notify user of processing mode and time estimate
+        if not use_parallel:
+            reasons = []
+            if use_gpu:
+                reasons.append("GPU mode active (incompatible)")
+            if n_cores <= 2:
+                reasons.append(f"insufficient cores ({n_cores})")
+            if total_calcs < 8:
+                reasons.append("dataset too small")
+            if is_live_mode:
+                reasons.append("live mode (stability)")
+            if not parallel_enabled:
+                reasons.append("disabled in config")
+
+            print(f"   ℹ️  Sequential processing: {', '.join(reasons)}")
+            print(f"   ⏱️  Estimated time: ~{total_calcs * 2.5:.0f} minutes")
+        else:
+            cores_to_use = config.MAX_PARALLEL_WORKERS if hasattr(config, 'MAX_PARALLEL_WORKERS') and config.MAX_PARALLEL_WORKERS > 0 else n_cores
+            print(f"   🚀 Parallel processing: using {cores_to_use} of {n_cores} available cores")
+            print(f"   ⏱️  Estimated time: ~{(total_calcs * 2.5 / cores_to_use):.0f} minutes")
 
         if use_parallel:
             # ─── MEMORY-EFFICIENT PARALLEL CHANNEL CALCULATION (16GB-SAFE + FAST) ───
-            # Extract only price arrays (tiny ~3.7MB) instead of full DataFrames (1GB+)
-            tsla_close = df['tsla_close'].values.astype(np.float32)
-            spy_close = df['spy_close'].values.astype(np.float32)
+            # Extract only price arrays (uses float64 for accuracy)
+            tsla_close = df['tsla_close'].values
+            spy_close = df['spy_close'].values
             tsla_ohlcv = {
-                'open': df['tsla_open'].values.astype(np.float32),
-                'high': df['tsla_high'].values.astype(np.float32),
-                'low': df['tsla_low'].values.astype(np.float32),
+                'open': df['tsla_open'].values,
+                'high': df['tsla_high'].values,
+                'low': df['tsla_low'].values,
                 'close': tsla_close,
-                'volume': df['tsla_volume'].values.astype(np.float32)
+                'volume': df['tsla_volume'].values
             }
             spy_ohlcv = {
-                'open': df['spy_open'].values.astype(np.float32),
-                'high': df['spy_high'].values.astype(np.float32),
-                'low': df['spy_low'].values.astype(np.float32),
+                'open': df['spy_open'].values,
+                'high': df['spy_high'].values,
+                'low': df['spy_low'].values,
                 'close': spy_close,
-                'volume': df['spy_volume'].values.astype(np.float32)
+                'volume': df['spy_volume'].values
             }
 
             # Store original timestamps for resampling
             timestamps = df.index.values
 
-            # Build lightweight task list
+            # Build lightweight task list (no unpicklable objects!)
             tasks = []
             for symbol, ohlcv_data in [('tsla', tsla_ohlcv), ('spy', spy_ohlcv)]:
                 for tf_name, tf_rule in timeframes.items():
@@ -547,41 +568,47 @@ class TradingFeatureExtractor(FeatureExtractor):
                         timestamps,
                         tf_name,
                         tf_rule,
-                        symbol,
-                        self.channel_calc,
-                        self.channel_features_calc
+                        symbol
+                        # Removed self.channel_calc and self.channel_features_calc
+                        # These will be created fresh in each worker process
                     ))
 
-            # Use all available cores safely
-            n_jobs = -1  # Use all cores - safe now with small memory footprint
-            print(f"   🚀 Using {n_jobs if n_jobs > 0 else 'all'} CPU cores for parallel channel calculation")
-            print(f"   Processing {len(tasks)} channel calculations in parallel...")
+            # Use configured number of cores or all available
+            max_workers = config.MAX_PARALLEL_WORKERS if hasattr(config, 'MAX_PARALLEL_WORKERS') else 0
+            n_jobs = max_workers if max_workers > 0 else -1
 
-            import contextlib
-            import joblib
+            # Check if we should use multi-progress bars
+            use_multi_progress = False
+            try:
+                from rich.progress import Progress
+                use_multi_progress = True
+            except ImportError:
+                pass
 
-            @contextlib.contextmanager
-            def tqdm_joblib(tqdm_object):
-                """Patch joblib to report progress to tqdm bar"""
-                class TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
-                    def __call__(self, *args, **kwargs):
-                        tqdm_object.update(n=self.batch_size)
-                        return super().__call__(*args, **kwargs)
-
-                old_batch_callback = joblib.parallel.BatchCompletionCallBack
-                joblib.parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
-                try:
-                    yield tqdm_object
-                finally:
-                    joblib.parallel.BatchCompletionCallBack = old_batch_callback
-                    tqdm_object.close()
-
-            # Professional-grade real-time progress monitoring
-            with tqdm(total=len(tasks), desc="   🔄 Channels", unit="tf", ncols=100, mininterval=0.5, bar_format="{l_bar}{bar:30}{r_bar}") as pbar:
-                with tqdm_joblib(pbar):
-                    results = Parallel(n_jobs=-1, backend='loky', prefer="processes", verbose=0)(
-                        delayed(self._compute_channel_memory_efficient)(task) for task in tasks
+            if use_multi_progress:
+                # Use custom parallel extraction with individual progress bars
+                from .parallel_channel_extraction import parallel_channel_extraction_with_multi_progress
+                print("   🎨 Using multi-progress display (one bar per timeframe)...")
+                results = parallel_channel_extraction_with_multi_progress(tasks, n_jobs)
+            else:
+                # Fallback to standard tqdm with joblib
+                results = list(
+                    tqdm(
+                        Parallel(
+                            n_jobs=n_jobs,
+                            backend='loky',
+                            prefer="processes",
+                            verbose=0,
+                            return_as="generator"
+                        )(delayed(self._compute_channel_memory_efficient)(task) for task in tasks),
+                        total=len(tasks),
+                        desc="   🔄 Channels",
+                        unit="tf",
+                        ncols=100,
+                        mininterval=0.5,
+                        bar_format="{l_bar}{bar:30}{r_bar}  {postfix}"
                     )
+                )
 
             # Merge results back into DataFrame format – ZERO fragmentation
             all_channel_data = {}
@@ -592,7 +619,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         else:
             # Original sequential processing (for GPU mode or small datasets)
-            calc_progress = tqdm(total=total_calcs, desc="   Rolling channels (SPY + TSLA)", ncols=80, leave=False, position=1, ascii=True)
+            calc_progress = tqdm(total=total_calcs, desc="   Rolling channels (SPY + TSLA)", ncols=100, leave=False, ascii=True, mininterval=0.5)
 
             channel_features = {}  # Initialize for sequential mode
 
@@ -691,142 +718,188 @@ class TradingFeatureExtractor(FeatureExtractor):
         Processes ~3.7MB of data instead of 1GB+ DataFrames.
 
         Args:
-            args: Tuple of (ohlcv_data, timestamps, tf_name, tf_rule, symbol, channel_calc, channel_features_calc)
+            args: Tuple of (ohlcv_data, timestamps, tf_name, tf_rule, symbol)
 
         Returns:
             Dictionary with column names as keys and numpy arrays as values
         """
         import pandas as pd
         import numpy as np
+        import sys
+        from pathlib import Path
 
-        ohlcv_data, timestamps, tf_name, tf_rule, symbol, channel_calc, channel_features_calc = args
+        # Debug: Track worker process
+        import os
+        pid = os.getpid()
 
-        # Create a minimal DataFrame just for resampling
-        df_minimal = pd.DataFrame(ohlcv_data, index=pd.DatetimeIndex(timestamps))
+        # Add parent directory to path for imports
+        parent_dir = Path(__file__).parent.parent.parent
+        sys.path.insert(0, str(parent_dir))
 
-        # Resample to target timeframe
-        resampled = df_minimal.resample(tf_rule).agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        }).dropna()
+        # Import and create fresh instances in worker process
+        from src.linear_regression import LinearRegressionChannel
 
-        n = len(timestamps)
-        prefix = f'{symbol}_channel_{tf_name}'
+        # Unpack args (no class instances now!)
+        ohlcv_data, timestamps, tf_name, tf_rule, symbol = args
 
-        # Pre-allocate result arrays
-        results = {
-            f'{prefix}_position': np.zeros(n, dtype=np.float32),
-            f'{prefix}_upper_dist': np.zeros(n, dtype=np.float32),
-            f'{prefix}_lower_dist': np.zeros(n, dtype=np.float32),
-            f'{prefix}_slope': np.zeros(n, dtype=np.float32),
-            f'{prefix}_slope_pct': np.zeros(n, dtype=np.float32),
-            f'{prefix}_stability': np.zeros(n, dtype=np.float32),
-            f'{prefix}_ping_pongs': np.zeros(n, dtype=np.float32),
-            f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=np.float32),
-            f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=np.float32),
-            f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=np.float32),
-            f'{prefix}_r_squared': np.zeros(n, dtype=np.float32),
-            f'{prefix}_is_bull': np.zeros(n, dtype=np.float32),
-            f'{prefix}_is_bear': np.zeros(n, dtype=np.float32),
-            f'{prefix}_is_sideways': np.zeros(n, dtype=np.float32),
-            f'{prefix}_duration': np.zeros(n, dtype=np.float32)
-        }
+        # Create fresh instances in this worker process
+        channel_calc = LinearRegressionChannel()
 
-        # Handle insufficient data case
-        if len(resampled) < 20:
-            return results  # Return zeros
+        try:
+            # Create a minimal DataFrame just for resampling
+            df_minimal = pd.DataFrame(ohlcv_data, index=pd.DatetimeIndex(timestamps))
 
-        # Dynamic lookback calculation
-        base_lookback = min(168, len(resampled) // 2)
+            # Resample to target timeframe
+            resampled = df_minimal.resample(tf_rule).agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).dropna()
 
-        # Process each resampled bar
-        for i in range(base_lookback, len(resampled)):
-            try:
-                # Get available data up to this point
-                available_window = resampled.iloc[:i]
+            n = len(timestamps)
+            prefix = f'{symbol}_channel_{tf_name}'
 
-                # Calculate dynamic lookback based on volatility
-                dynamic_lookback = self._calculate_dynamic_window(
-                    available_window['close'],
-                    base_window=min(168, len(available_window) // 2),
-                    min_window=30,
-                    max_window=min(300, len(available_window) // 2)
-                )
+            # Pre-allocate result arrays
+            results = {
+                f'{prefix}_position': np.zeros(n, dtype=np.float32),
+                f'{prefix}_upper_dist': np.zeros(n, dtype=np.float32),
+                f'{prefix}_lower_dist': np.zeros(n, dtype=np.float32),
+                f'{prefix}_slope': np.zeros(n, dtype=np.float32),
+                f'{prefix}_slope_pct': np.zeros(n, dtype=np.float32),
+                f'{prefix}_stability': np.zeros(n, dtype=np.float32),
+                f'{prefix}_ping_pongs': np.zeros(n, dtype=np.float32),
+                f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=np.float32),
+                f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=np.float32),
+                f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=np.float32),
+                f'{prefix}_r_squared': np.zeros(n, dtype=np.float32),
+                f'{prefix}_is_bull': np.zeros(n, dtype=np.float32),
+                f'{prefix}_is_bear': np.zeros(n, dtype=np.float32),
+                f'{prefix}_is_sideways': np.zeros(n, dtype=np.float32),
+                f'{prefix}_duration': np.zeros(n, dtype=np.float32)
+            }
 
-                # Find optimal channel window
-                channel = channel_calc.find_optimal_channel_window(
-                    available_window,
-                    timeframe=tf_name,
-                    max_lookback=dynamic_lookback,
-                    min_ping_pongs=3
-                )
+            # Handle insufficient data case
+            if len(resampled) < 20:
+                print(f"      [Worker {pid}] {symbol}_{tf_name} - Insufficient data, returning zeros")
+                return results  # Return zeros
 
-                # Skip if no valid channel
-                if channel is None:
+            # Dynamic lookback calculation
+            base_lookback = min(168, len(resampled) // 2)
+            total_bars = len(resampled) - base_lookback
+
+            # Process each resampled bar
+            for idx, i in enumerate(range(base_lookback, len(resampled))):
+                try:
+                    # Get available data up to this point
+                    available_window = resampled.iloc[:i]
+
+                    # Calculate dynamic lookback based on volatility
+                    dynamic_lookback = self._calculate_dynamic_window(
+                        available_window['close'],
+                        base_window=min(168, len(available_window) // 2),
+                        min_window=30,
+                        max_window=min(300, len(available_window) // 2)
+                    )
+
+                    # Find optimal channel window
+                    channel = channel_calc.find_optimal_channel_window(
+                        available_window,
+                        timeframe=tf_name,
+                        max_lookback=dynamic_lookback,
+                        min_ping_pongs=3
+                    )
+
+                    # Skip if no valid channel
+                    if channel is None:
+                        continue
+
+                    current_price = resampled['close'].iloc[i]
+                    position_data = channel_calc.get_channel_position(current_price, channel)
+
+                    # Get the actual window used
+                    actual_window = resampled.iloc[i-channel.actual_duration:i]
+
+                    # Calculate multi-threshold ping-pongs
+                    window_prices = actual_window['close'].values
+                    multi_pp = channel_calc._detect_ping_pongs_multi_threshold(
+                        window_prices,
+                        channel.upper_line,
+                        channel.lower_line,
+                        thresholds=[0.005, 0.01, 0.02, 0.03]
+                    )
+
+                    # Map to original timestamps
+                    timestamp = resampled.index[i]
+                    original_timestamps = pd.DatetimeIndex(timestamps)
+
+                    # Find all original bars that map to this resampled bar
+                    if i < len(resampled) - 1:
+                        next_timestamp = resampled.index[i + 1]
+                        mask = (original_timestamps >= timestamp) & (original_timestamps < next_timestamp)
+                    else:
+                        mask = original_timestamps >= timestamp
+
+                    # Assign values to all matching timestamps
+                    indices = np.where(mask)[0]
+                    for idx in indices:
+                        results[f'{prefix}_position'][idx] = position_data['position']
+                        results[f'{prefix}_upper_dist'][idx] = position_data['distance_to_upper_pct']
+                        results[f'{prefix}_lower_dist'][idx] = position_data['distance_to_lower_pct']
+                        results[f'{prefix}_slope'][idx] = channel.slope
+
+                        # Normalized slope
+                        slope_pct = (channel.slope / current_price) * 100 if current_price > 0 else 0.0
+                        results[f'{prefix}_slope_pct'][idx] = slope_pct
+
+                        # Direction flags
+                        results[f'{prefix}_is_bull'][idx] = float(slope_pct > 0.1)
+                        results[f'{prefix}_is_bear'][idx] = float(slope_pct < -0.1)
+                        results[f'{prefix}_is_sideways'][idx] = float(abs(slope_pct) <= 0.1)
+
+                        # Other metrics
+                        results[f'{prefix}_stability'][idx] = channel.stability_score if hasattr(channel, 'stability_score') else 0.0
+                        results[f'{prefix}_r_squared'][idx] = channel.r_squared
+                        results[f'{prefix}_duration'][idx] = channel.actual_duration
+
+                        # Multi-threshold ping-pongs
+                        results[f'{prefix}_ping_pongs_0_5pct'][idx] = multi_pp[0.005]
+                        results[f'{prefix}_ping_pongs_1_0pct'][idx] = multi_pp[0.01]
+                        results[f'{prefix}_ping_pongs'][idx] = multi_pp[0.02]  # Default 2%
+                        results[f'{prefix}_ping_pongs_3_0pct'][idx] = multi_pp[0.03]
+
+                except Exception as e:
+                    # Skip this timestamp on error
                     continue
 
-                current_price = resampled['close'].iloc[i]
-                position_data = channel_calc.get_channel_position(current_price, channel)
+            return results
 
-                # Get the actual window used
-                actual_window = resampled.iloc[i-channel.actual_duration:i]
-
-                # Calculate multi-threshold ping-pongs
-                window_prices = actual_window['close'].values
-                multi_pp = channel_calc._detect_ping_pongs_multi_threshold(
-                    window_prices,
-                    channel.upper_line,
-                    channel.lower_line,
-                    thresholds=[0.005, 0.01, 0.02, 0.03]
-                )
-
-                # Map to original timestamps
-                timestamp = resampled.index[i]
-                original_timestamps = pd.DatetimeIndex(timestamps)
-
-                # Find all original bars that map to this resampled bar
-                if i < len(resampled) - 1:
-                    next_timestamp = resampled.index[i + 1]
-                    mask = (original_timestamps >= timestamp) & (original_timestamps < next_timestamp)
-                else:
-                    mask = original_timestamps >= timestamp
-
-                # Assign values to all matching timestamps
-                indices = np.where(mask)[0]
-                for idx in indices:
-                    results[f'{prefix}_position'][idx] = position_data['position']
-                    results[f'{prefix}_upper_dist'][idx] = position_data['distance_to_upper_pct']
-                    results[f'{prefix}_lower_dist'][idx] = position_data['distance_to_lower_pct']
-                    results[f'{prefix}_slope'][idx] = channel.slope
-
-                    # Normalized slope
-                    slope_pct = (channel.slope / current_price) * 100 if current_price > 0 else 0.0
-                    results[f'{prefix}_slope_pct'][idx] = slope_pct
-
-                    # Direction flags
-                    results[f'{prefix}_is_bull'][idx] = float(slope_pct > 0.1)
-                    results[f'{prefix}_is_bear'][idx] = float(slope_pct < -0.1)
-                    results[f'{prefix}_is_sideways'][idx] = float(abs(slope_pct) <= 0.1)
-
-                    # Other metrics
-                    results[f'{prefix}_stability'][idx] = channel.stability_score if hasattr(channel, 'stability_score') else 0.0
-                    results[f'{prefix}_r_squared'][idx] = channel.r_squared
-                    results[f'{prefix}_duration'][idx] = channel.actual_duration
-
-                    # Multi-threshold ping-pongs
-                    results[f'{prefix}_ping_pongs_0_5pct'][idx] = multi_pp[0.005]
-                    results[f'{prefix}_ping_pongs_1_0pct'][idx] = multi_pp[0.01]
-                    results[f'{prefix}_ping_pongs'][idx] = multi_pp[0.02]  # Default 2%
-                    results[f'{prefix}_ping_pongs_3_0pct'][idx] = multi_pp[0.03]
-
-            except Exception as e:
-                # Skip this timestamp on error
-                continue
-
-        return results
+        except Exception as e:
+            import traceback
+            print(f"      [Worker {pid}] ERROR in {symbol}_{tf_name}: {str(e)}")
+            print(f"      [Worker {pid}] Traceback: {traceback.format_exc()}")
+            # Return zeros on error
+            n = len(timestamps)
+            prefix = f'{symbol}_channel_{tf_name}'
+            results = {
+                f'{prefix}_position': np.zeros(n, dtype=np.float32),
+                f'{prefix}_upper_dist': np.zeros(n, dtype=np.float32),
+                f'{prefix}_lower_dist': np.zeros(n, dtype=np.float32),
+                f'{prefix}_slope': np.zeros(n, dtype=np.float32),
+                f'{prefix}_slope_pct': np.zeros(n, dtype=np.float32),
+                f'{prefix}_stability': np.zeros(n, dtype=np.float32),
+                f'{prefix}_ping_pongs': np.zeros(n, dtype=np.float32),
+                f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=np.float32),
+                f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=np.float32),
+                f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=np.float32),
+                f'{prefix}_r_squared': np.zeros(n, dtype=np.float32),
+                f'{prefix}_is_bull': np.zeros(n, dtype=np.float32),
+                f'{prefix}_is_bear': np.zeros(n, dtype=np.float32),
+                f'{prefix}_is_sideways': np.zeros(n, dtype=np.float32),
+                f'{prefix}_duration': np.zeros(n, dtype=np.float32)
+            }
+            return results
 
     def _calculate_single_channel_task(self, args):
         """
@@ -923,10 +996,10 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Calculate channel at each timestamp
         bar_range = range(lookback, len(resampled_df))
 
-        # Only show progress bar in sequential mode
+        # Only show progress bar in sequential mode (removed nested position=2 to avoid terminal corruption)
         if show_progress:
-            progress_desc = f"      CPU: {symbol} {tf_name}"
-            bar_range_iter = tqdm(bar_range, desc=progress_desc, leave=False, position=2, ncols=80, ascii=True)
+            progress_desc = f"      {symbol} {tf_name}"
+            bar_range_iter = tqdm(bar_range, desc=progress_desc, leave=False, ncols=100, ascii=True, mininterval=0.5)
         else:
             bar_range_iter = bar_range
 
@@ -1228,7 +1301,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # GPU processing
         progress_desc = f"      GPU: {symbol} {tf_name}"
-        batch_range = tqdm(range(num_batches), desc=progress_desc, leave=False, position=2, ncols=80, ascii=True)
+        batch_range = tqdm(range(num_batches), desc=progress_desc, leave=False, ncols=100, ascii=True, mininterval=0.5)
         for batch_idx in batch_range:
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, num_windows)
@@ -1372,7 +1445,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         }
 
         total_calcs = len(timeframes) * 2
-        with tqdm(total=total_calcs, desc="   RSI features (SPY+TSLA)", ncols=80, leave=False, position=1, ascii=True) as pbar:
+        with tqdm(total=total_calcs, desc="   RSI features (SPY+TSLA)", ncols=100, leave=False, ascii=True, mininterval=0.5) as pbar:
             # Process both TSLA and SPY
             for symbol in ['tsla', 'spy']:
                 for tf_name, tf_rule in timeframes.items():
@@ -1655,7 +1728,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             is_high_impact_event = np.zeros(num_rows)
 
             # Extract events for each timestamp
-            event_pbar = tqdm(range(num_rows), desc="      Event features", leave=False, position=2, ncols=80, ascii=True)
+            event_pbar = tqdm(range(num_rows), desc="      Event features", leave=False, ncols=100, ascii=True, mininterval=0.5)
             for idx in event_pbar:
                 timestamp = raw_df.index[idx]
                 date_str = timestamp.strftime('%Y-%m-%d')
@@ -1748,7 +1821,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         print("  🔍 Validating continuation data availability...")
 
         with tqdm(total=len(timestamps), desc="    Data validation",
-                  unit="timestamps", ncols=100, position=2, leave=False) as pbar:
+                  unit="timestamps", ncols=100, leave=False, mininterval=0.5) as pbar:
 
             for i, ts in enumerate(timestamps):
                 try:
@@ -1819,7 +1892,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Progress bar for continuation label generation
         with tqdm(total=len(timestamps), desc="   Continuation labels",
-                  unit="timestamps", ncols=80, position=1, leave=False, ascii=True) as pbar:
+                  unit="timestamps", ncols=100, leave=False, ascii=True, mininterval=0.5) as pbar:
 
             for i, ts in enumerate(timestamps):
                 try:
