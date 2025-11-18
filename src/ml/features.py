@@ -23,7 +23,7 @@ from src.rsi_calculator import RSICalculator
 from .base import FeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.12"  # Added joblib parallelization for channel calculations
+FEATURE_VERSION = "v3.13_multiwindow_21"  # 21-window multi-OHLC system with no filtering
 
 
 def _check_gpu_available() -> tuple:
@@ -513,28 +513,27 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Check config setting and other conditions
         parallel_enabled = config.PARALLEL_CHANNEL_CALC if hasattr(config, 'PARALLEL_CHANNEL_CALC') else True
 
-        use_parallel = parallel_enabled and not use_gpu and n_cores > 2 and total_calcs >= 8 and not is_live_mode  # Don't parallelize live mode
+        # Simplified: CPU always uses parallel (can be n_jobs=1), GPU/live use sequential
+        use_parallel = parallel_enabled and not use_gpu and not is_live_mode
 
         # Notify user of processing mode and time estimate
         if not use_parallel:
             reasons = []
             if use_gpu:
-                reasons.append("GPU mode active (incompatible)")
-            if n_cores <= 2:
-                reasons.append(f"insufficient cores ({n_cores})")
-            if total_calcs < 8:
-                reasons.append("dataset too small")
+                reasons.append("GPU mode (requires sequential)")
             if is_live_mode:
                 reasons.append("live mode (stability)")
             if not parallel_enabled:
                 reasons.append("disabled in config")
 
             print(f"   ℹ️  Sequential processing: {', '.join(reasons)}")
-            print(f"   ⏱️  Estimated time: ~{total_calcs * 2.5:.0f} minutes")
+            print(f"   ⏱️  Using multi-window OHLC channels (6 windows per timeframe)")
         else:
             cores_to_use = config.MAX_PARALLEL_WORKERS if hasattr(config, 'MAX_PARALLEL_WORKERS') and config.MAX_PARALLEL_WORKERS > 0 else n_cores
             print(f"   🚀 Parallel processing: using {cores_to_use} of {n_cores} available cores")
-            print(f"   ⏱️  Estimated time: ~{(total_calcs * 2.5 / cores_to_use):.0f} minutes")
+            print(f"   ⏱️  Multi-window OHLC channels (6 windows per timeframe)")
+            if cores_to_use == 1:
+                print(f"   💡 Single-core parallel mode - good for debugging!")
 
         if use_parallel:
             # ─── MEMORY-EFFICIENT PARALLEL CHANNEL CALCULATION (16GB-SAFE + FAST) ───
@@ -618,80 +617,102 @@ class TradingFeatureExtractor(FeatureExtractor):
             channel_features = pd.DataFrame(all_channel_data, index=df.index)
 
         else:
-            # Original sequential processing (for GPU mode or small datasets)
-            calc_progress = tqdm(total=total_calcs, desc="   Rolling channels (SPY + TSLA)", ncols=100, leave=False, ascii=True, mininterval=0.5)
+            # Sequential processing with multi-window (for GPU mode or live mode)
+            calc_progress = tqdm(total=total_calcs, desc="   Sequential multi-window channels", ncols=100, leave=False, ascii=True, mininterval=0.5)
 
-            channel_features = {}  # Initialize for sequential mode
+            channel_features = {}  # Initialize
 
             for symbol in ['tsla', 'spy']:
                 for tf_name, tf_rule in timeframes.items():
-                    # HYBRID DATA SELECTION: Use appropriate resolution for live mode
+                    # Get data
                     if is_live_mode:
-                        # Live mode: Get data from appropriate resolution
                         if tf_name in ['5min', '15min', '30min']:
-                            # Use 1-min data (sufficient history)
                             source_data = multi_res_data['1min']
                         elif tf_name in ['1h', '2h', '3h', '4h']:
-                            # Use hourly data (2 years of history)
                             source_data = multi_res_data['1hour']
-                        else:  # daily, weekly, monthly, 3month
-                            # Use daily data (max history)
+                        else:
                             source_data = multi_res_data['daily']
-
-                        # Extract symbol columns
                         symbol_df = source_data[[c for c in source_data.columns if c.startswith(f'{symbol}_')]].copy()
                     else:
-                        # Training mode: Use input dataframe
                         symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
 
                     symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
 
-                    # Resample to target timeframe
+                    # Resample
                     resampled = symbol_df.resample(tf_rule).agg({
-                        'open': 'first',
-                        'high': 'max',
-                        'low': 'min',
-                        'close': 'last',
-                        'volume': 'sum'
+                        'open': 'first', 'high': 'max', 'low': 'min',
+                        'close': 'last', 'volume': 'sum'
                     }).dropna()
 
-                    prefix = f'{symbol}_channel'
-
                     if len(resampled) < 20:
-                        # Not enough data - fill with zeros for ALL channel features
-                        for feat in ['position', 'upper_dist', 'lower_dist', 'slope', 'slope_pct', 'stability',
-                                     'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
-                                     'r_squared', 'is_bull', 'is_bear', 'is_sideways', 'duration']:
-                            channel_features[f'{prefix}_{tf_name}_{feat}'] = np.zeros(num_rows)
                         calc_progress.update(1)
                         continue
 
-                    # ROLLING CHANNEL CALCULATION (GPU or CPU)
-                    # Use dynamic window sizing based on volatility
-                    base_lookback = min(168, len(resampled) // 2)
-                    if use_gpu:
-                        # GPU: use fixed base lookback for batching efficiency
-                        lookback = base_lookback
-                    else:
-                        # CPU: calculate dynamic lookback per timestamp
-                        lookback = base_lookback  # Will be overridden per timestamp  # Use half of data or 168, whichever is smaller
+                    # Use multi-window rolling calculation
+                    all_windows = self.channel_calc.calculate_multi_window_rolling(resampled, tf_name)
 
-                    if use_gpu:
-                        # GPU-accelerated calculation
-                        _, device_type = _check_gpu_available()
-                        rolling_results = self._calculate_rolling_channels_gpu(
-                            resampled, lookback, tf_name, symbol, df.index, device=device_type
-                        )
-                    else:
-                        # CPU calculation (original implementation)
-                        rolling_results = self._calculate_rolling_channels(
-                            resampled, lookback, tf_name, symbol, df.index,
-                            show_progress=True  # Show progress bar in sequential mode
-                        )
+                    # Store features from ALL windows
+                    for window, channels_list in all_windows.items():
+                        for i, channel in enumerate(channels_list):
+                            if channel is None:
+                                continue
 
-                    # Store rolling results (each row has unique values!)
-                    for feat_name, values in rolling_results.items():
-                        channel_features[f'{prefix}_{tf_name}_{feat_name}'] = values
+                            # Map to original timestamps
+                            if i < len(resampled):
+                                timestamp = resampled.index[i]
+                                if i < len(resampled) - 1:
+                                    next_timestamp = resampled.index[i + 1]
+                                    mask = (df.index >= timestamp) & (df.index < next_timestamp)
+                                else:
+                                    mask = df.index >= timestamp
+
+                                indices = np.where(mask)[0]
+                                current_price = resampled['close'].iloc[i]
+                                position_data = self.channel_calc.get_channel_position(current_price, channel)
+                                slope_pct = (channel.close_slope / current_price) * 100 if current_price > 0 else 0.0
+
+                                # Window-specific prefix
+                                w_prefix = f'{symbol}_channel_{tf_name}_w{window}'
+
+                                # Initialize arrays if first time
+                                if f'{w_prefix}_close_slope' not in channel_features:
+                                    for feat in ['position', 'upper_dist', 'lower_dist',
+                                                'close_slope', 'close_slope_pct', 'high_slope', 'high_slope_pct',
+                                                'low_slope', 'low_slope_pct', 'close_r_squared', 'high_r_squared',
+                                                'low_r_squared', 'r_squared_avg', 'channel_width_pct',
+                                                'slope_convergence', 'stability', 'ping_pongs',
+                                                'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
+                                                'is_bull', 'is_bear', 'is_sideways',
+                                                'quality_score', 'is_valid', 'insufficient_data', 'duration']:
+                                        channel_features[f'{w_prefix}_{feat}'] = np.zeros(num_rows, dtype=np.float32)
+
+                                # Store features
+                                for idx in indices:
+                                    channel_features[f'{w_prefix}_position'][idx] = position_data['position']
+                                    channel_features[f'{w_prefix}_upper_dist'][idx] = position_data['distance_to_upper_pct']
+                                    channel_features[f'{w_prefix}_lower_dist'][idx] = position_data['distance_to_lower_pct']
+                                    channel_features[f'{w_prefix}_close_slope'][idx] = channel.close_slope
+                                    channel_features[f'{w_prefix}_close_slope_pct'][idx] = slope_pct
+                                    channel_features[f'{w_prefix}_high_slope'][idx] = channel.high_slope
+                                    channel_features[f'{w_prefix}_low_slope'][idx] = channel.low_slope
+                                    channel_features[f'{w_prefix}_close_r_squared'][idx] = channel.close_r_squared
+                                    channel_features[f'{w_prefix}_high_r_squared'][idx] = channel.high_r_squared
+                                    channel_features[f'{w_prefix}_low_r_squared'][idx] = channel.low_r_squared
+                                    channel_features[f'{w_prefix}_r_squared_avg'][idx] = channel.r_squared
+                                    channel_features[f'{w_prefix}_channel_width_pct'][idx] = channel.channel_width_pct
+                                    channel_features[f'{w_prefix}_slope_convergence'][idx] = channel.slope_convergence
+                                    channel_features[f'{w_prefix}_stability'][idx] = channel.stability_score
+                                    channel_features[f'{w_prefix}_ping_pongs'][idx] = channel.ping_pongs
+                                    channel_features[f'{w_prefix}_ping_pongs_0_5pct'][idx] = channel.ping_pongs_0_5pct
+                                    channel_features[f'{w_prefix}_ping_pongs_1_0pct'][idx] = channel.ping_pongs_1_0pct
+                                    channel_features[f'{w_prefix}_ping_pongs_3_0pct'][idx] = channel.ping_pongs_3_0pct
+                                    channel_features[f'{w_prefix}_is_bull'][idx] = float(slope_pct > 0.1)
+                                    channel_features[f'{w_prefix}_is_bear'][idx] = float(slope_pct < -0.1)
+                                    channel_features[f'{w_prefix}_is_sideways'][idx] = float(abs(slope_pct) <= 0.1)
+                                    channel_features[f'{w_prefix}_quality_score'][idx] = channel.quality_score
+                                    channel_features[f'{w_prefix}_is_valid'][idx] = channel.is_valid
+                                    channel_features[f'{w_prefix}_insufficient_data'][idx] = channel.insufficient_data
+                                    channel_features[f'{w_prefix}_duration'][idx] = channel.actual_duration
 
                     calc_progress.update(1)
 

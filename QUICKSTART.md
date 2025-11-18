@@ -5,8 +5,7 @@
 ---
 
 # Create virtual environment
-python3 -m venv myenv
-source myenv/bin/activate  # On Mac/Linux
+x1  # On Mac/Linux
 # myenv\Scripts\activate   # On Windows
 
 

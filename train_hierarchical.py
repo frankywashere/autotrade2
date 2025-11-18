@@ -800,8 +800,28 @@ def main():
         end_date=f'{args.train_end_year}-12-31'
     )
 
+    data_years = (df.index[-1] - df.index[0]).days / 365.25
     print(f"   Loaded {len(df)} bars ({df.index[0]} to {df.index[-1]})")
+    print(f"   Data range: {data_years:.1f} years")
     print(f"   Historical buffer: {historical_buffer_years} years (for continuation analysis)")
+
+    # Validate minimum data requirement (for 21-window system with 3-month TF)
+    min_required = project_config.MIN_DATA_YEARS if hasattr(project_config, 'MIN_DATA_YEARS') else 2.5
+    if data_years < min_required:
+        print(f"\n   ⚠️  WARNING: Insufficient data!")
+        print(f"   You have: {data_years:.1f} years")
+        print(f"   Recommended: {min_required}+ years (for 3-month TF with 10-bar lookback)")
+        print(f"   Long timeframes will have features with insufficient_data=1.0")
+
+        if args.interactive:
+            response = input("\n   Continue anyway? [y/N]: ")
+            if response.lower() != 'y':
+                print("   Exiting...")
+                sys.exit(0)
+        else:
+            print("   Continuing in non-interactive mode...")
+    else:
+        print(f"   ✓ Data requirement met ({data_years:.1f} years >= {min_required} required)")
 
     # Slice data to user's selected training range (after loading historical buffer)
     training_start = pd.to_datetime(f'{args.train_start_year}-01-01')

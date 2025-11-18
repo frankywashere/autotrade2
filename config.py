@@ -152,3 +152,39 @@ WARMUP_BARS = MIN_LOOKBACK_BARS  # Can be overridden if needed
 # Buffer calculation
 AUTO_CALCULATE_BUFFER = True   # Calculate buffer from feature requirements
 HISTORICAL_BUFFER_YEARS = 2    # Years of data to load before training start
+
+# ======================================================================
+# DATA REQUIREMENTS - IMPORTANT!
+# ======================================================================
+# MINIMUM DATA REQUIREMENTS BY TIMEFRAME:
+#   Intraday (5min-4h):  6 months of data minimum
+#   Daily:               1 year of data minimum
+#   Weekly/Monthly:      3 years of data minimum (RECOMMENDED: 5 years)
+#   3-Month:             3 years minimum (each bar = 3 months)
+#
+# IMPORTANT: Training will start AFTER the warmup period to ensure
+# all timeframes have sufficient lookback data. With 11 timeframes
+# including weekly/monthly/3month, you should have AT LEAST 3 YEARS
+# of historical data. More is better!
+#
+# Example: Training on 2020-2023 requires data from 2017-2023 (warmup: 2017-2020)
+# ======================================================================
+
+# ======================================================================
+# CHANNEL WINDOW CONFIGURATION
+# ======================================================================
+# Window sizes for multi-window channel analysis (bars to look back)
+# Used for ALL timeframes - same windows for consistency
+# Model learns which windows are relevant for each timeframe
+CHANNEL_WINDOW_SIZES = [168, 160, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20, 15, 10]
+
+# Minimum data requirement (for 3-month timeframe with 10-bar window)
+# 10 bars × 3 months/bar = 30 months = 2.5 years
+MIN_DATA_YEARS = 2.5
+
+# ======================================================================
+# CONTINUATION LABEL CONFIGURATION
+# ======================================================================
+CONTINUATION_MODE = 'simple'  # 'simple' or 'enhanced'
+# - simple: Uses best 1h/4h windows for scoring (default, let model learn from all features)
+# - enhanced: Uses all 6 windows for explicit multi-window continuation scoring
