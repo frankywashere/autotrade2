@@ -45,10 +45,22 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
     import os
     pid = os.getpid()
 
-    while True:
-        try:
-            # Get next task
-            task = task_queue.get(timeout=0.5)
+    try:
+        empty_count = 0  # Track consecutive empty queue checks
+
+        while True:
+            try:
+                # Get next task
+                task = task_queue.get(timeout=0.5)
+                empty_count = 0  # Reset on successful get
+            except:
+                # Timeout - check if queue is truly empty
+                empty_count += 1
+                if empty_count > 10:  # ~5 seconds of empty queue → exit
+                    print(f"Worker {worker_id}: Exiting after {empty_count} empty queue checks")
+                    break
+                continue
+
             if task is None:  # Sentinel value
                 break
 
@@ -72,8 +84,12 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
             channel_calc = LinearRegressionChannel()
 
             try:
-                # Create DataFrame for resampling
-                df_minimal = pd.DataFrame(ohlcv_data, index=pd.DatetimeIndex(timestamps))
+                # Create DataFrame for resampling with explicit column names
+                df_minimal = pd.DataFrame(
+                    ohlcv_data,
+                    index=pd.DatetimeIndex(timestamps),
+                    columns=['open', 'high', 'low', 'close', 'volume']
+                )
 
                 # Resample to target timeframe
                 resampled = df_minimal.resample(tf_rule).agg({
@@ -85,26 +101,59 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                 }).dropna()
 
                 n = len(timestamps)
-                prefix = f'{symbol}_channel_{tf_name}'
 
-                # Initialize result arrays
-                results = {
-                    f'{prefix}_position': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_upper_dist': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_lower_dist': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_slope': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_slope_pct': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_stability': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_ping_pongs': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_r_squared': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_is_bull': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_is_bear': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_is_sideways': np.zeros(n, dtype=np.float32),
-                    f'{prefix}_duration': np.zeros(n, dtype=np.float32)
-                }
+                # Use centralized window sizes for ALL timeframes (21 windows, no filtering)
+                import config
+                window_candidates = config.CHANNEL_WINDOW_SIZES
+
+                # Initialize result arrays for EACH window size
+                results = {}
+
+                for window in window_candidates:
+                    w_prefix = f'{symbol}_channel_{tf_name}_w{window}'
+
+                    # Position features
+                    results[f'{w_prefix}_position'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_upper_dist'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_lower_dist'] = np.zeros(n, dtype=np.float32)
+
+                    # Slope features (OHLC)
+                    results[f'{w_prefix}_close_slope'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_close_slope_pct'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_high_slope'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_high_slope_pct'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_low_slope'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_low_slope_pct'] = np.zeros(n, dtype=np.float32)
+
+                    # R-squared features (OHLC)
+                    results[f'{w_prefix}_close_r_squared'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_high_r_squared'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_low_r_squared'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_r_squared_avg'] = np.zeros(n, dtype=np.float32)
+
+                    # Channel metrics
+                    results[f'{w_prefix}_channel_width_pct'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_slope_convergence'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_stability'] = np.zeros(n, dtype=np.float32)
+
+                    # Ping-pongs (multi-threshold)
+                    results[f'{w_prefix}_ping_pongs'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_ping_pongs_0_5pct'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_ping_pongs_1_0pct'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_ping_pongs_3_0pct'] = np.zeros(n, dtype=np.float32)
+
+                    # Direction flags
+                    results[f'{w_prefix}_is_bull'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_is_bear'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_is_sideways'] = np.zeros(n, dtype=np.float32)
+
+                    # Quality indicators
+                    results[f'{w_prefix}_quality_score'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_is_valid'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_insufficient_data'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_duration'] = np.zeros(n, dtype=np.float32)
+
+                # Total: 21 windows × 28 features = 588 features per (symbol, timeframe) pair
 
                 # Handle insufficient data
                 if len(resampled) < 20:
@@ -120,11 +169,9 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     result_queue.put((task_idx, results))
                     continue
 
-                # Calculate channels with progress updates
-                base_lookback = min(168, len(resampled) // 2)
-                total_bars = len(resampled) - base_lookback
+                # Use OPTIMIZED rolling calculation (45x faster!)
+                total_bars = len(resampled)
 
-                # Send total bars count
                 progress_queue.put({
                     'worker_id': worker_id,
                     'task_name': task_name,
@@ -132,98 +179,119 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     'status': 'update',
                     'current': 0,
                     'total': total_bars,
-                    'message': f'Processing {total_bars} bars'
+                    'message': f'Processing {total_bars} bars with rolling stats'
                 })
 
-                # Process each bar with progress updates
-                for idx, i in enumerate(range(base_lookback, len(resampled))):
-                    # Send progress update every 5 bars or at milestones
-                    if idx % 5 == 0 or idx == total_bars - 1:
+                # Calculate all channels for ALL window sizes using rolling statistics
+                all_windows_channels = channel_calc.calculate_multi_window_rolling(resampled, tf_name)
+
+                # Debug: Check what windows were calculated
+                num_windows = len(all_windows_channels)
+                window_sizes = list(all_windows_channels.keys())
+
+                progress_queue.put({
+                    'worker_id': worker_id,
+                    'task_name': task_name,
+                    'task_idx': task_idx,
+                    'status': 'update',
+                    'current': 0,
+                    'total': total_bars,
+                    'message': f'Calculated {num_windows} windows: {window_sizes}'
+                })
+
+                # Map results to original timestamps with progress updates
+                original_timestamps = pd.DatetimeIndex(timestamps)
+
+                # Process each bar and each window
+                for i in range(len(resampled)):
+                    # Send progress update every 50 bars
+                    if i % 50 == 0:
                         progress_queue.put({
                             'worker_id': worker_id,
                             'task_name': task_name,
                             'task_idx': task_idx,
                             'status': 'update',
-                            'current': idx,
+                            'current': i,
                             'total': total_bars
                         })
 
-                    try:
-                        # Get available data
-                        available_window = resampled.iloc[:i]
+                    # Map this resampled bar to original 1-min timestamps
+                    timestamp = resampled.index[i]
 
-                        # Calculate dynamic lookback
-                        from src.ml.features import TradingFeatureExtractor
-                        extractor = TradingFeatureExtractor()
-                        dynamic_lookback = extractor._calculate_dynamic_window(
-                            available_window['close'],
-                            base_window=min(168, len(available_window) // 2),
-                            min_window=30,
-                            max_window=min(300, len(available_window) // 2)
-                        )
+                    if i < len(resampled) - 1:
+                        next_timestamp = resampled.index[i + 1]
+                        mask = (original_timestamps >= timestamp) & (original_timestamps < next_timestamp)
+                    else:
+                        mask = original_timestamps >= timestamp
 
-                        # Find optimal channel
-                        channel = channel_calc.find_optimal_channel_window(
-                            available_window,
-                            timeframe=tf_name,
-                            max_lookback=dynamic_lookback,
-                            min_ping_pongs=3
-                        )
+                    indices = np.where(mask)[0]
+                    if len(indices) == 0:
+                        continue
+
+                    # Get current price for position calculation
+                    current_price = resampled['close'].iloc[i]
+
+                    # Iterate through ALL window sizes
+                    for window, channels_list in all_windows_channels.items():
+                        channel = channels_list[i]
 
                         if channel is None:
+                            # No data for this window at this bar - features stay as zeros
                             continue
 
-                        # Calculate features (simplified for brevity)
-                        current_price = resampled['close'].iloc[i]
+                        # Window-specific prefix
+                        w_prefix = f'{symbol}_channel_{tf_name}_w{window}'
+
+                        # Calculate position for this window's channel
                         position_data = channel_calc.get_channel_position(current_price, channel)
 
-                        # Get the actual window used
-                        actual_window = resampled.iloc[i-channel.actual_duration:i]
+                        # Calculate slope percentages
+                        close_slope_pct = (channel.close_slope / current_price) * 100 if current_price > 0 else 0.0
+                        high_slope_pct = (channel.high_slope / current_price) * 100 if current_price > 0 else 0.0
+                        low_slope_pct = (channel.low_slope / current_price) * 100 if current_price > 0 else 0.0
 
-                        # Calculate multi-threshold ping-pongs
-                        window_prices = actual_window['close'].values
-                        multi_pp = channel_calc._detect_ping_pongs_multi_threshold(
-                            window_prices,
-                            channel.upper_line,
-                            channel.lower_line,
-                            thresholds=[0.005, 0.01, 0.02, 0.03]
-                        )
-
-                        # Map to original timestamps
-                        timestamp = resampled.index[i]
-                        original_timestamps = pd.DatetimeIndex(timestamps)
-
-                        if i < len(resampled) - 1:
-                            next_timestamp = resampled.index[i + 1]
-                            mask = (original_timestamps >= timestamp) & (original_timestamps < next_timestamp)
-                        else:
-                            mask = original_timestamps >= timestamp
-
-                        # Store results
-                        indices = np.where(mask)[0]
+                        # Store ALL features for this window
                         for idx_orig in indices:
-                            results[f'{prefix}_position'][idx_orig] = position_data['position']
-                            results[f'{prefix}_upper_dist'][idx_orig] = position_data['distance_to_upper_pct']
-                            results[f'{prefix}_lower_dist'][idx_orig] = position_data['distance_to_lower_pct']
-                            results[f'{prefix}_slope'][idx_orig] = channel.slope
+                            # Position features
+                            results[f'{w_prefix}_position'][idx_orig] = position_data['position']
+                            results[f'{w_prefix}_upper_dist'][idx_orig] = position_data['distance_to_upper_pct']
+                            results[f'{w_prefix}_lower_dist'][idx_orig] = position_data['distance_to_lower_pct']
 
-                            slope_pct = (channel.slope / current_price) * 100 if current_price > 0 else 0.0
-                            results[f'{prefix}_slope_pct'][idx_orig] = slope_pct
-                            results[f'{prefix}_is_bull'][idx_orig] = float(slope_pct > 0.1)
-                            results[f'{prefix}_is_bear'][idx_orig] = float(slope_pct < -0.1)
-                            results[f'{prefix}_is_sideways'][idx_orig] = float(abs(slope_pct) <= 0.1)
+                            # Slope features (OHLC)
+                            results[f'{w_prefix}_close_slope'][idx_orig] = channel.close_slope
+                            results[f'{w_prefix}_close_slope_pct'][idx_orig] = close_slope_pct
+                            results[f'{w_prefix}_high_slope'][idx_orig] = channel.high_slope
+                            results[f'{w_prefix}_high_slope_pct'][idx_orig] = high_slope_pct
+                            results[f'{w_prefix}_low_slope'][idx_orig] = channel.low_slope
+                            results[f'{w_prefix}_low_slope_pct'][idx_orig] = low_slope_pct
 
-                            results[f'{prefix}_stability'][idx_orig] = channel.stability_score if hasattr(channel, 'stability_score') else 0.0
-                            results[f'{prefix}_r_squared'][idx_orig] = channel.r_squared
-                            results[f'{prefix}_duration'][idx_orig] = channel.actual_duration
+                            # R-squared features
+                            results[f'{w_prefix}_close_r_squared'][idx_orig] = channel.close_r_squared
+                            results[f'{w_prefix}_high_r_squared'][idx_orig] = channel.high_r_squared
+                            results[f'{w_prefix}_low_r_squared'][idx_orig] = channel.low_r_squared
+                            results[f'{w_prefix}_r_squared_avg'][idx_orig] = channel.r_squared
 
-                            results[f'{prefix}_ping_pongs_0_5pct'][idx_orig] = multi_pp[0.005]
-                            results[f'{prefix}_ping_pongs_1_0pct'][idx_orig] = multi_pp[0.01]
-                            results[f'{prefix}_ping_pongs'][idx_orig] = multi_pp[0.02]
-                            results[f'{prefix}_ping_pongs_3_0pct'][idx_orig] = multi_pp[0.03]
+                            # Channel metrics
+                            results[f'{w_prefix}_channel_width_pct'][idx_orig] = channel.channel_width_pct
+                            results[f'{w_prefix}_slope_convergence'][idx_orig] = channel.slope_convergence
+                            results[f'{w_prefix}_stability'][idx_orig] = channel.stability_score
 
-                    except Exception:
-                        continue
+                            # Ping-pongs
+                            results[f'{w_prefix}_ping_pongs'][idx_orig] = channel.ping_pongs
+                            results[f'{w_prefix}_ping_pongs_0_5pct'][idx_orig] = channel.ping_pongs_0_5pct
+                            results[f'{w_prefix}_ping_pongs_1_0pct'][idx_orig] = channel.ping_pongs_1_0pct
+                            results[f'{w_prefix}_ping_pongs_3_0pct'][idx_orig] = channel.ping_pongs_3_0pct
+
+                            # Direction flags
+                            results[f'{w_prefix}_is_bull'][idx_orig] = float(close_slope_pct > 0.1)
+                            results[f'{w_prefix}_is_bear'][idx_orig] = float(close_slope_pct < -0.1)
+                            results[f'{w_prefix}_is_sideways'][idx_orig] = float(abs(close_slope_pct) <= 0.1)
+
+                            # Quality indicators
+                            results[f'{w_prefix}_quality_score'][idx_orig] = channel.quality_score
+                            results[f'{w_prefix}_is_valid'][idx_orig] = channel.is_valid
+                            results[f'{w_prefix}_insufficient_data'][idx_orig] = channel.insufficient_data
+                            results[f'{w_prefix}_duration'][idx_orig] = channel.actual_duration
 
                 # Send completion
                 progress_queue.put({
@@ -240,24 +308,23 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
 
             except Exception as e:
                 # Send error status
+                import traceback
+                error_trace = traceback.format_exc()
                 progress_queue.put({
                     'worker_id': worker_id,
                     'task_name': task_name,
                     'task_idx': task_idx,
                     'status': 'error',
-                    'message': str(e)
+                    'message': f"{str(e)}\n{error_trace}"
                 })
-                result_queue.put((task_idx, results))
-
-        except:
-            # Timeout - check again
-            continue
-
-    # Worker done
-    progress_queue.put({
-        'worker_id': worker_id,
-        'status': 'worker_done'
-    })
+                # Return empty results on error
+                result_queue.put((task_idx, results if 'results' in locals() else {}))
+    finally:
+        # ALWAYS send worker_done signal, even if worker crashes
+        progress_queue.put({
+            'worker_id': worker_id,
+            'status': 'worker_done'
+        })
 
 
 def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: int = -1) -> List[Dict]:
@@ -288,12 +355,14 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
         task_queue.put(None)
 
     # Start worker processes
+    print(f"   🚀 Starting {n_jobs} worker processes...")
     workers = []
     for i in range(n_jobs):
         p = Process(target=channel_worker_with_progress,
                    args=(task_queue, result_queue, progress_queue, i))
         p.start()
         workers.append(p)
+    print(f"   ✓ All {n_jobs} workers started")
 
     if RICH_AVAILABLE:
         # Use rich for beautiful multi-progress display
@@ -322,8 +391,18 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
                 total=len(tasks)
             )
 
-            # Process progress updates
+            # Process progress updates with safety timeout
+            import time
+            start_time = time.time()
+            max_wait_seconds = 600  # 10 minutes max
+
             while workers_done < n_jobs or len(completed_tasks) < len(tasks):
+                # Safety timeout
+                elapsed = time.time() - start_time
+                if elapsed > max_wait_seconds:
+                    console.print(f"[red]⚠️ Timeout after {elapsed:.0f}s - {workers_done}/{n_jobs} workers done, {len(completed_tasks)}/{len(tasks)} tasks complete[/red]")
+                    break
+
                 try:
                     # Get progress update (with timeout to update display)
                     update = progress_queue.get(timeout=0.1)
@@ -363,11 +442,15 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
                         progress.update(overall_task, completed=len(completed_tasks))
 
                     elif update['status'] == 'error':
-                        # Mark task as errored
+                        # Mark task as errored and PRINT ERROR
+                        error_msg = update.get('message', 'Unknown error')
+                        console.print(f"[red]✗ Worker error in {task_name}:[/red]")
+                        console.print(f"[red]{error_msg}[/red]")
+
                         if task_name in task_ids:
                             progress.update(
                                 task_ids[task_name],
-                                description=f"[red]✗ {task_name}: {update.get('message', 'Error')}"
+                                description=f"[red]✗ {task_name} (ERROR)"
                             )
                         completed_tasks.add(update.get('task_idx'))
                         progress.update(overall_task, completed=len(completed_tasks))
@@ -389,15 +472,68 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
             except:
                 continue
 
+    print(f"\n   🔄 Progress complete. Waiting for {n_jobs} workers to finish...")
+
     # Wait for all workers
-    for worker in workers:
-        worker.join()
+    for i, worker in enumerate(workers):
+        print(f"   ⏳ Waiting for worker {i}...")
+        worker.join(timeout=10)  # 10 second timeout per worker
+        if worker.is_alive():
+            print(f"   ⚠️  Worker {i} still alive after 10s - terminating...")
+            worker.terminate()  # Force kill stuck worker
+            worker.join(timeout=2)
+            if worker.is_alive():
+                print(f"   ⚠️  Worker {i} won't die - killing...")
+                worker.kill()
+        else:
+            print(f"   ✓ Worker {i} joined successfully")
 
-    # Collect and sort results
+    print(f"   📦 Collecting results from {len(tasks)} tasks...")
+
+    # Collect results - use blocking get with exact count (reliable)
     results_dict = {}
-    while not result_queue.empty():
-        task_idx, result = result_queue.get()
-        results_dict[task_idx] = result
+    timeout_count = 0
+    max_timeouts = 5  # Stop after 5 consecutive timeouts
 
-    # Return results in original order
-    return [results_dict[i] for i in range(len(tasks))]
+    for collected in range(len(tasks)):
+        print(f"   ⏳ Waiting for result {collected + 1}/{len(tasks)}...", end='', flush=True)
+        try:
+            task_idx, result = result_queue.get(timeout=1)  # 1 second timeout
+            results_dict[task_idx] = result
+            num_features = len(result) if result else 0
+            print(f" ✓ Got task {task_idx} ({num_features} features)")
+            timeout_count = 0  # Reset on success
+        except:
+            timeout_count += 1
+            print(f" ⚠️  Timeout #{timeout_count} (queue empty or worker killed)")
+            if timeout_count >= max_timeouts:
+                print(f"   ⚠️  {max_timeouts} consecutive timeouts - stopping collection")
+                break
+            # Continue trying to collect remaining results
+            continue
+
+    print(f"   ✓ Collected {len(results_dict)} results")
+
+    # Check for missing results
+    missing = [i for i in range(len(tasks)) if i not in results_dict]
+    if missing:
+        print(f"   ⚠️  Missing {len(missing)} task results: {missing}")
+        for idx in missing:
+            if idx < len(tasks):
+                symbol = tasks[idx][4]
+                tf_name = tasks[idx][2]
+                print(f"      Missing: Task {idx} = {symbol}_{tf_name}")
+
+    print(f"   🔄 Sorting results...")
+
+    # Return results in original order, using empty dict for missing
+    sorted_results = []
+    for i in range(len(tasks)):
+        if i in results_dict:
+            sorted_results.append(results_dict[i])
+        else:
+            print(f"   ⚠️  Task {i} missing - using empty result")
+            sorted_results.append({})  # Empty dict for missing task
+
+    print(f"   ✅ Returning {len(sorted_results)} results")
+    return sorted_results

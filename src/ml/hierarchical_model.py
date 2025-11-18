@@ -39,7 +39,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
     def __init__(
         self,
-        input_size: int = 473,  # v3.9: Multi-threshold ping-pongs + normalized slope + direction flags + normalized prices + event features
+        input_size: int = None,  # v3.13: Pass from training script (was 473, now ~12,936 with 21-window system)
         hidden_size: int = 128,
         internal_neurons_ratio: float = 2.0,  # Total neurons = hidden_size × ratio
         device: str = 'cpu',
@@ -51,7 +51,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         Initialize hierarchical model with multi-task heads.
 
         Args:
-            input_size: Number of input features (309 with binary flags)
+            input_size: Number of input features (None = auto-detect from first batch)
             hidden_size: Hidden state size / output neurons (default: 128)
             internal_neurons_ratio: Total neurons = hidden_size × ratio (default: 2.0 → 256 total)
             device: 'cuda', 'mps', or 'cpu'
@@ -61,7 +61,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         """
         super().__init__()  # Calls nn.Module.__init__
 
-        self.input_size = input_size
+        self.input_size = input_size  # Can be None initially
         self.hidden_size = hidden_size
         self.internal_neurons_ratio = internal_neurons_ratio
         self.total_neurons = int(hidden_size * internal_neurons_ratio)
