@@ -131,4 +131,24 @@ LOG_DEVICE_OPERATIONS = False  # Log device transfer operations (debugging)
 PARALLEL_CHANNEL_CALC = True  # Use joblib for parallel channel calculations
 MAX_PARALLEL_WORKERS = 8      # Maximum CPU cores to use (0 = use all available)
 PARALLEL_BACKEND = 'loky'     # joblib backend: 'loky' (process), 'threading', 'multiprocessing'
-PARALLEL_VERBOSE = 10         # joblib verbosity level (0=silent, 10=progress, 50=debug)
+PARALLEL_VERBOSE = 0           # joblib verbosity level (0=silent, 10=progress, 50=debug) - set to 0 for clean output
+
+# ======================================================================
+# HISTORICAL LOOKBACK CONFIGURATION
+# ======================================================================
+
+# Feature extraction minimum lookback requirements
+MIN_LOOKBACK_BARS = 5148       # For 3-month channel features (~66 trading days)
+MIN_LOOKBACK_MONTHS = 3        # Approximate calendar months
+
+# Continuation analysis lookback requirements
+CONTINUATION_LOOKBACK_1H = 1512  # 3 months for 1h analysis (instead of 120 bars/10 hours)
+CONTINUATION_LOOKBACK_4H = 6048  # 1 year for 4h analysis (instead of 480 bars/40 hours)
+
+# Training dataset warmup settings
+SKIP_WARMUP_PERIOD = True      # Automatically exclude insufficient-history timestamps
+WARMUP_BARS = MIN_LOOKBACK_BARS  # Can be overridden if needed
+
+# Buffer calculation
+AUTO_CALCULATE_BUFFER = True   # Calculate buffer from feature requirements
+HISTORICAL_BUFFER_YEARS = 2    # Years of data to load before training start
