@@ -264,7 +264,7 @@ def train_epoch(
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
         # Memory cleanup to prevent accumulation
-        if batch_idx % 10 == 0:  # Every 10 batches
+        if batch_idx % 5 == 0:  # Every 5 batches (more aggressive for low memory)
             # Clear model's cached hidden states
             model.clear_cached_states()
 
