@@ -180,8 +180,8 @@ class HierarchicalDataset(Dataset):
         else:
             overshoot_label = 0.0
 
-        # Convert to tensors
-        x_tensor = torch.tensor(x, dtype=torch.float32)
+        # Convert to tensors (use float64 for full precision during training)
+        x_tensor = torch.tensor(x, dtype=torch.float64)
 
         # Calculate adaptive targets
         actual_max_idx = future_prices.argmax()
