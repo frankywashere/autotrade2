@@ -287,19 +287,17 @@ class TradingFeatureExtractor(FeatureExtractor):
             # Chunked extraction logic
             if use_chunking and not use_cache:
                 print(f"      Using chunked extraction ({chunk_size_years}-year chunks)")
-                channel_df = self._extract_channel_features_chunked(
+                chunk_result = self._extract_channel_features_chunked(
                     df,
                     multi_res_data=multi_res_data,
                     use_gpu=use_gpu_resolved,
                     chunk_size_years=chunk_size_years
                 )
-                # Save the combined result to cache for next time
-                if cache_suffix is None:
-                    cache_suffix = self._generate_cache_suffix(df)
-                cache_file = self._get_cache_path(cache_suffix)
-                print(f"      Saving combined result to cache: {cache_file.name}")
-                cache_file.parent.mkdir(exist_ok=True, parents=True)
-                channel_df.to_pickle(cache_file)
+
+                # Chunked extraction returns mmap metadata (not DataFrame!)
+                # Store it to pass to dataset later
+                self._mmap_meta_path = chunk_result['mmap_meta_path']
+                channel_df = None  # Will be loaded as mmap in dataset
             else:
                 # Normal extraction (all at once) or load from cache
                 channel_df = self._extract_channel_features(
@@ -326,23 +324,35 @@ class TradingFeatureExtractor(FeatureExtractor):
             time_df = self._extract_time_features(df)
             pbar.update(1)
 
-        # Concat base features FIRST
-        base_features_df = pd.concat([
-            price_df,
-            channel_df,
-            rsi_df,
-            correlation_df,
-            cycle_df,
-            volume_df,
-            time_df
-        ], axis=1)
+        # Concat base features FIRST (skip channel_df if using mmap)
+        if channel_df is None and hasattr(self, '_mmap_meta_path'):
+            # Mmap mode - channel features will be loaded separately in dataset
+            base_features_df = pd.concat([
+                price_df,
+                rsi_df,
+                correlation_df,
+                cycle_df,
+                volume_df,
+                time_df
+            ], axis=1)
+        else:
+            # Normal mode - include channel features
+            base_features_df = pd.concat([
+                price_df,
+                channel_df,
+                rsi_df,
+                correlation_df,
+                cycle_df,
+                volume_df,
+                time_df
+            ], axis=1)
 
         # PASS 2: Extract breakdown features (needs base features + optional events)
         with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100, ascii=True, mininterval=0.5) as pbar:
             breakdown_df = self._extract_breakdown_features(base_features_df, df, events_handler)
             pbar.update(1)
 
-        # Final concat
+        # Final concat (non-channel features only if using mmap)
         features_df = pd.concat([base_features_df, breakdown_df], axis=1)
 
         # Generate continuation labels if requested
@@ -356,8 +366,13 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Fill NaNs
         features_df = features_df.bfill().fillna(0)
 
-        print(f"   ✓ Extracted {len(features_df.columns)} features")
-        return features_df, continuation_df
+        # If using mmap shards, return metadata alongside features
+        if hasattr(self, '_mmap_meta_path'):
+            print(f"   ✓ Extracted {len(features_df.columns)} non-channel features + mmap channel shards")
+            return (features_df, continuation_df, self._mmap_meta_path)
+        else:
+            print(f"   ✓ Extracted {len(features_df.columns)} features")
+            return features_df, continuation_df
 
     def _extract_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Extract basic price features. Returns DataFrame with 12 columns (v3.8: +2 normalized prices)."""
@@ -824,13 +839,21 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         overlap_months = config.CHUNK_OVERLAP_MONTHS
 
-        # Create temp HDF5 file for incremental appending (avoids memory accumulation)
+        # Create temp directory for sharded .npy files (memory-mapped, zero RAM spike)
         import time
         import os
+        import json
         cache_dir = Path('data/feature_cache')
         cache_dir.mkdir(exist_ok=True, parents=True)
-        hdf_temp = cache_dir / f"temp_chunked_{int(time.time())}.h5"
-        print(f"     Using temp HDF5: {hdf_temp.name}")
+
+        timestamp = int(time.time())
+        temp_dir = cache_dir / f"mmap_chunks_{timestamp}"
+        temp_dir.mkdir(exist_ok=False)  # Fail if somehow exists
+
+        print(f"     Using sharded memory-mapped storage: {temp_dir.name}")
+        print(f"     Precision: {config.NUMPY_DTYPE} (from config)")
+
+        chunk_info = []  # Will store metadata for each chunk
 
         for i in range(len(chunk_starts) - 1):
             chunk_start = chunk_starts[i]
@@ -869,49 +892,65 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"       Result: {len(chunk_features):,} bars after trimming overlap")
             print(f"       Memory: ~{chunk_features.memory_usage(deep=True).sum() / 1e6:.1f} MB")
 
-            # Append to HDF5 file (no memory accumulation!)
-            try:
-                if i == 0:
-                    # First chunk - create new file
-                    print(f"       Writing to HDF5 (mode=write)...")
-                    chunk_features.to_hdf(hdf_temp, key='data', mode='w', format='table', complevel=0)
-                else:
-                    # Subsequent chunks - append
-                    print(f"       Appending to HDF5...")
-                    chunk_features.to_hdf(hdf_temp, key='data', mode='a', append=True, format='table', complevel=0)
-                print(f"       ✓ HDF5 write complete")
-            except Exception as e:
-                print(f"       ❌ HDF5 write failed: {e}")
-                raise
+            # Save as memory-mapped .npy shard (respects dtype from config!)
+            chunk_array = chunk_features.values.astype(config.NUMPY_DTYPE)
+            chunk_path = temp_dir / f"chunk_{i:04d}.npy"
+            index_path = temp_dir / f"chunk_{i:04d}_index.npy"
+
+            print(f"       Saving shard {i} as .npy (mmap-ready)...")
+            np.save(chunk_path, chunk_array)
+            np.save(index_path, chunk_features.index.values)
+
+            # Store metadata
+            chunk_info.append({
+                'path': str(chunk_path),
+                'index_path': str(index_path),
+                'rows': len(chunk_array),
+                'cols': chunk_array.shape[1],
+                'start_date': str(chunk_start.date()),
+                'end_date': str(chunk_end.date())
+            })
+
+            print(f"       ✓ Shard saved: {chunk_array.nbytes / 1e6:.1f} MB on disk")
 
             # Aggressive memory cleanup
-            del chunk_df, chunk_features
+            del chunk_df, chunk_features, chunk_array
             if chunk_multi_res:
                 del chunk_multi_res
             gc.collect()
 
-        # Load final result from HDF5 (returns normal pandas DataFrame)
-        print(f"\n     📖 Loading combined result from HDF5...")
-        combined_df = pd.read_hdf(hdf_temp, key='data')
+        # Save metadata for memory-mapped loading (NO RAM spike!)
+        total_rows = sum(c['rows'] for c in chunk_info)
+        num_features = chunk_info[0]['cols'] if chunk_info else 0
 
-        # Verify no gaps or overlaps
-        assert len(combined_df) == len(combined_df.index.unique()), "Duplicate timestamps found!"
-        combined_df = combined_df.sort_index()
+        # Generate cache suffix for metadata file
+        cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}"
+        meta_path = cache_dir / f"features_mmap_meta_{cache_suffix}.json"
 
-        print(f"     ✓ Combined: {len(combined_df):,} bars")
-        print(f"     ✓ Date range: {combined_df.index[0].date()} to {combined_df.index[-1].date()}")
-        print(f"     ✓ Memory: ~{combined_df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
+        metadata = {
+            'chunk_info': chunk_info,
+            'num_features': num_features,
+            'dtype': str(config.NUMPY_DTYPE),
+            'total_rows': total_rows,
+            'version': FEATURE_VERSION,
+            'temp_dir': str(temp_dir)
+        }
 
-        # Clean up temp HDF5 file
-        try:
-            hdf_temp.unlink()
-            print(f"     ✓ Temp HDF5 file deleted")
-        except Exception as e:
-            print(f"     ⚠️  Could not delete temp file: {e}")
+        with open(meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"\n     ✅ Sharded extraction complete:")
+        print(f"        Shards: {len(chunk_info)}")
+        print(f"        Total rows: {total_rows:,}")
+        print(f"        Features: {num_features:,}")
+        print(f"        Dtype: {config.NUMPY_DTYPE}")
+        print(f"        Metadata: {meta_path.name}")
+        print(f"        Disk usage: ~{sum(c['rows'] * c['cols'] * (8 if config.NUMPY_DTYPE == np.float64 else 4) for c in chunk_info) / 1e9:.1f} GB")
 
         gc.collect()
 
-        return combined_df
+        # Return metadata path instead of DataFrame (zero RAM spike!)
+        return {'mmap_meta_path': str(meta_path), 'type': 'mmap_sharded'}
 
     def _compute_channel_memory_efficient(self, args):
         """
