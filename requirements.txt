@@ -21,5 +21,4 @@ beautifulsoup4
 plotly
 rich
 joblib
-tables>=3.8.0
 

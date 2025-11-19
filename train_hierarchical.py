@@ -1052,7 +1052,7 @@ def main():
                 config.PARALLEL_CHANNEL_CALC = True
                 print("   🚀 Auto-enabling parallel processing for CPU mode")
 
-    features_df, continuation_df = extractor.extract_features(
+    result = extractor.extract_features(
         df,
         use_cache=use_cache,
         use_gpu=use_gpu,
@@ -1061,8 +1061,16 @@ def main():
         chunk_size_years=project_config.CHUNK_SIZE_YEARS
     )
 
+    # Handle both normal (2-tuple) and mmap (3-tuple) return formats
+    if len(result) == 3:
+        features_df, continuation_df, mmap_meta_path = result
+        print(f"   ℹ️  Using memory-mapped channel features from: {Path(mmap_meta_path).name}")
+    else:
+        features_df, continuation_df = result
+        mmap_meta_path = None
+
     # If we got 0 labels and didn't enable debug, enable it now for diagnosis
-    if len(continuation_df) == 0 and not debug_mode:
+    if continuation_df is not None and len(continuation_df) == 0 and not debug_mode:
         print("  ⚠️  Got 0 continuation labels. Re-running with debug mode enabled...")
         debug_mode = True
         continuation_df = extractor.generate_continuation_labels(df, timestamps, prediction_horizon=24, debug=debug_mode)
@@ -1082,7 +1090,8 @@ def main():
         mode='uniform_bars',
         preload=args.preload,
         validation_split=args.val_split,
-        include_continuation=True
+        include_continuation=True,
+        mmap_meta_path=mmap_meta_path  # Pass mmap metadata if using sharded storage
     )
 
     print(f"   Train samples: {len(train_dataset)}")

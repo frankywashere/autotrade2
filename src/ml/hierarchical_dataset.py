@@ -35,14 +35,15 @@ class HierarchicalDataset(Dataset):
 
     def __init__(
         self,
-        features_df: pd.DataFrame,
+        features_df: pd.DataFrame = None,
         raw_ohlc_df: pd.DataFrame = None,
         continuation_labels_df: pd.DataFrame = None,
         sequence_length: int = 200,
         prediction_horizon: int = 24,
         mode: str = 'uniform_bars',
         cache_indices: bool = True,
-        include_continuation: bool = False
+        include_continuation: bool = False,
+        mmap_meta_path: str = None
     ):
         """
         Initialize dataset.
@@ -65,16 +66,55 @@ class HierarchicalDataset(Dataset):
         self.mode = mode
         self.include_continuation = include_continuation
 
-        # Convert to numpy for speed
-        self.features_array = features_df.values
-        self.timestamps = features_df.index.values
+        # Memory-mapped shard loading (zero RAM spike!)
+        if mmap_meta_path is not None:
+            import json
+            import numpy as np
+            from pathlib import Path
 
-        # Dtype validation - ensure data matches config precision
-        expected_dtype = config.NUMPY_DTYPE
-        if self.features_array.dtype != expected_dtype:
-            print(f"  ⚠️  Feature dtype mismatch: {self.features_array.dtype} != {expected_dtype}")
-            print(f"     Converting to {expected_dtype} (may use extra memory temporarily)")
-            self.features_array = self.features_array.astype(expected_dtype)
+            print(f"  📂 Loading memory-mapped channel shards...")
+            meta = json.load(open(mmap_meta_path))
+
+            # Load channel feature shards as memory-maps
+            self.channel_mmaps = []
+            self.channel_cumulative_rows = [0]
+
+            for info in meta['chunk_info']:
+                mmap_array = np.load(info['path'], mmap_mode='r')
+                self.channel_mmaps.append(mmap_array)
+                self.channel_cumulative_rows.append(self.channel_cumulative_rows[-1] + info['rows'])
+
+            # Load timestamps from shards
+            all_timestamps = []
+            for info in meta['chunk_info']:
+                idx_array = np.load(info['index_path'], mmap_mode='r')
+                all_timestamps.append(idx_array)
+            self.timestamps = np.concatenate(all_timestamps)
+
+            # Load non-channel features normally (these are small - ~181 features)
+            if features_df is not None:
+                self.non_channel_array = features_df.values.astype(config.NUMPY_DTYPE)
+            else:
+                self.non_channel_array = None
+
+            self.using_mmaps = True
+            self.num_channel_features = meta['num_features']
+            print(f"     ✓ Loaded {len(self.channel_mmaps)} channel shards ({self.num_channel_features:,} features)")
+            print(f"     ✓ Loaded {self.non_channel_array.shape[1] if self.non_channel_array is not None else 0} non-channel features")
+            print(f"     ✓ Total rows: {meta['total_rows']:,}")
+
+        else:
+            # Normal path - load everything into RAM
+            self.using_mmaps = False
+            self.features_array = features_df.values
+            self.timestamps = features_df.index.values
+
+            # Dtype validation - ensure data matches config precision
+            expected_dtype = config.NUMPY_DTYPE
+            if self.features_array.dtype != expected_dtype:
+                print(f"  ⚠️  Feature dtype mismatch: {self.features_array.dtype} != {expected_dtype}")
+                print(f"     Converting to {expected_dtype} (may use extra memory temporarily)")
+                self.features_array = self.features_array.astype(expected_dtype)
 
         if raw_ohlc_df is not None:
             self.raw_ohlc_array = raw_ohlc_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
@@ -86,10 +126,20 @@ class HierarchicalDataset(Dataset):
 
         # Cache column indices (CRITICAL for performance)
         if cache_indices:
-            self.feature_names = features_df.columns.tolist()
-            self.close_idx = self.feature_names.index('tsla_close')
-            self.high_idx = self.feature_names.index('tsla_close')  # Will calc from close + returns
-            self.low_idx = self.feature_names.index('tsla_close')
+            if self.using_mmaps:
+                # For mmap mode, tsla_close is in non_channel_array
+                if self.non_channel_array is not None:
+                    self.feature_names = features_df.columns.tolist()
+                    self.close_idx = self.feature_names.index('tsla_close')
+                    self.high_idx = self.feature_names.index('tsla_close')
+                    self.low_idx = self.feature_names.index('tsla_close')
+                else:
+                    self.close_idx = 0  # Fallback
+            else:
+                self.feature_names = features_df.columns.tolist()
+                self.close_idx = self.feature_names.index('tsla_close')
+                self.high_idx = self.feature_names.index('tsla_close')  # Will calc from close + returns
+                self.low_idx = self.feature_names.index('tsla_close')
         else:
             self.close_idx = None
 
@@ -98,21 +148,63 @@ class HierarchicalDataset(Dataset):
         self.min_context = sequence_length
         self.total_required = sequence_length + prediction_horizon
 
+        # Get total length (from mmap or features_array)
+        if self.using_mmaps:
+            total_len = self.channel_cumulative_rows[-1]  # Total rows across all shards
+        else:
+            total_len = len(self.features_array)
+
         # Valid start indices
         self.valid_indices = list(range(
             self.min_context,
-            len(self.features_array) - prediction_horizon
+            total_len - prediction_horizon
         ))
 
         if len(self.valid_indices) == 0:
             raise ValueError(
                 f"Not enough data. Need at least {self.total_required} bars, "
-                f"but have {len(self.features_array)}"
+                f"but have {total_len}"
             )
 
     def __len__(self) -> int:
         """Return number of valid sequences."""
         return len(self.valid_indices)
+
+    def _get_channel_sequence_from_shards(self, start: int, end: int) -> np.ndarray:
+        """
+        Get a sequence of rows from memory-mapped shards (zero copy, minimal RAM).
+
+        Args:
+            start: Start row index (global)
+            end: End row index (global)
+
+        Returns:
+            Array of shape [end-start, num_channel_features]
+        """
+        import bisect
+
+        # Find which shards contain our range
+        start_shard = bisect.bisect_right(self.channel_cumulative_rows, start) - 1
+        end_shard = bisect.bisect_right(self.channel_cumulative_rows, end - 1) - 1
+
+        if start_shard == end_shard:
+            # Entire sequence in one shard (common case - fast!)
+            local_start = start - self.channel_cumulative_rows[start_shard]
+            local_end = end - self.channel_cumulative_rows[start_shard]
+            return self.channel_mmaps[start_shard][local_start:local_end]
+        else:
+            # Sequence spans multiple shards (rare - happens at shard boundaries)
+            pieces = []
+            for shard_idx in range(start_shard, end_shard + 1):
+                shard_start = max(start, self.channel_cumulative_rows[shard_idx])
+                shard_end = min(end, self.channel_cumulative_rows[shard_idx + 1])
+
+                local_start = shard_start - self.channel_cumulative_rows[shard_idx]
+                local_end = shard_end - self.channel_cumulative_rows[shard_idx]
+
+                pieces.append(self.channel_mmaps[shard_idx][local_start:local_end])
+
+            return np.vstack(pieces)  # Slightly faster than concatenate(axis=0)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
         """
@@ -138,19 +230,45 @@ class HierarchicalDataset(Dataset):
         seq_start = data_idx - self.sequence_length
         seq_end = data_idx
 
-        x = self.features_array[seq_start:seq_end, :]  # [200, 299]
+        # Handle memory-mapped shards vs normal array
+        if self.using_mmaps:
+            # Get channel features from shards (mmap - minimal RAM)
+            channel_sequence = self._get_channel_sequence_from_shards(seq_start, seq_end)
 
-        # Extract future window for target
-        future_start = seq_end
-        future_end = seq_end + self.prediction_horizon
+            # Get non-channel features (small, already in RAM)
+            if self.non_channel_array is not None:
+                non_channel_sequence = self.non_channel_array[seq_start:seq_end, :]
+                # Concatenate: [200, 12936] + [200, ~181] = [200, ~13117]
+                x = np.concatenate([channel_sequence, non_channel_sequence], axis=1)
+            else:
+                x = channel_sequence  # Only channels
 
-        future_window = self.features_array[future_start:future_end, :]
+            # Extract future window for target (also from shards)
+            future_start = seq_end
+            future_end = seq_end + self.prediction_horizon
+            channel_future = self._get_channel_sequence_from_shards(future_start, future_end)
+
+            if self.non_channel_array is not None:
+                non_channel_future = self.non_channel_array[future_start:future_end, :]
+                future_window = np.concatenate([channel_future, non_channel_future], axis=1)
+            else:
+                future_window = channel_future
+        else:
+            # Normal path - single array
+            x = self.features_array[seq_start:seq_end, :]  # [200, 299]
+            future_start = seq_end
+            future_end = seq_end + self.prediction_horizon
+            future_window = self.features_array[future_start:future_end, :]
 
         # Calculate target (percentage change from current price)
-        current_price = self.features_array[seq_end - 1, self.close_idx]
-
-        # Get future prices (GROUND TRUTH)
-        future_prices = future_window[:, self.close_idx]
+        if self.using_mmaps and self.non_channel_array is not None:
+            # tsla_close is in non_channel_array
+            current_price = self.non_channel_array[seq_end - 1, self.close_idx]
+            future_prices = future_window[:, self.num_channel_features + self.close_idx]
+        else:
+            current_price = self.features_array[seq_end - 1, self.close_idx]
+            # Get future prices (GROUND TRUTH)
+            future_prices = future_window[:, self.close_idx]
 
         # Calculate high and low (primary targets)
         future_high_actual = np.max(future_prices)
@@ -429,7 +547,8 @@ def create_hierarchical_dataset(
     mode: str = 'uniform_bars',
     preload: bool = False,
     validation_split: Optional[float] = None,
-    include_continuation: bool = False
+    include_continuation: bool = False,
+    mmap_meta_path: str = None
 ) -> Tuple[Dataset, Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -481,12 +600,14 @@ def create_hierarchical_dataset(
             train_dataset = HierarchicalDataset(
                 train_df, raw_ohlc_df, train_continuation_df,
                 sequence_length, prediction_horizon, mode,
-                include_continuation=include_continuation
+                include_continuation=include_continuation,
+                mmap_meta_path=mmap_meta_path
             )
             val_dataset = HierarchicalDataset(
                 val_df, raw_ohlc_df, val_continuation_df,
                 sequence_length, prediction_horizon, mode,
-                include_continuation=include_continuation
+                include_continuation=include_continuation,
+                mmap_meta_path=mmap_meta_path
             )
 
         return train_dataset, val_dataset
@@ -501,7 +622,8 @@ def create_hierarchical_dataset(
             dataset = HierarchicalDataset(
                 features_df, raw_ohlc_df, continuation_labels_df,
                 sequence_length, prediction_horizon, mode,
-                include_continuation=include_continuation
+                include_continuation=include_continuation,
+                mmap_meta_path=mmap_meta_path
             )
 
         return dataset, None
