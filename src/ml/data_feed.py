@@ -87,8 +87,15 @@ class CSVDataFeed(DataFeed):
         if not csv_path.exists():
             raise FileNotFoundError(f"Data file not found: {csv_path}")
 
-        # Load CSV
-        df = pd.read_csv(csv_path)
+        # Load CSV with explicit dtype for precision control
+        dtype_spec = {
+            'open': config.NUMPY_DTYPE,
+            'high': config.NUMPY_DTYPE,
+            'low': config.NUMPY_DTYPE,
+            'close': config.NUMPY_DTYPE,
+            'volume': np.float64  # Volume can stay float64 for precision
+        }
+        df = pd.read_csv(csv_path, dtype=dtype_spec)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
 

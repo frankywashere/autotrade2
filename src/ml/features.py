@@ -527,11 +527,11 @@ class TradingFeatureExtractor(FeatureExtractor):
                 reasons.append("disabled in config")
 
             print(f"   ℹ️  Sequential processing: {', '.join(reasons)}")
-            print(f"   ⏱️  Using multi-window OHLC channels (6 windows per timeframe)")
+            print(f"   ⏱️  Using multi-window OHLC channels ({len(config.CHANNEL_WINDOW_SIZES)} windows per timeframe)")
         else:
             cores_to_use = config.MAX_PARALLEL_WORKERS if hasattr(config, 'MAX_PARALLEL_WORKERS') and config.MAX_PARALLEL_WORKERS > 0 else n_cores
             print(f"   🚀 Parallel processing: using {cores_to_use} of {n_cores} available cores")
-            print(f"   ⏱️  Multi-window OHLC channels (6 windows per timeframe)")
+            print(f"   ⏱️  Multi-window OHLC channels ({len(config.CHANNEL_WINDOW_SIZES)} windows per timeframe)")
             if cores_to_use == 1:
                 print(f"   💡 Single-core parallel mode - good for debugging!")
 
@@ -1196,7 +1196,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         num_windows, lookback = windows.shape
 
         # X values (0, 1, 2, ..., lookback-1) for all windows
-        X = torch.arange(lookback, dtype=torch.float32, device=device).unsqueeze(0)  # [1, lookback]
+        X = torch.arange(lookback, dtype=config.TORCH_DTYPE, device=device).unsqueeze(0)  # [1, lookback]
         X_mean = X.mean()
 
         # Y values (prices) for each window
@@ -1331,8 +1331,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             'duration': np.zeros(num_original_rows)  # v3.11: Channel duration (fixed lookback for GPU)
         }
 
-        # Convert to PyTorch tensor
-        prices_tensor = torch.tensor(prices, dtype=torch.float32)
+        # Convert to PyTorch tensor (dtype from config)
+        prices_tensor = torch.tensor(prices, dtype=config.TORCH_DTYPE)
 
         # Process in batches (to fit in GPU memory)
         num_windows = len(prices) - lookback
@@ -1443,8 +1443,15 @@ class TradingFeatureExtractor(FeatureExtractor):
                         results['lower_dist'][mask] = lower_dist
                         results['duration'][mask] = lookback  # v3.11: GPU uses fixed lookback
 
-                    # Clear GPU memory
+                    # Clear GPU memory (synchronize first to ensure operations complete)
+                    if device == 'cuda':
+                        torch.cuda.synchronize()
+                    elif device == 'mps':
+                        # MPS doesn't have synchronize, but manual sync via event
+                        torch.mps.synchronize() if hasattr(torch.mps, 'synchronize') else None
+
                     del windows_batch, regression_results
+
                     if device == 'cuda':
                         torch.cuda.empty_cache()
                     elif device == 'mps':
@@ -2155,7 +2162,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             target_low = future_window['tsla_close'].min()
             y.append([target_high, target_low])
 
-        X = torch.tensor(np.array(X), dtype=torch.float32)
-        y = torch.tensor(np.array(y), dtype=torch.float32)
+        X = torch.tensor(np.array(X), dtype=config.TORCH_DTYPE)
+        y = torch.tensor(np.array(y), dtype=config.TORCH_DTYPE)
 
         return X, y
