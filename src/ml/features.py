@@ -206,7 +206,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, **kwargs) -> tuple:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, use_chunking: bool = False, chunk_size_years: int = 1, **kwargs) -> tuple:
         """
         Extract all 495 features from aligned SPY-TSLA data (v3.11 - With Dynamic Channel Duration Detection).
 
@@ -216,6 +216,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             use_gpu: GPU acceleration mode (default: 'auto')
                 - 'auto': Use GPU only if data size > 50,000 bars (smart default)
                 - True: Force GPU (if available, otherwise fallback to CPU)
+            use_chunking: Use chunked processing to save memory (default: False)
+            chunk_size_years: Size of each chunk in years when using chunked processing (default: 1)
                 - False/'never': Always use CPU
             cache_suffix: Optional suffix for cache filename (for testing GPU/CPU separately)
                 - None (default): Normal cache filename
@@ -282,7 +284,31 @@ class TradingFeatureExtractor(FeatureExtractor):
             price_df = self._extract_price_features(df)
             pbar.update(1)
 
-            channel_df = self._extract_channel_features(df, multi_res_data=multi_res_data, use_cache=use_cache, use_gpu=use_gpu_resolved, cache_suffix=cache_suffix)
+            # Chunked extraction logic
+            if use_chunking and not use_cache:
+                print(f"      Using chunked extraction ({chunk_size_years}-year chunks)")
+                channel_df = self._extract_channel_features_chunked(
+                    df,
+                    multi_res_data=multi_res_data,
+                    use_gpu=use_gpu_resolved,
+                    chunk_size_years=chunk_size_years
+                )
+                # Save the combined result to cache for next time
+                if cache_suffix is None:
+                    cache_suffix = self._generate_cache_suffix(df)
+                cache_file = self._get_cache_path(cache_suffix)
+                print(f"      Saving combined result to cache: {cache_file.name}")
+                cache_file.parent.mkdir(exist_ok=True, parents=True)
+                channel_df.to_pickle(cache_file)
+            else:
+                # Normal extraction (all at once) or load from cache
+                channel_df = self._extract_channel_features(
+                    df,
+                    multi_res_data=multi_res_data,
+                    use_cache=use_cache,
+                    use_gpu=use_gpu_resolved,
+                    cache_suffix=cache_suffix
+                )
             pbar.update(1)
 
             rsi_df = self._extract_rsi_features(df, multi_res_data=multi_res_data)
@@ -754,6 +780,113 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   ✓ Cache saved successfully")
 
         return result_df
+
+    def _extract_channel_features_chunked(
+        self,
+        df: pd.DataFrame,
+        multi_res_data: dict = None,
+        use_gpu: bool = False,
+        chunk_size_years: int = 1
+    ) -> pd.DataFrame:
+        """
+        Extract channel features using chunked processing to save memory.
+
+        Processes data in time-based chunks (e.g., 1 year at a time) with overlap
+        to ensure rolling features are calculated correctly at boundaries.
+
+        Args:
+            df: Full OHLC dataframe
+            multi_res_data: Multi-resolution data dict
+            use_gpu: Whether to use GPU acceleration
+            chunk_size_years: Size of each chunk in years
+
+        Returns:
+            Combined features dataframe
+        """
+        import gc
+        import config
+
+        print(f"\n  📦 Chunked Feature Extraction")
+        print(f"     Chunk size: {chunk_size_years} year(s)")
+        print(f"     Overlap: {config.CHUNK_OVERLAP_MONTHS} months")
+
+        # Calculate chunk boundaries
+        start_date = df.index[0]
+        end_date = df.index[-1]
+        total_years = (end_date - start_date).days / 365.25
+
+        print(f"     Total period: {start_date.date()} to {end_date.date()} ({total_years:.1f} years)")
+
+        # Create chunk date ranges
+        chunk_starts = pd.date_range(start=start_date, end=end_date, freq=f'{chunk_size_years}YS')
+        if chunk_starts[-1] < end_date:
+            chunk_starts = chunk_starts.append(pd.DatetimeIndex([end_date]))
+
+        chunk_results = []
+        overlap_months = config.CHUNK_OVERLAP_MONTHS
+
+        for i in range(len(chunk_starts) - 1):
+            chunk_start = chunk_starts[i]
+            chunk_end = chunk_starts[i + 1]
+
+            # Add overlap for lookback (except for first chunk)
+            if i > 0:
+                chunk_start_with_overlap = chunk_start - pd.DateOffset(months=overlap_months)
+            else:
+                chunk_start_with_overlap = chunk_start
+
+            # Extract chunk
+            chunk_df = df[(df.index >= chunk_start_with_overlap) & (df.index < chunk_end)].copy()
+            chunk_multi_res = None
+            if multi_res_data:
+                chunk_multi_res = {
+                    tf: mdf[(mdf.index >= chunk_start_with_overlap) & (mdf.index < chunk_end)].copy()
+                    for tf, mdf in multi_res_data.items()
+                }
+
+            print(f"\n     Chunk {i+1}/{len(chunk_starts)-1}: {chunk_start.date()} to {chunk_end.date()}")
+            print(f"       Bars: {len(chunk_df):,} (including {overlap_months}mo overlap)")
+
+            # Process chunk (no cache for individual chunks)
+            chunk_features = self._extract_channel_features(
+                chunk_df,
+                multi_res_data=chunk_multi_res,
+                use_cache=False,  # Don't cache individual chunks
+                use_gpu=use_gpu,
+                cache_suffix=None
+            )
+
+            # Remove overlap from results (keep only the actual chunk period)
+            chunk_features = chunk_features[chunk_features.index >= chunk_start]
+
+            print(f"       Result: {len(chunk_features):,} bars after trimming overlap")
+            print(f"       Memory: ~{chunk_features.memory_usage(deep=True).sum() / 1e6:.1f} MB")
+
+            chunk_results.append(chunk_features)
+
+            # Aggressive memory cleanup
+            del chunk_df, chunk_features
+            if chunk_multi_res:
+                del chunk_multi_res
+            gc.collect()
+
+        # Combine all chunks
+        print(f"\n     Combining {len(chunk_results)} chunks...")
+        combined_df = pd.concat(chunk_results, axis=0)
+
+        # Verify no gaps or overlaps
+        assert len(combined_df) == len(combined_df.index.unique()), "Duplicate timestamps found!"
+        combined_df = combined_df.sort_index()
+
+        print(f"     ✓ Combined: {len(combined_df):,} bars")
+        print(f"     ✓ Date range: {combined_df.index[0].date()} to {combined_df.index[-1].date()}")
+        print(f"     ✓ Memory: ~{combined_df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
+
+        # Final cleanup
+        del chunk_results
+        gc.collect()
+
+        return combined_df
 
     def _compute_channel_memory_efficient(self, args):
         """

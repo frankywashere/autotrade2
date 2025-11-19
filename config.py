@@ -134,6 +134,15 @@ PARALLEL_BACKEND = 'loky'     # joblib backend: 'loky' (process), 'threading', '
 PARALLEL_VERBOSE = 0           # joblib verbosity level (0=silent, 10=progress, 50=debug) - using tqdm instead
 
 # ======================================================================
+# CHUNKED FEATURE EXTRACTION CONFIGURATION
+# ======================================================================
+
+# Memory-efficient chunked processing for feature extraction
+USE_CHUNKED_EXTRACTION = None  # None=auto-detect, True=force on, False=force off
+CHUNK_SIZE_YEARS = 1           # Process features in 1-year chunks
+CHUNK_OVERLAP_MONTHS = 6       # Overlap between chunks to ensure rolling features are complete
+
+# ======================================================================
 # HISTORICAL LOOKBACK CONFIGURATION
 # ======================================================================
 
