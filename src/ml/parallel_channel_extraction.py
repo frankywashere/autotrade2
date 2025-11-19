@@ -21,7 +21,7 @@ try:
     from rich.live import Live
     from rich.layout import Layout
     from rich.panel import Panel
-    RICH_AVAILABLE = True
+    RICH_AVAILABLE = False  # TEMPORARILY DISABLED FOR DEBUGGING - set to True to re-enable
 except ImportError:
     RICH_AVAILABLE = False
 
@@ -58,16 +58,20 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                 # Timeout - check if queue is truly empty
                 empty_count += 1
                 if empty_count > 10:  # ~5 seconds of empty queue → exit
-                    print(f"Worker {worker_id}: Exiting after {empty_count} empty queue checks")
+                    print(f"   🏁 Worker {worker_id}: Exiting after {empty_count} empty queue checks (normal termination)", flush=True)
                     break
                 continue
 
             if task is None:  # Sentinel value
+                print(f"   🛑 Worker {worker_id}: Received sentinel, exiting")
                 break
 
             # Unpack task
             task_idx, (ohlcv_data, timestamps, tf_name, tf_rule, symbol) = task
             task_name = f"{symbol}_{tf_name}"
+
+            # DEBUG: Task start
+            print(f"   🔵 Worker {worker_id}: Starting task {task_idx} ({task_name})", flush=True)
 
             # Send start signal
             progress_queue.put({
@@ -100,6 +104,9 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     'close': 'last',
                     'volume': 'sum'
                 }).dropna()
+
+                # DEBUG: After resampling
+                print(f"   📊 Worker {worker_id}: Resampled {task_name} to {len(resampled)} bars", flush=True)
 
                 n = len(timestamps)
 
@@ -183,12 +190,19 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     'message': f'Processing {total_bars} bars with rolling stats'
                 })
 
+                # DEBUG: Before heavy calculation
+                import time
+                calc_start_time = time.time()
+                print(f"   ⚙️  Worker {worker_id}: Calculating multi-window channels for {task_name}...", flush=True)
+
                 # Calculate all channels for ALL window sizes using rolling statistics
                 all_windows_channels = channel_calc.calculate_multi_window_rolling(resampled, tf_name)
 
-                # Debug: Check what windows were calculated
+                # DEBUG: After heavy calculation
+                calc_elapsed = time.time() - calc_start_time
                 num_windows = len(all_windows_channels)
                 window_sizes = list(all_windows_channels.keys())
+                print(f"   ✅ Worker {worker_id}: Calculated {num_windows} windows in {calc_elapsed:.1f}s", flush=True)
 
                 progress_queue.put({
                     'worker_id': worker_id,
@@ -202,6 +216,9 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
 
                 # Map results to original timestamps with progress updates
                 original_timestamps = pd.DatetimeIndex(timestamps)
+
+                # DEBUG: Before mapping loop
+                print(f"   🔄 Worker {worker_id}: Starting mapping loop for {len(resampled)} bars...", flush=True)
 
                 # Process each bar and each window
                 for i in range(len(resampled)):
@@ -293,6 +310,9 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                         results[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
                         results[f'{w_prefix}_duration'][indices] = channel.actual_duration
 
+                # DEBUG: After mapping loop
+                print(f"   🗺️  Worker {worker_id}: Mapping complete, {len(results)} features ready", flush=True)
+
                 # Send completion
                 progress_queue.put({
                     'worker_id': worker_id,
@@ -303,8 +323,17 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     'total': total_bars
                 })
 
+                # DEBUG: Before putting to result queue
+                print(f"   📤 Worker {worker_id}: Putting {len(results)} features to result_queue...", flush=True)
+
                 # Send results
                 result_queue.put((task_idx, results))
+
+                # DEBUG: After putting to result queue
+                print(f"   ✅ Worker {worker_id}: Result sent successfully for task {task_idx}", flush=True)
+
+                # DEBUG: Before cleanup
+                print(f"   🧹 Worker {worker_id}: Cleaning up memory...", flush=True)
 
                 # Critical: Clear memory to prevent accumulation across tasks
                 del results
@@ -317,7 +346,12 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                 import gc
                 gc.collect()
 
+                # DEBUG: After cleanup
+                print(f"   ✨ Worker {worker_id}: Cleanup complete, ready for next task", flush=True)
+
             except Exception as e:
+                # DEBUG: Exception occurred
+                print(f"   ❌ Worker {worker_id}: EXCEPTION in task {task_idx} ({task_name}): {type(e).__name__}: {e}", flush=True)
                 # Send error status
                 import traceback
                 error_trace = traceback.format_exc()
@@ -329,9 +363,12 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     'message': f"{str(e)}\n{error_trace}"
                 })
                 # Return empty results on error
+                print(f"   📤 Worker {worker_id}: Sending empty result due to error...", flush=True)
                 result_queue.put((task_idx, results if 'results' in locals() else {}))
+                print(f"   ✅ Worker {worker_id}: Error result sent", flush=True)
 
                 # Clear memory even on error
+                print(f"   🧹 Worker {worker_id}: Cleaning up after error...", flush=True)
                 if 'results' in locals():
                     del results
                 if 'all_windows_channels' in locals():
@@ -342,12 +379,17 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     del df_minimal
                 import gc
                 gc.collect()
+                print(f"   ✨ Worker {worker_id}: Error cleanup complete", flush=True)
     finally:
+        # DEBUG: Worker exiting
+        print(f"   👋 Worker {worker_id}: Entering finally block, sending done signal...", flush=True)
+
         # ALWAYS send worker_done signal, even if worker crashes
         progress_queue.put({
             'worker_id': worker_id,
             'status': 'worker_done'
         })
+        print(f"   🏁 Worker {worker_id}: Done signal sent, worker exiting now", flush=True)
 
 
 def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: int = -1) -> List[Dict]:
@@ -495,22 +537,10 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
             except:
                 continue
 
-    print(f"\n   🔄 Progress complete. Waiting for {n_jobs} workers to finish...")
+    print(f"\n   🔄 Progress complete. Collecting results immediately...")
 
-    # FIX 5: Better Worker Shutdown - Give more time, collect results BEFORE killing
-    for i, worker in enumerate(workers):
-        print(f"   ⏳ Waiting for worker {i}...")
-        worker.join(timeout=30)  # Increased from 10s to 30s - give workers time to flush queue
-        if worker.is_alive():
-            print(f"   ⚠️  Worker {i} still alive after 30s - terminating...")
-            worker.terminate()  # Force kill stuck worker
-            worker.join(timeout=5)  # Give 5s to terminate gracefully
-            if worker.is_alive():
-                print(f"   ⚠️  Worker {i} won't die - killing...")
-                worker.kill()
-        else:
-            print(f"   ✓ Worker {i} joined successfully")
-
+    # CRITICAL FIX: Collect results FIRST while workers are still alive/flushing queues
+    # Don't wait for workers to exit - that wastes time waiting for background threads
     print(f"   📦 Collecting results from {len(tasks)} tasks...")
 
     # FIX 4: Check Queue Size First
@@ -608,6 +638,19 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
         else:
             print(f"   ⚠️  Task {i} missing - using empty result")
             sorted_results.append({})  # Empty dict for missing task
+
+    # Now that we have all results, clean up workers (optional - can skip entirely)
+    print(f"\n   🧹 Cleaning up workers (results already collected)...")
+    for i, worker in enumerate(workers):
+        if worker.is_alive():
+            print(f"   ⏳ Worker {i} still running, terminating gracefully...", flush=True)
+            worker.terminate()
+            worker.join(timeout=2)
+            if worker.is_alive():
+                worker.kill()
+        # Don't wait - just terminate and move on
+
+    print(f"   ✅ Workers cleaned up")
 
     print(f"   ✅ Returning {len(sorted_results)} results")
     return sorted_results

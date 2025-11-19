@@ -193,7 +193,7 @@ class HierarchicalDataset(Dataset):
             overshoot_label = 0.0
 
         # Convert to tensors (dtype from config for precision flexibility)
-        x_tensor = torch.tensor(x, dtype=config.TORCH_DTYPE)
+        x_tensor = torch.tensor(x, dtype=config.get_torch_dtype())
 
         # Calculate adaptive targets
         actual_max_idx = future_prices.argmax()
@@ -205,18 +205,18 @@ class HierarchicalDataset(Dataset):
         adaptive_confidence = 1.0 if bars_to_peak > 48 else 0.5  # Simple confidence
 
         targets = {
-            'high': torch.tensor(target_high_pct, dtype=config.TORCH_DTYPE),
-            'low': torch.tensor(target_low_pct, dtype=config.TORCH_DTYPE),
-            'hit_band': torch.tensor(hit_band_label, dtype=config.TORCH_DTYPE),
-            'hit_target': torch.tensor(hit_target_label, dtype=config.TORCH_DTYPE),
-            'expected_return': torch.tensor(expected_return_label, dtype=config.TORCH_DTYPE),
-            'overshoot': torch.tensor(overshoot_label, dtype=config.TORCH_DTYPE),
-            'continuation_duration': torch.tensor(0.0, dtype=config.TORCH_DTYPE),  # Placeholder
-            'continuation_gain': torch.tensor(0.0, dtype=config.TORCH_DTYPE),     # Placeholder
-            'continuation_confidence': torch.tensor(0.5, dtype=config.TORCH_DTYPE), # Placeholder
-            'price_change_pct': torch.tensor(adaptive_price_change, dtype=config.TORCH_DTYPE),
+            'high': torch.tensor(target_high_pct, dtype=config.get_torch_dtype()),
+            'low': torch.tensor(target_low_pct, dtype=config.get_torch_dtype()),
+            'hit_band': torch.tensor(hit_band_label, dtype=config.get_torch_dtype()),
+            'hit_target': torch.tensor(hit_target_label, dtype=config.get_torch_dtype()),
+            'expected_return': torch.tensor(expected_return_label, dtype=config.get_torch_dtype()),
+            'overshoot': torch.tensor(overshoot_label, dtype=config.get_torch_dtype()),
+            'continuation_duration': torch.tensor(0.0, dtype=config.get_torch_dtype()),  # Placeholder
+            'continuation_gain': torch.tensor(0.0, dtype=config.get_torch_dtype()),     # Placeholder
+            'continuation_confidence': torch.tensor(0.5, dtype=config.get_torch_dtype()), # Placeholder
+            'price_change_pct': torch.tensor(adaptive_price_change, dtype=config.get_torch_dtype()),
             'horizon_bars_log': adaptive_horizon_log,
-            'adaptive_confidence': torch.tensor(adaptive_confidence, dtype=config.TORCH_DTYPE)
+            'adaptive_confidence': torch.tensor(adaptive_confidence, dtype=config.get_torch_dtype())
         }
 
         # Add continuation prediction targets if enabled
@@ -226,14 +226,14 @@ class HierarchicalDataset(Dataset):
                 ts = pd.Timestamp(self.timestamps[seq_end - 1])
                 cont_row = self.continuation_labels_df[self.continuation_labels_df['timestamp'] == ts]
                 if not cont_row.empty:
-                    targets['continuation_duration'] = torch.tensor(cont_row['duration_hours'].iloc[0], dtype=config.TORCH_DTYPE)
-                    targets['continuation_gain'] = torch.tensor(cont_row['projected_gain'].iloc[0], dtype=config.TORCH_DTYPE)
-                    targets['continuation_confidence'] = torch.tensor(cont_row['confidence'].iloc[0], dtype=config.TORCH_DTYPE)
+                    targets['continuation_duration'] = torch.tensor(cont_row['duration_hours'].iloc[0], dtype=config.get_torch_dtype())
+                    targets['continuation_gain'] = torch.tensor(cont_row['projected_gain'].iloc[0], dtype=config.get_torch_dtype())
+                    targets['continuation_confidence'] = torch.tensor(cont_row['confidence'].iloc[0], dtype=config.get_torch_dtype())
             except:
                 # Fallback values
-                targets['continuation_duration'] = torch.tensor(0.0, dtype=config.TORCH_DTYPE)
-                targets['continuation_gain'] = torch.tensor(0.0, dtype=config.TORCH_DTYPE)
-                targets['continuation_confidence'] = torch.tensor(0.5, dtype=config.TORCH_DTYPE)
+                targets['continuation_duration'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                targets['continuation_gain'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                targets['continuation_confidence'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
 
         return x_tensor, targets
 
@@ -355,7 +355,7 @@ class PreloadHierarchicalDataset(Dataset):
         # Memory warning for large datasets
         estimated_samples = len(features_df) - sequence_length - prediction_horizon
         estimated_gb = (estimated_samples * sequence_length * features_df.shape[1] *
-                       (8 if config.TORCH_DTYPE == torch.float64 else 4)) / 1e9
+                       (8 if config.get_torch_dtype() == torch.float64 else 4)) / 1e9
 
         if estimated_gb > 50:
             print(f"⚠️  WARNING: Estimated memory usage: {estimated_gb:.1f} GB")
@@ -379,19 +379,19 @@ class PreloadHierarchicalDataset(Dataset):
 
         # Preload all samples
         num_samples = len(lazy_dataset)
-        self.X = torch.zeros((num_samples, sequence_length, features_df.shape[1]), dtype=config.TORCH_DTYPE)
+        self.X = torch.zeros((num_samples, sequence_length, features_df.shape[1]), dtype=config.get_torch_dtype())
 
         # Multi-task targets (store separately)
         self.targets = {
-            'high': torch.zeros(num_samples, dtype=config.TORCH_DTYPE),
-            'low': torch.zeros(num_samples, dtype=config.TORCH_DTYPE),
-            'hit_band': torch.zeros(num_samples, dtype=config.TORCH_DTYPE),
-            'hit_target': torch.zeros(num_samples, dtype=config.TORCH_DTYPE),
-            'expected_return': torch.zeros(num_samples, dtype=config.TORCH_DTYPE),
-            'overshoot': torch.zeros(num_samples, dtype=config.TORCH_DTYPE),
-            'continuation_duration': torch.zeros(num_samples, dtype=config.TORCH_DTYPE),
-            'continuation_gain': torch.zeros(num_samples, dtype=config.TORCH_DTYPE),
-            'continuation_confidence': torch.zeros(num_samples, dtype=config.TORCH_DTYPE)
+            'high': torch.zeros(num_samples, dtype=config.get_torch_dtype()),
+            'low': torch.zeros(num_samples, dtype=config.get_torch_dtype()),
+            'hit_band': torch.zeros(num_samples, dtype=config.get_torch_dtype()),
+            'hit_target': torch.zeros(num_samples, dtype=config.get_torch_dtype()),
+            'expected_return': torch.zeros(num_samples, dtype=config.get_torch_dtype()),
+            'overshoot': torch.zeros(num_samples, dtype=config.get_torch_dtype()),
+            'continuation_duration': torch.zeros(num_samples, dtype=config.get_torch_dtype()),
+            'continuation_gain': torch.zeros(num_samples, dtype=config.get_torch_dtype()),
+            'continuation_confidence': torch.zeros(num_samples, dtype=config.get_torch_dtype())
         }
 
         print(f"Loading {num_samples} sequences...")

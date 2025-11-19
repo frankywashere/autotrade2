@@ -194,9 +194,20 @@ TRAINING_PRECISION = 'float64'  # 'float64' or 'float32'
 
 # Derived dtypes (auto-set from TRAINING_PRECISION - don't modify directly)
 import numpy as np
-import torch
 NUMPY_DTYPE = np.float64 if TRAINING_PRECISION == 'float64' else np.float32
-TORCH_DTYPE = torch.float64 if TRAINING_PRECISION == 'float64' else torch.float32
+
+# Lazy-loaded torch dtype - avoids importing torch in multiprocessing workers
+# Workers only need NUMPY_DTYPE, never TORCH_DTYPE
+# This prevents macOS torch cleanup deadlock in spawn mode
+_TORCH_DTYPE = None
+
+def get_torch_dtype():
+    """Lazy load torch dtype only when actually needed (training, not in workers)."""
+    global _TORCH_DTYPE
+    if _TORCH_DTYPE is None:
+        import torch
+        _TORCH_DTYPE = torch.float64 if TRAINING_PRECISION == 'float64' else torch.float32
+    return _TORCH_DTYPE
 
 # ======================================================================
 # CHANNEL WINDOW CONFIGURATION
