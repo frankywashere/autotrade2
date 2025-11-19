@@ -206,7 +206,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, use_chunking: bool = False, chunk_size_years: int = 1, **kwargs) -> tuple:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, use_chunking: bool = False, chunk_size_years: int = 1, shard_storage_path: str = None, **kwargs) -> tuple:
         """
         Extract all 495 features from aligned SPY-TSLA data (v3.11 - With Dynamic Channel Duration Detection).
 
@@ -218,6 +218,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 - True: Force GPU (if available, otherwise fallback to CPU)
             use_chunking: Use chunked processing to save memory (default: False)
             chunk_size_years: Size of each chunk in years when using chunked processing (default: 1)
+            shard_storage_path: Custom path for shard storage (default: None = use data/feature_cache)
                 - False/'never': Always use CPU
             cache_suffix: Optional suffix for cache filename (for testing GPU/CPU separately)
                 - None (default): Normal cache filename
@@ -291,7 +292,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                     df,
                     multi_res_data=multi_res_data,
                     use_gpu=use_gpu_resolved,
-                    chunk_size_years=chunk_size_years
+                    chunk_size_years=chunk_size_years,
+                    shard_storage_path=shard_storage_path
                 )
 
                 # Chunked extraction returns mmap metadata (not DataFrame!)
@@ -801,8 +803,9 @@ class TradingFeatureExtractor(FeatureExtractor):
         df: pd.DataFrame,
         multi_res_data: dict = None,
         use_gpu: bool = False,
-        chunk_size_years: int = 1
-    ) -> pd.DataFrame:
+        chunk_size_years: int = 1,
+        shard_storage_path: str = None
+    ) -> dict:
         """
         Extract channel features using chunked processing to save memory.
 
@@ -843,7 +846,13 @@ class TradingFeatureExtractor(FeatureExtractor):
         import time
         import os
         import json
-        cache_dir = Path('data/feature_cache')
+
+        # Use custom path or default
+        if shard_storage_path:
+            cache_dir = Path(shard_storage_path)
+        else:
+            cache_dir = Path('data/feature_cache')
+
         cache_dir.mkdir(exist_ok=True, parents=True)
 
         timestamp = int(time.time())

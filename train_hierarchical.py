@@ -653,12 +653,31 @@ def interactive_setup(args):
         if args.use_chunking:
             print(f"   ✓ Will process features in 1-year chunks")
             print(f"   ℹ️  Peak RAM during extraction: ~2-5GB")
+
+            # Ask where to save shards
+            print()
+            use_custom_path = inquirer.confirm(
+                message="Use custom location for shard files?",
+                default=False
+            ).execute()
+
+            if use_custom_path:
+                args.shard_path = inquirer.text(
+                    message="Shard storage path (will create if doesn't exist):",
+                    default="data/feature_cache"
+                ).execute()
+                print(f"   ✓ Will save shards to: {args.shard_path}")
+            else:
+                args.shard_path = None
+                print(f"   ✓ Will use default location: data/feature_cache")
         else:
             print(f"   ⚡ Will process all features at once")
             print(f"   ⚠️  Peak RAM during extraction: ~20-40GB")
+            args.shard_path = None  # Not chunking, no shards
     else:
         # Cache will be loaded - chunking doesn't apply
         args.use_chunking = False
+        args.shard_path = None
 
     # Precision selection
     print()
@@ -848,6 +867,8 @@ def main():
                         help='Use chunked feature extraction to save memory (auto-detect if not specified)')
     parser.add_argument('--no-chunking', dest='use_chunking', action='store_false',
                         help='Disable chunked extraction (faster if you have enough RAM)')
+    parser.add_argument('--shard-path', type=str, default=None,
+                        help='Custom path for shard storage (default: data/feature_cache)')
     parser.add_argument('--output', type=str, default='models/hierarchical_lnn.pth',
                         help='Output model path')
 
@@ -1058,7 +1079,8 @@ def main():
         use_gpu=use_gpu,
         continuation=True,
         use_chunking=getattr(args, 'use_chunking', False),
-        chunk_size_years=project_config.CHUNK_SIZE_YEARS
+        chunk_size_years=project_config.CHUNK_SIZE_YEARS,
+        shard_storage_path=getattr(args, 'shard_path', None)
     )
 
     # Handle both normal (2-tuple) and mmap (3-tuple) return formats
