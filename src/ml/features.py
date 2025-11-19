@@ -279,6 +279,98 @@ class TradingFeatureExtractor(FeatureExtractor):
             use_gpu_resolved = False
             print(f"   💾 Using CPU for feature extraction (user requested)")
 
+        # ═══════════════════════════════════════════════════════════════
+        # UNIFIED CACHE VALIDATION (v3.15)
+        # ═══════════════════════════════════════════════════════════════
+
+        # Determine unified cache directory for ALL cached data
+        if shard_storage_path:
+            unified_cache_dir = Path(shard_storage_path)
+        else:
+            unified_cache_dir = Path('data/feature_cache')
+        unified_cache_dir.mkdir(exist_ok=True, parents=True)
+
+        # Generate unified cache key (version + date range + length + horizon)
+        cache_key = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}_h24"
+
+        # Upfront cache validation
+        print(f"\n📂 Cache Location: {unified_cache_dir}")
+        print(f"📂 Cache Validation ({FEATURE_VERSION}, {df.index[0].date()} to {df.index[-1].date()}, {len(df):,} bars, horizon=24):")
+
+        # Check 1: Channel shards (mmap metadata) or legacy pickle
+        import json
+        channel_cache_valid = False
+        channel_cache_type = None
+
+        # Check for sharded cache first (new method)
+        mmap_meta_files = list(unified_cache_dir.glob(f"features_mmap_meta_{FEATURE_VERSION}_*.json"))
+        if mmap_meta_files:
+            meta_file = mmap_meta_files[0]
+            try:
+                meta = json.load(open(meta_file))
+                # Validate all shard files exist
+                if all(Path(c['path']).exists() for c in meta['chunk_info']):
+                    total_gb = sum(c['rows'] * c['cols'] * (8 if 'float64' in meta['dtype'] else 4) for c in meta['chunk_info']) / 1e9
+                    print(f"   ✓ Channel shards: Valid ({len(meta['chunk_info'])} shards, {meta['total_rows']:,} rows, {total_gb:.1f} GB, {meta['dtype']})")
+                    channel_cache_valid = True
+                    channel_cache_type = 'mmap'
+                    self._mmap_meta_path = str(meta_file)
+                else:
+                    print(f"   ⚠️  Channel shards: Metadata found but shard files missing - will extract")
+            except Exception as e:
+                print(f"   ⚠️  Channel shards: Validation failed ({type(e).__name__}) - will extract")
+
+        # Fallback: Check for legacy pickle cache
+        if not channel_cache_valid:
+            legacy_cache = unified_cache_dir / f'rolling_channels_{cache_key}.pkl'
+            if legacy_cache.exists() and use_cache:
+                # Will be validated later in _extract_channel_features
+                print(f"   ℹ️  Channel cache: Found legacy pickle (will validate on load)")
+                channel_cache_type = 'legacy'
+            else:
+                print(f"   ❌ Channel cache: Not found - will extract (~5-7 min)")
+
+        # Check 2: Continuation labels
+        cont_cache_path = unified_cache_dir / f"continuation_labels_{cache_key}.pkl"
+        cont_cache_valid = False
+        if continuation and cont_cache_path.exists() and use_cache:
+            try:
+                test_load = pd.read_pickle(cont_cache_path)
+                if len(test_load) > 0 and 'timestamp' in test_load.columns:
+                    print(f"   ✓ Continuation labels: Valid ({len(test_load):,} labels, {cont_cache_path.stat().st_size / 1e6:.1f} MB)")
+                    cont_cache_valid = True
+                else:
+                    print(f"   ⚠️  Continuation labels: Invalid (corrupted or empty) - will regenerate")
+                    cont_cache_path.unlink()
+            except Exception as e:
+                print(f"   ⚠️  Continuation labels: Corrupted ({type(e).__name__}) - will regenerate")
+                if cont_cache_path.exists():
+                    cont_cache_path.unlink()
+        elif continuation:
+            print(f"   ❌ Continuation labels: Not found - will generate (~1 hour)")
+
+        # Invalidation: If ANY cache fails and use_cache=True, should we invalidate all?
+        # For now, keep independent (channel cache can work without continuation labels)
+
+        # Summary
+        print()
+        if channel_cache_valid and (cont_cache_valid or not continuation):
+            print(f"   🚀 All required caches valid - extraction will be fast!")
+        else:
+            needed = []
+            if not channel_cache_valid:
+                needed.append("channels (~5-7 min)")
+            if continuation and not cont_cache_valid:
+                needed.append("continuation labels (~1 hour)")
+            if needed:
+                print(f"   ⏱️  Will regenerate: {', '.join(needed)}")
+        print()
+
+        # Store cache paths for later use
+        self._unified_cache_dir = unified_cache_dir
+        self._cache_key = cache_key
+        self._cont_cache_path = cont_cache_path if continuation else None
+
         # PASS 1: Extract base features
         print("   Extracting base features...")
         with tqdm(total=7, desc="   Feature extraction", leave=True, ncols=100, ascii=True, mininterval=0.5) as pbar:
@@ -360,10 +452,24 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Generate continuation labels if requested
         continuation_df = None
         if continuation:
-            print("   Generating continuation labels...")
-            timestamps = df.index.tolist()
-            continuation_df = self.generate_continuation_labels(df, timestamps, prediction_horizon=24)
-            print(f"   ✓ Generated {len(continuation_df)} continuation labels")
+            # Try loading from cache first
+            if self._cont_cache_path and self._cont_cache_path.exists() and use_cache and cont_cache_valid:
+                print(f"   📂 Loading cached continuation labels...")
+                continuation_df = pd.read_pickle(self._cont_cache_path)
+                print(f"   ✓ Loaded {len(continuation_df):,} labels (saved ~1 hour!)")
+            else:
+                # Generate fresh labels
+                print("   🔄 Generating continuation labels (will take ~1 hour)...")
+                timestamps = df.index.tolist()
+                continuation_df = self.generate_continuation_labels(df, timestamps, prediction_horizon=24)
+                print(f"   ✓ Generated {len(continuation_df):,} continuation labels")
+
+                # Save to cache for next time
+                if self._cont_cache_path:
+                    print(f"   💾 Caching continuation labels to: {self._cont_cache_path.name}")
+                    self._cont_cache_path.parent.mkdir(exist_ok=True, parents=True)
+                    continuation_df.to_pickle(self._cont_cache_path)
+                    print(f"   ✓ Continuation cache saved successfully")
 
         # Fill NaNs
         features_df = features_df.bfill().fillna(0)
@@ -470,11 +576,19 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Check cache first
         if use_cache:
-            cache_dir = Path('data/feature_cache')
-            cache_dir.mkdir(exist_ok=True)
+            # Use unified cache directory if set, otherwise default
+            if hasattr(self, '_unified_cache_dir'):
+                cache_dir = self._unified_cache_dir
+            else:
+                cache_dir = Path('data/feature_cache')
+                cache_dir.mkdir(exist_ok=True)
 
-            # Create cache key from version + data range (version ensures cache invalidation when logic changes)
-            cache_key = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}"
+            # Use unified cache key if available (includes horizon), otherwise generate
+            if hasattr(self, '_cache_key'):
+                cache_key = self._cache_key
+            else:
+                # Create cache key from version + data range + horizon (version ensures cache invalidation when logic changes)
+                cache_key = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}_h24"
 
             # Add suffix if provided (for testing GPU/CPU separately)
             if cache_suffix:
@@ -497,11 +611,20 @@ class TradingFeatureExtractor(FeatureExtractor):
                                 result = pickle.load(f)
                             pbar.update(1)
 
-                        # Validate loaded data
-                        expected_cols = 154  # 77 features × 2 stocks (TSLA + SPY)
-                        if len(result.columns) != expected_cols:
-                            print(f"   ⚠️  Cache has {len(result.columns)} columns, expected {expected_cols}")
-                            print(f"   ⚠️  Regenerating cache...")
+                        # Validate loaded data (v3.15: Dynamic column count)
+                        num_cols = len(result.columns)
+
+                        # Calculate expected based on multi-window system
+                        num_windows = len(config.CHANNEL_WINDOW_SIZES)  # 21 windows
+                        features_per_window = 28  # OHLC slopes, r-squared, position, etc.
+                        timeframes = 11  # 5min, 15min, ..., monthly, 3month
+                        stocks = 2  # TSLA, SPY
+                        expected_cols = num_windows * features_per_window * timeframes * stocks  # = 12,936
+
+                        # Allow some tolerance (±10%) for version differences
+                        if num_cols < expected_cols * 0.9 or num_cols > expected_cols * 1.1:
+                            print(f"   ⚠️  Cache has {num_cols} columns (expected ~{expected_cols})")
+                            print(f"   ⚠️  Reason: Wrong version or corrupted - regenerating...")
                         elif len(result) != len(df):
                             print(f"   ⚠️  Cache has {len(result)} rows, expected {len(df)}")
                             print(f"   ⚠️  Regenerating cache...")
@@ -932,8 +1055,12 @@ class TradingFeatureExtractor(FeatureExtractor):
         total_rows = sum(c['rows'] for c in chunk_info)
         num_features = chunk_info[0]['cols'] if chunk_info else 0
 
-        # Generate cache suffix for metadata file
-        cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}"
+        # Use unified cache key for metadata file (includes horizon)
+        if hasattr(self, '_cache_key'):
+            cache_suffix = self._cache_key
+        else:
+            cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}_h24"
+
         meta_path = cache_dir / f"features_mmap_meta_{cache_suffix}.json"
 
         metadata = {
