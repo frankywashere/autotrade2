@@ -572,6 +572,37 @@ python train_hierarchical.py --interactive
 - float64: 30-40 GB (8 workers), 20-25 GB (4 workers)
 - float32: 20-30 GB (8 workers), 15-18 GB (4 workers)
 
+**Interactive Date Range Analysis (v3.14):**
+When users select their training dates in interactive mode, the system immediately provides comprehensive data sufficiency analysis:
+
+```
+? Training data start year: 2015
+? Training data end year: 2022
+
+📅 Training Date Range Analysis:
+   Requested: 2015-2022 (7 years)
+   Warmup required: 2.5 years (257,400 bars for 21-window system)
+
+   ⚠️  IF your CSV starts at 2015:
+       Effective training: 2017.5-2022 (4.5 years)
+       → First 2.5 years used for warmup (ensures complete feature history)
+
+   💡 To train from 2015, you need CSV data from 2012.5
+
+   ✓ Good! 4.5 years of quality training data after warmup
+
+If insufficient (<2 years after warmup):
+   ⚠️  Warning: Only 1.2 years of usable training data after warmup!
+   Continue with 2015-2017 anyway? [y/N]:
+```
+
+**Key Analysis Components:**
+- **Warmup Period**: 2.5 years required for 21-window multi-OHLC system (257,400 1-min bars)
+- **Effective Training**: Years after warmup period (ensures complete feature history)
+- **Data Requirements**: Automatic calculation of minimum CSV start date needed
+- **Quality Assessment**: Validates sufficient training data for robust model convergence
+- **User Guidance**: Clear warnings and recommendations for data sufficiency
+
 #### Quick Test (1 epoch)
 ```bash
 python train_hierarchical.py --epochs 1 --batch_size 32 --device cpu
@@ -587,6 +618,24 @@ python train_hierarchical.py \
     --patience 10 \
     --multi_task
 ```
+
+#### Memory-Constrained Systems (v3.14)
+Control feature extraction parallelism to reduce memory usage:
+```bash
+# Use only 4 cores (good for 32GB RAM systems)
+python train_hierarchical.py --feature_workers 4
+
+# Use only 2 cores (conservative, for 16GB RAM systems)
+python train_hierarchical.py --feature_workers 2
+
+# Use all available cores (default: config.MAX_PARALLEL_WORKERS=8)
+python train_hierarchical.py
+```
+
+**Memory Impact:**
+- 8 workers: 25-40 GB (float64) or 12-20 GB (float32)
+- 4 workers: 18-28 GB (float64) or 10-15 GB (float32)
+- 2 workers: 15-18 GB (float64) or 8-10 GB (float32)
 
 #### Training Timeline (v3.13 - Massively Improved)
 - **First run:** 40-60 seconds with rolling statistics (was 45-60 minutes!)

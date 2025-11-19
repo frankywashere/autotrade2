@@ -137,9 +137,12 @@ PARALLEL_VERBOSE = 0           # joblib verbosity level (0=silent, 10=progress, 
 # HISTORICAL LOOKBACK CONFIGURATION
 # ======================================================================
 
-# Feature extraction minimum lookback requirements
-MIN_LOOKBACK_BARS = 25740      # For 3-month channel features at 1-min bars (66 trading days × 390 bars/day)
-MIN_LOOKBACK_MONTHS = 3        # Approximate calendar months
+# Feature extraction minimum lookback requirements (v3.13: Updated for 21-window system)
+# For 3-month timeframe with 10-bar window (smallest window, longest timeframe):
+# 10 bars × 3 months/bar = 30 months = 2.5 years
+# 660 trading days × 390 bars/day = 257,400 1-min bars
+MIN_LOOKBACK_BARS = 257400     # 2.5 years of 1-min bars (was 25740 in v3.12)
+MIN_LOOKBACK_MONTHS = 30       # 2.5 years = 30 months (was 3 in v3.12)
 
 # Continuation analysis lookback requirements (in 1-min bars)
 CONTINUATION_LOOKBACK_1H = 25740   # 3 months at 1-min bars (66 trading days × 390 bars/day)
@@ -151,7 +154,7 @@ WARMUP_BARS = MIN_LOOKBACK_BARS  # Can be overridden if needed
 
 # Buffer calculation
 AUTO_CALCULATE_BUFFER = True   # Calculate buffer from feature requirements
-HISTORICAL_BUFFER_YEARS = 2    # Years of data to load before training start
+HISTORICAL_BUFFER_YEARS = 3    # Years of data to load before training start (increased for multi-window)
 
 # ======================================================================
 # DATA REQUIREMENTS - IMPORTANT!
