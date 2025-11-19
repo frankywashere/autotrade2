@@ -822,8 +822,15 @@ class TradingFeatureExtractor(FeatureExtractor):
         if chunk_starts[-1] < end_date:
             chunk_starts = chunk_starts.append(pd.DatetimeIndex([end_date]))
 
-        chunk_results = []
         overlap_months = config.CHUNK_OVERLAP_MONTHS
+
+        # Create temp HDF5 file for incremental appending (avoids memory accumulation)
+        import time
+        import os
+        cache_dir = Path('data/feature_cache')
+        cache_dir.mkdir(exist_ok=True, parents=True)
+        hdf_temp = cache_dir / f"temp_chunked_{int(time.time())}.h5"
+        print(f"     Using temp HDF5: {hdf_temp.name}")
 
         for i in range(len(chunk_starts) - 1):
             chunk_start = chunk_starts[i]
@@ -862,7 +869,20 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"       Result: {len(chunk_features):,} bars after trimming overlap")
             print(f"       Memory: ~{chunk_features.memory_usage(deep=True).sum() / 1e6:.1f} MB")
 
-            chunk_results.append(chunk_features)
+            # Append to HDF5 file (no memory accumulation!)
+            try:
+                if i == 0:
+                    # First chunk - create new file
+                    print(f"       Writing to HDF5 (mode=write)...")
+                    chunk_features.to_hdf(hdf_temp, key='data', mode='w', format='table', complevel=0)
+                else:
+                    # Subsequent chunks - append
+                    print(f"       Appending to HDF5...")
+                    chunk_features.to_hdf(hdf_temp, key='data', mode='a', append=True, format='table', complevel=0)
+                print(f"       ✓ HDF5 write complete")
+            except Exception as e:
+                print(f"       ❌ HDF5 write failed: {e}")
+                raise
 
             # Aggressive memory cleanup
             del chunk_df, chunk_features
@@ -870,9 +890,9 @@ class TradingFeatureExtractor(FeatureExtractor):
                 del chunk_multi_res
             gc.collect()
 
-        # Combine all chunks
-        print(f"\n     Combining {len(chunk_results)} chunks...")
-        combined_df = pd.concat(chunk_results, axis=0)
+        # Load final result from HDF5 (returns normal pandas DataFrame)
+        print(f"\n     📖 Loading combined result from HDF5...")
+        combined_df = pd.read_hdf(hdf_temp, key='data')
 
         # Verify no gaps or overlaps
         assert len(combined_df) == len(combined_df.index.unique()), "Duplicate timestamps found!"
@@ -882,8 +902,13 @@ class TradingFeatureExtractor(FeatureExtractor):
         print(f"     ✓ Date range: {combined_df.index[0].date()} to {combined_df.index[-1].date()}")
         print(f"     ✓ Memory: ~{combined_df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
 
-        # Final cleanup
-        del chunk_results
+        # Clean up temp HDF5 file
+        try:
+            hdf_temp.unlink()
+            print(f"     ✓ Temp HDF5 file deleted")
+        except Exception as e:
+            print(f"     ⚠️  Could not delete temp file: {e}")
+
         gc.collect()
 
         return combined_df
