@@ -21,7 +21,7 @@ try:
     from rich.live import Live
     from rich.layout import Layout
     from rich.panel import Panel
-    RICH_AVAILABLE = False  # TEMPORARILY DISABLED FOR DEBUGGING - set to True to re-enable
+    RICH_AVAILABLE = True  # Re-enabled after debugging
 except ImportError:
     RICH_AVAILABLE = False
 
