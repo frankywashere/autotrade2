@@ -497,14 +497,14 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
 
     print(f"\n   🔄 Progress complete. Waiting for {n_jobs} workers to finish...")
 
-    # Wait for all workers
+    # FIX 5: Better Worker Shutdown - Give more time, collect results BEFORE killing
     for i, worker in enumerate(workers):
         print(f"   ⏳ Waiting for worker {i}...")
-        worker.join(timeout=10)  # 10 second timeout per worker
+        worker.join(timeout=30)  # Increased from 10s to 30s - give workers time to flush queue
         if worker.is_alive():
-            print(f"   ⚠️  Worker {i} still alive after 10s - terminating...")
+            print(f"   ⚠️  Worker {i} still alive after 30s - terminating...")
             worker.terminate()  # Force kill stuck worker
-            worker.join(timeout=2)
+            worker.join(timeout=5)  # Give 5s to terminate gracefully
             if worker.is_alive():
                 print(f"   ⚠️  Worker {i} won't die - killing...")
                 worker.kill()
@@ -513,26 +513,77 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
 
     print(f"   📦 Collecting results from {len(tasks)} tasks...")
 
-    # Collect results - use blocking get with exact count (reliable)
+    # FIX 4: Check Queue Size First
+    print(f"   🔍 Checking result queue state...")
+    try:
+        queue_size = result_queue.qsize()
+        print(f"   ℹ️  Queue reports ~{queue_size} items available (expected {len(tasks)})")
+        if queue_size < len(tasks):
+            print(f"   ⚠️  Queue has fewer items than expected! May be missing {len(tasks) - queue_size} results")
+    except NotImplementedError:
+        print(f"   ℹ️  Queue size checking not available on this platform (macOS limitation)")
+    except Exception as e:
+        print(f"   ⚠️  Could not check queue size: {e}")
+
+    # FIX 2 & FIX 3: Non-blocking collection with hard timeout
+    import time
+    from queue import Empty
+
     results_dict = {}
     timeout_count = 0
-    max_timeouts = 5  # Stop after 5 consecutive timeouts
+    max_consecutive_timeouts = 10  # Allow more retries before giving up
+    collection_start_time = time.time()
+    HARD_TIMEOUT_SECONDS = 60  # Maximum 60 seconds for entire collection
 
-    for collected in range(len(tasks)):
-        print(f"   ⏳ Waiting for result {collected + 1}/{len(tasks)}...", end='', flush=True)
+    print(f"   ⏰ Starting collection with {HARD_TIMEOUT_SECONDS}s hard timeout...")
+
+    collected = 0
+    while collected < len(tasks):
+        # FIX 3: Check hard timeout
+        elapsed = time.time() - collection_start_time
+        if elapsed > HARD_TIMEOUT_SECONDS:
+            print(f"\n   ⚠️  HARD TIMEOUT after {elapsed:.1f}s! Only collected {collected}/{len(tasks)} results")
+            print(f"   ⚠️  Stopping collection to avoid infinite hang")
+            break
+
+        # FIX 1: Debug output with timestamp
+        print(f"   ⏳ [{elapsed:.1f}s] Waiting for result {collected + 1}/{len(tasks)}...", end='', flush=True)
+
         try:
-            task_idx, result = result_queue.get(timeout=1)  # 1 second timeout
+            # FIX 2: Non-blocking get
+            task_idx, result = result_queue.get_nowait()  # Don't block, return immediately
             results_dict[task_idx] = result
             num_features = len(result) if result else 0
             print(f" ✓ Got task {task_idx} ({num_features} features)")
+            collected += 1
             timeout_count = 0  # Reset on success
-        except:
+
+        except Empty:
+            # Queue is empty right now
             timeout_count += 1
-            print(f" ⚠️  Timeout #{timeout_count} (queue empty or worker killed)")
-            if timeout_count >= max_timeouts:
-                print(f"   ⚠️  {max_timeouts} consecutive timeouts - stopping collection")
+            print(f" ⚠️  Empty #{timeout_count}", flush=True)
+
+            if timeout_count >= max_consecutive_timeouts:
+                print(f"   ⚠️  {max_consecutive_timeouts} consecutive empties - queue likely exhausted")
+                print(f"   ℹ️  Collected {collected}/{len(tasks)} results so far")
                 break
-            # Continue trying to collect remaining results
+
+            # FIX 1: Debug - show we're still trying
+            if timeout_count % 5 == 0:
+                print(f"   🔄 Still trying... ({timeout_count} attempts, {elapsed:.1f}s elapsed)")
+
+            # Small sleep to avoid CPU spinning
+            time.sleep(0.1)
+            continue
+
+        except Exception as e:
+            # FIX 1: Log unexpected exceptions with details
+            print(f" ❌ Exception: {type(e).__name__}: {e}")
+            timeout_count += 1
+            if timeout_count >= max_consecutive_timeouts:
+                print(f"   ⚠️  Too many exceptions - stopping collection")
+                break
+            time.sleep(0.1)
             continue
 
     print(f"   ✓ Collected {len(results_dict)} results")
