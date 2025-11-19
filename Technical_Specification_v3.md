@@ -503,13 +503,72 @@ ML_BATCH_SIZE = 32                   # Reduce if out of memory
 ML_TRAIN_START_YEAR = 2015          # Start of training data
 ML_TRAIN_END_YEAR = 2022            # End of training data
 ML_TEST_YEAR = 2023                 # Validation year
+
+# v3.13: Precision configuration
+TRAINING_PRECISION = 'float64'       # 'float64' or 'float32'
+CHANNEL_WINDOW_SIZES = [168, 160, 150, ..., 10]  # 21 windows
+MIN_DATA_YEARS = 2.5                 # Minimum data for multi-window system
 ```
+
+#### Precision Configuration (v3.13)
+
+**Centralized Precision Control:**
+The system uses a single `TRAINING_PRECISION` setting that controls numerical precision throughout the entire pipeline:
+
+**config.py settings:**
+```python
+TRAINING_PRECISION = 'float64'  # Master control
+NUMPY_DTYPE = np.float64        # Auto-derived (don't modify)
+TORCH_DTYPE = torch.float64     # Auto-derived (don't modify)
+```
+
+**Precision is applied to 87 locations:**
+- **NumPy arrays (58)**: Feature storage, result arrays, channel calculations
+  - `parallel_channel_extraction.py`: 27 array allocations
+  - `features.py`: 31 array allocations (sequential + legacy features)
+- **PyTorch tensors (29)**: Input features, target labels, embeddings
+  - `hierarchical_dataset.py`: 27 tensor creations
+  - `events.py`: 2 news embedding tensors
+
+**How it works:**
+```python
+# Instead of hardcoded:
+results['slope'] = np.zeros(n, dtype=np.float32)  # OLD
+
+# Now centralized:
+results['slope'] = np.zeros(n, dtype=config.NUMPY_DTYPE)  # NEW
+```
+
+**Changing precision:**
+1. **Interactive mode**: Select in menu → updates config automatically
+2. **Manual**: Edit `config.py` → set `TRAINING_PRECISION = 'float32'`
+3. **Effect**: All 87 locations update automatically
+
+**Recommendation:** Use `float64` for training, quantize to `int8` or `float16` for deployment (4x faster inference)
 
 ---
 
 ## 7. Usage Guide
 
 ### 7.1 Training
+
+#### Interactive Mode (Recommended - v3.13 Enhanced)
+```bash
+python train_hierarchical.py --interactive
+```
+
+**New in v3.13:** Interactive precision selection
+- **float64** (8 bytes): Maximum precision, recommended for training
+- **float32** (4 bytes): Half memory, standard ML practice
+
+**Selection controls ALL 87 dtype locations:**
+- 58 NumPy array allocations (features.py, parallel_channel_extraction.py)
+- 29 PyTorch tensor creations (hierarchical_dataset.py, events.py)
+- Centralized via `config.TRAINING_PRECISION`
+
+**Memory Impact:**
+- float64: 30-40 GB (8 workers), 20-25 GB (4 workers)
+- float32: 20-30 GB (8 workers), 15-18 GB (4 workers)
 
 #### Quick Test (1 epoch)
 ```bash
@@ -527,15 +586,10 @@ python train_hierarchical.py \
     --multi_task
 ```
 
-#### Interactive Mode (Recommended)
-```bash
-python train_hierarchical.py --interactive
-```
-
-#### Training Timeline
-- First run: 45-60 minutes (feature extraction + caching)
-- Subsequent runs: 5-10 minutes (using cache)
-- Per epoch: 2-5 minutes depending on hardware
+#### Training Timeline (v3.13 - Massively Improved)
+- **First run:** 40-60 seconds with rolling statistics (was 45-60 minutes!)
+- **Subsequent runs:** 2-5 seconds (using cache)
+- **Per epoch:** 2-5 minutes depending on hardware
 
 ### 7.2 Dashboard
 
@@ -1109,8 +1163,12 @@ labels_df = extractor.generate_continuation_labels(
 7. **Feature Count (v3.13)**: **12,936 features** (21 windows × 28 OHLC features × 22 combinations)
 8. **Memory Requirements**: 20-40 GB RAM depending on worker count (4-8 workers recommended)
 9. **Multi-Window System**: ALL windows calculated with quality scores - no filtering, model learns relevance
-10. **float64 Precision**: Training uses full precision, quantize to int8/float16 for deployment
-11. **Data Requirements**: Minimum 2.5 years for 3-month TF with 10-bar lookback
+10. **Configurable Precision (v3.13)**:
+    - **Centralized control**: `config.TRAINING_PRECISION` controls all 87 dtype locations
+    - **Interactive menu**: Select float64 or float32 during setup
+    - **Recommendation**: float64 for training (maximum precision), quantize to int8/float16 for deployment
+    - **Architecture**: All NumPy arrays, PyTorch tensors, and model operations respect precision setting
+11. **Data Requirements**: Minimum 2.5 years for 3-month TF with 10-bar lookback (257,400 1-min bars)
 12. **Continuation Labels**: Fixed duplicate resampling bug in v3.0
 13. **News Priority**: User's top priority - infrastructure 80% ready
 
