@@ -146,7 +146,7 @@ class TSLAEventsHandler(EventHandler):
             embeddings.append(embedding)
 
         # Average embeddings if multiple events
-        embeddings_tensor = torch.tensor(embeddings, dtype=torch.float32)
+        embeddings_tensor = torch.tensor(embeddings, dtype=config.TORCH_DTYPE)
         return embeddings_tensor.mean(dim=0, keepdim=True)
 
 
@@ -261,7 +261,7 @@ class MacroEventsHandler(EventHandler):
             embedding = event_type_onehot + [days_normalized]
             embeddings.append(embedding)
 
-        embeddings_tensor = torch.tensor(embeddings, dtype=torch.float32)
+        embeddings_tensor = torch.tensor(embeddings, dtype=config.TORCH_DTYPE)
         return embeddings_tensor.mean(dim=0, keepdim=True)
 
 

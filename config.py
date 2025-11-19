@@ -171,6 +171,22 @@ HISTORICAL_BUFFER_YEARS = 2    # Years of data to load before training start
 # ======================================================================
 
 # ======================================================================
+# PRECISION CONFIGURATION (v3.13)
+# ======================================================================
+# Numerical precision for training
+# - 'float64': Maximum precision (8 bytes), best for training, ~10% more memory
+# - 'float32': Standard precision (4 bytes), faster, uses half memory
+#
+# Recommendation: Use float64 for training, quantize to int8/float16 for deployment
+TRAINING_PRECISION = 'float64'  # 'float64' or 'float32'
+
+# Derived dtypes (auto-set from TRAINING_PRECISION - don't modify directly)
+import numpy as np
+import torch
+NUMPY_DTYPE = np.float64 if TRAINING_PRECISION == 'float64' else np.float32
+TORCH_DTYPE = torch.float64 if TRAINING_PRECISION == 'float64' else torch.float32
+
+# ======================================================================
 # CHANNEL WINDOW CONFIGURATION
 # ======================================================================
 # Window sizes for multi-window channel analysis (bars to look back)
