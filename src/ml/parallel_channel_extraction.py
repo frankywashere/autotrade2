@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Tuple
+import config  # For precision configuration
 
 # Rich imports for beautiful progress bars
 try:
@@ -113,45 +114,45 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     w_prefix = f'{symbol}_channel_{tf_name}_w{window}'
 
                     # Position features
-                    results[f'{w_prefix}_position'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_upper_dist'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_lower_dist'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_position'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_upper_dist'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_lower_dist'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
                     # Slope features (OHLC)
-                    results[f'{w_prefix}_close_slope'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_close_slope_pct'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_high_slope'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_high_slope_pct'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_low_slope'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_low_slope_pct'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_close_slope'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_close_slope_pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_high_slope'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_high_slope_pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_low_slope'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_low_slope_pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
                     # R-squared features (OHLC)
-                    results[f'{w_prefix}_close_r_squared'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_high_r_squared'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_low_r_squared'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_r_squared_avg'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_close_r_squared'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_high_r_squared'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_low_r_squared'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_r_squared_avg'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
                     # Channel metrics
-                    results[f'{w_prefix}_channel_width_pct'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_slope_convergence'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_stability'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_channel_width_pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_slope_convergence'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_stability'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
                     # Ping-pongs (multi-threshold)
-                    results[f'{w_prefix}_ping_pongs'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_ping_pongs_0_5pct'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_ping_pongs_1_0pct'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_ping_pongs_3_0pct'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_ping_pongs'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_ping_pongs_0_5pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_ping_pongs_1_0pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_ping_pongs_3_0pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
                     # Direction flags
-                    results[f'{w_prefix}_is_bull'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_is_bear'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_is_sideways'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_is_bull'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_is_bear'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_is_sideways'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
                     # Quality indicators
-                    results[f'{w_prefix}_quality_score'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_is_valid'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_insufficient_data'] = np.zeros(n, dtype=np.float32)
-                    results[f'{w_prefix}_duration'] = np.zeros(n, dtype=np.float32)
+                    results[f'{w_prefix}_quality_score'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_is_valid'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_insufficient_data'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_duration'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
                 # Total: 21 windows × 28 features = 588 features per (symbol, timeframe) pair
 
@@ -250,48 +251,47 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                         high_slope_pct = (channel.high_slope / current_price) * 100 if current_price > 0 else 0.0
                         low_slope_pct = (channel.low_slope / current_price) * 100 if current_price > 0 else 0.0
 
-                        # Store ALL features for this window
-                        for idx_orig in indices:
-                            # Position features
-                            results[f'{w_prefix}_position'][idx_orig] = position_data['position']
-                            results[f'{w_prefix}_upper_dist'][idx_orig] = position_data['distance_to_upper_pct']
-                            results[f'{w_prefix}_lower_dist'][idx_orig] = position_data['distance_to_lower_pct']
+                        # Store ALL features for this window (vectorized - no loop)
+                        # Position features
+                        results[f'{w_prefix}_position'][indices] = position_data['position']
+                        results[f'{w_prefix}_upper_dist'][indices] = position_data['distance_to_upper_pct']
+                        results[f'{w_prefix}_lower_dist'][indices] = position_data['distance_to_lower_pct']
 
-                            # Slope features (OHLC)
-                            results[f'{w_prefix}_close_slope'][idx_orig] = channel.close_slope
-                            results[f'{w_prefix}_close_slope_pct'][idx_orig] = close_slope_pct
-                            results[f'{w_prefix}_high_slope'][idx_orig] = channel.high_slope
-                            results[f'{w_prefix}_high_slope_pct'][idx_orig] = high_slope_pct
-                            results[f'{w_prefix}_low_slope'][idx_orig] = channel.low_slope
-                            results[f'{w_prefix}_low_slope_pct'][idx_orig] = low_slope_pct
+                        # Slope features (OHLC)
+                        results[f'{w_prefix}_close_slope'][indices] = channel.close_slope
+                        results[f'{w_prefix}_close_slope_pct'][indices] = close_slope_pct
+                        results[f'{w_prefix}_high_slope'][indices] = channel.high_slope
+                        results[f'{w_prefix}_high_slope_pct'][indices] = high_slope_pct
+                        results[f'{w_prefix}_low_slope'][indices] = channel.low_slope
+                        results[f'{w_prefix}_low_slope_pct'][indices] = low_slope_pct
 
-                            # R-squared features
-                            results[f'{w_prefix}_close_r_squared'][idx_orig] = channel.close_r_squared
-                            results[f'{w_prefix}_high_r_squared'][idx_orig] = channel.high_r_squared
-                            results[f'{w_prefix}_low_r_squared'][idx_orig] = channel.low_r_squared
-                            results[f'{w_prefix}_r_squared_avg'][idx_orig] = channel.r_squared
+                        # R-squared features
+                        results[f'{w_prefix}_close_r_squared'][indices] = channel.close_r_squared
+                        results[f'{w_prefix}_high_r_squared'][indices] = channel.high_r_squared
+                        results[f'{w_prefix}_low_r_squared'][indices] = channel.low_r_squared
+                        results[f'{w_prefix}_r_squared_avg'][indices] = channel.r_squared
 
-                            # Channel metrics
-                            results[f'{w_prefix}_channel_width_pct'][idx_orig] = channel.channel_width_pct
-                            results[f'{w_prefix}_slope_convergence'][idx_orig] = channel.slope_convergence
-                            results[f'{w_prefix}_stability'][idx_orig] = channel.stability_score
+                        # Channel metrics
+                        results[f'{w_prefix}_channel_width_pct'][indices] = channel.channel_width_pct
+                        results[f'{w_prefix}_slope_convergence'][indices] = channel.slope_convergence
+                        results[f'{w_prefix}_stability'][indices] = channel.stability_score
 
-                            # Ping-pongs
-                            results[f'{w_prefix}_ping_pongs'][idx_orig] = channel.ping_pongs
-                            results[f'{w_prefix}_ping_pongs_0_5pct'][idx_orig] = channel.ping_pongs_0_5pct
-                            results[f'{w_prefix}_ping_pongs_1_0pct'][idx_orig] = channel.ping_pongs_1_0pct
-                            results[f'{w_prefix}_ping_pongs_3_0pct'][idx_orig] = channel.ping_pongs_3_0pct
+                        # Ping-pongs
+                        results[f'{w_prefix}_ping_pongs'][indices] = channel.ping_pongs
+                        results[f'{w_prefix}_ping_pongs_0_5pct'][indices] = channel.ping_pongs_0_5pct
+                        results[f'{w_prefix}_ping_pongs_1_0pct'][indices] = channel.ping_pongs_1_0pct
+                        results[f'{w_prefix}_ping_pongs_3_0pct'][indices] = channel.ping_pongs_3_0pct
 
-                            # Direction flags
-                            results[f'{w_prefix}_is_bull'][idx_orig] = float(close_slope_pct > 0.1)
-                            results[f'{w_prefix}_is_bear'][idx_orig] = float(close_slope_pct < -0.1)
-                            results[f'{w_prefix}_is_sideways'][idx_orig] = float(abs(close_slope_pct) <= 0.1)
+                        # Direction flags
+                        results[f'{w_prefix}_is_bull'][indices] = float(close_slope_pct > 0.1)
+                        results[f'{w_prefix}_is_bear'][indices] = float(close_slope_pct < -0.1)
+                        results[f'{w_prefix}_is_sideways'][indices] = float(abs(close_slope_pct) <= 0.1)
 
-                            # Quality indicators
-                            results[f'{w_prefix}_quality_score'][idx_orig] = channel.quality_score
-                            results[f'{w_prefix}_is_valid'][idx_orig] = channel.is_valid
-                            results[f'{w_prefix}_insufficient_data'][idx_orig] = channel.insufficient_data
-                            results[f'{w_prefix}_duration'][idx_orig] = channel.actual_duration
+                        # Quality indicators
+                        results[f'{w_prefix}_quality_score'][indices] = channel.quality_score
+                        results[f'{w_prefix}_is_valid'][indices] = channel.is_valid
+                        results[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
+                        results[f'{w_prefix}_duration'][indices] = channel.actual_duration
 
                 # Send completion
                 progress_queue.put({

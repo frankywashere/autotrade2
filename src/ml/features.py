@@ -689,7 +689,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                                                 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
                                                 'is_bull', 'is_bear', 'is_sideways',
                                                 'quality_score', 'is_valid', 'insufficient_data', 'duration']:
-                                        channel_features[f'{w_prefix}_{feat}'] = np.zeros(num_rows, dtype=np.float32)
+                                        channel_features[f'{w_prefix}_{feat}'] = np.zeros(num_rows, dtype=config.NUMPY_DTYPE)
 
                                 # Store features (vectorized - no loop for memory efficiency)
                                 channel_features[f'{w_prefix}_position'][indices] = position_data['position']
@@ -720,9 +720,23 @@ class TradingFeatureExtractor(FeatureExtractor):
 
                     calc_progress.update(1)
 
+                    # CRITICAL: Clear memory after each timeframe
+                    del all_windows
+                    if 'resampled' in locals():
+                        del resampled
+                    if 'symbol_df' in locals():
+                        del symbol_df
+                    import gc
+                    gc.collect()
+
             calc_progress.close()
 
         result_df = pd.DataFrame(channel_features, index=df.index)
+
+        # Clear dict now that DataFrame created (frees 26 GB)
+        del channel_features
+        import gc
+        gc.collect()
 
         # Save to cache (atomic write to prevent corruption)
         if use_cache:
@@ -788,21 +802,21 @@ class TradingFeatureExtractor(FeatureExtractor):
 
             # Pre-allocate result arrays
             results = {
-                f'{prefix}_position': np.zeros(n, dtype=np.float32),
-                f'{prefix}_upper_dist': np.zeros(n, dtype=np.float32),
-                f'{prefix}_lower_dist': np.zeros(n, dtype=np.float32),
-                f'{prefix}_slope': np.zeros(n, dtype=np.float32),
-                f'{prefix}_slope_pct': np.zeros(n, dtype=np.float32),
-                f'{prefix}_stability': np.zeros(n, dtype=np.float32),
-                f'{prefix}_ping_pongs': np.zeros(n, dtype=np.float32),
-                f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=np.float32),
-                f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=np.float32),
-                f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=np.float32),
-                f'{prefix}_r_squared': np.zeros(n, dtype=np.float32),
-                f'{prefix}_is_bull': np.zeros(n, dtype=np.float32),
-                f'{prefix}_is_bear': np.zeros(n, dtype=np.float32),
-                f'{prefix}_is_sideways': np.zeros(n, dtype=np.float32),
-                f'{prefix}_duration': np.zeros(n, dtype=np.float32)
+                f'{prefix}_position': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_upper_dist': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_lower_dist': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_slope': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_slope_pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_stability': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_ping_pongs': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_r_squared': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_is_bull': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_is_bear': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_is_sideways': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_duration': np.zeros(n, dtype=config.NUMPY_DTYPE)
             }
 
             # Handle insufficient data case
@@ -908,21 +922,21 @@ class TradingFeatureExtractor(FeatureExtractor):
             n = len(timestamps)
             prefix = f'{symbol}_channel_{tf_name}'
             results = {
-                f'{prefix}_position': np.zeros(n, dtype=np.float32),
-                f'{prefix}_upper_dist': np.zeros(n, dtype=np.float32),
-                f'{prefix}_lower_dist': np.zeros(n, dtype=np.float32),
-                f'{prefix}_slope': np.zeros(n, dtype=np.float32),
-                f'{prefix}_slope_pct': np.zeros(n, dtype=np.float32),
-                f'{prefix}_stability': np.zeros(n, dtype=np.float32),
-                f'{prefix}_ping_pongs': np.zeros(n, dtype=np.float32),
-                f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=np.float32),
-                f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=np.float32),
-                f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=np.float32),
-                f'{prefix}_r_squared': np.zeros(n, dtype=np.float32),
-                f'{prefix}_is_bull': np.zeros(n, dtype=np.float32),
-                f'{prefix}_is_bear': np.zeros(n, dtype=np.float32),
-                f'{prefix}_is_sideways': np.zeros(n, dtype=np.float32),
-                f'{prefix}_duration': np.zeros(n, dtype=np.float32)
+                f'{prefix}_position': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_upper_dist': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_lower_dist': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_slope': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_slope_pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_stability': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_ping_pongs': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_r_squared': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_is_bull': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_is_bear': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_is_sideways': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_duration': np.zeros(n, dtype=config.NUMPY_DTYPE)
             }
             return results
 

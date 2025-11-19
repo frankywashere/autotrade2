@@ -16,6 +16,7 @@ Features:
 
 import argparse
 import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -563,6 +564,28 @@ def interactive_setup(args):
         else:
             # Less than 3 cores
             print(f"🚀 Parallel Processing: Not available (only {n_cores} cores detected)")
+
+    # Precision selection
+    print()
+    precision_choice = inquirer.select(
+        message="Training precision:",
+        choices=[
+            Choice(value='float64', name='float64 (8 bytes) - Maximum precision ⭐ Recommended'),
+            Choice(value='float32', name='float32 (4 bytes) - Half memory, standard ML'),
+        ],
+        default='float64'
+    ).execute()
+
+    # Update config with precision choice
+    project_config.TRAINING_PRECISION = precision_choice
+    if precision_choice == 'float64':
+        project_config.NUMPY_DTYPE = np.float64
+        project_config.TORCH_DTYPE = torch.float64
+        print(f"   → Using float64 (maximum precision, ~10% more memory)")
+    else:
+        project_config.NUMPY_DTYPE = np.float32
+        project_config.TORCH_DTYPE = torch.float32
+        print(f"   → Using float32 (standard precision, half memory)")
 
     # Model parameters
     print()
