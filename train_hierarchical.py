@@ -616,6 +616,50 @@ def interactive_setup(args):
             # Less than 3 cores
             print(f"🚀 Parallel Processing: Not available (only {n_cores} cores detected)")
 
+    # Chunked Feature Extraction option
+    print()
+
+    # Only show if we'll be calculating features (not just loading cache)
+    show_chunking = not will_use_cache
+
+    if show_chunking:
+        # Detect RAM
+        import psutil
+        total_ram_gb = psutil.virtual_memory().total / 1e9
+
+        print(f"💾 Memory Management")
+        print(f"   Total RAM: {total_ram_gb:.1f} GB")
+
+        # Smart default based on RAM
+        if total_ram_gb < 32:
+            default_chunking = True
+            recommendation = "⭐ Recommended for your system"
+        elif total_ram_gb < 64:
+            default_chunking = True
+            recommendation = "Recommended (safer)"
+        else:
+            default_chunking = False
+            recommendation = "Optional (you have plenty of RAM)"
+
+        args.use_chunking = inquirer.select(
+            message=f"Use chunked feature extraction? {recommendation}",
+            choices=[
+                Choice(True, "Yes - Process in 1-year chunks (2-5GB RAM, ~10% slower) 💾"),
+                Choice(False, "No - Process all at once (20-40GB RAM, fastest) ⚡")
+            ],
+            default=default_chunking
+        ).execute()
+
+        if args.use_chunking:
+            print(f"   ✓ Will process features in 1-year chunks")
+            print(f"   ℹ️  Peak RAM during extraction: ~2-5GB")
+        else:
+            print(f"   ⚡ Will process all features at once")
+            print(f"   ⚠️  Peak RAM during extraction: ~20-40GB")
+    else:
+        # Cache will be loaded - chunking doesn't apply
+        args.use_chunking = False
+
     # Precision selection
     print()
     precision_choice = inquirer.select(
@@ -790,6 +834,10 @@ def main():
                         help='DataLoader num_workers (auto-set based on device if None)')
     parser.add_argument('--feature_workers', type=int, default=None,
                         help='Number of CPU cores for parallel feature extraction (default: config.MAX_PARALLEL_WORKERS, 0=all cores)')
+    parser.add_argument('--use-chunking', dest='use_chunking', action='store_true', default=None,
+                        help='Use chunked feature extraction to save memory (auto-detect if not specified)')
+    parser.add_argument('--no-chunking', dest='use_chunking', action='store_false',
+                        help='Disable chunked extraction (faster if you have enough RAM)')
     parser.add_argument('--output', type=str, default='models/hierarchical_lnn.pth',
                         help='Output model path')
 
@@ -831,6 +879,13 @@ def main():
         # project_config already imported at module level
         project_config.MAX_PARALLEL_WORKERS = args.feature_workers
         print(f"✓ Feature extraction workers: {args.feature_workers} cores (via --feature_workers)")
+
+    # Auto-detect chunking if not specified
+    if args.use_chunking is None:
+        import psutil
+        total_ram_gb = psutil.virtual_memory().total / 1e9
+        args.use_chunking = (total_ram_gb < 64)  # Enable if <64GB RAM
+        print(f"✓ Auto-detected chunking: {'Enabled' if args.use_chunking else 'Disabled'} (RAM: {total_ram_gb:.1f}GB)")
 
     # Load configuration
     config = None
@@ -991,7 +1046,9 @@ def main():
         df,
         use_cache=use_cache,
         use_gpu=use_gpu,
-        continuation=True
+        continuation=True,
+        use_chunking=getattr(args, 'use_chunking', False),
+        chunk_size_years=project_config.CHUNK_SIZE_YEARS
     )
 
     # If we got 0 labels and didn't enable debug, enable it now for diagnosis
