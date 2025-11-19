@@ -451,6 +451,37 @@ def interactive_setup(args):
         max_allowed=2024
     ).execute())
 
+    # Validate and notify about warmup impact
+    warmup_years = project_config.MIN_LOOKBACK_MONTHS / 12 if hasattr(project_config, 'MIN_LOOKBACK_MONTHS') else 2.5
+    requested_years = args.train_end_year - args.train_start_year
+    effective_start_year = args.train_start_year + warmup_years
+    effective_years = args.train_end_year - effective_start_year
+
+    print(f"\n   📅 Training Date Range Analysis:")
+    print(f"   Requested: {args.train_start_year}-{args.train_end_year} ({requested_years} years)")
+    print(f"   Warmup required: {warmup_years} years (257,400 bars for 21-window system)")
+    print(f"   ")
+    print(f"   ⚠️  IF your CSV starts at {args.train_start_year}:")
+    print(f"       Effective training: {effective_start_year:.1f}-{args.train_end_year} ({effective_years:.1f} years)")
+    print(f"       → First {warmup_years} years used for warmup (ensures complete feature history)")
+    print(f"   ")
+    print(f"   💡 To train from {args.train_start_year}, you need CSV data from {args.train_start_year - warmup_years:.1f}")
+    print(f"   ")
+
+    if effective_years < 2.0:
+        print(f"   ⚠️  Warning: Only {effective_years:.1f} years of usable training data after warmup!")
+        proceed = inquirer.confirm(
+            message=f"Continue with {args.train_start_year}-{args.train_end_year} anyway?",
+            default=False
+        ).execute()
+        if not proceed:
+            print("   Exiting - please adjust dates or get more historical data")
+            sys.exit(0)
+        else:
+            print(f"   ⚠️  Continuing with limited data ({effective_years:.1f} years)")
+    else:
+        print(f"   ✓ Good! {effective_years:.1f} years of quality training data after warmup")
+
     # Check for feature cache
     print()
     from src.ml.features import FEATURE_VERSION
@@ -757,6 +788,8 @@ def main():
                         help='Device: auto (detect), cuda (NVIDIA), mps (Apple Silicon), cpu')
     parser.add_argument('--num_workers', type=int, default=None,
                         help='DataLoader num_workers (auto-set based on device if None)')
+    parser.add_argument('--feature_workers', type=int, default=None,
+                        help='Number of CPU cores for parallel feature extraction (default: config.MAX_PARALLEL_WORKERS, 0=all cores)')
     parser.add_argument('--output', type=str, default='models/hierarchical_lnn.pth',
                         help='Output model path')
 
@@ -792,6 +825,12 @@ def main():
     # Auto-set num_workers if not specified
     if args.num_workers is None:
         args.num_workers = {'cuda': 4, 'mps': 2, 'cpu': 2}.get(args.device, 2)
+
+    # Override parallel worker count for feature extraction if specified
+    if args.feature_workers is not None:
+        import config as project_config
+        project_config.MAX_PARALLEL_WORKERS = args.feature_workers
+        print(f"✓ Feature extraction workers: {args.feature_workers} cores (via --feature_workers)")
 
     # Load configuration
     config = None
