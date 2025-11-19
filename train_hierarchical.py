@@ -828,7 +828,7 @@ def main():
 
     # Override parallel worker count for feature extraction if specified
     if args.feature_workers is not None:
-        import config as project_config
+        # project_config already imported at module level
         project_config.MAX_PARALLEL_WORKERS = args.feature_workers
         print(f"✓ Feature extraction workers: {args.feature_workers} cores (via --feature_workers)")
 
