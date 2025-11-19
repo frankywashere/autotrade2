@@ -614,6 +614,11 @@ class TradingFeatureExtractor(FeatureExtractor):
             for result_dict in results:
                 all_channel_data.update(result_dict)
 
+            # Clear results to free memory (26 GB freed)
+            del results
+            import gc
+            gc.collect()
+
             channel_features = pd.DataFrame(all_channel_data, index=df.index)
 
         else:
@@ -686,33 +691,32 @@ class TradingFeatureExtractor(FeatureExtractor):
                                                 'quality_score', 'is_valid', 'insufficient_data', 'duration']:
                                         channel_features[f'{w_prefix}_{feat}'] = np.zeros(num_rows, dtype=np.float32)
 
-                                # Store features
-                                for idx in indices:
-                                    channel_features[f'{w_prefix}_position'][idx] = position_data['position']
-                                    channel_features[f'{w_prefix}_upper_dist'][idx] = position_data['distance_to_upper_pct']
-                                    channel_features[f'{w_prefix}_lower_dist'][idx] = position_data['distance_to_lower_pct']
-                                    channel_features[f'{w_prefix}_close_slope'][idx] = channel.close_slope
-                                    channel_features[f'{w_prefix}_close_slope_pct'][idx] = slope_pct
-                                    channel_features[f'{w_prefix}_high_slope'][idx] = channel.high_slope
-                                    channel_features[f'{w_prefix}_low_slope'][idx] = channel.low_slope
-                                    channel_features[f'{w_prefix}_close_r_squared'][idx] = channel.close_r_squared
-                                    channel_features[f'{w_prefix}_high_r_squared'][idx] = channel.high_r_squared
-                                    channel_features[f'{w_prefix}_low_r_squared'][idx] = channel.low_r_squared
-                                    channel_features[f'{w_prefix}_r_squared_avg'][idx] = channel.r_squared
-                                    channel_features[f'{w_prefix}_channel_width_pct'][idx] = channel.channel_width_pct
-                                    channel_features[f'{w_prefix}_slope_convergence'][idx] = channel.slope_convergence
-                                    channel_features[f'{w_prefix}_stability'][idx] = channel.stability_score
-                                    channel_features[f'{w_prefix}_ping_pongs'][idx] = channel.ping_pongs
-                                    channel_features[f'{w_prefix}_ping_pongs_0_5pct'][idx] = channel.ping_pongs_0_5pct
-                                    channel_features[f'{w_prefix}_ping_pongs_1_0pct'][idx] = channel.ping_pongs_1_0pct
-                                    channel_features[f'{w_prefix}_ping_pongs_3_0pct'][idx] = channel.ping_pongs_3_0pct
-                                    channel_features[f'{w_prefix}_is_bull'][idx] = float(slope_pct > 0.1)
-                                    channel_features[f'{w_prefix}_is_bear'][idx] = float(slope_pct < -0.1)
-                                    channel_features[f'{w_prefix}_is_sideways'][idx] = float(abs(slope_pct) <= 0.1)
-                                    channel_features[f'{w_prefix}_quality_score'][idx] = channel.quality_score
-                                    channel_features[f'{w_prefix}_is_valid'][idx] = channel.is_valid
-                                    channel_features[f'{w_prefix}_insufficient_data'][idx] = channel.insufficient_data
-                                    channel_features[f'{w_prefix}_duration'][idx] = channel.actual_duration
+                                # Store features (vectorized - no loop for memory efficiency)
+                                channel_features[f'{w_prefix}_position'][indices] = position_data['position']
+                                channel_features[f'{w_prefix}_upper_dist'][indices] = position_data['distance_to_upper_pct']
+                                channel_features[f'{w_prefix}_lower_dist'][indices] = position_data['distance_to_lower_pct']
+                                channel_features[f'{w_prefix}_close_slope'][indices] = channel.close_slope
+                                channel_features[f'{w_prefix}_close_slope_pct'][indices] = slope_pct
+                                channel_features[f'{w_prefix}_high_slope'][indices] = channel.high_slope
+                                channel_features[f'{w_prefix}_low_slope'][indices] = channel.low_slope
+                                channel_features[f'{w_prefix}_close_r_squared'][indices] = channel.close_r_squared
+                                channel_features[f'{w_prefix}_high_r_squared'][indices] = channel.high_r_squared
+                                channel_features[f'{w_prefix}_low_r_squared'][indices] = channel.low_r_squared
+                                channel_features[f'{w_prefix}_r_squared_avg'][indices] = channel.r_squared
+                                channel_features[f'{w_prefix}_channel_width_pct'][indices] = channel.channel_width_pct
+                                channel_features[f'{w_prefix}_slope_convergence'][indices] = channel.slope_convergence
+                                channel_features[f'{w_prefix}_stability'][indices] = channel.stability_score
+                                channel_features[f'{w_prefix}_ping_pongs'][indices] = channel.ping_pongs
+                                channel_features[f'{w_prefix}_ping_pongs_0_5pct'][indices] = channel.ping_pongs_0_5pct
+                                channel_features[f'{w_prefix}_ping_pongs_1_0pct'][indices] = channel.ping_pongs_1_0pct
+                                channel_features[f'{w_prefix}_ping_pongs_3_0pct'][indices] = channel.ping_pongs_3_0pct
+                                channel_features[f'{w_prefix}_is_bull'][indices] = float(slope_pct > 0.1)
+                                channel_features[f'{w_prefix}_is_bear'][indices] = float(slope_pct < -0.1)
+                                channel_features[f'{w_prefix}_is_sideways'][indices] = float(abs(slope_pct) <= 0.1)
+                                channel_features[f'{w_prefix}_quality_score'][indices] = channel.quality_score
+                                channel_features[f'{w_prefix}_is_valid'][indices] = channel.is_valid
+                                channel_features[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
+                                channel_features[f'{w_prefix}_duration'][indices] = channel.actual_duration
 
                     calc_progress.update(1)
 

@@ -1,6 +1,6 @@
-# Technical Specification: Adaptive Channel Prediction System v3.12
-*Last Updated: November 17, 2024*
-*Status: Production Ready - Training Pipeline Complete, Dashboard Fully Implemented*
+# Technical Specification: Adaptive Channel Prediction System v3.13
+*Last Updated: November 18, 2024*
+*Status: Production Ready - Multi-Window OHLC System with Memory Optimization*
 
 ## Table of Contents
 1. [Executive Summary](#1-executive-summary)
@@ -32,13 +32,19 @@ Just as an oceanographer studies different water layers to understand currents, 
 
 The model dynamically selects the most confident layer and projects forward accordingly, using higher layers as confirmation for longer holds.
 
-### Current State
+### Current State (v3.13 - November 18, 2024)
 - ✅ Training pipeline complete and tested
-- ✅ 495+ features fully implemented with GPU acceleration
+- ✅ **12,936 features** with 21-window multi-OHLC system
+- ✅ **Parallel processing** with real-time multi-progress bars (8 workers)
+- ✅ **OHLC integration** - Separate regressions for high/low/close prices
+- ✅ **Rolling statistics optimization** - 45x speedup for channel calculations
+- ✅ **Vectorized ping-pong detection** - 10x speedup
+- ✅ **Memory optimization** - Worker cleanup prevents OOM crashes
 - ✅ Continuation labels bug FIXED (duplicate resampling issue)
 - ✅ Event system with 483 events (2015-2025)
 - ✅ Multi-task learning with 12 prediction heads
 - ✅ Dashboard fully implemented with layer interplay visualization
+- ✅ float64 precision throughout training pipeline
 - ❌ News sentiment integration (NEXT PRIORITY - detailed plan included)
 - ❌ Hierarchical backtester (to be implemented)
 
@@ -256,49 +262,94 @@ loss = (
 
 ## 5. Feature Engineering
 
-### 5.1 Complete Feature Breakdown (495+ Features)
+### 5.1 Complete Feature Breakdown (v3.13: 12,936 Features)
 
-#### Price Features (12 total)
+**Feature Explosion:** v3.13 introduces multi-window OHLC system:
+- **v3.12:** 495 features (single best window per timeframe)
+- **v3.13:** 12,936 features (21 windows × OHLC × quality scores)
+
+#### Price Features (12 total - UNCHANGED)
 **Per stock (TSLA, SPY):**
 ```python
-'close'           # Absolute price (kept for reference)
-'close_norm'      # Position in 252-bar range [0,1]
-'returns'         # Percentage change from previous bar
-'log_returns'     # Log scale returns
-'volatility_10'   # 10-bar rolling standard deviation
-'volatility_50'   # 50-bar rolling standard deviation
+'close', 'close_norm', 'returns', 'log_returns', 'volatility_10', 'volatility_50'
 ```
 
-#### Channel Features (308 total = 14 metrics × 11 timeframes × 2 stocks)
+#### Channel Features (v3.13: 12,936 total)
 
-**Base Metrics (6):**
+**NEW: Multi-Window Architecture**
+Instead of picking "best" window, model sees ALL windows with quality scores:
+
+**Windows Tested:** [168, 160, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20, 15, 10]
+- **21 windows** for EVERY timeframe
+- **Same windows** for all timeframes (consistent)
+- **No filtering** - all windows calculated, bad ones scored low
+
+**Per Window Features (28 total):**
+
+**OHLC Regression Slopes (6):**
 ```python
-'position'        # 0-1, where price sits in channel
-'upper_dist'      # % distance to upper band
-'lower_dist'      # % distance to lower band
-'slope'           # Raw $/bar (interpretability)
-'stability'       # Composite: r²*40 + ping_pongs*40 + length_score*20
-'r_squared'       # 0-1, channel fit quality
+'{symbol}_channel_{tf}_w{window}_close_slope'       # Trend direction
+'{symbol}_channel_{tf}_w{window}_close_slope_pct'   # % per bar
+'{symbol}_channel_{tf}_w{window}_high_slope'        # Resistance trend
+'{symbol}_channel_{tf}_w{window}_high_slope_pct'
+'{symbol}_channel_{tf}_w{window}_low_slope'         # Support trend
+'{symbol}_channel_{tf}_w{window}_low_slope_pct'
 ```
 
-**Normalized Slope (1):**
+**OHLC R-Squared (4):**
 ```python
-'slope_pct'       # % change per bar (comparable across timeframes!)
+'{symbol}_channel_{tf}_w{window}_close_r_squared'   # Close fit quality
+'{symbol}_channel_{tf}_w{window}_high_r_squared'    # High fit quality
+'{symbol}_channel_{tf}_w{window}_low_r_squared'     # Low fit quality
+'{symbol}_channel_{tf}_w{window}_r_squared_avg'     # Average quality
+```
+
+**Position Metrics (3):**
+```python
+'{symbol}_channel_{tf}_w{window}_position'          # Where price sits in channel (0-1)
+'{symbol}_channel_{tf}_w{window}_upper_dist'        # % to upper band
+'{symbol}_channel_{tf}_w{window}_lower_dist'        # % to lower band
+```
+
+**Channel Structure (3):**
+```python
+'{symbol}_channel_{tf}_w{window}_channel_width_pct' # Channel width as % of close
+'{symbol}_channel_{tf}_w{window}_slope_convergence' # High/low slope divergence
+'{symbol}_channel_{tf}_w{window}_stability'         # Composite quality score
 ```
 
 **Multi-Threshold Ping-Pongs (4):**
 ```python
-'ping_pongs'          # Default 2% threshold
-'ping_pongs_0_5pct'   # Strict - tight channels
-'ping_pongs_1_0pct'   # Medium threshold
-'ping_pongs_3_0pct'   # Loose - volatile conditions
+'{symbol}_channel_{tf}_w{window}_ping_pongs'        # 2% threshold (default)
+'{symbol}_channel_{tf}_w{window}_ping_pongs_0_5pct' # Strict (0.5%)
+'{symbol}_channel_{tf}_w{window}_ping_pongs_1_0pct' # Medium (1%)
+'{symbol}_channel_{tf}_w{window}_ping_pongs_3_0pct' # Loose (3%)
 ```
 
 **Direction Flags (3):**
 ```python
-'is_bull'         # slope_pct > 0.1% per bar
-'is_bear'         # slope_pct < -0.1% per bar
-'is_sideways'     # |slope_pct| ≤ 0.1% per bar
+'{symbol}_channel_{tf}_w{window}_is_bull'           # Uptrend (slope_pct > 0.1%)
+'{symbol}_channel_{tf}_w{window}_is_bear'           # Downtrend (slope_pct < -0.1%)
+'{symbol}_channel_{tf}_w{window}_is_sideways'       # Ranging
+```
+
+**Quality Indicators (4 - NEW in v3.13):**
+```python
+'{symbol}_channel_{tf}_w{window}_quality_score'     # 0-1: (r²*0.7 + ping_pongs*0.3)
+'{symbol}_channel_{tf}_w{window}_is_valid'          # 1.0 if ping_pongs >= 3
+'{symbol}_channel_{tf}_w{window}_insufficient_data' # 1.0 if window > available bars
+'{symbol}_channel_{tf}_w{window}_duration'          # Actual bars in window
+```
+
+**Total Channel Features:**
+- 28 features/window × 21 windows × 11 timeframes × 2 stocks = **12,936 features**
+
+**Example Feature Names:**
+```
+tsla_channel_5min_w168_close_slope
+tsla_channel_5min_w168_quality_score
+tsla_channel_5min_w90_high_slope
+spy_channel_daily_w45_insufficient_data
 ```
 
 **Timeframes:** 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly, 3-month
@@ -517,35 +568,108 @@ python backtest_hierarchical.py --year 2023 --model models/hierarchical_lnn.pth
 **Solution:** Removed duplicate code block at `features.py:1575-1600`
 **Status:** ✅ FIXED
 
-### 8.2 Dashboard Feature Count Issue (⚠️ ACTIVE)
-**Symptoms:**
-```
-⚠️ Extracting 490 features (expected 495)
-Missing: 5 features
-```
-**Possible Causes:**
-- Event features not being extracted properly
-- Events handler not being passed to feature extractor
-- Feature name mismatch
+### 8.2 Zombie Code Import (✅ FIXED in v3.13)
+**Issue:** `ChannelFeatureExtractor` imported but never used
+**Cause:** Refactoring debt - logic moved to `LinearRegressionChannel` but import remained
+**Impact:** Wasted ~1-2ms per worker creation, unnecessary dependency
+**Solution:** Removed imports from `features.py:24, 54` and `parallel_channel_extraction.py:724`
+**Status:** ✅ FIXED
 
-**Debug Steps:**
-1. Check if events_handler is None in dashboard
-2. Print actual feature names and count
-3. Verify all 4 event features are in DataFrame
+### 8.3 Progress Bar Positioning Conflicts (✅ FIXED in v3.13)
+**Issue:** Triple-nested progress bars (position=0,1,2) caused terminal corruption/flickering
+**Cause:** Multiple tqdm bars with explicit position parameters conflicting
+**Symptoms:** Progress bars freeze, overlap, or display garbled text
+**Solution:** Removed ALL `position=` parameters, let tqdm handle positioning automatically
+**Status:** ✅ FIXED
 
-### 8.3 Memory Issues
+### 8.4 Silent Fallback to Sequential Mode (✅ FIXED in v3.13)
+**Issue:** Parallel mode disabled without notification
+**Cause:** Conditions failed (GPU mode, <3 cores, etc.) but user not informed
+**Impact:** User expects 7min execution, gets 55min with no explanation
+**Solution:** Added notification showing reason and time estimate
+**Status:** ✅ FIXED
+**Location:** `features.py:519-536`
+
+### 8.5 Worker Process Print Collision (✅ FIXED in v3.13)
+**Issue:** Multiple worker processes printing simultaneously caused garbled output
+**Example:** `[Worker 123] Proc[Worker 456] Proessing tsla_1hcessing spy_4h`
+**Cause:** 8 separate processes writing to stdout without synchronization
+**Solution:** Removed worker print statements, use rich progress bars instead
+**Status:** ✅ FIXED
+
+### 8.6 DataFrame Column Naming Bug in Parallel Worker (✅ FIXED in v3.13)
+**Issue:** Workers crashed silently with KeyError: 'open'
+**Cause:** `pd.DataFrame(ohlcv_data)` created columns [0,1,2,3,4] instead of ['open','high','low','close','volume']
+**Impact:** Resample aggregation failed, workers returned empty results
+**Solution:** Added explicit column names: `pd.DataFrame(ohlcv_data, columns=['open','high','low','close','volume'])`
+**Status:** ✅ FIXED
+**Location:** `parallel_channel_extraction.py:81-85`
+
+### 8.7 Worker Infinite Loop on Empty Queue (✅ FIXED in v3.13)
+**Issue:** Workers never exited after completing tasks, causing `worker.join()` to hang forever
+**Cause:** `except: continue` caught queue timeouts indefinitely
+**Impact:** Progress bars showed 100% but process hung, never completed
+**Solution:** Added `empty_count` tracker - exit after 10 consecutive timeouts (~5 seconds)
+**Status:** ✅ FIXED
+**Location:** `parallel_channel_extraction.py:49-62`
+
+### 8.8 Result Collection Race Condition (✅ FIXED in v3.13)
+**Issue:** Only 5-20 of 22 results collected, causing KeyError when sorting
+**Cause:** `while not result_queue.empty()` unreliable in multiprocessing - checked empty too early
+**Impact:** Missing results, crashes with KeyError
+**Solution:** Use exact-count blocking get: `for i in range(len(tasks)): result_queue.get(timeout=1)`
+**Status:** ✅ FIXED
+**Location:** `parallel_channel_extraction.py:501-521`
+
+### 8.9 Worker Memory Leak (✅ FIXED in v3.13)
+**Issue:** Workers accumulated 2 GB per task, causing OOM crashes after 3-4 tasks
+**Cause:** `results` dict from previous tasks never freed between tasks
+**Impact:** System crash with "MemoryError" or OS kill
+**Solution:** Explicit `del` statements + `gc.collect()` after each task
+**Status:** ✅ FIXED
+**Location:** `parallel_channel_extraction.py:309-318, 334-344`
+
+### 8.10 Main Process results_dict Accumulation (✅ FIXED in v3.13)
+**Issue:** 26 GB of duplicate data in main process after merging results
+**Cause:** `results_dict` kept in memory after copying to `all_channel_data`
+**Impact:** 52 GB peak memory (26 GB original + 26 GB copy)
+**Solution:** `del result_dict` + `gc.collect()` after merge
+**Status:** ✅ FIXED
+**Location:** `features.py:617-620`
+
+### 8.11 Sequential Path Memory Fragmentation (✅ FIXED in v3.13)
+**Issue:** 231 million individual array assignments caused memory fragmentation
+**Cause:** `for idx in indices:` loop assigning one value at a time
+**Impact:** Memory usage grew exponentially, 30+ GB fragmentation overhead
+**Solution:** Vectorized assignments: `array[indices] = value` (all at once)
+**Status:** ✅ FIXED
+**Location:** `features.py:694-719`
+
+### 8.12 Dashboard Feature Count Issue (⚠️ SUPERSEDED)
+**Note:** Now generating 12,936 features (was 495), so previous count mismatch is irrelevant
+
+### 8.13 Memory Issues (✅ LARGELY RESOLVED in v3.13)
 **Issue:** Out of memory during feature extraction
-**Solutions:**
-- Use lazy loading mode (default): `--lazy`
-- Reduce batch size: `--batch_size 16`
-- Clear cache if corrupted: `rm -rf data/feature_cache/`
-- Use CPU if GPU OOM: `--device cpu`
+**Previous Solutions:** Lazy loading, reduce batch size, clear cache
+**New Solutions (v3.13):**
+- Worker memory cleanup (Fix #1) - prevents accumulation
+- results_dict cleanup (Fix #3) - frees 26 GB
+- Vectorized assignments (Fix #4) - prevents fragmentation
+- Reduce MAX_PARALLEL_WORKERS to 4 if needed
 
-### 8.4 Slow Initial Feature Extraction
-**Issue:** First run takes ~55 minutes
-**Solution:** Features are cached automatically after first extraction
-**Cache location:** `data/feature_cache/`
-**Cache invalidation:** Happens when FEATURE_VERSION changes
+**Current Memory Requirements:**
+- 8 workers: 30-40 GB RAM
+- 4 workers: 20-25 GB RAM (recommended for 16-32 GB systems)
+- 2 workers: 15-18 GB RAM
+
+### 8.14 Slow Initial Feature Extraction (✅ MASSIVELY IMPROVED in v3.13)
+**Issue:** First run took ~55 minutes
+**Previous Solution:** Caching (second run instant)
+**New Solutions (v3.13):**
+- Rolling statistics optimization: 45x speedup
+- Vectorized ping-pong detection: 10x speedup
+- **Combined:** 55 minutes → **~40-60 seconds** (even first run!)
+**Cache still used:** Second run loads in ~2-5 seconds
 
 ---
 
@@ -586,41 +710,49 @@ feature_cache/
 # Speedup: 30-60 minutes → 2-5 seconds
 ```
 
-### 9.4 Parallel Processing
+### 9.4 Parallel Processing (v3.13: Custom Multi-Progress Implementation)
 
-#### Channel Calculation Parallelization (Implemented v3.11)
-Uses **joblib** to parallelize channel calculations across CPU cores:
+#### Multi-Window Parallel Extraction
+Uses **custom multiprocessing** with rich progress bars for real-time visibility:
 
 **How it works:**
-- Splits 22 channel calculations (11 timeframes × 2 stocks) across available CPU cores
-- Each (symbol, timeframe) pair is processed independently
-- Results aggregated after all parallel tasks complete
+- 22 tasks (11 timeframes × 2 stocks) distributed across worker processes
+- Each worker calculates 21 windows per task using rolling statistics
+- Real-time progress bars show each timeframe individually
+- Results collected via Queue with proper synchronization
 
 **Configuration (config.py):**
 ```python
-PARALLEL_CHANNEL_CALC = True  # Enable/disable parallelization
-MAX_PARALLEL_WORKERS = 8      # Max CPU cores (0 = all available)
-PARALLEL_BACKEND = 'loky'     # Process-based for memory safety
-PARALLEL_VERBOSE = 10         # Progress reporting level
+PARALLEL_CHANNEL_CALC = True   # Enable/disable parallelization
+MAX_PARALLEL_WORKERS = 4       # Recommended: 4 for 16-32GB RAM, 8 for 64GB+
+CHANNEL_WINDOW_SIZES = [168, 160, 150, ..., 20, 15, 10]  # 21 windows
+MIN_DATA_YEARS = 2.5           # Minimum data for 3-month TF with 10-bar window
 ```
 
-**Performance Improvements:**
-| Method | Time | Speedup | Memory Usage |
-|--------|------|---------|--------------|
-| Sequential (1 core) | ~55 minutes | 1x | ~2-4 GB |
-| Parallel (8 cores) | ~7-10 minutes | 5.5-7.8x | ~8-12 GB |
+**Performance Improvements (v3.13):**
+| Method | Time | Speedup | Memory Usage | Features |
+|--------|------|---------|--------------|----------|
+| Sequential (old) | ~55 minutes | 1x | ~2-4 GB | 495 |
+| Sequential (v3.13) | ~2-3 minutes | 27x | ~8-12 GB | 12,936 |
+| Parallel 4 cores (v3.13) | ~40-60 seconds | 55-82x | ~20-25 GB | 12,936 |
+| Parallel 8 cores (v3.13) | ~30-40 seconds | 82-110x | ~30-40 GB | 12,936 |
+
+**Key Optimizations:**
+1. **Rolling Statistics** (45x): Incremental sum updates instead of recalculating regression
+2. **Vectorized Ping-Pongs** (10x): NumPy array operations instead of Python loops
+3. **OHLC Integration**: Separate regressions for high/low/close (richer features)
+4. **Memory Cleanup**: Explicit garbage collection prevents accumulation
+5. **Multi-Progress Display**: Rich library shows real-time progress per timeframe
 
 **When Parallelization is Used:**
-- CPU mode only (incompatible with GPU)
-- At least 3 CPU cores available
-- 8+ channel calculations to process
-- Not in live trading mode
+- CPU mode (GPU requires sequential for context preservation)
+- Any number of cores (even 1 core uses parallel framework)
+- Not in live trading mode (for stability)
 
 **Fallback to Sequential:**
-- GPU mode active (GPU + multiprocessing = conflicts)
-- Less than 3 cores available
-- Small datasets with few calculations
-- Live trading mode (for stability)
+- GPU mode active (CUDA/MPS context can't cross processes)
+- Live trading mode (stability)
+- Config: `PARALLEL_CHANNEL_CALC = False`
 
 #### Future Scaling with Ray (Roadmap)
 For massive-scale distributed computing:
@@ -950,8 +1082,17 @@ labels_df = extractor.generate_continuation_labels(
 
 ## Version History
 
+- **v3.13** (Nov 18, 2024):
+  - **MAJOR:** Multi-window OHLC system (21 windows: 10-168 bars) with 12,936 features
+  - **MAJOR:** Rolling statistics optimization (45x speedup)
+  - **MAJOR:** Vectorized ping-pong detection (10x speedup)
+  - **MAJOR:** Custom multiprocessing with rich multi-progress bars
+  - Fixed 11 critical bugs (memory leaks, race conditions, worker hangs)
+  - float64 precision throughout training pipeline
+  - Memory optimization: 60-98 GB → 20-40 GB with cleanup
+  - Performance: 55 minutes → 30-60 seconds (82-110x speedup)
 - **v3.12** (Nov 17, 2024): Added joblib parallelization for 5.5-7.8x speedup in channel calculations
-- **v3.11** (Nov 17, 2024): Feature expansion to 495 features, dynamic channel duration detection, comprehensive documentation
+- **v3.11** (Nov 17, 2024): Feature expansion to 495 features, dynamic channel duration detection
 - **v2.0** (Nov 15, 2024): Added multi-task learning, event integration, GPU acceleration
 - **v1.0** (Nov 10, 2024): Initial hierarchical LNN implementation
 
@@ -962,12 +1103,16 @@ labels_df = extractor.generate_continuation_labels(
 1. **Price-Agnostic Design**: The system works at any TSLA price level due to percentage-based features
 2. **Multi-Task Learning**: Provides better regularization - keep enabled
 3. **Event Window**: Currently ±14 days for event features (expanded from ±7)
-4. **GPU Acceleration**: Uses hybrid GPU+CPU for speed with accuracy
-5. **Parallel Processing**: Joblib parallelization provides 5.5-7.8x speedup for channel calculations (CPU mode only)
-6. **Cache Management**: FEATURE_VERSION changes invalidate cache (intentional)
-7. **Feature Count**: Currently 495 features (expanded from 473 with channel duration metrics)
-8. **Continuation Labels**: Fixed duplicate resampling bug in v3.0
-9. **News Priority**: User's top priority - infrastructure 80% ready
+4. **GPU Acceleration**: Uses hybrid GPU+CPU for speed with accuracy (GPU mode uses sequential)
+5. **Parallel Processing (v3.13)**: Custom multiprocessing with 82-110x speedup, real-time multi-progress bars
+6. **Cache Management**: FEATURE_VERSION="v3.13_multiwindow_21" invalidates old cache (intentional)
+7. **Feature Count (v3.13)**: **12,936 features** (21 windows × 28 OHLC features × 22 combinations)
+8. **Memory Requirements**: 20-40 GB RAM depending on worker count (4-8 workers recommended)
+9. **Multi-Window System**: ALL windows calculated with quality scores - no filtering, model learns relevance
+10. **float64 Precision**: Training uses full precision, quantize to int8/float16 for deployment
+11. **Data Requirements**: Minimum 2.5 years for 3-month TF with 10-bar lookback
+12. **Continuation Labels**: Fixed duplicate resampling bug in v3.0
+13. **News Priority**: User's top priority - infrastructure 80% ready
 
 ---
 

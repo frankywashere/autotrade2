@@ -306,6 +306,17 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                 # Send results
                 result_queue.put((task_idx, results))
 
+                # Critical: Clear memory to prevent accumulation across tasks
+                del results
+                if 'all_windows_channels' in locals():
+                    del all_windows_channels
+                if 'resampled' in locals():
+                    del resampled
+                if 'df_minimal' in locals():
+                    del df_minimal
+                import gc
+                gc.collect()
+
             except Exception as e:
                 # Send error status
                 import traceback
@@ -319,6 +330,18 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                 })
                 # Return empty results on error
                 result_queue.put((task_idx, results if 'results' in locals() else {}))
+
+                # Clear memory even on error
+                if 'results' in locals():
+                    del results
+                if 'all_windows_channels' in locals():
+                    del all_windows_channels
+                if 'resampled' in locals():
+                    del resampled
+                if 'df_minimal' in locals():
+                    del df_minimal
+                import gc
+                gc.collect()
     finally:
         # ALWAYS send worker_done signal, even if worker crashes
         progress_queue.put({
