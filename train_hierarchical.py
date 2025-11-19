@@ -675,11 +675,11 @@ def interactive_setup(args):
     project_config.TRAINING_PRECISION = precision_choice
     if precision_choice == 'float64':
         project_config.NUMPY_DTYPE = np.float64
-        project_config.TORCH_DTYPE = torch.float64
+        project_config._TORCH_DTYPE = torch.float64  # Set lazy-loaded value
         print(f"   → Using float64 (maximum precision, ~10% more memory)")
     else:
         project_config.NUMPY_DTYPE = np.float32
-        project_config.TORCH_DTYPE = torch.float32
+        project_config._TORCH_DTYPE = torch.float32  # Set lazy-loaded value
         print(f"   → Using float32 (standard precision, half memory)")
 
     # Model parameters
@@ -788,6 +788,16 @@ def interactive_setup(args):
 
 
 def main():
+    # Fix for macOS + torch + multiprocessing: use forkserver to avoid torch cleanup deadlock
+    # spawn (macOS default) causes workers to hang on exit when torch is imported
+    # forkserver is safe and faster (no torch init in workers with lazy loading)
+    import multiprocessing as mp
+    try:
+        mp.set_start_method('forkserver', force=True)
+        print("✓ Using forkserver multiprocessing (safer for torch on macOS)")
+    except ValueError:
+        pass  # Already set, or not available on this platform
+
     parser = argparse.ArgumentParser(description='Train Hierarchical LNN')
 
     # Data parameters
