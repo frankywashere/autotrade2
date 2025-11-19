@@ -675,6 +675,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                                 current_price = resampled['close'].iloc[i]
                                 position_data = self.channel_calc.get_channel_position(current_price, channel)
                                 slope_pct = (channel.close_slope / current_price) * 100 if current_price > 0 else 0.0
+                                high_slope_pct = (channel.high_slope / current_price) * 100 if current_price > 0 else 0.0
+                                low_slope_pct = (channel.low_slope / current_price) * 100 if current_price > 0 else 0.0
 
                                 # Window-specific prefix
                                 w_prefix = f'{symbol}_channel_{tf_name}_w{window}'
@@ -698,7 +700,9 @@ class TradingFeatureExtractor(FeatureExtractor):
                                 channel_features[f'{w_prefix}_close_slope'][indices] = channel.close_slope
                                 channel_features[f'{w_prefix}_close_slope_pct'][indices] = slope_pct
                                 channel_features[f'{w_prefix}_high_slope'][indices] = channel.high_slope
+                                channel_features[f'{w_prefix}_high_slope_pct'][indices] = high_slope_pct
                                 channel_features[f'{w_prefix}_low_slope'][indices] = channel.low_slope
+                                channel_features[f'{w_prefix}_low_slope_pct'][indices] = low_slope_pct
                                 channel_features[f'{w_prefix}_close_r_squared'][indices] = channel.close_r_squared
                                 channel_features[f'{w_prefix}_high_r_squared'][indices] = channel.high_r_squared
                                 channel_features[f'{w_prefix}_low_r_squared'][indices] = channel.low_r_squared
