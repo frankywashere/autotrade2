@@ -263,6 +263,26 @@ def train_epoch(
         # Update progress bar with current loss
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
+        # Memory cleanup to prevent accumulation
+        if batch_idx % 10 == 0:  # Every 10 batches
+            # Clear model's cached hidden states
+            model.clear_cached_states()
+
+            # Explicitly delete intermediate tensors
+            del predictions, hidden_states
+            if model.multi_task:
+                del mt
+
+            # Clear GPU/MPS cache
+            if device == 'cuda':
+                torch.cuda.empty_cache()
+            elif device == 'mps':
+                torch.mps.empty_cache()
+
+            # Run garbage collection
+            import gc
+            gc.collect()
+
     avg_loss = total_loss / len(dataloader)
     return avg_loss
 

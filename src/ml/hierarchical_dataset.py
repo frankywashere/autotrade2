@@ -69,8 +69,18 @@ class HierarchicalDataset(Dataset):
         self.features_array = features_df.values
         self.timestamps = features_df.index.values
 
+        # Dtype validation - ensure data matches config precision
+        expected_dtype = config.NUMPY_DTYPE
+        if self.features_array.dtype != expected_dtype:
+            print(f"  ⚠️  Feature dtype mismatch: {self.features_array.dtype} != {expected_dtype}")
+            print(f"     Converting to {expected_dtype} (may use extra memory temporarily)")
+            self.features_array = self.features_array.astype(expected_dtype)
+
         if raw_ohlc_df is not None:
             self.raw_ohlc_array = raw_ohlc_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
+            # Ensure OHLC also matches dtype
+            if self.raw_ohlc_array.dtype != expected_dtype:
+                self.raw_ohlc_array = self.raw_ohlc_array.astype(expected_dtype)
         else:
             self.raw_ohlc_array = None
 
@@ -182,8 +192,8 @@ class HierarchicalDataset(Dataset):
         else:
             overshoot_label = 0.0
 
-        # Convert to tensors (use float64 for full precision during training)
-        x_tensor = torch.tensor(x, dtype=torch.float64)
+        # Convert to tensors (dtype from config for precision flexibility)
+        x_tensor = torch.tensor(x, dtype=config.TORCH_DTYPE)
 
         # Calculate adaptive targets
         actual_max_idx = future_prices.argmax()
@@ -341,6 +351,19 @@ class PreloadHierarchicalDataset(Dataset):
         self.mode = mode
 
         print(f"Preloading dataset with {len(features_df)} bars...")
+
+        # Memory warning for large datasets
+        estimated_samples = len(features_df) - sequence_length - prediction_horizon
+        estimated_gb = (estimated_samples * sequence_length * features_df.shape[1] *
+                       (8 if config.TORCH_DTYPE == torch.float64 else 4)) / 1e9
+
+        if estimated_gb > 50:
+            print(f"⚠️  WARNING: Estimated memory usage: {estimated_gb:.1f} GB")
+            print(f"    This may cause swap usage or OOM errors!")
+            print(f"    Consider using lazy loading (preload=False) for datasets this large.")
+            response = input("    Continue with preload? (y/n): ")
+            if response.lower() != 'y':
+                raise MemoryError("Preload cancelled by user due to memory constraints")
 
         # Create lazy dataset first
         lazy_dataset = HierarchicalDataset(

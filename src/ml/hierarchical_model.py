@@ -405,6 +405,19 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
         return predictions, hidden_states
 
+    def clear_cached_states(self):
+        """
+        Clear cached hidden states to prevent memory accumulation.
+
+        Call this periodically during training (e.g., every 10-50 batches)
+        to free memory from accumulated detached tensors.
+        """
+        self.last_fast_input = None
+        self.last_medium_input = None
+        self.last_slow_input = None
+        self.last_market_state = None
+        self.last_news_vec = None
+
     def predict(
         self,
         x: torch.Tensor,
