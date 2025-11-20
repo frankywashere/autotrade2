@@ -128,11 +128,20 @@ class LinearRegressionChannel:
         upper_line = center_line + (self.std_dev * residual_std)
         lower_line = center_line - (self.std_dev * residual_std)
 
-        # Detect ping-pongs (bounces between upper and lower lines)
-        ping_pongs = self._detect_ping_pongs(prices, upper_line, lower_line)
+        # Detect ping-pongs and complete cycles at multiple thresholds
+        multi_pp = self._detect_ping_pongs_multi_threshold(
+            prices, upper_line, lower_line,
+            thresholds=[0.005, 0.01, 0.02, 0.03]
+        )
 
-        # Calculate stability score (0-100)
-        stability_score = self._calculate_stability(r_squared, ping_pongs, n)
+        # v3.17: Calculate complete cycles (full round-trips)
+        multi_cycles = self._detect_complete_cycles_multi_threshold(
+            prices, upper_line, lower_line,
+            thresholds=[0.005, 0.01, 0.02, 0.03]
+        )
+
+        # Calculate stability score (0-100) - use complete_cycles now
+        stability_score = self._calculate_stability(r_squared, multi_cycles[0.02], n)
 
         # Predict 24-hour range (not just next bar)
         # Calculate how many bars = 24 hours for this timeframe
@@ -177,11 +186,16 @@ class LinearRegressionChannel:
             std_dev=residual_std,
             channel_width_pct=((upper_line.mean() - lower_line.mean()) / center_line.mean() * 100) if center_line.mean() > 0 else 0,
             slope_convergence=0.0,  # No divergence in simple channel
-            # Ping-pongs (only calculate at 2% for now)
-            ping_pongs=ping_pongs,
-            ping_pongs_0_5pct=0,  # Not calculated in simple method
-            ping_pongs_1_0pct=0,  # Not calculated in simple method
-            ping_pongs_3_0pct=0,  # Not calculated in simple method
+            # Ping-pongs at multiple thresholds
+            ping_pongs=multi_pp[0.02],
+            ping_pongs_0_5pct=multi_pp[0.005],
+            ping_pongs_1_0pct=multi_pp[0.01],
+            ping_pongs_3_0pct=multi_pp[0.03],
+            # v3.17: Complete cycles at multiple thresholds
+            complete_cycles=multi_cycles[0.02],
+            complete_cycles_0_5pct=multi_cycles[0.005],
+            complete_cycles_1_0pct=multi_cycles[0.01],
+            complete_cycles_3_0pct=multi_cycles[0.03],
             # Quality metrics
             r_squared=r_squared,
             stability_score=stability_score,
