@@ -152,15 +152,34 @@ class LinearRegressionChannel:
         predicted_center = future_center[-1]  # End of 24h period
 
         return ChannelData(
-            slope=slope,
-            intercept=intercept,
+            # Close-based regression (primary)
+            close_slope=slope,
+            close_intercept=intercept,
+            close_r_squared=r_squared,
+            # For simple channel, high/low use same slope as close
+            high_slope=slope,
+            high_intercept=intercept + (self.std_dev * residual_std),
+            high_r_squared=r_squared,
+            low_slope=slope,
+            low_intercept=intercept - (self.std_dev * residual_std),
+            low_r_squared=r_squared,
+            # Channel lines
             upper_line=upper_line,
             lower_line=lower_line,
             center_line=center_line,
+            # Metrics
             std_dev=residual_std,
-            r_squared=r_squared,
+            channel_width_pct=((upper_line.mean() - lower_line.mean()) / center_line.mean() * 100) if center_line.mean() > 0 else 0,
+            slope_convergence=0.0,  # No divergence in simple channel
+            # Ping-pongs (only calculate at 2% for now)
             ping_pongs=ping_pongs,
+            ping_pongs_0_5pct=0,  # Not calculated in simple method
+            ping_pongs_1_0pct=0,  # Not calculated in simple method
+            ping_pongs_3_0pct=0,  # Not calculated in simple method
+            # Quality metrics
+            r_squared=r_squared,
             stability_score=stability_score,
+            # Predictions
             predicted_high=predicted_high,
             predicted_low=predicted_low,
             predicted_center=predicted_center,
