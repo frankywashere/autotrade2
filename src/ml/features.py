@@ -1172,17 +1172,17 @@ class TradingFeatureExtractor(FeatureExtractor):
                         max_window=min(300, len(available_window) // 2)
                     )
 
-                    # Find optimal channel window
-                    channel = channel_calc.find_optimal_channel_window(
+                    # v3.17: Find best channel regardless of quality (no filtering)
+                    # Even "bad" channels are stored - model learns when to ignore them
+                    channel = channel_calc.find_best_channel_any_quality(
                         available_window,
                         timeframe=tf_name,
-                        max_lookback=dynamic_lookback,
-                        min_ping_pongs=3
+                        max_lookback=dynamic_lookback
                     )
 
-                    # Skip if no valid channel
+                    # Only skip if truly no data (very rare)
                     if channel is None:
-                        continue
+                        continue  # Insufficient data, not quality issue
 
                     current_price = resampled['close'].iloc[i]
                     position_data = channel_calc.get_channel_position(current_price, channel)
@@ -1407,19 +1407,17 @@ class TradingFeatureExtractor(FeatureExtractor):
                     max_window=min(300, len(available_window) // 2)
                 )
 
-                # Find optimal channel window (v3.11: dynamic duration detection)
-                # Tests multiple lookbacks, requires minimum 3 ping-pongs
-                channel = self.channel_calc.find_optimal_channel_window(
+                # v3.17: Find best channel regardless of quality (no filtering)
+                # Even "bad" channels are stored - model learns when to ignore them
+                channel = self.channel_calc.find_best_channel_any_quality(
                     available_window,
                     timeframe=tf_name,
-                    max_lookback=dynamic_lookback,
-                    min_ping_pongs=3
+                    max_lookback=dynamic_lookback
                 )
 
-                # If no valid channel found, use zeros for all metrics
+                # Only skip if truly no data (very rare)
                 if channel is None:
-                    # No channel exists (all windows had <3 ping-pongs or poor R²)
-                    # Skip this timestamp or use zeros
+                    # Insufficient data (window too large for available data)
                     continue
 
                 current_price = resampled_df['close'].iloc[i]
