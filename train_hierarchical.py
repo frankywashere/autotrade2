@@ -163,6 +163,12 @@ def train_epoch(
             target_horizon_bars_log = targets_dict['horizon_bars_log'].to(device)
             target_adaptive_confidence = targets_dict['adaptive_confidence'].to(device)
 
+            # Adaptive mode targets (only exist when using adaptive continuation mode)
+            if 'adaptive_horizon' in targets_dict:
+                target_adaptive_horizon = targets_dict['adaptive_horizon'].to(device)
+            if 'conf_score' in targets_dict:
+                target_conf_score = targets_dict['conf_score'].to(device)
+
         # Forward pass
         predictions, hidden_states = model.forward(x)
 
@@ -229,6 +235,23 @@ def train_epoch(
                 target_continuation_confidence
             )
             loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
+
+            # Adaptive horizon losses (only when using adaptive mode)
+            if 'adaptive_horizon' in targets_dict and 'adaptive_horizon' in mt:
+                # Adaptive horizon (regression, 0-1 range normalized from 24-48 bars)
+                loss_adaptive_horizon = criterion(
+                    mt['adaptive_horizon'].squeeze(),
+                    target_adaptive_horizon
+                )
+                loss += loss_weights.get('adaptive_horizon', 0.3) * loss_adaptive_horizon
+
+            if 'conf_score' in targets_dict and 'adaptive_conf_score' in mt:
+                # Confidence score (binary classification, 0-1 range)
+                loss_adaptive_conf = F.binary_cross_entropy(
+                    mt['adaptive_conf_score'].squeeze(),
+                    target_conf_score
+                )
+                loss += loss_weights.get('adaptive_conf_score', 0.3) * loss_adaptive_conf
 
             # Adaptive projection losses
             loss_price_change = criterion(
@@ -701,6 +724,25 @@ def interactive_setup(args):
         project_config._TORCH_DTYPE = torch.float32  # Set lazy-loaded value
         print(f"   → Using float32 (standard precision, half memory)")
 
+    # Continuation label mode selection
+    print()
+    continuation_mode = inquirer.select(
+        message="Continuation label mode:",
+        choices=[
+            Choice(value='simple', name='Simple - Fixed 24-bar horizon (fast, tested) ⭐ Default'),
+            Choice(value='adaptive', name='Adaptive - Variable 24-48 bar horizon based on confidence 🎯 NEW'),
+        ],
+        default='simple'
+    ).execute()
+
+    # Update config with continuation mode
+    project_config.CONTINUATION_MODE = continuation_mode
+    if continuation_mode == 'adaptive':
+        print(f"   → Using adaptive horizons: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars ({project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} minutes at 1-min resolution)")
+        print(f"   ℹ️  Horizon adjusts based on RSI/slope confidence")
+    else:
+        print(f"   → Using simple mode: fixed 24-bar horizon (24 minutes at 1-min resolution)")
+
     # Model parameters
     print()
 
@@ -1078,6 +1120,7 @@ def main():
         use_cache=use_cache,
         use_gpu=use_gpu,
         continuation=True,
+        continuation_mode=project_config.CONTINUATION_MODE,
         use_chunking=getattr(args, 'use_chunking', False),
         chunk_size_years=project_config.CHUNK_SIZE_YEARS,
         shard_storage_path=getattr(args, 'shard_path', None)
@@ -1095,7 +1138,7 @@ def main():
     if continuation_df is not None and len(continuation_df) == 0 and not debug_mode:
         print("  ⚠️  Got 0 continuation labels. Re-running with debug mode enabled...")
         debug_mode = True
-        continuation_df = extractor.generate_continuation_labels(df, timestamps, prediction_horizon=24, debug=debug_mode)
+        continuation_df = extractor.generate_continuation_labels(df, timestamps, prediction_horizon=24, mode=project_config.CONTINUATION_MODE, debug=debug_mode)
 
     print(f"   Extracted {len(features_df.columns)} features")
     print(f"   Generated {len(continuation_df) if continuation_df is not None else 0} continuation labels")

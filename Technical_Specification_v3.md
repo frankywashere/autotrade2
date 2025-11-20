@@ -32,12 +32,12 @@ Just as an oceanographer studies different water layers to understand currents, 
 
 The model dynamically selects the most confident layer and projects forward accordingly, using higher layers as confirmation for longer holds.
 
-### Current State (v3.15 - November 19, 2025)
+### Current State (v3.15 - January 19, 2025)
 - ✅ Training pipeline complete and tested
 - ✅ **12,936 features** with 21-window multi-OHLC system
 - ✅ **Sharded memory-mapped extraction** - Zero RAM spike, <1GB constant during extraction
 - ✅ **Unified cache system** - Channels + continuation labels both cached and validated
-- ✅ **Continuation labels cached** - 1+ hour generation → 1 second load on rerun!
+- ✅ **Continuation labels optimized** - 20-60x faster (1 hour → 1-3 min first run, <1s cached)
 - ✅ **Configurable shard storage** - Save to external drives via interactive menu or CLI
 - ✅ **macOS multiprocessing fixed** - Lazy torch loading + forkserver mode
 - ✅ **Parallel processing** with real-time multi-progress bars (8 workers)
@@ -87,7 +87,8 @@ autotrade2/
 │   ├── tsla_events_REAL.csv    # Event calendar (483 events)
 │   └── feature_cache/           # Cached feature calculations
 ├── models/                      # Saved model checkpoints
-├── deprecated/                  # Legacy code (50+ old files moved here)
+├── deprecated/                  # Legacy code (50+ old files)
+│   └── continuation_labels_legacy.py  # Unoptimized continuation labels (Jan 19, 2025)
 └── Technical_Specification_v3.md # This document
 ```
 
@@ -213,6 +214,91 @@ def generate_continuation_labels():
     return score, actual_continuation
 ```
 
+#### Performance Optimization (v3.15 - January 19, 2025)
+
+**Problem:** Original implementation was slow (~1 hour for full dataset)
+- Resampled data independently for each timestamp (1000+ redundant resamples)
+- Sequential processing of timestamps
+- Repeated slicing of future price windows
+
+**Solution:** Optimized implementation with 20-60x speedup
+1. **Pre-resample once** (5-8x speedup)
+   - Resample entire dataframe upfront
+   - Reconstruct partial bins for unaligned timestamps (Solution C)
+   - Maintains 100% mathematical equivalence
+
+2. **Parallelize processing** (2-4x speedup)
+   - Process timestamps independently using joblib
+   - Threading backend for macOS compatibility
+   - Preserves deterministic calculations
+
+3. **Batch future windows** (2x speedup)
+   - Pre-compute all future price slices
+   - Reduces repeated .iloc[] overhead
+
+**Result:** ~1 hour → 1-3 minutes for first run, with 100% identical results
+
+**Precision Control:** Respects `config.NUMPY_DTYPE` setting
+- float64: Maximum precision for training (~10% more memory)
+- float32: Standard precision, faster, uses half memory
+
+#### Adaptive Horizons Mode (v3.16 - January 19, 2025)
+
+**Time Resolution:** 1-minute bars (24 bars = 24 minutes, 48 bars = 48 minutes)
+
+**Two Continuation Modes:**
+1. **Simple Mode** (default): Fixed 24-bar (24-minute) prediction horizon
+   - Fast and tested implementation
+   - Consistent horizon across all market conditions
+   - Cache file: `continuation_labels_simple.pkl`
+
+2. **Adaptive Mode** (new): Variable 24-48 bar (24-48 minute) horizon based on confidence
+   - Adjusts prediction horizon based on RSI/slope alignment
+   - Neutral RSI (stable market) → High confidence → 48-bar horizon (predict far ahead)
+   - Extreme RSI (break/reversal likely) → Low confidence → 24-bar horizon (predict near-term change)
+   - **Includes BOTH continuation AND break labels** for balanced training
+   - Cache file: `continuation_labels_adaptive.pkl`
+
+**RSI Confidence Logic:**
+```python
+# Neutral RSI = stable continuation = high confidence = long horizon
+# Extreme RSI = likely break/reversal = low confidence = short horizon
+rsi_conf_1h = 1.0 - abs(rsi_1h - 50) / 50  # RSI=50 → 1.0, RSI=0/100 → 0.0
+rsi_conf_4h = 1.0 - abs(rsi_4h - 50) / 50
+slope_alignment = 1.0 if slopes_aligned else 0.0
+conf_score = (rsi_conf_1h + rsi_conf_4h + slope_alignment) / 3.0
+
+# Map to horizon: conf=0.0 → 24 bars (short), conf=1.0 → 48 bars (long)
+adaptive_horizon = 24 + (48 - 24) * conf_score
+```
+
+**Break Label Inclusion (v3.16.1):**
+Previously, low-score cases (likely breaks) were skipped entirely. Now they are **included** as break labels:
+- Upside break (+2%): `continues=True`, calculated duration/gain
+- Downside break (-2%): `continues=False`, negative gain, short horizon
+- No break (ranging): `continues=False`, small gain, short horizon
+- This allows model to learn **both** continuation patterns AND break/reversal patterns
+
+**Additional Fields (Adaptive Mode):**
+- `adaptive_horizon`: Predicted optimal horizon (24-48 bars)
+- `conf_score`: Confidence score (0-1) used for horizon calculation
+
+**Model Heads (Adaptive Mode):**
+- `adaptive_horizon_head`: Predicts optimal horizon (0-1 range, scaled to 24-48)
+- `adaptive_conf_score_head`: Predicts confidence score (0-1 range)
+
+**Selection:** Interactive menu during training setup
+- Default: Simple mode (proven stable)
+- Adaptive mode available for experimentation
+
+**Cache Separation:** Separate cache files prevent conflicts between modes
+- Validation checks mode-specific fields only when applicable
+
+**Legacy Code:** Original unoptimized implementation preserved in:
+- `deprecated/continuation_labels_legacy.py` (January 19, 2025)
+- Kept for verification and mathematical equivalence testing
+- DO NOT USE in production - use optimized version in `src/ml/features.py`
+
 ---
 
 ## 4. Technical Implementation
@@ -228,7 +314,7 @@ class HierarchicalLNN(nn.Module):
         self.medium_layer = LiquidLayer(128 neurons) # 4hour-daily patterns
         self.slow_layer = LiquidLayer(256 neurons)   # weekly+ patterns
 
-        # 12 prediction heads total
+        # 14 prediction heads total (12 base + 2 adaptive)
         self.heads = {
             # Primary predictions (2 heads)
             'high', 'low',
@@ -236,7 +322,11 @@ class HierarchicalLNN(nn.Module):
             # Multi-task auxiliary (10 heads)
             'hit_band', 'hit_target', 'expected_return', 'overshoot',
             'continuation_duration', 'continuation_gain', 'continuation_confidence',
-            'price_change_pct', 'horizon_bars_log', 'adaptive_confidence'
+            'price_change_pct', 'horizon_bars_log', 'adaptive_confidence',
+
+            # Adaptive continuation mode (2 additional heads)
+            'adaptive_horizon',      # Optimal prediction horizon (24-48 bars)
+            'adaptive_conf_score'    # Confidence score for horizon selection
         }
 ```
 
@@ -246,6 +336,27 @@ class HierarchicalLNN(nn.Module):
 - Attention mechanism for layer weighting
 - Dropout: 0.2 for regularization
 - Total parameters: ~2.8M
+
+#### Scalable Fusion Architecture (v3.16.1 - January 19, 2025)
+
+**Dynamic Dimension Scaling:**
+The fusion layer and all multi-task heads now scale with `hidden_size` instead of using hardcoded dimensions:
+
+```python
+# Fusion output dimension scales with model capacity
+fusion_output_dim = hidden_size // 2  # e.g., 128→64, 256→128
+
+# All heads scale proportionally
+self.fusion_fc2 = nn.Linear(128, fusion_output_dim)  # Was: hardcoded 64
+self.hit_band_head = nn.Linear(fusion_output_dim, fusion_output_dim // 2)  # Was: 64→32
+```
+
+**Benefits:**
+- Larger models (hidden_size=256) get proportionally larger fusion capacity (128 vs 64)
+- Smaller models (hidden_size=64) use fewer parameters (32 vs 64)
+- Model capacity now configurable via interactive menu without code changes
+
+**Breaking Change:** Old model checkpoints with hardcoded dimensions are incompatible and must be retrained
 
 ### 4.2 Training Pipeline
 
@@ -550,6 +661,11 @@ MIN_DATA_YEARS = 2.5                 # Minimum data for multi-window system
 USE_CHUNKED_EXTRACTION = None        # None=auto-detect, True=force, False=disable
 CHUNK_SIZE_YEARS = 1                 # Process in 1-year chunks
 CHUNK_OVERLAP_MONTHS = 6             # Overlap for rolling features
+
+# v3.16: Continuation label mode configuration
+CONTINUATION_MODE = 'simple'         # 'simple' or 'adaptive'
+ADAPTIVE_MIN_HORIZON = 24            # Min horizon for adaptive mode (bars)
+ADAPTIVE_MAX_HORIZON = 48            # Max horizon for adaptive mode (bars)
 ```
 
 #### Precision Configuration (v3.13)

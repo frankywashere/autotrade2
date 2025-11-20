@@ -70,6 +70,10 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.downsample_medium_to_slow = downsample_medium_to_slow
         self.multi_task = multi_task
 
+        # Fusion output dimension scales with hidden_size (not hardcoded to 64)
+        # Allows larger models to have proportionally larger fusion capacity
+        self.fusion_output_dim = self.hidden_size // 2  # e.g., 128→64, 256→128
+
         # Calculate effective sequence lengths after downsampling
         # If input is 200 1-min bars:
         # - Fast: 200 bars (1-min)
@@ -116,10 +120,10 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # Input: 3 predictions (high, low, conf) × 3 layers + market_state + news
         fusion_input_size = 9 + 12 + 768 + 1  # 9 preds + 12 market state + 768 news + 1 news mask
         self.fusion_fc1 = nn.Linear(fusion_input_size, 128)
-        self.fusion_fc2 = nn.Linear(128, 64)
-        self.fusion_fc_high = nn.Linear(64, 1)
-        self.fusion_fc_low = nn.Linear(64, 1)
-        self.fusion_fc_conf = nn.Linear(64, 1)
+        self.fusion_fc2 = nn.Linear(128, self.fusion_output_dim)
+        self.fusion_fc_high = nn.Linear(self.fusion_output_dim, 1)
+        self.fusion_fc_low = nn.Linear(self.fusion_output_dim, 1)
+        self.fusion_fc_conf = nn.Linear(self.fusion_output_dim, 1)
 
         # Learnable fusion weights (initialized equally)
         self.fusion_weights = nn.Parameter(torch.ones(3) / 3)  # [fast, medium, slow]
@@ -128,34 +132,49 @@ class HierarchicalLNN(nn.Module, ModelBase):
         if multi_task:
             # Hit Band: Will price enter predicted band? (Binary classification)
             self.hit_band_head = nn.Sequential(
-                nn.Linear(64, 32),
+                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
                 nn.ReLU(),
-                nn.Linear(32, 1),
+                nn.Linear(self.fusion_output_dim // 2, 1),
                 nn.Sigmoid()
             )
 
             # Hit Target: Will trade work (target before stop)? (Binary classification)
             self.hit_target_head = nn.Sequential(
-                nn.Linear(64, 32),
+                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
                 nn.ReLU(),
-                nn.Linear(32, 1),
+                nn.Linear(self.fusion_output_dim // 2, 1),
                 nn.Sigmoid()
             )
 
             # Expected Return: Direct return prediction (Regression)
-            self.expected_return_head = nn.Linear(64, 1)
+            self.expected_return_head = nn.Linear(self.fusion_output_dim, 1)
 
             # Overshoot: How far price overshoots band (Regression)
-            self.overshoot_head = nn.Linear(64, 1)
+            self.overshoot_head = nn.Linear(self.fusion_output_dim, 1)
 
             # Continuation: Channel continuation duration and gain (Regression)
-            self.continuation_duration_head = nn.Linear(64, 1)
-            self.continuation_gain_head = nn.Linear(64, 1)
+            self.continuation_duration_head = nn.Linear(self.fusion_output_dim, 1)
+            self.continuation_gain_head = nn.Linear(self.fusion_output_dim, 1)
             self.continuation_confidence_head = nn.Sequential(
-                nn.Linear(64, 32),
+                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
                 nn.ReLU(),
-                nn.Linear(32, 1),
+                nn.Linear(self.fusion_output_dim // 2, 1),
                 nn.Sigmoid()
+            )
+
+            # Adaptive horizon predictor (for adaptive continuation mode)
+            # Predicts the optimal horizon (24-48 bars) based on market conditions
+            self.adaptive_horizon_head = nn.Sequential(
+                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
+                nn.ReLU(),
+                nn.Linear(self.fusion_output_dim // 2, 1),
+                nn.Sigmoid()  # Output 0-1, will be scaled to 24-48 bars
+            )
+            self.adaptive_conf_score_head = nn.Sequential(
+                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
+                nn.ReLU(),
+                nn.Linear(self.fusion_output_dim // 2, 1),
+                nn.Sigmoid()  # Confidence score 0-1
             )
 
             # Adaptive Projection: Dynamic timescale selection and horizon prediction
@@ -330,7 +349,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
         # Fusion network
         fusion_hidden = F.relu(self.fusion_fc1(fusion_input))
-        fusion_hidden = F.relu(self.fusion_fc2(fusion_hidden))  # [batch, 64]
+        fusion_hidden = F.relu(self.fusion_fc2(fusion_hidden))  # [batch, self.fusion_output_dim] (scales with hidden_size)
 
         # Primary predictions
         final_pred_high = self.fusion_fc_high(fusion_hidden)
@@ -368,6 +387,10 @@ class HierarchicalLNN(nn.Module, ModelBase):
             continuation_gain_pred = self.continuation_gain_head(fusion_hidden)  # [batch, 1]
             continuation_confidence_pred = self.continuation_confidence_head(fusion_hidden)  # [batch, 1]
 
+            # Adaptive horizon predictions (for adaptive mode)
+            adaptive_horizon_pred = self.adaptive_horizon_head(fusion_hidden)  # [batch, 1], 0-1 range
+            adaptive_conf_score_pred = self.adaptive_conf_score_head(fusion_hidden)  # [batch, 1], 0-1 range
+
             # Adaptive Projection: Dynamic timescale selection and horizon prediction
             fusion_input = torch.cat([
                 fast_hidden, medium_hidden, slow_hidden,
@@ -397,6 +420,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 'continuation_duration': continuation_duration_pred,
                 'continuation_gain': continuation_gain_pred,
                 'continuation_confidence': continuation_confidence_pred,
+                'adaptive_horizon': adaptive_horizon_pred,  # 0-1 range, will be scaled to 24-48
+                'adaptive_conf_score': adaptive_conf_score_pred,  # 0-1 confidence score
                 'price_change_pct': price_change_pct,
                 'horizon_bars': horizon_bars,
                 'adaptive_confidence': adaptive_confidence,
