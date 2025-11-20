@@ -78,6 +78,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         metrics = [
             'position', 'upper_dist', 'lower_dist', 'slope', 'slope_pct', 'stability',
             'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
+            'complete_cycles', 'complete_cycles_0_5pct', 'complete_cycles_1_0pct', 'complete_cycles_3_0pct',  # v3.17
             'r_squared', 'is_bull', 'is_bear', 'is_sideways', 'duration'
         ]
 
@@ -863,6 +864,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                                 channel_features[f'{w_prefix}_ping_pongs_0_5pct'][indices] = channel.ping_pongs_0_5pct
                                 channel_features[f'{w_prefix}_ping_pongs_1_0pct'][indices] = channel.ping_pongs_1_0pct
                                 channel_features[f'{w_prefix}_ping_pongs_3_0pct'][indices] = channel.ping_pongs_3_0pct
+                                channel_features[f'{w_prefix}_complete_cycles'][indices] = channel.complete_cycles
+                                channel_features[f'{w_prefix}_complete_cycles_0_5pct'][indices] = channel.complete_cycles_0_5pct
+                                channel_features[f'{w_prefix}_complete_cycles_1_0pct'][indices] = channel.complete_cycles_1_0pct
+                                channel_features[f'{w_prefix}_complete_cycles_3_0pct'][indices] = channel.complete_cycles_3_0pct
                                 channel_features[f'{w_prefix}_is_bull'][indices] = float(slope_pct > 0.1)
                                 channel_features[f'{w_prefix}_is_bear'][indices] = float(slope_pct < -0.1)
                                 channel_features[f'{w_prefix}_is_sideways'][indices] = float(abs(slope_pct) <= 0.1)
@@ -1132,6 +1137,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_complete_cycles': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_complete_cycles_0_5pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_complete_cycles_1_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_complete_cycles_3_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_r_squared': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_is_bull': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_is_bear': np.zeros(n, dtype=config.NUMPY_DTYPE),
@@ -1180,9 +1189,17 @@ class TradingFeatureExtractor(FeatureExtractor):
                     # Get the actual window used
                     actual_window = resampled.iloc[i-channel.actual_duration:i]
 
-                    # Calculate multi-threshold ping-pongs
+                    # Calculate multi-threshold ping-pongs and complete cycles
                     window_prices = actual_window['close'].values
                     multi_pp = channel_calc._detect_ping_pongs_multi_threshold(
+                        window_prices,
+                        channel.upper_line,
+                        channel.lower_line,
+                        thresholds=[0.005, 0.01, 0.02, 0.03]
+                    )
+
+                    # v3.17: Complete cycles (full round-trips)
+                    multi_cycles = channel_calc._detect_complete_cycles_multi_threshold(
                         window_prices,
                         channel.upper_line,
                         channel.lower_line,
@@ -1228,6 +1245,12 @@ class TradingFeatureExtractor(FeatureExtractor):
                         results[f'{prefix}_ping_pongs'][idx] = multi_pp[0.02]  # Default 2%
                         results[f'{prefix}_ping_pongs_3_0pct'][idx] = multi_pp[0.03]
 
+                        # v3.17: Multi-threshold complete cycles
+                        results[f'{prefix}_complete_cycles_0_5pct'][idx] = multi_cycles[0.005]
+                        results[f'{prefix}_complete_cycles_1_0pct'][idx] = multi_cycles[0.01]
+                        results[f'{prefix}_complete_cycles'][idx] = multi_cycles[0.02]  # Default 2%
+                        results[f'{prefix}_complete_cycles_3_0pct'][idx] = multi_cycles[0.03]
+
                 except Exception as e:
                     # Skip this timestamp on error
                     continue
@@ -1252,6 +1275,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_complete_cycles': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_complete_cycles_0_5pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_complete_cycles_1_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
+                f'{prefix}_complete_cycles_3_0pct': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_r_squared': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_is_bull': np.zeros(n, dtype=config.NUMPY_DTYPE),
                 f'{prefix}_is_bear': np.zeros(n, dtype=config.NUMPY_DTYPE),
@@ -1345,6 +1372,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             'ping_pongs_0_5pct': np.zeros(num_original_rows),  # 0.5% threshold
             'ping_pongs_1_0pct': np.zeros(num_original_rows),  # 1.0% threshold
             'ping_pongs_3_0pct': np.zeros(num_original_rows),  # 3.0% threshold
+            'complete_cycles': np.zeros(num_original_rows),  # v3.17: Complete round-trips at 2%
+            'complete_cycles_0_5pct': np.zeros(num_original_rows),
+            'complete_cycles_1_0pct': np.zeros(num_original_rows),
+            'complete_cycles_3_0pct': np.zeros(num_original_rows),
             'r_squared': np.zeros(num_original_rows),
             'is_bull': np.zeros(num_original_rows),  # Uptrending channel (>0.1% per bar)
             'is_bear': np.zeros(num_original_rows),  # Downtrending channel (<-0.1% per bar)
@@ -1396,9 +1427,17 @@ class TradingFeatureExtractor(FeatureExtractor):
                 # Get the actual window used for this channel
                 actual_window = resampled_df.iloc[i-channel.actual_duration:i]
 
-                # Calculate multi-threshold ping-pongs
+                # Calculate multi-threshold ping-pongs and complete cycles
                 window_prices = actual_window['close'].values
                 multi_pp = self.channel_calc._detect_ping_pongs_multi_threshold(
+                    window_prices,
+                    channel.upper_line,
+                    channel.lower_line,
+                    thresholds=[0.005, 0.01, 0.02, 0.03]
+                )
+
+                # v3.17: Complete cycles (full round-trips)
+                multi_cycles = self.channel_calc._detect_complete_cycles_multi_threshold(
                     window_prices,
                     channel.upper_line,
                     channel.lower_line,
@@ -1438,6 +1477,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                 results['ping_pongs_0_5pct'][mask] = multi_pp[0.005]  # 0.5% threshold
                 results['ping_pongs_1_0pct'][mask] = multi_pp[0.01]   # 1.0% threshold
                 results['ping_pongs_3_0pct'][mask] = multi_pp[0.03]   # 3.0% threshold
+                results['complete_cycles'][mask] = channel.complete_cycles  # v3.17: 2% threshold
+                results['complete_cycles_0_5pct'][mask] = multi_cycles[0.005]
+                results['complete_cycles_1_0pct'][mask] = multi_cycles[0.01]
+                results['complete_cycles_3_0pct'][mask] = multi_cycles[0.03]
                 results['r_squared'][mask] = channel.r_squared
                 results['duration'][mask] = channel.actual_duration  # v3.11: How many bars channel holds
 
@@ -1644,6 +1687,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             'ping_pongs_0_5pct': np.zeros(num_original_rows),  # 0.5% threshold
             'ping_pongs_1_0pct': np.zeros(num_original_rows),  # 1.0% threshold
             'ping_pongs_3_0pct': np.zeros(num_original_rows),  # 3.0% threshold
+            'complete_cycles': np.zeros(num_original_rows),  # v3.17: Complete round-trips at 2%
+            'complete_cycles_0_5pct': np.zeros(num_original_rows),
+            'complete_cycles_1_0pct': np.zeros(num_original_rows),
+            'complete_cycles_3_0pct': np.zeros(num_original_rows),
             'r_squared': np.zeros(num_original_rows),
             'is_bull': np.zeros(num_original_rows),  # Uptrending channel
             'is_bear': np.zeros(num_original_rows),  # Downtrending channel
@@ -2397,21 +2444,22 @@ class TradingFeatureExtractor(FeatureExtractor):
                 rsi_1h = self.rsi_calc.get_rsi_data(one_h_ohlc).value or 50.0
                 rsi_4h = self.rsi_calc.get_rsi_data(four_h_ohlc).value or 50.0
 
-                # Fit channels (must be done on reconstructed data)
-                channel_1h = self.channel_calc.find_optimal_channel_window(
+                # Fit channels - v3.17: NO FILTERING, keep all quality levels
+                # "Bad" channels signal that THIS timeframe is unreliable right now
+                # Model learns when to switch timeframes based on quality scores
+                channel_1h = self.channel_calc.find_best_channel_any_quality(
                     one_h_ohlc, timeframe='1h',
-                    max_lookback=min(60, max(5, len(one_h_ohlc)-2)),
-                    min_ping_pongs=2
+                    max_lookback=min(60, max(5, len(one_h_ohlc)-2))
                 )
 
-                channel_4h = self.channel_calc.find_optimal_channel_window(
+                channel_4h = self.channel_calc.find_best_channel_any_quality(
                     four_h_ohlc, timeframe='4h',
-                    max_lookback=min(120, max(10, len(four_h_ohlc)-2)),
-                    min_ping_pongs=2
+                    max_lookback=min(120, max(10, len(four_h_ohlc)-2))
                 )
 
+                # Only skip if truly no data (very rare)
                 if channel_1h is None or channel_4h is None:
-                    return None
+                    return None  # Insufficient data, not quality issue
 
                 # Get slopes
                 slope_1h = channel_1h.slope if channel_1h else 0.0
@@ -2526,6 +2574,13 @@ class TradingFeatureExtractor(FeatureExtractor):
                     'rsi_4h': rsi_4h,
                     'slope_1h': slope_1h,
                     'slope_4h': slope_4h,
+                    # v3.17: Channel quality signals for timeframe switching
+                    'channel_1h_cycles': channel_1h.complete_cycles if channel_1h else 0,
+                    'channel_4h_cycles': channel_4h.complete_cycles if channel_4h else 0,
+                    'channel_1h_r_squared': channel_1h.r_squared if channel_1h else 0.0,
+                    'channel_4h_r_squared': channel_4h.r_squared if channel_4h else 0.0,
+                    'channel_1h_valid': channel_1h.is_valid if channel_1h else 0.0,
+                    'channel_4h_valid': channel_4h.is_valid if channel_4h else 0.0,
                     # Adaptive mode fields (None for simple mode)
                     'adaptive_horizon': adaptive_horizon,
                     'conf_score': conf_score

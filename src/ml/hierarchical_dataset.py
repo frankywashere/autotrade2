@@ -360,6 +360,20 @@ class HierarchicalDataset(Dataset):
                         targets['adaptive_horizon'] = torch.tensor(cont_row['adaptive_horizon'].iloc[0], dtype=config.get_torch_dtype())
                     if 'conf_score' in cont_row.columns:
                         targets['conf_score'] = torch.tensor(cont_row['conf_score'].iloc[0], dtype=config.get_torch_dtype())
+
+                    # v3.17: Channel quality fields for timeframe switching
+                    if 'channel_1h_cycles' in cont_row.columns:
+                        targets['channel_1h_cycles'] = torch.tensor(cont_row['channel_1h_cycles'].iloc[0], dtype=config.get_torch_dtype())
+                    if 'channel_4h_cycles' in cont_row.columns:
+                        targets['channel_4h_cycles'] = torch.tensor(cont_row['channel_4h_cycles'].iloc[0], dtype=config.get_torch_dtype())
+                    if 'channel_1h_valid' in cont_row.columns:
+                        targets['channel_1h_valid'] = torch.tensor(cont_row['channel_1h_valid'].iloc[0], dtype=config.get_torch_dtype())
+                    if 'channel_4h_valid' in cont_row.columns:
+                        targets['channel_4h_valid'] = torch.tensor(cont_row['channel_4h_valid'].iloc[0], dtype=config.get_torch_dtype())
+                    if 'channel_1h_r_squared' in cont_row.columns:
+                        targets['channel_1h_r_squared'] = torch.tensor(cont_row['channel_1h_r_squared'].iloc[0], dtype=config.get_torch_dtype())
+                    if 'channel_4h_r_squared' in cont_row.columns:
+                        targets['channel_4h_r_squared'] = torch.tensor(cont_row['channel_4h_r_squared'].iloc[0], dtype=config.get_torch_dtype())
             except:
                 # Fallback values
                 targets['continuation_duration'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
