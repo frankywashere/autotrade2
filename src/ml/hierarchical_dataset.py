@@ -49,7 +49,7 @@ class HierarchicalDataset(Dataset):
         Initialize dataset.
 
         Args:
-            features_df: Features dataframe with 495+ columns
+            features_df: Features dataframe (165 non-channel + optional mmap 12,474 channel = 12,639 total)
             raw_ohlc_df: Raw OHLC data for input sequences
             continuation_labels_df: DataFrame with continuation labels
             sequence_length: Input sequence length (200 1-min bars)
@@ -190,13 +190,16 @@ class HierarchicalDataset(Dataset):
         end_shard = bisect.bisect_right(self.channel_cumulative_rows, end - 1) - 1
 
         if start_shard == end_shard:
-            # Entire sequence in one shard (common case - fast!)
+            # Entire sequence in one shard (common case - fast, zero-copy!)
             local_start = start - self.channel_cumulative_rows[start_shard]
             local_end = end - self.channel_cumulative_rows[start_shard]
             return self.channel_mmaps[start_shard][local_start:local_end]
         else:
             # Sequence spans multiple shards (rare - happens at shard boundaries)
-            pieces = []
+            # Pre-allocate contiguous array instead of vstack (avoids extra copy)
+            result = np.empty((end - start, self.num_channel_features), dtype=self.channel_mmaps[0].dtype)
+            pos = 0
+
             for shard_idx in range(start_shard, end_shard + 1):
                 shard_start = max(start, self.channel_cumulative_rows[shard_idx])
                 shard_end = min(end, self.channel_cumulative_rows[shard_idx + 1])
@@ -204,9 +207,11 @@ class HierarchicalDataset(Dataset):
                 local_start = shard_start - self.channel_cumulative_rows[shard_idx]
                 local_end = shard_end - self.channel_cumulative_rows[shard_idx]
 
-                pieces.append(self.channel_mmaps[shard_idx][local_start:local_end])
+                length = local_end - local_start
+                result[pos:pos + length] = self.channel_mmaps[shard_idx][local_start:local_end]
+                pos += length
 
-            return np.vstack(pieces)  # Slightly faster than concatenate(axis=0)
+            return result
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
         """
@@ -579,20 +584,16 @@ def create_hierarchical_dataset(
         val_dataset: Validation dataset (if validation_split provided)
     """
     if validation_split is not None:
-        # Split into train/val
+        # Calculate split index
         split_idx = int(len(features_df) * (1 - validation_split))
-
-        train_df = features_df.iloc[:split_idx]
-        val_df = features_df.iloc[split_idx:]
-
-        print(f"Split data: {len(train_df)} train, {len(val_df)} val")
+        print(f"Split data: {split_idx:,} train rows, {len(features_df) - split_idx:,} val rows")
 
         # Split continuation labels if provided
         train_continuation_df = None
         val_continuation_df = None
         if continuation_labels_df is not None:
             # Split continuation labels by timestamp
-            split_timestamp = train_df.index[-1]
+            split_timestamp = features_df.index[split_idx - 1]
             train_continuation_df = continuation_labels_df[
                 continuation_labels_df['timestamp'] <= split_timestamp
             ].copy()
@@ -600,28 +601,62 @@ def create_hierarchical_dataset(
                 continuation_labels_df['timestamp'] > split_timestamp
             ].copy()
 
-        if preload:
-            train_dataset = PreloadHierarchicalDataset(
-                train_df, raw_ohlc_df, train_continuation_df,
-                sequence_length, prediction_horizon, mode
+        if mmap_meta_path:
+            # When using mmaps, create ONE base dataset with FULL data,
+            # then restrict valid_indices to avoid duplicating mmap references
+            import copy
+
+            base_dataset = HierarchicalDataset(
+                features_df,  # Full non-channel features
+                raw_ohlc_df,
+                None,  # Continuation handled separately below
+                sequence_length, prediction_horizon, mode,
+                include_continuation=False,
+                mmap_meta_path=mmap_meta_path
             )
-            val_dataset = PreloadHierarchicalDataset(
-                val_df, raw_ohlc_df, val_continuation_df,
-                sequence_length, prediction_horizon, mode
-            )
+
+            # Calculate index ranges (valid_indices already has built-in buffers)
+            all_valid = base_dataset.valid_indices
+            train_valid = [i for i in all_valid if i < split_idx]
+            val_valid = [i for i in all_valid if i >= split_idx]
+
+            # Train dataset (modify in place)
+            train_dataset = base_dataset
+            train_dataset.valid_indices = train_valid
+            train_dataset.continuation_labels_df = train_continuation_df
+            train_dataset.include_continuation = include_continuation
+
+            # Val dataset (shallow copy, shares mmap/arrays but different indices)
+            val_dataset = copy.copy(base_dataset)
+            val_dataset.valid_indices = val_valid
+            val_dataset.continuation_labels_df = val_continuation_df
+            val_dataset.include_continuation = include_continuation
+
         else:
-            train_dataset = HierarchicalDataset(
-                train_df, raw_ohlc_df, train_continuation_df,
-                sequence_length, prediction_horizon, mode,
-                include_continuation=include_continuation,
-                mmap_meta_path=mmap_meta_path
-            )
-            val_dataset = HierarchicalDataset(
-                val_df, raw_ohlc_df, val_continuation_df,
-                sequence_length, prediction_horizon, mode,
-                include_continuation=include_continuation,
-                mmap_meta_path=mmap_meta_path
-            )
+            # No mmaps - traditional split
+            train_df = features_df.iloc[:split_idx]
+            val_df = features_df.iloc[split_idx:]
+
+            if preload:
+                train_dataset = PreloadHierarchicalDataset(
+                    train_df, raw_ohlc_df, train_continuation_df,
+                    sequence_length, prediction_horizon, mode
+                )
+                val_dataset = PreloadHierarchicalDataset(
+                    val_df, raw_ohlc_df, val_continuation_df,
+                    sequence_length, prediction_horizon, mode
+                )
+            else:
+                train_dataset = HierarchicalDataset(
+                    train_df, raw_ohlc_df, train_continuation_df,
+                    sequence_length, prediction_horizon, mode,
+                    include_continuation=include_continuation
+                )
+                val_dataset = HierarchicalDataset(
+                    val_df, raw_ohlc_df, val_continuation_df,
+                    sequence_length, prediction_horizon, mode,
+                    include_continuation=include_continuation
+                )
 
         return train_dataset, val_dataset
     else:
