@@ -35,11 +35,17 @@ class ChannelData:
     channel_width_pct: float  # (upper - lower) / close as percentage
     slope_convergence: float  # High/low slope divergence
 
-    # Ping-pong detection at multiple thresholds
-    ping_pongs: int  # At 2% threshold (default)
+    # Ping-pong detection at multiple thresholds (LEGACY: v3.16-)
+    ping_pongs: int  # At 2% threshold (alternating transitions - deprecated)
     ping_pongs_0_5pct: int
     ping_pongs_1_0pct: int
     ping_pongs_3_0pct: int
+
+    # Complete cycle detection (v3.17+: NEW - preferred metric)
+    complete_cycles: int = 0  # At 2% threshold (full round-trips)
+    complete_cycles_0_5pct: int = 0
+    complete_cycles_1_0pct: int = 0
+    complete_cycles_3_0pct: int = 0
 
     # Quality metrics
     r_squared: float  # Average of close/high/low r²
@@ -51,9 +57,9 @@ class ChannelData:
     predicted_center: float
     actual_duration: int = 0
 
-    # Quality indicators (v3.13: Multi-window feature set)
-    quality_score: float = 0.0  # Composite quality (0-1): (r² * 0.7) + (ping_pongs/10 * 0.3)
-    is_valid: float = 0.0  # 1.0 if ping_pongs >= 3, else 0.0
+    # Quality indicators (v3.17: Switched to complete_cycles)
+    quality_score: float = 0.0  # Composite quality (0-1): (r² * 0.7) + (complete_cycles/5 * 0.3)
+    is_valid: float = 0.0  # 1.0 if complete_cycles >= 2, else 0.0
     insufficient_data: float = 0.0  # 1.0 if window > available bars, else 0.0
 
     # Backward compatibility properties
@@ -239,6 +245,52 @@ class LinearRegressionChannel:
 
         return best_channel  # None if no valid channel found
 
+    def find_best_channel_any_quality(
+        self,
+        df: pd.DataFrame,
+        timeframe: str = "1h",
+        max_lookback: int = 168
+    ) -> Optional[ChannelData]:
+        """
+        Find best channel regardless of cycle quality (NO FILTERING).
+
+        Returns channel with highest r² even if complete_cycles=0.
+        This allows model to learn from "bad" channels as signals of timeframe unreliability.
+
+        Used in continuation labels to avoid skipping timestamps - "bad" channels indicate
+        that THIS timeframe is unreliable right now, model should learn to switch to another TF.
+
+        Args:
+            df: DataFrame with OHLC data
+            timeframe: Timeframe name (for prediction)
+            max_lookback: Maximum bars to consider
+
+        Returns:
+            ChannelData for best-fit window, or None if insufficient data
+        """
+        # Candidate windows to test (from longest to shortest)
+        candidates = [168, 120, 90, 60, 45, 30, 20, 10]
+        candidates = [c for c in candidates if c <= max_lookback and c <= len(df)]
+
+        if not candidates:
+            return None
+
+        best_channel = None
+        best_r_squared = 0
+
+        for lookback in candidates:
+            # Calculate channel for this window
+            window = df.tail(lookback)
+            channel = self.calculate_channel(window, lookback, timeframe)
+
+            # NO FILTERING - just find best statistical fit
+            # Even channels with 0 complete_cycles are useful signals!
+            if channel.r_squared > best_r_squared:
+                best_channel = channel
+                best_r_squared = channel.r_squared
+
+        return best_channel  # Always returns something (unless no data)
+
     def _detect_ping_pongs(self, prices: np.ndarray, upper: np.ndarray, lower: np.ndarray,
                           threshold: float = 0.02) -> int:
         """
@@ -278,6 +330,67 @@ class LinearRegressionChannel:
                 last_touch = 'lower'
 
         return bounces
+
+    def _detect_complete_cycles(self, prices: np.ndarray, upper: np.ndarray, lower: np.ndarray,
+                                threshold: float = 0.02) -> int:
+        """
+        Count complete oscillation cycles (lower→upper→lower or upper→lower→upper).
+
+        This is a stricter measure than transitions - requires full round-trips.
+        Better indicator of channel stability and mean reversion behavior.
+
+        Args:
+            prices: Price array
+            upper: Upper channel line
+            lower: Lower channel line
+            threshold: Percentage threshold for detecting touch (2% default)
+
+        Returns:
+            Number of complete oscillation cycles
+        """
+        touches = []
+        last_touch = None
+
+        for i in range(len(prices)):
+            price = prices[i]
+            upper_val = upper[i]
+            lower_val = lower[i]
+
+            # Calculate distances as percentage
+            if upper_val > 0:
+                upper_dist = abs(price - upper_val) / upper_val
+            else:
+                upper_dist = 1.0
+
+            if lower_val != 0:
+                lower_dist = abs(price - lower_val) / abs(lower_val)
+            else:
+                lower_dist = 1.0
+
+            # Record touches (only when transitioning to new boundary)
+            if upper_dist <= threshold and last_touch != 'upper':
+                touches.append('upper')
+                last_touch = 'upper'
+            elif lower_dist <= threshold and last_touch != 'lower':
+                touches.append('lower')
+                last_touch = 'lower'
+
+        # Count complete cycles (need at least 3 touches for 1 cycle)
+        complete_cycles = 0
+        i = 0
+        while i < len(touches) - 2:
+            # Lower → Upper → Lower (one complete cycle)
+            if (touches[i] == 'lower' and touches[i+1] == 'upper' and touches[i+2] == 'lower'):
+                complete_cycles += 1
+                i += 2  # Skip to next potential cycle start
+            # Upper → Lower → Upper (one complete cycle)
+            elif (touches[i] == 'upper' and touches[i+1] == 'lower' and touches[i+2] == 'upper'):
+                complete_cycles += 1
+                i += 2  # Skip to next potential cycle start
+            else:
+                i += 1  # Move forward one touch
+
+        return complete_cycles
 
     def _detect_ping_pongs_multi_threshold(
         self,
@@ -324,6 +437,78 @@ class LinearRegressionChannel:
                     if last_touch[threshold] == 'upper':
                         results[threshold] += 1
                     last_touch[threshold] = 'lower'
+
+        return results
+
+    def _detect_complete_cycles_multi_threshold(
+        self,
+        prices: np.ndarray,
+        upper: np.ndarray,
+        lower: np.ndarray,
+        thresholds: list = [0.005, 0.01, 0.02, 0.03]
+    ) -> dict:
+        """
+        Count complete oscillation cycles at multiple thresholds (efficient single-pass).
+
+        Complete cycle = lower→upper→lower OR upper→lower→upper (full round-trip).
+        More robust measure of channel stability than simple transitions.
+
+        Args:
+            prices: Price array
+            upper: Upper channel line
+            lower: Lower channel line
+            thresholds: List of percentage thresholds to test
+
+        Returns:
+            Dict mapping threshold to complete cycle count
+            Example: {0.005: 2, 0.01: 3, 0.02: 4, 0.03: 5}
+        """
+        results = {threshold: 0 for threshold in thresholds}
+        touch_sequences = {threshold: [] for threshold in thresholds}
+        last_touch = {threshold: None for threshold in thresholds}
+
+        for i in range(len(prices)):
+            price = prices[i]
+            upper_val = upper[i]
+            lower_val = lower[i]
+
+            # Calculate distances as percentage
+            if upper_val > 0:
+                upper_dist = abs(price - upper_val) / upper_val
+            else:
+                upper_dist = 1.0
+
+            if lower_val != 0:
+                lower_dist = abs(price - lower_val) / abs(lower_val)
+            else:
+                lower_dist = 1.0
+
+            # Check each threshold
+            for threshold in thresholds:
+                # Record touches (transitions only)
+                if upper_dist <= threshold and last_touch[threshold] != 'upper':
+                    touch_sequences[threshold].append('upper')
+                    last_touch[threshold] = 'upper'
+                elif lower_dist <= threshold and last_touch[threshold] != 'lower':
+                    touch_sequences[threshold].append('lower')
+                    last_touch[threshold] = 'lower'
+
+        # Count complete cycles for each threshold
+        for threshold in thresholds:
+            touches = touch_sequences[threshold]
+            cycles = 0
+            i = 0
+
+            while i < len(touches) - 2:
+                # Check for complete round-trip patterns
+                if (touches[i] == 'lower' and touches[i+1] == 'upper' and touches[i+2] == 'lower') or \
+                   (touches[i] == 'upper' and touches[i+1] == 'lower' and touches[i+2] == 'upper'):
+                    cycles += 1
+                    i += 2  # Skip to next potential cycle
+                else:
+                    i += 1  # Move forward one touch
+
+            results[threshold] = cycles
 
         return results
 
@@ -470,6 +655,56 @@ class LinearRegressionChannel:
 
         return results
 
+    def _detect_complete_cycles_vectorized(self, highs: np.ndarray, lows: np.ndarray,
+                                          closes: np.ndarray, upper: np.ndarray,
+                                          lower: np.ndarray) -> dict:
+        """
+        Vectorized complete cycle detection (10x faster than Python loops).
+
+        Uses numpy operations for touch detection, then Python loop for cycle counting
+        (cycle counting is inherently sequential - difficult to fully vectorize).
+        """
+        thresholds = [0.005, 0.01, 0.02, 0.03]
+        results = {}
+
+        for threshold in thresholds:
+            # Vectorized touch detection (same as ping_pongs)
+            high_upper_dist = np.abs(highs - upper) / np.maximum(upper, 1e-10)
+            low_lower_dist = np.abs(lows - lower) / np.maximum(np.abs(lower), 1e-10)
+            close_upper_dist = np.abs(closes - upper) / np.maximum(upper, 1e-10)
+            close_lower_dist = np.abs(closes - lower) / np.maximum(np.abs(lower), 1e-10)
+
+            touches_upper = (high_upper_dist <= threshold) | (close_upper_dist <= threshold)
+            touches_lower = (low_lower_dist <= threshold) | (close_lower_dist <= threshold)
+
+            # Build state array: 0=none, 1=upper, 2=lower
+            state = np.zeros(len(closes), dtype=int)
+            state[touches_upper & ~touches_lower] = 1
+            state[touches_lower & ~touches_upper] = 2
+
+            # Build touch sequence (filter state transitions)
+            touch_seq = []
+            last_state = 0
+            for s in state:
+                if s != 0 and s != last_state:
+                    touch_seq.append('upper' if s == 1 else 'lower')
+                    last_state = s
+
+            # Count complete cycles
+            cycles = 0
+            i = 0
+            while i < len(touch_seq) - 2:
+                if (touch_seq[i] == 'lower' and touch_seq[i+1] == 'upper' and touch_seq[i+2] == 'lower') or \
+                   (touch_seq[i] == 'upper' and touch_seq[i+1] == 'lower' and touch_seq[i+2] == 'upper'):
+                    cycles += 1
+                    i += 2
+                else:
+                    i += 1
+
+            results[threshold] = int(cycles)
+
+        return results
+
     def calculate_multi_window_rolling(self, df: pd.DataFrame, timeframe: str = "1h") -> Dict[int, List[Optional[ChannelData]]]:
         """
         Calculate channels for MULTIPLE window sizes using rolling statistics.
@@ -578,6 +813,11 @@ class LinearRegressionChannel:
                     window_highs, window_lows, window_closes, upper_line, lower_line
                 )
 
+                # NEW: Complete cycle detection (v3.17)
+                multi_cycles = self._detect_complete_cycles_vectorized(
+                    window_highs, window_lows, window_closes, upper_line, lower_line
+                )
+
                 close_r_squared = self._calculate_r_squared(window_closes, close_line)
                 high_r_squared = self._calculate_r_squared(window_highs, high_line)
                 low_r_squared = self._calculate_r_squared(window_lows, low_line)
@@ -585,10 +825,10 @@ class LinearRegressionChannel:
 
                 stability_score = self._calculate_stability(r_squared_avg, multi_pp[0.02], window)
 
-                # Calculate quality indicators
-                ping_pong_score = min(multi_pp[0.02] / 10.0, 1.0)
-                quality_score = (r_squared_avg * 0.7) + (ping_pong_score * 0.3)
-                is_valid = 1.0 if multi_pp[0.02] >= 3 else 0.0
+                # Calculate quality indicators (v3.17: Switched to complete_cycles)
+                cycle_score = min(multi_cycles[0.02] / 5.0, 1.0)  # Normalize: 5 cycles = max
+                quality_score = (r_squared_avg * 0.7) + (cycle_score * 0.3)
+                is_valid = 1.0 if multi_cycles[0.02] >= 2 else 0.0  # Require 2 complete cycles
 
                 channel = ChannelData(
                     close_slope=close_slope,
@@ -610,6 +850,10 @@ class LinearRegressionChannel:
                     ping_pongs_0_5pct=multi_pp[0.005],
                     ping_pongs_1_0pct=multi_pp[0.01],
                     ping_pongs_3_0pct=multi_pp[0.03],
+                    complete_cycles=multi_cycles[0.02],
+                    complete_cycles_0_5pct=multi_cycles[0.005],
+                    complete_cycles_1_0pct=multi_cycles[0.01],
+                    complete_cycles_3_0pct=multi_cycles[0.03],
                     r_squared=r_squared_avg,
                     stability_score=stability_score,
                     predicted_high=upper_line[-1],

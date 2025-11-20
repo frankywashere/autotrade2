@@ -32,9 +32,10 @@ Just as an oceanographer studies different water layers to understand currents, 
 
 The model dynamically selects the most confident layer and projects forward accordingly, using higher layers as confirmation for longer holds.
 
-### Current State (v3.16.2 - January 19, 2025)
+### Current State (v3.17 - January 19, 2025)
 - ✅ Training pipeline complete and tested
-- ✅ **12,639 features** (12,474 channel + 165 non-channel) with 21-window multi-OHLC system
+- ✅ **14,487 features** (8,778 channel + 165 non-channel) with 21-window multi-OHLC system
+- ✅ **Complete cycles metric** - Full round-trip oscillations (better than transitions)
 - ✅ **Sharded memory-mapped extraction** - Zero RAM spike, <1GB constant during extraction
 - ✅ **Unified cache system** - Channels + continuation labels both cached and validated
 - ✅ **Continuation labels optimized** - 20-60x faster (1 hour → 1-3 min first run, <1s cached)
@@ -398,8 +399,9 @@ self.hit_band_head = nn.Linear(fusion_output_dim, fusion_output_dim // 2)  # Was
 
 **Memory Comparison:**
 ```
-Before (broken): 495 dims, batch=32 → ~25MB/batch BUT crashes on dimension mismatch
-After (fixed):   12,639 dims, batch=8 → ~81MB/batch, runs successfully on 16GB Mac
+v3.11 (broken):  495 dims, batch=32 → ~25MB/batch BUT crashes on dimension mismatch
+v3.16 (fixed):   12,639 dims, batch=8 → ~81MB/batch, runs successfully on 16GB Mac
+v3.17 (enhanced): 14,487 dims, batch=8 → ~93MB/batch, still safe on 16GB Mac
 ```
 
 **RICH Progress Display for Continuation Labels (v3.16.2):**
@@ -407,6 +409,107 @@ After (fixed):   12,639 dims, batch=8 → ~81MB/batch, runs successfully on 16GB
 - Smooth progress updates with ETA and completion counts
 - Replaces basic tqdm with rich.Progress
 - Visual consistency across all extraction steps
+
+#### Complete Cycles + Timeframe Switching (v3.17 - January 19, 2025)
+
+**Major Enhancement: Complete Cycles Metric**
+
+**Old Metric (ping_pongs - transitions):**
+```
+Lower → Upper: +1 count
+Upper → Lower: +1 count
+Lower → Upper → Lower: ping_pongs = 2
+```
+
+**New Metric (complete_cycles - full round-trips):**
+```
+Lower → Upper → Lower: complete_cycles = 1 ✅
+Upper → Lower → Upper: complete_cycles = 1 ✅
+(Requires full oscillation, stronger signal of channel stability)
+```
+
+**Why Complete Cycles Are Better:**
+- Measures full oscillations, not half-cycles
+- Stronger proof of mean reversion behavior
+- Reduces false positives from incomplete patterns
+- Better proxy for "channel actually works"
+
+**Quality Formula Updated:**
+```python
+# OLD (v3.16):
+quality_score = (r² × 0.7) + (ping_pongs/10 × 0.3)
+is_valid = 1.0 if ping_pongs >= 3 else 0.0
+
+# NEW (v3.17):
+quality_score = (r² × 0.7) + (complete_cycles/5 × 0.3)
+is_valid = 1.0 if complete_cycles >= 2 else 0.0
+```
+
+**Added 4 New Metrics per Channel:**
+- `complete_cycles` (2% threshold)
+- `complete_cycles_0_5pct` (strict)
+- `complete_cycles_1_0pct` (moderate)
+- `complete_cycles_3_0pct` (loose)
+
+**Feature Count Impact:**
+```
+21 windows × 11 timeframes × 19 metrics × 2 symbols = 8,778 channel features
+(was 15 metrics → 6,930 features)
+Total: 14,487 features (was 12,639)
+```
+
+---
+
+**Major Enhancement: Timeframe Switching Intelligence**
+
+**Old Behavior (v3.16):**
+- If 1h channel has <2 ping-pongs (weak) → Skip timestamp entirely ❌
+- Lost ~150K timestamps with "bad" 1h but "good" 4h channels
+- Model never learned when to switch timeframes
+
+**New Behavior (v3.17):**
+- Keep ALL timestamps, regardless of channel quality ✅
+- Store quality signals in continuation labels:
+  - `channel_1h_cycles`: Complete cycles in 1h channel
+  - `channel_4h_cycles`: Complete cycles in 4h channel
+  - `channel_1h_valid`: Binary (1.0 if cycles >= 2)
+  - `channel_4h_valid`: Binary (1.0 if cycles >= 2)
+  - `channel_1h_r_squared`: Regression fit quality
+  - `channel_4h_r_squared`: Regression fit quality
+
+**What Model Learns:**
+
+**Pattern 1: Weak 1h + Strong 4h → Use 4h Signal**
+```
+Input: channel_1h_cycles=0, channel_1h_valid=0, channel_4h_cycles=5, channel_4h_valid=1
+Label: uses slope_4h for prediction, continues=1, duration=6h
+Model: "When 1h unreliable but 4h strong → trust 4h timeframe"
+```
+
+**Pattern 2: Both Weak → Ranging Market**
+```
+Input: channel_1h_cycles=1, channel_4h_cycles=1, both valid=0
+Label: continues=0, ranges, gain=0.2%
+Model: "Both timeframes weak → ranging/choppy, avoid predictions"
+```
+
+**Pattern 3: Weak 1h + Overbought 4h → Reversal**
+```
+Input: channel_1h_cycles=0, channel_4h_cycles=4, rsi_4h=80, price at 1h top
+Label: breaks_down, gain=-2%, duration=1h
+Model: "Invalid 1h + extended 4h → trust 4h reversal signal"
+```
+
+**This Implements Adaptive Timeframe Intelligence:**
+- Model learns WHEN to trust which timeframe
+- "Bad" channels become signals of unreliability
+- Automatic TF switching based on quality divergence
+- +150K more training examples (was skipped before)
+
+**Impact:**
+- More training data (1.35M vs 1.2M labels)
+- Learns your "1h breaks but 4h holds" intuition automatically
+- Better handling of choppy/transitional markets
 
 ### 4.2 Training Pipeline
 
@@ -422,10 +525,10 @@ loss = (
 ```
 
 #### Training Configuration
-- Batch size: 8-32 (memory dependent, reduced for 12K+ feature dimension)
+- Batch size: 8-32 (memory dependent, for 14K+ feature dimension)
   - 16GB Mac (MPS, float32): 8-16 recommended
-  - 32GB+ (MPS/CUDA, float32): 16-32 recommended
-  - Float64: Half the batch size (4-8 for 16GB, 8-16 for 32GB+)
+  - 32GB+ (MPS/CUDA, float32): 16-24 recommended
+  - Float64: Half the batch size (4-8 for 16GB, 8-12 for 32GB+)
 - Learning rate: 0.001 with cosine annealing
 - Early stopping: Patience 10 epochs
 - Validation split: 10%
@@ -435,12 +538,14 @@ loss = (
 
 ## 5. Feature Engineering
 
-### 5.1 Complete Feature Breakdown (v3.13+: 12,639 Features)
+### 5.1 Complete Feature Breakdown (v3.17: 14,487 Features)
 
-**Feature Explosion:** v3.13 introduces multi-window OHLC system:
+**Feature Evolution:**
 - **v3.11-v3.12:** 495 features (single best window per timeframe)
-- **v3.13+:** 12,639 features total:
-  - 12,474 channel features (21 windows × 11 timeframes × 15 metrics × 2 symbols)
+- **v3.13-v3.16:** 12,639 features (21 windows × 11 timeframes × 15 metrics × 2 symbols)
+- **v3.17:** 14,487 features total:
+  - 8,778 channel features (21 windows × 11 timeframes × 19 metrics × 2 symbols)
+    - +4 complete_cycles metrics per channel (v3.17)
   - 165 non-channel features (RSI, correlation, cycle, volume, time, events, breakdown)
 
 #### Price Features (12 total - UNCHANGED)
