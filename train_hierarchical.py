@@ -75,13 +75,13 @@ def get_best_device():
 
 
 def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
-    """Get recommended batch size for device."""
+    """Get recommended batch size for device (v3.16.2: Conservative for 12K+ features)."""
     recommendations = {
-        'cuda': 128,  # NVIDIA GPU
-        'mps_high': 96,  # M2 Max/Ultra with 64+ GB
-        'mps_mid': 64,   # M2 Pro/M1 Max with 32-64 GB
-        'mps_low': 32,   # M1/M1 Pro with 16-32 GB
-        'cpu': 32
+        'cuda': 64,   # NVIDIA GPU (reduced for 12K features)
+        'mps_high': 32,  # M2 Max/Ultra with 64+ GB (reduced)
+        'mps_mid': 16,   # M2 Pro/M1 Max with 32-64 GB (reduced)
+        'mps_low': 8,    # M1/M1 Pro with 16-32 GB (reduced for safety with 12,639 features)
+        'cpu': 16
     }
 
     if device == 'mps':
@@ -92,7 +92,7 @@ def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
         else:
             return recommendations['mps_low']
 
-    return recommendations.get(device, 32)
+    return recommendations.get(device, 16)
 
 
 def train_epoch(
@@ -1162,6 +1162,23 @@ def main():
     print(f"   Train samples: {len(train_dataset)}")
     if val_dataset:
         print(f"   Val samples: {len(val_dataset)}")
+
+    # Verify feature dimension matches between extractor and dataset
+    print("\n   🔍 Verifying feature dimensions...")
+    sample_x, sample_y = train_dataset[0]
+    actual_input_dim = sample_x.shape[-1]
+    expected_dim = extractor.get_feature_dim()
+
+    if actual_input_dim != expected_dim:
+        raise RuntimeError(
+            f"\n❌ FATAL: Feature dimension mismatch!\n"
+            f"   Model expects: {expected_dim} features\n"
+            f"   Dataset returns: {actual_input_dim} features\n"
+            f"   Difference: {abs(actual_input_dim - expected_dim)}\n"
+            f"   This will cause immediate OOM/crash.\n"
+            f"   Fix: Update TradingFeatureExtractor._build_feature_names() to match extraction code"
+        )
+    print(f"   ✅ Dimension check passed: {actual_input_dim} features match expected {expected_dim}")
 
     # Create dataloaders
     train_loader = DataLoader(

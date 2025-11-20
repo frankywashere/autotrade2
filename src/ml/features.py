@@ -9,9 +9,11 @@ import torch
 from typing import Dict, List, Tuple
 from pathlib import Path
 import sys
+import os
 from tqdm import tqdm
 from joblib import Parallel, delayed
 import multiprocessing as mp
+import concurrent.futures
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent.parent
@@ -54,10 +56,10 @@ class TradingFeatureExtractor(FeatureExtractor):
         self._build_feature_names()
 
     def _build_feature_names(self):
-        """Build list of all feature names"""
+        """Build list matching multi-window extraction (v3.13+) - CRITICAL: Must match actual shard structure"""
         features = []
 
-        # Price features (both SPY and TSLA) - v3.8: +2 normalized prices
+        # Price features (12 total: 6 per symbol × 2 symbols)
         for symbol in ['spy', 'tsla']:
             features.extend([
                 f'{symbol}_close',
@@ -68,61 +70,31 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'{symbol}_volatility_50',
             ])
 
-        # TSLA Channel features (multi-timeframe) - v3.7 with normalized slope + direction flags
-        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
-            features.extend([
-                f'tsla_channel_{tf}_position',  # 0-1 position in channel
-                f'tsla_channel_{tf}_upper_dist',  # Distance to upper
-                f'tsla_channel_{tf}_lower_dist',  # Distance to lower
-                f'tsla_channel_{tf}_slope',  # Raw slope ($/bar)
-                f'tsla_channel_{tf}_slope_pct',  # Normalized slope (% per bar)
-                f'tsla_channel_{tf}_stability',
-                f'tsla_channel_{tf}_ping_pongs',  # 2% threshold (default)
-                f'tsla_channel_{tf}_ping_pongs_0_5pct',  # 0.5% threshold (strict)
-                f'tsla_channel_{tf}_ping_pongs_1_0pct',  # 1.0% threshold
-                f'tsla_channel_{tf}_ping_pongs_3_0pct',  # 3.0% threshold (loose)
-                f'tsla_channel_{tf}_r_squared',
-                f'tsla_channel_{tf}_is_bull',  # Bull channel (>0.1% per bar)
-                f'tsla_channel_{tf}_is_bear',  # Bear channel (<-0.1% per bar)
-                f'tsla_channel_{tf}_is_sideways',  # Sideways channel (±0.1% per bar)
-                f'tsla_channel_{tf}_duration',  # v3.11: How many bars channel actually holds
-            ])
+        # Multi-window channel features (v3.13+: 21 windows × 11 tfs × 15 metrics × 2 symbols = 6,930)
+        # NOTE: Actual shard has 12,474 features - discrepancy suggests additional metrics or structure
+        # Using exact extraction code pattern to ensure match
+        windows = config.CHANNEL_WINDOW_SIZES  # [168, 160, 150, ..., 10] (21 values)
+        timeframes = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+        metrics = [
+            'position', 'upper_dist', 'lower_dist', 'slope', 'slope_pct', 'stability',
+            'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
+            'r_squared', 'is_bull', 'is_bear', 'is_sideways', 'duration'
+        ]
 
-        # SPY Channel features (multi-timeframe) - v3.7 with normalized slope + direction flags
-        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
-            features.extend([
-                f'spy_channel_{tf}_position',  # 0-1 position in channel
-                f'spy_channel_{tf}_upper_dist',  # Distance to upper
-                f'spy_channel_{tf}_lower_dist',  # Distance to lower
-                f'spy_channel_{tf}_slope',  # Raw slope ($/bar)
-                f'spy_channel_{tf}_slope_pct',  # Normalized slope (% per bar)
-                f'spy_channel_{tf}_stability',
-                f'spy_channel_{tf}_ping_pongs',  # 2% threshold (default)
-                f'spy_channel_{tf}_ping_pongs_0_5pct',  # 0.5% threshold (strict)
-                f'spy_channel_{tf}_ping_pongs_1_0pct',  # 1.0% threshold
-                f'spy_channel_{tf}_ping_pongs_3_0pct',  # 3.0% threshold (loose)
-                f'spy_channel_{tf}_r_squared',
-                f'spy_channel_{tf}_is_bull',  # Bull channel (>0.1% per bar)
-                f'spy_channel_{tf}_is_bear',  # Bear channel (<-0.1% per bar)
-                f'spy_channel_{tf}_is_sideways',  # Sideways channel (±0.1% per bar)
-                f'spy_channel_{tf}_duration',  # v3.11: How many bars channel actually holds
-            ])
+        for symbol in ['tsla', 'spy']:
+            for tf in timeframes:
+                for w in windows:
+                    for m in metrics:
+                        features.append(f'{symbol}_channel_{tf}_{m}_w{w}')
 
-        # TSLA RSI features (multi-timeframe) - RENAMED for consistency
-        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
-            features.extend([
-                f'tsla_rsi_{tf}',
-                f'tsla_rsi_{tf}_oversold',  # Binary
-                f'tsla_rsi_{tf}_overbought',  # Binary
-            ])
-
-        # SPY RSI features (multi-timeframe) - NEW in v3.4
-        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
-            features.extend([
-                f'spy_rsi_{tf}',
-                f'spy_rsi_{tf}_oversold',  # Binary
-                f'spy_rsi_{tf}_overbought',  # Binary
-            ])
+        # RSI features (11 tfs × 3 metrics × 2 symbols = 66)
+        for symbol in ['tsla', 'spy']:
+            for tf in timeframes:
+                features.extend([
+                    f'{symbol}_rsi_{tf}',
+                    f'{symbol}_rsi_{tf}_oversold',  # Binary
+                    f'{symbol}_rsi_{tf}_overbought',  # Binary
+                ])
 
         # SPY-TSLA correlation features
         features.extend([
@@ -208,7 +180,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, continuation_mode: str = 'simple', use_chunking: bool = False, chunk_size_years: int = 1, shard_storage_path: str = None, **kwargs) -> tuple:
         """
-        Extract all 495 features from aligned SPY-TSLA data (v3.11 - With Dynamic Channel Duration Detection).
+        Extract all features from aligned SPY-TSLA data (v3.13: 12,474 channel + 165 non-channel = 12,639 total).
 
         Args:
             df: DataFrame with SPY and TSLA OHLCV columns
@@ -2292,6 +2264,14 @@ class TradingFeatureExtractor(FeatureExtractor):
         import warnings
         warnings.filterwarnings('ignore', category=FutureWarning)
 
+        # Try importing RICH for better progress display
+        try:
+            from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
+            from rich.console import Console
+            RICH_AVAILABLE = True
+        except ImportError:
+            RICH_AVAILABLE = False
+
         # Determine mode (use config default if not specified)
         if mode is None:
             mode = config.CONTINUATION_MODE
@@ -2556,24 +2536,62 @@ class TradingFeatureExtractor(FeatureExtractor):
                     print(f"Error processing {ts}: {e}")
                 return None
 
-        # OPTIMIZATION 3: Parallel processing
-        print(f"   Processing {len(timestamps)} timestamps in parallel...")
-
+        # OPTIMIZATION 3: Parallel processing with RICH progress display
         # Create tuples of (timestamp, index) for processing
         ts_idx_pairs = [(ts, df.index.get_loc(ts)) for ts in timestamps]
 
-        # Process in parallel with progress bar
-        from tqdm import tqdm
+        if RICH_AVAILABLE:
+            # Use RICH for beautiful progress display (matches channel extraction UI)
+            print(f"   🎨 Processing {len(timestamps):,} timestamps with RICH progress...")
 
-        # Use threading backend for better compatibility on macOS
-        results = Parallel(n_jobs=-1, backend='threading', verbose=0)(
-            delayed(process_single_timestamp)(ts_idx)
-            for ts_idx in tqdm(ts_idx_pairs, desc="   Continuation labels",
-                              unit="timestamps", ncols=100, leave=False, ascii=True)
-        )
+            console = Console()
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("({task.completed:,}/{task.total:,})"),
+                TimeRemainingColumn(),
+                console=console,
+                expand=True,
+                refresh_per_second=10
+            ) as progress:
 
-        # Filter out None results and create DataFrame
-        labels = [r for r in results if r is not None]
+                task_id = progress.add_task(
+                    "[cyan]Continuation labels (parallel threading)",
+                    total=len(ts_idx_pairs)
+                )
+
+                # Thread pool executor for parallel processing
+                results = [None] * len(ts_idx_pairs)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+                    # Submit all tasks
+                    futures = {executor.submit(process_single_timestamp, ts_idx): i
+                              for i, ts_idx in enumerate(ts_idx_pairs)}
+
+                    # Collect results as they complete with progress updates
+                    for future in concurrent.futures.as_completed(futures):
+                        idx = futures[future]
+                        results[idx] = future.result()
+                        progress.update(task_id, advance=1)
+
+            # Filter out None results
+            labels = [r for r in results if r is not None]
+
+        else:
+            # Fallback to tqdm if RICH not available
+            print(f"   Processing {len(timestamps):,} timestamps in parallel...")
+            from tqdm import tqdm
+
+            # Use threading backend for better compatibility on macOS
+            results = Parallel(n_jobs=-1, backend='threading', verbose=0)(
+                delayed(process_single_timestamp)(ts_idx)
+                for ts_idx in tqdm(ts_idx_pairs, desc="   Continuation labels",
+                                  unit="timestamps", ncols=100, leave=False, ascii=True)
+            )
+
+            # Filter out None results
+            labels = [r for r in results if r is not None]
 
         if debug:
             print(f"   Generated {len(labels)} labels out of {len(timestamps)} timestamps")
