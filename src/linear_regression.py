@@ -42,22 +42,22 @@ class ChannelData:
     ping_pongs_3_0pct: int
 
     # Complete cycle detection (v3.17+: NEW - preferred metric)
-    complete_cycles: int = 0  # At 2% threshold (full round-trips)
-    complete_cycles_0_5pct: int = 0
-    complete_cycles_1_0pct: int = 0
-    complete_cycles_3_0pct: int = 0
+    complete_cycles: int  # At 2% threshold (full round-trips) - REQUIRED like ping_pongs
+    complete_cycles_0_5pct: int
+    complete_cycles_1_0pct: int
+    complete_cycles_3_0pct: int
 
-    # Quality metrics
+    # Quality metrics (required fields)
     r_squared: float  # Average of close/high/low r²
     stability_score: float
 
-    # Predictions
+    # Predictions (required fields)
     predicted_high: float
     predicted_low: float
     predicted_center: float
-    actual_duration: int = 0
 
-    # Quality indicators (v3.17: Switched to complete_cycles)
+    # Optional fields with defaults (MUST come last in dataclass!)
+    actual_duration: int = 0
     quality_score: float = 0.0  # Composite quality (0-1): (r² * 0.7) + (complete_cycles/5 * 0.3)
     is_valid: float = 0.0  # 1.0 if complete_cycles >= 2, else 0.0
     insufficient_data: float = 0.0  # 1.0 if window > available bars, else 0.0
