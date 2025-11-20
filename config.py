@@ -224,6 +224,10 @@ MIN_DATA_YEARS = 2.5
 # ======================================================================
 # CONTINUATION LABEL CONFIGURATION
 # ======================================================================
-CONTINUATION_MODE = 'simple'  # 'simple' or 'enhanced'
-# - simple: Uses best 1h/4h windows for scoring (default, let model learn from all features)
-# - enhanced: Uses all 6 windows for explicit multi-window continuation scoring
+CONTINUATION_MODE = 'simple'  # 'simple' or 'adaptive'
+# - simple: Fixed 24-bar horizon (default, fast, tested)
+# - adaptive: Variable 24-48 bar horizon based on RSI/slope confidence
+
+# Adaptive mode settings (only used when CONTINUATION_MODE = 'adaptive')
+ADAPTIVE_MIN_HORIZON = 24  # Minimum prediction horizon (bars) - 2 hours at 5-min resolution
+ADAPTIVE_MAX_HORIZON = 48  # Maximum prediction horizon (bars) - 4 hours at 5-min resolution

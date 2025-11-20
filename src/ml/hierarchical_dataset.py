@@ -66,6 +66,9 @@ class HierarchicalDataset(Dataset):
         self.mode = mode
         self.include_continuation = include_continuation
 
+        # Dtype validation - ensure data matches config precision
+        expected_dtype = config.NUMPY_DTYPE
+
         # Memory-mapped shard loading (zero RAM spike!)
         if mmap_meta_path is not None:
             import json
@@ -109,8 +112,7 @@ class HierarchicalDataset(Dataset):
             self.features_array = features_df.values
             self.timestamps = features_df.index.values
 
-            # Dtype validation - ensure data matches config precision
-            expected_dtype = config.NUMPY_DTYPE
+            # Validate and convert feature array dtype if needed
             if self.features_array.dtype != expected_dtype:
                 print(f"  ⚠️  Feature dtype mismatch: {self.features_array.dtype} != {expected_dtype}")
                 print(f"     Converting to {expected_dtype} (may use extra memory temporarily)")
@@ -347,11 +349,22 @@ class HierarchicalDataset(Dataset):
                     targets['continuation_duration'] = torch.tensor(cont_row['duration_hours'].iloc[0], dtype=config.get_torch_dtype())
                     targets['continuation_gain'] = torch.tensor(cont_row['projected_gain'].iloc[0], dtype=config.get_torch_dtype())
                     targets['continuation_confidence'] = torch.tensor(cont_row['confidence'].iloc[0], dtype=config.get_torch_dtype())
+
+                    # Add adaptive fields if they exist (when using adaptive mode)
+                    if 'adaptive_horizon' in cont_row.columns:
+                        targets['adaptive_horizon'] = torch.tensor(cont_row['adaptive_horizon'].iloc[0], dtype=config.get_torch_dtype())
+                    if 'conf_score' in cont_row.columns:
+                        targets['conf_score'] = torch.tensor(cont_row['conf_score'].iloc[0], dtype=config.get_torch_dtype())
             except:
                 # Fallback values
                 targets['continuation_duration'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
                 targets['continuation_gain'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
                 targets['continuation_confidence'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
+                # Fallback for adaptive fields if expected but not found
+                if self.continuation_labels_df is not None and 'adaptive_horizon' in self.continuation_labels_df.columns:
+                    targets['adaptive_horizon'] = torch.tensor(24.0, dtype=config.get_torch_dtype())  # Default to min horizon
+                if self.continuation_labels_df is not None and 'conf_score' in self.continuation_labels_df.columns:
+                    targets['conf_score'] = torch.tensor(0.5, dtype=config.get_torch_dtype())  # Default to neutral confidence
 
         return x_tensor, targets
 
