@@ -207,7 +207,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
 
         Returns tuple of (features_df, continuation_df):
-        - features_df: DataFrame with 495 columns
+        - features_df: DataFrame with feature columns (165 non-channel when using mmaps,
+          14,487 total when not using mmaps). Use get_feature_dim() for model input size.
         - continuation_df: DataFrame with continuation labels (or None if continuation=False)
         - 12 price features (6 per stock: close, close_norm, returns, log_returns, volatility_10, volatility_50)
         - 330 channel features (165 TSLA + 165 SPY) - v3.11: +22 duration features
@@ -1676,26 +1677,27 @@ class TradingFeatureExtractor(FeatureExtractor):
         prices = resampled_df['close'].values
 
         # Initialize result arrays (including multi-threshold ping-pongs, normalized slope, direction flags)
+        # v3.17: All arrays use config.NUMPY_DTYPE for float32/float64 toggleability
         results = {
-            'position': np.zeros(num_original_rows),
-            'upper_dist': np.zeros(num_original_rows),
-            'lower_dist': np.zeros(num_original_rows),
-            'slope': np.zeros(num_original_rows),  # Raw slope ($/bar)
-            'slope_pct': np.zeros(num_original_rows),  # Normalized slope (% per bar)
-            'stability': np.zeros(num_original_rows),
-            'ping_pongs': np.zeros(num_original_rows),  # Default 2% threshold
-            'ping_pongs_0_5pct': np.zeros(num_original_rows),  # 0.5% threshold
-            'ping_pongs_1_0pct': np.zeros(num_original_rows),  # 1.0% threshold
-            'ping_pongs_3_0pct': np.zeros(num_original_rows),  # 3.0% threshold
-            'complete_cycles': np.zeros(num_original_rows),  # v3.17: Complete round-trips at 2%
-            'complete_cycles_0_5pct': np.zeros(num_original_rows),
-            'complete_cycles_1_0pct': np.zeros(num_original_rows),
-            'complete_cycles_3_0pct': np.zeros(num_original_rows),
-            'r_squared': np.zeros(num_original_rows),
-            'is_bull': np.zeros(num_original_rows),  # Uptrending channel
-            'is_bear': np.zeros(num_original_rows),  # Downtrending channel
-            'is_sideways': np.zeros(num_original_rows),  # Ranging channel
-            'duration': np.zeros(num_original_rows)  # v3.11: Channel duration (fixed lookback for GPU)
+            'position': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),
+            'upper_dist': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),
+            'lower_dist': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),
+            'slope': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # Raw slope ($/bar)
+            'slope_pct': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # Normalized slope (% per bar)
+            'stability': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),
+            'ping_pongs': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # Default 2% threshold
+            'ping_pongs_0_5pct': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # 0.5% threshold
+            'ping_pongs_1_0pct': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # 1.0% threshold
+            'ping_pongs_3_0pct': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # 3.0% threshold
+            'complete_cycles': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # v3.17: Complete round-trips at 2%
+            'complete_cycles_0_5pct': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),
+            'complete_cycles_1_0pct': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),
+            'complete_cycles_3_0pct': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),
+            'r_squared': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),
+            'is_bull': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # Uptrending channel
+            'is_bear': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # Downtrending channel
+            'is_sideways': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE),  # Ranging channel
+            'duration': np.zeros(num_original_rows, dtype=config.NUMPY_DTYPE)  # v3.11: Channel duration (fixed lookback for GPU)
         }
 
         # Convert to PyTorch tensor (dtype from config)

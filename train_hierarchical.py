@@ -1140,9 +1140,17 @@ def main():
         debug_mode = True
         continuation_df = extractor.generate_continuation_labels(df, timestamps, prediction_horizon=24, mode=project_config.CONTINUATION_MODE, debug=debug_mode)
 
-    print(f"   Extracted {len(features_df.columns)} features")
+    # Display feature counts (clarify mmap vs non-mmap)
+    total_feature_dim = extractor.get_feature_dim()
+    print(f"   Total feature dimension: {total_feature_dim} (model input size)")
+    if mmap_meta_path:
+        channel_features = total_feature_dim - len(features_df.columns)
+        print(f"     ├─ Channel features (mmaps): {channel_features}")
+        print(f"     └─ Non-channel features (df): {len(features_df.columns)}")
+    else:
+        print(f"     └─ All features in dataframe: {len(features_df.columns)}")
     print(f"   Generated {len(continuation_df) if continuation_df is not None else 0} continuation labels")
-    print(f"   Feature names: {extractor.get_feature_names()[:5]}... (showing first 5)")
+    print(f"   Feature names (first 5): {extractor.get_feature_names()[:5]}...")
 
     # Create datasets
     print("\n3. Creating datasets...")
