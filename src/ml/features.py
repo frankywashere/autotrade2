@@ -810,12 +810,40 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         else:
             # Sequential processing with multi-window (for GPU mode or live mode)
-            calc_progress = tqdm(total=total_calcs, desc="   Sequential multi-window channels", ncols=100, leave=False, ascii=True, mininterval=0.5)
+            # v3.19: Try RICH for better progress display
+            try:
+                from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
+                from rich.console import Console
+
+                console = Console()
+                progress_ctx = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold blue]{task.description}"),
+                    BarColumn(),
+                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                    TextColumn("({task.completed}/{task.total})"),
+                    TimeRemainingColumn(),
+                    console=console,
+                    expand=True,
+                    refresh_per_second=10
+                )
+                calc_progress = progress_ctx.__enter__()
+                task_id = calc_progress.add_task("[cyan]Sequential channel extraction (GPU)", total=total_calcs)
+                using_rich = True
+            except:
+                # Fallback to tqdm
+                calc_progress = tqdm(total=total_calcs, desc="   Sequential multi-window channels", ncols=100, leave=False, ascii=True, mininterval=0.5)
+                task_id = None
+                using_rich = False
+                progress_ctx = None
 
             channel_features = {}  # Initialize
 
             for symbol in ['tsla', 'spy']:
                 for tf_name, tf_rule in timeframes.items():
+                    # Update progress description if using RICH
+                    if using_rich:
+                        calc_progress.update(task_id, description=f"[cyan]{symbol}_{tf_name}")
                     # Get data
                     if is_live_mode:
                         if tf_name in ['5min', '15min', '30min']:
@@ -876,6 +904,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                                                 'low_r_squared', 'r_squared_avg', 'channel_width_pct',
                                                 'slope_convergence', 'stability', 'ping_pongs',
                                                 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
+                                                'complete_cycles', 'complete_cycles_0_5pct', 'complete_cycles_1_0pct', 'complete_cycles_3_0pct',
                                                 'is_bull', 'is_bear', 'is_sideways',
                                                 'quality_score', 'is_valid', 'insufficient_data', 'duration']:
                                         channel_features[f'{w_prefix}_{feat}'] = np.zeros(num_rows, dtype=config.NUMPY_DTYPE)
@@ -913,7 +942,11 @@ class TradingFeatureExtractor(FeatureExtractor):
                                 channel_features[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
                                 channel_features[f'{w_prefix}_duration'][indices] = channel.actual_duration
 
-                    calc_progress.update(1)
+                    # Update progress (RICH or tqdm)
+                    if using_rich:
+                        calc_progress.update(task_id, advance=1)
+                    else:
+                        calc_progress.update(1)
 
                     # CRITICAL: Clear memory after each timeframe
                     del all_windows
@@ -924,7 +957,11 @@ class TradingFeatureExtractor(FeatureExtractor):
                     import gc
                     gc.collect()
 
-            calc_progress.close()
+            # Close progress (RICH context manager or tqdm)
+            if using_rich and progress_ctx:
+                progress_ctx.__exit__(None, None, None)
+            elif not using_rich:
+                calc_progress.close()
 
         result_df = pd.DataFrame(channel_features, index=df.index)
 
