@@ -32,10 +32,11 @@ Just as an oceanographer studies different water layers to understand currents, 
 
 The model dynamically selects the most confident layer and projects forward accordingly, using higher layers as confirmation for longer holds.
 
-### Current State (v3.17 - January 19, 2025)
+### Current State (v3.18 - January 20, 2025)
 - ✅ Training pipeline complete and tested
-- ✅ **14,487 features** (8,778 channel + 165 non-channel) with 21-window multi-OHLC system
+- ✅ **14,487 features** (14,322 channel + 165 non-channel) with 21-window multi-OHLC system
 - ✅ **Complete cycles metric** - Full round-trip oscillations (better than transitions)
+- ✅ **Hybrid monthly/3month processing** - Long timeframes on full dataset (avoids chunk data limits)
 - ✅ **Sharded memory-mapped extraction** - Zero RAM spike, <1GB constant during extraction
 - ✅ **Unified cache system** - Channels + continuation labels both cached and validated
 - ✅ **Continuation labels optimized** - 20-60x faster (1 hour → 1-3 min first run, <1s cached)
@@ -510,6 +511,90 @@ Model: "Invalid 1h + extended 4h → trust 4h reversal signal"
 - More training data (1.35M vs 1.2M labels)
 - Learns your "1h breaks but 4h holds" intuition automatically
 - Better handling of choppy/transitional markets
+
+---
+
+#### Hybrid Monthly/3Month Processing (v3.18 - January 20, 2025)
+
+**Problem: Chunk Size vs Long Timeframes**
+
+**Issue:**
+- Chunked extraction uses 1-year chunks + 6-month overlap = 18 months input
+- Monthly timeframe: 18 months = 18 monthly bars
+- 3-month timeframe: 18 months = 6 3-month bars
+- Minimum for channel calculations: 20 bars
+- Result: Every chunk marks monthly/3month as insufficient_data ❌
+
+**Old Behavior:**
+```
+Chunk 1 (2016): 18 monthly bars < 20 → insufficient_data=1.0
+Chunk 2 (2017): 18 monthly bars < 20 → insufficient_data=1.0
+... (all 8 chunks fail monthly/3month)
+```
+
+**Solution: Hybrid Processing**
+
+**Monthly/3month are TINY in memory:**
+```
+108 monthly bars × 31 metrics × 21 windows × 2 symbols = 141K values = 565 KB
+36 3-month bars × 31 × 21 × 2 = 47K values = 188 KB
+Total: 753 KB for ALL 10 years of monthly/3month data
+```
+
+**New Behavior:**
+```
+Before Chunking:
+1. Extract monthly/3month on FULL dataset (9 years = 108 monthly bars)
+2. 108 bars > 20 → High quality channels ✅
+3. Broadcast to 1.2M 1-min timestamps (forward-fill)
+4. Store in non_channel_array (~753 KB)
+
+During Chunking:
+1. Process only 5min-weekly (20 timeframes)
+2. Skip monthly/3month (already done)
+3. Save to mmap shards: 20 TFs × 31 × 21 × 2 = ~26K cols
+
+After Loading:
+1. Load mmap shards (20 TFs)
+2. Load non_channel_array (includes monthly/3month)
+3. Concatenate: Total 14,487 features ✅
+```
+
+**Implementation:**
+```python
+def _extract_monthly_3month_features(df):
+    """Process monthly/3month on full dataset (108 bars for 9 years)"""
+    # Calculate rolling channels with sufficient data
+    # Broadcast each monthly bar to all 1-min bars it spans
+    # Returns DataFrame: 1.2M rows × 1,302 cols (~753 KB)
+
+# In chunked extraction:
+monthly_3month_df = _extract_monthly_3month_features(df)  # Full dataset
+for chunk in chunks:
+    extract(chunk, skip=['monthly', '3month'])  # Only 20 TFs
+
+# Merge at load time:
+features = concat([mmap_shards_20tfs, monthly_3month_df, other_non_channel])
+```
+
+**Benefits:**
+- ✅ Monthly/3month have proper data (108 bars vs 18)
+- ✅ No insufficient_data flags for monthly/3month
+- ✅ Minimal memory overhead (753 KB vs 0)
+- ✅ Better channel quality for long timeframes
+
+**Feature Distribution:**
+```
+When chunked:
+  Mmap shards: 21 × 9 TFs × 31 × 2 = 11,718 channel features
+  Non-channel: 165 base + 2,604 monthly/3month = 2,769 features
+  Total: 14,487 features
+
+When not chunked:
+  All together: 21 × 11 TFs × 31 × 2 = 14,322 channel features
+  Non-channel: 165 base features
+  Total: 14,487 features
+```
 
 ### 4.2 Training Pipeline
 

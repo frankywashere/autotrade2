@@ -25,7 +25,7 @@ from src.rsi_calculator import RSICalculator
 from .base import FeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.17_complete_cycles_31metrics"  # 21-window + complete_cycles + all 31 metrics per channel
+FEATURE_VERSION = "v3.18_hybrid_monthly"  # 21-window + complete_cycles + hybrid monthly/3month processing
 
 
 def _check_gpu_available() -> tuple:
@@ -70,9 +70,12 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'{symbol}_volatility_50',
             ])
 
-        # Multi-window channel features (v3.17: CRITICAL - Must match extraction code exactly!)
-        # Extraction creates 31 features per channel window (not 19!)
-        # 21 windows × 11 timeframes × 31 metrics × 2 symbols = 14,322 channel features
+        # Multi-window channel features (v3.18: CRITICAL - Must match extraction code exactly!)
+        # Extraction creates 31 features per channel window
+        # When chunked: 21 windows × 9 TFs (5min-weekly) × 31 metrics × 2 = 11,718 in shards
+        #               + 21 windows × 2 TFs (monthly/3month) × 31 × 2 = 2,604 in non-channel
+        #               = 14,322 total channel features
+        # When not chunked: 21 windows × 11 TFs × 31 × 2 = 14,322 (all in shards)
         windows = config.CHANNEL_WINDOW_SIZES  # [168, 160, 150, ..., 10] (21 values)
         timeframes = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
 
@@ -392,8 +395,9 @@ class TradingFeatureExtractor(FeatureExtractor):
                 )
 
                 # Chunked extraction returns mmap metadata (not DataFrame!)
-                # Store it to pass to dataset later
+                # v3.18: Also extracts monthly/3month separately
                 self._mmap_meta_path = chunk_result['mmap_meta_path']
+                monthly_3month_df = chunk_result.get('monthly_3month_features')  # Hybrid processing
                 channel_df = None  # Will be loaded as mmap in dataset
             else:
                 # Normal extraction (all at once) or load from cache
@@ -404,6 +408,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                     use_gpu=use_gpu_resolved,
                     cache_suffix=cache_suffix
                 )
+                monthly_3month_df = None  # Not using hybrid mode (all TFs processed together)
             pbar.update(1)
 
             rsi_df = self._extract_rsi_features(df, multi_res_data=multi_res_data)
@@ -424,14 +429,11 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Concat base features FIRST (skip channel_df if using mmap)
         if channel_df is None and hasattr(self, '_mmap_meta_path'):
             # Mmap mode - channel features will be loaded separately in dataset
-            base_features_df = pd.concat([
-                price_df,
-                rsi_df,
-                correlation_df,
-                cycle_df,
-                volume_df,
-                time_df
-            ], axis=1)
+            # v3.18: Add monthly/3month if available (hybrid processing)
+            concat_list = [price_df, rsi_df, correlation_df, cycle_df, volume_df, time_df]
+            if monthly_3month_df is not None:
+                concat_list.append(monthly_3month_df)  # Add monthly/3month to non-channel features
+            base_features_df = pd.concat(concat_list, axis=1)
         else:
             # Normal mode - include channel features
             base_features_df = pd.concat([
@@ -649,7 +651,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         num_rows = len(df)
 
         # Resample to different timeframes
-        timeframes = {
+        # v3.18: Skip monthly/3month when chunking (processed separately on full dataset)
+        all_timeframes = {
             '5min': '5min',
             '15min': '15min',
             '30min': '30min',
@@ -663,8 +666,17 @@ class TradingFeatureExtractor(FeatureExtractor):
             '3month': '3ME'
         }
 
+        # Filter out monthly/3month if called from chunked extraction
+        # (They're processed separately on full dataset to avoid insufficient data)
+        if cache_suffix and 'chunk' in str(cache_suffix):
+            # Called from chunking - skip long TFs
+            timeframes = {k: v for k, v in all_timeframes.items() if k not in ['monthly', '3month']}
+            print(f"   ℹ️  Skipping monthly/3month (processed separately on full dataset)")
+        else:
+            timeframes = all_timeframes
+
         # Process both TSLA and SPY
-        total_calcs = len(timeframes) * 2  # 11 timeframes × 2 stocks
+        total_calcs = len(timeframes) * 2  # timeframes × 2 stocks
 
         # Print status messages with detailed info
         if is_live_mode:
@@ -1076,6 +1088,9 @@ class TradingFeatureExtractor(FeatureExtractor):
         print(f"     Chunk size: {chunk_size_years} year(s)")
         print(f"     Overlap: {config.CHUNK_OVERLAP_MONTHS} months")
 
+        # v3.18: Pre-process monthly/3month on full dataset (hybrid mode)
+        monthly_3month_features = self._extract_monthly_3month_features(df)
+
         # Calculate chunk boundaries
         start_date = df.index[0]
         end_date = df.index[-1]
@@ -1135,12 +1150,13 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"       Bars: {len(chunk_df):,} (including {overlap_months}mo overlap)")
 
             # Process chunk (no cache for individual chunks)
+            # v3.18: Pass cache_suffix='chunk' to signal skipping monthly/3month
             chunk_features = self._extract_channel_features(
                 chunk_df,
                 multi_res_data=chunk_multi_res,
                 use_cache=False,  # Don't cache individual chunks
                 use_gpu=use_gpu,
-                cache_suffix=None
+                cache_suffix='chunk_skip_long_tfs'  # Signals to skip monthly/3month
             )
 
             # Remove overlap from results (keep only the actual chunk period)
@@ -1211,7 +1227,12 @@ class TradingFeatureExtractor(FeatureExtractor):
         gc.collect()
 
         # Return metadata path instead of DataFrame (zero RAM spike!)
-        return {'mmap_meta_path': str(meta_path), 'type': 'mmap_sharded'}
+        # v3.18: Also return monthly/3month features (processed on full dataset)
+        return {
+            'mmap_meta_path': str(meta_path),
+            'type': 'mmap_sharded',
+            'monthly_3month_features': monthly_3month_features  # Hybrid processing
+        }
 
     def _compute_channel_memory_efficient(self, args):
         """
