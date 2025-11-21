@@ -462,7 +462,7 @@ def interactive_setup(args):
         message=f"Data loading workers (CPU threads for batch prep, recommended: {default_workers}):",
         default=default_workers,
         min_allowed=0,
-        max_allowed=8
+        max_allowed=128  # High limit for systems with many cores (e.g., 32-64 core servers)
     ).execute())
 
     if args.num_workers != default_workers:
