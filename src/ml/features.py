@@ -940,7 +940,8 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         return result_df
 
-    def _extract_monthly_3month_features(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    def _extract_monthly_3month_features(self, df: pd.DataFrame, use_cache: bool = True,
+                                         shard_storage_path: str = None) -> Optional[pd.DataFrame]:
         """
         Extract monthly/3month features on FULL dataset (v3.18 - Hybrid processing).
 
@@ -948,6 +949,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         But they're tiny in memory (~500 KB for 10 years), so process on full dataset once.
 
         Memory: 108 monthly × 31 metrics × 21 windows × 2 symbols = ~141K values = 565 KB
+        Cached after first run for instant loading (~1 sec vs 2-3 min calculation)!
 
         Returns:
             DataFrame with monthly/3month channel features, or None if insufficient data
@@ -955,6 +957,32 @@ class TradingFeatureExtractor(FeatureExtractor):
         if len(df) < 365 * 390:  # Less than 1 year of 1-min data
             print("   ⚠️  Insufficient data for monthly/3month features (need 1+ year)")
             return None
+
+        # Check cache first
+        if use_cache:
+            if shard_storage_path:
+                cache_dir = Path(shard_storage_path)
+            elif hasattr(self, '_unified_cache_dir'):
+                cache_dir = self._unified_cache_dir
+            else:
+                cache_dir = Path('data/feature_cache')
+
+            cache_dir.mkdir(exist_ok=True, parents=True)
+
+            # Cache key includes version and data range
+            cache_key = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}"
+            cache_file = cache_dir / f'monthly_3month_features_{cache_key}.pkl'
+
+            if cache_file.exists():
+                try:
+                    print(f"\n   📂 Loading cached monthly/3month features...")
+                    cached_df = pd.read_pickle(cache_file)
+                    print(f"   ✓ Loaded {len(cached_df.columns)} monthly/3month features from cache (saved ~2-3 min!)")
+                    return cached_df
+                except Exception as e:
+                    print(f"   ⚠️  Cache load failed: {e}, regenerating...")
+                    if cache_file.exists():
+                        cache_file.unlink()
 
         print("\n   📊 Pre-processing monthly/3month on full dataset (hybrid mode)...")
 
@@ -1054,9 +1082,20 @@ class TradingFeatureExtractor(FeatureExtractor):
                         all_features[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
                         all_features[f'{w_prefix}_duration'][indices] = channel.actual_duration
 
-        print(f"   ✓ Monthly/3month features: {len(all_features)} columns, memory: {sum(f.nbytes for f in all_features.values()) / 1e6:.1f} MB")
+        result_df = pd.DataFrame(all_features, index=df.index)
 
-        return pd.DataFrame(all_features, index=df.index)
+        print(f"   ✓ Monthly/3month features: {len(result_df.columns)} columns, memory: {result_df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
+
+        # Save to cache for next time
+        if use_cache and 'cache_file' in locals():
+            try:
+                print(f"   💾 Caching monthly/3month features to: {cache_file.name}")
+                result_df.to_pickle(cache_file)
+                print(f"   ✓ Cache saved (will load instantly next time!)")
+            except Exception as e:
+                print(f"   ⚠️  Could not save cache: {e}")
+
+        return result_df
 
     def _extract_channel_features_chunked(
         self,
@@ -1089,7 +1128,11 @@ class TradingFeatureExtractor(FeatureExtractor):
         print(f"     Overlap: {config.CHUNK_OVERLAP_MONTHS} months")
 
         # v3.18: Pre-process monthly/3month on full dataset (hybrid mode)
-        monthly_3month_features = self._extract_monthly_3month_features(df)
+        monthly_3month_features = self._extract_monthly_3month_features(
+            df,
+            use_cache=True,  # Cache these separately (small pickle file)
+            shard_storage_path=shard_storage_path
+        )
 
         # Calculate chunk boundaries
         start_date = df.index[0]
