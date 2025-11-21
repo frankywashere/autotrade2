@@ -25,7 +25,7 @@ from src.rsi_calculator import RSICalculator
 from .base import FeatureExtractor
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.13_multiwindow_21"  # 21-window multi-OHLC system with no filtering
+FEATURE_VERSION = "v3.17_complete_cycles_31metrics"  # 21-window + complete_cycles + all 31 metrics per channel
 
 
 def _check_gpu_available() -> tuple:
@@ -199,7 +199,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, continuation_mode: str = 'simple', use_chunking: bool = False, chunk_size_years: int = 1, shard_storage_path: str = None, **kwargs) -> tuple:
         """
-        Extract all features from aligned SPY-TSLA data (v3.13: 12,474 channel + 165 non-channel = 12,639 total).
+        Extract all features from aligned SPY-TSLA data (v3.17: 14,322 channel + 165 non-channel = 14,487 total).
 
         Args:
             df: DataFrame with SPY and TSLA OHLCV columns

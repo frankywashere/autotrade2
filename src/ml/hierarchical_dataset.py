@@ -133,15 +133,17 @@ class HierarchicalDataset(Dataset):
                 if self.non_channel_array is not None:
                     self.feature_names = features_df.columns.tolist()
                     self.close_idx = self.feature_names.index('tsla_close')
-                    self.high_idx = self.feature_names.index('tsla_close')
-                    self.low_idx = self.feature_names.index('tsla_close')
+                    # v3.17: high_idx/low_idx unused (we use raw_ohlc_array for actual extremes)
+                    self.high_idx = None  # Deprecated - not used
+                    self.low_idx = None   # Deprecated - not used
                 else:
                     self.close_idx = 0  # Fallback
             else:
                 self.feature_names = features_df.columns.tolist()
                 self.close_idx = self.feature_names.index('tsla_close')
-                self.high_idx = self.feature_names.index('tsla_close')  # Will calc from close + returns
-                self.low_idx = self.feature_names.index('tsla_close')
+                # v3.17: high_idx/low_idx unused (we use raw_ohlc_array for actual extremes)
+                self.high_idx = None  # Deprecated - not used
+                self.low_idx = None   # Deprecated - not used
         else:
             self.close_idx = None
 
@@ -271,15 +273,26 @@ class HierarchicalDataset(Dataset):
         if self.using_mmaps and self.non_channel_array is not None:
             # tsla_close is in non_channel_array
             current_price = self.non_channel_array[seq_end - 1, self.close_idx]
-            future_prices = future_window[:, self.num_channel_features + self.close_idx]
         else:
             current_price = self.features_array[seq_end - 1, self.close_idx]
-            # Get future prices (GROUND TRUTH)
-            future_prices = future_window[:, self.close_idx]
 
-        # Calculate high and low (primary targets)
-        future_high_actual = np.max(future_prices)
-        future_low_actual = np.min(future_prices)
+        # v3.17: Use actual OHLC high/low from raw_ohlc_array (not min/max of closes!)
+        if self.raw_ohlc_array is not None:
+            # Get future OHLC window [prediction_horizon, 4] where 4 = [open, high, low, close]
+            future_ohlc = self.raw_ohlc_array[seq_end:seq_end + self.prediction_horizon]
+
+            # Use ACTUAL intraday extremes (not just closes)
+            future_high_actual = np.max(future_ohlc[:, 1])  # Column 1 = high
+            future_low_actual = np.min(future_ohlc[:, 2])   # Column 2 = low
+        else:
+            # Fallback: Use min/max of close prices (old simplified method)
+            if self.using_mmaps and self.non_channel_array is not None:
+                future_prices = future_window[:, self.num_channel_features + self.close_idx]
+            else:
+                future_prices = future_window[:, self.close_idx]
+
+            future_high_actual = np.max(future_prices)
+            future_low_actual = np.min(future_prices)
 
         # Convert to percentage change
         target_high_pct = (future_high_actual - current_price) / current_price * 100.0

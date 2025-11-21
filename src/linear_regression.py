@@ -765,6 +765,7 @@ class LinearRegressionChannel:
                             upper_line=empty_array, lower_line=empty_array, center_line=empty_array,
                             std_dev=0.0, channel_width_pct=0.0, slope_convergence=0.0,
                             ping_pongs=0, ping_pongs_0_5pct=0, ping_pongs_1_0pct=0, ping_pongs_3_0pct=0,
+                            complete_cycles=0, complete_cycles_0_5pct=0, complete_cycles_1_0pct=0, complete_cycles_3_0pct=0,
                             r_squared=0.0, stability_score=0.0,
                             predicted_high=0.0, predicted_low=0.0, predicted_center=0.0,
                             actual_duration=0, quality_score=0.0, is_valid=0.0,

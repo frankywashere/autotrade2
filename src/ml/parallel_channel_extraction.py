@@ -150,6 +150,12 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     results[f'{w_prefix}_ping_pongs_1_0pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
                     results[f'{w_prefix}_ping_pongs_3_0pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
+                    # v3.17: Complete cycles (multi-threshold)
+                    results[f'{w_prefix}_complete_cycles'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_complete_cycles_0_5pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_complete_cycles_1_0pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_complete_cycles_3_0pct'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+
                     # Direction flags
                     results[f'{w_prefix}_is_bull'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
                     results[f'{w_prefix}_is_bear'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
@@ -161,19 +167,19 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     results[f'{w_prefix}_insufficient_data'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
                     results[f'{w_prefix}_duration'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
-                # Total: 21 windows × 28 features = 588 features per (symbol, timeframe) pair
+                # Total: 21 windows × 32 features = 672 features per (symbol, timeframe) pair (v3.17: +4 complete_cycles)
 
                 # Handle insufficient data
                 if len(resampled) < 20:
+                    # Log warning for insufficient data
                     progress_queue.put({
                         'worker_id': worker_id,
                         'task_name': task_name,
                         'task_idx': task_idx,
-                        'status': 'complete',
-                        'current': 100,
-                        'total': 100,
-                        'message': 'Insufficient data'
+                        'status': 'error',
+                        'message': f'⚠️  Insufficient data for {task_name}: {len(resampled)} bars < 20 minimum'
                     })
+                    # Return results with zeros (insufficient_data flags already set to 0)
                     result_queue.put((task_idx, results))
                     continue
 
@@ -298,6 +304,12 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                         results[f'{w_prefix}_ping_pongs_0_5pct'][indices] = channel.ping_pongs_0_5pct
                         results[f'{w_prefix}_ping_pongs_1_0pct'][indices] = channel.ping_pongs_1_0pct
                         results[f'{w_prefix}_ping_pongs_3_0pct'][indices] = channel.ping_pongs_3_0pct
+
+                        # v3.17: Complete cycles
+                        results[f'{w_prefix}_complete_cycles'][indices] = channel.complete_cycles
+                        results[f'{w_prefix}_complete_cycles_0_5pct'][indices] = channel.complete_cycles_0_5pct
+                        results[f'{w_prefix}_complete_cycles_1_0pct'][indices] = channel.complete_cycles_1_0pct
+                        results[f'{w_prefix}_complete_cycles_3_0pct'][indices] = channel.complete_cycles_3_0pct
 
                         # Direction flags
                         results[f'{w_prefix}_is_bull'][indices] = float(close_slope_pct > 0.1)
