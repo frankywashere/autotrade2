@@ -70,16 +70,34 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'{symbol}_volatility_50',
             ])
 
-        # Multi-window channel features (v3.13+: 21 windows × 11 tfs × 15 metrics × 2 symbols = 6,930)
-        # NOTE: Actual shard has 12,474 features - discrepancy suggests additional metrics or structure
-        # Using exact extraction code pattern to ensure match
+        # Multi-window channel features (v3.17: CRITICAL - Must match extraction code exactly!)
+        # Extraction creates 31 features per channel window (not 19!)
+        # 21 windows × 11 timeframes × 31 metrics × 2 symbols = 14,322 channel features
         windows = config.CHANNEL_WINDOW_SIZES  # [168, 160, 150, ..., 10] (21 values)
         timeframes = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+
+        # ALL 31 metrics that extraction code actually creates (from lines 848-878):
         metrics = [
-            'position', 'upper_dist', 'lower_dist', 'slope', 'slope_pct', 'stability',
+            # Position metrics (3)
+            'position', 'upper_dist', 'lower_dist',
+            # OHLC slopes - raw $/bar (3)
+            'close_slope', 'high_slope', 'low_slope',
+            # OHLC slopes - normalized % per bar (3)
+            'close_slope_pct', 'high_slope_pct', 'low_slope_pct',
+            # OHLC r-squared values (4)
+            'close_r_squared', 'high_r_squared', 'low_r_squared', 'r_squared_avg',
+            # Channel metrics (3)
+            'channel_width_pct', 'slope_convergence', 'stability',
+            # Ping-pongs - legacy transitions (4 thresholds)
             'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
-            'complete_cycles', 'complete_cycles_0_5pct', 'complete_cycles_1_0pct', 'complete_cycles_3_0pct',  # v3.17
-            'r_squared', 'is_bull', 'is_bear', 'is_sideways', 'duration'
+            # Complete cycles - v3.17 round-trips (4 thresholds)
+            'complete_cycles', 'complete_cycles_0_5pct', 'complete_cycles_1_0pct', 'complete_cycles_3_0pct',
+            # Direction flags (3)
+            'is_bull', 'is_bear', 'is_sideways',
+            # Quality indicators (3)
+            'quality_score', 'is_valid', 'insufficient_data',
+            # Duration (1)
+            'duration'
         ]
 
         for symbol in ['tsla', 'spy']:
