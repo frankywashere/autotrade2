@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import Dict, Tuple
 import sys
 
 # Add parent directory to path

@@ -1218,14 +1218,41 @@ def main():
     expected_dim = extractor.get_feature_dim()
 
     if actual_input_dim != expected_dim:
-        raise RuntimeError(
-            f"\n❌ FATAL: Feature dimension mismatch!\n"
-            f"   Model expects: {expected_dim} features\n"
-            f"   Dataset returns: {actual_input_dim} features\n"
-            f"   Difference: {abs(actual_input_dim - expected_dim)}\n"
-            f"   This will cause immediate OOM/crash.\n"
-            f"   Fix: Update TradingFeatureExtractor._build_feature_names() to match extraction code"
-        )
+        # Enhanced error with feature name comparison
+        expected_names = set(extractor.get_feature_names())
+
+        # Try to get actual feature names from dataset
+        if mmap_meta_path:
+            # With mmaps, combine channel + non-channel names
+            actual_names = set(features_df.columns.tolist())  # Non-channel only
+            print(f"\n   ⚠️  Note: With mmaps, only showing non-channel feature names for comparison")
+        else:
+            actual_names = set(features_df.columns.tolist())
+
+        missing = expected_names - actual_names
+        extra = actual_names - expected_names
+
+        error_msg = f"\n❌ FATAL: Feature dimension mismatch!\n"
+        error_msg += f"   Model expects: {expected_dim} features\n"
+        error_msg += f"   Dataset returns: {actual_input_dim} features\n"
+        error_msg += f"   Difference: {abs(actual_input_dim - expected_dim)}\n\n"
+
+        if missing and len(missing) < 100:
+            error_msg += f"   Missing from dataset ({len(missing)} features):\n"
+            error_msg += f"      {sorted(list(missing))[:10]}...\n\n"
+        elif missing:
+            error_msg += f"   Missing from dataset: {len(missing)} features (too many to list)\n\n"
+
+        if extra and len(extra) < 100:
+            error_msg += f"   Extra in dataset ({len(extra)} features):\n"
+            error_msg += f"      {sorted(list(extra))[:10]}...\n\n"
+        elif extra:
+            error_msg += f"   Extra in dataset: {len(extra)} features (likely old cache)\n\n"
+
+        error_msg += f"   Likely cause: Using old v3.13 shards (12,474 features) vs new v3.17 code (14,322 features)\n"
+        error_msg += f"   Fix: Delete old shards OR bump FEATURE_VERSION caused regeneration"
+
+        raise RuntimeError(error_msg)
     print(f"   ✅ Dimension check passed: {actual_input_dim} features match expected {expected_dim}")
 
     # Create dataloaders
