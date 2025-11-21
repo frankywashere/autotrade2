@@ -326,14 +326,16 @@ class TradingFeatureExtractor(FeatureExtractor):
                 print(f"   ❌ Channel cache: Not found - will extract (~5-7 min)")
 
         # Check 2: Continuation labels (with mode-specific caching)
-        cont_cache_path = unified_cache_dir / f"continuation_labels_{cache_key}_{config.CONTINUATION_MODE}.pkl"
+        # v3.18: adaptive_labels and adaptive_full share cache (labels identical)
+        cache_mode_suffix = 'adaptive' if 'adaptive' in config.CONTINUATION_MODE else 'simple'
+        cont_cache_path = unified_cache_dir / f"continuation_labels_{cache_key}_{cache_mode_suffix}.pkl"
         cont_cache_valid = False
         if continuation and cont_cache_path.exists() and use_cache:
             try:
                 test_load = pd.read_pickle(cont_cache_path)
                 if len(test_load) > 0 and 'timestamp' in test_load.columns:
                     # Validate mode-specific fields
-                    if config.CONTINUATION_MODE == 'adaptive':
+                    if 'adaptive' in config.CONTINUATION_MODE:
                         if 'adaptive_horizon' not in test_load.columns:
                             print(f"   ⚠️  Continuation labels: Invalid for adaptive mode (missing adaptive_horizon)")
                             cont_cache_path.unlink()
@@ -2548,8 +2550,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         four_h_full = four_h_full.astype(config.NUMPY_DTYPE)
 
         # OPTIMIZATION 2: Pre-compute future price windows
-        if mode == 'adaptive':
-            max_horizon = config.ADAPTIVE_MAX_HORIZON  # 48 bars
+        if 'adaptive' in mode:  # Matches 'adaptive_labels' and 'adaptive_full'
+            max_horizon = config.ADAPTIVE_MAX_HORIZON
             print(f"   Pre-computing future price windows (adaptive mode, max={max_horizon} bars)...")
         else:
             max_horizon = prediction_horizon  # 24 bars default
@@ -2686,7 +2688,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                     score -= 1
 
                 # Calculate adaptive horizon if in adaptive mode
-                if mode == 'adaptive':
+                if 'adaptive' in mode:  # Matches 'adaptive_labels' and 'adaptive_full'
                     # Calculate confidence components (using configured dtype)
                     rsi_conf_1h = np.array(1.0 - abs(rsi_1h - 50) / 50, dtype=config.NUMPY_DTYPE)
                     rsi_conf_4h = np.array(1.0 - abs(rsi_4h - 50) / 50, dtype=config.NUMPY_DTYPE)
@@ -2750,7 +2752,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                         label = f"ranges {actual_duration_hours:.1f}h, {max_gain:.1f}%"
 
                     # Force short horizon and low confidence for breaks
-                    if mode == 'adaptive':
+                    if 'adaptive' in mode:  # Matches 'adaptive_labels' and 'adaptive_full'
                         adaptive_horizon = config.ADAPTIVE_MIN_HORIZON  # 24 bars (short)
                         conf_score = 0.0  # Low confidence
                 else:
