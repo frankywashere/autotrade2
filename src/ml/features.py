@@ -6,7 +6,7 @@ Leverages existing Stage 1 components (channels, RSI) plus new features
 import pandas as pd
 import numpy as np
 import torch
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import sys
 import os
