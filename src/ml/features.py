@@ -928,6 +928,124 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         return result_df
 
+    def _extract_monthly_3month_features(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """
+        Extract monthly/3month features on FULL dataset (v3.18 - Hybrid processing).
+
+        These timeframes are too long for per-chunk processing (18 months → only 18 monthly bars).
+        But they're tiny in memory (~500 KB for 10 years), so process on full dataset once.
+
+        Memory: 108 monthly × 31 metrics × 21 windows × 2 symbols = ~141K values = 565 KB
+
+        Returns:
+            DataFrame with monthly/3month channel features, or None if insufficient data
+        """
+        if len(df) < 365 * 390:  # Less than 1 year of 1-min data
+            print("   ⚠️  Insufficient data for monthly/3month features (need 1+ year)")
+            return None
+
+        print("\n   📊 Pre-processing monthly/3month on full dataset (hybrid mode)...")
+
+        long_timeframes = {'monthly': '1ME', '3month': '3ME'}
+        all_features = {}
+
+        # Same metrics as regular channels
+        metrics = [
+            'position', 'upper_dist', 'lower_dist',
+            'close_slope', 'high_slope', 'low_slope',
+            'close_slope_pct', 'high_slope_pct', 'low_slope_pct',
+            'close_r_squared', 'high_r_squared', 'low_r_squared', 'r_squared_avg',
+            'channel_width_pct', 'slope_convergence', 'stability',
+            'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
+            'complete_cycles', 'complete_cycles_0_5pct', 'complete_cycles_1_0pct', 'complete_cycles_3_0pct',
+            'is_bull', 'is_bear', 'is_sideways',
+            'quality_score', 'is_valid', 'insufficient_data', 'duration'
+        ]
+
+        for symbol in ['tsla', 'spy']:
+            for tf_name, tf_rule in long_timeframes.items():
+                # Extract symbol data
+                symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
+                symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
+
+                # Resample to target timeframe
+                resampled = symbol_df.resample(tf_rule).agg({
+                    'open': 'first', 'high': 'max', 'low': 'min',
+                    'close': 'last', 'volume': 'sum'
+                }).dropna()
+
+                print(f"     {symbol}_{tf_name}: {len(resampled)} bars (full dataset, memory: ~{len(resampled) * 31 * 21 * 4 / 1e3:.0f} KB)")
+
+                if len(resampled) < 10:
+                    print(f"       ⚠️  Very few bars ({len(resampled)}), channels will have low quality")
+
+                # Calculate multi-window rolling channels
+                all_windows = self.channel_calc.calculate_multi_window_rolling(resampled, tf_name)
+
+                # Map to original 1-min timestamps (broadcast each TF bar to all 1-min bars it spans)
+                for window, channels_list in all_windows.items():
+                    w_prefix = f'{symbol}_channel_{tf_name}_w{window}'
+
+                    # Initialize arrays
+                    for metric in metrics:
+                        all_features[f'{w_prefix}_{metric}'] = np.zeros(len(df), dtype=config.NUMPY_DTYPE)
+
+                    # Broadcast to 1-min bars
+                    for i, channel in enumerate(channels_list):
+                        if channel is None:
+                            continue
+
+                        timestamp = resampled.index[i]
+                        if i < len(resampled) - 1:
+                            next_timestamp = resampled.index[i + 1]
+                            mask = (df.index >= timestamp) & (df.index < next_timestamp)
+                        else:
+                            mask = df.index >= timestamp
+
+                        indices = np.where(mask)[0]
+                        current_price = resampled['close'].iloc[i]
+                        position_data = self.channel_calc.get_channel_position(current_price, channel)
+
+                        # Assign all metrics (matching regular extraction)
+                        all_features[f'{w_prefix}_position'][indices] = position_data['position']
+                        all_features[f'{w_prefix}_upper_dist'][indices] = position_data['distance_to_upper_pct']
+                        all_features[f'{w_prefix}_lower_dist'][indices] = position_data['distance_to_lower_pct']
+                        all_features[f'{w_prefix}_close_slope'][indices] = channel.close_slope
+                        all_features[f'{w_prefix}_high_slope'][indices] = channel.high_slope
+                        all_features[f'{w_prefix}_low_slope'][indices] = channel.low_slope
+                        slope_pct = (channel.close_slope / current_price) * 100 if current_price > 0 else 0.0
+                        all_features[f'{w_prefix}_close_slope_pct'][indices] = slope_pct
+                        high_slope_pct = (channel.high_slope / current_price) * 100 if current_price > 0 else 0.0
+                        all_features[f'{w_prefix}_high_slope_pct'][indices] = high_slope_pct
+                        low_slope_pct = (channel.low_slope / current_price) * 100 if current_price > 0 else 0.0
+                        all_features[f'{w_prefix}_low_slope_pct'][indices] = low_slope_pct
+                        all_features[f'{w_prefix}_close_r_squared'][indices] = channel.close_r_squared
+                        all_features[f'{w_prefix}_high_r_squared'][indices] = channel.high_r_squared
+                        all_features[f'{w_prefix}_low_r_squared'][indices] = channel.low_r_squared
+                        all_features[f'{w_prefix}_r_squared_avg'][indices] = channel.r_squared
+                        all_features[f'{w_prefix}_channel_width_pct'][indices] = channel.channel_width_pct
+                        all_features[f'{w_prefix}_slope_convergence'][indices] = channel.slope_convergence
+                        all_features[f'{w_prefix}_stability'][indices] = channel.stability_score
+                        all_features[f'{w_prefix}_ping_pongs'][indices] = channel.ping_pongs
+                        all_features[f'{w_prefix}_ping_pongs_0_5pct'][indices] = channel.ping_pongs_0_5pct
+                        all_features[f'{w_prefix}_ping_pongs_1_0pct'][indices] = channel.ping_pongs_1_0pct
+                        all_features[f'{w_prefix}_ping_pongs_3_0pct'][indices] = channel.ping_pongs_3_0pct
+                        all_features[f'{w_prefix}_complete_cycles'][indices] = channel.complete_cycles
+                        all_features[f'{w_prefix}_complete_cycles_0_5pct'][indices] = channel.complete_cycles_0_5pct
+                        all_features[f'{w_prefix}_complete_cycles_1_0pct'][indices] = channel.complete_cycles_1_0pct
+                        all_features[f'{w_prefix}_complete_cycles_3_0pct'][indices] = channel.complete_cycles_3_0pct
+                        all_features[f'{w_prefix}_is_bull'][indices] = float(slope_pct > 0.1)
+                        all_features[f'{w_prefix}_is_bear'][indices] = float(slope_pct < -0.1)
+                        all_features[f'{w_prefix}_is_sideways'][indices] = float(abs(slope_pct) <= 0.1)
+                        all_features[f'{w_prefix}_quality_score'][indices] = channel.quality_score
+                        all_features[f'{w_prefix}_is_valid'][indices] = channel.is_valid
+                        all_features[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
+                        all_features[f'{w_prefix}_duration'][indices] = channel.actual_duration
+
+        print(f"   ✓ Monthly/3month features: {len(all_features)} columns, memory: {sum(f.nbytes for f in all_features.values()) / 1e6:.1f} MB")
+
+        return pd.DataFrame(all_features, index=df.index)
+
     def _extract_channel_features_chunked(
         self,
         df: pd.DataFrame,
