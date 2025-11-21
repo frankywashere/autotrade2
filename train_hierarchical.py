@@ -730,15 +730,55 @@ def interactive_setup(args):
         message="Continuation label mode:",
         choices=[
             Choice(value='simple', name='Simple - Fixed 24-bar horizon (fast, tested) ⭐ Default'),
-            Choice(value='adaptive', name='Adaptive - Variable 24-48 bar horizon based on confidence 🎯 NEW'),
+            Choice(value='adaptive', name='Adaptive - Variable 20-40 bar horizon based on confidence 🎯 NEW'),
         ],
         default='simple'
     ).execute()
 
     # Update config with continuation mode
     project_config.CONTINUATION_MODE = continuation_mode
+
     if continuation_mode == 'adaptive':
-        print(f"   → Using adaptive horizons: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars ({project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} minutes at 1-min resolution)")
+        print()
+        print(f"   Current adaptive horizon range: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars")
+
+        # Ask if user wants to customize the horizon range
+        customize_horizon = inquirer.confirm(
+            message="Customize adaptive horizon range?",
+            default=False
+        ).execute()
+
+        if customize_horizon:
+            # Get minimum horizon
+            min_horizon = int(inquirer.number(
+                message="Minimum horizon (bars):",
+                default=20,
+                min_allowed=10,
+                max_allowed=60,
+                validate=lambda x: x >= 10 and x <= 60
+            ).execute())
+
+            # Get maximum horizon (must be >= min_horizon)
+            max_horizon = int(inquirer.number(
+                message="Maximum horizon (bars):",
+                default=40,
+                min_allowed=min_horizon,
+                max_allowed=100,
+                validate=lambda x: x >= min_horizon and x <= 100
+            ).execute())
+
+            # Update config values in memory
+            project_config.ADAPTIVE_MIN_HORIZON = min_horizon
+            project_config.ADAPTIVE_MAX_HORIZON = max_horizon
+
+            print(f"   ✓ Updated adaptive horizons: {min_horizon}-{max_horizon} bars ({min_horizon}-{max_horizon} minutes)")
+
+            # Warn about cache invalidation if values differ from defaults
+            if min_horizon != 20 or max_horizon != 40:
+                print(f"   ⚠️  Non-default horizons will invalidate continuation label cache")
+        else:
+            print(f"   → Using default horizons: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars")
+
         print(f"   ℹ️  Horizon adjusts based on RSI/slope confidence")
     else:
         print(f"   → Using simple mode: fixed 24-bar horizon (24 minutes at 1-min resolution)")
