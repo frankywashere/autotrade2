@@ -284,7 +284,7 @@ class HierarchicalDataset(Dataset):
             # Use ACTUAL intraday extremes (not just closes)
             future_high_actual = np.max(future_ohlc[:, 1])  # Column 1 = high
             future_low_actual = np.min(future_ohlc[:, 2])   # Column 2 = low
-            future_prices = future_ohlc[:, 3]  # Column 3 = close (needed for other label calculations)
+            future_prices = future_ohlc[:, 3]  # Column 3 = close (needed for multi-task labels)
         else:
             # Fallback: Use min/max of close prices (old simplified method)
             if self.using_mmaps and self.non_channel_array is not None:
