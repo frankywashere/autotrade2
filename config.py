@@ -224,10 +224,11 @@ MIN_DATA_YEARS = 2.5
 # ======================================================================
 # CONTINUATION LABEL CONFIGURATION
 # ======================================================================
-CONTINUATION_MODE = 'simple'  # 'simple' or 'adaptive'
-# - simple: Fixed 24-bar horizon (default, fast, tested)
-# - adaptive: Variable 20-40 bar horizon based on RSI/slope confidence
+CONTINUATION_MODE = 'adaptive_labels'  # 'simple', 'adaptive_labels', 'adaptive_full'
+# - simple: Fixed 24-bar horizon for ALL targets (baseline)
+# - adaptive_labels: Fixed 24-bar for high/low, adaptive 20-40 for continuation (default)
+# - adaptive_full: Adaptive 20-40 for ALL targets including high/low (experimental)
 
-# Adaptive mode settings (only used when CONTINUATION_MODE = 'adaptive')
+# Adaptive mode settings (used when CONTINUATION_MODE contains 'adaptive')
 ADAPTIVE_MIN_HORIZON = 20  # Minimum prediction horizon (bars) - 20 minutes at 1-min resolution
 ADAPTIVE_MAX_HORIZON = 40  # Maximum prediction horizon (bars) - 40 minutes at 1-min resolution

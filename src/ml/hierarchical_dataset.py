@@ -276,7 +276,12 @@ class HierarchicalDataset(Dataset):
         else:
             current_price = self.features_array[seq_end - 1, self.close_idx]
 
-        # v3.17: Use actual OHLC high/low from raw_ohlc_array (not min/max of closes!)
+        # v3.18: Three adaptive modes:
+        # - simple: All targets over fixed 24 bars
+        # - adaptive_labels: high/low over 24, continuation over adaptive 20-40 (default)
+        # - adaptive_full: ALL targets over adaptive 20-40 (sliced below if enabled)
+
+        # Use actual OHLC high/low from raw_ohlc_array (not min/max of closes!)
         if self.raw_ohlc_array is not None:
             # Get future OHLC window [prediction_horizon, 4] where 4 = [open, high, low, close]
             future_ohlc = self.raw_ohlc_array[seq_end:seq_end + self.prediction_horizon]
@@ -294,6 +299,33 @@ class HierarchicalDataset(Dataset):
 
             future_high_actual = np.max(future_prices)
             future_low_actual = np.min(future_prices)
+
+        # v3.18: Adaptive Full mode - slice ALL targets to adaptive horizon
+        if config.CONTINUATION_MODE == 'adaptive_full' and self.include_continuation and self.continuation_labels_df is not None:
+            try:
+                # Get continuation label for this timestamp
+                ts = pd.Timestamp(self.timestamps[seq_end - 1])
+                cont_row = self.continuation_labels_df[self.continuation_labels_df['timestamp'] == ts]
+
+                if not cont_row.empty and 'adaptive_horizon' in cont_row.columns:
+                    adaptive_horizon = int(cont_row['adaptive_horizon'].iloc[0])
+
+                    # Slice to adaptive horizon (cap at available length)
+                    slice_len = min(adaptive_horizon, len(future_prices))
+
+                    if slice_len < len(future_prices):
+                        # Slice and recalculate ALL targets on adaptive window
+                        if self.raw_ohlc_array is not None:
+                            future_ohlc_sliced = future_ohlc[:slice_len]
+                            future_high_actual = np.max(future_ohlc_sliced[:, 1])
+                            future_low_actual = np.min(future_ohlc_sliced[:, 2])
+                            future_prices = future_ohlc_sliced[:, 3]
+                        else:
+                            future_prices = future_prices[:slice_len]
+                            future_high_actual = np.max(future_prices)
+                            future_low_actual = np.min(future_prices)
+            except:
+                pass  # Fall back to fixed horizon if any issues
 
         # Convert to percentage change
         target_high_pct = (future_high_actual - current_price) / current_price * 100.0
