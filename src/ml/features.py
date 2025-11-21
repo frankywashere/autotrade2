@@ -828,12 +828,23 @@ class TradingFeatureExtractor(FeatureExtractor):
                     refresh_per_second=10
                 )
                 calc_progress = progress_ctx.__enter__()
-                task_id = calc_progress.add_task("[cyan]Sequential channel extraction (GPU)", total=total_calcs)
+
+                # Create task for each TF (status board - shows sequential queue)
+                tf_tasks = {}
+                for sym in ['tsla', 'spy']:
+                    for tf in timeframes.keys():
+                        task_name = f"{sym}_{tf}"
+                        tf_tasks[task_name] = calc_progress.add_task(
+                            f"[dim]{task_name}",  # Dim initially (waiting)
+                            total=100,
+                            visible=True
+                        )
+
                 using_rich = True
             except:
                 # Fallback to tqdm
                 calc_progress = tqdm(total=total_calcs, desc="   Sequential multi-window channels", ncols=100, leave=False, ascii=True, mininterval=0.5)
-                task_id = None
+                tf_tasks = None
                 using_rich = False
                 progress_ctx = None
 
@@ -841,9 +852,15 @@ class TradingFeatureExtractor(FeatureExtractor):
 
             for symbol in ['tsla', 'spy']:
                 for tf_name, tf_rule in timeframes.items():
-                    # Update progress description if using RICH
-                    if using_rich:
-                        calc_progress.update(task_id, description=f"[cyan]{symbol}_{tf_name}")
+                    task_name = f"{symbol}_{tf_name}"
+
+                    # Update status: Mark current as active
+                    if using_rich and tf_tasks:
+                        calc_progress.update(
+                            tf_tasks[task_name],
+                            description=f"[cyan]⠹ {task_name}",
+                            completed=0
+                        )
                     # Get data
                     if is_live_mode:
                         if tf_name in ['5min', '15min', '30min']:
@@ -942,9 +959,13 @@ class TradingFeatureExtractor(FeatureExtractor):
                                 channel_features[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
                                 channel_features[f'{w_prefix}_duration'][indices] = channel.actual_duration
 
-                    # Update progress (RICH or tqdm)
-                    if using_rich:
-                        calc_progress.update(task_id, advance=1)
+                    # Update progress: Mark current as complete
+                    if using_rich and tf_tasks:
+                        calc_progress.update(
+                            tf_tasks[task_name],
+                            completed=100,
+                            description=f"[green]✓ {task_name}"
+                        )
                     else:
                         calc_progress.update(1)
 
