@@ -14,7 +14,6 @@ from tqdm import tqdm
 from joblib import Parallel, delayed
 import multiprocessing as mp
 import concurrent.futures
-from functools import lru_cache
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent.parent
@@ -55,7 +54,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         self.rsi_calc = RSICalculator()
         self.feature_names = []
         self._build_feature_names()
-        # v3.19: In-memory cache for continuation label channels (5-min buckets, 10-20× speedup)
+        # v3.19: Channel caching for continuation labels (10-20× speedup)
         self._channel_continuation_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
@@ -811,16 +810,12 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         else:
             # Sequential processing with multi-window (for GPU mode or live mode)
-            # v3.19: Dynamic progress description showing current timeframe
             calc_progress = tqdm(total=total_calcs, desc="   Sequential multi-window channels", ncols=100, leave=False, ascii=True, mininterval=0.5)
 
             channel_features = {}  # Initialize
 
             for symbol in ['tsla', 'spy']:
                 for tf_name, tf_rule in timeframes.items():
-                    # Update progress bar with current timeframe being processed
-                    calc_progress.set_description(f"   Processing {symbol}_{tf_name}")
-
                     # Get data
                     if is_live_mode:
                         if tf_name in ['5min', '15min', '30min']:
@@ -2491,30 +2486,26 @@ class TradingFeatureExtractor(FeatureExtractor):
         timeframe: str,
         max_lookback: int,
         timestamp: pd.Timestamp
-    ) -> Optional:
+    ):
         """
         Get channel with 5-minute bucket caching for continuation labels (v3.19).
 
-        Channels don't change significantly minute-to-minute. Cache per 5-min bucket
-        to avoid recalculating identical channels. Typical reuse: 5-10× per bucket.
-
-        Speedup: 10-20× overall (1-2 min → 5-10 seconds for label generation)
+        Channels don't change significantly minute-to-minute, so cache per 5-min bucket.
+        Typical reuse: 5-10 timestamps per bucket (10:00, 10:01, 10:02, 10:03, 10:04).
+        Expected speedup: 10-20× vs recalculating every timestamp.
 
         Args:
             ohlc_df: OHLC DataFrame for channel calculation
             timeframe: '1h' or '4h'
             max_lookback: Maximum bars to look back
-            timestamp: Current timestamp
+            timestamp: Current timestamp (for bucket key)
 
         Returns:
             ChannelData or None
         """
-        # Create cache key: 5-minute bucket
-        bucket_ts = timestamp - pd.Timedelta(
-            minutes=timestamp.minute % 5,
-            seconds=timestamp.second,
-            microseconds=timestamp.microsecond
-        )
+        # Create cache key: Round to 5-minute bucket
+        bucket_minutes = timestamp.minute - (timestamp.minute % 5)
+        bucket_ts = timestamp.replace(minute=bucket_minutes, second=0, microsecond=0)
         cache_key = (bucket_ts, timeframe, len(ohlc_df))
 
         # Check cache
@@ -2522,7 +2513,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             self._cache_hits += 1
             return self._channel_continuation_cache[cache_key]
 
-        # Cache miss - calculate
+        # Cache miss - calculate channel
         self._cache_misses += 1
 
         channel = self.channel_calc.find_best_channel_any_quality(
@@ -2531,9 +2522,9 @@ class TradingFeatureExtractor(FeatureExtractor):
             max_lookback=max_lookback
         )
 
-        # Store in cache (with size limit to prevent unbounded growth)
-        if len(self._channel_continuation_cache) >= 1000:
-            # Evict oldest entry (simple FIFO when full)
+        # Store in cache with simple size limit (LRU-style eviction)
+        if len(self._channel_continuation_cache) > 1000:
+            # Evict oldest entry (first in dict)
             oldest_key = next(iter(self._channel_continuation_cache))
             del self._channel_continuation_cache[oldest_key]
 
@@ -2711,7 +2702,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 rsi_1h = self.rsi_calc.get_rsi_data(one_h_ohlc).value or 50.0
                 rsi_4h = self.rsi_calc.get_rsi_data(four_h_ohlc).value or 50.0
 
-                # Fit channels - v3.19: Use cached channels (5-min buckets, 10-20× speedup!)
+                # Fit channels - v3.19: Cached channels (5-min buckets, 10-20× speedup)
                 # "Bad" channels signal that THIS timeframe is unreliable right now
                 # Model learns when to switch timeframes based on quality scores
                 channel_1h = self._get_channel_for_continuation_cached(
@@ -2922,15 +2913,16 @@ class TradingFeatureExtractor(FeatureExtractor):
         if debug:
             print(f"   Generated {len(labels)} labels out of {len(timestamps)} timestamps")
 
-        # v3.19: Display channel cache statistics
-        if self._cache_hits > 0 or self._cache_misses > 0:
-            total_lookups = self._cache_hits + self._cache_misses
-            hit_rate = (self._cache_hits / total_lookups * 100) if total_lookups > 0 else 0
-            speedup_estimate = total_lookups / self._cache_misses if self._cache_misses > 0 else 1.0
+        # v3.19: Log channel cache performance
+        if self._cache_hits + self._cache_misses > 0:
+            total = self._cache_hits + self._cache_misses
+            hit_rate = self._cache_hits / total * 100 if total > 0 else 0
+            speedup_estimate = total / self._cache_misses if self._cache_misses > 0 else 1.0
 
-            print(f"   📊 Channel cache performance:")
-            print(f"      Hits: {self._cache_hits:,} | Misses: {self._cache_misses:,} | Hit rate: {hit_rate:.1f}%")
-            print(f"      ⚡ Estimated speedup: {speedup_estimate:.1f}× vs no cache")
+            print(f"\n   📊 Channel Cache Performance:")
+            print(f"      Cache hits: {self._cache_hits:,} ({hit_rate:.1f}%)")
+            print(f"      Cache misses: {self._cache_misses:,}")
+            print(f"      Estimated speedup: {speedup_estimate:.1f}× vs no cache")
 
         return pd.DataFrame(labels)
 
