@@ -575,7 +575,7 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
     timeout_count = 0
     max_consecutive_timeouts = 10  # Allow more retries before giving up
     collection_start_time = time.time()
-    HARD_TIMEOUT_SECONDS = 360  # Maximum 6 minutes for entire collection
+    HARD_TIMEOUT_SECONDS = 10000  # Maximum ~2.8 hours for entire collection
 
     print(f"   ⏰ Starting collection with {HARD_TIMEOUT_SECONDS}s hard timeout...")
 
