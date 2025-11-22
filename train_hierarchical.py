@@ -659,6 +659,26 @@ def interactive_setup(args):
             # Less than 3 cores
             print(f"🚀 Parallel Processing: Not available (only {n_cores} cores detected)")
 
+    # Feature extraction parallel workers (only if using parallel)
+    if args.use_parallel:
+        print()
+        default_feature_workers = min(n_cores - 1, 8)
+
+        args.feature_workers = int(inquirer.number(
+            message=f"Feature extraction cores (0 = use all {n_cores}, default: {default_feature_workers}):",
+            default=default_feature_workers,
+            min_allowed=0,
+            max_allowed=128
+        ).execute())
+
+        if args.feature_workers == 0:
+            actual_cores = os.cpu_count()
+            print(f"   → Using ALL {actual_cores} CPU cores for feature extraction")
+            project_config.MAX_PARALLEL_WORKERS = actual_cores
+        else:
+            print(f"   → Using {args.feature_workers} cores for feature extraction")
+            project_config.MAX_PARALLEL_WORKERS = args.feature_workers
+
     # Chunked Feature Extraction option
     print()
 
@@ -721,23 +741,6 @@ def interactive_setup(args):
         # Cache will be loaded - chunking doesn't apply
         args.use_chunking = False
         args.shard_path = None
-
-    # Feature extraction parallel workers
-    print()
-    args.feature_workers = int(inquirer.number(
-        message="Feature extraction parallel cores (0 = use all, default: 8):",
-        default=8,
-        min_allowed=0,
-        max_allowed=128
-    ).execute())
-
-    if args.feature_workers == 0:
-        actual_cores = os.cpu_count()
-        print(f"   → Using ALL {actual_cores} CPU cores for feature extraction")
-        project_config.MAX_PARALLEL_WORKERS = actual_cores
-    else:
-        print(f"   → Using {args.feature_workers} cores for feature extraction")
-        project_config.MAX_PARALLEL_WORKERS = args.feature_workers
 
     # Precision selection
     print()
