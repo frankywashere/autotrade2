@@ -573,7 +573,7 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
 
     results_dict = {}
     timeout_count = 0
-    max_consecutive_timeouts = 10  # Allow more retries before giving up
+    max_consecutive_timeouts = 90  # Allow more retries before giving up
     collection_start_time = time.time()
     HARD_TIMEOUT_SECONDS = 10000  # Maximum ~2.8 hours for entire collection
 
@@ -657,7 +657,7 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
         if worker.is_alive():
             print(f"   ⏳ Worker {i} still running, terminating gracefully...", flush=True)
             worker.terminate()
-            worker.join(timeout=2)
+            worker.join(timeout=900)
             if worker.is_alive():
                 worker.kill()
         # Don't wait - just terminate and move on
