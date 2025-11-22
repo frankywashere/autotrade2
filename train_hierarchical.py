@@ -722,6 +722,23 @@ def interactive_setup(args):
         args.use_chunking = False
         args.shard_path = None
 
+    # Feature extraction parallel workers
+    print()
+    args.feature_workers = int(inquirer.number(
+        message="Feature extraction parallel cores (0 = use all, default: 8):",
+        default=8,
+        min_allowed=0,
+        max_allowed=128
+    ).execute())
+
+    if args.feature_workers == 0:
+        actual_cores = os.cpu_count()
+        print(f"   → Using ALL {actual_cores} CPU cores for feature extraction")
+        project_config.MAX_PARALLEL_WORKERS = actual_cores
+    else:
+        print(f"   → Using {args.feature_workers} cores for feature extraction")
+        project_config.MAX_PARALLEL_WORKERS = args.feature_workers
+
     # Precision selection
     print()
     precision_choice = inquirer.select(
