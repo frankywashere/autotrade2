@@ -764,6 +764,14 @@ def interactive_setup(args):
         project_config._TORCH_DTYPE = torch.float32  # Set lazy-loaded value
         print(f"   → Using float32 (standard precision, half memory)")
 
+    # Check MPS compatibility with precision
+    best_device = get_best_device()
+    if best_device == 'mps' and precision_choice == 'float64':
+        print()
+        print("⚠️  WARNING: MPS device doesn't support float64")
+        print("   Will automatically use float32 during training")
+        print("   (Actual switch happens when training starts)")
+
     # Continuation label mode selection
     print()
     continuation_mode = inquirer.select(
@@ -1075,6 +1083,15 @@ def main():
     elif args.device == 'mps' and not torch.backends.mps.is_available():
         print("⚠️ MPS not available, falling back to CPU")
         args.device = 'cpu'
+
+    # MPS compatibility check: MPS doesn't support float64
+    if args.device == 'mps' and config.TRAINING_PRECISION == 'float64':
+        print("⚠️  MPS device doesn't support float64 precision")
+        print("   Automatically using float32 instead")
+        config.TRAINING_PRECISION = 'float32'
+        config.NUMPY_DTYPE = np.float32
+        config._TORCH_DTYPE = torch.float32  # Reset cached value
+        print("   ✓ Switched to float32 for MPS compatibility")
 
     # Auto-set num_workers if not specified
     if args.num_workers is None:
