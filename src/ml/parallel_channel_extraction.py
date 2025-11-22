@@ -52,7 +52,7 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
         while True:
             try:
                 # Get next task
-                task = task_queue.get(timeout=0.5)
+                task = task_queue.get(timeout=900)
                 empty_count = 0  # Reset on successful get
             except:
                 # Timeout - check if queue is truly empty
@@ -482,7 +482,7 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
 
                 try:
                     # Get progress update (with timeout to update display)
-                    update = progress_queue.get(timeout=0.1)
+                    update = progress_queue.get(timeout=90)
 
                     if update['status'] == 'worker_done':
                         workers_done += 1

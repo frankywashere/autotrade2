@@ -436,10 +436,9 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Concat base features FIRST (skip channel_df if using mmap)
         if channel_df is None and hasattr(self, '_mmap_meta_path'):
             # Mmap mode - channel features will be loaded separately in dataset
-            # v3.18: Add monthly/3month if available (hybrid processing)
+            # v3.19: Monthly/3month now in separate shard (not in RAM concat)
             concat_list = [price_df, rsi_df, correlation_df, cycle_df, volume_df, time_df]
-            if monthly_3month_df is not None:
-                concat_list.append(monthly_3month_df)  # Add monthly/3month to non-channel features
+            # Monthly/3month removed - they're in monthly_3month_shard.npy, loaded as mmap
             base_features_df = pd.concat(concat_list, axis=1)
         else:
             # Normal mode - include channel features
@@ -1197,12 +1196,68 @@ class TradingFeatureExtractor(FeatureExtractor):
         print(f"     Chunk size: {chunk_size_years} year(s)")
         print(f"     Overlap: {config.CHUNK_OVERLAP_MONTHS} months")
 
-        # v3.18: Pre-process monthly/3month on full dataset (hybrid mode)
-        monthly_3month_features = self._extract_monthly_3month_features(
-            df,
-            use_cache=True,  # Cache these separately (small pickle file)
-            shard_storage_path=shard_storage_path
-        )
+        # v3.19: Pre-process monthly/3month on full dataset → SAVE TO SEPARATE SHARD (zero RAM!)
+        # This solves: 1) Insufficient data in chunks, 2) RAM explosion from DataFrame
+
+        # Use persistent directory (respects user's shard_storage_path choice)
+        if shard_storage_path:
+            monthly_shard_dir = Path(shard_storage_path) / "monthly_shards"
+        else:
+            monthly_shard_dir = Path('data/feature_cache') / "monthly_shards"
+        monthly_shard_dir.mkdir(exist_ok=True, parents=True)
+
+        # Use cache key for uniqueness + version for invalidation
+        if hasattr(self, '_cache_key'):
+            cache_suffix = self._cache_key
+        else:
+            cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}_h24"
+
+        monthly_shard_path = monthly_shard_dir / f"monthly_3month_shard_{cache_suffix}.npy"
+        monthly_shard_info = None
+
+        if monthly_shard_path.exists():
+            # Load existing shard
+            print(f"   📂 Loading cached monthly/3month shard: {monthly_shard_path.name}")
+            monthly_array = np.load(monthly_shard_path, mmap_mode='r')
+            monthly_shard_info = {
+                'path': str(monthly_shard_path.absolute()),  # ABSOLUTE path for downstream
+                'rows': monthly_array.shape[0],
+                'cols': monthly_array.shape[1],
+                'type': 'monthly_3month'
+            }
+            print(f"   ✓ Loaded monthly/3month: {monthly_array.shape[0]:,} rows × {monthly_array.shape[1]} cols")
+            del monthly_array  # Release mmap reference
+        else:
+            # Calculate and save to shard
+            print("\n   🔄 Calculating monthly/3month on full dataset (108 bars, high quality)...")
+            monthly_3month_features = self._extract_monthly_3month_features(
+                df,
+                use_cache=False,  # Don't pickle cache, we're sharding now
+                shard_storage_path=None  # Not using pickle cache anymore
+            )
+
+            if monthly_3month_features is not None and len(monthly_3month_features) > 0:
+                # Save to shard immediately
+                monthly_array = monthly_3month_features.values.astype(config.NUMPY_DTYPE)
+                np.save(monthly_shard_path, monthly_array)
+
+                monthly_shard_info = {
+                    'path': str(monthly_shard_path.absolute()),  # ABSOLUTE path
+                    'rows': len(monthly_array),
+                    'cols': monthly_array.shape[1],
+                    'type': 'monthly_3month'
+                }
+
+                print(f"   ✓ Saved monthly/3month shard: {monthly_array.shape} ({monthly_array.nbytes / 1e9:.2f} GB on disk)")
+
+                # CRITICAL: Free the 13-16 GB DataFrame immediately!
+                del monthly_3month_features
+                del monthly_array
+                import gc
+                gc.collect()
+                print(f"   ✓ Monthly/3month DataFrame freed from RAM")
+            else:
+                print(f"   ⚠️  No monthly/3month features generated")
 
         # Calculate chunk boundaries
         start_date = df.index[0]
@@ -1319,7 +1374,8 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         metadata = {
             'chunk_info': chunk_info,
-            'num_features': num_features,
+            'monthly_3month_shard': monthly_shard_info,  # v3.19: Separate shard for monthly/3month
+            'num_features': num_features + (monthly_shard_info['cols'] if monthly_shard_info else 0),
             'dtype': str(config.NUMPY_DTYPE),
             'total_rows': total_rows,
             'version': FEATURE_VERSION,
@@ -1340,11 +1396,11 @@ class TradingFeatureExtractor(FeatureExtractor):
         gc.collect()
 
         # Return metadata path instead of DataFrame (zero RAM spike!)
-        # v3.18: Also return monthly/3month features (processed on full dataset)
+        # v3.19: Monthly/3month now in separate shard (not in RAM!)
         return {
             'mmap_meta_path': str(meta_path),
             'type': 'mmap_sharded',
-            'monthly_3month_features': monthly_3month_features  # Hybrid processing
+            'monthly_3month_features': None  # Not in RAM - saved to separate shard
         }
 
     def _compute_channel_memory_efficient(self, args):

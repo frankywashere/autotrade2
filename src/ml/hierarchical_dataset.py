@@ -94,7 +94,20 @@ class HierarchicalDataset(Dataset):
                 all_timestamps.append(idx_array)
             self.timestamps = np.concatenate(all_timestamps)
 
-            # Load non-channel features normally (these are small - ~181 features)
+            # v3.19: Load monthly/3month separate shard if present
+            self.monthly_3month_mmap = None
+            if 'monthly_3month_shard' in meta and meta['monthly_3month_shard'] is not None:
+                monthly_shard_info = meta['monthly_3month_shard']
+                monthly_path = Path(monthly_shard_info['path'])
+
+                if monthly_path.exists():
+                    self.monthly_3month_mmap = np.load(str(monthly_path), mmap_mode='r')
+                    print(f"     ✓ Loaded monthly/3month shard: {self.monthly_3month_mmap.shape[0]:,} rows × {self.monthly_3month_mmap.shape[1]} cols")
+                else:
+                    print(f"     ⚠️  Monthly/3month shard not found: {monthly_path}")
+                    print(f"        Expected: {monthly_shard_info['cols']} features, will use zeros")
+
+            # Load non-channel features normally (these are small - ~165 base features)
             if features_df is not None:
                 self.non_channel_array = features_df.values.astype(config.NUMPY_DTYPE)
             else:
@@ -191,15 +204,18 @@ class HierarchicalDataset(Dataset):
         start_shard = bisect.bisect_right(self.channel_cumulative_rows, start) - 1
         end_shard = bisect.bisect_right(self.channel_cumulative_rows, end - 1) - 1
 
+        # v3.19: Calculate number of main channel features (excluding monthly if present)
+        main_channel_cols = self.num_channel_features - (self.monthly_3month_mmap.shape[1] if self.monthly_3month_mmap is not None else 0)
+
         if start_shard == end_shard:
             # Entire sequence in one shard (common case - fast, zero-copy!)
             local_start = start - self.channel_cumulative_rows[start_shard]
             local_end = end - self.channel_cumulative_rows[start_shard]
-            return self.channel_mmaps[start_shard][local_start:local_end]
+            main_result = self.channel_mmaps[start_shard][local_start:local_end]
         else:
             # Sequence spans multiple shards (rare - happens at shard boundaries)
             # Pre-allocate contiguous array instead of vstack (avoids extra copy)
-            result = np.empty((end - start, self.num_channel_features), dtype=self.channel_mmaps[0].dtype)
+            main_result = np.empty((end - start, main_channel_cols), dtype=self.channel_mmaps[0].dtype)
             pos = 0
 
             for shard_idx in range(start_shard, end_shard + 1):
@@ -210,10 +226,15 @@ class HierarchicalDataset(Dataset):
                 local_end = shard_end - self.channel_cumulative_rows[shard_idx]
 
                 length = local_end - local_start
-                result[pos:pos + length] = self.channel_mmaps[shard_idx][local_start:local_end]
+                main_result[pos:pos + length] = self.channel_mmaps[shard_idx][local_start:local_end]
                 pos += length
 
-            return result
+        # v3.19: Add monthly/3month shard if present (horizontal stack)
+        if self.monthly_3month_mmap is not None:
+            monthly_sequence = self.monthly_3month_mmap[start:end, :]
+            return np.hstack([main_result, monthly_sequence])
+        else:
+            return main_result
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
         """
