@@ -75,12 +75,12 @@ def get_best_device():
 
 
 def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
-    """Get recommended batch size for device (v3.16.2: Conservative for 12K+ features)."""
+    """Get recommended batch size for device (v3.19: Very conservative for MPS + 14K features)."""
     recommendations = {
-        'cuda': 64,   # NVIDIA GPU (reduced for 12K features)
-        'mps_high': 32,  # M2 Max/Ultra with 64+ GB (reduced)
-        'mps_mid': 16,   # M2 Pro/M1 Max with 32-64 GB (reduced)
-        'mps_low': 8,    # M1/M1 Pro with 16-32 GB (reduced for safety with 12,639 features)
+        'cuda': 64,   # NVIDIA GPU (reduced for 14K features)
+        'mps_high': 8,   # M2 Max/Ultra with 64+ GB (very conservative, num_workers=0 + from_numpy fix)
+        'mps_mid': 4,    # M2 Pro/M1 Max with 32-64 GB (4 is safer with memory efficiency fixes)
+        'mps_low': 2,    # M1/M1 Pro with 16-32 GB (very safe, only 2 samples per batch)
         'cpu': 16
     }
 
@@ -281,13 +281,17 @@ def train_epoch(
 
         optimizer.step()
 
+        # Immediate memory cleanup after gradient update (critical for MPS)
+        if device == 'mps':
+            torch.mps.empty_cache()
+
         total_loss += loss.item()
 
         # Update progress bar with current loss
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
         # Memory cleanup to prevent accumulation
-        if batch_idx % 5 == 0:  # Every 5 batches (more aggressive for low memory)
+        if batch_idx % 1 == 0:  # Every batch (critical for MPS memory efficiency with 14K features)
             # Clear model's cached hidden states
             model.clear_cached_states()
 
@@ -295,6 +299,9 @@ def train_epoch(
             del predictions, hidden_states
             if model.multi_task:
                 del mt
+
+            # Explicitly delete batch data
+            del x, targets_dict
 
             # Clear GPU/MPS cache
             if device == 'cuda':
@@ -456,7 +463,7 @@ def interactive_setup(args):
 
     # Data loading workers (RIGHT after device selection)
     print()
-    default_workers = {'cuda': 4, 'mps': 2, 'cpu': 2}.get(args.device, 2)
+    default_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device, 2)
 
     args.num_workers = int(inquirer.number(
         message=f"Data loading workers (CPU threads for batch prep, recommended: {default_workers}):",
@@ -923,7 +930,7 @@ def interactive_setup(args):
     args.batch_size = int(inquirer.number(
         message=f"Batch size (recommended: {recommended_batch}, max for {args.device.upper()}: {max_batch_size}):",
         default=recommended_batch,
-        min_allowed=8,
+        min_allowed=1,  # Allow very small batches for MPS (1-4 for memory constrained)
         max_allowed=max_batch_size
     ).execute())
 
@@ -1093,9 +1100,9 @@ def main():
         project_config._TORCH_DTYPE = torch.float32  # Reset cached value
         print("   ✓ Switched to float32 for MPS compatibility")
 
-    # Auto-set num_workers if not specified
+    # Auto-set num_workers if not specified (MPS needs 0 for memory efficiency)
     if args.num_workers is None:
-        args.num_workers = {'cuda': 4, 'mps': 2, 'cpu': 2}.get(args.device, 2)
+        args.num_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device, 2)
 
     # Override parallel worker count for feature extraction if specified
     if args.feature_workers is not None:
@@ -1371,7 +1378,8 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=(args.device == 'cuda')
+        pin_memory=(args.device == 'cuda'),
+        persistent_workers=(args.num_workers > 0)  # Prevent worker respawn overhead
     )
 
     val_loader = None
@@ -1381,7 +1389,8 @@ def main():
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            pin_memory=(args.device == 'cuda')
+            pin_memory=(args.device == 'cuda'),
+            persistent_workers=(args.num_workers > 0)  # Prevent worker respawn overhead
         )
 
     # Create model
