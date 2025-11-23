@@ -58,6 +58,7 @@ class ChannelLoader:
         self.channel_mmaps = []
         self.timestamps_mmaps = []
         self.cumulative_rows = [0]
+        self.monthly_mmap = None
 
         for chunk_info in self.meta['chunk_info']:
             # Load channel features
@@ -70,6 +71,16 @@ class ChannelLoader:
 
             # Track cumulative rows
             self.cumulative_rows.append(self.cumulative_rows[-1] + chunk_info['rows'])
+
+        # Load monthly/3month shard if present
+        if 'monthly_3month_shard' in self.meta and self.meta['monthly_3month_shard']:
+            m_info = self.meta['monthly_3month_shard']
+            m_path = Path(m_info['path'])
+            if m_path.exists():
+                self.monthly_mmap = np.load(str(m_path), mmap_mode='r')
+                print(f"  ✓ Loaded monthly/3month shard: {self.monthly_mmap.shape[0]:,} rows × {self.monthly_mmap.shape[1]} cols")
+            else:
+                print(f"  ⚠️ Monthly/3month shard missing at {m_path}")
 
         # Concatenate all timestamps
         self.all_timestamps = np.concatenate(self.timestamps_mmaps)
@@ -87,16 +98,22 @@ class ChannelLoader:
         extractor = TradingFeatureExtractor()
         all_feature_names = extractor.get_feature_names()
 
-        # Channel features only (first 8,778 in v3.17)
-        self.channel_feature_names = [
-            name for name in all_feature_names
-            if '_channel_' in name
-        ]
+        # Channel features only
+        channel_feature_names = [name for name in all_feature_names if '_channel_' in name]
 
-        # Create lookup dict
-        self.feature_to_idx = {name: idx for idx, name in enumerate(self.channel_feature_names)}
+        # Split main vs monthly/3month for hybrid shards
+        def is_monthly(name: str) -> bool:
+            return '_channel_monthly_' in name or '_channel_3month_' in name
 
-        print(f"✓ Indexed {len(self.channel_feature_names)} channel features")
+        self.main_channel_features = [n for n in channel_feature_names if not is_monthly(n)]
+        self.monthly_channel_features = [n for n in channel_feature_names if is_monthly(n)]
+
+        self.main_feature_to_idx = {name: idx for idx, name in enumerate(self.main_channel_features)}
+        self.monthly_feature_to_idx = {name: idx for idx, name in enumerate(self.monthly_channel_features)}
+
+        print(f"✓ Indexed {len(self.main_channel_features)} main channel features")
+        if self.monthly_channel_features:
+            print(f"✓ Indexed {len(self.monthly_channel_features)} monthly/3month features")
 
     def _find_timestamp_index(self, timestamp: pd.Timestamp) -> Optional[int]:
         """Find index of timestamp in mmap."""
@@ -150,21 +167,33 @@ class ChannelLoader:
         # Extract all metrics for this channel
         prefix = f'{symbol}_channel_{timeframe}'
         metrics = [
-            'position', 'upper_dist', 'lower_dist', 'slope', 'slope_pct', 'stability',
+            'position', 'upper_dist', 'lower_dist',
+            'close_slope', 'high_slope', 'low_slope',
+            'close_slope_pct', 'high_slope_pct', 'low_slope_pct',
+            'close_r_squared', 'high_r_squared', 'low_r_squared', 'r_squared_avg',
+            'channel_width_pct', 'slope_convergence', 'stability',
             'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
             'complete_cycles', 'complete_cycles_0_5pct', 'complete_cycles_1_0pct', 'complete_cycles_3_0pct',
-            'r_squared', 'is_bull', 'is_bear', 'is_sideways', 'duration',
-            'quality_score', 'is_valid'
+            'is_bull', 'is_bear', 'is_sideways',
+            'quality_score', 'is_valid', 'insufficient_data',
+            'duration'
         ]
 
         result = {'timestamp': timestamp, 'symbol': symbol, 'timeframe': timeframe, 'window': window}
 
+        # Select which mmap to use (monthly/3month vs main)
+        if timeframe in ['monthly', '3month'] and self.monthly_mmap is not None:
+            feature_map = self.monthly_feature_to_idx
+            shard_array = self.monthly_mmap
+        else:
+            feature_map = self.main_feature_to_idx
+            shard_array = self.channel_mmaps[shard_idx]
+
         for metric in metrics:
             feature_name = f'{prefix}_{metric}_w{window}'
-
-            if feature_name in self.feature_to_idx:
-                col_idx = self.feature_to_idx[feature_name]
-                value = self.channel_mmaps[shard_idx][local_idx, col_idx]
+            if feature_name in feature_map:
+                col_idx = feature_map[feature_name]
+                value = shard_array[local_idx, col_idx]
                 result[metric] = float(value)
 
         return result
