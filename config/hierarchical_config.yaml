@@ -54,6 +54,16 @@ loss_weights:
   expected_return: 0.3                # Direct return prediction
   overshoot: 0.3                      # How far price overshoots band
 
+  # Continuation prediction tasks (adaptive horizon)
+  continuation_duration: 0.5          # How long does the continuation last?
+  continuation_gain: 0.5              # Expected gain from continuation
+  continuation_confidence: 0.3        # Confidence in continuation prediction
+
+  # Adaptive prediction tasks (v3.18+)
+  price_change_pct: 0.4               # Price change percentage
+  horizon_bars_log: 0.3               # Log of adaptive prediction horizon
+  adaptive_confidence: 0.2             # Confidence in adaptive horizon
+
 # ===== TRADE VALIDATION =====
 validation:
   # Band tolerance for hit_band label
