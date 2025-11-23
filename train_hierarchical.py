@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
 from pathlib import Path
 import sys
 import os
@@ -95,6 +96,39 @@ def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
     return recommendations.get(device, 16)
 
 
+def hierarchical_collate(batch):
+    """
+    Custom collate to concatenate channels/non-channels once per batch (cuts per-sample copies).
+    """
+    channels = []
+    non_channels = []
+    targets = []
+    has_non_channel = False
+
+    for data, tgt in batch:
+        if isinstance(data, tuple) and len(data) == 2:
+            ch, nc = data
+        else:
+            ch, nc = data, None
+
+        channels.append(torch.from_numpy(ch))
+        if nc is not None:
+            non_channels.append(torch.from_numpy(nc))
+            has_non_channel = True
+        targets.append(tgt)
+
+    channel_batch = torch.stack(channels, dim=0)
+
+    if has_non_channel:
+        non_channel_batch = torch.stack(non_channels, dim=0)
+        x = torch.cat([channel_batch, non_channel_batch], dim=-1)
+    else:
+        x = channel_batch
+
+    targets_batch = default_collate(targets)
+    return x, targets_batch
+
+
 def train_epoch(
     model: HierarchicalLNN,
     dataloader: DataLoader,
@@ -145,29 +179,29 @@ def train_epoch(
 
     for batch_idx, (x, targets_dict) in enumerate(pbar):
         # Move to device
-        x = x.to(device)
+        x = x.to(device, non_blocking=True)
 
         # Move all targets to device
-        target_high = targets_dict['high'].to(device)
-        target_low = targets_dict['low'].to(device)
+        target_high = targets_dict['high'].to(device, non_blocking=True)
+        target_low = targets_dict['low'].to(device, non_blocking=True)
 
         if model.multi_task:
-            target_hit_band = targets_dict['hit_band'].to(device)
-            target_hit_target = targets_dict['hit_target'].to(device)
-            target_expected_return = targets_dict['expected_return'].to(device)
-            target_overshoot = targets_dict['overshoot'].to(device)
-            target_continuation_duration = targets_dict['continuation_duration'].to(device)
-            target_continuation_gain = targets_dict['continuation_gain'].to(device)
-            target_continuation_confidence = targets_dict['continuation_confidence'].to(device)
-            target_price_change_pct = targets_dict['price_change_pct'].to(device)
-            target_horizon_bars_log = targets_dict['horizon_bars_log'].to(device)
-            target_adaptive_confidence = targets_dict['adaptive_confidence'].to(device)
+            target_hit_band = targets_dict['hit_band'].to(device, non_blocking=True)
+            target_hit_target = targets_dict['hit_target'].to(device, non_blocking=True)
+            target_expected_return = targets_dict['expected_return'].to(device, non_blocking=True)
+            target_overshoot = targets_dict['overshoot'].to(device, non_blocking=True)
+            target_continuation_duration = targets_dict['continuation_duration'].to(device, non_blocking=True)
+            target_continuation_gain = targets_dict['continuation_gain'].to(device, non_blocking=True)
+            target_continuation_confidence = targets_dict['continuation_confidence'].to(device, non_blocking=True)
+            target_price_change_pct = targets_dict['price_change_pct'].to(device, non_blocking=True)
+            target_horizon_bars_log = targets_dict['horizon_bars_log'].to(device, non_blocking=True)
+            target_adaptive_confidence = targets_dict['adaptive_confidence'].to(device, non_blocking=True)
 
             # Adaptive mode targets (only exist when using adaptive continuation mode)
             if 'adaptive_horizon' in targets_dict:
-                target_adaptive_horizon = targets_dict['adaptive_horizon'].to(device)
+                target_adaptive_horizon = targets_dict['adaptive_horizon'].to(device, non_blocking=True)
             if 'conf_score' in targets_dict:
-                target_conf_score = targets_dict['conf_score'].to(device)
+                target_conf_score = targets_dict['conf_score'].to(device, non_blocking=True)
 
         # Forward pass
         predictions, hidden_states = model.forward(x)
@@ -1331,7 +1365,11 @@ def main():
     # Verify feature dimension matches between extractor and dataset
     print("\n   🔍 Verifying feature dimensions...")
     sample_x, sample_y = train_dataset[0]
-    actual_input_dim = sample_x.shape[-1]
+    if isinstance(sample_x, tuple) and len(sample_x) == 2:
+        ch, nc = sample_x
+        actual_input_dim = ch.shape[-1] + (nc.shape[-1] if nc is not None else 0)
+    else:
+        actual_input_dim = sample_x.shape[-1]
     expected_dim = extractor.get_feature_dim()
 
     if actual_input_dim != expected_dim:
@@ -1372,26 +1410,44 @@ def main():
         raise RuntimeError(error_msg)
     print(f"   ✅ Dimension check passed: {actual_input_dim} features match expected {expected_dim}")
 
+    # DataLoader tuning (MPS-friendly defaults)
+    prefetch_factor = 2 if args.num_workers and args.num_workers > 0 else None
+    mp_context = 'forkserver' if platform.system() == 'Darwin' and args.num_workers and args.num_workers > 0 else None
+
     # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
+    train_loader_kwargs = dict(
+        dataset=train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(args.device == 'cuda'),
-        persistent_workers=(args.num_workers > 0)  # Prevent worker respawn overhead
+        persistent_workers=(args.num_workers > 0),  # Prevent worker respawn overhead
+        collate_fn=hierarchical_collate
     )
+    if prefetch_factor is not None:
+        train_loader_kwargs['prefetch_factor'] = prefetch_factor
+    if mp_context is not None:
+        train_loader_kwargs['multiprocessing_context'] = mp_context
+
+    train_loader = DataLoader(**train_loader_kwargs)
 
     val_loader = None
     if val_dataset:
-        val_loader = DataLoader(
-            val_dataset,
+        val_loader_kwargs = dict(
+            dataset=val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             pin_memory=(args.device == 'cuda'),
-            persistent_workers=(args.num_workers > 0)  # Prevent worker respawn overhead
+            persistent_workers=(args.num_workers > 0),  # Prevent worker respawn overhead
+            collate_fn=hierarchical_collate
         )
+        if prefetch_factor is not None:
+            val_loader_kwargs['prefetch_factor'] = prefetch_factor
+        if mp_context is not None:
+            val_loader_kwargs['multiprocessing_context'] = mp_context
+
+        val_loader = DataLoader(**val_loader_kwargs)
 
     # Create model
     print("\n4. Creating HierarchicalLNN model...")

@@ -106,6 +106,7 @@ class HierarchicalDataset(Dataset):
             # Load channel feature shards as memory-maps
             self.channel_mmaps = []
             self.channel_cumulative_rows = [0]
+            self.premerged_channel_mmaps = None  # Optional: merged main + monthly for fast slicing
 
             for info in meta['chunk_info']:
                 mmap_array = np.load(info['path'], mmap_mode='r')
@@ -131,6 +132,8 @@ class HierarchicalDataset(Dataset):
                 else:
                     print(f"     ⚠️  Monthly/3month shard not found: {monthly_path}")
                     print(f"        Expected: {monthly_shard_info['cols']} features, will use zeros")
+            else:
+                self.premerged_channel_mmaps = None
 
             # Load non-channel features normally (these are small - ~165 base features)
             if features_df is not None:
@@ -143,6 +146,28 @@ class HierarchicalDataset(Dataset):
             print(f"     ✓ Loaded {len(self.channel_mmaps)} channel shards ({self.num_channel_features:,} features)")
             print(f"     ✓ Loaded {self.non_channel_array.shape[1] if self.non_channel_array is not None else 0} non-channel features")
             print(f"     ✓ Total rows: {meta['total_rows']:,}")
+
+            # Optional pre-merge of monthly/3month columns into channel shards (avoid per-sample hstack)
+            if self.monthly_3month_mmap is not None:
+                dtype = self.channel_mmaps[0].dtype
+                total_rows = meta['total_rows']
+                total_cols = self.channel_mmaps[0].shape[1] + self.monthly_3month_mmap.shape[1]
+                estimated_gb = total_rows * total_cols * np.dtype(dtype).itemsize / 1e9
+
+                # Guard against exploding RAM/disk for large datasets on laptops
+                premerge_limit_gb = 6.0  # conservative for 16 GB systems
+                if estimated_gb <= premerge_limit_gb:
+                    self.premerged_channel_mmaps = []
+                    print(f"     ↪︎ Pre-merging monthly/3month into channel shards (est ~{estimated_gb:.2f} GB in-memory)")
+                    for shard_idx, shard in enumerate(self.channel_mmaps):
+                        shard_start = self.channel_cumulative_rows[shard_idx]
+                        shard_end = self.channel_cumulative_rows[shard_idx + 1]
+                        monthly_slice = self.monthly_3month_mmap[shard_start:shard_end, :]
+                        merged = np.concatenate([shard, monthly_slice], axis=1)
+                        self.premerged_channel_mmaps.append(merged)
+                    print(f"     ✓ Pre-merge complete ({len(self.premerged_channel_mmaps)} merged shards)")
+                else:
+                    print(f"     ⚠️  Skipping pre-merge of monthly/3month (est {estimated_gb:.1f} GB > limit {premerge_limit_gb} GB)")
 
         else:
             # Normal path - load everything into RAM
@@ -163,6 +188,13 @@ class HierarchicalDataset(Dataset):
                 self.raw_ohlc_array = self.raw_ohlc_array.astype(expected_dtype)
         else:
             self.raw_ohlc_array = None
+
+        # Cached torch scalars to avoid per-sample tensor creation
+        self._torch_dtype = config.get_torch_dtype()
+        self._const_zero = torch.tensor(0.0, dtype=self._torch_dtype)
+        self._const_half = torch.tensor(0.5, dtype=self._torch_dtype)
+        self._const_one = torch.tensor(1.0, dtype=self._torch_dtype)
+        self._const_default_horizon = torch.tensor(24.0, dtype=self._torch_dtype)
 
         # Cache column indices (CRITICAL for performance)
         if cache_indices:
@@ -272,18 +304,24 @@ class HierarchicalDataset(Dataset):
         start_shard = bisect.bisect_right(self.channel_cumulative_rows, start) - 1
         end_shard = bisect.bisect_right(self.channel_cumulative_rows, end - 1) - 1
 
-        # v3.19: Calculate number of main channel features (excluding monthly if present)
-        main_channel_cols = self.num_channel_features - (self.monthly_3month_mmap.shape[1] if self.monthly_3month_mmap is not None else 0)
+        # Decide which shard source to use (pre-merged vs split main/monthly)
+        if self.premerged_channel_mmaps is not None:
+            shard_source = self.premerged_channel_mmaps
+            shard_cols = shard_source[0].shape[1]
+        else:
+            shard_source = self.channel_mmaps
+            # v3.19: Calculate number of main channel features (excluding monthly if present)
+            shard_cols = self.num_channel_features - (self.monthly_3month_mmap.shape[1] if self.monthly_3month_mmap is not None else 0)
 
         if start_shard == end_shard:
             # Entire sequence in one shard (common case - fast, zero-copy!)
             local_start = start - self.channel_cumulative_rows[start_shard]
             local_end = end - self.channel_cumulative_rows[start_shard]
-            main_result = self.channel_mmaps[start_shard][local_start:local_end]
+            main_result = shard_source[start_shard][local_start:local_end]
         else:
             # Sequence spans multiple shards (rare - happens at shard boundaries)
             # Pre-allocate contiguous array instead of vstack (avoids extra copy)
-            main_result = np.empty((end - start, main_channel_cols), dtype=self.channel_mmaps[0].dtype)
+            main_result = np.empty((end - start, shard_cols), dtype=shard_source[0].dtype)
             pos = 0
 
             for shard_idx in range(start_shard, end_shard + 1):
@@ -294,11 +332,11 @@ class HierarchicalDataset(Dataset):
                 local_end = shard_end - self.channel_cumulative_rows[shard_idx]
 
                 length = local_end - local_start
-                main_result[pos:pos + length] = self.channel_mmaps[shard_idx][local_start:local_end]
+                main_result[pos:pos + length] = shard_source[shard_idx][local_start:local_end]
                 pos += length
 
         # v3.19: Add monthly/3month shard if present (horizontal stack)
-        if self.monthly_3month_mmap is not None:
+        if self.monthly_3month_mmap is not None and self.premerged_channel_mmaps is None:
             monthly_sequence = self.monthly_3month_mmap[start:end, :]
             return np.hstack([main_result, monthly_sequence])
         else:
@@ -312,7 +350,7 @@ class HierarchicalDataset(Dataset):
             idx: Sample index
 
         Returns:
-            x: Input features [200, 299]
+            x: Tuple(channel_sequence, non_channel_sequence_or_None) each as np.ndarray [200, feat_dim]
             targets: Dict with:
                 - high: target_high % (regression)
                 - low: target_low % (regression)
@@ -336,27 +374,31 @@ class HierarchicalDataset(Dataset):
             # Get non-channel features (small, already in RAM)
             if self.non_channel_array is not None:
                 non_channel_sequence = self.non_channel_array[seq_start:seq_end, :]
-                # Concatenate: [200, 12936] + [200, ~181] = [200, ~13117]
-                x = np.concatenate([channel_sequence, non_channel_sequence], axis=1)
             else:
-                x = channel_sequence  # Only channels
+                non_channel_sequence = None  # Only channels
 
-            # Extract future window for target (also from shards)
-            future_start = seq_end
-            future_end = seq_end + self.prediction_horizon
-            channel_future = self._get_channel_sequence_from_shards(future_start, future_end)
+            future_window = None
+            if self.raw_ohlc_array is None:
+                # Only build future window when we don't have raw OHLC (fallback path)
+                future_start = seq_end
+                future_end = seq_end + self.prediction_horizon
+                channel_future = self._get_channel_sequence_from_shards(future_start, future_end)
 
-            if self.non_channel_array is not None:
-                non_channel_future = self.non_channel_array[future_start:future_end, :]
-                future_window = np.concatenate([channel_future, non_channel_future], axis=1)
-            else:
-                future_window = channel_future
+                if self.non_channel_array is not None:
+                    non_channel_future = self.non_channel_array[future_start:future_end, :]
+                    future_window = np.concatenate([channel_future, non_channel_future], axis=1)
+                else:
+                    future_window = channel_future
         else:
             # Normal path - single array
-            x = self.features_array[seq_start:seq_end, :]  # [200, 299]
-            future_start = seq_end
-            future_end = seq_end + self.prediction_horizon
-            future_window = self.features_array[future_start:future_end, :]
+            channel_sequence = self.features_array[seq_start:seq_end, :]  # [200, 299]
+            non_channel_sequence = None
+            if self.raw_ohlc_array is None:
+                future_start = seq_end
+                future_end = seq_end + self.prediction_horizon
+                future_window = self.features_array[future_start:future_end, :]
+            else:
+                future_window = None
 
         # Calculate target (percentage change from current price)
         if self.using_mmaps and self.non_channel_array is not None:
@@ -452,10 +494,6 @@ class HierarchicalDataset(Dataset):
         else:
             overshoot_label = 0.0
 
-        # Convert to tensors (dtype from config for precision flexibility)
-        # Use from_numpy for zero-copy conversion (vs torch.tensor which copies)
-        x_tensor = torch.from_numpy(x).to(dtype=config.get_torch_dtype())
-
         # Calculate adaptive targets
         actual_max_idx = future_prices.argmax()
         bars_to_peak = actual_max_idx  # Index directly represents bars into the future
@@ -472,12 +510,12 @@ class HierarchicalDataset(Dataset):
             'hit_target': torch.tensor(hit_target_label, dtype=config.get_torch_dtype()),
             'expected_return': torch.tensor(expected_return_label, dtype=config.get_torch_dtype()),
             'overshoot': torch.tensor(overshoot_label, dtype=config.get_torch_dtype()),
-            'continuation_duration': torch.tensor(0.0, dtype=config.get_torch_dtype()),  # Placeholder
-            'continuation_gain': torch.tensor(0.0, dtype=config.get_torch_dtype()),     # Placeholder
-            'continuation_confidence': torch.tensor(0.5, dtype=config.get_torch_dtype()), # Placeholder
+            'continuation_duration': self._const_zero,  # Placeholder
+            'continuation_gain': self._const_zero,      # Placeholder
+            'continuation_confidence': self._const_half, # Placeholder
             'price_change_pct': torch.tensor(adaptive_price_change, dtype=config.get_torch_dtype()),
             'horizon_bars_log': adaptive_horizon_log,
-            'adaptive_confidence': torch.tensor(adaptive_confidence, dtype=config.get_torch_dtype())
+            'adaptive_confidence': self._const_one if adaptive_confidence == 1.0 else self._const_half
         }
 
         # Add continuation prediction targets if enabled
@@ -540,55 +578,55 @@ class HierarchicalDataset(Dataset):
                             pass  # Can't calculate deltas, just continue
 
                     # Use fallback values
-                    targets['continuation_duration'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
-                    targets['continuation_gain'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
-                    targets['continuation_confidence'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
+                    targets['continuation_duration'] = self._const_zero
+                    targets['continuation_gain'] = self._const_zero
+                    targets['continuation_confidence'] = self._const_half
 
                     # Add fallback for all optional fields to maintain dict consistency
                     if self.has_adaptive_horizon:
-                        targets['adaptive_horizon'] = torch.tensor(24.0, dtype=config.get_torch_dtype())
+                        targets['adaptive_horizon'] = self._const_default_horizon
                     if self.has_conf_score:
-                        targets['conf_score'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
+                        targets['conf_score'] = self._const_half
                     if self.has_channel_1h_cycles:
-                        targets['channel_1h_cycles'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                        targets['channel_1h_cycles'] = self._const_zero
                     if self.has_channel_4h_cycles:
-                        targets['channel_4h_cycles'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                        targets['channel_4h_cycles'] = self._const_zero
                     if self.has_channel_1h_valid:
-                        targets['channel_1h_valid'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                        targets['channel_1h_valid'] = self._const_zero
                     if self.has_channel_4h_valid:
-                        targets['channel_4h_valid'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                        targets['channel_4h_valid'] = self._const_zero
                     if self.has_channel_1h_r_squared:
-                        targets['channel_1h_r_squared'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                        targets['channel_1h_r_squared'] = self._const_zero
                     if self.has_channel_4h_r_squared:
-                        targets['channel_4h_r_squared'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                        targets['channel_4h_r_squared'] = self._const_zero
 
             except Exception as e:
                 # Exception occurred - use fallback values
                 self._missing_label_count += 1
 
-                targets['continuation_duration'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
-                targets['continuation_gain'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
-                targets['continuation_confidence'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
+                targets['continuation_duration'] = self._const_zero
+                targets['continuation_gain'] = self._const_zero
+                targets['continuation_confidence'] = self._const_half
 
                 # Add fallback for all optional fields to maintain dict consistency
                 if self.has_adaptive_horizon:
-                    targets['adaptive_horizon'] = torch.tensor(24.0, dtype=config.get_torch_dtype())
+                    targets['adaptive_horizon'] = self._const_default_horizon
                 if self.has_conf_score:
-                    targets['conf_score'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
+                    targets['conf_score'] = self._const_half
                 if self.has_channel_1h_cycles:
-                    targets['channel_1h_cycles'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    targets['channel_1h_cycles'] = self._const_zero
                 if self.has_channel_4h_cycles:
-                    targets['channel_4h_cycles'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    targets['channel_4h_cycles'] = self._const_zero
                 if self.has_channel_1h_valid:
-                    targets['channel_1h_valid'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    targets['channel_1h_valid'] = self._const_zero
                 if self.has_channel_4h_valid:
-                    targets['channel_4h_valid'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    targets['channel_4h_valid'] = self._const_zero
                 if self.has_channel_1h_r_squared:
-                    targets['channel_1h_r_squared'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    targets['channel_1h_r_squared'] = self._const_zero
                 if self.has_channel_4h_r_squared:
-                    targets['channel_4h_r_squared'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    targets['channel_4h_r_squared'] = self._const_zero
 
-        return x_tensor, targets
+        return (channel_sequence, non_channel_sequence), targets
 
     def _check_target_sequence(
         self,
