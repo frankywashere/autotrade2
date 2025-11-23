@@ -462,7 +462,7 @@ class HierarchicalDataset(Dataset):
 
         # Simple adaptive targets (can be enhanced with channel bounds calculation)
         adaptive_price_change = target_high_pct if target_high_pct > abs(target_low_pct) else target_low_pct
-        adaptive_horizon_log = torch.log(torch.tensor(bars_to_peak / 24 + 1e-6))  # Normalized log
+        adaptive_horizon_log = torch.log(torch.tensor(bars_to_peak / 24 + 1e-6, dtype=config.get_torch_dtype()))  # Normalized log with proper dtype
         adaptive_confidence = 1.0 if bars_to_peak > 48 else 0.5  # Simple confidence
 
         targets = {
