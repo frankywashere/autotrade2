@@ -187,10 +187,10 @@ HISTORICAL_BUFFER_YEARS = 3    # Years of data to load before training start (in
 # ======================================================================
 # Numerical precision for training
 # - 'float64': Maximum precision (8 bytes), best for training, ~10% more memory
-# - 'float32': Standard precision (4 bytes), faster, uses half memory
+# - 'float32': Standard precision (4 bytes), faster, uses half memory, required for MPS
 #
-# Recommendation: Use float64 for training, quantize to int8/float16 for deployment
-TRAINING_PRECISION = 'float64'  # 'float64' or 'float32'
+# NOTE: MPS (Apple Silicon) requires float32. float64 unsupported on MPS devices.
+TRAINING_PRECISION = 'float32'  # 'float64' or 'float32' (MPS requires float32)
 
 # Derived dtypes (auto-set from TRAINING_PRECISION - don't modify directly)
 import numpy as np
