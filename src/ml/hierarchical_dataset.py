@@ -453,7 +453,8 @@ class HierarchicalDataset(Dataset):
             overshoot_label = 0.0
 
         # Convert to tensors (dtype from config for precision flexibility)
-        x_tensor = torch.tensor(x, dtype=config.get_torch_dtype())
+        # Use from_numpy for zero-copy conversion (vs torch.tensor which copies)
+        x_tensor = torch.from_numpy(x).to(dtype=config.get_torch_dtype())
 
         # Calculate adaptive targets
         actual_max_idx = future_prices.argmax()
