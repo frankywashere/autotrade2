@@ -423,6 +423,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 'adaptive_horizon': adaptive_horizon_pred,  # 0-1 range, will be scaled to 24-48
                 'adaptive_conf_score': adaptive_conf_score_pred,  # 0-1 confidence score
                 'price_change_pct': price_change_pct,
+                'horizon_bars_log': horizon_bars_log,
                 'horizon_bars': horizon_bars,
                 'adaptive_confidence': adaptive_confidence,
                 'dominant_layer': dominant_layer
