@@ -1085,12 +1085,12 @@ def main():
         args.device = 'cpu'
 
     # MPS compatibility check: MPS doesn't support float64
-    if args.device == 'mps' and config.TRAINING_PRECISION == 'float64':
+    if args.device == 'mps' and project_config.TRAINING_PRECISION == 'float64':
         print("⚠️  MPS device doesn't support float64 precision")
         print("   Automatically using float32 instead")
-        config.TRAINING_PRECISION = 'float32'
-        config.NUMPY_DTYPE = np.float32
-        config._TORCH_DTYPE = torch.float32  # Reset cached value
+        project_config.TRAINING_PRECISION = 'float32'
+        project_config.NUMPY_DTYPE = np.float32
+        project_config._TORCH_DTYPE = torch.float32  # Reset cached value
         print("   ✓ Switched to float32 for MPS compatibility")
 
     # Auto-set num_workers if not specified

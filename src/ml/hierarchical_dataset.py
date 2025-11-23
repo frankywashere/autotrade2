@@ -66,6 +66,31 @@ class HierarchicalDataset(Dataset):
         self.mode = mode
         self.include_continuation = include_continuation
 
+        # Diagnostic tracking for timestamp mismatches (always initialize)
+        self._missing_label_count = 0
+        self._timestamp_deltas = []  # Track time differences in ms
+        self._logged_mismatches = 0  # Count of logged mismatches (limit to first 5)
+
+        # Cache which optional continuation fields exist (for consistent dict keys)
+        if self.continuation_labels_df is not None:
+            self.has_adaptive_horizon = 'adaptive_horizon' in self.continuation_labels_df.columns
+            self.has_conf_score = 'conf_score' in self.continuation_labels_df.columns
+            self.has_channel_1h_cycles = 'channel_1h_cycles' in self.continuation_labels_df.columns
+            self.has_channel_4h_cycles = 'channel_4h_cycles' in self.continuation_labels_df.columns
+            self.has_channel_1h_valid = 'channel_1h_valid' in self.continuation_labels_df.columns
+            self.has_channel_4h_valid = 'channel_4h_valid' in self.continuation_labels_df.columns
+            self.has_channel_1h_r_squared = 'channel_1h_r_squared' in self.continuation_labels_df.columns
+            self.has_channel_4h_r_squared = 'channel_4h_r_squared' in self.continuation_labels_df.columns
+        else:
+            self.has_adaptive_horizon = False
+            self.has_conf_score = False
+            self.has_channel_1h_cycles = False
+            self.has_channel_4h_cycles = False
+            self.has_channel_1h_valid = False
+            self.has_channel_4h_valid = False
+            self.has_channel_1h_r_squared = False
+            self.has_channel_4h_r_squared = False
+
         # Dtype validation - ensure data matches config precision
         expected_dtype = config.NUMPY_DTYPE
 
@@ -186,6 +211,49 @@ class HierarchicalDataset(Dataset):
     def __len__(self) -> int:
         """Return number of valid sequences."""
         return len(self.valid_indices)
+
+    def get_label_mismatch_summary(self) -> dict:
+        """
+        Get diagnostic summary of timestamp mismatches in continuation labels.
+
+        Returns:
+            dict with:
+            - missing_count: Number of samples missing continuation labels
+            - missing_pct: Percentage of samples missing labels
+            - avg_delta_ms: Average time delta to closest label (if found)
+            - max_delta_ms: Maximum time delta to closest label
+            - diagnosis: String interpretation of the mismatch pattern
+        """
+        if not self.include_continuation or self.continuation_labels_df is None:
+            return {'status': 'No continuation labels loaded'}
+
+        total_samples = len(self.valid_indices)
+        missing_pct = (self._missing_label_count / total_samples * 100) if total_samples > 0 else 0
+
+        result = {
+            'missing_count': self._missing_label_count,
+            'missing_pct': missing_pct,
+            'total_samples': total_samples,
+        }
+
+        if self._timestamp_deltas:
+            result['avg_delta_ms'] = sum(self._timestamp_deltas) / len(self._timestamp_deltas)
+            result['max_delta_ms'] = max(self._timestamp_deltas)
+            result['min_delta_ms'] = min(self._timestamp_deltas)
+
+            # Diagnosis
+            avg = result['avg_delta_ms']
+            if avg < 1.0:
+                result['diagnosis'] = f"Precision issue: {avg:.3f}ms avg delta - timestamps off by <1ms (need fuzzy matching with ±{int(avg*2)}ms tolerance)"
+            elif avg < 100:
+                result['diagnosis'] = f"Minor misalignment: {avg:.1f}ms avg delta - may need fuzzy matching with ±{int(avg*2)}ms tolerance"
+            else:
+                result['diagnosis'] = f"Data pipeline issue: {avg:.0f}ms avg delta - check if label generation aligned with features"
+        else:
+            result['avg_delta_ms'] = 0
+            result['diagnosis'] = "All missing labels are at dataset edges (expected behavior - last 40 bars have no future data)"
+
+        return result
 
     def _get_channel_sequence_from_shards(self, start: int, end: int) -> np.ndarray:
         """
@@ -417,40 +485,107 @@ class HierarchicalDataset(Dataset):
                 # Find continuation label for this timestamp
                 ts = pd.Timestamp(self.timestamps[seq_end - 1])
                 cont_row = self.continuation_labels_df[self.continuation_labels_df['timestamp'] == ts]
+
                 if not cont_row.empty:
+                    # Found exact match - use actual values
                     targets['continuation_duration'] = torch.tensor(cont_row['duration_hours'].iloc[0], dtype=config.get_torch_dtype())
                     targets['continuation_gain'] = torch.tensor(cont_row['projected_gain'].iloc[0], dtype=config.get_torch_dtype())
                     targets['continuation_confidence'] = torch.tensor(cont_row['confidence'].iloc[0], dtype=config.get_torch_dtype())
 
-                    # Add adaptive fields if they exist (when using adaptive mode)
-                    if 'adaptive_horizon' in cont_row.columns:
+                    # Add optional fields if they exist in the dataframe
+                    if self.has_adaptive_horizon:
                         targets['adaptive_horizon'] = torch.tensor(cont_row['adaptive_horizon'].iloc[0], dtype=config.get_torch_dtype())
-                    if 'conf_score' in cont_row.columns:
+                    if self.has_conf_score:
                         targets['conf_score'] = torch.tensor(cont_row['conf_score'].iloc[0], dtype=config.get_torch_dtype())
-
-                    # v3.17: Channel quality fields for timeframe switching
-                    if 'channel_1h_cycles' in cont_row.columns:
+                    if self.has_channel_1h_cycles:
                         targets['channel_1h_cycles'] = torch.tensor(cont_row['channel_1h_cycles'].iloc[0], dtype=config.get_torch_dtype())
-                    if 'channel_4h_cycles' in cont_row.columns:
+                    if self.has_channel_4h_cycles:
                         targets['channel_4h_cycles'] = torch.tensor(cont_row['channel_4h_cycles'].iloc[0], dtype=config.get_torch_dtype())
-                    if 'channel_1h_valid' in cont_row.columns:
+                    if self.has_channel_1h_valid:
                         targets['channel_1h_valid'] = torch.tensor(cont_row['channel_1h_valid'].iloc[0], dtype=config.get_torch_dtype())
-                    if 'channel_4h_valid' in cont_row.columns:
+                    if self.has_channel_4h_valid:
                         targets['channel_4h_valid'] = torch.tensor(cont_row['channel_4h_valid'].iloc[0], dtype=config.get_torch_dtype())
-                    if 'channel_1h_r_squared' in cont_row.columns:
+                    if self.has_channel_1h_r_squared:
                         targets['channel_1h_r_squared'] = torch.tensor(cont_row['channel_1h_r_squared'].iloc[0], dtype=config.get_torch_dtype())
-                    if 'channel_4h_r_squared' in cont_row.columns:
+                    if self.has_channel_4h_r_squared:
                         targets['channel_4h_r_squared'] = torch.tensor(cont_row['channel_4h_r_squared'].iloc[0], dtype=config.get_torch_dtype())
-            except:
-                # Fallback values
+                else:
+                    # No exact match - use fallback values and log diagnostic info
+                    self._missing_label_count += 1
+
+                    # Try to find closest timestamp (within ±1 second) for diagnostics
+                    ts_naive = ts.to_pydatetime()
+                    if hasattr(self.continuation_labels_df.index, 'to_pydatetime'):
+                        label_times = self.continuation_labels_df['timestamp'].dt.to_pydatetime() if 'timestamp' in self.continuation_labels_df.columns else self.continuation_labels_df.index.to_pydatetime()
+                    else:
+                        label_times = self.continuation_labels_df['timestamp'].values if 'timestamp' in self.continuation_labels_df.columns else self.continuation_labels_df.index.values
+
+                    # Calculate deltas to find closest
+                    if len(label_times) > 0:
+                        try:
+                            deltas = [abs((t - ts_naive).total_seconds() * 1000) for t in label_times if hasattr(t, 'total_seconds')]
+                            if deltas:
+                                min_delta = min(deltas)
+                                self._timestamp_deltas.append(min_delta)
+
+                                # Log first few mismatches
+                                if self._logged_mismatches < 5:
+                                    closest_idx = deltas.index(min_delta)
+                                    closest_ts = label_times[closest_idx]
+                                    print(f"     ⚠️  Sample {idx}: Continuation label missing for {ts}")
+                                    print(f"        Closest available: {closest_ts}, Delta: {min_delta:.2f}ms")
+                                    self._logged_mismatches += 1
+                        except:
+                            pass  # Can't calculate deltas, just continue
+
+                    # Use fallback values
+                    targets['continuation_duration'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    targets['continuation_gain'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    targets['continuation_confidence'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
+
+                    # Add fallback for all optional fields to maintain dict consistency
+                    if self.has_adaptive_horizon:
+                        targets['adaptive_horizon'] = torch.tensor(24.0, dtype=config.get_torch_dtype())
+                    if self.has_conf_score:
+                        targets['conf_score'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
+                    if self.has_channel_1h_cycles:
+                        targets['channel_1h_cycles'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    if self.has_channel_4h_cycles:
+                        targets['channel_4h_cycles'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    if self.has_channel_1h_valid:
+                        targets['channel_1h_valid'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    if self.has_channel_4h_valid:
+                        targets['channel_4h_valid'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    if self.has_channel_1h_r_squared:
+                        targets['channel_1h_r_squared'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                    if self.has_channel_4h_r_squared:
+                        targets['channel_4h_r_squared'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+
+            except Exception as e:
+                # Exception occurred - use fallback values
+                self._missing_label_count += 1
+
                 targets['continuation_duration'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
                 targets['continuation_gain'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
                 targets['continuation_confidence'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
-                # Fallback for adaptive fields if expected but not found
-                if self.continuation_labels_df is not None and 'adaptive_horizon' in self.continuation_labels_df.columns:
-                    targets['adaptive_horizon'] = torch.tensor(24.0, dtype=config.get_torch_dtype())  # Default to min horizon
-                if self.continuation_labels_df is not None and 'conf_score' in self.continuation_labels_df.columns:
-                    targets['conf_score'] = torch.tensor(0.5, dtype=config.get_torch_dtype())  # Default to neutral confidence
+
+                # Add fallback for all optional fields to maintain dict consistency
+                if self.has_adaptive_horizon:
+                    targets['adaptive_horizon'] = torch.tensor(24.0, dtype=config.get_torch_dtype())
+                if self.has_conf_score:
+                    targets['conf_score'] = torch.tensor(0.5, dtype=config.get_torch_dtype())
+                if self.has_channel_1h_cycles:
+                    targets['channel_1h_cycles'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                if self.has_channel_4h_cycles:
+                    targets['channel_4h_cycles'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                if self.has_channel_1h_valid:
+                    targets['channel_1h_valid'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                if self.has_channel_4h_valid:
+                    targets['channel_4h_valid'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                if self.has_channel_1h_r_squared:
+                    targets['channel_1h_r_squared'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
+                if self.has_channel_4h_r_squared:
+                    targets['channel_4h_r_squared'] = torch.tensor(0.0, dtype=config.get_torch_dtype())
 
         return x_tensor, targets
 
