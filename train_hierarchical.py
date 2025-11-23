@@ -1003,15 +1003,34 @@ def interactive_setup(args):
     ).execute()
 
     # Summary
+    # Compose human-readable extras
+    parallel_workers = getattr(args, 'feature_workers', 'auto')
+    parallel_str = "Yes" if getattr(args, 'use_parallel', False) else "No"
+    if getattr(args, 'use_parallel', False):
+        parallel_str += f" (workers={parallel_workers})"
+
+    chunk_path = getattr(args, 'shard_path', None)
+    chunk_str = "Yes" if getattr(args, 'use_chunking', False) else "No"
+    if chunk_path:
+        chunk_str += f" → {chunk_path}"
+
     print("\n" + "=" * 70)
     print("📋 TRAINING CONFIGURATION SUMMARY")
     print("=" * 70)
-    print(f"  Device: {args.device.upper()}")
+    print(f"  Device: {args.device.upper()} (num_workers={args.num_workers})")
     print(f"  Training Period: {args.train_start_year}-{args.train_end_year}")
     print(f"  Epochs: {args.epochs}")
     print(f"  Batch Size: {args.batch_size}")
     print(f"  Learning Rate: {args.lr}")
     print(f"  Data Loading: {'Preload' if args.preload else 'Lazy'}")
+    print(f"  Cache: {'Regenerate' if getattr(args, 'regenerate_cache', True) else 'Use existing'}")
+    print(f"  Feature GPU: {'Yes' if getattr(args, 'use_gpu_features', False) else 'No'}")
+    print(f"  Parallel CPU: {parallel_str}")
+    print(f"  Chunking: {chunk_str}")
+    print(f"  Precision: {project_config.TRAINING_PRECISION}")
+    print(f"  Continuation Mode: {project_config.CONTINUATION_MODE} "
+          f"(horizon {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars)")
+    print(f"  Model Capacity: internal_ratio={args.internal_neurons_ratio}, hidden_size={args.hidden_size}")
     print(f"  Multi-Task: {'Enabled' if args.multi_task else 'Disabled'}")
     print(f"  Output: {args.output}")
     print("=" * 70)
