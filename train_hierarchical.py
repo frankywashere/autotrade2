@@ -787,7 +787,7 @@ def interactive_setup(args):
             message="Training data end year:",
             default=dflt('train_end_year', 2022),
             min_allowed=int(args.train_start_year),  # Explicit int conversion
-            max_allowed=2024
+            max_allowed=2100
         ).execute())
 
     # Validate and notify about warmup impact
