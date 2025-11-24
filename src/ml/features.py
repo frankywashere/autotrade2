@@ -15,6 +15,7 @@ from joblib import Parallel, delayed
 import multiprocessing as mp
 import concurrent.futures
 from collections import defaultdict
+import gc
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent.parent
