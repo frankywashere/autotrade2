@@ -301,6 +301,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         import json
         channel_cache_valid = False
         channel_cache_type = None
+        validated_meta_path = None
 
         # Check for sharded cache first (new method)
         mmap_meta_files = list(unified_cache_dir.glob(f"features_mmap_meta_{FEATURE_VERSION}_*.json"))
@@ -315,6 +316,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                     channel_cache_valid = True
                     channel_cache_type = 'mmap'
                     self._mmap_meta_path = str(meta_file)
+                    validated_meta_path = meta_file
                 else:
                     print(f"   ⚠️  Channel shards: Metadata found but shard files missing - will extract")
             except Exception as e:
@@ -383,6 +385,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         self._unified_cache_dir = unified_cache_dir
         self._cache_key = cache_key
         self._cont_cache_path = cont_cache_path if continuation else None
+        # Short-circuit channel extraction when mmap cache is valid and use_cache is True
+        skip_channel_calc = channel_cache_valid and use_cache and validated_meta_path is not None
 
         # PASS 1: Extract base features
         print("   Extracting base features...")
@@ -391,7 +395,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             pbar.update(1)
 
             # Chunked extraction logic
-            if use_chunking and not use_cache:
+            if use_chunking and not use_cache and not skip_channel_calc:
                 print(f"      Using chunked extraction ({chunk_size_years}-year chunks)")
                 chunk_result = self._extract_channel_features_chunked(
                     df,
@@ -406,7 +410,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 self._mmap_meta_path = chunk_result['mmap_meta_path']
                 monthly_3month_df = chunk_result.get('monthly_3month_features')  # Hybrid processing
                 channel_df = None  # Will be loaded as mmap in dataset
-            else:
+            elif not skip_channel_calc:
                 # Normal extraction (all at once) or load from cache
                 channel_df = self._extract_channel_features(
                     df,
@@ -416,6 +420,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                     cache_suffix=cache_suffix
                 )
                 monthly_3month_df = None  # Not using hybrid mode (all TFs processed together)
+            else:
+                # Skip channel calc entirely; rely on cached mmap
+                channel_df = None
+                monthly_3month_df = None
             pbar.update(1)
 
             rsi_df = self._extract_rsi_features(df, multi_res_data=multi_res_data)
