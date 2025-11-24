@@ -357,7 +357,8 @@ def train_epoch(
     criterion: nn.Module,
     device: str,
     epoch: int,
-    loss_weights: Dict = None
+    loss_weights: Dict = None,
+    scaler=None
 ) -> float:
     """
     Train for one epoch with multi-task loss.
@@ -370,6 +371,7 @@ def train_epoch(
         device: 'cuda' or 'cpu'
         epoch: Current epoch number
         loss_weights: Dict with task weights (from config)
+        scaler: Optional GradScaler for AMP (CUDA only)
 
     Returns:
         avg_loss: Average training loss
@@ -425,120 +427,231 @@ def train_epoch(
             if 'conf_score' in targets_dict:
                 target_conf_score = targets_dict['conf_score'].to(device, non_blocking=True)
 
-        # Forward pass
-        predictions, hidden_states = model.forward(x)
+        # Forward pass with optional AMP
+        use_amp = scaler is not None
 
-        # Primary loss (high/low regression)
-        pred_high = predictions[:, 0]
-        pred_low = predictions[:, 1]
+        # Use autocast for AMP, otherwise normal forward
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                predictions, hidden_states = model.forward(x)
 
-        loss_high = criterion(pred_high, target_high)
-        loss_low = criterion(pred_low, target_low)
+                # Primary loss (high/low regression)
+                pred_high = predictions[:, 0]
+                pred_low = predictions[:, 1]
 
-        # Weighted primary loss
-        loss = (loss_weights['high_prediction'] * loss_high +
-                loss_weights['low_prediction'] * loss_low)
+                loss_high = criterion(pred_high, target_high)
+                loss_low = criterion(pred_low, target_low)
 
-        # Multi-task losses
-        if model.multi_task and 'multi_task' in hidden_states:
-            mt = hidden_states['multi_task']
+                # Weighted primary loss
+                loss = (loss_weights['high_prediction'] * loss_high +
+                        loss_weights['low_prediction'] * loss_low)
 
-            # Hit band (binary classification)
-            loss_hit_band = F.binary_cross_entropy(
-                mt['hit_band'].squeeze(),
-                target_hit_band
-            )
-            loss += loss_weights['hit_band'] * loss_hit_band
+                # Multi-task losses
+                if model.multi_task and 'multi_task' in hidden_states:
+                    mt = hidden_states['multi_task']
 
-            # Hit target (binary classification)
-            loss_hit_target = F.binary_cross_entropy(
-                mt['hit_target'].squeeze(),
-                target_hit_target
-            )
-            loss += loss_weights['hit_target'] * loss_hit_target
+                    # Hit band (binary classification)
+                    loss_hit_band = F.binary_cross_entropy(
+                        mt['hit_band'].squeeze(),
+                        target_hit_band
+                    )
+                    loss += loss_weights['hit_band'] * loss_hit_band
 
-            # Expected return (regression)
-            loss_expected_return = criterion(
-                mt['expected_return'].squeeze(),
-                target_expected_return
-            )
-            loss += loss_weights['expected_return'] * loss_expected_return
+                    # Hit target (binary classification)
+                    loss_hit_target = F.binary_cross_entropy(
+                        mt['hit_target'].squeeze(),
+                        target_hit_target
+                    )
+                    loss += loss_weights['hit_target'] * loss_hit_target
 
-            # Overshoot (regression)
-            loss_overshoot = criterion(
-                mt['overshoot'].squeeze(),
-                target_overshoot
-            )
-            loss += loss_weights['overshoot'] * loss_overshoot
+                    # Expected return (regression)
+                    loss_expected_return = criterion(
+                        mt['expected_return'].squeeze(),
+                        target_expected_return
+                    )
+                    loss += loss_weights['expected_return'] * loss_expected_return
 
-            # Continuation duration (regression)
-            loss_continuation_duration = criterion(
-                mt['continuation_duration'].squeeze(),
-                target_continuation_duration
-            )
-            loss += loss_weights['continuation_duration'] * loss_continuation_duration
+                    # Overshoot (regression)
+                    loss_overshoot = criterion(
+                        mt['overshoot'].squeeze(),
+                        target_overshoot
+                    )
+                    loss += loss_weights['overshoot'] * loss_overshoot
 
-            # Continuation gain (regression)
-            loss_continuation_gain = criterion(
-                mt['continuation_gain'].squeeze(),
-                target_continuation_gain
-            )
-            loss += loss_weights['continuation_gain'] * loss_continuation_gain
+                    # Continuation duration (regression)
+                    loss_continuation_duration = criterion(
+                        mt['continuation_duration'].squeeze(),
+                        target_continuation_duration
+                    )
+                    loss += loss_weights['continuation_duration'] * loss_continuation_duration
 
-            # Continuation confidence (binary classification)
-            loss_continuation_confidence = F.binary_cross_entropy(
-                mt['continuation_confidence'].squeeze(),
-                target_continuation_confidence
-            )
-            loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
+                    # Continuation gain (regression)
+                    loss_continuation_gain = criterion(
+                        mt['continuation_gain'].squeeze(),
+                        target_continuation_gain
+                    )
+                    loss += loss_weights['continuation_gain'] * loss_continuation_gain
 
-            # Adaptive horizon losses (only when using adaptive mode)
-            if 'adaptive_horizon' in targets_dict and 'adaptive_horizon' in mt:
-                # Adaptive horizon (regression, 0-1 range normalized from 24-48 bars)
-                loss_adaptive_horizon = criterion(
-                    mt['adaptive_horizon'].squeeze(),
-                    target_adaptive_horizon
+                    # Continuation confidence (binary classification)
+                    loss_continuation_confidence = F.binary_cross_entropy(
+                        mt['continuation_confidence'].squeeze(),
+                        target_continuation_confidence
+                    )
+                    loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
+
+                    # Adaptive horizon losses (only when using adaptive mode)
+                    if 'adaptive_horizon' in targets_dict and 'adaptive_horizon' in mt:
+                        loss_adaptive_horizon = criterion(
+                            mt['adaptive_horizon'].squeeze(),
+                            target_adaptive_horizon
+                        )
+                        loss += loss_weights.get('adaptive_horizon', 0.3) * loss_adaptive_horizon
+
+                    if 'conf_score' in targets_dict and 'adaptive_conf_score' in mt:
+                        loss_adaptive_conf = F.binary_cross_entropy(
+                            mt['adaptive_conf_score'].squeeze(),
+                            target_conf_score
+                        )
+                        loss += loss_weights.get('adaptive_conf_score', 0.3) * loss_adaptive_conf
+
+                    # Adaptive projection losses
+                    loss_price_change = criterion(
+                        mt['price_change_pct'].squeeze(),
+                        target_price_change_pct
+                    )
+                    loss += loss_weights['price_change_pct'] * loss_price_change
+
+                    loss_horizon_log = criterion(
+                        mt['horizon_bars_log'].squeeze(),
+                        target_horizon_bars_log
+                    )
+                    loss += loss_weights['horizon_bars_log'] * loss_horizon_log
+
+                    loss_adaptive_confidence = F.binary_cross_entropy(
+                        mt['adaptive_confidence'].squeeze(),
+                        target_adaptive_confidence
+                    )
+                    loss += loss_weights['adaptive_confidence'] * loss_adaptive_confidence
+
+            # AMP backward pass
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+        else:
+            # Standard FP32 forward pass
+            predictions, hidden_states = model.forward(x)
+
+            # Primary loss (high/low regression)
+            pred_high = predictions[:, 0]
+            pred_low = predictions[:, 1]
+
+            loss_high = criterion(pred_high, target_high)
+            loss_low = criterion(pred_low, target_low)
+
+            # Weighted primary loss
+            loss = (loss_weights['high_prediction'] * loss_high +
+                    loss_weights['low_prediction'] * loss_low)
+
+            # Multi-task losses
+            if model.multi_task and 'multi_task' in hidden_states:
+                mt = hidden_states['multi_task']
+
+                # Hit band (binary classification)
+                loss_hit_band = F.binary_cross_entropy(
+                    mt['hit_band'].squeeze(),
+                    target_hit_band
                 )
-                loss += loss_weights.get('adaptive_horizon', 0.3) * loss_adaptive_horizon
+                loss += loss_weights['hit_band'] * loss_hit_band
 
-            if 'conf_score' in targets_dict and 'adaptive_conf_score' in mt:
-                # Confidence score (binary classification, 0-1 range)
-                loss_adaptive_conf = F.binary_cross_entropy(
-                    mt['adaptive_conf_score'].squeeze(),
-                    target_conf_score
+                # Hit target (binary classification)
+                loss_hit_target = F.binary_cross_entropy(
+                    mt['hit_target'].squeeze(),
+                    target_hit_target
                 )
-                loss += loss_weights.get('adaptive_conf_score', 0.3) * loss_adaptive_conf
+                loss += loss_weights['hit_target'] * loss_hit_target
 
-            # Adaptive projection losses
-            loss_price_change = criterion(
-                mt['price_change_pct'].squeeze(),
-                target_price_change_pct
-            )
-            loss += loss_weights['price_change_pct'] * loss_price_change
+                # Expected return (regression)
+                loss_expected_return = criterion(
+                    mt['expected_return'].squeeze(),
+                    target_expected_return
+                )
+                loss += loss_weights['expected_return'] * loss_expected_return
 
-            loss_horizon_log = criterion(
-                mt['horizon_bars_log'].squeeze(),
-                target_horizon_bars_log
-            )
-            loss += loss_weights['horizon_bars_log'] * loss_horizon_log
+                # Overshoot (regression)
+                loss_overshoot = criterion(
+                    mt['overshoot'].squeeze(),
+                    target_overshoot
+                )
+                loss += loss_weights['overshoot'] * loss_overshoot
 
-            loss_adaptive_confidence = F.binary_cross_entropy(
-                mt['adaptive_confidence'].squeeze(),
-                target_adaptive_confidence
-            )
-            loss += loss_weights['adaptive_confidence'] * loss_adaptive_confidence
+                # Continuation duration (regression)
+                loss_continuation_duration = criterion(
+                    mt['continuation_duration'].squeeze(),
+                    target_continuation_duration
+                )
+                loss += loss_weights['continuation_duration'] * loss_continuation_duration
 
-        # Backward pass
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+                # Continuation gain (regression)
+                loss_continuation_gain = criterion(
+                    mt['continuation_gain'].squeeze(),
+                    target_continuation_gain
+                )
+                loss += loss_weights['continuation_gain'] * loss_continuation_gain
 
-        # Clip gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # Continuation confidence (binary classification)
+                loss_continuation_confidence = F.binary_cross_entropy(
+                    mt['continuation_confidence'].squeeze(),
+                    target_continuation_confidence
+                )
+                loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
 
-        optimizer.step()
+                # Adaptive horizon losses (only when using adaptive mode)
+                if 'adaptive_horizon' in targets_dict and 'adaptive_horizon' in mt:
+                    loss_adaptive_horizon = criterion(
+                        mt['adaptive_horizon'].squeeze(),
+                        target_adaptive_horizon
+                    )
+                    loss += loss_weights.get('adaptive_horizon', 0.3) * loss_adaptive_horizon
 
-        # Immediate memory cleanup after gradient update (critical for MPS)
-        if device == 'mps':
+                if 'conf_score' in targets_dict and 'adaptive_conf_score' in mt:
+                    loss_adaptive_conf = F.binary_cross_entropy(
+                        mt['adaptive_conf_score'].squeeze(),
+                        target_conf_score
+                    )
+                    loss += loss_weights.get('adaptive_conf_score', 0.3) * loss_adaptive_conf
+
+                # Adaptive projection losses
+                loss_price_change = criterion(
+                    mt['price_change_pct'].squeeze(),
+                    target_price_change_pct
+                )
+                loss += loss_weights['price_change_pct'] * loss_price_change
+
+                loss_horizon_log = criterion(
+                    mt['horizon_bars_log'].squeeze(),
+                    target_horizon_bars_log
+                )
+                loss += loss_weights['horizon_bars_log'] * loss_horizon_log
+
+                loss_adaptive_confidence = F.binary_cross_entropy(
+                    mt['adaptive_confidence'].squeeze(),
+                    target_adaptive_confidence
+                )
+                loss += loss_weights['adaptive_confidence'] * loss_adaptive_confidence
+
+            # Standard backward pass
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        # Immediate memory cleanup after gradient update (throttled for MPS)
+        # Every 100 batches instead of every batch - much less overhead
+        if device == 'mps' and batch_idx % 100 == 0:
             torch.mps.empty_cache()
 
         total_loss += loss.item()
@@ -547,7 +660,10 @@ def train_epoch(
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
         # Memory cleanup to prevent accumulation
-        if batch_idx % 10 == 0:  # Throttle cleanup to every 10 batches (adjustable)
+        # CUDA: every 500 batches (empty_cache is expensive, ~5-10ms per call)
+        # MPS: every 50 batches (more memory constrained, needs more frequent cleanup)
+        cleanup_frequency = 500 if device == 'cuda' else 50
+        if batch_idx % cleanup_frequency == 0 and batch_idx > 0:
             # Clear model's cached hidden states
             model.clear_cached_states()
 
@@ -559,7 +675,7 @@ def train_epoch(
             # Explicitly delete batch data
             del x, targets_dict
 
-            # Clear GPU/MPS cache
+            # Clear GPU/MPS cache (expensive operations - do sparingly)
             if device == 'cuda':
                 torch.cuda.empty_cache()
             elif device == 'mps':
@@ -757,6 +873,24 @@ def interactive_setup(args):
         if not proceed:
             args.device = default_device
             print(f"   Switched to {args.device.upper()}")
+
+    # AMP (Mixed Precision) option - only for CUDA
+    args.amp = False  # Default to disabled
+    if args.device == 'cuda':
+        print()
+        args.amp = inquirer.select(
+            message="Enable Mixed Precision (AMP)?",
+            choices=[
+                Choice(value=True, name="Yes - 2-3x faster training, uses FP16 tensor cores ⚡"),
+                Choice(value=False, name="No - Standard FP32 precision (safer, slower)")
+            ],
+            default=True
+        ).execute()
+
+        if args.amp:
+            print("   ⚡ Mixed Precision (AMP) enabled - will use FP16 tensor cores")
+        else:
+            print("   → Standard FP32 precision (full precision)")
 
     # Data loading workers (RIGHT after device selection)
     print()
@@ -1250,6 +1384,9 @@ def interactive_setup(args):
     print("📋 TRAINING CONFIGURATION SUMMARY")
     print("=" * 70)
     print(f"  Device: {args.device.upper()} (num_workers={args.num_workers})")
+    if args.device == 'cuda':
+        amp_status = "Enabled ⚡" if getattr(args, 'amp', False) else "Disabled"
+        print(f"  Mixed Precision (AMP): {amp_status}")
     print(f"  Training Period: {args.train_start_year}-{args.train_end_year}")
     print(f"  Epochs: {args.epochs}")
     print(f"  Batch Size: {args.batch_size}")
@@ -1354,6 +1491,8 @@ def main():
                         help='Path to configuration YAML file')
     parser.add_argument('--multi_task', action='store_true', default=True,
                         help='Enable multi-task learning (default: True)')
+    parser.add_argument('--amp', action='store_true', default=False,
+                        help='Enable Automatic Mixed Precision (CUDA only, 2-3x faster)')
 
     # Interactive mode
     parser.add_argument('--interactive', action='store_true',
@@ -1748,9 +1887,27 @@ def main():
     print(f"   Multi-task heads: {'Enabled' if args.multi_task else 'Disabled'}")
     print(f"   Input features: {extractor.get_feature_dim()}")
 
+    # Apply torch.compile() for CUDA (PyTorch 2.0+ optimization, 10-40% speedup)
+    # Note: First epoch is slower due to compilation warmup, benefits show from epoch 2+
+    if args.device == 'cuda' and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+            print("   🔥 torch.compile() enabled - JIT compilation for faster training")
+        except Exception as e:
+            print(f"   ⚠️  torch.compile() failed ({e}), continuing without compilation")
+
     # Optimizer and loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
+
+    # Setup AMP (Automatic Mixed Precision) if enabled
+    scaler = None
+    if getattr(args, 'amp', False) and args.device == 'cuda':
+        from torch.cuda.amp import GradScaler
+        scaler = GradScaler()
+        print("   ⚡ Mixed Precision (AMP) enabled - using FP16 tensor cores")
+    elif getattr(args, 'amp', False) and args.device != 'cuda':
+        print("   ⚠️  AMP requested but only supported on CUDA - using FP32")
 
     # Training loop
     print("\n5. Training...")
@@ -1767,9 +1924,9 @@ def main():
         tqdm.write(f"\nEpoch {epoch + 1}/{args.epochs}")
         tqdm.write("-" * 70)
 
-        # Train (with loss_weights for multi-task)
+        # Train (with loss_weights for multi-task, and optional AMP scaler)
         train_loss = train_epoch(
-            model, train_loader, optimizer, criterion, args.device, epoch, loss_weights
+            model, train_loader, optimizer, criterion, args.device, epoch, loss_weights, scaler
         )
         train_losses.append(train_loss)
 
