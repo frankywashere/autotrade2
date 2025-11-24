@@ -1342,13 +1342,31 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"       Memory: ~{chunk_features.memory_usage(deep=True).sum() / 1e6:.1f} MB")
 
             # Save as memory-mapped .npy shard (respects dtype from config!)
-            chunk_array = chunk_features.values.astype(config.NUMPY_DTYPE)
             chunk_path = temp_dir / f"chunk_{i:04d}.npy"
             index_path = temp_dir / f"chunk_{i:04d}_index.npy"
 
             print(f"       Saving shard {i} as .npy (mmap-ready)...")
-            np.save(chunk_path, chunk_array)
-            np.save(index_path, chunk_features.index.values)
+            # Write data via memmap to avoid double-copy peak memory
+            data_mm = np.lib.format.open_memmap(
+                chunk_path,
+                mode='w+',
+                dtype=config.NUMPY_DTYPE,
+                shape=chunk_features.shape
+            )
+            np.copyto(data_mm, chunk_features.to_numpy(copy=False).astype(config.NUMPY_DTYPE, copy=False))
+            data_mm.flush()
+            del data_mm
+
+            # Save index via memmap as well
+            index_mm = np.lib.format.open_memmap(
+                index_path,
+                mode='w+',
+                dtype=chunk_features.index.values.dtype,
+                shape=chunk_features.index.shape
+            )
+            np.copyto(index_mm, chunk_features.index.values)
+            index_mm.flush()
+            del index_mm
 
             # Store metadata
             chunk_info.append({
