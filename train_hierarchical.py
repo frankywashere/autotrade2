@@ -25,6 +25,7 @@ from torch.utils.data._utils.collate import default_collate
 from pathlib import Path
 import sys
 import os
+import functools
 from datetime import datetime
 import json
 import platform
@@ -96,7 +97,7 @@ def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
     return recommendations.get(device, 16)
 
 
-def hierarchical_collate(batch):
+def hierarchical_collate(batch, device: str = None, move_to_device: bool = False):
     """
     Custom collate to concatenate channels/non-channels once per batch (cuts per-sample copies).
     """
@@ -111,8 +112,13 @@ def hierarchical_collate(batch):
         else:
             ch, nc = data, None
 
+        # Ensure contiguity to avoid hidden copies on stack
+        if not ch.flags['C_CONTIGUOUS']:
+            ch = np.ascontiguousarray(ch)
         channels.append(torch.from_numpy(ch))
         if nc is not None:
+            if not nc.flags['C_CONTIGUOUS']:
+                nc = np.ascontiguousarray(nc)
             non_channels.append(torch.from_numpy(nc))
             has_non_channel = True
         targets.append(tgt)
@@ -126,6 +132,13 @@ def hierarchical_collate(batch):
         x = channel_batch
 
     targets_batch = default_collate(targets)
+
+    if move_to_device and device is not None:
+        x = x.to(device, non_blocking=True)
+        # Move dict of targets
+        for k, v in targets_batch.items():
+            targets_batch[k] = v.to(device, non_blocking=True)
+
     return x, targets_batch
 
 
@@ -179,6 +192,7 @@ def train_epoch(
 
     for batch_idx, (x, targets_dict) in enumerate(pbar):
         # Move to device
+        # If collate already moved to device, this is a no-op; otherwise it moves now
         x = x.to(device, non_blocking=True)
 
         # Move all targets to device
@@ -307,7 +321,7 @@ def train_epoch(
             loss += loss_weights['adaptive_confidence'] * loss_adaptive_confidence
 
         # Backward pass
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
 
         # Clip gradients
@@ -325,7 +339,7 @@ def train_epoch(
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
         # Memory cleanup to prevent accumulation
-        if batch_idx % 1 == 0:  # Every batch (critical for MPS memory efficiency with 14K features)
+        if batch_idx % 10 == 0:  # Throttle cleanup to every 10 batches (adjustable)
             # Clear model's cached hidden states
             model.clear_cached_states()
 
@@ -1441,7 +1455,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=(args.device == 'cuda'),
         persistent_workers=(args.num_workers > 0),  # Prevent worker respawn overhead
-        collate_fn=hierarchical_collate
+        collate_fn=functools.partial(hierarchical_collate, device=args.device, move_to_device=False)
     )
     if prefetch_factor is not None:
         train_loader_kwargs['prefetch_factor'] = prefetch_factor
@@ -1459,7 +1473,7 @@ def main():
             num_workers=args.num_workers,
             pin_memory=(args.device == 'cuda'),
             persistent_workers=(args.num_workers > 0),  # Prevent worker respawn overhead
-            collate_fn=hierarchical_collate
+            collate_fn=functools.partial(hierarchical_collate, device=args.device, move_to_device=False)
         )
         if prefetch_factor is not None:
             val_loader_kwargs['prefetch_factor'] = prefetch_factor
