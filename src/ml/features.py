@@ -1382,7 +1382,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"       ✓ Shard saved: {bytes_on_disk / 1e6:.1f} MB on disk")
 
             # Aggressive memory cleanup
-            del chunk_df, chunk_features, chunk_array
+            del chunk_df, chunk_features
             if chunk_multi_res:
                 del chunk_multi_res
             gc.collect()
