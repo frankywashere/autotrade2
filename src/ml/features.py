@@ -821,6 +821,11 @@ class TradingFeatureExtractor(FeatureExtractor):
 
             channel_features = pd.DataFrame(all_channel_data, index=df.index)
 
+            # FIX 2: Clean up intermediate data after DataFrame creation
+            del all_channel_data
+            del tasks, tsla_ohlcv, spy_ohlcv, timestamps
+            gc.collect()
+
         else:
             # Sequential processing with multi-window (for GPU mode or live mode)
             # v3.19: Try RICH for better progress display
@@ -1335,6 +1340,12 @@ class TradingFeatureExtractor(FeatureExtractor):
                 cache_suffix='chunk_skip_long_tfs'  # Signals to skip monthly/3month
             )
 
+            # FIX 1: Free chunk_df and chunk_multi_res immediately (no longer needed)
+            del chunk_df
+            if chunk_multi_res:
+                del chunk_multi_res
+            gc.collect()
+
             # Remove overlap from results (keep only the actual chunk period)
             chunk_features = chunk_features[chunk_features.index >= chunk_start]
 
@@ -1345,46 +1356,33 @@ class TradingFeatureExtractor(FeatureExtractor):
             chunk_path = temp_dir / f"chunk_{i:04d}.npy"
             index_path = temp_dir / f"chunk_{i:04d}_index.npy"
 
-            print(f"       Saving shard {i} as .npy (mmap-ready)...")
-            # Write data via memmap to avoid double-copy peak memory
-            data_mm = np.lib.format.open_memmap(
-                chunk_path,
-                mode='w+',
-                dtype=config.NUMPY_DTYPE,
-                shape=chunk_features.shape
-            )
-            np.copyto(data_mm, chunk_features.to_numpy(copy=False).astype(config.NUMPY_DTYPE, copy=False))
-            data_mm.flush()
-            del data_mm
+            # FIX 3: Save index first, then convert DataFrame to numpy and free DataFrame immediately
+            # This avoids holding both DataFrame (~5GB) and numpy array (~5GB) simultaneously
+            index_values = chunk_features.index.values.copy()  # Small - just timestamps
+            chunk_shape = chunk_features.shape  # Save shape before deleting
 
-            # Save index via memmap as well
-            index_mm = np.lib.format.open_memmap(
-                index_path,
-                mode='w+',
-                dtype=chunk_features.index.values.dtype,
-                shape=chunk_features.index.shape
-            )
-            np.copyto(index_mm, chunk_features.index.values)
-            index_mm.flush()
-            del index_mm
+            chunk_array = chunk_features.values.astype(config.NUMPY_DTYPE)
+            del chunk_features  # Free DataFrame immediately (~5GB freed)
+            gc.collect()
 
-            # Store metadata (use chunk_features shape since chunk_array is memmapped and deleted)
+            print(f"       Saving shard {i} as .npy...")
+            np.save(chunk_path, chunk_array)
+            np.save(index_path, index_values)
+
+            # Store metadata
             chunk_info.append({
                 'path': str(chunk_path),
                 'index_path': str(index_path),
-                'rows': len(chunk_features),
-                'cols': chunk_features.shape[1],
+                'rows': len(chunk_array),
+                'cols': chunk_array.shape[1],
                 'start_date': str(chunk_start.date()),
                 'end_date': str(chunk_end.date())
             })
 
-            bytes_on_disk = chunk_features.shape[0] * chunk_features.shape[1] * np.dtype(config.NUMPY_DTYPE).itemsize
-            print(f"       ✓ Shard saved: {bytes_on_disk / 1e6:.1f} MB on disk")
+            print(f"       ✓ Shard saved: {chunk_array.nbytes / 1e6:.1f} MB on disk")
 
-            # Aggressive memory cleanup
-            del chunk_df, chunk_features
-            if chunk_multi_res:
-                del chunk_multi_res
+            # Final cleanup - only chunk_array remains
+            del chunk_array, index_values
             gc.collect()
 
         # Save metadata for memory-mapped loading (NO RAM spike!)
