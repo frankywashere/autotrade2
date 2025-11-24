@@ -204,6 +204,54 @@ def pick_manifest(manifests):
     ).execute()
 
 
+def find_available_caches(cache_dir: Path):
+    """Find available cache pairs (meta + continuation labels) in a directory."""
+    cache_dir = Path(cache_dir)
+    caches = []
+    for meta_path in cache_dir.glob("features_mmap_meta_*.json"):
+        cache_key = meta_path.name.replace("features_mmap_meta_", "").replace(".json", "")
+        mode_suffixes = ['adaptive', 'simple']
+        cont_path = None
+        for suffix in mode_suffixes:
+            candidate = cache_dir / f"continuation_labels_{cache_key}_{suffix}.pkl"
+            if candidate.exists():
+                cont_path = candidate
+                break
+        caches.append({
+            "cache_key": cache_key,
+            "meta_path": str(meta_path),
+            "cont_path": str(cont_path) if cont_path else None
+        })
+    return caches
+
+
+def pick_cache_pair(caches):
+    """Prompt user to select a cache pair to reuse."""
+    if not caches:
+        return None
+    try:
+        from InquirerPy import inquirer
+    except ImportError:
+        return None
+
+    choices = []
+    for c in caches:
+        cont_status = "with labels" if c.get("cont_path") else "no labels"
+        choices.append(
+            Choice(
+                value=c,
+                name=f"{c['cache_key']} ({cont_status})"
+            )
+        )
+    choices.append(Choice(value=None, name="Do not reuse cached features/labels"))
+
+    return inquirer.select(
+        message="Reuse existing cached features/labels?",
+        choices=choices,
+        default=choices[-1].value
+    ).execute()
+
+
 def save_cache_manifest(
     cache_dir: Path,
     cache_key: str,
@@ -609,6 +657,15 @@ def interactive_setup(args):
             if ah_range and len(ah_range) == 2 and all(v is not None for v in ah_range):
                 project_config.ADAPTIVE_MIN_HORIZON, project_config.ADAPTIVE_MAX_HORIZON = ah_range
 
+    # Scan for cached feature/label pairs in selected directory
+    cache_pairs = find_available_caches(args.shard_path)
+    selected_cache_pair = None
+    if cache_pairs:
+        selected_cache_pair = pick_cache_pair(cache_pairs)
+
+    # Default cache behavior: reuse if a cache pair was selected, regenerate otherwise
+    args.regenerate_cache = False if selected_cache_pair else True
+
     def dflt(key, fallback):
         return manifest_defaults.get(key, fallback)
 
@@ -741,50 +798,6 @@ def interactive_setup(args):
             print(f"   ⚠️  Continuing with limited data ({effective_years:.1f} years)")
     else:
         print(f"   ✓ Good! {effective_years:.1f} years of quality training data after warmup")
-
-    # Check for feature cache
-    print()
-    from src.ml.features import FEATURE_VERSION
-    from datetime import datetime as dt
-
-    cache_dir = Path('data/feature_cache')
-    cache_dir.mkdir(exist_ok=True)
-
-    # Look for cache files matching this date range (don't know exact length yet)
-    cache_pattern = f"rolling_channels_{FEATURE_VERSION}_{args.train_start_year}0101_{args.train_end_year}1231_*.pkl"
-    cache_files = list(cache_dir.glob(cache_pattern))
-
-    if cache_files:
-        # Found existing cache
-        cache_file = cache_files[0]
-        size_mb = cache_file.stat().st_size / (1024 * 1024)
-        created = dt.fromtimestamp(cache_file.stat().st_mtime)
-
-        print("📂 Feature Cache Found:")
-        print(f"   💾 Size: {size_mb:.1f} MB")
-        print(f"   📅 Created: {created.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"   📊 Version: {FEATURE_VERSION}")
-        print()
-
-        args.regenerate_cache = inquirer.select(
-            message="Use existing cache or regenerate features?",
-            choices=[
-                Choice(value=False, name="Use cache (fast - loads in ~5 seconds) ⭐"),
-                Choice(value=True, name="Regenerate cache (slow - takes ~45 minutes)")
-            ],
-            default=False
-        ).execute()
-
-        if args.regenerate_cache:
-            print(f"   ⚠️  Cache will be regenerated (~45 minutes)")
-        else:
-            print(f"   ✓ Will use existing cache")
-    else:
-        # No cache found
-        args.regenerate_cache = True
-        print("📂 No Feature Cache Found:")
-        print(f"   ⚠️  First run will take ~45 minutes to generate rolling channels")
-        print(f"   💡 Subsequent runs will load instantly from cache")
 
     # GPU Acceleration option (ALWAYS shown)
     print()
@@ -933,31 +946,14 @@ def interactive_setup(args):
         if args.use_chunking:
             print(f"   ✓ Will process features in 1-year chunks")
             print(f"   ℹ️  Peak RAM during extraction: ~2-5GB")
-
-            # Ask where to save shards
-            print()
-            use_custom_path = inquirer.confirm(
-                message="Use custom location for shard files?",
-                default=False
-            ).execute()
-
-            if use_custom_path:
-                args.shard_path = inquirer.text(
-                    message="Shard storage path (will create if doesn't exist):",
-                    default="data/feature_cache"
-                ).execute()
-                print(f"   ✓ Will save shards to: {args.shard_path}")
-            else:
-                args.shard_path = None
-                print(f"   ✓ Will use default location: data/feature_cache")
+            # Respect the initial cache directory selection for shard storage
+            print(f"   ✓ Shard storage path: {args.shard_path} (from initial selection)")
         else:
             print(f"   ⚡ Will process all features at once")
             print(f"   ⚠️  Peak RAM during extraction: ~20-40GB")
-            args.shard_path = None  # Not chunking, no shards
     else:
         # Cache will be loaded - chunking doesn't apply
         args.use_chunking = False
-        args.shard_path = None
 
     # Precision selection
     print()
@@ -1209,6 +1205,8 @@ def interactive_setup(args):
     print(f"  Model Capacity: internal_ratio={args.internal_neurons_ratio}, hidden_size={args.hidden_size}")
     print(f"  Multi-Task: {'Enabled' if args.multi_task else 'Disabled'}")
     print(f"  Output: {args.output}")
+    if selected_cache_pair:
+        print(f"  Cache reuse: {selected_cache_pair.get('cache_key')} from {args.shard_path}")
     print("=" * 70)
 
     # Confirmation
