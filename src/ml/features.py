@@ -1164,7 +1164,15 @@ class TradingFeatureExtractor(FeatureExtractor):
                         all_features[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
                         all_features[f'{w_prefix}_duration'][indices] = channel.actual_duration
 
+                # FIX 1: Clean up intermediate data after each timeframe
+                del symbol_df, resampled, all_windows
+                gc.collect()
+
         result_df = pd.DataFrame(all_features, index=df.index)
+
+        # FIX 2: Free the massive dict (~15.6 GB) now that DataFrame is created
+        del all_features
+        gc.collect()
 
         print(f"   ✓ Monthly/3month features: {len(result_df.columns)} columns, memory: {result_df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
 
@@ -1250,25 +1258,32 @@ class TradingFeatureExtractor(FeatureExtractor):
             )
 
             if monthly_3month_features is not None and len(monthly_3month_features) > 0:
-                # Save to shard immediately
+                # FIX 3: Avoid holding DataFrame + numpy array simultaneously (~31 GB peak)
+                # Save shape info before conversion
+                monthly_rows = len(monthly_3month_features)
+                monthly_cols = monthly_3month_features.shape[1]
+
+                # Convert to numpy and delete DataFrame IMMEDIATELY
                 monthly_array = monthly_3month_features.values.astype(config.NUMPY_DTYPE)
+                del monthly_3month_features  # Free ~15.6 GB before np.save
+                gc.collect()
+
+                # Now save (only monthly_array in memory, not both)
                 np.save(monthly_shard_path, monthly_array)
 
                 monthly_shard_info = {
                     'path': str(monthly_shard_path.absolute()),  # ABSOLUTE path
-                    'rows': len(monthly_array),
-                    'cols': monthly_array.shape[1],
+                    'rows': monthly_rows,
+                    'cols': monthly_cols,
                     'type': 'monthly_3month'
                 }
 
                 print(f"   ✓ Saved monthly/3month shard: {monthly_array.shape} ({monthly_array.nbytes / 1e9:.2f} GB on disk)")
 
-                # CRITICAL: Free the 13-16 GB DataFrame immediately!
-                del monthly_3month_features
+                # Final cleanup
                 del monthly_array
-                import gc
                 gc.collect()
-                print(f"   ✓ Monthly/3month DataFrame freed from RAM")
+                print(f"   ✓ Monthly/3month data freed from RAM")
             else:
                 print(f"   ⚠️  No monthly/3month features generated")
 
