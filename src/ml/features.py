@@ -1368,12 +1368,12 @@ class TradingFeatureExtractor(FeatureExtractor):
             index_mm.flush()
             del index_mm
 
-            # Store metadata
+            # Store metadata (use chunk_features shape since chunk_array is memmapped and deleted)
             chunk_info.append({
                 'path': str(chunk_path),
                 'index_path': str(index_path),
-                'rows': len(chunk_array),
-                'cols': chunk_array.shape[1],
+                'rows': len(chunk_features),
+                'cols': chunk_features.shape[1],
                 'start_date': str(chunk_start.date()),
                 'end_date': str(chunk_end.date())
             })
