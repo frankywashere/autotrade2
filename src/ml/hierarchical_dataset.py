@@ -504,18 +504,18 @@ class HierarchicalDataset(Dataset):
         adaptive_confidence = 1.0 if bars_to_peak > 48 else 0.5  # Simple confidence
 
         targets = {
-            'high': torch.tensor(target_high_pct, dtype=config.get_torch_dtype()),
-            'low': torch.tensor(target_low_pct, dtype=config.get_torch_dtype()),
-            'hit_band': torch.tensor(hit_band_label, dtype=config.get_torch_dtype()),
-            'hit_target': torch.tensor(hit_target_label, dtype=config.get_torch_dtype()),
-            'expected_return': torch.tensor(expected_return_label, dtype=config.get_torch_dtype()),
-            'overshoot': torch.tensor(overshoot_label, dtype=config.get_torch_dtype()),
-            'continuation_duration': self._const_zero,  # Placeholder
-            'continuation_gain': self._const_zero,      # Placeholder
-            'continuation_confidence': self._const_half, # Placeholder
-            'price_change_pct': torch.tensor(adaptive_price_change, dtype=config.get_torch_dtype()),
+            'high': target_high_pct,
+            'low': target_low_pct,
+            'hit_band': hit_band_label,
+            'hit_target': hit_target_label,
+            'expected_return': expected_return_label,
+            'overshoot': overshoot_label,
+            'continuation_duration': 0.0,   # Placeholder
+            'continuation_gain': 0.0,       # Placeholder
+            'continuation_confidence': 0.5, # Placeholder
+            'price_change_pct': adaptive_price_change,
             'horizon_bars_log': adaptive_horizon_log,
-            'adaptive_confidence': self._const_one if adaptive_confidence == 1.0 else self._const_half
+            'adaptive_confidence': adaptive_confidence
         }
 
         # Add continuation prediction targets if enabled
@@ -584,21 +584,21 @@ class HierarchicalDataset(Dataset):
 
                     # Add fallback for all optional fields to maintain dict consistency
                     if self.has_adaptive_horizon:
-                        targets['adaptive_horizon'] = self._const_default_horizon
+                        targets['adaptive_horizon'] = float(self._const_default_horizon)
                     if self.has_conf_score:
-                        targets['conf_score'] = self._const_half
+                        targets['conf_score'] = float(self._const_half)
                     if self.has_channel_1h_cycles:
-                        targets['channel_1h_cycles'] = self._const_zero
+                        targets['channel_1h_cycles'] = 0.0
                     if self.has_channel_4h_cycles:
-                        targets['channel_4h_cycles'] = self._const_zero
+                        targets['channel_4h_cycles'] = 0.0
                     if self.has_channel_1h_valid:
-                        targets['channel_1h_valid'] = self._const_zero
+                        targets['channel_1h_valid'] = 0.0
                     if self.has_channel_4h_valid:
-                        targets['channel_4h_valid'] = self._const_zero
+                        targets['channel_4h_valid'] = 0.0
                     if self.has_channel_1h_r_squared:
-                        targets['channel_1h_r_squared'] = self._const_zero
+                        targets['channel_1h_r_squared'] = 0.0
                     if self.has_channel_4h_r_squared:
-                        targets['channel_4h_r_squared'] = self._const_zero
+                        targets['channel_4h_r_squared'] = 0.0
 
             except Exception as e:
                 # Exception occurred - use fallback values
@@ -610,21 +610,21 @@ class HierarchicalDataset(Dataset):
 
                 # Add fallback for all optional fields to maintain dict consistency
                 if self.has_adaptive_horizon:
-                    targets['adaptive_horizon'] = self._const_default_horizon
+                    targets['adaptive_horizon'] = float(self._const_default_horizon)
                 if self.has_conf_score:
-                    targets['conf_score'] = self._const_half
+                    targets['conf_score'] = float(self._const_half)
                 if self.has_channel_1h_cycles:
-                    targets['channel_1h_cycles'] = self._const_zero
+                    targets['channel_1h_cycles'] = 0.0
                 if self.has_channel_4h_cycles:
-                    targets['channel_4h_cycles'] = self._const_zero
+                    targets['channel_4h_cycles'] = 0.0
                 if self.has_channel_1h_valid:
-                    targets['channel_1h_valid'] = self._const_zero
+                    targets['channel_1h_valid'] = 0.0
                 if self.has_channel_4h_valid:
-                    targets['channel_4h_valid'] = self._const_zero
+                    targets['channel_4h_valid'] = 0.0
                 if self.has_channel_1h_r_squared:
-                    targets['channel_1h_r_squared'] = self._const_zero
+                    targets['channel_1h_r_squared'] = 0.0
                 if self.has_channel_4h_r_squared:
-                    targets['channel_4h_r_squared'] = self._const_zero
+                    targets['channel_4h_r_squared'] = 0.0
 
         return (channel_sequence, non_channel_sequence), targets
 
