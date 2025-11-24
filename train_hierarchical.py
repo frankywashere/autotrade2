@@ -105,20 +105,33 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         torch_dtype = torch.float32
 
     channels = []
+    monthly_channels_list = []
     non_channels = []
     targets = []
     has_non_channel = False
 
     for data, tgt in batch:
-        if isinstance(data, tuple) and len(data) == 2:
-            ch, nc = data
+        # Expect (main, monthly, non_channel)
+        if isinstance(data, tuple) and len(data) == 3:
+            ch_main, ch_monthly, nc = data
+        elif isinstance(data, tuple) and len(data) == 2:
+            ch_main, nc = data
+            ch_monthly = None
         else:
-            ch, nc = data, None
+            ch_main, ch_monthly, nc = data, None, None
 
         # Ensure contiguity to avoid hidden copies on stack
-        if not ch.flags['C_CONTIGUOUS']:
-            ch = np.ascontiguousarray(ch)
-        channels.append(torch.from_numpy(ch))
+        if not ch_main.flags['C_CONTIGUOUS']:
+            ch_main = np.ascontiguousarray(ch_main)
+        channels.append(torch.from_numpy(ch_main))
+
+        monthly_channels = None
+        if ch_monthly is not None:
+            if not ch_monthly.flags['C_CONTIGUOUS']:
+                ch_monthly = np.ascontiguousarray(ch_monthly)
+            monthly_channels = torch.from_numpy(ch_monthly)
+        monthly_channels_list.append(monthly_channels)
+
         if nc is not None:
             if not nc.flags['C_CONTIGUOUS']:
                 nc = np.ascontiguousarray(nc)
@@ -128,11 +141,22 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
 
     channel_batch = torch.stack(channels, dim=0)
 
+    has_monthly = any(m is not None for m in monthly_channels_list)
+    if has_monthly:
+        ref_monthly = next(m for m in monthly_channels_list if m is not None)
+        monthly_batch = torch.stack(
+            [(m if m is not None else torch.zeros_like(ref_monthly)) for m in monthly_channels_list],
+            dim=0
+        )
+
+    parts = [channel_batch]
+    if has_monthly:
+        parts.append(monthly_batch)
     if has_non_channel:
         non_channel_batch = torch.stack(non_channels, dim=0)
-        x = torch.cat([channel_batch, non_channel_batch], dim=-1)
-    else:
-        x = channel_batch
+        parts.append(non_channel_batch)
+
+    x = torch.cat(parts, dim=-1)
 
     # Build targets tensor dict with proper dtype
     converted_targets = []
@@ -1413,9 +1437,6 @@ def main():
     print(f"🎭 Multi-task: {'Enabled' if args.multi_task else 'Disabled'}")
     print("=" * 70)
 
-    # Clear terminal for clean progress bar display
-    os.system('clear')
-
     # Load data with historical buffer for continuation analysis
     print("\n1. Loading 1-min data...")
     data_feed = CSVDataFeed(timeframe=args.input_timeframe)
@@ -1608,9 +1629,12 @@ def main():
     # Verify feature dimension matches between extractor and dataset
     print("\n   🔍 Verifying feature dimensions...")
     sample_x, sample_y = train_dataset[0]
-    if isinstance(sample_x, tuple) and len(sample_x) == 2:
-        ch, nc = sample_x
-        actual_input_dim = ch.shape[-1] + (nc.shape[-1] if nc is not None else 0)
+    if isinstance(sample_x, tuple):
+        dims = 0
+        for part in sample_x:
+            if part is not None and hasattr(part, 'shape'):
+                dims += part.shape[-1]
+        actual_input_dim = dims if dims > 0 else sample_x.shape[-1]
     else:
         actual_input_dim = sample_x.shape[-1]
     expected_dim = extractor.get_feature_dim()

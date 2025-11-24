@@ -287,7 +287,7 @@ class HierarchicalDataset(Dataset):
 
         return result
 
-    def _get_channel_sequence_from_shards(self, start: int, end: int) -> np.ndarray:
+    def _get_channel_sequence_from_shards(self, start: int, end: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
         Get a sequence of rows from memory-mapped shards (zero copy, minimal RAM).
 
@@ -296,7 +296,7 @@ class HierarchicalDataset(Dataset):
             end: End row index (global)
 
         Returns:
-            Array of shape [end-start, num_channel_features]
+            (main_channels, monthly_channels or None) where arrays have shape [end-start, cols]
         """
         import bisect
 
@@ -335,12 +335,12 @@ class HierarchicalDataset(Dataset):
                 main_result[pos:pos + length] = shard_source[shard_idx][local_start:local_end]
                 pos += length
 
-        # v3.19: Add monthly/3month shard if present (horizontal stack)
+        # v3.19: Return monthly/3month shard separately if not premerged
+        monthly_sequence = None
         if self.monthly_3month_mmap is not None and self.premerged_channel_mmaps is None:
             monthly_sequence = self.monthly_3month_mmap[start:end, :]
-            return np.hstack([main_result, monthly_sequence])
-        else:
-            return main_result
+
+        return main_result, monthly_sequence
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
         """
@@ -350,7 +350,7 @@ class HierarchicalDataset(Dataset):
             idx: Sample index
 
         Returns:
-            x: Tuple(channel_sequence, non_channel_sequence_or_None) each as np.ndarray [200, feat_dim]
+            x: Tuple(main_channels, monthly_channels_or_None, non_channel_sequence_or_None) each as np.ndarray [200, feat_dim]
             targets: Dict with:
                 - high: target_high % (regression)
                 - low: target_low % (regression)
@@ -369,29 +369,31 @@ class HierarchicalDataset(Dataset):
         # Handle memory-mapped shards vs normal array
         if self.using_mmaps:
             # Get channel features from shards (mmap - minimal RAM)
-            channel_sequence = self._get_channel_sequence_from_shards(seq_start, seq_end)
+            main_channel_sequence, monthly_sequence = self._get_channel_sequence_from_shards(seq_start, seq_end)
 
             # Get non-channel features (small, already in RAM)
-            if self.non_channel_array is not None:
-                non_channel_sequence = self.non_channel_array[seq_start:seq_end, :]
-            else:
-                non_channel_sequence = None  # Only channels
+            non_channel_sequence = self.non_channel_array[seq_start:seq_end, :] if self.non_channel_array is not None else None
 
             future_window = None
             if self.raw_ohlc_array is None:
                 # Only build future window when we don't have raw OHLC (fallback path)
                 future_start = seq_end
                 future_end = seq_end + self.prediction_horizon
-                channel_future = self._get_channel_sequence_from_shards(future_start, future_end)
+                main_future, monthly_future = self._get_channel_sequence_from_shards(future_start, future_end)
+
+                parts = [main_future]
+                if monthly_future is not None:
+                    parts.append(monthly_future)
 
                 if self.non_channel_array is not None:
                     non_channel_future = self.non_channel_array[future_start:future_end, :]
-                    future_window = np.concatenate([channel_future, non_channel_future], axis=1)
-                else:
-                    future_window = channel_future
+                    parts.append(non_channel_future)
+
+                future_window = np.concatenate(parts, axis=1)
         else:
             # Normal path - single array
-            channel_sequence = self.features_array[seq_start:seq_end, :]  # [200, 299]
+            main_channel_sequence = self.features_array[seq_start:seq_end, :]  # [200, 299]
+            monthly_sequence = None
             non_channel_sequence = None
             if self.raw_ohlc_array is None:
                 future_start = seq_end
@@ -626,7 +628,7 @@ class HierarchicalDataset(Dataset):
                 if self.has_channel_4h_r_squared:
                     targets['channel_4h_r_squared'] = 0.0
 
-        return (channel_sequence, non_channel_sequence), targets
+        return (main_channel_sequence, monthly_sequence, non_channel_sequence), targets
 
     def _check_target_sequence(
         self,
