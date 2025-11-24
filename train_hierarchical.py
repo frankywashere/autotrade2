@@ -38,7 +38,7 @@ sys.path.insert(0, str(parent_dir))
 
 from src.ml.hierarchical_model import HierarchicalLNN
 from src.ml.hierarchical_dataset import create_hierarchical_dataset
-from src.ml.features import TradingFeatureExtractor
+from src.ml.features import TradingFeatureExtractor, FEATURE_VERSION
 from src.ml.data_feed import CSVDataFeed
 import yaml
 import config as project_config
@@ -97,10 +97,13 @@ def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
     return recommendations.get(device, 16)
 
 
-def hierarchical_collate(batch, device: str = None, move_to_device: bool = False):
+def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None):
     """
     Custom collate to concatenate channels/non-channels once per batch (cuts per-sample copies).
     """
+    if torch_dtype is None:
+        torch_dtype = torch.float32
+
     channels = []
     non_channels = []
     targets = []
@@ -131,7 +134,18 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     else:
         x = channel_batch
 
-    targets_batch = default_collate(targets)
+    # Build targets tensor dict with proper dtype
+    converted_targets = []
+    for tgt in targets:
+        ct = {}
+        for k, v in tgt.items():
+            if isinstance(v, torch.Tensor):
+                ct[k] = v.to(dtype=torch_dtype)
+            else:
+                ct[k] = torch.tensor(v, dtype=torch_dtype)
+        converted_targets.append(ct)
+
+    targets_batch = default_collate(converted_targets)
 
     if move_to_device and device is not None:
         x = x.to(device, non_blocking=True)
@@ -1617,7 +1631,12 @@ def main():
         num_workers=args.num_workers,
         pin_memory=(args.device == 'cuda'),
         persistent_workers=(args.num_workers > 0),  # Prevent worker respawn overhead
-        collate_fn=functools.partial(hierarchical_collate, device=args.device, move_to_device=False)
+        collate_fn=functools.partial(
+            hierarchical_collate,
+            device=args.device,
+            move_to_device=False,
+            torch_dtype=project_config._TORCH_DTYPE
+        )
     )
     if prefetch_factor is not None:
         train_loader_kwargs['prefetch_factor'] = prefetch_factor
@@ -1635,7 +1654,12 @@ def main():
             num_workers=args.num_workers,
             pin_memory=(args.device == 'cuda'),
             persistent_workers=(args.num_workers > 0),  # Prevent worker respawn overhead
-            collate_fn=functools.partial(hierarchical_collate, device=args.device, move_to_device=False)
+            collate_fn=functools.partial(
+                hierarchical_collate,
+                device=args.device,
+                move_to_device=False,
+                torch_dtype=project_config._TORCH_DTYPE
+            )
         )
         if prefetch_factor is not None:
             val_loader_kwargs['prefetch_factor'] = prefetch_factor
