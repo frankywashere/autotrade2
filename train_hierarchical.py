@@ -142,6 +142,122 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     return x, targets_batch
 
 
+def load_cache_manifests(cache_dir: Path):
+    """Load cache manifests from a directory."""
+    manifests = []
+    try:
+        for path in Path(cache_dir).glob("cache_manifest_*.json"):
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                    data["_manifest_path"] = str(path)
+                    manifests.append(data)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return manifests
+
+
+def pick_manifest(manifests):
+    """Choose a manifest via Inquirer if available."""
+    if not manifests:
+        return None
+    try:
+        from InquirerPy import inquirer
+    except ImportError:
+        return None
+
+    choices = []
+    for m in manifests:
+        ck = m.get("cache_key", "unknown")
+        fr = m.get("date_range", {}).get("start", "?")
+        to = m.get("date_range", {}).get("end", "?")
+        mode = m.get("continuation_mode", "?")
+        fv = m.get("feature_version", "?")
+        choices.append(
+            Choice(
+                value=m,
+                name=f"{ck} | {fr}→{to} | mode={mode} | feat={fv}"
+            )
+        )
+    choices.append(Choice(value=None, name="Do not reuse cached settings"))
+
+    return inquirer.select(
+        message="Reuse existing cache (features/labels)?",
+        choices=choices,
+        default=choices[-1].value
+    ).execute()
+
+
+def save_cache_manifest(
+    cache_dir: Path,
+    cache_key: str,
+    mmap_meta_path: str,
+    continuation_path: str,
+    args,
+    df: pd.DataFrame
+):
+    """Persist a manifest alongside caches for reuse selection."""
+    try:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = cache_dir / f"cache_manifest_{cache_key}.json"
+
+        manifest = {
+            "cache_key": cache_key,
+            "feature_version": FEATURE_VERSION,
+            "date_range": {
+                "start": str(df.index[0]),
+                "end": str(df.index[-1]),
+                "rows": len(df)
+            },
+            "continuation_mode": project_config.CONTINUATION_MODE,
+            "adaptive_horizon_range": [
+                getattr(project_config, "ADAPTIVE_MIN_HORIZON", None),
+                getattr(project_config, "ADAPTIVE_MAX_HORIZON", None)
+            ],
+            "prediction_horizon": args.prediction_horizon,
+            "precision": project_config.TRAINING_PRECISION,
+            "dtype": str(project_config.NUMPY_DTYPE),
+            "paths": {
+                "mmap_meta": mmap_meta_path,
+                "continuation_labels": continuation_path
+            },
+            "cache_dir": str(cache_dir),
+            "shard_storage_path": getattr(args, "shard_path", None),
+            "use_chunking": getattr(args, "use_chunking", False),
+            "use_gpu_features": getattr(args, "use_gpu_features", False),
+            "use_parallel": getattr(args, "use_parallel", False),
+            "feature_workers": getattr(args, "feature_workers", None),
+            "timestamp": datetime.now().isoformat(),
+            "training_settings": {
+                "device": args.device,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "sequence_length": args.sequence_length,
+                "prediction_horizon": args.prediction_horizon,
+                "train_start_year": args.train_start_year,
+                "train_end_year": args.train_end_year,
+                "multi_task": args.multi_task,
+                "hidden_size": args.hidden_size,
+                "internal_neurons_ratio": args.internal_neurons_ratio,
+                "downsample_fast_to_medium": args.downsample_fast_to_medium,
+                "downsample_medium_to_slow": args.downsample_medium_to_slow,
+                "num_workers": args.num_workers,
+                "preload": getattr(args, "preload", False),
+                "output": getattr(args, "output", None),
+            }
+        }
+
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"   🗂️  Saved cache manifest: {manifest_path.name}")
+    except Exception as e:
+        print(f"   ⚠️  Could not save cache manifest ({type(e).__name__}): {e}")
+
+
 def train_epoch(
     model: HierarchicalLNN,
     dataloader: DataLoader,
@@ -450,6 +566,38 @@ def interactive_setup(args):
         print("Falling back to command-line args...")
         return args
 
+    # Initial cache directory selection
+    print("\n📂 Cache Directory Selection")
+    cache_dir_default = getattr(args, 'shard_path', 'data/feature_cache') or 'data/feature_cache'
+    args.shard_path = inquirer.text(
+        message="Cache directory for features/labels:",
+        default=cache_dir_default
+    ).execute()
+
+    # Scan for manifests in the chosen cache dir
+    manifests = load_cache_manifests(args.shard_path)
+    manifest_defaults = {}
+    selected_manifest = None
+    if manifests:
+        selected_manifest = pick_manifest(manifests)
+        if selected_manifest:
+            manifest_defaults = selected_manifest.get("training_settings", {})
+            # Apply precision / continuation mode defaults immediately
+            project_config.TRAINING_PRECISION = selected_manifest.get("precision", project_config.TRAINING_PRECISION)
+            if project_config.TRAINING_PRECISION == 'float64':
+                project_config.NUMPY_DTYPE = np.float64
+                project_config._TORCH_DTYPE = torch.float64
+            else:
+                project_config.NUMPY_DTYPE = np.float32
+                project_config._TORCH_DTYPE = torch.float32
+            project_config.CONTINUATION_MODE = selected_manifest.get("continuation_mode", project_config.CONTINUATION_MODE)
+            ah_range = selected_manifest.get("adaptive_horizon_range", [project_config.ADAPTIVE_MIN_HORIZON, project_config.ADAPTIVE_MAX_HORIZON])
+            if ah_range and len(ah_range) == 2 and all(v is not None for v in ah_range):
+                project_config.ADAPTIVE_MIN_HORIZON, project_config.ADAPTIVE_MAX_HORIZON = ah_range
+
+    def dflt(key, fallback):
+        return manifest_defaults.get(key, fallback)
+
     print("\n" + "=" * 70)
     print("🎯 HIERARCHICAL LNN - INTERACTIVE TRAINING SETUP")
     print("=" * 70)
@@ -492,7 +640,7 @@ def interactive_setup(args):
     args.device = inquirer.select(
         message="Select compute device:",
         choices=device_choices,
-        default=default_device
+        default=dflt('device', default_device)
     ).execute()
 
     # Validate selection
@@ -515,7 +663,7 @@ def interactive_setup(args):
 
     args.num_workers = int(inquirer.number(
         message=f"Data loading workers (CPU threads for batch prep, recommended: {default_workers}):",
-        default=default_workers,
+        default=dflt('num_workers', default_workers),
         min_allowed=0,
         max_allowed=128  # High limit for systems with many cores (e.g., 32-64 core servers)
     ).execute())
@@ -537,14 +685,14 @@ def interactive_setup(args):
     print()
     args.train_start_year = int(inquirer.number(
         message="Training data start year:",
-        default=2015,
+        default=dflt('train_start_year', 2015),
         min_allowed=2010,
         max_allowed=2023
     ).execute())
 
     args.train_end_year = int(inquirer.number(
         message="Training data end year:",
-        default=2022,
+        default=dflt('train_end_year', 2022),
         min_allowed=int(args.train_start_year),  # Explicit int conversion
         max_allowed=2024
     ).execute())
@@ -805,7 +953,7 @@ def interactive_setup(args):
             Choice(value='float64', name='float64 (8 bytes) - Maximum precision ⭐ Recommended'),
             Choice(value='float32', name='float32 (4 bytes) - Half memory, standard ML'),
         ],
-        default='float64'
+        default=dflt('precision', 'float64')
     ).execute()
 
     # Update config with precision choice
@@ -836,7 +984,7 @@ def interactive_setup(args):
             Choice(value='adaptive_labels', name='Adaptive Labels - Adaptive continuation, fixed high/low 🎯 Default'),
             Choice(value='adaptive_full', name='Fully Adaptive - All targets use adaptive horizon 🔬 Experimental'),
         ],
-        default='adaptive_labels'
+        default=dflt('continuation_mode', 'adaptive_labels')
     ).execute()
 
     # Update config with continuation mode
@@ -961,7 +1109,7 @@ def interactive_setup(args):
 
     args.epochs = int(inquirer.number(
         message="Number of epochs:",
-        default=100,
+        default=dflt('epochs', 100),
         min_allowed=1,
         max_allowed=1000
     ).execute())
@@ -977,14 +1125,14 @@ def interactive_setup(args):
 
     args.batch_size = int(inquirer.number(
         message=f"Batch size (recommended: {recommended_batch}, max for {args.device.upper()}: {max_batch_size}):",
-        default=recommended_batch,
+        default=dflt('batch_size', recommended_batch),
         min_allowed=1,  # Allow very small batches for MPS (1-4 for memory constrained)
         max_allowed=max_batch_size
     ).execute())
 
     args.lr = float(inquirer.number(
         message="Learning rate:",
-        default=0.001,
+        default=dflt('lr', 0.001),
         min_allowed=0.00001,
         max_allowed=0.01,
         float_allowed=True
@@ -998,7 +1146,7 @@ def interactive_setup(args):
             Choice(value=False, name=f'Lazy loading (2-3 GB RAM) - Recommended'),
             Choice(value=True, name=f'Preload (requires ~40 GB RAM) - 20% faster')
         ],
-        default=False
+        default=dflt('preload', False)
     ).execute()
     args.preload = preload_choice
 
@@ -1006,14 +1154,14 @@ def interactive_setup(args):
     print()
     args.multi_task = inquirer.confirm(
         message="Enable multi-task learning (hit_band, hit_target, expected_return)?",
-        default=True
+        default=dflt('multi_task', True)
     ).execute()
 
     # Output path
     print()
     args.output = inquirer.text(
         message="Model output path:",
-        default='models/hierarchical_lnn.pth'
+        default=dflt('output', 'models/hierarchical_lnn.pth')
     ).execute()
 
     # Summary
@@ -1375,6 +1523,20 @@ def main():
         print(f"     └─ All features in dataframe: {len(features_df.columns)}")
     print(f"   Generated {len(continuation_df) if continuation_df is not None else 0} continuation labels")
     print(f"   Feature names (first 5): {extractor.get_feature_names()[:5]}...")
+
+    # Save cache manifest for future reuse selection
+    cache_dir = getattr(extractor, "_unified_cache_dir", getattr(args, "shard_path", "data/feature_cache"))
+    cache_key = getattr(extractor, "_cache_key", None)
+    cont_path = getattr(extractor, "_cont_cache_path", None)
+    if cache_key:
+        save_cache_manifest(
+            cache_dir=Path(cache_dir),
+            cache_key=cache_key,
+            mmap_meta_path=mmap_meta_path,
+            continuation_path=str(cont_path) if cont_path else None,
+            args=args,
+            df=df
+        )
 
     # Create datasets
     print("\n3. Creating datasets...")
