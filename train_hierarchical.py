@@ -179,6 +179,7 @@ def pick_manifest(manifests):
         return None
     try:
         from InquirerPy import inquirer
+        from InquirerPy.base.control import Choice
     except ImportError:
         return None
 
@@ -231,8 +232,13 @@ def pick_cache_pair(caches):
         return None
     try:
         from InquirerPy import inquirer
+        from InquirerPy.base.control import Choice
     except ImportError:
         return None
+
+    # Auto-select when only one cache is available
+    if len(caches) == 1:
+        return caches[0]
 
     choices = []
     for c in caches:
@@ -248,7 +254,7 @@ def pick_cache_pair(caches):
     return inquirer.select(
         message="Reuse existing cached features/labels?",
         choices=choices,
-        default=choices[-1].value
+        default=choices[0].value  # Default to first cache
     ).execute()
 
 
@@ -754,99 +760,117 @@ def interactive_setup(args):
 
     # Training data range
     print()
-    args.train_start_year = int(inquirer.number(
-        message="Training data start year:",
-        default=dflt('train_start_year', 2015),
-        min_allowed=2010,
-        max_allowed=2023
-    ).execute())
+    if selected_cache_pair:
+        # Lock to cached date range to avoid regenerating
+        m_start = manifest_defaults.get('train_start_year', None)
+        m_end = manifest_defaults.get('train_end_year', None)
+        if not m_start or not m_end:
+            # Fallback to manifest date_range if training settings missing
+            dr = manifest_defaults.get('date_range', {})
+            try:
+                m_start = int(str(dr.get('start', ''))[:4])
+                m_end = int(str(dr.get('end', ''))[:4])
+            except Exception:
+                m_start, m_end = 2015, 2022
+        args.train_start_year = int(m_start)
+        args.train_end_year = int(m_end)
+        print(f"\n   📅 Using cached date range: {args.train_start_year}-{args.train_end_year}")
+    else:
+        args.train_start_year = int(inquirer.number(
+            message="Training data start year:",
+            default=dflt('train_start_year', 2015),
+            min_allowed=2010,
+            max_allowed=2023
+        ).execute())
 
-    args.train_end_year = int(inquirer.number(
-        message="Training data end year:",
-        default=dflt('train_end_year', 2022),
-        min_allowed=int(args.train_start_year),  # Explicit int conversion
-        max_allowed=2024
-    ).execute())
+        args.train_end_year = int(inquirer.number(
+            message="Training data end year:",
+            default=dflt('train_end_year', 2022),
+            min_allowed=int(args.train_start_year),  # Explicit int conversion
+            max_allowed=2024
+        ).execute())
 
     # Validate and notify about warmup impact
-    warmup_years = project_config.MIN_LOOKBACK_MONTHS / 12 if hasattr(project_config, 'MIN_LOOKBACK_MONTHS') else 2.5
-    requested_years = args.train_end_year - args.train_start_year
-    effective_start_year = args.train_start_year + warmup_years
-    effective_years = args.train_end_year - effective_start_year
+    if not selected_cache_pair:
+        warmup_years = project_config.MIN_LOOKBACK_MONTHS / 12 if hasattr(project_config, 'MIN_LOOKBACK_MONTHS') else 2.5
+        requested_years = args.train_end_year - args.train_start_year
+        effective_start_year = args.train_start_year + warmup_years
+        effective_years = args.train_end_year - effective_start_year
 
-    print(f"\n   📅 Training Date Range Analysis:")
-    print(f"   Requested: {args.train_start_year}-{args.train_end_year} ({requested_years} years)")
-    print(f"   Warmup required: {warmup_years} years (257,400 bars for 21-window system)")
-    print(f"   ")
-    print(f"   ⚠️  IF your CSV starts at {args.train_start_year}:")
-    print(f"       Effective training: {effective_start_year:.1f}-{args.train_end_year} ({effective_years:.1f} years)")
-    print(f"       → First {warmup_years} years used for warmup (ensures complete feature history)")
-    print(f"   ")
-    print(f"   💡 To train from {args.train_start_year}, you need CSV data from {args.train_start_year - warmup_years:.1f}")
-    print(f"   ")
+        print(f"\n   📅 Training Date Range Analysis:")
+        print(f"   Requested: {args.train_start_year}-{args.train_end_year} ({requested_years} years)")
+        print(f"   Warmup required: {warmup_years} years (257,400 bars for 21-window system)")
+        print(f"   ")
+        print(f"   ⚠️  IF your CSV starts at {args.train_start_year}:")
+        print(f"       Effective training: {effective_start_year:.1f}-{args.train_end_year} ({effective_years:.1f} years)")
+        print(f"       → First {warmup_years} years used for warmup (ensures complete feature history)")
+        print(f"   ")
+        print(f"   💡 To train from {args.train_start_year}, you need CSV data from {args.train_start_year - warmup_years:.1f}")
+        print(f"   ")
 
-    if effective_years < 2.0:
-        print(f"   ⚠️  Warning: Only {effective_years:.1f} years of usable training data after warmup!")
-        proceed = inquirer.confirm(
-            message=f"Continue with {args.train_start_year}-{args.train_end_year} anyway?",
-            default=False
-        ).execute()
-        if not proceed:
-            print("   Exiting - please adjust dates or get more historical data")
-            sys.exit(0)
-        else:
-            print(f"   ⚠️  Continuing with limited data ({effective_years:.1f} years)")
-    else:
-        print(f"   ✓ Good! {effective_years:.1f} years of quality training data after warmup")
-
-    # GPU Acceleration option (ALWAYS shown)
-    print()
-
-    # Check if GPU is available
-    gpu_available = torch.cuda.is_available() or torch.backends.mps.is_available()
-    if torch.cuda.is_available():
-        gpu_type = 'CUDA'
-        gpu_name = torch.cuda.get_device_name(0)
-    elif torch.backends.mps.is_available():
-        gpu_type = 'MPS'
-        gpu_name = 'Apple Silicon'
-    else:
-        gpu_type = None
-        gpu_name = 'Not Available'
-
-    # Determine if cache will be used
-    will_use_cache = not getattr(args, 'regenerate_cache', True)
-
-    if gpu_available:
-        print(f"⚡ GPU Acceleration Available: {gpu_name} ({gpu_type})")
-
-        if will_use_cache:
-            # Cache will be loaded - GPU won't be used this run
-            message = "Use GPU acceleration for feature extraction? (Note: Cache will be loaded this run, GPU only applies if cache regenerates)"
-        else:
-            # Will calculate features - GPU will be used
-            message = "Use GPU acceleration for feature extraction? (Speeds up calculation: ~45 mins → ~3 mins)"
-
-        args.use_gpu_features = inquirer.select(
-            message=message,
-            choices=[
-                Choice(True, f"Yes - Use {gpu_type} GPU (10-20x faster for calculation) ⚡"),
-                Choice(False, "No - Use CPU (reliable, compatible) 💾")
-            ],
-            default=True  # Default to GPU if available
-        ).execute()
-
-        if args.use_gpu_features:
-            if will_use_cache:
-                print(f"   ℹ️  GPU selected (will be used if cache needs regeneration)")
+        if effective_years < 2.0:
+            print(f"   ⚠️  Warning: Only {effective_years:.1f} years of usable training data after warmup!")
+            proceed = inquirer.confirm(
+                message=f"Continue with {args.train_start_year}-{args.train_end_year} anyway?",
+                default=False
+            ).execute()
+            if not proceed:
+                print("   Exiting - please adjust dates or get more historical data")
+                sys.exit(0)
             else:
-                print(f"   ⚡ GPU will accelerate feature calculation (~3 minutes instead of ~45 minutes)")
+                print(f"   ⚠️  Continuing with limited data ({effective_years:.1f} years)")
         else:
-            print(f"   💾 CPU will be used for feature calculation")
-    else:
-        # No GPU available
+            print(f"   ✓ Good! {effective_years:.1f} years of quality training data after warmup")
+
+    # GPU Acceleration option (skip if using cached features)
+    print()
+    will_use_cache = not getattr(args, 'regenerate_cache', True)
+    gpu_available = torch.cuda.is_available() or torch.backends.mps.is_available()
+    if selected_cache_pair and will_use_cache:
         args.use_gpu_features = False
-        print(f"⚡ GPU Acceleration: Not Available (CPU will be used)")
+        print("⚡ GPU Acceleration: Skipped (using cached features/labels)")
+    else:
+        # Check if GPU is available
+        if torch.cuda.is_available():
+            gpu_type = 'CUDA'
+            gpu_name = torch.cuda.get_device_name(0)
+        elif torch.backends.mps.is_available():
+            gpu_type = 'MPS'
+            gpu_name = 'Apple Silicon'
+        else:
+            gpu_type = None
+            gpu_name = 'Not Available'
+
+        if gpu_available:
+            print(f"⚡ GPU Acceleration Available: {gpu_name} ({gpu_type})")
+
+            if will_use_cache:
+                # Cache will be loaded - GPU won't be used this run
+                message = "Use GPU acceleration for feature extraction? (Note: Cache will be loaded this run, GPU only applies if cache regenerates)"
+            else:
+                # Will calculate features - GPU will be used
+                message = "Use GPU acceleration for feature extraction? (Speeds up calculation: ~45 mins → ~3 mins)"
+
+            args.use_gpu_features = inquirer.select(
+                message=message,
+                choices=[
+                    Choice(True, f"Yes - Use {gpu_type} GPU (10-20x faster for calculation) ⚡"),
+                    Choice(False, "No - Use CPU (reliable, compatible) 💾")
+                ],
+                default=True  # Default to GPU if available
+            ).execute()
+
+            if args.use_gpu_features:
+                if will_use_cache:
+                    print(f"   ℹ️  GPU selected (will be used if cache needs regeneration)")
+                else:
+                    print(f"   ⚡ GPU will accelerate feature calculation (~3 minutes instead of ~45 minutes)")
+            else:
+                print(f"   💾 CPU will be used for feature calculation")
+        else:
+            # No GPU available
+            args.use_gpu_features = False
+            print(f"⚡ GPU Acceleration: Not Available (CPU will be used)")
 
     # Parallel Processing option (for CPU mode)
     print()
@@ -955,16 +979,20 @@ def interactive_setup(args):
         # Cache will be loaded - chunking doesn't apply
         args.use_chunking = False
 
-    # Precision selection
-    print()
-    precision_choice = inquirer.select(
-        message="Training precision:",
-        choices=[
-            Choice(value='float64', name='float64 (8 bytes) - Maximum precision ⭐ Recommended'),
-            Choice(value='float32', name='float32 (4 bytes) - Half memory, standard ML'),
-        ],
-        default=dflt('precision', 'float64')
-    ).execute()
+    # Precision selection (skip if using cached features/labels)
+    if selected_cache_pair and will_use_cache:
+        print("\n   ⚙️  Using cached precision/continuation settings from manifest")
+        precision_choice = project_config.TRAINING_PRECISION
+    else:
+        print()
+        precision_choice = inquirer.select(
+            message="Training precision:",
+            choices=[
+                Choice(value='float64', name='float64 (8 bytes) - Maximum precision ⭐ Recommended'),
+                Choice(value='float32', name='float32 (4 bytes) - Half memory, standard ML'),
+            ],
+            default=dflt('precision', 'float64')
+        ).execute()
 
     # Update config with precision choice
     project_config.TRAINING_PRECISION = precision_choice
@@ -985,17 +1013,21 @@ def interactive_setup(args):
         print("   Will automatically use float32 during training")
         print("   (Actual switch happens when training starts)")
 
-    # Continuation label mode selection
-    print()
-    continuation_mode = inquirer.select(
-        message="Continuation prediction mode:",
-        choices=[
-            Choice(value='simple', name='Simple - Fixed 24-bar for all targets ⭐ Baseline'),
-            Choice(value='adaptive_labels', name='Adaptive Labels - Adaptive continuation, fixed high/low 🎯 Default'),
-            Choice(value='adaptive_full', name='Fully Adaptive - All targets use adaptive horizon 🔬 Experimental'),
-        ],
-        default=dflt('continuation_mode', 'adaptive_labels')
-    ).execute()
+    # Continuation label mode selection (skip if using cached features/labels)
+    if selected_cache_pair and will_use_cache:
+        continuation_mode = project_config.CONTINUATION_MODE
+        print(f"\n   ⚙️  Using cached continuation mode: {continuation_mode}")
+    else:
+        print()
+        continuation_mode = inquirer.select(
+            message="Continuation prediction mode:",
+            choices=[
+                Choice(value='simple', name='Simple - Fixed 24-bar for all targets ⭐ Baseline'),
+                Choice(value='adaptive_labels', name='Adaptive Labels - Adaptive continuation, fixed high/low 🎯 Default'),
+                Choice(value='adaptive_full', name='Fully Adaptive - All targets use adaptive horizon 🔬 Experimental'),
+            ],
+            default=dflt('continuation_mode', 'adaptive_labels')
+        ).execute()
 
     # Update config with continuation mode
     project_config.CONTINUATION_MODE = continuation_mode
@@ -1011,11 +1043,13 @@ def interactive_setup(args):
         print()
         print(f"   Current adaptive horizon range: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars")
 
-        # Ask if user wants to customize the horizon range
-        customize_horizon = inquirer.confirm(
-            message="Customize adaptive horizon range?",
-            default=False
-        ).execute()
+        # Ask if user wants to customize the horizon range (only if not locked to cache)
+        customize_horizon = False
+        if not (selected_cache_pair and will_use_cache):
+            customize_horizon = inquirer.confirm(
+                message="Customize adaptive horizon range?",
+                default=False
+            ).execute()
 
         if customize_horizon:
             # Get minimum horizon
@@ -1055,11 +1089,13 @@ def interactive_setup(args):
         print()
         print(f"   Current adaptive horizon range: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars")
 
-        # Ask if user wants to customize the horizon range
-        customize_horizon = inquirer.confirm(
-            message="Customize adaptive horizon range?",
-            default=False
-        ).execute()
+        # Ask if user wants to customize the horizon range (only if not locked to cache)
+        customize_horizon = False
+        if not (selected_cache_pair and will_use_cache):
+            customize_horizon = inquirer.confirm(
+                message="Customize adaptive horizon range?",
+                default=False
+            ).execute()
 
         if customize_horizon:
             # Get minimum horizon
