@@ -1378,7 +1378,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                 'end_date': str(chunk_end.date())
             })
 
-            print(f"       ✓ Shard saved: {chunk_array.nbytes / 1e6:.1f} MB on disk")
+            bytes_on_disk = chunk_features.shape[0] * chunk_features.shape[1] * np.dtype(config.NUMPY_DTYPE).itemsize
+            print(f"       ✓ Shard saved: {bytes_on_disk / 1e6:.1f} MB on disk")
 
             # Aggressive memory cleanup
             del chunk_df, chunk_features, chunk_array
