@@ -874,23 +874,75 @@ def interactive_setup(args):
             args.device = default_device
             print(f"   Switched to {args.device.upper()}")
 
-    # AMP (Mixed Precision) option - only for CUDA
+    # Consolidated precision menu for CUDA (combines AMP + base precision)
     args.amp = False  # Default to disabled
+    args.precision_mode = 'fp32'  # Track the user's choice
+
     if args.device == 'cuda':
         print()
-        args.amp = inquirer.select(
-            message="Enable Mixed Precision (AMP)?",
+        precision_choice = inquirer.select(
+            message="Training precision:",
             choices=[
-                Choice(value=True, name="Yes - 2-3x faster training, uses FP16 tensor cores ⚡"),
-                Choice(value=False, name="No - Standard FP32 precision (safer, slower)")
+                Choice(value='fp16_amp', name="FP16 (AMP) - 2-3x faster, uses tensor cores ⚡"),
+                Choice(value='fp32', name="FP32 - Standard precision"),
+                Choice(value='fp64', name="FP64 - Maximum precision (slowest)")
             ],
-            default=True
+            default='fp16_amp'
         ).execute()
 
-        if args.amp:
-            print("   ⚡ Mixed Precision (AMP) enabled - will use FP16 tensor cores")
+        args.precision_mode = precision_choice
+
+        if precision_choice == 'fp16_amp':
+            args.amp = True
+            project_config.TRAINING_PRECISION = 'float32'
+            project_config.NUMPY_DTYPE = np.float32
+            project_config._TORCH_DTYPE = torch.float32
+            print("   ⚡ FP16 (AMP) - Using FP16 tensor cores with FP32 base weights")
+        elif precision_choice == 'fp32':
+            args.amp = False
+            project_config.TRAINING_PRECISION = 'float32'
+            project_config.NUMPY_DTYPE = np.float32
+            project_config._TORCH_DTYPE = torch.float32
+            print("   → FP32 - Standard precision training")
+        else:  # fp64
+            args.amp = False
+            project_config.TRAINING_PRECISION = 'float64'
+            project_config.NUMPY_DTYPE = np.float64
+            project_config._TORCH_DTYPE = torch.float64
+            print("   → FP64 - Maximum precision (slower, more memory)")
+
+    elif args.device == 'mps':
+        # MPS only supports float32
+        print()
+        print("   ℹ️  MPS uses FP32 precision (float64 not supported)")
+        args.amp = False
+        project_config.TRAINING_PRECISION = 'float32'
+        project_config.NUMPY_DTYPE = np.float32
+        project_config._TORCH_DTYPE = torch.float32
+
+    else:  # CPU
+        print()
+        precision_choice = inquirer.select(
+            message="Training precision:",
+            choices=[
+                Choice(value='fp32', name="FP32 - Standard precision (recommended)"),
+                Choice(value='fp64', name="FP64 - Maximum precision (slower)")
+            ],
+            default='fp32'
+        ).execute()
+
+        args.precision_mode = precision_choice
+
+        if precision_choice == 'fp64':
+            project_config.TRAINING_PRECISION = 'float64'
+            project_config.NUMPY_DTYPE = np.float64
+            project_config._TORCH_DTYPE = torch.float64
+            print("   → FP64 - Maximum precision")
         else:
-            print("   → Standard FP32 precision (full precision)")
+            project_config.TRAINING_PRECISION = 'float32'
+            project_config.NUMPY_DTYPE = np.float32
+            project_config._TORCH_DTYPE = torch.float32
+            print("   → FP32 - Standard precision")
 
     # Data loading workers (RIGHT after device selection)
     print()
@@ -1137,39 +1189,8 @@ def interactive_setup(args):
         # Cache will be loaded - chunking doesn't apply
         args.use_chunking = False
 
-    # Precision selection (skip if using cached features/labels)
-    if selected_cache_pair and will_use_cache:
-        print("\n   ⚙️  Using cached precision/continuation settings from manifest")
-        precision_choice = project_config.TRAINING_PRECISION
-    else:
-        print()
-        precision_choice = inquirer.select(
-            message="Training precision:",
-            choices=[
-                Choice(value='float64', name='float64 (8 bytes) - Maximum precision ⭐ Recommended'),
-                Choice(value='float32', name='float32 (4 bytes) - Half memory, standard ML'),
-            ],
-            default=dflt('precision', 'float64')
-        ).execute()
-
-    # Update config with precision choice
-    project_config.TRAINING_PRECISION = precision_choice
-    if precision_choice == 'float64':
-        project_config.NUMPY_DTYPE = np.float64
-        project_config._TORCH_DTYPE = torch.float64  # Set lazy-loaded value
-        print(f"   → Using float64 (maximum precision, ~10% more memory)")
-    else:
-        project_config.NUMPY_DTYPE = np.float32
-        project_config._TORCH_DTYPE = torch.float32  # Set lazy-loaded value
-        print(f"   → Using float32 (standard precision, half memory)")
-
-    # Check MPS compatibility with precision
-    best_device = get_best_device()
-    if best_device == 'mps' and precision_choice == 'float64':
-        print()
-        print("⚠️  WARNING: MPS device doesn't support float64")
-        print("   Will automatically use float32 during training")
-        print("   (Actual switch happens when training starts)")
+    # Note: Precision is now selected in the consolidated menu right after device selection
+    # This section only handles continuation mode
 
     # Continuation label mode selection (skip if using cached features/labels)
     if selected_cache_pair and will_use_cache:
@@ -1380,13 +1401,20 @@ def interactive_setup(args):
     if chunk_path:
         chunk_str += f" → {chunk_path}"
 
+    # Format precision display
+    precision_mode = getattr(args, 'precision_mode', 'fp32')
+    if precision_mode == 'fp16_amp':
+        precision_display = "FP16 (AMP) ⚡"
+    elif precision_mode == 'fp64':
+        precision_display = "FP64"
+    else:
+        precision_display = "FP32"
+
     print("\n" + "=" * 70)
     print("📋 TRAINING CONFIGURATION SUMMARY")
     print("=" * 70)
     print(f"  Device: {args.device.upper()} (num_workers={args.num_workers})")
-    if args.device == 'cuda':
-        amp_status = "Enabled ⚡" if getattr(args, 'amp', False) else "Disabled"
-        print(f"  Mixed Precision (AMP): {amp_status}")
+    print(f"  Precision: {precision_display}")
     print(f"  Training Period: {args.train_start_year}-{args.train_end_year}")
     print(f"  Epochs: {args.epochs}")
     print(f"  Batch Size: {args.batch_size}")
@@ -1396,7 +1424,6 @@ def interactive_setup(args):
     print(f"  Feature GPU: {'Yes' if getattr(args, 'use_gpu_features', False) else 'No'}")
     print(f"  Parallel CPU: {parallel_str}")
     print(f"  Chunking: {chunk_str}")
-    print(f"  Precision: {project_config.TRAINING_PRECISION}")
     print(f"  Continuation Mode: {project_config.CONTINUATION_MODE} "
           f"(horizon {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars)")
     print(f"  Model Capacity: internal_ratio={args.internal_neurons_ratio}, hidden_size={args.hidden_size}")
