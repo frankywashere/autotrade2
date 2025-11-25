@@ -27,9 +27,10 @@ from src.rsi_calculator import RSICalculator
 from .base import FeatureExtractor
 
 # GPU acceleration (CUDA-only, gated by device selection)
+# Only enable if CUDA is actually available - MPS uses CPU path
 try:
     from .gpu_rolling import CUDARollingStats
-    GPU_ROLLING_AVAILABLE = True
+    GPU_ROLLING_AVAILABLE = torch.cuda.is_available()  # CUDA only, not MPS
 except ImportError:
     GPU_ROLLING_AVAILABLE = False
 
@@ -754,14 +755,14 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Check config setting and other conditions
         parallel_enabled = config.PARALLEL_CHANNEL_CALC if hasattr(config, 'PARALLEL_CHANNEL_CALC') else True
 
-        # Simplified: CPU always uses parallel (can be n_jobs=1), GPU/live use sequential
-        use_parallel = parallel_enabled and not use_gpu and not is_live_mode
+        # v3.20: GPU rolling stats (price/correlation) can run alongside parallel channel extraction
+        # GPU rolling stats are for _extract_price_features() and _extract_correlation_features()
+        # Channel extraction is CPU-bound linear regression - parallel CPU is still fastest
+        use_parallel = parallel_enabled and not is_live_mode
 
         # Notify user of processing mode and time estimate
         if not use_parallel:
             reasons = []
-            if use_gpu:
-                reasons.append("GPU mode (requires sequential)")
             if is_live_mode:
                 reasons.append("live mode (stability)")
             if not parallel_enabled:
@@ -771,7 +772,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   ⏱️  Using multi-window OHLC channels ({len(config.CHANNEL_WINDOW_SIZES)} windows per timeframe)")
         else:
             cores_to_use = config.MAX_PARALLEL_WORKERS if hasattr(config, 'MAX_PARALLEL_WORKERS') and config.MAX_PARALLEL_WORKERS > 0 else n_cores
-            print(f"   🚀 Parallel processing: using {cores_to_use} of {n_cores} available cores")
+            gpu_note = " + GPU rolling stats" if use_gpu else ""
+            print(f"   🚀 Parallel processing: using {cores_to_use} of {n_cores} available cores{gpu_note}")
             print(f"   ⏱️  Multi-window OHLC channels ({len(config.CHANNEL_WINDOW_SIZES)} windows per timeframe)")
             if cores_to_use == 1:
                 print(f"   💡 Single-core parallel mode - good for debugging!")

@@ -79,12 +79,25 @@ def get_best_device():
 def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
     """Get recommended batch size for device (v3.19: Very conservative for MPS + 14K features)."""
     recommendations = {
-        'cuda': 64,   # NVIDIA GPU (reduced for 14K features)
-        'mps_high': 8,   # M2 Max/Ultra with 64+ GB (very conservative, num_workers=0 + from_numpy fix)
-        'mps_mid': 4,    # M2 Pro/M1 Max with 32-64 GB (4 is safer with memory efficiency fixes)
-        'mps_low': 2,    # M1/M1 Pro with 16-32 GB (very safe, only 2 samples per batch)
+        'cuda_high': 256,  # NVIDIA GPU with 64GB+ VRAM (e.g., A100 80GB, H100)
+        'cuda': 64,        # NVIDIA GPU (standard, reduced for 14K features)
+        'mps_high': 8,     # M2 Max/Ultra with 64+ GB (very conservative, num_workers=0 + from_numpy fix)
+        'mps_mid': 4,      # M2 Pro/M1 Max with 32-64 GB (4 is safer with memory efficiency fixes)
+        'mps_low': 2,      # M1/M1 Pro with 16-32 GB (very safe, only 2 samples per batch)
         'cpu': 16
     }
+
+    if device == 'cuda':
+        # Check VRAM for high-memory GPUs
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if vram_gb >= 64:
+                    return recommendations['cuda_high']
+        except Exception:
+            pass  # Fall through to standard cuda
+        return recommendations['cuda']
 
     if device == 'mps':
         if total_ram_gb >= 64:
