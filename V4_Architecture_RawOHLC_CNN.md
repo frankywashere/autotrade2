@@ -568,6 +568,78 @@ class HierarchicalLNN_V4_Hybrid(nn.Module):
 
 ---
 
+## Supervised CNN Pre-Training: Guarantee Channel Learning
+
+**Problem with Pure CNN:** The CNN might NOT discover channels - it could learn completely different patterns (or worse, noise). No guarantee it finds the patterns we know work.
+
+**Solution: Pre-train CNN to explicitly learn channels**
+
+### Pre-Training Strategy
+
+1. **Generate channel labels from V3 system:**
+   ```python
+   # Use existing feature extraction to create labels
+   channel_labels = {
+       'position': tsla_channel_1h_position_w168,      # 0-1 position
+       'slope_pct': tsla_channel_1h_slope_pct_w168,    # Slope percentage
+       'ping_pongs': tsla_channel_1h_ping_pongs_w168,  # Bounce count
+       'r_squared': tsla_channel_1h_r_squared_w168,    # Channel quality
+       'channel_width': tsla_channel_1h_width_pct_w168 # Width percentage
+   }
+   ```
+
+2. **Train CNN to predict these labels from raw OHLC:**
+   ```python
+   class ChannelPretrainCNN(nn.Module):
+       def __init__(self):
+           self.cnn = nn.Sequential(
+               nn.Conv1d(4, 32, kernel_size=5, padding=2),
+               nn.ReLU(),
+               nn.Conv1d(32, 64, kernel_size=3, padding=1),
+               nn.ReLU(),
+               nn.AdaptiveAvgPool1d(1),
+               nn.Flatten()
+           )
+           # Predict channel metrics
+           self.channel_head = nn.Linear(64, 5)  # position, slope, ping_pongs, r2, width
+
+       def forward(self, raw_ohlc):
+           features = self.cnn(raw_ohlc)
+           return self.channel_head(features)
+
+   # Pre-training loss
+   pretrain_loss = MSE(predicted_channels, v3_channel_labels)
+   ```
+
+3. **Transfer pre-trained CNN to full model:**
+   ```python
+   # After pre-training
+   v4_model.fast_cnn.load_state_dict(pretrained_cnn.cnn.state_dict())
+
+   # Now the CNN "sees" channels before learning the trading task
+   # Fine-tuning can discover ADDITIONAL patterns beyond channels
+   ```
+
+### Benefits of Pre-Training
+
+| Aspect | Pure CNN | Pre-Trained CNN |
+|--------|----------|-----------------|
+| Channel detection | Maybe (hopes it learns) | Guaranteed (explicitly trained) |
+| Training time | Longer (learns from scratch) | Faster (starts with knowledge) |
+| Risk of missing patterns | High | Low |
+| Additional discoveries | Yes | Yes (fine-tuning finds more) |
+
+### Pre-Training Data Requirements
+
+- Use V3 feature extraction on historical data
+- Generate labels for all timeframes/windows
+- ~500k samples sufficient for pre-training
+- Pre-training time: ~1-2 hours on GPU
+
+**This ensures the CNN KNOWS what channels look like before it ever sees the trading task. It can then discover ADDITIONAL patterns during fine-tuning that we never coded.**
+
+---
+
 ## Migration Path
 
 ### Option A: Clean Switch (High Risk, High Reward)
