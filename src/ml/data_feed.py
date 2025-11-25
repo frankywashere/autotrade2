@@ -152,12 +152,10 @@ class CSVDataFeed(DataFeed):
         # Inner join on timestamp index
         common_timestamps = spy_df.index.intersection(tsla_df.index)
 
-        spy_aligned = spy_df.loc[common_timestamps].copy()
-        tsla_aligned = tsla_df.loc[common_timestamps].copy()
-
-        # Add suffix to distinguish columns
-        spy_aligned.columns = [f'spy_{col}' for col in spy_aligned.columns]
-        tsla_aligned.columns = [f'tsla_{col}' for col in tsla_aligned.columns]
+        # Optimize: avoid intermediate copy by chaining loc + rename
+        # rename() creates a new DataFrame, so no need for explicit .copy()
+        spy_aligned = spy_df.loc[common_timestamps].rename(columns=lambda x: f'spy_{x}')
+        tsla_aligned = tsla_df.loc[common_timestamps].rename(columns=lambda x: f'tsla_{x}')
 
         # Validate alignment
         assert len(spy_aligned) == len(tsla_aligned), "Alignment failed: length mismatch"

@@ -137,7 +137,12 @@ class HierarchicalDataset(Dataset):
 
             # Load non-channel features normally (these are small - ~165 base features)
             if features_df is not None:
-                self.non_channel_array = features_df.values.astype(config.NUMPY_DTYPE)
+                # Optimize: check dtype before converting
+                temp_array = features_df.values
+                if temp_array.dtype != config.NUMPY_DTYPE:
+                    self.non_channel_array = temp_array.astype(config.NUMPY_DTYPE)
+                else:
+                    self.non_channel_array = temp_array
             else:
                 self.non_channel_array = None
 
@@ -183,7 +188,7 @@ class HierarchicalDataset(Dataset):
 
         if raw_ohlc_df is not None:
             self.raw_ohlc_array = raw_ohlc_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
-            # Ensure OHLC also matches dtype
+            # Optimize: ensure OHLC matches dtype (already checks before converting)
             if self.raw_ohlc_array.dtype != expected_dtype:
                 self.raw_ohlc_array = self.raw_ohlc_array.astype(expected_dtype)
         else:

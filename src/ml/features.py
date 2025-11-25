@@ -26,6 +26,13 @@ from src.linear_regression import LinearRegressionChannel
 from src.rsi_calculator import RSICalculator
 from .base import FeatureExtractor
 
+# GPU acceleration (CUDA-only, gated by device selection)
+try:
+    from .gpu_rolling import CUDARollingStats
+    GPU_ROLLING_AVAILABLE = True
+except ImportError:
+    GPU_ROLLING_AVAILABLE = False
+
 # Feature cache version - increment when calculation logic changes
 FEATURE_VERSION = "v3.18_hybrid_monthly"  # 21-window + complete_cycles + hybrid monthly/3month processing
 
@@ -392,7 +399,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         # PASS 1: Extract base features
         print("   Extracting base features...")
         with tqdm(total=7, desc="   Feature extraction", leave=True, ncols=100, ascii=True, mininterval=0.5) as pbar:
-            price_df = self._extract_price_features(df)
+            price_df = self._extract_price_features(df, use_gpu=use_gpu_resolved)
             pbar.update(1)
 
             # Chunked extraction logic
@@ -430,7 +437,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             rsi_df = self._extract_rsi_features(df, multi_res_data=multi_res_data)
             pbar.update(1)
 
-            correlation_df = self._extract_correlation_features(df)
+            correlation_df = self._extract_correlation_features(df, use_gpu=use_gpu_resolved)
             pbar.update(1)
 
             cycle_df = self._extract_cycle_features(df)
@@ -448,9 +455,11 @@ class TradingFeatureExtractor(FeatureExtractor):
             # v3.19: Monthly/3month now in separate shard (not in RAM concat)
             concat_list = [price_df, rsi_df, correlation_df, cycle_df, volume_df, time_df]
             # Monthly/3month removed - they're in monthly_3month_shard.npy, loaded as mmap
-            base_features_df = pd.concat(concat_list, axis=1)
+            # Optimize: copy=False avoids unnecessary data copies
+            base_features_df = pd.concat(concat_list, axis=1, copy=False)
         else:
             # Normal mode - include channel features
+            # Optimize: copy=False avoids unnecessary data copies
             base_features_df = pd.concat([
                 price_df,
                 channel_df,
@@ -459,7 +468,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 cycle_df,
                 volume_df,
                 time_df
-            ], axis=1)
+            ], axis=1, copy=False)
 
         # PASS 2: Extract breakdown features (needs base features + optional events)
         with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100, ascii=True, mininterval=0.5) as pbar:
@@ -467,7 +476,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             pbar.update(1)
 
         # Final concat (non-channel features only if using mmap)
-        features_df = pd.concat([base_features_df, breakdown_df], axis=1)
+        # Optimize: copy=False avoids unnecessary data copies
+        features_df = pd.concat([base_features_df, breakdown_df], axis=1, copy=False)
 
         # Generate continuation labels if requested
         continuation_df = None
@@ -507,29 +517,59 @@ class TradingFeatureExtractor(FeatureExtractor):
             print("   🔍 DEBUG: Returning (features_df, continuation_df)")
             return features_df, continuation_df
 
-    def _extract_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Extract basic price features. Returns DataFrame with 12 columns (v3.8: +2 normalized prices)."""
+    def _extract_price_features(self, df: pd.DataFrame, use_gpu: bool = False) -> pd.DataFrame:
+        """Extract basic price features. Returns DataFrame with 12 columns (v3.8: +2 normalized prices).
+
+        Args:
+            df: OHLCV DataFrame
+            use_gpu: If True, use GPU-accelerated rolling statistics (CUDA only)
+        """
         price_features = {}
+
+        # GPU acceleration check - use_gpu flag comes from extract_features()
+        # which resolves it based on GPU_ROLLING_AVAILABLE and user device selection
+        if use_gpu and GPU_ROLLING_AVAILABLE:
+            gpu_roller = CUDARollingStats(device='cuda')
 
         for symbol in ['spy', 'tsla']:
             close_col = f'{symbol}_close'
             price_features[close_col] = df[close_col]
 
-            # Normalized price (position in 252-bar/1-year range) - v3.8
-            # 0 = at yearly low, 1 = at yearly high, 0.5 = middle
-            rolling_min = df[close_col].rolling(window=252, min_periods=20).min()
-            rolling_max = df[close_col].rolling(window=252, min_periods=20).max()
-            price_range = rolling_max - rolling_min
-            price_features[f'{symbol}_close_norm'] = ((df[close_col] - rolling_min) / price_range).fillna(0.5)
-
-            # Returns
+            # Returns (needed for volatility)
             returns = df[close_col].pct_change()
             price_features[f'{symbol}_returns'] = returns
             price_features[f'{symbol}_log_returns'] = np.log(df[close_col] / df[close_col].shift(1))
 
-            # Volatility (rolling std of returns)
-            price_features[f'{symbol}_volatility_10'] = returns.rolling(10).std()
-            price_features[f'{symbol}_volatility_50'] = returns.rolling(50).std()
+            if use_gpu and GPU_ROLLING_AVAILABLE:
+                # GPU path: batch compute all rolling operations
+                close_data = df[close_col].values
+                returns_data = returns.values
+
+                # Rolling min/max for normalization
+                rolling_results = gpu_roller.rolling_stats(
+                    close_data, windows=[252], stats=['min', 'max']
+                )
+                rolling_min = pd.Series(rolling_results['min_252'], index=df.index)
+                rolling_max = pd.Series(rolling_results['max_252'], index=df.index)
+
+                # Volatility (std of returns)
+                vol_results = gpu_roller.rolling_stats(
+                    returns_data, windows=[10, 50], stats=['std']
+                )
+                price_features[f'{symbol}_volatility_10'] = vol_results['std_10']
+                price_features[f'{symbol}_volatility_50'] = vol_results['std_50']
+            else:
+                # CPU path: original pandas implementation
+                rolling_min = df[close_col].rolling(window=252, min_periods=20).min()
+                rolling_max = df[close_col].rolling(window=252, min_periods=20).max()
+
+                # Volatility
+                price_features[f'{symbol}_volatility_10'] = returns.rolling(10).std()
+                price_features[f'{symbol}_volatility_50'] = returns.rolling(50).std()
+
+            # Normalized price (common to both paths)
+            price_range = rolling_max - rolling_min
+            price_features[f'{symbol}_close_norm'] = ((df[close_col] - rolling_min) / price_range).fillna(0.5)
 
         return pd.DataFrame(price_features, index=df.index)
 
@@ -888,11 +928,11 @@ class TradingFeatureExtractor(FeatureExtractor):
                             source_data = multi_res_data['1hour']
                         else:
                             source_data = multi_res_data['daily']
-                        symbol_df = source_data[[c for c in source_data.columns if c.startswith(f'{symbol}_')]].copy()
+                        # Optimize: chain column selection with rename to avoid intermediate copy
+                        symbol_df = source_data[[c for c in source_data.columns if c.startswith(f'{symbol}_')]].rename(columns=lambda c: c.replace(f'{symbol}_', ''))
                     else:
-                        symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].copy()
-
-                    symbol_df.columns = [c.replace(f'{symbol}_', '') for c in symbol_df.columns]
+                        # Optimize: chain column selection with rename to avoid intermediate copy
+                        symbol_df = df[[c for c in df.columns if c.startswith(f'{symbol}_')]].rename(columns=lambda c: c.replace(f'{symbol}_', ''))
 
                     # Resample
                     resampled = symbol_df.resample(tf_rule).agg({
@@ -2288,19 +2328,44 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         return pd.DataFrame(rsi_features, index=df.index)
 
-    def _extract_correlation_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Extract SPY-TSLA correlation and divergence features. Returns DataFrame with 5 columns."""
+    def _extract_correlation_features(self, df: pd.DataFrame, use_gpu: bool = False) -> pd.DataFrame:
+        """Extract SPY-TSLA correlation and divergence features. Returns DataFrame with 5 columns.
+
+        Args:
+            df: OHLCV DataFrame
+            use_gpu: If True, use GPU-accelerated rolling correlation (CUDA only)
+        """
         spy_returns = df['spy_close'].pct_change()
         tsla_returns = df['tsla_close'].pct_change()
 
-        correlation_features = {
-            'correlation_10': spy_returns.rolling(10).corr(tsla_returns),
-            'correlation_50': spy_returns.rolling(50).corr(tsla_returns),
-            'correlation_200': spy_returns.rolling(200).corr(tsla_returns),
-            'divergence': (((spy_returns > 0) & (tsla_returns < 0)) |
-                          ((spy_returns < 0) & (tsla_returns > 0))).astype(float),
-            'divergence_magnitude': abs(spy_returns - tsla_returns)
-        }
+        # GPU acceleration check - use_gpu flag comes from extract_features()
+        # which resolves it based on GPU_ROLLING_AVAILABLE and user device selection
+        if use_gpu and GPU_ROLLING_AVAILABLE:
+            # GPU path: compute correlations on CUDA
+            gpu_roller = CUDARollingStats(device='cuda')
+            corr_results = gpu_roller.rolling_correlation(
+                spy_returns.values, tsla_returns.values,
+                windows=[10, 50, 200]
+            )
+
+            correlation_features = {
+                'correlation_10': corr_results['corr_10'],
+                'correlation_50': corr_results['corr_50'],
+                'correlation_200': corr_results['corr_200'],
+                'divergence': (((spy_returns > 0) & (tsla_returns < 0)) |
+                              ((spy_returns < 0) & (tsla_returns > 0))).astype(float),
+                'divergence_magnitude': abs(spy_returns - tsla_returns)
+            }
+        else:
+            # CPU path: original pandas implementation
+            correlation_features = {
+                'correlation_10': spy_returns.rolling(10).corr(tsla_returns),
+                'correlation_50': spy_returns.rolling(50).corr(tsla_returns),
+                'correlation_200': spy_returns.rolling(200).corr(tsla_returns),
+                'divergence': (((spy_returns > 0) & (tsla_returns < 0)) |
+                              ((spy_returns < 0) & (tsla_returns > 0))).astype(float),
+                'divergence_magnitude': abs(spy_returns - tsla_returns)
+            }
 
         return pd.DataFrame(correlation_features, index=df.index)
 
