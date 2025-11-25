@@ -712,7 +712,12 @@ class HierarchicalLNN(nn.Module, ModelBase):
         """
         checkpoint = torch.load(path, map_location=self.device_type)
 
-        self.load_state_dict(checkpoint['model_state_dict'])
+        # Handle DataParallel checkpoints: strip 'module.' prefix if present
+        state_dict = checkpoint['model_state_dict']
+        if any(k.startswith('module.') for k in state_dict.keys()):
+            state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+
+        self.load_state_dict(state_dict)
 
         # Extract metadata
         metadata = {k: v for k, v in checkpoint.items() if k != 'model_state_dict'}
@@ -745,7 +750,12 @@ def load_hierarchical_model(model_path: str, device: str = 'cpu') -> Hierarchica
         multi_task=checkpoint.get('multi_task', True)  # Default to True for new models
     )
 
+    # Handle DataParallel checkpoints: strip 'module.' prefix if present
+    state_dict = checkpoint['model_state_dict']
+    if any(k.startswith('module.') for k in state_dict.keys()):
+        state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+
     # Load state dict
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(state_dict)
 
     return model

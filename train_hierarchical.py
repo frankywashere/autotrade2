@@ -45,7 +45,7 @@ import config as project_config
 
 
 def get_hardware_info():
-    """Detect available compute devices and hardware specs."""
+    """Detect available compute devices and hardware specs (including multi-GPU)."""
     info = {
         'cuda_available': torch.cuda.is_available(),
         'mps_available': torch.backends.mps.is_available(),
@@ -54,8 +54,26 @@ def get_hardware_info():
     }
 
     if info['cuda_available']:
-        info['cuda_device'] = torch.cuda.get_device_name()
-        info['cuda_memory_gb'] = torch.cuda.get_device_properties(0).total_memory / 1e9
+        # Multi-GPU detection
+        num_gpus = torch.cuda.device_count()
+        info['cuda_device_count'] = num_gpus
+        info['cuda_devices'] = []
+        total_vram = 0
+
+        for i in range(num_gpus):
+            gpu_name = torch.cuda.get_device_name(i)
+            gpu_vram = torch.cuda.get_device_properties(i).total_memory / 1e9
+            info['cuda_devices'].append({
+                'index': i,
+                'name': gpu_name,
+                'vram_gb': gpu_vram
+            })
+            total_vram += gpu_vram
+
+        # Summary fields for backward compatibility
+        info['cuda_device'] = info['cuda_devices'][0]['name'] if info['cuda_devices'] else 'Unknown'
+        info['cuda_memory_gb'] = info['cuda_devices'][0]['vram_gb'] if info['cuda_devices'] else 0
+        info['cuda_total_memory_gb'] = total_vram
 
     if info['mps_available']:
         info['mac_chip'] = platform.processor() or "Apple Silicon"
@@ -77,23 +95,34 @@ def get_best_device():
 
 
 def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
-    """Get recommended batch size for device (v3.19: Very conservative for MPS + 14K features)."""
+    """Get recommended batch size for device (v3.20: Multi-GPU support)."""
     recommendations = {
-        'cuda_high': 256,  # NVIDIA GPU with 64GB+ VRAM (e.g., A100 80GB, H100)
-        'cuda': 64,        # NVIDIA GPU (standard, reduced for 14K features)
-        'mps_high': 8,     # M2 Max/Ultra with 64+ GB (very conservative, num_workers=0 + from_numpy fix)
-        'mps_mid': 4,      # M2 Pro/M1 Max with 32-64 GB (4 is safer with memory efficiency fixes)
-        'mps_low': 2,      # M1/M1 Pro with 16-32 GB (very safe, only 2 samples per batch)
+        'cuda_multi': 512,   # Multi-GPU (2+ GPUs with 40GB+ each) - split across GPUs
+        'cuda_high': 256,    # Single GPU with 64GB+ VRAM (e.g., A100 80GB, H100)
+        'cuda': 64,          # NVIDIA GPU (standard, reduced for 14K features)
+        'mps_high': 8,       # M2 Max/Ultra with 64+ GB (very conservative, num_workers=0 + from_numpy fix)
+        'mps_mid': 4,        # M2 Pro/M1 Max with 32-64 GB (4 is safer with memory efficiency fixes)
+        'mps_low': 2,        # M1/M1 Pro with 16-32 GB (very safe, only 2 samples per batch)
         'cpu': 16
     }
 
     if device == 'cuda':
-        # Check VRAM for high-memory GPUs
+        # Check for multi-GPU and VRAM
         try:
             import torch
             if torch.cuda.is_available():
-                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-                if vram_gb >= 64:
+                num_gpus = torch.cuda.device_count()
+                # Get minimum VRAM across all GPUs (limiting factor for DataParallel)
+                min_vram = min(
+                    torch.cuda.get_device_properties(i).total_memory / 1e9
+                    for i in range(num_gpus)
+                )
+
+                if num_gpus > 1 and min_vram >= 40:
+                    # Multi-GPU with good VRAM per GPU (e.g., 2x A40 45GB)
+                    return recommendations['cuda_multi']
+                elif min_vram >= 64:
+                    # Single high-VRAM GPU
                     return recommendations['cuda_high']
         except Exception:
             pass  # Fall through to standard cuda
@@ -371,7 +400,8 @@ def train_epoch(
     device: str,
     epoch: int,
     loss_weights: Dict = None,
-    scaler=None
+    scaler=None,
+    use_multi_gpu: bool = False
 ) -> float:
     """
     Train for one epoch with multi-task loss.
@@ -550,7 +580,9 @@ def train_epoch(
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Handle DataParallel: get underlying model for gradient clipping
+            model_for_grad = model.module if use_multi_gpu else model
+            torch.nn.utils.clip_grad_norm_(model_for_grad.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -659,7 +691,9 @@ def train_epoch(
             # Standard backward pass
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Handle DataParallel: get underlying model for gradient clipping
+            model_for_grad = model.module if use_multi_gpu else model
+            torch.nn.utils.clip_grad_norm_(model_for_grad.parameters(), max_norm=1.0)
             optimizer.step()
 
         # Immediate memory cleanup after gradient update (throttled for MPS)
@@ -837,7 +871,14 @@ def interactive_setup(args):
 
     print("\n📱 Hardware Detection:")
     if hw_info['cuda_available']:
-        print(f"  ✓ NVIDIA GPU: {hw_info['cuda_device']} ({hw_info['cuda_memory_gb']:.1f} GB)")
+        num_gpus = hw_info.get('cuda_device_count', 1)
+        if num_gpus > 1:
+            # Multi-GPU display
+            print(f"  ✓ NVIDIA GPUs: {num_gpus}x detected ({hw_info['cuda_total_memory_gb']:.0f} GB total)")
+            for gpu in hw_info['cuda_devices']:
+                print(f"      GPU {gpu['index']}: {gpu['name']} ({gpu['vram_gb']:.0f} GB)")
+        else:
+            print(f"  ✓ NVIDIA GPU: {hw_info['cuda_device']} ({hw_info['cuda_memory_gb']:.1f} GB)")
     if hw_info['mps_available']:
         print(f"  ✓ Apple Silicon: {hw_info['mac_chip']} ({hw_info['total_ram_gb']:.0f} GB RAM)")
     print(f"  ✓ CPU: {hw_info['cpu_count']} threads")
@@ -845,9 +886,15 @@ def interactive_setup(args):
     # Device selection (always show all options, mark availability)
     device_choices = []
 
-    # CUDA option (always show, mark if detected)
+    # CUDA option (always show, mark if detected) - includes multi-GPU info
     if hw_info['cuda_available']:
-        device_choices.append(Choice(value='cuda', name='NVIDIA GPU (CUDA) - Fastest ⚡ [Detected]'))
+        num_gpus = hw_info.get('cuda_device_count', 1)
+        total_vram = hw_info.get('cuda_total_memory_gb', hw_info['cuda_memory_gb'])
+        if num_gpus > 1:
+            gpu_label = f'NVIDIA GPUs ({num_gpus}x, {total_vram:.0f}GB total) - Fastest ⚡ [Multi-GPU]'
+        else:
+            gpu_label = f'NVIDIA GPU ({hw_info["cuda_device"]}, {total_vram:.0f}GB) - Fastest ⚡ [Detected]'
+        device_choices.append(Choice(value='cuda', name=gpu_label))
     else:
         device_choices.append(Choice(value='cuda', name='NVIDIA GPU (CUDA) - Fastest ⚡ [Not Detected]'))
 
@@ -1927,14 +1974,34 @@ def main():
     print(f"   Multi-task heads: {'Enabled' if args.multi_task else 'Disabled'}")
     print(f"   Input features: {extractor.get_feature_dim()}")
 
+    # Multi-GPU DataParallel wrapping (before torch.compile and optimizer)
+    use_multi_gpu = False
+    if args.device == 'cuda' and torch.cuda.device_count() > 1:
+        num_gpus = torch.cuda.device_count()
+        print(f"\n   🚀 Multi-GPU Training: Using {num_gpus} GPUs with DataParallel")
+        for i in range(num_gpus):
+            name = torch.cuda.get_device_name(i)
+            vram = torch.cuda.get_device_properties(i).total_memory / 1e9
+            print(f"      GPU {i}: {name} ({vram:.0f} GB)")
+
+        model = nn.DataParallel(model)
+        use_multi_gpu = True
+        print(f"   📦 Effective batch size: {args.batch_size} (split across {num_gpus} GPUs, ~{args.batch_size // num_gpus} per GPU)")
+    else:
+        print(f"\n   📱 Single-Device Training: {args.device.upper()}")
+
     # Apply torch.compile() for CUDA (PyTorch 2.0+ optimization, 10-40% speedup)
     # Note: First epoch is slower due to compilation warmup, benefits show from epoch 2+
-    if args.device == 'cuda' and hasattr(torch, 'compile'):
+    # Note: torch.compile works with DataParallel but may need mode adjustment
+    if args.device == 'cuda' and hasattr(torch, 'compile') and not use_multi_gpu:
+        # Skip torch.compile for multi-GPU (can cause issues with DataParallel)
         try:
             model = torch.compile(model, mode='reduce-overhead')
             print("   🔥 torch.compile() enabled - JIT compilation for faster training")
         except Exception as e:
             print(f"   ⚠️  torch.compile() failed ({e}), continuing without compilation")
+    elif use_multi_gpu:
+        print("   ℹ️  torch.compile() skipped for multi-GPU (DataParallel handles optimization)")
 
     # Optimizer and loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -1966,7 +2033,7 @@ def main():
 
         # Train (with loss_weights for multi-task, and optional AMP scaler)
         train_loss = train_epoch(
-            model, train_loader, optimizer, criterion, args.device, epoch, loss_weights, scaler
+            model, train_loader, optimizer, criterion, args.device, epoch, loss_weights, scaler, use_multi_gpu
         )
         train_losses.append(train_loss)
 
@@ -2009,7 +2076,9 @@ def main():
                     'timestamp': datetime.now().isoformat()
                 }
 
-                model.save_checkpoint(args.output, metadata)
+                # Handle DataParallel: save underlying model (without module. prefix)
+                model_to_save = model.module if use_multi_gpu else model
+                model_to_save.save_checkpoint(args.output, metadata)
             else:
                 patience_counter += 1
                 tqdm.write(f"  Patience: {patience_counter}/{args.patience}")
