@@ -53,6 +53,44 @@ def _check_gpu_available() -> tuple:
         return False, 'cpu'
 
 
+def get_safe_worker_count(requested_workers: int = None) -> int:
+    """
+    Calculate safe number of parallel workers based on available RAM.
+    Each worker uses ~15GB during feature extraction.
+
+    Args:
+        requested_workers: User-requested worker count (None = auto-detect)
+
+    Returns:
+        Safe worker count with warning if requested exceeds recommendation
+    """
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().available / (1024**3)
+        total_gb = psutil.virtual_memory().total / (1024**3)
+    except ImportError:
+        # psutil not available, fall back to requested or default
+        print("    WARNING: psutil not installed, cannot detect available RAM")
+        return requested_workers if requested_workers and requested_workers > 0 else 4
+
+    # Each worker uses ~15GB, leave 5GB headroom for system
+    safe_workers = max(1, int((available_gb - 5) / 15))
+    max_safe = max(1, int((total_gb - 10) / 15))
+
+    if requested_workers is None or requested_workers == 0:
+        # Auto-detect: use safe count
+        print(f"    RAM: {total_gb:.1f}GB total, {available_gb:.1f}GB available")
+        print(f"    Auto-selected {safe_workers} parallel workers (each uses ~15GB)")
+        return safe_workers
+
+    if requested_workers > max_safe:
+        print(f"    WARNING: {requested_workers} workers requested but only {max_safe} recommended for {total_gb:.1f}GB RAM")
+        print(f"    Each worker uses ~15GB. Risk of OOM with {requested_workers} workers.")
+        print(f"    Recommended: {max_safe} workers or fewer. Proceeding with {requested_workers}...")
+
+    return requested_workers
+
+
 class TradingFeatureExtractor(FeatureExtractor):
     """
     Comprehensive feature extractor for stock trading
@@ -318,8 +356,20 @@ class TradingFeatureExtractor(FeatureExtractor):
             meta_file = mmap_meta_files[0]
             try:
                 meta = json.load(open(meta_file))
+                cache_base_dir = meta_file.parent  # Base for resolving relative paths
+
+                # Helper to resolve paths (handles both relative and legacy absolute paths)
+                def resolve_shard_path(p):
+                    path = Path(p)
+                    if path.is_absolute():
+                        return path  # Legacy absolute path
+                    return cache_base_dir / path  # New relative path
+
                 # Validate all shard files exist
-                if all(Path(c['path']).exists() for c in meta['chunk_info']):
+                all_shards_exist = all(
+                    resolve_shard_path(c['path']).exists() for c in meta['chunk_info']
+                )
+                if all_shards_exist:
                     total_gb = sum(c['rows'] * c['cols'] * (8 if 'float64' in meta['dtype'] else 4) for c in meta['chunk_info']) / 1e9
                     print(f"   ✓ Channel shards: Valid ({len(meta['chunk_info'])} shards, {meta['total_rows']:,} rows, {total_gb:.1f} GB, {meta['dtype']})")
                     channel_cache_valid = True
@@ -807,7 +857,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   ℹ️  Sequential processing: {', '.join(reasons)}")
             print(f"   ⏱️  Using multi-window OHLC channels ({len(config.CHANNEL_WINDOW_SIZES)} windows per timeframe)")
         else:
-            cores_to_use = config.MAX_PARALLEL_WORKERS if hasattr(config, 'MAX_PARALLEL_WORKERS') and config.MAX_PARALLEL_WORKERS > 0 else n_cores
+            requested = config.MAX_PARALLEL_WORKERS if hasattr(config, 'MAX_PARALLEL_WORKERS') else 0
+            cores_to_use = get_safe_worker_count(requested if requested > 0 else None)
             gpu_note = " + GPU rolling stats" if use_gpu else ""
             print(f"   🚀 Parallel processing: using {cores_to_use} of {n_cores} available cores{gpu_note}")
             print(f"   ⏱️  Multi-window OHLC channels ({len(config.CHANNEL_WINDOW_SIZES)} windows per timeframe)")
@@ -1315,12 +1366,15 @@ class TradingFeatureExtractor(FeatureExtractor):
         monthly_shard_path = monthly_shard_dir / f"monthly_3month_shard_{cache_suffix}.npy"
         monthly_shard_info = None
 
+        # Base cache dir for relative paths (monthly_shard_dir is {base}/monthly_shards)
+        base_cache_dir = monthly_shard_dir.parent
+
         if monthly_shard_path.exists():
             # Load existing shard
             print(f"   📂 Loading cached monthly/3month shard: {monthly_shard_path.name}")
             monthly_array = np.load(monthly_shard_path, mmap_mode='r')
             monthly_shard_info = {
-                'path': str(monthly_shard_path.absolute()),  # ABSOLUTE path for downstream
+                'path': str(monthly_shard_path.relative_to(base_cache_dir)),  # Relative path for portability
                 'rows': monthly_array.shape[0],
                 'cols': monthly_array.shape[1],
                 'type': 'monthly_3month'
@@ -1351,7 +1405,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 np.save(monthly_shard_path, monthly_array)
 
                 monthly_shard_info = {
-                    'path': str(monthly_shard_path.absolute()),  # ABSOLUTE path
+                    'path': str(monthly_shard_path.relative_to(base_cache_dir)),  # Relative path for portability
                     'rows': monthly_rows,
                     'cols': monthly_cols,
                     'type': 'monthly_3month'
@@ -1463,10 +1517,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             np.save(chunk_path, chunk_array)
             np.save(index_path, index_values)
 
-            # Store metadata
+            # Store metadata (use relative paths for portability across machines)
             chunk_info.append({
-                'path': str(chunk_path),
-                'index_path': str(index_path),
+                'path': str(chunk_path.relative_to(cache_dir)),
+                'index_path': str(index_path.relative_to(cache_dir)),
                 'rows': len(chunk_array),
                 'cols': chunk_array.shape[1],
                 'start_date': str(chunk_start.date()),

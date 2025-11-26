@@ -102,6 +102,14 @@ class HierarchicalDataset(Dataset):
 
             print(f"  📂 Loading memory-mapped channel shards...")
             meta = json.load(open(mmap_meta_path))
+            cache_base_dir = Path(mmap_meta_path).parent  # Base for resolving relative paths
+
+            # Helper to resolve paths (handles both relative and legacy absolute paths)
+            def resolve_shard_path(p):
+                path = Path(p)
+                if path.is_absolute():
+                    return path  # Legacy absolute path
+                return cache_base_dir / path  # New relative path
 
             # Load channel feature shards as memory-maps
             self.channel_mmaps = []
@@ -109,14 +117,16 @@ class HierarchicalDataset(Dataset):
             self.premerged_channel_mmaps = None  # Optional: merged main + monthly for fast slicing
 
             for info in meta['chunk_info']:
-                mmap_array = np.load(info['path'], mmap_mode='r')
+                shard_path = resolve_shard_path(info['path'])
+                mmap_array = np.load(str(shard_path), mmap_mode='r')
                 self.channel_mmaps.append(mmap_array)
                 self.channel_cumulative_rows.append(self.channel_cumulative_rows[-1] + info['rows'])
 
             # Load timestamps from shards
             all_timestamps = []
             for info in meta['chunk_info']:
-                idx_array = np.load(info['index_path'], mmap_mode='r')
+                index_path = resolve_shard_path(info['index_path'])
+                idx_array = np.load(str(index_path), mmap_mode='r')
                 all_timestamps.append(idx_array)
             self.timestamps = np.concatenate(all_timestamps)
 
@@ -124,7 +134,7 @@ class HierarchicalDataset(Dataset):
             self.monthly_3month_mmap = None
             if 'monthly_3month_shard' in meta and meta['monthly_3month_shard'] is not None:
                 monthly_shard_info = meta['monthly_3month_shard']
-                monthly_path = Path(monthly_shard_info['path'])
+                monthly_path = resolve_shard_path(monthly_shard_info['path'])
 
                 if monthly_path.exists():
                     self.monthly_3month_mmap = np.load(str(monthly_path), mmap_mode='r')
@@ -755,9 +765,24 @@ class PreloadHierarchicalDataset(Dataset):
         estimated_gb = (estimated_samples * sequence_length * features_df.shape[1] *
                        (8 if config.get_torch_dtype() == torch.float64 else 4)) / 1e9
 
-        if estimated_gb > 50:
+        # Dynamic memory check based on actual available RAM
+        try:
+            import psutil
+            available_gb = psutil.virtual_memory().available / (1024**3)
+            total_gb = psutil.virtual_memory().total / (1024**3)
+            warn_threshold = available_gb * 0.8  # Warn if using >80% of available RAM
+        except ImportError:
+            available_gb = 50  # Fallback assumption
+            total_gb = 64
+            warn_threshold = 50
+
+        if estimated_gb > warn_threshold:
             print(f"⚠️  WARNING: Estimated memory usage: {estimated_gb:.1f} GB")
-            print(f"    This may cause swap usage or OOM errors!")
+            print(f"    Available RAM: {available_gb:.1f} GB (of {total_gb:.1f} GB total)")
+            if estimated_gb > available_gb:
+                print(f"    This WILL cause OOM! Use lazy loading (preload=False) instead.")
+            else:
+                print(f"    This may cause swap usage or OOM errors!")
             print(f"    Consider using lazy loading (preload=False) for datasets this large.")
             response = input("    Continue with preload? (y/n): ")
             if response.lower() != 'y':

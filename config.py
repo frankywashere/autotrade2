@@ -129,7 +129,14 @@ LOG_DEVICE_OPERATIONS = False  # Log device transfer operations (debugging)
 
 # Channel Calculation Parallelization
 PARALLEL_CHANNEL_CALC = True  # Use joblib for parallel channel calculations
-MAX_PARALLEL_WORKERS = 8      # Maximum CPU cores to use (0 = use all available)
+MAX_PARALLEL_WORKERS = 4      # Default: 4 workers (safe for 32-64GB RAM)
+                              # Each worker uses ~15GB during feature extraction
+                              # Recommended: RAM_GB / 15, minimum 1
+                              # 16GB RAM -> 1 worker
+                              # 32GB RAM -> 2 workers
+                              # 48GB RAM -> 3 workers
+                              # 64GB+ RAM -> 4+ workers
+                              # Set to 0 for auto-detection based on available RAM
 PARALLEL_BACKEND = 'loky'     # joblib backend: 'loky' (process), 'threading', 'multiprocessing'
 PARALLEL_VERBOSE = 0           # joblib verbosity level (0=silent, 10=progress, 50=debug) - using tqdm instead
 

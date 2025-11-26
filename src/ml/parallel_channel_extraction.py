@@ -410,13 +410,15 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
 
     Args:
         tasks: List of (ohlcv_data, timestamps, tf_name, tf_rule, symbol) tuples
-        n_jobs: Number of parallel workers (-1 for all cores)
+        n_jobs: Number of parallel workers (-1 for all cores, 0 for auto-detect based on RAM)
 
     Returns:
         List of result dictionaries in original task order
     """
-    if n_jobs == -1:
-        n_jobs = mp.cpu_count()
+    if n_jobs == -1 or n_jobs == 0:
+        # Use memory-safe auto-detection
+        from .features import get_safe_worker_count
+        n_jobs = get_safe_worker_count(None)
 
     # Create queues
     task_queue = Queue()
