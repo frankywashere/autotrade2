@@ -144,11 +144,13 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     Memory-efficient collate: pre-allocate final tensor and fill directly.
     Eliminates redundant intermediate tensors from stack+cat pattern.
     """
+    import os
+    import sys
+
     # Debug: track collate calls (mutable default persists across calls)
     _debug_counter[0] += 1
     if _debug_counter[0] <= 3:
-        import sys
-        print(f"[DEBUG] collate called #{_debug_counter[0]}, batch_size={len(batch)}", file=sys.stderr, flush=True)
+        print(f"[DEBUG] collate worker PID={os.getpid()}, batch_size={len(batch)}, call #{_debug_counter[0]}", file=sys.stderr, flush=True)
 
     if torch_dtype is None:
         torch_dtype = torch.float32
@@ -176,6 +178,10 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     x = torch.zeros((batch_size, seq_len, total_features), dtype=torch_dtype)
 
     # Fill tensor directly without intermediate allocations
+    # Track contiguous copies for debugging memory duplication
+    copies_made = 0
+    copy_bytes = 0
+
     for i, (data, tgt) in enumerate(batch):
         # Parse data tuple
         if isinstance(data, tuple) and len(data) == 3:
@@ -188,25 +194,35 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
 
         # Copy channel features directly into pre-allocated tensor
         col_start = 0
-        x[i, :, col_start:col_start + ch_main_cols] = torch.from_numpy(
-            np.ascontiguousarray(ch_main) if not ch_main.flags['C_CONTIGUOUS'] else ch_main
-        )
+        if not ch_main.flags['C_CONTIGUOUS']:
+            copies_made += 1
+            copy_bytes += ch_main.nbytes
+            ch_main = np.ascontiguousarray(ch_main)
+        x[i, :, col_start:col_start + ch_main_cols] = torch.from_numpy(ch_main)
         col_start += ch_main_cols
 
         # Copy monthly features if present
         if ch_monthly is not None:
-            x[i, :, col_start:col_start + ch_monthly_cols] = torch.from_numpy(
-                np.ascontiguousarray(ch_monthly) if not ch_monthly.flags['C_CONTIGUOUS'] else ch_monthly
-            )
+            if not ch_monthly.flags['C_CONTIGUOUS']:
+                copies_made += 1
+                copy_bytes += ch_monthly.nbytes
+                ch_monthly = np.ascontiguousarray(ch_monthly)
+            x[i, :, col_start:col_start + ch_monthly_cols] = torch.from_numpy(ch_monthly)
         col_start += ch_monthly_cols
 
         # Copy non-channel features if present
         if nc is not None:
-            x[i, :, col_start:col_start + nc_cols] = torch.from_numpy(
-                np.ascontiguousarray(nc) if not nc.flags['C_CONTIGUOUS'] else nc
-            )
+            if not nc.flags['C_CONTIGUOUS']:
+                copies_made += 1
+                copy_bytes += nc.nbytes
+                nc = np.ascontiguousarray(nc)
+            x[i, :, col_start:col_start + nc_cols] = torch.from_numpy(nc)
 
         targets.append(tgt)
+
+    # Log copy detection for first few batches
+    if _debug_counter[0] <= 5 and copies_made > 0:
+        print(f"[DEBUG] collate made {copies_made} contiguous copies ({copy_bytes/1e6:.1f} MB) in batch #{_debug_counter[0]}", file=sys.stderr, flush=True)
 
     # Build targets tensor dict with proper dtype
     converted_targets = []
@@ -1773,6 +1789,9 @@ def main():
 
     # Load data with historical buffer for continuation analysis
     print("\n1. Loading 1-min data...")
+    if profiler:
+        profiler.snapshot("pre_data_load", 0, force_log=True)
+
     data_feed = CSVDataFeed(timeframe=args.input_timeframe)
 
     # Load with 2-year historical buffer for continuation analysis
@@ -1787,6 +1806,10 @@ def main():
 
     data_years = (df.index[-1] - df.index[0]).days / 365.25
     print(f"   Loaded {len(df)} bars ({df.index[0]} to {df.index[-1]})")
+
+    if profiler:
+        profiler.log_info(f"DATA_LOADED | rows={len(df)} | cols={len(df.columns)}")
+        profiler.snapshot("post_data_load", 0, force_log=True)
     print(f"   Data range: {data_years:.1f} years")
     print(f"   Historical buffer: {historical_buffer_years} years (for continuation analysis)")
 
@@ -1847,6 +1870,8 @@ def main():
 
     # Extract features and continuation labels
     print("\n2. Extracting features and continuation labels...")
+    if profiler:
+        profiler.snapshot("pre_feature_extraction", 0, force_log=True)
     extractor = TradingFeatureExtractor()
 
     # Validate data availability first
@@ -1915,6 +1940,10 @@ def main():
         debug_mode = True
         continuation_df = extractor.generate_continuation_labels(df, timestamps, prediction_horizon=24, mode=project_config.CONTINUATION_MODE, debug=debug_mode)
 
+    if profiler:
+        profiler.log_info(f"FEATURES_EXTRACTED | non_channel_cols={len(features_df.columns)} | continuation_rows={len(continuation_df) if continuation_df is not None else 0}")
+        profiler.snapshot("post_feature_extraction", 0, force_log=True)
+
     # Display feature counts (clarify mmap vs non-mmap)
     total_feature_dim = extractor.get_feature_dim()
     print(f"   Total feature dimension: {total_feature_dim} (model input size)")
@@ -1945,6 +1974,9 @@ def main():
 
     # Create datasets
     print("\n3. Creating datasets...")
+    if profiler:
+        profiler.snapshot("pre_dataset_create", 0, force_log=True)
+
     train_dataset, val_dataset = create_hierarchical_dataset(
         features_df,
         raw_ohlc_df=df,
@@ -1955,8 +1987,13 @@ def main():
         preload=args.preload,
         validation_split=args.val_split,
         include_continuation=True,
-        mmap_meta_path=mmap_meta_path  # Pass mmap metadata if using sharded storage
+        mmap_meta_path=mmap_meta_path,  # Pass mmap metadata if using sharded storage
+        profiler=profiler  # Pass profiler for granular RAM logging
     )
+
+    if profiler:
+        profiler.log_info(f"DATASET_CREATED | train_samples={len(train_dataset)} | val_samples={len(val_dataset) if val_dataset else 0}")
+        profiler.snapshot("post_dataset_create", 0, force_log=True)
 
     print(f"   Train samples: {len(train_dataset)}")
     if val_dataset:
@@ -2080,6 +2117,8 @@ def main():
 
     # Create model
     print("\n4. Creating HierarchicalLNN model...")
+    if profiler:
+        profiler.snapshot("pre_model_create", 0, force_log=True)
 
     total_neurons = int(args.hidden_size * args.internal_neurons_ratio)
     print(f"   Capacity: {total_neurons} total neurons, {args.hidden_size} output neurons")
@@ -2097,6 +2136,10 @@ def main():
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"   Model parameters: {num_params:,}")
+
+    if profiler:
+        profiler.log_info(f"MODEL_CREATED | params={num_params:,} | device={args.device}")
+        profiler.snapshot("post_model_create", 0, force_log=True)
     print(f"   Multi-task heads: {'Enabled' if args.multi_task else 'Disabled'}")
     print(f"   Input features: {extractor.get_feature_dim()}")
 
@@ -2132,6 +2175,13 @@ def main():
     # Optimizer and loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
+
+    if profiler:
+        gpu_mem_mb = 0
+        if args.device == 'cuda':
+            gpu_mem_mb = torch.cuda.memory_allocated() / 1e6
+        profiler.log_info(f"MODEL_READY | multi_gpu={use_multi_gpu} | gpu_mem_mb={gpu_mem_mb:.0f}")
+        profiler.snapshot("post_model_ready", 0, force_log=True)
 
     # Setup AMP (Automatic Mixed Precision) if enabled
     scaler = None

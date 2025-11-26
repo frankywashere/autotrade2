@@ -43,7 +43,8 @@ class HierarchicalDataset(Dataset):
         mode: str = 'uniform_bars',
         cache_indices: bool = True,
         include_continuation: bool = False,
-        mmap_meta_path: str = None
+        mmap_meta_path: str = None,
+        profiler=None
     ):
         """
         Initialize dataset.
@@ -57,7 +58,9 @@ class HierarchicalDataset(Dataset):
             mode: 'uniform_bars' (fixed # bars ahead)
             cache_indices: Cache column lookups for speed
             include_continuation: Whether to include continuation prediction targets
+            profiler: Optional MemoryProfiler for logging RAM usage
         """
+        self._profiler = profiler
         self.features_df = features_df
         self.raw_ohlc_df = raw_ohlc_df
         self.continuation_labels_df = continuation_labels_df
@@ -122,6 +125,12 @@ class HierarchicalDataset(Dataset):
                 self.channel_mmaps.append(mmap_array)
                 self.channel_cumulative_rows.append(self.channel_cumulative_rows[-1] + info['rows'])
 
+            # Log after loading channel mmaps
+            if self._profiler:
+                total_mmap_bytes = sum(m.nbytes for m in self.channel_mmaps)
+                self._profiler.log_info(f"CHANNEL_MMAPS_LOADED | shards={len(self.channel_mmaps)} | total_rows={self.channel_cumulative_rows[-1]:,} | virtual_size_gb={total_mmap_bytes/1e9:.2f}")
+                self._profiler.snapshot("post_channel_mmaps_load", 0, force_log=True)
+
             # Load timestamps from shards
             all_timestamps = []
             for info in meta['chunk_info']:
@@ -139,6 +148,11 @@ class HierarchicalDataset(Dataset):
                 if monthly_path.exists():
                     self.monthly_3month_mmap = np.load(str(monthly_path), mmap_mode='r')
                     print(f"     ✓ Loaded monthly/3month shard: {self.monthly_3month_mmap.shape[0]:,} rows × {self.monthly_3month_mmap.shape[1]} cols")
+                    # Log after loading monthly shard
+                    if self._profiler:
+                        monthly_size_gb = self.monthly_3month_mmap.nbytes / 1e9
+                        self._profiler.log_info(f"MONTHLY_SHARD_LOADED | rows={self.monthly_3month_mmap.shape[0]:,} | cols={self.monthly_3month_mmap.shape[1]} | virtual_size_gb={monthly_size_gb:.2f}")
+                        self._profiler.snapshot("post_monthly_shard_load", 0, force_log=True)
                 else:
                     print(f"     ⚠️  Monthly/3month shard not found: {monthly_path}")
                     print(f"        Expected: {monthly_shard_info['cols']} features, will use zeros")
@@ -153,6 +167,11 @@ class HierarchicalDataset(Dataset):
                     self.non_channel_array = temp_array.astype(config.NUMPY_DTYPE)
                 else:
                     self.non_channel_array = temp_array
+                # Log after loading non-channel array
+                if self._profiler:
+                    nc_size_mb = self.non_channel_array.nbytes / 1e6
+                    self._profiler.log_info(f"NON_CHANNEL_LOADED | rows={self.non_channel_array.shape[0]:,} | cols={self.non_channel_array.shape[1]} | size_mb={nc_size_mb:.1f}")
+                    self._profiler.snapshot("post_non_channel_load", 0, force_log=True)
             else:
                 self.non_channel_array = None
 
@@ -196,12 +215,35 @@ class HierarchicalDataset(Dataset):
                 if estimated_gb <= premerge_limit_gb:
                     self.premerged_channel_mmaps = []
                     print(f"     ↪︎ Pre-merging monthly/3month into channel shards (est ~{estimated_gb:.2f} GB in-memory)")
-                    for shard_idx, shard in enumerate(self.channel_mmaps):
+                    print(f"     INFO | PREMERGE_START | shards={len(self.channel_mmaps)} | est_gb={estimated_gb:.1f}")
+
+                    # Get initial RAM usage for tracking
+                    try:
+                        import psutil
+                        initial_ram_mb = psutil.Process().memory_info().rss / 1e6
+                    except:
+                        initial_ram_mb = 0
+
+                    cumulative_mb = 0
+                    from tqdm import tqdm
+                    for shard_idx, shard in enumerate(tqdm(self.channel_mmaps, desc="     Pre-merge", unit="shard")):
                         shard_start = self.channel_cumulative_rows[shard_idx]
                         shard_end = self.channel_cumulative_rows[shard_idx + 1]
                         monthly_slice = self.monthly_3month_mmap[shard_start:shard_end, :]
                         merged = np.concatenate([shard, monthly_slice], axis=1)
                         self.premerged_channel_mmaps.append(merged)
+
+                        # Log per-shard memory
+                        shard_size_mb = merged.nbytes / 1e6
+                        cumulative_mb += shard_size_mb
+                        try:
+                            current_ram_mb = psutil.Process().memory_info().rss / 1e6
+                            ram_delta_mb = current_ram_mb - initial_ram_mb
+                            print(f"     INFO | PREMERGE_SHARD | shard={shard_idx}/{len(self.channel_mmaps)} | size_mb={shard_size_mb:.0f} | cumulative_mb={cumulative_mb:.0f} | process_ram_mb={current_ram_mb:.0f} (+{ram_delta_mb:.0f})")
+                        except:
+                            print(f"     INFO | PREMERGE_SHARD | shard={shard_idx}/{len(self.channel_mmaps)} | size_mb={shard_size_mb:.0f} | cumulative_mb={cumulative_mb:.0f}")
+
+                    print(f"     INFO | PREMERGE_COMPLETE | total_gb={cumulative_mb/1000:.2f}")
                     print(f"     ✓ Pre-merge complete ({len(self.premerged_channel_mmaps)} merged shards)")
                 else:
                     print(f"     ⚠️  Skipping pre-merge of monthly/3month (est {estimated_gb:.1f} GB > limit {premerge_limit_gb} GB)")
@@ -897,7 +939,8 @@ def create_hierarchical_dataset(
     preload: bool = False,
     validation_split: Optional[float] = None,
     include_continuation: bool = False,
-    mmap_meta_path: str = None
+    mmap_meta_path: str = None,
+    profiler=None
 ) -> Tuple[Dataset, Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -909,6 +952,7 @@ def create_hierarchical_dataset(
         mode: 'uniform_bars'
         preload: If True, preload all data into memory
         validation_split: If provided, split data into train/val
+        profiler: Optional MemoryProfiler for logging RAM usage
 
     Returns:
         train_dataset: Training dataset
@@ -943,7 +987,8 @@ def create_hierarchical_dataset(
                 None,  # Continuation handled separately below
                 sequence_length, prediction_horizon, mode,
                 include_continuation=False,
-                mmap_meta_path=mmap_meta_path
+                mmap_meta_path=mmap_meta_path,
+                profiler=profiler
             )
 
             # Calculate index ranges (valid_indices already has built-in buffers)
@@ -981,12 +1026,14 @@ def create_hierarchical_dataset(
                 train_dataset = HierarchicalDataset(
                     train_df, raw_ohlc_df, train_continuation_df,
                     sequence_length, prediction_horizon, mode,
-                    include_continuation=include_continuation
+                    include_continuation=include_continuation,
+                    profiler=profiler
                 )
                 val_dataset = HierarchicalDataset(
                     val_df, raw_ohlc_df, val_continuation_df,
                     sequence_length, prediction_horizon, mode,
-                    include_continuation=include_continuation
+                    include_continuation=include_continuation,
+                    profiler=profiler
                 )
 
         return train_dataset, val_dataset
@@ -1002,7 +1049,8 @@ def create_hierarchical_dataset(
                 features_df, raw_ohlc_df, continuation_labels_df,
                 sequence_length, prediction_horizon, mode,
                 include_continuation=include_continuation,
-                mmap_meta_path=mmap_meta_path
+                mmap_meta_path=mmap_meta_path,
+                profiler=profiler
             )
 
         return dataset, None
