@@ -139,6 +139,30 @@ def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
     return recommendations.get(device, 16)
 
 
+def fix_ncps_buffers(model):
+    """
+    Register ncps sparsity_mask tensors as buffers for DataParallel compatibility.
+
+    The ncps library's CfcCell has a sparsity_mask tensor that isn't registered as a
+    proper PyTorch buffer. When DataParallel replicates the model to other GPUs,
+    the sparsity_mask stays on GPU 0, causing device mismatch errors.
+
+    This function iterates through all modules and registers any sparsity_mask
+    tensors as buffers so they properly move with the model.
+    """
+    fixed_count = 0
+    for name, module in model.named_modules():
+        # Check for ncps CfC cells that have sparsity_mask
+        if hasattr(module, 'sparsity_mask') and isinstance(module.sparsity_mask, torch.Tensor):
+            if not isinstance(module.sparsity_mask, nn.Parameter):
+                # Convert to buffer so it moves with the module
+                module.register_buffer('sparsity_mask', module.sparsity_mask)
+                fixed_count += 1
+    if fixed_count > 0:
+        print(f"   🔧 Fixed {fixed_count} ncps sparsity_mask tensors for multi-GPU compatibility")
+    return fixed_count
+
+
 def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0]):
     """
     Memory-efficient collate: pre-allocate final tensor and fill directly.
@@ -2152,6 +2176,10 @@ def main():
             name = torch.cuda.get_device_name(i)
             vram = torch.cuda.get_device_properties(i).total_memory / 1e9
             print(f"      GPU {i}: {name} ({vram:.0f} GB)")
+
+        # Fix ncps library buffers for multi-GPU compatibility
+        # The ncps CfcCell has sparsity_mask tensors that aren't registered as buffers
+        fix_ncps_buffers(model)
 
         model = nn.DataParallel(model)
         use_multi_gpu = True
