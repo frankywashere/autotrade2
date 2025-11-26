@@ -436,7 +436,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                 pbar.update(1)
 
                 # Chunked extraction logic
-                if use_chunking and not use_cache and not skip_channel_calc:
+                # Note: skip_channel_calc=True when mmap cache is valid, so this only runs on first extraction
+                if use_chunking and not skip_channel_calc:
                     print(f"      Using chunked extraction ({chunk_size_years}-year chunks)")
                     chunk_result = self._extract_channel_features_chunked(
                         df,
