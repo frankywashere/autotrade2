@@ -139,11 +139,17 @@ def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
     return recommendations.get(device, 16)
 
 
-def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None):
+def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0]):
     """
     Memory-efficient collate: pre-allocate final tensor and fill directly.
     Eliminates redundant intermediate tensors from stack+cat pattern.
     """
+    # Debug: track collate calls (mutable default persists across calls)
+    _debug_counter[0] += 1
+    if _debug_counter[0] <= 3:
+        import sys
+        print(f"[DEBUG] collate called #{_debug_counter[0]}, batch_size={len(batch)}", file=sys.stderr, flush=True)
+
     if torch_dtype is None:
         torch_dtype = torch.float32
 
@@ -462,10 +468,18 @@ def train_epoch(
     model.train()
     total_loss = 0.0
 
+    # Debug: log before DataLoader iteration
+    if profiler:
+        profiler.snapshot("pre_dataloader_iter", 0, force_log=True)
+        profiler.log_phase("dataloader_starting", {"num_workers": dataloader.num_workers, "batch_size": dataloader.batch_size})
+
     # Progress bar for batches
     pbar = tqdm(dataloader, desc=f"  Epoch {epoch+1} [Train]", leave=False, ncols=80)
 
     for batch_idx, (x, targets_dict) in enumerate(pbar):
+        # Debug: log after first batch received (proves DataLoader worked)
+        if profiler and batch_idx == 0:
+            profiler.snapshot("first_batch_received", 0, force_log=True)
         # Move to device
         # If collate already moved to device, this is a no-op; otherwise it moves now
         x = x.to(device, non_blocking=True)
@@ -2089,6 +2103,7 @@ def main():
         # Set epoch in profiler
         if profiler:
             profiler.set_epoch(epoch + 1)
+            profiler.snapshot("pre_train_epoch", 0, force_log=True)
 
         # Train (with loss_weights for multi-task, and optional AMP scaler)
         train_loss = train_epoch(

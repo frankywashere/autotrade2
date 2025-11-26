@@ -211,8 +211,15 @@ class HierarchicalDataset(Dataset):
             # Optimize: ensure OHLC matches dtype (already checks before converting)
             if self.raw_ohlc_array.dtype != expected_dtype:
                 self.raw_ohlc_array = self.raw_ohlc_array.astype(expected_dtype)
+            # Free the DataFrame - we only need the extracted array
+            # This prevents COW memory multiplication when DataLoader forks workers
+            self.raw_ohlc_df = None
         else:
             self.raw_ohlc_array = None
+
+        # Free features_df - we've extracted all needed arrays
+        # This prevents COW memory multiplication when DataLoader forks workers
+        self.features_df = None
 
         # Cached torch scalars to avoid per-sample tensor creation
         self._torch_dtype = config.get_torch_dtype()
