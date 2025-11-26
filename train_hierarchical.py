@@ -854,12 +854,13 @@ def validate(
     return avg_loss, avg_error
 
 
-def interactive_setup(args):
+def interactive_setup(args, profiler=None):
     """
     Interactive menu for training setup.
 
     Args:
         args: Initial argparse namespace
+        profiler: Optional MemoryProfiler for diagnostic logging
 
     Returns:
         Updated args with user selections
@@ -1032,6 +1033,8 @@ def interactive_setup(args):
 
         if detected_ram > 200:  # Likely seeing host RAM, not container
             print(f"   ⚠️  Detected {detected_ram:.0f}GB RAM - likely cloud container (seeing host RAM)")
+            if profiler:
+                profiler.log_info(f"CONTAINER_DETECTED | psutil_ram={detected_ram:.0f}GB")
             args.container_ram_gb = int(inquirer.number(
                 message="Actual container RAM (GB):",
                 default=46,
@@ -1044,8 +1047,12 @@ def interactive_setup(args):
             import os
             os.environ['CONTAINER_RAM_GB'] = str(args.container_ram_gb)
             os.environ['PREMERGE_LIMIT_GB'] = str(max(6, args.container_ram_gb // 3))  # ~1/3 of RAM for pre-merge
+            if profiler:
+                profiler.log_info(f"CONTAINER_RAM_SET | user_specified={args.container_ram_gb}GB | premerge_limit={max(6, args.container_ram_gb // 3)}GB")
         else:
             args.container_ram_gb = 0  # Use psutil detection
+            if profiler:
+                profiler.log_info(f"NATIVE_RAM | detected={detected_ram:.0f}GB | container_mode=False")
 
     elif args.device == 'mps':
         # MPS only supports float32
@@ -1667,9 +1674,24 @@ def main():
 
     args = parser.parse_args()
 
+    # Setup memory profiler early if enabled (so we can log diagnostics throughout)
+    profiler = None
+    if args.memory_profile:
+        from src.ml.memory_profiler import MemoryProfiler
+        profiler = MemoryProfiler(
+            log_path="logs/memory_debug.log",
+            device=args.device if args.device != 'auto' else 'unknown',
+            log_every_n=10,
+            spike_threshold_mb=500
+        )
+        # Log environment info
+        import os
+        profiler.log_info(f"CONTAINER_RAM_GB={os.environ.get('CONTAINER_RAM_GB', 'not_set')}")
+        profiler.log_info(f"PREMERGE_LIMIT_GB={os.environ.get('PREMERGE_LIMIT_GB', 'not_set')}")
+
     # Interactive mode overrides command-line args
     if args.interactive:
-        args = interactive_setup(args)
+        args = interactive_setup(args, profiler=profiler)
 
     # Auto-detect device if 'auto'
     if args.device == 'auto':
@@ -1940,9 +1962,15 @@ def main():
     df_mem_mb = df.memory_usage(deep=True).sum() / 1e6 if hasattr(df, 'memory_usage') else 0
     features_mem_mb = features_df.memory_usage(deep=True).sum() / 1e6 if hasattr(features_df, 'memory_usage') else 0
     cont_mem_mb = continuation_df.memory_usage(deep=True).sum() / 1e6 if continuation_df is not None and hasattr(continuation_df, 'memory_usage') else 0
+    total_freed_mb = df_mem_mb + features_mem_mb + cont_mem_mb
     print(f"   🧹 Freeing DataFrames: df={df_mem_mb:.0f}MB, features={features_mem_mb:.0f}MB, continuation={cont_mem_mb:.0f}MB")
+    if profiler:
+        profiler.log_info(f"DATAFRAME_CLEANUP | df={df_mem_mb:.0f}MB | features={features_mem_mb:.0f}MB | continuation={cont_mem_mb:.0f}MB | total={total_freed_mb:.0f}MB")
+        profiler.snapshot("pre_dataframe_cleanup", 0, force_log=True)
     del df, features_df, continuation_df
     gc.collect()
+    if profiler:
+        profiler.snapshot("post_dataframe_cleanup", 0, force_log=True)
 
     # Verify feature dimension matches between extractor and dataset
     print("\n   🔍 Verifying feature dimensions...")
@@ -2108,17 +2136,10 @@ def main():
     elif getattr(args, 'amp', False) and args.device != 'cuda':
         print("   ⚠️  AMP requested but only supported on CUDA - using FP32")
 
-    # Setup memory profiler if enabled
-    profiler = None
-    if getattr(args, 'memory_profile', False):
-        from src.ml.memory_profiler import MemoryProfiler
-        profiler = MemoryProfiler(
-            log_path="logs/memory_debug.log",
-            device=args.device,
-            log_every_n=10,
-            spike_threshold_mb=500
-        )
-        print("   📊 Memory profiling enabled - logging to logs/memory_debug.log")
+    # Note: Memory profiler was created early (after arg parsing) to capture diagnostics
+    if profiler:
+        profiler.log_info(f"TRAINING_START | device={args.device} | batch_size={args.batch_size} | num_workers={args.num_workers}")
+        profiler.snapshot("pre_training_loop", 0, force_log=True)
 
     # Training loop
     print("\n5. Training...")

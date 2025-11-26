@@ -242,6 +242,10 @@ class MemoryProfiler:
             f"epoch={self.current_epoch} | batch={self.current_batch}"
         )
 
+    def log_info(self, message: str):
+        """Log a diagnostic/info message."""
+        self._log(f"INFO | {message}")
+
     def get_summary(self) -> Dict:
         """
         Get summary statistics for the profiling session.
