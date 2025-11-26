@@ -170,17 +170,29 @@ class HierarchicalDataset(Dataset):
                 estimated_gb = total_rows * total_cols * np.dtype(dtype).itemsize / 1e9
 
                 # Dynamic pre-merge limit based on available RAM
-                # High-RAM systems can pre-merge larger datasets for better training performance
+                # IMPORTANT: psutil can misread container RAM (sees host instead of cgroup limit)
+                # Use conservative defaults and allow override via environment variable
+                import os
+                premerge_limit_gb = float(os.environ.get('PREMERGE_LIMIT_GB', '20'))  # Default 20GB (safe for most containers)
+
                 try:
                     import psutil
                     available_gb = psutil.virtual_memory().available / (1024**3)
                     total_gb = psutil.virtual_memory().total / (1024**3)
-                    # Use up to 50% of available RAM for pre-merge, max 90GB
-                    premerge_limit_gb = min(available_gb * 0.5, 90.0)
-                    print(f"     ℹ️  System RAM: {total_gb:.1f}GB total, {available_gb:.1f}GB available")
-                    print(f"     ℹ️  Pre-merge limit: {premerge_limit_gb:.1f}GB (50% of available, max 90GB)")
+
+                    # Detect likely container misreading (>200GB usually means seeing host RAM)
+                    if total_gb > 200:
+                        print(f"     ⚠️  Detected likely container: psutil sees {total_gb:.0f}GB (host RAM)")
+                        print(f"     ⚠️  Using conservative pre-merge limit: {premerge_limit_gb}GB")
+                        print(f"     ℹ️  Set PREMERGE_LIMIT_GB env var to override")
+                    else:
+                        # Trusted reading - use 50% of available, max 90GB
+                        premerge_limit_gb = min(available_gb * 0.5, 90.0)
+                        print(f"     ℹ️  System RAM: {total_gb:.1f}GB total, {available_gb:.1f}GB available")
+                        print(f"     ℹ️  Pre-merge limit: {premerge_limit_gb:.1f}GB (50% of available, max 90GB)")
                 except ImportError:
                     premerge_limit_gb = 6.0  # Fallback for systems without psutil
+                    print(f"     ℹ️  psutil not available, using {premerge_limit_gb}GB pre-merge limit")
                 if estimated_gb <= premerge_limit_gb:
                     self.premerged_channel_mmaps = []
                     print(f"     ↪︎ Pre-merging monthly/3month into channel shards (est ~{estimated_gb:.2f} GB in-memory)")
@@ -783,10 +795,25 @@ class PreloadHierarchicalDataset(Dataset):
                        (8 if config.get_torch_dtype() == torch.float64 else 4)) / 1e9
 
         # Dynamic memory check based on actual available RAM
+        # IMPORTANT: psutil can misread container RAM (sees host instead of cgroup limit)
+        import os
+        container_ram_gb = float(os.environ.get('CONTAINER_RAM_GB', '0'))
+
         try:
             import psutil
             available_gb = psutil.virtual_memory().available / (1024**3)
             total_gb = psutil.virtual_memory().total / (1024**3)
+
+            # Detect container or use override
+            if container_ram_gb > 0:
+                total_gb = container_ram_gb
+                available_gb = container_ram_gb * 0.8
+                print(f"    ℹ️  Using container RAM override: {container_ram_gb}GB")
+            elif total_gb > 200:  # Likely seeing host RAM
+                print(f"    ⚠️  Container detected: psutil sees {total_gb:.0f}GB (host RAM)")
+                total_gb = 46  # Conservative default
+                available_gb = 40
+
             warn_threshold = available_gb * 0.8  # Warn if using >80% of available RAM
         except ImportError:
             available_gb = 50  # Fallback assumption

@@ -53,21 +53,40 @@ def _check_gpu_available() -> tuple:
         return False, 'cpu'
 
 
-def get_safe_worker_count(requested_workers: int = None) -> int:
+def get_safe_worker_count(requested_workers: int = None, container_ram_gb: float = None) -> int:
     """
     Calculate safe number of parallel workers based on available RAM.
     Each worker uses ~15GB during feature extraction.
 
     Args:
         requested_workers: User-requested worker count (None = auto-detect)
+        container_ram_gb: Override RAM detection (for containers where psutil misreads)
 
     Returns:
         Safe worker count with warning if requested exceeds recommendation
     """
+    import os
+
+    # Check for environment variable override (useful for containers)
+    if container_ram_gb is None:
+        container_ram_gb = float(os.environ.get('CONTAINER_RAM_GB', '0'))
+
     try:
         import psutil
         available_gb = psutil.virtual_memory().available / (1024**3)
         total_gb = psutil.virtual_memory().total / (1024**3)
+
+        # Detect container: psutil sees host RAM (>200GB usually means container)
+        if total_gb > 200 and container_ram_gb == 0:
+            print(f"    ⚠️  Container detected: psutil sees {total_gb:.0f}GB (host RAM)")
+            print(f"    ⚠️  Using conservative 2 workers. Set CONTAINER_RAM_GB env var to override.")
+            return requested_workers if requested_workers and requested_workers > 0 else 2
+
+        # Use container override if provided
+        if container_ram_gb > 0:
+            total_gb = container_ram_gb
+            available_gb = container_ram_gb * 0.8  # Assume 80% available
+            print(f"    ℹ️  Using container RAM override: {container_ram_gb}GB")
     except ImportError:
         # psutil not available, fall back to requested or default
         print("    WARNING: psutil not installed, cannot detect available RAM")

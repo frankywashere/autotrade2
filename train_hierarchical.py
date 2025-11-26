@@ -1022,6 +1022,31 @@ def interactive_setup(args):
             project_config._TORCH_DTYPE = torch.float64
             print("   → FP64 - Maximum precision (slower, more memory)")
 
+        # Container RAM detection for cloud GPU instances (RunPod, Lambda, etc.)
+        print()
+        try:
+            import psutil
+            detected_ram = psutil.virtual_memory().total / (1024**3)
+        except ImportError:
+            detected_ram = 0
+
+        if detected_ram > 200:  # Likely seeing host RAM, not container
+            print(f"   ⚠️  Detected {detected_ram:.0f}GB RAM - likely cloud container (seeing host RAM)")
+            args.container_ram_gb = int(inquirer.number(
+                message="Actual container RAM (GB):",
+                default=46,
+                min_allowed=8,
+                max_allowed=256
+            ).execute())
+            print(f"   ℹ️  Using {args.container_ram_gb}GB for memory calculations")
+
+            # Set environment variables for other modules to use
+            import os
+            os.environ['CONTAINER_RAM_GB'] = str(args.container_ram_gb)
+            os.environ['PREMERGE_LIMIT_GB'] = str(max(6, args.container_ram_gb // 3))  # ~1/3 of RAM for pre-merge
+        else:
+            args.container_ram_gb = 0  # Use psutil detection
+
     elif args.device == 'mps':
         # MPS only supports float32
         print()
@@ -1908,6 +1933,16 @@ def main():
     print(f"   Train samples: {len(train_dataset)}")
     if val_dataset:
         print(f"   Val samples: {len(val_dataset)}")
+
+    # Free large DataFrames - dataset has extracted what it needs
+    # This is CRITICAL for memory on systems where psutil misreads container RAM
+    import gc
+    df_mem_mb = df.memory_usage(deep=True).sum() / 1e6 if hasattr(df, 'memory_usage') else 0
+    features_mem_mb = features_df.memory_usage(deep=True).sum() / 1e6 if hasattr(features_df, 'memory_usage') else 0
+    cont_mem_mb = continuation_df.memory_usage(deep=True).sum() / 1e6 if continuation_df is not None and hasattr(continuation_df, 'memory_usage') else 0
+    print(f"   🧹 Freeing DataFrames: df={df_mem_mb:.0f}MB, features={features_mem_mb:.0f}MB, continuation={cont_mem_mb:.0f}MB")
+    del df, features_df, continuation_df
+    gc.collect()
 
     # Verify feature dimension matches between extractor and dataset
     print("\n   🔍 Verifying feature dimensions...")
