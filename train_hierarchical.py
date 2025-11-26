@@ -468,6 +468,9 @@ def train_epoch(
     model.train()
     total_loss = 0.0
 
+    # Handle DataParallel: access underlying model for attribute checks
+    base_model = model.module if hasattr(model, 'module') else model
+
     # Debug: log before DataLoader iteration
     if profiler:
         profiler.snapshot("pre_dataloader_iter", 0, force_log=True)
@@ -488,7 +491,7 @@ def train_epoch(
         target_high = targets_dict['high'].to(device, non_blocking=True)
         target_low = targets_dict['low'].to(device, non_blocking=True)
 
-        if model.multi_task:
+        if base_model.multi_task:
             target_hit_band = targets_dict['hit_band'].to(device, non_blocking=True)
             target_hit_target = targets_dict['hit_target'].to(device, non_blocking=True)
             target_expected_return = targets_dict['expected_return'].to(device, non_blocking=True)
@@ -526,7 +529,7 @@ def train_epoch(
                         loss_weights['low_prediction'] * loss_low)
 
                 # Multi-task losses
-                if model.multi_task and 'multi_task' in hidden_states:
+                if base_model.multi_task and 'multi_task' in hidden_states:
                     mt = hidden_states['multi_task']
 
                     # Hit band (binary classification)
@@ -638,7 +641,7 @@ def train_epoch(
                     loss_weights['low_prediction'] * loss_low)
 
             # Multi-task losses
-            if model.multi_task and 'multi_task' in hidden_states:
+            if base_model.multi_task and 'multi_task' in hidden_states:
                 mt = hidden_states['multi_task']
 
                 # Hit band (binary classification)
@@ -756,11 +759,11 @@ def train_epoch(
                 mem_before = profiler.snapshot("cleanup_start", batch_idx, force_log=True)
 
             # Clear model's cached hidden states
-            model.clear_cached_states()
+            base_model.clear_cached_states()
 
             # Explicitly delete intermediate tensors
             del predictions, hidden_states
-            if model.multi_task:
+            if base_model.multi_task:
                 del mt
 
             # Explicitly delete batch data
