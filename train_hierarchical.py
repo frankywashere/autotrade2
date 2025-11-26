@@ -1049,9 +1049,12 @@ def interactive_setup(args, profiler=None):
             # Set environment variables for other modules to use
             import os
             os.environ['CONTAINER_RAM_GB'] = str(args.container_ram_gb)
-            os.environ['PREMERGE_LIMIT_GB'] = str(max(6, args.container_ram_gb // 3))  # ~1/3 of RAM for pre-merge
+            # Only set PREMERGE_LIMIT_GB if not already specified by user
+            if not os.environ.get('PREMERGE_LIMIT_GB'):
+                os.environ['PREMERGE_LIMIT_GB'] = str(max(6, args.container_ram_gb // 3))  # ~1/3 of RAM for pre-merge
             if profiler:
-                profiler.log_info(f"CONTAINER_RAM_SET | user_specified={args.container_ram_gb}GB | premerge_limit={max(6, args.container_ram_gb // 3)}GB")
+                actual_premerge = os.environ.get('PREMERGE_LIMIT_GB', str(max(6, args.container_ram_gb // 3)))
+                profiler.log_info(f"CONTAINER_RAM_SET | user_specified={args.container_ram_gb}GB | premerge_limit={actual_premerge}GB")
         else:
             args.container_ram_gb = 0  # Use psutil detection
             if profiler:
