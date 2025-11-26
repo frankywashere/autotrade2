@@ -373,17 +373,39 @@ class TradingFeatureExtractor(FeatureExtractor):
         elif continuation:
             print(f"   ❌ Continuation labels: Not found - will generate (~1 hour)")
 
+        # Check 3: Non-channel features (Price, RSI, Correlation, Cycle, Volume, Time, Breakdown)
+        non_channel_cache_path = unified_cache_dir / f"non_channel_features_{cache_key}.pkl"
+        non_channel_cache_valid = False
+        if non_channel_cache_path.exists() and use_cache:
+            try:
+                test_load = pd.read_pickle(non_channel_cache_path)
+                if len(test_load) > 0 and len(test_load.columns) > 0:
+                    print(f"   ✓ Non-channel features: Valid ({len(test_load.columns)} cols, {len(test_load):,} rows)")
+                    non_channel_cache_valid = True
+                else:
+                    print(f"   ⚠️  Non-channel features: Empty - will regenerate")
+            except Exception as e:
+                print(f"   ⚠️  Non-channel features: Corrupted ({type(e).__name__}) - will regenerate")
+                non_channel_cache_valid = False
+        else:
+            print(f"   ❌ Non-channel features: Not found - will extract (~10-30 sec)")
+
         # Invalidation: If ANY cache fails and use_cache=True, should we invalidate all?
         # For now, keep independent (channel cache can work without continuation labels)
 
         # Summary
         print()
-        if channel_cache_valid and (cont_cache_valid or not continuation):
-            print(f"   🚀 All required caches valid - extraction will be fast!")
+        all_caches_valid = channel_cache_valid and non_channel_cache_valid and (cont_cache_valid or not continuation)
+        if all_caches_valid:
+            print(f"   🚀 All caches valid - skipping extraction entirely!")
+        elif channel_cache_valid and (cont_cache_valid or not continuation):
+            print(f"   ⚡ Channel + labels cached - will only recompute non-channel features (~10-30 sec)")
         else:
             needed = []
             if not channel_cache_valid:
                 needed.append("channels (~5-7 min)")
+            if not non_channel_cache_valid:
+                needed.append("non-channel (~10-30 sec)")
             if continuation and not cont_cache_valid:
                 needed.append("continuation labels (~1 hour)")
             if needed:
@@ -394,91 +416,101 @@ class TradingFeatureExtractor(FeatureExtractor):
         self._unified_cache_dir = unified_cache_dir
         self._cache_key = cache_key
         self._cont_cache_path = cont_cache_path if continuation else None
+        self._non_channel_cache_path = non_channel_cache_path  # Store for saving/loading
         # Short-circuit channel extraction when mmap cache is valid and use_cache is True
         skip_channel_calc = channel_cache_valid and use_cache and validated_meta_path is not None
+        # Short-circuit ALL extraction when all caches valid
+        skip_all_extraction = skip_channel_calc and non_channel_cache_valid and use_cache
 
-        # PASS 1: Extract base features
-        print("   Extracting base features...")
-        with tqdm(total=7, desc="   Feature extraction", leave=True, ncols=100, ascii=True, mininterval=0.5) as pbar:
-            price_df = self._extract_price_features(df, use_gpu=use_gpu_resolved)
-            pbar.update(1)
-
-            # Chunked extraction logic
-            if use_chunking and not use_cache and not skip_channel_calc:
-                print(f"      Using chunked extraction ({chunk_size_years}-year chunks)")
-                chunk_result = self._extract_channel_features_chunked(
-                    df,
-                    multi_res_data=multi_res_data,
-                    use_gpu=use_gpu_resolved,
-                    chunk_size_years=chunk_size_years,
-                    shard_storage_path=shard_storage_path
-                )
-
-                # Chunked extraction returns mmap metadata (not DataFrame!)
-                # v3.18: Also extracts monthly/3month separately
-                self._mmap_meta_path = chunk_result['mmap_meta_path']
-                monthly_3month_df = chunk_result.get('monthly_3month_features')  # Hybrid processing
-                channel_df = None  # Will be loaded as mmap in dataset
-            elif not skip_channel_calc:
-                # Normal extraction (all at once) or load from cache
-                channel_df = self._extract_channel_features(
-                    df,
-                    multi_res_data=multi_res_data,
-                    use_cache=use_cache,
-                    use_gpu=use_gpu_resolved,
-                    cache_suffix=cache_suffix
-                )
-                monthly_3month_df = None  # Not using hybrid mode (all TFs processed together)
-            else:
-                # Skip channel calc entirely; rely on cached mmap
-                channel_df = None
-                monthly_3month_df = None
-            pbar.update(1)
-
-            rsi_df = self._extract_rsi_features(df, multi_res_data=multi_res_data)
-            pbar.update(1)
-
-            correlation_df = self._extract_correlation_features(df, use_gpu=use_gpu_resolved)
-            pbar.update(1)
-
-            cycle_df = self._extract_cycle_features(df)
-            pbar.update(1)
-
-            volume_df = self._extract_volume_features(df)
-            pbar.update(1)
-
-            time_df = self._extract_time_features(df)
-            pbar.update(1)
-
-        # Concat base features FIRST (skip channel_df if using mmap)
-        if channel_df is None and hasattr(self, '_mmap_meta_path'):
-            # Mmap mode - channel features will be loaded separately in dataset
-            # v3.19: Monthly/3month now in separate shard (not in RAM concat)
-            concat_list = [price_df, rsi_df, correlation_df, cycle_df, volume_df, time_df]
-            # Monthly/3month removed - they're in monthly_3month_shard.npy, loaded as mmap
-            # Optimize: copy=False avoids unnecessary data copies
-            base_features_df = pd.concat(concat_list, axis=1, copy=False)
+        # PASS 1: Extract base features (or load from cache if all valid)
+        if skip_all_extraction:
+            # Load non-channel features from cache - skip ALL extraction!
+            print("   📂 Loading non-channel features from cache...")
+            features_df = pd.read_pickle(non_channel_cache_path)
+            print(f"   ✓ Loaded {len(features_df.columns)} non-channel features from cache (saved ~10-30 sec!)")
         else:
-            # Normal mode - include channel features
+            # Normal extraction path
+            print("   Extracting base features...")
+            with tqdm(total=7, desc="   Feature extraction", leave=True, ncols=100, ascii=True, mininterval=0.5) as pbar:
+                price_df = self._extract_price_features(df, use_gpu=use_gpu_resolved)
+                pbar.update(1)
+
+                # Chunked extraction logic
+                if use_chunking and not use_cache and not skip_channel_calc:
+                    print(f"      Using chunked extraction ({chunk_size_years}-year chunks)")
+                    chunk_result = self._extract_channel_features_chunked(
+                        df,
+                        multi_res_data=multi_res_data,
+                        use_gpu=use_gpu_resolved,
+                        chunk_size_years=chunk_size_years,
+                        shard_storage_path=shard_storage_path
+                    )
+
+                    # Chunked extraction returns mmap metadata (not DataFrame!)
+                    # v3.18: Also extracts monthly/3month separately
+                    self._mmap_meta_path = chunk_result['mmap_meta_path']
+                    monthly_3month_df = chunk_result.get('monthly_3month_features')  # Hybrid processing
+                    channel_df = None  # Will be loaded as mmap in dataset
+                elif not skip_channel_calc:
+                    # Normal extraction (all at once) or load from cache
+                    channel_df = self._extract_channel_features(
+                        df,
+                        multi_res_data=multi_res_data,
+                        use_cache=use_cache,
+                        use_gpu=use_gpu_resolved,
+                        cache_suffix=cache_suffix
+                    )
+                    monthly_3month_df = None  # Not using hybrid mode (all TFs processed together)
+                else:
+                    # Skip channel calc entirely; rely on cached mmap
+                    channel_df = None
+                    monthly_3month_df = None
+                pbar.update(1)
+
+                rsi_df = self._extract_rsi_features(df, multi_res_data=multi_res_data)
+                pbar.update(1)
+
+                correlation_df = self._extract_correlation_features(df, use_gpu=use_gpu_resolved)
+                pbar.update(1)
+
+                cycle_df = self._extract_cycle_features(df)
+                pbar.update(1)
+
+                volume_df = self._extract_volume_features(df)
+                pbar.update(1)
+
+                time_df = self._extract_time_features(df)
+                pbar.update(1)
+
+            # Concat base features FIRST (skip channel_df if using mmap)
+            if channel_df is None and hasattr(self, '_mmap_meta_path'):
+                # Mmap mode - channel features will be loaded separately in dataset
+                # v3.19: Monthly/3month now in separate shard (not in RAM concat)
+                concat_list = [price_df, rsi_df, correlation_df, cycle_df, volume_df, time_df]
+                # Monthly/3month removed - they're in monthly_3month_shard.npy, loaded as mmap
+                # Optimize: copy=False avoids unnecessary data copies
+                base_features_df = pd.concat(concat_list, axis=1, copy=False)
+            else:
+                # Normal mode - include channel features
+                # Optimize: copy=False avoids unnecessary data copies
+                base_features_df = pd.concat([
+                    price_df,
+                    channel_df,
+                    rsi_df,
+                    correlation_df,
+                    cycle_df,
+                    volume_df,
+                    time_df
+                ], axis=1, copy=False)
+
+            # PASS 2: Extract breakdown features (needs base features + optional events)
+            with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100, ascii=True, mininterval=0.5) as pbar:
+                breakdown_df = self._extract_breakdown_features(base_features_df, df, events_handler)
+                pbar.update(1)
+
+            # Final concat (non-channel features only if using mmap)
             # Optimize: copy=False avoids unnecessary data copies
-            base_features_df = pd.concat([
-                price_df,
-                channel_df,
-                rsi_df,
-                correlation_df,
-                cycle_df,
-                volume_df,
-                time_df
-            ], axis=1, copy=False)
-
-        # PASS 2: Extract breakdown features (needs base features + optional events)
-        with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100, ascii=True, mininterval=0.5) as pbar:
-            breakdown_df = self._extract_breakdown_features(base_features_df, df, events_handler)
-            pbar.update(1)
-
-        # Final concat (non-channel features only if using mmap)
-        # Optimize: copy=False avoids unnecessary data copies
-        features_df = pd.concat([base_features_df, breakdown_df], axis=1, copy=False)
+            features_df = pd.concat([base_features_df, breakdown_df], axis=1, copy=False)
 
         # Generate continuation labels if requested
         continuation_df = None
@@ -502,20 +534,23 @@ class TradingFeatureExtractor(FeatureExtractor):
                     continuation_df.to_pickle(self._cont_cache_path)
                     print(f"   ✓ Continuation cache saved successfully")
 
-        # Fill NaNs
-        print("   🔍 DEBUG: About to fill NaN values in features_df...")
-        features_df = features_df.bfill().fillna(0)
-        print("   🔍 DEBUG: NaN filling complete")
+        # Fill NaNs (only if we extracted - cached data already has NaNs filled)
+        if not skip_all_extraction:
+            features_df = features_df.bfill().fillna(0)
+
+            # Save non-channel features to cache for next time (only when using mmap mode)
+            if hasattr(self, '_mmap_meta_path') and hasattr(self, '_non_channel_cache_path'):
+                print(f"   💾 Caching non-channel features to: {self._non_channel_cache_path.name}")
+                self._non_channel_cache_path.parent.mkdir(exist_ok=True, parents=True)
+                features_df.to_pickle(self._non_channel_cache_path)
+                print(f"   ✓ Non-channel cache saved ({len(features_df.columns)} cols, {len(features_df):,} rows)")
 
         # If using mmap shards, return metadata alongside features
-        print("   🔍 DEBUG: Checking mmap metadata...")
         if hasattr(self, '_mmap_meta_path'):
-            print(f"   ✓ Extracted {len(features_df.columns)} non-channel features + mmap channel shards")
-            print("   🔍 DEBUG: Returning (features_df, continuation_df, mmap_meta_path)")
+            print(f"   ✓ {len(features_df.columns)} non-channel features + mmap channel shards ready")
             return (features_df, continuation_df, self._mmap_meta_path)
         else:
-            print(f"   ✓ Extracted {len(features_df.columns)} features")
-            print("   🔍 DEBUG: Returning (features_df, continuation_df)")
+            print(f"   ✓ {len(features_df.columns)} features ready")
             return features_df, continuation_df
 
     def _extract_price_features(self, df: pd.DataFrame, use_gpu: bool = False) -> pd.DataFrame:

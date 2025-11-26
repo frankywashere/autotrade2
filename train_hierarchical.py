@@ -272,7 +272,7 @@ def pick_manifest(manifests):
 
 
 def find_available_caches(cache_dir: Path):
-    """Find available cache pairs (meta + continuation labels) in a directory."""
+    """Find available cache triplets (meta + continuation labels + non-channel) in a directory."""
     cache_dir = Path(cache_dir)
     caches = []
     for meta_path in cache_dir.glob("features_mmap_meta_*.json"):
@@ -284,16 +284,23 @@ def find_available_caches(cache_dir: Path):
             if candidate.exists():
                 cont_path = candidate
                 break
+
+        # Check for non-channel features cache (new!)
+        non_channel_path = cache_dir / f"non_channel_features_{cache_key}.pkl"
+        has_non_channel = non_channel_path.exists()
+
         caches.append({
             "cache_key": cache_key,
             "meta_path": str(meta_path),
-            "cont_path": str(cont_path) if cont_path else None
+            "cont_path": str(cont_path) if cont_path else None,
+            "non_channel_path": str(non_channel_path) if has_non_channel else None,
+            "complete": cont_path is not None and has_non_channel  # True = skip extraction entirely
         })
     return caches
 
 
 def pick_cache_pair(caches):
-    """Prompt user to select a cache pair to reuse."""
+    """Prompt user to select a cache triplet to reuse."""
     if not caches:
         return None
     try:
@@ -308,11 +315,21 @@ def pick_cache_pair(caches):
 
     choices = []
     for c in caches:
-        cont_status = "with labels" if c.get("cont_path") else "no labels"
+        # Build status string based on what's cached
+        if c.get("complete"):
+            status = "COMPLETE - skip extraction entirely"
+        elif c.get("cont_path") and c.get("non_channel_path"):
+            status = "COMPLETE - skip extraction entirely"
+        elif c.get("cont_path"):
+            status = "partial: channels + labels (will recompute non-channel ~10-30s)"
+        elif c.get("non_channel_path"):
+            status = "partial: channels + non-channel (no labels)"
+        else:
+            status = "channels only"
         choices.append(
             Choice(
                 value=c,
-                name=f"{c['cache_key']} ({cont_status})"
+                name=f"{c['cache_key']} ({status})"
             )
         )
     choices.append(Choice(value=None, name="Do not reuse cached features/labels"))
@@ -329,6 +346,7 @@ def save_cache_manifest(
     cache_key: str,
     mmap_meta_path: str,
     continuation_path: str,
+    non_channel_path: str,  # NEW: path to non-channel features cache
     args,
     df: pd.DataFrame
 ):
@@ -356,7 +374,8 @@ def save_cache_manifest(
             "dtype": str(project_config.NUMPY_DTYPE),
             "paths": {
                 "mmap_meta": mmap_meta_path,
-                "continuation_labels": continuation_path
+                "continuation_labels": continuation_path,
+                "non_channel_features": non_channel_path  # NEW
             },
             "cache_dir": str(cache_dir),
             "shard_storage_path": getattr(args, "shard_path", None),
@@ -1823,12 +1842,14 @@ def main():
     cache_dir = getattr(extractor, "_unified_cache_dir", getattr(args, "shard_path", "data/feature_cache"))
     cache_key = getattr(extractor, "_cache_key", None)
     cont_path = getattr(extractor, "_cont_cache_path", None)
+    non_channel_path = getattr(extractor, "_non_channel_cache_path", None)  # NEW
     if cache_key:
         save_cache_manifest(
             cache_dir=Path(cache_dir),
             cache_key=cache_key,
             mmap_meta_path=mmap_meta_path,
             continuation_path=str(cont_path) if cont_path else None,
+            non_channel_path=str(non_channel_path) if non_channel_path else None,  # NEW
             args=args,
             df=df
         )
