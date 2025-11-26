@@ -141,19 +141,37 @@ def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
 
 def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None):
     """
-    Custom collate to concatenate channels/non-channels once per batch (cuts per-sample copies).
+    Memory-efficient collate: pre-allocate final tensor and fill directly.
+    Eliminates redundant intermediate tensors from stack+cat pattern.
     """
     if torch_dtype is None:
         torch_dtype = torch.float32
 
-    channels = []
-    monthly_channels_list = []
-    non_channels = []
+    batch_size = len(batch)
     targets = []
-    has_non_channel = False
 
-    for data, tgt in batch:
-        # Expect (main, monthly, non_channel)
+    # Parse first sample to determine dimensions
+    first_data, first_tgt = batch[0]
+    if isinstance(first_data, tuple) and len(first_data) == 3:
+        first_ch_main, first_ch_monthly, first_nc = first_data
+    elif isinstance(first_data, tuple) and len(first_data) == 2:
+        first_ch_main, first_nc = first_data
+        first_ch_monthly = None
+    else:
+        first_ch_main, first_ch_monthly, first_nc = first_data, None, None
+
+    seq_len = first_ch_main.shape[0]
+    ch_main_cols = first_ch_main.shape[1]
+    ch_monthly_cols = first_ch_monthly.shape[1] if first_ch_monthly is not None else 0
+    nc_cols = first_nc.shape[1] if first_nc is not None else 0
+    total_features = ch_main_cols + ch_monthly_cols + nc_cols
+
+    # Pre-allocate final tensor (single allocation instead of stack+cat)
+    x = torch.zeros((batch_size, seq_len, total_features), dtype=torch_dtype)
+
+    # Fill tensor directly without intermediate allocations
+    for i, (data, tgt) in enumerate(batch):
+        # Parse data tuple
         if isinstance(data, tuple) and len(data) == 3:
             ch_main, ch_monthly, nc = data
         elif isinstance(data, tuple) and len(data) == 2:
@@ -162,43 +180,27 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         else:
             ch_main, ch_monthly, nc = data, None, None
 
-        # Ensure contiguity to avoid hidden copies on stack
-        if not ch_main.flags['C_CONTIGUOUS']:
-            ch_main = np.ascontiguousarray(ch_main)
-        channels.append(torch.from_numpy(ch_main))
-
-        monthly_channels = None
-        if ch_monthly is not None:
-            if not ch_monthly.flags['C_CONTIGUOUS']:
-                ch_monthly = np.ascontiguousarray(ch_monthly)
-            monthly_channels = torch.from_numpy(ch_monthly)
-        monthly_channels_list.append(monthly_channels)
-
-        if nc is not None:
-            if not nc.flags['C_CONTIGUOUS']:
-                nc = np.ascontiguousarray(nc)
-            non_channels.append(torch.from_numpy(nc))
-            has_non_channel = True
-        targets.append(tgt)
-
-    channel_batch = torch.stack(channels, dim=0)
-
-    has_monthly = any(m is not None for m in monthly_channels_list)
-    if has_monthly:
-        ref_monthly = next(m for m in monthly_channels_list if m is not None)
-        monthly_batch = torch.stack(
-            [(m if m is not None else torch.zeros_like(ref_monthly)) for m in monthly_channels_list],
-            dim=0
+        # Copy channel features directly into pre-allocated tensor
+        col_start = 0
+        x[i, :, col_start:col_start + ch_main_cols] = torch.from_numpy(
+            np.ascontiguousarray(ch_main) if not ch_main.flags['C_CONTIGUOUS'] else ch_main
         )
+        col_start += ch_main_cols
 
-    parts = [channel_batch]
-    if has_monthly:
-        parts.append(monthly_batch)
-    if has_non_channel:
-        non_channel_batch = torch.stack(non_channels, dim=0)
-        parts.append(non_channel_batch)
+        # Copy monthly features if present
+        if ch_monthly is not None:
+            x[i, :, col_start:col_start + ch_monthly_cols] = torch.from_numpy(
+                np.ascontiguousarray(ch_monthly) if not ch_monthly.flags['C_CONTIGUOUS'] else ch_monthly
+            )
+        col_start += ch_monthly_cols
 
-    x = torch.cat(parts, dim=-1)
+        # Copy non-channel features if present
+        if nc is not None:
+            x[i, :, col_start:col_start + nc_cols] = torch.from_numpy(
+                np.ascontiguousarray(nc) if not nc.flags['C_CONTIGUOUS'] else nc
+            )
+
+        targets.append(tgt)
 
     # Build targets tensor dict with proper dtype
     converted_targets = []
@@ -215,7 +217,6 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
 
     if move_to_device and device is not None:
         x = x.to(device, non_blocking=True)
-        # Move dict of targets
         for k, v in targets_batch.items():
             targets_batch[k] = v.to(device, non_blocking=True)
 
@@ -1946,7 +1947,7 @@ def main():
     print(f"   ✅ Dimension check passed: {actual_input_dim} features match expected {expected_dim}")
 
     # DataLoader tuning (MPS-friendly defaults)
-    prefetch_factor = 2 if args.num_workers and args.num_workers > 0 else None
+    prefetch_factor = 1 if args.num_workers and args.num_workers > 0 else None  # Reduced from 2 to prevent memory buildup
     mp_context = 'forkserver' if platform.system() == 'Darwin' and args.num_workers and args.num_workers > 0 else None
 
     # Create dataloaders
