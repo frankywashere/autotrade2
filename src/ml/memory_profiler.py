@@ -142,6 +142,9 @@ class MemoryProfiler:
         """Write timestamped message to log file."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         self.logger.info(f"{timestamp} | {message}")
+        # Flush immediately so logs survive OOM crashes
+        for handler in self.logger.handlers:
+            handler.flush()
 
     def set_epoch(self, epoch: int):
         """Set current epoch for logging context."""
