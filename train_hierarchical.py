@@ -420,7 +420,8 @@ def train_epoch(
     epoch: int,
     loss_weights: Dict = None,
     scaler=None,
-    use_multi_gpu: bool = False
+    use_multi_gpu: bool = False,
+    profiler=None
 ) -> float:
     """
     Train for one epoch with multi-task loss.
@@ -434,6 +435,7 @@ def train_epoch(
         epoch: Current epoch number
         loss_weights: Dict with task weights (from config)
         scaler: Optional GradScaler for AMP (CUDA only)
+        profiler: Optional MemoryProfiler for debugging
 
     Returns:
         avg_loss: Average training loss
@@ -722,14 +724,22 @@ def train_epoch(
 
         total_loss += loss.item()
 
-        # Update progress bar with current loss
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        # Update progress bar with current loss (and memory if profiling)
+        if profiler:
+            mem = profiler.snapshot("batch_end", batch_idx)
+            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'mem': f'{mem.get("gpu_mb", 0):.0f}MB'})
+        else:
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
         # Memory cleanup to prevent accumulation
         # CUDA: every 500 batches (empty_cache is expensive, ~5-10ms per call)
         # MPS: every 50 batches (more memory constrained, needs more frequent cleanup)
         cleanup_frequency = 500 if device == 'cuda' else 50
         if batch_idx % cleanup_frequency == 0 and batch_idx > 0:
+            # Track memory before cleanup if profiling
+            if profiler:
+                mem_before = profiler.snapshot("cleanup_start", batch_idx, force_log=True)
+
             # Clear model's cached hidden states
             model.clear_cached_states()
 
@@ -750,6 +760,13 @@ def train_epoch(
             # Run garbage collection
             import gc
             gc.collect()
+
+            # Log memory freed if profiling
+            if profiler:
+                mem_after = profiler.snapshot("cleanup_end", batch_idx, force_log=True)
+                freed_gpu = mem_before.get('gpu_mb', 0) - mem_after.get('gpu_mb', 0)
+                freed_ram = mem_before.get('ram_mb', 0) - mem_after.get('ram_mb', 0)
+                profiler.log_cleanup(freed_gpu, freed_ram)
 
     avg_loss = total_loss / len(dataloader)
     return avg_loss
@@ -1604,6 +1621,10 @@ def main():
     parser.add_argument('--interactive', action='store_true',
                         help='Interactive mode with menus')
 
+    # Memory profiling
+    parser.add_argument('--memory-profile', dest='memory_profile', action='store_true', default=False,
+                        help='Enable memory profiling to logs/memory_debug.log')
+
     args = parser.parse_args()
 
     # Interactive mode overrides command-line args
@@ -2037,6 +2058,18 @@ def main():
     elif getattr(args, 'amp', False) and args.device != 'cuda':
         print("   ⚠️  AMP requested but only supported on CUDA - using FP32")
 
+    # Setup memory profiler if enabled
+    profiler = None
+    if getattr(args, 'memory_profile', False):
+        from src.ml.memory_profiler import MemoryProfiler
+        profiler = MemoryProfiler(
+            log_path="logs/memory_debug.log",
+            device=args.device,
+            log_every_n=10,
+            spike_threshold_mb=500
+        )
+        print("   📊 Memory profiling enabled - logging to logs/memory_debug.log")
+
     # Training loop
     print("\n5. Training...")
     best_val_loss = float('inf')
@@ -2052,9 +2085,13 @@ def main():
         tqdm.write(f"\nEpoch {epoch + 1}/{args.epochs}")
         tqdm.write("-" * 70)
 
+        # Set epoch in profiler
+        if profiler:
+            profiler.set_epoch(epoch + 1)
+
         # Train (with loss_weights for multi-task, and optional AMP scaler)
         train_loss = train_epoch(
-            model, train_loader, optimizer, criterion, args.device, epoch, loss_weights, scaler, use_multi_gpu
+            model, train_loader, optimizer, criterion, args.device, epoch, loss_weights, scaler, use_multi_gpu, profiler
         )
         train_losses.append(train_loss)
 
@@ -2114,6 +2151,11 @@ def main():
     print("=" * 70)
     print(f"Best val loss: {best_val_loss:.4f}")
 
+    # Print memory profile summary if enabled
+    if profiler:
+        profiler.print_summary()
+        profiler.close()
+
     # Save training history
     history_path = Path(args.output).parent / 'hierarchical_training_history.json'
     history = {
@@ -2124,6 +2166,10 @@ def main():
         'total_epochs': epoch + 1,
         'args': vars(args)
     }
+
+    # Add memory profile to history if profiling was enabled
+    if profiler:
+        history['memory_profile'] = profiler.get_summary()
 
     with open(history_path, 'w') as f:
         json.dump(history, f, indent=2)

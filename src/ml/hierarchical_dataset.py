@@ -169,8 +169,18 @@ class HierarchicalDataset(Dataset):
                 total_cols = self.channel_mmaps[0].shape[1] + self.monthly_3month_mmap.shape[1]
                 estimated_gb = total_rows * total_cols * np.dtype(dtype).itemsize / 1e9
 
-                # Guard against exploding RAM/disk for large datasets on laptops
-                premerge_limit_gb = 6.0  # conservative for 16 GB systems
+                # Dynamic pre-merge limit based on available RAM
+                # High-RAM systems can pre-merge larger datasets for better training performance
+                try:
+                    import psutil
+                    available_gb = psutil.virtual_memory().available / (1024**3)
+                    total_gb = psutil.virtual_memory().total / (1024**3)
+                    # Use up to 50% of available RAM for pre-merge, max 90GB
+                    premerge_limit_gb = min(available_gb * 0.5, 90.0)
+                    print(f"     ℹ️  System RAM: {total_gb:.1f}GB total, {available_gb:.1f}GB available")
+                    print(f"     ℹ️  Pre-merge limit: {premerge_limit_gb:.1f}GB (50% of available, max 90GB)")
+                except ImportError:
+                    premerge_limit_gb = 6.0  # Fallback for systems without psutil
                 if estimated_gb <= premerge_limit_gb:
                     self.premerged_channel_mmaps = []
                     print(f"     ↪︎ Pre-merging monthly/3month into channel shards (est ~{estimated_gb:.2f} GB in-memory)")
