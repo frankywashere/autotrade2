@@ -2138,34 +2138,21 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
     extractor = TradingFeatureExtractor()
 
-    # Determine if we need to re-extract features
+    # Shard path for channel features (mmaps)
     shard_path = Path(args.shard_path) if args.shard_path else Path(project_config.SHARD_DIR)
-    expected_cache_key = f"{args.train_start_year}_{args.train_end_year}_v{FEATURE_VERSION}"
-    cache_key_file = shard_path / expected_cache_key / 'cache_key.txt'
-    cache_valid = cache_key_file.exists()
 
-    if cache_valid:
-        if is_main_process(rank):
-            print(f"   ✓ Using cached features from {shard_path / expected_cache_key}")
-        non_channel_cols = None
-        continuation_df = None
-    else:
-        if is_main_process(rank):
-            print(f"   Extracting fresh features...")
+    # Extract features (handles caching internally)
+    if is_main_process(rank):
+        print(f"   Extracting features (use_chunking={args.use_chunking})...")
 
-        # Use chunked extraction if enabled
-        if args.use_chunking:
-            non_channel_cols, continuation_df = extractor.extract_features_chunked(
-                df, df_sliced.index,
-                shard_dir=str(shard_path),
-                cache_key=expected_cache_key
-            )
-        else:
-            non_channel_cols, continuation_df = extractor.extract_features_to_shards(
-                df, df_sliced.index,
-                shard_dir=str(shard_path),
-                cache_key=expected_cache_key
-            )
+    features_df, continuation_df = extractor.extract_features(
+        df,
+        use_cache=True,
+        continuation=True,
+        use_chunking=args.use_chunking,
+        shard_storage_path=str(shard_path),
+    )
+    non_channel_cols = features_df.columns.tolist() if features_df is not None else None
 
     if profiler:
         nc_cols = len(non_channel_cols) if non_channel_cols is not None else 0
