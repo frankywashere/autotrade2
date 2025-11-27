@@ -1755,6 +1755,19 @@ def main():
     if args.interactive:
         args = interactive_setup(args, profiler=profiler)
 
+    # FIX: Create profiler if user enabled it in interactive mode (wasn't created earlier)
+    if args.memory_profile and profiler is None:
+        from src.ml.memory_profiler import MemoryProfiler
+        profiler = MemoryProfiler(
+            log_path="logs/memory_debug.log",
+            device=args.device if args.device != 'auto' else 'unknown',
+            log_every_n=10,
+            spike_threshold_mb=500
+        )
+        profiler.log_info(f"CONTAINER_RAM_GB={os.environ.get('CONTAINER_RAM_GB', 'not_set')}")
+        profiler.log_info(f"PREMERGE_LIMIT_GB={os.environ.get('PREMERGE_LIMIT_GB', 'not_set')}")
+        profiler.log_info("PROFILER_CREATED_POST_INTERACTIVE")
+
     # Auto-detect device if 'auto'
     if args.device == 'auto':
         args.device = get_best_device()
