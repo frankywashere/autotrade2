@@ -236,7 +236,10 @@ class ShuffleBufferSampler(torch.utils.data.Sampler):
 def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0]):
     """
     Memory-efficient collate: pre-allocate final tensor and fill directly.
-    Eliminates redundant intermediate tensors from stack+cat pattern.
+    Handles MIXED formats from adaptive mode (premerged vs mmap shards):
+    - Premerged samples: (merged_14322, None, non_channel)
+    - Mmap samples: (main_11718, monthly_2604, non_channel)
+    Both produce same total features (14322 + nc_cols).
     """
     import os
     import sys
@@ -254,7 +257,7 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     batch_size = len(batch)
     targets = []
 
-    # Parse first sample to determine dimensions
+    # Parse first sample to determine TOTAL dimensions
     first_data, first_tgt = batch[0]
     if isinstance(first_data, tuple) and len(first_data) == 3:
         first_ch_main, first_ch_monthly, first_nc = first_data
@@ -265,16 +268,17 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         first_ch_main, first_ch_monthly, first_nc = first_data, None, None
 
     seq_len = first_ch_main.shape[0]
-    ch_main_cols = first_ch_main.shape[1]
-    ch_monthly_cols = first_ch_monthly.shape[1] if first_ch_monthly is not None else 0
+    # Total channel cols = main + monthly (same total regardless of merged/split format)
+    first_main_cols = first_ch_main.shape[1]
+    first_monthly_cols = first_ch_monthly.shape[1] if first_ch_monthly is not None else 0
+    total_channel_cols = first_main_cols + first_monthly_cols  # Always 14322
     nc_cols = first_nc.shape[1] if first_nc is not None else 0
-    total_features = ch_main_cols + ch_monthly_cols + nc_cols
+    total_features = total_channel_cols + nc_cols
 
     # Pre-allocate final tensor (single allocation instead of stack+cat)
     x = torch.zeros((batch_size, seq_len, total_features), dtype=torch_dtype)
 
-    # Fill tensor directly without intermediate allocations
-    # Track contiguous copies for debugging memory duplication
+    # Fill tensor directly - handle mixed formats per-sample
     copies_made = 0
     copy_bytes = 0
 
@@ -288,31 +292,32 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         else:
             ch_main, ch_monthly, nc = data, None, None
 
-        # Copy channel features directly into pre-allocated tensor
-        col_start = 0
+        # Get THIS sample's main column count (may differ: 14322 merged vs 11718 split)
+        this_main_cols = ch_main.shape[1]
+
+        # Copy main channel features (position 0 to this_main_cols)
         if not ch_main.flags['C_CONTIGUOUS']:
             copies_made += 1
             copy_bytes += ch_main.nbytes
             ch_main = np.ascontiguousarray(ch_main)
-        x[i, :, col_start:col_start + ch_main_cols] = torch.from_numpy(ch_main)
-        col_start += ch_main_cols
+        x[i, :, 0:this_main_cols] = torch.from_numpy(ch_main)
 
-        # Copy monthly features if present
+        # Copy monthly features if separate (split format from mmap shards)
         if ch_monthly is not None:
+            this_monthly_cols = ch_monthly.shape[1]
             if not ch_monthly.flags['C_CONTIGUOUS']:
                 copies_made += 1
                 copy_bytes += ch_monthly.nbytes
                 ch_monthly = np.ascontiguousarray(ch_monthly)
-            x[i, :, col_start:col_start + ch_monthly_cols] = torch.from_numpy(ch_monthly)
-        col_start += ch_monthly_cols
+            x[i, :, this_main_cols:this_main_cols + this_monthly_cols] = torch.from_numpy(ch_monthly)
 
-        # Copy non-channel features if present
+        # Copy non-channel features at fixed position (after all channel features)
         if nc is not None:
             if not nc.flags['C_CONTIGUOUS']:
                 copies_made += 1
                 copy_bytes += nc.nbytes
                 nc = np.ascontiguousarray(nc)
-            x[i, :, col_start:col_start + nc_cols] = torch.from_numpy(nc)
+            x[i, :, total_channel_cols:total_channel_cols + nc_cols] = torch.from_numpy(nc)
 
         targets.append(tgt)
 

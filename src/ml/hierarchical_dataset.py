@@ -410,7 +410,7 @@ class HierarchicalDataset(Dataset):
 
         return result
 
-    def _get_channel_sequence_from_shards(self, start: int, end: int) -> Tuple[np.ndarray, None]:
+    def _get_channel_sequence_from_shards(self, start: int, end: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
         Get a sequence of rows from memory-mapped shards.
 
@@ -419,16 +419,18 @@ class HierarchicalDataset(Dataset):
         - Partial pre-merge (adaptive mode): some shards premerged, others mmap
         - No pre-merge: all shards via mmap + separate monthly
 
-        Always returns MERGED format (main + monthly concatenated) for consistency,
-        even when accessing mmap shards (does on-the-fly concatenation).
+        Returns format depends on shard type (collate handles both):
+        - Premerged shard: (merged_array, None) - already combined
+        - Mmap shard: (main_array, monthly_array) - separate, collate merges
 
         Args:
             start: Start row index (global)
             end: End row index (global)
 
         Returns:
-            (merged_channels, None) where merged_channels has shape [end-start, total_cols]
-            Second element is always None (monthly is included in merged_channels)
+            (main_channels, monthly_or_None) where:
+            - Premerged: main has all cols (14322), monthly is None
+            - Mmap: main has channel cols (11718), monthly has monthly cols (2604)
         """
         import bisect
 
@@ -458,16 +460,12 @@ class HierarchicalDataset(Dataset):
             if has_premerged and start_shard in self.premerged_channel_mmaps:
                 # Fast path: shard is premerged (includes monthly)
                 main_result = self.premerged_channel_mmaps[start_shard][local_start:local_end]
+                return main_result, None
             else:
-                # Slow path: shard is mmap - do on-the-fly merge for consistent output
-                main_chunk = self.channel_mmaps[start_shard][local_start:local_end]
-                if self.monthly_3month_mmap is not None:
-                    monthly_chunk = self.monthly_3month_mmap[start:end, :]
-                    main_result = np.concatenate([main_chunk, monthly_chunk], axis=1)
-                else:
-                    main_result = main_chunk
-
-            return main_result, None
+                # Mmap path: return SEPARATE arrays (collate handles merging)
+                main_result = self.channel_mmaps[start_shard][local_start:local_end]
+                monthly_result = self.monthly_3month_mmap[start:end, :] if self.monthly_3month_mmap is not None else None
+                return main_result, monthly_result
 
         else:
             # Sequence spans multiple shards (rare - happens at shard boundaries)
