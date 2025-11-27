@@ -445,6 +445,9 @@ class HierarchicalDataset(Dataset):
                 - expected_return: % (regression) - NO CIRCULARITY
                 - overshoot: ratio (regression) - NO CIRCULARITY
         """
+        import time
+        import sys
+        _getitem_start = time.perf_counter()
         # Get actual data index
         data_idx = self.valid_indices[idx]
 
@@ -713,6 +716,11 @@ class HierarchicalDataset(Dataset):
                     targets['channel_1h_r_squared'] = 0.0
                 if self.has_channel_4h_r_squared:
                     targets['channel_4h_r_squared'] = 0.0
+
+        # Performance logging for slow samples (diagnose mmap read bottlenecks)
+        _getitem_elapsed_ms = (time.perf_counter() - _getitem_start) * 1000
+        if _getitem_elapsed_ms > 50:  # Log if >50ms (should be <10ms with premerge)
+            print(f"[SLOW_GETITEM] idx={idx} took {_getitem_elapsed_ms:.0f}ms", file=sys.stderr, flush=True)
 
         return (main_channel_sequence, monthly_sequence, non_channel_sequence), targets
 

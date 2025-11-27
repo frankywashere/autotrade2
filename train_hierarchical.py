@@ -178,6 +178,8 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     """
     import os
     import sys
+    import time
+    _collate_start = time.perf_counter()
 
     # Debug: track collate calls (mutable default persists across calls)
     _debug_counter[0] += 1
@@ -273,6 +275,11 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         x = x.to(device, non_blocking=True)
         for k, v in targets_batch.items():
             targets_batch[k] = v.to(device, non_blocking=True)
+
+    # Log slow batch assembly (diagnose lazy loading bottlenecks)
+    _collate_elapsed = time.perf_counter() - _collate_start
+    if _collate_elapsed > 1.0:  # Log if >1 second
+        print(f"[SLOW_COLLATE] batch assembly took {_collate_elapsed:.1f}s for {batch_size} samples ({_collate_elapsed/batch_size*1000:.0f}ms/sample)", file=sys.stderr, flush=True)
 
     return x, targets_batch
 
@@ -520,6 +527,8 @@ def train_epoch(
     base_model = model.module if hasattr(model, 'module') else model
 
     # Debug: log before DataLoader iteration
+    import time as _time
+    _epoch_start = _time.perf_counter()
     if profiler:
         profiler.snapshot("pre_dataloader_iter", 0, force_log=True)
         profiler.log_phase("dataloader_starting", {"num_workers": dataloader.num_workers, "batch_size": dataloader.batch_size})
@@ -529,8 +538,12 @@ def train_epoch(
 
     for batch_idx, (x, targets_dict) in enumerate(pbar):
         # Debug: log after first batch received (proves DataLoader worked)
-        if profiler and batch_idx == 0:
-            profiler.snapshot("first_batch_received", 0, force_log=True)
+        if batch_idx == 0:
+            _first_batch_time = _time.perf_counter() - _epoch_start
+            print(f"[TIMING] First batch loaded in {_first_batch_time:.1f}s", file=__import__('sys').stderr, flush=True)
+            if profiler:
+                profiler.log_info(f"FIRST_BATCH_COMPLETE | time_sec={_first_batch_time:.1f}")
+                profiler.snapshot("first_batch_received", 0, force_log=True)
         # Move to device
         # If collate already moved to device, this is a no-op; otherwise it moves now
         x = x.to(device, non_blocking=True)
