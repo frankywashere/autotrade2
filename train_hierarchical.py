@@ -665,17 +665,20 @@ def train_epoch(
                     mt = hidden_states['multi_task']
 
                     # Hit band (binary classification)
-                    loss_hit_band = F.binary_cross_entropy(
-                        mt['hit_band'].squeeze(),
-                        target_hit_band
-                    )
+                    # Disable autocast for BCE - unsafe with FP16
+                    with torch.amp.autocast('cuda', enabled=False):
+                        loss_hit_band = F.binary_cross_entropy(
+                            mt['hit_band'].float().squeeze(),
+                            target_hit_band.float()
+                        )
                     loss += loss_weights['hit_band'] * loss_hit_band
 
                     # Hit target (binary classification)
-                    loss_hit_target = F.binary_cross_entropy(
-                        mt['hit_target'].squeeze(),
-                        target_hit_target
-                    )
+                    with torch.amp.autocast('cuda', enabled=False):
+                        loss_hit_target = F.binary_cross_entropy(
+                            mt['hit_target'].float().squeeze(),
+                            target_hit_target.float()
+                        )
                     loss += loss_weights['hit_target'] * loss_hit_target
 
                     # Expected return (regression)
@@ -707,10 +710,11 @@ def train_epoch(
                     loss += loss_weights['continuation_gain'] * loss_continuation_gain
 
                     # Continuation confidence (binary classification)
-                    loss_continuation_confidence = F.binary_cross_entropy(
-                        mt['continuation_confidence'].squeeze(),
-                        target_continuation_confidence
-                    )
+                    with torch.amp.autocast('cuda', enabled=False):
+                        loss_continuation_confidence = F.binary_cross_entropy(
+                            mt['continuation_confidence'].float().squeeze(),
+                            target_continuation_confidence.float()
+                        )
                     loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
 
                     # Adaptive horizon losses (only when using adaptive mode)
@@ -722,10 +726,11 @@ def train_epoch(
                         loss += loss_weights.get('adaptive_horizon', 0.3) * loss_adaptive_horizon
 
                     if 'conf_score' in targets_dict and 'adaptive_conf_score' in mt:
-                        loss_adaptive_conf = F.binary_cross_entropy(
-                            mt['adaptive_conf_score'].squeeze(),
-                            target_conf_score
-                        )
+                        with torch.amp.autocast('cuda', enabled=False):
+                            loss_adaptive_conf = F.binary_cross_entropy(
+                                mt['adaptive_conf_score'].float().squeeze(),
+                                target_conf_score.float()
+                            )
                         loss += loss_weights.get('adaptive_conf_score', 0.3) * loss_adaptive_conf
 
                     # Adaptive projection losses
@@ -741,10 +746,11 @@ def train_epoch(
                     )
                     loss += loss_weights['horizon_bars_log'] * loss_horizon_log
 
-                    loss_adaptive_confidence = F.binary_cross_entropy(
-                        mt['adaptive_confidence'].squeeze(),
-                        target_adaptive_confidence
-                    )
+                    with torch.amp.autocast('cuda', enabled=False):
+                        loss_adaptive_confidence = F.binary_cross_entropy(
+                            mt['adaptive_confidence'].float().squeeze(),
+                            target_adaptive_confidence.float()
+                        )
                     loss += loss_weights['adaptive_confidence'] * loss_adaptive_confidence
 
             # AMP backward pass
