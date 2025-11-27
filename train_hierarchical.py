@@ -2408,6 +2408,17 @@ def main():
         # It will then replicate to other GPUs automatically
         model = model.to('cuda:0')
 
+        # CRITICAL: Move sparsity_mask buffers back to CPU for proper DataParallel replication
+        # DataParallel only replicates CPU buffers to each GPU; CUDA buffers are shared by reference.
+        # By keeping sparsity_mask on CPU, DataParallel will copy it to each GPU during forward().
+        sparsity_cpu_count = 0
+        for name, module in model.named_modules():
+            if 'sparsity_mask' in module._buffers and module._buffers['sparsity_mask'] is not None:
+                module._buffers['sparsity_mask'] = module._buffers['sparsity_mask'].cpu()
+                sparsity_cpu_count += 1
+        if sparsity_cpu_count > 0:
+            print(f"   🔧 Moved {sparsity_cpu_count} sparsity_mask buffers to CPU for DataParallel replication")
+
         model = nn.DataParallel(model)
         use_multi_gpu = True
         print(f"   📦 Effective batch size: {args.batch_size} (split across {num_gpus} GPUs, ~{args.batch_size // num_gpus} per GPU)")
