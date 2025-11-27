@@ -1757,6 +1757,7 @@ def main():
 
     # FIX: Create profiler if user enabled it in interactive mode (wasn't created earlier)
     if args.memory_profile and profiler is None:
+        import os
         from src.ml.memory_profiler import MemoryProfiler
         profiler = MemoryProfiler(
             log_path="logs/memory_debug.log",
