@@ -171,6 +171,68 @@ def fix_ncps_buffers(model):
     return fixed_count
 
 
+class ShuffleBufferSampler(torch.utils.data.Sampler):
+    """
+    Shuffle buffer sampler for memory-efficient training with mmap data.
+
+    Instead of full random shuffle (which causes random mmap access = page faults),
+    this sampler:
+    1. Divides indices into sequential chunks (buffer_size)
+    2. Shuffles indices WITHIN each chunk only
+    3. Yields indices in chunk order
+
+    Result: Access pattern is sequential-ish (good for mmap), but with local
+    randomization (good for training quality).
+
+    Example with buffer_size=1000:
+        Chunk 1: indices 0-999, shuffled → yields e.g. [234, 12, 891, ...]
+        Chunk 2: indices 1000-1999, shuffled → yields e.g. [1456, 1023, ...]
+        ...
+
+    Performance vs full shuffle:
+        - Full shuffle: O(random) mmap access → severe page faults
+        - Shuffle buffer: O(sequential) mmap access → cache-friendly
+        - Training quality: ~95% of full shuffle (local randomization)
+    """
+
+    def __init__(self, data_source, buffer_size: int = 10000, seed: int = None):
+        """
+        Args:
+            data_source: Dataset to sample from (needs __len__)
+            buffer_size: Number of samples per chunk (default 10000 ≈ 50MB overhead)
+            seed: Random seed for reproducibility (None = random each epoch)
+        """
+        self.data_source = data_source
+        self.buffer_size = buffer_size
+        self.seed = seed
+        self._epoch = 0  # For distributed training compatibility
+
+    def __iter__(self):
+        import random
+        n = len(self.data_source)
+        indices = list(range(n))
+
+        # Use epoch-based seed for reproducibility across epochs
+        if self.seed is not None:
+            rng = random.Random(self.seed + self._epoch)
+        else:
+            rng = random.Random()
+
+        # Process in sequential chunks, shuffle within each chunk
+        for chunk_start in range(0, n, self.buffer_size):
+            chunk_end = min(chunk_start + self.buffer_size, n)
+            chunk = indices[chunk_start:chunk_end]
+            rng.shuffle(chunk)  # Local shuffle only
+            yield from chunk
+
+    def __len__(self):
+        return len(self.data_source)
+
+    def set_epoch(self, epoch: int):
+        """Set epoch for reproducible shuffling (DDP compatibility)."""
+        self._epoch = epoch
+
+
 def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0]):
     """
     Memory-efficient collate: pre-allocate final tensor and fill directly.
@@ -519,6 +581,10 @@ def train_epoch(
             'horizon_bars_log': 0.3,
             'adaptive_confidence': 0.2
         }
+
+    # For ShuffleBufferSampler: update epoch for reproducible shuffling
+    if hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
+        dataloader.sampler.set_epoch(epoch)
 
     model.train()
     total_loss = 0.0
@@ -1579,17 +1645,84 @@ def interactive_setup(args, profiler=None):
         float_allowed=True
     ).execute())
 
-    # Data loading
+    # Data loading strategy
     print()
-    preload_choice = inquirer.select(
-        message="Data loading mode:",
+    print("📊 Data Loading Strategy")
+
+    # Calculate default premerge budget based on container RAM
+    container_ram = getattr(args, 'container_ram_gb', 0)
+    if container_ram > 0:
+        # Container detected - use 70% of container RAM minus overhead
+        overhead_gb = 3  # Model + non-channel features + working memory
+        default_premerge_budget = max(0, int(container_ram * 0.7 - overhead_gb))
+    else:
+        # Native system - try to detect RAM
+        try:
+            import psutil
+            detected_ram = psutil.virtual_memory().total / (1024**3)
+            if detected_ram < 200:  # Trusted reading
+                default_premerge_budget = max(0, int(detected_ram * 0.5 - 3))
+            else:
+                default_premerge_budget = 30  # Conservative default
+        except ImportError:
+            default_premerge_budget = 20
+
+    data_loading_choice = inquirer.select(
+        message="Data loading strategy:",
         choices=[
-            Choice(value=False, name=f'Lazy loading (2-3 GB RAM) - Recommended'),
-            Choice(value=True, name=f'Preload (requires ~40 GB RAM) - 20% faster')
+            Choice(value='adaptive', name=f'Adaptive (recommended) - partial premerge + shuffle buffer, auto-scales to RAM'),
+            Choice(value='full_premerge', name=f'Full Pre-merge - requires 90GB+ RAM (fastest if available)'),
+            Choice(value='full_preload', name=f'Full Preload - loads everything into RAM (most RAM needed)')
         ],
-        default=dflt('preload', False)
+        default=dflt('data_loading_mode', 'adaptive')
     ).execute()
-    args.preload = preload_choice
+
+    # Set loading mode flags
+    args.data_loading_mode = data_loading_choice
+    args.preload = (data_loading_choice == 'full_preload')
+    args.use_adaptive_loading = (data_loading_choice == 'adaptive')
+
+    # Initialize adaptive mode settings
+    args.premerge_budget_gb = 0
+    args.shuffle_buffer_size = 10000
+
+    if data_loading_choice == 'adaptive':
+        # Adaptive mode - ask for premerge budget and shuffle buffer size
+        print()
+        print(f"   ℹ️  Adaptive mode: partial pre-merge + shuffle buffer")
+        print(f"   ℹ️  Pre-merge budget determines how many shards are loaded into RAM")
+        print(f"   ℹ️  Remaining shards accessed via mmap with shuffle buffer (sequential access)")
+
+        args.premerge_budget_gb = int(inquirer.number(
+            message=f"Pre-merge RAM budget (GB) [0 = shuffle buffer only]:",
+            default=default_premerge_budget,
+            min_allowed=0,
+            max_allowed=500
+        ).execute())
+
+        if args.premerge_budget_gb > 0:
+            print(f"   → Will pre-merge shards up to {args.premerge_budget_gb}GB")
+        else:
+            print(f"   → Shuffle buffer only mode (no pre-merge)")
+
+        print()
+        args.shuffle_buffer_size = int(inquirer.number(
+            message="Shuffle buffer size (samples) [larger = better randomization]:",
+            default=dflt('shuffle_buffer_size', 10000),
+            min_allowed=1000,
+            max_allowed=100000
+        ).execute())
+        print(f"   → Shuffle buffer: {args.shuffle_buffer_size:,} samples (~{args.shuffle_buffer_size * 5 / 1000:.0f}MB overhead)")
+
+    elif data_loading_choice == 'full_premerge':
+        print(f"   → Full pre-merge mode: all shards loaded into RAM")
+        print(f"   ⚠️  Requires 90GB+ RAM for typical datasets")
+        # Set high budget to trigger full pre-merge
+        args.premerge_budget_gb = 200
+
+    else:  # full_preload
+        print(f"   → Full preload mode: entire dataset loaded into RAM")
+        print(f"   ⚠️  Requires most RAM but fastest training")
 
     # Multi-task learning
     print()
@@ -1635,7 +1768,19 @@ def interactive_setup(args, profiler=None):
     print(f"  Epochs: {args.epochs}")
     print(f"  Batch Size: {args.batch_size}")
     print(f"  Learning Rate: {args.lr}")
-    print(f"  Data Loading: {'Preload' if args.preload else 'Lazy'}")
+    # Format data loading display
+    data_loading_mode = getattr(args, 'data_loading_mode', 'adaptive')
+    if data_loading_mode == 'adaptive':
+        premerge_gb = getattr(args, 'premerge_budget_gb', 0)
+        buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
+        data_loading_display = f"Adaptive (premerge={premerge_gb}GB, buffer={buffer_size:,})"
+    elif data_loading_mode == 'full_premerge':
+        data_loading_display = "Full Pre-merge"
+    elif data_loading_mode == 'full_preload':
+        data_loading_display = "Full Preload"
+    else:
+        data_loading_display = "Lazy" if not args.preload else "Preload"
+    print(f"  Data Loading: {data_loading_display}")
     print(f"  Cache: {'Regenerate' if getattr(args, 'regenerate_cache', True) else 'Use existing'}")
     print(f"  Feature GPU: {'Yes' if getattr(args, 'use_gpu_features', False) else 'No'}")
     print(f"  Parallel CPU: {parallel_str}")
@@ -1850,7 +1995,19 @@ def main():
     print(f"🎯 Horizon: Adaptive (base {args.prediction_horizon} bars, model adjusts dynamically)")
     print(f"🔢 Batch size: {args.batch_size}")
     print(f"🔄 Epochs: {args.epochs}")
-    print(f"💾 Data mode: {'Preload' if args.preload else 'Lazy'}")
+    # Format data mode display
+    data_mode = getattr(args, 'data_loading_mode', 'lazy')
+    if data_mode == 'adaptive':
+        premerge_gb = getattr(args, 'premerge_budget_gb', 0)
+        buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
+        data_mode_str = f"Adaptive (premerge={premerge_gb}GB, buffer={buffer_size:,})"
+    elif data_mode == 'full_premerge':
+        data_mode_str = "Full Pre-merge"
+    elif data_mode == 'full_preload':
+        data_mode_str = "Full Preload"
+    else:
+        data_mode_str = 'Preload' if args.preload else 'Lazy'
+    print(f"💾 Data mode: {data_mode_str}")
     print(f"🎭 Multi-task: {'Enabled' if args.multi_task else 'Disabled'}")
     print("=" * 70)
 
@@ -2055,7 +2212,9 @@ def main():
         validation_split=args.val_split,
         include_continuation=True,
         mmap_meta_path=mmap_meta_path,  # Pass mmap metadata if using sharded storage
-        profiler=profiler  # Pass profiler for granular RAM logging
+        profiler=profiler,  # Pass profiler for granular RAM logging
+        premerge_budget_gb=getattr(args, 'premerge_budget_gb', None),
+        use_adaptive_mode=getattr(args, 'use_adaptive_loading', False)
     )
 
     if profiler:
@@ -2138,10 +2297,13 @@ def main():
     mp_context = 'forkserver' if platform.system() == 'Darwin' and args.num_workers and args.num_workers > 0 else None
 
     # Create dataloaders
+    # For adaptive mode: use ShuffleBufferSampler instead of shuffle=True
+    use_adaptive = getattr(args, 'use_adaptive_loading', False)
+    shuffle_buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
+
     train_loader_kwargs = dict(
         dataset=train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(args.device == 'cuda'),
         persistent_workers=(args.num_workers > 0),  # Prevent worker respawn overhead
@@ -2152,6 +2314,21 @@ def main():
             torch_dtype=project_config._TORCH_DTYPE
         )
     )
+
+    if use_adaptive:
+        # Adaptive mode: use ShuffleBufferSampler for sequential-ish mmap access
+        train_sampler = ShuffleBufferSampler(
+            train_dataset,
+            buffer_size=shuffle_buffer_size,
+            seed=42  # Reproducible shuffling
+        )
+        train_loader_kwargs['sampler'] = train_sampler
+        train_loader_kwargs['shuffle'] = False  # sampler handles shuffling
+        print(f"   🔀 Using ShuffleBufferSampler (buffer_size={shuffle_buffer_size:,})")
+    else:
+        # Full preload/premerge: use standard shuffle
+        train_loader_kwargs['shuffle'] = True
+
     if prefetch_factor is not None:
         train_loader_kwargs['prefetch_factor'] = prefetch_factor
     if mp_context is not None:

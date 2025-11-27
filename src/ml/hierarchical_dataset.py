@@ -44,7 +44,9 @@ class HierarchicalDataset(Dataset):
         cache_indices: bool = True,
         include_continuation: bool = False,
         mmap_meta_path: str = None,
-        profiler=None
+        profiler=None,
+        premerge_budget_gb: float = None,
+        use_adaptive_mode: bool = False
     ):
         """
         Initialize dataset.
@@ -59,6 +61,8 @@ class HierarchicalDataset(Dataset):
             cache_indices: Cache column lookups for speed
             include_continuation: Whether to include continuation prediction targets
             profiler: Optional MemoryProfiler for logging RAM usage
+            premerge_budget_gb: RAM budget for partial pre-merge (adaptive mode)
+            use_adaptive_mode: Enable adaptive loading (partial premerge + shuffle buffer)
         """
         self._profiler = profiler
         self.features_df = features_df
@@ -182,40 +186,70 @@ class HierarchicalDataset(Dataset):
             print(f"     ✓ Total rows: {meta['total_rows']:,}")
 
             # Optional pre-merge of monthly/3month columns into channel shards (avoid per-sample hstack)
+            # Supports both full pre-merge (all shards) and partial pre-merge (adaptive mode)
+            self.premerged_shard_indices = set()  # Track which shards are premerged (for adaptive mode)
+            self.use_adaptive_mode = use_adaptive_mode
+
             if self.monthly_3month_mmap is not None:
                 dtype = self.channel_mmaps[0].dtype
                 total_rows = meta['total_rows']
                 total_cols = self.channel_mmaps[0].shape[1] + self.monthly_3month_mmap.shape[1]
                 estimated_gb = total_rows * total_cols * np.dtype(dtype).itemsize / 1e9
 
-                # Dynamic pre-merge limit based on available RAM
-                # IMPORTANT: psutil can misread container RAM (sees host instead of cgroup limit)
-                # Use conservative defaults and allow override via environment variable
+                # Determine pre-merge budget
                 import os
-                premerge_limit_gb = float(os.environ.get('PREMERGE_LIMIT_GB', '20'))  # Default 20GB (safe for most containers)
+                if premerge_budget_gb is not None:
+                    # Explicit budget from adaptive mode
+                    premerge_limit_gb = premerge_budget_gb
+                    print(f"     ℹ️  Using explicit pre-merge budget: {premerge_limit_gb}GB")
+                else:
+                    # Legacy behavior: dynamic detection
+                    premerge_limit_gb = float(os.environ.get('PREMERGE_LIMIT_GB', '20'))
 
-                try:
-                    import psutil
-                    available_gb = psutil.virtual_memory().available / (1024**3)
-                    total_gb = psutil.virtual_memory().total / (1024**3)
+                    try:
+                        import psutil
+                        available_gb = psutil.virtual_memory().available / (1024**3)
+                        total_gb = psutil.virtual_memory().total / (1024**3)
 
-                    # Detect likely container misreading (>200GB usually means seeing host RAM)
-                    if total_gb > 200:
-                        print(f"     ⚠️  Detected likely container: psutil sees {total_gb:.0f}GB (host RAM)")
-                        print(f"     ⚠️  Using conservative pre-merge limit: {premerge_limit_gb}GB")
-                        print(f"     ℹ️  Set PREMERGE_LIMIT_GB env var to override")
+                        if total_gb > 200:
+                            print(f"     ⚠️  Detected likely container: psutil sees {total_gb:.0f}GB (host RAM)")
+                            print(f"     ⚠️  Using conservative pre-merge limit: {premerge_limit_gb}GB")
+                            print(f"     ℹ️  Set PREMERGE_LIMIT_GB env var to override")
+                        else:
+                            premerge_limit_gb = min(available_gb * 0.5, 90.0)
+                            print(f"     ℹ️  System RAM: {total_gb:.1f}GB total, {available_gb:.1f}GB available")
+                            print(f"     ℹ️  Pre-merge limit: {premerge_limit_gb:.1f}GB (50% of available, max 90GB)")
+                    except ImportError:
+                        premerge_limit_gb = 6.0
+                        print(f"     ℹ️  psutil not available, using {premerge_limit_gb}GB pre-merge limit")
+
+                # Calculate per-shard sizes for greedy selection
+                shard_sizes_gb = []
+                for shard_idx, shard in enumerate(self.channel_mmaps):
+                    shard_rows = self.channel_cumulative_rows[shard_idx + 1] - self.channel_cumulative_rows[shard_idx]
+                    shard_gb = shard_rows * total_cols * np.dtype(dtype).itemsize / 1e9
+                    shard_sizes_gb.append((shard_idx, shard_gb))
+
+                # Greedy partial pre-merge: select shards that fit within budget
+                cumulative_budget_gb = 0
+                shards_to_premerge = []
+                for shard_idx, shard_gb in shard_sizes_gb:
+                    if cumulative_budget_gb + shard_gb <= premerge_limit_gb:
+                        shards_to_premerge.append(shard_idx)
+                        cumulative_budget_gb += shard_gb
+
+                if len(shards_to_premerge) > 0:
+                    # Partial or full pre-merge
+                    self.premerged_channel_mmaps = {}  # Dict: shard_idx -> merged array
+                    coverage_pct = len(shards_to_premerge) / len(self.channel_mmaps) * 100
+
+                    if len(shards_to_premerge) == len(self.channel_mmaps):
+                        print(f"     ↪︎ Full pre-merge: all {len(shards_to_premerge)} shards (~{cumulative_budget_gb:.1f}GB)")
                     else:
-                        # Trusted reading - use 50% of available, max 90GB
-                        premerge_limit_gb = min(available_gb * 0.5, 90.0)
-                        print(f"     ℹ️  System RAM: {total_gb:.1f}GB total, {available_gb:.1f}GB available")
-                        print(f"     ℹ️  Pre-merge limit: {premerge_limit_gb:.1f}GB (50% of available, max 90GB)")
-                except ImportError:
-                    premerge_limit_gb = 6.0  # Fallback for systems without psutil
-                    print(f"     ℹ️  psutil not available, using {premerge_limit_gb}GB pre-merge limit")
-                if estimated_gb <= premerge_limit_gb:
-                    self.premerged_channel_mmaps = []
-                    print(f"     ↪︎ Pre-merging monthly/3month into channel shards (est ~{estimated_gb:.2f} GB in-memory)")
-                    print(f"     INFO | PREMERGE_START | shards={len(self.channel_mmaps)} | est_gb={estimated_gb:.1f}")
+                        print(f"     ↪︎ Partial pre-merge: {len(shards_to_premerge)}/{len(self.channel_mmaps)} shards ({coverage_pct:.0f}% coverage, ~{cumulative_budget_gb:.1f}GB)")
+                        print(f"     ℹ️  Remaining {len(self.channel_mmaps) - len(shards_to_premerge)} shards will use mmap (shuffle buffer recommended)")
+
+                    print(f"     INFO | PREMERGE_START | shards={len(shards_to_premerge)}/{len(self.channel_mmaps)} | budget_gb={premerge_limit_gb:.1f} | est_gb={cumulative_budget_gb:.1f}")
 
                     # Get initial RAM usage for tracking
                     try:
@@ -226,12 +260,14 @@ class HierarchicalDataset(Dataset):
 
                     cumulative_mb = 0
                     from tqdm import tqdm
-                    for shard_idx, shard in enumerate(tqdm(self.channel_mmaps, desc="     Pre-merge", unit="shard")):
+                    for shard_idx in tqdm(shards_to_premerge, desc="     Pre-merge", unit="shard"):
+                        shard = self.channel_mmaps[shard_idx]
                         shard_start = self.channel_cumulative_rows[shard_idx]
                         shard_end = self.channel_cumulative_rows[shard_idx + 1]
                         monthly_slice = self.monthly_3month_mmap[shard_start:shard_end, :]
                         merged = np.concatenate([shard, monthly_slice], axis=1)
-                        self.premerged_channel_mmaps.append(merged)
+                        self.premerged_channel_mmaps[shard_idx] = merged
+                        self.premerged_shard_indices.add(shard_idx)
 
                         # Log per-shard memory
                         shard_size_mb = merged.nbytes / 1e6
@@ -243,10 +279,11 @@ class HierarchicalDataset(Dataset):
                         except:
                             print(f"     INFO | PREMERGE_SHARD | shard={shard_idx}/{len(self.channel_mmaps)} | size_mb={shard_size_mb:.0f} | cumulative_mb={cumulative_mb:.0f}")
 
-                    print(f"     INFO | PREMERGE_COMPLETE | total_gb={cumulative_mb/1000:.2f}")
+                    print(f"     INFO | PREMERGE_COMPLETE | shards={len(shards_to_premerge)}/{len(self.channel_mmaps)} | total_gb={cumulative_mb/1000:.2f}")
                     print(f"     ✓ Pre-merge complete ({len(self.premerged_channel_mmaps)} merged shards)")
                 else:
-                    print(f"     ⚠️  Skipping pre-merge of monthly/3month (est {estimated_gb:.1f} GB > limit {premerge_limit_gb} GB)")
+                    print(f"     ⚠️  Skipping pre-merge (budget {premerge_limit_gb:.1f}GB too small for any shard)")
+                    print(f"     ℹ️  All shards will use mmap access (shuffle buffer recommended)")
 
         else:
             # Normal path - load everything into RAM
@@ -377,6 +414,11 @@ class HierarchicalDataset(Dataset):
         """
         Get a sequence of rows from memory-mapped shards (zero copy, minimal RAM).
 
+        Supports:
+        - Full pre-merge: all shards in premerged_channel_mmaps dict
+        - Partial pre-merge (adaptive mode): some shards premerged, others mmap
+        - No pre-merge: all shards via mmap + separate monthly
+
         Args:
             start: Start row index (global)
             end: End row index (global)
@@ -390,43 +432,95 @@ class HierarchicalDataset(Dataset):
         start_shard = bisect.bisect_right(self.channel_cumulative_rows, start) - 1
         end_shard = bisect.bisect_right(self.channel_cumulative_rows, end - 1) - 1
 
-        # Decide which shard source to use (pre-merged vs split main/monthly)
-        if self.premerged_channel_mmaps is not None:
-            shard_source = self.premerged_channel_mmaps
-            shard_cols = shard_source[0].shape[1]
+        # Check if we have any premerged shards (dict-based for partial pre-merge support)
+        has_premerged = self.premerged_channel_mmaps is not None and len(self.premerged_channel_mmaps) > 0
+
+        # Determine output column count
+        if has_premerged:
+            # Get column count from any premerged shard
+            first_premerged_idx = next(iter(self.premerged_channel_mmaps.keys()))
+            merged_cols = self.premerged_channel_mmaps[first_premerged_idx].shape[1]
         else:
-            shard_source = self.channel_mmaps
-            # v3.19: Calculate number of main channel features (excluding monthly if present)
-            shard_cols = self.num_channel_features - (self.monthly_3month_mmap.shape[1] if self.monthly_3month_mmap is not None else 0)
+            merged_cols = self.num_channel_features  # Total features including monthly
+
+        # Calculate main (non-monthly) channel cols for mmap access
+        main_cols = self.num_channel_features - (self.monthly_3month_mmap.shape[1] if self.monthly_3month_mmap is not None else 0)
 
         if start_shard == end_shard:
-            # Entire sequence in one shard (common case - fast, zero-copy!)
+            # Entire sequence in one shard (common case)
             local_start = start - self.channel_cumulative_rows[start_shard]
             local_end = end - self.channel_cumulative_rows[start_shard]
-            main_result = shard_source[start_shard][local_start:local_end]
+
+            if has_premerged and start_shard in self.premerged_channel_mmaps:
+                # Fast path: shard is premerged (includes monthly)
+                main_result = self.premerged_channel_mmaps[start_shard][local_start:local_end]
+                monthly_sequence = None  # Already included in main_result
+            else:
+                # Slow path: shard is mmap (need separate monthly)
+                main_result = self.channel_mmaps[start_shard][local_start:local_end]
+                if self.monthly_3month_mmap is not None:
+                    monthly_sequence = self.monthly_3month_mmap[start:end, :]
+                else:
+                    monthly_sequence = None
+                return main_result, monthly_sequence
+
+            return main_result, None
+
         else:
             # Sequence spans multiple shards (rare - happens at shard boundaries)
-            # Pre-allocate contiguous array instead of vstack (avoids extra copy)
-            main_result = np.empty((end - start, shard_cols), dtype=shard_source[0].dtype)
-            pos = 0
+            # Check if all involved shards are premerged
+            all_premerged = has_premerged and all(
+                shard_idx in self.premerged_channel_mmaps
+                for shard_idx in range(start_shard, end_shard + 1)
+            )
 
-            for shard_idx in range(start_shard, end_shard + 1):
-                shard_start = max(start, self.channel_cumulative_rows[shard_idx])
-                shard_end = min(end, self.channel_cumulative_rows[shard_idx + 1])
+            if all_premerged:
+                # All shards premerged - simple concatenation
+                main_result = np.empty((end - start, merged_cols), dtype=self.premerged_channel_mmaps[start_shard].dtype)
+                pos = 0
 
-                local_start = shard_start - self.channel_cumulative_rows[shard_idx]
-                local_end = shard_end - self.channel_cumulative_rows[shard_idx]
+                for shard_idx in range(start_shard, end_shard + 1):
+                    shard_start = max(start, self.channel_cumulative_rows[shard_idx])
+                    shard_end = min(end, self.channel_cumulative_rows[shard_idx + 1])
 
-                length = local_end - local_start
-                main_result[pos:pos + length] = shard_source[shard_idx][local_start:local_end]
-                pos += length
+                    local_start = shard_start - self.channel_cumulative_rows[shard_idx]
+                    local_end = shard_end - self.channel_cumulative_rows[shard_idx]
 
-        # v3.19: Return monthly/3month shard separately if not premerged
-        monthly_sequence = None
-        if self.monthly_3month_mmap is not None and self.premerged_channel_mmaps is None:
-            monthly_sequence = self.monthly_3month_mmap[start:end, :]
+                    length = local_end - local_start
+                    main_result[pos:pos + length] = self.premerged_channel_mmaps[shard_idx][local_start:local_end]
+                    pos += length
 
-        return main_result, monthly_sequence
+                return main_result, None
+
+            else:
+                # Mixed or all-mmap: need to handle each shard individually
+                # Pre-allocate for merged output
+                main_result = np.empty((end - start, merged_cols), dtype=self.channel_mmaps[0].dtype)
+                pos = 0
+
+                for shard_idx in range(start_shard, end_shard + 1):
+                    shard_start = max(start, self.channel_cumulative_rows[shard_idx])
+                    shard_end = min(end, self.channel_cumulative_rows[shard_idx + 1])
+
+                    local_start = shard_start - self.channel_cumulative_rows[shard_idx]
+                    local_end = shard_end - self.channel_cumulative_rows[shard_idx]
+                    length = local_end - local_start
+
+                    if has_premerged and shard_idx in self.premerged_channel_mmaps:
+                        # This shard is premerged
+                        main_result[pos:pos + length] = self.premerged_channel_mmaps[shard_idx][local_start:local_end]
+                    else:
+                        # This shard is mmap - need to concatenate with monthly
+                        main_chunk = self.channel_mmaps[shard_idx][local_start:local_end]
+                        if self.monthly_3month_mmap is not None:
+                            monthly_chunk = self.monthly_3month_mmap[shard_start:shard_end, :]
+                            main_result[pos:pos + length] = np.concatenate([main_chunk, monthly_chunk], axis=1)
+                        else:
+                            main_result[pos:pos + length, :main_cols] = main_chunk
+
+                    pos += length
+
+                return main_result, None
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
         """
@@ -948,7 +1042,9 @@ def create_hierarchical_dataset(
     validation_split: Optional[float] = None,
     include_continuation: bool = False,
     mmap_meta_path: str = None,
-    profiler=None
+    profiler=None,
+    premerge_budget_gb: float = None,
+    use_adaptive_mode: bool = False
 ) -> Tuple[Dataset, Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -961,6 +1057,8 @@ def create_hierarchical_dataset(
         preload: If True, preload all data into memory
         validation_split: If provided, split data into train/val
         profiler: Optional MemoryProfiler for logging RAM usage
+        premerge_budget_gb: RAM budget for partial pre-merge (adaptive mode)
+        use_adaptive_mode: Enable adaptive loading (partial premerge + shuffle buffer)
 
     Returns:
         train_dataset: Training dataset
@@ -996,7 +1094,9 @@ def create_hierarchical_dataset(
                 sequence_length, prediction_horizon, mode,
                 include_continuation=False,
                 mmap_meta_path=mmap_meta_path,
-                profiler=profiler
+                profiler=profiler,
+                premerge_budget_gb=premerge_budget_gb,
+                use_adaptive_mode=use_adaptive_mode
             )
 
             # Calculate index ranges (valid_indices already has built-in buffers)
@@ -1058,7 +1158,9 @@ def create_hierarchical_dataset(
                 sequence_length, prediction_horizon, mode,
                 include_continuation=include_continuation,
                 mmap_meta_path=mmap_meta_path,
-                profiler=profiler
+                profiler=profiler,
+                premerge_budget_gb=premerge_budget_gb,
+                use_adaptive_mode=use_adaptive_mode
             )
 
         return dataset, None
