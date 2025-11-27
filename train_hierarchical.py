@@ -160,10 +160,6 @@ def fix_ncps_buffers(model):
             if isinstance(mask_tensor, nn.Parameter):
                 mask_tensor = mask_tensor.data
 
-            # CRITICAL: Move to CPU before registering as buffer
-            # DataParallel will then properly replicate to each GPU
-            mask_tensor = mask_tensor.cpu()
-
             # Delete the old attribute (Parameter or tensor) to avoid conflicts
             delattr(module, 'sparsity_mask')
 
@@ -2406,6 +2402,11 @@ def main():
         # Fix ncps library buffers for multi-GPU compatibility
         # The ncps CfcCell has sparsity_mask tensors that aren't registered as buffers
         fix_ncps_buffers(model)
+
+        # CRITICAL: Move entire model to primary GPU BEFORE DataParallel wrapping
+        # DataParallel requires the model (including all buffers) to be on cuda:0
+        # It will then replicate to other GPUs automatically
+        model = model.to('cuda:0')
 
         model = nn.DataParallel(model)
         use_multi_gpu = True
