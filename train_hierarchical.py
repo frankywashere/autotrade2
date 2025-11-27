@@ -160,6 +160,10 @@ def fix_ncps_buffers(model):
             if isinstance(mask_tensor, nn.Parameter):
                 mask_tensor = mask_tensor.data
 
+            # CRITICAL: Move to CPU before registering as buffer
+            # DataParallel will then properly replicate to each GPU
+            mask_tensor = mask_tensor.cpu()
+
             # Delete the old attribute (Parameter or tensor) to avoid conflicts
             delattr(module, 'sparsity_mask')
 
