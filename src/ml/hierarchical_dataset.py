@@ -410,21 +410,25 @@ class HierarchicalDataset(Dataset):
 
         return result
 
-    def _get_channel_sequence_from_shards(self, start: int, end: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    def _get_channel_sequence_from_shards(self, start: int, end: int) -> Tuple[np.ndarray, None]:
         """
-        Get a sequence of rows from memory-mapped shards (zero copy, minimal RAM).
+        Get a sequence of rows from memory-mapped shards.
 
         Supports:
         - Full pre-merge: all shards in premerged_channel_mmaps dict
         - Partial pre-merge (adaptive mode): some shards premerged, others mmap
         - No pre-merge: all shards via mmap + separate monthly
 
+        Always returns MERGED format (main + monthly concatenated) for consistency,
+        even when accessing mmap shards (does on-the-fly concatenation).
+
         Args:
             start: Start row index (global)
             end: End row index (global)
 
         Returns:
-            (main_channels, monthly_channels or None) where arrays have shape [end-start, cols]
+            (merged_channels, None) where merged_channels has shape [end-start, total_cols]
+            Second element is always None (monthly is included in merged_channels)
         """
         import bisect
 
@@ -454,15 +458,14 @@ class HierarchicalDataset(Dataset):
             if has_premerged and start_shard in self.premerged_channel_mmaps:
                 # Fast path: shard is premerged (includes monthly)
                 main_result = self.premerged_channel_mmaps[start_shard][local_start:local_end]
-                monthly_sequence = None  # Already included in main_result
             else:
-                # Slow path: shard is mmap (need separate monthly)
-                main_result = self.channel_mmaps[start_shard][local_start:local_end]
+                # Slow path: shard is mmap - do on-the-fly merge for consistent output
+                main_chunk = self.channel_mmaps[start_shard][local_start:local_end]
                 if self.monthly_3month_mmap is not None:
-                    monthly_sequence = self.monthly_3month_mmap[start:end, :]
+                    monthly_chunk = self.monthly_3month_mmap[start:end, :]
+                    main_result = np.concatenate([main_chunk, monthly_chunk], axis=1)
                 else:
-                    monthly_sequence = None
-                return main_result, monthly_sequence
+                    main_result = main_chunk
 
             return main_result, None
 
