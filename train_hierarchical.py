@@ -1671,15 +1671,14 @@ def interactive_setup(args, profiler=None):
         message="Data loading strategy:",
         choices=[
             Choice(value='adaptive', name=f'Adaptive (recommended) - partial premerge + shuffle buffer, auto-scales to RAM'),
-            Choice(value='full_premerge', name=f'Full Pre-merge - requires 90GB+ RAM (fastest if available)'),
-            Choice(value='full_preload', name=f'Full Preload - loads everything into RAM (most RAM needed)')
+            Choice(value='full_premerge', name=f'Full Pre-merge - requires 90GB+ RAM (fastest if available)')
         ],
         default=dflt('data_loading_mode', 'adaptive')
     ).execute()
 
     # Set loading mode flags
     args.data_loading_mode = data_loading_choice
-    args.preload = (data_loading_choice == 'full_preload')
+    args.preload = False  # Preload doesn't work with sharded mmap storage
     args.use_adaptive_loading = (data_loading_choice == 'adaptive')
 
     # Initialize adaptive mode settings
@@ -1719,10 +1718,6 @@ def interactive_setup(args, profiler=None):
         print(f"   ⚠️  Requires 90GB+ RAM for typical datasets")
         # Set high budget to trigger full pre-merge
         args.premerge_budget_gb = 200
-
-    else:  # full_preload
-        print(f"   → Full preload mode: entire dataset loaded into RAM")
-        print(f"   ⚠️  Requires most RAM but fastest training")
 
     # Multi-task learning
     print()
@@ -1776,10 +1771,8 @@ def interactive_setup(args, profiler=None):
         data_loading_display = f"Adaptive (premerge={premerge_gb}GB, buffer={buffer_size:,})"
     elif data_loading_mode == 'full_premerge':
         data_loading_display = "Full Pre-merge"
-    elif data_loading_mode == 'full_preload':
-        data_loading_display = "Full Preload"
     else:
-        data_loading_display = "Lazy" if not args.preload else "Preload"
+        data_loading_display = "Adaptive"  # Fallback to adaptive
     print(f"  Data Loading: {data_loading_display}")
     print(f"  Cache: {'Regenerate' if getattr(args, 'regenerate_cache', True) else 'Use existing'}")
     print(f"  Feature GPU: {'Yes' if getattr(args, 'use_gpu_features', False) else 'No'}")
@@ -2003,10 +1996,8 @@ def main():
         data_mode_str = f"Adaptive (premerge={premerge_gb}GB, buffer={buffer_size:,})"
     elif data_mode == 'full_premerge':
         data_mode_str = "Full Pre-merge"
-    elif data_mode == 'full_preload':
-        data_mode_str = "Full Preload"
     else:
-        data_mode_str = 'Preload' if args.preload else 'Lazy'
+        data_mode_str = "Adaptive"  # Fallback to adaptive
     print(f"💾 Data mode: {data_mode_str}")
     print(f"🎭 Multi-task: {'Enabled' if args.multi_task else 'Disabled'}")
     print("=" * 70)
