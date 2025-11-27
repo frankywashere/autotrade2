@@ -1643,13 +1643,15 @@ def interactive_setup(args, profiler=None):
 
 
 def main():
-    # Fix for macOS + torch + multiprocessing: use forkserver to avoid torch cleanup deadlock
-    # spawn (macOS default) causes workers to hang on exit when torch is imported
+    # Fix for Unix + torch + multiprocessing: use forkserver to avoid torch cleanup deadlock
+    # spawn causes workers to hang on exit when torch is imported
     # forkserver is safe and faster (no torch init in workers with lazy loading)
     import multiprocessing as mp
+    import sys
     try:
         mp.set_start_method('forkserver', force=True)
-        print("✓ Using forkserver multiprocessing (safer for torch on macOS)")
+        platform_note = "macOS" if sys.platform == "darwin" else "Linux"
+        print(f"✓ Using forkserver multiprocessing (safer for torch on {platform_note})")
     except ValueError:
         pass  # Already set, or not available on this platform
 
