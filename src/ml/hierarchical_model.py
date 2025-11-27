@@ -405,11 +405,10 @@ class HierarchicalLNN(nn.Module, ModelBase):
             horizon_bars = torch.exp(horizon_bars_log) * 24  # Base = 24 bars, can grow
             horizon_bars = torch.clamp(horizon_bars, 24, 2016)  # Max ~2 weeks (1-min bars)
 
-            # Determine dominant layer
+            # Determine dominant layer (keep as tensor to avoid torch.compile graph break)
             layer_weights = torch.stack([fast_pred_conf, medium_pred_conf, slow_pred_conf], dim=1)
             dominant_layer_idx = torch.argmax(layer_weights, dim=1)
-            layer_map = {0: "fast", 1: "medium", 2: "slow"}
-            dominant_layer = [layer_map[i.item()] for i in dominant_layer_idx]
+            # Note: To decode indices to strings: {0: "fast", 1: "medium", 2: "slow"}
 
             # Store in hidden_states
             hidden_states['multi_task'] = {
@@ -426,7 +425,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 'horizon_bars_log': horizon_bars_log,
                 'horizon_bars': horizon_bars,
                 'adaptive_confidence': adaptive_confidence,
-                'dominant_layer': dominant_layer
+                'dominant_layer_idx': dominant_layer_idx  # Tensor indices (0=fast, 1=medium, 2=slow)
             }
 
         return predictions, hidden_states

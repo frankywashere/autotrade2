@@ -423,7 +423,14 @@ def main():
         price_change_pct = adaptive_data['price_change_pct'].item()
         horizon_bars = adaptive_data['horizon_bars'].item()
         adaptive_confidence = adaptive_data['adaptive_confidence'].item()
-        dominant_layer = adaptive_data.get('dominant_layer', best['layer'])
+        # Decode dominant layer index to string (0=fast, 1=medium, 2=slow)
+        dominant_layer_idx = adaptive_data.get('dominant_layer_idx', None)
+        if dominant_layer_idx is not None:
+            layer_names = {0: 'fast', 1: 'medium', 2: 'slow'}
+            idx = dominant_layer_idx.item() if hasattr(dominant_layer_idx, 'item') else dominant_layer_idx
+            dominant_layer = layer_names.get(idx, best['layer'])
+        else:
+            dominant_layer = best['layer']
 
         # Calculate target prices using adaptive projection
         target_price = current_price * (1 + price_change_pct / 100)
@@ -623,7 +630,12 @@ def main():
     with st.expander("🧠 Layer Interplay & Confidence Debate"):
         # Get adaptive projection data if available
         multi_task = prediction.get('multi_task', {})
-        dominant_layer = multi_task.get('dominant_layer', 1)  # Default to medium
+        # Decode dominant layer index (0=fast, 1=medium, 2=slow)
+        dominant_layer_idx = multi_task.get('dominant_layer_idx', None)
+        if dominant_layer_idx is not None:
+            dominant_layer = dominant_layer_idx.item() if hasattr(dominant_layer_idx, 'item') else dominant_layer_idx
+        else:
+            dominant_layer = 1  # Default to medium
         weights = prediction.get('fusion_weights', [0.33, 0.33, 0.33])
 
         # Adaptive projection data

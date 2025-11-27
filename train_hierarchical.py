@@ -554,7 +554,7 @@ def train_epoch(
 
         # Use autocast for AMP, otherwise normal forward
         if use_amp:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 predictions, hidden_states = model.forward(x)
 
                 # Primary loss (high/low regression)
@@ -1152,6 +1152,12 @@ def interactive_setup(args, profiler=None):
             print(f"   → Using {args.num_workers} workers for CUDA (default: 4)")
 
     print(f"   ℹ️  Training uses ALL {args.device.upper()} cores, workers are for data loading only")
+
+    # Memory profiling option (for debugging RAM usage)
+    args.memory_profile = inquirer.confirm(
+        message="Enable memory profiling? (logs to logs/memory_debug.log)",
+        default=True
+    ).execute()
 
     # Get recommended batch size
     total_ram = hw_info.get('total_ram_gb', 16)
@@ -2214,8 +2220,8 @@ def main():
     # Setup AMP (Automatic Mixed Precision) if enabled
     scaler = None
     if getattr(args, 'amp', False) and args.device == 'cuda':
-        from torch.cuda.amp import GradScaler
-        scaler = GradScaler()
+        from torch.amp import GradScaler
+        scaler = GradScaler('cuda')
         print("   ⚡ Mixed Precision (AMP) enabled - using FP16 tensor cores")
     elif getattr(args, 'amp', False) and args.device != 'cuda':
         print("   ⚠️  AMP requested but only supported on CUDA - using FP32")
