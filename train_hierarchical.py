@@ -32,6 +32,12 @@ import platform
 from typing import Dict, Tuple
 from tqdm import tqdm
 
+# DDP (DistributedDataParallel) imports for multi-GPU training
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import torch.multiprocessing as mp  # For spawning DDP processes without torchrun
+
 # Add parent directory to path
 parent_dir = Path(__file__).parent
 sys.path.insert(0, str(parent_dir))
@@ -139,36 +145,8 @@ def get_recommended_batch_size(device: str, total_ram_gb: float = 16):
     return recommendations.get(device, 16)
 
 
-def fix_ncps_buffers(model):
-    """
-    Register ncps sparsity_mask tensors as buffers for DataParallel compatibility.
-
-    The ncps library's CfcCell has a sparsity_mask tensor that isn't registered as a
-    proper PyTorch buffer. When DataParallel replicates the model to other GPUs,
-    the sparsity_mask stays on GPU 0, causing device mismatch errors.
-
-    This function iterates through all modules and registers any sparsity_mask
-    tensors as buffers so they properly move with the model.
-    """
-    fixed_count = 0
-    for name, module in model.named_modules():
-        # Check for ncps CfC cells that have sparsity_mask
-        if hasattr(module, 'sparsity_mask') and isinstance(module.sparsity_mask, torch.Tensor):
-            mask_tensor = module.sparsity_mask
-
-            # If it's a Parameter (as in ncps library), extract the underlying tensor
-            if isinstance(mask_tensor, nn.Parameter):
-                mask_tensor = mask_tensor.data
-
-            # Delete the old attribute (Parameter or tensor) to avoid conflicts
-            delattr(module, 'sparsity_mask')
-
-            # Register as a buffer (properly replicated by DataParallel)
-            module.register_buffer('sparsity_mask', mask_tensor)
-            fixed_count += 1
-    if fixed_count > 0:
-        print(f"   🔧 Fixed {fixed_count} ncps sparsity_mask tensors for multi-GPU compatibility")
-    return fixed_count
+# NOTE: fix_ncps_buffers() was removed - it was a workaround for DataParallel
+# which is no longer used. Single-GPU mode and DDP don't need this fix.
 
 
 class ShuffleBufferSampler(torch.utils.data.Sampler):
@@ -231,6 +209,61 @@ class ShuffleBufferSampler(torch.utils.data.Sampler):
     def set_epoch(self, epoch: int):
         """Set epoch for reproducible shuffling (DDP compatibility)."""
         self._epoch = epoch
+
+
+# =============================================================================
+# DDP (DistributedDataParallel) Helper Functions
+# =============================================================================
+
+def setup_distributed():
+    """
+    Initialize DDP environment if launched with torchrun.
+    Returns (rank, world_size, local_rank, is_distributed).
+
+    Call this early in main() before any other setup.
+    """
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+        # Initialize process group
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+
+        return rank, world_size, local_rank, True
+
+    # Not launched with torchrun - single process mode
+    return 0, 1, 0, False
+
+
+def cleanup_distributed():
+    """Clean up DDP resources at end of training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def setup_distributed_spawn(rank: int, world_size: int):
+    """
+    Initialize DDP for mp.spawn() launched processes.
+
+    Unlike setup_distributed() which reads from env vars (torchrun),
+    this takes rank/world_size directly from mp.spawn() arguments.
+    """
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    dist.init_process_group(
+        backend='nccl',
+        rank=rank,
+        world_size=world_size
+    )
+    torch.cuda.set_device(rank)
+
+
+def is_main_process(rank: int) -> bool:
+    """Check if this is the main process (rank 0) for printing/saving."""
+    return rank == 0
 
 
 def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0]):
@@ -1127,6 +1160,80 @@ def interactive_setup(args, profiler=None):
             args.device = default_device
             print(f"   Switched to {args.device.upper()}")
 
+    # ==========================================================================
+    # GPU Mode Selection (Single GPU vs Multi-GPU DDP)
+    # ==========================================================================
+    args.gpu_mode = 'single'
+    args.use_ddp = False
+
+    if args.device == 'cuda' and hw_info.get('cuda_device_count', 1) > 1:
+        num_gpus = hw_info['cuda_device_count']
+        gpu_devices = hw_info.get('cuda_devices', [])
+
+        print(f"\n🎮 Multiple GPUs Detected ({num_gpus})")
+
+        gpu_mode_choices = [
+            Choice(value='single', name='Single GPU - All features available (adaptive, preload, etc.)'),
+            Choice(value='multi_ddp', name='Multi-GPU (DDP) - Maximum throughput, preload only'),
+        ]
+
+        args.gpu_mode = inquirer.select(
+            message="GPU configuration:",
+            choices=gpu_mode_choices,
+            default='single'
+        ).execute()
+
+        if args.gpu_mode == 'single':
+            # Let user pick which GPU
+            if gpu_devices:
+                gpu_choices = [
+                    Choice(value=f'cuda:{gpu["index"]}',
+                           name=f'GPU {gpu["index"]}: {gpu["name"]} ({gpu["vram_gb"]:.0f} GB)')
+                    for gpu in gpu_devices
+                ]
+            else:
+                gpu_choices = [
+                    Choice(value=f'cuda:{i}', name=f'GPU {i}')
+                    for i in range(num_gpus)
+                ]
+
+            args.device = inquirer.select(
+                message="Select GPU:",
+                choices=gpu_choices,
+                default='cuda:0'
+            ).execute()
+            args.use_ddp = False
+            args.num_ddp_gpus = 1
+            print(f"   ✓ Using {args.device} in single-GPU mode")
+        else:
+            # Multi-GPU DDP mode - let user choose how many GPUs
+            args.use_ddp = True
+            args.device = 'cuda'  # DDP will handle device assignment per process
+
+            # Build GPU count choices
+            gpu_count_choices = []
+            for n in range(2, num_gpus + 1):
+                if n == num_gpus:
+                    gpu_count_choices.append(
+                        Choice(value=n, name=f'{n} GPUs (all available)')
+                    )
+                else:
+                    gpu_count_choices.append(
+                        Choice(value=n, name=f'{n} GPUs')
+                    )
+
+            args.num_ddp_gpus = inquirer.select(
+                message="How many GPUs to use?",
+                choices=gpu_count_choices,
+                default=num_gpus  # Default to all
+            ).execute()
+
+            print(f"\n   ✓ Multi-GPU DDP mode: {args.num_ddp_gpus} GPUs")
+            print(f"   Will automatically spawn {args.num_ddp_gpus} training processes")
+            print(f"   Using GPUs: cuda:0 through cuda:{args.num_ddp_gpus - 1}")
+            print(f"   Effective batch size: {args.batch_size} x {args.num_ddp_gpus} = {args.batch_size * args.num_ddp_gpus}")
+            print(f"   Note: DDP forces Full Pre-merge mode (adaptive not compatible)")
+
     # Consolidated precision menu for CUDA (combines AMP + base precision)
     args.amp = False  # Default to disabled
     args.precision_mode = 'fp32'  # Track the user's choice
@@ -1377,8 +1484,8 @@ def interactive_setup(args, profiler=None):
 
     # Parallel Processing option (for CPU mode)
     print()
-    import multiprocessing as mp
-    n_cores = mp.cpu_count()
+    import multiprocessing as std_mp
+    n_cores = std_mp.cpu_count()
 
     # Only show parallel option if:
     # 1. Not using GPU (GPU and parallel are incompatible)
@@ -1678,14 +1785,20 @@ def interactive_setup(args, profiler=None):
         except ImportError:
             default_premerge_budget = 20
 
-    data_loading_choice = inquirer.select(
-        message="Data loading strategy:",
-        choices=[
-            Choice(value='adaptive', name=f'Adaptive (recommended) - partial premerge + shuffle buffer, auto-scales to RAM'),
-            Choice(value='full_premerge', name=f'Full Pre-merge - requires 90GB+ RAM (fastest if available)')
-        ],
-        default=dflt('data_loading_mode', 'adaptive')
-    ).execute()
+    # Check if DDP mode - force preload (adaptive not compatible with DistributedSampler)
+    if getattr(args, 'use_ddp', False):
+        print("\n   ⚠️  Multi-GPU DDP mode: forcing Full Pre-merge")
+        print("   (Adaptive mode not compatible with DistributedSampler)")
+        data_loading_choice = 'full_premerge'
+    else:
+        data_loading_choice = inquirer.select(
+            message="Data loading strategy:",
+            choices=[
+                Choice(value='adaptive', name=f'Adaptive (recommended) - partial premerge + shuffle buffer, auto-scales to RAM'),
+                Choice(value='full_premerge', name=f'Full Pre-merge - requires 90GB+ RAM (fastest if available)')
+            ],
+            default=dflt('data_loading_mode', 'adaptive')
+        ).execute()
 
     # Set loading mode flags
     args.data_loading_mode = data_loading_choice
@@ -1812,14 +1925,641 @@ def interactive_setup(args, profiler=None):
     return args
 
 
+def run_training(rank: int, world_size: int, args_dict: dict):
+    """
+    Training worker function. Called either directly (single GPU) or via mp.spawn (multi-GPU).
+
+    Args:
+        rank: Process rank (0 for single GPU, 0 to world_size-1 for DDP)
+        world_size: Total number of processes (1 for single GPU)
+        args_dict: Arguments as dictionary (required for mp.spawn serialization)
+    """
+    # Reconstruct args namespace from dict
+    args = argparse.Namespace(**args_dict)
+
+    # DDP setup for multi-GPU
+    is_distributed = world_size > 1
+    local_rank = rank  # For mp.spawn, rank == local_rank (single node)
+
+    if is_distributed:
+        # Check if DDP is already initialized (torchrun case)
+        if not dist.is_initialized():
+            # Not initialized - we're being called from mp.spawn
+            setup_distributed_spawn(rank, world_size)
+            if is_main_process(rank):
+                print(f"\n🚀 DDP Initialized via mp.spawn: {world_size} processes across {torch.cuda.device_count()} GPUs")
+        else:
+            # Already initialized - we're being called from torchrun
+            if is_main_process(rank):
+                print(f"\n🚀 DDP already initialized (torchrun): {world_size} processes")
+
+        args.device = f'cuda:{rank}'
+        args.use_ddp = True
+
+        if is_main_process(rank):
+            print(f"   Process rank {rank} using device {args.device}")
+
+    # =========================================================================
+    # TRAINING CODE STARTS HERE (moved from main())
+    # =========================================================================
+
+    # Setup memory profiler if enabled
+    profiler = None
+    if args.memory_profile:
+        from src.ml.memory_profiler import MemoryProfiler
+        profiler = MemoryProfiler(
+            log_path="logs/memory_debug.log",
+            device=args.device if args.device != 'auto' else 'unknown',
+            log_every_n=10,
+            spike_threshold_mb=500
+        )
+        profiler.log_info(f"CONTAINER_RAM_GB={os.environ.get('CONTAINER_RAM_GB', 'not_set')}")
+        profiler.log_info(f"PREMERGE_LIMIT_GB={os.environ.get('PREMERGE_LIMIT_GB', 'not_set')}")
+        profiler.log_info(f"PROFILER_RANK={rank}")
+
+    # Auto-detect device if 'auto' (only for single GPU mode)
+    if args.device == 'auto':
+        args.device = get_best_device()
+        if is_main_process(rank):
+            print(f"🔍 Auto-detected device: {args.device}")
+
+    # Validate device (skip for DDP since device is already set)
+    if not is_distributed:
+        if args.device == 'cuda' and not torch.cuda.is_available():
+            print("⚠️ CUDA not available, falling back to CPU")
+            args.device = 'cpu'
+        elif args.device == 'mps' and not torch.backends.mps.is_available():
+            print("⚠️ MPS not available, falling back to CPU")
+            args.device = 'cpu'
+
+    # MPS compatibility check: MPS doesn't support float64
+    if args.device == 'mps' and project_config.TRAINING_PRECISION == 'float64':
+        print("⚠️  MPS device doesn't support float64 precision")
+        print("   Automatically using float32 instead")
+        project_config.TRAINING_PRECISION = 'float32'
+        project_config.NUMPY_DTYPE = np.float32
+        project_config._TORCH_DTYPE = torch.float32
+        print("   ✓ Switched to float32 for MPS compatibility")
+
+    # Auto-set num_workers if not specified
+    if args.num_workers is None:
+        args.num_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device.split(':')[0], 2)
+
+    # Override parallel worker count for feature extraction if specified
+    if args.feature_workers is not None:
+        project_config.MAX_PARALLEL_WORKERS = args.feature_workers
+        if is_main_process(rank):
+            print(f"✓ Feature extraction workers: {args.feature_workers} cores (via --feature_workers)")
+
+    # Auto-detect chunking if not specified
+    if args.use_chunking is None:
+        import psutil
+        total_ram_gb = psutil.virtual_memory().total / 1e9
+        args.use_chunking = (total_ram_gb < 64)
+        if is_main_process(rank):
+            print(f"✓ Auto-detected chunking: {'Enabled' if args.use_chunking else 'Disabled'} (RAM: {total_ram_gb:.1f}GB)")
+
+    # Load configuration
+    config = None
+    loss_weights = None
+    if Path(args.config).exists():
+        with open(args.config) as f:
+            config = yaml.safe_load(f)
+            loss_weights = config.get('loss_weights', None)
+        if is_main_process(rank):
+            print(f"✅ Loaded config from: {args.config}")
+    else:
+        if is_main_process(rank):
+            print(f"⚠️ Config not found: {args.config}, using defaults")
+
+    # Hardware info (rank 0 only prints)
+    hw_info = get_hardware_info()
+
+    if is_main_process(rank):
+        print("\n" + "=" * 70)
+        print("🎯 HIERARCHICAL LNN TRAINING")
+        print("=" * 70)
+        print(f"📱 Device: {args.device.upper()}")
+        if args.device.startswith('cuda'):
+            print(f"   GPU: {hw_info.get('cuda_device', 'Unknown')}")
+            print(f"   VRAM: {hw_info.get('cuda_memory_gb', 0):.1f} GB")
+            if is_distributed:
+                print(f"   DDP: {world_size} processes, effective batch = {args.batch_size * world_size}")
+        elif args.device == 'mps':
+            print(f"   Chip: {hw_info.get('mac_chip', 'Apple Silicon')}")
+            print(f"   RAM: {hw_info.get('total_ram_gb', 0):.0f} GB")
+        print(f"📅 Training: {args.train_start_year}-{args.train_end_year}")
+        print(f"📊 Sequence: {args.sequence_length} bars")
+        print(f"🎯 Horizon: Adaptive (base {args.prediction_horizon} bars)")
+        print(f"🔢 Batch size: {args.batch_size}" + (f" x {world_size} GPUs = {args.batch_size * world_size}" if is_distributed else ""))
+        print(f"🔄 Epochs: {args.epochs}")
+        data_mode = getattr(args, 'data_loading_mode', 'adaptive')
+        if data_mode == 'adaptive':
+            premerge_gb = getattr(args, 'premerge_budget_gb', 0)
+            buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
+            data_mode_str = f"Adaptive (premerge={premerge_gb}GB, buffer={buffer_size:,})"
+        elif data_mode == 'full_premerge':
+            data_mode_str = "Full Pre-merge"
+        else:
+            data_mode_str = "Adaptive"
+        print(f"💾 Data mode: {data_mode_str}")
+        print(f"🎭 Multi-task: {'Enabled' if args.multi_task else 'Disabled'}")
+        print("=" * 70)
+
+    # =========================================================================
+    # DATA LOADING
+    # =========================================================================
+
+    if is_main_process(rank):
+        print("\n1. Loading 1-min data...")
+    if profiler:
+        profiler.snapshot("pre_data_load", 0, force_log=True)
+
+    data_feed = CSVDataFeed(timeframe=args.input_timeframe)
+
+    historical_buffer_years = 2
+    load_start_year = max(2010, args.train_start_year - historical_buffer_years)
+
+    df = data_feed.load_aligned_data(
+        start_date=f'{load_start_year}-01-01',
+        end_date=f'{args.train_end_year}-12-31'
+    )
+
+    data_years = (df.index[-1] - df.index[0]).days / 365.25
+    if is_main_process(rank):
+        print(f"   Loaded {len(df)} bars ({df.index[0]} to {df.index[-1]})")
+
+    if profiler:
+        profiler.log_info(f"DATA_LOADED | rows={len(df)} | cols={len(df.columns)}")
+        profiler.snapshot("post_data_load", 0, force_log=True)
+
+    if is_main_process(rank):
+        print(f"   Data range: {data_years:.1f} years")
+        print(f"   Historical buffer: {historical_buffer_years} years (for continuation analysis)")
+
+    # Validate minimum data requirement
+    min_required = project_config.MIN_DATA_YEARS if hasattr(project_config, 'MIN_DATA_YEARS') else 2.5
+    if data_years < min_required:
+        if is_main_process(rank):
+            print(f"\n   ⚠️  WARNING: Insufficient data!")
+            print(f"   You have: {data_years:.1f} years")
+            print(f"   Recommended: {min_required}+ years")
+    else:
+        if is_main_process(rank):
+            print(f"   ✓ Data requirement met ({data_years:.1f} years >= {min_required} required)")
+
+    # Slice data to training range
+    training_start = pd.to_datetime(f'{args.train_start_year}-01-01')
+    training_end = pd.to_datetime(f'{args.train_end_year}-12-31')
+    df_sliced = df[(df.index >= training_start) & (df.index <= training_end)].copy()
+
+    if is_main_process(rank):
+        print(f"   Training slice: {len(df_sliced)} bars ({df_sliced.index[0]} to {df_sliced.index[-1]})")
+
+    # Smart lookback buffer system
+    if project_config.SKIP_WARMUP_PERIOD:
+        first_training_idx = df.index.get_loc(df_sliced.index[0])
+        if first_training_idx < project_config.MIN_LOOKBACK_BARS:
+            needed = project_config.MIN_LOOKBACK_BARS - first_training_idx
+            old_start = df_sliced.index[0]
+            df_sliced = df_sliced.iloc[needed:]
+            if is_main_process(rank):
+                print(f"   ⚠️  Skipped {needed} initial samples (warmup period)")
+                print(f"   Adjusted start: {old_start} → {df_sliced.index[0]}")
+
+    # =========================================================================
+    # FEATURE EXTRACTION
+    # =========================================================================
+
+    if is_main_process(rank):
+        print("\n2. Extracting features...")
+    if profiler:
+        profiler.snapshot("pre_feature_extraction", 0, force_log=True)
+
+    extractor = TradingFeatureExtractor()
+
+    # Determine if we need to re-extract features
+    shard_path = Path(args.shard_path) if args.shard_path else Path(project_config.SHARD_DIR)
+    expected_cache_key = f"{args.train_start_year}_{args.train_end_year}_v{FEATURE_VERSION}"
+    cache_key_file = shard_path / expected_cache_key / 'cache_key.txt'
+    cache_valid = cache_key_file.exists()
+
+    if cache_valid:
+        if is_main_process(rank):
+            print(f"   ✓ Using cached features from {shard_path / expected_cache_key}")
+        non_channel_cols = None
+        continuation_df = None
+    else:
+        if is_main_process(rank):
+            print(f"   Extracting fresh features...")
+
+        # Use chunked extraction if enabled
+        if args.use_chunking:
+            non_channel_cols, continuation_df = extractor.extract_features_chunked(
+                df, df_sliced.index,
+                shard_dir=str(shard_path),
+                cache_key=expected_cache_key
+            )
+        else:
+            non_channel_cols, continuation_df = extractor.extract_features_to_shards(
+                df, df_sliced.index,
+                shard_dir=str(shard_path),
+                cache_key=expected_cache_key
+            )
+
+    if profiler:
+        nc_cols = len(non_channel_cols) if non_channel_cols is not None else 0
+        cont_rows = len(continuation_df) if continuation_df is not None else 0
+        profiler.log_info(f"FEATURES_EXTRACTED | non_channel_cols={nc_cols} | continuation_rows={cont_rows}")
+        profiler.snapshot("post_feature_extraction", 0, force_log=True)
+
+    # =========================================================================
+    # DATASET CREATION
+    # =========================================================================
+
+    if is_main_process(rank):
+        print("\n3. Creating dataset...")
+    if profiler:
+        profiler.snapshot("pre_dataset_create", 0, force_log=True)
+
+    # Determine data loading strategy
+    use_adaptive = getattr(args, 'use_adaptive_loading', False) and not is_distributed
+    premerge_budget_gb = getattr(args, 'premerge_budget_gb', 0)
+    shuffle_buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
+
+    # Create datasets
+    train_dataset, val_dataset = create_hierarchical_dataset(
+        df_sliced,
+        sequence_length=args.sequence_length,
+        prediction_horizon=args.prediction_horizon,
+        use_adaptive=use_adaptive,
+        premerge_budget_gb=premerge_budget_gb,
+        shard_path=str(shard_path / expected_cache_key) if cache_valid else None,
+        profiler=profiler
+    )
+
+    if profiler:
+        profiler.log_info(f"DATASET_CREATED | train_samples={len(train_dataset)} | val_samples={len(val_dataset)}")
+        profiler.snapshot("post_dataset_create", 0, force_log=True)
+
+    if is_main_process(rank):
+        print(f"   Training samples: {len(train_dataset):,}")
+        print(f"   Validation samples: {len(val_dataset):,}")
+
+    # =========================================================================
+    # DATALOADER SETUP
+    # =========================================================================
+
+    if is_main_process(rank):
+        print("\n4. Setting up data loaders...")
+
+    # Get feature dimensions from dataset
+    sample_data, sample_target = train_dataset[0]
+    if isinstance(sample_data, tuple):
+        if len(sample_data) == 3:
+            ch_main, ch_monthly, nc = sample_data
+            total_features = ch_main.shape[1] + (ch_monthly.shape[1] if ch_monthly is not None else 0) + nc.shape[1]
+        else:
+            ch_main, nc = sample_data
+            total_features = ch_main.shape[1] + nc.shape[1]
+    else:
+        total_features = sample_data.shape[1]
+
+    if is_main_process(rank):
+        print(f"   Total features: {total_features}")
+
+    # Collate function
+    torch_dtype = project_config.get_torch_dtype()
+    collate_fn = functools.partial(
+        hierarchical_collate,
+        device=args.device,
+        move_to_device=False,
+        torch_dtype=torch_dtype
+    )
+
+    # DataLoader kwargs
+    train_loader_kwargs = {
+        'batch_size': args.batch_size,
+        'num_workers': args.num_workers,
+        'pin_memory': args.device.startswith('cuda'),
+        'collate_fn': collate_fn,
+        'drop_last': True,
+        'persistent_workers': args.num_workers > 0,
+    }
+
+    val_loader_kwargs = {
+        'batch_size': args.batch_size,
+        'num_workers': args.num_workers,
+        'pin_memory': args.device.startswith('cuda'),
+        'collate_fn': collate_fn,
+        'shuffle': False,
+        'persistent_workers': args.num_workers > 0,
+    }
+
+    # Sampler setup
+    train_sampler = None
+    if is_distributed:
+        # DDP: use DistributedSampler
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True
+        )
+        train_loader_kwargs['sampler'] = train_sampler
+        train_loader_kwargs['shuffle'] = False
+        if is_main_process(rank):
+            print(f"   Using DistributedSampler ({world_size} replicas)")
+    elif use_adaptive:
+        # Adaptive mode: use ShuffleBufferSampler
+        train_sampler = ShuffleBufferSampler(
+            train_dataset,
+            buffer_size=shuffle_buffer_size,
+            seed=42
+        )
+        train_loader_kwargs['sampler'] = train_sampler
+        train_loader_kwargs['shuffle'] = False
+        if is_main_process(rank):
+            print(f"   Using ShuffleBufferSampler (buffer={shuffle_buffer_size:,})")
+    else:
+        # Full premerge: standard shuffle
+        train_loader_kwargs['shuffle'] = True
+        if is_main_process(rank):
+            print(f"   Using standard shuffle")
+
+    train_loader = DataLoader(train_dataset, **train_loader_kwargs)
+    val_loader = DataLoader(val_dataset, **val_loader_kwargs)
+
+    if is_main_process(rank):
+        print(f"   Train batches: {len(train_loader):,}")
+        print(f"   Val batches: {len(val_loader):,}")
+
+    # =========================================================================
+    # MODEL SETUP
+    # =========================================================================
+
+    if is_main_process(rank):
+        print("\n5. Creating model...")
+    if profiler:
+        profiler.snapshot("pre_model_create", 0, force_log=True)
+
+    model = HierarchicalLNN(
+        num_features=total_features,
+        sequence_length=args.sequence_length,
+        num_outputs=5 if args.multi_task else 3,
+        config=config
+    )
+
+    if profiler:
+        total_params = sum(p.numel() for p in model.parameters())
+        profiler.log_info(f"MODEL_CREATED | params={total_params:,} | device={args.device}")
+        profiler.snapshot("post_model_create", 0, force_log=True)
+
+    # Move model to device and wrap with DDP if distributed
+    model = model.to(args.device)
+
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        if is_main_process(rank):
+            print(f"   ✓ Model wrapped with DDP")
+    elif args.device.startswith('cuda') and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+            if is_main_process(rank):
+                print(f"   ✓ Model compiled with torch.compile")
+        except Exception as e:
+            if is_main_process(rank):
+                print(f"   ⚠️ torch.compile failed: {e}")
+
+    if profiler:
+        profiler.log_info(f"MODEL_READY | multi_gpu={is_distributed} | device={args.device}")
+        profiler.snapshot("post_model_ready", 0, force_log=True)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if is_main_process(rank):
+        print(f"   Total parameters: {total_params:,}")
+        print(f"   Trainable parameters: {trainable_params:,}")
+
+    # =========================================================================
+    # OPTIMIZER AND SCHEDULER
+    # =========================================================================
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=0.01
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=10,
+        T_mult=2
+    )
+
+    # AMP scaler for mixed precision
+    scaler = None
+    if args.amp and args.device.startswith('cuda'):
+        scaler = torch.amp.GradScaler('cuda')
+        if is_main_process(rank):
+            print("   ✓ AMP enabled (FP16 training)")
+
+    # =========================================================================
+    # TRAINING LOOP
+    # =========================================================================
+
+    if is_main_process(rank):
+        print("\n" + "=" * 70)
+        print("STARTING TRAINING")
+        print("=" * 70)
+
+    if profiler:
+        profiler.log_info(f"TRAINING_START | device={args.device} | batch_size={args.batch_size} | num_workers={args.num_workers}")
+        profiler.snapshot("pre_training_loop", 0, force_log=True)
+
+    best_val_loss = float('inf')
+    patience_counter = 0
+    train_losses = []
+    val_losses = []
+    val_errors = []
+
+    # Progress bar (rank 0 only)
+    epoch_pbar = tqdm(range(args.epochs), desc="Training", disable=not is_main_process(rank))
+
+    for epoch in epoch_pbar:
+        # Set epoch for distributed sampler
+        if is_distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        if profiler:
+            profiler.log_phase(f"EPOCH_START | epoch={epoch + 1}")
+            profiler.snapshot("pre_train_epoch", epoch + 1, force_log=True)
+
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        num_batches = 0
+
+        if profiler:
+            profiler.snapshot("pre_dataloader_iter", epoch + 1, force_log=True)
+            profiler.log_phase(f"dataloader_starting | epoch={epoch + 1} | batch=0 | num_workers={args.num_workers} | batch_size={args.batch_size}")
+
+        batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}", leave=False, disable=not is_main_process(rank))
+
+        for batch_idx, (features, targets) in enumerate(batch_pbar):
+            if profiler and batch_idx == 0:
+                profiler.log_info(f"FIRST_BATCH_COMPLETE | time_sec={0}")
+                profiler.snapshot("first_batch_received", epoch + 1, force_log=True)
+
+            features = features.to(args.device, non_blocking=True)
+            targets = targets.to(args.device, non_blocking=True)
+
+            optimizer.zero_grad()
+
+            # Forward pass with optional AMP
+            if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    outputs = model(features)
+                    loss = F.mse_loss(outputs, targets)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(features)
+                loss = F.mse_loss(outputs, targets)
+                loss.backward()
+                optimizer.step()
+
+            train_loss += loss.item()
+            num_batches += 1
+
+            if batch_idx % 100 == 0:
+                batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+            if profiler and batch_idx > 0 and batch_idx % profiler.log_every_n == 0:
+                profiler.snapshot(f"batch_{batch_idx}", epoch + 1)
+
+        avg_train_loss = train_loss / max(num_batches, 1)
+        train_losses.append(avg_train_loss)
+
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_error = 0.0
+        num_val_batches = 0
+
+        with torch.no_grad():
+            for features, targets in val_loader:
+                features = features.to(args.device, non_blocking=True)
+                targets = targets.to(args.device, non_blocking=True)
+
+                if scaler is not None:
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(features)
+                        loss = F.mse_loss(outputs, targets)
+                else:
+                    outputs = model(features)
+                    loss = F.mse_loss(outputs, targets)
+
+                val_loss += loss.item()
+                val_error += torch.abs(outputs - targets).mean().item()
+                num_val_batches += 1
+
+        avg_val_loss = val_loss / max(num_val_batches, 1)
+        avg_val_error = val_error / max(num_val_batches, 1)
+        val_losses.append(avg_val_loss)
+        val_errors.append(avg_val_error)
+
+        scheduler.step()
+
+        # Update progress bar
+        epoch_pbar.set_postfix({
+            'train': f'{avg_train_loss:.4f}',
+            'val': f'{avg_val_loss:.4f}',
+            'best': f'{best_val_loss:.4f}'
+        })
+
+        # Check for improvement (rank 0 saves model)
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+
+            if is_main_process(rank):
+                # Save best model
+                model_to_save = model.module if hasattr(model, 'module') else model
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                torch.save({
+                    'model_state_dict': model_to_save.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'epoch': epoch,
+                    'val_loss': avg_val_loss,
+                    'args': vars(args)
+                }, output_path)
+
+                tqdm.write(f"   ✓ Saved best model (val_loss: {avg_val_loss:.4f})")
+        else:
+            patience_counter += 1
+
+        # Early stopping
+        if patience_counter >= args.patience:
+            if is_main_process(rank):
+                tqdm.write(f"\n   Early stopping at epoch {epoch + 1} (patience={args.patience})")
+            break
+
+        if profiler:
+            profiler.snapshot("post_epoch", epoch + 1, force_log=True)
+
+    # =========================================================================
+    # TRAINING COMPLETE
+    # =========================================================================
+
+    if is_main_process(rank):
+        print("\n" + "=" * 70)
+        print("TRAINING COMPLETE")
+        print("=" * 70)
+        print(f"Best val loss: {best_val_loss:.4f}")
+
+    # Print memory profile summary
+    if profiler and is_main_process(rank):
+        profiler.print_summary()
+        profiler.close()
+
+    # Save training history (rank 0 only)
+    if is_main_process(rank):
+        history_path = Path(args.output).parent / 'hierarchical_training_history.json'
+        history = {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'val_errors': val_errors,
+            'best_val_loss': best_val_loss,
+            'total_epochs': epoch + 1,
+            'args': vars(args)
+        }
+
+        if profiler:
+            history['memory_profile'] = profiler.get_summary()
+
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
+
+        print(f"Training history saved to: {history_path}")
+
+    # Clean up DDP resources
+    cleanup_distributed()
+
+
 def main():
     # Fix for Unix + torch + multiprocessing: use forkserver to avoid torch cleanup deadlock
     # spawn causes workers to hang on exit when torch is imported
     # forkserver is safe and faster (no torch init in workers with lazy loading)
-    import multiprocessing as mp
-    import sys
+    # NOTE: We use torch.multiprocessing (imported as mp at top) which supports mp.spawn()
+    # Standard multiprocessing doesn't have spawn(), so we import it with different name
+    import multiprocessing as std_mp
     try:
-        mp.set_start_method('forkserver', force=True)
+        std_mp.set_start_method('forkserver', force=True)
         platform_note = "macOS" if sys.platform == "darwin" else "Linux"
         print(f"✓ Using forkserver multiprocessing (safer for torch on {platform_note})")
     except ValueError:
@@ -1865,8 +2605,15 @@ def main():
 
     # System parameters
     parser.add_argument('--device', type=str, default='auto',
-                        choices=['auto', 'cuda', 'mps', 'cpu'],
-                        help='Device: auto (detect), cuda (NVIDIA), mps (Apple Silicon), cpu')
+                        choices=['auto', 'cuda', 'cuda:0', 'cuda:1', 'cuda:2', 'cuda:3', 'mps', 'cpu'],
+                        help='Device: auto, cuda, cuda:N (specific GPU), mps, cpu')
+    parser.add_argument('--ddp', action='store_true', default=False,
+                        help='Use DistributedDataParallel for multi-GPU (auto-spawns processes)')
+    parser.add_argument('--num-gpus', dest='num_ddp_gpus', type=int, default=None,
+                        help='Number of GPUs to use for DDP (default: all available)')
+    parser.add_argument('--gpu_mode', type=str, default='single',
+                        choices=['single', 'multi_ddp'],
+                        help='GPU mode: single (one GPU) or multi_ddp (DDP across all GPUs)')
     parser.add_argument('--num_workers', type=int, default=None,
                         help='DataLoader num_workers (auto-set based on device if None)')
     parser.add_argument('--feature_workers', type=int, default=None,
@@ -1898,6 +2645,28 @@ def main():
 
     args = parser.parse_args()
 
+    # ==========================================================================
+    # DDP Initialization (must be VERY early, before any other setup)
+    # ==========================================================================
+    rank, world_size, local_rank, is_distributed = setup_distributed()
+
+    if is_distributed:
+        # Override args for DDP mode
+        args.use_ddp = True
+        args.gpu_mode = 'multi_ddp'
+        args.device = f'cuda:{local_rank}'
+        args.use_adaptive_loading = False  # Force preload for DDP
+
+        if is_main_process(rank):
+            print(f"\n🚀 DDP Initialized: {world_size} processes across {torch.cuda.device_count()} GPUs")
+            print(f"   This process: rank {rank}, local_rank {local_rank}, device {args.device}")
+    else:
+        # Not DDP - ensure defaults are set
+        if not hasattr(args, 'use_ddp'):
+            args.use_ddp = False
+        if not hasattr(args, 'gpu_mode'):
+            args.gpu_mode = 'single'
+
     # Setup memory profiler early if enabled (so we can log diagnostics throughout)
     profiler = None
     if args.memory_profile:
@@ -1914,661 +2683,52 @@ def main():
         profiler.log_info(f"PREMERGE_LIMIT_GB={os.environ.get('PREMERGE_LIMIT_GB', 'not_set')}")
 
     # Interactive mode overrides command-line args
+    # For DDP: only rank 0 runs interactive, then broadcasts args to other ranks
     if args.interactive:
-        args = interactive_setup(args, profiler=profiler)
+        if is_distributed:
+            if is_main_process(rank):
+                # Only rank 0 runs interactive setup
+                print(f"\n📋 Interactive setup (rank 0 of {world_size})")
+                args = interactive_setup(args, profiler=profiler)
 
-    # FIX: Create profiler if user enabled it in interactive mode (wasn't created earlier)
-    if args.memory_profile and profiler is None:
-        import os
-        from src.ml.memory_profiler import MemoryProfiler
-        profiler = MemoryProfiler(
-            log_path="logs/memory_debug.log",
-            device=args.device if args.device != 'auto' else 'unknown',
-            log_every_n=10,
-            spike_threshold_mb=500
-        )
-        profiler.log_info(f"CONTAINER_RAM_GB={os.environ.get('CONTAINER_RAM_GB', 'not_set')}")
-        profiler.log_info(f"PREMERGE_LIMIT_GB={os.environ.get('PREMERGE_LIMIT_GB', 'not_set')}")
-        profiler.log_info("PROFILER_CREATED_POST_INTERACTIVE")
+            # Broadcast args from rank 0 to all other ranks
+            # Convert args namespace to dict for broadcasting
+            args_dict = [vars(args) if rank == 0 else None]
+            dist.broadcast_object_list(args_dict, src=0)
 
-    # Auto-detect device if 'auto'
-    if args.device == 'auto':
-        args.device = get_best_device()
-        print(f"🔍 Auto-detected device: {args.device}")
+            if not is_main_process(rank):
+                # Reconstruct args namespace on non-rank-0 processes
+                args = argparse.Namespace(**args_dict[0])
 
-    # Validate device
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        print("⚠️ CUDA not available, falling back to CPU")
-        args.device = 'cpu'
-    elif args.device == 'mps' and not torch.backends.mps.is_available():
-        print("⚠️ MPS not available, falling back to CPU")
-        args.device = 'cpu'
+            # Sync all ranks before continuing
+            dist.barrier()
 
-    # MPS compatibility check: MPS doesn't support float64
-    if args.device == 'mps' and project_config.TRAINING_PRECISION == 'float64':
-        print("⚠️  MPS device doesn't support float64 precision")
-        print("   Automatically using float32 instead")
-        project_config.TRAINING_PRECISION = 'float32'
-        project_config.NUMPY_DTYPE = np.float32
-        project_config._TORCH_DTYPE = torch.float32  # Reset cached value
-        print("   ✓ Switched to float32 for MPS compatibility")
-
-    # Auto-set num_workers if not specified (MPS needs 0 for memory efficiency)
-    if args.num_workers is None:
-        args.num_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device, 2)
-
-    # Override parallel worker count for feature extraction if specified
-    if args.feature_workers is not None:
-        # project_config already imported at module level
-        project_config.MAX_PARALLEL_WORKERS = args.feature_workers
-        print(f"✓ Feature extraction workers: {args.feature_workers} cores (via --feature_workers)")
-
-    # Auto-detect chunking if not specified
-    if args.use_chunking is None:
-        import psutil
-        total_ram_gb = psutil.virtual_memory().total / 1e9
-        args.use_chunking = (total_ram_gb < 64)  # Enable if <64GB RAM
-        print(f"✓ Auto-detected chunking: {'Enabled' if args.use_chunking else 'Disabled'} (RAM: {total_ram_gb:.1f}GB)")
-
-    # Load configuration
-    config = None
-    loss_weights = None
-    if Path(args.config).exists():
-        with open(args.config) as f:
-            config = yaml.safe_load(f)
-            loss_weights = config.get('loss_weights', None)
-        print(f"✅ Loaded config from: {args.config}")
-    else:
-        print(f"⚠️ Config not found: {args.config}, using defaults")
-
-    # Hardware info
-    hw_info = get_hardware_info()
-
-    print("\n" + "=" * 70)
-    print("🎯 HIERARCHICAL LNN TRAINING")
-    print("=" * 70)
-    print(f"📱 Device: {args.device.upper()}")
-    if args.device == 'cuda':
-        print(f"   GPU: {hw_info.get('cuda_device', 'Unknown')}")
-        print(f"   VRAM: {hw_info.get('cuda_memory_gb', 0):.1f} GB")
-    elif args.device == 'mps':
-        print(f"   Chip: {hw_info.get('mac_chip', 'Apple Silicon')}")
-        print(f"   RAM: {hw_info.get('total_ram_gb', 0):.0f} GB")
-    print(f"📅 Training: {args.train_start_year}-{args.train_end_year}")
-    print(f"📊 Sequence: {args.sequence_length} bars ({args.sequence_length} minutes)")
-    print(f"🎯 Horizon: Adaptive (base {args.prediction_horizon} bars, model adjusts dynamically)")
-    print(f"🔢 Batch size: {args.batch_size}")
-    print(f"🔄 Epochs: {args.epochs}")
-    # Format data mode display
-    data_mode = getattr(args, 'data_loading_mode', 'lazy')
-    if data_mode == 'adaptive':
-        premerge_gb = getattr(args, 'premerge_budget_gb', 0)
-        buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
-        data_mode_str = f"Adaptive (premerge={premerge_gb}GB, buffer={buffer_size:,})"
-    elif data_mode == 'full_premerge':
-        data_mode_str = "Full Pre-merge"
-    else:
-        data_mode_str = "Adaptive"  # Fallback to adaptive
-    print(f"💾 Data mode: {data_mode_str}")
-    print(f"🎭 Multi-task: {'Enabled' if args.multi_task else 'Disabled'}")
-    print("=" * 70)
-
-    # Load data with historical buffer for continuation analysis
-    print("\n1. Loading 1-min data...")
-    if profiler:
-        profiler.snapshot("pre_data_load", 0, force_log=True)
-
-    data_feed = CSVDataFeed(timeframe=args.input_timeframe)
-
-    # Load with 2-year historical buffer for continuation analysis
-    # This ensures timestamps have sufficient lookback history
-    historical_buffer_years = 2
-    load_start_year = max(2010, args.train_start_year - historical_buffer_years)  # Don't go before 2010
-
-    df = data_feed.load_aligned_data(
-        start_date=f'{load_start_year}-01-01',
-        end_date=f'{args.train_end_year}-12-31'
-    )
-
-    data_years = (df.index[-1] - df.index[0]).days / 365.25
-    print(f"   Loaded {len(df)} bars ({df.index[0]} to {df.index[-1]})")
-
-    if profiler:
-        profiler.log_info(f"DATA_LOADED | rows={len(df)} | cols={len(df.columns)}")
-        profiler.snapshot("post_data_load", 0, force_log=True)
-    print(f"   Data range: {data_years:.1f} years")
-    print(f"   Historical buffer: {historical_buffer_years} years (for continuation analysis)")
-
-    # Validate minimum data requirement (for 21-window system with 3-month TF)
-    min_required = project_config.MIN_DATA_YEARS if hasattr(project_config, 'MIN_DATA_YEARS') else 2.5
-    if data_years < min_required:
-        print(f"\n   ⚠️  WARNING: Insufficient data!")
-        print(f"   You have: {data_years:.1f} years")
-        print(f"   Recommended: {min_required}+ years (for 3-month TF with 10-bar lookback)")
-        print(f"   Long timeframes will have features with insufficient_data=1.0")
-
-        if args.interactive:
-            response = input("\n   Continue anyway? [y/N]: ")
-            if response.lower() != 'y':
-                print("   Exiting...")
-                sys.exit(0)
+            if is_main_process(rank):
+                print(f"\n✓ Configuration broadcast to all {world_size} processes")
         else:
-            print("   Continuing in non-interactive mode...")
+            # Not torchrun - single process mode
+            # Run interactive setup, then decide dispatch method
+            args = interactive_setup(args, profiler=profiler)
+
+    # ==========================================================================
+    # DISPATCH TO run_training()
+    # ==========================================================================
+
+    if is_distributed:
+        # Torchrun mode: DDP already initialized via setup_distributed()
+        # run_training will detect this and skip its own DDP setup
+        run_training(rank, world_size, vars(args))
+    elif getattr(args, 'use_ddp', False):
+        # User selected multi-GPU in interactive menu, but not launched with torchrun
+        # Use mp.spawn to launch DDP processes automatically
+        num_gpus = getattr(args, 'num_ddp_gpus', torch.cuda.device_count())
+        print(f"\n🚀 Launching {num_gpus} DDP processes via mp.spawn...")
+        print(f"   Each process will use one GPU (cuda:0 to cuda:{num_gpus-1})")
+        mp.spawn(run_training, nprocs=num_gpus, args=(num_gpus, vars(args)))
     else:
-        print(f"   ✓ Data requirement met ({data_years:.1f} years >= {min_required} required)")
+        # Single GPU/device mode - call directly
+        run_training(0, 1, vars(args))
 
-    # Slice data to user's selected training range (after loading historical buffer)
-    training_start = pd.to_datetime(f'{args.train_start_year}-01-01')
-    training_end = pd.to_datetime(f'{args.train_end_year}-12-31')
-
-    # Keep full dataset for feature extraction (needs historical context)
-    # But create sliced version for timestamps used in continuation analysis
-    df_sliced = df[(df.index >= training_start) & (df.index <= training_end)].copy()
-    print(f"   Training slice: {len(df_sliced)} bars ({df_sliced.index[0]} to {df_sliced.index[-1]})")
-
-    # Smart lookback buffer system: Check if warmup period adjustment is needed
-    if project_config.SKIP_WARMUP_PERIOD:
-        # Calculate where first training timestamp sits in full dataset
-        first_training_idx = df.index.get_loc(df_sliced.index[0])
-
-        # Check if we have enough historical data before first training timestamp
-        if first_training_idx < project_config.MIN_LOOKBACK_BARS:
-            # Need to skip warmup period
-            warmup_end_idx = project_config.MIN_LOOKBACK_BARS
-            effective_start = df.index[warmup_end_idx]
-
-            print(f"\n   ⚠️  Adjusting training range for data quality:")
-            print(f"      Requested start: {df_sliced.index[0]}")
-            print(f"      Data file starts: {df.index[0]}")
-            print(f"      Minimum lookback required: {project_config.MIN_LOOKBACK_BARS} bars (~{project_config.MIN_LOOKBACK_MONTHS} months)")
-            print(f"      Effective training start: {effective_start}")
-
-            # Skip the warmup period
-            original_length = len(df_sliced)
-            df_sliced = df_sliced[df_sliced.index >= effective_start].copy()
-            warmup_skipped = original_length - len(df_sliced)
-
-            print(f"      Skipped {warmup_skipped} warmup bars ({warmup_skipped/390:.1f} trading days)")
-            print(f"      Remaining training data: {len(df_sliced)} bars ({df_sliced.index[0]} to {df_sliced.index[-1]})")
-            print(f"      ✓ All training samples will have complete {project_config.MIN_LOOKBACK_MONTHS}-month feature history")
-        else:
-            print(f"   ✓ Sufficient historical data available ({first_training_idx} bars before training start)")
-
-    # Extract features and continuation labels
-    print("\n2. Extracting features and continuation labels...")
-    if profiler:
-        profiler.snapshot("pre_feature_extraction", 0, force_log=True)
-    extractor = TradingFeatureExtractor()
-
-    # Validate data availability first
-    print("  Pre-validating continuation data...")
-    timestamps = df_sliced.index.tolist()
-    validation = extractor.validate_continuation_data_availability(df, timestamps)
-
-    if validation['sufficient_raw_data'] == 0:
-        print("  ⚠️  WARNING: No timestamps have sufficient data for continuation analysis!")
-        print("     This will result in 0 continuation labels.")
-        print("     Consider using a dataset with more historical data.")
-        print("     Enabling debug mode for detailed analysis...")
-        debug_mode = True
-    else:
-        sufficient_pct = (validation['sufficient_raw_data'] / validation['total_timestamps']) * 100
-        print(f"  📊 {sufficient_pct:.1f}% of timestamps have sufficient continuation data")
-        debug_mode = False
-
-    # Use cache unless regenerate_cache flag is set (from interactive menu)
-    use_cache = not getattr(args, 'regenerate_cache', False)
-
-    # Use GPU if enabled (from interactive menu or auto-detect)
-    # If --device cpu was specified, force CPU for features too
-    if hasattr(args, 'device') and args.device == 'cpu':
-        use_gpu = False
-    else:
-        use_gpu = args.use_gpu_features if hasattr(args, 'use_gpu_features') else 'auto'
-
-
-    # Set parallel processing option in config if specified
-    if hasattr(args, 'use_parallel'):
-        import config
-        config.PARALLEL_CHANNEL_CALC = args.use_parallel
-    else:
-        # If not in interactive mode and parallel isn't set, enable it by default for CPU
-        if use_gpu == False:  # Only enable parallel if we're definitely using CPU
-            import multiprocessing as mp
-            if mp.cpu_count() > 2:
-                import config
-                args.use_parallel = True
-                config.PARALLEL_CHANNEL_CALC = True
-                print("   🚀 Auto-enabling parallel processing for CPU mode")
-
-    result = extractor.extract_features(
-        df,
-        use_cache=use_cache,
-        use_gpu=use_gpu,
-        continuation=True,
-        continuation_mode=project_config.CONTINUATION_MODE,
-        use_chunking=getattr(args, 'use_chunking', False),
-        chunk_size_years=project_config.CHUNK_SIZE_YEARS,
-        shard_storage_path=getattr(args, 'shard_path', None)
-    )
-
-    # Handle both normal (2-tuple) and mmap (3-tuple) return formats
-    if len(result) == 3:
-        features_df, continuation_df, mmap_meta_path = result
-        print(f"   ℹ️  Using memory-mapped channel features from: {Path(mmap_meta_path).name}")
-    else:
-        features_df, continuation_df = result
-        mmap_meta_path = None
-
-    # If we got 0 labels and didn't enable debug, enable it now for diagnosis
-    if continuation_df is not None and len(continuation_df) == 0 and not debug_mode:
-        print("  ⚠️  Got 0 continuation labels. Re-running with debug mode enabled...")
-        debug_mode = True
-        continuation_df = extractor.generate_continuation_labels(df, timestamps, prediction_horizon=24, mode=project_config.CONTINUATION_MODE, debug=debug_mode)
-
-    if profiler:
-        profiler.log_info(f"FEATURES_EXTRACTED | non_channel_cols={len(features_df.columns)} | continuation_rows={len(continuation_df) if continuation_df is not None else 0}")
-        profiler.snapshot("post_feature_extraction", 0, force_log=True)
-
-    # Display feature counts (clarify mmap vs non-mmap)
-    total_feature_dim = extractor.get_feature_dim()
-    print(f"   Total feature dimension: {total_feature_dim} (model input size)")
-    if mmap_meta_path:
-        channel_features = total_feature_dim - len(features_df.columns)
-        print(f"     ├─ Channel features (mmaps): {channel_features}")
-        print(f"     └─ Non-channel features (df): {len(features_df.columns)}")
-    else:
-        print(f"     └─ All features in dataframe: {len(features_df.columns)}")
-    print(f"   Generated {len(continuation_df) if continuation_df is not None else 0} continuation labels")
-    print(f"   Feature names (first 5): {extractor.get_feature_names()[:5]}...")
-
-    # Save cache manifest for future reuse selection
-    cache_dir = getattr(extractor, "_unified_cache_dir", getattr(args, "shard_path", "data/feature_cache"))
-    cache_key = getattr(extractor, "_cache_key", None)
-    cont_path = getattr(extractor, "_cont_cache_path", None)
-    non_channel_path = getattr(extractor, "_non_channel_cache_path", None)  # NEW
-    if cache_key:
-        save_cache_manifest(
-            cache_dir=Path(cache_dir),
-            cache_key=cache_key,
-            mmap_meta_path=mmap_meta_path,
-            continuation_path=str(cont_path) if cont_path else None,
-            non_channel_path=str(non_channel_path) if non_channel_path else None,  # NEW
-            args=args,
-            df=df
-        )
-
-    # Create datasets
-    print("\n3. Creating datasets...")
-    if profiler:
-        profiler.snapshot("pre_dataset_create", 0, force_log=True)
-
-    train_dataset, val_dataset = create_hierarchical_dataset(
-        features_df,
-        raw_ohlc_df=df,
-        continuation_labels_df=continuation_df,
-        sequence_length=args.sequence_length,
-        prediction_horizon=args.prediction_horizon,
-        mode='uniform_bars',
-        preload=args.preload,
-        validation_split=args.val_split,
-        include_continuation=True,
-        mmap_meta_path=mmap_meta_path,  # Pass mmap metadata if using sharded storage
-        profiler=profiler,  # Pass profiler for granular RAM logging
-        premerge_budget_gb=getattr(args, 'premerge_budget_gb', None),
-        use_adaptive_mode=getattr(args, 'use_adaptive_loading', False)
-    )
-
-    if profiler:
-        profiler.log_info(f"DATASET_CREATED | train_samples={len(train_dataset)} | val_samples={len(val_dataset) if val_dataset else 0}")
-        profiler.snapshot("post_dataset_create", 0, force_log=True)
-
-    print(f"   Train samples: {len(train_dataset)}")
-    if val_dataset:
-        print(f"   Val samples: {len(val_dataset)}")
-
-    # Free large DataFrames - dataset has extracted what it needs
-    # This is CRITICAL for memory on systems where psutil misreads container RAM
-    import gc
-    df_mem_mb = df.memory_usage(deep=True).sum() / 1e6 if hasattr(df, 'memory_usage') else 0
-    features_mem_mb = features_df.memory_usage(deep=True).sum() / 1e6 if hasattr(features_df, 'memory_usage') else 0
-    cont_mem_mb = continuation_df.memory_usage(deep=True).sum() / 1e6 if continuation_df is not None and hasattr(continuation_df, 'memory_usage') else 0
-    total_freed_mb = df_mem_mb + features_mem_mb + cont_mem_mb
-    print(f"   🧹 Freeing DataFrames: df={df_mem_mb:.0f}MB, features={features_mem_mb:.0f}MB, continuation={cont_mem_mb:.0f}MB")
-    if profiler:
-        profiler.log_info(f"DATAFRAME_CLEANUP | df={df_mem_mb:.0f}MB | features={features_mem_mb:.0f}MB | continuation={cont_mem_mb:.0f}MB | total={total_freed_mb:.0f}MB")
-        profiler.snapshot("pre_dataframe_cleanup", 0, force_log=True)
-    del df, features_df, continuation_df
-    gc.collect()
-    if profiler:
-        profiler.snapshot("post_dataframe_cleanup", 0, force_log=True)
-
-    # Verify feature dimension matches between extractor and dataset
-    print("\n   🔍 Verifying feature dimensions...")
-    sample_x, sample_y = train_dataset[0]
-    if isinstance(sample_x, tuple):
-        dims = 0
-        for part in sample_x:
-            if part is not None and hasattr(part, 'shape'):
-                dims += part.shape[-1]
-        actual_input_dim = dims if dims > 0 else sample_x.shape[-1]
-    else:
-        actual_input_dim = sample_x.shape[-1]
-    expected_dim = extractor.get_feature_dim()
-
-    if actual_input_dim != expected_dim:
-        # Enhanced error with feature name comparison
-        expected_names = set(extractor.get_feature_names())
-
-        # Try to get actual feature names from dataset
-        if mmap_meta_path:
-            # With mmaps, combine channel + non-channel names
-            actual_names = set(features_df.columns.tolist())  # Non-channel only
-            print(f"\n   ⚠️  Note: With mmaps, only showing non-channel feature names for comparison")
-        else:
-            actual_names = set(features_df.columns.tolist())
-
-        missing = expected_names - actual_names
-        extra = actual_names - expected_names
-
-        error_msg = f"\n❌ FATAL: Feature dimension mismatch!\n"
-        error_msg += f"   Model expects: {expected_dim} features\n"
-        error_msg += f"   Dataset returns: {actual_input_dim} features\n"
-        error_msg += f"   Difference: {abs(actual_input_dim - expected_dim)}\n\n"
-
-        if missing and len(missing) < 100:
-            error_msg += f"   Missing from dataset ({len(missing)} features):\n"
-            error_msg += f"      {sorted(list(missing))[:10]}...\n\n"
-        elif missing:
-            error_msg += f"   Missing from dataset: {len(missing)} features (too many to list)\n\n"
-
-        if extra and len(extra) < 100:
-            error_msg += f"   Extra in dataset ({len(extra)} features):\n"
-            error_msg += f"      {sorted(list(extra))[:10]}...\n\n"
-        elif extra:
-            error_msg += f"   Extra in dataset: {len(extra)} features (likely old cache)\n\n"
-
-        error_msg += f"   Likely cause: Using old v3.13 shards (12,474 features) vs new v3.17 code (14,322 features)\n"
-        error_msg += f"   Fix: Delete old shards OR bump FEATURE_VERSION caused regeneration"
-
-        raise RuntimeError(error_msg)
-    print(f"   ✅ Dimension check passed: {actual_input_dim} features match expected {expected_dim}")
-
-    # DataLoader tuning (MPS-friendly defaults)
-    prefetch_factor = 1 if args.num_workers and args.num_workers > 0 else None  # Reduced from 2 to prevent memory buildup
-    mp_context = 'forkserver' if platform.system() == 'Darwin' and args.num_workers and args.num_workers > 0 else None
-
-    # Create dataloaders
-    # For adaptive mode: use ShuffleBufferSampler instead of shuffle=True
-    use_adaptive = getattr(args, 'use_adaptive_loading', False)
-    shuffle_buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
-
-    train_loader_kwargs = dict(
-        dataset=train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=(args.device == 'cuda'),
-        persistent_workers=(args.num_workers > 0),  # Prevent worker respawn overhead
-        collate_fn=functools.partial(
-            hierarchical_collate,
-            device=args.device,
-            move_to_device=False,
-            torch_dtype=project_config._TORCH_DTYPE
-        )
-    )
-
-    if use_adaptive:
-        # Adaptive mode: use ShuffleBufferSampler for sequential-ish mmap access
-        train_sampler = ShuffleBufferSampler(
-            train_dataset,
-            buffer_size=shuffle_buffer_size,
-            seed=42  # Reproducible shuffling
-        )
-        train_loader_kwargs['sampler'] = train_sampler
-        train_loader_kwargs['shuffle'] = False  # sampler handles shuffling
-        print(f"   🔀 Using ShuffleBufferSampler (buffer_size={shuffle_buffer_size:,})")
-    else:
-        # Full preload/premerge: use standard shuffle
-        train_loader_kwargs['shuffle'] = True
-
-    if prefetch_factor is not None:
-        train_loader_kwargs['prefetch_factor'] = prefetch_factor
-    if mp_context is not None:
-        train_loader_kwargs['multiprocessing_context'] = mp_context
-
-    train_loader = DataLoader(**train_loader_kwargs)
-
-    val_loader = None
-    if val_dataset:
-        val_loader_kwargs = dict(
-            dataset=val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=(args.device == 'cuda'),
-            persistent_workers=(args.num_workers > 0),  # Prevent worker respawn overhead
-            collate_fn=functools.partial(
-                hierarchical_collate,
-                device=args.device,
-                move_to_device=False,
-                torch_dtype=project_config._TORCH_DTYPE
-            )
-        )
-        if prefetch_factor is not None:
-            val_loader_kwargs['prefetch_factor'] = prefetch_factor
-        if mp_context is not None:
-            val_loader_kwargs['multiprocessing_context'] = mp_context
-
-        val_loader = DataLoader(**val_loader_kwargs)
-
-    # Create model
-    print("\n4. Creating HierarchicalLNN model...")
-    if profiler:
-        profiler.snapshot("pre_model_create", 0, force_log=True)
-
-    total_neurons = int(args.hidden_size * args.internal_neurons_ratio)
-    print(f"   Capacity: {total_neurons} total neurons, {args.hidden_size} output neurons")
-    print(f"   Internal processing neurons: {total_neurons - args.hidden_size}")
-
-    model = HierarchicalLNN(
-        input_size=extractor.get_feature_dim(),
-        hidden_size=args.hidden_size,
-        internal_neurons_ratio=args.internal_neurons_ratio,
-        device=args.device,
-        downsample_fast_to_medium=args.downsample_fast_to_medium,
-        downsample_medium_to_slow=args.downsample_medium_to_slow,
-        multi_task=args.multi_task
-    )
-
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"   Model parameters: {num_params:,}")
-
-    if profiler:
-        profiler.log_info(f"MODEL_CREATED | params={num_params:,} | device={args.device}")
-        profiler.snapshot("post_model_create", 0, force_log=True)
-    print(f"   Multi-task heads: {'Enabled' if args.multi_task else 'Disabled'}")
-    print(f"   Input features: {extractor.get_feature_dim()}")
-
-    # Multi-GPU DataParallel wrapping (before torch.compile and optimizer)
-    use_multi_gpu = False
-    if args.device == 'cuda' and torch.cuda.device_count() > 1:
-        num_gpus = torch.cuda.device_count()
-        print(f"\n   🚀 Multi-GPU Training: Using {num_gpus} GPUs with DataParallel")
-        for i in range(num_gpus):
-            name = torch.cuda.get_device_name(i)
-            vram = torch.cuda.get_device_properties(i).total_memory / 1e9
-            print(f"      GPU {i}: {name} ({vram:.0f} GB)")
-
-        # Fix ncps library buffers for multi-GPU compatibility
-        # The ncps CfcCell has sparsity_mask tensors that aren't registered as buffers
-        fix_ncps_buffers(model)
-
-        # CRITICAL: Move entire model to primary GPU BEFORE DataParallel wrapping
-        # DataParallel requires the model (including all buffers) to be on cuda:0
-        # It will then replicate to other GPUs automatically
-        model = model.to('cuda:0')
-
-        # CRITICAL: Move sparsity_mask buffers back to CPU for proper DataParallel replication
-        # DataParallel only replicates CPU buffers to each GPU; CUDA buffers are shared by reference.
-        # By keeping sparsity_mask on CPU, DataParallel will copy it to each GPU during forward().
-        sparsity_cpu_count = 0
-        for name, module in model.named_modules():
-            if 'sparsity_mask' in module._buffers and module._buffers['sparsity_mask'] is not None:
-                module._buffers['sparsity_mask'] = module._buffers['sparsity_mask'].cpu()
-                sparsity_cpu_count += 1
-        if sparsity_cpu_count > 0:
-            print(f"   🔧 Moved {sparsity_cpu_count} sparsity_mask buffers to CPU for DataParallel replication")
-
-        model = nn.DataParallel(model)
-        use_multi_gpu = True
-        print(f"   📦 Effective batch size: {args.batch_size} (split across {num_gpus} GPUs, ~{args.batch_size // num_gpus} per GPU)")
-    else:
-        print(f"\n   📱 Single-Device Training: {args.device.upper()}")
-
-    # Apply torch.compile() for CUDA (PyTorch 2.0+ optimization, 10-40% speedup)
-    # Note: First epoch is slower due to compilation warmup, benefits show from epoch 2+
-    # Note: torch.compile works with DataParallel but may need mode adjustment
-    if args.device == 'cuda' and hasattr(torch, 'compile') and not use_multi_gpu:
-        # Skip torch.compile for multi-GPU (can cause issues with DataParallel)
-        try:
-            model = torch.compile(model, mode='reduce-overhead')
-            print("   🔥 torch.compile() enabled - JIT compilation for faster training")
-        except Exception as e:
-            print(f"   ⚠️  torch.compile() failed ({e}), continuing without compilation")
-    elif use_multi_gpu:
-        print("   ℹ️  torch.compile() skipped for multi-GPU (DataParallel handles optimization)")
-
-    # Optimizer and loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
-
-    if profiler:
-        gpu_mem_mb = 0
-        if args.device == 'cuda':
-            gpu_mem_mb = torch.cuda.memory_allocated() / 1e6
-        profiler.log_info(f"MODEL_READY | multi_gpu={use_multi_gpu} | gpu_mem_mb={gpu_mem_mb:.0f}")
-        profiler.snapshot("post_model_ready", 0, force_log=True)
-
-    # Setup AMP (Automatic Mixed Precision) if enabled
-    scaler = None
-    if getattr(args, 'amp', False) and args.device == 'cuda':
-        from torch.amp import GradScaler
-        scaler = GradScaler('cuda')
-        print("   ⚡ Mixed Precision (AMP) enabled - using FP16 tensor cores")
-    elif getattr(args, 'amp', False) and args.device != 'cuda':
-        print("   ⚠️  AMP requested but only supported on CUDA - using FP32")
-
-    # Note: Memory profiler was created early (after arg parsing) to capture diagnostics
-    if profiler:
-        profiler.log_info(f"TRAINING_START | device={args.device} | batch_size={args.batch_size} | num_workers={args.num_workers}")
-        profiler.snapshot("pre_training_loop", 0, force_log=True)
-
-    # Training loop
-    print("\n5. Training...")
-    best_val_loss = float('inf')
-    patience_counter = 0
-    train_losses = []
-    val_losses = []
-    val_errors = []
-
-    # Outer progress bar for overall training
-    epoch_pbar = tqdm(range(args.epochs), desc="Training Progress", ncols=80, position=0, ascii=True)
-
-    for epoch in epoch_pbar:
-        tqdm.write(f"\nEpoch {epoch + 1}/{args.epochs}")
-        tqdm.write("-" * 70)
-
-        # Set epoch in profiler
-        if profiler:
-            profiler.set_epoch(epoch + 1)
-            profiler.snapshot("pre_train_epoch", 0, force_log=True)
-
-        # Train (with loss_weights for multi-task, and optional AMP scaler)
-        train_loss = train_epoch(
-            model, train_loader, optimizer, criterion, args.device, epoch, loss_weights, scaler, use_multi_gpu, profiler
-        )
-        train_losses.append(train_loss)
-
-        tqdm.write(f"  Train Loss: {train_loss:.4f}")
-
-        # Validate
-        if val_loader:
-            val_loss, val_error = validate(model, val_loader, criterion, args.device)
-            val_losses.append(val_loss)
-            val_errors.append(val_error)
-
-            tqdm.write(f"  Val Loss: {val_loss:.4f}, Val Error: {val_error:.4f}%")
-
-            # Early stopping
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-
-                # Save best model
-                tqdm.write(f"  ✓ New best model (val_loss: {val_loss:.4f})")
-
-                metadata = {
-                    'model_type': 'HierarchicalLNN',
-                    'input_size': extractor.get_feature_dim(),
-                    'hidden_size': args.hidden_size,
-                    'input_timeframe': args.input_timeframe,
-                    'sequence_length': args.sequence_length,
-                    'prediction_horizon': args.prediction_horizon,
-                    'prediction_mode': 'uniform_bars',
-                    'train_start_year': args.train_start_year,
-                    'train_end_year': args.train_end_year,
-                    'feature_names': extractor.get_feature_names(),
-                    'device_type': args.device,
-                    'epoch': epoch + 1,
-                    'train_loss': train_loss,
-                    'val_loss': val_loss,
-                    'val_error': val_error,
-                    'downsample_fast_to_medium': args.downsample_fast_to_medium,
-                    'downsample_medium_to_slow': args.downsample_medium_to_slow,
-                    'timestamp': datetime.now().isoformat()
-                }
-
-                # Handle DataParallel: save underlying model (without module. prefix)
-                model_to_save = model.module if use_multi_gpu else model
-                model_to_save.save_checkpoint(args.output, metadata)
-            else:
-                patience_counter += 1
-                tqdm.write(f"  Patience: {patience_counter}/{args.patience}")
-
-                if patience_counter >= args.patience:
-                    tqdm.write(f"\n  Early stopping triggered!")
-                    break
-
-    # Training complete
-    print("\n" + "=" * 70)
-    print("TRAINING COMPLETE")
-    print("=" * 70)
-    print(f"Best val loss: {best_val_loss:.4f}")
-
-    # Print memory profile summary if enabled
-    if profiler:
-        profiler.print_summary()
-        profiler.close()
-
-    # Save training history
-    history_path = Path(args.output).parent / 'hierarchical_training_history.json'
-    history = {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'val_errors': val_errors,
-        'best_val_loss': best_val_loss,
-        'total_epochs': epoch + 1,
-        'args': vars(args)
-    }
-
-    # Add memory profile to history if profiling was enabled
-    if profiler:
-        history['memory_profile'] = profiler.get_summary()
-
-    with open(history_path, 'w') as f:
-        json.dump(history, f, indent=2)
-
-    print(f"Training history saved to: {history_path}")
 
 
 if __name__ == '__main__':
