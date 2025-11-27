@@ -2145,13 +2145,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     if is_main_process(rank):
         print(f"   Extracting features (use_chunking={args.use_chunking})...")
 
-    features_df, continuation_df = extractor.extract_features(
+    result = extractor.extract_features(
         df,
         use_cache=True,
         continuation=True,
         use_chunking=args.use_chunking,
         shard_storage_path=str(shard_path),
     )
+    # Handle variable return: (features_df, continuation_df) or (features_df, continuation_df, mmap_meta_path)
+    features_df = result[0]
+    continuation_df = result[1]
+    mmap_meta_path = result[2] if len(result) > 2 else None
     non_channel_cols = features_df.columns.tolist() if features_df is not None else None
 
     if profiler:
