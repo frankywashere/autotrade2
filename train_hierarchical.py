@@ -154,10 +154,18 @@ def fix_ncps_buffers(model):
     for name, module in model.named_modules():
         # Check for ncps CfC cells that have sparsity_mask
         if hasattr(module, 'sparsity_mask') and isinstance(module.sparsity_mask, torch.Tensor):
-            if not isinstance(module.sparsity_mask, nn.Parameter):
-                # Convert to buffer so it moves with the module
-                module.register_buffer('sparsity_mask', module.sparsity_mask)
-                fixed_count += 1
+            mask_tensor = module.sparsity_mask
+
+            # If it's a Parameter (as in ncps library), extract the underlying tensor
+            if isinstance(mask_tensor, nn.Parameter):
+                mask_tensor = mask_tensor.data
+
+            # Delete the old attribute (Parameter or tensor) to avoid conflicts
+            delattr(module, 'sparsity_mask')
+
+            # Register as a buffer (properly replicated by DataParallel)
+            module.register_buffer('sparsity_mask', mask_tensor)
+            fixed_count += 1
     if fixed_count > 0:
         print(f"   🔧 Fixed {fixed_count} ncps sparsity_mask tensors for multi-GPU compatibility")
     return fixed_count
