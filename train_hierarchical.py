@@ -1272,6 +1272,21 @@ def interactive_setup(args, profiler=None):
             project_config._TORCH_DTYPE = torch.float64
             print("   → FP64 - Maximum precision (slower, more memory)")
 
+        # torch.compile option (CUDA only, PyTorch 2.0+)
+        print()
+        if hasattr(torch, 'compile'):
+            args.use_compile = inquirer.confirm(
+                message="Enable torch.compile? (JIT compilation, first batch takes 5-15 min but subsequent batches faster)",
+                default=True
+            ).execute()
+            if args.use_compile:
+                print("   ⚡ torch.compile enabled - first forward pass will show progress updates")
+            else:
+                print("   → torch.compile disabled - standard eager mode")
+        else:
+            args.use_compile = False
+            print("   ℹ️  torch.compile not available (requires PyTorch 2.0+)")
+
         # Container RAM detection for cloud GPU instances (RunPod, Lambda, etc.)
         print()
         try:
@@ -2324,7 +2339,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         if is_main_process(rank):
             print(f"   ✓ Model wrapped with DDP")
-    elif args.device.startswith('cuda') and hasattr(torch, 'compile'):
+    elif args.device.startswith('cuda') and getattr(args, 'use_compile', False) and hasattr(torch, 'compile'):
         try:
             model = torch.compile(model, mode='reduce-overhead')
             if is_main_process(rank):
@@ -2683,6 +2698,8 @@ def main():
                         help='Enable multi-task learning (default: True)')
     parser.add_argument('--amp', action='store_true', default=False,
                         help='Enable Automatic Mixed Precision (CUDA only, 2-3x faster)')
+    parser.add_argument('--use-compile', dest='use_compile', action='store_true', default=False,
+                        help='Enable torch.compile JIT compilation (CUDA only, first batch slow but faster afterward)')
 
     # Interactive mode
     parser.add_argument('--interactive', action='store_true',
