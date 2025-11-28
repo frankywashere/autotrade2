@@ -2180,13 +2180,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
     # Create datasets
     train_dataset, val_dataset = create_hierarchical_dataset(
-        df_sliced,
+        features_df=features_df,
+        raw_ohlc_df=df_sliced,
+        continuation_labels_df=continuation_df,
         sequence_length=args.sequence_length,
         prediction_horizon=args.prediction_horizon,
-        use_adaptive=use_adaptive,
+        validation_split=args.val_split,
+        include_continuation=True,
+        mmap_meta_path=mmap_meta_path,
+        profiler=profiler,
         premerge_budget_gb=premerge_budget_gb,
-        shard_path=str(shard_path / expected_cache_key) if cache_valid else None,
-        profiler=profiler
+        use_adaptive_mode=use_adaptive
     )
 
     if profiler:
