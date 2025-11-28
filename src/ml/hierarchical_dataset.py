@@ -587,8 +587,16 @@ class HierarchicalDataset(Dataset):
             # Get channel features from shards (mmap - minimal RAM)
             main_channel_sequence, monthly_sequence = self._get_channel_sequence_from_shards(seq_start, seq_end)
 
+            # Make contiguous here (one-time cost per sample, avoids collate copies)
+            if main_channel_sequence is not None:
+                main_channel_sequence = np.ascontiguousarray(main_channel_sequence)
+            if monthly_sequence is not None:
+                monthly_sequence = np.ascontiguousarray(monthly_sequence)
+
             # Get non-channel features (small, already in RAM)
             non_channel_sequence = self.non_channel_array[seq_start:seq_end, :] if self.non_channel_array is not None else None
+            if non_channel_sequence is not None:
+                non_channel_sequence = np.ascontiguousarray(non_channel_sequence)
 
             future_window = None
             if self.raw_ohlc_array is None:
@@ -603,18 +611,21 @@ class HierarchicalDataset(Dataset):
 
                 if self.non_channel_array is not None:
                     non_channel_future = self.non_channel_array[future_start:future_end, :]
+                    non_channel_future = np.ascontiguousarray(non_channel_future)
                     parts.append(non_channel_future)
 
                 future_window = np.concatenate(parts, axis=1)
+                # Concatenate may create non-contiguous result, ensure contiguous
+                future_window = np.ascontiguousarray(future_window)
         else:
             # Normal path - single array
-            main_channel_sequence = self.features_array[seq_start:seq_end, :]  # [200, 299]
+            main_channel_sequence = np.ascontiguousarray(self.features_array[seq_start:seq_end, :])  # [200, 299]
             monthly_sequence = None
             non_channel_sequence = None
             if self.raw_ohlc_array is None:
                 future_start = seq_end
                 future_end = seq_end + self.prediction_horizon
-                future_window = self.features_array[future_start:future_end, :]
+                future_window = np.ascontiguousarray(self.features_array[future_start:future_end, :])
             else:
                 future_window = None
 
