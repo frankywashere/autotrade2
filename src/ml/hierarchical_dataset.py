@@ -89,9 +89,16 @@ class HierarchicalDataset(Dataset):
             self.has_channel_1h_r_squared = 'channel_1h_r_squared' in self.continuation_labels_df.columns
             self.has_channel_4h_r_squared = 'channel_4h_r_squared' in self.continuation_labels_df.columns
 
-            # Index by timestamp for O(1) lookups instead of O(n) boolean mask
+            # Build dict for O(1) lookups (int64 nanoseconds → row index)
+            # This avoids pandas type coercion issues between numpy.datetime64 and pd.Timestamp
             if 'timestamp' in self.continuation_labels_df.columns:
-                self.continuation_labels_df = self.continuation_labels_df.set_index('timestamp', drop=False)
+                self._continuation_ts_to_idx = {}
+                for i, ts in enumerate(self.continuation_labels_df['timestamp'].values):
+                    # Convert to int64 nanoseconds (works for both numpy.datetime64 and pd.Timestamp)
+                    ts_ns = pd.Timestamp(ts).value
+                    self._continuation_ts_to_idx[ts_ns] = i
+            else:
+                self._continuation_ts_to_idx = {}
         else:
             self.has_adaptive_horizon = False
             self.has_conf_score = False
@@ -101,6 +108,7 @@ class HierarchicalDataset(Dataset):
             self.has_channel_4h_valid = False
             self.has_channel_1h_r_squared = False
             self.has_channel_4h_r_squared = False
+            self._continuation_ts_to_idx = {}
 
         # Dtype validation - ensure data matches config precision
         expected_dtype = config.NUMPY_DTYPE
@@ -624,15 +632,12 @@ class HierarchicalDataset(Dataset):
         # v3.18: Adaptive Full mode - slice ALL targets to adaptive horizon
         if config.CONTINUATION_MODE == 'adaptive_full' and self.include_continuation and self.continuation_labels_df is not None:
             try:
-                # Get continuation label for this timestamp (O(1) lookup via index)
-                ts = pd.Timestamp(self.timestamps[seq_end - 1])
-                try:
-                    cont_row = self.continuation_labels_df.loc[[ts]]
-                except KeyError:
-                    cont_row = pd.DataFrame()
+                # Get continuation label for this timestamp (O(1) lookup via dict)
+                ts_ns = pd.Timestamp(self.timestamps[seq_end - 1]).value
+                row_idx = self._continuation_ts_to_idx.get(ts_ns)
 
-                if not cont_row.empty and 'adaptive_horizon' in cont_row.columns:
-                    adaptive_horizon = int(cont_row['adaptive_horizon'].iloc[0])
+                if row_idx is not None and 'adaptive_horizon' in self.continuation_labels_df.columns:
+                    adaptive_horizon = int(self.continuation_labels_df.iloc[row_idx]['adaptive_horizon'])
 
                     # Slice to adaptive horizon (cap at available length)
                     slice_len = min(adaptive_horizon, len(future_prices))
@@ -714,42 +719,41 @@ class HierarchicalDataset(Dataset):
         # Add continuation prediction targets if enabled
         if self.include_continuation and self.continuation_labels_df is not None:
             try:
-                # Find continuation label for this timestamp (O(1) lookup via index)
-                ts = pd.Timestamp(self.timestamps[seq_end - 1])
-                try:
-                    cont_row = self.continuation_labels_df.loc[[ts]]
-                except KeyError:
-                    cont_row = pd.DataFrame()
+                # Find continuation label for this timestamp (O(1) lookup via dict)
+                ts_ns = pd.Timestamp(self.timestamps[seq_end - 1]).value
+                row_idx = self._continuation_ts_to_idx.get(ts_ns)
 
-                if not cont_row.empty:
+                if row_idx is not None:
                     # Found exact match - use actual values
-                    targets['continuation_duration'] = torch.tensor(cont_row['duration_hours'].iloc[0], dtype=config.get_torch_dtype())
-                    targets['continuation_gain'] = torch.tensor(cont_row['projected_gain'].iloc[0], dtype=config.get_torch_dtype())
-                    targets['continuation_confidence'] = torch.tensor(cont_row['confidence'].iloc[0], dtype=config.get_torch_dtype())
+                    cont_row = self.continuation_labels_df.iloc[row_idx]
+                    targets['continuation_duration'] = torch.tensor(cont_row['duration_hours'], dtype=config.get_torch_dtype())
+                    targets['continuation_gain'] = torch.tensor(cont_row['projected_gain'], dtype=config.get_torch_dtype())
+                    targets['continuation_confidence'] = torch.tensor(cont_row['confidence'], dtype=config.get_torch_dtype())
 
                     # Add optional fields if they exist in the dataframe
                     if self.has_adaptive_horizon:
-                        targets['adaptive_horizon'] = torch.tensor(cont_row['adaptive_horizon'].iloc[0], dtype=config.get_torch_dtype())
+                        targets['adaptive_horizon'] = torch.tensor(cont_row['adaptive_horizon'], dtype=config.get_torch_dtype())
                     if self.has_conf_score:
-                        targets['conf_score'] = torch.tensor(cont_row['conf_score'].iloc[0], dtype=config.get_torch_dtype())
+                        targets['conf_score'] = torch.tensor(cont_row['conf_score'], dtype=config.get_torch_dtype())
                     if self.has_channel_1h_cycles:
-                        targets['channel_1h_cycles'] = torch.tensor(cont_row['channel_1h_cycles'].iloc[0], dtype=config.get_torch_dtype())
+                        targets['channel_1h_cycles'] = torch.tensor(cont_row['channel_1h_cycles'], dtype=config.get_torch_dtype())
                     if self.has_channel_4h_cycles:
-                        targets['channel_4h_cycles'] = torch.tensor(cont_row['channel_4h_cycles'].iloc[0], dtype=config.get_torch_dtype())
+                        targets['channel_4h_cycles'] = torch.tensor(cont_row['channel_4h_cycles'], dtype=config.get_torch_dtype())
                     if self.has_channel_1h_valid:
-                        targets['channel_1h_valid'] = torch.tensor(cont_row['channel_1h_valid'].iloc[0], dtype=config.get_torch_dtype())
+                        targets['channel_1h_valid'] = torch.tensor(cont_row['channel_1h_valid'], dtype=config.get_torch_dtype())
                     if self.has_channel_4h_valid:
-                        targets['channel_4h_valid'] = torch.tensor(cont_row['channel_4h_valid'].iloc[0], dtype=config.get_torch_dtype())
+                        targets['channel_4h_valid'] = torch.tensor(cont_row['channel_4h_valid'], dtype=config.get_torch_dtype())
                     if self.has_channel_1h_r_squared:
-                        targets['channel_1h_r_squared'] = torch.tensor(cont_row['channel_1h_r_squared'].iloc[0], dtype=config.get_torch_dtype())
+                        targets['channel_1h_r_squared'] = torch.tensor(cont_row['channel_1h_r_squared'], dtype=config.get_torch_dtype())
                     if self.has_channel_4h_r_squared:
-                        targets['channel_4h_r_squared'] = torch.tensor(cont_row['channel_4h_r_squared'].iloc[0], dtype=config.get_torch_dtype())
+                        targets['channel_4h_r_squared'] = torch.tensor(cont_row['channel_4h_r_squared'], dtype=config.get_torch_dtype())
                 else:
                     # No exact match - use fallback values
                     self._missing_label_count += 1
 
                     # Log first few mismatches (without expensive closest-timestamp search)
                     if self._logged_mismatches < 5:
+                        ts = pd.Timestamp(self.timestamps[seq_end - 1])
                         print(f"     ⚠️  Sample {idx}: Continuation label missing for {ts}")
                         self._logged_mismatches += 1
 
