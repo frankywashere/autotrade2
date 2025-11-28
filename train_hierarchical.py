@@ -2642,12 +2642,21 @@ def main():
     # NOTE: We use torch.multiprocessing (imported as mp at top) which supports mp.spawn()
     # Standard multiprocessing doesn't have spawn(), so we import it with different name
     import multiprocessing as std_mp
+    # Set multiprocessing start method for CUDA compatibility
+    # spawn = CUDA-safe (fresh processes), fork = fast but CUDA-unsafe
     try:
-        std_mp.set_start_method('forkserver', force=True)
-        platform_note = "macOS" if sys.platform == "darwin" else "Linux"
-        print(f"✓ Using forkserver multiprocessing (safer for torch on {platform_note})")
-    except ValueError:
-        pass  # Already set, or not available on this platform
+        if torch.cuda.is_available():
+            # CUDA requires spawn to avoid fork() deadlocks with CUDA contexts
+            std_mp.set_start_method('spawn', force=True)
+            print(f"✓ Using spawn multiprocessing (CUDA-safe for DataLoader workers)")
+        else:
+            # CPU/MPS can use forkserver (faster startup than spawn)
+            std_mp.set_start_method('forkserver', force=True)
+            platform_note = "macOS" if sys.platform == "darwin" else "Linux"
+            print(f"✓ Using forkserver multiprocessing (optimized for {platform_note})")
+    except RuntimeError:
+        # Already set (e.g., from previous run in interactive Python)
+        pass
 
     parser = argparse.ArgumentParser(description='Train Hierarchical LNN')
 
