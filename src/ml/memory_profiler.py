@@ -120,12 +120,28 @@ class MemoryProfiler:
             self._psutil_available = False
 
     def _get_ram_memory(self) -> tuple:
-        """Get RAM usage (used_mb, total_mb)."""
+        """Get RAM usage (used_mb, total_mb). Container-aware."""
         if self._psutil_available:
             import psutil
-            mem = psutil.virtual_memory()
-            used_mb = (mem.total - mem.available) / (1024 ** 2)
-            total_mb = mem.total / (1024 ** 2)
+            import os
+
+            # Get PROCESS memory (not system-wide in container)
+            process = psutil.Process()
+            used_mb = process.memory_info().rss / (1024 ** 2)
+
+            # Get total RAM (container-aware)
+            container_ram_gb = os.environ.get('CONTAINER_RAM_GB')
+            if container_ram_gb:
+                # Container: use override value
+                try:
+                    total_mb = float(container_ram_gb) * 1024
+                except ValueError:
+                    # Fallback to psutil if parsing fails
+                    total_mb = psutil.virtual_memory().total / (1024 ** 2)
+            else:
+                # Native system: use psutil
+                total_mb = psutil.virtual_memory().total / (1024 ** 2)
+
             return used_mb, total_mb
         return 0, 0
 
