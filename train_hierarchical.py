@@ -2413,21 +2413,38 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 profiler.snapshot("first_batch_received", epoch + 1, force_log=True)
 
             features = features.to(args.device, non_blocking=True)
-            targets = targets.to(args.device, non_blocking=True)
+            # Move each tensor in targets dict to device
+            targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
 
             optimizer.zero_grad()
 
             # Forward pass with optional AMP
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    outputs = model(features)
-                    loss = F.mse_loss(outputs, targets)
+                    predictions, hidden_states = model(features)
+                    # Primary loss: high/low predictions
+                    target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                    loss = F.mse_loss(predictions[:, :2], target_tensor)
+                    # Multi-task losses (if enabled)
+                    if args.multi_task and 'multi_task' in hidden_states:
+                        mt = hidden_states['multi_task']
+                        loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band'])
+                        loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target'])
+                        loss = loss + 0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return'])
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                outputs = model(features)
-                loss = F.mse_loss(outputs, targets)
+                predictions, hidden_states = model(features)
+                # Primary loss: high/low predictions
+                target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                loss = F.mse_loss(predictions[:, :2], target_tensor)
+                # Multi-task losses (if enabled)
+                if args.multi_task and 'multi_task' in hidden_states:
+                    mt = hidden_states['multi_task']
+                    loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band'])
+                    loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target'])
+                    loss = loss + 0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return'])
                 loss.backward()
                 optimizer.step()
 
@@ -2452,18 +2469,21 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         with torch.no_grad():
             for features, targets in val_loader:
                 features = features.to(args.device, non_blocking=True)
-                targets = targets.to(args.device, non_blocking=True)
+                # Move each tensor in targets dict to device
+                targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
 
                 if scaler is not None:
                     with torch.amp.autocast('cuda'):
-                        outputs = model(features)
-                        loss = F.mse_loss(outputs, targets)
+                        predictions, hidden_states = model(features)
+                        target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                        loss = F.mse_loss(predictions[:, :2], target_tensor)
                 else:
-                    outputs = model(features)
-                    loss = F.mse_loss(outputs, targets)
+                    predictions, hidden_states = model(features)
+                    target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                    loss = F.mse_loss(predictions[:, :2], target_tensor)
 
                 val_loss += loss.item()
-                val_error += torch.abs(outputs - targets).mean().item()
+                val_error += torch.abs(predictions[:, :2] - target_tensor).mean().item()
                 num_val_batches += 1
 
         avg_val_loss = val_loss / max(num_val_batches, 1)
