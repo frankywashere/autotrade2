@@ -1095,18 +1095,12 @@ def create_hierarchical_dataset(
         split_idx = int(len(features_df) * (1 - validation_split))
         print(f"Split data: {split_idx:,} train rows, {len(features_df) - split_idx:,} val rows")
 
-        # Split continuation labels if provided
-        train_continuation_df = None
-        val_continuation_df = None
-        if continuation_labels_df is not None:
-            # Split continuation labels by timestamp
-            split_timestamp = features_df.index[split_idx - 1]
-            train_continuation_df = continuation_labels_df[
-                continuation_labels_df['timestamp'] <= split_timestamp
-            ].copy()
-            val_continuation_df = continuation_labels_df[
-                continuation_labels_df['timestamp'] > split_timestamp
-            ].copy()
+        # Give FULL continuation labels to both datasets
+        # (lookup is by timestamp, so each dataset only uses what it needs)
+        # Previously we split by timestamp, but valid_indices are split by position,
+        # causing misalignment when data isn't perfectly time-sorted
+        train_continuation_df = continuation_labels_df
+        val_continuation_df = continuation_labels_df
 
         if mmap_meta_path:
             # When using mmaps, create ONE base dataset with FULL data,
