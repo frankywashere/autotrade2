@@ -89,22 +89,8 @@ class HierarchicalDataset(Dataset):
             self.has_channel_1h_r_squared = 'channel_1h_r_squared' in self.continuation_labels_df.columns
             self.has_channel_4h_r_squared = 'channel_4h_r_squared' in self.continuation_labels_df.columns
 
-            # Build dict for O(1) lookups (int64 nanoseconds → row index)
-            # This avoids pandas type coercion issues between numpy.datetime64 and pd.Timestamp
-            if 'timestamp' in self.continuation_labels_df.columns:
-                self._continuation_ts_to_idx = {}
-                for i, ts in enumerate(self.continuation_labels_df['timestamp'].values):
-                    # Convert to int64 nanoseconds (works for both numpy.datetime64 and pd.Timestamp)
-                    ts_ns = pd.Timestamp(ts).value
-                    self._continuation_ts_to_idx[ts_ns] = i
-                # Debug: print dict stats
-                if len(self._continuation_ts_to_idx) > 0:
-                    sample_keys = list(self._continuation_ts_to_idx.keys())[:3]
-                    sample_ts = [pd.Timestamp(k) for k in sample_keys]
-                    print(f"     ℹ️  Continuation lookup dict: {len(self._continuation_ts_to_idx):,} entries")
-                    print(f"        Sample timestamps: {sample_ts[0]}, {sample_ts[1]}, {sample_ts[2]}")
-            else:
-                self._continuation_ts_to_idx = {}
+            # Build lookup dict for O(1) timestamp lookups
+            self._build_continuation_lookup()
         else:
             self.has_adaptive_horizon = False
             self.has_conf_score = False
@@ -384,6 +370,34 @@ class HierarchicalDataset(Dataset):
     def __len__(self) -> int:
         """Return number of valid sequences."""
         return len(self.valid_indices)
+
+    def _build_continuation_lookup(self):
+        """Build dict for O(1) timestamp lookups into continuation labels.
+
+        This method can be called after __init__ if continuation_labels_df is
+        assigned post-creation (e.g., in the mmap path of create_hierarchical_dataset).
+        """
+        if self.continuation_labels_df is None:
+            self._continuation_ts_to_idx = {}
+            return
+
+        if 'timestamp' not in self.continuation_labels_df.columns:
+            self._continuation_ts_to_idx = {}
+            return
+
+        # Build dict mapping int64 nanoseconds → row index
+        # This avoids pandas type coercion issues between numpy.datetime64 and pd.Timestamp
+        self._continuation_ts_to_idx = {}
+        for i, ts in enumerate(self.continuation_labels_df['timestamp'].values):
+            ts_ns = pd.Timestamp(ts).value
+            self._continuation_ts_to_idx[ts_ns] = i
+
+        # Debug output
+        if len(self._continuation_ts_to_idx) > 0:
+            sample_keys = list(self._continuation_ts_to_idx.keys())[:3]
+            sample_ts = [pd.Timestamp(k) for k in sample_keys]
+            print(f"     ℹ️  Continuation lookup dict: {len(self._continuation_ts_to_idx):,} entries")
+            print(f"        Sample timestamps: {sample_ts[0]}, {sample_ts[1]}, {sample_ts[2]}")
 
     def get_label_mismatch_summary(self) -> dict:
         """
@@ -1121,12 +1135,14 @@ def create_hierarchical_dataset(
             train_dataset.valid_indices = train_valid
             train_dataset.continuation_labels_df = train_continuation_df
             train_dataset.include_continuation = include_continuation
+            train_dataset._build_continuation_lookup()  # Rebuild dict after assignment
 
             # Val dataset (shallow copy, shares mmap/arrays but different indices)
             val_dataset = copy.copy(base_dataset)
             val_dataset.valid_indices = val_valid
             val_dataset.continuation_labels_df = val_continuation_df
             val_dataset.include_continuation = include_continuation
+            val_dataset._build_continuation_lookup()  # Rebuild dict after assignment
 
         else:
             # No mmaps - traditional split
