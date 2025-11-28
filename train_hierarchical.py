@@ -2179,9 +2179,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     shuffle_buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
 
     # Create datasets
+    # Note: raw_ohlc_df must match features_df length (both from full df)
+    # validation_split handles train/val separation
     train_dataset, val_dataset = create_hierarchical_dataset(
         features_df=features_df,
-        raw_ohlc_df=df_sliced,
+        raw_ohlc_df=df,  # Must match features_df length (both from full df)
         continuation_labels_df=continuation_df,
         sequence_length=args.sequence_length,
         prediction_horizon=args.prediction_horizon,
