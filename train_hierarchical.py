@@ -2065,7 +2065,6 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
     # Set torch.compile verbose logging if requested (must be before model creation)
     if args.device.startswith('cuda') and getattr(args, 'use_compile', False) and getattr(args, 'compile_verbose', False):
-        import os
         os.environ['TORCH_LOGS'] = 'dynamo,inductor,aot_autograd,output_code,graph_breaks,fusion'
 
         # Enable additional verbose output from dynamo and inductor
@@ -2261,7 +2260,6 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 - recommended_workers: Safe num_workers value
         """
         import psutil
-        import os
 
         # Get system RAM (container-aware)
         try:
