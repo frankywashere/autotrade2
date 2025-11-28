@@ -2407,6 +2407,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}", leave=False, disable=not is_main_process(rank))
 
+        # Track if this is the very first batch (for torch.compile feedback)
+        _is_first_batch_ever = (epoch == 0)
+        _first_forward_start = None
+
         for batch_idx, (features, targets) in enumerate(batch_pbar):
             if profiler and batch_idx == 0:
                 profiler.log_info(f"FIRST_BATCH_COMPLETE | time_sec={0}")
@@ -2417,6 +2421,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
 
             optimizer.zero_grad()
+
+            # Feedback for first batch (torch.compile takes time)
+            if _is_first_batch_ever and batch_idx == 0:
+                print(f"   ⏳ First forward pass (torch.compile JIT compilation, may take 5-15 min)...", flush=True)
+                _first_forward_start = time.perf_counter()
 
             # Forward pass with optional AMP
             if scaler is not None:
@@ -2447,6 +2456,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     loss = loss + 0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return'])
                 loss.backward()
                 optimizer.step()
+
+            # Report first batch completion time
+            if _is_first_batch_ever and batch_idx == 0 and _first_forward_start is not None:
+                _first_forward_elapsed = time.perf_counter() - _first_forward_start
+                print(f"   ✓ First batch complete ({_first_forward_elapsed:.1f}s) - subsequent batches will be fast", flush=True)
+                _is_first_batch_ever = False  # Don't print again
 
             train_loss += loss.item()
             num_batches += 1
