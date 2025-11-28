@@ -2300,10 +2300,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler.snapshot("pre_model_create", 0, force_log=True)
 
     model = HierarchicalLNN(
-        num_features=total_features,
-        sequence_length=args.sequence_length,
-        num_outputs=5 if args.multi_task else 3,
-        config=config
+        input_size=total_features,
+        hidden_size=args.hidden_size,
+        internal_neurons_ratio=args.internal_neurons_ratio,
+        device=args.device,
+        downsample_fast_to_medium=args.downsample_fast_to_medium,
+        downsample_medium_to_slow=args.downsample_medium_to_slow,
+        multi_task=args.multi_task,
     )
 
     if profiler:
