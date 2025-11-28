@@ -2424,9 +2424,21 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             optimizer.zero_grad()
 
             # Feedback for first batch (torch.compile takes time)
+            # Use a background thread to print progress while compiling
             if _is_first_batch_ever and batch_idx == 0:
                 print(f"   ⏳ First forward pass (torch.compile JIT compilation, may take 5-15 min)...", flush=True)
                 _first_forward_start = time.perf_counter()
+
+                # Start background thread to print progress dots
+                import threading
+                _compile_done = threading.Event()
+                def _print_compile_progress():
+                    elapsed = 0
+                    while not _compile_done.wait(timeout=30):
+                        elapsed += 30
+                        print(f"      Still compiling... ({elapsed}s)", flush=True)
+                _progress_thread = threading.Thread(target=_print_compile_progress, daemon=True)
+                _progress_thread.start()
 
             # Forward pass with optional AMP
             if scaler is not None:
@@ -2458,8 +2470,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 loss.backward()
                 optimizer.step()
 
-            # Report first batch completion time
+            # Report first batch completion time and stop progress thread
             if _is_first_batch_ever and batch_idx == 0 and _first_forward_start is not None:
+                _compile_done.set()  # Stop the progress thread
                 _first_forward_elapsed = time.perf_counter() - _first_forward_start
                 print(f"   ✓ First batch complete ({_first_forward_elapsed:.1f}s) - subsequent batches will be fast", flush=True)
                 _is_first_batch_ever = False  # Don't print again
