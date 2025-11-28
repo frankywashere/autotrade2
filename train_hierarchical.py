@@ -2051,9 +2051,22 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Set torch.compile verbose logging if requested (must be before model creation)
     if args.device.startswith('cuda') and getattr(args, 'use_compile', False) and getattr(args, 'compile_verbose', False):
         import os
-        os.environ['TORCH_LOGS'] = 'dynamo,inductor'
+        os.environ['TORCH_LOGS'] = 'dynamo,inductor,aot_autograd,output_code,graph_breaks,fusion'
+
+        # Enable additional verbose output from dynamo and inductor
+        try:
+            import torch._dynamo
+            import torch._inductor
+            torch._dynamo.config.verbose = True
+            torch._dynamo.config.suppress_errors = False  # Show why graphs break
+            torch._inductor.config.verbose = True
+            torch._inductor.config.debug = True
+        except (ImportError, AttributeError):
+            pass  # Older PyTorch versions might not have these
+
         if is_main_process(rank):
-            print(f"✓ torch.compile verbose logging enabled (TORCH_LOGS=dynamo,inductor)")
+            print(f"✓ torch.compile verbose logging enabled (comprehensive mode)")
+            print(f"   TORCH_LOGS=dynamo,inductor,aot_autograd,output_code,graph_breaks,fusion")
 
     # Load configuration
     config = None
@@ -2464,14 +2477,30 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 print(f"   ⏳ First forward pass (torch.compile JIT compilation, may take 5-15 min)...", flush=True)
                 _first_forward_start = time.perf_counter()
 
-                # Start background thread to print progress dots
+                # Start background thread to print progress dots with memory stats
                 import threading
                 _compile_done = threading.Event()
                 def _print_compile_progress():
                     elapsed = 0
-                    while not _compile_done.wait(timeout=30):
-                        elapsed += 30
-                        print(f"      Still compiling... ({elapsed}s)", flush=True)
+                    update_interval = 10  # More frequent updates (10s instead of 30s)
+
+                    while not _compile_done.wait(timeout=update_interval):
+                        elapsed += update_interval
+
+                        # Show memory usage to indicate activity
+                        try:
+                            import psutil
+                            process = psutil.Process(os.getpid())
+                            cpu_mem_gb = process.memory_info().rss / (1024**3)
+
+                            if args.device.startswith('cuda'):
+                                gpu_mem_gb = torch.cuda.memory_allocated() / (1024**3)
+                                print(f"      ⏳ Compiling... {elapsed}s [CPU: {cpu_mem_gb:.1f}GB, GPU: {gpu_mem_gb:.1f}GB]", flush=True)
+                            else:
+                                print(f"      ⏳ Compiling... {elapsed}s [Memory: {cpu_mem_gb:.1f}GB]", flush=True)
+                        except:
+                            # Fallback if psutil not available
+                            print(f"      ⏳ Compiling... {elapsed}s", flush=True)
                 _progress_thread = threading.Thread(target=_print_compile_progress, daemon=True)
                 _progress_thread.start()
 
