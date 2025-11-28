@@ -97,6 +97,12 @@ class HierarchicalDataset(Dataset):
                     # Convert to int64 nanoseconds (works for both numpy.datetime64 and pd.Timestamp)
                     ts_ns = pd.Timestamp(ts).value
                     self._continuation_ts_to_idx[ts_ns] = i
+                # Debug: print dict stats
+                if len(self._continuation_ts_to_idx) > 0:
+                    sample_keys = list(self._continuation_ts_to_idx.keys())[:3]
+                    sample_ts = [pd.Timestamp(k) for k in sample_keys]
+                    print(f"     ℹ️  Continuation lookup dict: {len(self._continuation_ts_to_idx):,} entries")
+                    print(f"        Sample timestamps: {sample_ts[0]}, {sample_ts[1]}, {sample_ts[2]}")
             else:
                 self._continuation_ts_to_idx = {}
         else:
@@ -751,10 +757,21 @@ class HierarchicalDataset(Dataset):
                     # No exact match - use fallback values
                     self._missing_label_count += 1
 
-                    # Log first few mismatches (without expensive closest-timestamp search)
+                    # Log first few mismatches with diagnostic info
                     if self._logged_mismatches < 5:
                         ts = pd.Timestamp(self.timestamps[seq_end - 1])
                         print(f"     ⚠️  Sample {idx}: Continuation label missing for {ts}")
+                        print(f"        Lookup key (ns): {ts_ns}")
+                        print(f"        Dict size: {len(self._continuation_ts_to_idx)}")
+                        # Find nearest key for diagnosis
+                        if len(self._continuation_ts_to_idx) > 0:
+                            import bisect
+                            sorted_keys = sorted(self._continuation_ts_to_idx.keys())
+                            pos = bisect.bisect_left(sorted_keys, ts_ns)
+                            if pos < len(sorted_keys):
+                                nearest = sorted_keys[pos]
+                                delta_sec = (nearest - ts_ns) / 1e9
+                                print(f"        Nearest key: {pd.Timestamp(nearest)} (delta: {delta_sec:.1f}s)")
                         self._logged_mismatches += 1
 
                     # Use fallback values
