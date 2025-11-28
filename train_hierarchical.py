@@ -2069,8 +2069,6 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         # Enable additional verbose output from dynamo and inductor
         try:
-            import torch._dynamo
-            import torch._inductor
             torch._dynamo.config.verbose = True
             torch._dynamo.config.suppress_errors = False  # Show why graphs break
             torch._inductor.config.verbose = True
