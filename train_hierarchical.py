@@ -2490,8 +2490,18 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             # Safe - just log for confirmation
             print(f"\n   ✓ Memory check: {mem_check['estimated_peak_gb']:.1f}GB peak / {mem_check['total_ram_gb']:.1f}GB available (safe)")
 
+    # Log memory before DataLoader creation (to catch OOM during worker spawn)
+    if profiler:
+        profiler.snapshot("pre_dataloader_creation", 0, force_log=True)
+        profiler.log_info(f"CREATING_DATALOADERS | num_workers={args.num_workers}")
+
     train_loader = DataLoader(train_dataset, **train_loader_kwargs)
     val_loader = DataLoader(val_dataset, **val_loader_kwargs)
+
+    # Log memory after DataLoader creation (measure worker spawn impact)
+    if profiler:
+        profiler.snapshot("post_dataloader_creation", 0, force_log=True)
+        profiler.log_info(f"DATALOADERS_CREATED | train_batches={len(train_loader)} | val_batches={len(val_loader)}")
 
     if is_main_process(rank):
         print(f"   Train batches: {len(train_loader):,}")
