@@ -88,6 +88,10 @@ class HierarchicalDataset(Dataset):
             self.has_channel_4h_valid = 'channel_4h_valid' in self.continuation_labels_df.columns
             self.has_channel_1h_r_squared = 'channel_1h_r_squared' in self.continuation_labels_df.columns
             self.has_channel_4h_r_squared = 'channel_4h_r_squared' in self.continuation_labels_df.columns
+
+            # Index by timestamp for O(1) lookups instead of O(n) boolean mask
+            if 'timestamp' in self.continuation_labels_df.columns:
+                self.continuation_labels_df = self.continuation_labels_df.set_index('timestamp', drop=False)
         else:
             self.has_adaptive_horizon = False
             self.has_conf_score = False
@@ -620,9 +624,12 @@ class HierarchicalDataset(Dataset):
         # v3.18: Adaptive Full mode - slice ALL targets to adaptive horizon
         if config.CONTINUATION_MODE == 'adaptive_full' and self.include_continuation and self.continuation_labels_df is not None:
             try:
-                # Get continuation label for this timestamp
+                # Get continuation label for this timestamp (O(1) lookup via index)
                 ts = pd.Timestamp(self.timestamps[seq_end - 1])
-                cont_row = self.continuation_labels_df[self.continuation_labels_df['timestamp'] == ts]
+                try:
+                    cont_row = self.continuation_labels_df.loc[[ts]]
+                except KeyError:
+                    cont_row = pd.DataFrame()
 
                 if not cont_row.empty and 'adaptive_horizon' in cont_row.columns:
                     adaptive_horizon = int(cont_row['adaptive_horizon'].iloc[0])
@@ -707,9 +714,12 @@ class HierarchicalDataset(Dataset):
         # Add continuation prediction targets if enabled
         if self.include_continuation and self.continuation_labels_df is not None:
             try:
-                # Find continuation label for this timestamp
+                # Find continuation label for this timestamp (O(1) lookup via index)
                 ts = pd.Timestamp(self.timestamps[seq_end - 1])
-                cont_row = self.continuation_labels_df[self.continuation_labels_df['timestamp'] == ts]
+                try:
+                    cont_row = self.continuation_labels_df.loc[[ts]]
+                except KeyError:
+                    cont_row = pd.DataFrame()
 
                 if not cont_row.empty:
                     # Found exact match - use actual values
@@ -735,33 +745,13 @@ class HierarchicalDataset(Dataset):
                     if self.has_channel_4h_r_squared:
                         targets['channel_4h_r_squared'] = torch.tensor(cont_row['channel_4h_r_squared'].iloc[0], dtype=config.get_torch_dtype())
                 else:
-                    # No exact match - use fallback values and log diagnostic info
+                    # No exact match - use fallback values
                     self._missing_label_count += 1
 
-                    # Try to find closest timestamp (within ±1 second) for diagnostics
-                    ts_naive = ts.to_pydatetime()
-                    if hasattr(self.continuation_labels_df.index, 'to_pydatetime'):
-                        label_times = self.continuation_labels_df['timestamp'].dt.to_pydatetime() if 'timestamp' in self.continuation_labels_df.columns else self.continuation_labels_df.index.to_pydatetime()
-                    else:
-                        label_times = self.continuation_labels_df['timestamp'].values if 'timestamp' in self.continuation_labels_df.columns else self.continuation_labels_df.index.values
-
-                    # Calculate deltas to find closest
-                    if len(label_times) > 0:
-                        try:
-                            deltas = [abs((t - ts_naive).total_seconds() * 1000) for t in label_times if hasattr(t, 'total_seconds')]
-                            if deltas:
-                                min_delta = min(deltas)
-                                self._timestamp_deltas.append(min_delta)
-
-                                # Log first few mismatches
-                                if self._logged_mismatches < 5:
-                                    closest_idx = deltas.index(min_delta)
-                                    closest_ts = label_times[closest_idx]
-                                    print(f"     ⚠️  Sample {idx}: Continuation label missing for {ts}")
-                                    print(f"        Closest available: {closest_ts}, Delta: {min_delta:.2f}ms")
-                                    self._logged_mismatches += 1
-                        except:
-                            pass  # Can't calculate deltas, just continue
+                    # Log first few mismatches (without expensive closest-timestamp search)
+                    if self._logged_mismatches < 5:
+                        print(f"     ⚠️  Sample {idx}: Continuation label missing for {ts}")
+                        self._logged_mismatches += 1
 
                     # Use fallback values
                     targets['continuation_duration'] = self._const_zero
@@ -1122,24 +1112,28 @@ def create_hierarchical_dataset(
             train_df = features_df.iloc[:split_idx]
             val_df = features_df.iloc[split_idx:]
 
+            # Also slice raw_ohlc_df to match features (critical for correct target calculation)
+            train_raw_ohlc = raw_ohlc_df.iloc[:split_idx] if raw_ohlc_df is not None else None
+            val_raw_ohlc = raw_ohlc_df.iloc[split_idx:] if raw_ohlc_df is not None else None
+
             if preload:
                 train_dataset = PreloadHierarchicalDataset(
-                    train_df, raw_ohlc_df, train_continuation_df,
+                    train_df, train_raw_ohlc, train_continuation_df,
                     sequence_length, prediction_horizon, mode
                 )
                 val_dataset = PreloadHierarchicalDataset(
-                    val_df, raw_ohlc_df, val_continuation_df,
+                    val_df, val_raw_ohlc, val_continuation_df,
                     sequence_length, prediction_horizon, mode
                 )
             else:
                 train_dataset = HierarchicalDataset(
-                    train_df, raw_ohlc_df, train_continuation_df,
+                    train_df, train_raw_ohlc, train_continuation_df,
                     sequence_length, prediction_horizon, mode,
                     include_continuation=include_continuation,
                     profiler=profiler
                 )
                 val_dataset = HierarchicalDataset(
-                    val_df, raw_ohlc_df, val_continuation_df,
+                    val_df, val_raw_ohlc, val_continuation_df,
                     sequence_length, prediction_horizon, mode,
                     include_continuation=include_continuation,
                     profiler=profiler
