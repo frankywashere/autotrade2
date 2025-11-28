@@ -2334,6 +2334,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Create datasets
     # Note: raw_ohlc_df must match features_df length (both from full df)
     # validation_split handles train/val separation
+    # Don't pass profiler to dataset if using workers (can't be pickled for spawn)
+    dataset_profiler = profiler if args.num_workers == 0 else None
+
     train_dataset, val_dataset = create_hierarchical_dataset(
         features_df=features_df,
         raw_ohlc_df=df,  # Must match features_df length (both from full df)
@@ -2343,7 +2346,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         validation_split=args.val_split,
         include_continuation=True,
         mmap_meta_path=mmap_meta_path,
-        profiler=profiler,
+        profiler=dataset_profiler,
         premerge_budget_gb=premerge_budget_gb,
         use_adaptive_mode=use_adaptive
     )
