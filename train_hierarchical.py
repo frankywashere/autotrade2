@@ -2239,92 +2239,52 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     premerge_budget_gb = getattr(args, 'premerge_budget_gb', 0)
     shuffle_buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
 
-    def estimate_dataloader_memory_usage(dataset, num_workers, device, container_ram_gb=0):
+    def check_dataloader_memory_safety(num_workers, container_ram_gb=0):
         """
-        Estimate peak RAM usage for DataLoader with spawn-based num_workers.
+        Check if DataLoader with num_workers will fit in available RAM.
+        Uses ACTUAL current RAM (not estimates) since dataset is already created.
 
         Args:
-            dataset: HierarchicalDataset instance
             num_workers: Number of worker processes
-            device: Device type (cuda/mps/cpu)
-            container_ram_gb: Container RAM override (0 = use psutil)
+            container_ram_gb: Container RAM limit (0 = use psutil)
 
         Returns:
-            dict with:
-                - estimated_dataset_gb: Dataset size estimate
-                - estimated_peak_gb: Peak RAM with workers
-                - available_gb: Available system RAM
-                - is_safe: Whether it fits in RAM
-                - recommended_workers: Safe num_workers value
+            dict with safety info and recommendations
         """
         import psutil
 
-        # Get system RAM (container-aware)
-        try:
-            if container_ram_gb > 0:
-                total_ram_gb = container_ram_gb
-                available_gb = container_ram_gb * 0.85  # Leave 15% headroom
-            else:
-                total_ram_gb = psutil.virtual_memory().total / (1024**3)
-                available_gb = psutil.virtual_memory().available / (1024**3)
+        # Get ACTUAL current process RAM (includes all premerged data!)
+        process = psutil.Process()
+        current_ram_gb = process.memory_info().rss / (1024**3)
 
-                # Container detection fallback
-                if total_ram_gb > 200:
-                    total_ram_gb = container_ram_gb if container_ram_gb > 0 else 46
-                    available_gb = total_ram_gb * 0.85
-        except ImportError:
-            total_ram_gb = 256
-            available_gb = 200
-
-        # Estimate dataset memory size
-        # Try to get from dataset attributes
-        try:
-            num_samples = len(dataset)
-
-            # Get feature dimensions
-            if hasattr(dataset, 'features_array') and dataset.features_array is not None:
-                # Preloaded dataset
-                feature_dim = dataset.features_array.shape[1]
-                seq_len = dataset.sequence_length
-                bytes_per_sample = feature_dim * seq_len * 4  # float32
-                estimated_dataset_gb = (num_samples * bytes_per_sample) / (1024**3)
-            elif hasattr(dataset, 'non_channel_array') and dataset.non_channel_array is not None:
-                # Memory-mapped dataset - use non_channel size as proxy
-                # Actual size is larger (includes channel mmaps) but conservative estimate
-                estimated_dataset_gb = dataset.non_channel_array.nbytes / (1024**3)
-                # Multiply by ~3 to account for channel features (rough estimate)
-                estimated_dataset_gb *= 3
-            else:
-                # Fallback: assume 10KB per sample (conservative)
-                estimated_dataset_gb = (num_samples * 10 * 1024) / (1024**3)
-        except Exception:
-            # Ultra-conservative fallback
-            estimated_dataset_gb = 20
-
-        # Calculate peak RAM with num_workers
-        # With spawn: main process + (num_workers × dataset copy)
-        if num_workers > 0:
-            # Each worker gets full dataset copy with spawn
-            worker_overhead = estimated_dataset_gb * num_workers
-            estimated_peak_gb = estimated_dataset_gb + worker_overhead + 5  # +5GB for model/buffers
+        # Get container limit
+        if container_ram_gb > 0:
+            total_ram_gb = container_ram_gb
         else:
-            # No workers = no copies
-            estimated_peak_gb = estimated_dataset_gb + 5
+            total_ram_gb = psutil.virtual_memory().total / (1024**3)
+            if total_ram_gb > 200:  # Container detection
+                total_ram_gb = 220  # Conservative default
 
-        # Determine if safe (use 80% threshold for safety)
+        # Calculate peak with workers (spawn gives each worker full dataset copy)
+        if num_workers > 0:
+            # Main process + (num_workers × dataset copy)
+            estimated_peak_gb = current_ram_gb * (num_workers + 1)
+        else:
+            estimated_peak_gb = current_ram_gb
+
+        # Safety check (80% threshold)
         is_safe = estimated_peak_gb < (total_ram_gb * 0.80)
 
-        # Calculate recommended workers (max that fits in 80% of RAM)
-        if estimated_dataset_gb > 0:
-            max_safe_workers = int((total_ram_gb * 0.80 - estimated_dataset_gb - 5) / estimated_dataset_gb)
-            recommended_workers = max(0, min(max_safe_workers, 2))  # Cap at 2 for safety
+        # Calculate max safe workers
+        if current_ram_gb > 0:
+            max_safe_workers = int((total_ram_gb * 0.80 / current_ram_gb) - 1)
+            recommended_workers = max(0, min(max_safe_workers, 2))
         else:
             recommended_workers = 0
 
         return {
-            'estimated_dataset_gb': estimated_dataset_gb,
+            'current_ram_gb': current_ram_gb,
             'estimated_peak_gb': estimated_peak_gb,
-            'available_gb': available_gb,
             'total_ram_gb': total_ram_gb,
             'is_safe': is_safe,
             'recommended_workers': recommended_workers,
@@ -2444,10 +2404,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # === MEMORY SAFETY CHECK: Warn before DataLoader creation ===
     # Check if num_workers with spawn will cause OOM
     if args.num_workers > 0 and is_main_process(rank):
-        mem_check = estimate_dataloader_memory_usage(
-            train_dataset,
+        mem_check = check_dataloader_memory_safety(
             args.num_workers,
-            args.device,
             container_ram_gb=getattr(args, 'container_ram_gb', 0)
         )
 
@@ -2455,14 +2413,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print(f"\n{'='*70}")
             print(f"⚠️  MEMORY WARNING: Potential OOM Risk")
             print(f"{'='*70}")
-            print(f"   Dataset size: ~{mem_check['estimated_dataset_gb']:.1f} GB")
+            print(f"   Current process RAM: {mem_check['current_ram_gb']:.1f} GB")
             print(f"   num_workers: {mem_check['num_workers']}")
             print(f"   Multiprocessing: spawn (CUDA-safe, but each worker gets dataset copy)")
             print(f"   ")
             print(f"   Expected peak RAM usage:")
-            print(f"   • Main process: {mem_check['estimated_dataset_gb']:.1f} GB (dataset)")
-            print(f"   • {mem_check['num_workers']} workers: {mem_check['estimated_dataset_gb'] * mem_check['num_workers']:.1f} GB ({mem_check['num_workers']} × {mem_check['estimated_dataset_gb']:.1f} GB)")
-            print(f"   • Model + buffers: ~5 GB")
+            print(f"   • Main process: {mem_check['current_ram_gb']:.1f} GB (current usage)")
+            print(f"   • {mem_check['num_workers']} workers: {mem_check['current_ram_gb'] * mem_check['num_workers']:.1f} GB ({mem_check['num_workers']} × {mem_check['current_ram_gb']:.1f} GB)")
+            print(f"   • Model + training overhead: ~5 GB")
             print(f"   • TOTAL: ~{mem_check['estimated_peak_gb']:.1f} GB")
             print(f"   ")
             print(f"   Available RAM: {mem_check['total_ram_gb']:.1f} GB")
@@ -2470,10 +2428,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print(f"   ❌ This will likely cause OOM kill!")
             print(f"   ")
             print(f"   Recommended: num_workers={mem_check['recommended_workers']}")
-            print(f"   • num_workers=0: {mem_check['estimated_dataset_gb'] + 5:.1f} GB total (no worker copies)")
-            print(f"   • num_workers=1: {mem_check['estimated_dataset_gb'] * 2 + 5:.1f} GB total (1 worker copy)")
+            print(f"   • num_workers=0: {mem_check['current_ram_gb'] + 5:.1f} GB total (no worker copies)")
+            print(f"   • num_workers=1: {mem_check['current_ram_gb'] * 2 + 5:.1f} GB total (1 worker copy)")
             if mem_check['recommended_workers'] >= 2:
-                print(f"   • num_workers=2: {mem_check['estimated_dataset_gb'] * 3 + 5:.1f} GB total (2 worker copies)")
+                print(f"   • num_workers=2: {mem_check['current_ram_gb'] * 3 + 5:.1f} GB total (2 worker copies)")
             print(f"{'='*70}")
 
             # Pause and ask user
