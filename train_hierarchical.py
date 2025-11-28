@@ -1287,6 +1287,19 @@ def interactive_setup(args, profiler=None):
             args.use_compile = False
             print("   ℹ️  torch.compile not available (requires PyTorch 2.0+)")
 
+        # torch.compile verbose debug option (only if compile is enabled)
+        if args.use_compile:
+            args.compile_verbose = inquirer.confirm(
+                message="Enable verbose torch.compile output? (shows dynamo/inductor logs during first forward pass)",
+                default=False
+            ).execute()
+            if args.compile_verbose:
+                print("   🔍 Verbose compile output enabled - will show graph breaks, kernel fusion, etc.")
+            else:
+                print("   → Standard compile output (minimal logging)")
+        else:
+            args.compile_verbose = False
+
         # Container RAM detection for cloud GPU instances (RunPod, Lambda, etc.)
         print()
         try:
@@ -2035,6 +2048,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         if is_main_process(rank):
             print(f"✓ Auto-detected chunking: {'Enabled' if args.use_chunking else 'Disabled'} (RAM: {total_ram_gb:.1f}GB)")
 
+    # Set torch.compile verbose logging if requested (must be before model creation)
+    if args.device.startswith('cuda') and getattr(args, 'use_compile', False) and getattr(args, 'compile_verbose', False):
+        import os
+        os.environ['TORCH_LOGS'] = 'dynamo,inductor'
+        if is_main_process(rank):
+            print(f"✓ torch.compile verbose logging enabled (TORCH_LOGS=dynamo,inductor)")
+
     # Load configuration
     config = None
     loss_weights = None
@@ -2700,6 +2720,8 @@ def main():
                         help='Enable Automatic Mixed Precision (CUDA only, 2-3x faster)')
     parser.add_argument('--use-compile', dest='use_compile', action='store_true', default=False,
                         help='Enable torch.compile JIT compilation (CUDA only, first batch slow but faster afterward)')
+    parser.add_argument('--compile-verbose', dest='compile_verbose', action='store_true', default=False,
+                        help='Enable verbose torch.compile output (sets TORCH_LOGS=dynamo,inductor for debugging graph breaks and kernel fusion)')
 
     # Interactive mode
     parser.add_argument('--interactive', action='store_true',
