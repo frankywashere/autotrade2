@@ -44,9 +44,7 @@ class HierarchicalDataset(Dataset):
         cache_indices: bool = True,
         include_continuation: bool = False,
         mmap_meta_path: str = None,
-        profiler=None,
-        premerge_budget_gb: float = None,
-        use_adaptive_mode: bool = False
+        profiler=None
     ):
         """
         Initialize dataset.
@@ -61,8 +59,6 @@ class HierarchicalDataset(Dataset):
             cache_indices: Cache column lookups for speed
             include_continuation: Whether to include continuation prediction targets
             profiler: Optional MemoryProfiler for logging RAM usage
-            premerge_budget_gb: RAM budget for partial pre-merge (adaptive mode)
-            use_adaptive_mode: Enable adaptive loading (partial premerge + shuffle buffer)
         """
         self._profiler = profiler
         self.features_df = features_df
@@ -91,6 +87,30 @@ class HierarchicalDataset(Dataset):
 
             # Build lookup dict for O(1) timestamp lookups
             self._build_continuation_lookup()
+
+            # Pre-extract numpy arrays for O(1) access (avoid pandas iloc overhead)
+            # This eliminates ~1ms per sample from iloc + torch.tensor() calls
+            self._cont_duration = self.continuation_labels_df['duration_hours'].values.astype(config.NUMPY_DTYPE)
+            self._cont_gain = self.continuation_labels_df['projected_gain'].values.astype(config.NUMPY_DTYPE)
+            self._cont_confidence = self.continuation_labels_df['confidence'].values.astype(config.NUMPY_DTYPE)
+
+            # Optional fields (check existence, extract if present)
+            if self.has_adaptive_horizon:
+                self._cont_adaptive_horizon = self.continuation_labels_df['adaptive_horizon'].values.astype(config.NUMPY_DTYPE)
+            if self.has_conf_score:
+                self._cont_conf_score = self.continuation_labels_df['conf_score'].values.astype(config.NUMPY_DTYPE)
+            if self.has_channel_1h_cycles:
+                self._cont_channel_1h_cycles = self.continuation_labels_df['channel_1h_cycles'].values.astype(config.NUMPY_DTYPE)
+            if self.has_channel_4h_cycles:
+                self._cont_channel_4h_cycles = self.continuation_labels_df['channel_4h_cycles'].values.astype(config.NUMPY_DTYPE)
+            if self.has_channel_1h_valid:
+                self._cont_channel_1h_valid = self.continuation_labels_df['channel_1h_valid'].values.astype(config.NUMPY_DTYPE)
+            if self.has_channel_4h_valid:
+                self._cont_channel_4h_valid = self.continuation_labels_df['channel_4h_valid'].values.astype(config.NUMPY_DTYPE)
+            if self.has_channel_1h_r_squared:
+                self._cont_channel_1h_r_squared = self.continuation_labels_df['channel_1h_r_squared'].values.astype(config.NUMPY_DTYPE)
+            if self.has_channel_4h_r_squared:
+                self._cont_channel_4h_r_squared = self.continuation_labels_df['channel_4h_r_squared'].values.astype(config.NUMPY_DTYPE)
         else:
             self.has_adaptive_horizon = False
             self.has_conf_score = False
@@ -147,6 +167,10 @@ class HierarchicalDataset(Dataset):
                 all_timestamps.append(idx_array)
             self.timestamps = np.concatenate(all_timestamps)
 
+            # Pre-convert timestamps to int64 nanoseconds for fast lookup
+            # Avoids pd.Timestamp() creation per sample (~50µs savings each)
+            self._timestamps_ns = self.timestamps.astype('datetime64[ns]').astype(np.int64)
+
             # v3.19: Load monthly/3month separate shard if present
             self.monthly_3month_mmap = None
             if 'monthly_3month_shard' in meta and meta['monthly_3month_shard'] is not None:
@@ -189,111 +213,20 @@ class HierarchicalDataset(Dataset):
             print(f"     ✓ Loaded {self.non_channel_array.shape[1] if self.non_channel_array is not None else 0} non-channel features")
             print(f"     ✓ Total rows: {meta['total_rows']:,}")
 
-            # Optional pre-merge of monthly/3month columns into channel shards (avoid per-sample hstack)
-            # Supports both full pre-merge (all shards) and partial pre-merge (adaptive mode)
-            self.premerged_shard_indices = set()  # Track which shards are premerged (for adaptive mode)
-            self.use_adaptive_mode = use_adaptive_mode
-
-            if self.monthly_3month_mmap is not None:
-                dtype = self.channel_mmaps[0].dtype
-                total_rows = meta['total_rows']
-                total_cols = self.channel_mmaps[0].shape[1] + self.monthly_3month_mmap.shape[1]
-                estimated_gb = total_rows * total_cols * np.dtype(dtype).itemsize / 1e9
-
-                # Determine pre-merge budget
-                import os
-                if premerge_budget_gb is not None:
-                    # Explicit budget from adaptive mode
-                    premerge_limit_gb = premerge_budget_gb
-                    print(f"     ℹ️  Using explicit pre-merge budget: {premerge_limit_gb}GB")
-                else:
-                    # Legacy behavior: dynamic detection
-                    premerge_limit_gb = float(os.environ.get('PREMERGE_LIMIT_GB', '20'))
-
-                    try:
-                        import psutil
-                        available_gb = psutil.virtual_memory().available / (1024**3)
-                        total_gb = psutil.virtual_memory().total / (1024**3)
-
-                        if total_gb > 200:
-                            print(f"     ⚠️  Detected likely container: psutil sees {total_gb:.0f}GB (host RAM)")
-                            print(f"     ⚠️  Using conservative pre-merge limit: {premerge_limit_gb}GB")
-                            print(f"     ℹ️  Set PREMERGE_LIMIT_GB env var to override")
-                        else:
-                            premerge_limit_gb = min(available_gb * 0.5, 90.0)
-                            print(f"     ℹ️  System RAM: {total_gb:.1f}GB total, {available_gb:.1f}GB available")
-                            print(f"     ℹ️  Pre-merge limit: {premerge_limit_gb:.1f}GB (50% of available, max 90GB)")
-                    except ImportError:
-                        premerge_limit_gb = 6.0
-                        print(f"     ℹ️  psutil not available, using {premerge_limit_gb}GB pre-merge limit")
-
-                # Calculate per-shard sizes for greedy selection
-                shard_sizes_gb = []
-                for shard_idx, shard in enumerate(self.channel_mmaps):
-                    shard_rows = self.channel_cumulative_rows[shard_idx + 1] - self.channel_cumulative_rows[shard_idx]
-                    shard_gb = shard_rows * total_cols * np.dtype(dtype).itemsize / 1e9
-                    shard_sizes_gb.append((shard_idx, shard_gb))
-
-                # Greedy partial pre-merge: select shards that fit within budget
-                cumulative_budget_gb = 0
-                shards_to_premerge = []
-                for shard_idx, shard_gb in shard_sizes_gb:
-                    if cumulative_budget_gb + shard_gb <= premerge_limit_gb:
-                        shards_to_premerge.append(shard_idx)
-                        cumulative_budget_gb += shard_gb
-
-                if len(shards_to_premerge) > 0:
-                    # Partial or full pre-merge
-                    self.premerged_channel_mmaps = {}  # Dict: shard_idx -> merged array
-                    coverage_pct = len(shards_to_premerge) / len(self.channel_mmaps) * 100
-
-                    if len(shards_to_premerge) == len(self.channel_mmaps):
-                        print(f"     ↪︎ Full pre-merge: all {len(shards_to_premerge)} shards (~{cumulative_budget_gb:.1f}GB)")
-                    else:
-                        print(f"     ↪︎ Partial pre-merge: {len(shards_to_premerge)}/{len(self.channel_mmaps)} shards ({coverage_pct:.0f}% coverage, ~{cumulative_budget_gb:.1f}GB)")
-                        print(f"     ℹ️  Remaining {len(self.channel_mmaps) - len(shards_to_premerge)} shards will use mmap (shuffle buffer recommended)")
-
-                    print(f"     INFO | PREMERGE_START | shards={len(shards_to_premerge)}/{len(self.channel_mmaps)} | budget_gb={premerge_limit_gb:.1f} | est_gb={cumulative_budget_gb:.1f}")
-
-                    # Get initial RAM usage for tracking
-                    try:
-                        import psutil
-                        initial_ram_mb = psutil.Process().memory_info().rss / 1e6
-                    except:
-                        initial_ram_mb = 0
-
-                    cumulative_mb = 0
-                    from tqdm import tqdm
-                    for shard_idx in tqdm(shards_to_premerge, desc="     Pre-merge", unit="shard"):
-                        shard = self.channel_mmaps[shard_idx]
-                        shard_start = self.channel_cumulative_rows[shard_idx]
-                        shard_end = self.channel_cumulative_rows[shard_idx + 1]
-                        monthly_slice = self.monthly_3month_mmap[shard_start:shard_end, :]
-                        merged = np.concatenate([shard, monthly_slice], axis=1)
-                        self.premerged_channel_mmaps[shard_idx] = merged
-                        self.premerged_shard_indices.add(shard_idx)
-
-                        # Log per-shard memory
-                        shard_size_mb = merged.nbytes / 1e6
-                        cumulative_mb += shard_size_mb
-                        try:
-                            current_ram_mb = psutil.Process().memory_info().rss / 1e6
-                            ram_delta_mb = current_ram_mb - initial_ram_mb
-                            print(f"     INFO | PREMERGE_SHARD | shard={shard_idx}/{len(self.channel_mmaps)} | size_mb={shard_size_mb:.0f} | cumulative_mb={cumulative_mb:.0f} | process_ram_mb={current_ram_mb:.0f} (+{ram_delta_mb:.0f})")
-                        except:
-                            print(f"     INFO | PREMERGE_SHARD | shard={shard_idx}/{len(self.channel_mmaps)} | size_mb={shard_size_mb:.0f} | cumulative_mb={cumulative_mb:.0f}")
-
-                    print(f"     INFO | PREMERGE_COMPLETE | shards={len(shards_to_premerge)}/{len(self.channel_mmaps)} | total_gb={cumulative_mb/1000:.2f}")
-                    print(f"     ✓ Pre-merge complete ({len(self.premerged_channel_mmaps)} merged shards)")
-                else:
-                    print(f"     ⚠️  Skipping pre-merge (budget {premerge_limit_gb:.1f}GB too small for any shard)")
-                    print(f"     ℹ️  All shards will use mmap access (shuffle buffer recommended)")
+            # No pre-merge: rely on mmap + OS page cache for memory efficiency
+            # Data is merged at batch-level in __getitems__ for optimal performance
+            self.premerged_channel_mmaps = None
+            self.premerged_shard_indices = set()
+            print(f"     ✓ Using mmap-only mode (no pre-merge, OS page cache manages hot data)")
 
         else:
             # Normal path - load everything into RAM
             self.using_mmaps = False
             self.features_array = features_df.values
             self.timestamps = features_df.index.values
+
+            # Pre-convert timestamps to int64 nanoseconds for fast lookup
+            self._timestamps_ns = self.timestamps.astype('datetime64[ns]').astype(np.int64)
 
             # Validate and convert feature array dtype if needed
             if self.features_array.dtype != expected_dtype:
@@ -446,14 +379,8 @@ class HierarchicalDataset(Dataset):
         """
         Get a sequence of rows from memory-mapped shards.
 
-        Supports:
-        - Full pre-merge: all shards in premerged_channel_mmaps dict
-        - Partial pre-merge (adaptive mode): some shards premerged, others mmap
-        - No pre-merge: all shards via mmap + separate monthly
-
-        Returns format depends on shard type (collate handles both):
-        - Premerged shard: (merged_array, None) - already combined
-        - Mmap shard: (main_array, monthly_array) - separate, collate merges
+        Always returns (main_channels, monthly_channels) as separate arrays.
+        Merging happens in __getitem__/__getitems__ for efficiency.
 
         Args:
             start: Start row index (global)
@@ -461,8 +388,8 @@ class HierarchicalDataset(Dataset):
 
         Returns:
             (main_channels, monthly_or_None) where:
-            - Premerged: main has all cols (14322), monthly is None
-            - Mmap: main has channel cols (11718), monthly has monthly cols (2604)
+            - main has channel cols (11718)
+            - monthly has monthly cols (2604) or None
         """
         import bisect
 
@@ -470,90 +397,34 @@ class HierarchicalDataset(Dataset):
         start_shard = bisect.bisect_right(self.channel_cumulative_rows, start) - 1
         end_shard = bisect.bisect_right(self.channel_cumulative_rows, end - 1) - 1
 
-        # Check if we have any premerged shards (dict-based for partial pre-merge support)
-        has_premerged = self.premerged_channel_mmaps is not None and len(self.premerged_channel_mmaps) > 0
-
-        # Determine output column count
-        if has_premerged:
-            # Get column count from any premerged shard
-            first_premerged_idx = next(iter(self.premerged_channel_mmaps.keys()))
-            merged_cols = self.premerged_channel_mmaps[first_premerged_idx].shape[1]
-        else:
-            merged_cols = self.num_channel_features  # Total features including monthly
-
-        # Calculate main (non-monthly) channel cols for mmap access
-        main_cols = self.num_channel_features - (self.monthly_3month_mmap.shape[1] if self.monthly_3month_mmap is not None else 0)
-
         if start_shard == end_shard:
-            # Entire sequence in one shard (common case)
+            # Entire sequence in one shard (common case - 99%+)
             local_start = start - self.channel_cumulative_rows[start_shard]
             local_end = end - self.channel_cumulative_rows[start_shard]
 
-            if has_premerged and start_shard in self.premerged_channel_mmaps:
-                # Fast path: shard is premerged (includes monthly)
-                main_result = self.premerged_channel_mmaps[start_shard][local_start:local_end]
-                return main_result, None
-            else:
-                # Mmap path: return SEPARATE arrays (collate handles merging)
-                main_result = self.channel_mmaps[start_shard][local_start:local_end]
-                monthly_result = self.monthly_3month_mmap[start:end, :] if self.monthly_3month_mmap is not None else None
-                return main_result, monthly_result
+            main_result = self.channel_mmaps[start_shard][local_start:local_end]
+            monthly_result = self.monthly_3month_mmap[start:end, :] if self.monthly_3month_mmap is not None else None
 
+            return main_result, monthly_result
         else:
-            # Sequence spans multiple shards (rare - happens at shard boundaries)
-            # Check if all involved shards are premerged
-            all_premerged = has_premerged and all(
-                shard_idx in self.premerged_channel_mmaps
-                for shard_idx in range(start_shard, end_shard + 1)
-            )
+            # Sequence spans multiple shards (rare - at shard boundaries)
+            main_cols = self.channel_mmaps[0].shape[1]
+            main_result = np.empty((end - start, main_cols), dtype=self.channel_mmaps[0].dtype)
+            pos = 0
 
-            if all_premerged:
-                # All shards premerged - simple concatenation
-                main_result = np.empty((end - start, merged_cols), dtype=self.premerged_channel_mmaps[start_shard].dtype)
-                pos = 0
+            for shard_idx in range(start_shard, end_shard + 1):
+                shard_start = max(start, self.channel_cumulative_rows[shard_idx])
+                shard_end = min(end, self.channel_cumulative_rows[shard_idx + 1])
 
-                for shard_idx in range(start_shard, end_shard + 1):
-                    shard_start = max(start, self.channel_cumulative_rows[shard_idx])
-                    shard_end = min(end, self.channel_cumulative_rows[shard_idx + 1])
+                local_start = shard_start - self.channel_cumulative_rows[shard_idx]
+                local_end = shard_end - self.channel_cumulative_rows[shard_idx]
+                length = local_end - local_start
 
-                    local_start = shard_start - self.channel_cumulative_rows[shard_idx]
-                    local_end = shard_end - self.channel_cumulative_rows[shard_idx]
+                main_result[pos:pos + length] = self.channel_mmaps[shard_idx][local_start:local_end]
+                pos += length
 
-                    length = local_end - local_start
-                    main_result[pos:pos + length] = self.premerged_channel_mmaps[shard_idx][local_start:local_end]
-                    pos += length
-
-                return main_result, None
-
-            else:
-                # Mixed or all-mmap: need to handle each shard individually
-                # Pre-allocate for merged output
-                main_result = np.empty((end - start, merged_cols), dtype=self.channel_mmaps[0].dtype)
-                pos = 0
-
-                for shard_idx in range(start_shard, end_shard + 1):
-                    shard_start = max(start, self.channel_cumulative_rows[shard_idx])
-                    shard_end = min(end, self.channel_cumulative_rows[shard_idx + 1])
-
-                    local_start = shard_start - self.channel_cumulative_rows[shard_idx]
-                    local_end = shard_end - self.channel_cumulative_rows[shard_idx]
-                    length = local_end - local_start
-
-                    if has_premerged and shard_idx in self.premerged_channel_mmaps:
-                        # This shard is premerged
-                        main_result[pos:pos + length] = self.premerged_channel_mmaps[shard_idx][local_start:local_end]
-                    else:
-                        # This shard is mmap - need to concatenate with monthly
-                        main_chunk = self.channel_mmaps[shard_idx][local_start:local_end]
-                        if self.monthly_3month_mmap is not None:
-                            monthly_chunk = self.monthly_3month_mmap[shard_start:shard_end, :]
-                            main_result[pos:pos + length] = np.concatenate([main_chunk, monthly_chunk], axis=1)
-                        else:
-                            main_result[pos:pos + length, :main_cols] = main_chunk
-
-                    pos += length
-
-                return main_result, None
+            monthly_result = self.monthly_3month_mmap[start:end, :] if self.monthly_3month_mmap is not None else None
+            return main_result, monthly_result
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
         """
@@ -750,36 +621,37 @@ class HierarchicalDataset(Dataset):
         # Add continuation prediction targets if enabled
         if self.include_continuation and self.continuation_labels_df is not None:
             try:
-                # Find continuation label for this timestamp (O(1) lookup via dict)
-                ts_ns = pd.Timestamp(self.timestamps[seq_end - 1]).value
+                # Fast timestamp lookup using pre-converted int64 nanoseconds
+                # (avoids pd.Timestamp() creation per sample - ~50µs savings)
+                ts_ns = self._timestamps_ns[seq_end - 1]
                 row_idx = self._continuation_ts_to_idx.get(ts_ns)
 
                 if row_idx is not None:
-                    # Found exact match - use actual values
-                    cont_row = self.continuation_labels_df.iloc[row_idx]
-                    targets['continuation_duration'] = torch.tensor(cont_row['duration_hours'], dtype=config.get_torch_dtype())
-                    targets['continuation_gain'] = torch.tensor(cont_row['projected_gain'], dtype=config.get_torch_dtype())
-                    targets['continuation_confidence'] = torch.tensor(cont_row['confidence'], dtype=config.get_torch_dtype())
+                    # Found exact match - use pre-extracted numpy arrays (O(1) access)
+                    # Return scalars, collate handles tensor conversion once per batch
+                    targets['continuation_duration'] = float(self._cont_duration[row_idx])
+                    targets['continuation_gain'] = float(self._cont_gain[row_idx])
+                    targets['continuation_confidence'] = float(self._cont_confidence[row_idx])
 
-                    # Add optional fields if they exist in the dataframe
+                    # Add optional fields if they exist
                     if self.has_adaptive_horizon:
-                        targets['adaptive_horizon'] = torch.tensor(cont_row['adaptive_horizon'], dtype=config.get_torch_dtype())
+                        targets['adaptive_horizon'] = float(self._cont_adaptive_horizon[row_idx])
                     if self.has_conf_score:
-                        targets['conf_score'] = torch.tensor(cont_row['conf_score'], dtype=config.get_torch_dtype())
+                        targets['conf_score'] = float(self._cont_conf_score[row_idx])
                     if self.has_channel_1h_cycles:
-                        targets['channel_1h_cycles'] = torch.tensor(cont_row['channel_1h_cycles'], dtype=config.get_torch_dtype())
+                        targets['channel_1h_cycles'] = float(self._cont_channel_1h_cycles[row_idx])
                     if self.has_channel_4h_cycles:
-                        targets['channel_4h_cycles'] = torch.tensor(cont_row['channel_4h_cycles'], dtype=config.get_torch_dtype())
+                        targets['channel_4h_cycles'] = float(self._cont_channel_4h_cycles[row_idx])
                     if self.has_channel_1h_valid:
-                        targets['channel_1h_valid'] = torch.tensor(cont_row['channel_1h_valid'], dtype=config.get_torch_dtype())
+                        targets['channel_1h_valid'] = float(self._cont_channel_1h_valid[row_idx])
                     if self.has_channel_4h_valid:
-                        targets['channel_4h_valid'] = torch.tensor(cont_row['channel_4h_valid'], dtype=config.get_torch_dtype())
+                        targets['channel_4h_valid'] = float(self._cont_channel_4h_valid[row_idx])
                     if self.has_channel_1h_r_squared:
-                        targets['channel_1h_r_squared'] = torch.tensor(cont_row['channel_1h_r_squared'], dtype=config.get_torch_dtype())
+                        targets['channel_1h_r_squared'] = float(self._cont_channel_1h_r_squared[row_idx])
                     if self.has_channel_4h_r_squared:
-                        targets['channel_4h_r_squared'] = torch.tensor(cont_row['channel_4h_r_squared'], dtype=config.get_torch_dtype())
+                        targets['channel_4h_r_squared'] = float(self._cont_channel_4h_r_squared[row_idx])
                 else:
-                    # No exact match - use fallback values
+                    # No exact match - use fallback values (scalars)
                     self._missing_label_count += 1
 
                     # Log first few mismatches with diagnostic info
@@ -799,16 +671,16 @@ class HierarchicalDataset(Dataset):
                                 print(f"        Nearest key: {pd.Timestamp(nearest)} (delta: {delta_sec:.1f}s)")
                         self._logged_mismatches += 1
 
-                    # Use fallback values
-                    targets['continuation_duration'] = self._const_zero
-                    targets['continuation_gain'] = self._const_zero
-                    targets['continuation_confidence'] = self._const_half
+                    # Use fallback values (scalars, not tensors)
+                    targets['continuation_duration'] = 0.0
+                    targets['continuation_gain'] = 0.0
+                    targets['continuation_confidence'] = 0.5
 
                     # Add fallback for all optional fields to maintain dict consistency
                     if self.has_adaptive_horizon:
-                        targets['adaptive_horizon'] = float(self._const_default_horizon)
+                        targets['adaptive_horizon'] = 24.0
                     if self.has_conf_score:
-                        targets['conf_score'] = float(self._const_half)
+                        targets['conf_score'] = 0.5
                     if self.has_channel_1h_cycles:
                         targets['channel_1h_cycles'] = 0.0
                     if self.has_channel_4h_cycles:
@@ -823,18 +695,18 @@ class HierarchicalDataset(Dataset):
                         targets['channel_4h_r_squared'] = 0.0
 
             except Exception as e:
-                # Exception occurred - use fallback values
+                # Exception occurred - use fallback values (scalars)
                 self._missing_label_count += 1
 
-                targets['continuation_duration'] = self._const_zero
-                targets['continuation_gain'] = self._const_zero
-                targets['continuation_confidence'] = self._const_half
+                targets['continuation_duration'] = 0.0
+                targets['continuation_gain'] = 0.0
+                targets['continuation_confidence'] = 0.5
 
                 # Add fallback for all optional fields to maintain dict consistency
                 if self.has_adaptive_horizon:
-                    targets['adaptive_horizon'] = float(self._const_default_horizon)
+                    targets['adaptive_horizon'] = 24.0
                 if self.has_conf_score:
-                    targets['conf_score'] = float(self._const_half)
+                    targets['conf_score'] = 0.5
                 if self.has_channel_1h_cycles:
                     targets['channel_1h_cycles'] = 0.0
                 if self.has_channel_4h_cycles:
@@ -1079,9 +951,7 @@ def create_hierarchical_dataset(
     validation_split: Optional[float] = None,
     include_continuation: bool = False,
     mmap_meta_path: str = None,
-    profiler=None,
-    premerge_budget_gb: float = None,
-    use_adaptive_mode: bool = False
+    profiler=None
 ) -> Tuple[Dataset, Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -1094,8 +964,6 @@ def create_hierarchical_dataset(
         preload: If True, preload all data into memory
         validation_split: If provided, split data into train/val
         profiler: Optional MemoryProfiler for logging RAM usage
-        premerge_budget_gb: RAM budget for partial pre-merge (adaptive mode)
-        use_adaptive_mode: Enable adaptive loading (partial premerge + shuffle buffer)
 
     Returns:
         train_dataset: Training dataset
@@ -1125,9 +993,7 @@ def create_hierarchical_dataset(
                 sequence_length, prediction_horizon, mode,
                 include_continuation=False,
                 mmap_meta_path=mmap_meta_path,
-                profiler=profiler,
-                premerge_budget_gb=premerge_budget_gb,
-                use_adaptive_mode=use_adaptive_mode
+                profiler=profiler
             )
 
             # Calculate index ranges (valid_indices already has built-in buffers)
@@ -1195,9 +1061,7 @@ def create_hierarchical_dataset(
                 sequence_length, prediction_horizon, mode,
                 include_continuation=include_continuation,
                 mmap_meta_path=mmap_meta_path,
-                profiler=profiler,
-                premerge_budget_gb=premerge_budget_gb,
-                use_adaptive_mode=use_adaptive_mode
+                profiler=profiler
             )
 
         return dataset, None

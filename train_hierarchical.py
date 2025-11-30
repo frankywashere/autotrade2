@@ -270,10 +270,10 @@ def is_main_process(rank: int) -> bool:
 def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0]):
     """
     Memory-efficient collate: pre-allocate final tensor and fill directly.
-    Handles MIXED formats from adaptive mode (premerged vs mmap shards):
-    - Premerged samples: (merged_14322, None, non_channel)
-    - Mmap samples: (main_11718, monthly_2604, non_channel)
-    Both produce same total features (14322 + nc_cols).
+    Expects samples as: ((main_channels, monthly_channels, non_channels), targets)
+    - main_channels: mmap slice [seq_len, 11718]
+    - monthly_channels: mmap slice [seq_len, 2604] or None
+    - non_channels: array [seq_len, nc_cols] or None
     """
     import os
     import sys
@@ -291,61 +291,43 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     batch_size = len(batch)
     targets = []
 
-    # Parse first sample to determine TOTAL dimensions
+    # Parse first sample to determine dimensions
     first_data, first_tgt = batch[0]
-    if isinstance(first_data, tuple) and len(first_data) == 3:
-        first_ch_main, first_ch_monthly, first_nc = first_data
-    elif isinstance(first_data, tuple) and len(first_data) == 2:
-        first_ch_main, first_nc = first_data
-        first_ch_monthly = None
-    else:
-        first_ch_main, first_ch_monthly, first_nc = first_data, None, None
+    first_ch_main, first_ch_monthly, first_nc = first_data
 
     seq_len = first_ch_main.shape[0]
-    # Total channel cols = main + monthly (same total regardless of merged/split format)
-    first_main_cols = first_ch_main.shape[1]
-    first_monthly_cols = first_ch_monthly.shape[1] if first_ch_monthly is not None else 0
-    total_channel_cols = first_main_cols + first_monthly_cols  # Always 14322
+    main_cols = first_ch_main.shape[1]
+    monthly_cols = first_ch_monthly.shape[1] if first_ch_monthly is not None else 0
+    total_channel_cols = main_cols + monthly_cols
     nc_cols = first_nc.shape[1] if first_nc is not None else 0
     total_features = total_channel_cols + nc_cols
 
     # Pre-allocate final tensor (single allocation instead of stack+cat)
     x = torch.zeros((batch_size, seq_len, total_features), dtype=torch_dtype)
 
-    # Fill tensor directly - handle mixed formats per-sample
+    # Fill tensor directly from mmap slices
     copies_made = 0
     copy_bytes = 0
 
     for i, (data, tgt) in enumerate(batch):
-        # Parse data tuple
-        if isinstance(data, tuple) and len(data) == 3:
-            ch_main, ch_monthly, nc = data
-        elif isinstance(data, tuple) and len(data) == 2:
-            ch_main, nc = data
-            ch_monthly = None
-        else:
-            ch_main, ch_monthly, nc = data, None, None
+        ch_main, ch_monthly, nc = data
 
-        # Get THIS sample's main column count (may differ: 14322 merged vs 11718 split)
-        this_main_cols = ch_main.shape[1]
-
-        # Copy main channel features (position 0 to this_main_cols)
+        # Copy main channel features
         if not ch_main.flags['C_CONTIGUOUS']:
             copies_made += 1
             copy_bytes += ch_main.nbytes
             ch_main = np.ascontiguousarray(ch_main)
-        x[i, :, 0:this_main_cols] = torch.from_numpy(ch_main)
+        x[i, :, 0:main_cols] = torch.from_numpy(ch_main)
 
-        # Copy monthly features if separate (split format from mmap shards)
+        # Copy monthly features if present
         if ch_monthly is not None:
-            this_monthly_cols = ch_monthly.shape[1]
             if not ch_monthly.flags['C_CONTIGUOUS']:
                 copies_made += 1
                 copy_bytes += ch_monthly.nbytes
                 ch_monthly = np.ascontiguousarray(ch_monthly)
-            x[i, :, this_main_cols:this_main_cols + this_monthly_cols] = torch.from_numpy(ch_monthly)
+            x[i, :, main_cols:main_cols + monthly_cols] = torch.from_numpy(ch_monthly)
 
-        # Copy non-channel features at fixed position (after all channel features)
+        # Copy non-channel features
         if nc is not None:
             if not nc.flags['C_CONTIGUOUS']:
                 copies_made += 1
@@ -621,7 +603,7 @@ def train_epoch(
             'adaptive_confidence': 0.2
         }
 
-    # For ShuffleBufferSampler: update epoch for reproducible shuffling
+    # For DistributedSampler: update epoch for reproducible shuffling
     if hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
         dataloader.sampler.set_epoch(epoch)
 
@@ -1323,12 +1305,8 @@ def interactive_setup(args, profiler=None):
             # Set environment variables for other modules to use
             import os
             os.environ['CONTAINER_RAM_GB'] = str(args.container_ram_gb)
-            # Only set PREMERGE_LIMIT_GB if not already specified by user
-            if not os.environ.get('PREMERGE_LIMIT_GB'):
-                os.environ['PREMERGE_LIMIT_GB'] = str(max(6, args.container_ram_gb // 3))  # ~1/3 of RAM for pre-merge
             if profiler:
-                actual_premerge = os.environ.get('PREMERGE_LIMIT_GB', str(max(6, args.container_ram_gb // 3)))
-                profiler.log_info(f"CONTAINER_RAM_SET | user_specified={args.container_ram_gb}GB | premerge_limit={actual_premerge}GB")
+                profiler.log_info(f"CONTAINER_RAM_SET | user_specified={args.container_ram_gb}GB")
         else:
             args.container_ram_gb = 0  # Use psutil detection
             if profiler:
@@ -1807,85 +1785,9 @@ def interactive_setup(args, profiler=None):
         float_allowed=True
     ).execute())
 
-    # Data loading strategy
-    print()
-    print("📊 Data Loading Strategy")
-
-    # Calculate default premerge budget based on container RAM
-    container_ram = getattr(args, 'container_ram_gb', 0)
-    if container_ram > 0:
-        # Container detected - use 70% of container RAM minus overhead
-        overhead_gb = 3  # Model + non-channel features + working memory
-        default_premerge_budget = max(0, int(container_ram * 0.7 - overhead_gb))
-    else:
-        # Native system - try to detect RAM
-        try:
-            import psutil
-            detected_ram = psutil.virtual_memory().total / (1024**3)
-            if detected_ram < 200:  # Trusted reading
-                default_premerge_budget = max(0, int(detected_ram * 0.5 - 3))
-            else:
-                default_premerge_budget = 30  # Conservative default
-        except ImportError:
-            default_premerge_budget = 20
-
-    # Check if DDP mode - force preload (adaptive not compatible with DistributedSampler)
-    if getattr(args, 'use_ddp', False):
-        print("\n   ⚠️  Multi-GPU DDP mode: forcing Full Pre-merge")
-        print("   (Adaptive mode not compatible with DistributedSampler)")
-        data_loading_choice = 'full_premerge'
-    else:
-        data_loading_choice = inquirer.select(
-            message="Data loading strategy:",
-            choices=[
-                Choice(value='adaptive', name=f'Adaptive (recommended) - partial premerge + shuffle buffer, auto-scales to RAM'),
-                Choice(value='full_premerge', name=f'Full Pre-merge - requires 90GB+ RAM (fastest if available)')
-            ],
-            default=dflt('data_loading_mode', 'adaptive')
-        ).execute()
-
-    # Set loading mode flags
-    args.data_loading_mode = data_loading_choice
-    args.preload = False  # Preload doesn't work with sharded mmap storage
-    args.use_adaptive_loading = (data_loading_choice == 'adaptive')
-
-    # Initialize adaptive mode settings
-    args.premerge_budget_gb = 0
-    args.shuffle_buffer_size = 10000
-
-    if data_loading_choice == 'adaptive':
-        # Adaptive mode - ask for premerge budget and shuffle buffer size
-        print()
-        print(f"   ℹ️  Adaptive mode: partial pre-merge + shuffle buffer")
-        print(f"   ℹ️  Pre-merge budget determines how many shards are loaded into RAM")
-        print(f"   ℹ️  Remaining shards accessed via mmap with shuffle buffer (sequential access)")
-
-        args.premerge_budget_gb = int(inquirer.number(
-            message=f"Pre-merge RAM budget (GB) [0 = shuffle buffer only]:",
-            default=default_premerge_budget,
-            min_allowed=0,
-            max_allowed=500
-        ).execute())
-
-        if args.premerge_budget_gb > 0:
-            print(f"   → Will pre-merge shards up to {args.premerge_budget_gb}GB")
-        else:
-            print(f"   → Shuffle buffer only mode (no pre-merge)")
-
-        print()
-        args.shuffle_buffer_size = int(inquirer.number(
-            message="Shuffle buffer size (samples) [larger = better randomization]:",
-            default=dflt('shuffle_buffer_size', 10000),
-            min_allowed=1000,
-            max_allowed=100000
-        ).execute())
-        print(f"   → Shuffle buffer: {args.shuffle_buffer_size:,} samples (~{args.shuffle_buffer_size * 5 / 1000:.0f}MB overhead)")
-
-    elif data_loading_choice == 'full_premerge':
-        print(f"   → Full pre-merge mode: all shards loaded into RAM")
-        print(f"   ⚠️  Requires 90GB+ RAM for typical datasets")
-        # Set high budget to trigger full pre-merge
-        args.premerge_budget_gb = 200
+    # Data loading: mmap-only mode with OS page cache (no pre-merge)
+    # Workers are safe now - mmap data is read-only, no COW explosion
+    args.preload = False
 
     # Multi-task learning
     print()
@@ -1931,17 +1833,7 @@ def interactive_setup(args, profiler=None):
     print(f"  Epochs: {args.epochs}")
     print(f"  Batch Size: {args.batch_size}")
     print(f"  Learning Rate: {args.lr}")
-    # Format data loading display
-    data_loading_mode = getattr(args, 'data_loading_mode', 'adaptive')
-    if data_loading_mode == 'adaptive':
-        premerge_gb = getattr(args, 'premerge_budget_gb', 0)
-        buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
-        data_loading_display = f"Adaptive (premerge={premerge_gb}GB, buffer={buffer_size:,})"
-    elif data_loading_mode == 'full_premerge':
-        data_loading_display = "Full Pre-merge"
-    else:
-        data_loading_display = "Adaptive"  # Fallback to adaptive
-    print(f"  Data Loading: {data_loading_display}")
+    print(f"  Data Loading: mmap + OS page cache (no pre-merge)")
     print(f"  Cache: {'Regenerate' if getattr(args, 'regenerate_cache', True) else 'Use existing'}")
     print(f"  Feature GPU: {'Yes' if getattr(args, 'use_gpu_features', False) else 'No'}")
     print(f"  Parallel CPU: {parallel_str}")
@@ -2114,16 +2006,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         print(f"🎯 Horizon: Adaptive (base {args.prediction_horizon} bars)")
         print(f"🔢 Batch size: {args.batch_size}" + (f" x {world_size} GPUs = {args.batch_size * world_size}" if is_distributed else ""))
         print(f"🔄 Epochs: {args.epochs}")
-        data_mode = getattr(args, 'data_loading_mode', 'adaptive')
-        if data_mode == 'adaptive':
-            premerge_gb = getattr(args, 'premerge_budget_gb', 0)
-            buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
-            data_mode_str = f"Adaptive (premerge={premerge_gb}GB, buffer={buffer_size:,})"
-        elif data_mode == 'full_premerge':
-            data_mode_str = "Full Pre-merge"
-        else:
-            data_mode_str = "Adaptive"
-        print(f"💾 Data mode: {data_mode_str}")
+        print(f"💾 Data mode: mmap + OS page cache")
         print(f"🎭 Multi-task: {'Enabled' if args.multi_task else 'Disabled'}")
         print("=" * 70)
 
@@ -2234,11 +2117,6 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     if profiler:
         profiler.snapshot("pre_dataset_create", 0, force_log=True)
 
-    # Determine data loading strategy
-    use_adaptive = getattr(args, 'use_adaptive_loading', False) and not is_distributed
-    premerge_budget_gb = getattr(args, 'premerge_budget_gb', 0)
-    shuffle_buffer_size = getattr(args, 'shuffle_buffer_size', 10000)
-
     def check_dataloader_memory_safety(num_workers, container_ram_gb=0):
         """
         Check if DataLoader with num_workers will fit in available RAM.
@@ -2253,7 +2131,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         """
         import psutil
 
-        # Get ACTUAL current process RAM (includes all premerged data!)
+        # Get ACTUAL current process RAM
         process = psutil.Process()
         current_ram_gb = process.memory_info().rss / (1024**3)
 
@@ -2306,9 +2184,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         validation_split=args.val_split,
         include_continuation=True,
         mmap_meta_path=mmap_meta_path,
-        profiler=dataset_profiler,
-        premerge_budget_gb=premerge_budget_gb,
-        use_adaptive_mode=use_adaptive
+        profiler=dataset_profiler
     )
 
     if profiler:
@@ -2326,20 +2202,16 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     if is_main_process(rank):
         print("\n4. Setting up data loaders...")
 
-    # Get feature dimensions from dataset
+    # Get feature dimensions from dataset (always 3-tuple: main, monthly, non_channel)
     sample_data, sample_target = train_dataset[0]
-    if isinstance(sample_data, tuple):
-        if len(sample_data) == 3:
-            ch_main, ch_monthly, nc = sample_data
-            total_features = ch_main.shape[1] + (ch_monthly.shape[1] if ch_monthly is not None else 0) + nc.shape[1]
-        else:
-            ch_main, nc = sample_data
-            total_features = ch_main.shape[1] + nc.shape[1]
-    else:
-        total_features = sample_data.shape[1]
+    ch_main, ch_monthly, nc = sample_data
+    main_cols = ch_main.shape[1]
+    monthly_cols = ch_monthly.shape[1] if ch_monthly is not None else 0
+    nc_cols = nc.shape[1] if nc is not None else 0
+    total_features = main_cols + monthly_cols + nc_cols
 
     if is_main_process(rank):
-        print(f"   Total features: {total_features}")
+        print(f"   Features: {main_cols} main + {monthly_cols} monthly + {nc_cols} non-channel = {total_features} total")
 
     # Collate function
     torch_dtype = project_config.get_torch_dtype()
@@ -2384,19 +2256,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         train_loader_kwargs['shuffle'] = False
         if is_main_process(rank):
             print(f"   Using DistributedSampler ({world_size} replicas)")
-    elif use_adaptive:
-        # Adaptive mode: use ShuffleBufferSampler
-        train_sampler = ShuffleBufferSampler(
-            train_dataset,
-            buffer_size=shuffle_buffer_size,
-            seed=42
-        )
-        train_loader_kwargs['sampler'] = train_sampler
-        train_loader_kwargs['shuffle'] = False
-        if is_main_process(rank):
-            print(f"   Using ShuffleBufferSampler (buffer={shuffle_buffer_size:,})")
     else:
-        # Full premerge: standard shuffle
+        # Standard shuffle (mmap-only mode with OS page cache)
         train_loader_kwargs['shuffle'] = True
         if is_main_process(rank):
             print(f"   Using standard shuffle")
@@ -2904,7 +2765,6 @@ def main():
         args.use_ddp = True
         args.gpu_mode = 'multi_ddp'
         args.device = f'cuda:{local_rank}'
-        args.use_adaptive_loading = False  # Force preload for DDP
 
         if is_main_process(rank):
             print(f"\n🚀 DDP Initialized: {world_size} processes across {torch.cuda.device_count()} GPUs")
@@ -2929,7 +2789,6 @@ def main():
         # Log environment info
         import os
         profiler.log_info(f"CONTAINER_RAM_GB={os.environ.get('CONTAINER_RAM_GB', 'not_set')}")
-        profiler.log_info(f"PREMERGE_LIMIT_GB={os.environ.get('PREMERGE_LIMIT_GB', 'not_set')}")
 
     # Interactive mode overrides command-line args
     # For DDP: only rank 0 runs interactive, then broadcasts args to other ranks
