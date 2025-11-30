@@ -1282,35 +1282,16 @@ def interactive_setup(args, profiler=None):
         else:
             args.compile_verbose = False
 
-        # Container RAM detection for cloud GPU instances (RunPod, Lambda, etc.)
-        print()
+        # RAM detection
         try:
             import psutil
             detected_ram = psutil.virtual_memory().total / (1024**3)
         except ImportError:
             detected_ram = 0
 
-        if detected_ram > 200:  # Likely seeing host RAM, not container
-            print(f"   ⚠️  Detected {detected_ram:.0f}GB RAM - likely cloud container (seeing host RAM)")
-            if profiler:
-                profiler.log_info(f"CONTAINER_DETECTED | psutil_ram={detected_ram:.0f}GB")
-            args.container_ram_gb = int(inquirer.number(
-                message="Actual container RAM (GB):",
-                default=46,
-                min_allowed=8,
-                max_allowed=256
-            ).execute())
-            print(f"   ℹ️  Using {args.container_ram_gb}GB for memory calculations")
-
-            # Set environment variables for other modules to use
-            import os
-            os.environ['CONTAINER_RAM_GB'] = str(args.container_ram_gb)
-            if profiler:
-                profiler.log_info(f"CONTAINER_RAM_SET | user_specified={args.container_ram_gb}GB")
-        else:
-            args.container_ram_gb = 0  # Use psutil detection
-            if profiler:
-                profiler.log_info(f"NATIVE_RAM | detected={detected_ram:.0f}GB | container_mode=False")
+        args.container_ram_gb = 0  # Use psutil detection by default
+        if profiler:
+            profiler.log_info(f"RAM_DETECTED | psutil_ram={detected_ram:.0f}GB")
 
     elif args.device == 'mps':
         # MPS only supports float32
