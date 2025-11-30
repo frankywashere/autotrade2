@@ -44,7 +44,8 @@ class HierarchicalDataset(Dataset):
         cache_indices: bool = True,
         include_continuation: bool = False,
         mmap_meta_path: str = None,
-        profiler=None
+        profiler=None,
+        preload_to_ram: bool = False
     ):
         """
         Initialize dataset.
@@ -59,7 +60,10 @@ class HierarchicalDataset(Dataset):
             cache_indices: Cache column lookups for speed
             include_continuation: Whether to include continuation prediction targets
             profiler: Optional MemoryProfiler for logging RAM usage
+            preload_to_ram: If True, load all mmap data into RAM at startup for fast access
+                           (requires ~90GB RAM but avoids 400ms/sample disk I/O)
         """
+        self._preload_to_ram = preload_to_ram
         self._profiler = profiler
         self.features_df = features_df
         self.raw_ohlc_df = raw_ohlc_df
@@ -213,11 +217,56 @@ class HierarchicalDataset(Dataset):
             print(f"     ✓ Loaded {self.non_channel_array.shape[1] if self.non_channel_array is not None else 0} non-channel features")
             print(f"     ✓ Total rows: {meta['total_rows']:,}")
 
-            # No pre-merge: rely on mmap + OS page cache for memory efficiency
-            # Data is merged at batch-level in __getitems__ for optimal performance
-            self.premerged_channel_mmaps = None
-            self.premerged_shard_indices = set()
-            print(f"     ✓ Using mmap-only mode (no pre-merge, OS page cache manages hot data)")
+            # Initialize preloaded arrays as None
+            self.preloaded_main = None
+            self.preloaded_monthly = None
+
+            if self._preload_to_ram:
+                # Preload all mmap data into RAM for fast access (avoids 400ms/sample disk I/O)
+                print(f"  📦 Preloading all channel data to RAM...")
+                import time
+                preload_start = time.perf_counter()
+
+                total_rows = self.channel_cumulative_rows[-1]
+                main_cols = self.channel_mmaps[0].shape[1]
+
+                # Allocate single contiguous array for main channel features
+                self.preloaded_main = np.empty((total_rows, main_cols), dtype=config.NUMPY_DTYPE)
+
+                # Copy from mmap shards
+                for i, mmap_arr in enumerate(self.channel_mmaps):
+                    start = self.channel_cumulative_rows[i]
+                    end = self.channel_cumulative_rows[i + 1]
+                    self.preloaded_main[start:end] = mmap_arr[:]
+                    if self._profiler:
+                        self._profiler.snapshot(f"preload_shard_{i}", 0, force_log=True)
+
+                # Copy monthly/3month shard if present
+                if self.monthly_3month_mmap is not None:
+                    self.preloaded_monthly = np.array(self.monthly_3month_mmap)
+
+                preload_time = time.perf_counter() - preload_start
+
+                # Log memory usage
+                main_gb = self.preloaded_main.nbytes / 1e9
+                monthly_gb = self.preloaded_monthly.nbytes / 1e9 if self.preloaded_monthly is not None else 0
+                total_gb = main_gb + monthly_gb
+
+                print(f"     ✓ Loaded {total_rows:,} rows into RAM ({total_gb:.1f} GB in {preload_time:.1f}s)")
+                if self._profiler:
+                    self._profiler.log_info(f"PRELOAD_COMPLETE | rows={total_rows:,} | main_gb={main_gb:.2f} | monthly_gb={monthly_gb:.2f} | time_sec={preload_time:.1f}")
+                    self._profiler.snapshot("post_preload_complete", 0, force_log=True)
+
+                # Clear mmap references to save virtual memory (optional, mmaps are lightweight)
+                # Keep them around as backup in case we need them
+                # self.channel_mmaps = None
+                # self.monthly_3month_mmap = None
+            else:
+                # mmap-only mode: rely on OS page cache for memory efficiency
+                print(f"     ✓ Using mmap-only mode (no pre-merge, OS page cache manages hot data)")
+
+            self.premerged_channel_mmaps = None  # Legacy field
+            self.premerged_shard_indices = set()  # Legacy field
 
         else:
             # Normal path - load everything into RAM
@@ -377,7 +426,7 @@ class HierarchicalDataset(Dataset):
 
     def _get_channel_sequence_from_shards(self, start: int, end: int) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
-        Get a sequence of rows from memory-mapped shards.
+        Get a sequence of rows from memory-mapped shards (or preloaded RAM).
 
         Always returns (main_channels, monthly_channels) as separate arrays.
         Merging happens in __getitem__/__getitems__ for efficiency.
@@ -391,6 +440,13 @@ class HierarchicalDataset(Dataset):
             - main has channel cols (11718)
             - monthly has monthly cols (2604) or None
         """
+        # FAST PATH: Use preloaded RAM data if available (avoids 400ms/sample disk I/O)
+        if self.preloaded_main is not None:
+            main_result = self.preloaded_main[start:end]
+            monthly_result = self.preloaded_monthly[start:end] if self.preloaded_monthly is not None else None
+            return main_result, monthly_result
+
+        # SLOW PATH: Memory-mapped disk access
         import bisect
 
         # Find which shards contain our range
@@ -994,7 +1050,8 @@ def create_hierarchical_dataset(
     validation_split: Optional[float] = None,
     include_continuation: bool = False,
     mmap_meta_path: str = None,
-    profiler=None
+    profiler=None,
+    preload_to_ram: bool = False
 ) -> Tuple[Dataset, Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -1004,9 +1061,11 @@ def create_hierarchical_dataset(
         sequence_length: Input sequence length
         prediction_horizon: Prediction horizon in bars
         mode: 'uniform_bars'
-        preload: If True, preload all data into memory
+        preload: If True, use PreloadHierarchicalDataset (legacy)
         validation_split: If provided, split data into train/val
         profiler: Optional MemoryProfiler for logging RAM usage
+        preload_to_ram: If True, load all mmap data into RAM at startup
+                       (requires ~90GB RAM but avoids 400ms/sample disk I/O)
 
     Returns:
         train_dataset: Training dataset
@@ -1036,7 +1095,8 @@ def create_hierarchical_dataset(
                 sequence_length, prediction_horizon, mode,
                 include_continuation=False,
                 mmap_meta_path=mmap_meta_path,
-                profiler=profiler
+                profiler=profiler,
+                preload_to_ram=preload_to_ram
             )
 
             # Calculate index ranges (valid_indices already has built-in buffers)
@@ -1081,13 +1141,15 @@ def create_hierarchical_dataset(
                     train_df, train_raw_ohlc, train_continuation_df,
                     sequence_length, prediction_horizon, mode,
                     include_continuation=include_continuation,
-                    profiler=profiler
+                    profiler=profiler,
+                    preload_to_ram=preload_to_ram
                 )
                 val_dataset = HierarchicalDataset(
                     val_df, val_raw_ohlc, val_continuation_df,
                     sequence_length, prediction_horizon, mode,
                     include_continuation=include_continuation,
-                    profiler=profiler
+                    profiler=profiler,
+                    preload_to_ram=preload_to_ram
                 )
 
         return train_dataset, val_dataset
@@ -1104,7 +1166,8 @@ def create_hierarchical_dataset(
                 sequence_length, prediction_horizon, mode,
                 include_continuation=include_continuation,
                 mmap_meta_path=mmap_meta_path,
-                profiler=profiler
+                profiler=profiler,
+                preload_to_ram=preload_to_ram
             )
 
         return dataset, None

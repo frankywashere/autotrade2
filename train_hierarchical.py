@@ -1345,33 +1345,72 @@ def interactive_setup(args, profiler=None):
             project_config._TORCH_DTYPE = torch.float32
             print("   → FP32 - Standard precision")
 
+    # Preload to RAM option (for CUDA with high-RAM systems)
+    args.preload_to_ram = False  # Default
+    if args.device.startswith('cuda'):
+        print()
+        # Detect RAM for guidance
+        try:
+            import psutil
+            detected_ram = psutil.virtual_memory().total / (1024**3)
+            container_ram = getattr(args, 'container_ram_gb', 0)
+            if container_ram > 0:
+                detected_ram = container_ram
+        except:
+            detected_ram = 0
+
+        # Only offer preload if system has enough RAM (90GB for data + overhead)
+        if detected_ram >= 100:
+            args.preload_to_ram = inquirer.confirm(
+                message=f"Preload all data to RAM? (~90GB, requires {int(detected_ram)}GB available - MUCH faster training)",
+                default=True  # Default to yes for high-RAM systems
+            ).execute()
+
+            if args.preload_to_ram:
+                print("   📦 Will load all channel data into RAM at startup")
+                print("   ⚡ Data access will be instant (RAM speed vs 400ms/sample disk I/O)")
+                print("   → Forcing num_workers=0 (data loading is instant, no prefetch needed)")
+        elif detected_ram >= 50:
+            print(f"   ℹ️  Detected {detected_ram:.0f}GB RAM - preload requires ~100GB (using mmap mode)")
+            args.preload_to_ram = False
+
     # Data loading workers (RIGHT after device selection)
     print()
-    default_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device, 2)
 
-    # Detect RAM for guidance
-    try:
-        import psutil
-        total_ram_gb = psutil.virtual_memory().total / (1024**3)
-        container_ram = getattr(args, 'container_ram_gb', 0)
-        if container_ram > 0:
-            total_ram_gb = container_ram
-    except:
-        total_ram_gb = 0
-
-    if total_ram_gb > 0:
-        guidance = f"\n   ℹ️  RAM: {total_ram_gb:.0f}GB available. With large datasets, each worker uses extra RAM."
+    # CRITICAL: Force 0 workers when preloading to avoid memory explosion
+    # With spawn multiprocessing, each worker gets a FULL COPY of preloaded numpy arrays
+    # 90GB × N workers = OOM disaster
+    if args.preload_to_ram:
+        args.num_workers = 0
+        print(f"   ℹ️  num_workers forced to 0 (preload mode)")
+        print(f"      Reason: Each worker would copy 90GB of preloaded data!")
+        print(f"      With data in RAM, __getitem__ is <1ms anyway (no prefetch benefit)")
     else:
-        guidance = ""
+        default_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device, 2)
 
-    args.num_workers = int(inquirer.number(
-        message=f"Data loading workers (CPU threads for batch prep, recommended: {default_workers}):{guidance}",
-        default=dflt('num_workers', default_workers),
-        min_allowed=0,
-        max_allowed=128  # High limit for systems with many cores (e.g., 32-64 core servers)
-    ).execute())
+        # Detect RAM for guidance
+        try:
+            import psutil
+            total_ram_gb = psutil.virtual_memory().total / (1024**3)
+            container_ram = getattr(args, 'container_ram_gb', 0)
+            if container_ram > 0:
+                total_ram_gb = container_ram
+        except:
+            total_ram_gb = 0
 
-    if args.num_workers != default_workers:
+        if total_ram_gb > 0:
+            guidance = f"\n   ℹ️  RAM: {total_ram_gb:.0f}GB available. With large datasets, each worker uses extra RAM."
+        else:
+            guidance = ""
+
+        args.num_workers = int(inquirer.number(
+            message=f"Data loading workers (CPU threads for batch prep, recommended: {default_workers}):{guidance}",
+            default=dflt('num_workers', default_workers),
+            min_allowed=0,
+            max_allowed=128  # High limit for systems with many cores (e.g., 32-64 core servers)
+        ).execute())
+
+    if not args.preload_to_ram and args.num_workers != default_workers:
         if args.device == 'mps' and args.num_workers > 2:
             print(f"   ⚠️  Using {args.num_workers} workers on MPS (default: 2)")
             print(f"      More workers = faster but more RAM usage (unified memory)")
@@ -2184,7 +2223,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         validation_split=args.val_split,
         include_continuation=True,
         mmap_meta_path=mmap_meta_path,
-        profiler=dataset_profiler
+        profiler=dataset_profiler,
+        preload_to_ram=args.preload_to_ram
     )
 
     if profiler:
