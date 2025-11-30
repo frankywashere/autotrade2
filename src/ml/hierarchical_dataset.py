@@ -176,18 +176,31 @@ class HierarchicalDataset(Dataset):
             self._timestamps_ns = self.timestamps.astype('datetime64[ns]').astype(np.int64)
 
             # v3.19: Load monthly/3month separate shard if present
+            # NOTE: Monthly shard may have more rows than chunks (includes 2015 data)
+            # We store _monthly_offset to apply when accessing
             self.monthly_3month_mmap = None
+            self._monthly_offset = 0
             if 'monthly_3month_shard' in meta and meta['monthly_3month_shard'] is not None:
                 monthly_shard_info = meta['monthly_3month_shard']
                 monthly_path = resolve_shard_path(monthly_shard_info['path'])
 
                 if monthly_path.exists():
                     self.monthly_3month_mmap = np.load(str(monthly_path), mmap_mode='r')
-                    print(f"     ✓ Loaded monthly/3month shard: {self.monthly_3month_mmap.shape[0]:,} rows × {self.monthly_3month_mmap.shape[1]} cols")
+                    monthly_rows = self.monthly_3month_mmap.shape[0]
+                    chunk_rows = self.channel_cumulative_rows[-1]
+
+                    # Check if monthly shard needs alignment
+                    if monthly_rows > chunk_rows:
+                        self._monthly_offset = monthly_rows - chunk_rows
+                        print(f"     ✓ Loaded monthly/3month shard: {monthly_rows:,} rows × {self.monthly_3month_mmap.shape[1]} cols")
+                        print(f"        ⚠️  Monthly shard offset: {self._monthly_offset:,} (will slice to align with chunks)")
+                    else:
+                        print(f"     ✓ Loaded monthly/3month shard: {monthly_rows:,} rows × {self.monthly_3month_mmap.shape[1]} cols")
+
                     # Log after loading monthly shard
                     if self._profiler:
                         monthly_size_gb = self.monthly_3month_mmap.nbytes / 1e9
-                        self._profiler.log_info(f"MONTHLY_SHARD_LOADED | rows={self.monthly_3month_mmap.shape[0]:,} | cols={self.monthly_3month_mmap.shape[1]} | virtual_size_gb={monthly_size_gb:.2f}")
+                        self._profiler.log_info(f"MONTHLY_SHARD_LOADED | rows={monthly_rows:,} | cols={self.monthly_3month_mmap.shape[1]} | virtual_size_gb={monthly_size_gb:.2f} | offset={self._monthly_offset}")
                         self._profiler.snapshot("post_monthly_shard_load", 0, force_log=True)
                 else:
                     print(f"     ⚠️  Monthly/3month shard not found: {monthly_path}")
@@ -197,6 +210,44 @@ class HierarchicalDataset(Dataset):
 
             # Load non-channel features normally (these are small - ~165 base features)
             if features_df is not None:
+                # CRITICAL: Align non-channel features with mmap chunks!
+                # Chunks may start from a later date (e.g., 2016) while non-channel
+                # starts earlier (e.g., 2015). We need to slice to match.
+                chunk_total_rows = self.channel_cumulative_rows[-1]
+                nc_total_rows = len(features_df)
+
+                if nc_total_rows > chunk_total_rows:
+                    # Non-channel has more rows (starts earlier) - slice to align
+                    # The offset is at the START (chunks skip early dates)
+                    offset = nc_total_rows - chunk_total_rows
+                    print(f"     ⚠️  Index alignment: non-channel has {nc_total_rows:,} rows, chunks have {chunk_total_rows:,}")
+                    print(f"        Slicing non-channel from index {offset:,} to align with chunks")
+
+                    # Validate alignment by checking timestamps
+                    chunk_first_ts = pd.Timestamp(self.timestamps[0])
+                    nc_timestamps = features_df.index
+
+                    # Find where non-channel matches first chunk timestamp
+                    nc_aligned_idx = nc_timestamps.get_indexer([chunk_first_ts], method='nearest')[0]
+                    if nc_aligned_idx != offset:
+                        print(f"        ℹ️  Timestamp-based offset: {nc_aligned_idx}, row-count offset: {offset}")
+                        # Use timestamp-based alignment (more accurate)
+                        offset = nc_aligned_idx
+
+                    # Slice features_df to match chunks
+                    features_df = features_df.iloc[offset:]
+                    print(f"        Aligned non-channel: {len(features_df):,} rows (matches chunks: {chunk_total_rows:,})")
+
+                    # Store offset for debugging
+                    self._nc_offset = offset
+                elif nc_total_rows < chunk_total_rows:
+                    raise ValueError(
+                        f"Non-channel features ({nc_total_rows:,} rows) has fewer rows than "
+                        f"mmap chunks ({chunk_total_rows:,} rows). Data is inconsistent!"
+                    )
+                else:
+                    self._nc_offset = 0
+
                 # Optimize: check dtype before converting
                 temp_array = features_df.values
                 if temp_array.dtype != config.NUMPY_DTYPE:
@@ -210,6 +261,7 @@ class HierarchicalDataset(Dataset):
                     self._profiler.snapshot("post_non_channel_load", 0, force_log=True)
             else:
                 self.non_channel_array = None
+                self._nc_offset = 0
 
             self.using_mmaps = True
             self.num_channel_features = meta['num_features']
@@ -241,9 +293,15 @@ class HierarchicalDataset(Dataset):
                     if self._profiler:
                         self._profiler.snapshot(f"preload_shard_{i}", 0, force_log=True)
 
-                # Copy monthly/3month shard if present
+                # Copy monthly/3month shard if present (apply offset to align with chunks)
                 if self.monthly_3month_mmap is not None:
-                    self.preloaded_monthly = np.array(self.monthly_3month_mmap)
+                    monthly_offset = getattr(self, '_monthly_offset', 0)
+                    if monthly_offset > 0:
+                        # Slice to align with chunks (skip early rows)
+                        self.preloaded_monthly = np.array(self.monthly_3month_mmap[monthly_offset:])
+                        print(f"        Sliced monthly shard from {monthly_offset:,} for alignment")
+                    else:
+                        self.preloaded_monthly = np.array(self.monthly_3month_mmap)
 
                 preload_time = time.perf_counter() - preload_start
 
@@ -441,6 +499,7 @@ class HierarchicalDataset(Dataset):
             - monthly has monthly cols (2604) or None
         """
         # FAST PATH: Use preloaded RAM data if available (avoids 400ms/sample disk I/O)
+        # NOTE: preloaded arrays are already aligned (sliced during preload)
         if self.preloaded_main is not None:
             main_result = self.preloaded_main[start:end]
             monthly_result = self.preloaded_monthly[start:end] if self.preloaded_monthly is not None else None
@@ -453,13 +512,20 @@ class HierarchicalDataset(Dataset):
         start_shard = bisect.bisect_right(self.channel_cumulative_rows, start) - 1
         end_shard = bisect.bisect_right(self.channel_cumulative_rows, end - 1) - 1
 
+        # Apply offset for monthly shard (it may have more rows from earlier dates)
+        monthly_offset = getattr(self, '_monthly_offset', 0)
+
         if start_shard == end_shard:
             # Entire sequence in one shard (common case - 99%+)
             local_start = start - self.channel_cumulative_rows[start_shard]
             local_end = end - self.channel_cumulative_rows[start_shard]
 
             main_result = self.channel_mmaps[start_shard][local_start:local_end]
-            monthly_result = self.monthly_3month_mmap[start:end, :] if self.monthly_3month_mmap is not None else None
+            # Apply offset when accessing monthly shard
+            if self.monthly_3month_mmap is not None:
+                monthly_result = self.monthly_3month_mmap[start + monthly_offset:end + monthly_offset, :]
+            else:
+                monthly_result = None
 
             return main_result, monthly_result
         else:
@@ -479,7 +545,11 @@ class HierarchicalDataset(Dataset):
                 main_result[pos:pos + length] = self.channel_mmaps[shard_idx][local_start:local_end]
                 pos += length
 
-            monthly_result = self.monthly_3month_mmap[start:end, :] if self.monthly_3month_mmap is not None else None
+            # Apply offset when accessing monthly shard
+            if self.monthly_3month_mmap is not None:
+                monthly_result = self.monthly_3month_mmap[start + monthly_offset:end + monthly_offset, :]
+            else:
+                monthly_result = None
             return main_result, monthly_result
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
@@ -615,6 +685,12 @@ class HierarchicalDataset(Dataset):
                 pass  # Fall back to fixed horizon if any issues
 
         # Convert to percentage change
+        # Defensive check: prevent division by zero or invalid prices
+        if current_price <= 0 or np.isnan(current_price) or np.isinf(current_price):
+            raise ValueError(
+                f"Invalid current_price at idx={idx}, data_idx={data_idx}, seq_end={seq_end}: "
+                f"current_price={current_price}. This indicates a data alignment issue."
+            )
         target_high_pct = (future_high_actual - current_price) / current_price * 100.0
         target_low_pct = (future_low_actual - current_price) / current_price * 100.0
 
