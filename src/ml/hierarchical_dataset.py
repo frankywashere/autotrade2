@@ -817,6 +817,49 @@ class HierarchicalDataset(Dataset):
             'prediction_horizon': self.prediction_horizon
         }
 
+    def __getitems__(self, indices):
+        """
+        Batch-optimized data loading with sorted access for mmap locality.
+
+        PyTorch DataLoader calls this when available (PyTorch 2.0+).
+        Key optimization: Sort indices by data position for sequential mmap access,
+        which dramatically improves OS page cache hit rate for spinning disks and
+        reduces random I/O for SSDs.
+
+        Args:
+            indices: List of sample indices to load
+
+        Returns:
+            List of ((main, monthly, nc), targets) tuples in original index order
+        """
+        import time
+        import sys
+        _batch_start = time.perf_counter()
+
+        batch_size = len(indices)
+
+        # Map to (original_position, sample_idx, data_idx) for sorting
+        indexed = [(i, idx, self.valid_indices[idx]) for i, idx in enumerate(indices)]
+
+        # Sort by data_idx for sequential mmap access (key optimization)
+        sorted_indexed = sorted(indexed, key=lambda x: x[2])
+
+        # Pre-allocate results list
+        results = [None] * batch_size
+
+        # Load samples in sorted order (sequential access pattern)
+        for orig_pos, sample_idx, _ in sorted_indexed:
+            results[orig_pos] = self.__getitem__(sample_idx)
+
+        # Performance logging for slow batches
+        _batch_elapsed_ms = (time.perf_counter() - _batch_start) * 1000
+        if _batch_elapsed_ms > 500:  # Log if batch takes >500ms
+            per_sample_ms = _batch_elapsed_ms / batch_size
+            print(f"[SLOW_GETITEMS] {batch_size} samples took {_batch_elapsed_ms:.0f}ms "
+                  f"({per_sample_ms:.1f}ms/sample)", file=sys.stderr, flush=True)
+
+        return results
+
 
 class PreloadHierarchicalDataset(Dataset):
     """
