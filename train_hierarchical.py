@@ -1377,26 +1377,48 @@ def interactive_setup(args, profiler=None):
     # Data loading workers (RIGHT after device selection)
     print()
 
-    # CRITICAL: Force 0 workers when preloading to avoid memory explosion
-    # With spawn multiprocessing, each worker gets a FULL COPY of preloaded numpy arrays
-    # 90GB × N workers = OOM disaster
+    # Detect RAM for guidance
+    try:
+        import psutil
+        total_ram_gb = psutil.virtual_memory().total / (1024**3)
+        container_ram = getattr(args, 'container_ram_gb', 0)
+        if container_ram > 0:
+            total_ram_gb = container_ram
+    except:
+        total_ram_gb = 0
+
     if args.preload_to_ram:
-        args.num_workers = 0
-        print(f"   ℹ️  num_workers forced to 0 (preload mode)")
-        print(f"      Reason: Each worker would copy 90GB of preloaded data!")
-        print(f"      With data in RAM, __getitem__ is <1ms anyway (no prefetch benefit)")
+        # With preload, each worker duplicates ~93GB of numpy arrays (spawn multiprocessing)
+        # Calculate max safe workers based on available RAM
+        preload_per_process = 93  # GB per process (main or worker)
+        base_overhead = 5  # GB for model, optimizer, etc.
+        max_safe_workers = max(0, int((total_ram_gb - base_overhead) / preload_per_process) - 1)
+
+        print(f"   ⚠️  PRELOAD MODE: Each worker duplicates ~93GB (spawn multiprocessing)")
+        print(f"      RAM: {total_ram_gb:.0f}GB available")
+        print(f"      0 workers: ~{base_overhead + preload_per_process}GB")
+        if max_safe_workers >= 1:
+            print(f"      1 worker:  ~{base_overhead + 2*preload_per_process}GB")
+        if max_safe_workers >= 2:
+            print(f"      2 workers: ~{base_overhead + 3*preload_per_process}GB")
+        if max_safe_workers >= 3:
+            print(f"      3 workers: ~{base_overhead + 4*preload_per_process}GB")
+        print(f"      Max safe: {max_safe_workers} workers")
+        print(f"      Note: With data in RAM, __getitem__ is <1ms (workers add minimal benefit)")
+
+        default_workers = 0  # Recommend 0 since data loading is instant
+        args.num_workers = int(inquirer.number(
+            message=f"Data loading workers (recommended: 0, max safe: {max_safe_workers}):",
+            default=dflt('num_workers', default_workers),
+            min_allowed=0,
+            max_allowed=max(max_safe_workers, 0)
+        ).execute())
+
+        if args.num_workers > 0:
+            estimated_ram = base_overhead + (args.num_workers + 1) * preload_per_process
+            print(f"   → Using {args.num_workers} workers (~{estimated_ram}GB estimated RAM)")
     else:
         default_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device, 2)
-
-        # Detect RAM for guidance
-        try:
-            import psutil
-            total_ram_gb = psutil.virtual_memory().total / (1024**3)
-            container_ram = getattr(args, 'container_ram_gb', 0)
-            if container_ram > 0:
-                total_ram_gb = container_ram
-        except:
-            total_ram_gb = 0
 
         if total_ram_gb > 0:
             guidance = f"\n   ℹ️  RAM: {total_ram_gb:.0f}GB available. With large datasets, each worker uses extra RAM."
