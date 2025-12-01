@@ -125,6 +125,11 @@ class PredictionService:
             events_handler=self._events_handler
         )
 
+        print(f"  ✓ Features extracted: {features_df.shape}")
+        print(f"    Index type: {type(features_df.index)}")
+        print(f"    First timestamp: {features_df.index[0] if len(features_df) > 0 else 'EMPTY'}")
+        print(f"    Last timestamp: {features_df.index[-1] if len(features_df) > 0 else 'EMPTY'}")
+
         # Get sequence
         sequence_length = 200
         if len(features_df) < sequence_length:
