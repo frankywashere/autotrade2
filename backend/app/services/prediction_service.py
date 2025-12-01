@@ -119,11 +119,17 @@ class PredictionService:
 
         # Extract features
         extractor = self._get_feature_extractor()
-        features_df = extractor.extract_features(
+        result = extractor.extract_features(
             df,
             use_cache=True,
             events_handler=self._events_handler
         )
+
+        # extract_features returns tuple: (features_df, continuation_df) or (features_df, continuation_df, mmap_path)
+        if isinstance(result, tuple):
+            features_df = result[0]  # Just get the features DataFrame
+        else:
+            features_df = result
 
         print(f"  ✓ Features extracted: {features_df.shape}")
         print(f"    Index type: {type(features_df.index)}")
