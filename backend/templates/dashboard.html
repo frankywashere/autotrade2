@@ -242,12 +242,16 @@
                         </div>
                     </div>
 
-                    <!-- P&L Chart (coming soon) -->
-                    <div class="bg-gray-800 rounded-lg p-6">
+                    <!-- P&L Chart -->
+                    <div class="bg-gray-800 rounded-lg p-6 mb-6">
                         <h3 class="text-lg font-semibold mb-4">Cumulative P&L Over Time</h3>
-                        <div id="pnl-chart">
-                            <p class="text-gray-400">Chart coming soon...</p>
-                        </div>
+                        <div id="pnl-chart"></div>
+                    </div>
+
+                    <!-- Returns Distribution -->
+                    <div class="bg-gray-800 rounded-lg p-6">
+                        <h3 class="text-lg font-semibold mb-4">Returns Distribution</h3>
+                        <div id="returns-chart"></div>
                     </div>
                 </div>
 
@@ -264,6 +268,51 @@
         }
         updateTimestamp();
         setInterval(updateTimestamp, 60000); // Update every minute
+
+        // Load P&L chart
+        async function loadPnlChart() {
+            try {
+                const response = await fetch('/api/charts/pnl-over-time');
+                const chartData = await response.json();
+                Plotly.newPlot('pnl-chart', chartData.data, chartData.layout, {
+                    responsive: true,
+                    displayModeBar: false
+                });
+            } catch (error) {
+                document.getElementById('pnl-chart').innerHTML =
+                    '<p class="text-gray-400">No trades yet. Log your first trade to see this chart!</p>';
+            }
+        }
+
+        // Load returns distribution chart
+        async function loadReturnsChart() {
+            try {
+                const response = await fetch('/api/charts/returns-distribution');
+                const chartData = await response.json();
+                Plotly.newPlot('returns-chart', chartData.data, chartData.layout, {
+                    responsive: true,
+                    displayModeBar: false
+                });
+            } catch (error) {
+                document.getElementById('returns-chart').innerHTML =
+                    '<p class="text-gray-400">No trades yet. Log your first trade to see this chart!</p>';
+            }
+        }
+
+        // Load charts when performance tab is shown
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initial load
+            setTimeout(() => {
+                loadPnlChart();
+                loadReturnsChart();
+            }, 1000);
+
+            // Reload every 30 seconds
+            setInterval(() => {
+                loadPnlChart();
+                loadReturnsChart();
+            }, 30000);
+        });
     </script>
 
 </body>

@@ -12,7 +12,7 @@ import sys
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from backend.app.routers import predictions, backtests, trades, alerts
+from backend.app.routers import predictions, backtests, trades, alerts, charts
 
 app = FastAPI(
     title="AutoTrade2 API",
@@ -41,6 +41,7 @@ app.include_router(predictions.router, prefix="/api/predictions", tags=["predict
 app.include_router(backtests.router, prefix="/api/backtests", tags=["backtests"])
 app.include_router(trades.router, prefix="/api/trades", tags=["trades"])
 app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
+app.include_router(charts.router, prefix="/api/charts", tags=["charts"])
 
 
 @app.get("/")
