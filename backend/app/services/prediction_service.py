@@ -182,7 +182,49 @@ class PredictionService:
 
         print(f"✓ New prediction generated (confidence: {prediction['confidence']:.2%})")
 
+        # Save to database for history and online learning
+        self._save_to_database(prediction)
+
         return prediction
+
+    def _save_to_database(self, prediction: Dict):
+        """
+        Save prediction to database for history tracking and online learning
+
+        Args:
+            prediction: Prediction dict from get_latest_prediction()
+        """
+        try:
+            from backend.app.models.database import Prediction
+
+            Prediction.create(
+                timestamp=prediction['timestamp'],
+                symbol=prediction['symbol'],
+                current_price=prediction['current_price'],
+                predicted_high=prediction['predicted_high'],
+                predicted_low=prediction['predicted_low'],
+                confidence=prediction['confidence'],
+                # Layer predictions
+                sub_pred_15min_high=prediction.get('fast_pred_high'),
+                sub_pred_15min_low=prediction.get('fast_pred_low'),
+                sub_pred_15min_conf=prediction.get('fast_pred_conf'),
+                sub_pred_1hour_high=prediction.get('medium_pred_high'),
+                sub_pred_1hour_low=prediction.get('medium_pred_low'),
+                sub_pred_1hour_conf=prediction.get('medium_pred_conf'),
+                sub_pred_4hour_high=prediction.get('slow_pred_high'),
+                sub_pred_4hour_low=prediction.get('slow_pred_low'),
+                sub_pred_4hour_conf=prediction.get('slow_pred_conf'),
+                # Future: Add multi-task predictions to database schema
+                has_actuals=False,
+                prediction_timestamp=prediction['timestamp'],
+                target_timestamp=prediction['timestamp'] + timedelta(hours=24)
+            )
+
+            print("  ✓ Prediction saved to database")
+
+        except Exception as e:
+            print(f"  ⚠️ Failed to save prediction: {e}")
+            # Don't fail the whole prediction if database save fails
 
     def is_model_loaded(self) -> bool:
         """Check if model is loaded"""

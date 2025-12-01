@@ -14,6 +14,7 @@ project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from backend.app.models.database import Prediction
+from backend.app.services.prediction_service import prediction_service
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent.parent / "templates"))
@@ -22,50 +23,82 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent.parent.parent / 
 @router.get("/latest", response_class=HTMLResponse)
 async def get_latest_prediction(request: Request):
     """
-    Get the most recent prediction
+    Get the most recent prediction (with 5-min caching)
 
     Returns:
         HTML fragment with prediction card
     """
     try:
-        # Get most recent prediction from database
-        prediction = (Prediction
-                     .select()
-                     .order_by(Prediction.timestamp.desc())
-                     .first())
+        # Try to generate/get cached prediction
+        try:
+            pred_dict = prediction_service.get_latest_prediction(force_refresh=False)
 
-        if not prediction:
-            return """
-            <div id="prediction-card" class="bg-gray-800 rounded-lg p-6">
-                <p class="text-yellow-400">No predictions found. Run the model first!</p>
-            </div>
-            """
+            # Convert dict to display format
+            prediction_age = (datetime.now() - pred_dict['timestamp']).total_seconds() / 60
+            age_text = f"{int(prediction_age)} min ago" if prediction_age < 60 else f"{int(prediction_age/60)} hours ago"
+
+            # Use the prediction dict directly
+            current_price = pred_dict['current_price']
+            predicted_high = pred_dict['predicted_high']
+            predicted_low = pred_dict['predicted_low']
+            confidence = pred_dict['confidence']
+            timestamp_str = pred_dict['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            is_cached = prediction_age < 5
+
+        except Exception as e:
+            print(f"Failed to generate live prediction: {e}")
+            # Fallback to database
+            prediction = (Prediction
+                         .select()
+                         .order_by(Prediction.timestamp.desc())
+                         .first())
+
+            if not prediction:
+                return """
+                <div id="prediction-card" class="bg-gray-800 rounded-lg p-6">
+                    <p class="text-yellow-400">No predictions found. Click 'Generate New Prediction' to create one!</p>
+                </div>
+                """
+
+            # Use database prediction
+            current_price = prediction.current_price
+            predicted_high = prediction.predicted_high
+            predicted_low = prediction.predicted_low
+            confidence = prediction.confidence
+            timestamp_str = prediction.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            prediction_age = (datetime.now() - prediction.timestamp).total_seconds() / 60
+            age_text = f"{int(prediction_age)} min ago" if prediction_age < 60 else f"{int(prediction_age/60)} hours ago"
+            is_cached = False
 
         # Calculate target prices
-        target_high_price = prediction.current_price * (1 + prediction.predicted_high / 100)
-        target_low_price = prediction.current_price * (1 + prediction.predicted_low / 100)
+        target_high_price = current_price * (1 + predicted_high / 100)
+        target_low_price = current_price * (1 + predicted_low / 100)
 
         # Confidence color
-        if prediction.confidence >= 0.8:
+        if confidence >= 0.8:
             conf_color = "text-green-400"
             conf_badge = "🟢 High"
-        elif prediction.confidence >= 0.6:
+        elif confidence >= 0.6:
             conf_color = "text-yellow-400"
             conf_badge = "🟡 Medium"
         else:
             conf_color = "text-red-400"
             conf_badge = "🔴 Low"
 
+        # Cache indicator
+        cache_badge = f"<span class='text-xs text-green-400'>✓ Cached ({age_text})</span>" if is_cached else f"<span class='text-xs text-gray-400'>⏰ {age_text}</span>"
+
         return f"""
         <div id="prediction-card" class="bg-gray-800 rounded-lg p-6 border border-gray-700">
             <div class="flex justify-between items-start mb-4">
                 <div>
                     <h2 class="text-2xl font-bold text-blue-400">Latest Prediction</h2>
-                    <p class="text-sm text-gray-400">{prediction.timestamp.strftime('%Y-%m-%d %H:%M:%S')}</p>
+                    <p class="text-sm text-gray-400">{timestamp_str}</p>
+                    <p class="text-xs">{cache_badge}</p>
                 </div>
                 <div class="text-right">
                     <div class="text-sm text-gray-400">Confidence</div>
-                    <div class="text-2xl font-bold {conf_color}">{prediction.confidence:.0%}</div>
+                    <div class="text-2xl font-bold {conf_color}">{confidence:.0%}</div>
                     <div class="text-xs {conf_color}">{conf_badge}</div>
                 </div>
             </div>
@@ -73,23 +106,19 @@ async def get_latest_prediction(request: Request):
             <div class="grid grid-cols-3 gap-4 mb-6">
                 <div class="bg-gray-700 rounded-lg p-4">
                     <div class="text-sm text-gray-400 mb-1">Current Price</div>
-                    <div class="text-2xl font-bold">${prediction.current_price:.2f}</div>
+                    <div class="text-2xl font-bold">${current_price:.2f}</div>
                 </div>
                 <div class="bg-green-900 bg-opacity-30 rounded-lg p-4 border border-green-700">
                     <div class="text-sm text-green-400 mb-1">Target High</div>
                     <div class="text-2xl font-bold text-green-400">${target_high_price:.2f}</div>
-                    <div class="text-xs text-green-400">{prediction.predicted_high:+.2f}%</div>
+                    <div class="text-xs text-green-400">{predicted_high:+.2f}%</div>
                 </div>
                 <div class="bg-red-900 bg-opacity-30 rounded-lg p-4 border border-red-700">
                     <div class="text-sm text-red-400 mb-1">Target Low</div>
                     <div class="text-2xl font-bold text-red-400">${target_low_price:.2f}</div>
-                    <div class="text-xs text-red-400">{prediction.predicted_low:+.2f}%</div>
+                    <div class="text-xs text-red-400">{predicted_low:+.2f}%</div>
                 </div>
             </div>
-
-            {"<div class='mt-4 p-3 bg-green-900 bg-opacity-30 border border-green-700 rounded-lg'>" +
-             "<p class='text-sm text-green-400'>✅ Actual prices available - prediction validated</p></div>"
-             if prediction.has_actuals else ""}
         </div>
         """
 
@@ -174,6 +203,83 @@ async def get_prediction_history(
 
     except Exception as e:
         return f"<div class='text-red-400'>Error: {str(e)}</div>"
+
+
+@router.post("/generate", response_class=HTMLResponse)
+async def generate_new_prediction(request: Request):
+    """
+    Force generation of new prediction (ignores cache)
+
+    Returns:
+        HTML with fresh prediction or error message
+    """
+    try:
+        print("Generating fresh prediction (user requested)...")
+        pred_dict = prediction_service.get_latest_prediction(force_refresh=True)
+
+        # Format same as /latest endpoint
+        current_price = pred_dict['current_price']
+        predicted_high = pred_dict['predicted_high']
+        predicted_low = pred_dict['predicted_low']
+        confidence = pred_dict['confidence']
+        timestamp_str = pred_dict['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+
+        target_high_price = current_price * (1 + predicted_high / 100)
+        target_low_price = current_price * (1 + predicted_low / 100)
+
+        conf_color = "text-green-400" if confidence >= 0.8 else "text-yellow-400" if confidence >= 0.6 else "text-red-400"
+        conf_badge = "🟢 High" if confidence >= 0.8 else "🟡 Medium" if confidence >= 0.6 else "🔴 Low"
+
+        return f"""
+        <div id="prediction-card" class="bg-gray-800 rounded-lg p-6 border border-green-700">
+            <div class="bg-green-900 bg-opacity-20 border border-green-700 rounded-lg p-2 mb-4">
+                <p class="text-sm text-green-400">✅ Fresh prediction generated!</p>
+            </div>
+            <div class="flex justify-between items-start mb-4">
+                <div>
+                    <h2 class="text-2xl font-bold text-blue-400">Latest Prediction</h2>
+                    <p class="text-sm text-gray-400">{timestamp_str}</p>
+                    <p class="text-xs text-green-400">✓ Just now</p>
+                </div>
+                <div class="text-right">
+                    <div class="text-sm text-gray-400">Confidence</div>
+                    <div class="text-2xl font-bold {conf_color}">{confidence:.0%}</div>
+                    <div class="text-xs {conf_color}">{conf_badge}</div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-3 gap-4 mb-6">
+                <div class="bg-gray-700 rounded-lg p-4">
+                    <div class="text-sm text-gray-400 mb-1">Current Price</div>
+                    <div class="text-2xl font-bold">${current_price:.2f}</div>
+                </div>
+                <div class="bg-green-900 bg-opacity-30 rounded-lg p-4 border border-green-700">
+                    <div class="text-sm text-green-400 mb-1">Target High</div>
+                    <div class="text-2xl font-bold text-green-400">${target_high_price:.2f}</div>
+                    <div class="text-xs text-green-400">{predicted_high:+.2f}%</div>
+                </div>
+                <div class="bg-red-900 bg-opacity-30 rounded-lg p-4 border border-red-700">
+                    <div class="text-sm text-red-400 mb-1">Target Low</div>
+                    <div class="text-2xl font-bold text-red-400">${target_low_price:.2f}</div>
+                    <div class="text-xs text-red-400">{predicted_low:+.2f}%</div>
+                </div>
+            </div>
+        </div>
+        """
+
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        return f"""
+        <div id="prediction-card" class="bg-red-900 bg-opacity-30 border border-red-700 rounded-lg p-6">
+            <p class="text-red-400 font-bold">❌ Failed to generate prediction</p>
+            <p class="text-sm text-gray-400 mt-2">Error: {str(e)}</p>
+            <details class="mt-4">
+                <summary class="text-xs text-gray-500 cursor-pointer">Show details</summary>
+                <pre class="text-xs text-gray-500 mt-2 overflow-auto">{error_details}</pre>
+            </details>
+        </div>
+        """
 
 
 @router.post("/{prediction_id}/validate")

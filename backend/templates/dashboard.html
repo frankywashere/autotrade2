@@ -36,6 +36,16 @@
                         Loading...
                     </div>
                     <button
+                        class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg text-sm font-medium"
+                        hx-post="/api/predictions/generate"
+                        hx-target="#prediction-card"
+                        hx-swap="outerHTML"
+                        hx-indicator="#gen-spinner"
+                    >
+                        <span class="htmx-indicator" id="gen-spinner">⏳ Generating...</span>
+                        <span class="htmx-not-indicator">🎯 Generate New Prediction</span>
+                    </button>
+                    <button
                         class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium"
                         hx-get="/api/predictions/latest"
                         hx-target="#prediction-card"
