@@ -2656,7 +2656,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     'optimizer_state_dict': optimizer.state_dict(),
                     'epoch': epoch,
                     'val_loss': avg_val_loss,
-                    'args': vars(args)
+                    'args': vars(args),
+                    # CRITICAL: Save model architecture params for future compatibility
+                    'input_size': model_to_save.input_size,
+                    'hidden_size': model_to_save.hidden_size,
+                    'internal_neurons_ratio': model_to_save.internal_neurons_ratio
                 }, output_path)
 
                 tqdm.write(f"   ✓ Saved best model (val_loss: {avg_val_loss:.4f})")
