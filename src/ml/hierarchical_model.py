@@ -738,15 +738,39 @@ def load_hierarchical_model(model_path: str, device: str = 'cpu') -> Hierarchica
     # Load checkpoint to get metadata
     checkpoint = torch.load(model_path, map_location=device)
 
-    # Create model with saved parameters
+    # Get parameters from checkpoint (check both top-level and args dict)
+    args = checkpoint.get('args', {})
+
+    # For input_size: infer from weights if not explicitly saved
+    input_size = checkpoint.get('input_size') or args.get('input_size')
+    if input_size is None:
+        # Infer from first layer weight shape (accounting for wiring transform)
+        state_dict = checkpoint['model_state_dict']
+        first_weight = state_dict.get('fast_layer.rnn_cell.layer_0.ff1.weight')
+        if first_weight is not None:
+            # CfC adds internal connections, so actual input = weight.shape[1] - some offset
+            # For AutoNCP wiring, the transform is: input -> input + hidden
+            # So we approximate: input_size ≈ weight.shape[1] - hidden_size
+            hidden_size = args.get('hidden_size', 128)
+            input_size = first_weight.shape[1] - hidden_size + 51  # Empirical adjustment
+            print(f"  ⚠️ Inferred input_size from weights: {input_size}")
+        else:
+            input_size = 14487  # Current feature count
+            print(f"  ⚠️ Using current feature count: {input_size}")
+
+    # Get other parameters
+    hidden_size = checkpoint.get('hidden_size') or args.get('hidden_size', 128)
+    internal_neurons_ratio = checkpoint.get('internal_neurons_ratio') or args.get('internal_neurons_ratio', 2.0)
+
+    # Create model with saved/inferred parameters
     model = HierarchicalLNN(
-        input_size=checkpoint.get('input_size', 309),  # Updated default
-        hidden_size=checkpoint.get('hidden_size', 128),
-        internal_neurons_ratio=checkpoint.get('internal_neurons_ratio', 2.0),
+        input_size=input_size,
+        hidden_size=hidden_size,
+        internal_neurons_ratio=internal_neurons_ratio,
         device=device,
-        downsample_fast_to_medium=checkpoint.get('downsample_fast_to_medium', 5),
-        downsample_medium_to_slow=checkpoint.get('downsample_medium_to_slow', 12),
-        multi_task=checkpoint.get('multi_task', True)  # Default to True for new models
+        downsample_fast_to_medium=checkpoint.get('downsample_fast_to_medium') or args.get('downsample_fast_to_medium', 5),
+        downsample_medium_to_slow=checkpoint.get('downsample_medium_to_slow') or args.get('downsample_medium_to_slow', 12),
+        multi_task=checkpoint.get('multi_task') or args.get('multi_task', True)
     )
 
     # Handle DataParallel checkpoints: strip 'module.' prefix if present
