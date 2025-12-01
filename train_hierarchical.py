@@ -2158,13 +2158,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         process = psutil.Process()
         current_ram_gb = process.memory_info().rss / (1024**3)
 
-        # Get container limit
+        # Get RAM limit
         if container_ram_gb > 0:
             total_ram_gb = container_ram_gb
         else:
             total_ram_gb = psutil.virtual_memory().total / (1024**3)
-            if total_ram_gb > 200:  # Container detection
-                total_ram_gb = 220  # Conservative default
 
         # Calculate peak with workers (spawn gives each worker full dataset copy)
         if num_workers > 0:
