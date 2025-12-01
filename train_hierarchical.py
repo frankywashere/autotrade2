@@ -2517,14 +2517,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
                     predictions, hidden_states = model(features)
-                    # Primary loss: high/low predictions (normalize % to decimal)
-                    target_tensor = torch.stack([targets['high'] / 100, targets['low'] / 100], dim=1)
+                    # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
+                    target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                     loss = F.mse_loss(predictions[:, :2], target_tensor)
 
                     # Debug: Print target/prediction stats on first batch
                     if batch_idx == 0 and epoch == 0:
-                        print(f"[DEBUG] targets high (normalized): mean={target_tensor[:,0].mean():.3f}, min={target_tensor[:,0].min():.3f}, max={target_tensor[:,0].max():.3f}", flush=True)
-                        print(f"[DEBUG] targets low (normalized): mean={target_tensor[:,1].mean():.3f}, min={target_tensor[:,1].min():.3f}, max={target_tensor[:,1].max():.3f}", flush=True)
+                        print(f"[DEBUG] targets high: mean={target_tensor[:,0].mean():.2f}%, min={target_tensor[:,0].min():.2f}%, max={target_tensor[:,0].max():.2f}%", flush=True)
+                        print(f"[DEBUG] targets low: mean={target_tensor[:,1].mean():.2f}%, min={target_tensor[:,1].min():.2f}%, max={target_tensor[:,1].max():.2f}%", flush=True)
                         print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.3f}, std={predictions[:,:2].std():.3f}", flush=True)
                         print(f"[DEBUG] primary loss (high/low MSE): {loss.item():.4f}", flush=True)
 
@@ -2549,14 +2549,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 scaler.update()
             else:
                 predictions, hidden_states = model(features)
-                # Primary loss: high/low predictions (normalize % to decimal)
-                target_tensor = torch.stack([targets['high'] / 100, targets['low'] / 100], dim=1)
+                # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
+                target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                 loss = F.mse_loss(predictions[:, :2], target_tensor)
 
                 # Debug: Print target/prediction stats on first batch
                 if batch_idx == 0 and epoch == 0:
-                    print(f"[DEBUG] targets high (normalized): mean={target_tensor[:,0].mean():.3f}, min={target_tensor[:,0].min():.3f}, max={target_tensor[:,0].max():.3f}", flush=True)
-                    print(f"[DEBUG] targets low (normalized): mean={target_tensor[:,1].mean():.3f}, min={target_tensor[:,1].min():.3f}, max={target_tensor[:,1].max():.3f}", flush=True)
+                    print(f"[DEBUG] targets high: mean={target_tensor[:,0].mean():.2f}%, min={target_tensor[:,0].min():.2f}%, max={target_tensor[:,0].max():.2f}%", flush=True)
+                    print(f"[DEBUG] targets low: mean={target_tensor[:,1].mean():.2f}%, min={target_tensor[:,1].min():.2f}%, max={target_tensor[:,1].max():.2f}%", flush=True)
                     print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.3f}, std={predictions[:,:2].std():.3f}", flush=True)
                     print(f"[DEBUG] primary loss (high/low MSE): {loss.item():.4f}", flush=True)
 
@@ -2613,13 +2613,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 if scaler is not None:
                     with torch.amp.autocast('cuda'):
                         predictions, hidden_states = model(features)
-                        # Normalize % to decimal (same as training)
-                        target_tensor = torch.stack([targets['high'] / 100, targets['low'] / 100], dim=1)
+                        # Raw % (data alignment fixed in dataset)
+                        target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                         loss = F.mse_loss(predictions[:, :2], target_tensor)
                 else:
                     predictions, hidden_states = model(features)
-                    # Normalize % to decimal (same as training)
-                    target_tensor = torch.stack([targets['high'] / 100, targets['low'] / 100], dim=1)
+                    # Raw % (data alignment fixed in dataset)
+                    target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                     loss = F.mse_loss(predictions[:, :2], target_tensor)
 
                 val_loss += loss.item()

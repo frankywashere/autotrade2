@@ -342,6 +342,11 @@ class HierarchicalDataset(Dataset):
                 self.features_array = self.features_array.astype(expected_dtype)
 
         if raw_ohlc_df is not None:
+            # CRITICAL: Apply same offset as non_channel to keep alignment
+            # Without this, raw_ohlc indices don't match chunk/non_channel indices
+            if hasattr(self, '_nc_offset') and self._nc_offset > 0:
+                raw_ohlc_df = raw_ohlc_df.iloc[self._nc_offset:]
+                print(f"     ✓ Aligned raw_ohlc: sliced {self._nc_offset:,} rows to match chunks")
             self.raw_ohlc_array = raw_ohlc_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
             # Optimize: ensure OHLC matches dtype (already checks before converting)
             if self.raw_ohlc_array.dtype != expected_dtype:
