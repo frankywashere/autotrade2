@@ -111,6 +111,10 @@ class ChannelLoader:
         self.main_feature_to_idx = {name: idx for idx, name in enumerate(self.main_channel_features)}
         self.monthly_feature_to_idx = {name: idx for idx, name in enumerate(self.monthly_channel_features)}
 
+        # Create unified feature_to_idx for backward compatibility
+        # Note: Main features use main shard, monthly use monthly shard
+        self.feature_to_idx = {**self.main_feature_to_idx}
+
         print(f"✓ Indexed {len(self.main_channel_features)} main channel features")
         if self.monthly_channel_features:
             print(f"✓ Indexed {len(self.monthly_channel_features)} monthly/3month features")
