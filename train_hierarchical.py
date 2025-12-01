@@ -269,10 +269,10 @@ def is_main_process(rank: int) -> bool:
 
 def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0]):
     """
-    Memory-efficient collate: pre-allocate final tensor and fill directly.
+    Fast collate: stack numpy arrays first, then single torch conversion.
     Expects samples as: ((main_channels, monthly_channels, non_channels), targets)
-    - main_channels: mmap slice [seq_len, 11718]
-    - monthly_channels: mmap slice [seq_len, 2604] or None
+    - main_channels: array [seq_len, 11718]
+    - monthly_channels: array [seq_len, 2604] or None
     - non_channels: array [seq_len, nc_cols] or None
     """
     import os
@@ -288,62 +288,43 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     if torch_dtype is None:
         torch_dtype = torch.float32
 
-    batch_size = len(batch)
-    targets = []
+    # Separate data and targets
+    data_list = [d for d, _ in batch]
+    targets_list = [t for _, t in batch]
 
-    # Parse first sample to determine dimensions
-    first_data, first_tgt = batch[0]
-    first_ch_main, first_ch_monthly, first_nc = first_data
+    # Check first sample for structure
+    first_ch_main, first_ch_monthly, first_nc = data_list[0]
+    has_monthly = first_ch_monthly is not None
+    has_nc = first_nc is not None
 
-    seq_len = first_ch_main.shape[0]
-    main_cols = first_ch_main.shape[1]
-    monthly_cols = first_ch_monthly.shape[1] if first_ch_monthly is not None else 0
-    total_channel_cols = main_cols + monthly_cols
-    nc_cols = first_nc.shape[1] if first_nc is not None else 0
-    total_features = total_channel_cols + nc_cols
+    # Stack numpy arrays (fast vectorized C operations)
+    # This is MUCH faster than looping with torch.from_numpy per sample
+    main_stack = np.stack([d[0] for d in data_list])  # [batch, seq, main_cols]
 
-    # Pre-allocate final tensor (single allocation instead of stack+cat)
-    x = torch.zeros((batch_size, seq_len, total_features), dtype=torch_dtype)
+    if has_monthly:
+        monthly_stack = np.stack([d[1] for d in data_list])  # [batch, seq, monthly_cols]
 
-    # Fill tensor directly from mmap slices
-    copies_made = 0
-    copy_bytes = 0
+    if has_nc:
+        nc_stack = np.stack([d[2] for d in data_list])  # [batch, seq, nc_cols]
 
-    for i, (data, tgt) in enumerate(batch):
-        ch_main, ch_monthly, nc = data
+    # Concatenate along feature axis (single operation)
+    parts = [main_stack]
+    if has_monthly:
+        parts.append(monthly_stack)
+    if has_nc:
+        parts.append(nc_stack)
 
-        # Copy main channel features
-        if not ch_main.flags['C_CONTIGUOUS']:
-            copies_made += 1
-            copy_bytes += ch_main.nbytes
-            ch_main = np.ascontiguousarray(ch_main)
-        x[i, :, 0:main_cols] = torch.from_numpy(ch_main)
+    combined = np.concatenate(parts, axis=2)  # [batch, seq, total_features]
 
-        # Copy monthly features if present
-        if ch_monthly is not None:
-            if not ch_monthly.flags['C_CONTIGUOUS']:
-                copies_made += 1
-                copy_bytes += ch_monthly.nbytes
-                ch_monthly = np.ascontiguousarray(ch_monthly)
-            x[i, :, main_cols:main_cols + monthly_cols] = torch.from_numpy(ch_monthly)
-
-        # Copy non-channel features
-        if nc is not None:
-            if not nc.flags['C_CONTIGUOUS']:
-                copies_made += 1
-                copy_bytes += nc.nbytes
-                nc = np.ascontiguousarray(nc)
-            x[i, :, total_channel_cols:total_channel_cols + nc_cols] = torch.from_numpy(nc)
-
-        targets.append(tgt)
-
-    # Log copy detection for first few batches
-    if _debug_counter[0] <= 5 and copies_made > 0:
-        print(f"[DEBUG] collate made {copies_made} contiguous copies ({copy_bytes/1e6:.1f} MB) in batch #{_debug_counter[0]}", file=sys.stderr, flush=True)
+    # Single torch conversion (fast)
+    # Use np.ascontiguousarray to ensure memory layout is compatible
+    if not combined.flags['C_CONTIGUOUS']:
+        combined = np.ascontiguousarray(combined)
+    x = torch.from_numpy(combined).to(dtype=torch_dtype)
 
     # Build targets tensor dict with proper dtype
     converted_targets = []
-    for tgt in targets:
+    for tgt in targets_list:
         ct = {}
         for k, v in tgt.items():
             if isinstance(v, torch.Tensor):
@@ -362,7 +343,7 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     # Log slow batch assembly (diagnose lazy loading bottlenecks)
     _collate_elapsed = time.perf_counter() - _collate_start
     if _collate_elapsed > 1.0:  # Log if >1 second
-        print(f"[SLOW_COLLATE] batch assembly took {_collate_elapsed:.1f}s for {batch_size} samples ({_collate_elapsed/batch_size*1000:.0f}ms/sample)", file=sys.stderr, flush=True)
+        print(f"[SLOW_COLLATE] batch assembly took {_collate_elapsed:.1f}s for {len(batch)} samples ({_collate_elapsed/len(batch)*1000:.0f}ms/sample)", file=sys.stderr, flush=True)
 
     return x, targets_batch
 
