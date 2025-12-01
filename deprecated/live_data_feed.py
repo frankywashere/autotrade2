@@ -142,6 +142,12 @@ class HybridLiveDataFeed:
         tsla_data.columns = [c.lower() for c in tsla_data.columns]
         spy_data.columns = [c.lower() for c in spy_data.columns]
 
+        # Remove timezone info (yfinance returns UTC, but we need timezone-naive for feature extraction)
+        if tsla_data.index.tz is not None:
+            tsla_data.index = tsla_data.index.tz_localize(None)
+        if spy_data.index.tz is not None:
+            spy_data.index = spy_data.index.tz_localize(None)
+
         # Add symbol prefix
         tsla_data = tsla_data.add_prefix('tsla_')
         spy_data = spy_data.add_prefix('spy_')
