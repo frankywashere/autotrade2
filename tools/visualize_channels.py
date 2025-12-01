@@ -89,7 +89,7 @@ def select_shard_location() -> Path:
     if selected == 'custom':
         path = inquirer.text(
             message="Enter shard path:",
-            default="/Volumes/ExternalDrive/feature_cache"
+            default="/Volumes/NVME2/featureslabels"
         ).execute()
 
         # Save for next time

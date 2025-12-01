@@ -61,12 +61,14 @@ class ChannelLoader:
         self.monthly_mmap = None
 
         for chunk_info in self.meta['chunk_info']:
-            # Load channel features
-            mmap_array = np.load(chunk_info['path'], mmap_mode='r')
+            # Load channel features (prepend shard_path for relative paths)
+            chunk_path = self.shard_path / chunk_info['path']
+            mmap_array = np.load(chunk_path, mmap_mode='r')
             self.channel_mmaps.append(mmap_array)
 
             # Load timestamps
-            ts_array = np.load(chunk_info['index_path'], mmap_mode='r')
+            index_path = self.shard_path / chunk_info['index_path']
+            ts_array = np.load(index_path, mmap_mode='r')
             self.timestamps_mmaps.append(ts_array)
 
             # Track cumulative rows
@@ -76,6 +78,9 @@ class ChannelLoader:
         if 'monthly_3month_shard' in self.meta and self.meta['monthly_3month_shard']:
             m_info = self.meta['monthly_3month_shard']
             m_path = Path(m_info['path'])
+            # Prepend shard_path if path is relative
+            if not m_path.is_absolute():
+                m_path = self.shard_path / m_path
             if m_path.exists():
                 self.monthly_mmap = np.load(str(m_path), mmap_mode='r')
                 print(f"  ✓ Loaded monthly/3month shard: {self.monthly_mmap.shape[0]:,} rows × {self.monthly_mmap.shape[1]} cols")
