@@ -2396,9 +2396,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     model = model.to(args.device)
 
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        # find_unused_parameters=True needed because:
+        # 1. fusion_weights is only used for logging, not in loss
+        # 2. CfC layers have sparse AutoNCP wiring - some neurons don't activate every forward pass
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         if is_main_process(rank):
-            print(f"   ✓ Model wrapped with DDP")
+            print(f"   ✓ Model wrapped with DDP (find_unused_parameters=True)")
     elif args.device.startswith('cuda') and getattr(args, 'use_compile', False) and hasattr(torch, 'compile'):
         try:
             model = torch.compile(model, mode='reduce-overhead')
@@ -2500,7 +2503,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
             # Feedback for first batch (torch.compile takes time)
             # Use a background thread to print progress while compiling
-            if _is_first_batch_ever and batch_idx == 0:
+            if _is_first_batch_ever and batch_idx == 0 and getattr(args, 'use_compile', False):
                 print(f"   ⏳ First forward pass (torch.compile JIT compilation, may take 5-15 min)...", flush=True)
                 _first_forward_start = time.perf_counter()
 
