@@ -169,17 +169,85 @@
 
                 <!-- Trades Tab -->
                 <div x-show="tab === 'trades'" x-cloak>
-                    <div class="bg-gray-800 rounded-lg p-6">
-                        <h2 class="text-xl font-semibold mb-4">Trade Management</h2>
-                        <p class="text-gray-400">Coming soon: Manual trade logging</p>
+                    <!-- Trade Entry Form -->
+                    <div class="bg-gray-800 rounded-lg p-6 mb-6">
+                        <h2 class="text-xl font-semibold mb-4">Log New Trade</h2>
+
+                        <div id="trade-message"></div>
+
+                        <form hx-post="/api/trades"
+                              hx-target="#trade-message"
+                              hx-swap="innerHTML"
+                              class="space-y-4">
+
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium mb-2">Entry Time</label>
+                                    <input type="datetime-local" name="entry_time"
+                                           class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg"
+                                           required>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium mb-2">Entry Price ($)</label>
+                                    <input type="number" name="entry_price" step="0.01"
+                                           class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg"
+                                           placeholder="242.50"
+                                           required>
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="block text-sm font-medium mb-2">Quantity</label>
+                                <input type="number" name="quantity" value="1"
+                                       class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg"
+                                       required>
+                            </div>
+
+                            <div>
+                                <label class="block text-sm font-medium mb-2">Notes (optional)</label>
+                                <textarea name="notes" rows="2"
+                                          class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg"
+                                          placeholder="Trade rationale..."></textarea>
+                            </div>
+
+                            <button type="submit"
+                                    class="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium">
+                                📝 Log Trade Entry
+                            </button>
+                        </form>
+                    </div>
+
+                    <!-- Trade History -->
+                    <div>
+                        <h3 class="text-lg font-semibold mb-4">Trade History</h3>
+                        <div id="trades-list"
+                             hx-get="/api/trades"
+                             hx-trigger="load"
+                             hx-swap="innerHTML">
+                            <div class="text-gray-400">Loading...</div>
+                        </div>
                     </div>
                 </div>
 
                 <!-- Performance Tab -->
                 <div x-show="tab === 'performance'" x-cloak>
-                    <div class="bg-gray-800 rounded-lg p-6">
+                    <!-- Performance Metrics -->
+                    <div class="mb-6">
                         <h2 class="text-xl font-semibold mb-4">Performance Metrics</h2>
-                        <p class="text-gray-400">Coming soon: Performance analytics</p>
+                        <div id="performance-metrics"
+                             hx-get="/api/trades/performance"
+                             hx-trigger="load, every 30s"
+                             hx-swap="innerHTML">
+                            <div class="text-gray-400">Loading...</div>
+                        </div>
+                    </div>
+
+                    <!-- P&L Chart (coming soon) -->
+                    <div class="bg-gray-800 rounded-lg p-6">
+                        <h3 class="text-lg font-semibold mb-4">Cumulative P&L Over Time</h3>
+                        <div id="pnl-chart">
+                            <p class="text-gray-400">Chart coming soon...</p>
+                        </div>
                     </div>
                 </div>
 
