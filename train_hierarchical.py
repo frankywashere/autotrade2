@@ -2520,12 +2520,30 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     # Primary loss: high/low predictions
                     target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                     loss = F.mse_loss(predictions[:, :2], target_tensor)
+
+                    # Debug: Print target/prediction stats on first batch
+                    if batch_idx == 0 and epoch == 0:
+                        print(f"[DEBUG] targets high: mean={targets['high'].mean():.1f}, min={targets['high'].min():.1f}, max={targets['high'].max():.1f}", flush=True)
+                        print(f"[DEBUG] targets low: mean={targets['low'].mean():.1f}, min={targets['low'].min():.1f}, max={targets['low'].max():.1f}", flush=True)
+                        print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.1f}, std={predictions[:,:2].std():.1f}", flush=True)
+                        print(f"[DEBUG] primary loss (high/low MSE): {loss.item():.2f}", flush=True)
+
                     # Multi-task losses (if enabled)
                     if args.multi_task and 'multi_task' in hidden_states:
                         mt = hidden_states['multi_task']
                         loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band'])
                         loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target'])
                         loss = loss + 0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return'])
+
+                        # Adaptive projection losses (trains the adaptive_projection network)
+                        if 'price_change_pct' in mt and 'price_change_pct' in targets:
+                            loss = loss + 0.4 * F.mse_loss(mt['price_change_pct'].squeeze(), targets['price_change_pct'])
+                            loss = loss + 0.3 * F.mse_loss(mt['horizon_bars_log'].squeeze(), targets['horizon_bars_log'])
+                            # adaptive_confidence uses BCE (sigmoid output vs 0/1 target)
+                            loss = loss + 0.2 * F.binary_cross_entropy(
+                                mt['adaptive_confidence'].float().squeeze(),
+                                targets['adaptive_confidence'].float()
+                            )
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -2534,12 +2552,30 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 # Primary loss: high/low predictions
                 target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                 loss = F.mse_loss(predictions[:, :2], target_tensor)
+
+                # Debug: Print target/prediction stats on first batch
+                if batch_idx == 0 and epoch == 0:
+                    print(f"[DEBUG] targets high: mean={targets['high'].mean():.1f}, min={targets['high'].min():.1f}, max={targets['high'].max():.1f}", flush=True)
+                    print(f"[DEBUG] targets low: mean={targets['low'].mean():.1f}, min={targets['low'].min():.1f}, max={targets['low'].max():.1f}", flush=True)
+                    print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.1f}, std={predictions[:,:2].std():.1f}", flush=True)
+                    print(f"[DEBUG] primary loss (high/low MSE): {loss.item():.2f}", flush=True)
+
                 # Multi-task losses (if enabled)
                 if args.multi_task and 'multi_task' in hidden_states:
                     mt = hidden_states['multi_task']
                     loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band'])
                     loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target'])
                     loss = loss + 0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return'])
+
+                    # Adaptive projection losses (trains the adaptive_projection network)
+                    if 'price_change_pct' in mt and 'price_change_pct' in targets:
+                        loss = loss + 0.4 * F.mse_loss(mt['price_change_pct'].squeeze(), targets['price_change_pct'])
+                        loss = loss + 0.3 * F.mse_loss(mt['horizon_bars_log'].squeeze(), targets['horizon_bars_log'])
+                        # adaptive_confidence uses BCE (sigmoid output vs 0/1 target)
+                        loss = loss + 0.2 * F.binary_cross_entropy(
+                            mt['adaptive_confidence'].float().squeeze(),
+                            targets['adaptive_confidence'].float()
+                        )
                 loss.backward()
                 optimizer.step()
 
