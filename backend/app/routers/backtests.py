@@ -19,26 +19,88 @@ class BacktestRequest(BaseModel):
 
 
 @router.post("/simulate")
-async def run_backtest_simulation(request: BacktestRequest):
+async def run_backtest_simulation(
+    start_date: date,
+    end_date: date,
+    confidence_threshold: float = 0.7,
+    layer: Optional[str] = None
+):
     """
     Quick backtest simulation using existing predictions
 
     Args:
-        request: Backtest configuration
+        start_date: Backtest start date
+        end_date: Backtest end date
+        confidence_threshold: Minimum confidence to trade
+        layer: Which layer to use (15min, 1hour, 4hour, daily, or None for fusion)
 
     Returns:
-        Backtest results with win rate, P&L, Sharpe ratio
+        HTML with backtest results
     """
-    # TODO: Implement with BacktestService
-    return {
-        "id": 1,
-        "name": request.name,
-        "status": "completed",
-        "total_trades": 0,
-        "win_rate": 0.0,
-        "total_pnl": 0.0,
-        "sharpe_ratio": 0.0
-    }
+    from backend.app.services.backtest_service import backtest_service
+
+    try:
+        results = backtest_service.run_simulation(
+            name=f"Backtest {start_date} to {end_date}",
+            start_date=start_date,
+            end_date=end_date,
+            confidence_threshold=confidence_threshold,
+            layer=layer
+        )
+
+        # Color coding
+        win_rate_color = "text-green-400" if results['win_rate'] > 0.5 else "text-yellow-400" if results['win_rate'] > 0.3 else "text-red-400"
+        pnl_color = "text-green-400" if results['total_pnl'] > 0 else "text-red-400"
+        sharpe_color = "text-green-400" if results['sharpe_ratio'] > 1 else "text-yellow-400" if results['sharpe_ratio'] > 0 else "text-red-400"
+
+        return f"""
+        <div class="bg-gray-700 rounded-lg p-6 border border-gray-600">
+            <h3 class="text-xl font-semibold mb-4 text-blue-400">Backtest Results</h3>
+
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                <div class="bg-gray-800 rounded-lg p-4">
+                    <div class="text-sm text-gray-400 mb-1">Total Trades</div>
+                    <div class="text-2xl font-bold">{results['total_trades']}</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4">
+                    <div class="text-sm text-gray-400 mb-1">Win Rate</div>
+                    <div class="text-2xl font-bold {win_rate_color}">{results['win_rate']:.1%}</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4">
+                    <div class="text-sm text-gray-400 mb-1">Total P&L</div>
+                    <div class="text-2xl font-bold {pnl_color}">{results['total_pnl']:+.2f}%</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4">
+                    <div class="text-sm text-gray-400 mb-1">Sharpe Ratio</div>
+                    <div class="text-2xl font-bold {sharpe_color}">{results['sharpe_ratio']:.2f}</div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4 mb-6">
+                <div class="bg-gray-800 rounded-lg p-4">
+                    <div class="text-sm text-gray-400 mb-1">Avg P&L per Trade</div>
+                    <div class="text-xl font-bold">{results['avg_pnl']:+.2f}%</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4">
+                    <div class="text-sm text-gray-400 mb-1">Max Drawdown</div>
+                    <div class="text-xl font-bold text-red-400">{results['max_drawdown']:.2f}%</div>
+                </div>
+            </div>
+
+            <div class="text-sm text-gray-400">
+                <p>Period: {start_date} to {end_date}</p>
+                <p>Confidence threshold: {confidence_threshold:.0%}</p>
+                <p>Layer: {layer or 'Fusion (default)'}</p>
+            </div>
+        </div>
+        """
+
+    except Exception as e:
+        return f"""
+        <div class="bg-red-900 bg-opacity-30 border border-red-700 rounded-lg p-4">
+            <p class="text-red-400">Error running backtest: {str(e)}</p>
+        </div>
+        """
 
 
 @router.get("/{backtest_id}")

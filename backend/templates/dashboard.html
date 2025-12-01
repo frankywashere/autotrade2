@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoTrade2 - ML Trading Dashboard</title>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- HTMX -->
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+
+    <!-- Alpine.js -->
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+    <!-- Plotly.js -->
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+
+    <style>
+        [x-cloak] { display: none !important; }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100">
+
+    <!-- Header -->
+    <nav class="bg-gray-800 border-b border-gray-700">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16">
+                <div class="flex items-center">
+                    <h1 class="text-2xl font-bold text-blue-400">🎯 AutoTrade2</h1>
+                    <span class="ml-4 text-sm text-gray-400">Hierarchical LNN Predictions</span>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div class="text-sm text-gray-400" id="last-update">
+                        Loading...
+                    </div>
+                    <button
+                        class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium"
+                        hx-get="/api/predictions/latest"
+                        hx-target="#prediction-card"
+                        hx-swap="outerHTML"
+                    >
+                        🔄 Refresh
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+
+        <!-- Tabs -->
+        <div class="mb-6" x-data="{ tab: 'predictions' }">
+            <div class="border-b border-gray-700">
+                <nav class="-mb-px flex space-x-8">
+                    <button
+                        @click="tab = 'predictions'"
+                        :class="tab === 'predictions' ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-400 hover:text-gray-300'"
+                        class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm"
+                    >
+                        📊 Live Predictions
+                    </button>
+                    <button
+                        @click="tab = 'backtest'"
+                        :class="tab === 'backtest' ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-400 hover:text-gray-300'"
+                        class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm"
+                    >
+                        📈 Backtesting
+                    </button>
+                    <button
+                        @click="tab = 'trades'"
+                        :class="tab === 'trades' ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-400 hover:text-gray-300'"
+                        class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm"
+                    >
+                        💰 Trades
+                    </button>
+                    <button
+                        @click="tab = 'performance'"
+                        :class="tab === 'performance' ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-400 hover:text-gray-300'"
+                        class="whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm"
+                    >
+                        📉 Performance
+                    </button>
+                </nav>
+            </div>
+
+            <!-- Tab Content -->
+            <div class="mt-6">
+
+                <!-- Predictions Tab -->
+                <div x-show="tab === 'predictions'" x-cloak>
+                    <div id="prediction-card"
+                         hx-get="/api/predictions/latest"
+                         hx-trigger="load, every 5m"
+                         hx-swap="outerHTML">
+                        <div class="bg-gray-800 rounded-lg p-6 animate-pulse">
+                            <div class="h-8 bg-gray-700 rounded w-1/4 mb-4"></div>
+                            <div class="h-4 bg-gray-700 rounded w-3/4"></div>
+                        </div>
+                    </div>
+
+                    <!-- Recent Predictions History -->
+                    <div class="mt-8">
+                        <h3 class="text-lg font-semibold mb-4">Recent Predictions</h3>
+                        <div id="predictions-history"
+                             hx-get="/api/predictions/history?limit=10"
+                             hx-trigger="load"
+                             hx-swap="innerHTML">
+                            <div class="text-gray-400">Loading...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Backtest Tab -->
+                <div x-show="tab === 'backtest'" x-cloak>
+                    <div class="bg-gray-800 rounded-lg p-6">
+                        <h2 class="text-xl font-semibold mb-4">Run Backtest Simulation</h2>
+
+                        <form hx-post="/api/backtests/simulate"
+                              hx-target="#backtest-results"
+                              hx-swap="innerHTML"
+                              class="space-y-4">
+
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-medium mb-2">Start Date</label>
+                                    <input type="date" name="start_date" value="2025-11-01"
+                                           class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg">
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium mb-2">End Date</label>
+                                    <input type="date" name="end_date" value="2025-11-30"
+                                           class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg">
+                                </div>
+                            </div>
+
+                            <div>
+                                <label class="block text-sm font-medium mb-2">Confidence Threshold</label>
+                                <input type="range" name="confidence_threshold" min="0.5" max="0.95" step="0.05" value="0.7"
+                                       class="w-full"
+                                       oninput="this.nextElementSibling.textContent = (this.value * 100).toFixed(0) + '%'">
+                                <span class="text-sm text-gray-400">70%</span>
+                            </div>
+
+                            <div>
+                                <label class="block text-sm font-medium mb-2">Layer</label>
+                                <select name="layer" class="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg">
+                                    <option value="">Fusion (default)</option>
+                                    <option value="15min">15 Minute</option>
+                                    <option value="1hour">1 Hour</option>
+                                    <option value="4hour">4 Hour</option>
+                                    <option value="daily">Daily</option>
+                                </select>
+                            </div>
+
+                            <button type="submit"
+                                    class="w-full px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium">
+                                Run Backtest
+                            </button>
+                        </form>
+
+                        <div id="backtest-results" class="mt-6">
+                            <!-- Results will appear here -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Trades Tab -->
+                <div x-show="tab === 'trades'" x-cloak>
+                    <div class="bg-gray-800 rounded-lg p-6">
+                        <h2 class="text-xl font-semibold mb-4">Trade Management</h2>
+                        <p class="text-gray-400">Coming soon: Manual trade logging</p>
+                    </div>
+                </div>
+
+                <!-- Performance Tab -->
+                <div x-show="tab === 'performance'" x-cloak>
+                    <div class="bg-gray-800 rounded-lg p-6">
+                        <h2 class="text-xl font-semibold mb-4">Performance Metrics</h2>
+                        <p class="text-gray-400">Coming soon: Performance analytics</p>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // Update timestamp
+        function updateTimestamp() {
+            document.getElementById('last-update').textContent =
+                'Last update: ' + new Date().toLocaleTimeString();
+        }
+        updateTimestamp();
+        setInterval(updateTimestamp, 60000); // Update every minute
+    </script>
+
+</body>
+</html>
