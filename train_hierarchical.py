@@ -437,7 +437,11 @@ def pick_cache_pair(caches):
 
     # Auto-select when only one cache is available
     if len(caches) == 1:
-        return caches[0]
+        cache = caches[0]
+        status = "COMPLETE" if cache.get("complete") else "partial"
+        print(f"\n✅ Auto-selected cache: {cache['cache_key']} ({status})")
+        print(f"   → Will skip feature extraction and use cached data\n")
+        return cache
 
     choices = []
     for c in caches:
