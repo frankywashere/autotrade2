@@ -2284,6 +2284,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         use_cache=True,
         continuation=True,
         use_chunking=args.use_chunking,
+        use_gpu=args.use_gpu_features,  # Pass user's GPU selection
         shard_storage_path=str(shard_path),
         vix_data=vix_data,  # v3.20: VIX features for volatility regime
         events_handler=events_handler,  # v4.0: Event features for earnings/FOMC patterns

@@ -470,17 +470,11 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
                 total=len(tasks)
             )
 
-            # Process progress updates with safety timeout
+            # Process progress updates (no timeout - let workers finish)
             import time
             start_time = time.time()
-            max_wait_seconds = 600  # 10 minutes max
 
             while workers_done < n_jobs or len(completed_tasks) < len(tasks):
-                # Safety timeout
-                elapsed = time.time() - start_time
-                if elapsed > max_wait_seconds:
-                    console.print(f"[red]⚠️ Timeout after {elapsed:.0f}s - {workers_done}/{n_jobs} workers done, {len(completed_tasks)}/{len(tasks)} tasks complete[/red]")
-                    break
 
                 try:
                     # Get progress update (with timeout to update display)
@@ -594,8 +588,8 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
         print(f"   ⏳ [{elapsed:.1f}s] Waiting for result {collected + 1}/{len(tasks)}...", end='', flush=True)
 
         try:
-            # FIX 2: Non-blocking get
-            task_idx, result = result_queue.get_nowait()  # Don't block, return immediately
+            # FIX 2: Blocking get with timeout (allows workers time to finish)
+            task_idx, result = result_queue.get(timeout=1.0)  # Wait up to 1s for result
             results_dict[task_idx] = result
             num_features = len(result) if result else 0
             print(f" ✓ Got task {task_idx} ({num_features} features)")
@@ -603,7 +597,7 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
             timeout_count = 0  # Reset on success
 
         except Empty:
-            # Queue is empty right now
+            # Queue is empty right now (workers still processing)
             timeout_count += 1
             print(f" ⚠️  Empty #{timeout_count}", flush=True)
 
