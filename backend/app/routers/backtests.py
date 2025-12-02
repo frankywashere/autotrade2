@@ -1,25 +1,47 @@
 """
 Backtesting API Router
 """
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from datetime import date
 from typing import Optional
+import asyncio
+import logging
 
+logger = logging.getLogger(__name__)
+limiter = Limiter(key_func=get_remote_address)
 router = APIRouter()
 
 
 class BacktestRequest(BaseModel):
-    """Backtest configuration"""
-    name: str
+    """Backtest configuration with validation"""
+    name: str = Field(..., min_length=1, max_length=100)
     start_date: date
     end_date: date
-    confidence_threshold: float = 0.7
-    layer: Optional[str] = None  # fast, medium, slow, or fusion
+    confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    layer: Optional[str] = Field(default=None, pattern="^(fast|medium|slow|fusion)$")
+
+    @field_validator('end_date')
+    @classmethod
+    def end_after_start(cls, v, info):
+        if 'start_date' in info.data and v <= info.data['start_date']:
+            raise ValueError('end_date must be after start_date')
+        return v
+
+    @field_validator('start_date')
+    @classmethod
+    def date_not_future(cls, v):
+        if v > date.today():
+            raise ValueError('start_date cannot be in future')
+        return v
 
 
 @router.post("/simulate")
+@limiter.limit("5/minute")
 async def run_backtest_simulation(
+    request: Request,
     start_date: date,
     end_date: date,
     confidence_threshold: float = 0.7,
@@ -27,8 +49,10 @@ async def run_backtest_simulation(
 ):
     """
     Quick backtest simulation using existing predictions
+    Rate limited: 5 requests per minute
 
     Args:
+        request: FastAPI request (for rate limiting)
         start_date: Backtest start date
         end_date: Backtest end date
         confidence_threshold: Minimum confidence to trade
@@ -40,12 +64,14 @@ async def run_backtest_simulation(
     from backend.app.services.backtest_service import backtest_service
 
     try:
-        results = backtest_service.run_simulation(
-            name=f"Backtest {start_date} to {end_date}",
-            start_date=start_date,
-            end_date=end_date,
-            confidence_threshold=confidence_threshold,
-            layer=layer
+        # Run blocking operation in thread pool
+        results = await asyncio.to_thread(
+            backtest_service.run_simulation,
+            f"Backtest {start_date} to {end_date}",
+            start_date,
+            end_date,
+            confidence_threshold,
+            layer
         )
 
         # Color coding
@@ -96,9 +122,10 @@ async def run_backtest_simulation(
         """
 
     except Exception as e:
-        return f"""
+        logger.exception("Error running backtest")
+        return """
         <div class="bg-red-900 bg-opacity-30 border border-red-700 rounded-lg p-4">
-            <p class="text-red-400">Error running backtest: {str(e)}</p>
+            <p class="text-red-400">Error running backtest. Please check your date range and try again.</p>
         </div>
         """
 

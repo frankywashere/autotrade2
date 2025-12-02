@@ -755,6 +755,40 @@ class HierarchicalDataset(Dataset):
             'adaptive_confidence': adaptive_confidence
         }
 
+        # ===== BREAKOUT LABELS (v3.21) =====
+        # Detect channel breakout using past prices for channel definition
+        # and future prices for breakout detection
+        try:
+            # Get past close prices for channel calculation
+            if self.raw_ohlc_array is not None:
+                past_ohlc = self.raw_ohlc_array[seq_start:seq_end]
+                past_prices_for_channel = past_ohlc[:, 3]  # Close prices
+            elif self.using_mmaps and self.non_channel_array is not None:
+                past_prices_for_channel = self.non_channel_array[seq_start:seq_end, self.close_idx]
+            else:
+                past_prices_for_channel = self.features_array[seq_start:seq_end, self.close_idx]
+
+            breakout_labels = self._detect_channel_breakout(
+                past_prices=past_prices_for_channel,
+                future_prices=future_prices,
+                current_price=current_price,
+                lookback=60,  # 1 hour channel
+                channel_std=2.0,
+                breakout_threshold=1.0
+            )
+
+            targets['breakout_occurred'] = breakout_labels['breakout_occurred']
+            targets['breakout_direction'] = breakout_labels['breakout_direction']
+            targets['breakout_bars_log'] = breakout_labels['breakout_bars_log']
+            targets['breakout_magnitude'] = breakout_labels['breakout_magnitude']
+
+        except Exception as e:
+            # Fallback values if breakout detection fails
+            targets['breakout_occurred'] = 0.0
+            targets['breakout_direction'] = 0.5
+            targets['breakout_bars_log'] = np.log(self.prediction_horizon + 1)
+            targets['breakout_magnitude'] = 0.0
+
         # Add continuation prediction targets if enabled
         if self.include_continuation and self.continuation_labels_df is not None:
             try:
@@ -920,6 +954,99 @@ class HierarchicalDataset(Dataset):
         # Neither hit - hold to end of horizon
         final_price = prices[-1]
         return (final_price - entry_price) / entry_price * 100.0
+
+    def _detect_channel_breakout(
+        self,
+        past_prices: np.ndarray,
+        future_prices: np.ndarray,
+        current_price: float,
+        lookback: int = 60,
+        channel_std: float = 2.0,
+        breakout_threshold: float = 1.0
+    ) -> dict:
+        """
+        Detect channel breakout in future prices based on past channel bounds.
+
+        Uses linear regression channel from past prices and detects when future
+        prices break out of the channel. This is a FORWARD-LOOKING label (no leakage
+        since we only use it for training targets, not features).
+
+        Args:
+            past_prices: Historical close prices (input sequence) - shape [seq_len]
+            future_prices: Future close prices (label window) - shape [horizon]
+            current_price: Current price at prediction time
+            lookback: Bars to use for channel calculation (default 60 = 1 hour)
+            channel_std: Channel width in std deviations (default 2.0)
+            breakout_threshold: Std deviations beyond channel for breakout (default 1.0)
+
+        Returns:
+            Dict with:
+                - breakout_occurred: 1.0 if breakout happened, 0.0 otherwise
+                - breakout_direction: 1.0 if upward, 0.0 if downward (or no breakout)
+                - breakout_bars: Bars until breakout (log-scaled), or max horizon
+                - breakout_magnitude: How far price moved beyond channel (% of channel width)
+        """
+        # Default values (no breakout)
+        result = {
+            'breakout_occurred': 0.0,
+            'breakout_direction': 0.5,  # Neutral
+            'breakout_bars_log': np.log(len(future_prices) + 1),  # Max horizon (log-scaled)
+            'breakout_magnitude': 0.0
+        }
+
+        # Need enough past data for channel calculation
+        if len(past_prices) < lookback or len(past_prices) < 10:
+            return result
+
+        # Calculate channel from past prices (last `lookback` bars)
+        y = past_prices[-lookback:]
+        X = np.arange(lookback)
+
+        # Fit linear regression
+        X_mean = X.mean()
+        y_mean = y.mean()
+        slope = np.sum((X - X_mean) * (y - y_mean)) / (np.sum((X - X_mean) ** 2) + 1e-10)
+        intercept = y_mean - slope * X_mean
+
+        # Calculate residuals and channel width
+        fitted = slope * X + intercept
+        residuals = y - fitted
+        channel_width = np.std(residuals) + 1e-10  # Avoid division by zero
+
+        # Project channel forward
+        # The channel at bar i (future) extends the regression line
+        upper_bounds = []
+        lower_bounds = []
+        for i in range(len(future_prices)):
+            future_bar_idx = lookback + i  # Continue from end of past sequence
+            projected_center = slope * future_bar_idx + intercept
+            upper_bounds.append(projected_center + channel_std * channel_width)
+            lower_bounds.append(projected_center - channel_std * channel_width)
+
+        upper_bounds = np.array(upper_bounds)
+        lower_bounds = np.array(lower_bounds)
+
+        # Detect breakout
+        breakout_threshold_dist = breakout_threshold * channel_width
+
+        for i, price in enumerate(future_prices):
+            # Check for upward breakout
+            if price > upper_bounds[i] + breakout_threshold_dist:
+                result['breakout_occurred'] = 1.0
+                result['breakout_direction'] = 1.0  # Up
+                result['breakout_bars_log'] = np.log(i + 1 + 1e-6)  # Log-scaled bars (+1 to avoid log(0))
+                result['breakout_magnitude'] = (price - upper_bounds[i]) / channel_width
+                break
+
+            # Check for downward breakout
+            elif price < lower_bounds[i] - breakout_threshold_dist:
+                result['breakout_occurred'] = 1.0
+                result['breakout_direction'] = 0.0  # Down
+                result['breakout_bars_log'] = np.log(i + 1 + 1e-6)
+                result['breakout_magnitude'] = (lower_bounds[i] - price) / channel_width
+                break
+
+        return result
 
     def get_sample_info(self, idx: int) -> dict:
         """

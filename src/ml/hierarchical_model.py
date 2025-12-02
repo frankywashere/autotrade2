@@ -186,6 +186,40 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 nn.Linear(128, 3)  # [price_change_pct, horizon_bars_log, confidence]
             )
 
+            # Breakout Prediction Heads (v3.21)
+            # Uses fusion output to predict channel breakouts
+            # Probability of breakout occurring in next N bars (0-1)
+            self.breakout_prob_head = nn.Sequential(
+                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
+                nn.ReLU(),
+                nn.Linear(self.fusion_output_dim // 2, 1),
+                nn.Sigmoid()
+            )
+
+            # Breakout direction if it occurs: 1=up, 0=down (probability of up-breakout)
+            self.breakout_direction_head = nn.Sequential(
+                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
+                nn.ReLU(),
+                nn.Linear(self.fusion_output_dim // 2, 1),
+                nn.Sigmoid()
+            )
+
+            # Expected bars until breakout (regression, log-transformed)
+            # Output will be exp() transformed to get actual bars (1-100 range)
+            self.breakout_bars_head = nn.Sequential(
+                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
+                nn.ReLU(),
+                nn.Linear(self.fusion_output_dim // 2, 1)
+            )
+
+            # Breakout confidence: separate from probability, indicates model certainty
+            self.breakout_confidence_head = nn.Sequential(
+                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
+                nn.ReLU(),
+                nn.Linear(self.fusion_output_dim // 2, 1),
+                nn.Sigmoid()
+            )
+
         # Move to device
         self.to(device)
 
@@ -428,6 +462,24 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 'dominant_layer_idx': dominant_layer_idx  # Tensor indices (0=fast, 1=medium, 2=slow)
             }
 
+            # Breakout predictions (v3.21) - check if heads exist for backward compat
+            if hasattr(self, 'breakout_prob_head'):
+                breakout_prob = self.breakout_prob_head(fusion_hidden)  # [batch, 1], 0-1
+                breakout_direction = self.breakout_direction_head(fusion_hidden)  # [batch, 1], 0-1 (up prob)
+                breakout_bars_log = self.breakout_bars_head(fusion_hidden)  # [batch, 1], log scale
+                breakout_confidence = self.breakout_confidence_head(fusion_hidden)  # [batch, 1], 0-1
+
+                # Transform breakout_bars from log to actual bars (1-100 range)
+                breakout_bars = torch.exp(breakout_bars_log).clamp(1, 100)
+
+                hidden_states['breakout'] = {
+                    'probability': breakout_prob,  # Prob of breakout in next N bars
+                    'direction': breakout_direction,  # Prob it's an up-breakout (vs down)
+                    'bars_until': breakout_bars,  # Expected bars until breakout
+                    'confidence': breakout_confidence,  # Model certainty
+                    'is_trained': False  # Will be True after training with breakout labels
+                }
+
         return predictions, hidden_states
 
     def clear_cached_states(self):
@@ -520,6 +572,18 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 result['expected_return_pred'] = mt['expected_return'][0, 0].item()
                 result['overshoot_pred'] = mt['overshoot'][0, 0].item()
 
+            # Add breakout predictions if available
+            if 'breakout' in hidden_states:
+                bo = hidden_states['breakout']
+                result['breakout'] = {
+                    'probability': bo['probability'][0, 0].item(),  # 0-1
+                    'direction': bo['direction'][0, 0].item(),  # 0-1 (up prob)
+                    'direction_label': 'up' if bo['direction'][0, 0].item() > 0.5 else 'down',
+                    'bars_until': bo['bars_until'][0, 0].item(),  # 1-100
+                    'confidence': bo['confidence'][0, 0].item(),  # 0-1
+                    'is_trained': bo['is_trained']  # False until trained
+                }
+
             return result
 
     def project_channel(
@@ -581,7 +645,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
                     # Validation time (when to check this prediction)
                     validation_time = datetime.now() + timedelta(minutes=horizon)
 
-                    projections.append({
+                    projection = {
                         'horizon_minutes': horizon,
                         'predicted_high': pred_high_pct,
                         'predicted_low': pred_low_pct,
@@ -594,7 +658,13 @@ class HierarchicalLNN(nn.Module, ModelBase):
                         'fast_layer_weight': pred_dict['fusion_weights'][0],
                         'medium_layer_weight': pred_dict['fusion_weights'][1],
                         'slow_layer_weight': pred_dict['fusion_weights'][2]
-                    })
+                    }
+
+                    # Add breakout predictions if available
+                    if 'breakout' in pred_dict:
+                        projection['breakout'] = pred_dict['breakout']
+
+                    projections.append(projection)
                 else:
                     # Confidence too low - stop projecting further
                     break
@@ -778,7 +848,20 @@ def load_hierarchical_model(model_path: str, device: str = 'cpu') -> Hierarchica
     if any(k.startswith('module.') for k in state_dict.keys()):
         state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
 
-    # Load state dict
-    model.load_state_dict(state_dict)
+    # Load state dict (strict=False for backward compat with older checkpoints
+    # that don't have breakout heads)
+    incompatible = model.load_state_dict(state_dict, strict=False)
+
+    # Log any missing keys (expected for new heads like breakout)
+    if incompatible.missing_keys:
+        # Only warn if keys are NOT breakout-related (expected to be missing)
+        non_breakout_missing = [k for k in incompatible.missing_keys if 'breakout' not in k]
+        if non_breakout_missing:
+            print(f"  ⚠️ Unexpected missing keys: {non_breakout_missing}")
+        else:
+            print(f"  ℹ️ Breakout heads initialized randomly (not in checkpoint)")
+
+    if incompatible.unexpected_keys:
+        print(f"  ⚠️ Unexpected keys in checkpoint: {incompatible.unexpected_keys}")
 
     return model

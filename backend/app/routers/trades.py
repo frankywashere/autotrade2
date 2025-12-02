@@ -3,11 +3,14 @@ Trade Management API Router
 """
 from fastapi import APIRouter, HTTPException, Request, Form
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
+import logging
 import sys
+
+logger = logging.getLogger(__name__)
 
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent.parent
@@ -20,19 +23,19 @@ router = APIRouter()
 
 
 class TradeCreate(BaseModel):
-    """Trade entry request"""
+    """Trade entry request with validation"""
     prediction_id: Optional[int] = None
     entry_time: datetime
-    entry_price: float
-    quantity: int = 1
-    notes: Optional[str] = None
+    entry_price: float = Field(..., gt=0, lt=100000)
+    quantity: int = Field(default=1, gt=0, lt=1000000)
+    notes: Optional[str] = Field(default=None, max_length=500)
 
 
 class TradeUpdate(BaseModel):
-    """Trade exit request"""
+    """Trade exit request with validation"""
     exit_time: datetime
-    exit_price: float
-    notes: Optional[str] = None
+    exit_price: float = Field(..., gt=0, lt=100000)
+    notes: Optional[str] = Field(default=None, max_length=500)
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -112,7 +115,8 @@ async def get_trades(request: Request, limit: int = 50, offset: int = 0):
         """
 
     except Exception as e:
-        return f"<div class='text-red-400'>Error loading trades: {str(e)}</div>"
+        logger.exception("Error loading trades")
+        return "<div class='text-red-400'>Error loading trades. Please try again.</div>"
 
 
 @router.post("/", response_class=HTMLResponse)
@@ -148,9 +152,10 @@ async def create_trade(
         """
 
     except Exception as e:
-        return f"""
+        logger.exception("Error logging trade")
+        return """
         <div class="bg-red-900 bg-opacity-30 border border-red-700 rounded-lg p-4 mb-4">
-            <p class="text-red-400">❌ Error logging trade: {str(e)}</p>
+            <p class="text-red-400">❌ Error logging trade. Please check your input and try again.</p>
         </div>
         """
 
@@ -203,9 +208,10 @@ async def update_trade(
         </div>
         """
     except Exception as e:
-        return f"""
+        logger.exception("Error updating trade")
+        return """
         <div class="bg-red-900 bg-opacity-30 border border-red-700 rounded-lg p-4 mb-4">
-            <p class="text-red-400">❌ Error: {str(e)}</p>
+            <p class="text-red-400">❌ Error updating trade. Please try again.</p>
         </div>
         """
 
@@ -265,4 +271,5 @@ async def get_performance_summary(request: Request):
         """
 
     except Exception as e:
-        return f"<div class='text-red-400'>Error: {str(e)}</div>"
+        logger.exception("Error loading performance metrics")
+        return "<div class='text-red-400'>Error loading performance metrics. Please try again.</div>"

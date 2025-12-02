@@ -4,10 +4,18 @@ Predictions API Router
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
+from html import escape
+import asyncio
+import logging
 import sys
+
+# Rate limiter (shared with main app)
+limiter = Limiter(key_func=get_remote_address)
 
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent.parent
@@ -18,6 +26,7 @@ from backend.app.services.prediction_service import prediction_service
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent.parent / "templates"))
+logger = logging.getLogger(__name__)
 
 
 @router.get("/latest", response_class=HTMLResponse)
@@ -31,7 +40,10 @@ async def get_latest_prediction(request: Request):
     try:
         # Try to generate/get cached prediction
         try:
-            pred_dict = prediction_service.get_latest_prediction(force_refresh=False)
+            # Run blocking operation in thread pool to avoid blocking event loop
+            pred_dict = await asyncio.to_thread(
+                prediction_service.get_latest_prediction, force_refresh=False
+            )
 
             # Convert dict to display format
             prediction_age = (datetime.now() - pred_dict['timestamp']).total_seconds() / 60
@@ -46,7 +58,7 @@ async def get_latest_prediction(request: Request):
             is_cached = prediction_age < 5
 
         except Exception as e:
-            print(f"Failed to generate live prediction: {e}")
+            logger.warning(f"Failed to generate live prediction: {e}")
             # Fallback to database
             prediction = (Prediction
                          .select()
@@ -123,9 +135,10 @@ async def get_latest_prediction(request: Request):
         """
 
     except Exception as e:
+        logger.exception("Error loading prediction")
         return f"""
         <div id="prediction-card" class="bg-gray-800 rounded-lg p-6 border border-red-700">
-            <p class="text-red-400">Error loading prediction: {str(e)}</p>
+            <p class="text-red-400">Error loading prediction. Please try again.</p>
         </div>
         """
 
@@ -202,20 +215,26 @@ async def get_prediction_history(
         """
 
     except Exception as e:
-        return f"<div class='text-red-400'>Error: {str(e)}</div>"
+        logger.exception("Error loading prediction history")
+        return "<div class='text-red-400'>Error loading history. Please try again.</div>"
 
 
 @router.post("/generate", response_class=HTMLResponse)
+@limiter.limit("1/minute")
 async def generate_new_prediction(request: Request):
     """
     Force generation of new prediction (ignores cache)
+    Rate limited: 1 request per minute
 
     Returns:
         HTML with fresh prediction or error message
     """
     try:
-        print("Generating fresh prediction (user requested)...")
-        pred_dict = prediction_service.get_latest_prediction(force_refresh=True)
+        logger.info("Generating fresh prediction (user requested)...")
+        # Run blocking operation in thread pool to avoid blocking event loop
+        pred_dict = await asyncio.to_thread(
+            prediction_service.get_latest_prediction, force_refresh=True
+        )
 
         # Format same as /latest endpoint
         current_price = pred_dict['current_price']
@@ -268,16 +287,330 @@ async def generate_new_prediction(request: Request):
         """
 
     except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        return f"""
+        logger.exception("Failed to generate prediction")
+        return """
         <div id="prediction-card" class="bg-red-900 bg-opacity-30 border border-red-700 rounded-lg p-6">
             <p class="text-red-400 font-bold">❌ Failed to generate prediction</p>
-            <p class="text-sm text-gray-400 mt-2">Error: {str(e)}</p>
-            <details class="mt-4">
-                <summary class="text-xs text-gray-500 cursor-pointer">Show details</summary>
-                <pre class="text-xs text-gray-500 mt-2 overflow-auto">{error_details}</pre>
-            </details>
+            <p class="text-sm text-gray-400 mt-2">Unable to generate prediction. Please try again later.</p>
+        </div>
+        """
+
+
+@router.get("/channel", response_class=HTMLResponse)
+async def get_channel_projection(request: Request):
+    """
+    Get dynamic horizon prediction with confidence-based selection.
+
+    Uses project_channel() to find the shortest horizon with sufficient confidence.
+    Shows a timeline of all valid horizons, highlighting the "best" (shortest confident) one.
+
+    Returns:
+        HTML fragment with multi-horizon prediction display
+    """
+    try:
+        # Run blocking operation in thread pool
+        result = await asyncio.to_thread(
+            prediction_service.get_channel_projection, force_refresh=False
+        )
+
+        projections = result['projections']
+        best = result['best_horizon']
+        current_price = result['current_price']
+        raw_confidence = result['raw_confidence']
+        timestamp = result['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+
+        # Extract breakout prediction if available
+        breakout = result.get('breakout', None)
+        breakout_html = ""
+        if breakout:
+            bo_prob = breakout['probability']
+            bo_dir = breakout['direction_label']
+            bo_bars = breakout['bars_until']
+            bo_conf = breakout['confidence']
+            bo_trained = breakout.get('is_trained', False)
+
+            # Color-code breakout probability
+            if bo_prob >= 0.7:
+                bo_color = "red" if bo_dir == "down" else "green"
+                bo_icon = "🚨" if bo_dir == "down" else "🚀"
+                bo_label = "HIGH"
+            elif bo_prob >= 0.5:
+                bo_color = "yellow"
+                bo_icon = "⚠️"
+                bo_label = "MODERATE"
+            else:
+                bo_color = "gray"
+                bo_icon = "📊"
+                bo_label = "LOW"
+
+            trained_badge = "" if bo_trained else " <span class='text-xs text-gray-500'>(untrained)</span>"
+
+            breakout_html = f"""
+            <div class="bg-{bo_color}-900 bg-opacity-30 border border-{bo_color}-600 rounded-lg p-3 mb-4">
+                <div class="flex justify-between items-center">
+                    <div>
+                        <span class="text-sm text-{bo_color}-400">{bo_icon} Channel Breakout Risk{trained_badge}</span>
+                        <div class="text-lg font-bold text-{bo_color}-400">{bo_label} - {bo_prob:.0%} probability</div>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-xs text-gray-400">Direction</div>
+                        <div class="text-lg font-bold text-{bo_color}-400">{bo_dir.upper()}</div>
+                    </div>
+                </div>
+                <div class="text-xs text-gray-400 mt-2">
+                    Est. ~{bo_bars:.0f} bars until breakout | Confidence: {bo_conf:.0%}
+                </div>
+            </div>
+            """
+
+        # Build horizon cards
+        horizon_cards = ""
+        horizon_labels = {
+            15: "15min",
+            30: "30min",
+            60: "1 hour",
+            120: "2 hours",
+            240: "4 hours",
+            1440: "24 hours"
+        }
+
+        if projections:
+            for i, proj in enumerate(projections):
+                horizon_min = proj['horizon_minutes']
+                label = horizon_labels.get(horizon_min, f"{horizon_min}min")
+                conf = proj['confidence']
+                high_price = proj['predicted_high_price']
+                low_price = proj['predicted_low_price']
+                high_pct = proj['predicted_high']
+                low_pct = proj['predicted_low']
+
+                # Highlight the best (first/shortest) horizon
+                is_best = (i == 0)
+                border_class = "border-blue-500 border-2" if is_best else "border-gray-600"
+                bg_class = "bg-blue-900 bg-opacity-30" if is_best else "bg-gray-800"
+                badge = '<span class="text-xs bg-blue-600 text-white px-2 py-1 rounded ml-2">BEST</span>' if is_best else ""
+
+                # Confidence color
+                if conf >= 0.75:
+                    conf_color = "text-green-400"
+                elif conf >= 0.65:
+                    conf_color = "text-yellow-400"
+                else:
+                    conf_color = "text-orange-400"
+
+                horizon_cards += f"""
+                <div class="{bg_class} {border_class} rounded-lg p-4">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="text-lg font-bold text-blue-300">{label}{badge}</span>
+                        <span class="text-sm {conf_color}">{conf:.0%} conf</span>
+                    </div>
+                    <div class="grid grid-cols-2 gap-2 text-sm">
+                        <div class="bg-green-900 bg-opacity-40 rounded p-2">
+                            <div class="text-green-400 text-xs">High</div>
+                            <div class="text-green-400 font-bold">${high_price:.2f}</div>
+                            <div class="text-green-400 text-xs">{high_pct:+.2f}%</div>
+                        </div>
+                        <div class="bg-red-900 bg-opacity-40 rounded p-2">
+                            <div class="text-red-400 text-xs">Low</div>
+                            <div class="text-red-400 font-bold">${low_price:.2f}</div>
+                            <div class="text-red-400 text-xs">{low_pct:+.2f}%</div>
+                        </div>
+                    </div>
+                </div>
+                """
+
+            # Best horizon summary
+            best_label = horizon_labels.get(best['horizon_minutes'], f"{best['horizon_minutes']}min")
+            best_conf = best['confidence']
+            best_high = best['predicted_high_price']
+            best_low = best['predicted_low_price']
+
+            return f"""
+            <div id="channel-projection" class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                <div class="flex justify-between items-start mb-4">
+                    <div>
+                        <h2 class="text-2xl font-bold text-blue-400">Dynamic Horizon Prediction</h2>
+                        <p class="text-sm text-gray-400">{timestamp}</p>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-sm text-gray-400">Current Price</div>
+                        <div class="text-2xl font-bold">${current_price:.2f}</div>
+                    </div>
+                </div>
+
+                {breakout_html}
+
+                <!-- Best Horizon Highlight -->
+                <div class="bg-blue-900 bg-opacity-30 border border-blue-600 rounded-lg p-4 mb-4">
+                    <div class="flex justify-between items-center">
+                        <div>
+                            <span class="text-sm text-blue-300">Best Prediction Available</span>
+                            <div class="text-3xl font-bold text-blue-400">{best_label}</div>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-sm text-gray-400">Confidence</div>
+                            <div class="text-2xl font-bold text-green-400">{best_conf:.0%}</div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 mt-3">
+                        <div class="text-center">
+                            <div class="text-sm text-green-400">Target High</div>
+                            <div class="text-xl font-bold text-green-400">${best_high:.2f}</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-sm text-red-400">Target Low</div>
+                            <div class="text-xl font-bold text-red-400">${best_low:.2f}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- All Valid Horizons -->
+                <div class="mb-4">
+                    <h3 class="text-sm text-gray-400 mb-2">All Valid Horizons ({len(projections)} available)</h3>
+                    <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+                        {horizon_cards}
+                    </div>
+                </div>
+
+                <div class="text-xs text-gray-500">
+                    <p>Raw model confidence: {raw_confidence:.0%} | Decay: e^(-horizon/60min)</p>
+                </div>
+            </div>
+            """
+
+        else:
+            # No projections meet confidence threshold
+            return f"""
+            <div id="channel-projection" class="bg-gray-800 rounded-lg p-6 border border-yellow-700">
+                <div class="flex justify-between items-start mb-4">
+                    <div>
+                        <h2 class="text-2xl font-bold text-yellow-400">Low Confidence</h2>
+                        <p class="text-sm text-gray-400">{timestamp}</p>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-sm text-gray-400">Current Price</div>
+                        <div class="text-2xl font-bold">${current_price:.2f}</div>
+                    </div>
+                </div>
+
+                {breakout_html}
+
+                <div class="bg-yellow-900 bg-opacity-30 border border-yellow-700 rounded-lg p-4">
+                    <p class="text-yellow-400">
+                        ⚠️ Model confidence ({raw_confidence:.0%}) is too low for reliable predictions.
+                    </p>
+                    <p class="text-sm text-gray-400 mt-2">
+                        After applying time decay, no horizon meets the 60% confidence threshold.
+                        Consider waiting for more favorable market conditions.
+                    </p>
+                </div>
+
+                <div class="mt-4 text-xs text-gray-500">
+                    <p>Raw model confidence: {raw_confidence:.0%} | Required after decay: ≥60%</p>
+                </div>
+            </div>
+            """
+
+    except Exception as e:
+        logger.exception("Error generating channel projection")
+        return f"""
+        <div id="channel-projection" class="bg-gray-800 rounded-lg p-6 border border-red-700">
+            <p class="text-red-400">Error generating channel projection. Please try again.</p>
+        </div>
+        """
+
+
+@router.post("/channel/generate", response_class=HTMLResponse)
+@limiter.limit("1/minute")
+async def generate_channel_projection(request: Request):
+    """
+    Force generation of new channel projection (ignores cache).
+    Rate limited: 1 request per minute
+
+    Returns:
+        HTML with fresh channel projection
+    """
+    try:
+        logger.info("Generating fresh channel projection (user requested)...")
+        result = await asyncio.to_thread(
+            prediction_service.get_channel_projection, force_refresh=True
+        )
+
+        # Reuse the same rendering logic as GET /channel
+        # For simplicity, redirect to the GET endpoint's response format
+        projections = result['projections']
+        best = result['best_horizon']
+        current_price = result['current_price']
+        raw_confidence = result['raw_confidence']
+        timestamp = result['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+
+        horizon_labels = {
+            15: "15min", 30: "30min", 60: "1 hour",
+            120: "2 hours", 240: "4 hours", 1440: "24 hours"
+        }
+
+        if projections:
+            best_label = horizon_labels.get(best['horizon_minutes'], f"{best['horizon_minutes']}min")
+            return f"""
+            <div id="channel-projection" class="bg-gray-800 rounded-lg p-6 border border-green-700">
+                <div class="bg-green-900 bg-opacity-20 border border-green-700 rounded-lg p-2 mb-4">
+                    <p class="text-sm text-green-400">✅ Fresh channel projection generated!</p>
+                </div>
+                <div class="flex justify-between items-start mb-4">
+                    <div>
+                        <h2 class="text-2xl font-bold text-blue-400">Dynamic Horizon Prediction</h2>
+                        <p class="text-sm text-gray-400">{timestamp}</p>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-sm text-gray-400">Current Price</div>
+                        <div class="text-2xl font-bold">${current_price:.2f}</div>
+                    </div>
+                </div>
+
+                <div class="bg-blue-900 bg-opacity-30 border border-blue-600 rounded-lg p-4">
+                    <div class="flex justify-between items-center">
+                        <div>
+                            <span class="text-sm text-blue-300">Best Prediction</span>
+                            <div class="text-3xl font-bold text-blue-400">{best_label}</div>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-sm text-gray-400">Confidence</div>
+                            <div class="text-2xl font-bold text-green-400">{best['confidence']:.0%}</div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 mt-3">
+                        <div class="text-center">
+                            <div class="text-sm text-green-400">Target High</div>
+                            <div class="text-xl font-bold text-green-400">${best['predicted_high_price']:.2f}</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-sm text-red-400">Target Low</div>
+                            <div class="text-xl font-bold text-red-400">${best['predicted_low_price']:.2f}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <p class="text-xs text-gray-500 mt-4">
+                    {len(projections)} valid horizons | Raw confidence: {raw_confidence:.0%}
+                </p>
+            </div>
+            """
+        else:
+            return f"""
+            <div id="channel-projection" class="bg-yellow-900 bg-opacity-30 border border-yellow-700 rounded-lg p-6">
+                <p class="text-yellow-400 font-bold">⚠️ Low Confidence</p>
+                <p class="text-sm text-gray-400 mt-2">
+                    Model confidence ({raw_confidence:.0%}) too low after time decay.
+                </p>
+            </div>
+            """
+
+    except Exception as e:
+        logger.exception("Failed to generate channel projection")
+        return """
+        <div id="channel-projection" class="bg-red-900 bg-opacity-30 border border-red-700 rounded-lg p-6">
+            <p class="text-red-400 font-bold">❌ Failed to generate channel projection</p>
+            <p class="text-sm text-gray-400 mt-2">Please try again later.</p>
         </div>
         """
 

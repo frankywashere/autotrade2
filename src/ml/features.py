@@ -1030,10 +1030,21 @@ class TradingFeatureExtractor(FeatureExtractor):
                         )
                     # Get data
                     if is_live_mode:
-                        if tf_name in ['5min', '15min', '30min']:
-                            source_data = multi_res_data['1min']
+                        # Use native yfinance intervals to avoid resampling gaps
+                        if tf_name == '5min':
+                            source_data = multi_res_data.get('5min', multi_res_data.get('1min'))
+                        elif tf_name == '15min':
+                            source_data = multi_res_data.get('15min', multi_res_data.get('1min'))
+                        elif tf_name == '30min':
+                            source_data = multi_res_data.get('30min', multi_res_data.get('1min'))
                         elif tf_name in ['1h', '2h', '3h', '4h']:
                             source_data = multi_res_data['1hour']
+                        elif tf_name == 'daily':
+                            source_data = multi_res_data['daily']
+                        elif tf_name == 'weekly':
+                            source_data = multi_res_data.get('weekly', multi_res_data.get('daily'))
+                        elif tf_name in ['monthly', '3month']:
+                            source_data = multi_res_data.get('monthly', multi_res_data.get('daily'))
                         else:
                             source_data = multi_res_data['daily']
                         # Optimize: chain column selection with rename to avoid intermediate copy
@@ -2380,17 +2391,24 @@ class TradingFeatureExtractor(FeatureExtractor):
             # Process both TSLA and SPY
             for symbol in ['tsla', 'spy']:
                 for tf_name, tf_rule in timeframes.items():
-                    # HYBRID DATA SELECTION: Use appropriate resolution for live mode
+                    # HYBRID DATA SELECTION: Use native yfinance intervals for live mode
                     if is_live_mode:
-                        # Live mode: Get data from appropriate resolution
-                        if tf_name in ['5min', '15min', '30min']:
-                            # Use 1-min data (sufficient history)
-                            source_data = multi_res_data['1min']
+                        # Use native yfinance intervals to avoid resampling gaps
+                        if tf_name == '5min':
+                            source_data = multi_res_data.get('5min', multi_res_data.get('1min'))
+                        elif tf_name == '15min':
+                            source_data = multi_res_data.get('15min', multi_res_data.get('1min'))
+                        elif tf_name == '30min':
+                            source_data = multi_res_data.get('30min', multi_res_data.get('1min'))
                         elif tf_name in ['1h', '2h', '3h', '4h']:
-                            # Use hourly data (2 years of history)
                             source_data = multi_res_data['1hour']
-                        else:  # daily, weekly, monthly, 3month
-                            # Use daily data (max history)
+                        elif tf_name == 'daily':
+                            source_data = multi_res_data['daily']
+                        elif tf_name == 'weekly':
+                            source_data = multi_res_data.get('weekly', multi_res_data.get('daily'))
+                        elif tf_name in ['monthly', '3month']:
+                            source_data = multi_res_data.get('monthly', multi_res_data.get('daily'))
+                        else:
                             source_data = multi_res_data['daily']
 
                         # Extract symbol columns

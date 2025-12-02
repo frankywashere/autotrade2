@@ -581,7 +581,12 @@ def train_epoch(
             'continuation_confidence': 0.3,
             'price_change_pct': 0.4,
             'horizon_bars_log': 0.3,
-            'adaptive_confidence': 0.2
+            'adaptive_confidence': 0.2,
+            # Breakout prediction weights (v3.21)
+            'breakout_occurred': 0.4,
+            'breakout_direction': 0.3,
+            'breakout_bars_log': 0.2,
+            'breakout_magnitude': 0.2
         }
 
     # For DistributedSampler: update epoch for reproducible shuffling
@@ -637,6 +642,13 @@ def train_epoch(
                 target_adaptive_horizon = targets_dict['adaptive_horizon'].to(device, non_blocking=True)
             if 'conf_score' in targets_dict:
                 target_conf_score = targets_dict['conf_score'].to(device, non_blocking=True)
+
+            # Breakout prediction targets (v3.21)
+            if 'breakout_occurred' in targets_dict:
+                target_breakout_occurred = targets_dict['breakout_occurred'].to(device, non_blocking=True)
+                target_breakout_direction = targets_dict['breakout_direction'].to(device, non_blocking=True)
+                target_breakout_bars_log = targets_dict['breakout_bars_log'].to(device, non_blocking=True)
+                target_breakout_magnitude = targets_dict['breakout_magnitude'].to(device, non_blocking=True)
 
         # Forward pass with optional AMP
         use_amp = scaler is not None
@@ -750,6 +762,40 @@ def train_epoch(
                         )
                     loss += loss_weights['adaptive_confidence'] * loss_adaptive_confidence
 
+                # Breakout prediction losses (v3.21)
+                if 'breakout' in hidden_states and 'breakout_occurred' in targets_dict:
+                    bo = hidden_states['breakout']
+
+                    # Breakout occurred (binary classification)
+                    with torch.amp.autocast('cuda', enabled=False):
+                        loss_breakout_occurred = F.binary_cross_entropy(
+                            bo['probability'].float().squeeze(),
+                            target_breakout_occurred.float()
+                        )
+                    loss += loss_weights['breakout_occurred'] * loss_breakout_occurred
+
+                    # Breakout direction (binary classification)
+                    with torch.amp.autocast('cuda', enabled=False):
+                        loss_breakout_direction = F.binary_cross_entropy(
+                            bo['direction'].float().squeeze(),
+                            target_breakout_direction.float()
+                        )
+                    loss += loss_weights['breakout_direction'] * loss_breakout_direction
+
+                    # Breakout timing (regression - log-scaled bars)
+                    loss_breakout_bars = criterion(
+                        bo['bars_until'].squeeze().log().clamp(-10, 10),
+                        target_breakout_bars_log
+                    )
+                    loss += loss_weights['breakout_bars_log'] * loss_breakout_bars
+
+                    # Breakout magnitude (regression)
+                    loss_breakout_magnitude = criterion(
+                        bo['confidence'].squeeze(),  # Use confidence head for magnitude
+                        target_breakout_magnitude.clamp(0, 5)  # Cap at 5x channel width
+                    )
+                    loss += loss_weights['breakout_magnitude'] * loss_breakout_magnitude
+
             # AMP backward pass
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -861,6 +907,38 @@ def train_epoch(
                     target_adaptive_confidence
                 )
                 loss += loss_weights['adaptive_confidence'] * loss_adaptive_confidence
+
+            # Breakout prediction losses (v3.21)
+            if 'breakout' in hidden_states and 'breakout_occurred' in targets_dict:
+                bo = hidden_states['breakout']
+
+                # Breakout occurred (binary classification)
+                loss_breakout_occurred = F.binary_cross_entropy(
+                    bo['probability'].squeeze(),
+                    target_breakout_occurred
+                )
+                loss += loss_weights['breakout_occurred'] * loss_breakout_occurred
+
+                # Breakout direction (binary classification)
+                loss_breakout_direction = F.binary_cross_entropy(
+                    bo['direction'].squeeze(),
+                    target_breakout_direction
+                )
+                loss += loss_weights['breakout_direction'] * loss_breakout_direction
+
+                # Breakout timing (regression - log-scaled bars)
+                loss_breakout_bars = criterion(
+                    bo['bars_until'].squeeze().log().clamp(-10, 10),
+                    target_breakout_bars_log
+                )
+                loss += loss_weights['breakout_bars_log'] * loss_breakout_bars
+
+                # Breakout magnitude (regression)
+                loss_breakout_magnitude = criterion(
+                    bo['confidence'].squeeze(),  # Use confidence head for magnitude
+                    target_breakout_magnitude.clamp(0, 5)  # Cap at 5x channel width
+                )
+                loss += loss_weights['breakout_magnitude'] * loss_breakout_magnitude
 
             # Standard backward pass
             optimizer.zero_grad(set_to_none=True)
