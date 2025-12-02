@@ -2229,6 +2229,26 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler.log_info(f"FEATURES_EXTRACTED | non_channel_cols={nc_cols} | continuation_rows={cont_rows}")
         profiler.snapshot("post_feature_extraction", 0, force_log=True)
 
+    # Save cache manifest for future reuse (only if we have all cache paths)
+    if is_main_process(rank) and hasattr(extractor, '_cache_key'):
+        cache_key = extractor._cache_key
+        cache_dir = extractor._unified_cache_dir if hasattr(extractor, '_unified_cache_dir') else shard_path
+        cont_path = str(extractor._cont_cache_path) if hasattr(extractor, '_cont_cache_path') and extractor._cont_cache_path else None
+        nc_path = str(extractor._non_channel_cache_path) if hasattr(extractor, '_non_channel_cache_path') else None
+        mmap_path = mmap_meta_path or (extractor._mmap_meta_path if hasattr(extractor, '_mmap_meta_path') else None)
+
+        if mmap_path and cont_path and nc_path:
+            save_cache_manifest(
+                cache_dir=cache_dir,
+                cache_key=cache_key,
+                mmap_meta_path=mmap_path,
+                continuation_path=cont_path,
+                non_channel_path=nc_path,
+                args=args,
+                df=df
+            )
+            print(f"   💾 Cache manifest saved: cache_manifest_{cache_key}.json")
+
     # =========================================================================
     # DATASET CREATION
     # =========================================================================
