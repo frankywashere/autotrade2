@@ -1,8 +1,10 @@
 """
-ML Prediction Service
+ML Prediction Service (v4.0)
 
 Wraps hierarchical_model.py for inference with caching.
-Extracts all 14,487 features fresh from live OHLCV data.
+v4.0: 11-layer architecture with ~9,000 features (down from 14,500)
+      - Includes VIX loading for market_state computation
+      - Uses market_state (12 dims) instead of news embeddings
 """
 import torch
 import numpy as np
@@ -17,8 +19,9 @@ import sys
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.ml.hierarchical_model import load_hierarchical_model
+from src.ml.hierarchical_model import load_hierarchical_model, HierarchicalLNN
 from src.ml.features import TradingFeatureExtractor
+from src.ml.market_state import calculate_market_state, MARKET_STATE_DIM
 from deprecated_code.live_data_feed import HybridLiveDataFeed
 from src.ml.events import CombinedEventsHandler
 
@@ -28,10 +31,12 @@ logger = logging.getLogger(__name__)
 
 class PredictionService:
     """
-    Singleton service for ML predictions.
+    Singleton service for ML predictions (v4.0).
 
     Features:
-    - Fresh feature extraction from live OHLCV data (14,487 features)
+    - Fresh feature extraction from live OHLCV data (~9,000 features)
+    - 11-layer hierarchical model (one per timeframe)
+    - VIX-based market_state computation (12 dims)
     - 5-minute prediction caching
     - Lazy model loading
     """
@@ -42,6 +47,7 @@ class PredictionService:
     _feature_extractor = None
     _data_feed = None
     _events_handler = None
+    _vix_data = None  # v4.0: VIX data for market_state
     _last_prediction = None
     _last_prediction_time = None
     _cache_ttl = timedelta(minutes=5)
@@ -49,6 +55,9 @@ class PredictionService:
     # Feature dimensions - loaded from model checkpoint (single source of truth)
     _expected_features = None  # Will be set from model.input_size when loaded
     SEQUENCE_LENGTH = 200
+
+    # v4.0: 11 timeframes for layer predictions
+    TIMEFRAMES = HierarchicalLNN.TIMEFRAMES
 
     @property
     def EXPECTED_FEATURES(self):
@@ -220,41 +229,51 @@ class PredictionService:
             with torch.no_grad():
                 result = self._model.predict(x_tensor)
 
-            # Format prediction
+            # Format prediction (v4.0: 11 layers instead of 3)
             prediction = {
                 'timestamp': datetime.now(),
                 'current_price': current_price,
                 'symbol': 'TSLA',
+                'model_version': '4.0',
 
                 # Fusion prediction
                 'predicted_high': float(result['predicted_high']),
                 'predicted_low': float(result['predicted_low']),
                 'confidence': float(result['confidence']),
 
-                # Layer predictions
-                'fast_pred_high': float(result.get('fast_pred_high', 0)),
-                'fast_pred_low': float(result.get('fast_pred_low', 0)),
-                'fast_pred_conf': float(result.get('fast_pred_conf', 0)),
+                # v4.0: Per-timeframe layer predictions (11 layers)
+                'layer_predictions': {},
 
-                'medium_pred_high': float(result.get('medium_pred_high', 0)),
-                'medium_pred_low': float(result.get('medium_pred_low', 0)),
-                'medium_pred_conf': float(result.get('medium_pred_conf', 0)),
-
-                'slow_pred_high': float(result.get('slow_pred_high', 0)),
-                'slow_pred_low': float(result.get('slow_pred_low', 0)),
-                'slow_pred_conf': float(result.get('slow_pred_conf', 0)),
-
-                # Fusion weights
-                'fusion_weights': result.get('fusion_weights', [0.33, 0.33, 0.33]),
+                # Fusion weights (now 11 values instead of 3)
+                'fusion_weights': result.get('fusion_weights', [1/11] * 11),
 
                 # Multi-task predictions (if available)
                 'multi_task': {
                     k: float(v) if hasattr(v, 'item') else v
                     for k, v in result.items()
-                    if k not in ['predicted_high', 'predicted_low', 'confidence', 'fusion_weights']
-                       and not k.startswith('fast_') and not k.startswith('medium_') and not k.startswith('slow_')
+                    if k not in ['predicted_high', 'predicted_low', 'confidence', 'fusion_weights', 'hidden_states']
+                       and not k.endswith('_pred_high') and not k.endswith('_pred_low') and not k.endswith('_pred_conf')
                 }
             }
+
+            # Add per-timeframe predictions (v4.0: 11 timeframes)
+            for tf in self.TIMEFRAMES:
+                prediction['layer_predictions'][tf] = {
+                    'high': float(result.get(f'{tf}_pred_high', 0)),
+                    'low': float(result.get(f'{tf}_pred_low', 0)),
+                    'confidence': float(result.get(f'{tf}_pred_conf', 0)),
+                }
+
+            # Backward compatibility: also include legacy fast/medium/slow keys
+            prediction['fast_pred_high'] = prediction['layer_predictions'].get('5min', {}).get('high', 0)
+            prediction['fast_pred_low'] = prediction['layer_predictions'].get('5min', {}).get('low', 0)
+            prediction['fast_pred_conf'] = prediction['layer_predictions'].get('5min', {}).get('confidence', 0)
+            prediction['medium_pred_high'] = prediction['layer_predictions'].get('1h', {}).get('high', 0)
+            prediction['medium_pred_low'] = prediction['layer_predictions'].get('1h', {}).get('low', 0)
+            prediction['medium_pred_conf'] = prediction['layer_predictions'].get('1h', {}).get('confidence', 0)
+            prediction['slow_pred_high'] = prediction['layer_predictions'].get('daily', {}).get('high', 0)
+            prediction['slow_pred_low'] = prediction['layer_predictions'].get('daily', {}).get('low', 0)
+            prediction['slow_pred_conf'] = prediction['layer_predictions'].get('daily', {}).get('confidence', 0)
 
             # Cache prediction
             self._last_prediction = prediction

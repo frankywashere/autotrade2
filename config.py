@@ -222,11 +222,37 @@ def get_torch_dtype():
 # Window sizes for multi-window channel analysis (bars to look back)
 # Used for ALL timeframes - same windows for consistency
 # Model learns which windows are relevant for each timeframe
-CHANNEL_WINDOW_SIZES = [168, 160, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20, 15, 10]
+# v4.0: Reduced from 21 windows to 14 (10-100 range only, removed 110-168)
+CHANNEL_WINDOW_SIZES = [100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20, 15, 10]
 
 # Minimum data requirement (for 3-month timeframe with 10-bar window)
 # 10 bars × 3 months/bar = 30 months = 2.5 years
 MIN_DATA_YEARS = 2.5
+
+# ======================================================================
+# MULTI-TIMEFRAME ARCHITECTURE CONFIGURATION (v4.0)
+# ======================================================================
+# 11 timeframes for the new hierarchical architecture
+# Each timeframe gets its own CfC layer with native OHLC data
+MODEL_TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+
+# Sequence lengths per timeframe (how many bars each layer sees)
+TIMEFRAME_SEQUENCE_LENGTHS = {
+    '5min': 200,    # 16.6 hours of 5-min data
+    '15min': 200,   # 50 hours
+    '30min': 200,   # 100 hours / 4.2 days
+    '1h': 200,      # 8.3 days
+    '2h': 100,      # 8.3 days
+    '3h': 100,      # 12.5 days
+    '4h': 100,      # 16.6 days
+    'daily': 60,    # 60 trading days / 3 months
+    'weekly': 52,   # 1 year
+    'monthly': 24,  # 2 years
+    '3month': 12,   # 3 years
+}
+
+# VIX data file path
+VIX_DATA_FILE = DATA_DIR / "VIX_History.csv"
 
 # ======================================================================
 # CONTINUATION LABEL CONFIGURATION

@@ -526,11 +526,11 @@ def save_cache_manifest(
                 "multi_task": args.multi_task,
                 "hidden_size": args.hidden_size,
                 "internal_neurons_ratio": args.internal_neurons_ratio,
-                "downsample_fast_to_medium": args.downsample_fast_to_medium,
-                "downsample_medium_to_slow": args.downsample_medium_to_slow,
+                # v4.0: downsample params removed (11-layer architecture uses native TF data)
                 "num_workers": args.num_workers,
                 "preload": getattr(args, "preload", False),
                 "output": getattr(args, "output", None),
+                "model_version": "4.0",  # v4.0: 11-layer architecture
             }
         }
 
@@ -2205,6 +2205,23 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         if is_main_process(rank):
             print(f"   ⚠️  VIX data not found at {vix_csv_path}")
 
+    # v4.0: Load events handler for earnings/FOMC features
+    events_handler = None
+    try:
+        from src.ml.events import CombinedEventsHandler
+        events_handler = CombinedEventsHandler(
+            tsla_file=str(project_config.TSLA_EVENTS_FILE),
+            macro_api_key=project_config.MACRO_EVENTS_API_KEY if hasattr(project_config, 'MACRO_EVENTS_API_KEY') else None
+        )
+        # Pre-load events to check coverage
+        events_df = events_handler.load_events()
+        if is_main_process(rank):
+            print(f"   ✓ Events loaded: {len(events_df)} events from {events_df['date'].min().date()} to {events_df['date'].max().date()}")
+    except Exception as e:
+        if is_main_process(rank):
+            print(f"   ⚠️  Events handler load failed: {e}")
+            print(f"      Event features will be zeros. Check {project_config.TSLA_EVENTS_FILE}")
+
     # Extract features (handles caching internally)
     if is_main_process(rank):
         print(f"   Extracting features (use_chunking={args.use_chunking})...")
@@ -2216,6 +2233,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         use_chunking=args.use_chunking,
         shard_storage_path=str(shard_path),
         vix_data=vix_data,  # v3.20: VIX features for volatility regime
+        events_handler=events_handler,  # v4.0: Event features for earnings/FOMC patterns
     )
     # Handle variable return: (features_df, continuation_df) or (features_df, continuation_df, mmap_meta_path)
     features_df = result[0]
@@ -2474,13 +2492,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     if profiler:
         profiler.snapshot("pre_model_create", 0, force_log=True)
 
+    # v4.0: HierarchicalLNN now has 11 CfC layers (one per timeframe)
+    # Uses input_size for backward compatibility (same features for all TFs for now)
     model = HierarchicalLNN(
-        input_size=total_features,
+        input_size=total_features,  # Backward compat: same size for all timeframes
         hidden_size=args.hidden_size,
         internal_neurons_ratio=args.internal_neurons_ratio,
         device=args.device,
-        downsample_fast_to_medium=args.downsample_fast_to_medium,
-        downsample_medium_to_slow=args.downsample_medium_to_slow,
         multi_task=args.multi_task,
     )
 

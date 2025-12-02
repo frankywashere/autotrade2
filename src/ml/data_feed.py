@@ -1,12 +1,14 @@
 """
 Concrete DataFeed implementations
 Currently supports CSV, easily extensible to IBKR/Alpha Vantage
+
+v4.0: Added VIX loading and multi-timeframe native OHLC support
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from .base import DataFeed
 import sys
 import os
@@ -210,6 +212,206 @@ class CSVDataFeed(DataFeed):
             raise ValueError("TSLA merged data validation failed - check terminal output above")
 
         return aligned_df
+
+    def load_vix_data(self, start_date: str = None, end_date: str = None) -> pd.DataFrame:
+        """
+        Load VIX data from CSV file.
+
+        VIX is loaded as daily data and will be forward-filled to match 1-min data
+        when merged with SPY/TSLA.
+
+        Returns:
+            DataFrame with columns: vix_open, vix_high, vix_low, vix_close
+        """
+        vix_path = config.VIX_DATA_FILE
+
+        if not vix_path.exists():
+            print(f"⚠️ VIX data file not found: {vix_path}")
+            print("   VIX features will be zeros. Download from: https://www.cboe.com/tradable_products/vix/vix_historical_data/")
+            return None
+
+        # Load VIX CSV
+        vix_df = pd.read_csv(vix_path)
+
+        # Handle different column name formats
+        date_col = None
+        for col in ['Date', 'date', 'DATE', 'timestamp']:
+            if col in vix_df.columns:
+                date_col = col
+                break
+
+        if date_col is None:
+            raise ValueError(f"VIX CSV must have a date column. Found: {vix_df.columns.tolist()}")
+
+        vix_df[date_col] = pd.to_datetime(vix_df[date_col])
+        vix_df.set_index(date_col, inplace=True)
+
+        # Standardize column names (handle CBOE format: Open, High, Low, Close)
+        col_mapping = {}
+        for col in vix_df.columns:
+            col_lower = col.lower()
+            if 'open' in col_lower:
+                col_mapping[col] = 'vix_open'
+            elif 'high' in col_lower:
+                col_mapping[col] = 'vix_high'
+            elif 'low' in col_lower:
+                col_mapping[col] = 'vix_low'
+            elif 'close' in col_lower:
+                col_mapping[col] = 'vix_close'
+
+        vix_df = vix_df.rename(columns=col_mapping)
+
+        # Keep only OHLC columns
+        ohlc_cols = ['vix_open', 'vix_high', 'vix_low', 'vix_close']
+        available_cols = [c for c in ohlc_cols if c in vix_df.columns]
+
+        if not available_cols:
+            raise ValueError(f"VIX CSV must have OHLC columns. Found: {vix_df.columns.tolist()}")
+
+        vix_df = vix_df[available_cols]
+
+        # Convert to float and handle any formatting issues
+        for col in vix_df.columns:
+            vix_df[col] = pd.to_numeric(vix_df[col], errors='coerce')
+
+        # Filter by date range
+        if start_date:
+            vix_df = vix_df[vix_df.index >= pd.to_datetime(start_date)]
+        if end_date:
+            vix_df = vix_df[vix_df.index <= pd.to_datetime(end_date)]
+
+        # Sort by date
+        vix_df = vix_df.sort_index()
+
+        print(f"✅ Loaded VIX data: {len(vix_df)} daily bars ({vix_df.index.min()} to {vix_df.index.max()})")
+
+        return vix_df
+
+    def load_aligned_data_with_vix(self, start_date: str = None, end_date: str = None) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        """
+        Load SPY, TSLA, and VIX data.
+
+        Returns:
+            Tuple of (aligned_df, vix_df)
+            - aligned_df: SPY/TSLA 1-min data aligned by timestamp
+            - vix_df: VIX daily data (to be merged during feature extraction)
+        """
+        # Load and align SPY/TSLA
+        aligned_df = self.load_aligned_data(start_date, end_date)
+
+        # Load VIX
+        vix_df = self.load_vix_data(start_date, end_date)
+
+        return aligned_df, vix_df
+
+    def resample_to_timeframe(self, df: pd.DataFrame, timeframe: str, symbol_prefix: str = '') -> pd.DataFrame:
+        """
+        Resample 1-min OHLCV data to a higher timeframe.
+
+        Args:
+            df: DataFrame with OHLCV columns (optionally prefixed)
+            timeframe: Target timeframe ('5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month')
+            symbol_prefix: Optional prefix for columns (e.g., 'spy_', 'tsla_')
+
+        Returns:
+            Resampled DataFrame with OHLCV at target timeframe
+        """
+        # Map timeframe to pandas resample rule
+        tf_map = {
+            '5min': '5T',
+            '15min': '15T',
+            '30min': '30T',
+            '1h': '1H',
+            '2h': '2H',
+            '3h': '3H',
+            '4h': '4H',
+            'daily': '1D',
+            'weekly': '1W',
+            'monthly': '1M',
+            '3month': '3M'
+        }
+
+        if timeframe not in tf_map:
+            raise ValueError(f"Unknown timeframe: {timeframe}. Valid: {list(tf_map.keys())}")
+
+        rule = tf_map[timeframe]
+
+        # Get column names
+        open_col = f'{symbol_prefix}open' if symbol_prefix else 'open'
+        high_col = f'{symbol_prefix}high' if symbol_prefix else 'high'
+        low_col = f'{symbol_prefix}low' if symbol_prefix else 'low'
+        close_col = f'{symbol_prefix}close' if symbol_prefix else 'close'
+        volume_col = f'{symbol_prefix}volume' if symbol_prefix else 'volume'
+
+        # Check which columns exist
+        cols_to_resample = {}
+        if open_col in df.columns:
+            cols_to_resample[open_col] = 'first'
+        if high_col in df.columns:
+            cols_to_resample[high_col] = 'max'
+        if low_col in df.columns:
+            cols_to_resample[low_col] = 'min'
+        if close_col in df.columns:
+            cols_to_resample[close_col] = 'last'
+        if volume_col in df.columns:
+            cols_to_resample[volume_col] = 'sum'
+
+        if not cols_to_resample:
+            raise ValueError(f"No OHLCV columns found with prefix '{symbol_prefix}'")
+
+        # Resample
+        resampled = df[list(cols_to_resample.keys())].resample(rule).agg(cols_to_resample)
+
+        # Drop any rows with NaN (incomplete bars)
+        resampled = resampled.dropna()
+
+        return resampled
+
+    def get_native_timeframe_data(self, aligned_df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """
+        Get native OHLCV data for a specific timeframe.
+
+        Resamples both SPY and TSLA to the target timeframe.
+
+        Args:
+            aligned_df: Aligned SPY/TSLA 1-min data
+            timeframe: Target timeframe
+
+        Returns:
+            DataFrame with resampled SPY and TSLA OHLCV
+        """
+        # Resample SPY
+        spy_cols = [c for c in aligned_df.columns if c.startswith('spy_')]
+        spy_resampled = self.resample_to_timeframe(aligned_df[spy_cols], timeframe, 'spy_')
+
+        # Resample TSLA
+        tsla_cols = [c for c in aligned_df.columns if c.startswith('tsla_')]
+        tsla_resampled = self.resample_to_timeframe(aligned_df[tsla_cols], timeframe, 'tsla_')
+
+        # Merge on index
+        resampled_df = pd.concat([spy_resampled, tsla_resampled], axis=1)
+
+        return resampled_df
+
+    def get_all_timeframe_data(self, aligned_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        """
+        Get native OHLCV data for all configured timeframes.
+
+        Args:
+            aligned_df: Aligned SPY/TSLA 1-min data
+
+        Returns:
+            Dict mapping timeframe name to resampled DataFrame
+        """
+        timeframe_data = {}
+
+        for tf in config.MODEL_TIMEFRAMES:
+            print(f"   Resampling to {tf}...", end=' ')
+            tf_df = self.get_native_timeframe_data(aligned_df, tf)
+            timeframe_data[tf] = tf_df
+            print(f"✓ {len(tf_df)} bars")
+
+        return timeframe_data
 
 
 class YFinanceDataFeed(DataFeed):
