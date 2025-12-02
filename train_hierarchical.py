@@ -398,11 +398,21 @@ def pick_manifest(manifests):
 
 
 def find_available_caches(cache_dir: Path):
-    """Find available cache triplets (meta + continuation labels + non-channel) in a directory."""
+    """Find available cache triplets (meta + continuation labels + non-channel) in a directory.
+
+    Supports both:
+    - Chunked/mmap mode: features_mmap_meta_*.json + shards
+    - Non-chunked/pickle mode: rolling_channels_*.pkl (legacy)
+    """
     cache_dir = Path(cache_dir)
     caches = []
+    seen_keys = set()
+
+    # 1. Find mmap caches (chunked mode)
     for meta_path in cache_dir.glob("features_mmap_meta_*.json"):
         cache_key = meta_path.name.replace("features_mmap_meta_", "").replace(".json", "")
+        seen_keys.add(cache_key)
+
         mode_suffixes = ['adaptive', 'simple']
         cont_path = None
         for suffix in mode_suffixes:
@@ -411,17 +421,49 @@ def find_available_caches(cache_dir: Path):
                 cont_path = candidate
                 break
 
-        # Check for non-channel features cache (new!)
+        # Check for non-channel features cache
         non_channel_path = cache_dir / f"non_channel_features_{cache_key}.pkl"
         has_non_channel = non_channel_path.exists()
 
         caches.append({
             "cache_key": cache_key,
+            "cache_type": "mmap",
             "meta_path": str(meta_path),
             "cont_path": str(cont_path) if cont_path else None,
             "non_channel_path": str(non_channel_path) if has_non_channel else None,
-            "complete": cont_path is not None and has_non_channel  # True = skip extraction entirely
+            "complete": cont_path is not None and has_non_channel
         })
+
+    # 2. Find pickle caches (non-chunked mode)
+    for pickle_path in cache_dir.glob("rolling_channels_*.pkl"):
+        # Extract cache key from pickle filename
+        # Format: rolling_channels_{cache_key}.pkl or rolling_channels_{cache_key}_{suffix}.pkl
+        name = pickle_path.name.replace("rolling_channels_", "").replace(".pkl", "")
+        # Remove any suffix like _GPU_TEST or _CPU_TEST
+        cache_key = name.split("_GPU_TEST")[0].split("_CPU_TEST")[0]
+
+        if cache_key in seen_keys:
+            continue  # Already found as mmap
+        seen_keys.add(cache_key)
+
+        mode_suffixes = ['adaptive', 'simple']
+        cont_path = None
+        for suffix in mode_suffixes:
+            candidate = cache_dir / f"continuation_labels_{cache_key}_{suffix}.pkl"
+            if candidate.exists():
+                cont_path = candidate
+                break
+
+        caches.append({
+            "cache_key": cache_key,
+            "cache_type": "pickle",
+            "meta_path": None,  # No mmap meta for pickle mode
+            "pickle_path": str(pickle_path),
+            "cont_path": str(cont_path) if cont_path else None,
+            "non_channel_path": None,  # Pickle mode includes all features
+            "complete": cont_path is not None  # Pickle has all features, just need continuation
+        })
+
     return caches
 
 
@@ -474,20 +516,30 @@ def pick_cache_pair(caches):
 def save_cache_manifest(
     cache_dir: Path,
     cache_key: str,
-    mmap_meta_path: str,
     continuation_path: str,
-    non_channel_path: str,  # NEW: path to non-channel features cache
     args,
-    df: pd.DataFrame
+    df: pd.DataFrame,
+    mmap_meta_path: str = None,  # Optional: only for chunked/mmap mode
+    non_channel_path: str = None,  # Optional: only for chunked/mmap mode
+    pickle_path: str = None,  # Optional: only for non-chunked/pickle mode
 ):
-    """Persist a manifest alongside caches for reuse selection."""
+    """Persist a manifest alongside caches for reuse selection.
+
+    Supports both:
+    - Chunked/mmap mode: mmap_meta_path + non_channel_path
+    - Non-chunked/pickle mode: pickle_path (all features in one file)
+    """
     try:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = cache_dir / f"cache_manifest_{cache_key}.json"
 
+        # Determine cache type
+        cache_type = "mmap" if mmap_meta_path else "pickle"
+
         manifest = {
             "cache_key": cache_key,
+            "cache_type": cache_type,
             "feature_version": FEATURE_VERSION,
             "date_range": {
                 "start": str(df.index[0]),
@@ -505,7 +557,8 @@ def save_cache_manifest(
             "paths": {
                 "mmap_meta": mmap_meta_path,
                 "continuation_labels": continuation_path,
-                "non_channel_features": non_channel_path  # NEW
+                "non_channel_features": non_channel_path,
+                "pickle_channels": pickle_path,  # For non-chunked mode
             },
             "cache_dir": str(cache_dir),
             "shard_storage_path": getattr(args, "shard_path", None),
@@ -2247,7 +2300,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler.log_info(f"FEATURES_EXTRACTED | non_channel_cols={nc_cols} | continuation_rows={cont_rows}")
         profiler.snapshot("post_feature_extraction", 0, force_log=True)
 
-    # Save cache manifest for future reuse (only if we have all cache paths)
+    # Save cache manifest for future reuse (supports both mmap and pickle modes)
     if is_main_process(rank) and hasattr(extractor, '_cache_key'):
         cache_key = extractor._cache_key
         cache_dir = extractor._unified_cache_dir if hasattr(extractor, '_unified_cache_dir') else shard_path
@@ -2255,17 +2308,27 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         nc_path = str(extractor._non_channel_cache_path) if hasattr(extractor, '_non_channel_cache_path') else None
         mmap_path = mmap_meta_path or (extractor._mmap_meta_path if hasattr(extractor, '_mmap_meta_path') else None)
 
-        if mmap_path and cont_path and nc_path:
+        # For non-chunked mode, find the pickle cache path
+        pickle_path = None
+        if not mmap_path:
+            potential_pickle = Path(cache_dir) / f"rolling_channels_{cache_key}.pkl"
+            if potential_pickle.exists():
+                pickle_path = str(potential_pickle)
+
+        # Save manifest for either mode: mmap (chunked) or pickle (non-chunked)
+        if cont_path and (mmap_path or pickle_path):
             save_cache_manifest(
                 cache_dir=cache_dir,
                 cache_key=cache_key,
-                mmap_meta_path=mmap_path,
                 continuation_path=cont_path,
-                non_channel_path=nc_path,
                 args=args,
-                df=df
+                df=df,
+                mmap_meta_path=mmap_path,
+                non_channel_path=nc_path,
+                pickle_path=pickle_path,
             )
-            print(f"   💾 Cache manifest saved: cache_manifest_{cache_key}.json")
+            cache_type = "mmap" if mmap_path else "pickle"
+            print(f"   💾 Cache manifest saved ({cache_type}): cache_manifest_{cache_key}.json")
 
     # =========================================================================
     # DATASET CREATION
