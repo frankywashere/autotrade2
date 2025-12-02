@@ -115,7 +115,58 @@ class HybridLiveDataFeed:
             'monthly': aligned_monthly,
         }
 
+        # Fetch VIX data for volatility regime detection (v3.20)
+        vix_data = self._fetch_vix_data()
+        if vix_data is not None and len(vix_data) > 0:
+            aligned_1min.attrs['vix_data'] = vix_data
+            print(f"   ✓ VIX data:         {len(vix_data):,} daily bars")
+
         return aligned_1min
+
+    def _fetch_vix_data(self) -> pd.DataFrame:
+        """
+        Fetch VIX daily data from yfinance for volatility regime detection.
+
+        Returns:
+            DataFrame with vix_open, vix_high, vix_low, vix_close columns
+            Index: DatetimeIndex (daily)
+        """
+        try:
+            # Fetch 2 years of daily VIX data
+            vix_df = yf.download('^VIX', period='2y', interval='1d', progress=False)
+
+            if vix_df.empty:
+                print("      ✗ VIX: No data available")
+                return None
+
+            # Flatten MultiIndex columns if present
+            if isinstance(vix_df.columns, pd.MultiIndex):
+                vix_df.columns = vix_df.columns.get_level_values(0)
+
+            # Rename columns to match expected format
+            vix_df.columns = [c.lower() for c in vix_df.columns]
+            vix_df = vix_df.rename(columns={
+                'open': 'vix_open',
+                'high': 'vix_high',
+                'low': 'vix_low',
+                'close': 'vix_close',
+                'adj close': 'vix_adj_close',
+                'volume': 'vix_volume'
+            })
+
+            # Remove timezone info
+            if vix_df.index.tz is not None:
+                vix_df.index = vix_df.index.tz_localize(None)
+
+            # Keep only essential columns
+            keep_cols = [c for c in ['vix_open', 'vix_high', 'vix_low', 'vix_close'] if c in vix_df.columns]
+            vix_df = vix_df[keep_cols]
+
+            return vix_df
+
+        except Exception as e:
+            print(f"      ✗ VIX: Error fetching - {e}")
+            return None
 
     def _fetch_all_intervals(self, symbol: str) -> Dict[str, pd.DataFrame]:
         """

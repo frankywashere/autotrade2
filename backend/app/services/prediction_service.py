@@ -146,12 +146,19 @@ class PredictionService:
 
             # Extract ALL features fresh from live data (no caching, no mmap)
             extractor = self._get_feature_extractor()
+
+            # Get VIX data from df.attrs if available (v3.20)
+            vix_data = df.attrs.get('vix_data', None)
+            if vix_data is not None:
+                logger.info(f"VIX data available: {len(vix_data)} daily bars")
+
             result = extractor.extract_features(
                 df,
                 use_cache=False,       # Force fresh extraction
                 use_chunking=False,    # No sharding for inference
                 continuation=False,    # Skip continuation labels
-                events_handler=self._events_handler
+                events_handler=self._events_handler,
+                vix_data=vix_data      # v3.20: VIX features for volatility regime
             )
 
             # extract_features returns (features_df, continuation_df) when continuation=False

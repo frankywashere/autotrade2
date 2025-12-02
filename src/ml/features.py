@@ -35,7 +35,48 @@ except ImportError:
     GPU_ROLLING_AVAILABLE = False
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.18_hybrid_monthly"  # 21-window + complete_cycles + hybrid monthly/3month processing
+FEATURE_VERSION = "v3.20_vix"  # 21-window + complete_cycles + hybrid monthly/3month + 15 VIX features
+
+
+def load_vix_data(csv_path: str = "data/VIX_History.csv") -> pd.DataFrame:
+    """
+    Load VIX historical data from CSV file.
+
+    Args:
+        csv_path: Path to VIX_History.csv file (default: data/VIX_History.csv)
+
+    Returns:
+        DataFrame with columns: vix_open, vix_high, vix_low, vix_close
+        Index: DatetimeIndex (date only, no timezone)
+
+    Expected CSV format:
+        DATE,OPEN,HIGH,LOW,CLOSE
+        01/02/1990,17.24,17.24,17.24,17.24
+        ...
+
+    Usage in training:
+        vix_data = load_vix_data()
+        features_df, _ = extractor.extract_features(df, vix_data=vix_data)
+    """
+    vix_df = pd.read_csv(csv_path)
+
+    # Parse date (format: MM/DD/YYYY)
+    vix_df['DATE'] = pd.to_datetime(vix_df['DATE'], format='%m/%d/%Y')
+    vix_df = vix_df.set_index('DATE')
+
+    # Rename columns to lowercase with vix_ prefix
+    vix_df = vix_df.rename(columns={
+        'OPEN': 'vix_open',
+        'HIGH': 'vix_high',
+        'LOW': 'vix_low',
+        'CLOSE': 'vix_close'
+    })
+
+    # Sort by date
+    vix_df = vix_df.sort_index()
+
+    print(f"   📊 Loaded VIX data: {len(vix_df):,} rows ({vix_df.index[0].date()} to {vix_df.index[-1].date()})")
+    return vix_df
 
 
 def _check_gpu_available() -> tuple:
@@ -271,9 +312,9 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, continuation_mode: str = 'simple', use_chunking: bool = False, chunk_size_years: int = 1, shard_storage_path: str = None, **kwargs) -> tuple:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, continuation_mode: str = 'simple', use_chunking: bool = False, chunk_size_years: int = 1, shard_storage_path: str = None, vix_data: pd.DataFrame = None, **kwargs) -> tuple:
         """
-        Extract all features from aligned SPY-TSLA data (v3.17: 14,322 channel + 165 non-channel = 14,487 total).
+        Extract all features from aligned SPY-TSLA data (v3.20: 14,322 channel + 180 non-channel = 14,502 total).
 
         Args:
             df: DataFrame with SPY and TSLA OHLCV columns
@@ -293,14 +334,18 @@ class TradingFeatureExtractor(FeatureExtractor):
                 - If provided: Enables earnings/FOMC proximity features
                 - If None: Event features will be zeros (backward compatible)
             continuation: Whether to generate continuation prediction labels (default: False)
+            vix_data: Optional VIX DataFrame for volatility regime features (v3.20)
+                - If provided: Enables 15 VIX-based features (level, percentile, regime, correlations, etc.)
+                - Expected columns: vix_close (or CLOSE), vix_high, vix_low with DatetimeIndex
+                - If None: VIX features will be zeros/defaults (backward compatible)
             **kwargs: Additional arguments (reserved for future use)
 
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
                                 tsla_open, tsla_high, tsla_low, tsla_close, tsla_volume
 
         Returns tuple of (features_df, continuation_df):
-        - features_df: DataFrame with feature columns (165 non-channel when using mmaps,
-          14,487 total when not using mmaps). Use get_feature_dim() for model input size.
+        - features_df: DataFrame with feature columns (180 non-channel when using mmaps,
+          14,502 total when not using mmaps). Use get_feature_dim() for model input size.
         - continuation_df: DataFrame with continuation labels (or None if continuation=False)
         - 12 price features (6 per stock: close, close_norm, returns, log_returns, volatility_10, volatility_50)
         - 330 channel features (165 TSLA + 165 SPY) - v3.11: +22 duration features
@@ -313,6 +358,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         - 4 cycle features
         - 2 volume features
         - 4 time features
+        - 15 VIX features (v3.20): vix_level, percentile_20d/252d, change_1d/5d, regime, tsla/spy_corr,
+          momentum_10d, ma_ratio, high_low_range, trend_20d, above_20, above_30, spike
         - 54 breakdown/channel enhancement features
         - 14 binary feature flags (is_monday, is_friday, is_volatile_now, in_channel flags)
         - 4 event features (v3.9): is_earnings_week, days_until_earnings, days_until_fomc, is_high_impact_event
@@ -500,7 +547,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         else:
             # Normal extraction path
             print("   Extracting base features...")
-            with tqdm(total=7, desc="   Feature extraction", leave=True, ncols=100, ascii=True, mininterval=0.5) as pbar:
+            with tqdm(total=8, desc="   Feature extraction", leave=True, ncols=100, ascii=True, mininterval=0.5) as pbar:
                 price_df = self._extract_price_features(df, use_gpu=use_gpu_resolved)
                 pbar.update(1)
 
@@ -552,11 +599,16 @@ class TradingFeatureExtractor(FeatureExtractor):
                 time_df = self._extract_time_features(df)
                 pbar.update(1)
 
+                # v3.20: VIX features for volatility regime detection
+                vix_df = self._extract_vix_features(df, vix_data)
+                pbar.update(1)
+
             # Concat base features FIRST (skip channel_df if using mmap)
             if channel_df is None and hasattr(self, '_mmap_meta_path'):
                 # Mmap mode - channel features will be loaded separately in dataset
                 # v3.19: Monthly/3month now in separate shard (not in RAM concat)
-                concat_list = [price_df, rsi_df, correlation_df, cycle_df, volume_df, time_df]
+                # v3.20: Added VIX features
+                concat_list = [price_df, rsi_df, correlation_df, cycle_df, volume_df, time_df, vix_df]
                 # Monthly/3month removed - they're in monthly_3month_shard.npy, loaded as mmap
                 # Optimize: copy=False avoids unnecessary data copies
                 base_features_df = pd.concat(concat_list, axis=1, copy=False)
@@ -570,7 +622,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                     correlation_df,
                     cycle_df,
                     volume_df,
-                    time_df
+                    time_df,
+                    vix_df
                 ], axis=1, copy=False)
 
             # PASS 2: Extract breakdown features (needs base features + optional events)
@@ -2543,6 +2596,152 @@ class TradingFeatureExtractor(FeatureExtractor):
         }
 
         return pd.DataFrame(time_features, index=df.index)
+
+    def _extract_vix_features(self, df: pd.DataFrame, vix_data: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Extract VIX-based features for volatility regime detection (v3.20).
+
+        Args:
+            df: Main DataFrame with TSLA/SPY data (must have tsla_close, spy_close)
+            vix_data: Optional VIX DataFrame. If None, returns zeros for all VIX features.
+                     Expected columns: vix_close (or CLOSE), vix_high, vix_low
+                     Index should be DatetimeIndex aligned with df
+
+        Returns:
+            DataFrame with ~15 VIX features. If vix_data is None or empty,
+            returns zeros (backward compatible with models trained without VIX).
+
+        Features (15 total):
+            - vix_level: Current VIX close (normalized by typical range 10-40)
+            - vix_percentile_20d: 20-day percentile rank
+            - vix_percentile_252d: 252-day (yearly) percentile rank
+            - vix_change_1d: 1-day percentage change
+            - vix_change_5d: 5-day percentage change
+            - vix_regime: Categorical (0=low <15, 1=normal 15-20, 2=elevated 20-30, 3=extreme >30)
+            - vix_tsla_corr_20d: 20-day rolling correlation (VIX changes vs TSLA returns)
+            - vix_spy_corr_20d: 20-day rolling correlation (VIX changes vs SPY returns)
+            - vix_momentum_10d: 10-day rate of change
+            - vix_ma_ratio: Ratio of VIX to 20-day MA (spike detection)
+            - vix_high_low_range: Daily high-low range normalized
+            - vix_trend_20d: 20-day slope of VIX (linear regression)
+            - vix_above_20: Binary flag if VIX > 20
+            - vix_above_30: Binary flag if VIX > 30
+            - vix_spike: Binary flag for >15% single-day spike
+        """
+        num_rows = len(df)
+        vix_features = {}
+
+        # Check if we have VIX data
+        has_vix = vix_data is not None and len(vix_data) > 0
+
+        if has_vix:
+            # Normalize column names (handle both raw CSV and processed formats)
+            vix_df = vix_data.copy()
+            if 'CLOSE' in vix_df.columns:
+                vix_df = vix_df.rename(columns={'CLOSE': 'vix_close', 'HIGH': 'vix_high', 'LOW': 'vix_low', 'OPEN': 'vix_open'})
+
+            # Align VIX data with main df index
+            # VIX is daily, so we forward-fill to match intraday data
+            vix_aligned = vix_df.reindex(df.index, method='ffill')
+
+            vix_close = vix_aligned['vix_close'] if 'vix_close' in vix_aligned.columns else pd.Series(np.nan, index=df.index)
+            vix_high = vix_aligned['vix_high'] if 'vix_high' in vix_aligned.columns else vix_close
+            vix_low = vix_aligned['vix_low'] if 'vix_low' in vix_aligned.columns else vix_close
+
+            # Fill any remaining NaNs (at start before VIX data begins)
+            vix_close = vix_close.bfill().fillna(20.0)  # Default to 20 (normal level)
+            vix_high = vix_high.bfill().fillna(20.0)
+            vix_low = vix_low.bfill().fillna(20.0)
+
+            # 1. VIX level (normalized: divide by 40 to get 0-1 range for typical VIX)
+            vix_features['vix_level'] = (vix_close / 40.0).clip(0, 2.5).values
+
+            # 2. VIX percentile ranks
+            def rolling_percentile(series, window):
+                """Calculate rolling percentile rank (0-1)"""
+                return series.rolling(window, min_periods=max(1, window // 4)).apply(
+                    lambda x: (x.values[-1] - x.min()) / (x.max() - x.min() + 1e-8) if len(x) > 1 else 0.5,
+                    raw=False
+                )
+
+            vix_features['vix_percentile_20d'] = rolling_percentile(vix_close, 20).fillna(0.5).values
+            vix_features['vix_percentile_252d'] = rolling_percentile(vix_close, 252).fillna(0.5).values
+
+            # 3. VIX changes
+            vix_pct_change = vix_close.pct_change()
+            vix_features['vix_change_1d'] = vix_pct_change.fillna(0).clip(-0.5, 0.5).values
+            vix_features['vix_change_5d'] = vix_close.pct_change(5).fillna(0).clip(-1.0, 1.0).values
+
+            # 4. VIX regime (categorical: 0=low, 1=normal, 2=elevated, 3=extreme)
+            regime = np.zeros(num_rows)
+            regime[vix_close.values < 15] = 0  # Low volatility
+            regime[(vix_close.values >= 15) & (vix_close.values < 20)] = 1  # Normal
+            regime[(vix_close.values >= 20) & (vix_close.values < 30)] = 2  # Elevated
+            regime[vix_close.values >= 30] = 3  # Extreme
+            vix_features['vix_regime'] = regime / 3.0  # Normalize to 0-1
+
+            # 5. Correlations with TSLA and SPY
+            tsla_returns = df['tsla_close'].pct_change().fillna(0)
+            spy_returns = df['spy_close'].pct_change().fillna(0)
+
+            # Rolling correlation (VIX typically moves inverse to stocks)
+            vix_features['vix_tsla_corr_20d'] = vix_pct_change.rolling(20, min_periods=5).corr(tsla_returns).fillna(0).values
+            vix_features['vix_spy_corr_20d'] = vix_pct_change.rolling(20, min_periods=5).corr(spy_returns).fillna(0).values
+
+            # 6. VIX momentum (rate of change)
+            vix_features['vix_momentum_10d'] = (vix_close / vix_close.shift(10) - 1).fillna(0).clip(-1, 1).values
+
+            # 7. VIX MA ratio (spike detection)
+            vix_ma_20 = vix_close.rolling(20, min_periods=5).mean()
+            vix_features['vix_ma_ratio'] = (vix_close / vix_ma_20).fillna(1.0).clip(0.5, 2.0).values
+
+            # 8. VIX high-low range (normalized)
+            vix_range = (vix_high - vix_low) / vix_close
+            vix_features['vix_high_low_range'] = vix_range.fillna(0).clip(0, 0.5).values
+
+            # 9. VIX trend (20-day slope using linear regression)
+            def rolling_slope(series, window):
+                """Calculate rolling linear regression slope"""
+                def slope(y):
+                    if len(y) < 2:
+                        return 0
+                    x = np.arange(len(y))
+                    try:
+                        return np.polyfit(x, y, 1)[0]
+                    except:
+                        return 0
+                return series.rolling(window, min_periods=max(5, window // 4)).apply(slope, raw=True)
+
+            vix_slope = rolling_slope(vix_close, 20).fillna(0)
+            # Normalize slope (typical daily VIX change is <1 point)
+            vix_features['vix_trend_20d'] = (vix_slope / 2.0).clip(-1, 1).values
+
+            # 10. Binary flags
+            vix_features['vix_above_20'] = (vix_close > 20).astype(float).values
+            vix_features['vix_above_30'] = (vix_close > 30).astype(float).values
+
+            # 11. Spike detection (>15% single-day increase)
+            vix_features['vix_spike'] = (vix_pct_change > 0.15).astype(float).values
+
+        else:
+            # No VIX data - return zeros for backward compatibility
+            vix_features['vix_level'] = np.zeros(num_rows)
+            vix_features['vix_percentile_20d'] = np.full(num_rows, 0.5)
+            vix_features['vix_percentile_252d'] = np.full(num_rows, 0.5)
+            vix_features['vix_change_1d'] = np.zeros(num_rows)
+            vix_features['vix_change_5d'] = np.zeros(num_rows)
+            vix_features['vix_regime'] = np.full(num_rows, 1.0 / 3.0)  # Default to "normal" regime
+            vix_features['vix_tsla_corr_20d'] = np.zeros(num_rows)
+            vix_features['vix_spy_corr_20d'] = np.zeros(num_rows)
+            vix_features['vix_momentum_10d'] = np.zeros(num_rows)
+            vix_features['vix_ma_ratio'] = np.ones(num_rows)
+            vix_features['vix_high_low_range'] = np.zeros(num_rows)
+            vix_features['vix_trend_20d'] = np.zeros(num_rows)
+            vix_features['vix_above_20'] = np.zeros(num_rows)
+            vix_features['vix_above_30'] = np.zeros(num_rows)
+            vix_features['vix_spike'] = np.zeros(num_rows)
+
+        return pd.DataFrame(vix_features, index=df.index)
 
     def _extract_breakdown_features(
         self,
