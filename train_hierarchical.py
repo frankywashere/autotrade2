@@ -45,7 +45,7 @@ sys.path.insert(0, str(parent_dir))
 
 from src.ml.hierarchical_model import HierarchicalLNN
 from src.ml.hierarchical_dataset import create_hierarchical_dataset
-from src.ml.features import TradingFeatureExtractor, FEATURE_VERSION
+from src.ml.features import TradingFeatureExtractor, FEATURE_VERSION, load_vix_data
 from src.ml.data_feed import CSVDataFeed
 import yaml
 import config as project_config
@@ -2186,6 +2186,21 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Shard path for channel features (mmaps)
     shard_path = Path(args.shard_path) if args.shard_path else Path(project_config.SHARD_DIR)
 
+    # Load VIX data for volatility regime features (v3.20)
+    vix_data = None
+    vix_csv_path = Path(project_config.DATA_DIR) / "VIX_History.csv"
+    if vix_csv_path.exists():
+        try:
+            vix_data = load_vix_data(str(vix_csv_path))
+            if is_main_process(rank):
+                print(f"   ✓ VIX data loaded: {len(vix_data)} days ({vix_data.index[0].date()} to {vix_data.index[-1].date()})")
+        except Exception as e:
+            if is_main_process(rank):
+                print(f"   ⚠️  VIX data load failed: {e}")
+    else:
+        if is_main_process(rank):
+            print(f"   ⚠️  VIX data not found at {vix_csv_path}")
+
     # Extract features (handles caching internally)
     if is_main_process(rank):
         print(f"   Extracting features (use_chunking={args.use_chunking})...")
@@ -2196,6 +2211,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         continuation=True,
         use_chunking=args.use_chunking,
         shard_storage_path=str(shard_path),
+        vix_data=vix_data,  # v3.20: VIX features for volatility regime
     )
     # Handle variable return: (features_df, continuation_df) or (features_df, continuation_df, mmap_meta_path)
     features_df = result[0]
