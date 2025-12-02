@@ -1,6 +1,10 @@
 # Data folder
 /data
 
+# Models folder (too large for GitHub)
+/models/
+*.pth
+
 # Python
 __pycache__/
 *.py[cod]
