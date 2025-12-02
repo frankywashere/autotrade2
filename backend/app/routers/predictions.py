@@ -615,6 +615,269 @@ async def generate_channel_projection(request: Request):
         """
 
 
+@router.get("/setups", response_class=HTMLResponse)
+async def get_trade_setups(request: Request):
+    """
+    Get multi-timeframe trade setups based on channel analysis.
+
+    Analyzes channels across Scalp, Intraday, Swing, and Position timeframes
+    and returns setups that meet confidence thresholds.
+
+    Returns:
+        HTML fragment with trade setup cards
+    """
+    try:
+        # Run blocking operation in thread pool
+        result = await asyncio.to_thread(
+            prediction_service.get_trade_setups, force_refresh=False
+        )
+
+        setups = result['setups']
+        best_setup = result['best_setup']
+        current_price = result['current_price']
+        timestamp = result['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+        model_prediction = result['model_prediction']
+
+        # Build setup cards
+        setup_cards = ""
+
+        # Type-specific styling
+        type_styles = {
+            'scalp': {'color': 'purple', 'icon': '⚡'},
+            'intraday': {'color': 'blue', 'icon': '📊'},
+            'swing': {'color': 'green', 'icon': '📈'},
+            'position': {'color': 'orange', 'icon': '🎯'}
+        }
+
+        for setup in setups:
+            style = type_styles.get(setup['type'], {'color': 'gray', 'icon': '📌'})
+            color = style['color']
+            icon = style['icon']
+
+            # Confidence color
+            conf = setup['confidence']
+            if conf >= 75:
+                conf_color = "green"
+                conf_badge = "HIGH"
+            elif conf >= 55:
+                conf_color = "yellow"
+                conf_badge = "MEDIUM"
+            else:
+                conf_color = "orange"
+                conf_badge = "LOW"
+
+            # Direction indicator
+            dir_map = {
+                'bullish': ('↗️', 'green', 'BULLISH'),
+                'bearish': ('↘️', 'red', 'BEARISH'),
+                'neutral': ('→', 'gray', 'NEUTRAL')
+            }
+            dir_icon, dir_color, dir_label = dir_map.get(setup['direction'], ('→', 'gray', 'NEUTRAL'))
+
+            # Is this the best setup?
+            is_best = (best_setup and setup['type'] == best_setup['type'])
+            best_badge = '<span class="text-xs bg-blue-600 text-white px-2 py-1 rounded ml-2">BEST</span>' if is_best else ''
+            border_class = "border-blue-500 border-2" if is_best else f"border-{color}-600"
+
+            setup_cards += f"""
+            <div class="bg-gray-800 {border_class} rounded-lg p-4 mb-3">
+                <div class="flex justify-between items-start mb-3">
+                    <div>
+                        <span class="text-lg font-bold text-{color}-400">{icon} {setup['label']}{best_badge}</span>
+                        <div class="text-xs text-gray-400">{setup['description']}</div>
+                        <div class="text-xs text-gray-500">{setup['channel_timeframe']} channel (R²={setup['r_squared']:.2f})</div>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-xs text-gray-400">Confidence</div>
+                        <div class="text-xl font-bold text-{conf_color}-400">{conf:.0f}%</div>
+                        <div class="text-xs text-{conf_color}-400">{conf_badge}</div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3 mb-3">
+                    <div class="bg-green-900 bg-opacity-30 rounded-lg p-3 border border-green-700">
+                        <div class="text-xs text-green-400">Target High</div>
+                        <div class="text-lg font-bold text-green-400">${setup['high']:.2f}</div>
+                        <div class="text-xs text-green-400">+{((setup['high']/current_price - 1) * 100):.2f}%</div>
+                    </div>
+                    <div class="bg-red-900 bg-opacity-30 rounded-lg p-3 border border-red-700">
+                        <div class="text-xs text-red-400">Target Low</div>
+                        <div class="text-lg font-bold text-red-400">${setup['low']:.2f}</div>
+                        <div class="text-xs text-red-400">{((setup['low']/current_price - 1) * 100):.2f}%</div>
+                    </div>
+                </div>
+
+                <div class="flex justify-between items-center text-sm">
+                    <div>
+                        <span class="text-gray-400">Duration:</span>
+                        <span class="text-white">{setup['duration']}</span>
+                    </div>
+                    <div>
+                        <span class="text-{dir_color}-400">{dir_icon} {dir_label}</span>
+                        <span class="text-gray-500 text-xs ml-1">({setup['slope_pct']:+.2f}%/bar)</span>
+                    </div>
+                </div>
+
+                <div class="mt-2 text-xs text-gray-500">
+                    {setup['risk_note']} | Position: {setup['position_in_channel']:.0%} in channel
+                </div>
+            </div>
+            """
+
+        # No setups case
+        if not setups:
+            setup_cards = """
+            <div class="bg-yellow-900 bg-opacity-30 border border-yellow-700 rounded-lg p-4">
+                <p class="text-yellow-400">⚠️ No valid trade setups found</p>
+                <p class="text-sm text-gray-400 mt-2">
+                    All channels are below the R² threshold (0.40).
+                    Wait for more defined price action.
+                </p>
+            </div>
+            """
+
+        # Model prediction comparison
+        model_conf = model_prediction['confidence']
+        model_high = model_prediction['predicted_high']
+        model_low = model_prediction['predicted_low']
+        model_high_price = current_price * (1 + model_high / 100)
+        model_low_price = current_price * (1 + model_low / 100)
+
+        return f"""
+        <div id="trade-setups" class="bg-gray-900 rounded-lg p-6">
+            <div class="flex justify-between items-start mb-4">
+                <div>
+                    <h2 class="text-2xl font-bold text-blue-400">Multi-Timeframe Trade Setups</h2>
+                    <p class="text-sm text-gray-400">{timestamp}</p>
+                    <p class="text-xs text-gray-500">{len(setups)} setup(s) found</p>
+                </div>
+                <div class="text-right">
+                    <div class="text-sm text-gray-400">TSLA Price</div>
+                    <div class="text-2xl font-bold">${current_price:.2f}</div>
+                </div>
+            </div>
+
+            <!-- Setup Cards -->
+            <div class="mb-4">
+                {setup_cards}
+            </div>
+
+            <!-- Model Prediction Comparison -->
+            <div class="bg-gray-800 border border-gray-600 rounded-lg p-4 mt-4">
+                <div class="text-sm text-gray-400 mb-2">Model Fused Prediction (24h horizon)</div>
+                <div class="grid grid-cols-3 gap-3 text-center">
+                    <div>
+                        <div class="text-xs text-gray-500">High</div>
+                        <div class="text-green-400 font-bold">${model_high_price:.2f}</div>
+                        <div class="text-xs text-green-400">{model_high:+.2f}%</div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">Low</div>
+                        <div class="text-red-400 font-bold">${model_low_price:.2f}</div>
+                        <div class="text-xs text-red-400">{model_low:+.2f}%</div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">Confidence</div>
+                        <div class="text-blue-400 font-bold">{model_conf:.0%}</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """
+
+    except Exception as e:
+        logger.exception("Error generating trade setups")
+        return f"""
+        <div id="trade-setups" class="bg-gray-800 rounded-lg p-6 border border-red-700">
+            <p class="text-red-400">Error generating trade setups. Please try again.</p>
+            <p class="text-xs text-gray-500 mt-2">{escape(str(e))}</p>
+        </div>
+        """
+
+
+@router.post("/setups/generate", response_class=HTMLResponse)
+@limiter.limit("1/minute")
+async def generate_trade_setups(request: Request):
+    """
+    Force generation of new trade setups (ignores cache).
+    Rate limited: 1 request per minute
+
+    Returns:
+        HTML with fresh trade setups
+    """
+    try:
+        logger.info("Generating fresh trade setups (user requested)...")
+        result = await asyncio.to_thread(
+            prediction_service.get_trade_setups, force_refresh=True
+        )
+
+        setups = result['setups']
+        current_price = result['current_price']
+        timestamp = result['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+
+        if setups:
+            best = setups[0]
+            return f"""
+            <div id="trade-setups" class="bg-gray-800 rounded-lg p-6 border border-green-700">
+                <div class="bg-green-900 bg-opacity-20 border border-green-700 rounded-lg p-2 mb-4">
+                    <p class="text-sm text-green-400">✅ Fresh trade setups generated!</p>
+                </div>
+                <div class="flex justify-between items-start mb-4">
+                    <div>
+                        <h2 class="text-2xl font-bold text-blue-400">Trade Setups</h2>
+                        <p class="text-sm text-gray-400">{timestamp}</p>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-sm text-gray-400">TSLA</div>
+                        <div class="text-2xl font-bold">${current_price:.2f}</div>
+                    </div>
+                </div>
+                <div class="bg-blue-900 bg-opacity-30 border border-blue-600 rounded-lg p-4">
+                    <div class="flex justify-between items-center">
+                        <div>
+                            <span class="text-sm text-blue-300">Best Setup</span>
+                            <div class="text-2xl font-bold text-blue-400">{best['label']}</div>
+                            <div class="text-xs text-gray-400">{best['channel_timeframe']} channel</div>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-sm text-gray-400">Confidence</div>
+                            <div class="text-2xl font-bold text-green-400">{best['confidence']:.0f}%</div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 mt-3">
+                        <div class="text-center">
+                            <div class="text-sm text-green-400">High</div>
+                            <div class="text-xl font-bold text-green-400">${best['high']:.2f}</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-sm text-red-400">Low</div>
+                            <div class="text-xl font-bold text-red-400">${best['low']:.2f}</div>
+                        </div>
+                    </div>
+                </div>
+                <p class="text-xs text-gray-500 mt-4">{len(setups)} total setup(s) | Duration: {best['duration']}</p>
+            </div>
+            """
+        else:
+            return f"""
+            <div id="trade-setups" class="bg-yellow-900 bg-opacity-30 border border-yellow-700 rounded-lg p-6">
+                <p class="text-yellow-400 font-bold">⚠️ No Valid Trade Setups</p>
+                <p class="text-sm text-gray-400 mt-2">
+                    All channels below R² threshold. Current price: ${current_price:.2f}
+                </p>
+            </div>
+            """
+
+    except Exception as e:
+        logger.exception("Failed to generate trade setups")
+        return """
+        <div id="trade-setups" class="bg-red-900 bg-opacity-30 border border-red-700 rounded-lg p-6">
+            <p class="text-red-400 font-bold">❌ Failed to generate trade setups</p>
+            <p class="text-sm text-gray-400 mt-2">Please try again later.</p>
+        </div>
+        """
+
+
 @router.post("/{prediction_id}/validate")
 async def validate_prediction(prediction_id: int):
     """

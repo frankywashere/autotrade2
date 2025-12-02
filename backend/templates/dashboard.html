@@ -82,10 +82,17 @@
             <div class="mt-6">
 
                 <!-- Predictions Tab -->
-                <div x-show="tab === 'predictions'" x-cloak x-data="{ view: 'channel' }">
+                <div x-show="tab === 'predictions'" x-cloak x-data="{ view: 'setups' }">
                     <!-- View Toggle -->
                     <div class="flex justify-center mb-6">
                         <div class="bg-gray-800 rounded-lg p-1 inline-flex">
+                            <button
+                                @click="view = 'setups'"
+                                :class="view === 'setups' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'"
+                                class="px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                            >
+                                Trade Setups
+                            </button>
                             <button
                                 @click="view = 'channel'"
                                 :class="view === 'channel' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'"
@@ -100,6 +107,33 @@
                             >
                                 Fixed 24h
                             </button>
+                        </div>
+                    </div>
+
+                    <!-- Multi-Timeframe Trade Setups View -->
+                    <div x-show="view === 'setups'" x-cloak>
+                        <div class="flex justify-end mb-2">
+                            <button
+                                class="px-3 py-1 bg-green-600 hover:bg-green-700 rounded text-sm font-medium"
+                                hx-post="/api/predictions/setups/generate"
+                                hx-target="#trade-setups"
+                                hx-swap="outerHTML"
+                                hx-indicator="#setups-spinner"
+                            >
+                                <span class="htmx-indicator" id="setups-spinner">Generating...</span>
+                                <span class="htmx-not-indicator">Refresh Setups</span>
+                            </button>
+                        </div>
+                        <div id="trade-setups"
+                             hx-get="/api/predictions/setups"
+                             hx-trigger="load, every 5m"
+                             hx-swap="outerHTML">
+                            <div class="bg-gray-800 rounded-lg p-6 animate-pulse">
+                                <div class="h-8 bg-gray-700 rounded w-1/3 mb-4"></div>
+                                <div class="h-32 bg-gray-700 rounded mb-4"></div>
+                                <div class="h-32 bg-gray-700 rounded mb-4"></div>
+                                <div class="h-32 bg-gray-700 rounded"></div>
+                            </div>
                         </div>
                     </div>
 

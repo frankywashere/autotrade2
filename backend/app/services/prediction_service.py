@@ -10,7 +10,7 @@ import logging
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import sys
 
 # Add project root to path
@@ -432,6 +432,282 @@ class PredictionService:
                     f"Best horizon: {best['horizon_minutes']}min "
                     f"(confidence: {best['confidence']:.2%})"
                 )
+
+            return result
+
+    def _extract_channel_setups(self, features_df, current_price: float) -> List[Dict]:
+        """
+        Extract trade setups from channel features across all timeframes.
+
+        Groups channels into trade categories (Scalp, Intraday, Swing, Position)
+        and finds the best channel in each category based on R-squared.
+
+        Args:
+            features_df: DataFrame with extracted features
+            current_price: Current TSLA price
+
+        Returns:
+            List of setup dicts sorted by confidence (descending)
+        """
+        # Map timeframe categories to their channel timeframes
+        timeframe_categories = {
+            'scalp': {
+                'channels': ['5min', '15min', '30min'],
+                'label': 'Scalp',
+                'description': 'Minutes to 1 hour',
+                'duration_map': {
+                    '5min': '5-30 min',
+                    '15min': '15-60 min',
+                    '30min': '30 min - 2 hr'
+                }
+            },
+            'intraday': {
+                'channels': ['1h', '2h', '3h', '4h'],
+                'label': 'Intraday',
+                'description': '1-8 hours',
+                'duration_map': {
+                    '1h': '1-4 hours',
+                    '2h': '2-6 hours',
+                    '3h': '3-8 hours',
+                    '4h': '4-12 hours'
+                }
+            },
+            'swing': {
+                'channels': ['daily'],
+                'label': 'Swing',
+                'description': 'Days to 2 weeks',
+                'duration_map': {
+                    'daily': '1-10 days'
+                }
+            },
+            'position': {
+                'channels': ['weekly', 'monthly'],
+                'label': 'Position',
+                'description': 'Weeks to months',
+                'duration_map': {
+                    'weekly': '1-4 weeks',
+                    'monthly': '1-3 months'
+                }
+            }
+        }
+
+        setups = []
+        # Try multiple window sizes, prefer larger (more stable) windows
+        windows_to_try = [60, 100, 30, 45, 80]
+
+        for category_name, config in timeframe_categories.items():
+            best_r2 = 0
+            best_channel_data = None
+
+            for tf_name in config['channels']:
+                # Try multiple window sizes, find the first one that exists
+                found_window = None
+                for window in windows_to_try:
+                    prefix = f'tsla_channel_{tf_name}_w{window}'
+                    r2_col = f'{prefix}_r_squared_avg'
+                    if r2_col in features_df.columns:
+                        found_window = window
+                        break
+
+                if found_window is None:
+                    continue
+
+                # Use the found window
+                prefix = f'tsla_channel_{tf_name}_w{found_window}'
+                r2_col = f'{prefix}_r_squared_avg'
+                width_col = f'{prefix}_channel_width_pct'
+                slope_col = f'{prefix}_close_slope_pct'
+                position_col = f'{prefix}_position'
+
+                # Get values from most recent row
+                r2 = features_df[r2_col].iloc[-1]
+                if np.isnan(r2) or r2 <= 0:
+                    continue
+
+                if r2 > best_r2:
+                    best_r2 = r2
+                    # Safely get values with defaults
+                    width = features_df[width_col].iloc[-1] if width_col in features_df.columns else 0.05
+                    slope = features_df[slope_col].iloc[-1] if slope_col in features_df.columns else 0.0
+                    position = features_df[position_col].iloc[-1] if position_col in features_df.columns else 0.5
+
+                    best_channel_data = {
+                        'timeframe': tf_name,
+                        'window': found_window,
+                        'r_squared': r2,
+                        'width_pct': width if not np.isnan(width) else 0.05,
+                        'slope_pct': slope if not np.isnan(slope) else 0.0,
+                        'position': position if not np.isnan(position) else 0.5,
+                        'duration': config['duration_map'].get(tf_name, 'unknown')
+                    }
+
+            # Only include if we found a valid channel above minimum threshold
+            min_r2_threshold = 0.40
+            if best_channel_data and best_r2 > min_r2_threshold:
+                # Calculate high/low from channel width
+                width_pct = best_channel_data['width_pct']
+                position = best_channel_data['position']
+
+                # Channel bounds: price can move within width, position tells us where we are
+                # Position 0 = at lower bound, 1 = at upper bound, 0.5 = middle
+                room_up = width_pct * (1 - position)  # Remaining room to upper bound
+                room_down = width_pct * position      # Remaining room to lower bound
+
+                high_price = current_price * (1 + room_up)
+                low_price = current_price * (1 - room_down)
+
+                # Confidence: R-squared scaled with some boost
+                # R² of 0.8 → 85% confidence, R² of 0.5 → 55% confidence
+                confidence = min(95, best_r2 * 100 + 5)
+
+                # Determine direction from slope
+                slope = best_channel_data['slope_pct']
+                if slope > 0.1:
+                    direction = 'bullish'
+                elif slope < -0.1:
+                    direction = 'bearish'
+                else:
+                    direction = 'neutral'
+
+                # Risk assessment based on position in channel
+                if position > 0.85:
+                    risk_note = 'Near upper bound - limited upside'
+                elif position < 0.15:
+                    risk_note = 'Near lower bound - limited downside'
+                elif position > 0.7:
+                    risk_note = 'Upper half of channel'
+                elif position < 0.3:
+                    risk_note = 'Lower half of channel'
+                else:
+                    risk_note = 'Mid-channel - balanced risk'
+
+                setups.append({
+                    'type': category_name,
+                    'label': config['label'],
+                    'description': config['description'],
+                    'channel_timeframe': best_channel_data['timeframe'],
+                    'r_squared': round(best_r2, 3),
+                    'confidence': round(confidence, 1),
+                    'high': round(high_price, 2),
+                    'low': round(low_price, 2),
+                    'duration': best_channel_data['duration'],
+                    'direction': direction,
+                    'slope_pct': round(slope, 3),
+                    'position_in_channel': round(position, 2),
+                    'risk_note': risk_note
+                })
+
+        # Sort by confidence descending
+        return sorted(setups, key=lambda x: x['confidence'], reverse=True)
+
+    def get_trade_setups(self, force_refresh: bool = False) -> Dict:
+        """
+        Get multi-timeframe trade setups based on channel analysis.
+
+        Analyzes channels across all timeframes (5min to monthly) and returns
+        trade setups for each category that meets confidence threshold.
+
+        Thread-safe: uses lock to prevent concurrent yfinance data scrambling.
+
+        Args:
+            force_refresh: Skip cache and fetch new data
+
+        Returns:
+            Dict with:
+                - setups: List of trade setups (Scalp, Intraday, Swing, Position)
+                - best_setup: Highest confidence setup
+                - current_price: Current TSLA price
+                - timestamp: Analysis time
+                - model_prediction: Also includes the model's fused prediction
+        """
+        with self._prediction_lock:
+            logger.info("Generating trade setups from channel analysis...")
+
+            # Load model if needed (for model prediction comparison)
+            self._load_model()
+
+            # Get live data
+            feed = self._get_data_feed()
+            df = feed.fetch_for_prediction()
+
+            if len(df) < self.SEQUENCE_LENGTH:
+                raise ValueError(
+                    f"Insufficient data: {len(df)} bars (need {self.SEQUENCE_LENGTH})\n"
+                    f"Market may be closed or data unavailable"
+                )
+
+            logger.info(f"Live data fetched: {len(df)} bars")
+
+            # Extract features
+            extractor = self._get_feature_extractor()
+            result = extractor.extract_features(
+                df,
+                use_cache=False,
+                use_chunking=False,
+                continuation=False,
+                events_handler=self._events_handler
+            )
+
+            if isinstance(result, tuple):
+                features_df = result[0]
+            else:
+                features_df = result
+
+            logger.info(f"Features extracted: {features_df.shape}")
+
+            # Handle feature dimension mismatch for model prediction
+            actual_features = features_df.shape[1]
+            if actual_features != self.EXPECTED_FEATURES:
+                if actual_features < self.EXPECTED_FEATURES:
+                    missing = self.EXPECTED_FEATURES - actual_features
+                    import pandas as pd
+                    padding_cols = {f'_pad_{i}': 0.0 for i in range(missing)}
+                    padding_df = pd.DataFrame(padding_cols, index=features_df.index)
+                    features_padded = pd.concat([features_df, padding_df], axis=1)
+                else:
+                    features_padded = features_df.iloc[:, :self.EXPECTED_FEATURES]
+            else:
+                features_padded = features_df
+
+            # Get current price
+            current_price = float(features_df.iloc[-1]['tsla_close'])
+
+            # Extract channel-based setups (uses features_df before padding)
+            setups = self._extract_channel_setups(features_df, current_price)
+
+            # Also get model prediction for comparison
+            sequence = features_padded.tail(self.SEQUENCE_LENGTH).values
+            x_tensor = torch.tensor(sequence, dtype=torch.float32).unsqueeze(0)
+
+            with torch.no_grad():
+                model_result = self._model.predict(x_tensor)
+
+            model_prediction = {
+                'predicted_high': float(model_result['predicted_high']),
+                'predicted_low': float(model_result['predicted_low']),
+                'confidence': float(model_result['confidence']),
+                'fusion_weights': model_result.get('fusion_weights', [0.33, 0.33, 0.33])
+            }
+
+            result = {
+                'setups': setups,
+                'best_setup': setups[0] if setups else None,
+                'current_price': current_price,
+                'timestamp': datetime.now(),
+                'model_prediction': model_prediction,
+                'setup_count': len(setups)
+            }
+
+            # Log summary
+            if setups:
+                best = setups[0]
+                logger.info(
+                    f"Best setup: {best['label']} ({best['channel_timeframe']} channel) "
+                    f"- {best['confidence']:.1f}% confidence, "
+                    f"${best['low']:.2f} - ${best['high']:.2f}"
+                )
+            else:
+                logger.info("No valid trade setups found (all channels below R² threshold)")
 
             return result
 
