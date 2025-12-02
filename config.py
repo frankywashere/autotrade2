@@ -153,7 +153,7 @@ CHUNK_OVERLAP_MONTHS = 6       # Overlap between chunks to ensure rolling featur
 # HISTORICAL LOOKBACK CONFIGURATION
 # ======================================================================
 
-# Feature extraction minimum lookback requirements (v3.13: Updated for 21-window system)
+# Feature extraction minimum lookback requirements (v4.0: Updated for 14-window system)
 # For 3-month timeframe with 10-bar window (smallest window, longest timeframe):
 # 10 bars × 3 months/bar = 30 months = 2.5 years
 # 660 trading days × 390 bars/day = 257,400 1-min bars

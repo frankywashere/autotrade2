@@ -1106,7 +1106,12 @@ class HierarchicalDataset(Dataset):
         indexed = [(i, idx, self.valid_indices[idx]) for i, idx in enumerate(indices)]
 
         # Sort by data_idx for sequential mmap access (key optimization)
-        sorted_indexed = sorted(indexed, key=lambda x: x[2])
+        # BUT: Only sort in mmap mode - when data is preloaded to RAM, sorting
+        # defeats shuffling and provides no I/O benefit (RAM has O(1) random access)
+        if not self._preload_to_ram:
+            sorted_indexed = sorted(indexed, key=lambda x: x[2])
+        else:
+            sorted_indexed = indexed  # Keep original shuffled order for RAM mode
 
         # Pre-allocate results list
         results = [None] * batch_size

@@ -1536,7 +1536,7 @@ def interactive_setup(args, profiler=None):
 
         print(f"\n   📅 Training Date Range Analysis:")
         print(f"   Requested: {args.train_start_year}-{args.train_end_year} ({requested_years} years)")
-        print(f"   Warmup required: {warmup_years} years (257,400 bars for 21-window system)")
+        print(f"   Warmup required: {warmup_years} years (257,400 bars for 14-window system)")
         print(f"   ")
         print(f"   ⚠️  IF your CSV starts at {args.train_start_year}:")
         print(f"       Effective training: {effective_start_year:.1f}-{args.train_end_year} ({effective_years:.1f} years)")
