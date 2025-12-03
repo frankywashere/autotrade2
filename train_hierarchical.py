@@ -1919,20 +1919,10 @@ def interactive_setup(args, profiler=None):
         max_allowed=1000
     ).execute())
 
-    # Device-specific max batch sizes
-    # Note: 512 may cause OOM on systems with <16GB RAM/VRAM
-    max_batch_sizes = {
-        'cuda': 512,    # Increased max for modern GPUs
-        'mps': 512,     # Increased max for M2 Max/Ultra with high RAM
-        'cpu': 512      # Increased max (requires 32GB+ RAM)
-    }
-    max_batch_size = max_batch_sizes.get(args.device, 512)
-
     args.batch_size = int(inquirer.number(
-        message=f"Batch size (recommended: {recommended_batch}, max for {args.device.upper()}: {max_batch_size}):",
+        message=f"Batch size (recommended: {recommended_batch}):",
         default=dflt('batch_size', recommended_batch),
-        min_allowed=1,  # Allow very small batches for MPS (1-4 for memory constrained)
-        max_allowed=max_batch_size
+        min_allowed=1
     ).execute())
 
     args.lr = float(inquirer.number(
