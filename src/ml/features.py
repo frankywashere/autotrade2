@@ -612,6 +612,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                 # Monthly/3month removed - they're in monthly_3month_shard.npy, loaded as mmap
                 # Optimize: copy=False avoids unnecessary data copies
                 base_features_df = pd.concat(concat_list, axis=1, copy=False)
+                # Free intermediate DataFrames (small in mmap mode, but good hygiene)
+                del price_df, rsi_df, correlation_df, cycle_df, volume_df, time_df, vix_df
             else:
                 # Normal mode - include channel features
                 # Optimize: copy=False avoids unnecessary data copies
@@ -625,6 +627,12 @@ class TradingFeatureExtractor(FeatureExtractor):
                     time_df,
                     vix_df
                 ], axis=1, copy=False)
+                # CRITICAL: Free intermediate DataFrames IMMEDIATELY to prevent OOM
+                # channel_df alone is ~90GB; without this, peak RAM hits ~280GB during concat
+                import gc
+                del price_df, channel_df, rsi_df, correlation_df, cycle_df, volume_df, time_df, vix_df
+                gc.collect()
+                print(f"   🧹 Freed intermediate feature DataFrames (~90GB)")
 
             # PASS 2: Extract breakdown features (needs base features + optional events)
             with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100, ascii=True, mininterval=0.5) as pbar:
@@ -634,6 +642,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             # Final concat (non-channel features only if using mmap)
             # Optimize: copy=False avoids unnecessary data copies
             features_df = pd.concat([base_features_df, breakdown_df], axis=1, copy=False)
+            # Free concat intermediates to reclaim ~92GB before continuation labels
+            import gc
+            del base_features_df, breakdown_df
+            gc.collect()
 
         # Generate continuation labels if requested
         continuation_df = None
