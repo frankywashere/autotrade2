@@ -2417,7 +2417,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print(f"\n   🔄 Generating native timeframe sequences from chunks...")
             print(f"   📄 Using: {chunk_meta_path.name}")
 
-            from src.ml.features import TradingFeatureExtractor
+            # TradingFeatureExtractor is already imported at the top of this file
             gen_extractor = TradingFeatureExtractor()
             gen_extractor.generate_native_tf_from_chunks(
                 chunks_meta_path=chunk_meta_path,

@@ -1142,6 +1142,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             meta['timeframe_columns'][tf] = tf_col_names
 
             resampled_chunks = []
+            cumulative_row_offset = 0  # Track position in monthly array across chunks
 
             # Stream through each chunk
             for chunk in chunk_info:
@@ -1162,12 +1163,15 @@ class TradingFeatureExtractor(FeatureExtractor):
                         i for i, mc in enumerate(monthly_columns) if f'_{tf}_' in mc
                     ]
                     if monthly_tf_indices:
-                        # Get corresponding rows from monthly shard (same row count as chunks)
-                        chunk_start = chunk.get('start_row', 0)
+                        # Get corresponding rows from monthly shard using cumulative offset
+                        chunk_start = cumulative_row_offset
                         chunk_end = chunk_start + len(tf_chunk)
                         monthly_tf_data = monthly_array[chunk_start:chunk_end, monthly_tf_indices].astype(np.float32)
                         if len(monthly_tf_data) == len(tf_chunk):
                             tf_chunk = np.hstack([tf_chunk, monthly_tf_data])
+
+                # Update cumulative offset for next chunk
+                cumulative_row_offset += len(chunk_array)
 
                 # Create DataFrame with proper column names and timestamps
                 df = pd.DataFrame(tf_chunk, columns=tf_col_names[:tf_chunk.shape[1]])
