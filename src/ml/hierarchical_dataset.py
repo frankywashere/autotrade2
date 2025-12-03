@@ -45,7 +45,8 @@ class HierarchicalDataset(Dataset):
         self,
         features_df: pd.DataFrame = None,
         raw_ohlc_df: pd.DataFrame = None,
-        continuation_labels_df: pd.DataFrame = None,
+        continuation_labels_df: pd.DataFrame = None,  # Legacy: single DataFrame
+        continuation_labels_dir: str = None,  # v4.3: Directory with per-TF label files
         sequence_length: int = 200,
         prediction_horizon: int = 24,
         mode: str = 'uniform_bars',
@@ -64,7 +65,8 @@ class HierarchicalDataset(Dataset):
         Args:
             features_df: Features dataframe (165 non-channel + optional mmap 12,474 channel = 12,639 total)
             raw_ohlc_df: Raw OHLC data for input sequences
-            continuation_labels_df: DataFrame with continuation labels
+            continuation_labels_df: [LEGACY] DataFrame with continuation labels (single TF)
+            continuation_labels_dir: [v4.3] Directory containing per-TF continuation label files
             sequence_length: Input sequence length (200 1-min bars) - ignored if use_native_timeframes=True
             prediction_horizon: How many bars ahead to predict (24 = 24 minutes)
             mode: 'uniform_bars' (fixed # bars ahead)
@@ -143,6 +145,14 @@ class HierarchicalDataset(Dataset):
             self.has_channel_1h_r_squared = False
             self.has_channel_4h_r_squared = False
             self._continuation_ts_to_idx = {}
+
+        # v4.3: Load per-TF hierarchical continuation labels
+        self.continuation_labels_dir = continuation_labels_dir
+        self._per_tf_continuation = {}  # Dict[tf, Dict] with arrays for each TF
+        self._per_tf_ts_to_idx = {}  # Dict[tf, Dict[int64_ns, row_idx]]
+
+        if continuation_labels_dir is not None:
+            self._load_hierarchical_continuation_labels(continuation_labels_dir)
 
         # Dtype validation - ensure data matches config precision
         expected_dtype = config.NUMPY_DTYPE
@@ -761,49 +771,65 @@ class HierarchicalDataset(Dataset):
             past_prices=past_prices
         )
 
-        # v4.2: Add continuation prediction targets (same as legacy mode)
-        # This enables duration/gain/confidence predictions in native TF mode
-        if self.include_continuation and self.continuation_labels_df is not None:
+        # v4.3: Add per-TF hierarchical continuation prediction targets
+        # Each timeframe gets its own duration/gain/confidence predictions
+        if self.include_continuation and len(self._per_tf_continuation) > 0:
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                if tf not in self._per_tf_continuation or tf not in self._per_tf_ts_to_idx:
+                    # No labels for this TF - use placeholders
+                    targets[f'cont_{tf}_duration'] = 0.0
+                    targets[f'cont_{tf}_gain'] = 0.0
+                    targets[f'cont_{tf}_confidence'] = 0.5
+                    continue
+
+                try:
+                    # Get timestamp for this timeframe
+                    if tf in self.tf_timestamps:
+                        # Find the corresponding index in this TF's array
+                        tf_timestamps = self.tf_timestamps[tf]
+                        tf_idx = np.searchsorted(tf_timestamps, ts_5min, side='right') - 1
+                        tf_idx = max(0, min(tf_idx, len(tf_timestamps) - 1))
+                        tf_ts = tf_timestamps[tf_idx]
+
+                        # Lookup in per-TF dict
+                        row_idx = self._per_tf_ts_to_idx[tf].get(int(tf_ts))
+
+                        if row_idx is not None:
+                            cont_data = self._per_tf_continuation[tf]
+                            targets[f'cont_{tf}_duration'] = float(cont_data['duration_bars'][row_idx])
+                            targets[f'cont_{tf}_gain'] = float(cont_data['max_gain_pct'][row_idx])
+                            targets[f'cont_{tf}_confidence'] = float(cont_data['confidence'][row_idx])
+                        else:
+                            # Timestamp not found - use placeholders
+                            targets[f'cont_{tf}_duration'] = 0.0
+                            targets[f'cont_{tf}_gain'] = 0.0
+                            targets[f'cont_{tf}_confidence'] = 0.5
+                    else:
+                        # TF timestamps not available
+                        targets[f'cont_{tf}_duration'] = 0.0
+                        targets[f'cont_{tf}_gain'] = 0.0
+                        targets[f'cont_{tf}_confidence'] = 0.5
+                except Exception:
+                    # Error - use placeholders
+                    targets[f'cont_{tf}_duration'] = 0.0
+                    targets[f'cont_{tf}_gain'] = 0.0
+                    targets[f'cont_{tf}_confidence'] = 0.5
+
+        # Legacy fallback: single continuation_labels_df (backward compatibility)
+        elif self.include_continuation and self.continuation_labels_df is not None:
             try:
-                # Get 5min timestamp for lookup
-                # Note: 5-min bar timestamp is the period START (e.g., 10:05)
-                # but features are from .last() which is ~4 min later (e.g., 10:09)
-                # We try aligned timestamp first, fall back to bar start
                 ts_5min = self.tf_timestamps['5min'][data_idx_5min]
-
-                # Try aligned timestamp (+4 min to match where .last() data came from)
-                ts_aligned_ns = int(ts_5min) + (4 * 60 * 1_000_000_000)  # +4 min in nanoseconds
+                ts_aligned_ns = int(ts_5min) + (4 * 60 * 1_000_000_000)
                 row_idx = self._continuation_ts_to_idx.get(ts_aligned_ns)
-
-                # Fall back to bar start timestamp if aligned not found (market boundaries)
                 if row_idx is None:
                     row_idx = self._continuation_ts_to_idx.get(int(ts_5min))
 
                 if row_idx is not None:
-                    # Core continuation targets
                     targets['continuation_duration'] = float(self._cont_duration[row_idx])
                     targets['continuation_gain'] = float(self._cont_gain[row_idx])
                     targets['continuation_confidence'] = float(self._cont_confidence[row_idx])
-
-                    # Optional fields (check flags set in __init__)
-                    if self.has_adaptive_horizon:
-                        targets['adaptive_horizon'] = float(self._cont_adaptive_horizon[row_idx])
-                    if self.has_conf_score:
-                        targets['conf_score'] = float(self._cont_conf_score[row_idx])
-                    if self.has_channel_1h_cycles:
-                        targets['channel_1h_cycles'] = float(self._cont_channel_1h_cycles[row_idx])
-                    if self.has_channel_4h_cycles:
-                        targets['channel_4h_cycles'] = float(self._cont_channel_4h_cycles[row_idx])
-                    if self.has_channel_1h_valid:
-                        targets['channel_1h_valid'] = float(self._cont_channel_1h_valid[row_idx])
-                    if self.has_channel_4h_valid:
-                        targets['channel_4h_valid'] = float(self._cont_channel_4h_valid[row_idx])
-                    if self.has_channel_1h_r_squared:
-                        targets['channel_1h_r_squared'] = float(self._cont_channel_1h_r_squared[row_idx])
-                    if self.has_channel_4h_r_squared:
-                        targets['channel_4h_r_squared'] = float(self._cont_channel_4h_r_squared[row_idx])
             except Exception:
-                pass  # Keep placeholder values on error
+                pass
 
         return timeframe_data, targets
 
@@ -838,6 +864,79 @@ class HierarchicalDataset(Dataset):
             sample_ts = [pd.Timestamp(k) for k in sample_keys]
             print(f"     ℹ️  Continuation lookup dict: {len(self._continuation_ts_to_idx):,} entries")
             print(f"        Sample timestamps: {sample_ts[0]}, {sample_ts[1]}, {sample_ts[2]}")
+
+    def _load_hierarchical_continuation_labels(self, labels_dir: str):
+        """
+        Load per-timeframe hierarchical continuation labels from directory.
+
+        v4.3: Each timeframe has its own continuation labels file with:
+        - timestamp: Bar timestamp at native TF resolution
+        - duration_bars: How many bars until channel break (at native resolution)
+        - max_gain_pct: Maximum favorable price move before break
+        - confidence: Channel quality score (0-1)
+
+        Args:
+            labels_dir: Directory containing per-TF label files
+                       (e.g., continuation_labels_5min_*.pkl, continuation_labels_1h_*.pkl)
+        """
+        import pickle
+        from pathlib import Path
+
+        labels_path = Path(labels_dir)
+        if not labels_path.exists():
+            print(f"     ⚠️  Continuation labels directory not found: {labels_dir}")
+            return
+
+        print(f"\n  📂 Loading hierarchical continuation labels from {labels_dir}...")
+
+        loaded_count = 0
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            # Look for label files matching pattern
+            pattern = f"continuation_labels_{tf}_*.pkl"
+            matching_files = list(labels_path.glob(pattern))
+
+            if not matching_files:
+                # Try without cache suffix
+                pattern_simple = f"continuation_labels_{tf}.pkl"
+                simple_file = labels_path / pattern_simple
+                if simple_file.exists():
+                    matching_files = [simple_file]
+
+            if not matching_files:
+                continue
+
+            # Use most recent file if multiple exist
+            label_file = sorted(matching_files)[-1]
+
+            try:
+                with open(label_file, 'rb') as f:
+                    labels_df = pickle.load(f)
+
+                if isinstance(labels_df, pd.DataFrame) and len(labels_df) > 0:
+                    # Extract arrays for O(1) access
+                    self._per_tf_continuation[tf] = {
+                        'duration_bars': labels_df['duration_bars'].values.astype(config.NUMPY_DTYPE),
+                        'max_gain_pct': labels_df['max_gain_pct'].values.astype(config.NUMPY_DTYPE),
+                        'confidence': labels_df['confidence'].values.astype(config.NUMPY_DTYPE),
+                    }
+
+                    # Build timestamp -> row_idx lookup dict
+                    # Note: timestamp is the INDEX, not a column
+                    self._per_tf_ts_to_idx[tf] = {}
+                    for i, ts in enumerate(labels_df.index):
+                        ts_ns = pd.Timestamp(ts).value
+                        self._per_tf_ts_to_idx[tf][ts_ns] = i
+
+                    loaded_count += 1
+                    print(f"     {tf}: {len(labels_df):,} labels loaded from {label_file.name}")
+
+            except Exception as e:
+                print(f"     ⚠️  Failed to load {tf} labels: {e}")
+
+        if loaded_count > 0:
+            print(f"     ✓ Loaded continuation labels for {loaded_count}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes")
+        else:
+            print(f"     ⚠️  No continuation label files found in {labels_dir}")
 
     def get_label_mismatch_summary(self) -> dict:
         """
@@ -1662,6 +1761,7 @@ def create_hierarchical_dataset(
     features_df: pd.DataFrame,
     raw_ohlc_df: pd.DataFrame = None,
     continuation_labels_df: pd.DataFrame = None,
+    continuation_labels_dir: str = None,  # v4.3: Directory with per-TF label files
     sequence_length: int = 200,
     prediction_horizon: int = 24,
     mode: str = 'uniform_bars',
@@ -1679,6 +1779,8 @@ def create_hierarchical_dataset(
 
     Args:
         features_df: Features DataFrame
+        continuation_labels_df: [Legacy] Single DataFrame with continuation labels
+        continuation_labels_dir: [v4.3] Directory with per-TF continuation label files
         sequence_length: Input sequence length
         prediction_horizon: Prediction horizon in bars
         mode: 'uniform_bars'
@@ -1713,8 +1815,11 @@ def create_hierarchical_dataset(
                 features_df,  # Full non-channel features
                 raw_ohlc_df,
                 None,  # Continuation handled separately below
-                sequence_length, prediction_horizon, mode,
-                include_continuation=False,
+                continuation_labels_dir=continuation_labels_dir,  # v4.3: Per-TF labels
+                sequence_length=sequence_length,
+                prediction_horizon=prediction_horizon,
+                mode=mode,
+                include_continuation=include_continuation,
                 mmap_meta_path=mmap_meta_path,
                 profiler=profiler,
                 preload_to_ram=preload_to_ram,
@@ -1732,14 +1837,15 @@ def create_hierarchical_dataset(
             train_dataset.valid_indices = train_valid
             train_dataset.continuation_labels_df = train_continuation_df
             train_dataset.include_continuation = include_continuation
-            train_dataset._build_continuation_lookup()  # Rebuild dict after assignment
+            train_dataset._build_continuation_lookup()  # Rebuild dict for legacy labels
 
             # Val dataset (shallow copy, shares mmap/arrays but different indices)
+            # NOTE: per-TF labels are shared (lookup is by timestamp, so safe)
             val_dataset = copy.copy(base_dataset)
             val_dataset.valid_indices = val_valid
             val_dataset.continuation_labels_df = val_continuation_df
             val_dataset.include_continuation = include_continuation
-            val_dataset._build_continuation_lookup()  # Rebuild dict after assignment
+            val_dataset._build_continuation_lookup()  # Rebuild dict for legacy labels
 
         else:
             # No mmaps - traditional split
@@ -1762,7 +1868,10 @@ def create_hierarchical_dataset(
             else:
                 train_dataset = HierarchicalDataset(
                     train_df, train_raw_ohlc, train_continuation_df,
-                    sequence_length, prediction_horizon, mode,
+                    continuation_labels_dir=continuation_labels_dir,
+                    sequence_length=sequence_length,
+                    prediction_horizon=prediction_horizon,
+                    mode=mode,
                     include_continuation=include_continuation,
                     profiler=profiler,
                     preload_to_ram=preload_to_ram,
@@ -1771,7 +1880,10 @@ def create_hierarchical_dataset(
                 )
                 val_dataset = HierarchicalDataset(
                     val_df, val_raw_ohlc, val_continuation_df,
-                    sequence_length, prediction_horizon, mode,
+                    continuation_labels_dir=continuation_labels_dir,
+                    sequence_length=sequence_length,
+                    prediction_horizon=prediction_horizon,
+                    mode=mode,
                     include_continuation=include_continuation,
                     profiler=profiler,
                     preload_to_ram=preload_to_ram,
@@ -1790,7 +1902,10 @@ def create_hierarchical_dataset(
         else:
             dataset = HierarchicalDataset(
                 features_df, raw_ohlc_df, continuation_labels_df,
-                sequence_length, prediction_horizon, mode,
+                continuation_labels_dir=continuation_labels_dir,
+                sequence_length=sequence_length,
+                prediction_horizon=prediction_horizon,
+                mode=mode,
                 include_continuation=include_continuation,
                 mmap_meta_path=mmap_meta_path,
                 profiler=profiler,

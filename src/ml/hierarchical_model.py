@@ -160,6 +160,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
             self.overshoot_head = nn.Linear(self.fusion_output_dim, 1)
 
             # Continuation: Channel continuation duration and gain (Regression)
+            # Legacy single-TF heads (for backward compatibility)
             self.continuation_duration_head = nn.Linear(self.fusion_output_dim, 1)
             self.continuation_gain_head = nn.Linear(self.fusion_output_dim, 1)
             self.continuation_confidence_head = nn.Sequential(
@@ -168,6 +169,20 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 nn.Linear(self.fusion_output_dim // 2, 1),
                 nn.Sigmoid()
             )
+
+            # v4.3: Per-timeframe continuation prediction heads
+            # Each TF has its own duration/gain/confidence predictions
+            self.per_tf_cont_heads = nn.ModuleDict()
+            for tf in self.TIMEFRAMES:
+                # Each TF continuation head takes that TF's hidden state
+                self.per_tf_cont_heads[f'{tf}_duration'] = nn.Linear(hidden_size, 1)
+                self.per_tf_cont_heads[f'{tf}_gain'] = nn.Linear(hidden_size, 1)
+                self.per_tf_cont_heads[f'{tf}_confidence'] = nn.Sequential(
+                    nn.Linear(hidden_size, hidden_size // 2),
+                    nn.ReLU(),
+                    nn.Linear(hidden_size // 2, 1),
+                    nn.Sigmoid()
+                )
 
             # Adaptive horizon predictor
             self.adaptive_horizon_head = nn.Sequential(
@@ -425,6 +440,28 @@ class HierarchicalLNN(nn.Module, ModelBase):
                     'confidence': breakout_confidence,
                     'is_trained': False
                 }
+
+            # v4.3: Per-TF continuation predictions
+            # Each timeframe gets duration/gain/confidence from its own hidden state
+            if hasattr(self, 'per_tf_cont_heads'):
+                per_tf_cont = {}
+                for i, tf in enumerate(self.TIMEFRAMES):
+                    if i < len(all_hidden):
+                        tf_hidden = all_hidden[i]  # [batch, hidden_size]
+                        duration = self.per_tf_cont_heads[f'{tf}_duration'](tf_hidden)
+                        gain = self.per_tf_cont_heads[f'{tf}_gain'](tf_hidden)
+                        confidence = self.per_tf_cont_heads[f'{tf}_confidence'](tf_hidden)
+
+                        per_tf_cont[f'cont_{tf}_duration'] = duration
+                        per_tf_cont[f'cont_{tf}_gain'] = gain
+                        per_tf_cont[f'cont_{tf}_confidence'] = confidence
+                    else:
+                        # Placeholder if hidden not available for this TF
+                        per_tf_cont[f'cont_{tf}_duration'] = torch.zeros(batch_size, 1, device=device)
+                        per_tf_cont[f'cont_{tf}_gain'] = torch.zeros(batch_size, 1, device=device)
+                        per_tf_cont[f'cont_{tf}_confidence'] = torch.full((batch_size, 1), 0.5, device=device)
+
+                output_dict['per_tf_continuation'] = per_tf_cont
 
         return predictions, output_dict
 

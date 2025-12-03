@@ -682,26 +682,37 @@ class TradingFeatureExtractor(FeatureExtractor):
             gc.collect()
 
         # Generate continuation labels if requested
-        continuation_df = None
+        # v4.3: Now generates hierarchical per-TF labels using channel-structure break detection
+        continuation_labels_dir = None
         if continuation:
-            # Try loading from cache first
-            if self._cont_cache_path and self._cont_cache_path.exists() and use_cache and cont_cache_valid:
-                print(f"   📂 Loading cached continuation labels...")
-                continuation_df = pd.read_pickle(self._cont_cache_path)
-                print(f"   ✓ Loaded {len(continuation_df):,} labels (saved ~1 hour!)")
-            else:
-                # Generate fresh labels
-                print("   🔄 Generating continuation labels (will take ~1 hour)...")
-                timestamps = df.index.tolist()
-                continuation_df = self.generate_continuation_labels(df, timestamps, prediction_horizon=24, mode=continuation_mode)
-                print(f"   ✓ Generated {len(continuation_df):,} continuation labels")
+            cache_dir = self._unified_cache_dir if hasattr(self, '_unified_cache_dir') else Path('data/feature_cache')
+            cache_suffix = f"v{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
 
-                # Save to cache for next time
-                if self._cont_cache_path:
-                    print(f"   💾 Caching continuation labels to: {self._cont_cache_path.name}")
-                    self._cont_cache_path.parent.mkdir(exist_ok=True, parents=True)
-                    continuation_df.to_pickle(self._cont_cache_path)
-                    print(f"   ✓ Continuation cache saved successfully")
+            # Check if all per-TF label files exist (cache check)
+            all_cached = True
+            if use_cache:
+                for tf in HIERARCHICAL_TIMEFRAMES:
+                    tf_label_path = cache_dir / f"continuation_labels_{tf}_{cache_suffix}.pkl"
+                    if not tf_label_path.exists():
+                        all_cached = False
+                        break
+            else:
+                all_cached = False
+
+            if all_cached:
+                print(f"   📂 Found cached hierarchical continuation labels ({len(HIERARCHICAL_TIMEFRAMES)} TFs)")
+                continuation_labels_dir = cache_dir
+            else:
+                # Generate fresh hierarchical labels
+                saved_files = self.generate_hierarchical_continuation_labels(
+                    df=df,
+                    timeframes=HIERARCHICAL_TIMEFRAMES,
+                    output_dir=cache_dir,
+                    cache_suffix=cache_suffix
+                )
+                if saved_files:
+                    continuation_labels_dir = cache_dir
+                    print(f"   ✓ Hierarchical continuation labels saved to: {cache_dir}")
 
         # Fill NaNs (only if we extracted - cached data already has NaNs filled)
         if not skip_all_extraction:
@@ -717,7 +728,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         # If using mmap shards, return metadata alongside features
         if hasattr(self, '_mmap_meta_path'):
             print(f"   ✓ {len(features_df.columns)} non-channel features + mmap channel shards ready")
-            return (features_df, continuation_df, self._mmap_meta_path)
+            # v4.3: Return continuation_labels_dir (Path) instead of continuation_df (DataFrame)
+            return (features_df, continuation_labels_dir, self._mmap_meta_path)
         else:
             # v4.1: Pre-compute timeframe-specific sequences for hierarchical model
             # This creates separate .npy files for each timeframe with native resolution
@@ -728,7 +740,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             self._precompute_timeframe_sequences(features_df, cache_dir, cache_key)
 
             print(f"   ✓ {len(features_df.columns)} features ready")
-            return features_df, continuation_df
+            # v4.3: Return continuation_labels_dir (Path) instead of continuation_df (DataFrame)
+            return features_df, continuation_labels_dir
 
     def _precompute_timeframe_sequences(
         self,
@@ -2183,7 +2196,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             'monthly_3month_shard': monthly_shard_info,  # v3.19: Separate shard for monthly/3month
             'feature_columns': feature_columns,  # v4.1: Column names for native TF generation
             'num_features': num_features + (monthly_shard_info['cols'] if monthly_shard_info else 0),
-            'dtype': str(config.NUMPY_DTYPE),
+            'dtype': np.dtype(config.NUMPY_DTYPE).name,
             'total_rows': total_rows,
             'version': FEATURE_VERSION,
             'temp_dir': str(temp_dir),
@@ -4062,6 +4075,259 @@ class TradingFeatureExtractor(FeatureExtractor):
         df_result = pd.DataFrame(label_data)
         print(f"   🔍 DEBUG: DataFrame built: {len(df_result)} rows × {len(df_result.columns)} columns")
         return df_result
+
+    def generate_hierarchical_continuation_labels(
+        self,
+        df: pd.DataFrame,
+        timeframes: list = None,
+        output_dir: Path = None,
+        cache_suffix: str = None
+    ) -> Dict[str, Path]:
+        """
+        Generate continuation labels for all hierarchical timeframes (v4.3).
+
+        Uses CHANNEL STRUCTURE to detect breaks (not arbitrary thresholds).
+        The channel's ±2σ deviation lines already reflect VIX/volatility/market conditions.
+
+        Key design decisions:
+        1. Break = price closes outside channel's ±2σ bounds (data-driven, not hardcoded %)
+        2. Prediction horizon = unlimited (scan until break OR end of data)
+        3. Each TF gets its own labels at native resolution
+        4. Model learns WHEN breaks happen from labels, learns WHY from features
+
+        Args:
+            df: 1-minute OHLC data with columns: tsla_open, tsla_high, tsla_low, tsla_close
+            timeframes: List of timeframes (defaults to HIERARCHICAL_TIMEFRAMES)
+            output_dir: Where to save per-TF label files
+            cache_suffix: Cache key suffix for file naming
+
+        Returns:
+            Dict mapping timeframe -> file path of saved labels
+        """
+        from scipy import stats
+
+        if timeframes is None:
+            timeframes = HIERARCHICAL_TIMEFRAMES
+        if output_dir is None:
+            output_dir = Path('data/feature_cache')
+        if cache_suffix is None:
+            cache_suffix = f"v{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        saved_files = {}
+
+        print(f"\n   🔄 Generating hierarchical continuation labels for {len(timeframes)} timeframes...")
+        print(f"      Break detection: Channel structure (±2σ lines) - no hardcoded thresholds")
+        print(f"      Prediction horizon: Unlimited (scan until break)")
+
+        # Process each timeframe
+        for tf in timeframes:
+            print(f"\n      Processing {tf} timeframe...")
+
+            # Resample to this TF's native resolution
+            tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
+            tf_data = df.resample(tf_rule).agg({
+                'tsla_open': 'first',
+                'tsla_high': 'max',
+                'tsla_low': 'min',
+                'tsla_close': 'last'
+            }).dropna()
+
+            print(f"         Resampled to {len(tf_data):,} {tf} bars")
+
+            # Get lookback for this TF
+            lookback_bars = TIMEFRAME_SEQUENCE_LENGTHS[tf]
+
+            if len(tf_data) < lookback_bars + 10:
+                print(f"         ⚠️  Not enough data for {tf} (need {lookback_bars}+ bars, have {len(tf_data)})")
+                continue
+
+            # Generate labels
+            tf_labels = []
+
+            for i in tqdm(range(lookback_bars, len(tf_data) - 1),
+                         desc=f"         {tf} labels", leave=False, ncols=100, ascii=True):
+                # Lookback window for channel fitting
+                lookback = tf_data.iloc[i - lookback_bars:i]
+
+                # Fit linear regression channel on lookback
+                try:
+                    x = np.arange(lookback_bars)
+                    closes = lookback['tsla_close'].values
+                    highs = lookback['tsla_high'].values
+                    lows = lookback['tsla_low'].values
+
+                    # Use scipy for linear regression
+                    slope, intercept, r_value, _, _ = stats.linregress(x, closes)
+                    r_squared = r_value ** 2
+
+                    # Calculate residuals and std dev
+                    predicted = slope * x + intercept
+                    residuals = closes - predicted
+                    residual_std = np.std(residuals)
+
+                    if residual_std < 1e-10:
+                        # Degenerate channel (flat line)
+                        continue
+
+                    # Calculate channel metrics
+                    upper_line = predicted + (2.0 * residual_std)
+                    lower_line = predicted - (2.0 * residual_std)
+
+                    # Simple cycle counting: alternating touches of upper/lower bands
+                    touches_upper = closes >= (predicted + 1.5 * residual_std)
+                    touches_lower = closes <= (predicted - 1.5 * residual_std)
+
+                    complete_cycles = 0
+                    last_touch = None
+                    for j in range(len(closes)):
+                        if touches_upper[j] and last_touch != 'upper':
+                            if last_touch == 'lower':
+                                complete_cycles += 1
+                            last_touch = 'upper'
+                        elif touches_lower[j] and last_touch != 'lower':
+                            if last_touch == 'upper':
+                                complete_cycles += 1
+                            last_touch = 'lower'
+
+                    is_valid = complete_cycles >= 2 and r_squared > 0.5
+
+                except Exception:
+                    continue
+
+                # Get current price and timestamp
+                current_price = tf_data.iloc[i]['tsla_close']
+                current_timestamp = tf_data.index[i]
+
+                # Future window (unlimited - scan until break OR end of data)
+                future = tf_data.iloc[i:]
+
+                # Detect continuation vs break using CHANNEL STRUCTURE
+                break_idx, max_gain = self._detect_channel_break_structure(
+                    slope=slope,
+                    intercept=intercept,
+                    residual_std=residual_std,
+                    lookback_bars=lookback_bars,
+                    future_prices=future,
+                    current_price=current_price
+                )
+
+                # Calculate duration (in bars)
+                duration_bars = break_idx if break_idx is not None else (len(future) - 1)
+
+                # Calculate confidence based on channel quality
+                confidence = self._calculate_continuation_confidence(
+                    r_squared=r_squared,
+                    cycles=complete_cycles,
+                    is_valid=is_valid
+                )
+
+                tf_labels.append({
+                    'timestamp': current_timestamp,
+                    'duration_bars': float(duration_bars),
+                    'max_gain_pct': float(max_gain),
+                    'confidence': float(confidence),
+                    'channel_cycles': int(complete_cycles),
+                    'channel_r_squared': float(r_squared),
+                    'channel_valid': int(is_valid),
+                    'channel_slope': float(slope),
+                    'channel_width': float(residual_std * 4)  # Full width (±2σ)
+                })
+
+            if len(tf_labels) == 0:
+                print(f"         ⚠️  No valid labels generated for {tf}")
+                continue
+
+            # Convert to DataFrame
+            labels_df = pd.DataFrame(tf_labels)
+            labels_df.set_index('timestamp', inplace=True)
+
+            # Save to file
+            output_path = output_dir / f"continuation_labels_{tf}_{cache_suffix}.pkl"
+            labels_df.to_pickle(output_path)
+
+            saved_files[tf] = output_path
+
+            # Stats
+            avg_duration = labels_df['duration_bars'].mean()
+            avg_confidence = labels_df['confidence'].mean()
+            print(f"         ✓ Saved {len(labels_df):,} labels | avg duration: {avg_duration:.1f} bars | avg conf: {avg_confidence:.2f}")
+
+        print(f"\n   ✓ Generated {len(saved_files)}/{len(timeframes)} timeframe continuation labels")
+        return saved_files
+
+    def _detect_channel_break_structure(
+        self,
+        slope: float,
+        intercept: float,
+        residual_std: float,
+        lookback_bars: int,
+        future_prices: pd.DataFrame,
+        current_price: float
+    ) -> Tuple[int, float]:
+        """
+        Detect when a channel breaks by scanning forward.
+        Uses CHANNEL STRUCTURE (±2σ deviation lines) not arbitrary thresholds.
+
+        Args:
+            slope: Channel slope from linear regression
+            intercept: Channel intercept
+            residual_std: Standard deviation of residuals (defines channel width)
+            lookback_bars: Number of bars in the lookback window
+            future_prices: DataFrame of future OHLC bars
+            current_price: Price at prediction point
+
+        Returns:
+            break_idx: Index of break (or None if no break)
+            max_gain: Maximum % gain before break
+        """
+        max_gain = 0.0
+
+        for i in range(len(future_prices)):
+            row = future_prices.iloc[i]
+            close = row['tsla_close']
+            high = row['tsla_high']
+
+            # Track maximum gain
+            gain_pct = (high - current_price) / current_price * 100
+            max_gain = max(max_gain, abs(gain_pct))
+
+            # Project channel forward to this bar
+            # At bar i (relative to prediction point), we're at x = lookback_bars + i
+            x_current = lookback_bars + i
+            center_at_x = slope * x_current + intercept
+            upper_at_x = center_at_x + (2.0 * residual_std)
+            lower_at_x = center_at_x - (2.0 * residual_std)
+
+            # Method 1: Price CLOSES outside channel bounds (primary break detection)
+            if close > upper_at_x or close < lower_at_x:
+                return i, max_gain
+
+        return None, max_gain
+
+    def _calculate_continuation_confidence(
+        self,
+        r_squared: float,
+        cycles: int,
+        is_valid: bool
+    ) -> float:
+        """
+        Calculate confidence score based on channel quality.
+
+        Returns: Float 0.0-1.0
+        """
+        if not is_valid:
+            return 0.1
+
+        # Base on r_squared (0.0-1.0) → contributes 0-0.7
+        conf = r_squared * 0.7
+
+        # Bonus for complete cycles (up to +0.3)
+        # 5+ cycles = maximum bonus
+        cycle_bonus = min(cycles / 5.0, 1.0) * 0.3
+
+        return min(conf + cycle_bonus, 0.99)
 
     def create_sequences(self, features_df: pd.DataFrame, sequence_length: int = 168,
                         target_horizon: int = 24) -> Tuple[torch.Tensor, torch.Tensor]:

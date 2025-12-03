@@ -577,7 +577,7 @@ def save_cache_manifest(
             ],
             "prediction_horizon": args.prediction_horizon,
             "precision": project_config.TRAINING_PRECISION,
-            "dtype": str(project_config.NUMPY_DTYPE),
+            "dtype": np.dtype(project_config.NUMPY_DTYPE).name,
             "paths": {
                 "mmap_meta": mmap_meta_path,
                 "continuation_labels": continuation_path,
@@ -731,6 +731,18 @@ def train_epoch(
                 target_breakout_bars_log = targets_dict['breakout_bars_log'].to(device, non_blocking=True)
                 target_breakout_magnitude = targets_dict['breakout_magnitude'].to(device, non_blocking=True)
 
+            # v4.3: Per-TF continuation targets
+            per_tf_cont_targets = {}
+            from src.ml.hierarchical_model import HierarchicalLNN
+            for tf in HierarchicalLNN.TIMEFRAMES:
+                dur_key = f'cont_{tf}_duration'
+                gain_key = f'cont_{tf}_gain'
+                conf_key = f'cont_{tf}_confidence'
+                if dur_key in targets_dict:
+                    per_tf_cont_targets[dur_key] = targets_dict[dur_key].to(device, non_blocking=True)
+                    per_tf_cont_targets[gain_key] = targets_dict[gain_key].to(device, non_blocking=True)
+                    per_tf_cont_targets[conf_key] = targets_dict[conf_key].to(device, non_blocking=True)
+
         # Forward pass with optional AMP
         use_amp = scaler is not None
 
@@ -785,27 +797,30 @@ def train_epoch(
                     )
                     loss += loss_weights['overshoot'] * loss_overshoot
 
-                    # Continuation duration (regression)
-                    loss_continuation_duration = criterion(
-                        mt['continuation_duration'].squeeze(),
-                        target_continuation_duration
-                    )
-                    loss += loss_weights['continuation_duration'] * loss_continuation_duration
-
-                    # Continuation gain (regression)
-                    loss_continuation_gain = criterion(
-                        mt['continuation_gain'].squeeze(),
-                        target_continuation_gain
-                    )
-                    loss += loss_weights['continuation_gain'] * loss_continuation_gain
-
-                    # Continuation confidence (binary classification)
-                    with torch.amp.autocast('cuda', enabled=False):
-                        loss_continuation_confidence = F.binary_cross_entropy(
-                            mt['continuation_confidence'].float().squeeze(),
-                            target_continuation_confidence.float()
+                    # Legacy continuation losses (skip when per-TF is active)
+                    use_per_tf_cont = len(per_tf_cont_targets) > 0
+                    if not use_per_tf_cont:
+                        # Continuation duration (regression)
+                        loss_continuation_duration = criterion(
+                            mt['continuation_duration'].squeeze(),
+                            target_continuation_duration
                         )
-                    loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
+                        loss += loss_weights['continuation_duration'] * loss_continuation_duration
+
+                        # Continuation gain (regression)
+                        loss_continuation_gain = criterion(
+                            mt['continuation_gain'].squeeze(),
+                            target_continuation_gain
+                        )
+                        loss += loss_weights['continuation_gain'] * loss_continuation_gain
+
+                        # Continuation confidence (binary classification)
+                        with torch.amp.autocast('cuda', enabled=False):
+                            loss_continuation_confidence = F.binary_cross_entropy(
+                                mt['continuation_confidence'].float().squeeze(),
+                                target_continuation_confidence.float()
+                            )
+                        loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
 
                     # Adaptive horizon losses (only when using adaptive mode)
                     if 'adaptive_horizon' in targets_dict and 'adaptive_horizon' in mt:
@@ -877,6 +892,39 @@ def train_epoch(
                     )
                     loss += loss_weights['breakout_magnitude'] * loss_breakout_magnitude
 
+                # v4.3: Per-TF continuation losses (normalized by # of timeframes)
+                if 'per_tf_continuation' in hidden_states and len(per_tf_cont_targets) > 0:
+                    per_tf_cont = hidden_states['per_tf_continuation']
+                    per_tf_loss_weight = loss_weights.get('per_tf_continuation', 0.1) / len(HierarchicalLNN.TIMEFRAMES)
+
+                    for tf in HierarchicalLNN.TIMEFRAMES:
+                        dur_key = f'cont_{tf}_duration'
+                        gain_key = f'cont_{tf}_gain'
+                        conf_key = f'cont_{tf}_confidence'
+
+                        if dur_key in per_tf_cont_targets and dur_key in per_tf_cont:
+                            # Duration loss (regression)
+                            loss_tf_dur = criterion(
+                                per_tf_cont[dur_key].squeeze(),
+                                per_tf_cont_targets[dur_key]
+                            )
+                            loss += per_tf_loss_weight * loss_tf_dur
+
+                            # Gain loss (regression)
+                            loss_tf_gain = criterion(
+                                per_tf_cont[gain_key].squeeze(),
+                                per_tf_cont_targets[gain_key]
+                            )
+                            loss += per_tf_loss_weight * loss_tf_gain
+
+                            # Confidence loss (binary classification)
+                            with torch.amp.autocast('cuda', enabled=False):
+                                loss_tf_conf = F.binary_cross_entropy(
+                                    per_tf_cont[conf_key].float().squeeze(),
+                                    per_tf_cont_targets[conf_key].float()
+                                )
+                            loss += per_tf_loss_weight * loss_tf_conf
+
             # AMP backward pass
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -934,26 +982,29 @@ def train_epoch(
                 )
                 loss += loss_weights['overshoot'] * loss_overshoot
 
-                # Continuation duration (regression)
-                loss_continuation_duration = criterion(
-                    mt['continuation_duration'].squeeze(),
-                    target_continuation_duration
-                )
-                loss += loss_weights['continuation_duration'] * loss_continuation_duration
+                # Legacy continuation losses (skip when per-TF is active)
+                use_per_tf_cont = len(per_tf_cont_targets) > 0
+                if not use_per_tf_cont:
+                    # Continuation duration (regression)
+                    loss_continuation_duration = criterion(
+                        mt['continuation_duration'].squeeze(),
+                        target_continuation_duration
+                    )
+                    loss += loss_weights['continuation_duration'] * loss_continuation_duration
 
-                # Continuation gain (regression)
-                loss_continuation_gain = criterion(
-                    mt['continuation_gain'].squeeze(),
-                    target_continuation_gain
-                )
-                loss += loss_weights['continuation_gain'] * loss_continuation_gain
+                    # Continuation gain (regression)
+                    loss_continuation_gain = criterion(
+                        mt['continuation_gain'].squeeze(),
+                        target_continuation_gain
+                    )
+                    loss += loss_weights['continuation_gain'] * loss_continuation_gain
 
-                # Continuation confidence (binary classification)
-                loss_continuation_confidence = F.binary_cross_entropy(
-                    mt['continuation_confidence'].squeeze(),
-                    target_continuation_confidence
-                )
-                loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
+                    # Continuation confidence (binary classification)
+                    loss_continuation_confidence = F.binary_cross_entropy(
+                        mt['continuation_confidence'].squeeze(),
+                        target_continuation_confidence
+                    )
+                    loss += loss_weights['continuation_confidence'] * loss_continuation_confidence
 
                 # Adaptive horizon losses (only when using adaptive mode)
                 if 'adaptive_horizon' in targets_dict and 'adaptive_horizon' in mt:
@@ -1020,6 +1071,38 @@ def train_epoch(
                     target_breakout_magnitude.clamp(0, 5)  # Cap at 5x channel width
                 )
                 loss += loss_weights['breakout_magnitude'] * loss_breakout_magnitude
+
+            # v4.3: Per-TF continuation losses (normalized by # of timeframes)
+            if 'per_tf_continuation' in hidden_states and len(per_tf_cont_targets) > 0:
+                per_tf_cont = hidden_states['per_tf_continuation']
+                per_tf_loss_weight = loss_weights.get('per_tf_continuation', 0.1) / len(HierarchicalLNN.TIMEFRAMES)
+
+                for tf in HierarchicalLNN.TIMEFRAMES:
+                    dur_key = f'cont_{tf}_duration'
+                    gain_key = f'cont_{tf}_gain'
+                    conf_key = f'cont_{tf}_confidence'
+
+                    if dur_key in per_tf_cont_targets and dur_key in per_tf_cont:
+                        # Duration loss (regression)
+                        loss_tf_dur = criterion(
+                            per_tf_cont[dur_key].squeeze(),
+                            per_tf_cont_targets[dur_key]
+                        )
+                        loss += per_tf_loss_weight * loss_tf_dur
+
+                        # Gain loss (regression)
+                        loss_tf_gain = criterion(
+                            per_tf_cont[gain_key].squeeze(),
+                            per_tf_cont_targets[gain_key]
+                        )
+                        loss += per_tf_loss_weight * loss_tf_gain
+
+                        # Confidence loss (binary classification)
+                        loss_tf_conf = F.binary_cross_entropy(
+                            per_tf_cont[conf_key].squeeze(),
+                            per_tf_cont_targets[conf_key]
+                        )
+                        loss += per_tf_loss_weight * loss_tf_conf
 
             # Standard backward pass
             optimizer.zero_grad(set_to_none=True)
@@ -2364,16 +2447,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         vix_data=vix_data,  # v3.20: VIX features for volatility regime
         events_handler=events_handler,  # v4.0: Event features for earnings/FOMC patterns
     )
-    # Handle variable return: (features_df, continuation_df) or (features_df, continuation_df, mmap_meta_path)
+    # Handle variable return: (features_df, continuation_labels_dir) or (features_df, continuation_labels_dir, mmap_meta_path)
+    # v4.3: continuation_labels_dir is a Path to per-TF label files, NOT a DataFrame
     features_df = result[0]
-    continuation_df = result[1]
+    continuation_labels_dir = result[1]  # Path to directory with per-TF label files
     mmap_meta_path = result[2] if len(result) > 2 else None
     non_channel_cols = features_df.columns.tolist() if features_df is not None else None
 
     if profiler:
         nc_cols = len(non_channel_cols) if non_channel_cols is not None else 0
-        cont_rows = len(continuation_df) if continuation_df is not None else 0
-        profiler.log_info(f"FEATURES_EXTRACTED | non_channel_cols={nc_cols} | continuation_rows={cont_rows}")
+        cont_labels_info = str(continuation_labels_dir) if continuation_labels_dir else "None"
+        profiler.log_info(f"FEATURES_EXTRACTED | non_channel_cols={nc_cols} | continuation_labels_dir={cont_labels_info}")
         profiler.snapshot("post_feature_extraction", 0, force_log=True)
 
     # Save cache manifest for future reuse (supports both mmap and pickle modes)
@@ -2538,7 +2622,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     train_dataset, val_dataset = create_hierarchical_dataset(
         features_df=features_df,
         raw_ohlc_df=df,  # Must match features_df length (both from full df)
-        continuation_labels_df=continuation_df,
+        continuation_labels_df=None,  # v4.3: No legacy DataFrame, use per-TF labels
+        continuation_labels_dir=str(continuation_labels_dir) if continuation_labels_dir else None,  # v4.3: Per-TF labels from shard_path
         sequence_length=args.sequence_length,
         prediction_horizon=args.prediction_horizon,
         validation_split=args.val_split,
@@ -3153,6 +3238,10 @@ def main():
     parser.add_argument('--no-native-tf-streaming', dest='native_tf_streaming',
                         action='store_false',
                         help='Use full load mode for native TF generation (~50GB RAM, faster)')
+
+    # v4.3: Hierarchical continuation labels
+    parser.add_argument('--continuation-labels-dir', dest='continuation_labels_dir', type=str, default=None,
+                        help='Directory with per-TF continuation label files (v4.3). If not provided, uses legacy single-TF labels.')
 
     # System parameters
     parser.add_argument('--device', type=str, default='auto',
