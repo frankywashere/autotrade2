@@ -894,11 +894,14 @@ class TradingFeatureExtractor(FeatureExtractor):
         chunk_info = mmap_meta['chunk_info']
         dtype = np.dtype(mmap_meta['dtype'])
         total_rows = mmap_meta['total_rows']
+        monthly_shard_info = mmap_meta.get('monthly_3month_shard')
 
         print(f"   📊 Found {len(chunk_info)} chunks, {total_rows:,} total rows")
+        if monthly_shard_info:
+            print(f"   📊 Found monthly/3month shard: {monthly_shard_info['rows']:,} rows × {monthly_shard_info['cols']} cols")
 
         # Step 1: Load all chunks and timestamps to build full feature DataFrame
-        print(f"   ⚙️  Loading chunks into memory (streaming approach)...")
+        print(f"   ⚙️  Loading chunks into memory...")
 
         all_features = []
         all_indices = []
@@ -924,8 +927,37 @@ class TradingFeatureExtractor(FeatureExtractor):
         full_features = np.vstack(all_features)
         full_indices = np.concatenate(all_indices)
 
-        # Create DataFrame with timestamps as index
-        df = pd.DataFrame(full_features)
+        # Load feature column names from metadata (v4.1: required for TF identification)
+        feature_columns = mmap_meta.get('feature_columns')
+        if not feature_columns:
+            raise ValueError(
+                "Missing 'feature_columns' in mmap_meta. "
+                "Re-run chunked extraction with the latest code to generate column names."
+            )
+
+        # Step 1b: Load monthly/3month shard if present
+        if monthly_shard_info:
+            monthly_path = cache_dir / monthly_shard_info['path']
+            if monthly_path.exists():
+                print(f"   📂 Loading monthly/3month shard...")
+                monthly_array = np.load(str(monthly_path), mmap_mode='r').astype(np.float32)
+
+                # Get monthly column names
+                monthly_columns = monthly_shard_info.get('columns')
+                if not monthly_columns:
+                    # Generate column names based on known structure (fallback)
+                    monthly_columns = [f'monthly_3month_col_{i}' for i in range(monthly_array.shape[1])]
+                    print(f"   ⚠️  Monthly column names not in metadata, using generic names")
+
+                # Concatenate monthly features to main features
+                full_features = np.hstack([full_features, monthly_array[:]])
+                feature_columns = feature_columns + monthly_columns
+                print(f"   ✓ Added monthly/3month: {monthly_array.shape[1]} columns")
+            else:
+                print(f"   ⚠️  Monthly shard not found: {monthly_path}")
+
+        # Create DataFrame with timestamps as index and proper column names
+        df = pd.DataFrame(full_features, columns=feature_columns)
         df.index = pd.to_datetime(full_indices, unit='ns')
 
         print(f"   ✓ Loaded {len(df):,} rows × {len(df.columns)} features")
@@ -938,7 +970,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         for col in all_cols:
             is_tf_specific = False
             for tf in HIERARCHICAL_TIMEFRAMES:
-                if f'_{tf}_' in str(col):
+                if f'_{tf}_' in col:  # Now col is a string (column name), not integer
                     tf_specific_cols[tf].append(col)
                     is_tf_specific = True
                     break
@@ -1802,6 +1834,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 # Save shape info before conversion
                 monthly_rows = len(monthly_3month_features)
                 monthly_cols = monthly_3month_features.shape[1]
+                monthly_columns = list(monthly_3month_features.columns)  # v4.1: Save column names
 
                 # Convert to numpy and delete DataFrame IMMEDIATELY
                 monthly_array = monthly_3month_features.values.astype(config.NUMPY_DTYPE)
@@ -1815,6 +1848,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                     'path': str(monthly_shard_path.relative_to(base_cache_dir)),  # Relative path for portability
                     'rows': monthly_rows,
                     'cols': monthly_cols,
+                    'columns': monthly_columns,  # v4.1: Column names for native TF generation
                     'type': 'monthly_3month'
                 }
 
@@ -1862,6 +1896,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         print(f"     Precision: {config.NUMPY_DTYPE} (from config)")
 
         chunk_info = []  # Will store metadata for each chunk
+        feature_columns = None  # Will be set from first chunk
 
         for i in range(len(chunk_starts) - 1):
             chunk_start = chunk_starts[i]
@@ -1916,6 +1951,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             index_values = chunk_features.index.values.copy()  # Small - just timestamps
             chunk_shape = chunk_features.shape  # Save shape before deleting
 
+            # Capture column names from first chunk (all chunks have same columns)
+            if feature_columns is None:
+                feature_columns = list(chunk_features.columns)
+
             chunk_array = chunk_features.values.astype(config.NUMPY_DTYPE)
             del chunk_features  # Free DataFrame immediately (~5GB freed)
             gc.collect()
@@ -1955,11 +1994,13 @@ class TradingFeatureExtractor(FeatureExtractor):
         metadata = {
             'chunk_info': chunk_info,
             'monthly_3month_shard': monthly_shard_info,  # v3.19: Separate shard for monthly/3month
+            'feature_columns': feature_columns,  # v4.1: Column names for native TF generation
             'num_features': num_features + (monthly_shard_info['cols'] if monthly_shard_info else 0),
             'dtype': str(config.NUMPY_DTYPE),
             'total_rows': total_rows,
             'version': FEATURE_VERSION,
-            'temp_dir': str(temp_dir)
+            'temp_dir': str(temp_dir),
+            'cache_key': cache_suffix  # v4.1: Add cache key for native TF generation
         }
 
         with open(meta_path, 'w') as f:

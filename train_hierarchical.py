@@ -1467,8 +1467,15 @@ def interactive_setup(args, profiler=None):
             print("   → FP32 - Standard precision")
 
     # Preload to RAM option (for CUDA with high-RAM systems)
+    # NOTE: Only relevant for legacy mmap mode - native TF mode uses smaller files (~5GB vs ~90GB)
     args.preload_to_ram = False  # Default
-    if args.device.startswith('cuda'):
+
+    # v4.1: Skip preload option when native TF mode is enabled (default)
+    # Native TF files are already small and efficient, preloading provides no benefit
+    if getattr(args, 'use_native_timeframes', True):
+        # Native TF mode is ON by default - no need for preload option
+        pass  # preload_to_ram stays False, no question asked
+    elif args.device.startswith('cuda'):
         print()
         # Detect RAM for guidance
         try:
