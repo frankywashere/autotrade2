@@ -270,10 +270,14 @@ def is_main_process(rank: int) -> bool:
 def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0]):
     """
     Fast collate: stack numpy arrays first, then single torch conversion.
-    Expects samples as: ((main_channels, monthly_channels, non_channels), targets)
-    - main_channels: array [seq_len, 11718]
-    - monthly_channels: array [seq_len, 2604] or None
-    - non_channels: array [seq_len, nc_cols] or None
+
+    Supports two input formats:
+    1. Legacy: ((main_channels, monthly_channels, non_channels), targets)
+       - Returns: (Tensor [batch, seq, total_features], targets_dict)
+
+    2. v4.1 Native timeframe: (Dict[str, np.ndarray], targets)
+       - Returns: (Dict[str, Tensor], targets_dict)
+       - Each timeframe has its own tensor with shape [batch, seq_len, features]
     """
     import os
     import sys
@@ -292,35 +296,51 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     data_list = [d for d, _ in batch]
     targets_list = [t for _, t in batch]
 
-    # Check first sample for structure
-    first_ch_main, first_ch_monthly, first_nc = data_list[0]
-    has_monthly = first_ch_monthly is not None
-    has_nc = first_nc is not None
+    # Detect format: dict (v4.1 native timeframe) or tuple (legacy)
+    is_native_timeframe = isinstance(data_list[0], dict)
 
-    # Stack numpy arrays (fast vectorized C operations)
-    # This is MUCH faster than looping with torch.from_numpy per sample
-    main_stack = np.stack([d[0] for d in data_list])  # [batch, seq, main_cols]
+    if is_native_timeframe:
+        # v4.1: Native timeframe mode - stack dicts into Dict[str, Tensor]
+        batched_tf_data = {}
+        for tf in data_list[0].keys():
+            # Stack all samples for this timeframe
+            tf_arrays = [d[tf] for d in data_list]
+            stacked = np.stack(tf_arrays)  # [batch, seq_len, features]
 
-    if has_monthly:
-        monthly_stack = np.stack([d[1] for d in data_list])  # [batch, seq, monthly_cols]
+            if not stacked.flags['C_CONTIGUOUS']:
+                stacked = np.ascontiguousarray(stacked)
 
-    if has_nc:
-        nc_stack = np.stack([d[2] for d in data_list])  # [batch, seq, nc_cols]
+            batched_tf_data[tf] = torch.from_numpy(stacked).to(dtype=torch_dtype)
 
-    # Concatenate along feature axis (single operation)
-    parts = [main_stack]
-    if has_monthly:
-        parts.append(monthly_stack)
-    if has_nc:
-        parts.append(nc_stack)
+        x = batched_tf_data
+    else:
+        # Legacy: tuple format (main_channels, monthly_channels, non_channels)
+        first_ch_main, first_ch_monthly, first_nc = data_list[0]
+        has_monthly = first_ch_monthly is not None
+        has_nc = first_nc is not None
 
-    combined = np.concatenate(parts, axis=2)  # [batch, seq, total_features]
+        # Stack numpy arrays (fast vectorized C operations)
+        main_stack = np.stack([d[0] for d in data_list])  # [batch, seq, main_cols]
 
-    # Single torch conversion (fast)
-    # Use np.ascontiguousarray to ensure memory layout is compatible
-    if not combined.flags['C_CONTIGUOUS']:
-        combined = np.ascontiguousarray(combined)
-    x = torch.from_numpy(combined).to(dtype=torch_dtype)
+        if has_monthly:
+            monthly_stack = np.stack([d[1] for d in data_list])  # [batch, seq, monthly_cols]
+
+        if has_nc:
+            nc_stack = np.stack([d[2] for d in data_list])  # [batch, seq, nc_cols]
+
+        # Concatenate along feature axis (single operation)
+        parts = [main_stack]
+        if has_monthly:
+            parts.append(monthly_stack)
+        if has_nc:
+            parts.append(nc_stack)
+
+        combined = np.concatenate(parts, axis=2)  # [batch, seq, total_features]
+
+        # Single torch conversion (fast)
+        if not combined.flags['C_CONTIGUOUS']:
+            combined = np.ascontiguousarray(combined)
+        x = torch.from_numpy(combined).to(dtype=torch_dtype)
 
     # Build targets tensor dict with proper dtype
     converted_targets = []
@@ -336,7 +356,11 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     targets_batch = default_collate(converted_targets)
 
     if move_to_device and device is not None:
-        x = x.to(device, non_blocking=True)
+        if is_native_timeframe:
+            for tf in x:
+                x[tf] = x[tf].to(device, non_blocking=True)
+        else:
+            x = x.to(device, non_blocking=True)
         for k, v in targets_batch.items():
             targets_batch[k] = v.to(device, non_blocking=True)
 
@@ -2547,14 +2571,32 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler.snapshot("pre_model_create", 0, force_log=True)
 
     # v4.0: HierarchicalLNN now has 11 CfC layers (one per timeframe)
-    # Uses input_size for backward compatibility (same features for all TFs for now)
-    model = HierarchicalLNN(
-        input_size=total_features,  # Backward compat: same size for all timeframes
-        hidden_size=args.hidden_size,
-        internal_neurons_ratio=args.internal_neurons_ratio,
-        device=args.device,
-        multi_task=args.multi_task,
-    )
+    # v4.1: Native timeframe mode uses per-TF feature sizes
+    if getattr(args, 'use_native_timeframes', False) and hasattr(train_dataset, 'timeframe_feature_counts'):
+        # Native timeframe mode - each layer gets different feature count
+        input_sizes = train_dataset.timeframe_feature_counts
+        if is_main_process(rank):
+            print(f"   Using native timeframe mode with per-layer input sizes:")
+            for tf, count in input_sizes.items():
+                seq_len = train_dataset.tf_sequence_lengths.get(tf, '?')
+                print(f"      {tf}: {count} features × {seq_len} bars")
+
+        model = HierarchicalLNN(
+            input_sizes=input_sizes,  # v4.1: Dict[str, int] for native timeframe mode
+            hidden_size=args.hidden_size,
+            internal_neurons_ratio=args.internal_neurons_ratio,
+            device=args.device,
+            multi_task=args.multi_task,
+        )
+    else:
+        # Legacy mode - same size for all timeframes
+        model = HierarchicalLNN(
+            input_size=total_features,  # Backward compat: same size for all timeframes
+            hidden_size=args.hidden_size,
+            internal_neurons_ratio=args.internal_neurons_ratio,
+            device=args.device,
+            multi_task=args.multi_task,
+        )
 
     if profiler:
         total_params = sum(p.numel() for p in model.parameters())
@@ -2965,6 +3007,14 @@ def main():
                         help='Early stopping patience')
     parser.add_argument('--preload', action='store_true',
                         help='Preload all data into memory')
+    parser.add_argument('--use-gpu-features', dest='use_gpu_features', action='store_true', default=False,
+                        help='Use GPU acceleration for feature extraction (CUDA only)')
+
+    # v4.1: Native timeframe mode
+    parser.add_argument('--native-timeframes', dest='use_native_timeframes', action='store_true', default=False,
+                        help='Use native timeframe mode: each CfC layer receives features at its native resolution (5min layer sees 5-min bars)')
+    parser.add_argument('--tf-meta', dest='tf_meta_path', type=str, default=None,
+                        help='Path to tf_meta_*.json file for native timeframe mode')
 
     # System parameters
     parser.add_argument('--device', type=str, default='auto',

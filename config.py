@@ -5,6 +5,7 @@ from pathlib import Path
 # Paths
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
+SHARD_DIR = DATA_DIR / "feature_cache"  # Directory for mmap shards and cached features
 
 # API Keys
 CLAUDE_API_KEY = "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"

@@ -37,6 +37,40 @@ except ImportError:
 # Feature cache version - increment when calculation logic changes
 FEATURE_VERSION = "v3.20_vix"  # 21-window + complete_cycles + hybrid monthly/3month + 15 VIX features
 
+# v4.1: Native timeframe sequence lengths for hierarchical model
+# Each layer sees enough bars at its native resolution to learn channel patterns
+TIMEFRAME_SEQUENCE_LENGTHS = {
+    '5min': 200,    # ~17 hours of 5-min bars
+    '15min': 100,   # ~25 hours of 15-min bars
+    '30min': 80,    # ~40 hours of 30-min bars
+    '1h': 168,      # 1 week of hourly bars
+    '2h': 84,       # 1 week of 2-hour bars
+    '3h': 56,       # 1 week of 3-hour bars
+    '4h': 42,       # 1 week of 4-hour bars
+    'daily': 30,    # 30 trading days
+    'weekly': 20,   # 20 weeks
+    'monthly': 12,  # 12 months
+    '3month': 8,    # 24 months (8 quarters)
+}
+
+# Timeframe resample rules for pandas
+TIMEFRAME_RESAMPLE_RULES = {
+    '5min': '5min',
+    '15min': '15min',
+    '30min': '30min',
+    '1h': '1h',
+    '2h': '2h',
+    '3h': '3h',
+    '4h': '4h',
+    'daily': '1D',
+    'weekly': '1W',
+    'monthly': '1ME',
+    '3month': '3ME',
+}
+
+# All timeframes in order (matches hierarchical model layers)
+HIERARCHICAL_TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+
 
 def load_vix_data(csv_path: str = "data/VIX_History.csv") -> pd.DataFrame:
     """
@@ -685,8 +719,111 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   ✓ {len(features_df.columns)} non-channel features + mmap channel shards ready")
             return (features_df, continuation_df, self._mmap_meta_path)
         else:
+            # v4.1: Pre-compute timeframe-specific sequences for hierarchical model
+            # This creates separate .npy files for each timeframe with native resolution
+            if hasattr(self, '_unified_cache_dir'):
+                cache_key = self._cache_key if hasattr(self, '_cache_key') else FEATURE_VERSION
+                self._precompute_timeframe_sequences(features_df, self._unified_cache_dir, cache_key)
+
             print(f"   ✓ {len(features_df.columns)} features ready")
             return features_df, continuation_df
+
+    def _precompute_timeframe_sequences(
+        self,
+        features_df: pd.DataFrame,
+        cache_dir: Path,
+        cache_key: str
+    ) -> None:
+        """
+        Pre-compute resampled feature sequences for each timeframe.
+
+        This enables the hierarchical model to receive native timeframe resolution:
+        - 5min layer sees 5-min bars (not 1-min bars)
+        - 1h layer sees hourly bars
+        - etc.
+
+        Args:
+            features_df: Full features DataFrame at 1-min resolution
+            cache_dir: Directory to save timeframe-specific .npy files
+            cache_key: Cache key for file naming
+        """
+        import json
+
+        print(f"\n   🔄 Pre-computing timeframe sequences for hierarchical model...")
+
+        # Identify shared columns (not timeframe-specific)
+        # These are columns that don't contain _5min_, _15min_, etc.
+        all_cols = list(features_df.columns)
+        shared_cols = []
+        tf_specific_cols = {tf: [] for tf in HIERARCHICAL_TIMEFRAMES}
+
+        for col in all_cols:
+            is_tf_specific = False
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                # Match patterns like _5min_, _15min_, _1h_, _daily_, etc.
+                if f'_{tf}_' in col:
+                    tf_specific_cols[tf].append(col)
+                    is_tf_specific = True
+                    break
+            if not is_tf_specific:
+                shared_cols.append(col)
+
+        print(f"   📊 Found {len(shared_cols)} shared columns, {sum(len(v) for v in tf_specific_cols.values())} timeframe-specific")
+
+        # Metadata to save
+        meta = {
+            'feature_version': FEATURE_VERSION,
+            'cache_key': cache_key,
+            'sequence_lengths': TIMEFRAME_SEQUENCE_LENGTHS,
+            'shared_columns': shared_cols,
+            'timeframe_columns': {},
+            'timeframe_shapes': {},
+            'total_rows_1min': len(features_df),
+        }
+
+        # Process each timeframe
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Resampling timeframes", leave=False, ncols=100, ascii=True):
+            tf_cols = shared_cols + tf_specific_cols[tf]
+            meta['timeframe_columns'][tf] = tf_cols
+
+            # Select columns for this timeframe
+            tf_features = features_df[tf_cols].copy()
+
+            # Resample to native timeframe resolution
+            tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
+
+            # Use .last() to get the value at the end of each bar (most recent)
+            # This is appropriate for features that represent state at a point in time
+            resampled = tf_features.resample(tf_rule).last().dropna()
+
+            # Save as .npy for memory-mapped loading
+            output_path = cache_dir / f"tf_sequence_{tf}_{cache_key}.npy"
+            np.save(output_path, resampled.values.astype(np.float32))
+
+            # Save timestamps separately for index conversion
+            ts_path = cache_dir / f"tf_timestamps_{tf}_{cache_key}.npy"
+            # Convert to Unix timestamps (int64 nanoseconds)
+            timestamps_ns = resampled.index.view(np.int64)
+            np.save(ts_path, timestamps_ns)
+
+            meta['timeframe_shapes'][tf] = list(resampled.shape)
+
+            # Log progress
+            seq_len = TIMEFRAME_SEQUENCE_LENGTHS[tf]
+            real_time = {
+                '5min': '~17 hours', '15min': '~25 hours', '30min': '~40 hours',
+                '1h': '1 week', '2h': '1 week', '3h': '1 week', '4h': '1 week',
+                'daily': '30 days', 'weekly': '20 weeks', 'monthly': '12 months', '3month': '24 months'
+            }
+            print(f"      {tf}: {resampled.shape[0]:,} bars × {resampled.shape[1]} features (seq_len={seq_len}, {real_time.get(tf, '?')})")
+
+        # Save metadata
+        meta_path = cache_dir / f"tf_meta_{cache_key}.json"
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+
+        print(f"   ✓ Saved {len(HIERARCHICAL_TIMEFRAMES)} timeframe sequences to {cache_dir}")
+        print(f"   📄 Metadata: {meta_path.name}")
 
     def _extract_price_features(self, df: pd.DataFrame, use_gpu: bool = False) -> pd.DataFrame:
         """Extract basic price features. Returns DataFrame with 12 columns (v3.8: +2 normalized prices).

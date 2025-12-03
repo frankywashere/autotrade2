@@ -6,15 +6,19 @@ Loads 1-min data and dynamically creates training sequences with:
 - 200 1-min bars as input
 - Target high/low in next 24 bars (prediction horizon)
 - Percentage-based targets (not absolute prices)
+
+v4.1: Added native timeframe mode where each CfC layer receives
+its timeframe's features at native resolution (5min layer sees 5-min bars, etc.)
 """
 
 import torch
 from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict, Union
 from pathlib import Path
 import sys
+import json
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent.parent
@@ -22,7 +26,11 @@ sys.path.insert(0, str(parent_dir))
 
 import config  # For precision configuration
 
-from src.ml.features import TradingFeatureExtractor
+from src.ml.features import (
+    TradingFeatureExtractor,
+    TIMEFRAME_SEQUENCE_LENGTHS,
+    HIERARCHICAL_TIMEFRAMES
+)
 
 
 class HierarchicalDataset(Dataset):
@@ -45,7 +53,10 @@ class HierarchicalDataset(Dataset):
         include_continuation: bool = False,
         mmap_meta_path: str = None,
         profiler=None,
-        preload_to_ram: bool = False
+        preload_to_ram: bool = False,
+        # v4.1: Native timeframe mode
+        use_native_timeframes: bool = False,
+        tf_meta_path: str = None,
     ):
         """
         Initialize dataset.
@@ -54,7 +65,7 @@ class HierarchicalDataset(Dataset):
             features_df: Features dataframe (165 non-channel + optional mmap 12,474 channel = 12,639 total)
             raw_ohlc_df: Raw OHLC data for input sequences
             continuation_labels_df: DataFrame with continuation labels
-            sequence_length: Input sequence length (200 1-min bars)
+            sequence_length: Input sequence length (200 1-min bars) - ignored if use_native_timeframes=True
             prediction_horizon: How many bars ahead to predict (24 = 24 minutes)
             mode: 'uniform_bars' (fixed # bars ahead)
             cache_indices: Cache column lookups for speed
@@ -62,6 +73,9 @@ class HierarchicalDataset(Dataset):
             profiler: Optional MemoryProfiler for logging RAM usage
             preload_to_ram: If True, load all mmap data into RAM at startup for fast access
                            (requires ~90GB RAM but avoids 400ms/sample disk I/O)
+            use_native_timeframes: If True, return Dict[str, Tensor] where each timeframe
+                                   gets its native resolution features (5min layer sees 5-min bars)
+            tf_meta_path: Path to tf_meta_*.json file with timeframe sequence metadata
         """
         self._preload_to_ram = preload_to_ram
         self._profiler = profiler
@@ -72,6 +86,10 @@ class HierarchicalDataset(Dataset):
         self.prediction_horizon = prediction_horizon
         self.mode = mode
         self.include_continuation = include_continuation
+
+        # v4.1: Native timeframe mode
+        self.use_native_timeframes = use_native_timeframes
+        self.tf_meta_path = tf_meta_path
 
         # Diagnostic tracking for timestamp mismatches (always initialize)
         self._missing_label_count = 0
@@ -128,6 +146,11 @@ class HierarchicalDataset(Dataset):
 
         # Dtype validation - ensure data matches config precision
         expected_dtype = config.NUMPY_DTYPE
+
+        # v4.1: Native timeframe mode - load per-TF sequences
+        if self.use_native_timeframes and tf_meta_path is not None:
+            self._init_native_timeframe_mode(tf_meta_path, raw_ohlc_df, expected_dtype)
+            return  # Skip legacy loading paths
 
         # Memory-mapped shard loading (zero RAM spike!)
         if mmap_meta_path is not None:
@@ -412,6 +435,213 @@ class HierarchicalDataset(Dataset):
                 f"but have {total_len}"
             )
 
+    def _init_native_timeframe_mode(
+        self,
+        tf_meta_path: str,
+        raw_ohlc_df: pd.DataFrame,
+        expected_dtype
+    ):
+        """
+        Initialize native timeframe mode - each layer gets features at its native resolution.
+
+        Args:
+            tf_meta_path: Path to tf_meta_*.json metadata file
+            raw_ohlc_df: Raw OHLC DataFrame for target calculation
+            expected_dtype: Expected numpy dtype for features
+        """
+        print(f"\n  📂 Loading native timeframe sequences...")
+
+        # Load metadata
+        with open(tf_meta_path) as f:
+            self.tf_meta = json.load(f)
+
+        cache_dir = Path(tf_meta_path).parent
+        cache_key = self.tf_meta['cache_key']
+
+        # Load per-timeframe arrays and timestamps
+        self.tf_mmaps = {}
+        self.tf_timestamps = {}  # For index conversion
+        self.tf_columns = self.tf_meta['timeframe_columns']
+        self.tf_sequence_lengths = self.tf_meta['sequence_lengths']
+        self.timeframe_feature_counts = {}  # For model input_sizes
+
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            # Load feature array
+            mmap_path = cache_dir / f"tf_sequence_{tf}_{cache_key}.npy"
+            if mmap_path.exists():
+                self.tf_mmaps[tf] = np.load(str(mmap_path), mmap_mode='r')
+                self.timeframe_feature_counts[tf] = self.tf_mmaps[tf].shape[1]
+
+                # Load timestamps
+                ts_path = cache_dir / f"tf_timestamps_{tf}_{cache_key}.npy"
+                if ts_path.exists():
+                    self.tf_timestamps[tf] = np.load(str(ts_path), mmap_mode='r')
+
+                shape = self.tf_mmaps[tf].shape
+                seq_len = self.tf_sequence_lengths[tf]
+                print(f"     {tf}: {shape[0]:,} bars × {shape[1]} features (seq_len={seq_len})")
+            else:
+                raise FileNotFoundError(f"Missing timeframe sequence file: {mmap_path}")
+
+        # Store raw OHLC for target calculation
+        if raw_ohlc_df is not None:
+            self.raw_ohlc_array = raw_ohlc_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
+            if self.raw_ohlc_array.dtype != expected_dtype:
+                self.raw_ohlc_array = self.raw_ohlc_array.astype(expected_dtype)
+        else:
+            self.raw_ohlc_array = None
+
+        # Use 1-min timestamps from 5min array (first timeframe, most granular)
+        # Actually we need 1-min timestamps for index conversion
+        # The total_rows_1min tells us how many 1-min bars there are
+        self.total_1min_rows = self.tf_meta['total_rows_1min']
+
+        # Calculate valid indices based on:
+        # 1. Minimum context required by longest timeframe sequence
+        # 2. Future bars needed for target calculation
+        max_seq_len = max(self.tf_sequence_lengths.values())
+        # Convert to 1-min index: need enough 1-min bars that all timeframes have their seq_len
+        # For 5min with seq_len=200, we need 200 * 5 = 1000 1-min bars
+        # For 3month with seq_len=8, we need ~8 * 90 days * 6.5 hours * 60 min ≈ 280,800 1-min bars
+        # But this is handled by the resampled arrays themselves
+        # Valid indices are based on the minimum of all timeframe array lengths
+        min_tf_rows = min(self.tf_mmaps[tf].shape[0] for tf in HIERARCHICAL_TIMEFRAMES)
+
+        # We use 5min bars as the reference for indexing (since it's our finest resampled resolution)
+        # Each sample corresponds to a 5min bar index
+        self.min_context = max(self.tf_sequence_lengths.values())
+        self.total_required = self.min_context + (self.prediction_horizon // 5 + 1)  # Convert to 5-min bars
+
+        # Valid indices are positions in the 5min array
+        self.valid_indices = list(range(
+            self.min_context,
+            self.tf_mmaps['5min'].shape[0] - (self.prediction_horizon // 5 + 1)
+        ))
+
+        print(f"     ✓ Loaded {len(HIERARCHICAL_TIMEFRAMES)} timeframe sequences")
+        print(f"     ✓ Valid samples: {len(self.valid_indices):,}")
+
+        # Set flags
+        self.using_mmaps = False  # Not using legacy mmap mode
+        self.using_native_timeframes = True
+
+        # Cache torch dtype
+        self._torch_dtype = config.get_torch_dtype()
+
+        # We need to find tsla_close index in the 5min features for current price lookup
+        if 'tsla_close' in self.tf_columns['5min']:
+            self.close_idx_5min = self.tf_columns['5min'].index('tsla_close')
+        else:
+            # Search for it
+            for i, col in enumerate(self.tf_columns['5min']):
+                if 'tsla_close' in col:
+                    self.close_idx_5min = i
+                    break
+            else:
+                raise ValueError("Cannot find tsla_close in 5min features")
+
+    def _getitem_native_timeframe(self, idx: int) -> Tuple[Dict[str, np.ndarray], dict]:
+        """
+        Get sample in native timeframe mode - returns Dict[str, np.ndarray].
+
+        Args:
+            idx: Sample index
+
+        Returns:
+            timeframe_data: Dict mapping timeframe -> features [seq_len, features]
+            targets: Dict with prediction targets
+        """
+        # Get 5min array index (our reference timeframe)
+        data_idx_5min = self.valid_indices[idx]
+
+        # Get the 5min timestamp at this index for cross-timeframe alignment
+        ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+
+        # Build features dict for each timeframe
+        timeframe_data = {}
+
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            seq_len = self.tf_sequence_lengths[tf]
+
+            # Find index in this timeframe's array that corresponds to our 5min timestamp
+            # Binary search for the closest timestamp <= ts_5min
+            tf_timestamps = self.tf_timestamps[tf]
+            tf_idx = np.searchsorted(tf_timestamps, ts_5min, side='right') - 1
+            tf_idx = max(seq_len, tf_idx)  # Ensure we have enough history
+
+            # Extract sequence
+            start = tf_idx - seq_len
+            end = tf_idx
+
+            tf_features = self.tf_mmaps[tf][start:end, :]
+            timeframe_data[tf] = np.ascontiguousarray(tf_features)
+
+        # Calculate targets using 5min data (or raw OHLC if available)
+        # Get current price from 5min features
+        current_price = self.tf_mmaps['5min'][data_idx_5min - 1, self.close_idx_5min]
+
+        # Get future prices for target calculation
+        # prediction_horizon is in 1-min bars, convert to 5-min bars
+        horizon_5min = self.prediction_horizon // 5 + 1
+
+        if self.raw_ohlc_array is not None:
+            # Use raw 1-min OHLC for more accurate targets
+            # Need to map 5min index back to 1min index
+            # Each 5min bar corresponds to ~5 1-min bars
+            # Use timestamp to find the 1-min index
+            # For simplicity, approximate: 1min_idx ≈ 5min_idx * 5
+            approx_1min_idx = data_idx_5min * 5
+            future_start = approx_1min_idx
+            future_end = min(approx_1min_idx + self.prediction_horizon, len(self.raw_ohlc_array))
+
+            if future_end > future_start:
+                future_ohlc = self.raw_ohlc_array[future_start:future_end]
+                future_high = np.max(future_ohlc[:, 1])  # high column
+                future_low = np.min(future_ohlc[:, 2])   # low column
+                future_prices = future_ohlc[:, 3]  # close column
+            else:
+                # Not enough future data
+                future_high = current_price
+                future_low = current_price
+                future_prices = np.array([current_price])
+        else:
+            # Fallback: Use 5min closes as future reference
+            future_5min_end = min(data_idx_5min + horizon_5min, len(self.tf_mmaps['5min']))
+            future_5min = self.tf_mmaps['5min'][data_idx_5min:future_5min_end, self.close_idx_5min]
+            future_high = np.max(future_5min)
+            future_low = np.min(future_5min)
+            future_prices = future_5min
+
+        # Calculate percentage targets
+        if current_price > 0:
+            target_high_pct = (future_high - current_price) / current_price * 100.0
+            target_low_pct = (future_low - current_price) / current_price * 100.0
+        else:
+            target_high_pct = 0.0
+            target_low_pct = 0.0
+
+        # Build targets dict (simplified version - add more labels as needed)
+        targets = {
+            'high': target_high_pct,
+            'low': target_low_pct,
+            'hit_band': 0.0,  # Placeholder
+            'hit_target': 0.0,  # Placeholder
+            'expected_return': target_high_pct if target_high_pct > abs(target_low_pct) else target_low_pct,
+            'overshoot': 0.0,  # Placeholder
+            'continuation_duration': 0.0,
+            'continuation_gain': 0.0,
+            'continuation_confidence': 0.5,
+            'price_change_pct': target_high_pct,
+            'horizon_bars_log': np.log(self.prediction_horizon + 1),
+            'adaptive_confidence': 0.5,
+            'breakout_occurred': 0.0,
+            'breakout_direction': 0.5,
+            'breakout_bars_log': np.log(self.prediction_horizon + 1),
+            'breakout_magnitude': 0.0,
+        }
+
+        return timeframe_data, targets
+
     def __len__(self) -> int:
         """Return number of valid sequences."""
         return len(self.valid_indices)
@@ -557,7 +787,7 @@ class HierarchicalDataset(Dataset):
                 monthly_result = None
             return main_result, monthly_result
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
+    def __getitem__(self, idx: int) -> Union[Tuple[tuple, dict], Tuple[Dict[str, np.ndarray], dict]]:
         """
         Get a single training sample with multi-task labels.
 
@@ -565,7 +795,11 @@ class HierarchicalDataset(Dataset):
             idx: Sample index
 
         Returns:
-            x: Tuple(main_channels, monthly_channels_or_None, non_channel_sequence_or_None) each as np.ndarray [200, feat_dim]
+            If use_native_timeframes=False (legacy mode):
+                x: Tuple(main_channels, monthly_channels_or_None, non_channel_sequence_or_None) each as np.ndarray [200, feat_dim]
+            If use_native_timeframes=True (v4.1 mode):
+                x: Dict[str, np.ndarray] mapping timeframe -> features [seq_len, feat_dim]
+
             targets: Dict with:
                 - high: target_high % (regression)
                 - low: target_low % (regression)
@@ -577,6 +811,11 @@ class HierarchicalDataset(Dataset):
         import time
         import sys
         _getitem_start = time.perf_counter()
+
+        # v4.1: Native timeframe mode - return Dict[str, np.ndarray]
+        if getattr(self, 'using_native_timeframes', False):
+            return self._getitem_native_timeframe(idx)
+
         # Get actual data index
         data_idx = self.valid_indices[idx]
 
