@@ -827,18 +827,26 @@ class TradingFeatureExtractor(FeatureExtractor):
         print(f"   ✓ Saved {len(HIERARCHICAL_TIMEFRAMES)} timeframe sequences to {cache_dir}")
         print(f"   📄 Metadata: {meta_path.name}")
 
-    def generate_native_tf_from_chunks(self, chunks_meta_path: Path, output_cache_dir: Path) -> None:
+    def generate_native_tf_from_chunks(
+        self,
+        chunks_meta_path: Path,
+        output_cache_dir: Path,
+        streaming: bool = True
+    ) -> None:
         """
         Priority 3 (Option A): Generate native timeframe sequences from existing mmap chunks.
 
         This enables the two-machine workflow:
         1. Machine A (low RAM): Extract features with --use-chunking → generates mmap shards
-        2. Machine B (high RAM): Call this method → generates native TF sequences from chunks
+        2. Machine B: Call this method → generates native TF sequences from chunks
         3. Machine B: Train with --native-timeframes → uses pre-computed sequences
 
         Args:
             chunks_meta_path: Path to mmap_meta JSON file from chunked extraction
             output_cache_dir: Directory to save native TF .npy files
+            streaming: If True (default), process one chunk at a time per timeframe.
+                      Peak RAM ~5-8GB. If False, load all chunks into RAM (~50GB)
+                      for slightly faster processing.
 
         Workflow:
         ```bash
@@ -899,6 +907,44 @@ class TradingFeatureExtractor(FeatureExtractor):
         print(f"   📊 Found {len(chunk_info)} chunks, {total_rows:,} total rows")
         if monthly_shard_info:
             print(f"   📊 Found monthly/3month shard: {monthly_shard_info['rows']:,} rows × {monthly_shard_info['cols']} cols")
+        print(f"   💾 Mode: {'Streaming (low RAM ~5-8GB)' if streaming else 'Full load (~50GB RAM)'}")
+
+        # Load feature column names from metadata (v4.1: required for TF identification)
+        feature_columns = mmap_meta.get('feature_columns')
+        if not feature_columns:
+            raise ValueError(
+                "Missing 'feature_columns' in mmap_meta. "
+                "Re-run chunked extraction with the latest code to generate column names."
+            )
+
+        # Branch based on streaming mode
+        if streaming:
+            self._generate_native_tf_streaming(
+                chunk_info, cache_dir, output_cache_dir, mmap_meta,
+                monthly_shard_info, feature_columns
+            )
+        else:
+            self._generate_native_tf_full_load(
+                chunk_info, cache_dir, output_cache_dir, mmap_meta,
+                monthly_shard_info, feature_columns
+            )
+
+    def _generate_native_tf_full_load(
+        self,
+        chunk_info: list,
+        cache_dir: Path,
+        output_cache_dir: Path,
+        mmap_meta: dict,
+        monthly_shard_info: dict,
+        feature_columns: list
+    ) -> None:
+        """
+        Full load implementation: load all chunks into RAM then resample.
+        Peak RAM: ~50GB for full dataset.
+        Faster than streaming but requires high RAM.
+        """
+        import json
+        import pandas as pd
 
         # Step 1: Load all chunks and timestamps to build full feature DataFrame
         print(f"   ⚙️  Loading chunks into memory...")
@@ -927,13 +973,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         full_features = np.vstack(all_features)
         full_indices = np.concatenate(all_indices)
 
-        # Load feature column names from metadata (v4.1: required for TF identification)
-        feature_columns = mmap_meta.get('feature_columns')
-        if not feature_columns:
-            raise ValueError(
-                "Missing 'feature_columns' in mmap_meta. "
-                "Re-run chunked extraction with the latest code to generate column names."
-            )
+        # feature_columns is passed as parameter (already validated in main method)
 
         # Step 1b: Load monthly/3month shard if present
         if monthly_shard_info:
@@ -1030,6 +1070,149 @@ class TradingFeatureExtractor(FeatureExtractor):
             json.dump(meta, f, indent=2)
 
         print(f"   ✓ Generated {len(HIERARCHICAL_TIMEFRAMES)} timeframe sequences to {output_cache_dir}")
+        print(f"   📄 Metadata: {meta_path.name}")
+
+    def _generate_native_tf_streaming(
+        self,
+        chunk_info: list,
+        cache_dir: Path,
+        output_cache_dir: Path,
+        mmap_meta: dict,
+        monthly_shard_info: dict,
+        feature_columns: list
+    ) -> None:
+        """
+        Streaming implementation: process one timeframe at a time, one chunk at a time.
+        Peak RAM: ~5-8GB (one chunk's TF columns + accumulated resampled results).
+        """
+        import json
+        import gc
+        import pandas as pd
+
+        # Get column indices for shared vs TF-specific
+        shared_col_indices = []
+        tf_col_indices = {tf: [] for tf in HIERARCHICAL_TIMEFRAMES}
+
+        for i, col in enumerate(feature_columns):
+            is_tf_specific = False
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                if f'_{tf}_' in col:
+                    tf_col_indices[tf].append(i)
+                    is_tf_specific = True
+                    break
+            if not is_tf_specific:
+                shared_col_indices.append(i)
+
+        print(f"   📊 Found {len(shared_col_indices)} shared columns, {sum(len(v) for v in tf_col_indices.values())} timeframe-specific")
+
+        # Load monthly shard info for column indices (if present)
+        monthly_array = None
+        monthly_columns = []
+        if monthly_shard_info:
+            monthly_path = cache_dir / monthly_shard_info['path']
+            if monthly_path.exists():
+                monthly_array = np.load(str(monthly_path), mmap_mode='r')
+                monthly_columns = monthly_shard_info.get('columns', [])
+                print(f"   📂 Monthly shard: {monthly_array.shape[1]} columns (memory-mapped)")
+
+        # Metadata for output
+        meta = {
+            'feature_version': FEATURE_VERSION,
+            'cache_key': mmap_meta.get('cache_key', 'from_chunks'),
+            'sequence_lengths': TIMEFRAME_SEQUENCE_LENGTHS,
+            'shared_columns': [feature_columns[i] for i in shared_col_indices],
+            'timeframe_columns': {},
+            'timeframe_shapes': {},
+            'total_rows_1min': mmap_meta['total_rows'],
+        }
+
+        print(f"   🔄 Streaming resample (one TF at a time, one chunk at a time)...")
+
+        # Process each timeframe independently
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Timeframes", leave=True, ncols=100, ascii=True):
+            # Columns for this TF: shared + TF-specific
+            tf_indices = shared_col_indices + tf_col_indices[tf]
+            tf_col_names = [feature_columns[i] for i in tf_indices]
+
+            # Add monthly columns for monthly/3month TFs
+            if tf in ['monthly', '3month'] and monthly_columns:
+                monthly_tf_cols = [mc for mc in monthly_columns if f'_{tf}_' in mc]
+                tf_col_names.extend(monthly_tf_cols)
+
+            meta['timeframe_columns'][tf] = tf_col_names
+
+            resampled_chunks = []
+
+            # Stream through each chunk
+            for chunk in chunk_info:
+                chunk_path = cache_dir / chunk['path']
+                index_path = cache_dir / chunk['index_path']
+
+                # Memory-map chunk (minimal RAM - just the file mapping)
+                chunk_array = np.load(str(chunk_path), mmap_mode='r')
+                index_array = np.load(str(index_path), mmap_mode='r')
+
+                # Extract only this TF's columns (copies only ~1200 cols, not 14000)
+                tf_chunk = chunk_array[:, tf_indices].astype(np.float32)
+
+                # Add monthly data for monthly/3month TFs
+                if tf in ['monthly', '3month'] and monthly_array is not None:
+                    # Find monthly column indices for this TF
+                    monthly_tf_indices = [
+                        i for i, mc in enumerate(monthly_columns) if f'_{tf}_' in mc
+                    ]
+                    if monthly_tf_indices:
+                        # Get corresponding rows from monthly shard (same row count as chunks)
+                        chunk_start = chunk.get('start_row', 0)
+                        chunk_end = chunk_start + len(tf_chunk)
+                        monthly_tf_data = monthly_array[chunk_start:chunk_end, monthly_tf_indices].astype(np.float32)
+                        if len(monthly_tf_data) == len(tf_chunk):
+                            tf_chunk = np.hstack([tf_chunk, monthly_tf_data])
+
+                # Create DataFrame with proper column names and timestamps
+                df = pd.DataFrame(tf_chunk, columns=tf_col_names[:tf_chunk.shape[1]])
+                df.index = pd.to_datetime(index_array, unit='ns')
+
+                # Resample this chunk
+                tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
+                resampled = df.resample(tf_rule).last().dropna()
+
+                if len(resampled) > 0:
+                    resampled_chunks.append(resampled)
+
+                # Free memory immediately
+                del chunk_array, index_array, tf_chunk, df, resampled
+
+            # Concatenate all resampled chunks for this TF
+            if resampled_chunks:
+                final_df = pd.concat(resampled_chunks, axis=0)
+                # Handle overlapping timestamps at chunk boundaries
+                final_df = final_df[~final_df.index.duplicated(keep='last')]
+                final_df = final_df.sort_index()
+
+                # Save .npy files
+                output_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}.npy"
+                np.save(output_path, final_df.values.astype(np.float32))
+
+                ts_path = output_cache_dir / f"tf_timestamps_{tf}_{meta['cache_key']}.npy"
+                np.save(ts_path, final_df.index.view(np.int64))
+
+                meta['timeframe_shapes'][tf] = list(final_df.shape)
+
+                seq_len = TIMEFRAME_SEQUENCE_LENGTHS[tf]
+                print(f"      {tf}: {final_df.shape[0]:,} bars × {final_df.shape[1]} features (seq_len={seq_len})")
+
+                del final_df, resampled_chunks
+
+            # Force garbage collection after each TF
+            gc.collect()
+
+        # Save metadata
+        meta_path = output_cache_dir / f"tf_meta_{meta['cache_key']}.json"
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+
+        print(f"   ✓ Generated {len(HIERARCHICAL_TIMEFRAMES)} timeframe sequences (streaming)")
         print(f"   📄 Metadata: {meta_path.name}")
 
     def _extract_price_features(self, df: pd.DataFrame, use_gpu: bool = False) -> pd.DataFrame:

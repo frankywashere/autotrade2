@@ -1800,6 +1800,46 @@ def interactive_setup(args, profiler=None):
         # Cache will be loaded - chunking doesn't apply
         args.use_chunking = False
 
+    # Native TF generation option (only show if chunking is enabled OR existing chunks found)
+    import glob
+    chunk_meta_files = glob.glob(str(Path(args.shard_path or 'data/feature_cache') / 'features_mmap_meta_*.json'))
+    has_existing_chunks = len(chunk_meta_files) > 0
+
+    if has_existing_chunks or args.use_chunking:
+        print()
+        print("=" * 60)
+        print("  NATIVE TIMEFRAME GENERATION")
+        print("=" * 60)
+        if has_existing_chunks:
+            print(f"   Found {len(chunk_meta_files)} existing chunk metadata file(s)")
+
+        args.generate_native_tf = inquirer.select(
+            message="Generate native timeframe sequences from chunk shards?",
+            choices=[
+                Choice('skip', "Skip - Use existing tf_meta or generate during training"),
+                Choice('streaming', "Yes (Streaming) - Low RAM (~5-8GB), processes one chunk at a time 💾"),
+                Choice('full_load', "Yes (Full Load) - Fast but needs ~50GB RAM ⚡"),
+            ],
+            default='skip'
+        ).execute()
+
+        if args.generate_native_tf == 'streaming':
+            print(f"   ✓ Will generate native TF sequences (streaming mode)")
+            print(f"   💾 Peak RAM: ~5-8GB")
+            args.native_tf_streaming = True
+        elif args.generate_native_tf == 'full_load':
+            print(f"   ✓ Will generate native TF sequences (full load mode)")
+            print(f"   💾 Peak RAM: ~50GB - ensure sufficient memory!")
+            args.native_tf_streaming = False
+        else:
+            print(f"   → Skipping native TF generation")
+            args.generate_native_tf = None
+            args.native_tf_streaming = True  # Default for CLI usage
+    else:
+        print(f"\n   ℹ️  No chunk shards found. Native TF will be generated during training if needed.")
+        args.generate_native_tf = None
+        args.native_tf_streaming = True  # Default for CLI usage
+
     # Note: Precision is now selected in the consolidated menu right after device selection
     # This section only handles continuation mode
 
@@ -2017,6 +2057,9 @@ def interactive_setup(args, profiler=None):
     print(f"  Feature GPU: {'Yes' if getattr(args, 'use_gpu_features', False) else 'No'}")
     print(f"  Parallel CPU: {parallel_str}")
     print(f"  Chunking: {chunk_str}")
+    if getattr(args, 'generate_native_tf', None):
+        mode = 'streaming (~5-8GB)' if getattr(args, 'native_tf_streaming', True) else 'full load (~50GB)'
+        print(f"  Native TF Gen: {mode}")
     print(f"  Continuation Mode: {project_config.CONTINUATION_MODE} "
           f"(horizon {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars)")
     print(f"  Model Capacity: internal_ratio={args.internal_neurons_ratio}, hidden_size={args.hidden_size}")
@@ -2362,6 +2405,34 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             )
             cache_type = "mmap" if mmap_path else "pickle"
             print(f"   💾 Cache manifest saved ({cache_type}): cache_manifest_{cache_key}.json")
+
+    # =========================================================================
+    # GENERATE NATIVE TF SEQUENCES FROM CHUNKS (if requested via interactive menu)
+    # =========================================================================
+    if is_main_process(rank) and getattr(args, 'generate_native_tf', None) and args.generate_native_tf != 'skip':
+        # Find the chunk metadata file
+        chunk_meta_files = list(shard_path.glob('features_mmap_meta_*.json'))
+        if chunk_meta_files:
+            chunk_meta_path = chunk_meta_files[0]  # Use most recent
+            print(f"\n   🔄 Generating native timeframe sequences from chunks...")
+            print(f"   📄 Using: {chunk_meta_path.name}")
+
+            from src.ml.features import TradingFeatureExtractor
+            gen_extractor = TradingFeatureExtractor()
+            gen_extractor.generate_native_tf_from_chunks(
+                chunks_meta_path=chunk_meta_path,
+                output_cache_dir=shard_path,
+                streaming=getattr(args, 'native_tf_streaming', True)
+            )
+
+            # Update tf_meta_path for native timeframe mode
+            tf_meta_files = list(shard_path.glob('tf_meta_*.json'))
+            if tf_meta_files:
+                args.tf_meta_path = str(tf_meta_files[0])
+                print(f"   ✓ Native TF sequences ready: {args.tf_meta_path}")
+        else:
+            print(f"   ⚠️  No chunk metadata found in {shard_path}")
+            print(f"       Run with --use-chunking first to generate chunk shards")
 
     # =========================================================================
     # AUTO-DISCOVER TF_META PATH FOR NATIVE TIMEFRAME MODE
@@ -3073,6 +3144,15 @@ def main():
                         help='Disable native timeframe mode (use legacy mmap mode - SLOW)')
     parser.add_argument('--tf-meta', dest='tf_meta_path', type=str, default=None,
                         help='Path to tf_meta_*.json file for native timeframe mode')
+    parser.add_argument('--generate-native-tf', dest='generate_native_tf',
+                        choices=['skip', 'streaming', 'full_load'], default=None,
+                        help='Generate native TF from chunks: skip, streaming (~5-8GB RAM), or full_load (~50GB RAM)')
+    parser.add_argument('--native-tf-streaming', dest='native_tf_streaming',
+                        action='store_true', default=True,
+                        help='Use streaming mode for native TF generation (default: True, ~5-8GB RAM)')
+    parser.add_argument('--no-native-tf-streaming', dest='native_tf_streaming',
+                        action='store_false',
+                        help='Use full load mode for native TF generation (~50GB RAM, faster)')
 
     # System parameters
     parser.add_argument('--device', type=str, default='auto',
