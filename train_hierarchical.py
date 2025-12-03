@@ -2134,11 +2134,16 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         if is_main_process(rank):
             print(f"✓ Auto-detected chunking: {'Enabled' if args.use_chunking else 'Disabled'} (RAM: {total_ram_gb:.1f}GB)")
 
-    # Native timeframes requires non-chunked mode for pre-computed sequences
+    # Native timeframes + chunking: Allow chunking for extraction, native TF will be generated later
+    # This enables the two-machine workflow:
+    #   Machine A (low RAM): --use-chunking → creates chunks
+    #   Machine B (high RAM): generate_native_tf_from_chunks() → then train with native TF
     if args.use_native_timeframes and args.use_chunking:
         if is_main_process(rank):
-            print(f"⚠️  Native timeframes requires --no-chunking (disabling chunking)")
-        args.use_chunking = False
+            print(f"   ℹ️  Chunked extraction mode: Native TF sequences will need to be generated after")
+            print(f"       Run generate_native_tf_from_chunks() on high-RAM machine before training")
+        # Don't disable chunking - let extraction proceed
+        # Native TF mode will fail gracefully later if tf_meta doesn't exist
 
     # Set torch.compile verbose logging if requested (must be before model creation)
     if args.device.startswith('cuda') and getattr(args, 'use_compile', False) and getattr(args, 'compile_verbose', False):
@@ -2382,8 +2387,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 else:
                     if is_main_process(rank):
                         print(f"   ⚠️  Native timeframes enabled but no tf_meta_*.json found in {cache_dir}")
-                        print(f"       Run with --no-chunking to generate native timeframe sequences")
-                        print(f"       Or pass --tf-meta /path/to/tf_meta_*.json explicitly")
+                        print(f"       Option 1: Run with --no-chunking to generate native TF sequences")
+                        print(f"       Option 2: Generate from existing chunks:")
+                        print(f"                 from src.ml.features import TradingFeatureExtractor")
+                        print(f"                 extractor = TradingFeatureExtractor()")
+                        print(f"                 extractor.generate_native_tf_from_chunks(")
+                        print(f"                     'data/feature_cache/features_mmap_meta_*.json',")
+                        print(f"                     'data/feature_cache')")
+                    # Fall back to legacy mode for this run
+                    args.use_native_timeframes = False
+                    if is_main_process(rank):
+                        print(f"   → Falling back to legacy mmap mode for this run")
 
     # =========================================================================
     # DATASET CREATION
