@@ -340,10 +340,84 @@
     </div>
 
     <script>
+        // =================================================================
+        // WebSocket Connection for Real-Time Updates
+        // =================================================================
+        let ws = null;
+        let wsReconnectTimer = null;
+        const wsStatusEl = document.getElementById('last-update');
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws/predictions`);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                wsStatusEl.innerHTML = '<span class="text-green-400">● Live</span> ' + new Date().toLocaleTimeString();
+                if (wsReconnectTimer) {
+                    clearTimeout(wsReconnectTimer);
+                    wsReconnectTimer = null;
+                }
+            };
+
+            ws.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+
+                if (message.type === 'prediction_update') {
+                    console.log('New prediction received:', message.data);
+                    wsStatusEl.innerHTML = '<span class="text-green-400">● Live</span> Updated: ' + new Date().toLocaleTimeString();
+
+                    // Trigger HTMX refresh on prediction containers
+                    // This reloads the prediction data from the API
+                    htmx.trigger('#trade-setups-container', 'refresh');
+                    htmx.trigger('#channel-container', 'refresh');
+                    htmx.trigger('#prediction-container', 'refresh');
+
+                    // Show toast notification
+                    showToast('New prediction available!');
+                } else if (message.type === 'ping') {
+                    // Respond to keep-alive
+                    ws.send('pong');
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                wsStatusEl.innerHTML = '<span class="text-yellow-400">○ Reconnecting...</span>';
+
+                // Reconnect after 5 seconds
+                wsReconnectTimer = setTimeout(connectWebSocket, 5000);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                wsStatusEl.innerHTML = '<span class="text-red-400">○ Error</span>';
+            };
+        }
+
+        // Toast notification for updates
+        function showToast(message) {
+            const toast = document.createElement('div');
+            toast.className = 'fixed bottom-4 right-4 bg-blue-600 text-white px-4 py-2 rounded-lg shadow-lg z-50 animate-pulse';
+            toast.textContent = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
+        }
+
+        // Initialize WebSocket on page load
+        document.addEventListener('DOMContentLoaded', connectWebSocket);
+
+        // =================================================================
+        // Existing Functionality
+        // =================================================================
+
         // Update timestamp
         function updateTimestamp() {
-            document.getElementById('last-update').textContent =
-                'Last update: ' + new Date().toLocaleTimeString();
+            // Only update if WebSocket isn't managing status
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                document.getElementById('last-update').textContent =
+                    'Last update: ' + new Date().toLocaleTimeString();
+            }
         }
         updateTimestamp();
         setInterval(updateTimestamp, 60000); // Update every minute

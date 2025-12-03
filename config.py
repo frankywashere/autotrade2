@@ -50,7 +50,12 @@ MIN_CONFLUENCE_SCORE = 60  # Minimum score to trigger alert (0-100)
 
 # GUI Settings
 CHART_UPDATE_SECONDS = 60
-DASHBOARD_PORT = 8501  # For Streamlit
+DASHBOARD_PORT = 8501  # For Streamlit (legacy)
+
+# Live Dashboard Settings (v2.0 - FastAPI)
+PREDICTION_REFRESH_MINUTES = 15  # Auto-refresh interval for background predictions
+ALERT_CONFIDENCE_THRESHOLD = 0.7  # Minimum confidence to trigger Telegram alert
+RUN_24_7 = True  # Run prediction loop outside market hours
 
 # Live Data Settings
 USE_LIVE_DATA = True  # Merge CSV with live data from yfinance

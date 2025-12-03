@@ -2127,6 +2127,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         if is_main_process(rank):
             print(f"✓ Auto-detected chunking: {'Enabled' if args.use_chunking else 'Disabled'} (RAM: {total_ram_gb:.1f}GB)")
 
+    # Native timeframes requires non-chunked mode for pre-computed sequences
+    if args.use_native_timeframes and args.use_chunking:
+        if is_main_process(rank):
+            print(f"⚠️  Native timeframes requires --no-chunking (disabling chunking)")
+        args.use_chunking = False
+
     # Set torch.compile verbose logging if requested (must be before model creation)
     if args.device.startswith('cuda') and getattr(args, 'use_compile', False) and getattr(args, 'compile_verbose', False):
         os.environ['TORCH_LOGS'] = 'dynamo,inductor,aot_autograd,output_code,graph_breaks,fusion'
@@ -2346,6 +2352,33 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print(f"   💾 Cache manifest saved ({cache_type}): cache_manifest_{cache_key}.json")
 
     # =========================================================================
+    # AUTO-DISCOVER TF_META PATH FOR NATIVE TIMEFRAME MODE
+    # =========================================================================
+    if args.use_native_timeframes and args.tf_meta_path is None:
+        # Auto-discover tf_meta_*.json in cache directory
+        cache_dir = extractor._unified_cache_dir if hasattr(extractor, '_unified_cache_dir') else shard_path
+        cache_key = extractor._cache_key if hasattr(extractor, '_cache_key') else None
+
+        if cache_key:
+            potential_tf_meta = Path(cache_dir) / f"tf_meta_{cache_key}.json"
+            if potential_tf_meta.exists():
+                args.tf_meta_path = str(potential_tf_meta)
+                if is_main_process(rank):
+                    print(f"   🔄 Auto-discovered native timeframe meta: {potential_tf_meta.name}")
+            else:
+                # Try to find any tf_meta file in cache dir
+                tf_meta_files = list(Path(cache_dir).glob("tf_meta_*.json"))
+                if tf_meta_files:
+                    args.tf_meta_path = str(tf_meta_files[0])
+                    if is_main_process(rank):
+                        print(f"   🔄 Auto-discovered native timeframe meta: {tf_meta_files[0].name}")
+                else:
+                    if is_main_process(rank):
+                        print(f"   ⚠️  Native timeframes enabled but no tf_meta_*.json found in {cache_dir}")
+                        print(f"       Run with --no-chunking to generate native timeframe sequences")
+                        print(f"       Or pass --tf-meta /path/to/tf_meta_*.json explicitly")
+
+    # =========================================================================
     # DATASET CREATION
     # =========================================================================
 
@@ -2420,7 +2453,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         include_continuation=True,
         mmap_meta_path=mmap_meta_path,
         profiler=dataset_profiler,
-        preload_to_ram=args.preload_to_ram
+        preload_to_ram=args.preload_to_ram,
+        use_native_timeframes=args.use_native_timeframes,
+        tf_meta_path=args.tf_meta_path
     )
 
     if profiler:
@@ -3010,9 +3045,11 @@ def main():
     parser.add_argument('--use-gpu-features', dest='use_gpu_features', action='store_true', default=False,
                         help='Use GPU acceleration for feature extraction (CUDA only)')
 
-    # v4.1: Native timeframe mode
-    parser.add_argument('--native-timeframes', dest='use_native_timeframes', action='store_true', default=False,
+    # v4.1: Native timeframe mode (default=True for performance)
+    parser.add_argument('--native-timeframes', dest='use_native_timeframes', action='store_true', default=True,
                         help='Use native timeframe mode: each CfC layer receives features at its native resolution (5min layer sees 5-min bars)')
+    parser.add_argument('--no-native-timeframes', dest='use_native_timeframes', action='store_false',
+                        help='Disable native timeframe mode (use legacy mmap mode - SLOW)')
     parser.add_argument('--tf-meta', dest='tf_meta_path', type=str, default=None,
                         help='Path to tf_meta_*.json file for native timeframe mode')
 
