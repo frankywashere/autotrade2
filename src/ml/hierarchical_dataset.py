@@ -761,6 +761,50 @@ class HierarchicalDataset(Dataset):
             past_prices=past_prices
         )
 
+        # v4.2: Add continuation prediction targets (same as legacy mode)
+        # This enables duration/gain/confidence predictions in native TF mode
+        if self.include_continuation and self.continuation_labels_df is not None:
+            try:
+                # Get 5min timestamp for lookup
+                # Note: 5-min bar timestamp is the period START (e.g., 10:05)
+                # but features are from .last() which is ~4 min later (e.g., 10:09)
+                # We try aligned timestamp first, fall back to bar start
+                ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+
+                # Try aligned timestamp (+4 min to match where .last() data came from)
+                ts_aligned_ns = int(ts_5min) + (4 * 60 * 1_000_000_000)  # +4 min in nanoseconds
+                row_idx = self._continuation_ts_to_idx.get(ts_aligned_ns)
+
+                # Fall back to bar start timestamp if aligned not found (market boundaries)
+                if row_idx is None:
+                    row_idx = self._continuation_ts_to_idx.get(int(ts_5min))
+
+                if row_idx is not None:
+                    # Core continuation targets
+                    targets['continuation_duration'] = float(self._cont_duration[row_idx])
+                    targets['continuation_gain'] = float(self._cont_gain[row_idx])
+                    targets['continuation_confidence'] = float(self._cont_confidence[row_idx])
+
+                    # Optional fields (check flags set in __init__)
+                    if self.has_adaptive_horizon:
+                        targets['adaptive_horizon'] = float(self._cont_adaptive_horizon[row_idx])
+                    if self.has_conf_score:
+                        targets['conf_score'] = float(self._cont_conf_score[row_idx])
+                    if self.has_channel_1h_cycles:
+                        targets['channel_1h_cycles'] = float(self._cont_channel_1h_cycles[row_idx])
+                    if self.has_channel_4h_cycles:
+                        targets['channel_4h_cycles'] = float(self._cont_channel_4h_cycles[row_idx])
+                    if self.has_channel_1h_valid:
+                        targets['channel_1h_valid'] = float(self._cont_channel_1h_valid[row_idx])
+                    if self.has_channel_4h_valid:
+                        targets['channel_4h_valid'] = float(self._cont_channel_4h_valid[row_idx])
+                    if self.has_channel_1h_r_squared:
+                        targets['channel_1h_r_squared'] = float(self._cont_channel_1h_r_squared[row_idx])
+                    if self.has_channel_4h_r_squared:
+                        targets['channel_4h_r_squared'] = float(self._cont_channel_4h_r_squared[row_idx])
+            except Exception:
+                pass  # Keep placeholder values on error
+
         return timeframe_data, targets
 
     def __len__(self) -> int:
