@@ -488,8 +488,11 @@ class HierarchicalDataset(Dataset):
             self.raw_ohlc_array = raw_ohlc_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
             if self.raw_ohlc_array.dtype != expected_dtype:
                 self.raw_ohlc_array = self.raw_ohlc_array.astype(expected_dtype)
+            # Store timestamps for Priority 1b: timestamp-based index conversion
+            self.raw_ohlc_timestamps = raw_ohlc_df.index.values.astype('datetime64[ns]').astype('int64')
         else:
             self.raw_ohlc_array = None
+            self.raw_ohlc_timestamps = np.array([], dtype='int64')
 
         # Use 1-min timestamps from 5min array (first timeframe, most granular)
         # Actually we need 1-min timestamps for index conversion
@@ -504,8 +507,18 @@ class HierarchicalDataset(Dataset):
         # For 5min with seq_len=200, we need 200 * 5 = 1000 1-min bars
         # For 3month with seq_len=8, we need ~8 * 90 days * 6.5 hours * 60 min ≈ 280,800 1-min bars
         # But this is handled by the resampled arrays themselves
-        # Valid indices are based on the minimum of all timeframe array lengths
-        min_tf_rows = min(self.tf_mmaps[tf].shape[0] for tf in HIERARCHICAL_TIMEFRAMES)
+        # FIX (Priority 2): Handle missing/insufficient timeframes gracefully
+        available_tfs = [tf for tf in HIERARCHICAL_TIMEFRAMES if tf in self.tf_mmaps]
+        if not available_tfs:
+            raise ValueError("No valid timeframe sequences found!")
+
+        missing_tfs = [tf for tf in HIERARCHICAL_TIMEFRAMES if tf not in self.tf_mmaps]
+        if missing_tfs:
+            print(f"     ⚠️  Warning: Missing timeframes (insufficient data): {', '.join(missing_tfs)}")
+            print(f"     📊 Will use available timeframes: {', '.join(available_tfs)}")
+
+        # Valid indices are based on the minimum of available timeframe array lengths
+        min_tf_rows = min(self.tf_mmaps[tf].shape[0] for tf in available_tfs)
 
         # We use 5min bars as the reference for indexing (since it's our finest resampled resolution)
         # Each sample corresponds to a 5min bar index
@@ -540,6 +553,116 @@ class HierarchicalDataset(Dataset):
             else:
                 raise ValueError("Cannot find tsla_close in 5min features")
 
+    def _calculate_targets_from_future(self, current_price: float, future_prices: np.ndarray,
+                                       seq_start: int, seq_end: int,
+                                       past_prices: np.ndarray = None) -> dict:
+        """
+        Calculate multi-task targets from future price data.
+
+        This method implements the full target calculation logic used in legacy mode.
+        It's shared between __getitem__ (legacy) and _getitem_native_timeframe (native).
+
+        Args:
+            current_price: Current close price
+            future_prices: Array of future prices
+            seq_start: Start index of historical sequence (for breakout detection)
+            seq_end: End index of historical sequence / current index
+            past_prices: Optional past prices for channel-based breakout detection
+
+        Returns:
+            Dictionary with all target labels
+        """
+        # Defensive check
+        if current_price <= 0 or np.isnan(current_price) or np.isinf(current_price):
+            raise ValueError(f"Invalid current_price: {current_price}")
+
+        # Get high/low from future prices
+        future_high_actual = np.max(future_prices)
+        future_low_actual = np.min(future_prices)
+
+        # Convert to percentage change
+        target_high_pct = (future_high_actual - current_price) / current_price * 100.0
+        target_low_pct = (future_low_actual - current_price) / current_price * 100.0
+
+        # Label 1: Hit Band
+        ideal_band_high = future_high_actual * 1.02
+        ideal_band_low = future_low_actual * 0.98
+        prices_in_ideal_band = (future_prices >= ideal_band_low) & (future_prices <= ideal_band_high)
+        hit_band_label = float(prices_in_ideal_band.sum() / len(prices_in_ideal_band) > 0.8)
+
+        # Label 2: Hit Target Before Stop
+        target_price = future_high_actual
+        stop_price = current_price * (1 + target_low_pct/100 - 0.02)
+        hit_target_label = float(self._check_target_sequence(
+            future_prices, current_price, target_price, stop_price
+        ))
+
+        # Label 3: Expected Return
+        expected_return_label = self._simulate_trade_execution(
+            future_prices, current_price, target_price, stop_price
+        )
+
+        # Label 4: Overshoot
+        band_range = abs(target_high_pct - target_low_pct)
+        if band_range > 0:
+            overshoot_high = max(0, future_high_actual - ideal_band_high) / current_price * 100
+            overshoot_low = max(0, ideal_band_low - future_low_actual) / current_price * 100
+            overshoot_label = (overshoot_high + overshoot_low) / band_range
+        else:
+            overshoot_label = 0.0
+
+        # Adaptive targets
+        actual_max_idx = future_prices.argmax()
+        bars_to_peak = actual_max_idx
+        adaptive_price_change = target_high_pct if target_high_pct > abs(target_low_pct) else target_low_pct
+        adaptive_horizon_log = np.log(bars_to_peak / 24 + 1e-6)
+        adaptive_confidence = 1.0 if bars_to_peak > 48 else 0.5
+
+        targets = {
+            'high': target_high_pct,
+            'low': target_low_pct,
+            'hit_band': hit_band_label,
+            'hit_target': hit_target_label,
+            'expected_return': expected_return_label,
+            'overshoot': overshoot_label,
+            'continuation_duration': 0.0,   # Placeholder (requires continuation_labels_df)
+            'continuation_gain': 0.0,       # Placeholder
+            'continuation_confidence': 0.5, # Placeholder
+            'price_change_pct': adaptive_price_change,
+            'horizon_bars_log': adaptive_horizon_log,
+            'adaptive_confidence': adaptive_confidence,
+        }
+
+        # Breakout labels
+        try:
+            if past_prices is not None:
+                breakout_labels = self._detect_channel_breakout(
+                    past_prices=past_prices,
+                    future_prices=future_prices,
+                    current_price=current_price,
+                    lookback=60,
+                    channel_std=2.0,
+                    breakout_threshold=1.0
+                )
+                targets['breakout_occurred'] = breakout_labels['breakout_occurred']
+                targets['breakout_direction'] = breakout_labels['breakout_direction']
+                targets['breakout_bars_log'] = breakout_labels['breakout_bars_log']
+                targets['breakout_magnitude'] = breakout_labels['breakout_magnitude']
+            else:
+                # Defaults if no past prices available
+                targets['breakout_occurred'] = 0.0
+                targets['breakout_direction'] = 0.5
+                targets['breakout_bars_log'] = np.log(self.prediction_horizon + 1)
+                targets['breakout_magnitude'] = 0.0
+        except Exception:
+            # Fallback if breakout detection fails
+            targets['breakout_occurred'] = 0.0
+            targets['breakout_direction'] = 0.5
+            targets['breakout_bars_log'] = np.log(self.prediction_horizon + 1)
+            targets['breakout_magnitude'] = 0.0
+
+        return targets
+
     def _getitem_native_timeframe(self, idx: int) -> Tuple[Dict[str, np.ndarray], dict]:
         """
         Get sample in native timeframe mode - returns Dict[str, np.ndarray].
@@ -561,6 +684,10 @@ class HierarchicalDataset(Dataset):
         timeframe_data = {}
 
         for tf in HIERARCHICAL_TIMEFRAMES:
+            # FIX (Priority 2): Skip missing/unavailable timeframes
+            if tf not in self.tf_mmaps:
+                continue
+
             seq_len = self.tf_sequence_lengths[tf]
 
             # Find index in this timeframe's array that corresponds to our 5min timestamp
@@ -576,69 +703,63 @@ class HierarchicalDataset(Dataset):
             tf_features = self.tf_mmaps[tf][start:end, :]
             timeframe_data[tf] = np.ascontiguousarray(tf_features)
 
-        # Calculate targets using 5min data (or raw OHLC if available)
         # Get current price from 5min features
         current_price = self.tf_mmaps['5min'][data_idx_5min - 1, self.close_idx_5min]
 
         # Get future prices for target calculation
-        # prediction_horizon is in 1-min bars, convert to 5-min bars
         horizon_5min = self.prediction_horizon // 5 + 1
 
         if self.raw_ohlc_array is not None:
             # Use raw 1-min OHLC for more accurate targets
-            # Need to map 5min index back to 1min index
-            # Each 5min bar corresponds to ~5 1-min bars
-            # Use timestamp to find the 1-min index
-            # For simplicity, approximate: 1min_idx ≈ 5min_idx * 5
-            approx_1min_idx = data_idx_5min * 5
+            # FIX (Priority 1b): Use timestamp-based lookup instead of approximation
+            # Get the 5min timestamp at current data_idx_5min
+            if '5min' in self.tf_timestamps and len(self.tf_timestamps['5min']) > data_idx_5min:
+                ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+
+                # Use binary search to find corresponding 1-min index by timestamp
+                # This handles market gaps (weekends, holidays) correctly
+                if hasattr(self, 'raw_ohlc_timestamps') and len(self.raw_ohlc_timestamps) > 0:
+                    approx_1min_idx = np.searchsorted(self.raw_ohlc_timestamps, ts_5min, side='right') - 1
+                    approx_1min_idx = max(0, min(approx_1min_idx, len(self.raw_ohlc_array) - 1))
+                else:
+                    # Fallback if timestamps not available: use approximation
+                    approx_1min_idx = data_idx_5min * 5
+            else:
+                # Fallback if 5min timestamps not available
+                approx_1min_idx = data_idx_5min * 5
+
             future_start = approx_1min_idx
             future_end = min(approx_1min_idx + self.prediction_horizon, len(self.raw_ohlc_array))
 
             if future_end > future_start:
                 future_ohlc = self.raw_ohlc_array[future_start:future_end]
-                future_high = np.max(future_ohlc[:, 1])  # high column
-                future_low = np.min(future_ohlc[:, 2])   # low column
-                future_prices = future_ohlc[:, 3]  # close column
+                future_high = np.max(future_ohlc[:, 1])
+                future_low = np.min(future_ohlc[:, 2])
+                future_prices = future_ohlc[:, 3]
             else:
-                # Not enough future data
                 future_high = current_price
                 future_low = current_price
                 future_prices = np.array([current_price])
         else:
-            # Fallback: Use 5min closes as future reference
+            # Fallback: Use 5min closes
             future_5min_end = min(data_idx_5min + horizon_5min, len(self.tf_mmaps['5min']))
             future_5min = self.tf_mmaps['5min'][data_idx_5min:future_5min_end, self.close_idx_5min]
             future_high = np.max(future_5min)
             future_low = np.min(future_5min)
             future_prices = future_5min
 
-        # Calculate percentage targets
-        if current_price > 0:
-            target_high_pct = (future_high - current_price) / current_price * 100.0
-            target_low_pct = (future_low - current_price) / current_price * 100.0
-        else:
-            target_high_pct = 0.0
-            target_low_pct = 0.0
+        # Get past prices for breakout detection
+        past_5min_start = max(0, data_idx_5min - 200)
+        past_prices = self.tf_mmaps['5min'][past_5min_start:data_idx_5min, self.close_idx_5min]
 
-        # Build targets dict (simplified version - add more labels as needed)
-        targets = {
-            'high': target_high_pct,
-            'low': target_low_pct,
-            'hit_band': 0.0,  # Placeholder
-            'hit_target': 0.0,  # Placeholder
-            'expected_return': target_high_pct if target_high_pct > abs(target_low_pct) else target_low_pct,
-            'overshoot': 0.0,  # Placeholder
-            'continuation_duration': 0.0,
-            'continuation_gain': 0.0,
-            'continuation_confidence': 0.5,
-            'price_change_pct': target_high_pct,
-            'horizon_bars_log': np.log(self.prediction_horizon + 1),
-            'adaptive_confidence': 0.5,
-            'breakout_occurred': 0.0,
-            'breakout_direction': 0.5,
-            'breakout_bars_log': np.log(self.prediction_horizon + 1),
-            'breakout_magnitude': 0.0,
-        }
+        # FIX (Priority 1): Call new helper method to calculate proper targets
+        targets = self._calculate_targets_from_future(
+            current_price=current_price,
+            future_prices=future_prices,
+            seq_start=past_5min_start,
+            seq_end=data_idx_5min,
+            past_prices=past_prices
+        )
 
         return timeframe_data, targets
 
@@ -1505,7 +1626,9 @@ def create_hierarchical_dataset(
     include_continuation: bool = False,
     mmap_meta_path: str = None,
     profiler=None,
-    preload_to_ram: bool = False
+    preload_to_ram: bool = False,
+    use_native_timeframes: bool = False,
+    tf_meta_path: str = None
 ) -> Tuple[Dataset, Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -1550,7 +1673,9 @@ def create_hierarchical_dataset(
                 include_continuation=False,
                 mmap_meta_path=mmap_meta_path,
                 profiler=profiler,
-                preload_to_ram=preload_to_ram
+                preload_to_ram=preload_to_ram,
+                use_native_timeframes=use_native_timeframes,
+                tf_meta_path=tf_meta_path
             )
 
             # Calculate index ranges (valid_indices already has built-in buffers)
@@ -1596,14 +1721,18 @@ def create_hierarchical_dataset(
                     sequence_length, prediction_horizon, mode,
                     include_continuation=include_continuation,
                     profiler=profiler,
-                    preload_to_ram=preload_to_ram
+                    preload_to_ram=preload_to_ram,
+                    use_native_timeframes=use_native_timeframes,
+                    tf_meta_path=tf_meta_path
                 )
                 val_dataset = HierarchicalDataset(
                     val_df, val_raw_ohlc, val_continuation_df,
                     sequence_length, prediction_horizon, mode,
                     include_continuation=include_continuation,
                     profiler=profiler,
-                    preload_to_ram=preload_to_ram
+                    preload_to_ram=preload_to_ram,
+                    use_native_timeframes=use_native_timeframes,
+                    tf_meta_path=tf_meta_path
                 )
 
         return train_dataset, val_dataset
@@ -1621,7 +1750,9 @@ def create_hierarchical_dataset(
                 include_continuation=include_continuation,
                 mmap_meta_path=mmap_meta_path,
                 profiler=profiler,
-                preload_to_ram=preload_to_ram
+                preload_to_ram=preload_to_ram,
+                use_native_timeframes=use_native_timeframes,
+                tf_meta_path=tf_meta_path
             )
 
         return dataset, None

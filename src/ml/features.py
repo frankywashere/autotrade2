@@ -721,9 +721,11 @@ class TradingFeatureExtractor(FeatureExtractor):
         else:
             # v4.1: Pre-compute timeframe-specific sequences for hierarchical model
             # This creates separate .npy files for each timeframe with native resolution
-            if hasattr(self, '_unified_cache_dir'):
-                cache_key = self._cache_key if hasattr(self, '_cache_key') else FEATURE_VERSION
-                self._precompute_timeframe_sequences(features_df, self._unified_cache_dir, cache_key)
+            # FIX (Priority 0): This code is in the "non-chunked" branch (after line 720 check)
+            # so _unified_cache_dir is ALWAYS set here. Removed the hasattr check.
+            cache_dir = self._unified_cache_dir
+            cache_key = self._cache_key if hasattr(self, '_cache_key') else FEATURE_VERSION
+            self._precompute_timeframe_sequences(features_df, cache_dir, cache_key)
 
             print(f"   ✓ {len(features_df.columns)} features ready")
             return features_df, continuation_df
@@ -823,6 +825,179 @@ class TradingFeatureExtractor(FeatureExtractor):
             json.dump(meta, f, indent=2)
 
         print(f"   ✓ Saved {len(HIERARCHICAL_TIMEFRAMES)} timeframe sequences to {cache_dir}")
+        print(f"   📄 Metadata: {meta_path.name}")
+
+    def generate_native_tf_from_chunks(self, chunks_meta_path: Path, output_cache_dir: Path) -> None:
+        """
+        Priority 3 (Option A): Generate native timeframe sequences from existing mmap chunks.
+
+        This enables the two-machine workflow:
+        1. Machine A (low RAM): Extract features with --use-chunking → generates mmap shards
+        2. Machine B (high RAM): Call this method → generates native TF sequences from chunks
+        3. Machine B: Train with --native-timeframes → uses pre-computed sequences
+
+        Args:
+            chunks_meta_path: Path to mmap_meta JSON file from chunked extraction
+            output_cache_dir: Directory to save native TF .npy files
+
+        Workflow:
+        ```bash
+        # Machine A (low RAM)
+        python train_hierarchical.py --train_start_year 2015 --train_end_year 2023 \\
+          --use-chunking --feature_workers 1
+        # Creates: data/feature_cache/features_mmap_meta_*.json + mmap shards
+
+        # Transfer chunks to Machine B ...
+
+        # Machine B (high RAM)
+        python -c "
+          from src.ml.features import TradingFeatureExtractor
+          extractor = TradingFeatureExtractor()
+          extractor.generate_native_tf_from_chunks(
+              chunks_meta_path='data/feature_cache/features_mmap_meta_v3.20_vix_20150101_20231230_1234567_h24.json',
+              output_cache_dir='data/feature_cache'
+          )
+        "
+        # Creates: tf_sequence_*.npy, tf_timestamps_*.npy, tf_meta_*.json
+
+        # Now train with native TF mode
+        python train_hierarchical.py --native-timeframes --tf-meta data/feature_cache/tf_meta_v3.20_vix_*.json
+        ```
+
+        Implementation approach:
+        1. Load mmap_meta to understand chunk structure
+        2. Memory-map all feature chunks (don't load into RAM)
+        3. For each timeframe:
+           a. Create output .npy file
+           b. Stream through chunks sequentially
+           c. Resample on-the-fly using pandas
+           d. Append resampled data to output file
+        4. Create tf_meta JSON with mapping info
+
+        This avoids loading all 49GB chunks into RAM at once.
+        """
+        import json
+        import pandas as pd
+        from pathlib import Path
+
+        chunks_meta_path = Path(chunks_meta_path)
+        output_cache_dir = Path(output_cache_dir)
+        cache_dir = chunks_meta_path.parent
+
+        print(f"\n   🔄 Generating native timeframe sequences from chunks...")
+        print(f"   📄 Loading metadata from: {chunks_meta_path.name}")
+
+        # Load mmap metadata
+        with open(chunks_meta_path) as f:
+            mmap_meta = json.load(f)
+
+        chunk_info = mmap_meta['chunk_info']
+        dtype = np.dtype(mmap_meta['dtype'])
+        total_rows = mmap_meta['total_rows']
+
+        print(f"   📊 Found {len(chunk_info)} chunks, {total_rows:,} total rows")
+
+        # Step 1: Load all chunks and timestamps to build full feature DataFrame
+        print(f"   ⚙️  Loading chunks into memory (streaming approach)...")
+
+        all_features = []
+        all_indices = []
+
+        for i, chunk in enumerate(chunk_info):
+            chunk_path = cache_dir / chunk['path']
+            index_path = cache_dir / chunk['index_path']
+
+            if not chunk_path.exists() or not index_path.exists():
+                raise FileNotFoundError(f"Chunk files missing: {chunk_path}")
+
+            # Memory-map the feature array
+            chunk_array = np.load(str(chunk_path), mmap_mode='r').astype(np.float32)
+            index_array = np.load(str(index_path), mmap_mode='r')
+
+            all_features.append(chunk_array)
+            all_indices.append(index_array)
+
+            if (i + 1) % 5 == 0 or i == len(chunk_info) - 1:
+                print(f"       Loaded {i+1}/{len(chunk_info)} chunks ({sum(len(idx) for idx in all_indices):,} rows)")
+
+        # Concatenate all features and indices
+        full_features = np.vstack(all_features)
+        full_indices = np.concatenate(all_indices)
+
+        # Create DataFrame with timestamps as index
+        df = pd.DataFrame(full_features)
+        df.index = pd.to_datetime(full_indices, unit='ns')
+
+        print(f"   ✓ Loaded {len(df):,} rows × {len(df.columns)} features")
+
+        # Step 2: Identify shared vs timeframe-specific columns (same logic as _precompute_timeframe_sequences)
+        all_cols = list(df.columns)
+        shared_cols = []
+        tf_specific_cols = {tf: [] for tf in HIERARCHICAL_TIMEFRAMES}
+
+        for col in all_cols:
+            is_tf_specific = False
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                if f'_{tf}_' in str(col):
+                    tf_specific_cols[tf].append(col)
+                    is_tf_specific = True
+                    break
+            if not is_tf_specific:
+                shared_cols.append(col)
+
+        print(f"   📊 Found {len(shared_cols)} shared columns, {sum(len(v) for v in tf_specific_cols.values())} timeframe-specific")
+
+        # Metadata for output
+        meta = {
+            'feature_version': FEATURE_VERSION,
+            'cache_key': mmap_meta.get('cache_key', 'from_chunks'),
+            'sequence_lengths': TIMEFRAME_SEQUENCE_LENGTHS,
+            'shared_columns': shared_cols,
+            'timeframe_columns': {},
+            'timeframe_shapes': {},
+            'total_rows_1min': len(df),
+        }
+
+        # Step 3: Resample for each timeframe and save
+        print(f"   🔄 Resampling to timeframe resolutions...")
+
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Resampling", leave=False, ncols=100, ascii=True):
+            tf_cols = shared_cols + tf_specific_cols[tf]
+            meta['timeframe_columns'][tf] = tf_cols
+
+            # Select columns for this timeframe and resample
+            tf_features = df[tf_cols].copy()
+            tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
+
+            # Use .last() to get value at end of each bar (same as _precompute_timeframe_sequences)
+            resampled = tf_features.resample(tf_rule).last().dropna()
+
+            # Save as .npy file
+            output_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}.npy"
+            np.save(output_path, resampled.values.astype(np.float32))
+
+            # Save timestamps separately
+            ts_path = output_cache_dir / f"tf_timestamps_{tf}_{meta['cache_key']}.npy"
+            timestamps_ns = resampled.index.view(np.int64)
+            np.save(ts_path, timestamps_ns)
+
+            meta['timeframe_shapes'][tf] = list(resampled.shape)
+
+            # Log progress
+            seq_len = TIMEFRAME_SEQUENCE_LENGTHS[tf]
+            real_time = {
+                '5min': '~17 hours', '15min': '~25 hours', '30min': '~40 hours',
+                '1h': '1 week', '2h': '1 week', '3h': '1 week', '4h': '1 week',
+                'daily': '30 days', 'weekly': '20 weeks', 'monthly': '12 months', '3month': '24 months'
+            }
+            print(f"      {tf}: {resampled.shape[0]:,} bars × {resampled.shape[1]} features (seq_len={seq_len}, {real_time.get(tf, '?')})")
+
+        # Save metadata
+        meta_path = output_cache_dir / f"tf_meta_{meta['cache_key']}.json"
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+
+        print(f"   ✓ Generated {len(HIERARCHICAL_TIMEFRAMES)} timeframe sequences to {output_cache_dir}")
         print(f"   📄 Metadata: {meta_path.name}")
 
     def _extract_price_features(self, df: pd.DataFrame, use_gpu: bool = False) -> pd.DataFrame:
