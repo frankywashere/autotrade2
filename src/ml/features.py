@@ -3445,48 +3445,61 @@ class TradingFeatureExtractor(FeatureExtractor):
                     breakdown_features[f'{symbol}_in_channel_{tf_name}'] = np.zeros(num_rows)
 
         # Event proximity features (v3.9) - scheduled dates are public (NO LEAKAGE)
+        # v4.2: Optimized - compute at daily level then forward-fill to 1-min
+        # Events only change daily, so checking every minute was wasteful (1.7M → ~3,400 lookups)
         if events_handler is not None:
-            # Initialize event feature arrays
-            is_earnings_week = np.zeros(num_rows)
-            days_until_earnings = np.zeros(num_rows)
-            days_until_fomc = np.zeros(num_rows)
-            is_high_impact_event = np.zeros(num_rows)
+            import config as cfg
 
-            # Extract events for each timestamp
-            event_pbar = tqdm(range(num_rows), desc="      Event features", leave=False, ncols=100, ascii=True, mininterval=0.5)
-            for idx in event_pbar:
-                timestamp = raw_df.index[idx]
-                date_str = timestamp.strftime('%Y-%m-%d')
+            # Step 1: Get unique dates (vectorized) - ~3,400 dates for 8 years of data
+            date_strings = raw_df.index.strftime('%Y-%m-%d')
+            unique_dates = sorted(set(date_strings))
 
+            # Step 2: Pre-compute events by date (fast - only ~3,400 lookups instead of 1.7M)
+            daily_features = {}
+            for date_str in tqdm(unique_dates, desc="      Event features", leave=False, ncols=100, ascii=True):
                 try:
-                    # Get events within configured window (±14 days by default)
-                    import config as cfg
                     events = events_handler.get_events_for_date(date_str, lookback_days=cfg.EVENT_LOOKBACK_DAYS)
+
+                    feat = {
+                        'is_earnings_week': 0.0,
+                        'days_until_earnings': 0.0,
+                        'days_until_fomc': 0.0,
+                        'is_high_impact_event': 0.0
+                    }
 
                     if events:
                         # Find closest earnings event
                         earnings_events = [e for e in events if e['event_type'] in ['earnings', 'delivery']]
                         if earnings_events:
-                            # Get closest earnings
-                            closest_earnings = min(earnings_events, key=lambda e: abs(e['days_until']))
-                            days_until_earnings[idx] = closest_earnings['days_until']
-                            is_earnings_week[idx] = float(abs(closest_earnings['days_until']) <= cfg.EVENT_LOOKBACK_DAYS)
+                            # v4.2 bugfix: correct key is 'days_until_event' not 'days_until'
+                            closest = min(earnings_events, key=lambda e: abs(e['days_until_event']))
+                            feat['days_until_earnings'] = closest['days_until_event']
+                            feat['is_earnings_week'] = float(abs(closest['days_until_event']) <= cfg.EVENT_LOOKBACK_DAYS)
 
                         # Find closest FOMC event
                         fomc_events = [e for e in events if e['event_type'] == 'fomc']
                         if fomc_events:
-                            closest_fomc = min(fomc_events, key=lambda e: abs(e['days_until']))
-                            days_until_fomc[idx] = closest_fomc['days_until']
+                            closest = min(fomc_events, key=lambda e: abs(e['days_until_event']))
+                            feat['days_until_fomc'] = closest['days_until_event']
 
                         # High impact = earnings/FOMC within 3 days
-                        high_impact_events = [e for e in events
-                                             if e['event_type'] in ['earnings', 'fomc', 'delivery']
-                                             and abs(e['days_until']) <= 3]
-                        is_high_impact_event[idx] = float(len(high_impact_events) > 0)
+                        high_impact = [e for e in events
+                                      if e['event_type'] in ['earnings', 'fomc', 'delivery']
+                                      and abs(e['days_until_event']) <= 3]
+                        feat['is_high_impact_event'] = float(len(high_impact) > 0)
 
+                    daily_features[date_str] = feat
                 except Exception:
-                    # If event lookup fails, leave as zeros
-                    continue
+                    daily_features[date_str] = {
+                        'is_earnings_week': 0.0, 'days_until_earnings': 0.0,
+                        'days_until_fomc': 0.0, 'is_high_impact_event': 0.0
+                    }
+
+            # Step 3: Map daily values to all 1-min bars (vectorized forward-fill)
+            is_earnings_week = np.array([daily_features.get(d, {}).get('is_earnings_week', 0.0) for d in date_strings])
+            days_until_earnings = np.array([daily_features.get(d, {}).get('days_until_earnings', 0.0) for d in date_strings])
+            days_until_fomc = np.array([daily_features.get(d, {}).get('days_until_fomc', 0.0) for d in date_strings])
+            is_high_impact_event = np.array([daily_features.get(d, {}).get('is_high_impact_event', 0.0) for d in date_strings])
 
             # Store event features
             breakdown_features['is_earnings_week'] = is_earnings_week
