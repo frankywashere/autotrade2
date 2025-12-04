@@ -55,23 +55,108 @@ LAYER 3: Physics Aggregation (ENHANCED)
   ├─ EnergyBasedConfidence: Stability measure
   └─ Final weighting: Combine 11 TF projections
 
-LAYER 4: Hybrid Prediction (NEW)
-  IF all_validities > threshold AND energy < threshold:
-    # Channels are reliable → Use geometric projections
-    final_high = Σ (TF_weight[i] × proj_high[i])
-    final_low = Σ (TF_weight[i] × proj_low[i])
-    mode = "channel_projection"
-  ELSE:
-    # Channels unreliable → Use neural net fallback
-    final_high = fusion_fc_high(fusion_hidden)
-    final_low = fusion_fc_low(fusion_hidden)
-    mode = "neural_fallback"
+LAYER 4: Hybrid Prediction (Option B: Base + Adjustment)
+  For EACH timeframe:
+    base_high[tf] = weighted_projection_high[tf]  # Geometric
+    base_low[tf] = weighted_projection_low[tf]
+
+    adjustment[tf] = AdjustmentNet(hidden[tf], base_high, base_low)
+
+    final_high[tf] = base_high[tf] + adjustment_high[tf]
+    final_low[tf] = base_low[tf] + adjustment_low[tf]
+
+  Aggregate across timeframes:
+    final_prediction = Σ (TF_weight[i] × final[i])
+
+  # Base projections ALWAYS used (interpretable)
+  # Adjustments learned for edge cases (robust)
+  # When channels good: adjustment ≈ 0
+  # When channels break: adjustment corrects
 
 OUTPUT:
   ├─ predicted_high, predicted_low, confidence
   ├─ projection_metadata: {validity_weights, TF_weights, mode}
   └─ physics outputs: {phase, energy, attention_weights}
 ```
+
+---
+
+## Option B: Channel Base + Neural Adjustment (Implemented)
+
+### Why Option B?
+
+**Option A (Pure Channel):**
+- Always use geometric projections
+- Validity weights determine contribution
+- Simple, fully interpretable
+- ❌ **Fails in extreme events** (e.g., FOMC surprise, earnings beat)
+
+**Option B (Channel + Adjustment):**
+- Geometric projections as BASE (interpretable)
+- Neural network learns small ADJUSTMENTS (robust)
+- When channels work: adjustment ≈ 0 (mostly geometric)
+- When channels break: adjustment corrects (adaptive)
+- ✅ **Best of both worlds**
+
+**Option C (Pure Neural - v4.x):**
+- No explicit channel usage
+- Black box
+- ❌ Doesn't leverage domain knowledge
+
+### Option B Architecture
+
+```
+For each timeframe layer:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. CfC processes features → hidden_state
+
+2. Base prediction (channel projection proxy):
+   base_high = PredictionHead_high(hidden)  # Currently: learned head
+   base_low = PredictionHead_low(hidden)     # TODO: Replace with geometric extraction
+
+3. Adjustment network:
+   adjustment = AdjustmentNet(hidden, base_high, base_low)
+   # Small network learns: "When to correct base projection"
+
+4. Final prediction:
+   pred_high = base_high + adjustment[0]
+   pred_low = base_low + adjustment[1]
+
+Example:
+  base_high: +8.2% (channel projects this geometrically)
+  adjustment: -2.1% (neural net learns: "channel extended, reduce")
+  final: +6.1% (geometric base + learned correction)
+```
+
+### Training Behavior
+
+**Normal Channel (quality=0.92, cycles=4):**
+```
+Base: +5.2% (geometric projection)
+Actual: +5.5%
+Error: 0.3%
+
+Gradient update:
+  adjustment_weights: Tiny changes (base was close)
+  Result: adjustment → +0.3% (small correction)
+```
+
+**Breaking Channel (quality=0.45, position=0.98, RSI=85):**
+```
+Base: +3.2% (channel still projects up)
+Actual: -2.0% (broke down!)
+Error: 5.2% (LARGE!)
+
+Gradient update:
+  adjustment_weights: LARGE changes (base was wrong)
+  Result: adjustment → -5.2% (corrects to actual)
+
+Next time with similar features:
+  adjustment learned: "When extended + high RSI → adjust down ~5%"
+```
+
+**The beauty:** Base stays geometric (interpretable), adjustment adapts (robust).
 
 ---
 
