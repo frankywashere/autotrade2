@@ -3172,7 +3172,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     'val_loss': avg_val_loss,
                     'args': vars(args),
                     # CRITICAL: Save model architecture params for future compatibility
-                    'input_size': model_to_save.input_size,
+                    'input_sizes': model_to_save.input_sizes,  # v4.x: Dict[str, int] for native TF mode
                     'hidden_size': model_to_save.hidden_size,
                     'internal_neurons_ratio': model_to_save.internal_neurons_ratio
                 }, output_path)

@@ -53,7 +53,7 @@ class PredictionService:
     _cache_ttl = timedelta(minutes=5)
 
     # Feature dimensions - loaded from model checkpoint (single source of truth)
-    _expected_features = None  # Will be set from model.input_size when loaded
+    _expected_features = None  # Will be set from model.input_sizes when loaded
     SEQUENCE_LENGTH = 200
 
     # v4.0: 11 timeframes for layer predictions
@@ -92,8 +92,13 @@ class PredictionService:
             self._model.eval()
 
             # Set expected features from model (single source of truth)
-            PredictionService._expected_features = self._model.input_size
-            logger.info(f"Model loaded successfully (input_size={self._model.input_size})")
+            # v4.x: input_sizes is a dict, use 5min as reference (or first available)
+            input_sizes = self._model.input_sizes
+            if input_sizes:
+                PredictionService._expected_features = input_sizes.get('5min', list(input_sizes.values())[0])
+            else:
+                PredictionService._expected_features = 900  # fallback default
+            logger.info(f"Model loaded successfully (input_sizes={input_sizes})")
 
     def _get_feature_extractor(self):
         """Get feature extractor (singleton)"""
