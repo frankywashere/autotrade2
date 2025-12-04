@@ -1005,6 +1005,27 @@ class TradingFeatureExtractor(FeatureExtractor):
                     monthly_columns = [f'monthly_3month_col_{i}' for i in range(monthly_array.shape[1])]
                     print(f"   ⚠️  Monthly column names not in metadata, using generic names")
 
+                # Check row count alignment
+                chunk_rows = full_features.shape[0]
+                monthly_rows = monthly_array.shape[0]
+                if chunk_rows != monthly_rows:
+                    print(f"\n" + "=" * 70)
+                    print(f"   ❌ CACHE ROW COUNT MISMATCH DETECTED!")
+                    print(f"=" * 70)
+                    print(f"   Chunks total:    {chunk_rows:,} rows")
+                    print(f"   Monthly shard:   {monthly_rows:,} rows")
+                    print(f"   Difference:      {abs(monthly_rows - chunk_rows):,} rows")
+                    print(f"")
+                    print(f"   This means your cache shards were created with different data ranges.")
+                    print(f"   FIX: Delete cache and regenerate:")
+                    print(f"        rm -rf data/feature_cache/features_mmap_*")
+                    print(f"        rm -rf data/feature_cache/monthly_3month_*")
+                    print(f"=" * 70 + "\n")
+                    raise ValueError(
+                        f"Cache row count mismatch: chunks={chunk_rows:,} vs monthly={monthly_rows:,}. "
+                        f"Delete cache and regenerate."
+                    )
+
                 # Concatenate monthly features to main features
                 full_features = np.hstack([full_features, monthly_array[:]])
                 feature_columns = feature_columns + monthly_columns
@@ -1148,6 +1169,27 @@ class TradingFeatureExtractor(FeatureExtractor):
                 monthly_array = np.load(str(monthly_path), mmap_mode='r')
                 monthly_columns = monthly_shard_info.get('columns', [])
                 print(f"   📂 Monthly shard: {monthly_array.shape[1]} columns (memory-mapped)")
+
+                # Check row count alignment with chunks
+                chunk_total_rows = mmap_meta.get('total_rows', 0)
+                monthly_rows = monthly_array.shape[0]
+                if chunk_total_rows > 0 and chunk_total_rows != monthly_rows:
+                    print(f"\n" + "=" * 70)
+                    print(f"   ❌ CACHE ROW COUNT MISMATCH DETECTED!")
+                    print(f"=" * 70)
+                    print(f"   Chunks total:    {chunk_total_rows:,} rows")
+                    print(f"   Monthly shard:   {monthly_rows:,} rows")
+                    print(f"   Difference:      {abs(monthly_rows - chunk_total_rows):,} rows")
+                    print(f"")
+                    print(f"   This means your cache shards were created with different data ranges.")
+                    print(f"   FIX: Delete cache and regenerate:")
+                    print(f"        rm -rf data/feature_cache/features_mmap_*")
+                    print(f"        rm -rf data/feature_cache/monthly_3month_*")
+                    print(f"=" * 70 + "\n")
+                    raise ValueError(
+                        f"Cache row count mismatch: chunks={chunk_total_rows:,} vs monthly={monthly_rows:,}. "
+                        f"Delete cache and regenerate."
+                    )
 
         # Load non-channel features (contains tsla_close, spy_close, etc.)
         non_channel_path = cache_dir / f"non_channel_features_{mmap_meta['cache_key']}.pkl"
@@ -2113,7 +2155,12 @@ class TradingFeatureExtractor(FeatureExtractor):
         print(f"     Total period: {start_date.date()} to {end_date.date()} ({total_years:.1f} years)")
 
         # Create chunk date ranges
+        # Use YS (Year Start) but prepend actual start_date to avoid losing partial first year
+        # Bug fix: pd.date_range with freq='1YS' skips to next Jan 1st, dropping data before that
         chunk_starts = pd.date_range(start=start_date, end=end_date, freq=f'{chunk_size_years}YS')
+        # Prepend start_date if it's before the first YS boundary (e.g., 2015-01-02 < 2016-01-01)
+        if len(chunk_starts) == 0 or chunk_starts[0] > start_date:
+            chunk_starts = pd.DatetimeIndex([start_date]).append(chunk_starts)
         if chunk_starts[-1] < end_date:
             chunk_starts = chunk_starts.append(pd.DatetimeIndex([end_date]))
 
