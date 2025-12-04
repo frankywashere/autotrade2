@@ -167,7 +167,11 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     results[f'{w_prefix}_insufficient_data'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
                     results[f'{w_prefix}_duration'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
-                # Total: 21 windows × 32 features = 672 features per (symbol, timeframe) pair (v3.17: +4 complete_cycles)
+                    # v5.0: Channel projections (geometric predictions)
+                    results[f'{w_prefix}_projected_high'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_projected_low'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+
+                # Total: 21 windows × 34 features = 714 features per (symbol, timeframe) pair (v5.0: +2 projections)
 
                 # Handle insufficient data
                 if len(resampled) < 20:
@@ -321,6 +325,13 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                         results[f'{w_prefix}_is_valid'][indices] = channel.is_valid
                         results[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
                         results[f'{w_prefix}_duration'][indices] = channel.actual_duration
+
+                        # v5.0: Channel projections (geometric predictions from linear regression)
+                        # Convert from absolute price to percentage
+                        projected_high_pct = (channel.predicted_high - current_price) / current_price * 100 if current_price > 0 else 0.0
+                        projected_low_pct = (channel.predicted_low - current_price) / current_price * 100 if current_price > 0 else 0.0
+                        results[f'{w_prefix}_projected_high'][indices] = projected_high_pct
+                        results[f'{w_prefix}_projected_low'][indices] = projected_low_pct
 
                 # DEBUG: After mapping loop
                 # print(f"   🗺️  Worker {worker_id}: Mapping complete, {len(results)} features ready", flush=True)

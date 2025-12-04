@@ -37,7 +37,8 @@ except ImportError:
 # Feature cache version - increment when calculation logic changes
 VIX_CALC_VERSION = "v1"  # v4.4: Track VIX feature calculation version (increment if VIX logic changes)
 EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
-FEATURE_VERSION = f"v3.20_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}"  # 21-window + complete_cycles + hybrid monthly/3month + 15 VIX features + event features
+CHANNEL_PROJECTION_VERSION = "v1"  # v5.0: Track channel projection features
+FEATURE_VERSION = f"v5.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}"  # 21-window + complete_cycles + hybrid monthly/3month + VIX + events + channel projections
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
 # Each layer sees enough bars at its native resolution to learn channel patterns
@@ -1819,7 +1820,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                                                 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
                                                 'complete_cycles', 'complete_cycles_0_5pct', 'complete_cycles_1_0pct', 'complete_cycles_3_0pct',
                                                 'is_bull', 'is_bear', 'is_sideways',
-                                                'quality_score', 'is_valid', 'insufficient_data', 'duration']:
+                                                'quality_score', 'is_valid', 'insufficient_data', 'duration',
+                                                'projected_high', 'projected_low']:  # v5.0: Channel projections
                                         channel_features[f'{w_prefix}_{feat}'] = np.zeros(num_rows, dtype=config.NUMPY_DTYPE)
 
                                 # Store features (vectorized - no loop for memory efficiency)
@@ -1854,6 +1856,12 @@ class TradingFeatureExtractor(FeatureExtractor):
                                 channel_features[f'{w_prefix}_is_valid'][indices] = channel.is_valid
                                 channel_features[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
                                 channel_features[f'{w_prefix}_duration'][indices] = channel.actual_duration
+
+                                # v5.0: Store channel projections (geometric predictions)
+                                projected_high_pct = (channel.predicted_high - current_price) / current_price * 100 if current_price > 0 else 0.0
+                                projected_low_pct = (channel.predicted_low - current_price) / current_price * 100 if current_price > 0 else 0.0
+                                channel_features[f'{w_prefix}_projected_high'][indices] = projected_high_pct
+                                channel_features[f'{w_prefix}_projected_low'][indices] = projected_low_pct
 
                     # Update progress: Mark current as complete
                     if using_rich and tf_tasks:

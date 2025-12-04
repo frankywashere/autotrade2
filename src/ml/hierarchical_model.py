@@ -41,6 +41,98 @@ sys.path.insert(0, str(parent_dir))
 import config as project_config
 
 
+class ChannelProjectionExtractor(nn.Module):
+    """
+    v5.0: Extracts and weights channel projections from features.
+
+    For each timeframe, combines 21 window projections weighted by learned validity.
+    Each window's projection is a geometric channel projection (slope × horizon).
+    Neural network learns which windows to trust based on quality metrics.
+    """
+
+    def __init__(self, timeframe: str, hidden_size: int, num_windows: int = 21):
+        """
+        Args:
+            timeframe: Timeframe name (e.g., '5min', '1h', 'daily')
+            hidden_size: Size of CfC hidden state
+            num_windows: Number of window sizes (default: 21)
+        """
+        super().__init__()
+        self.timeframe = timeframe
+        self.hidden_size = hidden_size
+        self.num_windows = num_windows
+
+        # Validity predictor: learns which window projections to trust
+        # Input: hidden_state (128) + quality_score (1) + r_squared (1) + complete_cycles (1) + position (1) = 132
+        self.validity_net = nn.Sequential(
+            nn.Linear(hidden_size + 4, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()  # 0-1 validity score
+        )
+
+    def forward(
+        self,
+        hidden_state: torch.Tensor,
+        projections: torch.Tensor,
+        quality_scores: torch.Tensor,
+        r_squared: torch.Tensor,
+        complete_cycles: torch.Tensor,
+        position: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Combine window projections weighted by learned validity.
+
+        Args:
+            hidden_state: [batch, hidden_size] - CfC layer output
+            projections: [batch, num_windows, 2] - (high, low) projections for each window
+            quality_scores: [batch, num_windows] - Quality score per window
+            r_squared: [batch, num_windows] - R² per window
+            complete_cycles: [batch, num_windows] - Complete cycles per window
+            position: [batch, num_windows] - Channel position per window
+
+        Returns:
+            dict with weighted_high, weighted_low, validity_weights
+        """
+        batch_size = hidden_state.shape[0]
+
+        # Calculate validity for each window
+        validity_list = []
+        for w in range(self.num_windows):
+            # Combine hidden state with window-specific quality metrics
+            window_context = torch.cat([
+                hidden_state,
+                quality_scores[:, w:w+1],
+                r_squared[:, w:w+1],
+                complete_cycles[:, w:w+1],
+                position[:, w:w+1]
+            ], dim=-1)  # [batch, hidden_size + 4]
+
+            validity = self.validity_net(window_context)  # [batch, 1]
+            validity_list.append(validity)
+
+        # Stack validities: [batch, num_windows]
+        validity_weights = torch.cat(validity_list, dim=-1)
+
+        # Normalize to sum to 1 (softmax)
+        validity_weights_norm = F.softmax(validity_weights, dim=-1)  # [batch, num_windows]
+
+        # Weighted combination of projections
+        # projections shape: [batch, num_windows, 2]
+        weighted_high = (projections[:, :, 0] * validity_weights_norm).sum(dim=-1, keepdim=True)  # [batch, 1]
+        weighted_low = (projections[:, :, 1] * validity_weights_norm).sum(dim=-1, keepdim=True)   # [batch, 1]
+
+        return {
+            'weighted_high': weighted_high,
+            'weighted_low': weighted_low,
+            'validity_weights': validity_weights_norm,  # For interpretability
+            'raw_validities': validity_weights  # Before softmax
+        }
+
+
 class HierarchicalLNN(nn.Module, ModelBase):
     """
     Hierarchical Liquid Neural Network with 11 temporal scales (v4.0).
@@ -91,6 +183,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.device_type = device
         self.multi_task = multi_task
         self.use_fusion_head = use_fusion_head
+        self.use_channel_projections = True  # v5.0: Enable channel-based predictions
 
         # Backward compatibility: if old-style single input_size provided
         if input_size is not None and not input_sizes:
@@ -271,6 +364,18 @@ class HierarchicalLNN(nn.Module, ModelBase):
             hidden_size=hidden_size,
             n_timeframes=len(self.TIMEFRAMES)
         )
+
+        # =========================================================================
+        # v5.0: CHANNEL PROJECTION EXTRACTORS (one per timeframe)
+        # =========================================================================
+        # Each extractor learns which of 21 window projections to trust
+        self.projection_extractors = nn.ModuleDict({
+            tf: ChannelProjectionExtractor(
+                timeframe=tf,
+                hidden_size=hidden_size,
+                num_windows=21  # 21 window sizes per timeframe
+            ) for tf in self.TIMEFRAMES
+        })
 
         # Move to device
         self.to(device)
