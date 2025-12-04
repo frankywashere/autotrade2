@@ -27,6 +27,12 @@ from ncps.torch import CfC
 from ncps.wirings import AutoNCP
 
 from .base import ModelBase
+from .physics_attention import (
+    CoulombTimeframeAttention,
+    MarketPhaseClassifier,
+    TimeframeInteractionHierarchy,
+    EnergyBasedConfidence
+)
 
 # Import config for timeframe settings
 import sys
@@ -57,6 +63,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         internal_neurons_ratio: float = 2.0,  # Total neurons = hidden_size × ratio
         device: str = 'cpu',
         multi_task: bool = True,  # Enable multi-task heads
+        use_fusion_head: bool = True,  # v4.1: Can disable for physics-only mode
         # Backward compatibility
         input_size: int = None,  # Deprecated: use input_sizes dict
     ):
@@ -71,6 +78,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
             internal_neurons_ratio: Total neurons = hidden_size × ratio (default: 2.0 → 256 total)
             device: 'cuda', 'mps', or 'cpu'
             multi_task: Enable multi-task prediction heads
+            use_fusion_head: If True, use fusion head for final predictions.
+                           If False, use physics-based aggregation from Coulomb attention.
             input_size: [DEPRECATED] Single input size (for backward compatibility only)
         """
         super().__init__()
@@ -81,6 +90,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.total_neurons = int(hidden_size * internal_neurons_ratio)
         self.device_type = device
         self.multi_task = multi_task
+        self.use_fusion_head = use_fusion_head
 
         # Backward compatibility: if old-style single input_size provided
         if input_size is not None and not input_sizes:
@@ -130,8 +140,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.fusion_fc_low = nn.Linear(self.fusion_output_dim, 1)
         self.fusion_fc_conf = nn.Linear(self.fusion_output_dim, 1)
 
-        # Learnable fusion weights for each layer
-        self.fusion_weights = nn.Parameter(torch.ones(self.NUM_LAYERS) / self.NUM_LAYERS)
+        # NOTE: Static fusion_weights removed - replaced by dynamic CoulombTimeframeAttention
 
         # =========================================================================
         # MULTI-TASK HEADS
@@ -236,6 +245,33 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 nn.Sigmoid()
             )
 
+        # =========================================================================
+        # PHYSICS-INSPIRED MODULES (GWC-based)
+        # =========================================================================
+        # Dynamic timeframe attention based on screened Coulomb potential
+        self.coulomb_attention = CoulombTimeframeAttention(
+            hidden_size=hidden_size,
+            n_timeframes=len(self.TIMEFRAMES)
+        )
+
+        # Explicit V₁, V₂, V₃ interaction hierarchy
+        self.interaction_hierarchy = TimeframeInteractionHierarchy(
+            hidden_size=hidden_size,
+            n_timeframes=len(self.TIMEFRAMES)
+        )
+
+        # Market phase classifier
+        self.phase_classifier = MarketPhaseClassifier(
+            hidden_size=hidden_size,
+            n_timeframes=len(self.TIMEFRAMES)
+        )
+
+        # Energy-based confidence scorer
+        self.energy_scorer = EnergyBasedConfidence(
+            hidden_size=hidden_size,
+            n_timeframes=len(self.TIMEFRAMES)
+        )
+
         # Move to device
         self.to(device)
 
@@ -333,7 +369,24 @@ class HierarchicalLNN(nn.Module, ModelBase):
             layer_confidences.append(pred_conf)
 
         # =========================================================================
-        # FUSION HEAD
+        # PHYSICS-INSPIRED PROCESSING
+        # =========================================================================
+        # Build dict of final hidden states for physics modules
+        tf_hidden_dict = {tf: all_hidden[i] for i, tf in enumerate(self.TIMEFRAMES) if i < len(all_hidden)}
+
+        # Apply Coulomb attention - dynamic cross-timeframe attention
+        if hasattr(self, 'coulomb_attention') and len(tf_hidden_dict) == len(self.TIMEFRAMES):
+            tf_hidden_dict = self.coulomb_attention(tf_hidden_dict)
+            # Update all_hidden with attended states
+            all_hidden = [tf_hidden_dict[tf] for tf in self.TIMEFRAMES]
+
+        # Apply interaction hierarchy - V₁, V₂, V₃ structured interactions
+        if hasattr(self, 'interaction_hierarchy') and len(tf_hidden_dict) == len(self.TIMEFRAMES):
+            tf_hidden_dict = self.interaction_hierarchy(tf_hidden_dict)
+            all_hidden = [tf_hidden_dict[tf] for tf in self.TIMEFRAMES]
+
+        # =========================================================================
+        # FUSION HEAD vs PHYSICS-BASED AGGREGATION
         # =========================================================================
         # Concatenate all layer predictions: 11 × 3 = 33
         all_layer_preds = torch.cat(layer_predictions, dim=-1)  # [batch, 33]
@@ -344,26 +397,84 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
         self.last_market_state = market_state.detach()
 
-        # Fusion input: 33 + 12 = 45
-        fusion_input = torch.cat([all_layer_preds, market_state], dim=-1)
+        if self.use_fusion_head:
+            # Standard fusion head approach
+            # Fusion input: 33 + 12 = 45
+            fusion_input = torch.cat([all_layer_preds, market_state], dim=-1)
 
-        # Fusion network
-        fusion_hidden = F.relu(self.fusion_fc1(fusion_input))
-        fusion_hidden = F.relu(self.fusion_fc2(fusion_hidden))
+            # Fusion network
+            fusion_hidden = F.relu(self.fusion_fc1(fusion_input))
+            fusion_hidden = F.relu(self.fusion_fc2(fusion_hidden))
 
-        # Primary predictions
-        final_pred_high = self.fusion_fc_high(fusion_hidden)
-        final_pred_low = self.fusion_fc_low(fusion_hidden)
-        final_pred_conf = torch.sigmoid(self.fusion_fc_conf(fusion_hidden))
+            # Primary predictions
+            final_pred_high = self.fusion_fc_high(fusion_hidden)
+            final_pred_low = self.fusion_fc_low(fusion_hidden)
+            final_pred_conf = torch.sigmoid(self.fusion_fc_conf(fusion_hidden))
+        else:
+            # Physics-based aggregation: weighted average of per-TF predictions
+            # Use per-TF confidences as attention weights (already transformed by physics modules)
 
-        predictions = torch.cat([final_pred_high, final_pred_low, final_pred_conf], dim=-1)
+            # Extract per-TF predictions from layer_predictions
+            per_tf_highs = []
+            per_tf_lows = []
+            per_tf_confs = []
+            for i in range(len(self.TIMEFRAMES)):
+                idx = i * 3
+                per_tf_highs.append(layer_predictions[idx])     # [batch, 1]
+                per_tf_lows.append(layer_predictions[idx + 1])  # [batch, 1]
+                per_tf_confs.append(layer_predictions[idx + 2]) # [batch, 1]
+
+            per_tf_highs = torch.cat(per_tf_highs, dim=-1)  # [batch, 11]
+            per_tf_lows = torch.cat(per_tf_lows, dim=-1)    # [batch, 11]
+            per_tf_confs = torch.cat(per_tf_confs, dim=-1)  # [batch, 11]
+
+            # Use confidence as attention weights
+            weights = F.softmax(per_tf_confs, dim=-1)  # [batch, 11]
+
+            # Weighted average
+            final_pred_high = (per_tf_highs * weights).sum(dim=-1, keepdim=True)  # [batch, 1]
+            final_pred_low = (per_tf_lows * weights).sum(dim=-1, keepdim=True)    # [batch, 1]
+            final_pred_conf = (per_tf_confs * weights).sum(dim=-1, keepdim=True)  # [batch, 1]
+
+            # For multi-task heads, we still need fusion_hidden
+            # Create a simple representation from physics-enhanced hidden states
+            fusion_input = torch.cat([all_layer_preds, market_state], dim=-1)
+            fusion_hidden = F.relu(self.fusion_fc1(fusion_input))
+            fusion_hidden = F.relu(self.fusion_fc2(fusion_hidden))
+
+        # =========================================================================
+        # PHYSICS-INSPIRED OUTPUTS
+        # =========================================================================
+        # Phase classification
+        if hasattr(self, 'phase_classifier') and len(tf_hidden_dict) == len(self.TIMEFRAMES):
+            phase_output = self.phase_classifier(tf_hidden_dict)
+        else:
+            phase_output = None
+
+        # Energy-based confidence adjustment
+        if hasattr(self, 'energy_scorer') and len(tf_hidden_dict) == len(self.TIMEFRAMES):
+            energy_output = self.energy_scorer(
+                tf_hidden_dict,
+                base_confidence=final_pred_conf.squeeze(-1)
+            )
+            # Use energy-adjusted confidence for final prediction
+            adjusted_conf = energy_output['adjusted_confidence'].unsqueeze(-1)
+            predictions = torch.cat([final_pred_high, final_pred_low, adjusted_conf], dim=-1)
+        else:
+            energy_output = None
+            predictions = torch.cat([final_pred_high, final_pred_low, final_pred_conf], dim=-1)
 
         # Build output dict
         output_dict = {
             'hidden_states': layer_hidden_states,
-            'fusion_weights': F.softmax(self.fusion_weights, dim=0),
-            'layer_predictions': {}
+            'layer_predictions': {},
         }
+
+        # Add physics outputs
+        if phase_output is not None:
+            output_dict['phase'] = phase_output
+        if energy_output is not None:
+            output_dict['energy'] = energy_output
 
         # Store per-layer predictions
         for i, tf in enumerate(self.TIMEFRAMES):
@@ -550,8 +661,22 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 'predicted_low': pred_low,
                 'confidence': pred_conf,
                 'hidden_states': output_dict['hidden_states'],
-                'fusion_weights': output_dict['fusion_weights'].cpu().numpy().tolist()
             }
+
+            # Add physics outputs if available
+            if 'phase' in output_dict:
+                result['phase'] = {
+                    'id': output_dict['phase']['phase_id'][0].item(),
+                    'name': output_dict['phase']['phase_names'][output_dict['phase']['phase_id'][0].item()],
+                    'probs': output_dict['phase']['phase_probs'][0].cpu().numpy().tolist(),
+                    'entropy': output_dict['phase']['phase_entropy'][0].item()
+                }
+            if 'energy' in output_dict:
+                result['energy'] = {
+                    'total': output_dict['energy']['energy'][0].item(),
+                    'confidence': output_dict['energy']['energy_confidence'][0].item(),
+                    'temperature': output_dict['energy']['temperature'].item()
+                }
 
             # Add per-layer predictions
             for tf in self.TIMEFRAMES:
@@ -636,8 +761,13 @@ class HierarchicalLNN(nn.Module, ModelBase):
                         'confidence_original': pred_dict['confidence'],
                         'decay_factor': decay_factor,
                         'validation_time': validation_time.isoformat(),
-                        'fusion_weights': pred_dict['fusion_weights']
                     }
+
+                    # Add physics outputs if available
+                    if 'phase' in pred_dict:
+                        projection['phase'] = pred_dict['phase']
+                    if 'energy' in pred_dict:
+                        projection['energy'] = pred_dict['energy']
 
                     if 'breakout' in pred_dict:
                         projection['breakout'] = pred_dict['breakout']
@@ -714,16 +844,18 @@ class HierarchicalLNN(nn.Module, ModelBase):
         checkpoint = {
             'model_state_dict': self.state_dict(),
             'model_type': 'HierarchicalLNN',
-            'model_version': '4.0',
+            'model_version': '4.2',  # Updated for use_fusion_head flag
             'input_sizes': self.input_sizes,
             'hidden_size': self.hidden_size,
             'internal_neurons_ratio': self.internal_neurons_ratio,
             'total_neurons': self.total_neurons,
             'device_type': self.device_type,
             'multi_task': self.multi_task,
+            'use_fusion_head': self.use_fusion_head,  # v4.2: Physics-only mode option
             'timeframes': self.TIMEFRAMES,
             'num_layers': self.NUM_LAYERS,
             'fusion_input_dim': self.FUSION_INPUT_DIM,
+            'has_physics_modules': True,  # GWC-inspired physics attention
         }
 
         if metadata:
@@ -776,13 +908,17 @@ def load_hierarchical_model(model_path: str, device: str = 'cpu') -> Hierarchica
     hidden_size = checkpoint.get('hidden_size') or args.get('hidden_size', 128)
     internal_neurons_ratio = checkpoint.get('internal_neurons_ratio') or args.get('internal_neurons_ratio', 2.0)
 
+    # v4.2: Get use_fusion_head (default True for backward compatibility)
+    use_fusion_head = checkpoint.get('use_fusion_head', True)
+
     # Create model
     model = HierarchicalLNN(
         input_sizes=input_sizes,
         hidden_size=hidden_size,
         internal_neurons_ratio=internal_neurons_ratio,
         device=device,
-        multi_task=checkpoint.get('multi_task') or args.get('multi_task', True)
+        multi_task=checkpoint.get('multi_task') or args.get('multi_task', True),
+        use_fusion_head=use_fusion_head
     )
 
     # Handle DataParallel checkpoints

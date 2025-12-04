@@ -667,7 +667,10 @@ def train_epoch(
             'breakout_occurred': 0.4,
             'breakout_direction': 0.3,
             'breakout_bars_log': 0.2,
-            'breakout_magnitude': 0.2
+            'breakout_magnitude': 0.2,
+            # Physics-inspired weights (v4.1 GWC)
+            'phase_entropy': 0.05,    # Encourage confident phase predictions
+            'energy_reg': 0.01,       # Gentle energy regularization
         }
 
     # For DistributedSampler: update epoch for reproducible shuffling
@@ -928,6 +931,23 @@ def train_epoch(
                                 )
                             loss += per_tf_loss_weight * loss_tf_conf
 
+                # =========================================================================
+                # PHYSICS-INSPIRED LOSSES (v4.1 GWC)
+                # =========================================================================
+                # Phase classification loss (self-supervised: encourage confident predictions)
+                if 'phase' in hidden_states:
+                    phase_entropy = hidden_states['phase']['phase_entropy']
+                    # Low entropy = confident phase prediction = good
+                    loss_phase = phase_entropy.mean() * loss_weights.get('phase_entropy', 0.05)
+                    loss = loss + loss_phase
+
+                # Energy-based confidence regularization
+                if 'energy' in hidden_states:
+                    energy = hidden_states['energy']['energy']
+                    # Gentle regularization: prefer lower energy (more stable) configurations
+                    energy_reg = energy.mean() * loss_weights.get('energy_reg', 0.01)
+                    loss = loss + energy_reg
+
             # AMP backward pass
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -1106,6 +1126,23 @@ def train_epoch(
                             per_tf_cont_targets[conf_key]
                         )
                         loss += per_tf_loss_weight * loss_tf_conf
+
+            # =========================================================================
+            # PHYSICS-INSPIRED LOSSES (v4.1 GWC)
+            # =========================================================================
+            # Phase classification loss (self-supervised: encourage confident predictions)
+            if 'phase' in hidden_states:
+                phase_entropy = hidden_states['phase']['phase_entropy']
+                # Low entropy = confident phase prediction = good
+                loss_phase = phase_entropy.mean() * loss_weights.get('phase_entropy', 0.05)
+                loss = loss + loss_phase
+
+            # Energy-based confidence regularization
+            if 'energy' in hidden_states:
+                energy = hidden_states['energy']['energy']
+                # Gentle regularization: prefer lower energy (more stable) configurations
+                energy_reg = energy.mean() * loss_weights.get('energy_reg', 0.01)
+                loss = loss + energy_reg
 
             # Standard backward pass
             optimizer.zero_grad(set_to_none=True)
@@ -2104,6 +2141,13 @@ def interactive_setup(args, profiler=None):
         default=dflt('multi_task', True)
     ).execute()
 
+    # Fusion head vs physics-only mode
+    print()
+    args.use_fusion_head = inquirer.confirm(
+        message="Use fusion head? (No = physics-based aggregation only)",
+        default=dflt('use_fusion_head', True)
+    ).execute()
+
     # Output path
     print()
     args.output = inquirer.text(
@@ -2153,6 +2197,8 @@ def interactive_setup(args, profiler=None):
           f"(horizon {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars)")
     print(f"  Model Capacity: internal_ratio={args.internal_neurons_ratio}, hidden_size={args.hidden_size}")
     print(f"  Multi-Task: {'Enabled' if args.multi_task else 'Disabled'}")
+    fusion_mode = 'Fusion Head' if getattr(args, 'use_fusion_head', True) else 'Physics-Only (GWC)'
+    print(f"  Aggregation: {fusion_mode}")
     print(f"  Output: {args.output}")
     if selected_cache_pair:
         print(f"  Cache reuse: {selected_cache_pair.get('cache_key')} from {args.shard_path}")
@@ -2813,6 +2859,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             internal_neurons_ratio=args.internal_neurons_ratio,
             device=args.device,
             multi_task=args.multi_task,
+            use_fusion_head=getattr(args, 'use_fusion_head', True),
         )
     else:
         # Legacy mode - same size for all timeframes
@@ -2822,6 +2869,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             internal_neurons_ratio=args.internal_neurons_ratio,
             device=args.device,
             multi_task=args.multi_task,
+            use_fusion_head=getattr(args, 'use_fusion_head', True),
         )
 
     if profiler:
@@ -3294,6 +3342,10 @@ def main():
                         help='Path to configuration YAML file')
     parser.add_argument('--multi_task', action='store_true', default=True,
                         help='Enable multi-task learning (default: True)')
+    parser.add_argument('--use-fusion-head', dest='use_fusion_head', action='store_true', default=True,
+                        help='Use fusion head for final predictions (default: True)')
+    parser.add_argument('--no-fusion-head', dest='use_fusion_head', action='store_false',
+                        help='Disable fusion head, use physics-based aggregation instead')
     parser.add_argument('--amp', action='store_true', default=False,
                         help='Enable Automatic Mixed Precision (CUDA only, 2-3x faster)')
     parser.add_argument('--use-compile', dest='use_compile', action='store_true', default=False,
