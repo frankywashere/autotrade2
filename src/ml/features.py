@@ -35,7 +35,9 @@ except ImportError:
     GPU_ROLLING_AVAILABLE = False
 
 # Feature cache version - increment when calculation logic changes
-FEATURE_VERSION = "v3.20_vix"  # 21-window + complete_cycles + hybrid monthly/3month + 15 VIX features
+VIX_CALC_VERSION = "v1"  # v4.4: Track VIX feature calculation version (increment if VIX logic changes)
+EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
+FEATURE_VERSION = f"v3.20_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}"  # 21-window + complete_cycles + hybrid monthly/3month + 15 VIX features + event features
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
 # Each layer sees enough bars at its native resolution to learn channel patterns
@@ -437,8 +439,29 @@ class TradingFeatureExtractor(FeatureExtractor):
             unified_cache_dir = Path('data/feature_cache')
         unified_cache_dir.mkdir(exist_ok=True, parents=True)
 
-        # Generate unified cache key (version + date range + length + horizon)
-        cache_key = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}_h24"
+        # Generate unified cache key (version + date range + length + horizon + VIX/Events timestamps)
+        # v4.4: Include VIX and Events file timestamps to detect stale data
+        vix_suffix = ""
+        if vix_data is not None:
+            try:
+                vix_csv_path = Path(config.DATA_DIR) / "VIX_History.csv"
+                if vix_csv_path.exists():
+                    vix_mtime = int(vix_csv_path.stat().st_mtime)
+                    vix_suffix = f"_vix{vix_mtime}"
+            except Exception:
+                pass  # If VIX file not accessible, skip suffix
+
+        events_suffix = ""
+        if events_handler is not None:
+            try:
+                events_csv_path = Path(config.TSLA_EVENTS_FILE) if hasattr(config, 'TSLA_EVENTS_FILE') else None
+                if events_csv_path and events_csv_path.exists():
+                    events_mtime = int(events_csv_path.stat().st_mtime)
+                    events_suffix = f"_ev{events_mtime}"
+            except Exception:
+                pass  # If events file not accessible, skip suffix
+
+        cache_key = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}_{len(df)}{vix_suffix}{events_suffix}_h24"
 
         # Upfront cache validation
         print(f"\n📂 Cache Location: {unified_cache_dir}")

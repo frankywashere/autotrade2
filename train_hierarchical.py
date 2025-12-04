@@ -561,6 +561,13 @@ def save_cache_manifest(
         # Determine cache type
         cache_type = "mmap" if mmap_meta_path else "pickle"
 
+        # v4.4: Convert paths to filenames only (all files in cache_dir, portable)
+        def extract_filename(path):
+            """Extract filename from path (supports str and Path)."""
+            if path is None:
+                return None
+            return Path(path).name  # Just the filename, no directory
+
         manifest = {
             "cache_key": cache_key,
             "cache_type": cache_type,
@@ -578,13 +585,25 @@ def save_cache_manifest(
             "prediction_horizon": args.prediction_horizon,
             "precision": project_config.TRAINING_PRECISION,
             "dtype": np.dtype(project_config.NUMPY_DTYPE).name,
-            "paths": {
-                "mmap_meta": mmap_meta_path,
-                "continuation_labels": continuation_path,
-                "non_channel_features": non_channel_path,
-                "pickle_channels": pickle_path,  # For non-chunked mode
+            "files": {
+                # v4.4: Filenames only (all files in cache_dir)
+                "mmap_meta": extract_filename(mmap_meta_path),
+                "continuation_labels": extract_filename(continuation_path),
+                "non_channel_features": extract_filename(non_channel_path),
+                "pickle_channels": extract_filename(pickle_path),
             },
-            "cache_dir": str(cache_dir),
+            "source_files": {
+                # v4.4: Track VIX/Events files for staleness detection
+                "vix_csv": "VIX_History.csv",
+                "vix_path": str(Path(project_config.DATA_DIR) / "VIX_History.csv") if hasattr(project_config, 'DATA_DIR') else None,
+                "vix_mtime": None,
+                "vix_size_bytes": None,
+                "events_csv": "tsla_events_REAL.csv",
+                "events_path": str(project_config.TSLA_EVENTS_FILE) if hasattr(project_config, 'TSLA_EVENTS_FILE') else None,
+                "events_mtime": None,
+                "events_count": None,
+            },
+            "cache_dir_ref": str(cache_dir),  # Reference only (for human debugging)
             "shard_storage_path": getattr(args, "shard_path", None),
             "use_chunking": getattr(args, "use_chunking", False),
             "use_gpu_features": getattr(args, "use_gpu_features", False),
@@ -603,19 +622,139 @@ def save_cache_manifest(
                 "multi_task": args.multi_task,
                 "hidden_size": args.hidden_size,
                 "internal_neurons_ratio": args.internal_neurons_ratio,
-                # v4.0: downsample params removed (11-layer architecture uses native TF data)
                 "num_workers": args.num_workers,
                 "preload": getattr(args, "preload", False),
                 "output": getattr(args, "output", None),
-                "model_version": "4.0",  # v4.0: 11-layer architecture
+                "model_version": "4.4",  # v4.4: 3-way split + cache improvements
+                "use_test_set": getattr(args, "use_test_set", False),
+                "test_split": getattr(args, "test_split", None),
             }
         }
+
+        # Populate VIX/Events metadata if files exist
+        try:
+            vix_csv_path = Path(project_config.DATA_DIR) / "VIX_History.csv" if hasattr(project_config, 'DATA_DIR') else None
+            if vix_csv_path and vix_csv_path.exists():
+                vix_stat = vix_csv_path.stat()
+                manifest["source_files"]["vix_mtime"] = int(vix_stat.st_mtime)
+                manifest["source_files"]["vix_size_bytes"] = vix_stat.st_size
+        except Exception:
+            pass
+
+        try:
+            events_csv_path = Path(project_config.TSLA_EVENTS_FILE) if hasattr(project_config, 'TSLA_EVENTS_FILE') else None
+            if events_csv_path and events_csv_path.exists():
+                events_stat = events_csv_path.stat()
+                manifest["source_files"]["events_mtime"] = int(events_stat.st_mtime)
+                manifest["source_files"]["events_size_bytes"] = events_stat.st_size
+                # Try to count events
+                try:
+                    events_df = pd.read_csv(events_csv_path)
+                    manifest["source_files"]["events_count"] = len(events_df)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
         print(f"   🗂️  Saved cache manifest: {manifest_path.name}")
     except Exception as e:
         print(f"   ⚠️  Could not save cache manifest ({type(e).__name__}): {e}")
+
+
+def validate_cache_from_manifest(manifest_path: Path, verbose: bool = True) -> dict:
+    """
+    Validate cache files using manifest (v4.4).
+
+    Args:
+        manifest_path: Path to cache_manifest_*.json file
+        verbose: If True, print validation messages
+
+    Returns:
+        dict with validation results and resolved paths
+    """
+    cache_dir = manifest_path.parent
+
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except Exception as e:
+        if verbose:
+            print(f"   ❌ Failed to load manifest: {e}")
+        return {"valid": False, "error": f"Manifest load failed: {e}"}
+
+    result = {
+        "valid": True,
+        "manifest": manifest,
+        "cache_dir": cache_dir,
+        "paths": {},
+        "missing_files": [],
+        "warnings": []
+    }
+
+    # Resolve and validate all files
+    files = manifest.get("files", {})
+
+    for key, filename in files.items():
+        if filename is None:
+            continue
+
+        file_path = cache_dir / filename
+        result["paths"][key] = file_path
+
+        if not file_path.exists():
+            result["valid"] = False
+            result["missing_files"].append(filename)
+
+    # Check VIX/Events staleness
+    source_files = manifest.get("source_files", {})
+
+    # VIX staleness check
+    if source_files.get("vix_mtime"):
+        try:
+            vix_csv_path = Path(source_files.get("vix_path", "data/VIX_History.csv"))
+            if vix_csv_path.exists():
+                current_vix_mtime = int(vix_csv_path.stat().st_mtime)
+                cached_vix_mtime = source_files["vix_mtime"]
+                if current_vix_mtime != cached_vix_mtime:
+                    from datetime import datetime
+                    result["warnings"].append({
+                        "type": "vix_stale",
+                        "message": f"VIX file updated: cached {datetime.fromtimestamp(cached_vix_mtime).date()}, current {datetime.fromtimestamp(current_vix_mtime).date()}"
+                    })
+        except Exception:
+            pass
+
+    # Events staleness check
+    if source_files.get("events_mtime"):
+        try:
+            events_csv_path = Path(source_files.get("events_path", "data/tsla_events_REAL.csv"))
+            if events_csv_path.exists():
+                current_events_mtime = int(events_csv_path.stat().st_mtime)
+                cached_events_mtime = source_files["events_mtime"]
+                if current_events_mtime != cached_events_mtime:
+                    from datetime import datetime
+                    result["warnings"].append({
+                        "type": "events_stale",
+                        "message": f"Events file updated: cached {datetime.fromtimestamp(cached_events_mtime).date()}, current {datetime.fromtimestamp(current_events_mtime).date()}"
+                    })
+        except Exception:
+            pass
+
+    # Print results
+    if verbose:
+        if result["valid"]:
+            print(f"   ✅ Manifest validation: All files found")
+            if result["warnings"]:
+                for warning in result["warnings"]:
+                    print(f"   ⚠️  {warning['message']}")
+        else:
+            print(f"   ❌ Manifest validation failed: {len(result['missing_files'])} files missing")
+            for filename in result["missing_files"]:
+                print(f"      Missing: {filename}")
+
+    return result
 
 
 def train_epoch(
@@ -2134,6 +2273,55 @@ def interactive_setup(args, profiler=None):
     # Workers are safe now - mmap data is read-only, no COW explosion
     args.preload = False
 
+    # Dataset split configuration
+    print()
+    args.use_test_set = inquirer.select(
+        message="Dataset split configuration:",
+        choices=[
+            Choice(value=True, name='3-way split: 85% train, 10% validation, 5% test (recommended) ⭐'),
+            Choice(value=False, name='2-way split: 90% train, 10% validation (classic)')
+        ],
+        default=dflt('use_test_set', True)
+    ).execute()
+
+    if args.use_test_set:
+        args.train_split = 0.85
+        args.val_split = 0.10
+        args.test_split = 0.05
+        print(f"   ✓ 3-way split: 85% train, 10% validation, 5% test")
+        print(f"   ℹ️  Test set will ONLY be evaluated after training completes")
+
+        # Split preview (estimated - actual dates shown during dataset creation)
+        total_years = args.train_end_year - args.train_start_year
+        train_years = total_years * 0.85
+        val_years = total_years * 0.10
+        test_years = total_years * 0.05
+
+        est_train_end_year = args.train_start_year + train_years
+        est_val_end_year = est_train_end_year + val_years
+
+        print(f"\n   📅 Estimated Split Ranges:")
+        print(f"      Train: {args.train_start_year} - ~{est_train_end_year:.1f} ({train_years:.1f} years)")
+        print(f"      Val:   ~{est_train_end_year:.1f} - ~{est_val_end_year:.1f} ({val_years:.1f} years)")
+        print(f"      Test:  ~{est_val_end_year:.1f} - {args.train_end_year} ({test_years:.1f} years)")
+        print(f"      (Actual dates shown during dataset creation)")
+    else:
+        args.train_split = 0.90
+        args.val_split = 0.10
+        args.test_split = None
+        print(f"   ✓ 2-way split: 90% train, 10% validation")
+
+        # Split preview
+        total_years = args.train_end_year - args.train_start_year
+        train_years = total_years * 0.90
+        val_years = total_years * 0.10
+        est_val_start_year = args.train_start_year + train_years
+
+        print(f"\n   📅 Estimated Split Ranges:")
+        print(f"      Train: {args.train_start_year} - ~{est_val_start_year:.1f} ({train_years:.1f} years)")
+        print(f"      Val:   ~{est_val_start_year:.1f} - {args.train_end_year} ({val_years:.1f} years)")
+        print(f"      (Actual dates shown during dataset creation)")
+
     # Multi-task learning
     print()
     args.multi_task = inquirer.confirm(
@@ -2600,12 +2788,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 if is_main_process(rank):
                     print(f"   🔄 Auto-discovered native timeframe meta: {potential_tf_meta.name}")
             else:
-                # Try to find any tf_meta file in cache dir
+                # Try to find any tf_meta file in cache dir (v4.4: sort by mtime, pick newest)
                 tf_meta_files = list(Path(cache_dir).glob("tf_meta_*.json"))
                 if tf_meta_files:
-                    args.tf_meta_path = str(tf_meta_files[0])
+                    # Sort by modification time (newest first) to pick most recent cache
+                    tf_meta_files_sorted = sorted(tf_meta_files, key=lambda p: p.stat().st_mtime, reverse=True)
+                    args.tf_meta_path = str(tf_meta_files_sorted[0])
                     if is_main_process(rank):
-                        print(f"   🔄 Auto-discovered native timeframe meta: {tf_meta_files[0].name}")
+                        if len(tf_meta_files) > 1:
+                            print(f"   🔄 Auto-discovered {len(tf_meta_files)} tf_meta files, using newest: {tf_meta_files_sorted[0].name}")
+                        else:
+                            print(f"   🔄 Auto-discovered native timeframe meta: {tf_meta_files_sorted[0].name}")
                 else:
                     if is_main_process(rank):
                         print(f"   ⚠️  Native timeframes enabled but no tf_meta_*.json found in {cache_dir}")
@@ -2686,7 +2879,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Don't pass profiler to dataset if using workers (can't be pickled for spawn)
     dataset_profiler = profiler if args.num_workers == 0 else None
 
-    train_dataset, val_dataset = create_hierarchical_dataset(
+    train_dataset, val_dataset, test_dataset = create_hierarchical_dataset(
         features_df=features_df,
         raw_ohlc_df=df,  # Must match features_df length (both from full df)
         continuation_labels_df=None,  # v4.3: No legacy DataFrame, use per-TF labels
@@ -2694,6 +2887,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         sequence_length=args.sequence_length,
         prediction_horizon=args.prediction_horizon,
         validation_split=args.val_split,
+        test_split=args.test_split if hasattr(args, 'test_split') else None,  # v4.4: Optional test split
         include_continuation=True,
         mmap_meta_path=mmap_meta_path,
         profiler=dataset_profiler,
@@ -2839,14 +3033,23 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     train_loader = DataLoader(train_dataset, **train_loader_kwargs)
     val_loader = DataLoader(val_dataset, **val_loader_kwargs)
 
+    # v4.4: Create test loader if test_dataset exists
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(test_dataset, **val_loader_kwargs)  # Use val kwargs (no shuffle, no drop_last)
+
     # Log memory after DataLoader creation (measure worker spawn impact)
     if profiler:
         profiler.snapshot("post_dataloader_creation", 0, force_log=True)
-        profiler.log_info(f"DATALOADERS_CREATED | train_batches={len(train_loader)} | val_batches={len(val_loader)}")
+        test_info = f" | test_batches={len(test_loader)}" if test_loader else ""
+        profiler.log_info(f"DATALOADERS_CREATED | train_batches={len(train_loader)} | val_batches={len(val_loader)}{test_info}")
 
     if is_main_process(rank):
         print(f"   Train batches: {len(train_loader):,}")
         print(f"   Val batches: {len(val_loader):,}")
+        if test_loader:
+            print(f"   Test batches: {len(test_loader):,} (held-out, evaluated after training)")
+
 
     # =========================================================================
     # MODEL SETUP
@@ -3215,6 +3418,77 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         print("=" * 70)
         print(f"Best val loss: {best_val_loss:.4f}")
 
+        # v4.4: Held-out test set evaluation (if test_loader exists)
+        if test_loader is not None:
+            print("\n" + "=" * 70)
+            print("🧪 HELD-OUT TEST SET EVALUATION")
+            print("=" * 70)
+            print("Evaluating on truly unseen data (not used during training)...")
+            print()
+
+            model.eval()
+            test_loss = 0.0
+            test_error = 0.0
+            test_predictions_list = []
+            test_targets_list = []
+            num_test_batches = 0
+
+            with torch.no_grad():
+                for features, targets in tqdm(test_loader, desc="Test batches", leave=False):
+                    # Move to device
+                    if isinstance(features, dict):
+                        features = {tf: f.to(args.device, non_blocking=True) for tf, f in features.items()}
+                    else:
+                        features = features.to(args.device, non_blocking=True)
+                    targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
+
+                    # Forward pass
+                    if scaler is not None:
+                        with torch.amp.autocast('cuda'):
+                            predictions, _ = model(features)
+                            target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                            loss = F.mse_loss(predictions[:, :2], target_tensor)
+                    else:
+                        predictions, _ = model(features)
+                        target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                        loss = F.mse_loss(predictions[:, :2], target_tensor)
+
+                    test_loss += loss.item()
+                    test_error += torch.abs(predictions[:, :2] - target_tensor).mean().item()
+                    num_test_batches += 1
+
+                    # Collect for detailed analysis
+                    test_predictions_list.append(predictions[:, :2].cpu())
+                    test_targets_list.append(target_tensor.cpu())
+
+            avg_test_loss = test_loss / max(num_test_batches, 1)
+            avg_test_error = test_error / max(num_test_batches, 1)
+
+            # Combine all predictions for analysis
+            all_test_preds = torch.cat(test_predictions_list, dim=0).numpy()
+            all_test_targets = torch.cat(test_targets_list, dim=0).numpy()
+
+            # Calculate metrics
+            high_mae = np.abs(all_test_preds[:, 0] - all_test_targets[:, 0]).mean()
+            low_mae = np.abs(all_test_preds[:, 1] - all_test_targets[:, 1]).mean()
+            high_rmse = np.sqrt(np.mean((all_test_preds[:, 0] - all_test_targets[:, 0])**2))
+            low_rmse = np.sqrt(np.mean((all_test_preds[:, 1] - all_test_targets[:, 1])**2))
+
+            print(f"\n📊 Test Set Results:")
+            print(f"   Test Loss (MSE): {avg_test_loss:.4f}")
+            print(f"   Test MAE: {avg_test_error:.4f}%")
+            print(f"   ")
+            print(f"   High Predictions:")
+            print(f"     MAE:  {high_mae:.4f}%")
+            print(f"     RMSE: {high_rmse:.4f}%")
+            print(f"   Low Predictions:")
+            print(f"     MAE:  {low_mae:.4f}%")
+            print(f"     RMSE: {low_rmse:.4f}%")
+            print(f"   ")
+            print(f"   Samples evaluated: {len(all_test_preds):,}")
+            print(f"   ⚠️  This is your TRUE performance on unseen data")
+            print("=" * 70)
+
     # Print memory profile summary
     if profiler and is_main_process(rank):
         profiler.print_summary()
@@ -3372,6 +3646,10 @@ def main():
     parser.add_argument('--interactive', action='store_true',
                         help='Interactive mode with menus')
 
+    # Cache verification
+    parser.add_argument('--verify-cache', dest='verify_cache', action='store_true',
+                        help='Verify cache integrity and exit (checks all cache files, VIX/Events staleness)')
+
     # Memory profiling
     parser.add_argument('--memory-profile', dest='memory_profile', action='store_true', default=False,
                         help='Enable memory profiling to logs/memory_debug.log')
@@ -3381,6 +3659,56 @@ def main():
                         help='Enable verbose debug logging (collate workers, slow batches, etc.)')
 
     args = parser.parse_args()
+
+    # ==========================================================================
+    # CACHE VERIFICATION MODE (v4.4)
+    # ==========================================================================
+    if args.verify_cache:
+        cache_dir = Path(args.shard_path if args.shard_path else 'data/feature_cache')
+
+        print("\n" + "=" * 70)
+        print("🔍 CACHE INTEGRITY CHECK")
+        print("=" * 70)
+        print(f"Cache directory: {cache_dir}")
+        print()
+
+        # Find all manifests
+        manifest_files = sorted(cache_dir.glob("cache_manifest_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+        if not manifest_files:
+            print("❌ No cache manifests found")
+            print(f"   Expected: cache_manifest_*.json in {cache_dir}")
+            sys.exit(1)
+
+        print(f"Found {len(manifest_files)} cache manifest(s):\n")
+
+        for i, manifest_path in enumerate(manifest_files, 1):
+            print(f"[{i}] {manifest_path.name}")
+            validation = validate_cache_from_manifest(manifest_path, verbose=True)
+
+            if validation["valid"]:
+                manifest = validation["manifest"]
+                print(f"   Cache type: {manifest.get('cache_type', 'unknown')}")
+                print(f"   Date range: {manifest['date_range']['start']} to {manifest['date_range']['end']}")
+                print(f"   Feature version: {manifest.get('feature_version', 'unknown')}")
+                print(f"   Precision: {manifest.get('precision', 'unknown')}")
+
+                # Show source file status
+                source_files = manifest.get("source_files", {})
+                if source_files.get("vix_mtime"):
+                    from datetime import datetime
+                    vix_date = datetime.fromtimestamp(source_files["vix_mtime"]).date()
+                    print(f"   VIX data: {vix_date}")
+                if source_files.get("events_count"):
+                    events_date = datetime.fromtimestamp(source_files["events_mtime"]).date() if source_files.get("events_mtime") else "unknown"
+                    print(f"   Events: {source_files['events_count']} events ({events_date})")
+
+            print()
+
+        print("=" * 70)
+        print(f"✅ Cache verification complete")
+        print("=" * 70)
+        sys.exit(0)
 
     # ==========================================================================
     # DDP Initialization (must be VERY early, before any other setup)

@@ -1768,25 +1768,27 @@ def create_hierarchical_dataset(
     mode: str = 'uniform_bars',
     preload: bool = False,
     validation_split: Optional[float] = None,
+    test_split: Optional[float] = None,  # v4.4: Support for 3-way split
     include_continuation: bool = False,
     mmap_meta_path: str = None,
     profiler=None,
     preload_to_ram: bool = False,
     use_native_timeframes: bool = False,
     tf_meta_path: str = None
-) -> Tuple[Dataset, Optional[Dataset]]:
+) -> Tuple[Dataset, Optional[Dataset], Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
 
     Args:
         features_df: Features DataFrame
         continuation_labels_df: [Legacy] Single DataFrame with continuation labels
-        continuation_labels_dir: [v4.3] Directory with per-TF continuation label files
+        continuation_labels_dir: [v4.3] Directory with per-TF label files
         sequence_length: Input sequence length
         prediction_horizon: Prediction horizon in bars
         mode: 'uniform_bars'
         preload: If True, use PreloadHierarchicalDataset (legacy)
-        validation_split: If provided, split data into train/val
+        validation_split: If provided, split data into train/val or train/val/test
+        test_split: If provided, create held-out test set (v4.4)
         profiler: Optional MemoryProfiler for logging RAM usage
         preload_to_ram: If True, load all mmap data into RAM at startup
                        (requires ~90GB RAM but avoids 400ms/sample disk I/O)
@@ -1794,9 +1796,149 @@ def create_hierarchical_dataset(
     Returns:
         train_dataset: Training dataset
         val_dataset: Validation dataset (if validation_split provided)
+        test_dataset: Test dataset (if test_split provided)
     """
-    if validation_split is not None:
-        # Calculate split index
+    # v4.4: Support for 3-way split (train/val/test)
+    if test_split is not None and validation_split is not None:
+        # 3-way split (e.g., 85/10/5)
+        total_len = len(features_df)
+        train_split_ratio = 1.0 - validation_split - test_split
+        train_end_idx = int(total_len * train_split_ratio)
+        val_end_idx = int(total_len * (train_split_ratio + validation_split))
+
+        # Calculate date ranges for logging
+        train_start_date = features_df.index[0].date()
+        train_end_date = features_df.index[min(train_end_idx - 1, total_len - 1)].date()
+        val_start_date = features_df.index[train_end_idx].date()
+        val_end_date = features_df.index[min(val_end_idx - 1, total_len - 1)].date()
+        test_start_date = features_df.index[val_end_idx].date()
+        test_end_date = features_df.index[total_len - 1].date()
+
+        print(f"\n📊 3-Way Split:")
+        print(f"   Train: {train_end_idx:,} samples ({train_start_date} to {train_end_date}) [{train_split_ratio*100:.0f}%]")
+        print(f"   Val:   {val_end_idx - train_end_idx:,} samples ({val_start_date} to {val_end_date}) [{validation_split*100:.0f}%]")
+        print(f"   Test:  {total_len - val_end_idx:,} samples ({test_start_date} to {test_end_date}) [{test_split*100:.0f}%]")
+        print(f"   ⚠️  Test set will NOT be used during training (held-out evaluation only)\n")
+
+        # All datasets get full continuation labels (lookup by timestamp)
+        train_continuation_df = continuation_labels_df
+        val_continuation_df = continuation_labels_df
+        test_continuation_df = continuation_labels_df
+
+        if mmap_meta_path:
+            # When using mmaps, create ONE base dataset with FULL data,
+            # then restrict valid_indices for each split
+            import copy
+
+            base_dataset = HierarchicalDataset(
+                features_df,  # Full non-channel features
+                raw_ohlc_df,
+                None,  # Continuation handled separately below
+                continuation_labels_dir=continuation_labels_dir,
+                sequence_length=sequence_length,
+                prediction_horizon=prediction_horizon,
+                mode=mode,
+                include_continuation=include_continuation,
+                mmap_meta_path=mmap_meta_path,
+                profiler=profiler,
+                preload_to_ram=preload_to_ram,
+                use_native_timeframes=use_native_timeframes,
+                tf_meta_path=tf_meta_path
+            )
+
+            # Calculate index ranges for 3-way split
+            all_valid = base_dataset.valid_indices
+            train_valid = [i for i in all_valid if i < train_end_idx]
+            val_valid = [i for i in all_valid if train_end_idx <= i < val_end_idx]
+            test_valid = [i for i in all_valid if i >= val_end_idx]
+
+            # Train dataset (modify in place)
+            train_dataset = base_dataset
+            train_dataset.valid_indices = train_valid
+            train_dataset.continuation_labels_df = train_continuation_df
+            train_dataset.include_continuation = include_continuation
+            train_dataset._build_continuation_lookup()
+
+            # Val dataset (shallow copy)
+            val_dataset = copy.copy(base_dataset)
+            val_dataset.valid_indices = val_valid
+            val_dataset.continuation_labels_df = val_continuation_df
+            val_dataset.include_continuation = include_continuation
+            val_dataset._build_continuation_lookup()
+
+            # Test dataset (shallow copy)
+            test_dataset = copy.copy(base_dataset)
+            test_dataset.valid_indices = test_valid
+            test_dataset.continuation_labels_df = test_continuation_df
+            test_dataset.include_continuation = include_continuation
+            test_dataset._build_continuation_lookup()
+
+        else:
+            # No mmaps - traditional split
+            train_df = features_df.iloc[:train_end_idx]
+            val_df = features_df.iloc[train_end_idx:val_end_idx]
+            test_df = features_df.iloc[val_end_idx:]
+
+            # Slice raw_ohlc_df to match features
+            train_raw_ohlc = raw_ohlc_df.iloc[:train_end_idx] if raw_ohlc_df is not None else None
+            val_raw_ohlc = raw_ohlc_df.iloc[train_end_idx:val_end_idx] if raw_ohlc_df is not None else None
+            test_raw_ohlc = raw_ohlc_df.iloc[val_end_idx:] if raw_ohlc_df is not None else None
+
+            if preload:
+                train_dataset = PreloadHierarchicalDataset(
+                    train_df, train_raw_ohlc, train_continuation_df,
+                    sequence_length, prediction_horizon, mode
+                )
+                val_dataset = PreloadHierarchicalDataset(
+                    val_df, val_raw_ohlc, val_continuation_df,
+                    sequence_length, prediction_horizon, mode
+                )
+                test_dataset = PreloadHierarchicalDataset(
+                    test_df, test_raw_ohlc, test_continuation_df,
+                    sequence_length, prediction_horizon, mode
+                )
+            else:
+                train_dataset = HierarchicalDataset(
+                    train_df, train_raw_ohlc, train_continuation_df,
+                    continuation_labels_dir=continuation_labels_dir,
+                    sequence_length=sequence_length,
+                    prediction_horizon=prediction_horizon,
+                    mode=mode,
+                    include_continuation=include_continuation,
+                    profiler=profiler,
+                    preload_to_ram=preload_to_ram,
+                    use_native_timeframes=use_native_timeframes,
+                    tf_meta_path=tf_meta_path
+                )
+                val_dataset = HierarchicalDataset(
+                    val_df, val_raw_ohlc, val_continuation_df,
+                    continuation_labels_dir=continuation_labels_dir,
+                    sequence_length=sequence_length,
+                    prediction_horizon=prediction_horizon,
+                    mode=mode,
+                    include_continuation=include_continuation,
+                    profiler=profiler,
+                    preload_to_ram=preload_to_ram,
+                    use_native_timeframes=use_native_timeframes,
+                    tf_meta_path=tf_meta_path
+                )
+                test_dataset = HierarchicalDataset(
+                    test_df, test_raw_ohlc, test_continuation_df,
+                    continuation_labels_dir=continuation_labels_dir,
+                    sequence_length=sequence_length,
+                    prediction_horizon=prediction_horizon,
+                    mode=mode,
+                    include_continuation=include_continuation,
+                    profiler=profiler,
+                    preload_to_ram=preload_to_ram,
+                    use_native_timeframes=use_native_timeframes,
+                    tf_meta_path=tf_meta_path
+                )
+
+        return train_dataset, val_dataset, test_dataset
+
+    elif validation_split is not None:
+        # 2-way split (backward compatible)
         split_idx = int(len(features_df) * (1 - validation_split))
         print(f"Split data: {split_idx:,} train rows, {len(features_df) - split_idx:,} val rows")
 
@@ -1892,7 +2034,7 @@ def create_hierarchical_dataset(
                     tf_meta_path=tf_meta_path
                 )
 
-        return train_dataset, val_dataset
+        return train_dataset, val_dataset, None  # v4.4: Return None for test_dataset (2-way split)
     else:
         # No validation split
         if preload:
@@ -1915,7 +2057,7 @@ def create_hierarchical_dataset(
                 tf_meta_path=tf_meta_path
             )
 
-        return dataset, None
+        return dataset, None, None  # v4.4: Return None for val_dataset and test_dataset (no split)
 
 
 def test_hierarchical_dataset():
