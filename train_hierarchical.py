@@ -286,7 +286,7 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
 
     # Debug: track collate calls (mutable default persists across calls)
     _debug_counter[0] += 1
-    if _debug_counter[0] <= 3:
+    if _debug_counter[0] <= 3 and os.environ.get('TRAIN_DEBUG', '0') == '1':
         print(f"[DEBUG] collate worker PID={os.getpid()}, batch_size={len(batch)}, call #{_debug_counter[0]}", file=sys.stderr, flush=True)
 
     if torch_dtype is None:
@@ -2148,6 +2148,13 @@ def interactive_setup(args, profiler=None):
         default=dflt('use_fusion_head', True)
     ).execute()
 
+    # Debug logging
+    print()
+    args.debug = inquirer.confirm(
+        message="Enable debug logging? (Shows collate workers, slow batches)",
+        default=dflt('debug', False)
+    ).execute()
+
     # Output path
     print()
     args.output = inquirer.text(
@@ -2199,6 +2206,8 @@ def interactive_setup(args, profiler=None):
     print(f"  Multi-Task: {'Enabled' if args.multi_task else 'Disabled'}")
     fusion_mode = 'Fusion Head' if getattr(args, 'use_fusion_head', True) else 'Physics-Only (GWC)'
     print(f"  Aggregation: {fusion_mode}")
+    debug_mode = 'Enabled' if getattr(args, 'debug', False) else 'Disabled'
+    print(f"  Debug Logging: {debug_mode}")
     print(f"  Output: {args.output}")
     if selected_cache_pair:
         print(f"  Cache reuse: {selected_cache_pair.get('cache_key')} from {args.shard_path}")
@@ -2229,6 +2238,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     """
     # Reconstruct args namespace from dict
     args = argparse.Namespace(**args_dict)
+
+    # Set debug mode environment variable for child processes (collate workers, dataset)
+    if getattr(args, 'debug', False):
+        os.environ['TRAIN_DEBUG'] = '1'
+    else:
+        os.environ['TRAIN_DEBUG'] = '0'
 
     # DDP setup for multi-GPU
     is_distributed = world_size > 1
@@ -3360,6 +3375,10 @@ def main():
     # Memory profiling
     parser.add_argument('--memory-profile', dest='memory_profile', action='store_true', default=False,
                         help='Enable memory profiling to logs/memory_debug.log')
+
+    # Debug mode
+    parser.add_argument('--debug', action='store_true', default=False,
+                        help='Enable verbose debug logging (collate workers, slow batches, etc.)')
 
     args = parser.parse_args()
 

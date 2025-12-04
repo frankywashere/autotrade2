@@ -1625,9 +1625,10 @@ class HierarchicalDataset(Dataset):
         for orig_pos, sample_idx, _ in sorted_indexed:
             results[orig_pos] = self.__getitem__(sample_idx)
 
-        # Performance logging for slow batches
+        # Performance logging for slow batches (only if debug mode enabled)
+        import os
         _batch_elapsed_ms = (time.perf_counter() - _batch_start) * 1000
-        if _batch_elapsed_ms > 500:  # Log if batch takes >500ms
+        if _batch_elapsed_ms > 500 and os.environ.get('TRAIN_DEBUG', '0') == '1':  # Log if batch takes >500ms
             per_sample_ms = _batch_elapsed_ms / batch_size
             print(f"[SLOW_GETITEMS] {batch_size} samples took {_batch_elapsed_ms:.0f}ms "
                   f"({per_sample_ms:.1f}ms/sample)", file=sys.stderr, flush=True)
