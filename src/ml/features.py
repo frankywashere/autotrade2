@@ -2200,13 +2200,24 @@ class TradingFeatureExtractor(FeatureExtractor):
                 chunk_start_with_overlap = chunk_start
 
             # Extract chunk
-            chunk_df = df[(df.index >= chunk_start_with_overlap) & (df.index < chunk_end)].copy()
+            # Use <= for last chunk to include the final row, < for others to avoid overlap
+            is_last_chunk = (i == len(chunk_starts) - 2)
+            if is_last_chunk:
+                chunk_df = df[(df.index >= chunk_start_with_overlap) & (df.index <= chunk_end)].copy()
+            else:
+                chunk_df = df[(df.index >= chunk_start_with_overlap) & (df.index < chunk_end)].copy()
             chunk_multi_res = None
             if multi_res_data:
-                chunk_multi_res = {
-                    tf: mdf[(mdf.index >= chunk_start_with_overlap) & (mdf.index < chunk_end)].copy()
-                    for tf, mdf in multi_res_data.items()
-                }
+                if is_last_chunk:
+                    chunk_multi_res = {
+                        tf: mdf[(mdf.index >= chunk_start_with_overlap) & (mdf.index <= chunk_end)].copy()
+                        for tf, mdf in multi_res_data.items()
+                    }
+                else:
+                    chunk_multi_res = {
+                        tf: mdf[(mdf.index >= chunk_start_with_overlap) & (mdf.index < chunk_end)].copy()
+                        for tf, mdf in multi_res_data.items()
+                    }
 
             print(f"\n     Chunk {i+1}/{len(chunk_starts)-1}: {chunk_start.date()} to {chunk_end.date()}")
             print(f"       Bars: {len(chunk_df):,} (including {overlap_months}mo overlap)")
