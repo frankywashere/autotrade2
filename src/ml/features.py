@@ -491,37 +491,40 @@ class TradingFeatureExtractor(FeatureExtractor):
             else:
                 print(f"   ❌ Channel cache: Not found - will extract (~5-7 min)")
 
-        # Check 2: Continuation labels (with mode-specific caching)
-        # v3.18: adaptive_labels and adaptive_full share cache (labels identical)
-        cache_mode_suffix = 'adaptive' if 'adaptive' in config.CONTINUATION_MODE else 'simple'
-        cont_cache_path = unified_cache_dir / f"continuation_labels_{cache_key}_{cache_mode_suffix}.pkl"
+        # Check 2: Continuation labels (hierarchical per-TF format, v4.3+)
+        # Labels are stored per-timeframe: continuation_labels_{tf}_v{version}_{dates}.pkl
         cont_cache_valid = False
-        if continuation and cont_cache_path.exists() and use_cache:
-            try:
-                test_load = pd.read_pickle(cont_cache_path)
-                if len(test_load) > 0 and 'timestamp' in test_load.columns:
-                    # Validate mode-specific fields
-                    if 'adaptive' in config.CONTINUATION_MODE:
-                        if 'adaptive_horizon' not in test_load.columns:
-                            print(f"   ⚠️  Continuation labels: Invalid for adaptive mode (missing adaptive_horizon)")
-                            cont_cache_path.unlink()
-                            cont_cache_valid = False
-                        else:
-                            print(f"   ✓ Continuation labels (adaptive): Valid ({len(test_load):,} labels, {cont_cache_path.stat().st_size / 1e6:.1f} MB)")
-                            cont_cache_valid = True
-                    else:
-                        print(f"   ✓ Continuation labels (simple): Valid ({len(test_load):,} labels, {cont_cache_path.stat().st_size / 1e6:.1f} MB)")
-                        cont_cache_valid = True
+        if continuation and use_cache:
+            # Build cache suffix matching the format used in extract_features() and generate_hierarchical_continuation_labels()
+            # Uses df.index dates formatted as YYYYMMDD
+            hierarchical_cache_suffix = f"v{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
+
+            # Check if all per-TF label files exist
+            found_tfs = []
+            missing_tfs = []
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                tf_label_path = unified_cache_dir / f"continuation_labels_{tf}_{hierarchical_cache_suffix}.pkl"
+                if tf_label_path.exists():
+                    found_tfs.append(tf)
                 else:
-                    print(f"   ⚠️  Continuation labels: Invalid (corrupted or empty) - will regenerate")
-                    cont_cache_path.unlink()
-                    cont_cache_valid = False
-            except Exception as e:
-                print(f"   ⚠️  Continuation labels: Corrupted ({type(e).__name__}) - will regenerate")
-                if cont_cache_path.exists():
-                    cont_cache_path.unlink()
-        elif continuation:
-            print(f"   ❌ Continuation labels: Not found - will generate (~1 hour)")
+                    missing_tfs.append(tf)
+
+            if len(found_tfs) == len(HIERARCHICAL_TIMEFRAMES):
+                # All TFs cached - validate one file to ensure format is correct
+                sample_path = unified_cache_dir / f"continuation_labels_5min_{hierarchical_cache_suffix}.pkl"
+                try:
+                    test_load = pd.read_pickle(sample_path)
+                    if len(test_load) > 0 and 'duration_bars' in test_load.columns:
+                        print(f"   ✓ Continuation labels (hierarchical): Valid ({len(HIERARCHICAL_TIMEFRAMES)} TFs cached)")
+                        cont_cache_valid = True
+                    else:
+                        print(f"   ⚠️  Continuation labels: Invalid format - will regenerate")
+                except Exception as e:
+                    print(f"   ⚠️  Continuation labels: Corrupted ({type(e).__name__}) - will regenerate")
+            elif len(found_tfs) > 0:
+                print(f"   ⚠️  Continuation labels: Partial ({len(found_tfs)}/{len(HIERARCHICAL_TIMEFRAMES)} TFs) - will regenerate missing")
+            else:
+                print(f"   ❌ Continuation labels: Not found - will generate (~1 hour)")
 
         # Check 3: Non-channel features (Price, RSI, Correlation, Cycle, Volume, Time, Breakdown)
         non_channel_cache_path = unified_cache_dir / f"non_channel_features_{cache_key}.pkl"
@@ -565,7 +568,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Store cache paths for later use
         self._unified_cache_dir = unified_cache_dir
         self._cache_key = cache_key
-        self._cont_cache_path = cont_cache_path if continuation else None
+        # Note: continuation labels now use hierarchical per-TF format (directory-based), not single file
         self._non_channel_cache_path = non_channel_cache_path  # Store for saving/loading
         # Short-circuit channel extraction when mmap cache is valid and use_cache is True
         skip_channel_calc = channel_cache_valid and use_cache and validated_meta_path is not None
@@ -1013,7 +1016,25 @@ class TradingFeatureExtractor(FeatureExtractor):
         df = pd.DataFrame(full_features, columns=feature_columns)
         df.index = pd.to_datetime(full_indices, unit='ns')
 
-        print(f"   ✓ Loaded {len(df):,} rows × {len(df.columns)} features")
+        print(f"   ✓ Loaded {len(df):,} rows × {len(df.columns)} channel features")
+
+        # Load and merge non-channel features (contains tsla_close, spy_close, etc.)
+        non_channel_path = cache_dir / f"non_channel_features_{mmap_meta['cache_key']}.pkl"
+        if non_channel_path.exists():
+            print(f"   📂 Loading non-channel features...")
+            non_channel_df = pd.read_pickle(non_channel_path)
+            # Ensure same index format
+            if not isinstance(non_channel_df.index, pd.DatetimeIndex):
+                non_channel_df.index = pd.to_datetime(non_channel_df.index)
+            # Align indices and merge (non-channel first so tsla_close is accessible)
+            common_idx = df.index.intersection(non_channel_df.index)
+            if len(common_idx) > 0:
+                df = pd.concat([non_channel_df.loc[common_idx], df.loc[common_idx]], axis=1)
+                print(f"   ✓ Merged {len(non_channel_df.columns)} non-channel features ({len(df):,} aligned rows)")
+            else:
+                print(f"   ⚠️  No overlapping timestamps between channel and non-channel features")
+        else:
+            print(f"   ⚠️  No non-channel features found: {non_channel_path.name}")
 
         # Step 2: Identify shared vs timeframe-specific columns (same logic as _precompute_timeframe_sequences)
         all_cols = list(df.columns)
@@ -1128,12 +1149,25 @@ class TradingFeatureExtractor(FeatureExtractor):
                 monthly_columns = monthly_shard_info.get('columns', [])
                 print(f"   📂 Monthly shard: {monthly_array.shape[1]} columns (memory-mapped)")
 
+        # Load non-channel features (contains tsla_close, spy_close, etc.)
+        non_channel_path = cache_dir / f"non_channel_features_{mmap_meta['cache_key']}.pkl"
+        non_channel_df = None
+        non_channel_columns = []
+        if non_channel_path.exists():
+            non_channel_df = pd.read_pickle(non_channel_path)
+            if not isinstance(non_channel_df.index, pd.DatetimeIndex):
+                non_channel_df.index = pd.to_datetime(non_channel_df.index)
+            non_channel_columns = list(non_channel_df.columns)
+            print(f"   📂 Non-channel features: {len(non_channel_columns)} columns")
+        else:
+            print(f"   ⚠️  No non-channel features found: {non_channel_path.name}")
+
         # Metadata for output
         meta = {
             'feature_version': FEATURE_VERSION,
             'cache_key': mmap_meta.get('cache_key', 'from_chunks'),
             'sequence_lengths': TIMEFRAME_SEQUENCE_LENGTHS,
-            'shared_columns': [feature_columns[i] for i in shared_col_indices],
+            'shared_columns': non_channel_columns + [feature_columns[i] for i in shared_col_indices],
             'timeframe_columns': {},
             'timeframe_shapes': {},
             'total_rows_1min': mmap_meta['total_rows'],
@@ -1143,9 +1177,9 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Process each timeframe independently
         for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Timeframes", leave=True, ncols=100, ascii=True):
-            # Columns for this TF: shared + TF-specific
+            # Columns for this TF: non-channel + shared channel + TF-specific channel
             tf_indices = shared_col_indices + tf_col_indices[tf]
-            tf_col_names = [feature_columns[i] for i in tf_indices]
+            tf_col_names = non_channel_columns + [feature_columns[i] for i in tf_indices]
 
             # Add monthly columns for monthly/3month TFs
             if tf in ['monthly', '3month'] and monthly_columns:
@@ -1187,8 +1221,18 @@ class TradingFeatureExtractor(FeatureExtractor):
                 cumulative_row_offset += len(chunk_array)
 
                 # Create DataFrame with proper column names and timestamps
-                df = pd.DataFrame(tf_chunk, columns=tf_col_names[:tf_chunk.shape[1]])
+                # Start with channel features only (tf_col_names includes non-channel at front)
+                channel_col_names = tf_col_names[len(non_channel_columns):]
+                df = pd.DataFrame(tf_chunk, columns=channel_col_names[:tf_chunk.shape[1]])
                 df.index = pd.to_datetime(index_array, unit='ns')
+
+                # Merge non-channel features for this chunk
+                if non_channel_df is not None and len(non_channel_columns) > 0:
+                    # Slice non-channel DataFrame to match chunk's timestamp range
+                    nc_chunk = non_channel_df.loc[df.index[0]:df.index[-1]]
+                    if len(nc_chunk) == len(df):
+                        # Prepend non-channel columns (so tsla_close comes first)
+                        df = pd.concat([nc_chunk, df], axis=1)
 
                 # Resample this chunk
                 tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]

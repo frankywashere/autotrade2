@@ -698,9 +698,12 @@ def train_epoch(
             if profiler:
                 profiler.log_info(f"FIRST_BATCH_COMPLETE | time_sec={_first_batch_time:.1f}")
                 profiler.snapshot("first_batch_received", 0, force_log=True)
-        # Move to device
+        # Move to device - handle both native TF mode (dict) and legacy mode (tensor)
         # If collate already moved to device, this is a no-op; otherwise it moves now
-        x = x.to(device, non_blocking=True)
+        if isinstance(x, dict):
+            x = {tf: f.to(device, non_blocking=True) for tf, f in x.items()}
+        else:
+            x = x.to(device, non_blocking=True)
 
         # Move all targets to device
         target_high = targets_dict['high'].to(device, non_blocking=True)
@@ -1197,8 +1200,11 @@ def validate(
 
     with torch.no_grad():
         for x, targets in pbar:
-            # Move to device
-            x = x.to(device)
+            # Move to device - handle both native TF mode (dict) and legacy mode (tensor)
+            if isinstance(x, dict):
+                x = {tf: f.to(device) for tf, f in x.items()}
+            else:
+                x = x.to(device)
 
             # Handle dict targets (multi-task) or tensor targets (legacy)
             if isinstance(targets, dict):
@@ -2650,16 +2656,24 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     if is_main_process(rank):
         print("\n4. Setting up data loaders...")
 
-    # Get feature dimensions from dataset (always 3-tuple: main, monthly, non_channel)
+    # Get feature dimensions from dataset
     sample_data, sample_target = train_dataset[0]
-    ch_main, ch_monthly, nc = sample_data
-    main_cols = ch_main.shape[1]
-    monthly_cols = ch_monthly.shape[1] if ch_monthly is not None else 0
-    nc_cols = nc.shape[1] if nc is not None else 0
-    total_features = main_cols + monthly_cols + nc_cols
 
-    if is_main_process(rank):
-        print(f"   Features: {main_cols} main + {monthly_cols} monthly + {nc_cols} non-channel = {total_features} total")
+    # Detect native timeframe mode (dict) vs legacy mode (tuple)
+    if isinstance(sample_data, dict):
+        # v4.1 Native timeframe mode - sample_data is Dict[str, np.ndarray]
+        total_features = sample_data['5min'].shape[1]  # All TFs have same feature count
+        if is_main_process(rank):
+            print(f"   Native TF mode: {len(sample_data)} timeframes × {total_features} features each")
+    else:
+        # Legacy mode - sample_data is (ch_main, ch_monthly, nc) tuple
+        ch_main, ch_monthly, nc = sample_data
+        main_cols = ch_main.shape[1]
+        monthly_cols = ch_monthly.shape[1] if ch_monthly is not None else 0
+        nc_cols = nc.shape[1] if nc is not None else 0
+        total_features = main_cols + monthly_cols + nc_cols
+        if is_main_process(rank):
+            print(f"   Features: {main_cols} main + {monthly_cols} monthly + {nc_cols} non-channel = {total_features} total")
 
     # Collate function
     torch_dtype = project_config.get_torch_dtype()
@@ -2918,7 +2932,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 profiler.log_info(f"FIRST_BATCH_COMPLETE | time_sec={0}")
                 profiler.snapshot("first_batch_received", epoch + 1, force_log=True)
 
-            features = features.to(args.device, non_blocking=True)
+            # Move features to device - handle both native TF mode (dict) and legacy mode (tensor)
+            if isinstance(features, dict):
+                features = {tf: f.to(args.device, non_blocking=True) for tf, f in features.items()}
+            else:
+                features = features.to(args.device, non_blocking=True)
             # Move each tensor in targets dict to device
             targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
 
@@ -3050,7 +3068,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         with torch.no_grad():
             for features, targets in val_loader:
-                features = features.to(args.device, non_blocking=True)
+                # Move features to device - handle both native TF mode (dict) and legacy mode (tensor)
+                if isinstance(features, dict):
+                    features = {tf: f.to(args.device, non_blocking=True) for tf, f in features.items()}
+                else:
+                    features = features.to(args.device, non_blocking=True)
                 # Move each tensor in targets dict to device
                 targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
 
