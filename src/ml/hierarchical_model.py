@@ -762,8 +762,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
             final_pred_low = self.fusion_fc_low(fusion_hidden)
             final_pred_conf = torch.sigmoid(self.fusion_fc_conf(fusion_hidden))
         else:
-            # Physics-based aggregation: weighted average of per-TF predictions
-            # Use per-TF confidences as attention weights (already transformed by physics modules)
+            # Physics-based aggregation: SELECT best channel, don't blend!
+            # Each TF is a separate channel prediction - pick the most confident one
 
             # Extract per-TF predictions from layer_predictions
             per_tf_highs = []
@@ -779,13 +779,23 @@ class HierarchicalLNN(nn.Module, ModelBase):
             per_tf_lows = torch.cat(per_tf_lows, dim=-1)    # [batch, 11]
             per_tf_confs = torch.cat(per_tf_confs, dim=-1)  # [batch, 11]
 
-            # Use confidence as attention weights
-            weights = F.softmax(per_tf_confs, dim=-1)  # [batch, 11]
+            # SELECT the most confident TF (not weighted average!)
+            best_tf_idx = torch.argmax(per_tf_confs, dim=-1)  # [batch]
 
-            # Weighted average
-            final_pred_high = (per_tf_highs * weights).sum(dim=-1, keepdim=True)  # [batch, 1]
-            final_pred_low = (per_tf_lows * weights).sum(dim=-1, keepdim=True)    # [batch, 1]
-            final_pred_conf = (per_tf_confs * weights).sum(dim=-1, keepdim=True)  # [batch, 1]
+            # Gather the best TF's predictions for each sample in batch
+            batch_indices = torch.arange(per_tf_highs.shape[0], device=per_tf_highs.device)
+            final_pred_high = per_tf_highs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
+            final_pred_low = per_tf_lows[batch_indices, best_tf_idx].unsqueeze(-1)    # [batch, 1]
+            final_pred_conf = per_tf_confs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
+
+            # Store selection info for interpretability
+            selection_info = {
+                'best_tf_idx': best_tf_idx,
+                'best_tf_name': [self.TIMEFRAMES[idx.item()] for idx in best_tf_idx],
+                'per_tf_highs': per_tf_highs,
+                'per_tf_lows': per_tf_lows,
+                'per_tf_confs': per_tf_confs,
+            }
 
             # For multi-task heads, we still need fusion_hidden
             # Create a simple representation from physics-enhanced hidden states
@@ -830,6 +840,10 @@ class HierarchicalLNN(nn.Module, ModelBase):
             output_dict['phase'] = phase_output
         if energy_output is not None:
             output_dict['energy'] = energy_output
+
+        # v5.1: Add channel selection info (Physics-Only mode)
+        if not self.use_fusion_head:
+            output_dict['channel_selection'] = selection_info
 
         # Store per-layer predictions
         for i, tf in enumerate(self.TIMEFRAMES):

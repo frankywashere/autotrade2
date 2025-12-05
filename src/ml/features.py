@@ -41,20 +41,9 @@ CHANNEL_PROJECTION_VERSION = "v1"  # v5.0: Track channel projection features
 FEATURE_VERSION = f"v5.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}"  # 21-window + complete_cycles + hybrid monthly/3month + VIX + events + channel projections
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
+# IMPORTED FROM config.py (single source of truth)
 # Each layer sees enough bars at its native resolution to learn channel patterns
-TIMEFRAME_SEQUENCE_LENGTHS = {
-    '5min': 200,    # ~17 hours of 5-min bars
-    '15min': 100,   # ~25 hours of 15-min bars
-    '30min': 80,    # ~40 hours of 30-min bars
-    '1h': 168,      # 1 week of hourly bars
-    '2h': 84,       # 1 week of 2-hour bars
-    '3h': 56,       # 1 week of 3-hour bars
-    '4h': 42,       # 1 week of 4-hour bars
-    'daily': 30,    # 30 trading days
-    'weekly': 20,   # 20 weeks
-    'monthly': 12,  # 12 months
-    '3month': 8,    # 24 months (8 quarters)
-}
+TIMEFRAME_SEQUENCE_LENGTHS = config.TIMEFRAME_SEQUENCE_LENGTHS
 
 # Timeframe resample rules for pandas
 TIMEFRAME_RESAMPLE_RULES = {

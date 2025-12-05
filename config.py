@@ -243,18 +243,20 @@ MIN_DATA_YEARS = 2.5
 MODEL_TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
 
 # Sequence lengths per timeframe (how many bars each layer sees)
+# SINGLE SOURCE OF TRUTH - features.py imports this
+# These values determine both training data shape AND live inference buffer sizes
 TIMEFRAME_SEQUENCE_LENGTHS = {
-    '5min': 200,    # 16.6 hours of 5-min data
-    '15min': 200,   # 50 hours
-    '30min': 200,   # 100 hours / 4.2 days
-    '1h': 200,      # 8.3 days
-    '2h': 100,      # 8.3 days
-    '3h': 100,      # 12.5 days
-    '4h': 100,      # 16.6 days
-    'daily': 60,    # 60 trading days / 3 months
-    'weekly': 52,   # 1 year
-    'monthly': 24,  # 2 years
-    '3month': 12,   # 3 years
+    '5min': 200,    # ~17 hours of 5-min bars (intraday patterns)
+    '15min': 100,   # ~25 hours of 15-min bars (~1 day context)
+    '30min': 80,    # ~40 hours of 30-min bars
+    '1h': 168,      # 1 week of hourly bars (weekly cycles)
+    '2h': 84,       # 1 week of 2-hour bars
+    '3h': 56,       # 1 week of 3-hour bars
+    '4h': 42,       # 1 week of 4-hour bars
+    'daily': 30,    # 30 trading days (monthly patterns)
+    'weekly': 20,   # 20 weeks (~5 months, quarterly trends)
+    'monthly': 12,  # 12 months (annual cycles)
+    '3month': 8,    # 8 quarters (2 years, multi-year trends)
 }
 
 # VIX data file path
