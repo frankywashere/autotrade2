@@ -625,9 +625,17 @@ def save_cache_manifest(
                 "num_workers": args.num_workers,
                 "preload": getattr(args, "preload", False),
                 "output": getattr(args, "output", None),
-                "model_version": "4.4",  # v4.4: 3-way split + cache improvements
+                "model_version": "5.0",  # v5.0: Channel-based predictions
                 "use_test_set": getattr(args, "use_test_set", False),
                 "test_split": getattr(args, "test_split", None),
+                "use_geometric_base": getattr(args, "use_geometric_base", True),
+                "use_fusion_head": getattr(args, "use_fusion_head", True),
+                "architecture_mode": (
+                    "geometric_physics" if (getattr(args, "use_geometric_base", True) and not getattr(args, "use_fusion_head", True)) else
+                    "geometric_fusion" if (getattr(args, "use_geometric_base", True) and getattr(args, "use_fusion_head", True)) else
+                    "learned_fusion" if (not getattr(args, "use_geometric_base", True) and getattr(args, "use_fusion_head", True)) else
+                    "learned_physics"
+                ),
             }
         }
 
@@ -2329,12 +2337,114 @@ def interactive_setup(args, profiler=None):
         default=dflt('multi_task', True)
     ).execute()
 
-    # Fusion head vs physics-only mode
+    # =========================================================================
+    # v5.0: ARCHITECTURE CONFIGURATION (2 independent decisions)
+    # =========================================================================
     print()
-    args.use_fusion_head = inquirer.confirm(
-        message="Use fusion head? (No = physics-based aggregation only)",
-        default=dflt('use_fusion_head', True)
+    print("=" * 70)
+    print("🏗️  PREDICTION ARCHITECTURE (v5.0)")
+    print("=" * 70)
+    print()
+    print("Two independent decisions that define your architecture:")
+    print()
+
+    # Decision 1: Base prediction source
+    args.use_geometric_base = inquirer.select(
+        message="1️⃣  Base prediction source:",
+        choices=[
+            Choice(value=True, name='Geometric Projections - Use channel formulas directly (slope × bars) ⭐'),
+            Choice(value=False, name='Learned Approximation - Neural net learns to approximate projections')
+        ],
+        default=dflt('use_geometric_base', True)
     ).execute()
+
+    if args.use_geometric_base:
+        print("   ✅ Base: Geometric channel projections (slope × bars + upper/lower bounds)")
+        print("      - Extracts projected_high/low from features")
+        print("      - Validity network weights 21 windows")
+        print("      - Fully interpretable (see formula)")
+    else:
+        print("   ⚠️  Base: Learned approximation (neural net)")
+        print("      - Learns to approximate channel projections")
+        print("      - Less interpretable (black box)")
+
+    print()
+
+    # Decision 2: Aggregation method
+    args.use_fusion_head = inquirer.select(
+        message="2️⃣  Final aggregation method:",
+        choices=[
+            Choice(value=False, name='Physics-Only - Weighted average (interpretable) ⭐'),
+            Choice(value=True, name='Fusion Head - Neural network combines all TFs (flexible)')
+        ],
+        default=dflt('use_fusion_head', False)
+    ).execute()
+
+    if args.use_fusion_head:
+        print("   ⚠️  Combine: Fusion head (learned combination)")
+        print("      - Neural network combines 11 TF predictions")
+        print("      - Flexible but less interpretable")
+    else:
+        print("   ✅ Combine: Physics-based weighted average")
+        print("      - CoulombAttention determines TF weights")
+        print("      - Explicit formula (fully interpretable)")
+
+    # Show final configuration
+    print()
+    print("─" * 70)
+    mode_matrix = [
+        ["", "Physics-Only", "Fusion Head"],
+        ["Geometric Base", "✅ YOUR VISION (100%)", "🧪 Testing"],
+        ["Learned Base", "⚠️  Not Recommended", "📊 Baseline (v4.x)"]
+    ]
+
+    if args.use_geometric_base and not args.use_fusion_head:
+        mode_name = "Geometric + Physics-Only"
+        mode_desc = "✅ YOUR PRIMARY VISION (100% channel-based)"
+        interpretability = "10/10"
+    elif args.use_geometric_base and args.use_fusion_head:
+        mode_name = "Geometric + Fusion Head"
+        mode_desc = "🧪 TESTING MODE (geometric base, learned fusion)"
+        interpretability = "7/10"
+    elif not args.use_geometric_base and args.use_fusion_head:
+        mode_name = "Learned + Fusion Head"
+        mode_desc = "📊 BASELINE (v4.x style for comparison)"
+        interpretability = "5/10"
+    else:
+        mode_name = "Learned + Physics-Only"
+        mode_desc = "⚠️  NOT RECOMMENDED (learned base defeats physics purpose)"
+        interpretability = "6/10"
+
+    print(f"📊 Selected Configuration: {mode_name}")
+    print(f"   {mode_desc}")
+    print(f"   Interpretability: {interpretability}")
+    print()
+
+    if args.use_geometric_base:
+        print("   How it works:")
+        print("     1. Extract 21 geometric projections per TF (from features)")
+        print("     2. Validity network learns which windows to trust")
+        print("     3. Base = weighted combination of geometric projections")
+        print("     4. Adjustment network learns corrections")
+        print("     5. Final per TF = base + adjustment")
+        if not args.use_fusion_head:
+            print("     6. Physics weights TFs explicitly (CoulombAttention)")
+            print("     7. Final = weighted average (interpretable formula)")
+        else:
+            print("     6. Fusion network combines TFs (learned)")
+            print("     7. Final = neural net combination (less interpretable)")
+    else:
+        print("   How it works:")
+        print("     1. CfC processes features → hidden state")
+        print("     2. Base heads learn to predict (neural net)")
+        print("     3. Adjustment network learns corrections")
+        print("     4. Final per TF = base + adjustment")
+        if not args.use_fusion_head:
+            print("     5. Physics weights TFs explicitly")
+        else:
+            print("     5. Fusion network combines TFs")
+
+    print("─" * 70)
 
     # Debug logging
     print()
@@ -2392,8 +2502,24 @@ def interactive_setup(args, profiler=None):
           f"(horizon {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars)")
     print(f"  Model Capacity: internal_ratio={args.internal_neurons_ratio}, hidden_size={args.hidden_size}")
     print(f"  Multi-Task: {'Enabled' if args.multi_task else 'Disabled'}")
-    fusion_mode = 'Fusion Head' if getattr(args, 'use_fusion_head', True) else 'Physics-Only (GWC)'
-    print(f"  Aggregation: {fusion_mode}")
+
+    # v5.0: Show architecture mode
+    use_geo = getattr(args, 'use_geometric_base', True)
+    use_fusion = getattr(args, 'use_fusion_head', True)
+
+    if use_geo and not use_fusion:
+        arch_mode = "Geometric + Physics-Only ⭐"
+    elif use_geo and use_fusion:
+        arch_mode = "Geometric + Fusion Head 🧪"
+    elif not use_geo and use_fusion:
+        arch_mode = "Learned + Fusion Head 📊"
+    else:
+        arch_mode = "Learned + Physics-Only"
+
+    print(f"  Architecture: {arch_mode}")
+    print(f"    Base: {'Geometric (channel projections)' if use_geo else 'Learned (neural approximation)'}")
+    print(f"    Combine: {'Physics-based (weighted avg)' if not use_fusion else 'Fusion Head (neural net)'}")
+
     debug_mode = 'Enabled' if getattr(args, 'debug', False) else 'Disabled'
     print(f"  Debug Logging: {debug_mode}")
     print(f"  Output: {args.output}")
@@ -3078,6 +3204,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             device=args.device,
             multi_task=args.multi_task,
             use_fusion_head=getattr(args, 'use_fusion_head', True),
+            use_geometric_base=getattr(args, 'use_geometric_base', True),  # v5.0
         )
     else:
         # Legacy mode - same size for all timeframes
@@ -3088,6 +3215,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             device=args.device,
             multi_task=args.multi_task,
             use_fusion_head=getattr(args, 'use_fusion_head', True),
+            use_geometric_base=getattr(args, 'use_geometric_base', True),  # v5.0
         )
 
     if profiler:

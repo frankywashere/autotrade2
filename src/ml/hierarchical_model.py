@@ -278,6 +278,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         device: str = 'cpu',
         multi_task: bool = True,  # Enable multi-task heads
         use_fusion_head: bool = True,  # v4.1: Can disable for physics-only mode
+        use_geometric_base: bool = True,  # v5.0: Use geometric projections or learned approximation
         # Backward compatibility
         input_size: int = None,  # Deprecated: use input_sizes dict
     ):
@@ -294,6 +295,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
             multi_task: Enable multi-task prediction heads
             use_fusion_head: If True, use fusion head for final predictions.
                            If False, use physics-based aggregation from Coulomb attention.
+            use_geometric_base: If True, extract geometric projections from features as base.
+                              If False, learn base approximations with neural nets.
             input_size: [DEPRECATED] Single input size (for backward compatibility only)
         """
         super().__init__()
@@ -305,7 +308,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.device_type = device
         self.multi_task = multi_task
         self.use_fusion_head = use_fusion_head
-        self.use_channel_projections = True  # v5.0: Enable channel-based predictions
+        self.use_geometric_base = use_geometric_base  # v5.0: Geometric vs learned base
+        self.use_channel_projections = use_geometric_base  # v5.0: Enable projection extractors if geometric
 
         # Backward compatibility: if old-style single input_size provided
         if input_size is not None and not input_sizes:
