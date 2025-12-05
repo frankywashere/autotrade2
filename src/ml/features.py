@@ -714,7 +714,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         continuation_labels_dir = None
         if continuation:
             cache_dir = self._unified_cache_dir if hasattr(self, '_unified_cache_dir') else Path('data/feature_cache')
-            cache_suffix = f"v{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
+            # v5.0 fix: FEATURE_VERSION already starts with 'v', don't add another
+            cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
 
             # Check if all per-TF label files exist (cache check)
             all_cached = True

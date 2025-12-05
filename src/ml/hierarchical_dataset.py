@@ -1848,9 +1848,23 @@ def create_hierarchical_dataset(
 
             # Calculate index ranges for 3-way split
             all_valid = base_dataset.valid_indices
-            train_valid = [i for i in all_valid if i < train_end_idx]
-            val_valid = [i for i in all_valid if train_end_idx <= i < val_end_idx]
-            test_valid = [i for i in all_valid if i >= val_end_idx]
+
+            # v5.0 fix: Convert split indices to native TF index space if using native timeframes
+            # The split indices (train_end_idx, val_end_idx) are calculated from features_df (1-min resolution)
+            # But valid_indices are in native TF space (5-min resolution) when use_native_timeframes=True
+            if use_native_timeframes and hasattr(base_dataset, 'tf_mmaps') and base_dataset.tf_mmaps:
+                # Get the 5min array length (the finest native TF resolution)
+                native_tf_len = base_dataset.tf_mmaps['5min'].shape[0]
+                conversion_factor = total_len / native_tf_len
+                train_end_idx_adj = int(train_end_idx / conversion_factor)
+                val_end_idx_adj = int(val_end_idx / conversion_factor)
+            else:
+                train_end_idx_adj = train_end_idx
+                val_end_idx_adj = val_end_idx
+
+            train_valid = [i for i in all_valid if i < train_end_idx_adj]
+            val_valid = [i for i in all_valid if train_end_idx_adj <= i < val_end_idx_adj]
+            test_valid = [i for i in all_valid if i >= val_end_idx_adj]
 
             # Train dataset (modify in place)
             train_dataset = base_dataset
