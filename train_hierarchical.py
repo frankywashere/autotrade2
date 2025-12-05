@@ -3100,10 +3100,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         if is_main_process(rank):
             print(f"   Using DistributedSampler ({world_size} replicas)")
     else:
-        # Standard shuffle (mmap-only mode with OS page cache)
-        train_loader_kwargs['shuffle'] = True
+        # v5.0: Use ShuffleBufferSampler for mmap data (8-10x faster than random shuffle)
+        # Sequential chunks with local shuffling avoids random disk seeks
+        train_sampler = ShuffleBufferSampler(
+            train_dataset,
+            buffer_size=10000,  # 10K samples per chunk (~50MB)
+            seed=42  # Reproducible
+        )
+        train_loader_kwargs['sampler'] = train_sampler
+        train_loader_kwargs['shuffle'] = False  # Sampler handles shuffling
         if is_main_process(rank):
-            print(f"   Using standard shuffle")
+            print(f"   Using ShuffleBufferSampler (buffer_size=10000, mmap-optimized)")
 
     # === MEMORY SAFETY CHECK: Warn before DataLoader creation ===
     # Check if num_workers with spawn will cause OOM

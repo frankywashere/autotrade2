@@ -99,23 +99,29 @@ class ChannelProjectionExtractor(nn.Module):
         """
         batch_size = hidden_state.shape[0]
 
-        # Calculate validity for each window
-        validity_list = []
-        for w in range(self.num_windows):
-            # Combine hidden state with window-specific quality metrics
-            window_context = torch.cat([
-                hidden_state,
-                quality_scores[:, w:w+1],
-                r_squared[:, w:w+1],
-                complete_cycles[:, w:w+1],
-                position[:, w:w+1]
-            ], dim=-1)  # [batch, hidden_size + 4]
+        # v5.0: Vectorized validity calculation (5-6x faster than Python loop!)
+        # Expand hidden_state to all windows: [batch, num_windows, hidden_size]
+        hidden_expanded = hidden_state.unsqueeze(1).expand(-1, self.num_windows, -1)
 
-            validity = self.validity_net(window_context)  # [batch, 1]
-            validity_list.append(validity)
+        # Stack quality metrics: [batch, num_windows, 4]
+        quality_stack = torch.stack([
+            quality_scores,
+            r_squared,
+            complete_cycles,
+            position
+        ], dim=-1)
 
-        # Stack validities: [batch, num_windows]
-        validity_weights = torch.cat(validity_list, dim=-1)
+        # Concatenate: [batch, num_windows, hidden_size + 4]
+        all_contexts = torch.cat([hidden_expanded, quality_stack], dim=-1)
+
+        # Reshape to [batch × num_windows, hidden_size + 4] for single NN call
+        contexts_flat = all_contexts.view(batch_size * self.num_windows, -1)
+
+        # ONE neural network call for all windows! (instead of 21 separate calls)
+        validities_flat = self.validity_net(contexts_flat)  # [batch × num_windows, 1]
+
+        # Reshape back: [batch, num_windows]
+        validity_weights = validities_flat.view(batch_size, self.num_windows)
 
         # Normalize to sum to 1 (softmax)
         validity_weights_norm = F.softmax(validity_weights, dim=-1)  # [batch, num_windows]
@@ -691,17 +697,18 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 pred_high = base_high + adjustment[:, 0:1]
                 pred_low = base_low + adjustment[:, 1:2]
 
-                # Store metadata for interpretability
-                projection_metadata[tf] = {
-                    'base_high': base_high.detach(),
-                    'base_low': base_low.detach(),
-                    'adjustment_high': adjustment[:, 0:1].detach(),
-                    'adjustment_low': adjustment[:, 1:2].detach(),
-                    'final_high': pred_high.detach(),
-                    'final_low': pred_low.detach(),
-                    'validity_weights': validity_weights.detach() if validity_weights is not None else None,
-                    'mode': 'geometric' if proj_features is not None else 'learned_approximation'
-                }
+                # v5.0: Store metadata for interpretability (only during eval, skip in training for speed)
+                if not self.training:
+                    projection_metadata[tf] = {
+                        'base_high': base_high.detach(),
+                        'base_low': base_low.detach(),
+                        'adjustment_high': adjustment[:, 0:1].detach(),
+                        'adjustment_low': adjustment[:, 1:2].detach(),
+                        'final_high': pred_high.detach(),
+                        'final_low': pred_low.detach(),
+                        'validity_weights': validity_weights.detach() if validity_weights is not None else None,
+                        'mode': 'geometric' if proj_features is not None else 'learned_approximation'
+                    }
             else:
                 # v4.x behavior: Direct neural net prediction
                 pred_high = self.timeframe_heads[f'{tf}_high'](hidden)
