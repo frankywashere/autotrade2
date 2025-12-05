@@ -521,47 +521,18 @@ class TradingFeatureExtractor(FeatureExtractor):
         if continuation and use_cache:
             # Build cache suffix matching the format used in extract_features() and generate_hierarchical_continuation_labels()
             # Uses df.index dates formatted as YYYYMMDD
-            hierarchical_cache_suffix = f"v{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
+            # v5.0: FEATURE_VERSION already starts with 'v', don't add another
+            hierarchical_cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
 
-            # v5.0: Also check for compatible older versions (backward compatibility)
-            compatible_versions = [
-                FEATURE_VERSION,  # Current: v5.0_vixv1_evv1_projv1
-                "v4.4_vixv1_evv1",  # v4.4 compatible (projections don't affect continuation)
-                "v3.20_vixv1_evv1",  # v3.20 compatible
-                "v3.20_vix",  # v3.20 original
-            ]
-
-            # Check if all per-TF label files exist (try compatible versions)
+            # Check if all per-TF label files exist
             found_tfs = []
             missing_tfs = []
-            found_version = None
-
-            for version in compatible_versions:
-                test_suffix = f"v{version}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
-                all_found = True
-
-                for tf in HIERARCHICAL_TIMEFRAMES:
-                    tf_label_path = unified_cache_dir / f"continuation_labels_{tf}_{test_suffix}.pkl"
-                    if not tf_label_path.exists():
-                        all_found = False
-                        break
-
-                if all_found:
-                    # Found complete set with this version
-                    found_version = version
-                    hierarchical_cache_suffix = test_suffix
-                    found_tfs = HIERARCHICAL_TIMEFRAMES.copy()
-                    missing_tfs = []
-                    break
-
-            # If not found with any version, check current version only
-            if not found_version:
-                for tf in HIERARCHICAL_TIMEFRAMES:
-                    tf_label_path = unified_cache_dir / f"continuation_labels_{tf}_{hierarchical_cache_suffix}.pkl"
-                    if tf_label_path.exists():
-                        found_tfs.append(tf)
-                    else:
-                        missing_tfs.append(tf)
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                tf_label_path = unified_cache_dir / f"continuation_labels_{tf}_{hierarchical_cache_suffix}.pkl"
+                if tf_label_path.exists():
+                    found_tfs.append(tf)
+                else:
+                    missing_tfs.append(tf)
 
             if len(found_tfs) == len(HIERARCHICAL_TIMEFRAMES):
                 # All TFs cached - validate one file to ensure format is correct
@@ -569,10 +540,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                 try:
                     test_load = pd.read_pickle(sample_path)
                     if len(test_load) > 0 and 'duration_bars' in test_load.columns:
-                        version_msg = f" (using {found_version})" if found_version and found_version != FEATURE_VERSION else ""
-                        print(f"   ✓ Continuation labels (hierarchical): Valid ({len(HIERARCHICAL_TIMEFRAMES)} TFs cached{version_msg})")
+                        print(f"   ✓ Continuation labels (hierarchical): Valid ({len(HIERARCHICAL_TIMEFRAMES)} TFs cached)")
                         cont_cache_valid = True
-                        self._cont_cache_suffix = hierarchical_cache_suffix  # Store for loading
                     else:
                         print(f"   ⚠️  Continuation labels: Invalid format - will regenerate")
                 except Exception as e:
@@ -583,42 +552,14 @@ class TradingFeatureExtractor(FeatureExtractor):
                 print(f"   ❌ Continuation labels: Not found - will generate (~1 hour)")
 
         # Check 3: Non-channel features (Price, RSI, Correlation, Cycle, Volume, Time, Breakdown)
-        # v5.0: Try current version, then compatible older versions
+        non_channel_cache_path = unified_cache_dir / f"non_channel_features_{cache_key}.pkl"
         non_channel_cache_valid = False
-        non_channel_cache_path = None
-
-        if use_cache:
-            # Try current cache key first
-            test_path = unified_cache_dir / f"non_channel_features_{cache_key}.pkl"
-
-            if test_path.exists():
-                non_channel_cache_path = test_path
-            else:
-                # Try older compatible cache keys (VIX/Events timestamps might differ)
-                # Look for any non_channel file with matching date range
-                pattern = f"non_channel_features_{FEATURE_VERSION.split('_')[0]}_*{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}*.pkl"
-                matches = list(unified_cache_dir.glob(pattern))
-
-                if matches:
-                    # Use most recent match
-                    non_channel_cache_path = sorted(matches, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-                else:
-                    # Try v4.4/v3.20 versions
-                    for old_version in ["v4.4_vixv1_evv1", "v3.20_vixv1_evv1", "v3.20_vix"]:
-                        old_key = cache_key.replace(FEATURE_VERSION, old_version)
-                        test_path = unified_cache_dir / f"non_channel_features_{old_key}.pkl"
-                        if test_path.exists():
-                            non_channel_cache_path = test_path
-                            break
-
-        if non_channel_cache_path and non_channel_cache_path.exists():
+        if non_channel_cache_path.exists() and use_cache:
             try:
                 test_load = pd.read_pickle(non_channel_cache_path)
                 if len(test_load) > 0 and len(test_load.columns) > 0:
-                    version_note = f" (using {non_channel_cache_path.name})" if non_channel_cache_path.name != f"non_channel_features_{cache_key}.pkl" else ""
-                    print(f"   ✓ Non-channel features: Valid ({len(test_load.columns)} cols, {len(test_load):,} rows{version_note})")
+                    print(f"   ✓ Non-channel features: Valid ({len(test_load.columns)} cols, {len(test_load):,} rows)")
                     non_channel_cache_valid = True
-                    self._non_channel_cache_path = non_channel_cache_path  # Store actual path found
                 else:
                     print(f"   ⚠️  Non-channel features: Empty - will regenerate")
             except Exception as e:
@@ -626,9 +567,6 @@ class TradingFeatureExtractor(FeatureExtractor):
                 non_channel_cache_valid = False
         else:
             print(f"   ❌ Non-channel features: Not found - will extract (~10-30 sec)")
-            if not non_channel_cache_path:
-                # Set default path for saving
-                self._non_channel_cache_path = unified_cache_dir / f"non_channel_features_{cache_key}.pkl"
 
         # Invalidation: If ANY cache fails and use_cache=True, should we invalidate all?
         # For now, keep independent (channel cache can work without continuation labels)
@@ -4307,7 +4245,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         if output_dir is None:
             output_dir = Path('data/feature_cache')
         if cache_suffix is None:
-            cache_suffix = f"v{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
+            # v5.0: FEATURE_VERSION already starts with 'v', don't add another
+            cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
