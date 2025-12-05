@@ -2845,7 +2845,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     if is_main_process(rank) and hasattr(extractor, '_cache_key'):
         cache_key = extractor._cache_key
         cache_dir = extractor._unified_cache_dir if hasattr(extractor, '_unified_cache_dir') else shard_path
-        cont_path = str(extractor._cont_cache_path) if hasattr(extractor, '_cont_cache_path') and extractor._cont_cache_path else None
+        # v5.0 fix: Use continuation_labels_dir from return value (not non-existent _cont_cache_path)
+        cont_path = str(continuation_labels_dir) if continuation_labels_dir else None
         nc_path = str(extractor._non_channel_cache_path) if hasattr(extractor, '_non_channel_cache_path') else None
         mmap_path = mmap_meta_path or (extractor._mmap_meta_path if hasattr(extractor, '_mmap_meta_path') else None)
 
