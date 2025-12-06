@@ -116,6 +116,10 @@ def calculate_channel(df: pd.DataFrame, symbol: str = 'tsla', window: int = 100)
     projected_high_pct = (projected_high - current_price) / current_price * 100
     projected_low_pct = (projected_low - current_price) / current_price * 100
 
+    # Find which bars these occur at
+    projected_high_bar = np.argmax(future_upper)
+    projected_low_bar = np.argmin(future_lower)
+
     # Quality score (simplified)
     quality = r_squared * (1.0 if complete_cycles >= 2 else 0.5)
 
@@ -139,6 +143,8 @@ def calculate_channel(df: pd.DataFrame, symbol: str = 'tsla', window: int = 100)
         'projected_low': projected_low,
         'projected_high_pct': projected_high_pct,
         'projected_low_pct': projected_low_pct,
+        'projected_high_bar': projected_high_bar,  # Which future bar has the high
+        'projected_low_bar': projected_low_bar,    # Which future bar has the low
         'future_x': future_x,
         'future_upper': future_upper,
         'future_lower': future_lower,
@@ -154,7 +160,8 @@ def plot_channel(
     window: int,
     show_projection: bool = True,
     show_touches: bool = True,
-    is_selected: bool = False
+    is_selected: bool = False,
+    model_prediction: Dict = None
 ):
     """
     Plot channel with current state and projection.
@@ -172,16 +179,20 @@ def plot_channel(
 
     fig, ax = plt.subplots(1, 1, figsize=(16, 8))
 
+    # Use bar numbers for x-axis (solves market hours / gap issues)
+    x_historical = np.arange(len(window_df))
+    x_future = np.arange(len(window_df), len(window_df) + len(channel['future_x']))
+
     # Plot price
-    ax.plot(window_df.index, window_df[f'{symbol}_close'],
+    ax.plot(x_historical, window_df[f'{symbol}_close'],
             label='Price', linewidth=2, color='black', zorder=3)
 
     # Plot channel lines
-    ax.plot(window_df.index, channel['upper_line'],
+    ax.plot(x_historical, channel['upper_line'],
             'r--', label='Upper (2σ)', alpha=0.7, linewidth=1.5)
-    ax.plot(window_df.index, channel['lower_line'],
+    ax.plot(x_historical, channel['lower_line'],
             'g--', label='Lower (2σ)', alpha=0.7, linewidth=1.5)
-    ax.plot(window_df.index, channel['center_line'],
+    ax.plot(x_historical, channel['center_line'],
             'b-', label='Center (regression)', alpha=0.5, linewidth=1)
 
     # Mark current position
@@ -191,38 +202,56 @@ def plot_channel(
     # Show touches
     if show_touches:
         if channel['upper_touches']:
-            ax.scatter(window_df.index[channel['upper_touches']],
+            ax.scatter(x_historical[channel['upper_touches']],
                       window_df[f'{symbol}_close'].iloc[channel['upper_touches']],
                       color='red', s=100, zorder=5, marker='o', alpha=0.7,
                       label=f'Upper touches ({len(channel["upper_touches"])})')
 
         if channel['lower_touches']:
-            ax.scatter(window_df.index[channel['lower_touches']],
+            ax.scatter(x_historical[channel['lower_touches']],
                       window_df[f'{symbol}_close'].iloc[channel['lower_touches']],
                       color='green', s=100, zorder=5, marker='o', alpha=0.7,
                       label=f'Lower touches ({len(channel["lower_touches"])})')
 
     # Show projection
     if show_projection:
-        # Create future timestamps (approximate)
-        last_ts = window_df.index[-1]
-        freq = pd.infer_freq(window_df.index)
-        if freq:
-            future_dates = pd.date_range(last_ts, periods=len(channel['future_x'])+1, freq=freq)[1:]
-        else:
-            # Fallback: extend x-axis numerically
-            future_dates = range(len(window_df), len(window_df) + len(channel['future_x']))
+        ax.plot(x_future, channel['future_upper'],
+                'r:', label='Proj Upper', alpha=0.5, linewidth=2)
+        ax.plot(x_future, channel['future_lower'],
+                'g:', label='Proj Lower', alpha=0.5, linewidth=2)
+        ax.plot(x_future, channel['future_center'],
+                'b:', alpha=0.3, linewidth=1)
 
-        ax.plot(future_dates, channel['future_upper'],
-                'r:', label='Projected Upper', alpha=0.5, linewidth=2)
-        ax.plot(future_dates, channel['future_lower'],
-                'g:', label='Projected Lower', alpha=0.5, linewidth=2)
-        ax.plot(future_dates, channel['future_center'],
-                'b:', label='Projected Center', alpha=0.3, linewidth=1)
+        # Mark raw geometric projected high/low
+        high_bar_idx = channel['projected_high_bar']
+        low_bar_idx = channel['projected_low_bar']
 
-        # Mark projected high/low
-        ax.axhline(channel['projected_high'], color='red', linestyle='--', alpha=0.3)
-        ax.axhline(channel['projected_low'], color='green', linestyle='--', alpha=0.3)
+        ax.scatter([x_future[high_bar_idx]], [channel['projected_high']],
+                  color='red', marker='o', s=250, zorder=10, edgecolors='darkred',
+                  linewidths=2.5, label=f'Raw High: {channel["projected_high_pct"]:+.2f}% (bar {high_bar_idx})')
+
+        ax.scatter([x_future[low_bar_idx]], [channel['projected_low']],
+                  color='green', marker='o', s=250, zorder=10, edgecolors='darkgreen',
+                  linewidths=2.5, label=f'Raw Low: {channel["projected_low_pct"]:+.2f}% (bar {low_bar_idx})')
+
+        # If we have model's adjusted prediction, show it too
+        if model_prediction and 'high' in model_prediction and 'low' in model_prediction:
+            # Convert model's % back to price
+            current = channel['current_price']
+            adjusted_high_price = current * (1 + model_prediction['high'] / 100)
+            adjusted_low_price = current * (1 + model_prediction['low'] / 100)
+
+            # Show as stars at end of projection window
+            ax.scatter([x_future[-1]], [adjusted_high_price],
+                      color='red', marker='*', s=500, zorder=11, edgecolors='darkred',
+                      linewidths=2, label=f'Model High: {model_prediction["high"]:+.2f}%')
+
+            ax.scatter([x_future[-1]], [adjusted_low_price],
+                      color='green', marker='*', s=500, zorder=11, edgecolors='darkgreen',
+                      linewidths=2, label=f'Model Low: {model_prediction["low"]:+.2f}%')
+
+    # Add vertical line to mark current bar (boundary between historical and projected)
+    ax.axvline(len(window_df) - 1, color='orange', linestyle='-', alpha=0.5, linewidth=2, label='Current Bar')
 
     # Title with selection indicator
     title_prefix = "⭐ SELECTED: " if is_selected else ""
@@ -234,8 +263,9 @@ def plot_channel(
         fontsize=12, fontweight='bold'
     )
 
+    ax.set_xlabel('Bar Number', fontsize=12)
     ax.set_ylabel('Price ($)', fontsize=12)
-    ax.legend(loc='best', fontsize=10)
+    ax.legend(loc='best', fontsize=9)
     ax.grid(True, alpha=0.3)
 
     # Add metrics box
@@ -402,16 +432,20 @@ def visualize_current_channels(
         channel = calculate_channel(tf_df, symbol, actual_window)
         window_df = channel['window_df']
 
+        # Use bar numbers for x-axis
+        x_historical = np.arange(len(window_df))
+        x_future = np.arange(len(window_df), len(window_df) + len(channel['future_x']))
+
         # Plot price
-        ax.plot(window_df.index, window_df[f'{symbol}_close'],
+        ax.plot(x_historical, window_df[f'{symbol}_close'],
                label='Price', linewidth=2, color='black', zorder=3)
 
         # Plot channel
-        ax.plot(window_df.index, channel['upper_line'],
+        ax.plot(x_historical, channel['upper_line'],
                'r--', label='Upper (2σ)', alpha=0.7, linewidth=1.5)
-        ax.plot(window_df.index, channel['lower_line'],
+        ax.plot(x_historical, channel['lower_line'],
                'g--', label='Lower (2σ)', alpha=0.7, linewidth=1.5)
-        ax.plot(window_df.index, channel['center_line'],
+        ax.plot(x_historical, channel['center_line'],
                'b-', label='Center', alpha=0.5, linewidth=1)
 
         # Current price
@@ -420,30 +454,61 @@ def visualize_current_channels(
 
         # Touches
         if channel['upper_touches']:
-            ax.scatter(window_df.index[channel['upper_touches']],
+            ax.scatter(x_historical[channel['upper_touches']],
                       window_df[f'{symbol}_close'].iloc[channel['upper_touches']],
                       color='red', s=100, zorder=5, marker='o', alpha=0.7)
 
         if channel['lower_touches']:
-            ax.scatter(window_df.index[channel['lower_touches']],
+            ax.scatter(x_historical[channel['lower_touches']],
                       window_df[f'{symbol}_close'].iloc[channel['lower_touches']],
                       color='green', s=100, zorder=5, marker='o', alpha=0.7)
 
         # Show projection
         if show_projection:
-            last_ts = window_df.index[-1]
-            freq = pd.infer_freq(window_df.index)
-            if freq:
-                future_dates = pd.date_range(last_ts, periods=len(channel['future_x'])+1, freq=freq)[1:]
-                ax.plot(future_dates, channel['future_upper'],
-                       'r:', label='Proj Upper', alpha=0.5, linewidth=2)
-                ax.plot(future_dates, channel['future_lower'],
-                       'g:', label='Proj Lower', alpha=0.5, linewidth=2)
-                ax.plot(future_dates, channel['future_center'],
-                       'b:', alpha=0.3, linewidth=1)
+            ax.plot(x_future, channel['future_upper'],
+                   'r:', label='Proj Upper', alpha=0.5, linewidth=2)
+            ax.plot(x_future, channel['future_lower'],
+                   'g:', label='Proj Lower', alpha=0.5, linewidth=2)
+            ax.plot(x_future, channel['future_center'],
+                   'b:', alpha=0.3, linewidth=1)
 
-                ax.axhline(channel['projected_high'], color='red', linestyle='--', alpha=0.2)
-                ax.axhline(channel['projected_low'], color='green', linestyle='--', alpha=0.2)
+            # Mark raw geometric projected high/low
+            high_bar_idx = channel['projected_high_bar']
+            low_bar_idx = channel['projected_low_bar']
+
+            ax.scatter([x_future[high_bar_idx]], [channel['projected_high']],
+                      color='red', marker='o', s=250, zorder=10, edgecolors='darkred',
+                      linewidths=2.5, label=f'Raw High: {channel["projected_high_pct"]:+.2f}% (bar {high_bar_idx})')
+
+            ax.scatter([x_future[low_bar_idx]], [channel['projected_low']],
+                      color='green', marker='o', s=250, zorder=10, edgecolors='darkgreen',
+                      linewidths=2.5, label=f'Raw Low: {channel["projected_low_pct"]:+.2f}% (bar {low_bar_idx})')
+
+            # If we have model's adjusted prediction for this TF, show it
+            model_pred_for_tf = None
+            if prediction_result and 'all_channels' in prediction_result:
+                for ch in prediction_result['all_channels']:
+                    if ch['timeframe'] == tf:
+                        model_pred_for_tf = ch
+                        break
+
+            if model_pred_for_tf:
+                # Convert model's % back to price
+                current = channel['current_price']
+                adjusted_high_price = current * (1 + model_pred_for_tf['high'] / 100)
+                adjusted_low_price = current * (1 + model_pred_for_tf['low'] / 100)
+
+                # Show as stars
+                ax.scatter([x_future[-1]], [adjusted_high_price],
+                          color='red', marker='*', s=500, zorder=11, edgecolors='darkred',
+                          linewidths=2, label=f'Model High: {model_pred_for_tf["high"]:+.2f}%')
+
+                ax.scatter([x_future[-1]], [adjusted_low_price],
+                          color='green', marker='*', s=500, zorder=11, edgecolors='darkgreen',
+                          linewidths=2, label=f'Model Low: {model_pred_for_tf["low"]:+.2f}%')
+
+        # Mark current bar boundary
+        ax.axvline(len(window_df) - 1, color='orange', linestyle='-', alpha=0.5, linewidth=2, label='Current Bar')
 
         # Get confidence from prediction result
         confidence = None
@@ -466,8 +531,9 @@ def visualize_current_channels(
             fontsize=11, fontweight='bold' if tf == selected_tf else 'normal'
         )
 
+        ax.set_xlabel('Bar Number', fontsize=10)
         ax.set_ylabel('Price ($)', fontsize=11)
-        ax.legend(loc='best', fontsize=9)
+        ax.legend(loc='best', fontsize=8, ncol=2)
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -533,7 +599,7 @@ def main():
     # Fetch live data
     print("\n2. Fetching live data...")
     try:
-        predictor.fetch_live_data(intraday_days=60, daily_days=400)
+        predictor.fetch_live_data(intraday_days=60, daily_days=400, longer_days=5475)
     except Exception as e:
         print(f"❌ Failed to fetch data: {e}")
         return
@@ -580,8 +646,18 @@ def main():
         tf = input("Enter timeframe: ").strip()
         if tf in predictor.data_buffer.buffers:
             channel = calculate_channel(predictor.data_buffer.buffers[tf], 'tsla', 100)
+
+            # Get model prediction for this TF
+            model_pred_for_tf = None
+            if result and 'all_channels' in result:
+                for ch in result['all_channels']:
+                    if ch['timeframe'] == tf:
+                        model_pred_for_tf = ch
+                        break
+
             fig = plot_channel(channel, 'tsla', tf, 100,
-                             is_selected=(tf == result.get('selected_tf') if result else False))
+                             is_selected=(tf == result.get('selected_tf') if result else False),
+                             model_prediction=model_pred_for_tf)
             plt.show()
         else:
             print(f"❌ Timeframe {tf} not found in buffer")

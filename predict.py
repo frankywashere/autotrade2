@@ -625,10 +625,11 @@ class LiveFeatureExtractor:
             missing = set(columns) - set(available)
             warnings.warn(f"{tf}: Missing {len(missing)} columns (will use zeros)")
 
-            # Add missing columns as zeros
-            for col in columns:
-                if col not in resampled.columns:
-                    resampled[col] = 0.0
+            # Add missing columns as zeros (efficient concat instead of loop)
+            missing_cols = [c for c in columns if c not in resampled.columns]
+            if missing_cols:
+                missing_df = pd.DataFrame(0.0, index=resampled.index, columns=missing_cols)
+                resampled = pd.concat([resampled, missing_df], axis=1)
 
         # Select columns in exact order
         tf_features = resampled[columns].values
@@ -809,6 +810,7 @@ class LivePredictor:
         self,
         intraday_days: int = 60,
         daily_days: int = 400,
+        longer_days: int = 5475,  # ~15 years for weekly/monthly (ensures w168 coverage)
         refresh_vix: bool = True
     ) -> None:
         """
@@ -817,7 +819,8 @@ class LivePredictor:
         This fetches each timeframe directly from yfinance (no resampling needed)
         to get maximum data availability:
         - Intraday (5m, 15m, 30m, 1h): Up to 60 days from yfinance
-        - Daily/longer (1d, 1wk, 1mo, 3mo): Years of data available
+        - Daily: ~400 days (~1.5 years)
+        - Weekly/Monthly: ~15 years (ensures w168 window coverage)
 
         Fetches:
         - Native intervals: 5m, 15m, 30m, 1h, 1d, 1wk, 1mo, 3mo
@@ -827,6 +830,7 @@ class LivePredictor:
         Args:
             intraday_days: Days of intraday data (default: 60, max for yfinance)
             daily_days: Days of daily data (default: 400, ~1.5 years)
+            longer_days: Days for weekly/monthly (default: 5475 = 15 years)
             refresh_vix: Also refresh VIX data (default: True)
 
         Example:
@@ -839,27 +843,21 @@ class LivePredictor:
         # Invalidate cached features since we're loading new data
         self._cache_invalidated = True
 
-        # Map our TFs to yfinance intervals
+        # Map our TFs to yfinance intervals with appropriate history lengths
         native_intervals = {
-            '5min': '5m',
-            '15min': '15m',
-            '30min': '30m',
-            '1hour': '1h',
-            'daily': '1d',
-            'weekly': '1wk',
-            'monthly': '1mo',
-            '3month': '3mo',
+            '5min': ('5m', min(intraday_days, 60)),     # Intraday limit
+            '15min': ('15m', min(intraday_days, 60)),
+            '30min': ('30m', min(intraday_days, 60)),
+            '1hour': ('1h', min(intraday_days, 60)),
+            'daily': ('1d', daily_days),
+            'weekly': ('1wk', longer_days),             # Need ~15 years for w168
+            'monthly': ('1mo', longer_days),
+            '3month': ('3mo', longer_days),
         }
 
         # Fetch each native interval
-        for our_tf, yf_interval in native_intervals.items():
-            # Determine days to fetch
-            if yf_interval in ['5m', '15m', '30m', '1h']:
-                days = min(intraday_days, 60)  # yfinance limit for intraday
-                print(f"\n   --- {our_tf.upper()} ({yf_interval}, {days} days) ---")
-            else:
-                days = daily_days
-                print(f"\n   --- {our_tf.upper()} ({yf_interval}, {days} days) ---")
+        for our_tf, (yf_interval, days) in native_intervals.items():
+            print(f"\n   --- {our_tf.upper()} ({yf_interval}, {days} days) ---")
 
             # Fetch from yfinance
             data = fetch_live_ohlcv(['SPY', 'TSLA'], days=days, interval=yf_interval)

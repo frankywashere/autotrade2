@@ -148,7 +148,9 @@ def render_sidebar():
     with col1:
         intraday_days = st.number_input("Intraday (days)", 1, 60, 60, help="Days of intraday data (5m, 15m, 30m, 1h). Max 60 days from yfinance.")
     with col2:
-        daily_days = st.number_input("Daily+ (days)", 30, 1000, 400, help="Days of daily/weekly/monthly data")
+        daily_days = st.number_input("Daily (days)", 30, 2000, 400, help="Days of daily data")
+
+    longer_days = st.sidebar.number_input("Weekly/Monthly (days)", 365, 7300, 5475, help="Days for weekly/monthly data (~15 years for w168 coverage)")
 
     if st.sidebar.button("📡 Fetch Live Data", use_container_width=True):
         if st.session_state.predictor:
@@ -156,7 +158,8 @@ def render_sidebar():
                 try:
                     st.session_state.predictor.fetch_live_data(
                         intraday_days=intraday_days,
-                        daily_days=daily_days
+                        daily_days=daily_days,
+                        longer_days=longer_days
                     )
                     st.session_state.data_loaded = True
                     st.session_state.last_refresh = datetime.now()

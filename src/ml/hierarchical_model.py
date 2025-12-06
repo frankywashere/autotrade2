@@ -43,18 +43,18 @@ import config as project_config
 
 class ChannelProjectionExtractor(nn.Module):
     """
-    v5.0: Extracts and weights channel projections from features.
+    v5.1: Selects best window projection by quality (no learned blending).
 
-    For each timeframe, combines 21 window projections weighted by learned validity.
-    Each window's projection is a geometric channel projection (slope × horizon).
-    Neural network learns which windows to trust based on quality metrics.
+    For each timeframe, picks the single best window from 21 candidates
+    based on quality score (composite of r², complete_cycles, etc.).
+    Pure geometric selection - no neural network, fully interpretable.
     """
 
     def __init__(self, timeframe: str, hidden_size: int, num_windows: int = 21):
         """
         Args:
             timeframe: Timeframe name (e.g., '5min', '1h', 'daily')
-            hidden_size: Size of CfC hidden state
+            hidden_size: Size of CfC hidden state (unused in v5.1, kept for compatibility)
             num_windows: Number of window sizes (default: 21)
         """
         super().__init__()
@@ -62,17 +62,7 @@ class ChannelProjectionExtractor(nn.Module):
         self.hidden_size = hidden_size
         self.num_windows = num_windows
 
-        # Validity predictor: learns which window projections to trust
-        # Input: hidden_state (128) + quality_score (1) + r_squared (1) + complete_cycles (1) + position (1) = 132
-        self.validity_net = nn.Sequential(
-            nn.Linear(hidden_size + 4, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()  # 0-1 validity score
-        )
+        # No learned parameters in v5.1 - pure quality-based selection
 
     def forward(
         self,
@@ -84,10 +74,10 @@ class ChannelProjectionExtractor(nn.Module):
         position: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """
-        Combine window projections weighted by learned validity.
+        Select best window projection by quality score (no blending).
 
         Args:
-            hidden_state: [batch, hidden_size] - CfC layer output
+            hidden_state: [batch, hidden_size] - CfC layer output (unused in v5.1)
             projections: [batch, num_windows, 2] - (high, low) projections for each window
             quality_scores: [batch, num_windows] - Quality score per window
             r_squared: [batch, num_windows] - R² per window
@@ -95,47 +85,28 @@ class ChannelProjectionExtractor(nn.Module):
             position: [batch, num_windows] - Channel position per window
 
         Returns:
-            dict with weighted_high, weighted_low, validity_weights
+            dict with selected_high, selected_low, best_window_idx
         """
-        batch_size = hidden_state.shape[0]
+        batch_size = projections.shape[0]
 
-        # v5.0: Vectorized validity calculation (5-6x faster than Python loop!)
-        # Expand hidden_state to all windows: [batch, num_windows, hidden_size]
-        hidden_expanded = hidden_state.unsqueeze(1).expand(-1, self.num_windows, -1)
+        # v5.1: Simple selection - pick window with highest quality
+        # Quality score already incorporates r², cycles, and other metrics
+        best_window_idx = torch.argmax(quality_scores, dim=-1)  # [batch]
 
-        # Stack quality metrics: [batch, num_windows, 4]
-        quality_stack = torch.stack([
-            quality_scores,
-            r_squared,
-            complete_cycles,
-            position
-        ], dim=-1)
+        # Gather projections from best window for each sample in batch
+        batch_indices = torch.arange(batch_size, device=projections.device)
+        selected_high = projections[batch_indices, best_window_idx, 0].unsqueeze(-1)  # [batch, 1]
+        selected_low = projections[batch_indices, best_window_idx, 1].unsqueeze(-1)   # [batch, 1]
 
-        # Concatenate: [batch, num_windows, hidden_size + 4]
-        all_contexts = torch.cat([hidden_expanded, quality_stack], dim=-1)
-
-        # Reshape to [batch × num_windows, hidden_size + 4] for single NN call
-        contexts_flat = all_contexts.view(batch_size * self.num_windows, -1)
-
-        # ONE neural network call for all windows! (instead of 21 separate calls)
-        validities_flat = self.validity_net(contexts_flat)  # [batch × num_windows, 1]
-
-        # Reshape back: [batch, num_windows]
-        validity_weights = validities_flat.view(batch_size, self.num_windows)
-
-        # Normalize to sum to 1 (softmax)
-        validity_weights_norm = F.softmax(validity_weights, dim=-1)  # [batch, num_windows]
-
-        # Weighted combination of projections
-        # projections shape: [batch, num_windows, 2]
-        weighted_high = (projections[:, :, 0] * validity_weights_norm).sum(dim=-1, keepdim=True)  # [batch, 1]
-        weighted_low = (projections[:, :, 1] * validity_weights_norm).sum(dim=-1, keepdim=True)   # [batch, 1]
+        # Create one-hot weights for interpretability (which window was selected)
+        validity_weights = torch.zeros(batch_size, self.num_windows, device=projections.device)
+        validity_weights[batch_indices, best_window_idx] = 1.0
 
         return {
-            'weighted_high': weighted_high,
-            'weighted_low': weighted_low,
-            'validity_weights': validity_weights_norm,  # For interpretability
-            'raw_validities': validity_weights  # Before softmax
+            'weighted_high': selected_high,  # Keep same key names for compatibility
+            'weighted_low': selected_low,
+            'validity_weights': validity_weights,  # One-hot (1.0 for selected, 0.0 for others)
+            'best_window_idx': best_window_idx  # For interpretability
         }
 
 
@@ -699,16 +670,27 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
                 # v5.0: Store metadata for interpretability (only during eval, skip in training for speed)
                 if not self.training:
-                    projection_metadata[tf] = {
+                    metadata = {
                         'base_high': base_high.detach(),
                         'base_low': base_low.detach(),
                         'adjustment_high': adjustment[:, 0:1].detach(),
                         'adjustment_low': adjustment[:, 1:2].detach(),
                         'final_high': pred_high.detach(),
                         'final_low': pred_low.detach(),
-                        'validity_weights': validity_weights.detach() if validity_weights is not None else None,
                         'mode': 'geometric' if proj_features is not None else 'learned_approximation'
                     }
+
+                    # v5.1: Add window selection info
+                    if validity_weights is not None:
+                        metadata['validity_weights'] = validity_weights.detach()
+                        if 'best_window_idx' in proj_output:
+                            metadata['best_window_idx'] = proj_output['best_window_idx'].detach()
+                            # Map to actual window size for interpretability
+                            window_sizes = [168, 160, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20, 15, 10]
+                            best_idx = proj_output['best_window_idx'][0].item()  # First sample
+                            metadata['selected_window_size'] = window_sizes[best_idx] if best_idx < len(window_sizes) else None
+
+                    projection_metadata[tf] = metadata
             else:
                 # v4.x behavior: Direct neural net prediction
                 pred_high = self.timeframe_heads[f'{tf}_high'](hidden)
