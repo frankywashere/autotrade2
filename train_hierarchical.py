@@ -1443,6 +1443,136 @@ def interactive_setup(args, profiler=None):
         print("Falling back to command-line args...")
         return args
 
+    # =========================================================================
+    # RESUME FROM CHECKPOINT (first option)
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("🔄 RESUME TRAINING CHECK")
+    print("=" * 70)
+
+    # Look for existing checkpoints
+    default_checkpoint = Path(args.output)
+    checkpoint_candidates = []
+
+    if default_checkpoint.exists():
+        checkpoint_candidates.append(str(default_checkpoint))
+
+    # Also check models/ directory
+    models_dir = Path('models')
+    if models_dir.exists():
+        for pth_file in models_dir.glob('*.pth'):
+            if str(pth_file) not in checkpoint_candidates:
+                checkpoint_candidates.append(str(pth_file))
+
+    if checkpoint_candidates:
+        print(f"\n📁 Found {len(checkpoint_candidates)} checkpoint(s):")
+        for cp in checkpoint_candidates:
+            try:
+                ckpt = torch.load(cp, map_location='cpu', weights_only=False)
+                epoch = ckpt.get('epoch', '?')
+                val_loss = ckpt.get('val_loss', 0)
+                print(f"   • {cp} (epoch {epoch}, val_loss: {val_loss:.4f})")
+            except Exception as e:
+                print(f"   • {cp} (could not read: {e})")
+
+        resume_choice = inquirer.select(
+            message="Resume from checkpoint?",
+            choices=[
+                Choice(value=None, name="No - Start fresh training"),
+                *[Choice(value=cp, name=f"Resume from: {cp}") for cp in checkpoint_candidates]
+            ],
+            default=None
+        ).execute()
+
+        if resume_choice:
+            args.resume_checkpoint = resume_choice
+            print(f"\n✓ Will resume from: {resume_choice}")
+            # Load checkpoint to get saved args
+            ckpt = torch.load(resume_choice, map_location='cpu', weights_only=False)
+            saved_args = ckpt.get('args', {})
+
+            # Restore key settings from checkpoint
+            for key in ['device', 'batch_size', 'lr', 'epochs',
+                        'train_start_year', 'train_end_year', 'use_geometric_base',
+                        'use_fusion_head', 'multi_task']:
+                if key in saved_args:
+                    setattr(args, key, saved_args[key])
+
+            args.resume_epoch = ckpt.get('epoch', 0) + 1  # Start from next epoch
+            print(f"   Resuming from epoch {args.resume_epoch}")
+            print(f"   Settings restored from checkpoint")
+
+            # =========================================================
+            # VERIFY CACHE PATH (features/labels/native TFs)
+            # Uses existing cache scanning functions
+            # =========================================================
+            saved_cache_path = saved_args.get('shard_path', 'data/feature_cache')
+            cache_exists = Path(saved_cache_path).exists()
+
+            print(f"\n📂 Cache Path Verification")
+            print(f"   Saved path: {saved_cache_path}")
+            print(f"   Status: {'✓ Exists' if cache_exists else '✗ Not found'}")
+
+            if cache_exists:
+                # Use existing functions to scan cache
+                manifests = load_cache_manifests(saved_cache_path)
+                cache_pairs = find_available_caches(saved_cache_path)
+
+                # Check for native TF files
+                cache_path = Path(saved_cache_path)
+                tf_meta_files = list(cache_path.glob('tf_meta*.json'))
+                native_tf_files = list(cache_path.glob('tf_sequence*.npy'))
+
+                print(f"   Manifests: {'✓ ' + str(len(manifests)) + ' found' if manifests else '✗ None'}")
+                print(f"   Cache pairs: {'✓ ' + str(len(cache_pairs)) + ' found' if cache_pairs else '✗ None'}")
+                print(f"   TF Meta: {'✓' if tf_meta_files else '✗'}")
+                print(f"   Native TF sequences: {'✓ ' + str(len(native_tf_files)) + ' files' if native_tf_files else '✗ None'}")
+
+            cache_choice = inquirer.select(
+                message="Cache directory:",
+                choices=[
+                    Choice(value='use_saved', name=f"Use saved path: {saved_cache_path}" + (" ✓" if cache_exists else " (not found!)")),
+                    Choice(value='specify', name="Specify different cache path"),
+                ],
+                default='use_saved' if cache_exists else 'specify'
+            ).execute()
+
+            if cache_choice == 'specify':
+                args.shard_path = inquirer.text(
+                    message="Cache directory for features/labels:",
+                    default=saved_cache_path
+                ).execute()
+            else:
+                args.shard_path = saved_cache_path
+
+            # Verify the chosen path exists
+            if not Path(args.shard_path).exists():
+                print(f"\n⚠️ Warning: Cache path '{args.shard_path}' does not exist!")
+                print("   Training will fail if features/labels cannot be loaded.")
+
+            # Ask if they want to continue with same epochs or extend
+            extend_choice = inquirer.select(
+                message=f"Original training was {saved_args.get('epochs', 10)} epochs. You're at epoch {args.resume_epoch}.",
+                choices=[
+                    Choice(value='continue', name=f"Continue to epoch {saved_args.get('epochs', 10)}"),
+                    Choice(value='extend', name="Extend training (set new total epochs)"),
+                ],
+                default='continue'
+            ).execute()
+
+            if extend_choice == 'extend':
+                args.epochs = inquirer.number(
+                    message="New total epochs:",
+                    default=saved_args.get('epochs', 10) + 10,
+                    min_allowed=args.resume_epoch
+                ).execute()
+                args.epochs = int(args.epochs)
+
+            return args  # Skip rest of setup, use saved settings
+    else:
+        print("\n   No existing checkpoints found. Starting fresh.")
+        args.resume_checkpoint = None
+
     # Initial cache directory selection
     print("\n📂 Cache Directory Selection")
     cache_dir_default = getattr(args, 'shard_path', 'data/feature_cache') or 'data/feature_cache'
@@ -3284,26 +3414,55 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print("   ✓ AMP enabled (FP16 training)")
 
     # =========================================================================
+    # RESUME FROM CHECKPOINT (if requested)
+    # =========================================================================
+    start_epoch = 0
+    if hasattr(args, 'resume_checkpoint') and args.resume_checkpoint:
+        if is_main_process(rank):
+            print(f"\n📂 Loading checkpoint: {args.resume_checkpoint}")
+
+        checkpoint = torch.load(args.resume_checkpoint, map_location=args.device, weights_only=False)
+
+        # Load model weights
+        model_to_load = model.module if hasattr(model, 'module') else model
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
+
+        # Load optimizer state
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        # Get starting epoch
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        best_val_loss = checkpoint.get('val_loss', float('inf'))
+
+        if is_main_process(rank):
+            print(f"   ✓ Model weights loaded")
+            print(f"   ✓ Optimizer state loaded")
+            print(f"   ✓ Resuming from epoch {start_epoch + 1}")
+            print(f"   ✓ Best val_loss so far: {best_val_loss:.4f}")
+
+    # =========================================================================
     # TRAINING LOOP
     # =========================================================================
 
     if is_main_process(rank):
         print("\n" + "=" * 70)
-        print("STARTING TRAINING")
+        print("STARTING TRAINING" + (f" (resuming from epoch {start_epoch + 1})" if start_epoch > 0 else ""))
         print("=" * 70)
 
     if profiler:
         profiler.log_info(f"TRAINING_START | device={args.device} | batch_size={args.batch_size} | num_workers={args.num_workers}")
         profiler.snapshot("pre_training_loop", 0, force_log=True)
 
-    best_val_loss = float('inf')
+    # Only reset best_val_loss if not resuming (it was set during checkpoint load)
+    if start_epoch == 0:
+        best_val_loss = float('inf')
     patience_counter = 0
     train_losses = []
     val_losses = []
     val_errors = []
 
     # Progress bar (rank 0 only)
-    epoch_pbar = tqdm(range(args.epochs), desc="Training", disable=not is_main_process(rank))
+    epoch_pbar = tqdm(range(start_epoch, args.epochs), desc="Training", disable=not is_main_process(rank))
 
     for epoch in epoch_pbar:
         # Set epoch for distributed sampler
