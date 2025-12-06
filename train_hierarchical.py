@@ -3687,7 +3687,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     # CRITICAL: Save model architecture params for future compatibility
                     'input_sizes': model_to_save.input_sizes,  # v4.x: Dict[str, int] for native TF mode
                     'hidden_size': model_to_save.hidden_size,
-                    'internal_neurons_ratio': model_to_save.internal_neurons_ratio
+                    'internal_neurons_ratio': model_to_save.internal_neurons_ratio,
+                    # v5.1: Save architecture flags at top level for easier access
+                    'use_fusion_head': getattr(args, 'use_fusion_head', False),
+                    'use_geometric_base': getattr(args, 'use_geometric_base', True),
+                    'multi_task': getattr(args, 'multi_task', True)
                 }, output_path)
 
                 tqdm.write(f"   ✓ Saved best model (val_loss: {avg_val_loss:.4f})")

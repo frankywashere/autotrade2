@@ -1277,8 +1277,11 @@ def load_hierarchical_model(model_path: str, device: str = 'cpu') -> Hierarchica
     hidden_size = checkpoint.get('hidden_size') or args.get('hidden_size', 128)
     internal_neurons_ratio = checkpoint.get('internal_neurons_ratio') or args.get('internal_neurons_ratio', 2.0)
 
-    # v4.2: Get use_fusion_head (default True for backward compatibility)
-    use_fusion_head = checkpoint.get('use_fusion_head', True)
+    # v4.2: Get use_fusion_head (check args first, then top-level, default False for Physics-Only)
+    use_fusion_head = args.get('use_fusion_head', checkpoint.get('use_fusion_head', False))
+
+    # v5.0: Get use_geometric_base (check args first, then top-level, default True)
+    use_geometric_base = args.get('use_geometric_base', checkpoint.get('use_geometric_base', True))
 
     # Create model
     model = HierarchicalLNN(
@@ -1287,7 +1290,8 @@ def load_hierarchical_model(model_path: str, device: str = 'cpu') -> Hierarchica
         internal_neurons_ratio=internal_neurons_ratio,
         device=device,
         multi_task=checkpoint.get('multi_task') or args.get('multi_task', True),
-        use_fusion_head=use_fusion_head
+        use_fusion_head=use_fusion_head,
+        use_geometric_base=use_geometric_base
     )
 
     # Handle DataParallel checkpoints
