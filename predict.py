@@ -710,6 +710,10 @@ class LivePredictor:
         self.sequence_lengths = self.feature_extractor.sequence_lengths
         self.model_path = model_path
 
+        # Cache for extracted features (prevents re-extraction on every prediction)
+        self._cached_features = None
+        self._cache_invalidated = True  # Flag to know when to re-extract
+
         print(f"   ✓ Ready for inference")
         print(f"   Sequence lengths: {self.sequence_lengths}")
 
@@ -733,6 +737,9 @@ class LivePredictor:
         if resample and interval == '1min':
             print("   Resampling to all timeframes...")
             self.data_buffer.resample_from_1min()
+
+        # Invalidate cache when data is loaded
+        self._cache_invalidated = True
 
     def load_separate_data(
         self,
@@ -794,6 +801,9 @@ class LivePredictor:
 
         self.data_buffer.update_bar(combined_bar, interval)
 
+        # Invalidate cache when data is updated
+        self._cache_invalidated = True
+
     def fetch_live_data(
         self,
         intraday_days: int = 7,
@@ -822,6 +832,9 @@ class LivePredictor:
             result = predictor.predict()
         """
         print(f"\n📡 Fetching live data from yfinance...")
+
+        # Invalidate cached features since we're loading new data
+        self._cache_invalidated = True
 
         # 1. Fetch 1-minute data for intraday timeframes
         print(f"\n   --- Intraday Data (1-min, {intraday_days} days) ---")
@@ -904,8 +917,14 @@ class LivePredictor:
         # Check buffer status
         buffer_status = self.data_buffer.get_status()
 
-        # Extract features
-        features = self.feature_extractor.extract_features(self.data_buffer)
+        # Extract features (or use cached if data hasn't changed)
+        if self._cache_invalidated or self._cached_features is None:
+            print("   🔄 Extracting features (data changed)...")
+            features = self.feature_extractor.extract_features(self.data_buffer)
+            self._cached_features = features
+            self._cache_invalidated = False
+        else:
+            features = self._cached_features
 
         # Move features to device
         features_device = {
