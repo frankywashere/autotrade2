@@ -559,7 +559,7 @@ class LiveFeatureExtractor:
 
         # Extract features using the SAME pipeline as training
         # use_cache=False forces fresh extraction (no mmap)
-        # use_chunking=False since we have small data
+        # skip_native_tf_generation=True prevents creating new tf_meta files
         print("   Extracting features in LIVE mode...")
         extraction_result = self.extractor.extract_features(
             df,
@@ -567,6 +567,7 @@ class LiveFeatureExtractor:
             use_gpu=False,  # CPU for stability in live
             continuation=False,
             use_chunking=False,
+            skip_native_tf_generation=True,  # Don't create new tf_meta files!
             vix_data=self.vix_data
         )
 
@@ -806,23 +807,25 @@ class LivePredictor:
 
     def fetch_live_data(
         self,
-        intraday_days: int = 7,
+        intraday_days: int = 60,
         daily_days: int = 400,
         refresh_vix: bool = True
     ) -> None:
         """
-        Fetch live SPY, TSLA, and VIX data from yfinance.
+        Fetch live SPY, TSLA, and VIX data from yfinance using NATIVE intervals.
 
-        This is the easiest way to get started with live inference.
-        Automatically fetches and aligns all required data at multiple resolutions.
+        This fetches each timeframe directly from yfinance (no resampling needed)
+        to get maximum data availability:
+        - Intraday (5m, 15m, 30m, 1h): Up to 60 days from yfinance
+        - Daily/longer (1d, 1wk, 1mo, 3mo): Years of data available
 
         Fetches:
-        - 1-minute data for intraday TFs (5min through 4h)
-        - Daily data for longer TFs (daily, weekly, monthly)
+        - Native intervals: 5m, 15m, 30m, 1h, 1d, 1wk, 1mo, 3mo
+        - Resampled: 2h, 3h, 4h (from 1h, since yfinance doesn't have these)
         - VIX daily data
 
         Args:
-            intraday_days: Days of 1-min data (default: 7, max ~30)
+            intraday_days: Days of intraday data (default: 60, max for yfinance)
             daily_days: Days of daily data (default: 400, ~1.5 years)
             refresh_vix: Also refresh VIX data (default: True)
 
@@ -831,47 +834,68 @@ class LivePredictor:
             predictor.fetch_live_data()
             result = predictor.predict()
         """
-        print(f"\n📡 Fetching live data from yfinance...")
+        print(f"\n📡 Fetching live data from yfinance (native intervals)...")
 
         # Invalidate cached features since we're loading new data
         self._cache_invalidated = True
 
-        # 1. Fetch 1-minute data for intraday timeframes
-        print(f"\n   --- Intraday Data (1-min, {intraday_days} days) ---")
-        intraday_data = fetch_live_ohlcv(['SPY', 'TSLA'], days=intraday_days, interval='1m')
+        # Map our TFs to yfinance intervals
+        native_intervals = {
+            '5min': '5m',
+            '15min': '15m',
+            '30min': '30m',
+            '1hour': '1h',
+            'daily': '1d',
+            'weekly': '1wk',
+            'monthly': '1mo',
+            '3month': '3mo',
+        }
 
-        if 'SPY' not in intraday_data or 'TSLA' not in intraday_data:
-            raise ValueError("Failed to fetch intraday SPY/TSLA data")
+        # Fetch each native interval
+        for our_tf, yf_interval in native_intervals.items():
+            # Determine days to fetch
+            if yf_interval in ['5m', '15m', '30m', '1h']:
+                days = min(intraday_days, 60)  # yfinance limit for intraday
+                print(f"\n   --- {our_tf.upper()} ({yf_interval}, {days} days) ---")
+            else:
+                days = daily_days
+                print(f"\n   --- {our_tf.upper()} ({yf_interval}, {days} days) ---")
 
-        intraday_combined = align_spy_tsla(intraday_data['SPY'], intraday_data['TSLA'])
+            # Fetch from yfinance
+            data = fetch_live_ohlcv(['SPY', 'TSLA'], days=days, interval=yf_interval)
 
-        # 2. Fetch daily data for longer timeframes
-        print(f"\n   --- Daily Data ({daily_days} days) ---")
-        daily_data = fetch_live_ohlcv(['SPY', 'TSLA'], days=daily_days, interval='1d')
+            if 'SPY' not in data or 'TSLA' not in data:
+                print(f"   ⚠️ Failed to fetch {our_tf}, will try resampling later")
+                continue
 
-        if 'SPY' not in daily_data or 'TSLA' not in daily_data:
-            raise ValueError("Failed to fetch daily SPY/TSLA data")
+            # Align and load
+            combined = align_spy_tsla(data['SPY'], data['TSLA'])
+            self.data_buffer.load_from_dataframe(combined, interval=our_tf)
 
-        daily_combined = align_spy_tsla(daily_data['SPY'], daily_data['TSLA'])
+        # Resample 2h, 3h, 4h from 1h (yfinance doesn't have these natively)
+        print(f"\n   --- Resampling 2h, 3h, 4h from 1h ---")
+        self._resample_hourly_to_multihour()
 
-        # 3. Load into buffers
-        print(f"\n   --- Loading into buffers ---")
-        self.data_buffer.load_from_dataframe(intraday_combined, interval='1min')
-        self.data_buffer.load_from_dataframe(daily_combined, interval='daily')
-
-        # 4. Resample intraday to intermediate timeframes
-        print("   Resampling to all timeframes...")
-        self.data_buffer.resample_from_1min()
-
-        # 5. Resample daily to weekly/monthly
-        self._resample_daily_to_longer()
-
-        # 6. Refresh VIX if requested
+        # Refresh VIX if requested
         if refresh_vix:
             self.refresh_vix()
 
         print(f"\n✓ Live data ready!")
         self._print_buffer_summary()
+
+    def _resample_hourly_to_multihour(self) -> None:
+        """Resample 1h data to 2h, 3h, 4h (yfinance doesn't have these)."""
+        hourly_df = self.data_buffer.buffers.get('1hour')
+        if hourly_df is None or len(hourly_df) == 0:
+            print("   ⚠️ No 1h data to resample from")
+            return
+
+        # Resample to 2h, 3h, 4h
+        for interval, rule in [('2h', '2h'), ('3h', '3h'), ('4h', '4h')]:
+            resampled = self.data_buffer._resample_ohlcv(hourly_df, rule)
+            if len(resampled) > 0:
+                self.data_buffer.buffers[interval] = resampled
+                print(f"   Resampled to {interval}: {len(resampled):,} bars")
 
     def _resample_daily_to_longer(self) -> None:
         """Resample daily data to weekly and monthly."""

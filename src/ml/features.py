@@ -338,7 +338,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, continuation_mode: str = 'simple', use_chunking: bool = False, chunk_size_years: int = 1, shard_storage_path: str = None, vix_data: pd.DataFrame = None, **kwargs) -> tuple:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, continuation_mode: str = 'simple', use_chunking: bool = False, chunk_size_years: int = 1, shard_storage_path: str = None, vix_data: pd.DataFrame = None, skip_native_tf_generation: bool = False, **kwargs) -> tuple:
         """
         Extract all features from aligned SPY-TSLA data (v3.20: 14,322 channel + 180 non-channel = 14,502 total).
 
@@ -751,11 +751,11 @@ class TradingFeatureExtractor(FeatureExtractor):
         else:
             # v4.1: Pre-compute timeframe-specific sequences for hierarchical model
             # This creates separate .npy files for each timeframe with native resolution
-            # FIX (Priority 0): This code is in the "non-chunked" branch (after line 720 check)
-            # so _unified_cache_dir is ALWAYS set here. Removed the hasattr check.
-            cache_dir = self._unified_cache_dir
-            cache_key = self._cache_key if hasattr(self, '_cache_key') else FEATURE_VERSION
-            self._precompute_timeframe_sequences(features_df, cache_dir, cache_key)
+            # v5.1: Skip in live mode to avoid creating new tf_meta files
+            if not skip_native_tf_generation:
+                cache_dir = self._unified_cache_dir
+                cache_key = self._cache_key if hasattr(self, '_cache_key') else FEATURE_VERSION
+                self._precompute_timeframe_sequences(features_df, cache_dir, cache_key)
 
             print(f"   ✓ {len(features_df.columns)} features ready")
             # v4.3: Return continuation_labels_dir (Path) instead of continuation_df (DataFrame)

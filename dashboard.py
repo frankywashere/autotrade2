@@ -72,7 +72,23 @@ def init_session_state():
 def load_model(model_path: str):
     """Load the hierarchical model (cached)."""
     try:
-        predictor = LivePredictor(model_path, device='auto')
+        # Find the TRAINING tf_meta (not live-generated ones)
+        # Training tf_meta has the full training date range and largest row count
+        import glob
+        tf_meta_files = sorted(glob.glob('data/feature_cache/tf_meta_*.json'))
+
+        # Prefer files with earlier start dates (training data) and with 'ev' hash (events)
+        training_tf_meta = None
+        for f in tf_meta_files:
+            if '_ev' in f:  # Has events hash = from training
+                training_tf_meta = f
+                break
+
+        # Fallback: use first one found (earliest date)
+        if training_tf_meta is None and tf_meta_files:
+            training_tf_meta = tf_meta_files[0]
+
+        predictor = LivePredictor(model_path, tf_meta_path=training_tf_meta, device='auto')
         return predictor, None
     except Exception as e:
         return None, str(e)
@@ -126,13 +142,13 @@ def render_sidebar():
 
     # Data controls
     st.sidebar.subheader("Data Fetch Settings")
-    st.sidebar.caption("Raw data to fetch (model uses fixed lookback)")
+    st.sidebar.caption("Native intervals from yfinance (no resampling)")
 
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        intraday_days = st.number_input("1-min data (days)", 1, 30, 7, help="Days of 1-minute bars for intraday TFs")
+        intraday_days = st.number_input("Intraday (days)", 1, 60, 60, help="Days of intraday data (5m, 15m, 30m, 1h). Max 60 days from yfinance.")
     with col2:
-        daily_days = st.number_input("Daily data (days)", 30, 1000, 400, help="Days of daily bars for daily/weekly/monthly TFs")
+        daily_days = st.number_input("Daily+ (days)", 30, 1000, 400, help="Days of daily/weekly/monthly data")
 
     if st.sidebar.button("📡 Fetch Live Data", use_container_width=True):
         if st.session_state.predictor:
