@@ -45,6 +45,14 @@ try:
 except ImportError:
     HAS_EVENT_SYSTEM = False
 
+# v5.3: Import hierarchical containment and RSI validation
+try:
+    from .hierarchical_containment import HierarchicalContainmentChecker, get_rsi_from_features
+    from .rsi_validator import RSIDirectionValidator, RSIFeatureExtractor
+    HAS_HIERARCHICAL_FEATURES = True
+except ImportError:
+    HAS_HIERARCHICAL_FEATURES = False
+
 # Import config for timeframe settings
 import sys
 parent_dir = Path(__file__).parent.parent.parent
@@ -688,13 +696,16 @@ class HierarchicalLNN(nn.Module, ModelBase):
             )
 
         # =========================================================================
-        # v5.2: PROBABILISTIC DURATION HEADS (mean + log_std per TF)
+        # v5.2/v5.3: PROBABILISTIC DURATION HEADS (mean + log_std per TF)
         # =========================================================================
         # Each TF predicts duration with uncertainty
+        # v5.3: Larger input to accommodate parent TF hiddens (up to 2 parents × 128)
         self.duration_heads = nn.ModuleDict()
         for tf in self.TIMEFRAMES:
-            # Context: hidden + VIX + events
-            context_dim = hidden_size + self.vix_hidden_size + self.event_embed_dim
+            # v5.3 Context: hidden + parent_hiddens (up to 2×128) + VIX + events
+            # Max: 128 + 256 + 128 + 32 = 544
+            # Use max size, zero-pad when fewer parents available
+            context_dim = hidden_size + (hidden_size * 2) + self.vix_hidden_size + self.event_embed_dim
 
             self.duration_heads[f'{tf}_mean'] = nn.Sequential(
                 nn.Linear(context_dim, 64),
@@ -738,6 +749,17 @@ class HierarchicalLNN(nn.Module, ModelBase):
             vix_size=self.vix_hidden_size,
             event_size=self.event_embed_dim
         )
+
+        # v5.3: Hierarchical Containment & RSI (static methods, no parameters)
+        # =========================================================================
+        if HAS_HIERARCHICAL_FEATURES:
+            self.containment_checker = HierarchicalContainmentChecker
+            self.rsi_extractor = RSIFeatureExtractor
+            self.rsi_validator = RSIDirectionValidator
+        else:
+            self.containment_checker = None
+            self.rsi_extractor = None
+            self.rsi_validator = None
 
         # v5.2: Track VIX/event state for live inference
         self.cached_vix_hidden = None
@@ -872,7 +894,9 @@ class HierarchicalLNN(nn.Module, ModelBase):
             pass
 
         # =========================================================================
-        # PROCESS EACH TIMEFRAME LAYER
+        # v5.3: TWO-PASS ARCHITECTURE
+        # Pass 1: Build all hidden states (CfC processing)
+        # Pass 2: Predict durations/validity with full hierarchical context
         # =========================================================================
         layer_predictions = []
         layer_hidden_states = {}
@@ -881,7 +905,11 @@ class HierarchicalLNN(nn.Module, ModelBase):
         projection_metadata = {}  # v5.0: Store projection details for interpretability
         duration_outputs = {}  # v5.2: Probabilistic duration
         validity_outputs = {}  # v5.2: Forward-looking validity
+        tf_hidden_dict = {}  # v5.3: Dict for easy parent access
 
+        # =========================================================================
+        # PASS 1: PROCESS ALL CFC LAYERS (build hidden states only)
+        # =========================================================================
         prev_hidden = None
         for i, tf in enumerate(self.TIMEFRAMES):
             # Get input for this timeframe
@@ -928,15 +956,45 @@ class HierarchicalLNN(nn.Module, ModelBase):
             hidden = layer_out[:, -1, :]  # [batch, hidden_size]
             layer_hidden_states[tf] = h_new
             all_hidden.append(hidden)
+            tf_hidden_dict[tf] = hidden  # v5.3: Store in dict for parent access
             prev_hidden = hidden
 
+        # =========================================================================
+        # PASS 2: PREDICTIONS WITH HIERARCHICAL CONTEXT
+        # Now all hidden states exist, can access parent TFs for duration/validity
+        # =========================================================================
+        for i, tf in enumerate(self.TIMEFRAMES):
+            # Get this TF's hidden state
+            hidden = tf_hidden_dict.get(tf)
+            if hidden is None:
+                # TF was skipped
+                continue
+
             # =====================================================================
-            # v5.2: COMPUTE DURATION FIRST (needed for duration-aware projections)
+            # v5.3: DURATION PREDICTION WITH HIERARCHICAL CONTEXT
             # =====================================================================
             duration_scale = 1.0  # Default scale
             if hasattr(self, 'duration_heads') and f'{tf}_mean' in self.duration_heads:
-                # Duration context: hidden + VIX + events
-                duration_context = torch.cat([hidden, hidden_vix, event_embed], dim=-1)
+                # v5.3: Get parent TF hidden states (larger timeframes)
+                parent_hiddens = []
+                for parent_idx in range(i+1, min(i+3, len(self.TIMEFRAMES))):  # Next 2 parents
+                    parent_tf = self.TIMEFRAMES[parent_idx]
+                    if parent_tf in tf_hidden_dict:
+                        parent_hiddens.append(tf_hidden_dict[parent_tf])
+
+                # v5.3: Build duration context with zero-padding for missing parents
+                # Always use same input size (544) for all TFs
+                if len(parent_hiddens) == 2:
+                    parent_hidden_concat = torch.cat(parent_hiddens, dim=-1)  # [batch, 256]
+                elif len(parent_hiddens) == 1:
+                    # Pad with zeros for missing second parent
+                    parent_hidden_concat = torch.cat([parent_hiddens[0], torch.zeros_like(parent_hiddens[0])], dim=-1)
+                else:
+                    # No parents - use zeros
+                    parent_hidden_concat = torch.zeros(batch_size, hidden_size * 2, device=device)
+
+                # Duration context: hidden + parents (zero-padded) + VIX + events
+                duration_context = torch.cat([hidden, parent_hidden_concat, hidden_vix, event_embed], dim=-1)
 
                 # Probabilistic duration (mean + std)
                 duration_mean = self.duration_heads[f'{tf}_mean'](duration_context)
@@ -1214,6 +1272,42 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # Add validity outputs (forward-looking)
         if validity_outputs:
             output_dict['validity'] = validity_outputs
+
+        # =========================================================================
+        # v5.3: HIERARCHICAL CONTAINMENT ANALYSIS (interpretability)
+        # =========================================================================
+        if self.containment_checker and not self.training:
+            # Build projections dict for containment checking
+            all_projections_dict = {}
+            all_validities_dict = {}
+
+            for i, tf in enumerate(self.TIMEFRAMES):
+                # Get predictions from layer_predictions
+                if i * 3 + 2 < len(layer_predictions):
+                    all_projections_dict[tf] = {
+                        'high': layer_predictions[i*3][0, 0].item(),
+                        'low': layer_predictions[i*3 + 1][0, 0].item(),
+                    }
+                if tf in validity_outputs:
+                    all_validities_dict[tf] = validity_outputs[tf][0, 0].item()
+
+            # Determine selected TF
+            if not self.use_fusion_head and 'selection_info' in locals():
+                selected_tf = self.TIMEFRAMES[selection_info['best_tf_idx'][0].item()]
+            else:
+                # Use highest validity TF
+                if all_validities_dict:
+                    selected_tf = max(all_validities_dict, key=all_validities_dict.get)
+                else:
+                    selected_tf = 'daily'  # Fallback
+
+            # Check containment
+            containment_results = self.containment_checker.check_all_containments(
+                selected_tf,
+                all_projections_dict,
+                all_validities_dict
+            )
+            output_dict['containment'] = containment_results
 
         # Add VIX hidden state
         output_dict['hidden_vix'] = hidden_vix

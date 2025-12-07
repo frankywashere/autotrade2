@@ -2717,6 +2717,27 @@ def interactive_setup(args, profiler=None):
 
     print("─" * 70)
 
+    # v5.3: RSI cross-TF direction guidance
+    print()
+    args.rsi_direction_guidance = inquirer.select(
+        message="3️⃣  RSI cross-TF direction validation:",
+        choices=[
+            Choice(value='soft_bias', name='Soft Bias - Model learns RSI patterns ⭐ Default'),
+            Choice(value='validation', name='Validation Check - Verify with larger TF RSI, adjust confidence'),
+            Choice(value='none', name='None - Disable explicit RSI guidance'),
+        ],
+        default='soft_bias'
+    ).execute()
+
+    if args.rsi_direction_guidance == 'soft_bias':
+        print("   ✅ Soft Bias: RSI features in model input, learns importance")
+    elif args.rsi_direction_guidance == 'validation':
+        print("   🔍 Validation: Post-prediction check against parent TF RSI")
+        print("      - Boosts confidence if RSI agrees")
+        print("      - Reduces confidence if RSI conflicts")
+    else:
+        print("   ⚠️  None: RSI guidance disabled (for ablation testing)")
+
     # Debug logging
     print()
     args.debug = inquirer.confirm(

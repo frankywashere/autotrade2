@@ -1071,6 +1071,10 @@ class LivePredictor:
         if events:
             result['v52_events'] = events
 
+        # v5.3: Add containment analysis
+        if 'containment' in output_dict:
+            result['v53_containment'] = output_dict['containment']
+
         return result
 
     def get_buffer_status(self) -> Dict[str, Dict]:
