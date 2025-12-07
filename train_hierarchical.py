@@ -470,7 +470,7 @@ def find_available_caches(cache_dir: Path):
         cache_key = meta_path.name.replace("features_mmap_meta_", "").replace(".json", "")
         seen_keys.add(cache_key)
 
-        mode_suffixes = ['adaptive', 'simple']
+        mode_suffixes = ['adaptive']  # v5.2: Removed 'simple'
         cont_path = None
         for suffix in mode_suffixes:
             candidate = cache_dir / f"continuation_labels_{cache_key}_{suffix}.pkl"
@@ -507,7 +507,7 @@ def find_available_caches(cache_dir: Path):
             continue  # Already found as mmap
         seen_keys.add(cache_key)
 
-        mode_suffixes = ['adaptive', 'simple']
+        mode_suffixes = ['adaptive']  # v5.2: Removed 'simple'
         cont_path = None
         for suffix in mode_suffixes:
             candidate = cache_dir / f"continuation_labels_{cache_key}_{suffix}.pkl"
@@ -3205,7 +3205,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         include_continuation=True,
         mmap_meta_path=mmap_meta_path,
         profiler=dataset_profiler,
-        preload_to_ram=args.preload_to_ram,
+        preload_to_ram=False,  # v5.2: Always false
         use_native_timeframes=args.use_native_timeframes,
         tf_meta_path=args.tf_meta_path
     )
@@ -3952,8 +3952,7 @@ def main():
                         help='Learning rate')
     parser.add_argument('--patience', type=int, default=10,
                         help='Early stopping patience')
-    parser.add_argument('--preload', action='store_true',
-                        help='Preload all data into memory')
+    # v5.2: Preload removed - native TF mode makes it obsolete
     parser.add_argument('--use-gpu-features', dest='use_gpu_features', action='store_true', default=False,
                         help='Use GPU acceleration for feature extraction (CUDA only)')
 
