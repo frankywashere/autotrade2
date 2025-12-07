@@ -700,6 +700,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Generate continuation labels if requested
         # v4.3: Now generates hierarchical per-TF labels using channel-structure break detection
+        # v5.2: Also generates transition labels for multi-phase compositor
         continuation_labels_dir = None
         if continuation:
             cache_dir = self._unified_cache_dir if hasattr(self, '_unified_cache_dir') else Path('data/feature_cache')
@@ -707,21 +708,28 @@ class TradingFeatureExtractor(FeatureExtractor):
             cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
 
             # Check if all per-TF label files exist (cache check)
-            all_cached = True
+            # v5.2: Also check for transition labels
+            all_continuation_cached = True
+            all_transition_cached = True
             if use_cache:
                 for tf in HIERARCHICAL_TIMEFRAMES:
+                    # Check continuation labels
                     tf_label_path = cache_dir / f"continuation_labels_{tf}_{cache_suffix}.pkl"
                     if not tf_label_path.exists():
-                        all_cached = False
-                        break
+                        all_continuation_cached = False
+                    # Check transition labels (v5.2)
+                    tf_transition_path = cache_dir / f"transition_labels_{tf}_{cache_suffix}.pkl"
+                    if not tf_transition_path.exists():
+                        all_transition_cached = False
             else:
-                all_cached = False
+                all_continuation_cached = False
+                all_transition_cached = False
 
-            if all_cached:
+            if all_continuation_cached:
                 print(f"   📂 Found cached hierarchical continuation labels ({len(HIERARCHICAL_TIMEFRAMES)} TFs)")
                 continuation_labels_dir = cache_dir
             else:
-                # Generate fresh hierarchical labels
+                # Generate fresh hierarchical continuation labels
                 saved_files = self.generate_hierarchical_continuation_labels(
                     df=df,
                     timeframes=HIERARCHICAL_TIMEFRAMES,
@@ -731,6 +739,22 @@ class TradingFeatureExtractor(FeatureExtractor):
                 if saved_files:
                     continuation_labels_dir = cache_dir
                     print(f"   ✓ Hierarchical continuation labels saved to: {cache_dir}")
+                    # Mark that we generated fresh continuation labels → need fresh transition labels
+                    all_transition_cached = False
+
+            # v5.2: Generate transition labels (uses continuation labels)
+            if continuation_labels_dir:
+                if all_transition_cached:
+                    print(f"   📂 Found cached transition labels ({len(HIERARCHICAL_TIMEFRAMES)} TFs)")
+                else:
+                    print(f"\n   🔄 Generating transition labels for v5.2 multi-phase compositor...")
+                    transition_files = self.generate_transition_labels(
+                        continuation_labels_dir=cache_dir,
+                        output_dir=cache_dir,
+                        cache_suffix=cache_suffix
+                    )
+                    if transition_files:
+                        print(f"   ✓ Transition labels saved to: {cache_dir}")
 
         # Fill NaNs (only if we extracted - cached data already has NaNs filled)
         if not skip_all_extraction:
@@ -4453,6 +4477,201 @@ class TradingFeatureExtractor(FeatureExtractor):
         cycle_bonus = min(cycles / 5.0, 1.0) * 0.3
 
         return min(conf + cycle_bonus, 0.99)
+
+    def generate_transition_labels(
+        self,
+        continuation_labels_dir: Path,
+        output_dir: Path = None,
+        cache_suffix: str = None
+    ) -> Dict[str, Path]:
+        """
+        Generate transition labels for v5.2 Multi-Phase Compositor.
+
+        USES existing hierarchical continuation labels (duration_bars, channel_slope).
+        ADDS transition classification: what happens AFTER each channel breaks?
+
+        Transition Types:
+            CONTINUE (0): Same channel extends (didn't break within lookahead)
+            SWITCH_TF (1): Different TF's channel takes over (has higher quality)
+            REVERSE (2): Same TF, opposite direction (bull→bear or vice versa)
+            SIDEWAYS (3): Same TF, enters consolidation
+
+        Args:
+            continuation_labels_dir: Directory with existing continuation_labels_{tf}_*.pkl files
+            output_dir: Where to save transition labels (defaults to same as input)
+            cache_suffix: Cache suffix for file naming (if None, extracts from continuation labels)
+
+        Returns:
+            Dict mapping timeframe -> transition labels file path
+        """
+        from pathlib import Path
+
+        # Constants
+        TRANSITION_CONTINUE = 0
+        TRANSITION_SWITCH_TF = 1
+        TRANSITION_REVERSE = 2
+        TRANSITION_SIDEWAYS = 3
+
+        SLOPE_THRESHOLD = 0.0005  # Below this absolute value = sideways
+
+        def slope_to_direction(slope: float) -> int:
+            """Convert slope to direction: 0=BULL, 1=BEAR, 2=SIDEWAYS"""
+            if slope > SLOPE_THRESHOLD:
+                return 0  # BULL
+            elif slope < -SLOPE_THRESHOLD:
+                return 1  # BEAR
+            else:
+                return 2  # SIDEWAYS
+
+        continuation_labels_dir = Path(continuation_labels_dir)
+        if output_dir is None:
+            output_dir = continuation_labels_dir
+        else:
+            output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_files = {}
+
+        print(f"      Input: {continuation_labels_dir}")
+        print(f"      Output: {output_dir}")
+
+        # Load all TF continuation labels for cross-TF quality comparison
+        all_tf_labels = {}
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            cont_files = list(continuation_labels_dir.glob(f"continuation_labels_{tf}_*.pkl"))
+            if cont_files:
+                all_tf_labels[tf] = pd.read_pickle(cont_files[0])
+                print(f"      Loaded {tf}: {len(all_tf_labels[tf]):,} rows")
+
+        if len(all_tf_labels) == 0:
+            print("      ⚠️  No continuation labels found!")
+            return {}
+
+        # Process each timeframe
+        for current_tf in HIERARCHICAL_TIMEFRAMES:
+            if current_tf not in all_tf_labels:
+                continue
+
+            cont_labels = all_tf_labels[current_tf]
+            transition_labels = []
+
+            print(f"\n      Processing {current_tf}...")
+
+            for i in tqdm(range(len(cont_labels) - 20), desc=f"         {current_tf}", leave=False, ncols=100):
+                row = cont_labels.iloc[i]
+                timestamp = row.name if hasattr(row, 'name') else cont_labels.index[i]
+                duration = int(row['duration_bars'])
+                current_slope = row['channel_slope']
+                current_r_squared = row.get('channel_r_squared', 0.5)
+                current_direction = slope_to_direction(current_slope)
+
+                # Look at what happened after the channel ended
+                future_idx = i + max(1, duration) + 5  # Look 5 bars after break
+
+                if future_idx >= len(cont_labels):
+                    # Not enough future data
+                    transition_labels.append({
+                        'timestamp': timestamp,
+                        'duration_bars': duration,
+                        'transition_type': TRANSITION_CONTINUE,
+                        'switch_to_tf': None,
+                        'current_direction': current_direction,
+                        'new_direction': current_direction,
+                        'new_slope': current_slope,
+                        'current_r_squared': current_r_squared,
+                    })
+                    continue
+
+                future_row = cont_labels.iloc[future_idx]
+                future_slope = future_row['channel_slope']
+                future_direction = slope_to_direction(future_slope)
+                future_r_squared = future_row.get('channel_r_squared', 0.5)
+
+                # Determine transition type
+                transition_type = TRANSITION_CONTINUE
+                switch_to_tf = None
+
+                # Check 1: Did direction change in same TF?
+                if current_direction != future_direction:
+                    if future_direction == 2:  # SIDEWAYS
+                        transition_type = TRANSITION_SIDEWAYS
+                    else:
+                        transition_type = TRANSITION_REVERSE
+
+                # Check 2: Did a different TF take over (higher quality)?
+                # Only check if we didn't already detect a direction change
+                if transition_type == TRANSITION_CONTINUE:
+                    # Find TF with highest quality at the break point
+                    best_tf = current_tf
+                    best_quality = future_r_squared
+
+                    for other_tf, other_labels in all_tf_labels.items():
+                        if other_tf == current_tf:
+                            continue
+
+                        # Find the row in other TF closest to our timestamp
+                        try:
+                            # Get the index in the other TF's labels
+                            other_idx = other_labels.index.get_indexer(
+                                [timestamp], method='nearest'
+                            )[0]
+
+                            if other_idx >= 0 and other_idx < len(other_labels):
+                                other_quality = other_labels.iloc[other_idx].get('channel_r_squared', 0)
+                                if other_quality > best_quality + 0.1:  # 0.1 threshold
+                                    best_quality = other_quality
+                                    best_tf = other_tf
+                        except Exception:
+                            continue
+
+                    if best_tf != current_tf:
+                        transition_type = TRANSITION_SWITCH_TF
+                        switch_to_tf = best_tf
+
+                transition_labels.append({
+                    'timestamp': timestamp,
+                    'duration_bars': duration,
+                    'transition_type': transition_type,
+                    'switch_to_tf': switch_to_tf,
+                    'current_direction': current_direction,
+                    'new_direction': future_direction,
+                    'new_slope': future_slope,
+                    'current_r_squared': current_r_squared,
+                })
+
+            if len(transition_labels) == 0:
+                print(f"         ⚠️  No transition labels generated for {current_tf}")
+                continue
+
+            # Convert to DataFrame and save
+            labels_df = pd.DataFrame(transition_labels)
+            labels_df.set_index('timestamp', inplace=True)
+
+            # Use provided cache_suffix, or extract from existing continuation labels
+            effective_suffix = cache_suffix
+            if effective_suffix is None:
+                cont_files = list(continuation_labels_dir.glob(f"continuation_labels_{current_tf}_*.pkl"))
+                if cont_files:
+                    # Extract suffix from existing file name
+                    existing_name = cont_files[0].stem
+                    effective_suffix = existing_name.replace(f"continuation_labels_{current_tf}_", "")
+                else:
+                    effective_suffix = "v5.2"
+
+            output_path = output_dir / f"transition_labels_{current_tf}_{effective_suffix}.pkl"
+            labels_df.to_pickle(output_path)
+            saved_files[current_tf] = output_path
+
+            # Stats
+            type_counts = labels_df['transition_type'].value_counts().to_dict()
+            type_names = {0: 'CONTINUE', 1: 'SWITCH_TF', 2: 'REVERSE', 3: 'SIDEWAYS'}
+            print(f"         ✓ Saved {len(labels_df):,} labels to {output_path.name}")
+            for t_type, count in sorted(type_counts.items()):
+                pct = 100 * count / len(labels_df)
+                print(f"           {type_names.get(t_type, t_type)}: {count:,} ({pct:.1f}%)")
+
+        print(f"\n   ✓ Generated transition labels for {len(saved_files)}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes")
+        return saved_files
 
     def create_sequences(self, features_df: pd.DataFrame, sequence_length: int = 168,
                         target_horizon: int = 24) -> Tuple[torch.Tensor, torch.Tensor]:

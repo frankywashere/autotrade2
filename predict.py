@@ -954,8 +954,27 @@ class LivePredictor:
             for tf, tensor in features.items()
         }
 
+        # v5.2: Load VIX sequence for inference
+        vix_sequence = None
+        events = None
+
+        try:
+            from src.ml.live_events import VIXSequenceLoader, LiveEventFetcher
+            from datetime import date
+
+            # Load VIX sequence (90 days)
+            vix_loader = VIXSequenceLoader('data/VIX_History.csv')
+            vix_seq = vix_loader.get_sequence(as_of_date=date.today(), sequence_length=90)
+            vix_sequence = torch.tensor(vix_seq, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+            # Fetch upcoming events
+            event_fetcher = LiveEventFetcher()
+            events = event_fetcher.fetch_upcoming_events()
+        except Exception as e:
+            print(f"   ⚠️  v5.2 VIX/events not available: {e}")
+
         # Run inference
-        predictions, output_dict = self.model(features_device)
+        predictions, output_dict = self.model(features_device, vix_sequence=vix_sequence, events=events)
 
         # Extract primary results (from selected best TF)
         pred_high = predictions[0, 0].item()
@@ -1006,6 +1025,51 @@ class LivePredictor:
                 }
                 for tf, preds in output_dict['layer_predictions'].items()
             }
+
+        # v5.2: Add duration predictions
+        if 'duration' in output_dict:
+            result['v52_duration'] = {}
+            for tf, dur_data in output_dict['duration'].items():
+                result['v52_duration'][tf] = {
+                    'expected': dur_data['expected'][0, 0].item(),
+                    'conservative': dur_data['conservative'][0, 0].item(),
+                    'aggressive': dur_data['aggressive'][0, 0].item(),
+                    'confidence': dur_data['confidence'][0, 0].item(),
+                }
+
+        # v5.2: Add validity predictions
+        if 'validity' in output_dict:
+            result['v52_validity'] = {
+                tf: val[0, 0].item()
+                for tf, val in output_dict['validity'].items()
+            }
+
+        # v5.2: Add compositor predictions
+        if 'compositor' in output_dict:
+            compositor = output_dict['compositor']
+            trans_probs = compositor['transition_probs'][0].cpu().numpy()
+            dir_probs = compositor['direction_probs'][0].cpu().numpy()
+            tf_switch_probs = compositor['tf_switch_probs'][0].cpu().numpy()
+
+            result['v52_compositor'] = {
+                'transition': {
+                    'continue': float(trans_probs[0]),
+                    'switch_tf': float(trans_probs[1]),
+                    'reverse': float(trans_probs[2]),
+                    'sideways': float(trans_probs[3]),
+                },
+                'direction': {
+                    'bull': float(dir_probs[0]),
+                    'bear': float(dir_probs[1]),
+                    'sideways': float(dir_probs[2]),
+                },
+                'tf_switch_probs': {tf: float(tf_switch_probs[i]) for i, tf in enumerate(self.model.TIMEFRAMES)},
+                'phase2_slope': compositor['phase2_slope'][0, 0].item(),
+            }
+
+        # v5.2: Add events info
+        if events:
+            result['v52_events'] = events
 
         return result
 

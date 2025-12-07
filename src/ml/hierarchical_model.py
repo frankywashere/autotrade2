@@ -1,17 +1,21 @@
 """
-Hierarchical Liquid Neural Network for Multi-Scale Stock Prediction (v4.0)
+Hierarchical Liquid Neural Network for Multi-Scale Stock Prediction (v5.2)
 
 Architecture:
 - 11 CfC layers (one per timeframe: 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly, 3month)
+- VIX CfC layer: 90-day daily VIX sequence processing (v5.2)
+- Event embedding: FOMC, earnings, deliveries (v5.2)
 - Each layer receives NATIVE OHLC data at its timeframe (not downsampled 1-min)
 - Bottom-up hidden state passing (fast → slow)
 - Fusion Head: 33 layer predictions + 12 market_state = 45 dims
 
-Key Features:
-- Proper multi-timeframe learning (each layer sees meaningful bar counts)
-- Market state integration (VIX, volatility regime, event proximity)
-- Online learning support for continuous adaptation
-- Channel projection with confidence decay
+v5.2 Key Features:
+- VIX CfC layer for regime-aware predictions
+- Event embedding for catalyst-aware duration predictions
+- Probabilistic duration (mean + std)
+- Validity heads (forward-looking channel assessment)
+- Multi-Phase Compositor (transition type + direction prediction)
+- Dual output (raw geometric + adjusted)
 """
 
 import torch
@@ -34,11 +38,156 @@ from .physics_attention import (
     EnergyBasedConfidence
 )
 
+# v5.2: Import event system
+try:
+    from .live_events import EventEmbedding, VIXSequenceLoader
+    HAS_EVENT_SYSTEM = True
+except ImportError:
+    HAS_EVENT_SYSTEM = False
+
 # Import config for timeframe settings
 import sys
 parent_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(parent_dir))
 import config as project_config
+
+
+# =============================================================================
+# v5.2 MULTI-PHASE COMPOSITOR
+# =============================================================================
+
+class MultiPhaseCompositor(nn.Module):
+    """
+    v5.2: Predict channel transitions and Phase 2 projections.
+
+    Predicts what happens when current channel ends:
+    - Transition type: CONTINUE, SWITCH_TF, REVERSE, SIDEWAYS
+    - Direction: BULL, BEAR, SIDEWAYS
+    - Phase 2 slope magnitude
+
+    Analogy: Relay race handoff detector - who takes the baton next?
+    """
+
+    # Transition type constants
+    TRANSITION_CONTINUE = 0   # Same channel extends
+    TRANSITION_SWITCH_TF = 1  # Different TF's channel takes over
+    TRANSITION_REVERSE = 2    # Same TF, opposite direction
+    TRANSITION_SIDEWAYS = 3   # Same TF, enters consolidation
+
+    # Direction constants
+    DIRECTION_BULL = 0
+    DIRECTION_BEAR = 1
+    DIRECTION_SIDEWAYS = 2
+
+    def __init__(
+        self,
+        hidden_size: int,
+        n_timeframes: int = 11,
+        vix_size: int = 128,
+        event_size: int = 32
+    ):
+        """
+        Initialize Multi-Phase Compositor.
+
+        Args:
+            hidden_size: Size of each TF hidden state
+            n_timeframes: Number of timeframes (11)
+            vix_size: Size of VIX hidden state
+            event_size: Size of event embedding
+        """
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.n_timeframes = n_timeframes
+
+        # Input: all TF hiddens + VIX + events
+        input_dim = hidden_size * n_timeframes + vix_size + event_size
+
+        # Transition type predictor (4 classes)
+        self.transition_head = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 4),  # [continue, switch_tf, reverse, sideways]
+        )
+
+        # TF switch predictor (which TF to switch to, if switching)
+        self.tf_switch_head = nn.Sequential(
+            nn.Linear(hidden_size * n_timeframes, 128),
+            nn.ReLU(),
+            nn.Linear(128, n_timeframes),  # Probability per TF
+        )
+
+        # Phase 2 direction predictor (3 classes: bull, bear, sideways)
+        # Uses selected TF hidden + VIX
+        self.direction_head = nn.Sequential(
+            nn.Linear(hidden_size + vix_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3),  # [bull, bear, sideways]
+        )
+
+        # Phase 2 slope magnitude predictor
+        self.phase2_slope_head = nn.Sequential(
+            nn.Linear(hidden_size + vix_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(
+        self,
+        all_hidden: Dict[str, torch.Tensor],
+        hidden_vix: torch.Tensor,
+        event_embed: torch.Tensor,
+        current_tf: str,
+        timeframes: List[str]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Predict transition type and Phase 2 parameters.
+
+        Args:
+            all_hidden: Dict mapping timeframe -> hidden state [batch, hidden_size]
+            hidden_vix: VIX hidden state [batch, vix_size]
+            event_embed: Event embedding [batch, event_size]
+            current_tf: Current selected timeframe name
+            timeframes: List of timeframe names in order
+
+        Returns:
+            Dict with transition_probs, tf_switch_probs, direction_probs, phase2_slope
+        """
+        # Stack all hidden states
+        h_all = torch.cat([all_hidden[tf] for tf in timeframes], dim=-1)
+
+        # Full context including VIX and events
+        context = torch.cat([h_all, hidden_vix, event_embed], dim=-1)
+
+        # Transition type prediction
+        transition_logits = self.transition_head(context)
+        transition_probs = F.softmax(transition_logits, dim=-1)
+
+        # TF switch probabilities
+        tf_switch_logits = self.tf_switch_head(h_all)
+        tf_switch_probs = F.softmax(tf_switch_logits, dim=-1)
+
+        # Phase 2 direction (based on current TF hidden + VIX)
+        current_hidden = all_hidden[current_tf]
+        dir_context = torch.cat([current_hidden, hidden_vix], dim=-1)
+        direction_logits = self.direction_head(dir_context)
+        direction_probs = F.softmax(direction_logits, dim=-1)
+
+        # Phase 2 slope magnitude
+        phase2_slope = self.phase2_slope_head(dir_context)
+
+        return {
+            'transition_logits': transition_logits,      # [batch, 4] - for loss
+            'transition_probs': transition_probs,        # [batch, 4] - softmax
+            'tf_switch_logits': tf_switch_logits,        # [batch, 11] - for loss
+            'tf_switch_probs': tf_switch_probs,          # [batch, 11] - softmax
+            'direction_logits': direction_logits,        # [batch, 3] - for loss
+            'direction_probs': direction_probs,          # [batch, 3] - softmax
+            'phase2_slope': phase2_slope,                # [batch, 1]
+        }
 
 
 class ChannelProjectionExtractor(nn.Module):
@@ -303,23 +452,34 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # 11 CfC LAYERS (one per timeframe)
         # =========================================================================
         # Each layer receives: native OHLC features for its timeframe
-        # First layer (5min): just features
-        # Subsequent layers: features + previous layer's hidden state
+        # First layer (5min): features + VIX + events
+        # Subsequent layers: features + previous hidden + VIX + events
+        #
+        # v5.2: VIX hidden (128) + event embed (32) = 160 additional dims per layer
 
         self.timeframe_layers = nn.ModuleDict()
         self.timeframe_heads = nn.ModuleDict()
 
+        # v5.2: Pre-declare dimensions for VIX/events (will be set properly in __init__)
+        # These are used during layer creation before VIX layer is created
+        _vix_hidden_size = 128
+        _event_embed_dim = 32
+
         for i, tf in enumerate(self.TIMEFRAMES):
             tf_input_size = self.input_sizes.get(tf, 900)  # Default to 900 if not specified
 
-            # First layer takes only features, subsequent layers add hidden from previous
+            # First layer takes features + VIX + events
+            # Subsequent layers add previous hidden state
             if i == 0:
-                layer_input_size = tf_input_size
+                layer_input_size = tf_input_size + _vix_hidden_size + _event_embed_dim
             else:
-                layer_input_size = tf_input_size + hidden_size  # Concat previous hidden
+                layer_input_size = tf_input_size + hidden_size + _vix_hidden_size + _event_embed_dim
+
+            # v5.2: Increase total neurons to handle larger input (320 instead of 256)
+            layer_total_neurons = int(hidden_size * 2.5)  # 128 * 2.5 = 320
 
             # Create CfC layer with AutoNCP wiring
-            wiring = AutoNCP(self.total_neurons, hidden_size)
+            wiring = AutoNCP(layer_total_neurons, hidden_size)
             self.timeframe_layers[tf] = CfC(layer_input_size, wiring, batch_first=True)
 
             # Create output heads for this layer
@@ -498,6 +658,91 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # v5.0: Projection feature extractor (will be initialized on first forward)
         self.projection_feature_extractor = None
 
+        # =========================================================================
+        # v5.2: VIX CfC LAYER
+        # =========================================================================
+        # Processes 90 days of daily VIX data to capture regime information
+        # Output is broadcast to all TF layers
+        self.vix_input_size = 11  # OHLC (4) + derived (7)
+        self.vix_hidden_size = 128
+        self.vix_sequence_length = 90  # Days
+
+        vix_wiring = AutoNCP(256, self.vix_hidden_size)
+        self.vix_layer = CfC(self.vix_input_size, vix_wiring, batch_first=True)
+
+        # =========================================================================
+        # v5.2: EVENT EMBEDDING
+        # =========================================================================
+        self.event_embed_dim = 32
+        if HAS_EVENT_SYSTEM:
+            self.event_embedding = EventEmbedding(
+                event_types=6,  # fomc, earnings, delivery, cpi, nfp, other
+                embed_dim=self.event_embed_dim
+            )
+        else:
+            # Fallback: simple learnable embedding
+            self.event_embedding = nn.Sequential(
+                nn.Linear(6, 16),  # 6 event type indicators
+                nn.ReLU(),
+                nn.Linear(16, self.event_embed_dim),
+            )
+
+        # =========================================================================
+        # v5.2: PROBABILISTIC DURATION HEADS (mean + log_std per TF)
+        # =========================================================================
+        # Each TF predicts duration with uncertainty
+        self.duration_heads = nn.ModuleDict()
+        for tf in self.TIMEFRAMES:
+            # Context: hidden + VIX + events
+            context_dim = hidden_size + self.vix_hidden_size + self.event_embed_dim
+
+            self.duration_heads[f'{tf}_mean'] = nn.Sequential(
+                nn.Linear(context_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(64, 1),
+                nn.Softplus(),  # Positive duration
+            )
+            self.duration_heads[f'{tf}_log_std'] = nn.Sequential(
+                nn.Linear(context_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 1),
+            )
+
+        # =========================================================================
+        # v5.2: VALIDITY HEADS (forward-looking channel assessment)
+        # =========================================================================
+        # Predicts: Will this channel hold going forward?
+        # Uses quality_score as ONE input (not the answer) + VIX + events + position
+        self.validity_heads = nn.ModuleDict()
+        for tf in self.TIMEFRAMES:
+            # Input: hidden + VIX + events + [quality_score, position_in_channel]
+            validity_input_dim = hidden_size + self.vix_hidden_size + self.event_embed_dim + 2
+
+            self.validity_heads[tf] = nn.Sequential(
+                nn.Linear(validity_input_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+                nn.Sigmoid()  # 0-1: probability channel holds
+            )
+
+        # =========================================================================
+        # v5.2: MULTI-PHASE COMPOSITOR
+        # =========================================================================
+        self.compositor = MultiPhaseCompositor(
+            hidden_size=hidden_size,
+            n_timeframes=len(self.TIMEFRAMES),
+            vix_size=self.vix_hidden_size,
+            event_size=self.event_embed_dim
+        )
+
+        # v5.2: Track VIX/event state for live inference
+        self.cached_vix_hidden = None
+        self.cached_event_embed = None
+
         # Move to device
         self.to(device)
 
@@ -546,6 +791,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
         x: torch.Tensor,
         market_state: Optional[torch.Tensor] = None,
         hidden_states: Optional[Dict[str, torch.Tensor]] = None,
+        vix_sequence: Optional[torch.Tensor] = None,  # v5.2: [batch, 90, 11] VIX data
+        events: Optional[List[Dict]] = None,  # v5.2: Event list from LiveEventFetcher
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Forward pass through 11 hierarchical layers.
@@ -555,14 +802,16 @@ class HierarchicalLNN(nn.Module, ModelBase):
                OR a single Tensor [batch, seq_len, features] for backward compatibility
             market_state: Market regime features [batch, 12]
             hidden_states: Optional dict of initial hidden states per timeframe
+            vix_sequence: v5.2 - VIX sequence [batch, 90, 11] for VIX CfC
+            events: v5.2 - Event list for event embedding
 
         Returns:
             predictions: [batch, 3] - [predicted_high, predicted_low, confidence]
-            output_dict: Dict with hidden states, layer predictions, multi-task outputs
+            output_dict: Dict with hidden states, layer predictions, multi-task outputs, v5.2 outputs
         """
         # Handle backward compatibility: single tensor input
         if isinstance(x, torch.Tensor):
-            return self.forward_single_input(x, market_state)
+            return self.forward_single_input(x, market_state, vix_sequence, events)
 
         # x is now timeframe_data dict
         timeframe_data = x
@@ -577,6 +826,42 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
         # Store inputs for online learning
         self.last_inputs = {tf: data.detach() for tf, data in timeframe_data.items()}
+
+        # =========================================================================
+        # v5.2: VIX CfC PROCESSING
+        # =========================================================================
+        if vix_sequence is not None:
+            # Process VIX sequence through VIX CfC layer
+            vix_out, _ = self.vix_layer(vix_sequence, None)
+            hidden_vix = vix_out[:, -1, :]  # [batch, vix_hidden_size]
+            self.cached_vix_hidden = hidden_vix.detach()
+        elif self.cached_vix_hidden is not None:
+            # Use cached VIX hidden from previous pass (live inference)
+            hidden_vix = self.cached_vix_hidden.to(device)
+            if hidden_vix.shape[0] != batch_size:
+                hidden_vix = hidden_vix[:1].expand(batch_size, -1)
+        else:
+            # No VIX available - use zeros
+            hidden_vix = torch.zeros(batch_size, self.vix_hidden_size, device=device)
+
+        # =========================================================================
+        # v5.2: EVENT EMBEDDING
+        # =========================================================================
+        if events is not None and HAS_EVENT_SYSTEM and isinstance(self.event_embedding, EventEmbedding):
+            # Use proper event embedding
+            event_embed = self.event_embedding(events, batch_size, device)
+            self.cached_event_embed = event_embed.detach()
+        elif self.cached_event_embed is not None:
+            # Use cached event embedding (live inference)
+            event_embed = self.cached_event_embed.to(device)
+            if event_embed.shape[0] != batch_size:
+                event_embed = event_embed[:1].expand(batch_size, -1)
+        else:
+            # No events - use zeros or no-event embedding
+            if HAS_EVENT_SYSTEM and isinstance(self.event_embedding, EventEmbedding):
+                event_embed = self.event_embedding([], batch_size, device)
+            else:
+                event_embed = torch.zeros(batch_size, self.event_embed_dim, device=device)
 
         # v5.0: Initialize projection feature extractor on first forward (need feature names from data)
         # This will be used to extract projection/quality features from input tensors
@@ -594,6 +879,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
         layer_confidences = []
         all_hidden = []
         projection_metadata = {}  # v5.0: Store projection details for interpretability
+        duration_outputs = {}  # v5.2: Probabilistic duration
+        validity_outputs = {}  # v5.2: Forward-looking validity
 
         prev_hidden = None
         for i, tf in enumerate(self.TIMEFRAMES):
@@ -611,13 +898,25 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 continue
 
             x_tf = timeframe_data[tf]  # [batch, seq_len, features]
+            seq_len = x_tf.shape[1]
 
             # Concatenate previous hidden state if not first layer
             if i > 0 and prev_hidden is not None:
                 # Expand hidden to match sequence length
-                seq_len = x_tf.shape[1]
                 prev_hidden_expanded = prev_hidden.unsqueeze(1).expand(-1, seq_len, -1)
                 x_tf = torch.cat([x_tf, prev_hidden_expanded], dim=-1)
+
+            # v5.2: Concatenate VIX hidden state to CfC input
+            # This gives each TF layer awareness of volatility regime
+            if hidden_vix is not None:
+                vix_expanded = hidden_vix.unsqueeze(1).expand(-1, seq_len, -1)
+                x_tf = torch.cat([x_tf, vix_expanded], dim=-1)
+
+            # v5.2: Concatenate event embedding to CfC input
+            # This gives each TF layer awareness of upcoming catalysts
+            if event_embed is not None:
+                event_expanded = event_embed.unsqueeze(1).expand(-1, seq_len, -1)
+                x_tf = torch.cat([x_tf, event_expanded], dim=-1)
 
             # Get initial hidden state if provided
             h_init = hidden_states.get(tf, None)
@@ -630,6 +929,42 @@ class HierarchicalLNN(nn.Module, ModelBase):
             layer_hidden_states[tf] = h_new
             all_hidden.append(hidden)
             prev_hidden = hidden
+
+            # =====================================================================
+            # v5.2: COMPUTE DURATION FIRST (needed for duration-aware projections)
+            # =====================================================================
+            duration_scale = 1.0  # Default scale
+            if hasattr(self, 'duration_heads') and f'{tf}_mean' in self.duration_heads:
+                # Duration context: hidden + VIX + events
+                duration_context = torch.cat([hidden, hidden_vix, event_embed], dim=-1)
+
+                # Probabilistic duration (mean + std)
+                duration_mean = self.duration_heads[f'{tf}_mean'](duration_context)
+                duration_log_std = self.duration_heads[f'{tf}_log_std'](duration_context)
+                duration_std = torch.exp(duration_log_std).clamp(1, 20)
+
+                # Three projection scenarios
+                conservative = (duration_mean - duration_std).clamp(1, 48)
+                expected = duration_mean.clamp(1, 48)
+                aggressive = (duration_mean + duration_std).clamp(1, 48)
+
+                # Duration confidence = inverse of relative uncertainty
+                duration_confidence = 1.0 - (duration_std / (duration_mean + 1e-6)).clamp(0, 0.95)
+
+                duration_outputs[tf] = {
+                    'mean': duration_mean,
+                    'log_std': duration_log_std,
+                    'std': duration_std,
+                    'conservative': conservative,
+                    'expected': expected,
+                    'aggressive': aggressive,
+                    'confidence': duration_confidence,
+                }
+
+                # v5.2: Duration-aware projection scaling
+                # If predicted duration < 24 bars, scale down projections proportionally
+                # If > 24 bars, scale up (clamped to reasonable range)
+                duration_scale = (duration_mean / 24.0).clamp(0.3, 2.0)  # [batch, 1]
 
             # v5.0: Channel-based predictions (Option B: Base + Adjustment)
             if self.use_channel_projections and hasattr(self, 'projection_adjusters'):
@@ -668,6 +1003,13 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 pred_high = base_high + adjustment[:, 0:1]
                 pred_low = base_low + adjustment[:, 1:2]
 
+                # v5.2: Apply duration-aware scaling
+                # Shorter expected duration → smaller price move
+                # Longer expected duration → larger price move
+                if isinstance(duration_scale, torch.Tensor):
+                    pred_high = pred_high * duration_scale
+                    pred_low = pred_low * duration_scale
+
                 # v5.0: Store metadata for interpretability (only during eval, skip in training for speed)
                 if not self.training:
                     metadata = {
@@ -696,10 +1038,39 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 pred_high = self.timeframe_heads[f'{tf}_high'](hidden)
                 pred_low = self.timeframe_heads[f'{tf}_low'](hidden)
 
+                # v5.2: Apply duration-aware scaling (same as projection case)
+                if isinstance(duration_scale, torch.Tensor):
+                    pred_high = pred_high * duration_scale
+                    pred_low = pred_low * duration_scale
+
             pred_conf = torch.sigmoid(self.timeframe_heads[f'{tf}_conf'](hidden))
 
             layer_predictions.extend([pred_high, pred_low, pred_conf])
             layer_confidences.append(pred_conf)
+
+            # =====================================================================
+            # v5.2: VALIDITY PREDICTION for this TF
+            # (Duration already computed above before projections)
+            # =====================================================================
+            if hasattr(self, 'validity_heads') and tf in self.validity_heads:
+                # Get quality score and position from projection features (or use defaults)
+                if proj_features is not None:
+                    quality_score = proj_features['quality_scores'].mean(dim=-1, keepdim=True)  # [batch, 1]
+                    position = proj_features['position'].mean(dim=-1, keepdim=True)  # [batch, 1]
+                else:
+                    # Fallback: use confidence as proxy for quality, 0.5 for position
+                    quality_score = pred_conf
+                    position = torch.full((batch_size, 1), 0.5, device=device)
+
+                # Validity input: hidden + VIX + events + [quality, position]
+                validity_input = torch.cat([
+                    hidden, hidden_vix, event_embed,
+                    quality_score, position
+                ], dim=-1)
+
+                # Forward-looking validity prediction
+                validity = self.validity_heads[tf](validity_input)
+                validity_outputs[tf] = validity
 
         # =========================================================================
         # PHYSICS-INSPIRED PROCESSING
@@ -827,6 +1198,44 @@ class HierarchicalLNN(nn.Module, ModelBase):
         if not self.use_fusion_head:
             output_dict['channel_selection'] = selection_info
 
+        # =========================================================================
+        # v5.2: DURATION, VALIDITY, AND COMPOSITOR OUTPUTS
+        # =========================================================================
+        # Add duration outputs (probabilistic)
+        if duration_outputs:
+            output_dict['duration'] = duration_outputs
+
+        # Add validity outputs (forward-looking)
+        if validity_outputs:
+            output_dict['validity'] = validity_outputs
+
+        # Add VIX hidden state
+        output_dict['hidden_vix'] = hidden_vix
+
+        # Add event embedding
+        output_dict['event_embed'] = event_embed
+
+        # Determine selected TF for compositor (use physics selection if available)
+        if not self.use_fusion_head and 'selection_info' in dir():
+            selected_tf = self.TIMEFRAMES[selection_info['best_tf_idx'][0].item()]
+        else:
+            # Use highest confidence TF
+            conf_tensor = torch.cat(layer_confidences, dim=-1)  # [batch, 11]
+            best_tf_idx = torch.argmax(conf_tensor, dim=-1)[0].item()
+            selected_tf = self.TIMEFRAMES[best_tf_idx]
+
+        # Run Multi-Phase Compositor
+        if hasattr(self, 'compositor'):
+            compositor_output = self.compositor(
+                all_hidden=tf_hidden_dict,
+                hidden_vix=hidden_vix,
+                event_embed=event_embed,
+                current_tf=selected_tf,
+                timeframes=self.TIMEFRAMES
+            )
+            output_dict['compositor'] = compositor_output
+            output_dict['selected_tf'] = selected_tf
+
         # Store per-layer predictions
         for i, tf in enumerate(self.TIMEFRAMES):
             idx = i * 3
@@ -931,6 +1340,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self,
         x: torch.Tensor,
         market_state: Optional[torch.Tensor] = None,
+        vix_sequence: Optional[torch.Tensor] = None,  # v5.2
+        events: Optional[List[Dict]] = None,  # v5.2
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
         Backward-compatible forward for single tensor input.
@@ -941,6 +1352,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
         Args:
             x: Input features [batch, seq_len, features]
             market_state: Market regime features [batch, 12]
+            vix_sequence: v5.2 - VIX sequence [batch, 90, 11]
+            events: v5.2 - Event list
 
         Returns:
             Same as forward()
@@ -969,7 +1382,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 padding = torch.zeros(batch_size, target_len - full_seq_len, n_features, device=x.device)
                 timeframe_data[tf] = torch.cat([padding, x], dim=1)
 
-        return self.forward(timeframe_data, market_state)
+        return self.forward(timeframe_data, market_state, vix_sequence=vix_sequence, events=events)
 
     def clear_cached_states(self):
         """Clear cached hidden states to prevent memory accumulation."""

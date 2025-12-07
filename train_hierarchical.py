@@ -292,9 +292,19 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
     if torch_dtype is None:
         torch_dtype = torch.float32
 
-    # Separate data and targets
-    data_list = [d for d, _ in batch]
-    targets_list = [t for _, t in batch]
+    # v5.2: Handle both 2-element (legacy) and 4-element (features, targets, vix, events) tuples
+    if len(batch[0]) == 4:
+        # v5.2 format
+        data_list = [sample[0] for sample in batch]
+        targets_list = [sample[1] for sample in batch]
+        vix_list = [sample[2] for sample in batch]
+        events_list = [sample[3] for sample in batch]
+    else:
+        # Legacy format
+        data_list = [d for d, _ in batch]
+        targets_list = [t for _, t in batch]
+        vix_list = None
+        events_list = None
 
     # Detect format: dict (v4.1 native timeframe) or tuple (legacy)
     is_native_timeframe = isinstance(data_list[0], dict)
@@ -364,12 +374,28 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         for k, v in targets_batch.items():
             targets_batch[k] = v.to(device, non_blocking=True)
 
+    # v5.2: Collate VIX sequences
+    vix_batch = None
+    if vix_list is not None:
+        # Filter out None values and stack
+        valid_vix = [v for v in vix_list if v is not None]
+        if len(valid_vix) > 0:
+            vix_batch = torch.tensor(np.array(valid_vix), dtype=torch_dtype)
+            if move_to_device and device is not None:
+                vix_batch = vix_batch.to(device, non_blocking=True)
+
+    # v5.2: Collate events (list of lists)
+    events_batch = None
+    if events_list is not None:
+        # Events stay as list - EventEmbedding.forward_batch() handles lists
+        events_batch = events_list
+
     # Log slow batch assembly (diagnose lazy loading bottlenecks)
     _collate_elapsed = time.perf_counter() - _collate_start
     if _collate_elapsed > 1.0:  # Log if >1 second
         print(f"[SLOW_COLLATE] batch assembly took {_collate_elapsed:.1f}s for {len(batch)} samples ({_collate_elapsed/len(batch)*1000:.0f}ms/sample)", file=sys.stderr, flush=True)
 
-    return x, targets_batch
+    return x, targets_batch, vix_batch, events_batch
 
 
 def load_cache_manifests(cache_dir: Path):
@@ -427,10 +453,17 @@ def find_available_caches(cache_dir: Path):
     Supports both:
     - Chunked/mmap mode: features_mmap_meta_*.json + shards
     - Non-chunked/pickle mode: rolling_channels_*.pkl (legacy)
+
+    v5.2: Also tracks transition labels for multi-phase compositor
     """
     cache_dir = Path(cache_dir)
     caches = []
     seen_keys = set()
+
+    # v5.2: Count transition label files (per-TF pattern: transition_labels_{tf}_*.pkl)
+    def count_transition_labels(cache_dir: Path) -> int:
+        """Count how many TF transition label files exist."""
+        return len(list(cache_dir.glob("transition_labels_*.pkl")))
 
     # 1. Find mmap caches (chunked mode)
     for meta_path in cache_dir.glob("features_mmap_meta_*.json"):
@@ -449,12 +482,16 @@ def find_available_caches(cache_dir: Path):
         non_channel_path = cache_dir / f"non_channel_features_{cache_key}.pkl"
         has_non_channel = non_channel_path.exists()
 
+        # v5.2: Check for transition labels
+        transition_label_count = count_transition_labels(cache_dir)
+
         caches.append({
             "cache_key": cache_key,
             "cache_type": "mmap",
             "meta_path": str(meta_path),
             "cont_path": str(cont_path) if cont_path else None,
             "non_channel_path": str(non_channel_path) if has_non_channel else None,
+            "transition_labels_count": transition_label_count,  # v5.2
             "complete": cont_path is not None and has_non_channel
         })
 
@@ -478,6 +515,9 @@ def find_available_caches(cache_dir: Path):
                 cont_path = candidate
                 break
 
+        # v5.2: Check for transition labels
+        transition_label_count = count_transition_labels(cache_dir)
+
         caches.append({
             "cache_key": cache_key,
             "cache_type": "pickle",
@@ -485,6 +525,7 @@ def find_available_caches(cache_dir: Path):
             "pickle_path": str(pickle_path),
             "cont_path": str(cont_path) if cont_path else None,
             "non_channel_path": None,  # Pickle mode includes all features
+            "transition_labels_count": transition_label_count,  # v5.2
             "complete": cont_path is not None  # Pickle has all features, just need continuation
         })
 
@@ -505,19 +546,25 @@ def pick_cache_pair(caches):
     if len(caches) == 1:
         cache = caches[0]
         status = "COMPLETE" if cache.get("complete") else "partial"
-        print(f"\n✅ Auto-selected cache: {cache['cache_key']} ({status})")
+        trans_count = cache.get("transition_labels_count", 0)
+        trans_info = f" + {trans_count} transition labels" if trans_count > 0 else ""
+        print(f"\n✅ Auto-selected cache: {cache['cache_key']} ({status}{trans_info})")
         print(f"   → Will skip feature extraction and use cached data\n")
         return cache
 
     choices = []
     for c in caches:
         # Build status string based on what's cached
+        # v5.2: Include transition label count
+        trans_count = c.get("transition_labels_count", 0)
+        trans_info = f" +{trans_count}TL" if trans_count > 0 else ""
+
         if c.get("complete"):
-            status = "COMPLETE - skip extraction entirely"
+            status = f"COMPLETE{trans_info} - skip extraction entirely"
         elif c.get("cont_path") and c.get("non_channel_path"):
-            status = "COMPLETE - skip extraction entirely"
+            status = f"COMPLETE{trans_info} - skip extraction entirely"
         elif c.get("cont_path"):
-            status = "partial: channels + labels (will recompute non-channel ~10-30s)"
+            status = f"partial{trans_info}: channels + labels (will recompute non-channel ~10-30s)"
         elif c.get("non_channel_path"):
             status = "partial: channels + non-channel (no labels)"
         else:
@@ -568,6 +615,10 @@ def save_cache_manifest(
                 return None
             return Path(path).name  # Just the filename, no directory
 
+        # v5.2: Auto-detect transition labels
+        transition_label_files = list(cache_dir.glob("transition_labels_*.pkl"))
+        transition_labels_count = len(transition_label_files)
+
         manifest = {
             "cache_key": cache_key,
             "cache_type": cache_type,
@@ -591,6 +642,9 @@ def save_cache_manifest(
                 "continuation_labels": extract_filename(continuation_path),
                 "non_channel_features": extract_filename(non_channel_path),
                 "pickle_channels": extract_filename(pickle_path),
+                # v5.2: Track transition labels for multi-phase compositor
+                "transition_labels_count": transition_labels_count,
+                "transition_labels": [f.name for f in transition_label_files] if transition_label_files else None,
             },
             "source_files": {
                 # v4.4: Track VIX/Events files for staleness detection
@@ -896,13 +950,31 @@ def train_epoch(
                     per_tf_cont_targets[gain_key] = targets_dict[gain_key].to(device, non_blocking=True)
                     per_tf_cont_targets[conf_key] = targets_dict[conf_key].to(device, non_blocking=True)
 
+        # v5.2: Extract transition labels from per-TF fields in targets
+        transition_labels = {}
+        from src.ml.hierarchical_model import HierarchicalLNN
+        for tf in HierarchicalLNN.TIMEFRAMES:
+            trans_type_key = f'trans_{tf}_type'
+            if trans_type_key in targets_dict:
+                transition_labels[tf] = {
+                    'transition_type': int(targets_dict[trans_type_key][0].item()),  # First sample
+                    'switch_to_tf': int(targets_dict.get(f'trans_{tf}_switch_to', torch.tensor([0]))[0].item()),
+                    'phase2_direction': int(targets_dict.get(f'trans_{tf}_direction', torch.tensor([1]))[0].item()),
+                    'phase2_slope': float(targets_dict.get(f'trans_{tf}_slope', torch.tensor([0.0]))[0].item()),
+                }
+
+        # If no transition labels found, set to None (backward compatibility)
+        if not transition_labels:
+            transition_labels = None
+
         # Forward pass with optional AMP
         use_amp = scaler is not None
 
         # Use autocast for AMP, otherwise normal forward
         if use_amp:
             with torch.amp.autocast('cuda'):
-                predictions, hidden_states = model.forward(x)
+                # v5.2: Pass VIX sequence and events to model
+                predictions, hidden_states = model.forward(x, vix_sequence=vix_sequence, events=events)
 
                 # Primary loss (high/low regression)
                 pred_high = predictions[:, 0]
@@ -1095,6 +1167,67 @@ def train_epoch(
                     energy_reg = energy.mean() * loss_weights.get('energy_reg', 0.01)
                     loss = loss + energy_reg
 
+                # =====================================================================
+                # v5.2 LOSSES: Duration NLL, Validity, Transition, Direction
+                # =====================================================================
+
+                # v5.2: Probabilistic duration loss (Gaussian NLL)
+                if 'duration' in hidden_states and transition_labels:
+                    duration_outputs = hidden_states['duration']
+                    for tf, dur_data in duration_outputs.items():
+                        if tf in transition_labels:
+                            # Get target duration from continuation labels (duration_bars)
+                            target_dur = per_tf_cont_targets.get(f'cont_{tf}_duration')
+                            if target_dur is not None:
+                                mean = dur_data['mean'].squeeze()
+                                log_std = dur_data['log_std'].squeeze()
+                                variance = torch.exp(2 * log_std) + 1e-6
+                                # Gaussian NLL
+                                nll = 0.5 * ((target_dur - mean) ** 2 / variance + 2 * log_std)
+                                loss_duration_nll = nll.mean() * loss_weights.get('duration_nll', 0.3)
+                                loss = loss + loss_duration_nll
+
+                # v5.2: Validity loss (BCE)
+                if 'validity' in hidden_states and transition_labels:
+                    validity_outputs = hidden_states['validity']
+                    for tf, validity_pred in validity_outputs.items():
+                        if tf in transition_labels:
+                            # Target validity: 1 if channel continues, 0 if transitions
+                            trans_type = transition_labels[tf].get('transition_type', 0)
+                            target_validity = 1.0 if trans_type == 0 else 0.0
+                            target_val_tensor = torch.full_like(validity_pred.squeeze(), target_validity)
+                            with torch.amp.autocast('cuda', enabled=False):
+                                loss_validity = F.binary_cross_entropy(
+                                    validity_pred.float().squeeze(),
+                                    target_val_tensor.float()
+                                ) * loss_weights.get('validity', 0.2)
+                            loss = loss + loss_validity
+
+                # v5.2: Transition type loss (cross-entropy)
+                if 'compositor' in hidden_states and transition_labels:
+                    compositor = hidden_states['compositor']
+                    # Get selected TF for this batch
+                    selected_tf = hidden_states.get('selected_tf', 'daily')
+                    if selected_tf in transition_labels:
+                        trans_type = transition_labels[selected_tf].get('transition_type', 0)
+                        target_trans = torch.tensor([trans_type], device=device, dtype=torch.long)
+                        target_trans = target_trans.expand(predictions.shape[0])
+                        loss_transition = F.cross_entropy(
+                            compositor['transition_logits'],
+                            target_trans
+                        ) * loss_weights.get('transition', 0.3)
+                        loss = loss + loss_transition
+
+                        # Direction loss
+                        new_dir = transition_labels[selected_tf].get('new_direction', 0)
+                        target_dir = torch.tensor([new_dir], device=device, dtype=torch.long)
+                        target_dir = target_dir.expand(predictions.shape[0])
+                        loss_direction = F.cross_entropy(
+                            compositor['direction_logits'],
+                            target_dir
+                        ) * loss_weights.get('direction', 0.2)
+                        loss = loss + loss_direction
+
             # AMP backward pass
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -1107,7 +1240,8 @@ def train_epoch(
 
         else:
             # Standard FP32 forward pass
-            predictions, hidden_states = model.forward(x)
+            # v5.2: Pass VIX sequence and events to model
+            predictions, hidden_states = model.forward(x, vix_sequence=vix_sequence, events=events)
 
             # Primary loss (high/low regression)
             pred_high = predictions[:, 0]
@@ -1290,6 +1424,66 @@ def train_epoch(
                 # Gentle regularization: prefer lower energy (more stable) configurations
                 energy_reg = energy.mean() * loss_weights.get('energy_reg', 0.01)
                 loss = loss + energy_reg
+
+            # =====================================================================
+            # v5.2 LOSSES (FP32): Duration NLL, Validity, Transition, Direction
+            # =====================================================================
+
+            # v5.2: Probabilistic duration loss (Gaussian NLL)
+            if 'duration' in hidden_states and transition_labels:
+                duration_outputs = hidden_states['duration']
+                for tf, dur_data in duration_outputs.items():
+                    if tf in transition_labels:
+                        # Get target duration from continuation labels (duration_bars)
+                        target_dur = per_tf_cont_targets.get(f'cont_{tf}_duration')
+                        if target_dur is not None:
+                            mean = dur_data['mean'].squeeze()
+                            log_std = dur_data['log_std'].squeeze()
+                            variance = torch.exp(2 * log_std) + 1e-6
+                            # Gaussian NLL
+                            nll = 0.5 * ((target_dur - mean) ** 2 / variance + 2 * log_std)
+                            loss_duration_nll = nll.mean() * loss_weights.get('duration_nll', 0.3)
+                            loss = loss + loss_duration_nll
+
+            # v5.2: Validity loss (BCE)
+            if 'validity' in hidden_states and transition_labels:
+                validity_outputs = hidden_states['validity']
+                for tf, validity_pred in validity_outputs.items():
+                    if tf in transition_labels:
+                        # Target validity: 1 if channel continues, 0 if transitions
+                        trans_type = transition_labels[tf].get('transition_type', 0)
+                        target_validity = 1.0 if trans_type == 0 else 0.0
+                        target_val_tensor = torch.full_like(validity_pred.squeeze(), target_validity)
+                        loss_validity = F.binary_cross_entropy(
+                            validity_pred.squeeze(),
+                            target_val_tensor
+                        ) * loss_weights.get('validity', 0.2)
+                        loss = loss + loss_validity
+
+            # v5.2: Transition type loss (cross-entropy)
+            if 'compositor' in hidden_states and transition_labels:
+                compositor = hidden_states['compositor']
+                # Get selected TF for this batch
+                selected_tf = hidden_states.get('selected_tf', 'daily')
+                if selected_tf in transition_labels:
+                    trans_type = transition_labels[selected_tf].get('transition_type', 0)
+                    target_trans = torch.tensor([trans_type], device=device, dtype=torch.long)
+                    target_trans = target_trans.expand(predictions.shape[0])
+                    loss_transition = F.cross_entropy(
+                        compositor['transition_logits'],
+                        target_trans
+                    ) * loss_weights.get('transition', 0.3)
+                    loss = loss + loss_transition
+
+                    # Direction loss
+                    new_dir = transition_labels[selected_tf].get('new_direction', 0)
+                    target_dir = torch.tensor([new_dir], device=device, dtype=torch.long)
+                    target_dir = target_dir.expand(predictions.shape[0])
+                    loss_direction = F.cross_entropy(
+                        compositor['direction_logits'],
+                        target_dir
+                    ) * loss_weights.get('direction', 0.2)
+                    loss = loss + loss_direction
 
             # Standard backward pass
             optimizer.zero_grad(set_to_none=True)
@@ -3488,12 +3682,21 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         _is_first_batch_ever = (epoch == 0)
         _first_forward_start = None
 
-        for batch_idx, (features, targets) in enumerate(batch_pbar):
+        for batch_idx, batch_data in enumerate(batch_pbar):
             if profiler and batch_idx == 0:
                 profiler.log_info(f"FIRST_BATCH_COMPLETE | time_sec={0}")
                 profiler.snapshot("first_batch_received", epoch + 1, force_log=True)
 
+            # v5.2: Unpack batch (supports both 2-element and 4-element formats)
+            if len(batch_data) == 4:
+                features, targets, vix_batch, events_batch = batch_data
+            else:
+                features, targets = batch_data
+                vix_batch = None
+                events_batch = None
+
             # Move features to device - handle both native TF mode (dict) and legacy mode (tensor)
+            # Note: vix_batch already on device from collate if move_to_device=True
             if isinstance(features, dict):
                 features = {tf: f.to(args.device, non_blocking=True) for tf, f in features.items()}
             else:
@@ -3539,7 +3742,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             # Forward pass with optional AMP
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    predictions, hidden_states = model(features)
+                    # v5.2: Pass VIX sequence and events to model
+                    predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
                     # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
                     target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                     loss = F.mse_loss(predictions[:, :2], target_tensor)
@@ -3571,7 +3775,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                predictions, hidden_states = model(features)
+                # v5.2: Pass VIX sequence and events to model
+                predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
                 # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
                 target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                 loss = F.mse_loss(predictions[:, :2], target_tensor)
@@ -3628,7 +3833,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         num_val_batches = 0
 
         with torch.no_grad():
-            for features, targets in val_loader:
+            for batch_data in val_loader:
+                # v5.2: Unpack batch
+                if len(batch_data) == 4:
+                    features, targets, vix_batch_val, events_batch_val = batch_data
+                else:
+                    features, targets = batch_data
+                    vix_batch_val = None
+                    events_batch_val = None
                 # Move features to device - handle both native TF mode (dict) and legacy mode (tensor)
                 if isinstance(features, dict):
                     features = {tf: f.to(args.device, non_blocking=True) for tf, f in features.items()}
@@ -3639,12 +3851,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
                 if scaler is not None:
                     with torch.amp.autocast('cuda'):
-                        predictions, hidden_states = model(features)
+                        # v5.2: Pass VIX and events
+                        predictions, hidden_states = model(features, vix_sequence=vix_batch_val, events=events_batch_val)
                         # Raw % (data alignment fixed in dataset)
                         target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                         loss = F.mse_loss(predictions[:, :2], target_tensor)
                 else:
-                    predictions, hidden_states = model(features)
+                    # v5.2: Pass VIX and events
+                    predictions, hidden_states = model(features, vix_sequence=vix_batch_val, events=events_batch_val)
                     # Raw % (data alignment fixed in dataset)
                     target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                     loss = F.mse_loss(predictions[:, :2], target_tensor)

@@ -154,6 +154,31 @@ class HierarchicalDataset(Dataset):
         if continuation_labels_dir is not None:
             self._load_hierarchical_continuation_labels(continuation_labels_dir)
 
+        # v5.2: Load per-TF transition labels
+        self._per_tf_transition = {}  # Dict[tf, Dict] with transition arrays for each TF
+        self._per_tf_trans_ts_to_idx = {}  # Dict[tf, Dict[int64_ns, row_idx]]
+
+        if continuation_labels_dir is not None:
+            self._load_transition_labels(continuation_labels_dir)
+
+        # v5.2: VIX sequence loader
+        self._vix_loader = None
+        self._vix_sequence_length = 90
+        self._event_fetcher = None
+
+        # Try to initialize VIX loader if VIX data available
+        try:
+            from src.ml.live_events import VIXSequenceLoader, LiveEventFetcher
+            vix_path = Path('data/VIX_History.csv')
+            if vix_path.exists():
+                self._vix_loader = VIXSequenceLoader(str(vix_path))
+                print(f"     ✓ v5.2: VIX loader initialized from {vix_path}")
+            # Initialize event fetcher for training (no API key needed for historical)
+            self._event_fetcher = LiveEventFetcher()
+            print(f"     ✓ v5.2: Event fetcher initialized")
+        except ImportError:
+            pass  # live_events not available
+
         # Dtype validation - ensure data matches config precision
         expected_dtype = config.NUMPY_DTYPE
 
@@ -716,9 +741,31 @@ class HierarchicalDataset(Dataset):
         # Get current price from 5min features
         current_price = self.tf_mmaps['5min'][data_idx_5min - 1, self.close_idx_5min]
 
-        # Get future prices for target calculation
-        horizon_5min = self.prediction_horizon // 5 + 1
+        # v5.2: Get actual channel duration for this sample (if available)
+        # Use actual continuation duration instead of fixed prediction_horizon
+        actual_duration_bars = None
+        if self._per_tf_continuation and '5min' in self._per_tf_continuation:
+            # Get continuation data for 5min TF
+            cont_data = self._per_tf_continuation['5min']
+            ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+            ts_idx = cont_data.get('ts_to_idx', {}).get(int(ts_5min))
 
+            if ts_idx is not None and 'duration_bars' in cont_data:
+                # Duration in 5min bars (native resolution)
+                actual_duration_bars = int(cont_data['duration_bars'][ts_idx])
+
+        # Use actual duration if available, otherwise fall back to fixed horizon
+        if actual_duration_bars and actual_duration_bars > 0:
+            # v5.2: Use actual channel continuation duration
+            horizon_5min = actual_duration_bars
+            # Convert to 1-min bars for raw OHLC lookup
+            horizon_1min = horizon_5min * 5
+        else:
+            # Fallback: fixed horizon
+            horizon_5min = self.prediction_horizon // 5 + 1
+            horizon_1min = self.prediction_horizon
+
+        # Get future prices for target calculation
         if self.raw_ohlc_array is not None:
             # Use raw 1-min OHLC for more accurate targets
             # FIX (Priority 1b): Use timestamp-based lookup instead of approximation
@@ -739,7 +786,8 @@ class HierarchicalDataset(Dataset):
                 approx_1min_idx = data_idx_5min * 5
 
             future_start = approx_1min_idx
-            future_end = min(approx_1min_idx + self.prediction_horizon, len(self.raw_ohlc_array))
+            # v5.2: Use actual duration (horizon_1min) instead of fixed prediction_horizon
+            future_end = min(approx_1min_idx + horizon_1min, len(self.raw_ohlc_array))
 
             if future_end > future_start:
                 future_ohlc = self.raw_ohlc_array[future_start:future_end]
@@ -831,7 +879,40 @@ class HierarchicalDataset(Dataset):
             except Exception:
                 pass
 
-        return timeframe_data, targets
+        # v5.2: Add transition labels to targets (if available)
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            if self._per_tf_transition and tf in self._per_tf_transition:
+                trans_data = self._per_tf_transition[tf]
+                ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+                ts_idx = trans_data.get('ts_to_idx', {}).get(int(ts_5min))
+
+                if ts_idx is not None:
+                    targets[f'trans_{tf}_type'] = float(trans_data['transition_type'][ts_idx])
+                    targets[f'trans_{tf}_switch_to'] = float(trans_data.get('switch_to_tf', [0])[ts_idx])
+                    targets[f'trans_{tf}_direction'] = float(trans_data.get('phase2_direction', [1])[ts_idx])
+                    targets[f'trans_{tf}_slope'] = float(trans_data.get('phase2_slope', [0.0])[ts_idx])
+
+        # v5.2: Get VIX sequence for this sample
+        vix_seq = None
+        if self._vix_loader:
+            try:
+                ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+                ts = pd.Timestamp(ts_5min, unit='ns')
+                vix_seq = self._vix_loader.get_sequence(ts.date(), self._vix_sequence_length)
+            except Exception:
+                pass
+
+        # v5.2: Get events for this timestamp
+        events = None
+        if self._event_fetcher:
+            try:
+                ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+                ts = pd.Timestamp(ts_5min, unit='ns')
+                events = self._event_fetcher.get_events_for_training(ts)
+            except Exception:
+                pass
+
+        return timeframe_data, targets, vix_seq, events
 
     def __len__(self) -> int:
         """Return number of valid sequences."""
@@ -937,6 +1018,92 @@ class HierarchicalDataset(Dataset):
             print(f"     ✓ Loaded continuation labels for {loaded_count}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes")
         else:
             print(f"     ⚠️  No continuation label files found in {labels_dir}")
+
+    def _load_transition_labels(self, labels_dir: str):
+        """
+        v5.2: Load per-timeframe transition labels from directory.
+
+        Transition labels describe what happens AFTER a channel breaks:
+        - transition_type: 0=continue, 1=switch_tf, 2=reverse, 3=sideways
+        - switch_to_tf: Which TF to switch to (if switching)
+        - current_direction: Bull(0), Bear(1), Sideways(2)
+        - new_direction: Post-transition direction
+        - new_slope: Post-transition slope
+
+        Args:
+            labels_dir: Directory containing transition label files
+        """
+        import pickle
+        from pathlib import Path
+
+        labels_path = Path(labels_dir)
+        if not labels_path.exists():
+            return
+
+        print(f"\n  📂 Loading v5.2 transition labels from {labels_dir}...")
+
+        loaded_count = 0
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            # Look for label files matching pattern
+            pattern = f"transition_labels_{tf}_*.pkl"
+            matching_files = list(labels_path.glob(pattern))
+
+            if not matching_files:
+                # Try without cache suffix
+                pattern_simple = f"transition_labels_{tf}.pkl"
+                simple_file = labels_path / pattern_simple
+                if simple_file.exists():
+                    matching_files = [simple_file]
+
+            if not matching_files:
+                continue
+
+            # Use most recent file if multiple exist
+            label_file = sorted(matching_files)[-1]
+
+            try:
+                with open(label_file, 'rb') as f:
+                    labels_df = pickle.load(f)
+
+                if isinstance(labels_df, pd.DataFrame) and len(labels_df) > 0:
+                    # Extract arrays for O(1) access
+                    self._per_tf_transition[tf] = {
+                        'transition_type': labels_df['transition_type'].values.astype(np.int64),
+                        'current_direction': labels_df['current_direction'].values.astype(np.int64),
+                        'new_direction': labels_df['new_direction'].values.astype(np.int64),
+                        'new_slope': labels_df['new_slope'].values.astype(config.NUMPY_DTYPE),
+                    }
+
+                    # Optional: switch_to_tf (may have None values)
+                    if 'switch_to_tf' in labels_df.columns:
+                        # Convert TF names to indices, None to -1
+                        tf_to_idx = {tf: i for i, tf in enumerate(HIERARCHICAL_TIMEFRAMES)}
+                        switch_indices = []
+                        for val in labels_df['switch_to_tf']:
+                            if val is None or pd.isna(val):
+                                switch_indices.append(-1)
+                            else:
+                                switch_indices.append(tf_to_idx.get(val, -1))
+                        self._per_tf_transition[tf]['switch_to_tf'] = np.array(switch_indices, dtype=np.int64)
+
+                    # Build timestamp -> row_idx lookup dict
+                    self._per_tf_trans_ts_to_idx[tf] = {}
+                    for i, ts in enumerate(labels_df.index):
+                        ts_ns = pd.Timestamp(ts).value
+                        self._per_tf_trans_ts_to_idx[tf][ts_ns] = i
+
+                    loaded_count += 1
+                    # Stats
+                    type_counts = np.bincount(self._per_tf_transition[tf]['transition_type'], minlength=4)
+                    print(f"     {tf}: {len(labels_df):,} labels | CONT:{type_counts[0]} SWITCH:{type_counts[1]} REV:{type_counts[2]} SIDE:{type_counts[3]}")
+
+            except Exception as e:
+                print(f"     ⚠️  Failed to load {tf} transition labels: {e}")
+
+        if loaded_count > 0:
+            print(f"     ✓ Loaded transition labels for {loaded_count}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes")
+        else:
+            print(f"     ⚠️  No transition label files found in {labels_dir}")
 
     def get_label_mismatch_summary(self) -> dict:
         """
@@ -1393,6 +1560,48 @@ class HierarchicalDataset(Dataset):
                     targets['channel_1h_r_squared'] = 0.0
                 if self.has_channel_4h_r_squared:
                     targets['channel_4h_r_squared'] = 0.0
+
+        # =====================================================================
+        # v5.2: Add VIX sequence and events to targets for model training
+        # =====================================================================
+        if self._vix_loader is not None:
+            try:
+                # Get timestamp for this sample
+                sample_ts = pd.Timestamp(self.timestamps[seq_end - 1])
+                vix_seq = self._vix_loader.get_sequence(
+                    as_of_date=sample_ts.date(),
+                    sequence_length=self._vix_sequence_length
+                )
+                targets['vix_sequence'] = vix_seq  # [90, 11] numpy array
+            except Exception:
+                targets['vix_sequence'] = np.zeros((self._vix_sequence_length, 11), dtype=config.NUMPY_DTYPE)
+
+        if self._event_fetcher is not None:
+            try:
+                sample_ts = pd.Timestamp(self.timestamps[seq_end - 1])
+                events = self._event_fetcher.get_events_for_training(sample_ts, days_ahead=30)
+                targets['events'] = events  # List of event dicts
+            except Exception:
+                targets['events'] = []
+
+        # v5.2: Add transition labels if available
+        if self._per_tf_transition:
+            try:
+                sample_ts = pd.Timestamp(self.timestamps[seq_end - 1])
+                ts_ns = sample_ts.value
+                targets['transition_labels'] = {}
+                for tf in HIERARCHICAL_TIMEFRAMES:
+                    if tf in self._per_tf_trans_ts_to_idx:
+                        row_idx = self._per_tf_trans_ts_to_idx[tf].get(ts_ns)
+                        if row_idx is not None:
+                            targets['transition_labels'][tf] = {
+                                'transition_type': int(self._per_tf_transition[tf]['transition_type'][row_idx]),
+                                'current_direction': int(self._per_tf_transition[tf]['current_direction'][row_idx]),
+                                'new_direction': int(self._per_tf_transition[tf]['new_direction'][row_idx]),
+                                'new_slope': float(self._per_tf_transition[tf]['new_slope'][row_idx]),
+                            }
+            except Exception:
+                pass  # Skip transition labels if lookup fails
 
         # Performance logging for slow samples (diagnose mmap read bottlenecks)
         _getitem_elapsed_ms = (time.perf_counter() - _getitem_start) * 1000
