@@ -2063,43 +2063,10 @@ def interactive_setup(args, profiler=None):
             project_config._TORCH_DTYPE = torch.float32
             print("   → FP32 - Standard precision")
 
-    # Preload to RAM option (for CUDA with high-RAM systems)
-    # NOTE: Only relevant for legacy mmap mode - native TF mode uses smaller files (~5GB vs ~90GB)
-    args.preload_to_ram = False  # Default
+    # v5.2: Native TF mode is default - preload option removed (obsolete)
+    args.preload_to_ram = False  # Always false
 
-    # v4.1: Skip preload option when native TF mode is enabled (default)
-    # Native TF files are already small and efficient, preloading provides no benefit
-    if getattr(args, 'use_native_timeframes', True):
-        # Native TF mode is ON by default - no need for preload option
-        pass  # preload_to_ram stays False, no question asked
-    elif args.device.startswith('cuda'):
-        print()
-        # Detect RAM for guidance
-        try:
-            import psutil
-            detected_ram = psutil.virtual_memory().total / (1024**3)
-            container_ram = getattr(args, 'container_ram_gb', 0)
-            if container_ram > 0:
-                detected_ram = container_ram
-        except:
-            detected_ram = 0
-
-        # Only offer preload if system has enough RAM (90GB for data + overhead)
-        if detected_ram >= 100:
-            args.preload_to_ram = inquirer.confirm(
-                message=f"Preload all data to RAM? (~90GB, requires {int(detected_ram)}GB available - MUCH faster training)",
-                default=True  # Default to yes for high-RAM systems
-            ).execute()
-
-            if args.preload_to_ram:
-                print("   📦 Will load all channel data into RAM at startup")
-                print("   ⚡ Data access will be instant (RAM speed vs 400ms/sample disk I/O)")
-                print("   → Forcing num_workers=0 (data loading is instant, no prefetch needed)")
-        elif detected_ram >= 50:
-            print(f"   ℹ️  Detected {detected_ram:.0f}GB RAM - preload requires ~100GB (using mmap mode)")
-            args.preload_to_ram = False
-
-    # Data loading workers (RIGHT after device selection)
+    # Data loading workers
     print()
 
     # Detect RAM for guidance
@@ -2112,52 +2079,21 @@ def interactive_setup(args, profiler=None):
     except:
         total_ram_gb = 0
 
-    if args.preload_to_ram:
-        # With preload, each worker duplicates ~93GB of numpy arrays (spawn multiprocessing)
-        # Calculate max safe workers based on available RAM
-        preload_per_process = 93  # GB per process (main or worker)
-        base_overhead = 5  # GB for model, optimizer, etc.
-        max_safe_workers = max(0, int((total_ram_gb - base_overhead) / preload_per_process) - 1)
+    default_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device, 2)
 
-        print(f"   ⚠️  PRELOAD MODE: Each worker duplicates ~93GB (spawn multiprocessing)")
-        print(f"      RAM: {total_ram_gb:.0f}GB available")
-        print(f"      0 workers: ~{base_overhead + preload_per_process}GB")
-        if max_safe_workers >= 1:
-            print(f"      1 worker:  ~{base_overhead + 2*preload_per_process}GB")
-        if max_safe_workers >= 2:
-            print(f"      2 workers: ~{base_overhead + 3*preload_per_process}GB")
-        if max_safe_workers >= 3:
-            print(f"      3 workers: ~{base_overhead + 4*preload_per_process}GB")
-        print(f"      Max safe: {max_safe_workers} workers")
-        print(f"      Note: With data in RAM, __getitem__ is <1ms (workers add minimal benefit)")
-
-        default_workers = 0  # Recommend 0 since data loading is instant
-        args.num_workers = int(inquirer.number(
-            message=f"Data loading workers (recommended: 0, max safe: {max_safe_workers}):",
-            default=dflt('num_workers', default_workers),
-            min_allowed=0,
-            max_allowed=max(max_safe_workers, 0)
-        ).execute())
-
-        if args.num_workers > 0:
-            estimated_ram = base_overhead + (args.num_workers + 1) * preload_per_process
-            print(f"   → Using {args.num_workers} workers (~{estimated_ram}GB estimated RAM)")
+    if total_ram_gb > 0:
+        guidance = f"\n   ℹ️  RAM: {total_ram_gb:.0f}GB available. With large datasets, each worker uses extra RAM."
     else:
-        default_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device, 2)
+        guidance = ""
 
-        if total_ram_gb > 0:
-            guidance = f"\n   ℹ️  RAM: {total_ram_gb:.0f}GB available. With large datasets, each worker uses extra RAM."
-        else:
-            guidance = ""
+    args.num_workers = int(inquirer.number(
+        message=f"Data loading workers (CPU threads for batch prep, recommended: {default_workers}):{guidance}",
+        default=dflt('num_workers', default_workers),
+        min_allowed=0,
+        max_allowed=128  # High limit for systems with many cores
+    ).execute())
 
-        args.num_workers = int(inquirer.number(
-            message=f"Data loading workers (CPU threads for batch prep, recommended: {default_workers}):{guidance}",
-            default=dflt('num_workers', default_workers),
-            min_allowed=0,
-            max_allowed=128  # High limit for systems with many cores (e.g., 32-64 core servers)
-        ).execute())
-
-    if not args.preload_to_ram and args.num_workers != default_workers:
+    if args.num_workers != default_workers:
         if args.device == 'mps' and args.num_workers > 2:
             print(f"   ⚠️  Using {args.num_workers} workers on MPS (default: 2)")
             print(f"      More workers = faster but more RAM usage (unified memory)")
@@ -2449,7 +2385,6 @@ def interactive_setup(args, profiler=None):
         continuation_mode = inquirer.select(
             message="Continuation prediction mode:",
             choices=[
-                Choice(value='simple', name='Simple - Fixed 24-bar for all targets ⭐ Baseline'),
                 Choice(value='adaptive_labels', name='Adaptive Labels - Adaptive continuation, fixed high/low 🎯 Default'),
                 Choice(value='adaptive_full', name='Fully Adaptive - All targets use adaptive horizon 🔬 Experimental'),
             ],
@@ -2459,11 +2394,8 @@ def interactive_setup(args, profiler=None):
     # Update config with continuation mode
     project_config.CONTINUATION_MODE = continuation_mode
 
-    if continuation_mode == 'simple':
-        print(f"   → Simple mode: Fixed 24-bar horizon (24 minutes)")
-        print(f"      All targets calculated over same fixed window")
-
-    elif continuation_mode == 'adaptive_labels':
+    # v5.2 Note: Actual-duration targets override these modes (uses continuation_labels duration_bars)
+    if continuation_mode == 'adaptive_labels':
         print(f"   → Adaptive Labels mode:")
         print(f"      Primary targets (high/low): Fixed 24-bar window")
         print(f"      Continuation labels: Adaptive horizon based on confidence")
@@ -2743,6 +2675,21 @@ def interactive_setup(args, profiler=None):
     print(f"   {mode_desc}")
     print(f"   Interpretability: {interpretability}")
     print()
+
+    # v5.2: Reject Learned + Physics-Only (makes no architectural sense)
+    if not args.use_geometric_base and not args.use_fusion_head:
+        print("\n" + "="*70)
+        print("❌ ERROR: Learned + Physics-Only is not supported")
+        print("="*70)
+        print("This combination defeats the purpose of physics-based aggregation.")
+        print("Physics modules weight geometric channels, not learned approximations.")
+        print()
+        print("Please select one of these valid combinations:")
+        print("  ✅ Geometric + Physics-Only (recommended)")
+        print("  ✅ Geometric + Fusion Head (testing)")
+        print("  ✅ Learned + Fusion Head (baseline)")
+        print()
+        sys.exit(1)
 
     if args.use_geometric_base:
         print("   How it works:")
@@ -3260,10 +3207,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         print(f"                 extractor.generate_native_tf_from_chunks(")
                         print(f"                     'data/feature_cache/features_mmap_meta_*.json',")
                         print(f"                     'data/feature_cache')")
-                    # Fall back to legacy mode for this run
-                    args.use_native_timeframes = False
-                    if is_main_process(rank):
-                        print(f"   → Falling back to legacy mmap mode for this run")
+                    # v5.2: Require native TF mode, no fallback to legacy
+                    print(f"\n   ❌ ERROR: Native TF metadata required for v5.2")
+                    print(f"   Please regenerate features with native TF generation enabled.")
+                    sys.exit(1)
 
     # =========================================================================
     # DATASET CREATION
