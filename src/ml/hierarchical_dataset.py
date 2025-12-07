@@ -191,7 +191,7 @@ class HierarchicalDataset(Dataset):
         if mmap_meta_path is not None:
             import json
             import numpy as np
-            from pathlib import Path
+            # Path already imported at module level (line 19)
 
             print(f"  📂 Loading memory-mapped channel shards...")
             meta = json.load(open(mmap_meta_path))
@@ -961,7 +961,7 @@ class HierarchicalDataset(Dataset):
                        (e.g., continuation_labels_5min_*.pkl, continuation_labels_1h_*.pkl)
         """
         import pickle
-        from pathlib import Path
+        # Path already imported at module level
 
         labels_path = Path(labels_dir)
         if not labels_path.exists():
@@ -1034,7 +1034,7 @@ class HierarchicalDataset(Dataset):
             labels_dir: Directory containing transition label files
         """
         import pickle
-        from pathlib import Path
+        # Path already imported at module level
 
         labels_path = Path(labels_dir)
         if not labels_path.exists():

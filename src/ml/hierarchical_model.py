@@ -1043,23 +1043,20 @@ class HierarchicalLNN(nn.Module, ModelBase):
                     pred_high = pred_high * duration_scale
                     pred_low = pred_low * duration_scale
 
-            pred_conf = torch.sigmoid(self.timeframe_heads[f'{tf}_conf'](hidden))
-
-            layer_predictions.extend([pred_high, pred_low, pred_conf])
-            layer_confidences.append(pred_conf)
-
             # =====================================================================
-            # v5.2: VALIDITY PREDICTION for this TF
+            # v5.2: VALIDITY PREDICTION for this TF (compute BEFORE using as confidence)
             # (Duration already computed above before projections)
             # =====================================================================
+            validity = None
             if hasattr(self, 'validity_heads') and tf in self.validity_heads:
                 # Get quality score and position from projection features (or use defaults)
                 if proj_features is not None:
                     quality_score = proj_features['quality_scores'].mean(dim=-1, keepdim=True)  # [batch, 1]
                     position = proj_features['position'].mean(dim=-1, keepdim=True)  # [batch, 1]
                 else:
-                    # Fallback: use confidence as proxy for quality, 0.5 for position
-                    quality_score = pred_conf
+                    # Fallback: use old confidence head temporarily, will update below
+                    old_conf = torch.sigmoid(self.timeframe_heads[f'{tf}_conf'](hidden))
+                    quality_score = old_conf
                     position = torch.full((batch_size, 1), 0.5, device=device)
 
                 # Validity input: hidden + VIX + events + [quality, position]
@@ -1071,6 +1068,15 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 # Forward-looking validity prediction
                 validity = self.validity_heads[tf](validity_input)
                 validity_outputs[tf] = validity
+
+            # v5.2: Use validity as confidence if available, otherwise old confidence head
+            if validity is not None:
+                pred_conf = validity  # NEW: Use forward-looking validity!
+            else:
+                pred_conf = torch.sigmoid(self.timeframe_heads[f'{tf}_conf'](hidden))  # Fallback: old confidence
+
+            layer_predictions.extend([pred_high, pred_low, pred_conf])
+            layer_confidences.append(pred_conf)
 
         # =========================================================================
         # PHYSICS-INSPIRED PROCESSING
