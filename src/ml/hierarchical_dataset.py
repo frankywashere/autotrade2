@@ -884,13 +884,15 @@ class HierarchicalDataset(Dataset):
             if self._per_tf_transition and tf in self._per_tf_transition:
                 trans_data = self._per_tf_transition[tf]
                 ts_5min = self.tf_timestamps['5min'][data_idx_5min]
-                ts_idx = trans_data.get('ts_to_idx', {}).get(int(ts_5min))
+                # Fix: Use class-level timestamp index, not inside trans_data
+                ts_idx = self._per_tf_trans_ts_to_idx.get(tf, {}).get(int(ts_5min))
 
                 if ts_idx is not None:
                     targets[f'trans_{tf}_type'] = float(trans_data['transition_type'][ts_idx])
                     targets[f'trans_{tf}_switch_to'] = float(trans_data.get('switch_to_tf', [0])[ts_idx])
-                    targets[f'trans_{tf}_direction'] = float(trans_data.get('phase2_direction', [1])[ts_idx])
-                    targets[f'trans_{tf}_slope'] = float(trans_data.get('phase2_slope', [0.0])[ts_idx])
+                    # Fix: Correct key name (new_direction, not phase2_direction)
+                    targets[f'trans_{tf}_direction'] = float(trans_data.get('new_direction', [1])[ts_idx])
+                    targets[f'trans_{tf}_slope'] = float(trans_data.get('new_slope', [0.0])[ts_idx])
 
         # v5.2: Get VIX sequence for this sample
         vix_seq = None
