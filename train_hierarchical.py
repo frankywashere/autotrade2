@@ -2376,121 +2376,16 @@ def interactive_setup(args, profiler=None):
     # Note: Precision is now selected in the consolidated menu right after device selection
     # This section only handles continuation mode
 
-    # Continuation label mode selection (skip if using cached features/labels)
-    if selected_cache_pair and will_use_cache:
-        continuation_mode = project_config.CONTINUATION_MODE
-        print(f"\n   ⚙️  Using cached continuation mode: {continuation_mode}")
-    else:
-        print()
-        continuation_mode = inquirer.select(
-            message="Continuation prediction mode:",
-            choices=[
-                Choice(value='adaptive_labels', name='Adaptive Labels - Adaptive continuation, fixed high/low 🎯 Default'),
-                Choice(value='adaptive_full', name='Fully Adaptive - All targets use adaptive horizon 🔬 Experimental'),
-            ],
-            default=dflt('continuation_mode', 'adaptive_labels')
-        ).execute()
-
-    # Update config with continuation mode
+    # v5.2/v5.3: Continuation mode hardcoded to adaptive_labels
+    # Actual-duration targets use continuation_labels duration_bars anyway
+    continuation_mode = 'adaptive_labels'
     project_config.CONTINUATION_MODE = continuation_mode
 
-    # v5.2 Note: Actual-duration targets override these modes (uses continuation_labels duration_bars)
-    if continuation_mode == 'adaptive_labels':
-        print(f"   → Adaptive Labels mode:")
-        print(f"      Primary targets (high/low): Fixed 24-bar window")
-        print(f"      Continuation labels: Adaptive horizon based on confidence")
-        print()
-        print(f"   Current adaptive horizon range: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars")
+    # Use cached mode if available
+    if selected_cache_pair and will_use_cache:
+        continuation_mode = project_config.CONTINUATION_MODE
 
-        # Ask if user wants to customize the horizon range (only if not locked to cache)
-        customize_horizon = False
-        if not (selected_cache_pair and will_use_cache):
-            customize_horizon = inquirer.confirm(
-                message="Customize adaptive horizon range?",
-                default=False
-            ).execute()
-
-        if customize_horizon:
-            # Get minimum horizon
-            min_horizon = int(inquirer.number(
-                message="Minimum horizon (bars):",
-                default=20,
-                min_allowed=10,
-                max_allowed=60
-            ).execute())
-
-            # Get maximum horizon (must be >= min_horizon)
-            max_horizon = int(inquirer.number(
-                message="Maximum horizon (bars):",
-                default=40,
-                min_allowed=min_horizon,
-                max_allowed=100
-            ).execute())
-
-            # Update config values in memory
-            project_config.ADAPTIVE_MIN_HORIZON = min_horizon
-            project_config.ADAPTIVE_MAX_HORIZON = max_horizon
-
-            print(f"   ✓ Updated adaptive horizons: {min_horizon}-{max_horizon} bars ({min_horizon}-{max_horizon} minutes)")
-
-            # Warn about cache invalidation if values differ from defaults
-            if min_horizon != 20 or max_horizon != 40:
-                print(f"   ⚠️  Non-default horizons will invalidate continuation label cache")
-        else:
-            print(f"   → Using default horizons: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars")
-
-        print(f"   ℹ️  Horizon adjusts based on RSI/slope confidence")
-        print(f"   ℹ️  High/low targets: Fixed 24-bar window (multi-task learning)")
-
-    elif continuation_mode == 'adaptive_full':
-        print(f"   → Fully Adaptive mode (EXPERIMENTAL):")
-        print(f"      ALL targets use adaptive horizon (high/low + continuation)")
-        print()
-        print(f"   Current adaptive horizon range: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars")
-
-        # Ask if user wants to customize the horizon range (only if not locked to cache)
-        customize_horizon = False
-        if not (selected_cache_pair and will_use_cache):
-            customize_horizon = inquirer.confirm(
-                message="Customize adaptive horizon range?",
-                default=False
-            ).execute()
-
-        if customize_horizon:
-            # Get minimum horizon
-            min_horizon = int(inquirer.number(
-                message="Minimum horizon (bars):",
-                default=20,
-                min_allowed=10,
-                max_allowed=60
-            ).execute())
-
-            # Get maximum horizon (must be >= min_horizon)
-            max_horizon = int(inquirer.number(
-                message="Maximum horizon (bars):",
-                default=40,
-                min_allowed=min_horizon,
-                max_allowed=100
-            ).execute())
-
-            # Update config values in memory
-            project_config.ADAPTIVE_MIN_HORIZON = min_horizon
-            project_config.ADAPTIVE_MAX_HORIZON = max_horizon
-
-            print(f"   ✓ Updated adaptive horizons: {min_horizon}-{max_horizon} bars ({min_horizon}-{max_horizon} minutes)")
-
-            # Warn about cache invalidation if values differ from defaults
-            if min_horizon != 20 or max_horizon != 40:
-                print(f"   ⚠️  Non-default horizons will invalidate continuation label cache")
-        else:
-            print(f"   → Using default horizons: {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars")
-
-        print(f"   ℹ️  All targets (high/low/continuation) calculated over SAME adaptive horizon")
-        print(f"   ⚠️  Experimental - targets vary per sample based on confidence")
-
-    else:  # simple mode
-        print(f"   → Simple mode: Fixed 24-bar horizon (24 minutes at 1-min resolution)")
-        print(f"      All targets over same fixed window")
+    print(f"\n   ✓ Continuation mode: {continuation_mode} (v5.2 uses actual duration from labels)")
 
     # Model parameters
     print()
