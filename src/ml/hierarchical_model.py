@@ -478,12 +478,11 @@ class HierarchicalLNN(nn.Module, ModelBase):
         for i, tf in enumerate(self.TIMEFRAMES):
             tf_input_size = self.input_sizes.get(tf, 900)  # Default to 900 if not specified
 
-            # First layer takes features + VIX + events
-            # Subsequent layers add previous hidden state
-            if i == 0:
-                layer_input_size = tf_input_size + _vix_hidden_size + _event_embed_dim
-            else:
-                layer_input_size = tf_input_size + hidden_size + _vix_hidden_size + _event_embed_dim
+            # v5.3.1: All layers same size (flow-independent)
+            # Always allocate space for neighbor hidden (zero-padded if unused in flow)
+            # This allows top_down/bidirectional without size mismatches
+            layer_input_size = tf_input_size + hidden_size + _vix_hidden_size + _event_embed_dim
+            # = 1104 + 128 + 128 + 32 = 1392 for all layers
 
             # v5.2: Increase total neurons to handle larger input (320 instead of 256)
             layer_total_neurons = int(hidden_size * 2.5)  # 128 * 2.5 = 320
@@ -951,32 +950,31 @@ class HierarchicalLNN(nn.Module, ModelBase):
             x_tf = timeframe_data[tf]  # [batch, seq_len, features]
             seq_len = x_tf.shape[1]
 
-            # v5.3.1: Concatenate neighbor hidden based on flow direction
+            # v5.3.1: Get neighbor hidden (or zeros) based on flow direction
+            neighbor_hidden = None
+
             if self.information_flow == 'bottom_up':
-                # Bottom-up: concat previous (faster) TF
+                # Bottom-up: get previous (faster) TF
                 if i > 0:
-                    prev_idx = i - 1
-                    neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[prev_idx])
-                    if neighbor_hidden is not None:
-                        neighbor_expanded = neighbor_hidden.unsqueeze(1).expand(-1, seq_len, -1)
-                        x_tf = torch.cat([x_tf, neighbor_expanded], dim=-1)
+                    neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[i - 1])
 
             elif self.information_flow == 'top_down':
-                # Top-down: concat next (slower) TF
+                # Top-down: get next (slower) TF
                 if i < len(self.TIMEFRAMES) - 1:
-                    next_idx = i + 1
-                    neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[next_idx])
-                    if neighbor_hidden is not None:
-                        neighbor_expanded = neighbor_hidden.unsqueeze(1).expand(-1, seq_len, -1)
-                        x_tf = torch.cat([x_tf, neighbor_expanded], dim=-1)
+                    neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[i + 1])
 
             else:  # Bidirectional modes - do bottom-up in Pass 1
                 if i > 0:
-                    prev_idx = i - 1
-                    neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[prev_idx])
-                    if neighbor_hidden is not None:
-                        neighbor_expanded = neighbor_hidden.unsqueeze(1).expand(-1, seq_len, -1)
-                        x_tf = torch.cat([x_tf, neighbor_expanded], dim=-1)
+                    neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[i - 1])
+
+            # Always concat neighbor slot (zero-pad if no neighbor)
+            if neighbor_hidden is not None:
+                neighbor_expanded = neighbor_hidden.unsqueeze(1).expand(-1, seq_len, -1)
+            else:
+                # Zero-pad neighbor slot (flow-independent size)
+                neighbor_expanded = torch.zeros(batch_size, seq_len, self.hidden_size, device=device)
+
+            x_tf = torch.cat([x_tf, neighbor_expanded], dim=-1)
 
             # v5.2: Concatenate VIX hidden state to CfC input
             # This gives each TF layer awareness of volatility regime
