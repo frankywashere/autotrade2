@@ -403,9 +403,22 @@ class VIXSequenceLoader:
         import pandas as pd
 
         try:
-            df = pd.read_csv(self.vix_csv_path, parse_dates=['Date'])
-            df.set_index('Date', inplace=True)
-            df.sort_index(inplace=True)
+            # Try different date column names (Date vs DATE)
+            df = pd.read_csv(self.vix_csv_path)
+
+            # Find date column (case-insensitive)
+            date_col = None
+            for col in df.columns:
+                if col.lower() == 'date':
+                    date_col = col
+                    break
+
+            if date_col:
+                df[date_col] = pd.to_datetime(df[date_col])
+                df.set_index(date_col, inplace=True)
+                df.sort_index(inplace=True)
+            else:
+                raise ValueError("No Date column found in VIX CSV")
 
             # Rename columns to standard format
             df = df.rename(columns={

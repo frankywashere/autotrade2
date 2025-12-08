@@ -2438,8 +2438,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     if is_main_process(rank):
         print("\n4. Setting up data loaders...")
 
-    # Get feature dimensions from dataset
-    sample_data, sample_target = train_dataset[0]
+    # v5.2: Get feature dimensions from dataset (now 4-tuple)
+    sample = train_dataset[0]
+    if len(sample) == 4:
+        sample_data, sample_target, sample_vix, sample_events = sample
+    else:
+        sample_data, sample_target = sample
 
     # Detect native timeframe mode (dict) vs legacy mode (tuple)
     if isinstance(sample_data, dict):
