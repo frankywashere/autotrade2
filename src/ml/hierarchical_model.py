@@ -1061,12 +1061,18 @@ class HierarchicalLNN(nn.Module, ModelBase):
             # =====================================================================
             duration_scale = 1.0  # Default scale
             if hasattr(self, 'duration_heads') and f'{tf}_mean' in self.duration_heads:
-                # v5.3: Get parent TF hidden states (larger timeframes)
+                # v5.3: Get parent TF hidden states (LARGER timeframes, flow-independent)
+                # Use hierarchy position, not loop index (fixes top_down mode!)
+                tf_hierarchy_idx = self.TIMEFRAMES.index(tf)  # Actual position (0-10)
                 parent_hiddens = []
-                for parent_idx in range(i+1, min(i+3, len(self.TIMEFRAMES))):  # Next 2 parents
-                    parent_tf = self.TIMEFRAMES[parent_idx]
-                    if parent_tf in tf_hidden_dict:
-                        parent_hiddens.append(tf_hidden_dict[parent_tf])
+
+                # Parents are next 2 LARGER TFs in hierarchy (regardless of processing order)
+                for offset in [1, 2]:
+                    parent_hierarchy_idx = tf_hierarchy_idx + offset
+                    if parent_hierarchy_idx < len(self.TIMEFRAMES):
+                        parent_tf = self.TIMEFRAMES[parent_hierarchy_idx]
+                        if parent_tf in tf_hidden_dict:
+                            parent_hiddens.append(tf_hidden_dict[parent_tf])
 
                 # v5.3: Build duration context with zero-padding for missing parents
                 # Always use same input size (544) for all TFs
@@ -1377,7 +1383,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 if tf in validity_outputs:
                     all_validities_dict[tf] = validity_outputs[tf][0, 0].item()
 
-            # Determine selected TF
+            # Determine selected TF (use locals() not dir())
             if not self.use_fusion_head and 'selection_info' in locals():
                 selected_tf = self.TIMEFRAMES[selection_info['best_tf_idx'][0].item()]
             else:
@@ -1402,7 +1408,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         output_dict['event_embed'] = event_embed
 
         # Determine selected TF for compositor (use physics selection if available)
-        if not self.use_fusion_head and 'selection_info' in dir():
+        if not self.use_fusion_head and 'selection_info' in locals():
             selected_tf = self.TIMEFRAMES[selection_info['best_tf_idx'][0].item()]
         else:
             # Use highest confidence TF

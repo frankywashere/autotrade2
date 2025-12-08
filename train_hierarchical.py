@@ -2788,16 +2788,25 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                                 targets['adaptive_confidence'].float()
                             )
 
-                # v5.3: Confidence calibration (every 10th batch for efficiency)
+                # v5.3: Confidence calibration (ALL samples in batch, every 10th batch)
                 if 'layer_predictions' in hidden_states and batch_idx % 10 == 0:
-                    calib_loss = 0.0
+                    calib_loss_total = 0.0
+                    num_calibrated = 0
+
                     for tf_name, preds in hidden_states['layer_predictions'].items():
-                        pred_high = preds[0, 0]
-                        conf = preds[0, 2]
-                        error = torch.abs(pred_high - target_tensor[0, 0])
-                        accuracy = (1.0 - error / (torch.abs(target_tensor[0, 0]) + 1e-6).clamp(0, 2)).clamp(0, 1)
-                        calib_loss += (conf - accuracy.detach()) ** 2
-                    loss = loss + 0.05 * (calib_loss / 11.0)
+                        # preds: [batch_size, 3]
+                        for sample_idx in range(preds.shape[0]):
+                            pred_high = preds[sample_idx, 0]
+                            conf = preds[sample_idx, 2]
+                            target_high = target_tensor[sample_idx, 0]
+
+                            error = torch.abs(pred_high - target_high)
+                            accuracy = (1.0 - error / (torch.abs(target_high) + 1e-6).clamp(0, 2)).clamp(0, 1)
+                            calib_loss_total += (conf - accuracy.detach()) ** 2
+                            num_calibrated += 1
+
+                    if num_calibrated > 0:
+                        loss = loss + 0.05 * (calib_loss_total / num_calibrated)
 
                 # v5.2/v5.3 LOSSES: Duration, Validity, Transition (same as non-AMP path)
                 transition_labels_dict = {}
@@ -2809,12 +2818,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                             'new_direction': int(targets.get(f'trans_{tf}_direction', torch.tensor([1]))[0].item()),
                         }
 
+                # Duration NLL loss (check key exists)
                 if 'duration' in hidden_states:
                     for tf, dur_data in hidden_states['duration'].items():
-                        if f'cont_{tf}_duration' in targets:
+                        target_dur_key = f'cont_{tf}_duration'
+                        if target_dur_key in targets:  # Only train if target exists
                             mean = dur_data['mean'].squeeze()
                             log_std = dur_data['log_std'].squeeze()
-                            target_dur = targets[f'cont_{tf}_duration'].squeeze()
+                            target_dur = targets[target_dur_key].squeeze()
                             variance = torch.exp(2 * log_std) + 1e-6
                             nll = 0.5 * ((target_dur - mean) ** 2 / variance + 2 * log_std)
                             loss = loss + 0.3 * nll.mean()
@@ -2871,16 +2882,25 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                             targets['adaptive_confidence'].float()
                         )
 
-                # v5.3: Confidence calibration (every 10th batch for efficiency)
+                # v5.3: Confidence calibration (ALL samples in batch, every 10th batch)
                 if 'layer_predictions' in hidden_states and batch_idx % 10 == 0:
-                    calib_loss = 0.0
+                    calib_loss_total = 0.0
+                    num_calibrated = 0
+
                     for tf_name, preds in hidden_states['layer_predictions'].items():
-                        pred_high = preds[0, 0]
-                        conf = preds[0, 2]
-                        error = torch.abs(pred_high - target_tensor[0, 0])
-                        accuracy = (1.0 - error / (torch.abs(target_tensor[0, 0]) + 1e-6).clamp(0, 2)).clamp(0, 1)
-                        calib_loss += (conf - accuracy.detach()) ** 2
-                    loss = loss + 0.05 * (calib_loss / 11.0)
+                        # preds: [batch_size, 3]
+                        for sample_idx in range(preds.shape[0]):
+                            pred_high = preds[sample_idx, 0]
+                            conf = preds[sample_idx, 2]
+                            target_high = target_tensor[sample_idx, 0]
+
+                            error = torch.abs(pred_high - target_high)
+                            accuracy = (1.0 - error / (torch.abs(target_high) + 1e-6).clamp(0, 2)).clamp(0, 1)
+                            calib_loss_total += (conf - accuracy.detach()) ** 2
+                            num_calibrated += 1
+
+                    if num_calibrated > 0:
+                        loss = loss + 0.05 * (calib_loss_total / num_calibrated)
 
                 # =====================================================================
                 # v5.2/v5.3 LOSSES: Duration, Validity, Transition, Direction
@@ -2895,11 +2915,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                             'new_direction': int(targets.get(f'trans_{tf}_direction', torch.tensor([1]))[0].item()),
                         }
 
-                # Duration NLL loss
-                if 'duration' in hidden_states and len(transition_labels_dict) > 0:
+                # Duration NLL loss (check key exists before using)
+                if 'duration' in hidden_states:
                     for tf, dur_data in hidden_states['duration'].items():
                         target_dur_key = f'cont_{tf}_duration'
-                        if target_dur_key in targets:
+                        if target_dur_key in targets:  # Only train if target exists
                             mean = dur_data['mean'].squeeze()
                             log_std = dur_data['log_std'].squeeze()
                             target_dur = targets[target_dur_key].squeeze()

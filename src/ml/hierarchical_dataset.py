@@ -879,20 +879,30 @@ class HierarchicalDataset(Dataset):
             except Exception:
                 pass
 
-        # v5.2: Add transition labels to targets (if available)
+        # v5.2: Add transition labels to targets (always add keys, use defaults if missing)
         for tf in HIERARCHICAL_TIMEFRAMES:
+            # Try to get actual transition label
+            trans_found = False
+
             if self._per_tf_transition and tf in self._per_tf_transition:
                 trans_data = self._per_tf_transition[tf]
                 ts_5min = self.tf_timestamps['5min'][data_idx_5min]
-                # Fix: Use class-level timestamp index, not inside trans_data
                 ts_idx = self._per_tf_trans_ts_to_idx.get(tf, {}).get(int(ts_5min))
 
                 if ts_idx is not None:
+                    # Has actual label - use it
                     targets[f'trans_{tf}_type'] = float(trans_data['transition_type'][ts_idx])
                     targets[f'trans_{tf}_switch_to'] = float(trans_data.get('switch_to_tf', [0])[ts_idx])
-                    # Fix: Correct key name (new_direction, not phase2_direction)
                     targets[f'trans_{tf}_direction'] = float(trans_data.get('new_direction', [1])[ts_idx])
                     targets[f'trans_{tf}_slope'] = float(trans_data.get('new_slope', [0.0])[ts_idx])
+                    trans_found = True
+
+            # If no label found, add conservative defaults (near dataset end or sparse TF)
+            if not trans_found:
+                targets[f'trans_{tf}_type'] = 0.0  # CONTINUE (conservative)
+                targets[f'trans_{tf}_switch_to'] = 0.0  # N/A
+                targets[f'trans_{tf}_direction'] = 1.0  # BEAR (neutral default)
+                targets[f'trans_{tf}_slope'] = 0.0  # No slope change
 
         # v5.2: Get VIX sequence for this sample
         vix_seq = None
@@ -901,8 +911,17 @@ class HierarchicalDataset(Dataset):
                 ts_5min = self.tf_timestamps['5min'][data_idx_5min]
                 ts = pd.Timestamp(ts_5min, unit='ns')
                 vix_seq = self._vix_loader.get_sequence(ts.date(), self._vix_sequence_length)
-            except Exception:
-                pass
+
+                # Debug: Check if VIX loading actually worked
+                if vix_seq is None:
+                    print(f"⚠️ VIX sequence returned None for {ts.date()}")
+                elif len(vix_seq) == 0:
+                    print(f"⚠️ VIX sequence empty for {ts.date()}")
+
+            except Exception as e:
+                # Don't silently fail - log the actual error!
+                print(f"⚠️ VIX loading error for {ts.date()}: {type(e).__name__}: {e}")
+                vix_seq = None
 
         # v5.2: Get events for this timestamp
         events = None
