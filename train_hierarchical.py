@@ -2867,7 +2867,45 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         error = torch.abs(pred_high - target_tensor[0, 0])
                         accuracy = (1.0 - error / (torch.abs(target_tensor[0, 0]) + 1e-6).clamp(0, 2)).clamp(0, 1)
                         calib_loss += (conf - accuracy.detach()) ** 2
-                    loss = loss + 0.05 * (calib_loss / 11.0)  # Average over TFs
+                    loss = loss + 0.05 * (calib_loss / 11.0)
+
+                # v5.2/v5.3 LOSSES: Duration, Validity, Transition (same as non-AMP path)
+                transition_labels_dict = {}
+                for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
+                    trans_type_key = f'trans_{tf}_type'
+                    if trans_type_key in targets:
+                        transition_labels_dict[tf] = {
+                            'transition_type': int(targets[trans_type_key][0].item()),
+                            'new_direction': int(targets.get(f'trans_{tf}_direction', torch.tensor([1]))[0].item()),
+                        }
+
+                if 'duration' in hidden_states:
+                    for tf, dur_data in hidden_states['duration'].items():
+                        if f'cont_{tf}_duration' in targets:
+                            mean = dur_data['mean'].squeeze()
+                            log_std = dur_data['log_std'].squeeze()
+                            target_dur = targets[f'cont_{tf}_duration'].squeeze()
+                            variance = torch.exp(2 * log_std) + 1e-6
+                            nll = 0.5 * ((target_dur - mean) ** 2 / variance + 2 * log_std)
+                            loss = loss + 0.3 * nll.mean()
+
+                if 'validity' in hidden_states:
+                    for tf, validity_pred in hidden_states['validity'].items():
+                        if tf in transition_labels_dict:
+                            target_val = 1.0 if transition_labels_dict[tf]['transition_type'] == 0 else 0.0
+                            loss = loss + 0.2 * F.binary_cross_entropy(
+                                validity_pred.squeeze(),
+                                torch.tensor([target_val], device=args.device).expand(validity_pred.shape[0])
+                            )
+
+                if 'compositor' in hidden_states and 'selected_tf' in hidden_states:
+                    sel_tf = hidden_states['selected_tf']
+                    if sel_tf in transition_labels_dict:
+                        comp = hidden_states['compositor']
+                        trans = torch.tensor([transition_labels_dict[sel_tf]['transition_type']], device=args.device, dtype=torch.long).expand(predictions.shape[0])
+                        direc = torch.tensor([transition_labels_dict[sel_tf]['new_direction']], device=args.device, dtype=torch.long).expand(predictions.shape[0])
+                        loss = loss + 0.3 * F.cross_entropy(comp['transition_logits'], trans)
+                        loss = loss + 0.2 * F.cross_entropy(comp['direction_logits'], direc)
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -2913,6 +2951,57 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         accuracy = (1.0 - error / (torch.abs(target_tensor[0, 0]) + 1e-6).clamp(0, 2)).clamp(0, 1)
                         calib_loss += (conf - accuracy.detach()) ** 2
                     loss = loss + 0.05 * (calib_loss / 11.0)
+
+                # =====================================================================
+                # v5.2/v5.3 LOSSES: Duration, Validity, Transition, Direction
+                # =====================================================================
+                # Extract transition labels from targets (if available)
+                transition_labels_dict = {}
+                for i, tf in enumerate(['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']):
+                    trans_type_key = f'trans_{tf}_type'
+                    if trans_type_key in targets:
+                        transition_labels_dict[tf] = {
+                            'transition_type': int(targets[trans_type_key][0].item()),
+                            'new_direction': int(targets.get(f'trans_{tf}_direction', torch.tensor([1]))[0].item()),
+                        }
+
+                # Duration NLL loss
+                if 'duration' in hidden_states and len(transition_labels_dict) > 0:
+                    for tf, dur_data in hidden_states['duration'].items():
+                        target_dur_key = f'cont_{tf}_duration'
+                        if target_dur_key in targets:
+                            mean = dur_data['mean'].squeeze()
+                            log_std = dur_data['log_std'].squeeze()
+                            target_dur = targets[target_dur_key].squeeze()
+                            variance = torch.exp(2 * log_std) + 1e-6
+                            nll = 0.5 * ((target_dur - mean) ** 2 / variance + 2 * log_std)
+                            loss = loss + 0.3 * nll.mean()
+
+                # Validity loss
+                if 'validity' in hidden_states and len(transition_labels_dict) > 0:
+                    for tf, validity_pred in hidden_states['validity'].items():
+                        if tf in transition_labels_dict:
+                            trans_type = transition_labels_dict[tf]['transition_type']
+                            target_validity = 1.0 if trans_type == 0 else 0.0
+                            loss_validity = F.binary_cross_entropy(
+                                validity_pred.squeeze(),
+                                torch.tensor([target_validity], device=args.device).expand(validity_pred.shape[0])
+                            )
+                            loss = loss + 0.2 * loss_validity
+
+                # Transition/Direction losses
+                if 'compositor' in hidden_states and 'selected_tf' in hidden_states:
+                    selected_tf = hidden_states['selected_tf']
+                    if selected_tf in transition_labels_dict:
+                        compositor = hidden_states['compositor']
+                        trans_type = transition_labels_dict[selected_tf]['transition_type']
+                        new_dir = transition_labels_dict[selected_tf]['new_direction']
+
+                        target_trans = torch.tensor([trans_type], device=args.device, dtype=torch.long).expand(predictions.shape[0])
+                        loss = loss + 0.3 * F.cross_entropy(compositor['transition_logits'], target_trans)
+
+                        target_dir = torch.tensor([new_dir], device=args.device, dtype=torch.long).expand(predictions.shape[0])
+                        loss = loss + 0.2 * F.cross_entropy(compositor['direction_logits'], target_dir)
 
                 loss.backward()
                 optimizer.step()
