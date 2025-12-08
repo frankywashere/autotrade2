@@ -3007,7 +3007,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     # v5.1: Save architecture flags at top level for easier access
                     'use_fusion_head': getattr(args, 'use_fusion_head', False),
                     'use_geometric_base': getattr(args, 'use_geometric_base', True),
-                    'multi_task': getattr(args, 'multi_task', True)
+                    'multi_task': getattr(args, 'multi_task', True),
+                    # v5.3.1: Save information flow (critical!)
+                    'information_flow': getattr(args, 'information_flow', 'bottom_up'),
                 }, output_path)
 
                 tqdm.write(f"   ✓ Saved best model (val_loss: {avg_val_loss:.4f})")

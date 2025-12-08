@@ -1866,6 +1866,9 @@ def load_hierarchical_model(model_path: str, device: str = 'cpu') -> Hierarchica
     # v5.0: Get use_geometric_base (check args first, then top-level, default True)
     use_geometric_base = args.get('use_geometric_base', checkpoint.get('use_geometric_base', True))
 
+    # v5.3.1: Get information_flow (critical for correct CfC processing order!)
+    information_flow = args.get('information_flow', checkpoint.get('information_flow', 'bottom_up'))
+
     # Create model
     model = HierarchicalLNN(
         input_sizes=input_sizes,
@@ -1874,7 +1877,8 @@ def load_hierarchical_model(model_path: str, device: str = 'cpu') -> Hierarchica
         device=device,
         multi_task=checkpoint.get('multi_task') or args.get('multi_task', True),
         use_fusion_head=use_fusion_head,
-        use_geometric_base=use_geometric_base
+        use_geometric_base=use_geometric_base,
+        information_flow=information_flow  # v5.3.1: Match training flow!
     )
 
     # Handle DataParallel checkpoints
