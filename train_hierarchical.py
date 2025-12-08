@@ -1791,6 +1791,40 @@ def interactive_setup(args, profiler=None):
     print("   Interpretability: 10/10")
     print("─" * 70)
 
+    # v5.3.1: Information Flow Direction
+    print()
+    args.information_flow = inquirer.select(
+        message="Information flow strategy:",
+        choices=[
+            Choice('bottom_up', 'Bottom-Up - Fast → Slow (details inform strategy) ⭐ Default'),
+            Choice('top_down', 'Top-Down - Slow → Fast (strategy guides details)'),
+            Choice('bidirectional_bottom', 'Bidirectional (Bottom-First) - Micro foundation + macro overlay'),
+            Choice('bidirectional_top', 'Bidirectional (Top-First) - Macro framework + micro refinement'),
+        ],
+        default='bottom_up'
+    ).execute()
+
+    if args.information_flow == 'bottom_up':
+        print("   ✅ Bottom-Up: 5min → 3month (current v5.3)")
+        print("      Each TF sees previous (faster) TF's understanding")
+        print("      Good for: Detail aggregation, noise filtering")
+    elif args.information_flow == 'top_down':
+        print("   🔄 Top-Down: 3month → 5min (reversed)")
+        print("      Each TF sees next (slower) TF's understanding")
+        print("      Good for: Macro constraints, strategic context")
+    elif args.information_flow == 'bidirectional_bottom':
+        print("   ⇅ Bidirectional (Bottom-First): 5min→3month then 3month→5min")
+        print("      Pass 1: Build micro understanding (bottom-up)")
+        print("      Pass 2: Add macro overlay (top-down refinement)")
+        print("      Good for: Micro-driven with macro validation")
+        print("      +550K parameters (refinement networks)")
+    else:  # bidirectional_top
+        print("   ⇅ Bidirectional (Top-First): 3month→5min then 5min→3month")
+        print("      Pass 1: Build macro framework (top-down)")
+        print("      Pass 2: Add micro details (bottom-up refinement)")
+        print("      Good for: Macro-driven with micro timing")
+        print("      +550K parameters (refinement networks)")
+
     # v5.3: RSI cross-TF direction guidance
     print()
     args.rsi_direction_guidance = inquirer.select(
@@ -2577,8 +2611,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             internal_neurons_ratio=args.internal_neurons_ratio,
             device=args.device,
             multi_task=args.multi_task,
-            use_fusion_head=getattr(args, 'use_fusion_head', True),
-            use_geometric_base=getattr(args, 'use_geometric_base', True),  # v5.0
+            use_fusion_head=False,  # v5.3: Locked to Physics-Only
+            use_geometric_base=True,  # v5.3: Locked to Geometric
+            information_flow=getattr(args, 'information_flow', 'bottom_up'),  # v5.3.1
         )
     else:
         # Legacy mode - same size for all timeframes
@@ -2588,8 +2623,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             internal_neurons_ratio=args.internal_neurons_ratio,
             device=args.device,
             multi_task=args.multi_task,
-            use_fusion_head=getattr(args, 'use_fusion_head', True),
-            use_geometric_base=getattr(args, 'use_geometric_base', True),  # v5.0
+            use_fusion_head=False,  # v5.3: Locked to Physics-Only
+            use_geometric_base=True,  # v5.3: Locked to Geometric
+            information_flow=getattr(args, 'information_flow', 'bottom_up'),  # v5.3.1
         )
 
     if profiler:

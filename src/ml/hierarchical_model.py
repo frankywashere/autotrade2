@@ -413,6 +413,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         multi_task: bool = True,  # Enable multi-task heads
         use_fusion_head: bool = True,  # v4.1: Can disable for physics-only mode
         use_geometric_base: bool = True,  # v5.0: Use geometric projections or learned approximation
+        information_flow: str = 'bottom_up',  # v5.3.1: bottom_up, top_down, bidirectional_bottom, bidirectional_top
         # Backward compatibility
         input_size: int = None,  # Deprecated: use input_sizes dict
     ):
@@ -444,6 +445,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.use_fusion_head = use_fusion_head
         self.use_geometric_base = use_geometric_base  # v5.0: Geometric vs learned base
         self.use_channel_projections = use_geometric_base  # v5.0: Enable projection extractors if geometric
+        self.information_flow = information_flow  # v5.3.1: Flow direction
 
         # Backward compatibility: if old-style single input_size provided
         if input_size is not None and not input_sizes:
@@ -761,6 +763,21 @@ class HierarchicalLNN(nn.Module, ModelBase):
             self.rsi_extractor = None
             self.rsi_validator = None
 
+        # v5.3.1: Refinement Networks (for bidirectional modes)
+        # =========================================================================
+        # Small networks that combine current hidden + neighbor hidden in Pass 2
+        if 'bidirectional' in information_flow:
+            self.refinement_nets = nn.ModuleDict()
+            for tf in self.TIMEFRAMES:
+                self.refinement_nets[tf] = nn.Sequential(
+                    nn.Linear(hidden_size * 2, hidden_size),  # Current + neighbor
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(hidden_size, hidden_size)
+                )
+        else:
+            self.refinement_nets = None
+
         # v5.2: Track VIX/event state for live inference
         self.cached_vix_hidden = None
         self.cached_event_embed = None
@@ -908,31 +925,58 @@ class HierarchicalLNN(nn.Module, ModelBase):
         tf_hidden_dict = {}  # v5.3: Dict for easy parent access
 
         # =========================================================================
-        # PASS 1: PROCESS ALL CFC LAYERS (build hidden states only)
+        # PASS 1: PROCESS ALL CFC LAYERS (build hidden states)
+        # v5.3.1: Support 4 information flow modes
         # =========================================================================
-        prev_hidden = None
-        for i, tf in enumerate(self.TIMEFRAMES):
+
+        # Determine processing order based on information_flow
+        if self.information_flow == 'top_down':
+            tf_indices = list(reversed(range(len(self.TIMEFRAMES))))  # 10→0 (3month→5min)
+        else:
+            tf_indices = list(range(len(self.TIMEFRAMES)))  # 0→10 (5min→3month)
+
+        # Process in chosen order
+        for idx in tf_indices:
+            i = idx  # Keep i for compatibility
+            tf = self.TIMEFRAMES[i]
+
             # Get input for this timeframe
             if tf not in timeframe_data:
                 # Skip if timeframe data not provided
                 # Use zeros for predictions
-                layer_predictions.extend([
-                    torch.zeros(batch_size, 1, device=device),
-                    torch.zeros(batch_size, 1, device=device),
-                    torch.zeros(batch_size, 1, device=device)
-                ])
-                layer_confidences.append(torch.zeros(batch_size, 1, device=device))
                 all_hidden.append(torch.zeros(batch_size, self.hidden_size, device=device))
+                tf_hidden_dict[tf] = all_hidden[-1]
                 continue
 
             x_tf = timeframe_data[tf]  # [batch, seq_len, features]
             seq_len = x_tf.shape[1]
 
-            # Concatenate previous hidden state if not first layer
-            if i > 0 and prev_hidden is not None:
-                # Expand hidden to match sequence length
-                prev_hidden_expanded = prev_hidden.unsqueeze(1).expand(-1, seq_len, -1)
-                x_tf = torch.cat([x_tf, prev_hidden_expanded], dim=-1)
+            # v5.3.1: Concatenate neighbor hidden based on flow direction
+            if self.information_flow == 'bottom_up':
+                # Bottom-up: concat previous (faster) TF
+                if i > 0:
+                    prev_idx = i - 1
+                    neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[prev_idx])
+                    if neighbor_hidden is not None:
+                        neighbor_expanded = neighbor_hidden.unsqueeze(1).expand(-1, seq_len, -1)
+                        x_tf = torch.cat([x_tf, neighbor_expanded], dim=-1)
+
+            elif self.information_flow == 'top_down':
+                # Top-down: concat next (slower) TF
+                if i < len(self.TIMEFRAMES) - 1:
+                    next_idx = i + 1
+                    neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[next_idx])
+                    if neighbor_hidden is not None:
+                        neighbor_expanded = neighbor_hidden.unsqueeze(1).expand(-1, seq_len, -1)
+                        x_tf = torch.cat([x_tf, neighbor_expanded], dim=-1)
+
+            else:  # Bidirectional modes - do bottom-up in Pass 1
+                if i > 0:
+                    prev_idx = i - 1
+                    neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[prev_idx])
+                    if neighbor_hidden is not None:
+                        neighbor_expanded = neighbor_hidden.unsqueeze(1).expand(-1, seq_len, -1)
+                        x_tf = torch.cat([x_tf, neighbor_expanded], dim=-1)
 
             # v5.2: Concatenate VIX hidden state to CfC input
             # This gives each TF layer awareness of volatility regime
@@ -957,11 +1001,55 @@ class HierarchicalLNN(nn.Module, ModelBase):
             layer_hidden_states[tf] = h_new
             all_hidden.append(hidden)
             tf_hidden_dict[tf] = hidden  # v5.3: Store in dict for parent access
-            prev_hidden = hidden
 
         # =========================================================================
-        # PASS 2: PREDICTIONS WITH HIERARCHICAL CONTEXT
-        # Now all hidden states exist, can access parent TFs for duration/validity
+        # v5.3.1: BIDIRECTIONAL PASS 2 (if enabled)
+        # Refine hidden states with opposite-direction context
+        # =========================================================================
+        if 'bidirectional' in self.information_flow and self.refinement_nets:
+            # Determine Pass 2 direction (opposite of Pass 1)
+            if self.information_flow == 'bidirectional_bottom':
+                # Pass 1 was bottom-up, Pass 2 is top-down
+                pass2_indices = list(reversed(range(len(self.TIMEFRAMES))))
+            else:  # bidirectional_top
+                # Pass 1 was top-down, Pass 2 is bottom-up
+                pass2_indices = list(range(len(self.TIMEFRAMES)))
+
+            # Refine each hidden with neighbor from opposite direction
+            for idx in pass2_indices:
+                i = idx
+                tf = self.TIMEFRAMES[i]
+
+                if tf not in tf_hidden_dict:
+                    continue
+
+                current_hidden = tf_hidden_dict[tf]
+
+                # Get neighbor from opposite direction
+                if self.information_flow == 'bidirectional_bottom':
+                    # Top-down in Pass 2
+                    if i < len(self.TIMEFRAMES) - 1:
+                        neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[i + 1])
+                    else:
+                        neighbor_hidden = None
+                else:  # bidirectional_top
+                    # Bottom-up in Pass 2
+                    if i > 0:
+                        neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[i - 1])
+                    else:
+                        neighbor_hidden = None
+
+                # Refine with neighbor context
+                if neighbor_hidden is not None:
+                    refinement_input = torch.cat([current_hidden, neighbor_hidden], dim=-1)
+                    refined_hidden = self.refinement_nets[tf](refinement_input)
+                    tf_hidden_dict[tf] = refined_hidden
+                    # Update all_hidden as well (for downstream compatibility)
+                    all_hidden[i] = refined_hidden
+
+        # =========================================================================
+        # PASS 2 (or PASS 3 for bidirectional): PREDICTIONS WITH HIERARCHICAL CONTEXT
+        # Now all hidden states exist (and refined if bidirectional)
         # =========================================================================
         for i, tf in enumerate(self.TIMEFRAMES):
             # Get this TF's hidden state
