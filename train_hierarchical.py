@@ -2778,13 +2778,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 events_batch = None
 
             # Move features to device - handle both native TF mode (dict) and legacy mode (tensor)
-            # Note: vix_batch already on device from collate if move_to_device=True
             if isinstance(features, dict):
                 features = {tf: f.to(args.device, non_blocking=True) for tf, f in features.items()}
             else:
                 features = features.to(args.device, non_blocking=True)
+
             # Move each tensor in targets dict to device
             targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
+
+            # v5.2: Move VIX batch to device if present
+            if vix_batch is not None:
+                vix_batch = vix_batch.to(args.device, non_blocking=True)
 
             optimizer.zero_grad()
 
@@ -2947,13 +2951,19 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     features, targets = batch_data
                     vix_batch_val = None
                     events_batch_val = None
-                # Move features to device - handle both native TF mode (dict) and legacy mode (tensor)
+
+                # Move features to device
                 if isinstance(features, dict):
                     features = {tf: f.to(args.device, non_blocking=True) for tf, f in features.items()}
                 else:
                     features = features.to(args.device, non_blocking=True)
-                # Move each tensor in targets dict to device
+
+                # Move targets to device
                 targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
+
+                # v5.2: Move VIX batch to device if present
+                if vix_batch_val is not None:
+                    vix_batch_val = vix_batch_val.to(args.device, non_blocking=True)
 
                 if scaler is not None:
                     with torch.amp.autocast('cuda'):

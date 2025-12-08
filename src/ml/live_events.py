@@ -420,8 +420,13 @@ class VIXSequenceLoader:
             else:
                 raise ValueError("No Date column found in VIX CSV")
 
-            # Rename columns to standard format
+            # Rename columns to standard format (handle both cases)
             df = df.rename(columns={
+                'OPEN': 'vix_open',
+                'HIGH': 'vix_high',
+                'LOW': 'vix_low',
+                'CLOSE': 'vix_close',
+                # Also handle lowercase
                 'Open': 'vix_open',
                 'High': 'vix_high',
                 'Low': 'vix_low',
