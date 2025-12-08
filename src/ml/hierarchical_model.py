@@ -1077,7 +1077,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
                     parent_hidden_concat = torch.cat([parent_hiddens[0], torch.zeros_like(parent_hiddens[0])], dim=-1)
                 else:
                     # No parents - use zeros
-                    parent_hidden_concat = torch.zeros(batch_size, hidden_size * 2, device=device)
+                    parent_hidden_concat = torch.zeros(batch_size, self.hidden_size * 2, device=device)
 
                 # Duration context: hidden + parents (zero-padded) + VIX + events
                 duration_context = torch.cat([hidden, parent_hidden_concat, hidden_vix, event_embed], dim=-1)
