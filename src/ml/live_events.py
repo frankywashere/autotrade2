@@ -452,7 +452,7 @@ class VIXSequenceLoader:
             df.loc[df['vix_close'] > 40, 'vix_regime'] = 3  # Extreme
 
             # Fill NaN with forward fill then zeros
-            df = df.fillna(method='ffill').fillna(0)
+            df = df.ffill().fillna(0)
 
             self.vix_data = df[self.VIX_FEATURES]
 

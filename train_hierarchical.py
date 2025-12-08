@@ -1833,22 +1833,38 @@ def interactive_setup(args, profiler=None):
     print(f"  Model Capacity: internal_ratio={args.internal_neurons_ratio}, hidden_size={args.hidden_size}")
     print(f"  Multi-Task: {'Enabled' if args.multi_task else 'Disabled'}")
 
-    # v5.0: Show architecture mode
-    use_geo = getattr(args, 'use_geometric_base', True)
-    use_fusion = getattr(args, 'use_fusion_head', True)
+    # v5.3: Architecture (locked to production)
+    print(f"  Architecture: Geometric + Physics-Only ⭐")
+    print(f"    Base: Geometric (channel projections)")
+    print(f"    Combine: Physics-based (select best TF)")
 
-    if use_geo and not use_fusion:
-        arch_mode = "Geometric + Physics-Only ⭐"
-    elif use_geo and use_fusion:
-        arch_mode = "Geometric + Fusion Head 🧪"
-    elif not use_geo and use_fusion:
-        arch_mode = "Learned + Fusion Head 📊"
-    else:
-        arch_mode = "Learned + Physics-Only"
+    # v5.3.1: Information flow
+    info_flow = getattr(args, 'information_flow', 'bottom_up')
+    flow_display = {
+        'bottom_up': '5min→3month (details first)',
+        'top_down': '3month→5min (strategy first)',
+        'bidirectional_bottom': '5min→3month→5min (micro+macro)',
+        'bidirectional_top': '3month→5min→3month (macro+micro)',
+    }
+    print(f"  Information Flow: {flow_display.get(info_flow, info_flow)}")
 
-    print(f"  Architecture: {arch_mode}")
-    print(f"    Base: {'Geometric (channel projections)' if use_geo else 'Learned (neural approximation)'}")
-    print(f"    Combine: {'Physics-based (weighted avg)' if not use_fusion else 'Fusion Head (neural net)'}")
+    # v5.2/v5.3: Context systems
+    print(f"  VIX CfC: 90-day sequence (regime awareness)")
+    print(f"  Events: FOMC + Earnings + Deliveries + Macro")
+    print(f"  Parent Context: Duration sees 2 larger TFs")
+
+    # v5.3: RSI validation
+    rsi_mode = getattr(args, 'rsi_direction_guidance', 'soft_bias')
+    rsi_display = {
+        'soft_bias': 'Learned (model trains on RSI)',
+        'validation': 'Post-check (adjusts confidence)',
+        'none': 'Disabled'
+    }
+    print(f"  RSI Validation: {rsi_display.get(rsi_mode, rsi_mode)}")
+
+    # v5.3: Additional features
+    print(f"  Confidence Calibration: Enabled (accuracy-based)")
+    print(f"  Hierarchical Containment: Analysis enabled")
 
     debug_mode = 'Enabled' if getattr(args, 'debug', False) else 'Disabled'
     print(f"  Debug Logging: {debug_mode}")
