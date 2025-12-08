@@ -887,8 +887,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # v5.2: EVENT EMBEDDING
         # =========================================================================
         if events is not None and HAS_EVENT_SYSTEM and isinstance(self.event_embedding, EventEmbedding):
-            # Use proper event embedding
-            event_embed = self.event_embedding(events, batch_size, device)
+            # v5.2: Events is a batch (list of lists), use forward_batch
+            event_embed = self.event_embedding.forward_batch(events, device)
             self.cached_event_embed = event_embed.detach()
         elif self.cached_event_embed is not None:
             # Use cached event embedding (live inference)
