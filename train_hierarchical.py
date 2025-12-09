@@ -2776,9 +2776,26 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 with torch.amp.autocast('cuda'):
                     # v5.2: Pass VIX sequence and events to model
                     predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
+
+                    # 🛡️ NaN Check: Predictions
+                    if not torch.isfinite(predictions).all():
+                        print(f"\n🚨 NaN/Inf in predictions at batch {batch_idx}!")
+                        raise ValueError("Non-finite predictions detected")
+
                     # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
                     target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+
+                    # 🛡️ NaN Check: Targets
+                    if not torch.isfinite(target_tensor).all():
+                        print(f"\n🚨 NaN/Inf in targets!")
+                        raise ValueError("Non-finite targets")
+
                     loss = F.mse_loss(predictions[:, :2], target_tensor)
+
+                    # 🛡️ NaN Check: Loss
+                    if not torch.isfinite(loss):
+                        print(f"\n🚨 NaN/Inf loss at batch {batch_idx}!")
+                        raise ValueError("Non-finite loss")
 
                     # Debug: Print target/prediction stats on first batch
                     if batch_idx == 0 and epoch == 0:
@@ -2870,9 +2887,29 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             else:
                 # v5.2: Pass VIX sequence and events to model
                 predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
+
+                # 🛡️ NaN Check 1: Predictions
+                if not torch.isfinite(predictions).all():
+                    print(f"\n🚨 NaN/Inf in predictions at batch {batch_idx}, epoch {epoch}!")
+                    print(f"   Min: {predictions.min().item()}, Max: {predictions.max().item()}")
+                    raise ValueError("Non-finite predictions - training aborted")
+
                 # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
                 target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+
+                # 🛡️ NaN Check 2: Targets
+                if not torch.isfinite(target_tensor).all():
+                    print(f"\n🚨 NaN/Inf in targets at batch {batch_idx}!")
+                    raise ValueError("Non-finite targets detected")
+
                 loss = F.mse_loss(predictions[:, :2], target_tensor)
+
+                # 🛡️ NaN Check 3: Loss
+                if not torch.isfinite(loss):
+                    print(f"\n🚨 NaN/Inf loss at batch {batch_idx}!")
+                    print(f"   Predictions: mean={predictions[:,:2].mean().item()}, std={predictions[:,:2].std().item()}")
+                    print(f"   Targets: mean={target_tensor.mean().item()}, std={target_tensor.std().item()}")
+                    raise ValueError("Non-finite loss - check for exploding gradients or bad data")
 
                 # Debug: Print target/prediction stats on first batch
                 if batch_idx == 0 and epoch == 0:
@@ -2970,6 +3007,16 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         loss = loss + 0.2 * F.cross_entropy(compositor['direction_logits'], target_dir)
 
                 loss.backward()
+
+                # 🛡️ Gradient clipping (prevent explosion)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # 🛡️ NaN Check 4: Gradients
+                for name, param in model.named_parameters():
+                    if param.grad is not None and not torch.isfinite(param.grad).all():
+                        print(f"\n🚨 NaN/Inf gradient in {name} at batch {batch_idx}!")
+                        raise ValueError(f"Non-finite gradient in {name}")
+
                 optimizer.step()
 
             # Report first batch completion time and stop progress thread
@@ -3120,22 +3167,34 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             num_test_batches = 0
 
             with torch.no_grad():
-                for features, targets in tqdm(test_loader, desc="Test batches", leave=False):
+                for batch_data in tqdm(test_loader, desc="Test batches", leave=False):
+                    # v5.2: Unpack 4-tuple
+                    if len(batch_data) == 4:
+                        features, targets, vix_batch_test, events_batch_test = batch_data
+                    else:
+                        features, targets = batch_data
+                        vix_batch_test = None
+                        events_batch_test = None
+
                     # Move to device
                     if isinstance(features, dict):
                         features = {tf: f.to(args.device, non_blocking=True) for tf, f in features.items()}
                     else:
                         features = features.to(args.device, non_blocking=True)
+
                     targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
 
-                    # Forward pass
+                    if vix_batch_test is not None:
+                        vix_batch_test = vix_batch_test.to(args.device, non_blocking=True)
+
+                    # Forward pass with VIX/events
                     if scaler is not None:
                         with torch.amp.autocast('cuda'):
-                            predictions, _ = model(features)
+                            predictions, _ = model(features, vix_sequence=vix_batch_test, events=events_batch_test)
                             target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                             loss = F.mse_loss(predictions[:, :2], target_tensor)
                     else:
-                        predictions, _ = model(features)
+                        predictions, _ = model(features, vix_sequence=vix_batch_test, events=events_batch_test)
                         target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                         loss = F.mse_loss(predictions[:, :2], target_tensor)
 
