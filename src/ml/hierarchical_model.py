@@ -502,13 +502,12 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # Input: 33 layer predictions (11 TF × 3 outputs) + 12 market_state = 45 dims
         # No more news embeddings (removed)
 
+        # v5.3: Keep fc1/fc2 for multi-task heads, remove prediction heads
         self.fusion_fc1 = nn.Linear(self.FUSION_INPUT_DIM, 128)
         self.fusion_fc2 = nn.Linear(128, self.fusion_output_dim)
-        self.fusion_fc_high = nn.Linear(self.fusion_output_dim, 1)
-        self.fusion_fc_low = nn.Linear(self.fusion_output_dim, 1)
-        self.fusion_fc_conf = nn.Linear(self.fusion_output_dim, 1)
+        # fusion_fc_high, fusion_fc_low, fusion_fc_conf REMOVED (locked to Physics-Only)
 
-        # NOTE: Static fusion_weights removed - replaced by dynamic CoulombTimeframeAttention
+        # NOTE: fusion_hidden is still created in forward() for multi-task heads
 
         # =========================================================================
         # MULTI-TASK HEADS
@@ -1257,60 +1256,43 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
         self.last_market_state = market_state.detach()
 
-        if self.use_fusion_head:
-            # Standard fusion head approach
-            # Fusion input: 33 + 12 = 45
-            fusion_input = torch.cat([all_layer_preds, market_state], dim=-1)
+        # v5.3: Locked to Physics-Only - SELECT best channel
+        # Extract per-TF predictions from layer_predictions
+        per_tf_highs = []
+        per_tf_lows = []
+        per_tf_confs = []
+        for i in range(len(self.TIMEFRAMES)):
+            idx = i * 3
+            per_tf_highs.append(layer_predictions[idx])     # [batch, 1]
+            per_tf_lows.append(layer_predictions[idx + 1])  # [batch, 1]
+            per_tf_confs.append(layer_predictions[idx + 2]) # [batch, 1]
 
-            # Fusion network
-            fusion_hidden = F.relu(self.fusion_fc1(fusion_input))
-            fusion_hidden = F.relu(self.fusion_fc2(fusion_hidden))
+        per_tf_highs = torch.cat(per_tf_highs, dim=-1)  # [batch, 11]
+        per_tf_lows = torch.cat(per_tf_lows, dim=-1)    # [batch, 11]
+        per_tf_confs = torch.cat(per_tf_confs, dim=-1)  # [batch, 11]
 
-            # Primary predictions
-            final_pred_high = self.fusion_fc_high(fusion_hidden)
-            final_pred_low = self.fusion_fc_low(fusion_hidden)
-            final_pred_conf = torch.sigmoid(self.fusion_fc_conf(fusion_hidden))
-        else:
-            # Physics-based aggregation: SELECT best channel, don't blend!
-            # Each TF is a separate channel prediction - pick the most confident one
+        # SELECT the most confident TF (not weighted average!)
+        best_tf_idx = torch.argmax(per_tf_confs, dim=-1)  # [batch]
 
-            # Extract per-TF predictions from layer_predictions
-            per_tf_highs = []
-            per_tf_lows = []
-            per_tf_confs = []
-            for i in range(len(self.TIMEFRAMES)):
-                idx = i * 3
-                per_tf_highs.append(layer_predictions[idx])     # [batch, 1]
-                per_tf_lows.append(layer_predictions[idx + 1])  # [batch, 1]
-                per_tf_confs.append(layer_predictions[idx + 2]) # [batch, 1]
+        # Gather the best TF's predictions for each sample in batch
+        batch_indices = torch.arange(per_tf_highs.shape[0], device=per_tf_highs.device)
+        final_pred_high = per_tf_highs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
+        final_pred_low = per_tf_lows[batch_indices, best_tf_idx].unsqueeze(-1)    # [batch, 1]
+        final_pred_conf = per_tf_confs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
 
-            per_tf_highs = torch.cat(per_tf_highs, dim=-1)  # [batch, 11]
-            per_tf_lows = torch.cat(per_tf_lows, dim=-1)    # [batch, 11]
-            per_tf_confs = torch.cat(per_tf_confs, dim=-1)  # [batch, 11]
+        # Store selection info for interpretability
+        selection_info = {
+            'best_tf_idx': best_tf_idx,
+            'best_tf_name': [self.TIMEFRAMES[idx.item()] for idx in best_tf_idx],
+            'per_tf_highs': per_tf_highs,
+            'per_tf_lows': per_tf_lows,
+            'per_tf_confs': per_tf_confs,
+        }
 
-            # SELECT the most confident TF (not weighted average!)
-            best_tf_idx = torch.argmax(per_tf_confs, dim=-1)  # [batch]
-
-            # Gather the best TF's predictions for each sample in batch
-            batch_indices = torch.arange(per_tf_highs.shape[0], device=per_tf_highs.device)
-            final_pred_high = per_tf_highs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
-            final_pred_low = per_tf_lows[batch_indices, best_tf_idx].unsqueeze(-1)    # [batch, 1]
-            final_pred_conf = per_tf_confs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
-
-            # Store selection info for interpretability
-            selection_info = {
-                'best_tf_idx': best_tf_idx,
-                'best_tf_name': [self.TIMEFRAMES[idx.item()] for idx in best_tf_idx],
-                'per_tf_highs': per_tf_highs,
-                'per_tf_lows': per_tf_lows,
-                'per_tf_confs': per_tf_confs,
-            }
-
-            # For multi-task heads, we still need fusion_hidden
-            # Create a simple representation from physics-enhanced hidden states
-            fusion_input = torch.cat([all_layer_preds, market_state], dim=-1)
-            fusion_hidden = F.relu(self.fusion_fc1(fusion_input))
-            fusion_hidden = F.relu(self.fusion_fc2(fusion_hidden))
+        # For multi-task heads, create fusion_hidden from physics-enhanced states
+        fusion_input = torch.cat([all_layer_preds, market_state], dim=-1)
+        fusion_hidden = F.relu(self.fusion_fc1(fusion_input))
+        fusion_hidden = F.relu(self.fusion_fc2(fusion_hidden))
 
         # =========================================================================
         # PHYSICS-INSPIRED OUTPUTS
