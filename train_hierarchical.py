@@ -26,9 +26,6 @@ from pathlib import Path
 import sys
 import os
 
-# Enable TF32 on Ampere+ GPUs (RTX 30/40/50 series)
-# Uses Tensor Cores for ~2x faster FP32 matmul with negligible precision loss
-torch.set_float32_matmul_precision('medium')
 import functools
 from datetime import datetime
 import json
@@ -1163,39 +1160,57 @@ def interactive_setup(args, profiler=None):
     # Consolidated precision menu for CUDA (combines AMP + base precision)
     args.amp = False  # Default to disabled
     args.precision_mode = 'fp32'  # Track the user's choice
+    args.use_tf32 = False  # v5.3: TF32 Tensor Core acceleration
 
     if args.device == 'cuda':
         print()
         precision_choice = inquirer.select(
             message="Training precision:",
             choices=[
-                Choice(value='fp16_amp', name="FP16 (AMP) - 2-3x faster, uses tensor cores ⚡"),
-                Choice(value='fp32', name="FP32 - Standard precision"),
-                Choice(value='fp64', name="FP64 - Maximum precision (slowest)")
+                Choice(value='fp32_tf32', name="FP32 with TF32 Tensor Cores ⭐ Recommended (~2x faster)"),
+                Choice(value='fp32', name="FP32 Standard (no acceleration)"),
+                Choice(value='fp16_amp', name="FP16 (AMP) - ⚠️ Causes NaN in v5.3"),
+                Choice(value='fp64', name="FP64 - Double precision (very slow)")
             ],
-            default='fp16_amp'
+            default=dflt('precision_mode', 'fp32_tf32')
         ).execute()
 
         args.precision_mode = precision_choice
 
-        if precision_choice == 'fp16_amp':
-            args.amp = True
+        if precision_choice == 'fp32_tf32':
+            args.amp = False
+            args.use_tf32 = True
+            torch.set_float32_matmul_precision('medium')  # Enable TF32
             project_config.TRAINING_PRECISION = 'float32'
             project_config.NUMPY_DTYPE = np.float32
             project_config._TORCH_DTYPE = torch.float32
-            print("   ⚡ FP16 (AMP) - Using FP16 tensor cores with FP32 base weights")
+            print("   ⭐ FP32 with TF32 Tensor Cores")
+            print("   → Ampere+ GPU acceleration (~2x matmul speedup)")
+            print("   → Stable (no NaN, same range as FP32)")
         elif precision_choice == 'fp32':
             args.amp = False
+            args.use_tf32 = False
+            torch.set_float32_matmul_precision('highest')  # Disable TF32
             project_config.TRAINING_PRECISION = 'float32'
             project_config.NUMPY_DTYPE = np.float32
             project_config._TORCH_DTYPE = torch.float32
-            print("   → FP32 - Standard precision training")
+            print("   → FP32 Standard - Highest precision (slower)")
+        elif precision_choice == 'fp16_amp':
+            args.amp = True
+            args.use_tf32 = False
+            project_config.TRAINING_PRECISION = 'float32'
+            project_config.NUMPY_DTYPE = np.float32
+            project_config._TORCH_DTYPE = torch.float32
+            print("   ⚠️  FP16 (AMP) - Mixed precision training")
+            print("   → Known issue: Causes NaN in duration NLL loss")
+            print("   → Not recommended for v5.3.1 (use FP32+TF32 instead)")
         else:  # fp64
             args.amp = False
+            args.use_tf32 = False
             project_config.TRAINING_PRECISION = 'float64'
             project_config.NUMPY_DTYPE = np.float64
             project_config._TORCH_DTYPE = torch.float64
-            print("   → FP64 - Maximum precision (slower, more memory)")
+            print("   → FP64 - Maximum precision (very slow, high memory)")
 
         # torch.compile option (CUDA only, PyTorch 2.0+)
         print()
