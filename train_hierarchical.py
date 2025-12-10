@@ -25,6 +25,10 @@ from torch.utils.data._utils.collate import default_collate
 from pathlib import Path
 import sys
 import os
+
+# Enable TF32 on Ampere+ GPUs (RTX 30/40/50 series)
+# Uses Tensor Cores for ~2x faster FP32 matmul with negligible precision loss
+torch.set_float32_matmul_precision('medium')
 import functools
 from datetime import datetime
 import json
