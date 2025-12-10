@@ -1089,7 +1089,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
                 # Probabilistic duration (mean + std)
                 duration_mean = self.duration_heads[f'{tf}_mean'](duration_context)
-                duration_log_std = self.duration_heads[f'{tf}_log_std'](duration_context)
+                # 🛡️ Clamp log_std to prevent variance collapse (exp(-6) to exp(6) = safe range)
+                duration_log_std = self.duration_heads[f'{tf}_log_std'](duration_context).clamp(-3, 3)
                 duration_std = torch.exp(duration_log_std).clamp(1, 20)
 
                 # Three projection scenarios

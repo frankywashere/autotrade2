@@ -2839,7 +2839,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                             num_calibrated += 1
 
                     if num_calibrated > 0:
-                        loss = loss + 0.05 * (calib_loss_total / num_calibrated)
+                        calib_component = 0.05 * (calib_loss_total / num_calibrated)
+                        loss = loss + calib_component
+                        loss_components['calibration'] = calib_component.item()
 
                 # v5.2/v5.3 LOSSES: Duration, Validity, Transition (same as non-AMP path)
                 transition_labels_dict = {}
@@ -2902,7 +2904,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     print(f"\n🚨 NaN/Inf in targets at batch {batch_idx}!")
                     raise ValueError("Non-finite targets detected")
 
-                loss = F.mse_loss(predictions[:, :2], target_tensor)
+                # Track loss components
+                loss_components = {'primary': 0.0, 'multi_task': 0.0, 'duration': 0.0,
+                                  'validity': 0.0, 'transition': 0.0, 'calibration': 0.0}
+
+                primary_loss = F.mse_loss(predictions[:, :2], target_tensor)
+                loss = primary_loss
+                loss_components['primary'] = primary_loss.item()
 
                 # 🛡️ NaN Check 3: Loss
                 if not torch.isfinite(loss):
@@ -2921,9 +2929,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 # Multi-task losses (if enabled)
                 if args.multi_task and 'multi_task' in hidden_states:
                     mt = hidden_states['multi_task']
-                    loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band'])
-                    loss = loss + 0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target'])
-                    loss = loss + 0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return'])
+                    mt_loss = (0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band']) +
+                              0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target']) +
+                              0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return']))
+                    loss = loss + mt_loss
+                    loss_components['multi_task'] = mt_loss.item()
 
                     # Adaptive projection losses (trains the adaptive_projection network)
                     if 'price_change_pct' in mt and 'price_change_pct' in targets:
@@ -2953,7 +2963,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                             num_calibrated += 1
 
                     if num_calibrated > 0:
-                        loss = loss + 0.05 * (calib_loss_total / num_calibrated)
+                        calib_component = 0.05 * (calib_loss_total / num_calibrated)
+                        loss = loss + calib_component
+                        loss_components['calibration'] = calib_component.item()
 
                 # =====================================================================
                 # v5.2/v5.3 LOSSES: Duration, Validity, Transition, Direction
@@ -2969,6 +2981,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         }
 
                 # Duration NLL loss (check key exists before using)
+                duration_loss_total = 0.0
                 if 'duration' in hidden_states:
                     for tf, dur_data in hidden_states['duration'].items():
                         target_dur_key = f'cont_{tf}_duration'
@@ -2978,21 +2991,31 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                             target_dur = targets[target_dur_key].squeeze()
                             variance = torch.exp(2 * log_std) + 1e-6
                             nll = 0.5 * ((target_dur - mean) ** 2 / variance + 2 * log_std)
-                            loss = loss + 0.3 * nll.mean()
+                            duration_loss_total += 0.3 * nll.mean()
+
+                if duration_loss_total > 0:
+                    loss = loss + duration_loss_total
+                    loss_components['duration'] = duration_loss_total.item()
 
                 # Validity loss
+                validity_loss_total = 0.0
                 if 'validity' in hidden_states and len(transition_labels_dict) > 0:
                     for tf, validity_pred in hidden_states['validity'].items():
                         if tf in transition_labels_dict:
                             trans_type = transition_labels_dict[tf]['transition_type']
                             target_validity = 1.0 if trans_type == 0 else 0.0
-                            loss_validity = F.binary_cross_entropy(
+                            loss_val = F.binary_cross_entropy(
                                 validity_pred.squeeze(),
                                 torch.tensor([target_validity], device=args.device).expand(validity_pred.shape[0])
                             )
-                            loss = loss + 0.2 * loss_validity
+                            validity_loss_total += 0.2 * loss_val
+
+                if validity_loss_total > 0:
+                    loss = loss + validity_loss_total
+                    loss_components['validity'] = validity_loss_total.item()
 
                 # Transition/Direction losses
+                transition_loss_total = 0.0
                 if 'compositor' in hidden_states and 'selected_tf' in hidden_states:
                     selected_tf = hidden_states['selected_tf']
                     if selected_tf in transition_labels_dict:
@@ -3001,10 +3024,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         new_dir = transition_labels_dict[selected_tf]['new_direction']
 
                         target_trans = torch.tensor([trans_type], device=args.device, dtype=torch.long).expand(predictions.shape[0])
-                        loss = loss + 0.3 * F.cross_entropy(compositor['transition_logits'], target_trans)
+                        trans_loss = 0.3 * F.cross_entropy(compositor['transition_logits'], target_trans)
 
                         target_dir = torch.tensor([new_dir], device=args.device, dtype=torch.long).expand(predictions.shape[0])
-                        loss = loss + 0.2 * F.cross_entropy(compositor['direction_logits'], target_dir)
+                        dir_loss = 0.2 * F.cross_entropy(compositor['direction_logits'], target_dir)
+
+                        transition_loss_total = trans_loss + dir_loss
+                        loss = loss + transition_loss_total
+                        loss_components['transition'] = transition_loss_total.item()
 
                 loss.backward()
 
@@ -3029,8 +3056,21 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             train_loss += loss.item()
             num_batches += 1
 
+            # Debug: Log loss breakdown every 100 batches
             if batch_idx % 100 == 0:
                 batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+                # Print component breakdown every 100 batches for diagnosis
+                if batch_idx > 0 and batch_idx % 100 == 0:
+                    print(f"\n📊 [{batch_idx}] Loss components:")
+                    print(f"   Primary: {loss_components.get('primary', 0):.3f}")
+                    print(f"   Multi-task: {loss_components.get('multi_task', 0):.3f}")
+                    print(f"   Duration: {loss_components.get('duration', 0):.3f}")
+                    print(f"   Validity: {loss_components.get('validity', 0):.3f}")
+                    print(f"   Transition: {loss_components.get('transition', 0):.3f}")
+                    print(f"   Calibration: {loss_components.get('calibration', 0):.3f}")
+                    print(f"   ─────────────────────")
+                    print(f"   Total: {loss.item():.3f}")
 
             if profiler and batch_idx > 0 and batch_idx % profiler.log_every_n == 0:
                 profiler.snapshot(f"batch_{batch_idx}", epoch + 1)
