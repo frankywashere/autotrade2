@@ -2693,6 +2693,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         'calibration': []
     }
 
+    # v5.3: Diagnostic tracking for transition loss issue
+    transition_diagnostics = {
+        'matches': 0,           # How many batches had matching selected_tf
+        'total_batches': 0,     # Total batches
+        'selected_tf_counts': {},  # Which TFs selected how often
+    }
+
     # Progress bar (rank 0 only)
     epoch_pbar = tqdm(range(start_epoch, args.epochs), desc="Training", disable=not is_main_process(rank))
 
@@ -3031,7 +3038,15 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 transition_loss_total = 0.0
                 if 'compositor' in hidden_states and 'selected_tf' in hidden_states:
                     selected_tf = hidden_states['selected_tf']
+
+                    # 🔍 Track diagnostics
+                    transition_diagnostics['total_batches'] += 1
+                    transition_diagnostics['selected_tf_counts'][selected_tf] = transition_diagnostics['selected_tf_counts'].get(selected_tf, 0) + 1
+
                     if selected_tf in transition_labels_dict:
+                        # Match! Compositor can train
+                        transition_diagnostics['matches'] += 1
+
                         compositor = hidden_states['compositor']
                         trans_type = transition_labels_dict[selected_tf]['transition_type']
                         new_dir = transition_labels_dict[selected_tf]['new_direction']
@@ -3045,6 +3060,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         transition_loss_total = trans_loss + dir_loss
                         loss = loss + transition_loss_total
                         loss_components['transition'] = transition_loss_total.item()
+                    else:
+                        # No match - compositor doesn't train this batch
+                        loss_components['transition'] = 0.0
 
                 loss.backward()
 
@@ -3088,6 +3106,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     print(f"   Calibration: {loss_components.get('calibration', 0):.3f}")
                     print(f"   ─────────────────────")
                     print(f"   Total: {loss.item():.3f}")
+
+                    # 🔍 Transition diagnostics
+                    if transition_diagnostics['total_batches'] > 0:
+                        match_rate = transition_diagnostics['matches'] / transition_diagnostics['total_batches']
+                        print(f"\n🔍 Transition Training:")
+                        print(f"   Match rate: {match_rate:.1%} ({transition_diagnostics['matches']}/{transition_diagnostics['total_batches']} batches)")
+                        print(f"   Most selected: {max(transition_diagnostics['selected_tf_counts'], key=transition_diagnostics['selected_tf_counts'].get) if transition_diagnostics['selected_tf_counts'] else 'None'}")
 
             if profiler and batch_idx > 0 and batch_idx % profiler.log_every_n == 0:
                 profiler.snapshot(f"batch_{batch_idx}", epoch + 1)
@@ -3307,11 +3332,21 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Save training history (rank 0 only)
     if is_main_process(rank):
         history_path = Path(args.output).parent / 'hierarchical_training_history.json'
+
+        # Calculate transition match rate
+        match_rate = transition_diagnostics['matches'] / max(transition_diagnostics['total_batches'], 1)
+
         history = {
             'train_losses': train_losses,
             'val_losses': val_losses,
             'val_errors': val_errors,
             'loss_components': component_history,  # v5.3: Per-component breakdown
+            'transition_diagnostics': {  # v5.3: Why is transition loss so low?
+                'match_rate': match_rate,
+                'matches': transition_diagnostics['matches'],
+                'total_batches': transition_diagnostics['total_batches'],
+                'selected_tf_distribution': transition_diagnostics['selected_tf_counts']
+            },
             'best_val_loss': best_val_loss,
             'total_epochs': epoch + 1,
             'args': vars(args)
