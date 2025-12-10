@@ -1,9 +1,10 @@
-# Technical Specification: Hierarchical Channel Duration Prediction System v5.3
+# Technical Specification: Hierarchical Channel Duration Prediction System v5.3.1
 
-**Version:** 5.3
+**Version:** 5.3.1
 **Branch:** `hierarchical-containment`
-**Date:** December 7, 2025
-**Status:** Production Ready - Hierarchical Learning Architecture
+**Date:** December 9, 2025
+**Status:** Production Ready - 4-Way Information Flow Architecture
+**Parameters:** 20.0M (down from 21M in v5.2)
 
 ---
 
@@ -78,14 +79,33 @@ Then **geometric projection IS the answer** - adjustments become small refinemen
 
 ---
 
-### v5.3: Hierarchical Learning (CURRENT)
+### v5.3: Hierarchical Learning
 - **Added**: Two-pass architecture (all CfCs, then predictions)
 - **Added**: Parent TF context in duration prediction (544-dim input)
 - **Added**: Hierarchical containment analysis
 - **Added**: RSI cross-TF validation (menu toggle)
 - **Added**: Phase 2 = informational only (solves imagined-channel-domination problem)
+- **Added**: Confidence calibration (MSE-based accuracy matching)
 
 **Benefit**: "Learn when to bounce off parent support vs break through"
+
+---
+
+### v5.3.1: 4-Way Information Flow (CURRENT)
+- **Added**: Information flow modes (menu toggle)
+  - Bottom-Up: 5min→3month (details inform strategy) - Default
+  - Top-Down: 3month→5min (strategy guides details)
+  - Bidirectional (Bottom-First): Micro foundation + macro overlay
+  - Bidirectional (Top-First): Macro framework + micro refinement
+- **Added**: Refinement networks for bidirectional modes (+550K params)
+- **Removed**: Fusion prediction heads (locked to Physics-Only, -1M params)
+- **Added**: Comprehensive NaN detection (4-point system)
+- **Added**: Transition label defaults (handle missing labels gracefully)
+- **Fixed**: 20+ critical bugs (robustness hardening)
+
+**Benefit**: "Experiment with different information flow paradigms"
+
+**Known Limitation**: FP16 AMP causes numerical instability (use FP32)
 
 ---
 
@@ -589,19 +609,24 @@ src/ml/loss_v52.py              # Deleted (orphaned)
 
 ## Appendix A: Architecture Comparison Table
 
-| Feature | v5.0 | v5.1 | v5.2 | v5.3 |
-|---------|------|------|------|------|
-| Window selection | Learned blend (21→1) | Quality argmax | Quality argmax | Quality argmax |
-| TF aggregation | Blend or select | Select | Select | Select |
-| Duration | Fixed 24 bars | Fixed 24 bars | Learned (VIX+events) | Learned (parents+VIX+events) |
-| VIX | 15 scalar features | 15 scalar features | CfC sequence (90 days) | CfC sequence (90 days) |
-| Events | Static proximity | Static proximity | Dynamic APIs | Dynamic APIs |
-| Validity | Learned confidence | Learned confidence | Forward-looking | Forward-looking |
-| Transitions | N/A | N/A | Compositor predictions | Compositor predictions |
-| Parent context | Hierarchical CfCs only | Hierarchical CfCs only | Hierarchical CfCs only | Duration sees parents! |
-| Containment | N/A | N/A | N/A | Interpretability output |
-| Phase 2 | N/A | N/A | Contrib to final | Informational only |
-| Parameters | ~13.8M | ~13.7M (removed validity nets) | ~14.1M (+VIX+events) | ~14.2M (+parent inputs) |
+| Feature | v5.0 | v5.1 | v5.2 | v5.3 | v5.3.1 |
+|---------|------|------|------|------|--------|
+| Window selection | Learned blend | Quality argmax | Quality argmax | Quality argmax | Quality argmax |
+| TF aggregation | Blend or select | Select | Select | Select | Select |
+| Information flow | Bottom-up only | Bottom-up only | Bottom-up only | Bottom-up only | 4 modes! |
+| Duration | Fixed 24 bars | Fixed 24 bars | Learned (VIX+events) | Learned (parents+VIX+events) | Same |
+| VIX | 15 scalars | 15 scalars | CfC sequence (90 days) | CfC sequence | CfC sequence |
+| Events | Static | Static | Dynamic APIs | Dynamic APIs | Dynamic APIs |
+| Validity | Learned conf | Learned conf | Forward-looking | Forward-looking | Forward-looking |
+| Confidence | Meta-learned | Meta-learned | Meta-learned | Calibrated (MSE) | Calibrated (MSE) |
+| Transitions | N/A | N/A | Compositor | Compositor | Compositor |
+| Parent context | CfCs only | CfCs only | CfCs only | Duration sees parents | Duration sees parents |
+| Containment | N/A | N/A | N/A | Analysis output | Analysis output |
+| Phase 2 | N/A | N/A | Contrib to final | Informational | Informational |
+| Fusion heads | Included | Included | Included | Included | **REMOVED** |
+| NaN detection | None | None | None | None | Comprehensive |
+| Parameters | ~13.8M | ~13.7M | ~14.1M | ~14.2M | **~20.0M** |
+| Precision | FP16/FP32 | FP16/FP32 | FP16/FP32 | FP16/FP32 | **FP32 only** |
 
 ---
 
@@ -717,7 +742,22 @@ src/ml/loss_v52.py              # Deleted (orphaned)
 
 ---
 
-**Model Version:** v5.3
-**Architecture:** Hierarchical Duration Predictor with Parent Context
+**Model Version:** v5.3.1
+**Architecture:** Hierarchical Duration Predictor with 4-Way Information Flow
 **Status:** Production Ready
-**Last Updated:** December 7, 2025
+**Parameters:** 20,989,277 total / 18,594,101 trainable
+**Recommended Precision:** FP32 (FP16 AMP has numerical stability issues)
+**Recommended LR:** 0.0003 (0.01 causes immediate NaN explosion)
+**Branch:** hierarchical-containment
+**Total Commits:** 349
+**Last Updated:** December 9, 2025
+
+---
+
+## CRITICAL NOTES:
+
+1. **FP16 AMP Not Recommended**: Causes NaN in duration NLL loss due to variance underflow
+2. **torch.compile Not Supported**: Too many graph breaks (dynamic indexing, .item() calls)
+3. **Learning Rate**: Must use ≤0.0005 (model has 20M params, 0.01 causes instant explosion)
+4. **Information Flow**: Test all 4 modes to find best for your data
+5. **No Feature Re-extraction Needed**: Changes are architecture-only
