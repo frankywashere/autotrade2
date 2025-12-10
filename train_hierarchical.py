@@ -2683,6 +2683,16 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     val_losses = []
     val_errors = []
 
+    # v5.3: Component-level tracking per epoch
+    component_history = {
+        'primary': [],
+        'multi_task': [],
+        'duration': [],
+        'validity': [],
+        'transition': [],
+        'calibration': []
+    }
+
     # Progress bar (rank 0 only)
     epoch_pbar = tqdm(range(start_epoch, args.epochs), desc="Training", disable=not is_main_process(rank))
 
@@ -2699,6 +2709,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         model.train()
         train_loss = 0.0
         num_batches = 0
+
+        # v5.3: Accumulate components for this epoch
+        epoch_components = {k: [] for k in component_history.keys()}
 
         if profiler:
             profiler.snapshot("pre_dataloader_iter", epoch + 1, force_log=True)
@@ -3056,6 +3069,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             train_loss += loss.item()
             num_batches += 1
 
+            # v5.3: Accumulate component losses for epoch averaging
+            for component, value in loss_components.items():
+                epoch_components[component].append(value)
+
             # Debug: Log loss breakdown every 100 batches
             if batch_idx % 100 == 0:
                 batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
@@ -3077,6 +3094,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         avg_train_loss = train_loss / max(num_batches, 1)
         train_losses.append(avg_train_loss)
+
+        # v5.3: Average component losses for this epoch
+        for component, values in epoch_components.items():
+            if len(values) > 0:
+                avg_component = sum(values) / len(values)
+                component_history[component].append(avg_component)
+            else:
+                component_history[component].append(0.0)
 
         # Validation phase
         model.eval()
@@ -3286,6 +3311,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             'train_losses': train_losses,
             'val_losses': val_losses,
             'val_errors': val_errors,
+            'loss_components': component_history,  # v5.3: Per-component breakdown
             'best_val_loss': best_val_loss,
             'total_epochs': epoch + 1,
             'args': vars(args)
