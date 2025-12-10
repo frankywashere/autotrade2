@@ -1295,8 +1295,8 @@ def interactive_setup(args, profiler=None):
     args.num_workers = int(inquirer.number(
         message=f"Data loading workers (CPU threads for batch prep, recommended: {default_workers}):{guidance}",
         default=dflt('num_workers', default_workers),
-        min_allowed=0,
-        max_allowed=128  # High limit for systems with many cores
+        min_allowed=0
+        # No max cap - user can set based on CPU cores available
     ).execute())
 
     if args.num_workers != default_workers:
