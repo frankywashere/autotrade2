@@ -343,15 +343,24 @@ class EventEmbedding(nn.Module):
         device: torch.device
     ) -> torch.Tensor:
         """
-        Process a batch of event lists (for training).
+        Process a batch of event lists (training) or single list (inference).
 
         Args:
-            events_batch: List of event lists, one per sample in batch
+            events_batch: List of event lists (training) OR single event list (inference)
             device: Target device
 
         Returns:
             [batch_size, embed_dim] embeddings
         """
+        if not events_batch:
+            return torch.zeros(1, self.embed_dim, device=device)
+
+        # Handle inference: single event list (list of dicts, not list of lists)
+        if len(events_batch) > 0 and isinstance(events_batch[0], dict):
+            # Inference mode - process single event list
+            return self.forward(events_batch, batch_size=1, device=device)
+
+        # Training mode: batch of event lists
         batch_size = len(events_batch)
         embeddings = []
 
