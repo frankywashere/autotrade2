@@ -413,7 +413,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         multi_task: bool = True,  # Enable multi-task heads
         use_fusion_head: bool = True,  # v4.1: Can disable for physics-only mode
         use_geometric_base: bool = True,  # v5.0: Use geometric projections or learned approximation
-        information_flow: str = 'bottom_up',  # v5.3.1: bottom_up, top_down, bidirectional_bottom, bidirectional_top
+        information_flow: str = 'bottom_up',  # v5.3.2: independent, bottom_up, top_down, bidirectional_bottom, bidirectional_top
         # Backward compatibility
         input_size: int = None,  # Deprecated: use input_sizes dict
     ):
@@ -949,10 +949,14 @@ class HierarchicalLNN(nn.Module, ModelBase):
             x_tf = timeframe_data[tf]  # [batch, seq_len, features]
             seq_len = x_tf.shape[1]
 
-            # v5.3.1: Get neighbor hidden (or zeros) based on flow direction
+            # v5.3.2: Get neighbor hidden (or zeros) based on flow direction
             neighbor_hidden = None
 
-            if self.information_flow == 'bottom_up':
+            if self.information_flow == 'independent':
+                # Independent: each TF processes alone, no cross-TF hidden states
+                neighbor_hidden = None  # Explicitly no neighbor
+
+            elif self.information_flow == 'bottom_up':
                 # Bottom-up: get previous (faster) TF
                 if i > 0:
                     neighbor_hidden = tf_hidden_dict.get(self.TIMEFRAMES[i - 1])

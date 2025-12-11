@@ -1740,20 +1740,26 @@ def interactive_setup(args, profiler=None):
     print("   Interpretability: 10/10")
     print("─" * 70)
 
-    # v5.3.1: Information Flow Direction
+    # v5.3.2: Information Flow Direction (added 'independent' mode)
     print()
     args.information_flow = inquirer.select(
         message="Information flow strategy:",
         choices=[
-            Choice('bottom_up', 'Bottom-Up - Fast → Slow (details inform strategy) ⭐ Default'),
+            Choice('independent', 'Independent - Each TF alone (no cross-TF hidden states) ⭐ Baseline'),
+            Choice('bottom_up', 'Bottom-Up - Fast → Slow (details inform strategy)'),
             Choice('top_down', 'Top-Down - Slow → Fast (strategy guides details)'),
             Choice('bidirectional_bottom', 'Bidirectional (Bottom-First) - Micro foundation + macro overlay'),
             Choice('bidirectional_top', 'Bidirectional (Top-First) - Macro framework + micro refinement'),
         ],
-        default='bottom_up'
+        default='independent'
     ).execute()
 
-    if args.information_flow == 'bottom_up':
+    if args.information_flow == 'independent':
+        print("   🔲 Independent: Each TF processes alone")
+        print("      No cross-TF hidden state passing")
+        print("      Good for: Baseline comparison, stability, debugging")
+        print("      Simplest mode - each timeframe is self-contained")
+    elif args.information_flow == 'bottom_up':
         print("   ✅ Bottom-Up: 5min → 3month (current v5.3)")
         print("      Each TF sees previous (faster) TF's understanding")
         print("      Good for: Detail aggregation, noise filtering")
@@ -1860,6 +1866,7 @@ def interactive_setup(args, profiler=None):
     # v5.3.1: Information flow
     info_flow = getattr(args, 'information_flow', 'bottom_up')
     flow_display = {
+        'independent': 'Each TF alone (no cross-TF)',
         'bottom_up': '5min→3month (details first)',
         'top_down': '3month→5min (strategy first)',
         'bidirectional_bottom': '5min→3month→5min (micro+macro)',
@@ -2719,10 +2726,33 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         'selected_tf_counts': {},  # Which TFs selected how often
     }
 
+    # v5.3.2: Enhanced diagnostics (what was missing from history!)
+    learning_rates = []           # LR per epoch (scheduler changes it)
+    epoch_times = []              # Minutes per epoch
+    gradient_norms = []           # Avg gradient norm per epoch (before clipping)
+    best_epoch = 0                # Which epoch had best val_loss
+    early_stop_triggered = False  # Did early stopping fire?
+
+    # v5.3.2: Duration/validity prediction statistics per epoch
+    duration_stats = {
+        'mean_predictions': [],   # Avg duration prediction per epoch
+        'std_predictions': [],    # Std of duration predictions
+    }
+    validity_stats = {
+        'mean_validity': [],      # Avg validity score per epoch
+        'selected_tf_mode': [],   # Most common TF selected per epoch
+    }
+
+    # v5.3.2: Test set results (computed at end but wasn't saved!)
+    test_results = None
+
     # Progress bar (rank 0 only)
     epoch_pbar = tqdm(range(start_epoch, args.epochs), desc="Training", disable=not is_main_process(rank))
 
     for epoch in epoch_pbar:
+        # v5.3.2: Track epoch timing
+        epoch_start_time = time.perf_counter()
+
         # Set epoch for distributed sampler
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -2738,6 +2768,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         # v5.3: Accumulate components for this epoch
         epoch_components = {k: [] for k in component_history.keys()}
+
+        # v5.3.2: Accumulate gradient norms and prediction stats per epoch
+        epoch_grad_norms = []
+        epoch_duration_preds = []
+        epoch_validity_preds = []
 
         if profiler:
             profiler.snapshot("pre_dataloader_iter", epoch + 1, force_log=True)
@@ -3085,6 +3120,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
                 loss.backward()
 
+                # v5.3.2: Track gradient norm BEFORE clipping (shows true gradient magnitude)
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        total_norm += p.grad.data.norm(2).item() ** 2
+                total_norm = total_norm ** 0.5
+                epoch_grad_norms.append(total_norm)
+
                 # 🛡️ Gradient clipping (prevent explosion)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
@@ -3109,6 +3152,18 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             # v5.3: Accumulate component losses for epoch averaging
             for component, value in loss_components.items():
                 epoch_components[component].append(value)
+
+            # v5.3.2: Track duration/validity predictions for diagnostics
+            if 'duration' in hidden_states and 'selected_tf' in hidden_states:
+                sel_tf = hidden_states['selected_tf']
+                if sel_tf in hidden_states['duration']:
+                    dur_mean = hidden_states['duration'][sel_tf]['mean'].mean().item()
+                    epoch_duration_preds.append(dur_mean)
+            if 'validity' in hidden_states and 'selected_tf' in hidden_states:
+                sel_tf = hidden_states['selected_tf']
+                if sel_tf in hidden_states['validity']:
+                    val_score = hidden_states['validity'][sel_tf].mean().item()
+                    epoch_validity_preds.append(val_score)
 
             # Debug: Log loss breakdown every 100 batches
             if batch_idx % 100 == 0:
@@ -3201,6 +3256,43 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         scheduler.step()
 
+        # v5.3.2: Track epoch-level diagnostics
+        epoch_end_time = time.perf_counter()
+        epoch_minutes = (epoch_end_time - epoch_start_time) / 60.0
+        epoch_times.append(epoch_minutes)
+
+        # Track LR (scheduler may have changed it)
+        current_lr = scheduler.get_last_lr()[0]
+        learning_rates.append(current_lr)
+
+        # Track gradient norm stats
+        if epoch_grad_norms:
+            gradient_norms.append(sum(epoch_grad_norms) / len(epoch_grad_norms))
+        else:
+            gradient_norms.append(0.0)
+
+        # Track duration/validity prediction stats
+        if epoch_duration_preds:
+            duration_stats['mean_predictions'].append(sum(epoch_duration_preds) / len(epoch_duration_preds))
+            duration_stats['std_predictions'].append(
+                (sum((x - duration_stats['mean_predictions'][-1])**2 for x in epoch_duration_preds) / len(epoch_duration_preds)) ** 0.5
+            )
+        else:
+            duration_stats['mean_predictions'].append(0.0)
+            duration_stats['std_predictions'].append(0.0)
+
+        if epoch_validity_preds:
+            validity_stats['mean_validity'].append(sum(epoch_validity_preds) / len(epoch_validity_preds))
+        else:
+            validity_stats['mean_validity'].append(0.0)
+
+        # Track most common TF this epoch
+        if transition_diagnostics['selected_tf_counts']:
+            mode_tf = max(transition_diagnostics['selected_tf_counts'], key=transition_diagnostics['selected_tf_counts'].get)
+            validity_stats['selected_tf_mode'].append(mode_tf)
+        else:
+            validity_stats['selected_tf_mode'].append('unknown')
+
         # Update progress bar
         epoch_pbar.set_postfix({
             'train': f'{avg_train_loss:.4f}',
@@ -3211,6 +3303,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         # Check for improvement (rank 0 saves model)
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            best_epoch = epoch + 1  # v5.3.2: Track which epoch was best
             patience_counter = 0
 
             if is_main_process(rank):
@@ -3243,6 +3336,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         # Early stopping
         if patience_counter >= args.patience:
+            early_stop_triggered = True  # v5.3.2: Track that early stopping fired
             if is_main_process(rank):
                 tqdm.write(f"\n   Early stopping at epoch {epoch + 1} (patience={args.patience})")
             break
@@ -3343,6 +3437,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print(f"   ⚠️  This is your TRUE performance on unseen data")
             print("=" * 70)
 
+            # v5.3.2: Save test results (previously computed but not saved!)
+            test_results = {
+                'test_loss': avg_test_loss,
+                'test_mae': avg_test_error,
+                'high_mae': float(high_mae),
+                'high_rmse': float(high_rmse),
+                'low_mae': float(low_mae),
+                'low_rmse': float(low_rmse),
+                'num_samples': len(all_test_preds)
+            }
+
     # Print memory profile summary
     if profiler and is_main_process(rank):
         profiler.print_summary()
@@ -3368,7 +3473,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             },
             'best_val_loss': best_val_loss,
             'total_epochs': epoch + 1,
-            'args': vars(args)
+            'args': vars(args),
+
+            # v5.3.2: Enhanced diagnostics (what was missing!)
+            'learning_rates': learning_rates,           # LR per epoch (scheduler changes)
+            'epoch_times_minutes': epoch_times,         # Minutes per epoch
+            'gradient_norms': gradient_norms,           # Avg gradient norm per epoch (before clipping)
+            'best_epoch': best_epoch,                   # Which epoch had best val_loss
+            'early_stop_triggered': early_stop_triggered,  # Did early stopping fire?
+            'duration_stats': duration_stats,           # Mean/std of duration predictions
+            'validity_stats': validity_stats,           # Mean validity, most common TF
+            'test_results': test_results,               # Test set evaluation (was computed but not saved!)
         }
 
         if profiler:
