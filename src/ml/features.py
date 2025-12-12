@@ -291,9 +291,10 @@ class TradingFeatureExtractor(FeatureExtractor):
         features.append('tsla_volume_surge')
         for tf in ['15min', '1h', '4h', 'daily']:
             features.append(f'tsla_rsi_divergence_{tf}')
-        for tf in ['1h', '4h', 'daily']:
+        # v5.3.2: Expanded to all trading TFs for comprehensive break prediction
+        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
             features.append(f'tsla_channel_duration_ratio_{tf}')
-        for tf in ['1h', '4h']:
+        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
             features.append(f'channel_alignment_spy_tsla_{tf}')
 
         # Time-in-channel features (additional breakdown indicators)
@@ -3513,9 +3514,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             else:
                 breakdown_features[f'tsla_rsi_divergence_{tf_name}'] = np.zeros(num_rows)
 
-        # 3. Channel duration vs historical average (3 timeframes)
+        # 3. Channel duration vs historical average
+        # v5.3.2: Expanded to all trading TFs for comprehensive break prediction
         # Use stability score as proxy for channel duration
-        for tf_name in ['1h', '4h', 'daily']:
+        for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
             stability_col = f'tsla_channel_{tf_name}_stability'
 
             if stability_col in features_df.columns:
@@ -3527,8 +3529,9 @@ class TradingFeatureExtractor(FeatureExtractor):
             else:
                 breakdown_features[f'tsla_channel_duration_ratio_{tf_name}'] = np.ones(num_rows)
 
-        # 4. SPY-TSLA channel alignment (2 timeframes)
-        for tf_name in ['1h', '4h']:
+        # 4. SPY-TSLA channel alignment
+        # v5.3.2: Expanded to all trading TFs for comprehensive break prediction
+        for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
             tsla_pos_col = f'tsla_channel_{tf_name}_position'
             spy_pos_col = f'spy_channel_{tf_name}_position'
 

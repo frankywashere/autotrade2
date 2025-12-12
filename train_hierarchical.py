@@ -3021,10 +3021,15 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         weight_decay=0.01
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    # v5.3.2: ReduceLROnPlateau for stable training (adapts to actual progress)
+    # Cosine annealing was dropping LR too aggressively (to 0.000002) causing instability
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_0=10,
-        T_mult=2
+        mode='min',           # Reduce when val_loss stops decreasing
+        factor=0.5,           # Halve LR when stuck
+        patience=5,           # Wait 5 epochs before reducing
+        min_lr=1e-6,          # Don't go below this
+        verbose=True          # Print when LR changes
     )
 
     # AMP scaler for mixed precision
@@ -3637,7 +3642,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         val_losses.append(avg_val_loss)
         val_errors.append(avg_val_error)
 
-        scheduler.step()
+        # v5.3.2: ReduceLROnPlateau needs the metric to monitor
+        scheduler.step(avg_val_loss)
 
         # v5.3.2: Track epoch-level diagnostics
         epoch_end_time = time.perf_counter()
@@ -3645,7 +3651,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         epoch_times.append(epoch_minutes)
 
         # Track LR (scheduler may have changed it)
-        current_lr = scheduler.get_last_lr()[0]
+        # v5.3.2: ReduceLROnPlateau doesn't have get_last_lr(), get from optimizer instead
+        current_lr = optimizer.param_groups[0]['lr']
         learning_rates.append(current_lr)
 
         # Track gradient norm stats

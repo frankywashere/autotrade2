@@ -65,7 +65,7 @@ class ChannelData:
 
     # Optional fields with defaults (MUST come last in dataclass!)
     actual_duration: int = 0
-    quality_score: float = 0.0  # Composite quality (0-1): (r² * 0.7) + (complete_cycles/5 * 0.3)
+    quality_score: float = 0.0  # Composite quality (0-1): v5.3.2: cycles × (0.5 + 0.5 × r²) - bounces primary
     is_valid: float = 0.0  # 1.0 if complete_cycles >= 2, else 0.0
     insufficient_data: float = 0.0  # 1.0 if window > available bars, else 0.0
 
@@ -344,10 +344,10 @@ class LinearRegressionChannel:
             if channel.ping_pongs < min_ping_pongs:
                 continue
 
-            # Score = R² (70%) + normalized ping-pongs (30%)
-            # Higher R² = better fit, more ping-pongs = more confirmations
+            # Score = Ping-pongs primary, R² only matters if bounces exist
+            # v5.3.2: Flipped weighting - actual price confirmations more important than statistical fit
             ping_pong_score = min(channel.ping_pongs / 10.0, 1.0)  # Normalize to 0-1
-            composite_score = (channel.r_squared * 0.7) + (ping_pong_score * 0.3)
+            composite_score = ping_pong_score * (0.5 + 0.5 * channel.r_squared)
 
             # Track best
             if composite_score > best_score:
@@ -950,8 +950,9 @@ class LinearRegressionChannel:
                 stability_score = self._calculate_stability(r_squared_avg, multi_pp[0.02], window)
 
                 # Calculate quality indicators (v3.17: Switched to complete_cycles)
+                # v5.3.2: Ping-pongs/cycles primary - R² only matters if bounces exist
                 cycle_score = min(multi_cycles[0.02] / 5.0, 1.0)  # Normalize: 5 cycles = max
-                quality_score = (r_squared_avg * 0.7) + (cycle_score * 0.3)
+                quality_score = cycle_score * (0.5 + 0.5 * r_squared_avg)
                 is_valid = 1.0 if multi_cycles[0.02] >= 2 else 0.0  # Require 2 complete cycles
 
                 channel = ChannelData(

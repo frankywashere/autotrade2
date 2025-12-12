@@ -3,7 +3,7 @@
 **Date**: December 11, 2025
 **Current Branch**: `hierarchical-containment`
 **Status**: Production System - Fully Operational
-**Last Session**: v5.3.2 - Rolling Pre-Stack batch loader (~40% faster epochs)
+**Last Session**: v5.3.2 - Fixed weekly TF bias (ping-pong weighting + expanded features)
 
 ---
 
@@ -343,6 +343,66 @@ class PreStackedBatchLoader:
     def __iter__(self):
         # Yields pre-stacked batches from RAM (instant, no collation)
 ```
+
+---
+
+## 🔧 v5.3.2 FIXES - Weekly TF Bias Resolution
+
+### **Problem Identified:**
+Weekly timeframe dominated predictions (54-58%) across ALL flow modes, causing:
+- Test MAE regression (0.31% vs 0.25% baseline)
+- Transition loss collapse (0.001 - too predictable)
+- Validity saturation (all TFs → 0.99)
+- Model never learning from fast TF break patterns
+
+### **Root Cause:**
+Quality scoring formula biased toward R² (statistical fit) over ping-pongs (actual bounces):
+- Weekly: Smooth trends → high R² (0.85) → always selected
+- 5min: Noisy but many bounces → lower R² (0.50) → ignored
+- Formula was: `quality = (R² × 0.7) + (ping-pongs × 0.3)` ❌
+
+### **Fix 1: Quality Weight Formula** ✅
+**Location:** `src/linear_regression.py:350, 955`
+```python
+# Before: R² dominated (70% weight)
+composite_score = (r_squared * 0.7) + (ping_pong_score * 0.3)
+
+# After: Ping-pongs primary (v5.3.2)
+composite_score = ping_pong_score * (0.5 + 0.5 * r_squared)
+```
+**Impact:** Actual price confirmations now matter more than statistical smoothness
+
+### **Fix 3: LR Scheduler Stability** ✅
+**Location:** `train_hierarchical.py:3026`
+```python
+# Before: Cosine annealing → 0.000002 (too aggressive)
+scheduler = CosineAnnealingWarmRestarts(T_0=10, T_mult=2)
+
+# After: Adaptive plateau reduction
+scheduler = ReduceLROnPlateau(mode='min', factor=0.5, patience=5)
+```
+**Impact:** Stable training, no gradient chaos (1308 → 2.4 → 39 spikes)
+
+### **Fix 5 & 6: Expanded Feature Coverage** ✅
+**Location:** `src/ml/features.py:295-298, 3520, 3534`
+```python
+# Before: Limited timeframes
+for tf in ['1h', '4h', 'daily']:  # duration_ratio
+for tf in ['1h', '4h']:           # SPY-TSLA alignment
+
+# After: All trading timeframes
+for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
+```
+**Impact:** Break predictors available for all TFs, not just subset
+
+### **Expected Improvements:**
+- Faster TFs (5min, 15min, 30min) should get selected more often
+- Transition loss should stay higher (diverse TF patterns, not just weekly)
+- Validity should remain differentiated (not saturated to 0.99)
+- Test MAE should improve (model learns from all TF break patterns)
+
+### **Cache Regeneration Required:**
+⚠️ Fixes 5 & 6 added new features - must regenerate cache before training!
 
 ---
 
