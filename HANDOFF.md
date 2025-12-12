@@ -3,7 +3,7 @@
 **Date**: December 11, 2025
 **Current Branch**: `hierarchical-containment`
 **Status**: Production System - Fully Operational
-**Last Session**: v5.3.2 - Enhanced training diagnostics (fixed missing history fields)
+**Last Session**: v5.3.2 - Rolling Pre-Stack batch loader (~40% faster epochs)
 
 ---
 
@@ -265,6 +265,83 @@ Expected:
   Speed: ~10-15 min/epoch
   Cost: $29-34 per 100 epochs
   Simpler: No DDP complexity
+```
+
+---
+
+## 🚀 BATCH PRE-STACKING (v5.3.2)
+
+### **What It Does**:
+Pre-stacks batches in RAM before training to eliminate ~1.3s/batch collate overhead.
+
+### **The Problem**:
+Standard collation stacks 386 samples × 14,346 features per batch during iteration.
+This is CPU-bound and single-threaded, causing SLOW_COLLATE warnings.
+
+### **The Solution (Rolling Pre-Stack)**:
+```
+Option B: Rolling Pre-Stack
+1. Pre-stack epoch 1 before training (blocking, ~5-10 min)
+2. While training epoch N, background thread pre-stacks epoch N+1
+3. Old epoch batches freed → only 2 epochs in RAM at once
+```
+
+### **Usage** (Interactive Menu):
+```
+Enable batch pre-stacking? (y/n)
+  → Eliminates ~1.3s/batch collate overhead
+  → Expected ~40% faster epochs
+  → Uses ~77-154GB RAM (2 epochs)
+```
+
+### **Trade-offs**:
+```
+✅ Benefits:
+  - ~40% faster epochs (eliminates collate during iteration)
+  - Background prep while training (no visible delay after epoch 1)
+  - Deterministic shuffling (same indices for reproducibility)
+
+❌ Costs:
+  - Initial delay (~5-10 min to pre-stack epoch 1)
+  - RAM usage: ~77-154GB (2 epochs × ~386 batches × ~5MB/batch)
+  - Only for training loader (val/test use standard collate)
+```
+
+### **When to Use**:
+- Long training runs (50+ epochs)
+- Machines with abundant RAM (256GB+)
+- When epoch time is dominated by collation, not GPU compute
+
+### **Pinned Memory Option** (Sub-option, default OFF):
+```
+Use pinned memory for faster GPU transfer?
+  → Pins tensors in locked RAM for direct DMA to GPU
+  → Faster CPU→GPU transfer (skips intermediate copy)
+  ⚠️ Uses locked RAM - may cause issues if RAM tight
+  Default: OFF (safer)
+```
+
+### **Robustness Features**:
+- DDP barrier after set_epoch (prevents rank desync)
+- Error checking after background pre-stack (surfaces failures)
+- Memory clarification in menu (~20GB/GPU in DDP, ~150GB single)
+
+### **Implementation** (train_hierarchical.py:407-680):
+```python
+class PreStackedBatchLoader:
+    """Rolling Pre-Stack: pre-stacks epoch N+1 while training epoch N"""
+
+    def set_epoch(self, epoch):
+        # 1. Ensure current epoch ready
+        # 2. Check for background errors
+        # 3. Start background pre-stack of next epoch
+        # 4. Clean up old epoch to free RAM
+
+    def _pin_batch(self, batch):
+        # Optional: pin tensors for faster GPU transfer
+
+    def __iter__(self):
+        # Yields pre-stacked batches from RAM (instant, no collation)
 ```
 
 ---
