@@ -705,6 +705,215 @@ class PreStackedBatchLoader:
         self._num_batches_cache.clear()
 
 
+class RollingBufferBatchLoader:
+    """
+    Rolling buffer batch loader (v5.3.2) - RAM-efficient pre-stacking.
+
+    Instead of pre-stacking entire epochs (needs TB of RAM), maintains
+    a rolling buffer of N batches (configurable based on available RAM).
+
+    Benefits:
+    - Eliminates collate overhead (~9% faster)
+    - Fits in reasonable RAM (50-200 batches = 45-180 GB)
+    - Collation happens in background (parallel with GPU training)
+
+    Trade-offs:
+    - Uses more RAM than standard DataLoader (but WAY less than full epoch)
+    - Slightly more complex than standard DataLoader
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        buffer_size: int,  # Number of batches to keep in buffer
+        collate_fn,
+        rank: int = 0,
+        world_size: int = 1,
+        verbose: bool = True,
+        drop_last: bool = True,
+        use_pinned: bool = False,
+    ):
+        from collections import deque
+
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.buffer_size = buffer_size
+        self.collate_fn = collate_fn
+        self.rank = rank
+        self.world_size = world_size
+        self.verbose = verbose
+        self.drop_last = drop_last
+        self.use_pinned = use_pinned
+
+        # Rolling buffer (FIFO queue with max size)
+        self.batch_buffer = deque(maxlen=buffer_size)
+
+        # Shuffling state
+        self.current_epoch = 0
+        self.epoch_indices = {}
+
+        # Background thread for collation
+        self.collate_thread = None
+        self.collate_lock = threading.Lock()
+        self.collate_error = None
+        self.stop_background = False
+
+        # Track position
+        self.current_batch_idx = 0
+        self.total_batches = 0
+
+    def _get_rank_indices(self, epoch: int):
+        """Get shuffled indices for this epoch and rank."""
+        if epoch not in self.epoch_indices:
+            # Generate shuffle for this epoch
+            dataset_size = len(self.dataset)
+            g = torch.Generator()
+            g.manual_seed(42 + epoch)
+            all_indices = torch.randperm(dataset_size, generator=g).tolist()
+
+            if self.world_size > 1:
+                # Split across ranks (DDP)
+                per_rank = len(all_indices) // self.world_size
+                start = self.rank * per_rank
+                end = start + per_rank
+                self.epoch_indices[epoch] = all_indices[start:end]
+            else:
+                self.epoch_indices[epoch] = all_indices
+
+        return self.epoch_indices[epoch]
+
+    def _collate_batch(self, batch_idx: int, epoch_indices: list):
+        """Collate a single batch."""
+        start = batch_idx * self.batch_size
+        end = start + self.batch_size
+
+        if start >= len(epoch_indices):
+            return None
+
+        batch_indices = epoch_indices[start:end]
+        if len(batch_indices) < self.batch_size and self.drop_last:
+            return None
+
+        # Fetch samples
+        samples = [self.dataset[i] for i in batch_indices]
+
+        # Collate
+        batch = self.collate_fn(samples, suppress_slow_warnings=True)
+
+        # Pin memory if requested
+        if self.use_pinned:
+            batch = self._pin_batch(batch)
+
+        return batch
+
+    def _pin_batch(self, batch):
+        """Pin tensors for faster GPU transfer (same as PreStackedBatchLoader)."""
+        def pin_tensor(t):
+            if t is None:
+                return None
+            if isinstance(t, torch.Tensor) and not t.is_pinned():
+                return t.pin_memory()
+            return t
+
+        def pin_dict(d):
+            if d is None:
+                return None
+            return {k: pin_tensor(v) for k, v in d.items()}
+
+        if len(batch) == 4:
+            features, targets, vix_batch, events_batch = batch
+            features = pin_dict(features) if isinstance(features, dict) else pin_tensor(features)
+            targets = pin_dict(targets)
+            vix_batch = pin_tensor(vix_batch)
+            events_batch = pin_tensor(events_batch)
+            return (features, targets, vix_batch, events_batch)
+        else:
+            features, targets = batch
+            features = pin_dict(features) if isinstance(features, dict) else pin_tensor(features)
+            targets = pin_dict(targets)
+            return (features, targets)
+
+    def _fill_initial_buffer(self, epoch_indices: list):
+        """Pre-collate initial buffer before training starts."""
+        if self.verbose and self.rank == 0:
+            print(f"📦 Rolling buffer: Pre-collating first {self.buffer_size} batches...")
+
+        for i in range(min(self.buffer_size, self.total_batches)):
+            batch = self._collate_batch(i, epoch_indices)
+            if batch is not None:
+                self.batch_buffer.append(batch)
+
+        if self.verbose and self.rank == 0:
+            buffer_gb = len(self.batch_buffer) * (self.batch_size * 3.6e6) / 1e9
+            print(f"   ✓ Buffer ready: {len(self.batch_buffer)} batches ({buffer_gb:.0f} GB)")
+
+    def set_epoch(self, epoch: int):
+        """Set current epoch and initialize buffer."""
+        self.current_epoch = epoch
+        self.current_batch_idx = 0
+
+        # Get indices for this epoch
+        epoch_indices = self._get_rank_indices(epoch)
+        self.total_batches = len(epoch_indices) // self.batch_size
+        if not self.drop_last and len(epoch_indices) % self.batch_size > 0:
+            self.total_batches += 1
+
+        # Clear old buffer
+        self.batch_buffer.clear()
+
+        # Fill initial buffer
+        self._fill_initial_buffer(epoch_indices)
+
+        # Store indices for background collation
+        self._current_epoch_indices = epoch_indices
+
+    def _background_collate_next(self, next_batch_idx: int):
+        """Collate next batch in background."""
+        try:
+            batch = self._collate_batch(next_batch_idx, self._current_epoch_indices)
+            if batch is not None:
+                with self.collate_lock:
+                    self.batch_buffer.append(batch)  # Deque auto-drops oldest
+        except Exception as e:
+            self.collate_error = e
+
+    def __iter__(self):
+        """Iterate over batches with rolling buffer."""
+        epoch_indices = self._current_epoch_indices
+
+        for batch_idx in range(self.total_batches):
+            # Get batch from buffer (should be at front)
+            with self.collate_lock:
+                if len(self.batch_buffer) == 0:
+                    # Buffer empty - shouldn't happen, but fallback to direct collate
+                    batch = self._collate_batch(batch_idx, epoch_indices)
+                else:
+                    batch = self.batch_buffer.popleft()
+
+            # Start background collation of future batch
+            next_batch_idx = batch_idx + self.buffer_size
+            if next_batch_idx < self.total_batches:
+                thread = threading.Thread(
+                    target=self._background_collate_next,
+                    args=(next_batch_idx,),
+                    daemon=True
+                )
+                thread.start()
+
+            yield batch
+
+    def __len__(self):
+        """Number of batches in epoch."""
+        return self.total_batches
+
+    def cleanup(self):
+        """Clean up resources."""
+        self.stop_background = True
+        self.batch_buffer.clear()
+        self.epoch_indices.clear()
+
+
 def load_cache_manifests(cache_dir: Path):
     """Load cache manifests from a directory."""
     manifests = []
@@ -1638,30 +1847,63 @@ def interactive_setup(args, profiler=None):
     # v5.3.2: Pre-stacking option for faster epochs
     print()
     total_ram = hw_info.get('total_ram_gb', 16)
-    prestack_recommended = total_ram >= 128  # Recommend if 128GB+ RAM
 
-    # Memory clarification: ~20GB per GPU in DDP, or ~150GB total for single GPU
-    # Multi-GPU splits data, so each rank pre-stacks 1/world_size
-    if prestack_recommended:
-        prestack_msg = "Enable batch pre-stacking? (~20GB/GPU or ~150GB single, ~40% faster) ⭐ Recommended"
-    else:
-        prestack_msg = f"Enable batch pre-stacking? (~20GB/GPU or ~150GB single, you have {total_ram:.0f}GB)"
+    # v5.3.2: Calculate realistic RAM requirements per mode
+    # Native TF mode: ~3.6 MB per sample
+    bytes_per_sample = 3.6e6
+    estimated_train_samples = 1_400_000  # Approximate
+    batch_size_estimate = 256  # Typical
+    batches_per_epoch = estimated_train_samples // batch_size_estimate
+    bytes_per_batch = batch_size_estimate * bytes_per_sample
 
-    args.use_prestack = inquirer.confirm(
-        message=prestack_msg,
-        default=prestack_recommended
+    # Full epoch RAM (2 epochs in memory)
+    full_epoch_ram_gb = (2 * batches_per_epoch * bytes_per_batch) / 1e9
+
+    # Rolling buffer RAM (calculate optimal buffer size)
+    safety_margin = 0.8  # Use 80% of available RAM
+    usable_ram_gb = total_ram * safety_margin
+    max_buffer_batches = int((usable_ram_gb * 1e9) / bytes_per_batch)
+    rolling_buffer_ram_gb = (max_buffer_batches * bytes_per_batch) / 1e9
+
+    # Pre-stacking mode selection
+    prestack_choices = [
+        "Disabled - Standard DataLoader (safe, ~9% slower) ⭐ Recommended",
+        f"Rolling Buffer - Pre-stack {max_buffer_batches} batches (~{rolling_buffer_ram_gb:.0f}GB RAM, ~9% faster)",
+        f"Full Epoch - Pre-stack all batches (~{full_epoch_ram_gb:.0f}GB RAM, ~40% faster) ⚠️ Needs massive RAM"
+    ]
+
+    prestack_choice = inquirer.select(
+        message="Batch pre-stacking mode:",
+        choices=prestack_choices,
+        default=prestack_choices[0]
     ).execute()
+
+    # Parse selection
+    if "Disabled" in prestack_choice:
+        args.use_prestack = False
+        args.prestack_mode = None
+        print("   → Standard DataLoader (collate during training)")
+    elif "Rolling Buffer" in prestack_choice:
+        args.use_prestack = True
+        args.prestack_mode = 'rolling'
+        args.prestack_buffer_size = max_buffer_batches
+        print(f"   📦 Rolling buffer enabled ({max_buffer_batches} batches, {rolling_buffer_ram_gb:.0f} GB RAM)")
+        print(f"      → Pre-stacks next {max_buffer_batches} batches ahead")
+        print(f"      → Background thread maintains rolling window")
+        print(f"      → Eliminates collate wait (~9% faster)")
+        print()
+    else:  # Full Epoch
+        args.use_prestack = True
+        args.prestack_mode = 'full_epoch'
+        args.prestack_buffer_size = None
+        print(f"   📦 Full epoch pre-stacking enabled")
+        print(f"      ⚠️ WARNING: Needs ~{full_epoch_ram_gb:.0f}GB RAM (you have {total_ram:.0f}GB)")
+        print(f"      → Will likely OOM if RAM insufficient!")
+        print()
 
     # v5.3.2: Pinned memory option (only if prestack enabled)
     args.use_pinned_prestack = False
     if args.use_prestack:
-        print("   📦 Pre-stacking enabled (Rolling Pre-Stack)")
-        print("      → Epoch 1 pre-stacked before training (~5-10 min)")
-        print("      → Subsequent epochs pre-stacked in background")
-        print("      → Eliminates ~1.3s/batch collate overhead")
-        print("      → Expected speedup: ~40% faster epochs")
-        print()
-
         # Pinned memory sub-option
         pinned_msg = "Use pinned memory for faster GPU transfer? (⚠️ uses locked RAM, may cause issues if RAM tight)"
         args.use_pinned_prestack = inquirer.confirm(
@@ -1674,8 +1916,6 @@ def interactive_setup(args, profiler=None):
             print("      ⚠️ Warning: If you see CUDA OOM, disable this option")
         else:
             print("   → Standard memory (safe, slightly slower transfer)")
-    else:
-        print("   → Standard DataLoader (collate during training)")
 
     # Get recommended batch size
     total_ram = hw_info.get('total_ram_gb', 16)
@@ -2197,8 +2437,13 @@ def interactive_setup(args, profiler=None):
     print(f"  Data Loading: mmap + OS page cache (no pre-merge)")
     # v5.3.2: Pre-stacking status
     if getattr(args, 'use_prestack', False):
+        prestack_mode = getattr(args, 'prestack_mode', 'full_epoch')
         pinned_str = " + pinned" if getattr(args, 'use_pinned_prestack', False) else ""
-        print(f"  Batch Pre-Stack: Enabled (rolling{pinned_str}, ~40% faster) ⭐")
+        if prestack_mode == 'rolling':
+            buffer_size = getattr(args, 'prestack_buffer_size', 100)
+            print(f"  Batch Pre-Stack: Rolling buffer ({buffer_size} batches{pinned_str}, ~9% faster) ⭐")
+        else:
+            print(f"  Batch Pre-Stack: Full epoch (2 epochs{pinned_str}, ~40% faster) ⚠️ High RAM")
     else:
         print(f"  Batch Pre-Stack: Disabled (standard collate)")
     print(f"  Cache: {'Regenerate' if getattr(args, 'regenerate_cache', True) else 'Use existing'}")
@@ -2922,21 +3167,43 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # v5.3.2: Create PreStackedBatchLoader if enabled
     prestack_loader = None
     if getattr(args, 'use_prestack', False):
-        if is_main_process(rank):
-            print(f"\n   📦 Pre-stack mode enabled - creating PreStackedBatchLoader...")
-        prestack_loader = PreStackedBatchLoader(
-            dataset=train_dataset,
-            batch_size=args.batch_size,
-            num_epochs=args.epochs,
-            collate_fn=hierarchical_collate,
-            rank=rank if is_distributed else 0,
-            world_size=world_size if is_distributed else 1,
-            verbose=is_main_process(rank),
-            drop_last=True,
-            use_pinned=getattr(args, 'use_pinned_prestack', False),
-        )
-        if is_main_process(rank):
-            print(f"   ✓ PreStackedBatchLoader ready ({len(prestack_loader)} batches/epoch)")
+        prestack_mode = getattr(args, 'prestack_mode', 'full_epoch')
+
+        if prestack_mode == 'rolling':
+            # v5.3.2: Rolling buffer mode - RAM-efficient
+            if is_main_process(rank):
+                print(f"\n   📦 Rolling buffer mode - creating RollingBufferBatchLoader...")
+            prestack_loader = RollingBufferBatchLoader(
+                dataset=train_dataset,
+                batch_size=args.batch_size,
+                buffer_size=getattr(args, 'prestack_buffer_size', 100),
+                collate_fn=hierarchical_collate,
+                rank=rank if is_distributed else 0,
+                world_size=world_size if is_distributed else 1,
+                verbose=is_main_process(rank),
+                drop_last=True,
+                use_pinned=getattr(args, 'use_pinned_prestack', False),
+            )
+            if is_main_process(rank):
+                buffer_size = getattr(args, 'prestack_buffer_size', 100)
+                print(f"   ✓ RollingBufferBatchLoader ready ({buffer_size} batch buffer)")
+        else:
+            # Original full epoch mode
+            if is_main_process(rank):
+                print(f"\n   📦 Full epoch mode - creating PreStackedBatchLoader...")
+            prestack_loader = PreStackedBatchLoader(
+                dataset=train_dataset,
+                batch_size=args.batch_size,
+                num_epochs=args.epochs,
+                collate_fn=hierarchical_collate,
+                rank=rank if is_distributed else 0,
+                world_size=world_size if is_distributed else 1,
+                verbose=is_main_process(rank),
+                drop_last=True,
+                use_pinned=getattr(args, 'use_pinned_prestack', False),
+            )
+            if is_main_process(rank):
+                print(f"   ✓ PreStackedBatchLoader ready ({len(prestack_loader)} batches/epoch)")
 
 
     # =========================================================================
