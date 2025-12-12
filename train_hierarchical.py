@@ -3033,8 +3033,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         mode='min',           # Reduce when val_loss stops decreasing
         factor=0.5,           # Halve LR when stuck
         patience=5,           # Wait 5 epochs before reducing
-        min_lr=1e-6,          # Don't go below this
-        verbose=True          # Print when LR changes
+        min_lr=1e-6           # Don't go below this
     )
 
     # AMP scaler for mixed precision
