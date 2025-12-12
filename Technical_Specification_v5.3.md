@@ -116,9 +116,9 @@ Then **geometric projection IS the answer** - adjustments become small refinemen
 - **Fixed**: LR scheduler instability (Cosine → ReduceLROnPlateau)
   - Before: Dropped to 0.000002 causing gradient chaos (1308 → 2.4 → 39)
   - After: Adaptive plateau reduction (monitors val_loss, stable decay)
-- **Expanded**: Break predictor features to all 9 trading timeframes
-  - Before: SPY-TSLA alignment (1h, 4h only), duration_ratio (1h, 4h, daily only)
-  - After: All trading TFs (5min → weekly) for comprehensive break pattern learning
+- **Expanded**: Break predictor features to ALL 11 timeframes with adaptive windows
+  - Before: SPY-TSLA alignment (1h, 4h only), duration_ratio (1h, 4h, daily only), fixed 50-bar rolling window
+  - After: ALL 11 TFs (5min → 3month) with adaptive rolling windows (1500 bars for 5min down to 8 bars for 3month)
 - **Fixed**: Scheduler get_last_lr() bug (incompatible with ReduceLROnPlateau)
 
 **Problem Solved**: Weekly dominated selection (54-58%) across ALL flow modes
@@ -646,7 +646,7 @@ deprecated_code/backend/         # FastAPI dashboard (incomplete, moved v5.3.2)
 | Duration | Fixed 24 bars | Fixed 24 bars | Learned (VIX+events) | Learned (parents+VIX+events) | Same | Same |
 | VIX | 15 scalars | 15 scalars | CfC sequence (90 days) | CfC sequence | CfC sequence | CfC sequence |
 | Events | Static | Static | Dynamic APIs | Dynamic APIs | Dynamic APIs | Dynamic APIs |
-| Break predictors | N/A | N/A | Limited TFs | Limited TFs | Limited TFs | **All 9 TFs** |
+| Break predictors | N/A | N/A | Limited TFs | Limited TFs | Limited TFs | **All 11 TFs (adaptive)** |
 | Validity | Learned conf | Learned conf | Forward-looking | Forward-looking | Forward-looking | Forward-looking |
 | Confidence | Meta-learned | Meta-learned | Meta-learned | Calibrated (MSE) | Calibrated (MSE) | Calibrated (MSE) |
 | Transitions | N/A | N/A | Compositor | Compositor | Compositor | Compositor |

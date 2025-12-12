@@ -383,17 +383,34 @@ scheduler = ReduceLROnPlateau(mode='min', factor=0.5, patience=5)
 ```
 **Impact:** Stable training, no gradient chaos (1308 → 2.4 → 39 spikes)
 
-### **Fix 5 & 6: Expanded Feature Coverage** ✅
-**Location:** `src/ml/features.py:295-298, 3520, 3534`
+### **Fix 5 & 6: Expanded Feature Coverage with Adaptive Windows** ✅
+**Location:** `src/ml/features.py:295-298, 3522-3551`
 ```python
-# Before: Limited timeframes
+# Before: Limited timeframes, fixed 50-bar rolling window
 for tf in ['1h', '4h', 'daily']:  # duration_ratio
 for tf in ['1h', '4h']:           # SPY-TSLA alignment
+avg_stability = stability.rolling(50, min_periods=10).mean()  # Fixed window!
 
-# After: All trading timeframes
-for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
+# After: ALL 11 timeframes with adaptive rolling windows
+adaptive_windows = {
+    '5min': 1500,    # ~30 days (19 trading days)
+    '15min': 400,    # ~100 hours
+    '30min': 300,    # ~187.5 hours
+    '1h': 200,       # ~200 hours
+    '2h': 100,       # ~200 hours
+    '3h': 80,        # ~240 hours
+    '4h': 60,        # ~240 hours
+    'daily': 100,    # 100 days (~4 months)
+    'weekly': 20,    # 20 weeks (~5 months)
+    'monthly': 15,   # 15 months (~1.25 years)
+    '3month': 8,     # 8 quarters (2 years)
+}
+
+for tf in ALL_11_TIMEFRAMES:
+    window = adaptive_windows[tf]
+    avg_stability = stability.rolling(window, min_periods=window//2).mean()
 ```
-**Impact:** Break predictors available for all TFs, not just subset
+**Impact:** Break predictors available for ALL 11 TFs with appropriate historical context per TF
 
 ### **Expected Improvements:**
 - Faster TFs (5min, 15min, 30min) should get selected more often

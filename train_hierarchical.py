@@ -2234,9 +2234,9 @@ def interactive_setup(args, profiler=None):
     print(f"  Events: FOMC + Earnings + Deliveries + Macro")
     print(f"  Parent Context: Duration sees 2 larger TFs")
 
-    # v5.3.2: Quality & break predictors
+    # v5.3.2: Quality & break predictors (adaptive windows)
     print(f"  Channel Quality: Ping-pongs primary (v5.3.2)")
-    print(f"  Break Predictors: All 9 TFs - duration_ratio + SPY-TSLA alignment")
+    print(f"  Break Predictors: ALL 11 TFs (adaptive windows) - duration_ratio + SPY-TSLA alignment")
 
     # v5.3: RSI validation
     rsi_mode = getattr(args, 'rsi_direction_guidance', 'soft_bias')

@@ -291,10 +291,10 @@ class TradingFeatureExtractor(FeatureExtractor):
         features.append('tsla_volume_surge')
         for tf in ['15min', '1h', '4h', 'daily']:
             features.append(f'tsla_rsi_divergence_{tf}')
-        # v5.3.2: Expanded to all trading TFs for comprehensive break prediction
-        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
+        # v5.3.2: Expanded to ALL 11 TFs with adaptive rolling windows for break prediction
+        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             features.append(f'tsla_channel_duration_ratio_{tf}')
-        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
+        for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             features.append(f'channel_alignment_spy_tsla_{tf}')
 
         # Time-in-channel features (additional breakdown indicators)
@@ -3515,23 +3515,40 @@ class TradingFeatureExtractor(FeatureExtractor):
                 breakdown_features[f'tsla_rsi_divergence_{tf_name}'] = np.zeros(num_rows)
 
         # 3. Channel duration vs historical average
-        # v5.3.2: Expanded to all trading TFs for comprehensive break prediction
+        # v5.3.2: Expanded to ALL 11 TFs with adaptive rolling windows
         # Use stability score as proxy for channel duration
-        for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
+
+        # Adaptive window sizes based on data availability (maximized where possible)
+        adaptive_windows = {
+            '5min': 1500,    # ~30 days (19 trading days × 78 bars/day)
+            '15min': 400,    # ~100 hours of trading
+            '30min': 300,    # ~187.5 hours
+            '1h': 200,       # ~200 hours (~30 trading days)
+            '2h': 100,       # ~200 hours
+            '3h': 80,        # ~240 hours
+            '4h': 60,        # ~240 hours
+            'daily': 100,    # 100 days (~4 months)
+            'weekly': 20,    # 20 weeks (~5 months)
+            'monthly': 15,   # 15 months (~1.25 years)
+            '3month': 8,     # 8 quarters (2 years)
+        }
+
+        for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             stability_col = f'tsla_channel_{tf_name}_stability'
 
             if stability_col in features_df.columns:
                 stability = features_df[stability_col]
-                # Duration ratio = current stability vs rolling average
-                avg_stability = stability.rolling(50, min_periods=10).mean()
+                # Duration ratio = current stability vs rolling average (adaptive window per TF)
+                window = adaptive_windows[tf_name]
+                avg_stability = stability.rolling(window, min_periods=window//2).mean()
                 duration_ratio = (stability / (avg_stability + 1e-8)).fillna(1.0)
                 breakdown_features[f'tsla_channel_duration_ratio_{tf_name}'] = duration_ratio.values
             else:
                 breakdown_features[f'tsla_channel_duration_ratio_{tf_name}'] = np.ones(num_rows)
 
         # 4. SPY-TSLA channel alignment
-        # v5.3.2: Expanded to all trading TFs for comprehensive break prediction
-        for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']:
+        # v5.3.2: Expanded to ALL 11 TFs for comprehensive break prediction
+        for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             tsla_pos_col = f'tsla_channel_{tf_name}_position'
             spy_pos_col = f'spy_channel_{tf_name}_position'
 
