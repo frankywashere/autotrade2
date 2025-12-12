@@ -3484,6 +3484,57 @@ class TradingFeatureExtractor(FeatureExtractor):
         breakdown_features = {}
         num_rows = len(features_df)
 
+        # v5.3.2: For native TF mode, we need to load w50 window stability/position from mmap chunks
+        # In native TF mode, channel features are in chunks, not in features_df (which only has shared cols)
+        # We'll load them from the cache directory if available
+        # IMPORTANT: Track added columns so we can remove them after calculation (don't save to cache!)
+        _temp_w50_cols_added = []
+
+        if hasattr(self, '_unified_cache_dir'):
+            cache_dir = self._unified_cache_dir
+
+            # Try to find and load mmap chunks to get w50 stability/position
+            mmap_meta_files = list(cache_dir.glob('features_mmap_meta_*.json'))
+
+            if mmap_meta_files and len(mmap_meta_files) > 0:
+                import json
+
+                # Load the mmap metadata
+                with open(mmap_meta_files[0], 'r') as f:
+                    mmap_meta = json.load(f)
+
+                chunk_info = mmap_meta.get('chunk_info', [])
+                # FIX: Use correct key name 'feature_columns' (not 'columns')
+                columns = mmap_meta.get('feature_columns', [])
+
+                # Find w50 stability and position columns
+                w50_cols = {}
+                w50_indices = {}
+                for i, col in enumerate(columns):
+                    if '_w50_stability' in col or '_w50_position' in col:
+                        w50_cols[col] = i
+                        w50_indices[i] = col
+
+                if w50_cols:
+                    # Load just the w50 columns from mmap chunks
+                    channel_data = {col: [] for col in w50_cols.keys()}
+
+                    for chunk in chunk_info:
+                        chunk_path = cache_dir / chunk['path']
+                        if chunk_path.exists():
+                            # Memory-map this chunk
+                            chunk_mmap = np.load(chunk_path, mmap_mode='r')
+
+                            # Extract w50 columns
+                            for col_name, col_idx in w50_cols.items():
+                                channel_data[col_name].append(chunk_mmap[:, col_idx])
+
+                    # Concatenate all chunks and add to features_df temporarily
+                    for col in w50_cols.keys():
+                        if channel_data[col]:
+                            features_df[col] = np.concatenate(channel_data[col])
+                            _temp_w50_cols_added.append(col)  # Track for removal later
+
         # Extract necessary data from RAW df (OHLCV)
         tsla_prices = raw_df['tsla_close'].values
         spy_prices = raw_df['spy_close'].values
@@ -3534,59 +3585,98 @@ class TradingFeatureExtractor(FeatureExtractor):
         }
 
         for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
-            stability_col = f'tsla_channel_{tf_name}_stability'
+            # v5.3.2: In native TF mode, stability has window suffix (e.g., w50)
+            # Try both column name formats
+            stability_col = f'tsla_channel_{tf_name}_stability'  # Non-native mode
+            stability_col_w50 = f'tsla_channel_{tf_name}_w50_stability'  # Native TF mode
 
             if stability_col in features_df.columns:
                 stability = features_df[stability_col]
-                # Duration ratio = current stability vs rolling average (adaptive window per TF)
-                window = adaptive_windows[tf_name]
-                avg_stability = stability.rolling(window, min_periods=window//2).mean()
-                duration_ratio = (stability / (avg_stability + 1e-8)).fillna(1.0)
-                breakdown_features[f'tsla_channel_duration_ratio_{tf_name}'] = duration_ratio.values
+            elif stability_col_w50 in features_df.columns:
+                # Native TF mode - use w50 window as representative
+                stability = features_df[stability_col_w50]
             else:
+                # Column not found - fill with default
                 breakdown_features[f'tsla_channel_duration_ratio_{tf_name}'] = np.ones(num_rows)
+                continue
+
+            # Duration ratio = current stability vs rolling average (adaptive window per TF)
+            window = adaptive_windows[tf_name]
+            avg_stability = stability.rolling(window, min_periods=window//2).mean()
+            duration_ratio = (stability / (avg_stability + 1e-8)).fillna(1.0)
+            breakdown_features[f'tsla_channel_duration_ratio_{tf_name}'] = duration_ratio.values
 
         # 4. SPY-TSLA channel alignment
         # v5.3.2: Expanded to ALL 11 TFs for comprehensive break prediction
         for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
+            # v5.3.2: In native TF mode, position has window suffix (e.g., w50)
+            # Try both column name formats
             tsla_pos_col = f'tsla_channel_{tf_name}_position'
             spy_pos_col = f'spy_channel_{tf_name}_position'
+            tsla_pos_col_w50 = f'tsla_channel_{tf_name}_w50_position'
+            spy_pos_col_w50 = f'spy_channel_{tf_name}_w50_position'
 
+            # Try to find position columns (both formats)
             if tsla_pos_col in features_df.columns and spy_pos_col in features_df.columns:
-                tsla_pos = features_df[tsla_pos_col] * 2 - 1  # Convert 0-1 to -1 to +1
-                spy_pos = features_df[spy_pos_col] * 2 - 1
-
-                # Alignment: both at top (+1) or both at bottom (-1) = high alignment
-                alignment = tsla_pos * spy_pos  # -1 to +1
-                breakdown_features[f'channel_alignment_spy_tsla_{tf_name}'] = alignment.values
+                tsla_pos = features_df[tsla_pos_col]
+                spy_pos = features_df[spy_pos_col]
+            elif tsla_pos_col_w50 in features_df.columns and spy_pos_col_w50 in features_df.columns:
+                # Native TF mode - use w50 window
+                tsla_pos = features_df[tsla_pos_col_w50]
+                spy_pos = features_df[spy_pos_col_w50]
             else:
+                # Columns not found - fill with default
                 breakdown_features[f'channel_alignment_spy_tsla_{tf_name}'] = np.zeros(num_rows)
+                continue
+
+            # Convert to -1 to +1 range and calculate alignment
+            tsla_pos = tsla_pos * 2 - 1  # Convert 0-1 to -1 to +1
+            spy_pos = spy_pos * 2 - 1
+
+            # Alignment: both at top (+1) or both at bottom (-1) = high alignment
+            alignment = tsla_pos * spy_pos  # -1 to +1
+            breakdown_features[f'channel_alignment_spy_tsla_{tf_name}'] = alignment.values
 
         # 5. Time in channel features (11 timeframes × 2 stocks)
         # Use channel stability as proxy (higher stability = longer time in channel)
         for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             for symbol in ['tsla', 'spy']:
+                # v5.3.2: Try both column formats (with/without window suffix)
                 stability_col = f'{symbol}_channel_{tf_name}_stability'
+                stability_col_w50 = f'{symbol}_channel_{tf_name}_w50_stability'
 
                 if stability_col in features_df.columns:
-                    # Normalize stability to represent "time in channel" score
                     stability = features_df[stability_col]
-                    time_in_channel = np.clip(stability * 100, 0, 100)  # 0-100 scale
-                    breakdown_features[f'{symbol}_time_in_channel_{tf_name}'] = time_in_channel.values
+                elif stability_col_w50 in features_df.columns:
+                    # Native TF mode - use w50 window
+                    stability = features_df[stability_col_w50]
                 else:
                     breakdown_features[f'{symbol}_time_in_channel_{tf_name}'] = np.zeros(num_rows)
+                    continue
+
+                # Normalize stability to represent "time in channel" score
+                time_in_channel = np.clip(stability * 100, 0, 100)  # 0-100 scale
+                breakdown_features[f'{symbol}_time_in_channel_{tf_name}'] = time_in_channel.values
 
         # 6. Enhanced normalized channel position (11 timeframes × 2 stocks)
         for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
             for symbol in ['tsla', 'spy']:
+                # v5.3.2: Try both column formats (with/without window suffix)
                 pos_col = f'{symbol}_channel_{tf_name}_position'
+                pos_col_w50 = f'{symbol}_channel_{tf_name}_w50_position'
 
                 if pos_col in features_df.columns:
-                    # Convert 0-1 position to -1 to +1 (bottom to top)
-                    position_norm = features_df[pos_col] * 2 - 1
-                    breakdown_features[f'{symbol}_channel_position_norm_{tf_name}'] = position_norm.values
+                    position = features_df[pos_col]
+                elif pos_col_w50 in features_df.columns:
+                    # Native TF mode - use w50 window
+                    position = features_df[pos_col_w50]
                 else:
                     breakdown_features[f'{symbol}_channel_position_norm_{tf_name}'] = np.zeros(num_rows)
+                    continue
+
+                # Convert 0-1 position to -1 to +1 (bottom to top)
+                position_norm = position * 2 - 1
+                breakdown_features[f'{symbol}_channel_position_norm_{tf_name}'] = position_norm.values
 
         # 7. Binary feature flags (NO LEAKAGE - past data only)
 
@@ -3702,6 +3792,13 @@ class TradingFeatureExtractor(FeatureExtractor):
             print(f"   Missing/Extra: {num_breakdown - expected_breakdown} features")
         else:
             print(f"   ✓ Breakdown features: {num_breakdown} (correct)")
+
+        # FIX: Remove temporary w50 columns from features_df to prevent saving to cache
+        # These were only needed for breakdown calculation, not for final saved features
+        if _temp_w50_cols_added:
+            for col in _temp_w50_cols_added:
+                if col in features_df.columns:
+                    features_df.drop(columns=[col], inplace=True)
 
         return pd.DataFrame(breakdown_features, index=raw_df.index)
 
