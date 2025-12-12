@@ -170,9 +170,15 @@ MIN_LOOKBACK_MONTHS = 30       # 2.5 years = 30 months (was 3 in v3.12)
 CONTINUATION_LOOKBACK_1H = 25740   # 3 months at 1-min bars (66 trading days × 390 bars/day)
 CONTINUATION_LOOKBACK_4H = 98280   # 1 year at 1-min bars (252 trading days × 390 bars/day)
 
+# v5.3.2: Adaptive rolling window for breakdown features (in 1-min bars)
+# Largest window is 3month: 8 quarters × 66 days/quarter × 390 bars/day
+MAX_ADAPTIVE_WINDOW_BARS = 206160  # 528 trading days for 3month adaptive window
+
 # Training dataset warmup settings
 SKIP_WARMUP_PERIOD = True      # Automatically exclude insufficient-history timestamps
-WARMUP_BARS = MIN_LOOKBACK_BARS  # Can be overridden if needed
+# Master warmup: max of all requirements (channel windows, adaptive windows, continuation)
+WARMUP_BARS = max(MIN_LOOKBACK_BARS, MAX_ADAPTIVE_WINDOW_BARS, CONTINUATION_LOOKBACK_4H)
+# = max(257400, 206160, 98280) = 257400 (channel requirement is largest)
 
 # Buffer calculation
 AUTO_CALCULATE_BUFFER = True   # Calculate buffer from feature requirements

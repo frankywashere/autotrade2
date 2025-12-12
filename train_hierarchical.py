@@ -2645,15 +2645,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print(f"✓ torch.compile verbose logging enabled (comprehensive mode)")
             print(f"   TORCH_LOGS=dynamo,inductor,aot_autograd,output_code,graph_breaks,fusion")
 
-    # Load configuration
+    # Load configuration (currently unused - model uses hardcoded loss weights)
+    # v5.3.2: Removed unused loss_weights variable (was loaded but never passed to model)
     config = None
-    loss_weights = None
     if Path(args.config).exists():
         with open(args.config) as f:
             config = yaml.safe_load(f)
-            loss_weights = config.get('loss_weights', None)
         if is_main_process(rank):
-            print(f"✅ Loaded config from: {args.config}")
+            print(f"✅ Loaded config from: {args.config} (currently unused)")
     else:
         if is_main_process(rank):
             print(f"⚠️ Config not found: {args.config}, using defaults")
@@ -2809,6 +2808,19 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     features_df = result[0]
     continuation_labels_dir = result[1]  # Path to directory with per-TF label files
     mmap_meta_path = result[2] if len(result) > 2 else None
+
+    # v5.3.2: Slice features_df to match df_sliced (apply warmup period)
+    # Features were extracted on full df for rolling window context, but we only use post-warmup data
+    if features_df is not None and len(df_sliced) != len(df):
+        warmup_offset = df.index.get_loc(df_sliced.index[0])
+        if is_main_process(rank):
+            print(f"   Applying warmup offset: Slicing features from index {warmup_offset} ({df.index[warmup_offset].date()})")
+        features_df = features_df.iloc[warmup_offset:]
+        # Also slice raw OHLC to match
+        df = df.iloc[warmup_offset:]
+        if is_main_process(rank):
+            print(f"   ✓ Features after warmup: {len(features_df):,} rows ({features_df.index[0].date()} to {features_df.index[-1].date()})")
+
     non_channel_cols = features_df.columns.tolist() if features_df is not None else None
 
     if profiler:

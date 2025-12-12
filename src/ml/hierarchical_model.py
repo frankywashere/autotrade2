@@ -1546,10 +1546,11 @@ class HierarchicalLNN(nn.Module, ModelBase):
         timeframe_data = {}
 
         # Distribute to timeframes with appropriate sequence lengths
+        # v5.3.2: Fixed fallback to match config.py (was incorrectly all 200 for intraday TFs)
         seq_lens = getattr(project_config, 'TIMEFRAME_SEQUENCE_LENGTHS', {
-            '5min': 200, '15min': 200, '30min': 200, '1h': 200,
-            '2h': 100, '3h': 100, '4h': 100,
-            'daily': 60, 'weekly': 52, 'monthly': 24, '3month': 12,
+            '5min': 200, '15min': 100, '30min': 80, '1h': 168,
+            '2h': 84, '3h': 56, '4h': 42,
+            'daily': 30, 'weekly': 20, 'monthly': 12, '3month': 8,
         })
 
         batch_size, full_seq_len, n_features = x.shape

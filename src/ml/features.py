@@ -3535,6 +3535,32 @@ class TradingFeatureExtractor(FeatureExtractor):
                             features_df[col] = np.concatenate(channel_data[col])
                             _temp_w50_cols_added.append(col)  # Track for removal later
 
+                # Also load monthly/3month w50 columns from monthly shard
+                monthly_shard_info = mmap_meta.get('monthly_3month_shard', {})
+                if monthly_shard_info and monthly_shard_info.get('columns'):
+                    monthly_cols = monthly_shard_info['columns']
+                    monthly_path_rel = monthly_shard_info.get('path')
+
+                    if monthly_path_rel:
+                        monthly_path = cache_dir / monthly_path_rel
+
+                        # Find monthly/3month w50 stability and position columns
+                        monthly_w50_cols = {}
+                        for i, col in enumerate(monthly_cols):
+                            # Only get monthly and 3month w50 stability/position
+                            if ('_monthly_w50_stability' in col or '_monthly_w50_position' in col or
+                                '_3month_w50_stability' in col or '_3month_w50_position' in col):
+                                monthly_w50_cols[col] = i
+
+                        if monthly_w50_cols and monthly_path.exists():
+                            # Load the monthly shard
+                            monthly_mmap = np.load(monthly_path, mmap_mode='r')
+
+                            # Extract w50 columns and add to features_df
+                            for col_name, col_idx in monthly_w50_cols.items():
+                                features_df[col_name] = monthly_mmap[:, col_idx]
+                                _temp_w50_cols_added.append(col_name)
+
         # Extract necessary data from RAW df (OHLCV)
         tsla_prices = raw_df['tsla_close'].values
         spy_prices = raw_df['spy_close'].values
@@ -3570,18 +3596,20 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Use stability score as proxy for channel duration
 
         # Adaptive window sizes based on data availability (maximized where possible)
+        # CRITICAL: These are in 1-MIN bars (features_df is 1-min resolution!)
+        # To get N bars at TF resolution, multiply by minutes per bar
         adaptive_windows = {
-            '5min': 1500,    # ~30 days (19 trading days × 78 bars/day)
-            '15min': 400,    # ~100 hours of trading
-            '30min': 300,    # ~187.5 hours
-            '1h': 200,       # ~200 hours (~30 trading days)
-            '2h': 100,       # ~200 hours
-            '3h': 80,        # ~240 hours
-            '4h': 60,        # ~240 hours
-            'daily': 100,    # 100 days (~4 months)
-            'weekly': 20,    # 20 weeks (~5 months)
-            'monthly': 15,   # 15 months (~1.25 years)
-            '3month': 8,     # 8 quarters (2 years)
+            '5min': 7500,     # 1500 5-min bars × 5 min/bar = 7500 1-min bars (~19 trading days)
+            '15min': 6000,    # 400 15-min bars × 15 min/bar = 6000 1-min bars (~15 trading days)
+            '30min': 9000,    # 300 30-min bars × 30 min/bar = 9000 1-min bars (~23 trading days)
+            '1h': 12000,      # 200 1-hour bars × 60 min/bar = 12000 1-min bars (~31 trading days)
+            '2h': 12000,      # 100 2-hour bars × 120 min/bar = 12000 1-min bars (~31 trading days)
+            '3h': 14400,      # 80 3-hour bars × 180 min/bar = 14400 1-min bars (~37 trading days)
+            '4h': 14400,      # 60 4-hour bars × 240 min/bar = 14400 1-min bars (~37 trading days)
+            'daily': 39000,   # 100 daily bars × 390 min/bar = 39000 1-min bars (100 trading days)
+            'weekly': 39000,  # 20 weekly bars × 1950 min/bar = 39000 1-min bars (100 trading days)
+            'monthly': 128700, # 15 monthly bars × 8580 min/bar = 128700 1-min bars (330 trading days)
+            '3month': 206160, # 8 quarters × 25770 min/bar = 206160 1-min bars (528 trading days)
         }
 
         for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
@@ -3603,7 +3631,9 @@ class TradingFeatureExtractor(FeatureExtractor):
             # Duration ratio = current stability vs rolling average (adaptive window per TF)
             window = adaptive_windows[tf_name]
             avg_stability = stability.rolling(window, min_periods=window//2).mean()
-            duration_ratio = (stability / (avg_stability + 1e-8)).fillna(1.0)
+            # v5.3.2 fix: Use larger epsilon (0.01) to prevent extremes from near-zero averages
+            # 1e-8 was too small, causing 1.7M extremes when avg_stability was tiny
+            duration_ratio = (stability / (avg_stability + 0.01)).fillna(1.0)
             breakdown_features[f'tsla_channel_duration_ratio_{tf_name}'] = duration_ratio.values
 
         # 4. SPY-TSLA channel alignment
