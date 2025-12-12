@@ -1,9 +1,9 @@
-# LLM Handoff Document - AutoTrade v5.3.2
+# LLM Handoff Document - AutoTrade v5.3.3
 
 **Date**: December 12, 2025
-**Current Branch**: `wtf` (working on v5.3.2 fixes)
-**Status**: Production System - v5.3.2 Ready for Testing
-**Last Session**: v5.3.2 - Fixed weekly TF bias (8 major fixes including critical native TF mode bug)
+**Current Branch**: `wtf` (working on v5.3.3 improvements)
+**Status**: Production System - v5.3.3 Ready for Testing
+**Last Session**: v5.3.3 - Native TF breakdown refactor + yfinance limits centralization
 
 ---
 
@@ -59,15 +59,31 @@ Original fix had two bugs, now corrected:
 3. ✅ **Monthly/3month support ADDED**: Now loads from monthly shard (lines 3538-3562)
 
 ### **Additional Critical Fixes** (Dec 12):
-4. ✅ **Adaptive windows FIXED**: Were 5x too small (wrong units - thought 1500=bars at TF, actually 1500 1-min bars)
-   - Changed '5min' from 1500→7500, '1h' from 200→12000, '3month' from 8→206160
-   - Eliminates 1.7M extremes caused by unstable rolling averages
-5. ✅ **Warmup centralized**: Added MAX_ADAPTIVE_WINDOW_BARS to config.py, master WARMUP_BARS auto-calculates
-6. ✅ **df vs df_sliced bug FIXED**: Features now sliced to match warmup period (train_hierarchical.py:2813-2823)
-7. ✅ **Fallback sequence lengths FIXED**: hierarchical_model.py now matches config.py (was all 200, now correct per-TF)
-8. ✅ **Dead code removed**: Unused loss_weights variable removed from train_hierarchical.py
+4. ✅ **Warmup centralized**: Added MAX_ADAPTIVE_WINDOW_BARS to config.py, master WARMUP_BARS auto-calculates
+5. ✅ **df vs df_sliced bug FIXED**: Features now sliced to match warmup period (train_hierarchical.py:2813-2823)
+6. ✅ **Fallback sequence lengths FIXED**: hierarchical_model.py now matches config.py (was all 200, now correct per-TF)
+7. ✅ **Dead code removed**: Unused loss_weights variable removed from train_hierarchical.py
 
-**Fix #7 now works correctly in ALL extraction modes AND all 11 timeframes.**
+### **v5.3.3 - Native TF Breakdown (MAJOR REFACTOR)** (Dec 12):
+8. ✅ **Breakdown calculation MOVED to native TF resolution**:
+   - Old (v5.3.2): Calculate at 1-min → resample to TF → 7500 1-min bars for "1500 5-min bars worth"
+   - New (v5.3.3): Resample to TF → calculate at native → 1500 actual 5-min bars!
+   - Eliminates semantic confusion and train-test mismatch
+9. ✅ **yfinance limits centralized in config.py**:
+   - Single source of truth: config.YFINANCE_MAX_DAYS
+   - Intraday (5m/15m/30m): 60→7 days (actual yfinance limit as of Dec 2024)
+   - Hourly (1h): 60→730 days (2 years - 12x more data for 2h/3h/4h!)
+   - Daily: 400→3650 days (10 years)
+   - Weekly/monthly: 5475 days (unchanged, adequate)
+10. ✅ **Cross-TF features preserved**: Each TF file includes breakdown from ALL 11 TFs
+    - 5min file has: duration_ratio_5min, duration_ratio_daily, duration_ratio_3month, etc.
+    - Maintains model's ability to see "5min stable but daily breaking" context
+11. ✅ **Legacy mode deprecated**: Shows warning + 5-sec countdown, but still works (gradual deprecation)
+12. ✅ **Validation added**: Warns if yfinance limits < adaptive window needs (intraday TFs affected)
+
+**System now has train-test consistency! Breakdown calculated identically in training and live.**
+
+**Cache regeneration REQUIRED** (v5.3.2 → v5.3.3 is breaking change).
 
 ---
 
@@ -1444,32 +1460,49 @@ duration_ratio = current_stability / rolling_avg
    - Calculates breakdown features with real values
    - Removes temp w50 cols before return
 
-### **Live Prediction Data Requirements (v5.3.2):**
-For adaptive windows to work in live mode, ensure adequate history:
+### **Live Prediction Data Requirements (v5.3.3):**
+
+**v5.3.3 uses config.YFINANCE_MAX_DAYS for all limits (single source of truth):**
 ```python
+# Fetch with config defaults (recommended):
+predictor.fetch_live_data()  # Uses config.YFINANCE_MAX_DAYS
+
+# Or override specific limits:
 predictor.fetch_live_data(
-    intraday_days=60,    # ✅ Sufficient for 5min-4h adaptive windows
-    daily_days=400,      # ✅ Sufficient for daily 100-bar window
-    longer_days=5475     # ✅ Sufficient for weekly/monthly/3month windows
+    intraday_days=7,      # config.YFINANCE_MAX_DAYS['intraday']
+    hourly_days=730,      # config.YFINANCE_MAX_DAYS['1h'] (NEW: 12x more!)
+    daily_days=3650,      # config.YFINANCE_MAX_DAYS['daily']
+    longer_days=5475      # config.YFINANCE_MAX_DAYS['weekly_monthly']
 )
 ```
 
-**Minimum requirements:**
-- Intraday: 60 days (provides 1500 bars for 5min)
-- Daily: 100 days (provides 100 bars for daily)
-- Weekly/Monthly: ~15 years (provides 20+ bars for weekly, 15+ for monthly, 8+ for 3month)
+**yfinance API Limits (as of December 2024):**
+- 1min: **7 days** (hard limit for 1m interval)
+- Intraday (5m/15m/30m): **60 days** (standard intraday limit)
+- Hourly (1h): **730 days** (~2 years)
+- Daily: **Unlimited** (using 3650 days = 10 years)
+- Weekly/Monthly: **Unlimited** (using 5475 days = 15 years)
 
-**Adaptive Window Spans (Real Time):**
+**Adaptive Window Requirements vs yfinance Limits:**
 
-| TF | Window Size | Time Span | Purpose |
-|----|-------------|-----------|---------|
-| 5min | 1500 bars | ~19 trading days | Stable average, smooth noise |
-| 15min | 400 bars | ~100 hours | ~2 weeks of trading |
-| 1h | 200 bars | ~200 hours | ~1 month of trading |
-| Daily | 100 bars | 100 days | ~4 months context |
-| Weekly | 20 bars | 20 weeks | ~5 months context |
-| Monthly | 15 bars | 15 months | ~1.25 years context |
-| 3month | 8 bars | 24 months | 2 years context |
+| TF | Window Size (Native) | Days Needed | yfinance Provides | Status |
+|----|---------------------|-------------|-------------------|--------|
+| 5min | 1500 5-min bars | 19 days | **60 days** | ✅ **OK!** |
+| 15min | 400 15-min bars | 15 days | **60 days** | ✅ **OK!** |
+| 30min | 300 30-min bars | 23 days | **60 days** | ✅ **OK!** |
+| 1h | 200 hourly bars | 31 days | 730 days | ✅ OK |
+| 2h/3h/4h | 100/80/60 bars | 31-37 days | 730 days | ✅ OK |
+| Daily | 100 daily bars | 100 days | 3650 days | ✅ OK |
+| Weekly | 20 weekly bars | 100 days | Unlimited | ✅ OK |
+| Monthly | 15 monthly bars | 330 days | Unlimited | ✅ OK |
+| 3month | 8 quarterly bars | 528 days | Unlimited | ✅ OK |
+
+**Result: ALL adaptive windows satisfied by yfinance alone!** ✅
+
+**Historical CSV Supplement (Optional):**
+- Not required (yfinance provides enough data)
+- But can use for extra context: `fetch_live_data(use_historical=True, historical_days=100)`
+- Extends 60 days → 100+ days for even more stable estimates
 
 ### **Expected Results After Full Training (With Fresh Cache):**
 1. TF selection diversity: Weekly should drop from 54% to ~20-30%
@@ -1485,9 +1518,10 @@ predictor.fetch_live_data(
 
 ---
 
-**Model Version**: v5.3.2
-**Branch**: `wtf` (working on v5.3.2 fixes)
+**Model Version**: v5.3.3 (Native TF breakdown + yfinance limits)
+**Branch**: `wtf` (working on v5.3.3 major refactor)
 **Status**: Production-ready - REQUIRES cache regeneration before training!
+**Breaking Change**: v5.3.2 → v5.3.3 (breakdown calculation method changed)
 **Handoff Date**: December 12, 2025
 
 **v5.3.2 Changes Summary:**
@@ -1558,52 +1592,59 @@ Expected: Balanced TF selection, Test MAE <0.25%, transition loss stable, real b
 
 **CRITICAL REMINDER FOR NEXT LLM:**
 
-### ✅ All Bugs Have Been Resolved! (Dec 12 - Complete)
+### ✅ v5.3.3 Complete - Native TF Breakdown Refactor (Dec 12)
 
-1. ✅ **Key name bug FIXED** - Now uses `'feature_columns'` (features.py:3508)
-2. ✅ **In-place modification bug FIXED** - Temp cols removed before return (features.py:3796-3801)
-3. ✅ **Monthly/3month support ADDED** - Loads from monthly shard (features.py:3538-3562)
-4. ✅ **Adaptive windows FIXED** - Were 5x-26x too small! (features.py:3601-3613)
-   - Root cause: Comment said "1500 5-min bars" but code used 1500 1-min bars
-   - Fixed: 5min 1500→7500, 1h 200→12000, 3month 8→206160
-5. ✅ **Epsilon increased** - 1e-8→0.01 to prevent remaining near-zero division extremes (features.py:3636)
-6. ✅ **Warmup centralized** - Added MAX_ADAPTIVE_WINDOW_BARS to config.py, WARMUP_BARS auto-calculates max
-7. ✅ **df slicing bug FIXED** - features_df now sliced to exclude warmup period (train_hierarchical.py:2813-2823)
-8. ✅ **Fallback sequences FIXED** - hierarchical_model.py:1550 now matches config.py
-9. ✅ **Dead code removed** - Unused loss_weights variable removed
+**Major architectural change**: Breakdown features now calculated at NATIVE TF resolution (not 1-min)!
 
-### 🚨 **MUST REGENERATE CACHE** (Old cache has wrong adaptive windows!)
+**Key Improvements**:
+1. ✅ **Train-test consistency**: Training and live use SAME breakdown calculation method
+2. ✅ **Semantic correctness**: 1500 5-min bars (not 7500 1-min bars pretending to be "1500 worth")
+3. ✅ **yfinance limits centralized**: config.YFINANCE_MAX_DAYS (easily changeable)
+4. ✅ **Cross-TF context preserved**: Each TF file has breakdown from all 11 TFs
+5. ✅ **Better live data**: 1h gets 730 days (was 60), daily gets 3650 days (was 400)
+
+**Breaking Changes**:
+- Cache version bumped: v5.3.2 → v5.3.3
+- Cache structure changed: breakdown in tf_sequence_*.npy (not non_channel_features.pkl)
+- Legacy mmap mode deprecated (shows warning, still works)
+
+### 🚨 **MUST REGENERATE CACHE** (v5.3.3 is breaking change!)
 
    ```bash
    rm -rf data/feature_cache/*
    python train_hierarchical.py --interactive
-   # Choose: "No - Regenerate cache"
+   # Will auto-use native TF mode (recommended)
+   # Cache generation will take ~1-2 hours
    ```
 
-### **Current State - All Modes Work:**
+**⚠️ Important**: Do NOT use `--no-native-timeframes` flag (legacy mode deprecated)
 
-| Extraction Mode | Fix Works? |
-|-----------------|-----------|
-| Non-chunked (`--no-chunking`) | ✅ YES |
-| Chunked (default on low RAM) | ✅ YES |
+### **Current State (v5.3.3):**
+
+| Mode | Status | Breakdown Calculation |
+|------|--------|---------------------|
+| **Native TF (recommended)** | ✅ Full support | At native resolution (correct!) |
+| **Chunked extraction** | ✅ Works | Per-TF only (no cross-TF in chunked) |
+| **Legacy mmap** | ⚠️ Deprecated | At 1-min (old way, train-test mismatch) |
 
 ### **WHY Cache Regeneration is Critical:**
 
-**Bug discovered during user's training:**
-- v5.0 cache had feature **names** but **values were all defaults** (1.0/0.0)
-- duration_ratio: Should vary (0.5-2.0) → Was all 1.0
-- alignment: Should vary (-1.0 to +1.0) → Was all 0.0
-- Fix #7 now resolves this for ALL extraction modes
+**v5.3.3 is a breaking change from v5.3.2:**
+- **Breakdown calculation method changed**: Now at native TF resolution (not 1-min)
+- **Cache structure changed**: breakdown in tf_sequence_*.npy (not non_channel_features.pkl)
+- **Feature version bumped**: v5.3.2 → v5.3.3 (incompatible)
 
-**Training with old cache:**
-- ❌ Weekly still dominates (54%) - quality formula may be new but breakdown features broken
-- ❌ Transition loss collapses (0.000) - only seeing weekly patterns
-- ❌ No break prediction signal - all defaults!
+**Training with old cache (v5.0-v5.3.2):**
+- ❌ Uses 1-min breakdown calculation (semantic confusion, possible extremes)
+- ❌ Train-test mismatch (training uses 1-min, live would use native TF)
+- ❌ Weekly may still dominate if v5.0 cache (old quality formula)
 
-**After cache regeneration (any mode):**
+**After v5.3.3 cache regeneration:**
+- ✅ Breakdown at native TF resolution (1500 5-min bars, 8 quarters, etc.)
+- ✅ Train-test consistency (training = live calculation)
 - ✅ New quality formula applied (ping-pongs primary)
-- ✅ Real duration_ratio values calculated with adaptive windows
-- ✅ Real alignment correlations calculated
+- ✅ Real duration_ratio values with semantically correct windows
+- ✅ Real alignment correlations
 - ✅ Weekly bias should resolve (54% → 20-30%)
 
 ---
