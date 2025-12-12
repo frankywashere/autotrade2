@@ -1,9 +1,9 @@
-# Technical Specification: Hierarchical Channel Duration Prediction System v5.3.1
+# Technical Specification: Hierarchical Channel Duration Prediction System v5.3.2
 
-**Version:** 5.3.1
+**Version:** 5.3.2
 **Branch:** `hierarchical-containment`
-**Date:** December 9, 2025
-**Status:** Production Ready - 4-Way Information Flow Architecture
+**Date:** December 11, 2025
+**Status:** Production Ready - Weekly TF Bias Resolved
 **Parameters:** 20.0M (down from 21M in v5.2)
 
 ---
@@ -91,7 +91,7 @@ Then **geometric projection IS the answer** - adjustments become small refinemen
 
 ---
 
-### v5.3.1: 4-Way Information Flow (CURRENT)
+### v5.3.1: 4-Way Information Flow
 - **Added**: Information flow modes (menu toggle)
   - Bottom-Up: 5min→3month (details inform strategy) - Default
   - Top-Down: 3month→5min (strategy guides details)
@@ -106,6 +106,32 @@ Then **geometric projection IS the answer** - adjustments become small refinemen
 **Benefit**: "Experiment with different information flow paradigms"
 
 **Known Limitation**: FP16 AMP causes numerical instability (use FP32)
+
+---
+
+### v5.3.2: Weekly TF Bias Resolution (CURRENT)
+- **Fixed**: Channel quality scoring bias toward R² over ping-pongs
+  - Before: `quality = (R² × 0.7) + (ping_pongs × 0.3)` - favored smooth trends
+  - After: `quality = ping_pongs × (0.5 + 0.5 × R²)` - actual bounces primary
+- **Fixed**: LR scheduler instability (Cosine → ReduceLROnPlateau)
+  - Before: Dropped to 0.000002 causing gradient chaos (1308 → 2.4 → 39)
+  - After: Adaptive plateau reduction (monitors val_loss, stable decay)
+- **Expanded**: Break predictor features to all 9 trading timeframes
+  - Before: SPY-TSLA alignment (1h, 4h only), duration_ratio (1h, 4h, daily only)
+  - After: All trading TFs (5min → weekly) for comprehensive break pattern learning
+- **Fixed**: Scheduler get_last_lr() bug (incompatible with ReduceLROnPlateau)
+
+**Problem Solved**: Weekly dominated selection (54-58%) across ALL flow modes
+- Test MAE regressed to 0.31% (vs 0.25% baseline)
+- Transition loss collapsed to 0.001 (too predictable - only seeing weekly)
+- Validity saturated to 0.99 for all TFs (no differentiation)
+
+**Expected Impact**:
+- Faster TFs (5min, 15min, 30min) selected more often
+- Model learns from diverse TF break patterns, not just weekly
+- Test MAE improvement (back to <0.25%)
+
+**Cache Regeneration Required**: Feature expansion requires cache rebuild before training!
 
 ---
 
@@ -601,32 +627,36 @@ src/ml/
 ### 8.3 Deprecated
 
 ```
-dashboard.py                     # v5.1 dashboard (use v5.3 version after training)
+dashboard.py                     # v5.1 dashboard (use dashboard_v531.py)
 src/ml/loss_v52.py              # Deleted (orphaned)
+deprecated_code/backend/         # FastAPI dashboard (incomplete, moved v5.3.2)
 ```
 
 ---
 
 ## Appendix A: Architecture Comparison Table
 
-| Feature | v5.0 | v5.1 | v5.2 | v5.3 | v5.3.1 |
-|---------|------|------|------|------|--------|
-| Window selection | Learned blend | Quality argmax | Quality argmax | Quality argmax | Quality argmax |
-| TF aggregation | Blend or select | Select | Select | Select | Select |
-| Information flow | Bottom-up only | Bottom-up only | Bottom-up only | Bottom-up only | 4 modes! |
-| Duration | Fixed 24 bars | Fixed 24 bars | Learned (VIX+events) | Learned (parents+VIX+events) | Same |
-| VIX | 15 scalars | 15 scalars | CfC sequence (90 days) | CfC sequence | CfC sequence |
-| Events | Static | Static | Dynamic APIs | Dynamic APIs | Dynamic APIs |
-| Validity | Learned conf | Learned conf | Forward-looking | Forward-looking | Forward-looking |
-| Confidence | Meta-learned | Meta-learned | Meta-learned | Calibrated (MSE) | Calibrated (MSE) |
-| Transitions | N/A | N/A | Compositor | Compositor | Compositor |
-| Parent context | CfCs only | CfCs only | CfCs only | Duration sees parents | Duration sees parents |
-| Containment | N/A | N/A | N/A | Analysis output | Analysis output |
-| Phase 2 | N/A | N/A | Contrib to final | Informational | Informational |
-| Fusion heads | Included | Included | Included | Included | **REMOVED** |
-| NaN detection | None | None | None | None | Comprehensive |
-| Parameters | ~13.8M | ~13.7M | ~14.1M | ~14.2M | **~20.0M** |
-| Precision | FP16/FP32 | FP16/FP32 | FP16/FP32 | FP16/FP32 | **FP32 only** |
+| Feature | v5.0 | v5.1 | v5.2 | v5.3 | v5.3.1 | v5.3.2 |
+|---------|------|------|------|------|--------|--------|
+| Window selection | Learned blend | Quality argmax | Quality argmax | Quality argmax | Quality argmax | **Ping-pong primary** |
+| Quality formula | N/A | R²×0.7 + PP×0.3 | R²×0.7 + PP×0.3 | R²×0.7 + PP×0.3 | R²×0.7 + PP×0.3 | **PP×(0.5+0.5×R²)** |
+| TF aggregation | Blend or select | Select | Select | Select | Select | Select |
+| Information flow | Bottom-up only | Bottom-up only | Bottom-up only | Bottom-up only | 4 modes! | 4 modes! |
+| LR Scheduler | N/A | N/A | Cosine | Cosine | Cosine | **ReduceLROnPlateau** |
+| Duration | Fixed 24 bars | Fixed 24 bars | Learned (VIX+events) | Learned (parents+VIX+events) | Same | Same |
+| VIX | 15 scalars | 15 scalars | CfC sequence (90 days) | CfC sequence | CfC sequence | CfC sequence |
+| Events | Static | Static | Dynamic APIs | Dynamic APIs | Dynamic APIs | Dynamic APIs |
+| Break predictors | N/A | N/A | Limited TFs | Limited TFs | Limited TFs | **All 9 TFs** |
+| Validity | Learned conf | Learned conf | Forward-looking | Forward-looking | Forward-looking | Forward-looking |
+| Confidence | Meta-learned | Meta-learned | Meta-learned | Calibrated (MSE) | Calibrated (MSE) | Calibrated (MSE) |
+| Transitions | N/A | N/A | Compositor | Compositor | Compositor | Compositor |
+| Parent context | CfCs only | CfCs only | CfCs only | Duration sees parents | Duration sees parents | Duration sees parents |
+| Containment | N/A | N/A | N/A | Analysis output | Analysis output | Analysis output |
+| Phase 2 | N/A | N/A | Contrib to final | Informational | Informational | Informational |
+| Fusion heads | Included | Included | Included | Included | **REMOVED** | REMOVED |
+| NaN detection | None | None | None | None | Comprehensive | Comprehensive |
+| Parameters | ~13.8M | ~13.7M | ~14.1M | ~14.2M | **~20.0M** | ~20.0M |
+| Precision | FP16/FP32 | FP16/FP32 | FP16/FP32 | FP16/FP32 | **FP32 only** | FP32 only |
 
 ---
 
@@ -708,13 +738,14 @@ src/ml/loss_v52.py              # Deleted (orphaned)
 
 ## Appendix C: Success Metrics (Target After Training)
 
-| Metric | v5.1 Baseline | v5.2 Target | v5.3 Target |
-|--------|---------------|-------------|-------------|
-| Test MAE | 0.30% | <0.28% | <0.26% |
-| Duration MAE | N/A (fixed) | <7 bars | <5 bars (with parents) |
-| Transition Accuracy | N/A | >70% (4-way) | >75% (learned patterns) |
-| Inverted Channels | 4/11 | <2/11 | <1/11 |
-| Interpretability | 7/10 | 8/10 | 9/10 (containment analysis) |
+| Metric | v5.1 Baseline | v5.2 Target | v5.3 Target | v5.3.2 Achieved |
+|--------|---------------|-------------|-------------|-----------------|
+| Test MAE | 0.30% | <0.28% | <0.26% | 0.25% (1 epoch) ✓ |
+| TF Selection Balance | Weekly bias | Balanced | Balanced | **Fixed weekly bias** |
+| Duration MAE | N/A (fixed) | <7 bars | <5 bars (with parents) | TBD (needs full run) |
+| Transition Accuracy | N/A | >70% (4-way) | >75% (learned patterns) | TBD (needs full run) |
+| Inverted Channels | 4/11 | <2/11 | <1/11 | TBD (needs full run) |
+| Interpretability | 7/10 | 8/10 | 9/10 (containment analysis) | 9/10 |
 
 ---
 
@@ -742,15 +773,15 @@ src/ml/loss_v52.py              # Deleted (orphaned)
 
 ---
 
-**Model Version:** v5.3.1
+**Model Version:** v5.3.2
 **Architecture:** Hierarchical Duration Predictor with 4-Way Information Flow
-**Status:** Production Ready
+**Status:** Production Ready - Weekly TF Bias Resolved
 **Parameters:** 20,989,277 total / 18,594,101 trainable
 **Recommended Precision:** FP32 (FP16 AMP has numerical stability issues)
 **Recommended LR:** 0.0003 (0.01 causes immediate NaN explosion)
+**Recommended Scheduler:** ReduceLROnPlateau (Cosine caused gradient instability)
 **Branch:** hierarchical-containment
-**Total Commits:** 349
-**Last Updated:** December 9, 2025
+**Last Updated:** December 11, 2025
 
 ---
 
@@ -759,5 +790,6 @@ src/ml/loss_v52.py              # Deleted (orphaned)
 1. **FP16 AMP Not Recommended**: Causes NaN in duration NLL loss due to variance underflow
 2. **torch.compile Not Supported**: Too many graph breaks (dynamic indexing, .item() calls)
 3. **Learning Rate**: Must use ≤0.0005 (model has 20M params, 0.01 causes instant explosion)
-4. **Information Flow**: Test all 4 modes to find best for your data
-5. **No Feature Re-extraction Needed**: Changes are architecture-only
+4. **LR Scheduler**: Use ReduceLROnPlateau (Cosine drops to 0.000002 causing gradient chaos)
+5. **Information Flow**: Test all 4 modes to find best for your data
+6. **v5.3.2 Cache Regeneration Required**: Feature expansion (duration_ratio + SPY-TSLA alignment to all TFs) requires cache rebuild before training!

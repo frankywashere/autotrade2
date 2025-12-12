@@ -2193,6 +2193,7 @@ def interactive_setup(args, profiler=None):
     print(f"  Epochs: {args.epochs}")
     print(f"  Batch Size: {args.batch_size}")
     print(f"  Learning Rate: {args.lr}")
+    print(f"  LR Scheduler: ReduceLROnPlateau (adaptive, v5.3.2)")
     print(f"  Data Loading: mmap + OS page cache (no pre-merge)")
     # v5.3.2: Pre-stacking status
     if getattr(args, 'use_prestack', False):
@@ -2232,6 +2233,10 @@ def interactive_setup(args, profiler=None):
     print(f"  VIX CfC: 90-day sequence (regime awareness)")
     print(f"  Events: FOMC + Earnings + Deliveries + Macro")
     print(f"  Parent Context: Duration sees 2 larger TFs")
+
+    # v5.3.2: Quality & break predictors
+    print(f"  Channel Quality: Ping-pongs primary (v5.3.2)")
+    print(f"  Break Predictors: All 9 TFs - duration_ratio + SPY-TSLA alignment")
 
     # v5.3: RSI validation
     rsi_mode = getattr(args, 'rsi_direction_guidance', 'soft_bias')
