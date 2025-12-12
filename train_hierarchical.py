@@ -269,7 +269,7 @@ def is_main_process(rank: int) -> bool:
     return rank == 0
 
 
-def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0]):
+def hierarchical_collate(batch, device: str = None, move_to_device: bool = False, torch_dtype=None, _debug_counter=[0], suppress_slow_warnings=False):
     """
     Fast collate: stack numpy arrays first, then single torch conversion.
 
@@ -394,7 +394,7 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
 
     # Log slow batch assembly (diagnose lazy loading bottlenecks)
     _collate_elapsed = time.perf_counter() - _collate_start
-    if _collate_elapsed > 1.0:  # Log if >1 second
+    if _collate_elapsed > 1.0 and not suppress_slow_warnings:  # Log if >1 second and not suppressed
         print(f"[SLOW_COLLATE] batch assembly took {_collate_elapsed:.1f}s for {len(batch)} samples ({_collate_elapsed/len(batch)*1000:.0f}ms/sample)", file=sys.stderr, flush=True)
 
     return x, targets_batch, vix_batch, events_batch
@@ -534,13 +534,11 @@ class PreStackedBatchLoader:
 
         batches = []
 
-        # Progress bar only for rank 0 and when requested
+        # Initial message
         if show_progress and self.verbose and self.rank == 0:
-            iterator = tqdm(range(num_full_batches), desc=f"📦 Pre-stacking epoch {epoch + 1}", leave=False)
-        else:
-            iterator = range(num_full_batches)
+            print(f"📦 Pre-stacking epoch {epoch + 1}: 0/{num_full_batches} batches...", flush=True)
 
-        for batch_idx in iterator:
+        for batch_idx in range(num_full_batches):
             start = batch_idx * self.batch_size
             end = start + self.batch_size
             batch_indices = rank_indices[start:end]
@@ -548,14 +546,19 @@ class PreStackedBatchLoader:
             # Fetch samples
             samples = [self.dataset[i] for i in batch_indices]
 
-            # Collate into batch
-            batch = self.collate_fn(samples)
+            # Collate into batch (suppress SLOW_COLLATE warnings during pre-stacking)
+            batch = self.collate_fn(samples, suppress_slow_warnings=True)
 
             # v5.3.2: Pin memory if requested (faster CPU→GPU transfer)
             if self.use_pinned:
                 batch = self._pin_batch(batch)
 
             batches.append(batch)
+
+            # Progress update every 10 batches
+            if show_progress and self.verbose and self.rank == 0 and (batch_idx + 1) % 10 == 0:
+                progress_pct = (batch_idx + 1) / num_full_batches
+                print(f"   Progress: {batch_idx + 1}/{num_full_batches} batches ({progress_pct:.0%})", flush=True)
 
         # Handle last partial batch if not drop_last
         if not self.drop_last:
@@ -564,7 +567,7 @@ class PreStackedBatchLoader:
                 start = num_full_batches * self.batch_size
                 batch_indices = rank_indices[start:]
                 samples = [self.dataset[i] for i in batch_indices]
-                batch = self.collate_fn(samples)
+                batch = self.collate_fn(samples, suppress_slow_warnings=True)
                 if self.use_pinned:
                     batch = self._pin_batch(batch)
                 batches.append(batch)
