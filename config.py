@@ -171,8 +171,86 @@ CONTINUATION_LOOKBACK_1H = 25740   # 3 months at 1-min bars (66 trading days × 
 CONTINUATION_LOOKBACK_4H = 98280   # 1 year at 1-min bars (252 trading days × 390 bars/day)
 
 # v5.3.2: Adaptive rolling window for breakdown features (in 1-min bars)
+# NOTE: v5.3.3+ uses ADAPTIVE_WINDOW_BARS_NATIVE (native TF resolution) for new calculations
+# This remains for backward compatibility with v5.3.2 caches
 # Largest window is 3month: 8 quarters × 66 days/quarter × 390 bars/day
 MAX_ADAPTIVE_WINDOW_BARS = 206160  # 528 trading days for 3month adaptive window
+
+# ======================================================================
+# LIVE DATA FETCH LIMITS (v5.3.3)
+# ======================================================================
+# yfinance API limits as of December 2024
+# IMPORTANT: If yfinance limits change, update here to affect all fetch operations
+# Changing these values may require cache regeneration if adaptive windows are affected
+YFINANCE_MAX_DAYS = {
+    '1min': 7,           # 1m - hard 7-day limit (as of Dec 2024)
+    'intraday': 60,      # 5m/15m/30m - 60-day limit (standard intraday)
+    '1h': 730,           # Hourly data - 2 years available (730 days)
+    'daily': 3650,       # Daily - 10 years (practically unlimited, using conservative 10yr)
+    'weekly_monthly': 5475,  # Weekly/monthly - 15 years (adequate for all windows)
+}
+
+# Adaptive rolling windows for breakdown features (v5.3.3+)
+# These are in NATIVE TF RESOLUTION (not 1-min bars!)
+# Example: '5min': 1500 means 1500 5-minute bars (~19 trading days)
+# Used by: _calculate_breakdown_at_native_tf() in features.py
+ADAPTIVE_WINDOW_BARS_NATIVE = {
+    '5min': 1500,     # 1500 5-min bars (~19 trading days)
+    '15min': 400,     # 400 15-min bars (~15 trading days)
+    '30min': 300,     # 300 30-min bars (~23 trading days)
+    '1h': 200,        # 200 1-hour bars (~31 trading days)
+    '2h': 100,        # 100 2-hour bars (~31 trading days)
+    '3h': 80,         # 80 3-hour bars (~37 trading days)
+    '4h': 60,         # 60 4-hour bars (~37 trading days)
+    'daily': 100,     # 100 daily bars (100 trading days)
+    'weekly': 20,     # 20 weekly bars (~100 trading days / 20 weeks)
+    'monthly': 15,    # 15 monthly bars (~330 trading days / 15 months)
+    '3month': 8,      # 8 quarters (~528 trading days / 2 years)
+}
+
+# Days required for each TF's adaptive window (for validation)
+ADAPTIVE_WINDOW_DAYS_REQUIRED = {
+    '5min': 19,      # 1500 5-min bars / (78 bars/day)
+    '15min': 15,     # 400 15-min bars / (26 bars/day)
+    '30min': 23,     # 300 30-min bars / (13 bars/day)
+    '1h': 31,        # 200 1-hour bars / (6.5 bars/day)
+    '2h': 31,        # 100 2-hour bars / (6.5/2 bars/day)
+    '3h': 37,        # 80 3-hour bars
+    '4h': 37,        # 60 4-hour bars
+    'daily': 100,    # 100 daily bars
+    'weekly': 100,   # 20 weekly bars
+    'monthly': 330,  # 15 monthly bars
+    '3month': 528,   # 8 quarters
+}
+
+def validate_live_data_compatibility():
+    """
+    Validate that adaptive windows can be satisfied by yfinance limits.
+    Returns list of warnings for TFs where live data will be insufficient.
+
+    Returns:
+        List[str]: Warning messages for insufficient TFs (empty if all OK)
+    """
+    warnings = []
+
+    for tf, days_needed in ADAPTIVE_WINDOW_DAYS_REQUIRED.items():
+        # Determine which yfinance limit applies
+        if tf in ['5min', '15min', '30min']:
+            max_available = YFINANCE_MAX_DAYS['intraday']  # 60 days
+        elif tf in ['1h', '2h', '3h', '4h']:
+            max_available = YFINANCE_MAX_DAYS['1h']  # 730 days
+        elif tf == 'daily':
+            max_available = YFINANCE_MAX_DAYS['daily']  # 3650 days
+        else:  # weekly, monthly, 3month
+            max_available = YFINANCE_MAX_DAYS['weekly_monthly']  # 5475 days
+
+        if days_needed > max_available:
+            warnings.append(
+                f"{tf}: needs {days_needed} days for adaptive window, "
+                f"but yfinance only provides {max_available} days (use historical CSV supplement)"
+            )
+
+    return warnings
 
 # Training dataset warmup settings
 SKIP_WARMUP_PERIOD = True      # Automatically exclude insufficient-history timestamps

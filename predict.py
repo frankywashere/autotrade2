@@ -241,16 +241,19 @@ class LiveDataBuffer:
     """
 
     # Required history per interval (bars needed for feature extraction + seq_len)
-    # Formula: max_channel_window(168) + seq_len + buffer
+    # v5.3.3: Updated to match yfinance limits and adaptive window requirements
     REQUIRED_HISTORY = {
         '1min': 50000,     # ~35 days (for resampling to higher TFs)
-        '5min': 10000,     # ~35 days
-        '15min': 4000,     # ~42 days
-        '30min': 2000,     # ~42 days
-        '1hour': 1000,     # ~42 days
-        'daily': 500,      # ~2 years
-        'weekly': 200,     # ~4 years
-        'monthly': 60,     # ~5 years
+        '5min': 546,       # ~7 days (yfinance intraday limit: 7 days × 78 bars/day)
+        '15min': 182,      # ~7 days (7 days × 26 bars/day)
+        '30min': 91,       # ~7 days (7 days × 13 bars/day)
+        '1hour': 4745,     # ~730 days (730 days × 6.5 bars/day)
+        '2hour': 2372,     # ~730 days (resampled from 1h)
+        '3hour': 1582,     # ~730 days (resampled from 1h)
+        '4hour': 1186,     # ~730 days (resampled from 1h)
+        'daily': 3650,     # 10 years (3650 days)
+        'weekly': 781,     # ~15 years (5475 days / 7 days/week)
+        'monthly': 180,    # ~15 years (5475 days / 30 days/month)
     }
 
     def __init__(self):
@@ -381,6 +384,52 @@ class LiveDataBuffer:
             agg_dict[f'{symbol}_volume'] = 'sum'
 
         return df.resample(rule).agg(agg_dict).dropna()
+
+    def load_historical_csv(
+        self,
+        interval: str,
+        csv_path: str,
+        max_days: int = None
+    ) -> None:
+        """
+        Load historical data from CSV to supplement yfinance limits.
+
+        v5.3.3: Enables full adaptive windows in live mode by using historical CSV data.
+        Merges with any existing live data, removing duplicates.
+
+        Args:
+            interval: Timeframe ('5min', '1hour', 'daily', etc.)
+            csv_path: Path to CSV file (e.g., 'data/TSLA_5min.csv')
+            max_days: Limit historical data to N days (None = load all)
+
+        Example:
+            buffer.load_historical_csv('5min', 'data/TSLA_5min.csv', max_days=60)
+            # Now has 60 days of 5min data for stable rolling averages!
+        """
+        try:
+            # Load historical CSV
+            historical = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+
+            # Limit to max_days if specified
+            if max_days:
+                cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=max_days)
+                historical = historical[historical.index >= cutoff_date]
+
+            # Merge with existing buffer (if any live data)
+            if interval in self.buffers and len(self.buffers[interval]) > 0:
+                combined = pd.concat([historical, self.buffers[interval]])
+                # Remove duplicates (keep latest)
+                combined = combined[~combined.index.duplicated(keep='last')]
+                combined = combined.sort_index()
+                self.buffers[interval] = combined
+            else:
+                self.buffers[interval] = historical
+
+            print(f"   ✅ Loaded {len(historical):,} historical bars for {interval} from CSV")
+            print(f"      Total: {len(self.buffers[interval]):,} bars ({self.buffers[interval].index[0].date()} to {self.buffers[interval].index[-1].date()})")
+
+        except Exception as e:
+            print(f"   ⚠️  Failed to load historical CSV for {interval}: {e}")
 
     def get_multi_res_data(self) -> Dict[str, pd.DataFrame]:
         """
@@ -808,51 +857,79 @@ class LivePredictor:
 
     def fetch_live_data(
         self,
-        intraday_days: int = 60,
-        daily_days: int = 400,
-        longer_days: int = 5475,  # ~15 years for weekly/monthly (ensures w168 coverage)
+        intraday_days: int = None,     # v5.3.3: Now defaults to config
+        hourly_days: int = None,       # v5.3.3: NEW param for hourly (730 days!)
+        daily_days: int = None,        # v5.3.3: Now defaults to config
+        longer_days: int = None,       # v5.3.3: Now defaults to config
+        use_historical: bool = True,   # v5.3.3: Supplement with historical CSV data
+        historical_days: int = 60,     # v5.3.3: How many days of historical to load
         refresh_vix: bool = True
     ) -> None:
         """
         Fetch live SPY, TSLA, and VIX data from yfinance using NATIVE intervals.
 
-        This fetches each timeframe directly from yfinance (no resampling needed)
-        to get maximum data availability:
-        - Intraday (5m, 15m, 30m, 1h): Up to 60 days from yfinance
-        - Daily: ~400 days (~1.5 years)
-        - Weekly/Monthly: ~15 years (ensures w168 window coverage)
+        v5.3.3: Now uses config.YFINANCE_MAX_DAYS for defaults (single source of truth).
+        Limits updated to match actual yfinance API capabilities as of Dec 2024.
+
+        This fetches each timeframe directly from yfinance (no resampling needed):
+        - 1min: 7 days (yfinance hard limit as of 2024)
+        - Intraday (5m, 15m, 30m): 60 days (yfinance intraday limit)
+        - Hourly (1h): 730 days (~2 years, yfinance max)
+        - Daily (1d): 3650 days (10 years)
+        - Weekly/Monthly: 5475 days (~15 years)
+
+        Historical CSV Supplement (v5.3.3) - OPTIONAL:
+        - If use_historical=True, loads historical CSV data to supplement yfinance
+        - Useful if you need more than 60 days for intraday (adaptive windows may need 60+ days)
+        - Merges historical + live, removes duplicates
 
         Fetches:
         - Native intervals: 5m, 15m, 30m, 1h, 1d, 1wk, 1mo, 3mo
         - Resampled: 2h, 3h, 4h (from 1h, since yfinance doesn't have these)
         - VIX daily data
+        - Optional: Historical CSV data (if use_historical=True)
 
         Args:
-            intraday_days: Days of intraday data (default: 60, max for yfinance)
-            daily_days: Days of daily data (default: 400, ~1.5 years)
-            longer_days: Days for weekly/monthly (default: 5475 = 15 years)
+            intraday_days: Days of intraday (5m/15m/30m) data (default: config.YFINANCE_MAX_DAYS['intraday'])
+            hourly_days: Days of hourly (1h) data (default: config.YFINANCE_MAX_DAYS['1h'])
+            daily_days: Days of daily data (default: config.YFINANCE_MAX_DAYS['daily'])
+            longer_days: Days for weekly/monthly (default: config.YFINANCE_MAX_DAYS['weekly_monthly'])
+            use_historical: Supplement with historical CSV data (default: True, recommended)
+            historical_days: How many days of historical data to load (default: 60)
             refresh_vix: Also refresh VIX data (default: True)
 
         Example:
             predictor = LivePredictor('models/hierarchical_lnn.pth')
-            predictor.fetch_live_data()
+            predictor.fetch_live_data()  # Uses config defaults
             result = predictor.predict()
         """
+        # v5.3.3: Use config defaults if not specified
+        import config as project_config
+        intraday_days = intraday_days if intraday_days is not None else project_config.YFINANCE_MAX_DAYS['intraday']
+        hourly_days = hourly_days if hourly_days is not None else project_config.YFINANCE_MAX_DAYS['1h']
+        daily_days = daily_days if daily_days is not None else project_config.YFINANCE_MAX_DAYS['daily']
+        longer_days = longer_days if longer_days is not None else project_config.YFINANCE_MAX_DAYS['weekly_monthly']
+
         print(f"\n📡 Fetching live data from yfinance (native intervals)...")
+        print(f"   Intraday (5m/15m/30m): {intraday_days} days")
+        print(f"   Hourly (1h): {hourly_days} days")
+        print(f"   Daily (1d): {daily_days} days")
+        print(f"   Weekly/Monthly: {longer_days} days")
 
         # Invalidate cached features since we're loading new data
         self._cache_invalidated = True
 
         # Map our TFs to yfinance intervals with appropriate history lengths
+        # v5.3.3: Updated limits to match actual yfinance API
         native_intervals = {
-            '5min': ('5m', min(intraday_days, 60)),     # Intraday limit
-            '15min': ('15m', min(intraday_days, 60)),
-            '30min': ('30m', min(intraday_days, 60)),
-            '1hour': ('1h', min(intraday_days, 60)),
-            'daily': ('1d', daily_days),
-            'weekly': ('1wk', longer_days),             # Need ~15 years for w168
-            'monthly': ('1mo', longer_days),
-            '3month': ('3mo', longer_days),
+            '5min': ('5m', intraday_days),         # 7 days (yfinance hard limit)
+            '15min': ('15m', intraday_days),       # 7 days
+            '30min': ('30m', intraday_days),       # 7 days
+            '1hour': ('1h', hourly_days),          # 730 days (yfinance max for hourly)
+            'daily': ('1d', daily_days),           # 3650 days (10 years)
+            'weekly': ('1wk', longer_days),        # 5475 days (~15 years)
+            'monthly': ('1mo', longer_days),       # 5475 days
+            '3month': ('3mo', longer_days),        # 5475 days
         }
 
         # Fetch each native interval
@@ -873,6 +950,28 @@ class LivePredictor:
         # Resample 2h, 3h, 4h from 1h (yfinance doesn't have these natively)
         print(f"\n   --- Resampling 2h, 3h, 4h from 1h ---")
         self._resample_hourly_to_multihour()
+
+        # v5.3.3: Supplement with historical CSV data (overcomes yfinance 7-day intraday limit)
+        if use_historical:
+            print(f"\n   --- Supplementing with Historical CSV Data ---")
+            print(f"   Loading {historical_days} days of historical data for intraday TFs...")
+
+            # Define CSV paths (assumes data/ directory structure)
+            import config as project_config
+            data_dir = project_config.DATA_DIR
+            historical_files = {
+                '5min': data_dir / 'TSLA_5min.csv',
+                '15min': data_dir / 'TSLA_15min.csv',
+                '30min': data_dir / 'TSLA_30min.csv',
+            }
+
+            for interval, csv_path in historical_files.items():
+                if csv_path.exists():
+                    # Load and merge (removes duplicates, keeps live data when overlap)
+                    self.data_buffer.load_historical_csv(interval, str(csv_path), max_days=historical_days)
+                else:
+                    print(f"   ⚠️  Historical CSV not found: {csv_path}")
+                    print(f"      Skipping historical supplement for {interval}")
 
         # Refresh VIX if requested
         if refresh_vix:

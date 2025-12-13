@@ -136,8 +136,11 @@ def render_sidebar():
                 try:
                     st.session_state.predictor.fetch_live_data(
                         intraday_days=intraday_days,
+                        hourly_days=None,      # v5.3.3: Use config default (730 days)
                         daily_days=daily_days,
-                        longer_days=longer_days
+                        longer_days=longer_days,
+                        use_historical=True,   # v5.3.3: Supplement with CSV data
+                        historical_days=60     # v5.3.3: Load 60 days of historical
                     )
                     st.session_state.data_loaded = True
                     st.session_state.last_refresh = datetime.now()

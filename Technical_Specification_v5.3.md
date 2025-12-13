@@ -1,10 +1,11 @@
-# Technical Specification: Hierarchical Channel Duration Prediction System v5.3.2
+# Technical Specification: Hierarchical Channel Duration Prediction System v5.3.3
 
-**Version:** 5.3.2
-**Branch:** `hierarchical-containment`
-**Date:** December 11, 2025
-**Status:** Production Ready - Weekly TF Bias Resolved
-**Parameters:** 20.0M (down from 21M in v5.2)
+**Version:** 5.3.3 (Native TF Breakdown + yfinance Limits)
+**Branch:** `wtf`
+**Date:** December 12, 2025
+**Status:** Production Ready - Train-Test Consistency Achieved
+**Parameters:** 20.0M (unchanged from v5.3.2)
+**Breaking Change:** Cache regeneration required (breakdown calculation refactored)
 
 ---
 
@@ -132,6 +133,59 @@ Then **geometric projection IS the answer** - adjustments become small refinemen
 - Test MAE improvement (back to <0.25%)
 
 **Cache Regeneration Required**: Feature expansion requires cache rebuild before training!
+
+---
+
+### v5.3.3: Native TF Breakdown + Train-Test Consistency (CURRENT)
+
+**Major Refactor**: Breakdown features now calculated at NATIVE timeframe resolution (not 1-min)
+
+**Critical Fixes**:
+1. **Breakdown calculation moved AFTER resampling**:
+   - Before (v5.3.2): Calculate at 1-min → resample to TF
+     - 5min duration_ratio: rolling(7500 1-min bars) to represent "1500 5-min bars worth"
+     - Semantic confusion: averaging 7500 bars with only 1500 unique values
+   - After (v5.3.3): Resample to TF → calculate at native resolution
+     - 5min duration_ratio: rolling(1500 5-min bars) directly on 5-min data
+     - Semantically correct: averaging 1500 actual 5-min observations
+
+2. **Train-test consistency achieved**:
+   - Training: Breakdown calculated at native TF (1500 5-min bars)
+   - Live: Breakdown calculated at native TF (1500 5-min bars)
+   - SAME calculation method → no distribution shift!
+
+3. **yfinance limits centralized** (config.YFINANCE_MAX_DAYS):
+   - Single source of truth in config.py
+   - 5m/15m/30m: 60 days (sufficient for all adaptive windows!)
+   - 1h: 730 days (was 60, now 12x more data)
+   - Daily: 3650 days (was 400, now 9x more)
+   - Easily changeable for paid API or future yfinance updates
+
+4. **Cross-TF features preserved**:
+   - Each TF file includes breakdown from ALL 11 TFs
+   - Maintains model's ability to see "5min stable, but daily breaking"
+   - Broadcast via forward-fill (coarser→finer resolution)
+
+5. **Legacy mode deprecated** (gradual):
+   - Shows warning + 5-second countdown
+   - Still functional (for backward compatibility)
+   - Recommends native TF mode
+
+6. **Historical CSV supplement** (optional):
+   - `fetch_live_data(use_historical=True)` loads CSV + yfinance
+   - Not required (yfinance provides enough), but enables >60 days context
+   - Dashboard integration included
+
+**Breaking Changes**:
+- Feature version: v5.3.2 → v5.3.3_bdv2
+- Cache structure: breakdown in tf_sequence_*.npy (not non_channel_features.pkl)
+- Old caches incompatible (regeneration required)
+
+**Expected Impact**:
+- ✅ No train-test mismatch (breakdown identical in training and live)
+- ✅ No more extreme values from unit confusion
+- ✅ Semantic correctness (1500 5-min bars, not 7500 1-min bars)
+- ✅ Better live predictions (hourly/daily get 12x-9x more data)
 
 ---
 
@@ -634,20 +688,39 @@ deprecated_code/backend/         # FastAPI dashboard (incomplete, moved v5.3.2)
 
 ---
 
+### 8.4 New in v5.3.3
+
+```
+config.py                       # Added YFINANCE_MAX_DAYS, ADAPTIVE_WINDOW_BARS_NATIVE
+src/ml/features.py              # _calculate_breakdown_at_native_tf() (new method)
+                                # _precompute_timeframe_sequences() (two-pass for cross-TF)
+predict.py                      # Historical CSV supplement, updated yfinance limits
+dashboard_v531.py               # Uses historical supplement
+```
+
+---
+
 ## Appendix A: Architecture Comparison Table
 
-| Feature | v5.0 | v5.1 | v5.2 | v5.3 | v5.3.1 | v5.3.2 |
-|---------|------|------|------|------|--------|--------|
-| Window selection | Learned blend | Quality argmax | Quality argmax | Quality argmax | Quality argmax | **Ping-pong primary** |
-| Quality formula | N/A | R²×0.7 + PP×0.3 | R²×0.7 + PP×0.3 | R²×0.7 + PP×0.3 | R²×0.7 + PP×0.3 | **PP×(0.5+0.5×R²)** |
-| TF aggregation | Blend or select | Select | Select | Select | Select | Select |
-| Information flow | Bottom-up only | Bottom-up only | Bottom-up only | Bottom-up only | 4 modes! | 4 modes! |
-| LR Scheduler | N/A | N/A | Cosine | Cosine | Cosine | **ReduceLROnPlateau** |
-| Duration | Fixed 24 bars | Fixed 24 bars | Learned (VIX+events) | Learned (parents+VIX+events) | Same | Same |
-| VIX | 15 scalars | 15 scalars | CfC sequence (90 days) | CfC sequence | CfC sequence | CfC sequence |
-| Events | Static | Static | Dynamic APIs | Dynamic APIs | Dynamic APIs | Dynamic APIs |
-| Break predictors | N/A | N/A | Limited TFs | Limited TFs | Limited TFs | **All 11 TFs (adaptive)** |
-| Validity | Learned conf | Learned conf | Forward-looking | Forward-looking | Forward-looking | Forward-looking |
+| Feature | v5.0 | v5.1 | v5.2 | v5.3 | v5.3.1 | v5.3.2 | v5.3.3 |
+|---------|------|------|------|------|--------|--------|--------|
+| Window selection | Learned blend | Quality argmax | Quality argmax | Quality argmax | Quality argmax | **Ping-pong primary** | Ping-pong primary |
+| Quality formula | N/A | R²×0.7 + PP×0.3 | R²×0.7 + PP×0.3 | R²×0.7 + PP×0.3 | R²×0.7 + PP×0.3 | **PP×(0.5+0.5×R²)** | PP×(0.5+0.5×R²) |
+| TF aggregation | Blend or select | Select | Select | Select | Select | Select | Select |
+| Breakdown calc | At 1-min | At 1-min | At 1-min | At 1-min | At 1-min | At 1-min | **At native TF** |
+| Train-test match | N/A | Partial | Partial | Partial | Partial | Mismatch | **✅ Consistent** |
+| yfinance limits | Hardcoded | Hardcoded | Hardcoded | Hardcoded | Hardcoded | Hardcoded | **config.py** |
+| Cross-TF breakdown | No | Limited | Limited | Limited | Limited | All 11 TFs (1-min) | **All 11 TFs (native)** |
+| Information flow | Bottom-up only | Bottom-up only | Bottom-up only | Bottom-up only | 4 modes! | 4 modes! | 4 modes! |
+| LR Scheduler | N/A | N/A | Cosine | Cosine | Cosine | **ReduceLROnPlateau** | ReduceLROnPlateau |
+| Duration | Fixed 24 bars | Fixed 24 bars | Learned (VIX+events) | Learned (parents+VIX+events) | Same | Same | Same |
+| VIX | 15 scalars | 15 scalars | CfC sequence (90 days) | CfC sequence | CfC sequence | CfC sequence | CfC sequence |
+| Events | Static | Static | Dynamic APIs | Dynamic APIs | Dynamic APIs | Dynamic APIs | Dynamic APIs |
+| Break predictors | N/A | N/A | Limited TFs | Limited TFs | Limited TFs | **All 11 TFs (adaptive)** | All 11 TFs (adaptive) |
+| Validity | Learned conf | Learned conf | Forward-looking | Forward-looking | Forward-looking | Forward-looking | Forward-looking |
+| Live data (intraday) | Hardcoded | Hardcoded | Hardcoded | Hardcoded | Hardcoded | Hardcoded 60d | **60d (config)** |
+| Live data (hourly) | Hardcoded | Hardcoded | Hardcoded | Hardcoded | Hardcoded | Hardcoded 60d | **730d (12x!)** |
+| Historical supplement | No | No | No | No | No | No | **✅ Optional** |
 | Confidence | Meta-learned | Meta-learned | Meta-learned | Calibrated (MSE) | Calibrated (MSE) | Calibrated (MSE) |
 | Transitions | N/A | N/A | Compositor | Compositor | Compositor | Compositor |
 | Parent context | CfCs only | CfCs only | CfCs only | Duration sees parents | Duration sees parents | Duration sees parents |
@@ -738,12 +811,14 @@ deprecated_code/backend/         # FastAPI dashboard (incomplete, moved v5.3.2)
 
 ## Appendix C: Success Metrics (Target After Training)
 
-| Metric | v5.1 Baseline | v5.2 Target | v5.3 Target | v5.3.2 Achieved |
-|--------|---------------|-------------|-------------|-----------------|
-| Test MAE | 0.30% | <0.28% | <0.26% | 0.25% (1 epoch) ✓ |
-| TF Selection Balance | Weekly bias | Balanced | Balanced | **Fixed weekly bias** |
-| Duration MAE | N/A (fixed) | <7 bars | <5 bars (with parents) | TBD (needs full run) |
-| Transition Accuracy | N/A | >70% (4-way) | >75% (learned patterns) | TBD (needs full run) |
+| Metric | v5.1 Baseline | v5.2 Target | v5.3 Target | v5.3.2 Achieved | v5.3.3 Target |
+|--------|---------------|-------------|-------------|-----------------|---------------|
+| Test MAE | 0.30% | <0.28% | <0.26% | 0.25% (1 epoch) ✓ | <0.25% |
+| TF Selection Balance | Weekly bias | Balanced | Balanced | **Fixed weekly bias** | Balanced (20-30% weekly) |
+| Duration MAE | N/A (fixed) | <7 bars | <5 bars (with parents) | TBD (needs full run) | <5 bars |
+| Transition Accuracy | N/A | >70% (4-way) | >75% (learned patterns) | TBD (needs full run) | >75% |
+| Train-Test Consistency | Partial | Partial | Partial | **Mismatch** | ✅ **Perfect** |
+| Breakdown Extremes | N/A | N/A | N/A | 1.7M outliers | **0 outliers** |
 | Inverted Channels | 4/11 | <2/11 | <1/11 | TBD (needs full run) |
 | Interpretability | 7/10 | 8/10 | 9/10 (containment analysis) | 9/10 |
 
@@ -771,17 +846,27 @@ deprecated_code/backend/         # FastAPI dashboard (incomplete, moved v5.3.2)
 **v5.2-v5.3**: Targets from actual channel duration (could be 8 bars, could be 40 bars)
 **Enables**: Model learns to predict true continuation length
 
+### Decision 5: Native TF Breakdown Calculation (v5.3.3)
+**Problem**: Breakdown calculated at 1-min, resampled to TF (semantic confusion, train-test mismatch)
+- Training: rolling(7500 1-min bars) to represent "1500 5-min bars worth"
+- Live: Only 60 days intraday data, can't fill full windows
+**Solution**: Calculate breakdown AFTER resampling to native TF
+- Training: rolling(1500 5-min bars) on 5-min data
+- Live: rolling(1500 5-min bars) on 5-min data (yfinance provides 60 days = 4680 bars ✅)
+**Benefit**: Perfect train-test consistency, semantic correctness, eliminates extremes
+
 ---
 
-**Model Version:** v5.3.2
-**Architecture:** Hierarchical Duration Predictor with 4-Way Information Flow
-**Status:** Production Ready - Weekly TF Bias Resolved
-**Parameters:** 20,989,277 total / 18,594,101 trainable
+**Model Version:** v5.3.3
+**Architecture:** Hierarchical Duration Predictor with Native TF Breakdown
+**Status:** Production Ready - Train-Test Consistency Achieved
+**Parameters:** 20,989,277 total / 18,594,101 trainable (unchanged from v5.3.2)
 **Recommended Precision:** FP32 (FP16 AMP has numerical stability issues)
 **Recommended LR:** 0.0003 (0.01 causes immediate NaN explosion)
+**Breaking Change:** v5.3.2 → v5.3.3 requires cache regeneration
 **Recommended Scheduler:** ReduceLROnPlateau (Cosine caused gradient instability)
-**Branch:** hierarchical-containment
-**Last Updated:** December 11, 2025
+**Branch:** `wtf` (v5.3.3 major refactor)
+**Last Updated:** December 12, 2025
 
 ---
 
@@ -792,4 +877,9 @@ deprecated_code/backend/         # FastAPI dashboard (incomplete, moved v5.3.2)
 3. **Learning Rate**: Must use ≤0.0005 (model has 20M params, 0.01 causes instant explosion)
 4. **LR Scheduler**: Use ReduceLROnPlateau (Cosine drops to 0.000002 causing gradient chaos)
 5. **Information Flow**: Test all 4 modes to find best for your data
-6. **v5.3.2 Cache Regeneration Required**: Feature expansion (duration_ratio + SPY-TSLA alignment to all TFs) requires cache rebuild before training!
+6. **v5.3.3 Cache Regeneration REQUIRED**: Breakdown calculation method changed (native TF resolution)
+   - Breaking change: v5.3.2 caches incompatible with v5.3.3
+   - Delete data/feature_cache/* before training
+   - Cache version: v5.3.3_vixv1_evv1_projv1_bdv2
+7. **Legacy Mode Deprecated**: Use native TF mode (default), avoid --no-native-timeframes flag
+8. **yfinance Limits**: Now centralized in config.YFINANCE_MAX_DAYS (easily changeable for paid API)

@@ -2749,6 +2749,33 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
     if is_main_process(rank):
         print("\n2. Extracting features...")
+
+        # v5.3.3: Deprecation warning for legacy mmap mode
+        if not args.use_native_timeframes:
+            print("\n" + "=" * 70)
+            print("⚠️  WARNING: Legacy mmap mode is DEPRECATED as of v5.3.3")
+            print("=" * 70)
+            print("   Breakdown features will use OLD calculation (1-min resolution).")
+            print("   This may cause train-test mismatch with live predictions.")
+            print("")
+            print("   RECOMMENDED: Use native timeframe mode instead:")
+            print("   - Remove --no-native-timeframes flag")
+            print("   - Or add --native-timeframes explicitly")
+            print("")
+            print("   Native TF mode benefits:")
+            print("   - Faster training (optimized data loading)")
+            print("   - Better live prediction consistency")
+            print("   - Correct breakdown feature calculation")
+            print("=" * 70)
+            print("   Continuing with legacy mode in 5 seconds...")
+
+            # Give user 5 seconds to cancel
+            import time
+            for i in range(5, 0, -1):
+                print(f"   {i}...", end='\r', flush=True)
+                time.sleep(1)
+            print("   Proceeding with legacy mode.\n")
+
     if profiler:
         profiler.snapshot("pre_feature_extraction", 0, force_log=True)
 
@@ -2828,6 +2855,15 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         cont_labels_info = str(continuation_labels_dir) if continuation_labels_dir else "None"
         profiler.log_info(f"FEATURES_EXTRACTED | non_channel_cols={nc_cols} | continuation_labels_dir={cont_labels_info}")
         profiler.snapshot("post_feature_extraction", 0, force_log=True)
+
+    # v5.3.3: Validate that live data can support adaptive windows
+    if is_main_process(rank) and args.use_native_timeframes:
+        compatibility_warnings = project_config.validate_live_data_compatibility()
+        if compatibility_warnings:
+            print("\n⚠️  Live Prediction Data Warnings:")
+            for warning in compatibility_warnings:
+                print(f"   • {warning}")
+            print("   (Training uses full historical data; live may have degraded features)\n")
 
     # Save cache manifest for future reuse (supports both mmap and pickle modes)
     if is_main_process(rank) and hasattr(extractor, '_cache_key'):
