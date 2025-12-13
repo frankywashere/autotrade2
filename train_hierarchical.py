@@ -2770,7 +2770,6 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print("   Continuing with legacy mode in 5 seconds...")
 
             # Give user 5 seconds to cancel
-            import time
             for i in range(5, 0, -1):
                 print(f"   {i}...", end='\r', flush=True)
                 time.sleep(1)

@@ -3751,8 +3751,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                     continue
 
                 # Normalize stability to represent "time in channel" score
-                time_in_channel = np.clip(stability * 100, 0, 100)  # 0-100 scale
-                breakdown_features[f'{symbol}_time_in_channel_{tf_name}'] = time_in_channel.values
+                time_in_channel = np.clip(stability * 100, 0, 100)  # 0-100 scale (np.clip returns ndarray)
+                breakdown_features[f'{symbol}_time_in_channel_{tf_name}'] = np.asarray(time_in_channel)
 
         # 6. Enhanced normalized channel position (11 timeframes × 2 stocks)
         for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
@@ -3935,7 +3935,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             stability = resampled_df[stability_col]
             avg_stability = stability.rolling(window, min_periods=window//2).mean()
             duration_ratio = (stability / (avg_stability + 0.01)).fillna(1.0)
-            breakdown_features[f'tsla_channel_duration_ratio_{tf}'] = duration_ratio.values
+            breakdown_features[f'tsla_channel_duration_ratio_{tf}'] = np.asarray(duration_ratio)
         else:
             breakdown_features[f'tsla_channel_duration_ratio_{tf}'] = np.ones(num_rows)
 
@@ -3946,7 +3946,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             tsla_pos = resampled_df[tsla_pos_col] * 2 - 1  # Convert 0-1 to -1 to +1
             spy_pos = resampled_df[spy_pos_col] * 2 - 1
             alignment = tsla_pos * spy_pos  # -1 to +1 (both aligned)
-            breakdown_features[f'channel_alignment_spy_tsla_{tf}'] = alignment.values
+            breakdown_features[f'channel_alignment_spy_tsla_{tf}'] = np.asarray(alignment)
         else:
             breakdown_features[f'channel_alignment_spy_tsla_{tf}'] = np.zeros(num_rows)
 
@@ -3955,8 +3955,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             stability_col = f'{symbol}_channel_{tf}_w50_stability'
             if stability_col in resampled_df.columns:
                 stability = resampled_df[stability_col]
-                time_in_channel = np.clip(stability * 100, 0, 100)  # 0-100 scale
-                breakdown_features[f'{symbol}_time_in_channel_{tf}'] = time_in_channel.values
+                time_in_channel = np.clip(stability * 100, 0, 100)  # 0-100 scale (np.clip returns ndarray)
+                breakdown_features[f'{symbol}_time_in_channel_{tf}'] = np.asarray(time_in_channel)
             else:
                 breakdown_features[f'{symbol}_time_in_channel_{tf}'] = np.zeros(num_rows)
 
@@ -3965,7 +3965,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             pos_col = f'{symbol}_channel_{tf}_w50_position'
             if pos_col in resampled_df.columns:
                 position_norm = resampled_df[pos_col] * 2 - 1  # Convert 0-1 to -1 to +1
-                breakdown_features[f'{symbol}_channel_position_norm_{tf}'] = position_norm.values
+                breakdown_features[f'{symbol}_channel_position_norm_{tf}'] = np.asarray(position_norm)
             else:
                 breakdown_features[f'{symbol}_channel_position_norm_{tf}'] = np.zeros(num_rows)
 
@@ -3975,7 +3975,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             recent_vol = volume.rolling(5, min_periods=1).mean()
             historical_vol = volume.rolling(20, min_periods=5).mean().shift(5)
             volume_surge = ((recent_vol - historical_vol) / (historical_vol + 1e-8)).fillna(0)
-            breakdown_features['tsla_volume_surge'] = volume_surge.values
+            breakdown_features['tsla_volume_surge'] = np.asarray(volume_surge)
         else:
             breakdown_features['tsla_volume_surge'] = np.zeros(num_rows)
 
@@ -3986,7 +3986,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             rsi_normalized = resampled_df[rsi_col] / 100.0  # 0-1 range
             channel_pos = resampled_df[pos_col]  # Already 0-1
             divergence = rsi_normalized - channel_pos  # -1 to +1
-            breakdown_features[f'tsla_rsi_divergence_{tf}'] = divergence.values
+            breakdown_features[f'tsla_rsi_divergence_{tf}'] = np.asarray(divergence)
         else:
             breakdown_features[f'tsla_rsi_divergence_{tf}'] = np.zeros(num_rows)
 
@@ -4013,7 +4013,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             current_vol = tsla_close.pct_change().rolling(10, min_periods=1).std()
             historical_vol = current_vol.rolling(50, min_periods=10).mean()
             is_volatile = (current_vol > 1.5 * historical_vol).fillna(False).astype(float)
-            breakdown_features['is_volatile_now'] = is_volatile.values
+            breakdown_features['is_volatile_now'] = np.asarray(is_volatile)
         else:
             breakdown_features['is_volatile_now'] = np.zeros(num_rows)
 
@@ -4024,7 +4024,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 stability = resampled_df[stability_col]
                 # In channel if stability > 5 (simplified threshold)
                 in_channel = (stability > 5.0).astype(float)
-                breakdown_features[f'{symbol}_in_channel_{tf}'] = in_channel.values
+                breakdown_features[f'{symbol}_in_channel_{tf}'] = np.asarray(in_channel)
             else:
                 breakdown_features[f'{symbol}_in_channel_{tf}'] = np.zeros(num_rows)
 
