@@ -255,15 +255,7 @@ def setup_distributed_spawn(rank: int, world_size: int):
     this takes rank/world_size directly from mp.spawn() arguments.
     """
     os.environ['MASTER_ADDR'] = 'localhost'
-
-    # Use environment variable if set, otherwise find an available port
-    if 'MASTER_PORT' not in os.environ:
-        # Find an available port (avoid port reuse conflicts)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('localhost', 0))
-            s.listen(1)
-            available_port = s.getsockname()[1]
-        os.environ['MASTER_PORT'] = str(available_port)
+    os.environ['MASTER_PORT'] = '12355'
 
     dist.init_process_group(
         backend='nccl',
@@ -4201,6 +4193,24 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             'duration_stats': duration_stats,           # Mean/std of duration predictions
             'validity_stats': validity_stats,           # Mean validity, most common TF
             'test_results': test_results,               # Test set evaluation (was computed but not saved!)
+
+            # v5.3.3: Breakdown calculation and train-test consistency metadata
+            'v533_metadata': {
+                'breakdown_method': 'native_tf' if args.use_native_timeframes else 'legacy_1min',
+                'train_test_consistent': args.use_native_timeframes,  # Native TF = consistent with live
+                'feature_version': extractor._cache_key if hasattr(extractor, '_cache_key') else 'unknown',
+                'cache_structure': 'native_tf_sequences' if args.use_native_timeframes else 'legacy_mmap',
+                'adaptive_window_method': 'native_tf_bars' if args.use_native_timeframes else 'legacy_1min_bars',
+                'yfinance_limits': {
+                    '1min': project_config.YFINANCE_MAX_DAYS.get('1min') if hasattr(project_config, 'YFINANCE_MAX_DAYS') else None,
+                    'intraday': project_config.YFINANCE_MAX_DAYS.get('intraday') if hasattr(project_config, 'YFINANCE_MAX_DAYS') else None,
+                    '1h': project_config.YFINANCE_MAX_DAYS.get('1h') if hasattr(project_config, 'YFINANCE_MAX_DAYS') else None,
+                    'daily': project_config.YFINANCE_MAX_DAYS.get('daily') if hasattr(project_config, 'YFINANCE_MAX_DAYS') else None,
+                    'weekly_monthly': project_config.YFINANCE_MAX_DAYS.get('weekly_monthly') if hasattr(project_config, 'YFINANCE_MAX_DAYS') else None,
+                } if hasattr(project_config, 'YFINANCE_MAX_DAYS') else None,
+                'cross_tf_features': args.use_native_timeframes,  # Native TF includes cross-TF breakdown
+                'duplicate_breakdown_bug_fixed': True,  # v5.3.3 fix: no more duplicates in non-chunked mode
+            },
         }
 
         if profiler:
@@ -4483,15 +4493,6 @@ def main():
         num_gpus = getattr(args, 'num_ddp_gpus', torch.cuda.device_count())
         print(f"\n🚀 Launching {num_gpus} DDP processes via mp.spawn...")
         print(f"   Each process will use one GPU (cuda:0 to cuda:{num_gpus-1})")
-
-        # Find an available port for DDP (avoid conflicts from previous training runs)
-        if 'MASTER_PORT' not in os.environ:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(('localhost', 0))
-                s.listen(1)
-                available_port = s.getsockname()[1]
-            os.environ['MASTER_PORT'] = str(available_port)
-
         mp.spawn(run_training, nprocs=num_gpus, args=(num_gpus, vars(args)))
     else:
         # Single GPU/device mode - call directly
