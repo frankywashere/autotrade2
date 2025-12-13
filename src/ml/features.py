@@ -1170,31 +1170,57 @@ class TradingFeatureExtractor(FeatureExtractor):
             'total_rows_1min': len(df),
         }
 
-        # Step 3: Resample for each timeframe and save
-        print(f"   🔄 Resampling to timeframe resolutions...")
+        # Step 3: v5.3.3 Two-pass for cross-TF breakdown features
+        # Pass 1: Calculate breakdown for each TF at native resolution
+        print(f"   📊 Pass 1/2: Calculating breakdown at native TF resolutions...")
+        all_tf_resampled = {}  # Store resampled DataFrames
+        all_tf_breakdown = {}  # Store breakdown features per TF
 
-        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Resampling", leave=False, ncols=100, ascii=True):
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Calc breakdown per TF", leave=False, ncols=100, ascii=True):
             tf_cols = shared_cols + tf_specific_cols[tf]
-            meta['timeframe_columns'][tf] = tf_cols
 
             # Select columns for this timeframe and resample
             tf_features = df[tf_cols].copy()
             tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
 
-            # Use .last() to get value at end of each bar (same as _precompute_timeframe_sequences)
+            # Use .last() to get value at end of each bar
             resampled = tf_features.resample(tf_rule).last().dropna()
 
-            # v5.3.3: Calculate breakdown at native TF resolution
+            # Calculate breakdown at THIS TF's native resolution
             breakdown_tf = self._calculate_breakdown_at_native_tf(
                 resampled,
                 tf=tf,
                 raw_df=None,          # Not available in chunked mode
                 events_handler=None   # Not available in chunked mode
             )
-            # Add breakdown features
-            resampled = pd.concat([resampled, breakdown_tf], axis=1, copy=False)
 
-            # Save as .npy file (now includes breakdown)
+            # Store for Pass 2
+            all_tf_resampled[tf] = resampled
+            all_tf_breakdown[tf] = breakdown_tf
+
+        # Pass 2: Add cross-TF breakdown features and save
+        print(f"   💾 Pass 2/2: Adding cross-TF features and saving...")
+
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Saving TF sequences", leave=False, ncols=100, ascii=True):
+            # Get this TF's base features
+            resampled = all_tf_resampled[tf]
+
+            # Add breakdown from ALL TFs (resampled to match this TF's resolution)
+            for other_tf, other_breakdown in all_tf_breakdown.items():
+                # Resample other TF's breakdown to match current TF's index
+                # Use forward-fill (ffill) to broadcast coarser→finer (e.g., daily→5min)
+                if len(other_breakdown) > 0:
+                    breakdown_aligned = other_breakdown.reindex(resampled.index, method='ffill')
+                    # Concat horizontally (add columns)
+                    resampled = pd.concat([resampled, breakdown_aligned], axis=1, copy=False)
+
+            # Remove duplicate columns (can happen from same-TF concat)
+            resampled = resampled.loc[:, ~resampled.columns.duplicated(keep='first')]
+
+            # Update metadata with final column list (includes cross-TF breakdown)
+            meta['timeframe_columns'][tf] = list(resampled.columns)
+
+            # Save as .npy file (now includes cross-TF breakdown)
             output_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}.npy"
             np.save(output_path, resampled.values.astype(np.float32))
 
@@ -1312,7 +1338,14 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         print(f"   🔄 Streaming resample (one TF at a time, one chunk at a time)...")
 
-        # Process each timeframe independently
+        # v5.3.3: Two-pass processing for cross-TF breakdown features
+        # Pass 1: Calculate breakdown for each TF at native resolution, store in memory
+        # Pass 2: Add all TF breakdowns to each file (reindexed to match)
+        all_tf_breakdown = {}  # Store breakdown DataFrames (small, ~400MB total)
+        all_tf_resampled_base = {}  # Store base features temporarily
+
+        # Pass 1: Process each timeframe and calculate its breakdown
+        print(f"   📊 Pass 1/2: Calculating breakdown at native TF resolutions...")
         for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Timeframes", leave=True, ncols=100, ascii=True):
             # Columns for this TF: non-channel + shared channel + TF-specific channel
             tf_indices = shared_col_indices + tf_col_indices[tf]
@@ -1396,25 +1429,78 @@ class TradingFeatureExtractor(FeatureExtractor):
                     raw_df=None,          # Not available in chunked mode
                     events_handler=None   # Not available in chunked mode
                 )
-                # Add breakdown to final_df
-                final_df = pd.concat([final_df, breakdown_tf], axis=1, copy=False)
 
-                # Save .npy files (now includes breakdown)
-                output_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}.npy"
-                np.save(output_path, final_df.values.astype(np.float32))
+                # Store breakdown for cross-TF broadcast (Pass 2)
+                all_tf_breakdown[tf] = breakdown_tf
 
+                # Save base features to temp file (will add cross-TF breakdown in Pass 2)
+                temp_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}_temp.npy"
+                np.save(temp_path, final_df.values.astype(np.float32))
+
+                # Save timestamps (final location - doesn't change in Pass 2)
                 ts_path = output_cache_dir / f"tf_timestamps_{tf}_{meta['cache_key']}.npy"
                 np.save(ts_path, final_df.index.view(np.int64))
 
-                meta['timeframe_shapes'][tf] = list(final_df.shape)
+                # Store column names and index for Pass 2
+                all_tf_resampled_base[tf] = {
+                    'columns': list(final_df.columns),
+                    'index': final_df.index.copy(),
+                    'shape': final_df.shape
+                }
 
                 seq_len = TIMEFRAME_SEQUENCE_LENGTHS[tf]
-                print(f"      {tf}: {final_df.shape[0]:,} bars × {final_df.shape[1]} features (seq_len={seq_len})")
+                print(f"      {tf}: {final_df.shape[0]:,} bars × {final_df.shape[1]} base features (seq_len={seq_len})")
 
                 del final_df, resampled_chunks
 
             # Force garbage collection after each TF
             gc.collect()
+
+        # Pass 2: Add cross-TF breakdown features to each file
+        print(f"\n   💾 Pass 2/2: Adding cross-TF breakdown features...")
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Adding cross-TF", leave=False, ncols=100, ascii=True):
+            if tf not in all_tf_resampled_base:
+                continue
+
+            base_info = all_tf_resampled_base[tf]
+            temp_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}_temp.npy"
+
+            # Load base features
+            base_array = np.load(str(temp_path))
+            base_df = pd.DataFrame(base_array, columns=base_info['columns'], index=base_info['index'])
+
+            # Add breakdown from ALL TFs (reindexed to match this TF's resolution)
+            for other_tf, other_breakdown in all_tf_breakdown.items():
+                if len(other_breakdown) > 0:
+                    # Reindex other TF's breakdown to match current TF's index
+                    # Use forward-fill (ffill) to broadcast coarser→finer (e.g., daily→5min)
+                    breakdown_aligned = other_breakdown.reindex(base_df.index, method='ffill')
+                    # Concat horizontally (add columns)
+                    base_df = pd.concat([base_df, breakdown_aligned], axis=1, copy=False)
+
+            # Remove duplicate columns (from current TF's own breakdown already added)
+            base_df = base_df.loc[:, ~base_df.columns.duplicated(keep='first')]
+
+            # Save final file with all cross-TF breakdown
+            output_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}.npy"
+            np.save(output_path, base_df.values.astype(np.float32))
+
+            # Update metadata with final column count
+            meta['timeframe_columns'][tf] = list(base_df.columns)
+            meta['timeframe_shapes'][tf] = list(base_df.shape)
+
+            seq_len = TIMEFRAME_SEQUENCE_LENGTHS[tf]
+            print(f"      {tf}: {base_df.shape[0]:,} bars × {base_df.shape[1]} features (with cross-TF breakdown)")
+
+            # Clean up temp file
+            temp_path.unlink()
+            del base_array, base_df
+
+            gc.collect()
+
+        # Clean up memory
+        del all_tf_breakdown, all_tf_resampled_base
+        gc.collect()
 
         # Save metadata
         meta_path = output_cache_dir / f"tf_meta_{meta['cache_key']}.json"
