@@ -648,8 +648,10 @@ class LiveFeatureExtractor:
         """
         Extract features for a specific timeframe.
 
+        v5.3.3: Now calculates breakdown at native TF resolution (same as training).
+
         Args:
-            features_df: Full features DataFrame at 1-min resolution
+            features_df: Full features DataFrame (base features, NO breakdown in v5.3.3)
             tf: Target timeframe
 
         Returns:
@@ -660,6 +662,22 @@ class LiveFeatureExtractor:
 
         # Resample features to this TF
         resampled = features_df.resample(resample_rule).last().dropna()
+
+        # v5.3.3: Calculate breakdown at native TF resolution (train-test consistency!)
+        # Import here to avoid circular dependency
+        from src.ml.features import TradingFeatureExtractor
+        temp_extractor = TradingFeatureExtractor()
+
+        # Calculate breakdown for THIS TF at native resolution
+        breakdown_native = temp_extractor._calculate_breakdown_at_native_tf(
+            resampled,
+            tf=tf,
+            raw_df=None,  # Not available in live mode (events set to zeros)
+            events_handler=None
+        )
+
+        # Add breakdown to resampled features
+        resampled = pd.concat([resampled, breakdown_native], axis=1, copy=False)
 
         # Get the columns for this TF (from tf_meta)
         if tf in self.feature_columns:

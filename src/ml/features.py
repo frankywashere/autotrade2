@@ -689,17 +689,29 @@ class TradingFeatureExtractor(FeatureExtractor):
                 print(f"   🧹 Freed intermediate feature DataFrames (~90GB)")
 
             # PASS 2: Extract breakdown features (needs base features + optional events)
-            with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100, ascii=True, mininterval=0.5) as pbar:
-                breakdown_df = self._extract_breakdown_features(base_features_df, df, events_handler)
-                pbar.update(1)
+            # v5.3.3: Only calculate legacy 1-min breakdown if native TF generation will be skipped
+            # (live mode, legacy mode, or when explicitly disabled)
+            if skip_native_tf_generation:
+                # Legacy/live mode - need breakdown at 1-min resolution now
+                with tqdm(total=1, desc="   Breakdown features", leave=False, ncols=100, ascii=True, mininterval=0.5) as pbar:
+                    breakdown_df = self._extract_breakdown_features(base_features_df, df, events_handler)
+                    pbar.update(1)
 
-            # Final concat (non-channel features only if using mmap)
-            # Optimize: copy=False avoids unnecessary data copies
-            features_df = pd.concat([base_features_df, breakdown_df], axis=1, copy=False)
-            # Free concat intermediates to reclaim ~92GB before continuation labels
-            import gc
-            del base_features_df, breakdown_df
-            gc.collect()
+                # Final concat (non-channel features only if using mmap)
+                # Optimize: copy=False avoids unnecessary data copies
+                features_df = pd.concat([base_features_df, breakdown_df], axis=1, copy=False)
+                # Free concat intermediates to reclaim ~92GB before continuation labels
+                import gc
+                del base_features_df, breakdown_df
+                gc.collect()
+            else:
+                # Native TF mode - breakdown will be calculated at native resolution later
+                # in _precompute_timeframe_sequences() or generate_native_tf_from_chunks()
+                features_df = base_features_df  # No breakdown yet (avoids duplicates)
+                # Free base_features_df reference (features_df now owns the data)
+                import gc
+                del base_features_df
+                gc.collect()
 
         # Generate continuation labels if requested
         # v4.3: Now generates hierarchical per-TF labels using channel-structure break detection
