@@ -25,6 +25,7 @@ from torch.utils.data._utils.collate import default_collate
 from pathlib import Path
 import sys
 import os
+import socket
 
 import functools
 from datetime import datetime
@@ -254,7 +255,15 @@ def setup_distributed_spawn(rank: int, world_size: int):
     this takes rank/world_size directly from mp.spawn() arguments.
     """
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+
+    # Use environment variable if set, otherwise find an available port
+    if 'MASTER_PORT' not in os.environ:
+        # Find an available port (avoid port reuse conflicts)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('localhost', 0))
+            s.listen(1)
+            available_port = s.getsockname()[1]
+        os.environ['MASTER_PORT'] = str(available_port)
 
     dist.init_process_group(
         backend='nccl',
@@ -4474,6 +4483,15 @@ def main():
         num_gpus = getattr(args, 'num_ddp_gpus', torch.cuda.device_count())
         print(f"\n🚀 Launching {num_gpus} DDP processes via mp.spawn...")
         print(f"   Each process will use one GPU (cuda:0 to cuda:{num_gpus-1})")
+
+        # Find an available port for DDP (avoid conflicts from previous training runs)
+        if 'MASTER_PORT' not in os.environ:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('localhost', 0))
+                s.listen(1)
+                available_port = s.getsockname()[1]
+            os.environ['MASTER_PORT'] = str(available_port)
+
         mp.spawn(run_training, nprocs=num_gpus, args=(num_gpus, vars(args)))
     else:
         # Single GPU/device mode - call directly
