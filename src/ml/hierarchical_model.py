@@ -1726,6 +1726,86 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
         return projections
 
+    def predict_with_projections(
+        self,
+        x: torch.Tensor,
+        features_dict: Dict[str, float],
+        current_price: float,
+        market_state: Optional[torch.Tensor] = None,
+        symbol: str = 'tsla',
+        windows: List[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Generate predictions with learned channel projections (v5.6).
+
+        This method runs inference and then calculates price projections
+        using the model's predicted duration for each timeframe.
+
+        Args:
+            x: Input features [batch, seq_len, features] or Dict[str, Tensor]
+            features_dict: Dict of feature name -> value (for channel state)
+            current_price: Current close price
+            market_state: Optional market state [batch, 12]
+            symbol: Symbol to project ('tsla' or 'spy')
+            windows: Window sizes to project (default: config windows)
+
+        Returns:
+            Dict with:
+                - All standard prediction outputs
+                - 'learned_projections': Dict[str, ChannelProjection]
+                - 'best_projection': Best projection based on R:R and confidence
+        """
+        from .projection_calculator import (
+            calculate_projections_from_model_output,
+            calculate_best_projection,
+        )
+
+        self.eval()
+
+        with torch.no_grad():
+            # Run forward pass
+            if isinstance(x, dict):
+                predictions, output_dict = self.forward(x, market_state)
+            else:
+                predictions, output_dict = self.forward_single_input(x, market_state)
+
+            # Get standard predictions
+            result = self.predict(x, market_state)
+
+            # Calculate learned projections using predicted duration
+            learned_projections = calculate_projections_from_model_output(
+                model_output=output_dict,
+                features=features_dict,
+                current_price=current_price,
+                timeframes=self.TIMEFRAMES,
+                windows=windows,
+                symbol=symbol,
+            )
+
+            result['learned_projections'] = learned_projections
+
+            # Find best projection
+            best_proj = calculate_best_projection(
+                learned_projections,
+                min_confidence=0.5,
+                min_rr_ratio=1.5,
+            )
+            result['best_projection'] = best_proj
+
+            # Add duration predictions for each TF
+            if 'duration' in output_dict:
+                result['duration_predictions'] = {}
+                for tf in self.TIMEFRAMES:
+                    if tf in output_dict['duration']:
+                        dur_data = output_dict['duration'][tf]
+                        result['duration_predictions'][tf] = {
+                            'mean': dur_data['mean'][0, 0].item() if isinstance(dur_data['mean'], torch.Tensor) else dur_data['mean'],
+                            'std': dur_data['std'][0, 0].item() if isinstance(dur_data['std'], torch.Tensor) else dur_data['std'],
+                            'confidence': dur_data['confidence'][0, 0].item() if isinstance(dur_data['confidence'], torch.Tensor) else dur_data['confidence'],
+                        }
+
+            return result
+
     def update_online(
         self,
         x: torch.Tensor,

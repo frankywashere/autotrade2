@@ -1,5 +1,5 @@
 """
-Vectorized Channel Calculation with Partial Bars (v5.5)
+Vectorized Channel Calculation with Partial Bars (v5.5.1)
 
 This module calculates channel features at 5min resolution including partial TF bars.
 Uses vectorized numpy operations for efficiency - ~100x faster than loop-based approach.
@@ -11,6 +11,11 @@ v5.5: Added 22 missing channel features for parity with old LinearRegressionChan
   - slope_convergence, is_bull, is_bear, is_sideways, quality_score, duration
   - projected_high, projected_low
   - ping_pongs (4 thresholds), complete_cycles (4 thresholds)
+
+v5.5.1: Fixed forward projections to match old LinearRegressionChannel behavior:
+  - projected_high/low/center now project 24 hours forward (TF-specific)
+  - Uses BARS_PER_24H mapping: 5min=78, 15min=26, 1h=24, daily=1, etc.
+  - This predicts WHERE the channel WILL BE, not just current position
 """
 
 import numpy as np
@@ -198,6 +203,10 @@ def calculate_channel_features_vectorized(
     Calculate channel features at 5min resolution with partial bars.
     Vectorized implementation - processes all bars in each TF period together.
 
+    v5.6: Removed fixed projection features (projected_high/low/center).
+    Projections are now calculated at inference time using learned duration predictions.
+    This reduces feature count from 34 to 31 per window.
+
     Args:
         df_5min: 5min OHLCV DataFrame
         symbol: 'tsla' or 'spy'
@@ -209,6 +218,7 @@ def calculate_channel_features_vectorized(
     Returns:
         DataFrame with channel features at 5min resolution
     """
+
     # Extract symbol columns
     symbol_df = df_5min[[f'{symbol}_open', f'{symbol}_high', f'{symbol}_low',
                           f'{symbol}_close', f'{symbol}_volume']].copy()
@@ -275,10 +285,7 @@ def calculate_channel_features_vectorized(
         f'{prefix}_is_bear': np.zeros(n_5min, dtype=np.float32),
         f'{prefix}_is_sideways': np.zeros(n_5min, dtype=np.float32),
 
-        # NEW: Projections (3 features)
-        f'{prefix}_projected_high': np.zeros(n_5min, dtype=np.float32),
-        f'{prefix}_projected_low': np.zeros(n_5min, dtype=np.float32),
-        f'{prefix}_projected_center': np.zeros(n_5min, dtype=np.float32),
+        # v5.6: Removed projected_high/low/center - now calculated at inference from learned duration
 
         # NEW: Ping-pongs at 4 thresholds (4 features)
         f'{prefix}_ping_pongs': np.zeros(n_5min, dtype=np.float32),
@@ -456,10 +463,9 @@ def calculate_channel_features_vectorized(
         is_bear = (close_slope_pct < -0.1).astype(np.float32)
         is_sideways = (np.abs(close_slope_pct) <= 0.1).astype(np.float32)
 
-        # Projections (current regression line endpoints)
-        projected_high = upper_at_partial
-        projected_low = lower_at_partial
-        projected_center = center_at_partial
+        # v5.6: Removed fixed projection calculation
+        # Projections are now calculated at inference time using learned duration predictions
+        # The model predicts how long the channel will continue, then we project by that duration
 
         # Duration (TF bars since start of window - constant for this period)
         duration = np.full(len(bar_indices), float(n_hist + 1), dtype=np.float32)
@@ -550,10 +556,7 @@ def calculate_channel_features_vectorized(
         output[f'{prefix}_is_bear'][bar_indices] = is_bear
         output[f'{prefix}_is_sideways'][bar_indices] = is_sideways
 
-        # Store NEW features - Projections
-        output[f'{prefix}_projected_high'][bar_indices] = projected_high.astype(np.float32)
-        output[f'{prefix}_projected_low'][bar_indices] = projected_low.astype(np.float32)
-        output[f'{prefix}_projected_center'][bar_indices] = projected_center.astype(np.float32)
+        # v5.6: Removed projected_high/low/center storage - calculated at inference
 
         # Store NEW features - Ping-pongs
         output[f'{prefix}_ping_pongs'][bar_indices] = pp_2pct
@@ -666,7 +669,8 @@ def _calculate_5min_channel_features_rolling(symbol_df: pd.DataFrame, symbol: st
     For 5min TF, each bar IS the complete bar - no partial bar concept applies.
     Uses pandas rolling + numpy for O(n) vectorized computation.
 
-    Returns 34 features per window (matching old LinearRegressionChannel).
+    v5.6: Returns 31 features per window (removed projected_high/low/center).
+    Projections are now calculated at inference time using learned duration predictions.
     """
     n = len(symbol_df)
     prefix = f'{symbol}_channel_5min_w{window}'
@@ -720,10 +724,7 @@ def _calculate_5min_channel_features_rolling(symbol_df: pd.DataFrame, symbol: st
             f'{prefix}_is_bear': np.zeros(n, dtype=np.float32),
             f'{prefix}_is_sideways': np.zeros(n, dtype=np.float32),
 
-            # NEW: Projections (3 features)
-            f'{prefix}_projected_high': np.zeros(n, dtype=np.float32),
-            f'{prefix}_projected_low': np.zeros(n, dtype=np.float32),
-            f'{prefix}_projected_center': np.zeros(n, dtype=np.float32),
+            # v5.6: Removed projected_high/low/center - now calculated at inference from learned duration
 
             # NEW: Ping-pongs at 4 thresholds (4 features)
             f'{prefix}_ping_pongs': np.zeros(n, dtype=np.float32),
@@ -837,10 +838,9 @@ def _calculate_5min_channel_features_rolling(symbol_df: pd.DataFrame, symbol: st
     is_bear = (close_slope_pct < -0.1).astype(np.float32)
     is_sideways = (np.abs(close_slope_pct) <= 0.1).astype(np.float32)
 
-    # Projections (channel bounds at current bar)
-    projected_high = upper
-    projected_low = lower
-    projected_center = center
+    # v5.6: Removed fixed projection calculation
+    # Projections are now calculated at inference time using learned duration predictions
+    # The model predicts how long the channel will continue, then we project by that duration
 
     # Duration (window size - constant for 5min)
     duration = np.full(n_windows, float(window), dtype=np.float32)
@@ -932,10 +932,7 @@ def _calculate_5min_channel_features_rolling(symbol_df: pd.DataFrame, symbol: st
     output[f'{prefix}_is_bear'][start_idx:end_idx] = is_bear
     output[f'{prefix}_is_sideways'][start_idx:end_idx] = is_sideways
 
-    # NEW: Projections
-    output[f'{prefix}_projected_high'][start_idx:end_idx] = projected_high.astype(np.float32)
-    output[f'{prefix}_projected_low'][start_idx:end_idx] = projected_low.astype(np.float32)
-    output[f'{prefix}_projected_center'][start_idx:end_idx] = projected_center.astype(np.float32)
+    # v5.6: Removed projected_high/low/center storage - calculated at inference
 
     # NEW: Ping-pongs
     output[f'{prefix}_ping_pongs'][start_idx:end_idx] = pp_2pct

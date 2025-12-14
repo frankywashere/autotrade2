@@ -37,11 +37,11 @@ except ImportError:
 # Feature cache version - increment when calculation logic changes
 VIX_CALC_VERSION = "v1"  # v4.4: Track VIX feature calculation version (increment if VIX logic changes)
 EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
-CHANNEL_PROJECTION_VERSION = "v1"  # v5.0: Track channel projection features
+CHANNEL_PROJECTION_VERSION = "v2"  # v5.6: Removed fixed projections - now calculated at inference from learned duration
 BREAKDOWN_CALC_VERSION = "v2"  # v5.3.3: Track breakdown calculation method (v1=1-min, v2=native TF)
-PARTIAL_BAR_VERSION = "v2"  # v5.5: Added 22 missing channel features (ping-pongs, cycles, R², etc.)
-FEATURE_VERSION = f"v5.5.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}"
-# v5.5.0: Added 22 missing channel features (34 per window now) - ping-pongs, cycles, R² variants, etc.
+PARTIAL_BAR_VERSION = "v4"  # v5.6: Removed projected_high/low/center - projections calculated at inference
+FEATURE_VERSION = f"v5.6.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}"
+# v5.6.0: Removed fixed projection features (31 per window now) - projections calculated at inference using learned duration
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
 # IMPORTED FROM config.py (single source of truth)
@@ -256,12 +256,13 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'{symbol}_volatility_50',
             ])
 
-        # Multi-window channel features (v5.5: 34 features per window)
-        # Total: 14 windows × 11 TFs × 34 metrics × 2 symbols = 10,472 channel features
+        # Multi-window channel features (v5.6: 31 features per window - removed projections)
+        # Total: 14 windows × 11 TFs × 31 metrics × 2 symbols = 9,548 channel features
+        # v5.6: Projections are now calculated at inference using learned duration predictions
         windows = config.CHANNEL_WINDOW_SIZES  # [100, 90, 80, ..., 10] (14 values)
         timeframes = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
 
-        # ALL 34 metrics from partial_channel_calc_vectorized.py
+        # ALL 31 metrics from partial_channel_calc_vectorized.py (v5.6: removed projected_high/low/center)
         # Naming pattern: {symbol}_channel_{tf}_w{window}_{metric}
         metrics = [
             # Position metrics (3)
@@ -284,8 +285,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             'quality_score', 'is_valid', 'insufficient_data',
             # Duration (1)
             'duration',
-            # Projections (3) - v5.5
-            'projected_high', 'projected_low', 'projected_center',
+            # v5.6: Removed projected_high/low/center - now calculated at inference from learned duration
         ]
 
         for symbol in ['tsla', 'spy']:
@@ -1710,10 +1710,10 @@ class TradingFeatureExtractor(FeatureExtractor):
 
                         # Calculate expected based on multi-window system
                         num_windows = len(config.CHANNEL_WINDOW_SIZES)  # 14 windows
-                        features_per_window = 34  # v5.5: Full channel feature set
+                        features_per_window = 31  # v5.6: Removed projected_high/low/center (was 34)
                         timeframes = 11  # 5min, 15min, ..., monthly, 3month
                         stocks = 2  # TSLA, SPY
-                        expected_cols = num_windows * features_per_window * timeframes * stocks  # = 10,472
+                        expected_cols = num_windows * features_per_window * timeframes * stocks  # = 9,548
 
                         # Allow some tolerance (±10%) for version differences
                         if num_cols < expected_cols * 0.9 or num_cols > expected_cols * 1.1:
@@ -1740,8 +1740,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         if use_partial_bars and not is_live_mode:
             from .partial_channel_calc_vectorized import calculate_all_channel_features_vectorized
 
-            print(f"   🔄 Calculating channels with PARTIAL BARS (v5.5 - includes in-progress TF data)...")
-            print(f"   📊 Processing 11 timeframes × 2 stocks × {len(config.CHANNEL_WINDOW_SIZES)} windows × 34 features")
+            print(f"   🔄 Calculating channels with PARTIAL BARS (v5.6 - includes in-progress TF data)...")
+            print(f"   📊 Processing 11 timeframes × 2 stocks × {len(config.CHANNEL_WINDOW_SIZES)} windows × 31 features")
 
             all_timeframes = {
                 '5min': '5min', '15min': '15min', '30min': '30min', '1h': '1h',
