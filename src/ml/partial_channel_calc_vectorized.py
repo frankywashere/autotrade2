@@ -90,24 +90,38 @@ def calculate_channel_features_vectorized(
     # Process by TF period (vectorized within each period)
     # Find unique periods and their boundaries
     period = symbol_df.index.to_period(TIMEFRAME_PERIOD_RULES.get(tf, tf))
-    unique_periods = period.unique()
+
+    # OPTIMIZATION: Use pd.factorize to get sequential codes (0, 1, 2, ...) that map to unique periods
+    # This is much faster than period.codes which returns ordinal numbers
+    period_codes, unique_periods = pd.factorize(period)
+
+    # OPTIMIZATION: Precompute period-to-indices mapping ONCE (O(n) instead of O(n²))
+    # period_codes[i] gives the index into unique_periods for bar i
+    period_to_indices = {}
+    for i, code in enumerate(period_codes):
+        if code not in period_to_indices:
+            period_to_indices[code] = []
+        period_to_indices[code].append(i)
+    # Convert lists to numpy arrays for efficiency
+    period_to_indices = {k: np.array(v) for k, v in period_to_indices.items()}
 
     iterator = range(len(unique_periods))
     if show_progress:
         iterator = tqdm(iterator, desc=f"   {symbol}_{tf}_w{window}", leave=False, ncols=100)
 
-    for period_idx in iterator:
-        current_period = unique_periods[period_idx]
+    # OPTIMIZATION: Convert tf_timestamps to numpy for binary search
+    tf_timestamps_ns = tf_timestamps.view(np.int64) if hasattr(tf_timestamps, 'view') else tf_timestamps.astype(np.int64)
 
-        # Find 5min bars in this period
-        period_mask = period == current_period
-        bar_indices = np.where(period_mask)[0]
+    for period_idx in iterator:
+        # Use precomputed mapping - period_idx is guaranteed to be in the dict
+        bar_indices = period_to_indices[period_idx]
         if len(bar_indices) == 0:
             continue
 
-        # Find complete TF bars before this period
+        # Find complete TF bars before this period using binary search (O(log n) instead of O(n))
         period_start_ts = symbol_df.index[bar_indices[0]]
-        n_complete_before = (tf_timestamps < period_start_ts).sum()
+        period_start_ns = period_start_ts.value  # nanoseconds
+        n_complete_before = np.searchsorted(tf_timestamps_ns, period_start_ns, side='left')
 
         # Need at least window-1 complete bars + 1 partial
         if n_complete_before < window - 1:
@@ -233,19 +247,25 @@ def calculate_all_channel_features_vectorized(
     tf: str,
     tf_rule: str,
     windows: List[int] = None,
-    show_progress: bool = True
+    show_progress: bool = True,
+    debug: bool = False
 ) -> pd.DataFrame:
     """
     Calculate channel features for all window sizes.
     """
+    import sys
     if windows is None:
         windows = [10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100, 120, 140, 168, 200, 252, 336, 504]
 
     results = []
-    for w in windows:
+    for i, w in enumerate(windows):
+        if debug:
+            t0 = time.time()
         result = calculate_channel_features_vectorized(
             df_5min, symbol, tf, tf_rule, w, show_progress=show_progress
         )
+        if debug:
+            print(f"         [{symbol}_{tf}] Window {w}: {time.time()-t0:.1f}s", file=sys.stderr, flush=True)
         results.append(result)
 
     return pd.concat(results, axis=1)
@@ -390,10 +410,11 @@ def _calculate_5min_channel_features_rolling(symbol_df: pd.DataFrame, symbol: st
         upper = np.maximum(upper_raw, center + 2.0 * residual_std)
         lower = np.minimum(lower_raw, center - 2.0 * residual_std)
 
-        # R-squared
+        # R-squared (compute division safely to avoid RuntimeWarning)
         ss_res = np.sum((close_windows - y_pred) ** 2, axis=1)
         ss_tot = np.sum((close_windows - close_windows.mean(axis=1, keepdims=True)) ** 2, axis=1)
-        r_squared = np.where(ss_tot > 1e-10, 1 - ss_res / ss_tot, 0)
+        ss_tot_safe = np.maximum(ss_tot, 1e-10)  # Avoid divide by zero
+        r_squared = np.where(ss_tot > 1e-10, 1 - ss_res / ss_tot_safe, 0)
         r_squared = np.clip(r_squared, 0, 1)
 
         # Position (using the close at end of each window's range, which is closes[window-1:])
@@ -401,9 +422,10 @@ def _calculate_5min_channel_features_rolling(symbol_df: pd.DataFrame, symbol: st
         # We have n - window + 1 windows, so current_prices should have that many elements
         current_prices = closes[window - 1:]  # Length: n - window + 1
         channel_range = upper - lower
+        channel_range_safe = np.maximum(channel_range, 1e-10)  # Avoid divide by zero
         position = np.where(
             channel_range > 1e-10,
-            (current_prices[:len(channel_range)] - lower) / channel_range,
+            (current_prices[:len(channel_range)] - lower) / channel_range_safe,
             0.5
         )
         position = np.clip(position, 0, 1)

@@ -574,7 +574,7 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
     except Exception as e:
         print(f"   ⚠️  Could not check queue size: {e}")
 
-    # FIX 2 & FIX 3: Non-blocking collection with hard timeout
+    # Non-blocking collection (no hard timeout - user can manually cancel with Ctrl+C)
     import time
     from queue import Empty
 
@@ -582,20 +582,14 @@ def parallel_channel_extraction_with_multi_progress(tasks: List[Tuple], n_jobs: 
     timeout_count = 0
     max_consecutive_timeouts = 900  # Allow more retries before giving up
     collection_start_time = time.time()
-    HARD_TIMEOUT_SECONDS = 10000  # Maximum ~2.8 hours for entire collection
 
-    print(f"   ⏰ Starting collection with {HARD_TIMEOUT_SECONDS}s hard timeout...")
+    print(f"   ⏳ Starting collection (no timeout - press Ctrl+C to cancel)...")
 
     collected = 0
     while collected < len(tasks):
-        # FIX 3: Check hard timeout
         elapsed = time.time() - collection_start_time
-        if elapsed > HARD_TIMEOUT_SECONDS:
-            print(f"\n   ⚠️  HARD TIMEOUT after {elapsed:.1f}s! Only collected {collected}/{len(tasks)} results")
-            print(f"   ⚠️  Stopping collection to avoid infinite hang")
-            break
 
-        # FIX 1: Debug output with timestamp
+        # Debug output with timestamp
         print(f"   ⏳ [{elapsed:.1f}s] Waiting for result {collected + 1}/{len(tasks)}...", end='', flush=True)
 
         try:

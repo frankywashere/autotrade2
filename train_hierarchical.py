@@ -2080,22 +2080,33 @@ def interactive_setup(args, profiler=None):
     # Feature extraction parallel workers (only if using parallel)
     if args.use_parallel:
         print()
-        default_feature_workers = min(n_cores - 1, 8)
+
+        # Calculate RAM-based recommendation (each worker uses ~15GB)
+        import psutil
+        total_ram_gb = psutil.virtual_memory().total / 1e9
+        ram_based_workers = max(1, int(total_ram_gb / 15))
+        core_based_workers = min(n_cores - 1, 8)
+
+        # Use the more conservative of RAM-based or core-based
+        default_feature_workers = min(ram_based_workers, core_based_workers)
+
+        print(f"   RAM: {total_ram_gb:.1f}GB (each worker uses ~15GB)")
+        print(f"   Safe workers for your RAM: {ram_based_workers}")
 
         args.feature_workers = int(inquirer.number(
-            message=f"Feature extraction cores (0 = use all {n_cores}, default: {default_feature_workers}):",
+            message=f"Feature extraction workers (recommended: {default_feature_workers}, max safe: {ram_based_workers}):",
             default=default_feature_workers,
-            min_allowed=0,
+            min_allowed=1,
             max_allowed=128
         ).execute())
 
-        if args.feature_workers == 0:
-            actual_cores = os.cpu_count()
-            print(f"   → Using ALL {actual_cores} CPU cores for feature extraction")
-            project_config.MAX_PARALLEL_WORKERS = actual_cores
-        else:
-            print(f"   → Using {args.feature_workers} cores for feature extraction")
-            project_config.MAX_PARALLEL_WORKERS = args.feature_workers
+        # Warn if user picks more than RAM allows
+        if args.feature_workers > ram_based_workers:
+            print(f"   ⚠️  WARNING: {args.feature_workers} workers × 15GB = {args.feature_workers * 15}GB needed")
+            print(f"   ⚠️  You only have {total_ram_gb:.1f}GB RAM - expect heavy swapping or OOM!")
+
+        print(f"   → Using {args.feature_workers} workers for feature extraction")
+        project_config.MAX_PARALLEL_WORKERS = args.feature_workers
 
     # Chunked Feature Extraction option
     print()

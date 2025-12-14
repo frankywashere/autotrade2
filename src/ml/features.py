@@ -193,19 +193,34 @@ def _compute_partial_bar_channel_worker(task):
     """
     import pandas as pd
     import numpy as np
+    import sys
+    import time
     from .partial_channel_calc_vectorized import calculate_all_channel_features_vectorized
 
     df_data, df_columns, timestamps_ns, symbol, tf_name, tf_rule, windows = task
+
+    # Debug: print start (flush immediately so it shows)
+    start_time = time.time()
+    print(f"      [Worker] Starting {symbol}_{tf_name}...", file=sys.stderr, flush=True)
 
     # Reconstruct DataFrame from numpy arrays
     df = pd.DataFrame(df_data, columns=df_columns)
     df.index = pd.to_datetime(timestamps_ns, unit='ns')
 
+    # Enable debug for problematic TFs (15min and 30min)
+    debug_mode = tf_name in ['15min', '30min']
+    if debug_mode:
+        print(f"      [Worker] {symbol}_{tf_name}: {len(df):,} bars, {len(windows)} windows", file=sys.stderr, flush=True)
+
     # Calculate channel features with partial bars
     result = calculate_all_channel_features_vectorized(
         df, symbol, tf_name, tf_rule,
-        windows=windows, show_progress=False
+        windows=windows, show_progress=False, debug=debug_mode
     )
+
+    # Debug: print completion
+    elapsed = time.time() - start_time
+    print(f"      [Worker] Completed {symbol}_{tf_name} in {elapsed:.1f}s", file=sys.stderr, flush=True)
 
     return result
 
@@ -1755,6 +1770,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                 n_jobs = max_workers if max_workers > 0 else -1
                 cores_to_use = get_safe_worker_count(max_workers if max_workers > 0 else None)
                 print(f"   🚀 Parallel processing: using {cores_to_use} of {n_cores} cores")
+                print(f"   📋 Config: MAX_PARALLEL_WORKERS={max_workers}, n_jobs={n_jobs}")
                 print(f"   ⏱️  Estimated time: ~{22 // max(cores_to_use, 1) + 2} minutes")
 
                 # Build task list for parallel execution
@@ -1769,8 +1785,31 @@ class TradingFeatureExtractor(FeatureExtractor):
                     for tf_name, tf_rule in timeframes.items():
                         tasks.append((df_data, df_columns, timestamps_ns, symbol, tf_name, tf_rule, windows))
 
+                # DEBUG: Test one task sequentially first to verify code works
+                print(f"   🧪 Testing first task sequentially (tsla_5min)...")
+                import time as _time
+                _test_start = _time.time()
+                _test_result = _compute_partial_bar_channel_worker(tasks[0])
+                _test_elapsed = _time.time() - _test_start
+                print(f"   ✅ Test task completed in {_test_elapsed:.1f}s - {_test_result.shape[1]} features")
+
+                # Validate: check that results are not all zeros
+                _nonzero_cols = (_test_result.abs().sum() > 0).sum()
+                _sample_col = [c for c in _test_result.columns if 'position' in c][0]
+                _sample_vals = _test_result[_sample_col].iloc[-100:]
+                _nonzero_pct = (_sample_vals != 0.5).mean() * 100  # 0.5 is default
+                print(f"   📊 Validation: {_nonzero_cols}/{_test_result.shape[1]} columns have data, "
+                      f"position varies {_nonzero_pct:.0f}% of last 100 bars")
+                if _nonzero_pct < 50:
+                    print(f"   ⚠️  WARNING: Position values mostly default (0.5) - may indicate bug!")
+                # Show sample values
+                print(f"   📈 Sample {_sample_col}: min={_sample_vals.min():.3f}, "
+                      f"max={_sample_vals.max():.3f}, mean={_sample_vals.mean():.3f}")
+
                 # Use joblib for parallel processing (same as original channel code)
-                all_results = list(
+                print(f"   🚀 Launching {len(tasks)-1} remaining tasks in parallel...")
+                all_results = [_test_result]  # Start with test result
+                all_results.extend(list(
                     tqdm(
                         Parallel(
                             n_jobs=n_jobs,
@@ -1778,20 +1817,21 @@ class TradingFeatureExtractor(FeatureExtractor):
                             prefer="processes",
                             verbose=0,
                             return_as="generator"
-                        )(delayed(_compute_partial_bar_channel_worker)(task) for task in tasks),
-                        total=len(tasks),
+                        )(delayed(_compute_partial_bar_channel_worker)(task) for task in tasks[1:]),
+                        total=len(tasks)-1,
                         desc="   🔄 Partial bar channels",
                         unit="tf",
                         ncols=100,
                         mininterval=0.5,
                         bar_format="{l_bar}{bar:30}{r_bar}  {postfix}"
                     )
-                )
+                ))
             else:
                 # Sequential processing (fallback)
                 print(f"   ℹ️  Sequential processing (parallel disabled in config)")
                 print(f"   ⏱️  Estimated time: ~15-20 minutes")
 
+                import gc as _gc
                 all_results = []
                 for symbol in ['tsla', 'spy']:
                     for tf_name, tf_rule in timeframes.items():
@@ -1802,11 +1842,12 @@ class TradingFeatureExtractor(FeatureExtractor):
                             show_progress=True
                         )
                         all_results.append(result)
-                        gc.collect()
+                        _gc.collect()
 
             channel_features = pd.concat(all_results, axis=1)
             del all_results
-            gc.collect()
+            import gc as _gc2
+            _gc2.collect()
 
             # Save to cache
             if use_cache:
