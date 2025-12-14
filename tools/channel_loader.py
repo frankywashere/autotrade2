@@ -373,3 +373,265 @@ class ChannelLoader:
                 }
 
         return stats
+
+    # =========================================================================
+    # v5.7: LABEL LOADING FOR VERIFICATION
+    # =========================================================================
+
+    def _load_labels(self):
+        """Load continuation and transition labels if available."""
+        if hasattr(self, '_labels_loaded') and self._labels_loaded:
+            return
+
+        self._continuation_labels = {}  # tf -> {'timestamps': array, 'duration_bars': array, 'max_gain_pct': array}
+        self._transition_labels = {}    # tf -> {'timestamps': array, 'transition_type': array, 'new_direction': array}
+
+        # Look for labels directory
+        labels_dir = self.shard_path / 'continuation_labels'
+        if not labels_dir.exists():
+            # Try parent directory
+            labels_dir = self.shard_path.parent / 'continuation_labels'
+
+        if not labels_dir.exists():
+            print(f"  ⚠️ Labels directory not found at {labels_dir}")
+            self._labels_loaded = True
+            return
+
+        # Load continuation labels for each TF
+        timeframes = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+
+        for tf in timeframes:
+            # Continuation labels
+            cont_file = labels_dir / f'{tf}_labels.parquet'
+            if cont_file.exists():
+                try:
+                    df = pd.read_parquet(cont_file)
+                    self._continuation_labels[tf] = {
+                        'timestamps': df.index.values,
+                        'duration_bars': df['duration_bars'].values if 'duration_bars' in df.columns else None,
+                        'max_gain_pct': df['max_gain_pct'].values if 'max_gain_pct' in df.columns else None,
+                    }
+                except Exception as e:
+                    print(f"  ⚠️ Could not load {cont_file.name}: {e}")
+
+            # Transition labels
+            trans_file = labels_dir / f'transition_{tf}_labels.parquet'
+            if trans_file.exists():
+                try:
+                    df = pd.read_parquet(trans_file)
+                    self._transition_labels[tf] = {
+                        'timestamps': df.index.values,
+                        'transition_type': df['transition_type'].values if 'transition_type' in df.columns else None,
+                        'new_direction': df['new_direction'].values if 'new_direction' in df.columns else None,
+                    }
+                except Exception as e:
+                    print(f"  ⚠️ Could not load {trans_file.name}: {e}")
+
+        loaded_cont = len(self._continuation_labels)
+        loaded_trans = len(self._transition_labels)
+        if loaded_cont > 0 or loaded_trans > 0:
+            print(f"  ✓ Loaded labels: {loaded_cont} continuation, {loaded_trans} transition TFs")
+
+        self._labels_loaded = True
+
+    def get_continuation_label(
+        self,
+        timestamp: pd.Timestamp,
+        timeframe: str = '1h'
+    ) -> Optional[Dict]:
+        """
+        Get continuation label for a timestamp/timeframe.
+
+        Args:
+            timestamp: Timestamp to query
+            timeframe: Timeframe
+
+        Returns:
+            Dict with 'duration_bars', 'max_gain_pct' or None if not found
+        """
+        self._load_labels()
+
+        if timeframe not in self._continuation_labels:
+            return None
+
+        labels = self._continuation_labels[timeframe]
+        if labels['timestamps'] is None:
+            return None
+
+        # Find closest timestamp
+        ts_index = pd.DatetimeIndex(labels['timestamps'])
+        try:
+            idx = ts_index.get_indexer([timestamp], method='nearest')[0]
+            if idx < 0:
+                return None
+
+            # Check if timestamp is close enough (within 1 hour)
+            time_diff = abs((ts_index[idx] - timestamp).total_seconds())
+            if time_diff > 3600:  # More than 1 hour away
+                return None
+
+            result = {'timestamp': ts_index[idx]}
+            if labels['duration_bars'] is not None:
+                result['duration_bars'] = int(labels['duration_bars'][idx])
+            if labels['max_gain_pct'] is not None:
+                result['max_gain_pct'] = float(labels['max_gain_pct'][idx])
+
+            return result
+
+        except Exception:
+            return None
+
+    def get_transition_label(
+        self,
+        timestamp: pd.Timestamp,
+        timeframe: str = '1h'
+    ) -> Optional[Dict]:
+        """
+        Get transition label for a timestamp/timeframe.
+
+        Args:
+            timestamp: Timestamp to query
+            timeframe: Timeframe
+
+        Returns:
+            Dict with 'transition_type', 'new_direction' or None if not found
+        """
+        self._load_labels()
+
+        if timeframe not in self._transition_labels:
+            return None
+
+        labels = self._transition_labels[timeframe]
+        if labels['timestamps'] is None:
+            return None
+
+        # Find closest timestamp
+        ts_index = pd.DatetimeIndex(labels['timestamps'])
+        try:
+            idx = ts_index.get_indexer([timestamp], method='nearest')[0]
+            if idx < 0:
+                return None
+
+            # Check if timestamp is close enough (within 1 hour)
+            time_diff = abs((ts_index[idx] - timestamp).total_seconds())
+            if time_diff > 3600:
+                return None
+
+            result = {'timestamp': ts_index[idx]}
+            if labels['transition_type'] is not None:
+                result['transition_type'] = int(labels['transition_type'][idx])
+                result['transition_name'] = ['CONTINUE', 'SWITCH_TF', 'REVERSE', 'SIDEWAYS'][result['transition_type']]
+            if labels['new_direction'] is not None:
+                result['new_direction'] = int(labels['new_direction'][idx])
+                result['direction_name'] = ['BEAR', 'BULL', 'SIDEWAYS'][result['new_direction']] if result['new_direction'] < 3 else 'UNKNOWN'
+
+            return result
+
+        except Exception:
+            return None
+
+    def find_timestamps_by_transition_type(
+        self,
+        transition_type: int,
+        timeframe: str = '1h',
+        limit: int = 100
+    ) -> list:
+        """
+        Find timestamps with a specific transition type.
+
+        Args:
+            transition_type: 0=continue, 1=switch_tf, 2=reverse, 3=sideways
+            timeframe: Timeframe to search
+            limit: Max results
+
+        Returns:
+            List of timestamps
+        """
+        self._load_labels()
+
+        if timeframe not in self._transition_labels:
+            return []
+
+        labels = self._transition_labels[timeframe]
+        if labels['transition_type'] is None:
+            return []
+
+        # Find matching indices
+        matches = np.where(labels['transition_type'] == transition_type)[0]
+
+        # Convert to timestamps
+        results = []
+        for idx in matches[:limit]:
+            ts = pd.Timestamp(labels['timestamps'][idx])
+            results.append(ts)
+
+        return results
+
+    def get_future_price_data(
+        self,
+        timestamp: pd.Timestamp,
+        symbol: str = 'tsla',
+        bars_forward: int = 50,
+        timeframe: str = '1h'
+    ) -> Optional[pd.DataFrame]:
+        """
+        Get price data AFTER the timestamp to verify breaks.
+
+        Args:
+            timestamp: Starting timestamp
+            symbol: 'tsla' or 'spy'
+            bars_forward: Number of bars to fetch after timestamp
+            timeframe: Timeframe
+
+        Returns:
+            DataFrame with OHLC data after timestamp
+        """
+        from src.ml.data_feed import CSVDataFeed
+
+        # Determine which CSV to load based on timeframe
+        if timeframe in ['5min', '15min', '30min', '1h', '2h', '3h', '4h']:
+            feed = CSVDataFeed(timeframe='1min')
+        else:
+            feed = CSVDataFeed(timeframe='1hour')
+
+        # Load data after timestamp
+        import datetime
+        start_date = timestamp
+        end_date = timestamp + datetime.timedelta(days=30)
+
+        try:
+            df = feed.load_data(
+                symbol.upper(),
+                start_date=start_date.strftime('%Y-%m-%d'),
+                end_date=end_date.strftime('%Y-%m-%d')
+            )
+
+            # Resample if needed
+            if timeframe != '1min':
+                timeframe_map = {
+                    '5min': '5T', '15min': '15T', '30min': '30T',
+                    '1h': '1h', '2h': '2h', '3h': '3h', '4h': '4h',
+                    'daily': '1D', 'weekly': '1W', 'monthly': '1M'
+                }
+                resample_rule = timeframe_map.get(timeframe, '1h')
+
+                df = df.resample(resample_rule).agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum'
+                }).dropna()
+
+            # Get bars after timestamp
+            try:
+                start_idx = df.index.get_indexer([timestamp], method='nearest')[0]
+                end_idx = min(start_idx + bars_forward, len(df))
+
+                return df.iloc[start_idx:end_idx].copy()
+            except:
+                return None
+
+        except Exception as e:
+            print(f"  ⚠️ Could not load future data: {e}")
+            return None
