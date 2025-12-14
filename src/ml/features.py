@@ -256,16 +256,13 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'{symbol}_volatility_50',
             ])
 
-        # Multi-window channel features (v3.18: CRITICAL - Must match extraction code exactly!)
-        # Extraction creates 31 features per channel window
-        # When chunked: 21 windows × 9 TFs (5min-weekly) × 31 metrics × 2 = 11,718 in shards
-        #               + 21 windows × 2 TFs (monthly/3month) × 31 × 2 = 2,604 in non-channel
-        #               = 14,322 total channel features
-        # When not chunked: 21 windows × 11 TFs × 31 × 2 = 14,322 (all in shards)
-        windows = config.CHANNEL_WINDOW_SIZES  # [168, 160, 150, ..., 10] (21 values)
+        # Multi-window channel features (v5.5: 34 features per window)
+        # Total: 14 windows × 11 TFs × 34 metrics × 2 symbols = 10,472 channel features
+        windows = config.CHANNEL_WINDOW_SIZES  # [100, 90, 80, ..., 10] (14 values)
         timeframes = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
 
-        # ALL 31 metrics that extraction code actually creates (from lines 848-878):
+        # ALL 34 metrics from partial_channel_calc_vectorized.py
+        # Naming pattern: {symbol}_channel_{tf}_w{window}_{metric}
         metrics = [
             # Position metrics (3)
             'position', 'upper_dist', 'lower_dist',
@@ -277,23 +274,25 @@ class TradingFeatureExtractor(FeatureExtractor):
             'close_r_squared', 'high_r_squared', 'low_r_squared', 'r_squared_avg',
             # Channel metrics (3)
             'channel_width_pct', 'slope_convergence', 'stability',
-            # Ping-pongs - legacy transitions (4 thresholds)
+            # Ping-pongs - alternating touches (4 thresholds)
             'ping_pongs', 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
-            # Complete cycles - v3.17 round-trips (4 thresholds)
+            # Complete cycles - full round-trips (4 thresholds)
             'complete_cycles', 'complete_cycles_0_5pct', 'complete_cycles_1_0pct', 'complete_cycles_3_0pct',
             # Direction flags (3)
             'is_bull', 'is_bear', 'is_sideways',
             # Quality indicators (3)
             'quality_score', 'is_valid', 'insufficient_data',
             # Duration (1)
-            'duration'
+            'duration',
+            # Projections (3) - v5.5
+            'projected_high', 'projected_low', 'projected_center',
         ]
 
         for symbol in ['tsla', 'spy']:
             for tf in timeframes:
                 for w in windows:
                     for m in metrics:
-                        features.append(f'{symbol}_channel_{tf}_{m}_w{w}')
+                        features.append(f'{symbol}_channel_{tf}_w{w}_{m}')
 
         # RSI features (11 tfs × 3 metrics × 2 symbols = 66)
         for symbol in ['tsla', 'spy']:
@@ -1710,11 +1709,11 @@ class TradingFeatureExtractor(FeatureExtractor):
                         num_cols = len(result.columns)
 
                         # Calculate expected based on multi-window system
-                        num_windows = len(config.CHANNEL_WINDOW_SIZES)  # 21 windows
-                        features_per_window = 28  # OHLC slopes, r-squared, position, etc.
+                        num_windows = len(config.CHANNEL_WINDOW_SIZES)  # 14 windows
+                        features_per_window = 34  # v5.5: Full channel feature set
                         timeframes = 11  # 5min, 15min, ..., monthly, 3month
                         stocks = 2  # TSLA, SPY
-                        expected_cols = num_windows * features_per_window * timeframes * stocks  # = 12,936
+                        expected_cols = num_windows * features_per_window * timeframes * stocks  # = 10,472
 
                         # Allow some tolerance (±10%) for version differences
                         if num_cols < expected_cols * 0.9 or num_cols > expected_cols * 1.1:
@@ -1741,8 +1740,8 @@ class TradingFeatureExtractor(FeatureExtractor):
         if use_partial_bars and not is_live_mode:
             from .partial_channel_calc_vectorized import calculate_all_channel_features_vectorized
 
-            print(f"   🔄 Calculating channels with PARTIAL BARS (v5.4 - includes in-progress TF data)...")
-            print(f"   📊 Processing 11 timeframes × 2 stocks × 21 windows")
+            print(f"   🔄 Calculating channels with PARTIAL BARS (v5.5 - includes in-progress TF data)...")
+            print(f"   📊 Processing 11 timeframes × 2 stocks × {len(config.CHANNEL_WINDOW_SIZES)} windows × 34 features")
 
             all_timeframes = {
                 '5min': '5min', '15min': '15min', '30min': '30min', '1h': '1h',
@@ -2242,7 +2241,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         These timeframes are too long for per-chunk processing (18 months → only 18 monthly bars).
         But they're tiny in memory (~500 KB for 10 years), so process on full dataset once.
 
-        Memory: 108 monthly × 31 metrics × 21 windows × 2 symbols = ~141K values = 565 KB
+        Memory: 108 monthly × 34 metrics × 14 windows × 2 symbols = ~103K values = 412 KB
         Cached after first run for instant loading (~1 sec vs 2-3 min calculation)!
 
         Returns:
