@@ -1144,6 +1144,21 @@ class TradingFeatureExtractor(FeatureExtractor):
             # Ensure same index format
             if not isinstance(non_channel_df.index, pd.DatetimeIndex):
                 non_channel_df.index = pd.to_datetime(non_channel_df.index)
+
+            # v5.3.3: Remove old breakdown columns - we'll calculate fresh at native TF resolution
+            breakdown_patterns = [
+                'duration_ratio', 'alignment', 'time_in_channel', 'position_norm',
+                'in_channel', 'rsi_divergence', 'volume_surge',
+                'is_monday', 'is_tuesday', 'is_wednesday', 'is_thursday', 'is_friday',
+                'is_first_hour', 'is_last_hour', 'is_volatile_now',
+                'is_earnings_week', 'days_until_earnings', 'days_until_fomc', 'is_high_impact_event'
+            ]
+            old_breakdown_cols = [c for c in non_channel_df.columns
+                                  if any(pattern in c for pattern in breakdown_patterns)]
+            if old_breakdown_cols:
+                non_channel_df = non_channel_df.drop(columns=old_breakdown_cols)
+                print(f"   ✓ Removed {len(old_breakdown_cols)} old breakdown cols (will recalculate at native TF)")
+
             # Align indices and merge (non-channel first so tsla_close is accessible)
             common_idx = df.index.intersection(non_channel_df.index)
             if len(common_idx) > 0:
@@ -1332,8 +1347,25 @@ class TradingFeatureExtractor(FeatureExtractor):
             non_channel_df = pd.read_pickle(non_channel_path)
             if not isinstance(non_channel_df.index, pd.DatetimeIndex):
                 non_channel_df.index = pd.to_datetime(non_channel_df.index)
+
+            # v5.3.3: Remove old breakdown columns - we'll calculate fresh at native TF resolution
+            # Old breakdown was calculated at 1-min, we want native TF calculation for train-test consistency
+            breakdown_patterns = [
+                'duration_ratio', 'alignment', 'time_in_channel', 'position_norm',
+                'in_channel', 'rsi_divergence', 'volume_surge',
+                'is_monday', 'is_tuesday', 'is_wednesday', 'is_thursday', 'is_friday',
+                'is_first_hour', 'is_last_hour', 'is_volatile_now',
+                'is_earnings_week', 'days_until_earnings', 'days_until_fomc', 'is_high_impact_event'
+            ]
+            old_breakdown_cols = [c for c in non_channel_df.columns
+                                  if any(pattern in c for pattern in breakdown_patterns)]
+            if old_breakdown_cols:
+                non_channel_df = non_channel_df.drop(columns=old_breakdown_cols)
+                print(f"   📂 Non-channel features: {len(non_channel_df.columns)} columns (removed {len(old_breakdown_cols)} old breakdown cols)")
+            else:
+                print(f"   📂 Non-channel features: {len(non_channel_df.columns)} columns")
+
             non_channel_columns = list(non_channel_df.columns)
-            print(f"   📂 Non-channel features: {len(non_channel_columns)} columns")
         else:
             print(f"   ⚠️  No non-channel features found: {non_channel_path.name}")
 
@@ -1485,8 +1517,11 @@ class TradingFeatureExtractor(FeatureExtractor):
             for other_tf, other_breakdown in all_tf_breakdown.items():
                 if len(other_breakdown) > 0:
                     # Reindex other TF's breakdown to match current TF's index
-                    # Use forward-fill (ffill) to broadcast coarser→finer (e.g., daily→5min)
-                    breakdown_aligned = other_breakdown.reindex(base_df.index, method='ffill')
+                    # v5.3.3 fix: Use bfill().ffill() to handle NaN at start
+                    # Old code used only ffill, which left NaN when no previous coarser bar existed
+                    # Example: first 5min bars have no previous weekly bar → NaN
+                    # bfill() fills initial NaN with first available value, then ffill() handles the rest
+                    breakdown_aligned = other_breakdown.reindex(base_df.index).bfill().ffill()
                     # Concat horizontally (add columns)
                     base_df = pd.concat([base_df, breakdown_aligned], axis=1, copy=False)
 
@@ -3370,15 +3405,24 @@ class TradingFeatureExtractor(FeatureExtractor):
                         continue
 
                     try:
-                        rsi_data = self.rsi_calc.get_rsi_data(resampled)
-                        rsi_value = rsi_data.value if rsi_data.value is not None else 50.0
+                        # v5.3.3 fix: Calculate FULL RSI series (not just last value!)
+                        # Old code only took last value and broadcast to all rows - BUG!
+                        rsi_series = self.rsi_calc.calculate_rsi(resampled)
 
-                        # Store features (broadcast scalar to all rows)
-                        rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, rsi_value)
-                        rsi_features[f'{prefix}_{tf_name}_oversold'] = np.full(num_rows, 1.0 if rsi_data.oversold else 0.0)
-                        rsi_features[f'{prefix}_{tf_name}_overbought'] = np.full(num_rows, 1.0 if rsi_data.overbought else 0.0)
+                        # Map RSI values back to original df timestamps using ffill
+                        # (each resampled bar's RSI applies until next resampled bar)
+                        rsi_aligned = rsi_series.reindex(df.index, method='ffill')
 
-                    except Exception:
+                        # Fill any initial NaN (before first RSI) with neutral 50
+                        rsi_aligned = rsi_aligned.bfill().fillna(50.0)
+
+                        # Store features as arrays (not broadcast scalars!)
+                        rsi_values = rsi_aligned.values
+                        rsi_features[f'{prefix}_{tf_name}'] = rsi_values
+                        rsi_features[f'{prefix}_{tf_name}_oversold'] = (rsi_values < 30).astype(float)
+                        rsi_features[f'{prefix}_{tf_name}_overbought'] = (rsi_values > 70).astype(float)
+
+                    except Exception as e:
                         # Fill with defaults
                         rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, 50.0)
                         rsi_features[f'{prefix}_{tf_name}_oversold'] = np.zeros(num_rows)
@@ -4068,7 +4112,18 @@ class TradingFeatureExtractor(FeatureExtractor):
                 breakdown_features[f'{symbol}_channel_position_norm_{tf}'] = np.zeros(num_rows)
 
         # 5. Volume surge (if volume data available at this resolution)
-        if 'tsla_volume' in resampled_df.columns and len(resampled_df) >= 20:
+        # v5.3.3 fix: Use tsla_volume_ratio (which is available) instead of tsla_volume (which isn't)
+        # tsla_volume_ratio = current_volume / 20-day rolling mean, so > 1 means above average
+        if 'tsla_volume_ratio' in resampled_df.columns and len(resampled_df) >= 10:
+            vol_ratio = resampled_df['tsla_volume_ratio']
+            # Volume surge = how much current volume_ratio exceeds recent average ratio
+            recent_avg_ratio = vol_ratio.rolling(5, min_periods=1).mean()
+            historical_avg_ratio = vol_ratio.rolling(10, min_periods=3).mean().shift(3)
+            # Surge is relative change in volume_ratio
+            volume_surge = ((recent_avg_ratio - historical_avg_ratio) / (historical_avg_ratio + 1e-8)).fillna(0)
+            breakdown_features['tsla_volume_surge'] = np.asarray(volume_surge)
+        elif 'tsla_volume' in resampled_df.columns and len(resampled_df) >= 20:
+            # Fallback to raw volume if available
             volume = resampled_df['tsla_volume']
             recent_vol = volume.rolling(5, min_periods=1).mean()
             historical_vol = volume.rolling(20, min_periods=5).mean().shift(5)

@@ -2079,15 +2079,28 @@ def create_hierarchical_dataset(
             # Calculate index ranges for 3-way split
             all_valid = base_dataset.valid_indices
 
-            # v5.0 fix: Convert split indices to native TF index space if using native timeframes
-            # The split indices (train_end_idx, val_end_idx) are calculated from features_df (1-min resolution)
-            # But valid_indices are in native TF space (5-min resolution) when use_native_timeframes=True
+            # v5.3.3 fix: Use TIMESTAMPS to find correct split boundaries
+            # features_df is post-warmup (starts 2017), tf_mmaps includes pre-warmup (starts 2015)
+            # The old ratio-based conversion was WRONG - it included pre-warmup rows in training!
             if use_native_timeframes and hasattr(base_dataset, 'tf_mmaps') and base_dataset.tf_mmaps:
-                # Get the 5min array length (the finest native TF resolution)
-                native_tf_len = base_dataset.tf_mmaps['5min'].shape[0]
-                conversion_factor = total_len / native_tf_len
-                train_end_idx_adj = int(train_end_idx / conversion_factor)
-                val_end_idx_adj = int(val_end_idx / conversion_factor)
+                # Get boundary timestamps from features_df (which is correctly post-warmup)
+                warmup_start_ts = features_df.index[0].value  # nanoseconds
+                train_end_ts = features_df.index[train_end_idx - 1].value
+                val_end_ts = features_df.index[val_end_idx - 1].value
+
+                # Get 5min timestamps array from dataset
+                tf_timestamps = base_dataset.tf_timestamps['5min']
+
+                # Find corresponding indices in 5min array using binary search
+                warmup_idx_5min = int(np.searchsorted(tf_timestamps, warmup_start_ts, side='left'))
+                train_end_idx_adj = int(np.searchsorted(tf_timestamps, train_end_ts, side='right'))
+                val_end_idx_adj = int(np.searchsorted(tf_timestamps, val_end_ts, side='right'))
+
+                # Filter all_valid to only include post-warmup indices
+                all_valid = [i for i in all_valid if i >= warmup_idx_5min]
+
+                # Log the fix for debugging
+                print(f"   📍 Warmup boundary: 5min index {warmup_idx_5min} ({features_df.index[0].date()})")
             else:
                 train_end_idx_adj = train_end_idx
                 val_end_idx_adj = val_end_idx
