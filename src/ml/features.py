@@ -2137,6 +2137,7 @@ class TradingFeatureExtractor(FeatureExtractor):
 
                                 # Initialize arrays if first time
                                 if f'{w_prefix}_close_slope' not in channel_features:
+                                    # v5.6: 31 features per window (removed projected_high/low/center)
                                     for feat in ['position', 'upper_dist', 'lower_dist',
                                                 'close_slope', 'close_slope_pct', 'high_slope', 'high_slope_pct',
                                                 'low_slope', 'low_slope_pct', 'close_r_squared', 'high_r_squared',
@@ -2145,8 +2146,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                                                 'ping_pongs_0_5pct', 'ping_pongs_1_0pct', 'ping_pongs_3_0pct',
                                                 'complete_cycles', 'complete_cycles_0_5pct', 'complete_cycles_1_0pct', 'complete_cycles_3_0pct',
                                                 'is_bull', 'is_bear', 'is_sideways',
-                                                'quality_score', 'is_valid', 'insufficient_data', 'duration',
-                                                'projected_high', 'projected_low']:  # v5.0: Channel projections
+                                                'quality_score', 'is_valid', 'insufficient_data', 'duration']:
                                         channel_features[f'{w_prefix}_{feat}'] = np.zeros(num_rows, dtype=config.NUMPY_DTYPE)
 
                                 # Store features (vectorized - no loop for memory efficiency)
@@ -2182,11 +2182,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                                 channel_features[f'{w_prefix}_insufficient_data'][indices] = channel.insufficient_data
                                 channel_features[f'{w_prefix}_duration'][indices] = channel.actual_duration
 
-                                # v5.0: Store channel projections (geometric predictions)
-                                projected_high_pct = (channel.predicted_high - current_price) / current_price * 100 if current_price > 0 else 0.0
-                                projected_low_pct = (channel.predicted_low - current_price) / current_price * 100 if current_price > 0 else 0.0
-                                channel_features[f'{w_prefix}_projected_high'][indices] = projected_high_pct
-                                channel_features[f'{w_prefix}_projected_low'][indices] = projected_low_pct
+                                # v5.6: Removed projection storage - now calculated at inference from learned duration
 
                     # Update progress: Mark current as complete
                     if using_rich and tf_tasks:
