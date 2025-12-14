@@ -2237,7 +2237,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         These timeframes are too long for per-chunk processing (18 months → only 18 monthly bars).
         But they're tiny in memory (~500 KB for 10 years), so process on full dataset once.
 
-        Memory: 108 monthly × 34 metrics × 14 windows × 2 symbols = ~103K values = 412 KB
+        Memory: 108 monthly × 31 metrics × 14 windows × 2 symbols = ~94K values = 376 KB
         Cached after first run for instant loading (~1 sec vs 2-3 min calculation)!
 
         Returns:

@@ -1,21 +1,21 @@
 """
-Vectorized Channel Calculation with Partial Bars (v5.5.1)
+Vectorized Channel Calculation with Partial Bars (v5.6)
 
 This module calculates channel features at 5min resolution including partial TF bars.
 Uses vectorized numpy operations for efficiency - ~100x faster than loop-based approach.
 
 Key optimization: Process all 5min bars within a TF period in parallel
 
-v5.5: Added 22 missing channel features for parity with old LinearRegressionChannel:
+v5.5: Added missing channel features for parity with old LinearRegressionChannel:
   - high_slope_pct, low_slope_pct, high_r_squared, low_r_squared, r_squared_avg
   - slope_convergence, is_bull, is_bear, is_sideways, quality_score, duration
-  - projected_high, projected_low
   - ping_pongs (4 thresholds), complete_cycles (4 thresholds)
 
-v5.5.1: Fixed forward projections to match old LinearRegressionChannel behavior:
-  - projected_high/low/center now project 24 hours forward (TF-specific)
-  - Uses BARS_PER_24H mapping: 5min=78, 15min=26, 1h=24, daily=1, etc.
-  - This predicts WHERE the channel WILL BE, not just current position
+v5.6: Removed projection features (projected_high/low/center)
+  - Projections are now calculated at INFERENCE time using learned duration predictions
+  - Model predicts how long channel will continue, then projects geometrically
+  - See projection_calculator.py for the new approach
+  - Feature count: 31 per window (was 34)
 """
 
 import numpy as np
@@ -249,7 +249,7 @@ def calculate_channel_features_vectorized(
     # Compute partial bar state at each 5min timestamp
     partial_state = compute_partial_bars(symbol_df, tf)
 
-    # Initialize output arrays (34 features per window)
+    # Initialize output arrays (31 features per window - v5.6: removed projections)
     prefix = f'{symbol}_channel_{tf}_w{window}'
     output = {
         # Original 12 features

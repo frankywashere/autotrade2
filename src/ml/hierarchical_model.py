@@ -267,126 +267,10 @@ class ChannelProjectionExtractor(nn.Module):
         }
 
 
-class ProjectionFeatureExtractor:
-    """
-    v5.0: Helper to extract channel projection and quality features from input tensor.
-
-    Finds projection features (projected_high, projected_low) and corresponding
-    quality metrics for each window, organized by timeframe.
-    """
-
-    def __init__(self, feature_names: List[str], num_windows: int = 21):
-        """
-        Build index mappings for fast feature extraction.
-
-        Args:
-            feature_names: List of all feature names in order
-            num_windows: Number of window sizes (default: 21)
-        """
-        self.feature_names = feature_names
-        self.num_windows = num_windows
-        self.window_sizes = [168, 160, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20, 15, 10]
-
-        # Build index maps for each timeframe and symbol
-        self.indices = {}
-
-        for symbol in ['tsla', 'spy']:
-            for tf in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
-                key = f"{symbol}_{tf}"
-                self.indices[key] = self._build_indices(symbol, tf)
-
-    def _build_indices(self, symbol: str, tf: str) -> Dict[str, List[int]]:
-        """Build feature indices for one symbol-timeframe combination."""
-        indices = {
-            'projected_high': [],
-            'projected_low': [],
-            'quality_score': [],
-            'r_squared_avg': [],
-            'complete_cycles': [],
-            'position': []
-        }
-
-        # Find indices for each window
-        for w in self.window_sizes:
-            prefix = f"{symbol}_channel_{tf}_w{w}"
-
-            # Find each feature's index
-            for feat_name, feat_list in indices.items():
-                full_name = f"{prefix}_{feat_name}"
-                try:
-                    idx = self.feature_names.index(full_name)
-                    feat_list.append(idx)
-                except ValueError:
-                    # Feature not found (might be missing in legacy data)
-                    feat_list.append(-1)  # Sentinel value
-
-        return indices
-
-    def extract(self, x: torch.Tensor, symbol: str, tf: str) -> Dict[str, torch.Tensor]:
-        """
-        Extract projection and quality features for one symbol-timeframe.
-
-        Args:
-            x: Input features [batch, seq_len, total_features] or [batch, total_features]
-            symbol: 'tsla' or 'spy'
-            tf: Timeframe name
-
-        Returns:
-            dict with tensors shaped [batch, num_windows] or [batch, num_windows, 2]
-        """
-        key = f"{symbol}_{tf}"
-        idx_map = self.indices.get(key, {})
-
-        # Handle sequence input (take last timestep)
-        if x.dim() == 3:
-            x = x[:, -1, :]  # [batch, features]
-
-        batch_size = x.shape[0]
-        device = x.device
-
-        # Extract projections [batch, num_windows, 2]
-        proj_high_list = []
-        proj_low_list = []
-
-        for idx_high, idx_low in zip(idx_map['projected_high'], idx_map['projected_low']):
-            if idx_high >= 0:
-                proj_high_list.append(x[:, idx_high:idx_high+1])
-            else:
-                proj_high_list.append(torch.zeros(batch_size, 1, device=device))
-
-            if idx_low >= 0:
-                proj_low_list.append(x[:, idx_low:idx_low+1])
-            else:
-                proj_low_list.append(torch.zeros(batch_size, 1, device=device))
-
-        projections_high = torch.cat(proj_high_list, dim=-1)  # [batch, num_windows]
-        projections_low = torch.cat(proj_low_list, dim=-1)    # [batch, num_windows]
-        projections = torch.stack([projections_high, projections_low], dim=-1)  # [batch, num_windows, 2]
-
-        # Extract quality metrics [batch, num_windows]
-        quality_list = []
-        r_squared_list = []
-        cycles_list = []
-        position_list = []
-
-        for idx_q, idx_r, idx_c, idx_p in zip(
-            idx_map['quality_score'],
-            idx_map['r_squared_avg'],
-            idx_map['complete_cycles'],
-            idx_map['position']
-        ):
-            quality_list.append(x[:, idx_q:idx_q+1] if idx_q >= 0 else torch.zeros(batch_size, 1, device=device))
-            r_squared_list.append(x[:, idx_r:idx_r+1] if idx_r >= 0 else torch.zeros(batch_size, 1, device=device))
-            cycles_list.append(x[:, idx_c:idx_c+1] if idx_c >= 0 else torch.zeros(batch_size, 1, device=device))
-            position_list.append(x[:, idx_p:idx_p+1] if idx_p >= 0 else torch.zeros(batch_size, 1, device=device))
-
-        return {
-            'projections': projections,  # [batch, num_windows, 2]
-            'quality_scores': torch.cat(quality_list, dim=-1),  # [batch, num_windows]
-            'r_squared': torch.cat(r_squared_list, dim=-1),
-            'complete_cycles': torch.cat(cycles_list, dim=-1),
-            'position': torch.cat(position_list, dim=-1)
-        }
+# v5.6: Removed ProjectionFeatureExtractor class
+# Projection features (projected_high/low) are no longer input features.
+# Projections are now calculated at inference time using learned duration predictions.
+# See projection_calculator.py for the new approach.
 
 
 class HierarchicalLNN(nn.Module, ModelBase):
@@ -443,8 +327,9 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.device_type = device
         self.multi_task = multi_task
         self.use_fusion_head = use_fusion_head
-        self.use_geometric_base = use_geometric_base  # v5.0: Geometric vs learned base
-        self.use_channel_projections = use_geometric_base  # v5.0: Enable projection extractors if geometric
+        self.use_geometric_base = use_geometric_base  # v5.0: Kept for checkpoint compatibility
+        # v5.6: Disabled - projection features removed from input, now calculated at inference
+        self.use_channel_projections = False  # Always False now
         self.information_flow = information_flow  # v5.3.1: Flow direction
 
         # Backward compatibility: if old-style single input_size provided
@@ -663,8 +548,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
             ) for tf in self.TIMEFRAMES
         })
 
-        # v5.0: Projection feature extractor (will be initialized on first forward)
-        self.projection_feature_extractor = None
+        # v5.6: Removed projection_feature_extractor (projection features no longer in input)
 
         # =========================================================================
         # v5.2: VIX CfC LAYER
@@ -787,45 +671,10 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.last_inputs = {}
         self.last_market_state = None
 
-    def _extract_projection_features_from_tensor(
-        self,
-        x_tf: torch.Tensor,
-        tf: str,
-        symbol: str = 'tsla'
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Extract channel projection and quality features from input tensor (v5.0).
-        v5.3.2: Enhanced to extract key break predictors (RSI, duration, ping-pongs, SPY corr)
-
-        This is a simplified extractor that assumes feature order follows the standard pattern.
-        For native TF mode where we don't have explicit feature names.
-
-        Args:
-            x_tf: Input features [batch, seq_len, features] or [batch, features]
-            tf: Timeframe name
-            symbol: 'tsla' or 'spy'
-
-        Returns:
-            dict with extracted projection and quality tensors, or None if unavailable
-        """
-        # Handle sequence input (take last timestep)
-        if x_tf.dim() == 3:
-            x = x_tf[:, -1, :]  # [batch, features]
-        else:
-            x = x_tf
-
-        batch_size = x.shape[0]
-        device = x.device
-
-        # v5.3.2: Extract key break predictor signals
-        # NOTE: This is a placeholder - actual feature indices need to be determined
-        # For now, we'll use learned representations through the hidden state
-        # This will be enhanced when we have explicit feature name mapping
-
-        # Return None - signals to use learned heads as base
-        # The hidden state already contains compressed RSI, duration, etc.
-        # Fix 1 (ping-pong weighted quality) addresses the main bias
-        return None
+    # v5.6: Removed _extract_projection_features_from_tensor
+    # Projection features no longer exist in input features
+    # Projections are calculated at inference using learned duration predictions
+    # See projection_calculator.py
 
     def forward(
         self,
@@ -904,13 +753,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
             else:
                 event_embed = torch.zeros(batch_size, self.event_embed_dim, device=device)
 
-        # v5.0: Initialize projection feature extractor on first forward (need feature names from data)
-        # This will be used to extract projection/quality features from input tensors
-        if self.projection_feature_extractor is None and self.use_channel_projections:
-            # NOTE: For native TF mode, we can't easily get feature names here
-            # Will initialize lazily when needed, or require explicit initialization
-            # For now, mark as "will initialize when feature names available"
-            pass
+        # v5.6: Removed projection feature extractor initialization
+        # Projection features no longer exist in input - calculated at inference from learned duration
 
         # =========================================================================
         # v5.3: TWO-PASS ARCHITECTURE
@@ -1124,82 +968,15 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 # If > 24 bars, scale up (clamped to reasonable range)
                 duration_scale = (duration_mean / 24.0).clamp(0.3, 2.0)  # [batch, 1]
 
-            # v5.0: Channel-based predictions (Option B: Base + Adjustment)
-            if self.use_channel_projections and hasattr(self, 'projection_adjusters'):
-                # Try to extract geometric projections from features
-                proj_features = self._extract_projection_features_from_tensor(
-                    timeframe_data[tf], tf, symbol='tsla'
-                )
+            # v5.6: Direct neural net prediction (projection features removed)
+            # Projections are now calculated at inference time using learned duration
+            pred_high = self.timeframe_heads[f'{tf}_high'](hidden)
+            pred_low = self.timeframe_heads[f'{tf}_low'](hidden)
 
-                if proj_features is not None and hasattr(self, 'projection_extractors'):
-                    # Use ChannelProjectionExtractor for validity-weighted geometric base
-                    proj_output = self.projection_extractors[tf](
-                        hidden_state=hidden,
-                        projections=proj_features['projections'],
-                        quality_scores=proj_features['quality_scores'],
-                        r_squared=proj_features['r_squared'],
-                        complete_cycles=proj_features['complete_cycles'],
-                        position=proj_features['position']
-                    )
-
-                    # Base is weighted geometric projection
-                    base_high = proj_output['weighted_high']
-                    base_low = proj_output['weighted_low']
-                    validity_weights = proj_output['validity_weights']
-                else:
-                    # Fallback: Use learned heads (will learn to approximate projections)
-                    base_high = self.timeframe_heads[f'{tf}_high'](hidden)
-                    base_low = self.timeframe_heads[f'{tf}_low'](hidden)
-                    validity_weights = None
-
-                # Adjustment network: learns corrections to base projection
-                # Input: hidden state + base predictions
-                adjuster_input = torch.cat([hidden, base_high, base_low], dim=-1)  # [batch, hidden_size + 2]
-                adjustment = self.projection_adjusters[tf](adjuster_input)  # [batch, 2]
-
-                # Final prediction = base + adjustment (OPTION B)
-                pred_high = base_high + adjustment[:, 0:1]
-                pred_low = base_low + adjustment[:, 1:2]
-
-                # v5.2: Apply duration-aware scaling
-                # Shorter expected duration → smaller price move
-                # Longer expected duration → larger price move
-                if isinstance(duration_scale, torch.Tensor):
-                    pred_high = pred_high * duration_scale
-                    pred_low = pred_low * duration_scale
-
-                # v5.0: Store metadata for interpretability (only during eval, skip in training for speed)
-                if not self.training:
-                    metadata = {
-                        'base_high': base_high.detach(),
-                        'base_low': base_low.detach(),
-                        'adjustment_high': adjustment[:, 0:1].detach(),
-                        'adjustment_low': adjustment[:, 1:2].detach(),
-                        'final_high': pred_high.detach(),
-                        'final_low': pred_low.detach(),
-                        'mode': 'geometric' if proj_features is not None else 'learned_approximation'
-                    }
-
-                    # v5.1: Add window selection info
-                    if validity_weights is not None:
-                        metadata['validity_weights'] = validity_weights.detach()
-                        if 'best_window_idx' in proj_output:
-                            metadata['best_window_idx'] = proj_output['best_window_idx'].detach()
-                            # Map to actual window size for interpretability
-                            window_sizes = [168, 160, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20, 15, 10]
-                            best_idx = proj_output['best_window_idx'][0].item()  # First sample
-                            metadata['selected_window_size'] = window_sizes[best_idx] if best_idx < len(window_sizes) else None
-
-                    projection_metadata[tf] = metadata
-            else:
-                # v4.x behavior: Direct neural net prediction
-                pred_high = self.timeframe_heads[f'{tf}_high'](hidden)
-                pred_low = self.timeframe_heads[f'{tf}_low'](hidden)
-
-                # v5.2: Apply duration-aware scaling (same as projection case)
-                if isinstance(duration_scale, torch.Tensor):
-                    pred_high = pred_high * duration_scale
-                    pred_low = pred_low * duration_scale
+            # v5.2: Apply duration-aware scaling
+            if isinstance(duration_scale, torch.Tensor):
+                pred_high = pred_high * duration_scale
+                pred_low = pred_low * duration_scale
 
             # =====================================================================
             # v5.2: VALIDITY PREDICTION for this TF (compute BEFORE using as confidence)
