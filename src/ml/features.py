@@ -3577,19 +3577,34 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Get period mapping for 5min bars
         period_rule = TIMEFRAME_PERIOD_RULES.get(tf_name, tf_name)
         periods = symbol_df.index.to_period(period_rule)
-        unique_periods = periods.unique()
 
-        # Process by TF period
-        for period_idx, current_period in enumerate(unique_periods):
-            # Find 5min bars in this period
-            period_mask = periods == current_period
-            bar_indices = np.where(period_mask)[0]
-            if len(bar_indices) == 0:
+        # OPTIMIZATION: Use pd.factorize to get sequential codes (0, 1, 2, ...) that map to unique periods
+        # This is O(n) instead of O(n²) for the period mask lookup
+        period_codes, unique_periods = pd.factorize(periods)
+
+        # OPTIMIZATION: Precompute period-to-indices mapping ONCE (O(n) instead of O(n²))
+        period_to_indices = {}
+        for i, code in enumerate(period_codes):
+            if code not in period_to_indices:
+                period_to_indices[code] = []
+            period_to_indices[code].append(i)
+        # Convert lists to numpy arrays for efficiency
+        period_to_indices = {k: np.array(v) for k, v in period_to_indices.items()}
+
+        # Convert tf_timestamps to numpy for binary search
+        tf_timestamps_ns = tf_timestamps.view(np.int64) if hasattr(tf_timestamps, 'view') else tf_timestamps.astype(np.int64)
+
+        # Process by TF period using precomputed mapping
+        for period_idx in range(len(unique_periods)):
+            # Use precomputed mapping - O(1) lookup instead of O(n) mask
+            bar_indices = period_to_indices.get(period_idx)
+            if bar_indices is None or len(bar_indices) == 0:
                 continue
 
-            # Find complete TF bars before this period
+            # Find complete TF bars before this period using binary search (O(log n) instead of O(n))
             period_start_ts = symbol_df.index[bar_indices[0]]
-            n_complete_before = (tf_timestamps < period_start_ts).sum()
+            period_start_ns = period_start_ts.value  # nanoseconds
+            n_complete_before = np.searchsorted(tf_timestamps_ns, period_start_ns, side='left')
 
             # Need at least RSI period + 1 bars for valid calculation
             if n_complete_before < rsi_period + 1:
@@ -3604,33 +3619,36 @@ class TradingFeatureExtractor(FeatureExtractor):
             hist_gains = np.maximum(hist_deltas, 0)
             hist_losses = np.maximum(-hist_deltas, 0)
 
-            # For each 5min bar, compute RSI with partial bar
+            # Get the last (rsi_period-1) gains/losses from history
+            recent_gains = hist_gains[-(rsi_period-1):] if len(hist_gains) >= rsi_period-1 else hist_gains
+            recent_losses = hist_losses[-(rsi_period-1):] if len(hist_losses) >= rsi_period-1 else hist_losses
+
+            # VECTORIZED: Compute RSI for all bars in this period at once
             partial_closes = partial_state.partial_close[bar_indices]
+            last_complete_close = hist_closes[-1]
 
-            for i, (bar_idx, partial_close) in enumerate(zip(bar_indices, partial_closes)):
-                # Delta from last complete bar to partial
-                delta_partial = partial_close - hist_closes[-1]
-                gain_partial = max(delta_partial, 0)
-                loss_partial = max(-delta_partial, 0)
+            # Delta from last complete bar to each partial bar
+            delta_partials = partial_closes - last_complete_close
+            gain_partials = np.maximum(delta_partials, 0)
+            loss_partials = np.maximum(-delta_partials, 0)
 
-                # Combine: gains = hist_gains + [gain_partial]
-                # We need rolling average of last `rsi_period` values
-                all_gains = np.append(hist_gains[-(rsi_period-1):], gain_partial)
-                all_losses = np.append(hist_losses[-(rsi_period-1):], loss_partial)
+            # Sum of recent gains/losses (constant for this period)
+            sum_recent_gains = np.sum(recent_gains)
+            sum_recent_losses = np.sum(recent_losses)
 
-                avg_gain = np.mean(all_gains)
-                avg_loss = np.mean(all_losses)
+            # Average gains/losses for each bar (vectorized)
+            avg_gains = (sum_recent_gains + gain_partials) / rsi_period
+            avg_losses = (sum_recent_losses + loss_partials) / rsi_period
 
-                # Calculate RSI
-                if avg_loss == 0:
-                    rsi = 100.0
-                elif avg_gain == 0:
-                    rsi = 0.0
-                else:
-                    rs = avg_gain / avg_loss
-                    rsi = 100 - (100 / (1 + rs))
+            # Calculate RSI (vectorized with safe division)
+            # RSI = 100 - (100 / (1 + RS)) where RS = avg_gain / avg_loss
+            with np.errstate(divide='ignore', invalid='ignore'):
+                rs = np.where(avg_losses > 0, avg_gains / avg_losses, np.inf)
+                rsi_vals = np.where(avg_losses == 0, 100.0,
+                           np.where(avg_gains == 0, 0.0,
+                           100 - (100 / (1 + rs))))
 
-                rsi_values[bar_idx] = rsi
+            rsi_values[bar_indices] = rsi_vals.astype(np.float32)
 
         return rsi_values
 
