@@ -1,10 +1,16 @@
 """
-Vectorized Channel Calculation with Partial Bars (v5.4)
+Vectorized Channel Calculation with Partial Bars (v5.5)
 
 This module calculates channel features at 5min resolution including partial TF bars.
 Uses vectorized numpy operations for efficiency - ~100x faster than loop-based approach.
 
 Key optimization: Process all 5min bars within a TF period in parallel
+
+v5.5: Added 22 missing channel features for parity with old LinearRegressionChannel:
+  - high_slope_pct, low_slope_pct, high_r_squared, low_r_squared, r_squared_avg
+  - slope_convergence, is_bull, is_bear, is_sideways, quality_score, duration
+  - projected_high, projected_low
+  - ping_pongs (4 thresholds), complete_cycles (4 thresholds)
 """
 
 import numpy as np
@@ -14,7 +20,170 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import time
 
+# Numba JIT compilation for performance-critical loops
+try:
+    import numba
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+
 from .partial_bars import compute_partial_bars, PartialBarState, TIMEFRAME_PERIOD_RULES
+
+
+# Numba JIT-compiled ping-pong detection functions
+if NUMBA_AVAILABLE:
+    @numba.jit(nopython=True, fastmath=True)
+    def _detect_ping_pongs_jit(prices: np.ndarray, upper: np.ndarray, lower: np.ndarray,
+                                threshold: float = 0.02) -> int:
+        """
+        JIT-compiled ping-pong detection - counts alternating touches of upper/lower bounds.
+        """
+        bounces = 0
+        last_touch = 0  # 0=none, 1=upper, 2=lower
+
+        for i in range(len(prices)):
+            price = prices[i]
+            upper_val = upper[i]
+            lower_val = lower[i]
+
+            # Calculate distances as percentage
+            if upper_val > 0:
+                upper_dist = abs(price - upper_val) / upper_val
+            else:
+                upper_dist = 1.0
+            if abs(lower_val) > 0:
+                lower_dist = abs(price - lower_val) / abs(lower_val)
+            else:
+                lower_dist = 1.0
+
+            # Check if price touches upper line
+            if upper_dist <= threshold:
+                if last_touch == 2:  # Was at lower
+                    bounces += 1
+                last_touch = 1
+
+            # Check if price touches lower line
+            elif lower_dist <= threshold:
+                if last_touch == 1:  # Was at upper
+                    bounces += 1
+                last_touch = 2
+
+        return bounces
+
+    @numba.jit(nopython=True, fastmath=True)
+    def _detect_complete_cycles_jit(prices: np.ndarray, upper: np.ndarray, lower: np.ndarray,
+                                     threshold: float = 0.02) -> int:
+        """
+        JIT-compiled complete cycles detection - counts full round-trips.
+        Lower → Upper → Lower = 1 cycle
+        Upper → Lower → Upper = 1 cycle
+        """
+        touches = np.empty(len(prices), dtype=np.int8)  # 0=none, 1=upper, 2=lower
+        touch_count = 0
+        last_touch = 0
+
+        for i in range(len(prices)):
+            price = prices[i]
+            upper_val = upper[i]
+            lower_val = lower[i]
+
+            # Calculate distances with zero protection
+            if upper_val > 0:
+                upper_dist = abs(price - upper_val) / upper_val
+            else:
+                upper_dist = 1.0
+            if lower_val != 0:
+                lower_dist = abs(price - lower_val) / abs(lower_val)
+            else:
+                lower_dist = 1.0
+
+            # Record touches (only when transitioning)
+            if upper_dist <= threshold and last_touch != 1:
+                touches[touch_count] = 1  # upper
+                touch_count += 1
+                last_touch = 1
+            elif lower_dist <= threshold and last_touch != 2:
+                touches[touch_count] = 2  # lower
+                touch_count += 1
+                last_touch = 2
+
+        # Count complete cycles
+        complete_cycles = 0
+        i = 0
+        while i < touch_count - 2:
+            # Lower → Upper → Lower (2 → 1 → 2)
+            if touches[i] == 2 and touches[i+1] == 1 and touches[i+2] == 2:
+                complete_cycles += 1
+                i += 2
+            # Upper → Lower → Upper (1 → 2 → 1)
+            elif touches[i] == 1 and touches[i+1] == 2 and touches[i+2] == 1:
+                complete_cycles += 1
+                i += 2
+            else:
+                i += 1
+
+        return complete_cycles
+else:
+    # Fallback Python implementations (slower but functional)
+    def _detect_ping_pongs_jit(prices: np.ndarray, upper: np.ndarray, lower: np.ndarray,
+                                threshold: float = 0.02) -> int:
+        """Python fallback for ping-pong detection."""
+        bounces = 0
+        last_touch = 0
+
+        for i in range(len(prices)):
+            price = prices[i]
+            upper_val = upper[i]
+            lower_val = lower[i]
+
+            upper_dist = abs(price - upper_val) / max(upper_val, 1e-10)
+            lower_dist = abs(price - lower_val) / max(abs(lower_val), 1e-10)
+
+            if upper_dist <= threshold:
+                if last_touch == 2:
+                    bounces += 1
+                last_touch = 1
+            elif lower_dist <= threshold:
+                if last_touch == 1:
+                    bounces += 1
+                last_touch = 2
+
+        return bounces
+
+    def _detect_complete_cycles_jit(prices: np.ndarray, upper: np.ndarray, lower: np.ndarray,
+                                     threshold: float = 0.02) -> int:
+        """Python fallback for cycle detection."""
+        touches = []
+        last_touch = 0
+
+        for i in range(len(prices)):
+            price = prices[i]
+            upper_val = upper[i]
+            lower_val = lower[i]
+
+            upper_dist = abs(price - upper_val) / max(upper_val, 1e-10)
+            lower_dist = abs(price - lower_val) / max(abs(lower_val), 1e-10)
+
+            if upper_dist <= threshold and last_touch != 1:
+                touches.append(1)
+                last_touch = 1
+            elif lower_dist <= threshold and last_touch != 2:
+                touches.append(2)
+                last_touch = 2
+
+        complete_cycles = 0
+        i = 0
+        while i < len(touches) - 2:
+            if touches[i] == 2 and touches[i+1] == 1 and touches[i+2] == 2:
+                complete_cycles += 1
+                i += 2
+            elif touches[i] == 1 and touches[i+1] == 2 and touches[i+2] == 1:
+                complete_cycles += 1
+                i += 2
+            else:
+                i += 1
+
+        return complete_cycles
 
 
 def calculate_channel_features_vectorized(
@@ -70,9 +239,10 @@ def calculate_channel_features_vectorized(
     # Compute partial bar state at each 5min timestamp
     partial_state = compute_partial_bars(symbol_df, tf)
 
-    # Initialize output arrays
+    # Initialize output arrays (34 features per window)
     prefix = f'{symbol}_channel_{tf}_w{window}'
     output = {
+        # Original 12 features
         f'{prefix}_close_slope': np.zeros(n_5min, dtype=np.float32),
         f'{prefix}_close_slope_pct': np.zeros(n_5min, dtype=np.float32),
         f'{prefix}_close_r_squared': np.zeros(n_5min, dtype=np.float32),
@@ -85,6 +255,42 @@ def calculate_channel_features_vectorized(
         f'{prefix}_stability': np.zeros(n_5min, dtype=np.float32),
         f'{prefix}_is_valid': np.zeros(n_5min, dtype=np.float32),
         f'{prefix}_insufficient_data': np.ones(n_5min, dtype=np.float32),
+
+        # NEW: Slope percentage variants (2 features)
+        f'{prefix}_high_slope_pct': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_low_slope_pct': np.zeros(n_5min, dtype=np.float32),
+
+        # NEW: R-squared variants (3 features)
+        f'{prefix}_high_r_squared': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_low_r_squared': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_r_squared_avg': np.zeros(n_5min, dtype=np.float32),
+
+        # NEW: Derived metrics (3 features)
+        f'{prefix}_slope_convergence': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_quality_score': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_duration': np.zeros(n_5min, dtype=np.float32),
+
+        # NEW: Direction flags (3 features)
+        f'{prefix}_is_bull': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_is_bear': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_is_sideways': np.zeros(n_5min, dtype=np.float32),
+
+        # NEW: Projections (3 features)
+        f'{prefix}_projected_high': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_projected_low': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_projected_center': np.zeros(n_5min, dtype=np.float32),
+
+        # NEW: Ping-pongs at 4 thresholds (4 features)
+        f'{prefix}_ping_pongs': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_ping_pongs_0_5pct': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_ping_pongs_1_0pct': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_ping_pongs_3_0pct': np.zeros(n_5min, dtype=np.float32),
+
+        # NEW: Complete cycles at 4 thresholds (4 features)
+        f'{prefix}_complete_cycles': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_complete_cycles_0_5pct': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_complete_cycles_1_0pct': np.zeros(n_5min, dtype=np.float32),
+        f'{prefix}_complete_cycles_3_0pct': np.zeros(n_5min, dtype=np.float32),
     }
 
     # Process by TF period (vectorized within each period)
@@ -209,22 +415,109 @@ def calculate_channel_features_vectorized(
         # Channel width
         channel_width_pct = channel_range / np.maximum(center_at_partial, 1e-10) * 100
 
-        # R-squared (simplified - using historical only for speed)
-        ss_res = np.sum(hist_residuals ** 2, axis=1)
-        ss_tot = n_hist * np.var(hist_closes)
-        close_r_squared = np.where(ss_tot > 1e-10, 1 - ss_res / ss_tot, 0)
+        # R-squared for close (using historical only for speed)
+        ss_res_close = np.sum(hist_residuals ** 2, axis=1)
+        ss_tot_close = n_hist * np.var(hist_closes)
+        close_r_squared = np.where(ss_tot_close > 1e-10, 1 - ss_res_close / ss_tot_close, 0)
         close_r_squared = np.clip(close_r_squared, 0, 1)
 
+        # R-squared for high
+        high_predicted = high_slope[:, None] * x_hist[None, :] + high_intercept[:, None]
+        high_residuals = hist_highs[None, :] - high_predicted
+        ss_res_high = np.sum(high_residuals ** 2, axis=1)
+        ss_tot_high = n_hist * np.var(hist_highs)
+        high_r_squared = np.where(ss_tot_high > 1e-10, 1 - ss_res_high / ss_tot_high, 0)
+        high_r_squared = np.clip(high_r_squared, 0, 1)
+
+        # R-squared for low
+        low_predicted = low_slope[:, None] * x_hist[None, :] + low_intercept[:, None]
+        low_residuals = hist_lows[None, :] - low_predicted
+        ss_res_low = np.sum(low_residuals ** 2, axis=1)
+        ss_tot_low = n_hist * np.var(hist_lows)
+        low_r_squared = np.where(ss_tot_low > 1e-10, 1 - ss_res_low / ss_tot_low, 0)
+        low_r_squared = np.clip(low_r_squared, 0, 1)
+
+        # Average R-squared
+        r_squared_avg = (close_r_squared + high_r_squared + low_r_squared) / 3
+
         # Slope percentages
-        close_slope_pct = close_slope / np.maximum(current_prices, 1e-10) * 100
+        current_prices_safe = np.maximum(current_prices, 1e-10)
+        close_slope_pct = close_slope / current_prices_safe * 100
+        high_slope_pct = high_slope / current_prices_safe * 100
+        low_slope_pct = low_slope / current_prices_safe * 100
+
+        # Slope convergence: how parallel are the channel lines (1 = parallel, 0 = diverging)
+        slope_range = np.abs(high_slope - low_slope)
+        slope_convergence = 1 - slope_range / (np.abs(close_slope) + 1e-10)
+        slope_convergence = np.clip(slope_convergence, 0, 1)
+
+        # Direction flags (based on close_slope_pct)
+        is_bull = (close_slope_pct > 0.1).astype(np.float32)
+        is_bear = (close_slope_pct < -0.1).astype(np.float32)
+        is_sideways = (np.abs(close_slope_pct) <= 0.1).astype(np.float32)
+
+        # Projections (current regression line endpoints)
+        projected_high = upper_at_partial
+        projected_low = lower_at_partial
+        projected_center = center_at_partial
+
+        # Duration (TF bars since start of window - constant for this period)
+        duration = np.full(len(bar_indices), float(n_hist + 1), dtype=np.float32)
+
+        # Compute channel lines over historical window for ping-pong detection
+        # Lines at each historical position
+        x_full = np.arange(n_hist + 1)  # Include partial bar position
+        center_line = close_slope[:, None] * x_full[None, :] + close_intercept[:, None]
+        upper_line_raw = high_slope[:, None] * x_full[None, :] + high_intercept[:, None]
+        lower_line_raw = low_slope[:, None] * x_full[None, :] + low_intercept[:, None]
+
+        # Adjust lines with std dev
+        upper_line = np.maximum(upper_line_raw, center_line + 2.0 * residual_std[:, None])
+        lower_line = np.minimum(lower_line_raw, center_line - 2.0 * residual_std[:, None])
+
+        # Ping-pong and cycle detection - need to iterate over each bar in period
+        # For efficiency, we compute for the first bar only (same channel for all bars in period)
+        # since the historical bars don't change within a TF period
+        n_bars_in_period = len(bar_indices)
+
+        # Build price array: historical closes + partial close for each bar
+        # For ping-pong detection, use historical closes only (partial doesn't count as complete)
+        pp_2pct = np.zeros(n_bars_in_period, dtype=np.float32)
+        pp_0_5pct = np.zeros(n_bars_in_period, dtype=np.float32)
+        pp_1_0pct = np.zeros(n_bars_in_period, dtype=np.float32)
+        pp_3_0pct = np.zeros(n_bars_in_period, dtype=np.float32)
+        cc_2pct = np.zeros(n_bars_in_period, dtype=np.float32)
+        cc_0_5pct = np.zeros(n_bars_in_period, dtype=np.float32)
+        cc_1_0pct = np.zeros(n_bars_in_period, dtype=np.float32)
+        cc_3_0pct = np.zeros(n_bars_in_period, dtype=np.float32)
+
+        # Use the first bar's channel for ping-pong detection (all bars in period share same historical data)
+        if n_bars_in_period > 0:
+            upper_for_pp = upper_line[0, :n_hist]  # Historical portion only
+            lower_for_pp = lower_line[0, :n_hist]
+
+            # Detect ping-pongs at each threshold
+            pp_2pct[:] = _detect_ping_pongs_jit(hist_closes, upper_for_pp, lower_for_pp, 0.02)
+            pp_0_5pct[:] = _detect_ping_pongs_jit(hist_closes, upper_for_pp, lower_for_pp, 0.005)
+            pp_1_0pct[:] = _detect_ping_pongs_jit(hist_closes, upper_for_pp, lower_for_pp, 0.01)
+            pp_3_0pct[:] = _detect_ping_pongs_jit(hist_closes, upper_for_pp, lower_for_pp, 0.03)
+
+            # Detect complete cycles at each threshold
+            cc_2pct[:] = _detect_complete_cycles_jit(hist_closes, upper_for_pp, lower_for_pp, 0.02)
+            cc_0_5pct[:] = _detect_complete_cycles_jit(hist_closes, upper_for_pp, lower_for_pp, 0.005)
+            cc_1_0pct[:] = _detect_complete_cycles_jit(hist_closes, upper_for_pp, lower_for_pp, 0.01)
+            cc_3_0pct[:] = _detect_complete_cycles_jit(hist_closes, upper_for_pp, lower_for_pp, 0.03)
+
+        # Quality score: cycles × (0.5 + 0.5 × r²)
+        quality_score = cc_2pct * (0.5 + 0.5 * r_squared_avg)
 
         # Stability
         stability = close_r_squared * 10
 
-        # Is valid
-        is_valid = np.where(close_r_squared > 0.5, 1.0, 0.0)
+        # Is valid (based on cycles >= 2, like old system)
+        is_valid = np.where(cc_2pct >= 2, 1.0, 0.0)
 
-        # Store results
+        # Store results - Original 12 features
         output[f'{prefix}_close_slope'][bar_indices] = close_slope.astype(np.float32)
         output[f'{prefix}_close_slope_pct'][bar_indices] = close_slope_pct.astype(np.float32)
         output[f'{prefix}_close_r_squared'][bar_indices] = close_r_squared.astype(np.float32)
@@ -237,6 +530,42 @@ def calculate_channel_features_vectorized(
         output[f'{prefix}_stability'][bar_indices] = stability.astype(np.float32)
         output[f'{prefix}_is_valid'][bar_indices] = is_valid.astype(np.float32)
         output[f'{prefix}_insufficient_data'][bar_indices] = 0.0
+
+        # Store NEW features - Slope percentages
+        output[f'{prefix}_high_slope_pct'][bar_indices] = high_slope_pct.astype(np.float32)
+        output[f'{prefix}_low_slope_pct'][bar_indices] = low_slope_pct.astype(np.float32)
+
+        # Store NEW features - R-squared variants
+        output[f'{prefix}_high_r_squared'][bar_indices] = high_r_squared.astype(np.float32)
+        output[f'{prefix}_low_r_squared'][bar_indices] = low_r_squared.astype(np.float32)
+        output[f'{prefix}_r_squared_avg'][bar_indices] = r_squared_avg.astype(np.float32)
+
+        # Store NEW features - Derived metrics
+        output[f'{prefix}_slope_convergence'][bar_indices] = slope_convergence.astype(np.float32)
+        output[f'{prefix}_quality_score'][bar_indices] = quality_score.astype(np.float32)
+        output[f'{prefix}_duration'][bar_indices] = duration
+
+        # Store NEW features - Direction flags
+        output[f'{prefix}_is_bull'][bar_indices] = is_bull
+        output[f'{prefix}_is_bear'][bar_indices] = is_bear
+        output[f'{prefix}_is_sideways'][bar_indices] = is_sideways
+
+        # Store NEW features - Projections
+        output[f'{prefix}_projected_high'][bar_indices] = projected_high.astype(np.float32)
+        output[f'{prefix}_projected_low'][bar_indices] = projected_low.astype(np.float32)
+        output[f'{prefix}_projected_center'][bar_indices] = projected_center.astype(np.float32)
+
+        # Store NEW features - Ping-pongs
+        output[f'{prefix}_ping_pongs'][bar_indices] = pp_2pct
+        output[f'{prefix}_ping_pongs_0_5pct'][bar_indices] = pp_0_5pct
+        output[f'{prefix}_ping_pongs_1_0pct'][bar_indices] = pp_1_0pct
+        output[f'{prefix}_ping_pongs_3_0pct'][bar_indices] = pp_3_0pct
+
+        # Store NEW features - Complete cycles
+        output[f'{prefix}_complete_cycles'][bar_indices] = cc_2pct
+        output[f'{prefix}_complete_cycles_0_5pct'][bar_indices] = cc_0_5pct
+        output[f'{prefix}_complete_cycles_1_0pct'][bar_indices] = cc_1_0pct
+        output[f'{prefix}_complete_cycles_3_0pct'][bar_indices] = cc_3_0pct
 
     return pd.DataFrame(output, index=symbol_df.index)
 
@@ -336,6 +665,8 @@ def _calculate_5min_channel_features_rolling(symbol_df: pd.DataFrame, symbol: st
 
     For 5min TF, each bar IS the complete bar - no partial bar concept applies.
     Uses pandas rolling + numpy for O(n) vectorized computation.
+
+    Returns 34 features per window (matching old LinearRegressionChannel).
     """
     n = len(symbol_df)
     prefix = f'{symbol}_channel_5min_w{window}'
@@ -344,101 +675,19 @@ def _calculate_5min_channel_features_rolling(symbol_df: pd.DataFrame, symbol: st
     highs = symbol_df['high'].values.astype(np.float64)
     lows = symbol_df['low'].values.astype(np.float64)
 
-    # Use pandas rolling for efficient computation
-    close_series = pd.Series(closes, index=symbol_df.index)
-    high_series = pd.Series(highs, index=symbol_df.index)
-    low_series = pd.Series(lows, index=symbol_df.index)
-
     # Pre-compute x values for regression (constant for all windows)
     x = np.arange(window, dtype=np.float64)
     x_mean = x.mean()
     x_var = np.sum((x - x_mean) ** 2)
     x_centered = x - x_mean
 
-    # Rolling statistics using pandas (vectorized, fast)
-    close_mean = close_series.rolling(window, min_periods=window).mean().values
-    high_mean = high_series.rolling(window, min_periods=window).mean().values
-    low_mean = low_series.rolling(window, min_periods=window).mean().values
-    close_std = close_series.rolling(window, min_periods=window).std().values
-
-    # For slope, we need rolling covariance with x
-    # cov(x, y) = E[xy] - E[x]E[y] = sum((x-x_mean)(y-y_mean)) / n
-    # slope = cov(x, y) / var(x)
-
-    # Create weighted series for covariance calculation
-    # We need sum of (x_i - x_mean) * (y_i - y_mean) for each window
-    # This equals sum(x_centered * y) - x_mean * sum(y) + n * x_mean * y_mean
-    # Simplified: sum(x_centered * y) since x is the same for all windows
-
     # Use stride tricks to create rolling windows efficiently
     from numpy.lib.stride_tricks import sliding_window_view
 
-    if n >= window:
-        # Create sliding windows of closes, highs, lows
-        close_windows = sliding_window_view(closes, window)  # Shape: (n - window + 1, window)
-        high_windows = sliding_window_view(highs, window)
-        low_windows = sliding_window_view(lows, window)
-
-        # Compute covariances with x (vectorized across all windows)
-        # x_centered has shape (window,), windows have shape (n-window+1, window)
-        # Result: shape (n-window+1,)
-        close_cov = np.sum(x_centered * (close_windows - close_windows.mean(axis=1, keepdims=True)), axis=1)
-        high_cov = np.sum(x_centered * (high_windows - high_windows.mean(axis=1, keepdims=True)), axis=1)
-        low_cov = np.sum(x_centered * (low_windows - low_windows.mean(axis=1, keepdims=True)), axis=1)
-
-        # Slopes
-        close_slope = close_cov / x_var
-        high_slope = high_cov / x_var
-        low_slope = low_cov / x_var
-
-        # Intercepts (at x = x_mean)
-        close_intercept = close_windows.mean(axis=1) - close_slope * x_mean
-        high_intercept = high_windows.mean(axis=1) - high_slope * x_mean
-        low_intercept = low_windows.mean(axis=1) - low_slope * x_mean
-
-        # Channel bounds at end of window (x = window - 1)
-        x_now = window - 1
-        center = close_slope * x_now + close_intercept
-        upper_raw = high_slope * x_now + high_intercept
-        lower_raw = low_slope * x_now + low_intercept
-
-        # Residual std for bound adjustment
-        y_pred = close_slope[:, None] * x[None, :] + close_intercept[:, None]
-        residual_std = np.std(close_windows - y_pred, axis=1)
-
-        # Adjust bounds
-        upper = np.maximum(upper_raw, center + 2.0 * residual_std)
-        lower = np.minimum(lower_raw, center - 2.0 * residual_std)
-
-        # R-squared (compute division safely to avoid RuntimeWarning)
-        ss_res = np.sum((close_windows - y_pred) ** 2, axis=1)
-        ss_tot = np.sum((close_windows - close_windows.mean(axis=1, keepdims=True)) ** 2, axis=1)
-        ss_tot_safe = np.maximum(ss_tot, 1e-10)  # Avoid divide by zero
-        r_squared = np.where(ss_tot > 1e-10, 1 - ss_res / ss_tot_safe, 0)
-        r_squared = np.clip(r_squared, 0, 1)
-
-        # Position (using the close at end of each window's range, which is closes[window-1:])
-        # Window i contains closes[i:i+window], and current price is closes[i+window-1]
-        # We have n - window + 1 windows, so current_prices should have that many elements
-        current_prices = closes[window - 1:]  # Length: n - window + 1
-        channel_range = upper - lower
-        channel_range_safe = np.maximum(channel_range, 1e-10)  # Avoid divide by zero
-        position = np.where(
-            channel_range > 1e-10,
-            (current_prices[:len(channel_range)] - lower) / channel_range_safe,
-            0.5
-        )
-        position = np.clip(position, 0, 1)
-
-        # Distances
-        current_prices_safe = np.maximum(current_prices[:len(channel_range)], 1e-10)
-        upper_dist = (upper - current_prices[:len(channel_range)]) / current_prices_safe * 100
-        lower_dist = (current_prices[:len(channel_range)] - lower) / current_prices_safe * 100
-        channel_width = channel_range / np.maximum(center, 1e-10) * 100
-        close_slope_pct = close_slope / current_prices_safe * 100
-
-        # Initialize output arrays
-        output = {
+    # Helper to create default output dict with zeros
+    def _create_default_output():
+        return {
+            # Original 12 features
             f'{prefix}_close_slope': np.zeros(n, dtype=np.float32),
             f'{prefix}_close_slope_pct': np.zeros(n, dtype=np.float32),
             f'{prefix}_close_r_squared': np.zeros(n, dtype=np.float32),
@@ -451,41 +700,254 @@ def _calculate_5min_channel_features_rolling(symbol_df: pd.DataFrame, symbol: st
             f'{prefix}_stability': np.zeros(n, dtype=np.float32),
             f'{prefix}_is_valid': np.zeros(n, dtype=np.float32),
             f'{prefix}_insufficient_data': np.ones(n, dtype=np.float32),
+
+            # NEW: Slope percentage variants (2 features)
+            f'{prefix}_high_slope_pct': np.zeros(n, dtype=np.float32),
+            f'{prefix}_low_slope_pct': np.zeros(n, dtype=np.float32),
+
+            # NEW: R-squared variants (3 features)
+            f'{prefix}_high_r_squared': np.zeros(n, dtype=np.float32),
+            f'{prefix}_low_r_squared': np.zeros(n, dtype=np.float32),
+            f'{prefix}_r_squared_avg': np.zeros(n, dtype=np.float32),
+
+            # NEW: Derived metrics (3 features)
+            f'{prefix}_slope_convergence': np.zeros(n, dtype=np.float32),
+            f'{prefix}_quality_score': np.zeros(n, dtype=np.float32),
+            f'{prefix}_duration': np.zeros(n, dtype=np.float32),
+
+            # NEW: Direction flags (3 features)
+            f'{prefix}_is_bull': np.zeros(n, dtype=np.float32),
+            f'{prefix}_is_bear': np.zeros(n, dtype=np.float32),
+            f'{prefix}_is_sideways': np.zeros(n, dtype=np.float32),
+
+            # NEW: Projections (3 features)
+            f'{prefix}_projected_high': np.zeros(n, dtype=np.float32),
+            f'{prefix}_projected_low': np.zeros(n, dtype=np.float32),
+            f'{prefix}_projected_center': np.zeros(n, dtype=np.float32),
+
+            # NEW: Ping-pongs at 4 thresholds (4 features)
+            f'{prefix}_ping_pongs': np.zeros(n, dtype=np.float32),
+            f'{prefix}_ping_pongs_0_5pct': np.zeros(n, dtype=np.float32),
+            f'{prefix}_ping_pongs_1_0pct': np.zeros(n, dtype=np.float32),
+            f'{prefix}_ping_pongs_3_0pct': np.zeros(n, dtype=np.float32),
+
+            # NEW: Complete cycles at 4 thresholds (4 features)
+            f'{prefix}_complete_cycles': np.zeros(n, dtype=np.float32),
+            f'{prefix}_complete_cycles_0_5pct': np.zeros(n, dtype=np.float32),
+            f'{prefix}_complete_cycles_1_0pct': np.zeros(n, dtype=np.float32),
+            f'{prefix}_complete_cycles_3_0pct': np.zeros(n, dtype=np.float32),
         }
 
-        # Fill in valid values (starting from index window-1)
-        start_idx = window - 1
-        end_idx = start_idx + len(close_slope)
-
-        output[f'{prefix}_close_slope'][start_idx:end_idx] = close_slope.astype(np.float32)
-        output[f'{prefix}_close_slope_pct'][start_idx:end_idx] = close_slope_pct.astype(np.float32)
-        output[f'{prefix}_close_r_squared'][start_idx:end_idx] = r_squared.astype(np.float32)
-        output[f'{prefix}_high_slope'][start_idx:end_idx] = high_slope.astype(np.float32)
-        output[f'{prefix}_low_slope'][start_idx:end_idx] = low_slope.astype(np.float32)
-        output[f'{prefix}_position'][start_idx:end_idx] = position.astype(np.float32)
-        output[f'{prefix}_upper_dist'][start_idx:end_idx] = upper_dist.astype(np.float32)
-        output[f'{prefix}_lower_dist'][start_idx:end_idx] = lower_dist.astype(np.float32)
-        output[f'{prefix}_channel_width_pct'][start_idx:end_idx] = channel_width.astype(np.float32)
-        output[f'{prefix}_stability'][start_idx:end_idx] = (r_squared * 10).astype(np.float32)
-        output[f'{prefix}_is_valid'][start_idx:end_idx] = (r_squared > 0.5).astype(np.float32)
-        output[f'{prefix}_insufficient_data'][start_idx:end_idx] = 0.0
-
-    else:
+    if n < window:
         # Not enough data - return defaults
-        output = {
-            f'{prefix}_close_slope': np.zeros(n, dtype=np.float32),
-            f'{prefix}_close_slope_pct': np.zeros(n, dtype=np.float32),
-            f'{prefix}_close_r_squared': np.zeros(n, dtype=np.float32),
-            f'{prefix}_high_slope': np.zeros(n, dtype=np.float32),
-            f'{prefix}_low_slope': np.zeros(n, dtype=np.float32),
-            f'{prefix}_position': np.full(n, 0.5, dtype=np.float32),
-            f'{prefix}_upper_dist': np.zeros(n, dtype=np.float32),
-            f'{prefix}_lower_dist': np.zeros(n, dtype=np.float32),
-            f'{prefix}_channel_width_pct': np.zeros(n, dtype=np.float32),
-            f'{prefix}_stability': np.zeros(n, dtype=np.float32),
-            f'{prefix}_is_valid': np.zeros(n, dtype=np.float32),
-            f'{prefix}_insufficient_data': np.ones(n, dtype=np.float32),
-        }
+        return pd.DataFrame(_create_default_output(), index=symbol_df.index)
+
+    # Create sliding windows of closes, highs, lows
+    close_windows = sliding_window_view(closes, window)  # Shape: (n - window + 1, window)
+    high_windows = sliding_window_view(highs, window)
+    low_windows = sliding_window_view(lows, window)
+    n_windows = len(close_windows)
+
+    # Compute covariances with x (vectorized across all windows)
+    close_cov = np.sum(x_centered * (close_windows - close_windows.mean(axis=1, keepdims=True)), axis=1)
+    high_cov = np.sum(x_centered * (high_windows - high_windows.mean(axis=1, keepdims=True)), axis=1)
+    low_cov = np.sum(x_centered * (low_windows - low_windows.mean(axis=1, keepdims=True)), axis=1)
+
+    # Slopes
+    close_slope = close_cov / x_var
+    high_slope = high_cov / x_var
+    low_slope = low_cov / x_var
+
+    # Intercepts (at x = x_mean)
+    close_intercept = close_windows.mean(axis=1) - close_slope * x_mean
+    high_intercept = high_windows.mean(axis=1) - high_slope * x_mean
+    low_intercept = low_windows.mean(axis=1) - low_slope * x_mean
+
+    # Channel bounds at end of window (x = window - 1)
+    x_now = window - 1
+    center = close_slope * x_now + close_intercept
+    upper_raw = high_slope * x_now + high_intercept
+    lower_raw = low_slope * x_now + low_intercept
+
+    # Predicted values for each window
+    close_pred = close_slope[:, None] * x[None, :] + close_intercept[:, None]
+    high_pred = high_slope[:, None] * x[None, :] + high_intercept[:, None]
+    low_pred = low_slope[:, None] * x[None, :] + low_intercept[:, None]
+
+    # Residual std for bound adjustment
+    residual_std = np.std(close_windows - close_pred, axis=1)
+
+    # Adjust bounds
+    upper = np.maximum(upper_raw, center + 2.0 * residual_std)
+    lower = np.minimum(lower_raw, center - 2.0 * residual_std)
+
+    # R-squared for close
+    ss_res_close = np.sum((close_windows - close_pred) ** 2, axis=1)
+    ss_tot_close = np.sum((close_windows - close_windows.mean(axis=1, keepdims=True)) ** 2, axis=1)
+    ss_tot_close_safe = np.maximum(ss_tot_close, 1e-10)
+    close_r_squared = np.where(ss_tot_close > 1e-10, 1 - ss_res_close / ss_tot_close_safe, 0)
+    close_r_squared = np.clip(close_r_squared, 0, 1)
+
+    # R-squared for high
+    ss_res_high = np.sum((high_windows - high_pred) ** 2, axis=1)
+    ss_tot_high = np.sum((high_windows - high_windows.mean(axis=1, keepdims=True)) ** 2, axis=1)
+    ss_tot_high_safe = np.maximum(ss_tot_high, 1e-10)
+    high_r_squared = np.where(ss_tot_high > 1e-10, 1 - ss_res_high / ss_tot_high_safe, 0)
+    high_r_squared = np.clip(high_r_squared, 0, 1)
+
+    # R-squared for low
+    ss_res_low = np.sum((low_windows - low_pred) ** 2, axis=1)
+    ss_tot_low = np.sum((low_windows - low_windows.mean(axis=1, keepdims=True)) ** 2, axis=1)
+    ss_tot_low_safe = np.maximum(ss_tot_low, 1e-10)
+    low_r_squared = np.where(ss_tot_low > 1e-10, 1 - ss_res_low / ss_tot_low_safe, 0)
+    low_r_squared = np.clip(low_r_squared, 0, 1)
+
+    # Average R-squared
+    r_squared_avg = (close_r_squared + high_r_squared + low_r_squared) / 3
+
+    # Position
+    current_prices = closes[window - 1:]  # Length: n - window + 1
+    channel_range = upper - lower
+    channel_range_safe = np.maximum(channel_range, 1e-10)
+    position = np.where(
+        channel_range > 1e-10,
+        (current_prices[:n_windows] - lower) / channel_range_safe,
+        0.5
+    )
+    position = np.clip(position, 0, 1)
+
+    # Distances and width
+    current_prices_safe = np.maximum(current_prices[:n_windows], 1e-10)
+    upper_dist = (upper - current_prices[:n_windows]) / current_prices_safe * 100
+    lower_dist = (current_prices[:n_windows] - lower) / current_prices_safe * 100
+    channel_width = channel_range / np.maximum(center, 1e-10) * 100
+
+    # Slope percentages
+    close_slope_pct = close_slope / current_prices_safe * 100
+    high_slope_pct = high_slope / current_prices_safe * 100
+    low_slope_pct = low_slope / current_prices_safe * 100
+
+    # Slope convergence
+    slope_range = np.abs(high_slope - low_slope)
+    slope_convergence = 1 - slope_range / (np.abs(close_slope) + 1e-10)
+    slope_convergence = np.clip(slope_convergence, 0, 1)
+
+    # Direction flags
+    is_bull = (close_slope_pct > 0.1).astype(np.float32)
+    is_bear = (close_slope_pct < -0.1).astype(np.float32)
+    is_sideways = (np.abs(close_slope_pct) <= 0.1).astype(np.float32)
+
+    # Projections (channel bounds at current bar)
+    projected_high = upper
+    projected_low = lower
+    projected_center = center
+
+    # Duration (window size - constant for 5min)
+    duration = np.full(n_windows, float(window), dtype=np.float32)
+
+    # Ping-pongs and cycles - compute for each window
+    # For 5min path, we need to iterate since each window has different bounds
+    pp_2pct = np.zeros(n_windows, dtype=np.float32)
+    pp_0_5pct = np.zeros(n_windows, dtype=np.float32)
+    pp_1_0pct = np.zeros(n_windows, dtype=np.float32)
+    pp_3_0pct = np.zeros(n_windows, dtype=np.float32)
+    cc_2pct = np.zeros(n_windows, dtype=np.float32)
+    cc_0_5pct = np.zeros(n_windows, dtype=np.float32)
+    cc_1_0pct = np.zeros(n_windows, dtype=np.float32)
+    cc_3_0pct = np.zeros(n_windows, dtype=np.float32)
+
+    # Compute channel lines for each window (upper/lower at each position)
+    # upper_lines[i, j] = upper bound for window i at position j
+    upper_lines = high_slope[:, None] * x[None, :] + high_intercept[:, None]
+    lower_lines = low_slope[:, None] * x[None, :] + low_intercept[:, None]
+    center_lines = close_slope[:, None] * x[None, :] + close_intercept[:, None]
+
+    # Adjust with residual std
+    upper_lines = np.maximum(upper_lines, center_lines + 2.0 * residual_std[:, None])
+    lower_lines = np.minimum(lower_lines, center_lines - 2.0 * residual_std[:, None])
+
+    # Iterate over windows to compute ping-pongs and cycles
+    for i in range(n_windows):
+        prices_in_window = close_windows[i]
+        upper_in_window = upper_lines[i]
+        lower_in_window = lower_lines[i]
+
+        # Detect at each threshold
+        pp_2pct[i] = _detect_ping_pongs_jit(prices_in_window, upper_in_window, lower_in_window, 0.02)
+        pp_0_5pct[i] = _detect_ping_pongs_jit(prices_in_window, upper_in_window, lower_in_window, 0.005)
+        pp_1_0pct[i] = _detect_ping_pongs_jit(prices_in_window, upper_in_window, lower_in_window, 0.01)
+        pp_3_0pct[i] = _detect_ping_pongs_jit(prices_in_window, upper_in_window, lower_in_window, 0.03)
+
+        cc_2pct[i] = _detect_complete_cycles_jit(prices_in_window, upper_in_window, lower_in_window, 0.02)
+        cc_0_5pct[i] = _detect_complete_cycles_jit(prices_in_window, upper_in_window, lower_in_window, 0.005)
+        cc_1_0pct[i] = _detect_complete_cycles_jit(prices_in_window, upper_in_window, lower_in_window, 0.01)
+        cc_3_0pct[i] = _detect_complete_cycles_jit(prices_in_window, upper_in_window, lower_in_window, 0.03)
+
+    # Quality score: cycles × (0.5 + 0.5 × r²)
+    quality_score = cc_2pct * (0.5 + 0.5 * r_squared_avg)
+
+    # Stability
+    stability = close_r_squared * 10
+
+    # Is valid (based on cycles >= 2)
+    is_valid = np.where(cc_2pct >= 2, 1.0, 0.0)
+
+    # Initialize output arrays
+    output = _create_default_output()
+
+    # Fill in valid values (starting from index window-1)
+    start_idx = window - 1
+    end_idx = start_idx + n_windows
+
+    # Original 12 features
+    output[f'{prefix}_close_slope'][start_idx:end_idx] = close_slope.astype(np.float32)
+    output[f'{prefix}_close_slope_pct'][start_idx:end_idx] = close_slope_pct.astype(np.float32)
+    output[f'{prefix}_close_r_squared'][start_idx:end_idx] = close_r_squared.astype(np.float32)
+    output[f'{prefix}_high_slope'][start_idx:end_idx] = high_slope.astype(np.float32)
+    output[f'{prefix}_low_slope'][start_idx:end_idx] = low_slope.astype(np.float32)
+    output[f'{prefix}_position'][start_idx:end_idx] = position.astype(np.float32)
+    output[f'{prefix}_upper_dist'][start_idx:end_idx] = upper_dist.astype(np.float32)
+    output[f'{prefix}_lower_dist'][start_idx:end_idx] = lower_dist.astype(np.float32)
+    output[f'{prefix}_channel_width_pct'][start_idx:end_idx] = channel_width.astype(np.float32)
+    output[f'{prefix}_stability'][start_idx:end_idx] = stability.astype(np.float32)
+    output[f'{prefix}_is_valid'][start_idx:end_idx] = is_valid.astype(np.float32)
+    output[f'{prefix}_insufficient_data'][start_idx:end_idx] = 0.0
+
+    # NEW: Slope percentages
+    output[f'{prefix}_high_slope_pct'][start_idx:end_idx] = high_slope_pct.astype(np.float32)
+    output[f'{prefix}_low_slope_pct'][start_idx:end_idx] = low_slope_pct.astype(np.float32)
+
+    # NEW: R-squared variants
+    output[f'{prefix}_high_r_squared'][start_idx:end_idx] = high_r_squared.astype(np.float32)
+    output[f'{prefix}_low_r_squared'][start_idx:end_idx] = low_r_squared.astype(np.float32)
+    output[f'{prefix}_r_squared_avg'][start_idx:end_idx] = r_squared_avg.astype(np.float32)
+
+    # NEW: Derived metrics
+    output[f'{prefix}_slope_convergence'][start_idx:end_idx] = slope_convergence.astype(np.float32)
+    output[f'{prefix}_quality_score'][start_idx:end_idx] = quality_score.astype(np.float32)
+    output[f'{prefix}_duration'][start_idx:end_idx] = duration
+
+    # NEW: Direction flags
+    output[f'{prefix}_is_bull'][start_idx:end_idx] = is_bull
+    output[f'{prefix}_is_bear'][start_idx:end_idx] = is_bear
+    output[f'{prefix}_is_sideways'][start_idx:end_idx] = is_sideways
+
+    # NEW: Projections
+    output[f'{prefix}_projected_high'][start_idx:end_idx] = projected_high.astype(np.float32)
+    output[f'{prefix}_projected_low'][start_idx:end_idx] = projected_low.astype(np.float32)
+    output[f'{prefix}_projected_center'][start_idx:end_idx] = projected_center.astype(np.float32)
+
+    # NEW: Ping-pongs
+    output[f'{prefix}_ping_pongs'][start_idx:end_idx] = pp_2pct
+    output[f'{prefix}_ping_pongs_0_5pct'][start_idx:end_idx] = pp_0_5pct
+    output[f'{prefix}_ping_pongs_1_0pct'][start_idx:end_idx] = pp_1_0pct
+    output[f'{prefix}_ping_pongs_3_0pct'][start_idx:end_idx] = pp_3_0pct
+
+    # NEW: Complete cycles
+    output[f'{prefix}_complete_cycles'][start_idx:end_idx] = cc_2pct
+    output[f'{prefix}_complete_cycles_0_5pct'][start_idx:end_idx] = cc_0_5pct
+    output[f'{prefix}_complete_cycles_1_0pct'][start_idx:end_idx] = cc_1_0pct
+    output[f'{prefix}_complete_cycles_3_0pct'][start_idx:end_idx] = cc_3_0pct
 
     return pd.DataFrame(output, index=symbol_df.index)
 

@@ -39,9 +39,9 @@ VIX_CALC_VERSION = "v1"  # v4.4: Track VIX feature calculation version (incremen
 EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
 CHANNEL_PROJECTION_VERSION = "v1"  # v5.0: Track channel projection features
 BREAKDOWN_CALC_VERSION = "v2"  # v5.3.3: Track breakdown calculation method (v1=1-min, v2=native TF)
-PARTIAL_BAR_VERSION = "v1"  # v5.4: Partial bar support - channels include in-progress TF bars
-FEATURE_VERSION = f"v5.4.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}"
-# v5.4.0: Partial bar support - at each 5min bar, coarser TF channels include in-progress data
+PARTIAL_BAR_VERSION = "v2"  # v5.5: Added 22 missing channel features (ping-pongs, cycles, R², etc.)
+FEATURE_VERSION = f"v5.5.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}"
+# v5.5.0: Added 22 missing channel features (34 per window now) - ping-pongs, cycles, R² variants, etc.
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
 # IMPORTED FROM config.py (single source of truth)
