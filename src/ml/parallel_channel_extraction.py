@@ -170,8 +170,9 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                     # v5.0: Channel projections (geometric predictions)
                     results[f'{w_prefix}_projected_high'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
                     results[f'{w_prefix}_projected_low'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
+                    results[f'{w_prefix}_projected_center'] = np.zeros(n, dtype=config.NUMPY_DTYPE)
 
-                # Total: 21 windows × 34 features = 714 features per (symbol, timeframe) pair (v5.0: +2 projections)
+                # Total: 14 windows × 34 features = 476 features per (symbol, timeframe) pair (v5.5: +projected_center)
 
                 # Handle insufficient data
                 if len(resampled) < 20:
@@ -330,8 +331,10 @@ def channel_worker_with_progress(task_queue: Queue, result_queue: Queue, progres
                         # Convert from absolute price to percentage
                         projected_high_pct = (channel.predicted_high - current_price) / current_price * 100 if current_price > 0 else 0.0
                         projected_low_pct = (channel.predicted_low - current_price) / current_price * 100 if current_price > 0 else 0.0
+                        projected_center_pct = (channel.predicted_center - current_price) / current_price * 100 if current_price > 0 else 0.0
                         results[f'{w_prefix}_projected_high'][indices] = projected_high_pct
                         results[f'{w_prefix}_projected_low'][indices] = projected_low_pct
+                        results[f'{w_prefix}_projected_center'][indices] = projected_center_pct
 
                 # DEBUG: After mapping loop
                 # print(f"   🗺️  Worker {worker_id}: Mapping complete, {len(results)} features ready", flush=True)
