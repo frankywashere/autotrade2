@@ -819,49 +819,67 @@ class HierarchicalDataset(Dataset):
             past_prices=past_prices
         )
 
-        # v4.3: Add per-TF hierarchical continuation prediction targets
+        # v4.3/v5.4: Add per-TF hierarchical continuation prediction targets
         # Each timeframe gets its own duration/gain/confidence predictions
+        # v5.4: With 5min labels, use direct index lookup (faster, more accurate)
+        # v5.4.1: Add validity mask to distinguish real vs placeholder labels
         if self.include_continuation and len(self._per_tf_continuation) > 0:
             for tf in HIERARCHICAL_TIMEFRAMES:
                 if tf not in self._per_tf_continuation or tf not in self._per_tf_ts_to_idx:
-                    # No labels for this TF - use placeholders
+                    # No labels for this TF - use placeholders with invalid flag
                     targets[f'cont_{tf}_duration'] = 0.0
                     targets[f'cont_{tf}_gain'] = 0.0
                     targets[f'cont_{tf}_confidence'] = 0.5
+                    targets[f'cont_{tf}_valid'] = 0.0  # Mark as invalid
                     continue
 
                 try:
-                    # Get timestamp for this timeframe
-                    if tf in self.tf_timestamps:
-                        # Find the corresponding index in this TF's array
-                        tf_timestamps = self.tf_timestamps[tf]
-                        tf_idx = np.searchsorted(tf_timestamps, ts_5min, side='right') - 1
-                        tf_idx = max(0, min(tf_idx, len(tf_timestamps) - 1))
-                        tf_ts = tf_timestamps[tf_idx]
+                    row_idx = None
 
-                        # Lookup in per-TF dict
-                        row_idx = self._per_tf_ts_to_idx[tf].get(int(tf_ts))
+                    # v5.4: Check if using 5min labels (direct index lookup)
+                    if hasattr(self, '_uses_5min_labels') and self._uses_5min_labels.get(tf, False):
+                        # Direct index lookup - labels are at 5min resolution
+                        cont_data = self._per_tf_continuation[tf]
+                        n_labels = len(cont_data['duration_bars'])
 
-                        if row_idx is not None:
-                            cont_data = self._per_tf_continuation[tf]
-                            targets[f'cont_{tf}_duration'] = float(cont_data['duration_bars'][row_idx])
-                            targets[f'cont_{tf}_gain'] = float(cont_data['max_gain_pct'][row_idx])
-                            targets[f'cont_{tf}_confidence'] = float(cont_data['confidence'][row_idx])
-                        else:
-                            # Timestamp not found - use placeholders
-                            targets[f'cont_{tf}_duration'] = 0.0
-                            targets[f'cont_{tf}_gain'] = 0.0
-                            targets[f'cont_{tf}_confidence'] = 0.5
+                        # Use timestamp-based lookup for accuracy
+                        row_idx = self._per_tf_ts_to_idx[tf].get(int(ts_5min))
+
+                        # v5.4.1: Remove fallback to index - only use timestamp match
+                        # Fallback caused wrong labels when timestamps didn't align
+                        # if row_idx is None and data_idx_5min < n_labels:
+                        #     row_idx = data_idx_5min
+
                     else:
-                        # TF timestamps not available
+                        # Original approach: TF-resolution labels with searchsorted lookup
+                        if tf in self.tf_timestamps:
+                            tf_timestamps = self.tf_timestamps[tf]
+                            tf_idx = np.searchsorted(tf_timestamps, ts_5min, side='right') - 1
+                            tf_idx = max(0, min(tf_idx, len(tf_timestamps) - 1))
+                            tf_ts = tf_timestamps[tf_idx]
+
+                            # Lookup in per-TF dict
+                            row_idx = self._per_tf_ts_to_idx[tf].get(int(tf_ts))
+
+                    if row_idx is not None:
+                        cont_data = self._per_tf_continuation[tf]
+                        targets[f'cont_{tf}_duration'] = float(cont_data['duration_bars'][row_idx])
+                        targets[f'cont_{tf}_gain'] = float(cont_data['max_gain_pct'][row_idx])
+                        targets[f'cont_{tf}_confidence'] = float(cont_data['confidence'][row_idx])
+                        targets[f'cont_{tf}_valid'] = 1.0  # Mark as valid
+                    else:
+                        # Timestamp not found - use placeholders with invalid flag
                         targets[f'cont_{tf}_duration'] = 0.0
                         targets[f'cont_{tf}_gain'] = 0.0
                         targets[f'cont_{tf}_confidence'] = 0.5
+                        targets[f'cont_{tf}_valid'] = 0.0  # Mark as invalid
+
                 except Exception:
-                    # Error - use placeholders
+                    # Error - use placeholders with invalid flag
                     targets[f'cont_{tf}_duration'] = 0.0
                     targets[f'cont_{tf}_gain'] = 0.0
                     targets[f'cont_{tf}_confidence'] = 0.5
+                    targets[f'cont_{tf}_valid'] = 0.0  # Mark as invalid
 
         # Legacy fallback: single continuation_labels_df (backward compatibility)
         elif self.include_continuation and self.continuation_labels_df is not None:
@@ -879,7 +897,7 @@ class HierarchicalDataset(Dataset):
             except Exception:
                 pass
 
-        # v5.2: Add transition labels to targets (always add keys, use defaults if missing)
+        # v5.2/v5.4.1: Add transition labels to targets with validity flags
         for tf in HIERARCHICAL_TIMEFRAMES:
             # Try to get actual transition label
             trans_found = False
@@ -895,14 +913,16 @@ class HierarchicalDataset(Dataset):
                     targets[f'trans_{tf}_switch_to'] = float(trans_data.get('switch_to_tf', [0])[ts_idx])
                     targets[f'trans_{tf}_direction'] = float(trans_data.get('new_direction', [1])[ts_idx])
                     targets[f'trans_{tf}_slope'] = float(trans_data.get('new_slope', [0.0])[ts_idx])
+                    targets[f'trans_{tf}_valid'] = 1.0  # Mark as valid
                     trans_found = True
 
-            # If no label found, add conservative defaults (near dataset end or sparse TF)
+            # If no label found, add conservative defaults with invalid flag
             if not trans_found:
                 targets[f'trans_{tf}_type'] = 0.0  # CONTINUE (conservative)
                 targets[f'trans_{tf}_switch_to'] = 0.0  # N/A
                 targets[f'trans_{tf}_direction'] = 1.0  # BEAR (neutral default)
                 targets[f'trans_{tf}_slope'] = 0.0  # No slope change
+                targets[f'trans_{tf}_valid'] = 0.0  # Mark as invalid
 
         # v5.2: Get VIX sequence for this sample
         vix_seq = None
@@ -971,15 +991,17 @@ class HierarchicalDataset(Dataset):
         """
         Load per-timeframe hierarchical continuation labels from directory.
 
+        v5.4: First looks for 5min-resolution labels (continuation_labels_5min_{tf}_*.pkl)
+              Falls back to TF-resolution labels (continuation_labels_{tf}_*.pkl)
+
         v4.3: Each timeframe has its own continuation labels file with:
-        - timestamp: Bar timestamp at native TF resolution
-        - duration_bars: How many bars until channel break (at native resolution)
+        - timestamp: Bar timestamp at native TF resolution (or 5min for v5.4)
+        - duration_bars: How many bars until channel break
         - max_gain_pct: Maximum favorable price move before break
         - confidence: Channel quality score (0-1)
 
         Args:
             labels_dir: Directory containing per-TF label files
-                       (e.g., continuation_labels_5min_*.pkl, continuation_labels_1h_*.pkl)
         """
         import pickle
         # Path already imported at module level
@@ -991,24 +1013,36 @@ class HierarchicalDataset(Dataset):
 
         print(f"\n  📂 Loading hierarchical continuation labels from {labels_dir}...")
 
+        # Track which TFs use 5min labels for direct index lookup
+        self._uses_5min_labels = {}
+
         loaded_count = 0
         for tf in HIERARCHICAL_TIMEFRAMES:
-            # Look for label files matching pattern
-            pattern = f"continuation_labels_{tf}_*.pkl"
-            matching_files = list(labels_path.glob(pattern))
+            # v5.4: First try 5min-resolution labels (preferred)
+            pattern_5min = f"continuation_labels_5min_{tf}_*.pkl"
+            matching_5min = list(labels_path.glob(pattern_5min))
 
-            if not matching_files:
-                # Try without cache suffix
-                pattern_simple = f"continuation_labels_{tf}.pkl"
-                simple_file = labels_path / pattern_simple
-                if simple_file.exists():
-                    matching_files = [simple_file]
+            if matching_5min:
+                # Use 5min labels - enable direct index lookup
+                label_file = sorted(matching_5min)[-1]
+                self._uses_5min_labels[tf] = True
+            else:
+                # Fall back to TF-resolution labels
+                pattern = f"continuation_labels_{tf}_*.pkl"
+                matching_files = list(labels_path.glob(pattern))
 
-            if not matching_files:
-                continue
+                if not matching_files:
+                    # Try without cache suffix
+                    pattern_simple = f"continuation_labels_{tf}.pkl"
+                    simple_file = labels_path / pattern_simple
+                    if simple_file.exists():
+                        matching_files = [simple_file]
 
-            # Use most recent file if multiple exist
-            label_file = sorted(matching_files)[-1]
+                if not matching_files:
+                    continue
+
+                label_file = sorted(matching_files)[-1]
+                self._uses_5min_labels[tf] = False
 
             try:
                 with open(label_file, 'rb') as f:
@@ -1030,13 +1064,15 @@ class HierarchicalDataset(Dataset):
                         self._per_tf_ts_to_idx[tf][ts_ns] = i
 
                     loaded_count += 1
-                    print(f"     {tf}: {len(labels_df):,} labels loaded from {label_file.name}")
+                    resolution = "5min" if self._uses_5min_labels.get(tf) else "native"
+                    print(f"     {tf}: {len(labels_df):,} labels ({resolution}) from {label_file.name}")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to load {tf} labels: {e}")
 
         if loaded_count > 0:
-            print(f"     ✓ Loaded continuation labels for {loaded_count}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes")
+            n_5min = sum(1 for v in self._uses_5min_labels.values() if v)
+            print(f"     ✓ Loaded continuation labels for {loaded_count}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes ({n_5min} at 5min resolution)")
         else:
             print(f"     ⚠️  No continuation label files found in {labels_dir}")
 

@@ -39,8 +39,9 @@ VIX_CALC_VERSION = "v1"  # v4.4: Track VIX feature calculation version (incremen
 EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
 CHANNEL_PROJECTION_VERSION = "v1"  # v5.0: Track channel projection features
 BREAKDOWN_CALC_VERSION = "v2"  # v5.3.3: Track breakdown calculation method (v1=1-min, v2=native TF)
-FEATURE_VERSION = f"v5.3.3_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}"
-# v5.3.3: Native TF breakdown (calculated AFTER resampling, not before) + adaptive windows corrected + yfinance limits
+PARTIAL_BAR_VERSION = "v1"  # v5.4: Partial bar support - channels include in-progress TF bars
+FEATURE_VERSION = f"v5.4.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}"
+# v5.4.0: Partial bar support - at each 5min bar, coarser TF channels include in-progress data
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
 # IMPORTED FROM config.py (single source of truth)
@@ -177,6 +178,36 @@ def get_safe_worker_count(requested_workers: int = None, container_ram_gb: float
         print(f"    Recommended: {max_safe} workers or fewer. Proceeding with {requested_workers}...")
 
     return requested_workers
+
+
+def _compute_partial_bar_channel_worker(task):
+    """
+    Worker function for parallel partial bar channel calculation.
+    Must be at module level for joblib pickling.
+
+    Args:
+        task: Tuple of (df_data, df_columns, timestamps_ns, symbol, tf_name, tf_rule, windows)
+
+    Returns:
+        DataFrame with channel features for this symbol/timeframe combination
+    """
+    import pandas as pd
+    import numpy as np
+    from .partial_channel_calc_vectorized import calculate_all_channel_features_vectorized
+
+    df_data, df_columns, timestamps_ns, symbol, tf_name, tf_rule, windows = task
+
+    # Reconstruct DataFrame from numpy arrays
+    df = pd.DataFrame(df_data, columns=df_columns)
+    df.index = pd.to_datetime(timestamps_ns, unit='ns')
+
+    # Calculate channel features with partial bars
+    result = calculate_all_channel_features_vectorized(
+        df, symbol, tf_name, tf_rule,
+        windows=windows, show_progress=False
+    )
+
+    return result
 
 
 class TradingFeatureExtractor(FeatureExtractor):
@@ -867,49 +898,35 @@ class TradingFeatureExtractor(FeatureExtractor):
             'total_rows_1min': len(features_df),
         }
 
-        # v5.3.3: Two-pass processing for native TF breakdown features
-        # Pass 1: Calculate breakdown for ALL TFs at their native resolutions
-        print(f"   📊 Pass 1/2: Calculating breakdown features at native TF resolutions...")
-        all_tf_resampled = {}  # Store resampled DataFrames
-        all_tf_breakdown = {}  # Store breakdown features per TF
+        # v5.4: Single-pass processing with partial bar channels
+        # Calculate breakdown at 5min from 5min channel features, then resample to each TF
+        print(f"   📊 Calculating breakdown features at 5min resolution (v5.4)...")
 
-        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Calc breakdown per TF", leave=False, ncols=100, ascii=True):
-            tf_cols = shared_cols + tf_specific_cols[tf]
-            tf_features = features_df[tf_cols].copy()
+        # Calculate all breakdown features at 5min resolution
+        breakdown_5min = self._calculate_all_breakdown_at_5min(
+            features_df,
+            raw_df=raw_df,
+            events_handler=events_handler
+        )
+
+        # Add breakdown to features_df for resampling
+        features_with_breakdown = pd.concat([features_df, breakdown_5min], axis=1, copy=False)
+
+        print(f"   💾 Resampling and saving timeframe sequences...")
+
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Saving TF sequences", leave=False, ncols=100, ascii=True):
+            # Get columns for this TF: shared + TF-specific + all breakdown
+            tf_cols = shared_cols + tf_specific_cols[tf] + list(breakdown_5min.columns)
+            tf_features = features_with_breakdown[tf_cols].copy()
 
             # Resample to native TF resolution
             tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
             resampled = tf_features.resample(tf_rule).last().dropna()
 
-            # Calculate breakdown at THIS TF's native resolution
-            breakdown_native = self._calculate_breakdown_at_native_tf(
-                resampled,
-                tf=tf,
-                raw_df=raw_df,
-                events_handler=events_handler
-            )
+            # Remove duplicate columns (if any)
+            resampled = resampled.loc[:, ~resampled.columns.duplicated(keep='first')]
 
-            # Store for Pass 2
-            all_tf_resampled[tf] = resampled
-            all_tf_breakdown[tf] = breakdown_native
-
-        # Pass 2: Add cross-TF breakdown features and save
-        print(f"   💾 Pass 2/2: Adding cross-TF features and saving...")
-
-        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Saving TF sequences", leave=False, ncols=100, ascii=True):
-            # Get this TF's base features
-            resampled = all_tf_resampled[tf]
-
-            # Add breakdown from ALL TFs (resampled to match this TF's resolution)
-            for other_tf, other_breakdown in all_tf_breakdown.items():
-                # Resample other TF's breakdown to match current TF's index
-                # Use forward-fill (ffill) to broadcast coarser→finer (e.g., daily→5min)
-                if len(other_breakdown) > 0:
-                    breakdown_aligned = other_breakdown.reindex(resampled.index, method='ffill')
-                    # Concat horizontally (add columns)
-                    resampled = pd.concat([resampled, breakdown_aligned], axis=1, copy=False)
-
-            # Update metadata with final column list (includes cross-TF breakdown)
+            # Update metadata with final column list
             meta['timeframe_columns'][tf] = list(resampled.columns)
 
             # Save as .npy for memory-mapped loading
@@ -1145,7 +1162,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             if not isinstance(non_channel_df.index, pd.DatetimeIndex):
                 non_channel_df.index = pd.to_datetime(non_channel_df.index)
 
-            # v5.3.3: Remove old breakdown columns - we'll calculate fresh at native TF resolution
+            # v5.4: Remove old breakdown columns - we'll calculate fresh at 5min resolution
             breakdown_patterns = [
                 'duration_ratio', 'alignment', 'time_in_channel', 'position_norm',
                 'in_channel', 'rsi_divergence', 'volume_surge',
@@ -1157,7 +1174,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                                   if any(pattern in c for pattern in breakdown_patterns)]
             if old_breakdown_cols:
                 non_channel_df = non_channel_df.drop(columns=old_breakdown_cols)
-                print(f"   ✓ Removed {len(old_breakdown_cols)} old breakdown cols (will recalculate at native TF)")
+                print(f"   ✓ Removed {len(old_breakdown_cols)} old breakdown cols (will recalculate at 5min)")
 
             # Align indices and merge (non-channel first so tsla_close is accessible)
             common_idx = df.index.intersection(non_channel_df.index)
@@ -1197,57 +1214,42 @@ class TradingFeatureExtractor(FeatureExtractor):
             'total_rows_1min': len(df),
         }
 
-        # Step 3: v5.3.3 Two-pass for cross-TF breakdown features
-        # Pass 1: Calculate breakdown for each TF at native resolution
-        print(f"   📊 Pass 1/2: Calculating breakdown at native TF resolutions...")
-        all_tf_resampled = {}  # Store resampled DataFrames
-        all_tf_breakdown = {}  # Store breakdown features per TF
+        # v5.4: Single-pass processing with breakdown at 5min resolution
+        # Calculate breakdown from 5min channel features, then resample to each TF
+        print(f"   📊 Calculating breakdown at 5min resolution (v5.4 single-pass)...")
+        breakdown_5min = self._calculate_all_breakdown_at_5min(
+            df,
+            raw_df=None,          # Not available in chunked mode
+            events_handler=None   # Not available in chunked mode
+        )
+        print(f"   ✓ Generated {len(breakdown_5min.columns)} breakdown features at 5min")
 
-        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Calc breakdown per TF", leave=False, ncols=100, ascii=True):
+        # Merge breakdown with features at 5min
+        df_with_breakdown = pd.concat([df, breakdown_5min], axis=1)
+
+        # Now resample to each TF and save
+        print(f"   💾 Resampling to native TF resolutions and saving...")
+
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Saving TF sequences", leave=False, ncols=100, ascii=True):
+            # Get columns for this TF (shared + TF-specific + breakdown)
             tf_cols = shared_cols + tf_specific_cols[tf]
+            # Get breakdown columns (they're shared across all TFs)
+            breakdown_cols = list(breakdown_5min.columns)
 
-            # Select columns for this timeframe and resample
-            tf_features = df[tf_cols].copy()
+            # Select columns for this timeframe
+            tf_features = df_with_breakdown[tf_cols + breakdown_cols].copy()
             tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
 
             # Use .last() to get value at end of each bar
             resampled = tf_features.resample(tf_rule).last().dropna()
 
-            # Calculate breakdown at THIS TF's native resolution
-            breakdown_tf = self._calculate_breakdown_at_native_tf(
-                resampled,
-                tf=tf,
-                raw_df=None,          # Not available in chunked mode
-                events_handler=None   # Not available in chunked mode
-            )
-
-            # Store for Pass 2
-            all_tf_resampled[tf] = resampled
-            all_tf_breakdown[tf] = breakdown_tf
-
-        # Pass 2: Add cross-TF breakdown features and save
-        print(f"   💾 Pass 2/2: Adding cross-TF features and saving...")
-
-        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Saving TF sequences", leave=False, ncols=100, ascii=True):
-            # Get this TF's base features
-            resampled = all_tf_resampled[tf]
-
-            # Add breakdown from ALL TFs (resampled to match this TF's resolution)
-            for other_tf, other_breakdown in all_tf_breakdown.items():
-                # Resample other TF's breakdown to match current TF's index
-                # Use forward-fill (ffill) to broadcast coarser→finer (e.g., daily→5min)
-                if len(other_breakdown) > 0:
-                    breakdown_aligned = other_breakdown.reindex(resampled.index, method='ffill')
-                    # Concat horizontally (add columns)
-                    resampled = pd.concat([resampled, breakdown_aligned], axis=1, copy=False)
-
             # Remove duplicate columns (can happen from same-TF concat)
             resampled = resampled.loc[:, ~resampled.columns.duplicated(keep='first')]
 
-            # Update metadata with final column list (includes cross-TF breakdown)
+            # Update metadata with final column list
             meta['timeframe_columns'][tf] = list(resampled.columns)
 
-            # Save as .npy file (now includes cross-TF breakdown)
+            # Save as .npy file
             output_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}.npy"
             np.save(output_path, resampled.values.astype(np.float32))
 
@@ -1380,173 +1382,142 @@ class TradingFeatureExtractor(FeatureExtractor):
             'total_rows_1min': mmap_meta['total_rows'],
         }
 
-        print(f"   🔄 Streaming resample (one TF at a time, one chunk at a time)...")
+        # v5.4: Single-pass processing with breakdown at 5min resolution
+        # Phase 1: Load all chunks to build full 5min DataFrame
+        # Phase 2: Calculate breakdown at 5min from channel features
+        # Phase 3: Resample to each TF and save
 
-        # v5.3.3: Two-pass processing for cross-TF breakdown features
-        # Pass 1: Calculate breakdown for each TF at native resolution, store in memory
-        # Pass 2: Add all TF breakdowns to each file (reindexed to match)
-        all_tf_breakdown = {}  # Store breakdown DataFrames (small, ~400MB total)
-        all_tf_resampled_base = {}  # Store base features temporarily
+        print(f"   🔄 Loading 5min data from chunks (v5.4 single-pass)...")
 
-        # Pass 1: Process each timeframe and calculate its breakdown
-        print(f"   📊 Pass 1/2: Calculating breakdown at native TF resolutions...")
-        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Timeframes", leave=True, ncols=100, ascii=True):
-            # Columns for this TF: non-channel + shared channel + TF-specific channel
-            tf_indices = shared_col_indices + tf_col_indices[tf]
-            tf_col_names = non_channel_columns + [feature_columns[i] for i in tf_indices]
+        # Phase 1: Load all chunks at 5min resolution
+        all_chunks_features = []
+        all_chunks_indices = []
+        cumulative_row_offset = 0
 
-            # Add monthly columns for monthly/3month TFs
-            if tf in ['monthly', '3month'] and monthly_columns:
-                monthly_tf_cols = [mc for mc in monthly_columns if f'_{tf}_' in mc]
-                tf_col_names.extend(monthly_tf_cols)
+        for i, chunk in enumerate(tqdm(chunk_info, desc="   Loading chunks", leave=False, ncols=100, ascii=True)):
+            chunk_path = cache_dir / chunk['path']
+            index_path = cache_dir / chunk['index_path']
 
-            meta['timeframe_columns'][tf] = tf_col_names
+            # Memory-map chunk (minimal RAM - just the file mapping)
+            chunk_array = np.load(str(chunk_path), mmap_mode='r')
+            index_array = np.load(str(index_path), mmap_mode='r')
 
-            resampled_chunks = []
-            cumulative_row_offset = 0  # Track position in monthly array across chunks
+            # Load ALL columns (for 5min breakdown calculation)
+            all_chunks_features.append(chunk_array[:].astype(np.float32))
+            all_chunks_indices.append(index_array[:])
 
-            # Stream through each chunk
-            for chunk in chunk_info:
-                chunk_path = cache_dir / chunk['path']
-                index_path = cache_dir / chunk['index_path']
+            cumulative_row_offset += len(chunk_array)
+            del chunk_array, index_array
 
-                # Memory-map chunk (minimal RAM - just the file mapping)
-                chunk_array = np.load(str(chunk_path), mmap_mode='r')
-                index_array = np.load(str(index_path), mmap_mode='r')
+        # Concatenate all chunks
+        print(f"   📊 Concatenating {len(all_chunks_features)} chunks...")
+        full_features = np.vstack(all_chunks_features)
+        full_indices = np.concatenate(all_chunks_indices)
+        del all_chunks_features, all_chunks_indices
+        gc.collect()
 
-                # Extract only this TF's columns (copies only ~1200 cols, not 14000)
-                tf_chunk = chunk_array[:, tf_indices].astype(np.float32)
+        # Build full 5min DataFrame
+        df = pd.DataFrame(full_features, columns=feature_columns)
+        df.index = pd.to_datetime(full_indices, unit='ns')
+        del full_features, full_indices
+        gc.collect()
 
-                # Add monthly data for monthly/3month TFs
-                if tf in ['monthly', '3month'] and monthly_array is not None:
-                    # Find monthly column indices for this TF
-                    monthly_tf_indices = [
-                        i for i, mc in enumerate(monthly_columns) if f'_{tf}_' in mc
-                    ]
-                    if monthly_tf_indices:
-                        # Get corresponding rows from monthly shard using cumulative offset
-                        chunk_start = cumulative_row_offset
-                        chunk_end = chunk_start + len(tf_chunk)
-                        monthly_tf_data = monthly_array[chunk_start:chunk_end, monthly_tf_indices].astype(np.float32)
-                        if len(monthly_tf_data) == len(tf_chunk):
-                            tf_chunk = np.hstack([tf_chunk, monthly_tf_data])
+        print(f"   ✓ Loaded {len(df):,} rows × {len(df.columns)} channel features at 5min")
 
-                # Update cumulative offset for next chunk
-                cumulative_row_offset += len(chunk_array)
+        # Add monthly/3month shard if present
+        if monthly_array is not None:
+            print(f"   📂 Adding monthly/3month shard...")
+            if monthly_array.shape[0] == len(df):
+                monthly_cols = monthly_shard_info.get('columns', [f'monthly_3month_col_{i}' for i in range(monthly_array.shape[1])])
+                monthly_df = pd.DataFrame(monthly_array[:].astype(np.float32), columns=monthly_cols, index=df.index)
+                df = pd.concat([df, monthly_df], axis=1)
+                del monthly_df
+                print(f"   ✓ Added {len(monthly_cols)} monthly/3month columns")
+            else:
+                print(f"   ⚠️  Monthly shard row count mismatch: {monthly_array.shape[0]} vs {len(df)}")
 
-                # Create DataFrame with proper column names and timestamps
-                # Start with channel features only (tf_col_names includes non-channel at front)
-                channel_col_names = tf_col_names[len(non_channel_columns):]
-                df = pd.DataFrame(tf_chunk, columns=channel_col_names[:tf_chunk.shape[1]])
-                df.index = pd.to_datetime(index_array, unit='ns')
+        # Merge non-channel features (contains tsla_close, spy_close, etc.)
+        if non_channel_df is not None and len(non_channel_columns) > 0:
+            common_idx = df.index.intersection(non_channel_df.index)
+            if len(common_idx) > 0:
+                df = pd.concat([non_channel_df.loc[common_idx], df.loc[common_idx]], axis=1)
+                print(f"   ✓ Merged {len(non_channel_columns)} non-channel features ({len(df):,} aligned rows)")
 
-                # Merge non-channel features for this chunk
-                if non_channel_df is not None and len(non_channel_columns) > 0:
-                    # Slice non-channel DataFrame to match chunk's timestamp range
-                    nc_chunk = non_channel_df.loc[df.index[0]:df.index[-1]]
-                    if len(nc_chunk) == len(df):
-                        # Prepend non-channel columns (so tsla_close comes first)
-                        df = pd.concat([nc_chunk, df], axis=1)
+        # Phase 2: Calculate breakdown at 5min resolution
+        print(f"   📊 Calculating breakdown at 5min resolution...")
+        breakdown_5min = self._calculate_all_breakdown_at_5min(
+            df,
+            raw_df=None,          # Not available in chunked mode
+            events_handler=None   # Not available in chunked mode
+        )
+        print(f"   ✓ Generated {len(breakdown_5min.columns)} breakdown features at 5min")
 
-                # Resample this chunk
-                tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
-                resampled = df.resample(tf_rule).last().dropna()
+        # Merge breakdown with features at 5min
+        df_with_breakdown = pd.concat([df, breakdown_5min], axis=1)
+        del df, breakdown_5min
+        gc.collect()
 
-                if len(resampled) > 0:
-                    resampled_chunks.append(resampled)
+        # Identify shared vs TF-specific columns
+        all_cols = list(df_with_breakdown.columns)
+        shared_cols = []
+        tf_specific_cols = {tf: [] for tf in HIERARCHICAL_TIMEFRAMES}
 
-                # Free memory immediately
-                del chunk_array, index_array, tf_chunk, df, resampled
+        for col in all_cols:
+            is_tf_specific = False
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                if f'_{tf}_' in col:
+                    tf_specific_cols[tf].append(col)
+                    is_tf_specific = True
+                    break
+            if not is_tf_specific:
+                shared_cols.append(col)
 
-            # Concatenate all resampled chunks for this TF
-            if resampled_chunks:
-                final_df = pd.concat(resampled_chunks, axis=0)
-                # Handle overlapping timestamps at chunk boundaries
-                final_df = final_df[~final_df.index.duplicated(keep='last')]
-                final_df = final_df.sort_index()
+        print(f"   📊 Found {len(shared_cols)} shared columns, {sum(len(v) for v in tf_specific_cols.values())} timeframe-specific")
 
-                # v5.3.3: Calculate breakdown at native TF resolution (after resampling)
-                # Note: events_handler not available in chunked mode (set to None)
-                breakdown_tf = self._calculate_breakdown_at_native_tf(
-                    final_df,
-                    tf=tf,
-                    raw_df=None,          # Not available in chunked mode
-                    events_handler=None   # Not available in chunked mode
-                )
+        # Phase 3: Resample to each TF and save
+        print(f"   💾 Resampling to native TF resolutions and saving...")
 
-                # Store breakdown for cross-TF broadcast (Pass 2)
-                all_tf_breakdown[tf] = breakdown_tf
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Saving TF sequences", leave=False, ncols=100, ascii=True):
+            # Get columns for this TF (shared + TF-specific)
+            tf_cols = shared_cols + tf_specific_cols[tf]
 
-                # Save base features to temp file (will add cross-TF breakdown in Pass 2)
-                temp_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}_temp.npy"
-                np.save(temp_path, final_df.values.astype(np.float32))
+            # Select columns for this timeframe
+            tf_features = df_with_breakdown[tf_cols].copy()
+            tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
 
-                # Save timestamps (final location - doesn't change in Pass 2)
-                ts_path = output_cache_dir / f"tf_timestamps_{tf}_{meta['cache_key']}.npy"
-                np.save(ts_path, final_df.index.view(np.int64))
+            # Use .last() to get value at end of each bar
+            resampled = tf_features.resample(tf_rule).last().dropna()
+            del tf_features
 
-                # Store column names and index for Pass 2
-                all_tf_resampled_base[tf] = {
-                    'columns': list(final_df.columns),
-                    'index': final_df.index.copy(),
-                    'shape': final_df.shape
-                }
+            # Remove duplicate columns
+            resampled = resampled.loc[:, ~resampled.columns.duplicated(keep='first')]
 
-                seq_len = TIMEFRAME_SEQUENCE_LENGTHS[tf]
-                print(f"      {tf}: {final_df.shape[0]:,} bars × {final_df.shape[1]} base features (seq_len={seq_len})")
+            # Update metadata
+            meta['timeframe_columns'][tf] = list(resampled.columns)
+            meta['timeframe_shapes'][tf] = list(resampled.shape)
 
-                del final_df, resampled_chunks
-
-            # Force garbage collection after each TF
-            gc.collect()
-
-        # Pass 2: Add cross-TF breakdown features to each file
-        print(f"\n   💾 Pass 2/2: Adding cross-TF breakdown features...")
-        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Adding cross-TF", leave=False, ncols=100, ascii=True):
-            if tf not in all_tf_resampled_base:
-                continue
-
-            base_info = all_tf_resampled_base[tf]
-            temp_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}_temp.npy"
-
-            # Load base features
-            base_array = np.load(str(temp_path))
-            base_df = pd.DataFrame(base_array, columns=base_info['columns'], index=base_info['index'])
-
-            # Add breakdown from ALL TFs (reindexed to match this TF's resolution)
-            for other_tf, other_breakdown in all_tf_breakdown.items():
-                if len(other_breakdown) > 0:
-                    # Reindex other TF's breakdown to match current TF's index
-                    # v5.3.3 fix: Use bfill().ffill() to handle NaN at start
-                    # Old code used only ffill, which left NaN when no previous coarser bar existed
-                    # Example: first 5min bars have no previous weekly bar → NaN
-                    # bfill() fills initial NaN with first available value, then ffill() handles the rest
-                    breakdown_aligned = other_breakdown.reindex(base_df.index).bfill().ffill()
-                    # Concat horizontally (add columns)
-                    base_df = pd.concat([base_df, breakdown_aligned], axis=1, copy=False)
-
-            # Remove duplicate columns (from current TF's own breakdown already added)
-            base_df = base_df.loc[:, ~base_df.columns.duplicated(keep='first')]
-
-            # Save final file with all cross-TF breakdown
+            # Save as .npy file
             output_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}.npy"
-            np.save(output_path, base_df.values.astype(np.float32))
+            np.save(output_path, resampled.values.astype(np.float32))
 
-            # Update metadata with final column count
-            meta['timeframe_columns'][tf] = list(base_df.columns)
-            meta['timeframe_shapes'][tf] = list(base_df.shape)
+            # Save timestamps
+            ts_path = output_cache_dir / f"tf_timestamps_{tf}_{meta['cache_key']}.npy"
+            np.save(ts_path, resampled.index.view(np.int64))
 
+            # Log progress
             seq_len = TIMEFRAME_SEQUENCE_LENGTHS[tf]
-            print(f"      {tf}: {base_df.shape[0]:,} bars × {base_df.shape[1]} features (with cross-TF breakdown)")
+            real_time = {
+                '5min': '~17 hours', '15min': '~25 hours', '30min': '~40 hours',
+                '1h': '1 week', '2h': '1 week', '3h': '1 week', '4h': '1 week',
+                'daily': '30 days', 'weekly': '20 weeks', 'monthly': '12 months', '3month': '24 months'
+            }
+            print(f"      {tf}: {resampled.shape[0]:,} bars × {resampled.shape[1]} features (seq_len={seq_len}, {real_time.get(tf, '?')})")
 
-            # Clean up temp file
-            temp_path.unlink()
-            del base_array, base_df
-
+            del resampled
             gc.collect()
 
-        # Clean up memory
-        del all_tf_breakdown, all_tf_resampled_base
+        # Clean up
+        del df_with_breakdown
         gc.collect()
 
         # Save metadata
@@ -1660,21 +1631,25 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         return adjusted_window
 
-    def _extract_channel_features(self, df: pd.DataFrame, use_cache: bool = True, multi_res_data: dict = None, use_gpu: bool = False, cache_suffix: str = None) -> pd.DataFrame:
+    def _extract_channel_features(self, df: pd.DataFrame, use_cache: bool = True, multi_res_data: dict = None, use_gpu: bool = False, cache_suffix: str = None, use_partial_bars: bool = True) -> pd.DataFrame:
         """
         Extract ROLLING linear regression channel features for multiple timeframes.
 
         CRITICAL: Channels are calculated at EACH timestamp using a rolling lookback window.
         This captures channel dynamics (formation, strength, breakdown) over time.
 
+        v5.4: When use_partial_bars=True, channels for coarser TFs include in-progress data.
+        At Monday 9:30am, weekly channel includes [last 49 weeks] + [Monday's partial data].
+
         NOW PROCESSES BOTH TSLA AND SPY (v3.4)
-        Returns DataFrame with 154 columns (77 TSLA + 77 SPY).
+        Returns DataFrame with channel features at 5min resolution.
 
         Args:
             df: OHLCV DataFrame
             use_cache: If True, load from cache or save to cache (recommended)
             use_gpu: If True, use GPU acceleration (10-20x faster for large datasets)
             cache_suffix: Optional suffix for cache filename (for testing, e.g., 'GPU_TEST')
+            use_partial_bars: If True, include partial bar data for coarser TFs (v5.4)
         """
         import hashlib
         import pickle
@@ -1747,6 +1722,101 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Check if multi-resolution data was provided (live mode)
         is_live_mode = multi_res_data is not None
 
+        # v5.4: Use partial bar calculation for training mode (not live mode)
+        if use_partial_bars and not is_live_mode:
+            from .partial_channel_calc_vectorized import calculate_all_channel_features_vectorized
+
+            print(f"   🔄 Calculating channels with PARTIAL BARS (v5.4 - includes in-progress TF data)...")
+            print(f"   📊 Processing 11 timeframes × 2 stocks × 21 windows")
+
+            all_timeframes = {
+                '5min': '5min', '15min': '15min', '30min': '30min', '1h': '1h',
+                '2h': '2h', '3h': '3h', '4h': '4h', 'daily': '1D',
+                'weekly': '1W', 'monthly': '1ME', '3month': '3ME'
+            }
+
+            # Filter timeframes if chunking
+            if cache_suffix and 'chunk' in str(cache_suffix):
+                timeframes = {k: v for k, v in all_timeframes.items() if k not in ['monthly', '3month']}
+                print(f"   ℹ️  Skipping monthly/3month (processed separately on full dataset)")
+            else:
+                timeframes = all_timeframes
+
+            # Determine whether to use parallel processing
+            # Note: GPU is for rolling stats (price/correlation), not channel regression
+            # Channel extraction is CPU-bound - parallel CPU is still fastest
+            n_cores = mp.cpu_count()
+            parallel_enabled = config.PARALLEL_CHANNEL_CALC if hasattr(config, 'PARALLEL_CHANNEL_CALC') else True
+            use_parallel = parallel_enabled
+
+            if use_parallel:
+                # Parallel processing for partial bar channels (using joblib like original)
+                max_workers = config.MAX_PARALLEL_WORKERS if hasattr(config, 'MAX_PARALLEL_WORKERS') else 0
+                n_jobs = max_workers if max_workers > 0 else -1
+                cores_to_use = get_safe_worker_count(max_workers if max_workers > 0 else None)
+                print(f"   🚀 Parallel processing: using {cores_to_use} of {n_cores} cores")
+                print(f"   ⏱️  Estimated time: ~{22 // max(cores_to_use, 1) + 2} minutes")
+
+                # Build task list for parallel execution
+                # Prepare data for workers (numpy arrays are picklable)
+                df_data = df.values
+                timestamps_ns = df.index.view(np.int64)
+                df_columns = list(df.columns)
+                windows = config.CHANNEL_WINDOW_SIZES
+
+                tasks = []
+                for symbol in ['tsla', 'spy']:
+                    for tf_name, tf_rule in timeframes.items():
+                        tasks.append((df_data, df_columns, timestamps_ns, symbol, tf_name, tf_rule, windows))
+
+                # Use joblib for parallel processing (same as original channel code)
+                all_results = list(
+                    tqdm(
+                        Parallel(
+                            n_jobs=n_jobs,
+                            backend='loky',
+                            prefer="processes",
+                            verbose=0,
+                            return_as="generator"
+                        )(delayed(_compute_partial_bar_channel_worker)(task) for task in tasks),
+                        total=len(tasks),
+                        desc="   🔄 Partial bar channels",
+                        unit="tf",
+                        ncols=100,
+                        mininterval=0.5,
+                        bar_format="{l_bar}{bar:30}{r_bar}  {postfix}"
+                    )
+                )
+            else:
+                # Sequential processing (fallback)
+                print(f"   ℹ️  Sequential processing (parallel disabled in config)")
+                print(f"   ⏱️  Estimated time: ~15-20 minutes")
+
+                all_results = []
+                for symbol in ['tsla', 'spy']:
+                    for tf_name, tf_rule in timeframes.items():
+                        print(f"   Processing {symbol}_{tf_name}...")
+                        result = calculate_all_channel_features_vectorized(
+                            df, symbol, tf_name, tf_rule,
+                            windows=config.CHANNEL_WINDOW_SIZES,
+                            show_progress=True
+                        )
+                        all_results.append(result)
+                        gc.collect()
+
+            channel_features = pd.concat(all_results, axis=1)
+            del all_results
+            gc.collect()
+
+            # Save to cache
+            if use_cache:
+                print(f"   💾 Saving to cache: {cache_file.name}")
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(channel_features, f)
+
+            return channel_features
+
+        # Original approach (for live mode or use_partial_bars=False)
         channel_features = {}
         num_rows = len(df)
 
@@ -3325,12 +3395,16 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         return results
 
-    def _extract_rsi_features(self, df: pd.DataFrame, multi_res_data: dict = None) -> pd.DataFrame:
+    def _extract_rsi_features(self, df: pd.DataFrame, multi_res_data: dict = None,
+                               use_partial_bars: bool = True) -> pd.DataFrame:
         """
         Extract RSI features for multiple timeframes.
         NOW PROCESSES BOTH TSLA AND SPY (v3.4)
         Returns DataFrame with 66 columns (33 TSLA + 33 SPY).
         Supports HYBRID mode for live predictions (uses multi-resolution data).
+
+        v5.4: When use_partial_bars=True, RSI for coarser TFs includes in-progress data.
+        At Monday 9:30am, weekly RSI includes [last N weeks] + [Monday's partial data].
         """
         rsi_features = {}
         num_rows = len(df)
@@ -3351,6 +3425,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             'monthly': '1ME',
             '3month': '3ME'
         }
+
+        # v5.4: Import partial bars module if needed
+        if use_partial_bars and not is_live_mode:
+            from .partial_bars import compute_partial_bars, TIMEFRAME_PERIOD_RULES
 
         total_calcs = len(timeframes) * 2
         with tqdm(total=total_calcs, desc="   RSI features (SPY+TSLA)", ncols=100, leave=False, ascii=True, mininterval=0.5) as pbar:
@@ -3405,19 +3483,22 @@ class TradingFeatureExtractor(FeatureExtractor):
                         continue
 
                     try:
-                        # v5.3.3 fix: Calculate FULL RSI series (not just last value!)
-                        # Old code only took last value and broadcast to all rows - BUG!
-                        rsi_series = self.rsi_calc.calculate_rsi(resampled)
+                        # v5.4: Use partial bars for training mode on coarser TFs
+                        if use_partial_bars and not is_live_mode and tf_name not in ['5min']:
+                            # Calculate RSI with partial bars at 5min resolution
+                            rsi_values = self._calculate_rsi_with_partial_bars(
+                                symbol_df, resampled, tf_name, num_rows,
+                                compute_partial_bars, TIMEFRAME_PERIOD_RULES
+                            )
+                        else:
+                            # v5.3.3 approach: Calculate RSI on complete bars, ffill to 5min
+                            rsi_series = self.rsi_calc.calculate_rsi(resampled)
 
-                        # Map RSI values back to original df timestamps using ffill
-                        # (each resampled bar's RSI applies until next resampled bar)
-                        rsi_aligned = rsi_series.reindex(df.index, method='ffill')
+                            # Map RSI values back to original df timestamps using ffill
+                            rsi_aligned = rsi_series.reindex(df.index, method='ffill')
+                            rsi_aligned = rsi_aligned.bfill().fillna(50.0)
+                            rsi_values = rsi_aligned.values
 
-                        # Fill any initial NaN (before first RSI) with neutral 50
-                        rsi_aligned = rsi_aligned.bfill().fillna(50.0)
-
-                        # Store features as arrays (not broadcast scalars!)
-                        rsi_values = rsi_aligned.values
                         rsi_features[f'{prefix}_{tf_name}'] = rsi_values
                         rsi_features[f'{prefix}_{tf_name}_oversold'] = (rsi_values < 30).astype(float)
                         rsi_features[f'{prefix}_{tf_name}_overbought'] = (rsi_values > 70).astype(float)
@@ -3427,10 +3508,95 @@ class TradingFeatureExtractor(FeatureExtractor):
                         rsi_features[f'{prefix}_{tf_name}'] = np.full(num_rows, 50.0)
                         rsi_features[f'{prefix}_{tf_name}_oversold'] = np.zeros(num_rows)
                         rsi_features[f'{prefix}_{tf_name}_overbought'] = np.zeros(num_rows)
-                    
+
                     pbar.update(1)
 
         return pd.DataFrame(rsi_features, index=df.index)
+
+    def _calculate_rsi_with_partial_bars(self, symbol_df: pd.DataFrame, resampled: pd.DataFrame,
+                                          tf_name: str, num_rows: int,
+                                          compute_partial_bars, TIMEFRAME_PERIOD_RULES) -> np.ndarray:
+        """
+        Calculate RSI at 5min resolution including partial TF bar data.
+
+        At each 5min bar, the RSI is computed using:
+        - All complete TF bars before the current period
+        - The partial bar (in-progress data for current TF period)
+
+        This gives "live" RSI that evolves within each TF period.
+        """
+        rsi_period = self.rsi_calc.period  # Usually 14
+
+        # Compute partial bar state at each 5min timestamp
+        partial_state = compute_partial_bars(symbol_df, tf_name)
+
+        # Complete bar closes and timestamps
+        complete_closes = resampled['close'].values
+        tf_timestamps = resampled.index
+        n_complete = len(complete_closes)
+
+        # Output array
+        rsi_values = np.full(num_rows, 50.0, dtype=np.float32)
+
+        # Get period mapping for 5min bars
+        period_rule = TIMEFRAME_PERIOD_RULES.get(tf_name, tf_name)
+        periods = symbol_df.index.to_period(period_rule)
+        unique_periods = periods.unique()
+
+        # Process by TF period
+        for period_idx, current_period in enumerate(unique_periods):
+            # Find 5min bars in this period
+            period_mask = periods == current_period
+            bar_indices = np.where(period_mask)[0]
+            if len(bar_indices) == 0:
+                continue
+
+            # Find complete TF bars before this period
+            period_start_ts = symbol_df.index[bar_indices[0]]
+            n_complete_before = (tf_timestamps < period_start_ts).sum()
+
+            # Need at least RSI period + 1 bars for valid calculation
+            if n_complete_before < rsi_period + 1:
+                # Not enough data - leave as default 50
+                continue
+
+            # Get historical closes (complete bars before this period)
+            hist_closes = complete_closes[:n_complete_before]
+
+            # Precompute gains/losses for historical bars
+            hist_deltas = np.diff(hist_closes)
+            hist_gains = np.maximum(hist_deltas, 0)
+            hist_losses = np.maximum(-hist_deltas, 0)
+
+            # For each 5min bar, compute RSI with partial bar
+            partial_closes = partial_state.partial_close[bar_indices]
+
+            for i, (bar_idx, partial_close) in enumerate(zip(bar_indices, partial_closes)):
+                # Delta from last complete bar to partial
+                delta_partial = partial_close - hist_closes[-1]
+                gain_partial = max(delta_partial, 0)
+                loss_partial = max(-delta_partial, 0)
+
+                # Combine: gains = hist_gains + [gain_partial]
+                # We need rolling average of last `rsi_period` values
+                all_gains = np.append(hist_gains[-(rsi_period-1):], gain_partial)
+                all_losses = np.append(hist_losses[-(rsi_period-1):], loss_partial)
+
+                avg_gain = np.mean(all_gains)
+                avg_loss = np.mean(all_losses)
+
+                # Calculate RSI
+                if avg_loss == 0:
+                    rsi = 100.0
+                elif avg_gain == 0:
+                    rsi = 0.0
+                else:
+                    rs = avg_gain / avg_loss
+                    rsi = 100 - (100 / (1 + rs))
+
+                rsi_values[bar_idx] = rsi
+
+        return rsi_values
 
     def _extract_correlation_features(self, df: pd.DataFrame, use_gpu: bool = False) -> pd.DataFrame:
         """Extract SPY-TSLA correlation and divergence features. Returns DataFrame with 5 columns.
@@ -4208,6 +4374,149 @@ class TradingFeatureExtractor(FeatureExtractor):
             breakdown_features['is_high_impact_event'] = np.zeros(num_rows)
 
         return pd.DataFrame(breakdown_features, index=resampled_df.index)
+
+    def _calculate_all_breakdown_at_5min(
+        self,
+        features_df: pd.DataFrame,  # Full features at 5min resolution
+        raw_df: pd.DataFrame = None,
+        events_handler = None
+    ) -> pd.DataFrame:
+        """
+        Calculate breakdown features for ALL TFs at 5min resolution (v5.4).
+
+        With partial bars, channel features for all TFs are already at 5min.
+        This method calculates breakdown from these 5min channel features,
+        producing breakdown that evolves within each TF period.
+
+        Args:
+            features_df: Full features DataFrame at 5min resolution (with partial bar channels)
+            raw_df: Original OHLCV DataFrame (for event features)
+            events_handler: Optional event handler
+
+        Returns:
+            DataFrame with all breakdown features at 5min resolution
+        """
+        all_breakdown = {}
+        num_rows = len(features_df)
+
+        # Process each TF's breakdown from its 5min channel features
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            # Get adaptive window - convert from native TF bars to 5min bars
+            native_window = config.ADAPTIVE_WINDOW_BARS_NATIVE.get(tf, 100)
+            # Approximate 5min bars per TF bar
+            bars_per_tf = {
+                '5min': 1, '15min': 3, '30min': 6, '1h': 12,
+                '2h': 24, '3h': 36, '4h': 48, 'daily': 78,
+                'weekly': 78*5, 'monthly': 78*22, '3month': 78*66
+            }
+            window = min(native_window * bars_per_tf.get(tf, 1), num_rows // 4)
+            window = max(window, 10)  # Minimum window
+
+            # 1. Duration ratio (current stability vs rolling average)
+            stability_col = f'tsla_channel_{tf}_w50_stability'
+            if stability_col in features_df.columns:
+                stability = features_df[stability_col]
+                avg_stability = stability.rolling(window, min_periods=window//4).mean()
+                duration_ratio = (stability / (avg_stability + 0.01)).fillna(1.0)
+                all_breakdown[f'tsla_channel_duration_ratio_{tf}'] = np.asarray(duration_ratio)
+            else:
+                all_breakdown[f'tsla_channel_duration_ratio_{tf}'] = np.ones(num_rows)
+
+            # 2. Channel alignment (SPY-TSLA)
+            tsla_pos_col = f'tsla_channel_{tf}_w50_position'
+            spy_pos_col = f'spy_channel_{tf}_w50_position'
+            if tsla_pos_col in features_df.columns and spy_pos_col in features_df.columns:
+                tsla_pos = features_df[tsla_pos_col] * 2 - 1
+                spy_pos = features_df[spy_pos_col] * 2 - 1
+                alignment = tsla_pos * spy_pos
+                all_breakdown[f'channel_alignment_spy_tsla_{tf}'] = np.asarray(alignment)
+            else:
+                all_breakdown[f'channel_alignment_spy_tsla_{tf}'] = np.zeros(num_rows)
+
+            # 3. Time in channel
+            for symbol in ['tsla', 'spy']:
+                stab_col = f'{symbol}_channel_{tf}_w50_stability'
+                if stab_col in features_df.columns:
+                    stab = features_df[stab_col]
+                    time_in_channel = np.clip(stab * 100, 0, 100)
+                    all_breakdown[f'{symbol}_time_in_channel_{tf}'] = np.asarray(time_in_channel)
+                else:
+                    all_breakdown[f'{symbol}_time_in_channel_{tf}'] = np.zeros(num_rows)
+
+            # 4. Normalized position
+            for symbol in ['tsla', 'spy']:
+                pos_col = f'{symbol}_channel_{tf}_w50_position'
+                if pos_col in features_df.columns:
+                    position_norm = features_df[pos_col] * 2 - 1
+                    all_breakdown[f'{symbol}_channel_position_norm_{tf}'] = np.asarray(position_norm)
+                else:
+                    all_breakdown[f'{symbol}_channel_position_norm_{tf}'] = np.zeros(num_rows)
+
+            # 5. RSI divergence
+            rsi_col = f'tsla_rsi_{tf}'
+            pos_col = f'tsla_channel_{tf}_w50_position'
+            if rsi_col in features_df.columns and pos_col in features_df.columns:
+                rsi_normalized = features_df[rsi_col] / 100.0
+                channel_pos = features_df[pos_col]
+                divergence = rsi_normalized - channel_pos
+                all_breakdown[f'tsla_rsi_divergence_{tf}'] = np.asarray(divergence)
+            else:
+                all_breakdown[f'tsla_rsi_divergence_{tf}'] = np.zeros(num_rows)
+
+            # 6. In-channel binary flags
+            for symbol in ['tsla', 'spy']:
+                stab_col = f'{symbol}_channel_{tf}_w50_stability'
+                if stab_col in features_df.columns:
+                    stability = features_df[stab_col]
+                    in_channel = (stability > 5.0).astype(float)
+                    all_breakdown[f'{symbol}_in_channel_{tf}'] = np.asarray(in_channel)
+                else:
+                    all_breakdown[f'{symbol}_in_channel_{tf}'] = np.zeros(num_rows)
+
+        # Non-TF-specific features (calculated once)
+        # Volume surge
+        if 'tsla_volume_ratio' in features_df.columns and num_rows >= 10:
+            vol_ratio = features_df['tsla_volume_ratio']
+            recent_avg = vol_ratio.rolling(5, min_periods=1).mean()
+            hist_avg = vol_ratio.rolling(10, min_periods=3).mean().shift(3)
+            surge = ((recent_avg - hist_avg) / (hist_avg + 1e-8)).fillna(0)
+            all_breakdown['tsla_volume_surge'] = np.asarray(surge)
+        else:
+            all_breakdown['tsla_volume_surge'] = np.zeros(num_rows)
+
+        # Day of week flags
+        all_breakdown['is_monday'] = (features_df.index.dayofweek == 0).astype(float)
+        all_breakdown['is_tuesday'] = (features_df.index.dayofweek == 1).astype(float)
+        all_breakdown['is_wednesday'] = (features_df.index.dayofweek == 2).astype(float)
+        all_breakdown['is_thursday'] = (features_df.index.dayofweek == 3).astype(float)
+        all_breakdown['is_friday'] = (features_df.index.dayofweek == 4).astype(float)
+
+        # Market timing flags
+        if hasattr(features_df.index, 'hour'):
+            hours = features_df.index.hour
+            all_breakdown['is_first_hour'] = ((hours >= 9) & (hours < 11)).astype(float)
+            all_breakdown['is_last_hour'] = ((hours >= 15) & (hours < 16)).astype(float)
+        else:
+            all_breakdown['is_first_hour'] = np.zeros(num_rows)
+            all_breakdown['is_last_hour'] = np.zeros(num_rows)
+
+        # Volatility regime
+        if 'tsla_close' in features_df.columns and num_rows >= 50:
+            tsla_close = features_df['tsla_close']
+            current_vol = tsla_close.pct_change().rolling(10, min_periods=1).std()
+            historical_vol = current_vol.rolling(50, min_periods=10).mean()
+            is_volatile = (current_vol > 1.5 * historical_vol).fillna(False).astype(float)
+            all_breakdown['is_volatile_now'] = np.asarray(is_volatile)
+        else:
+            all_breakdown['is_volatile_now'] = np.zeros(num_rows)
+
+        # Event features (zeros for now - events not critical)
+        all_breakdown['is_earnings_week'] = np.zeros(num_rows)
+        all_breakdown['days_until_earnings'] = np.zeros(num_rows)
+        all_breakdown['days_until_fomc'] = np.zeros(num_rows)
+        all_breakdown['is_high_impact_event'] = np.zeros(num_rows)
+
+        return pd.DataFrame(all_breakdown, index=features_df.index)
 
     def test_continuation_labels(self, df: pd.DataFrame) -> None:
         """Test continuation label generation on sample data."""
@@ -5001,6 +5310,170 @@ class TradingFeatureExtractor(FeatureExtractor):
         cycle_bonus = min(cycles / 5.0, 1.0) * 0.3
 
         return min(conf + cycle_bonus, 0.99)
+
+    def generate_hierarchical_continuation_labels_5min(
+        self,
+        features_df: pd.DataFrame,  # 5min features with partial bar channels
+        df: pd.DataFrame,           # Raw OHLCV for price lookups
+        timeframes: list = None,
+        output_dir: Path = None,
+        cache_suffix: str = None
+    ) -> Dict[str, Path]:
+        """
+        Generate continuation labels at 5min resolution (v5.4).
+
+        With partial bars, each 5min bar has its own channel that includes
+        in-progress TF data. Labels are generated at 5min resolution using
+        these evolving channels.
+
+        Key semantic change from TF-resolution labels:
+        - OLD: "Will LAST WEEK's complete channel continue?"
+        - NEW: "Will the channel I'm currently in (including today's data) continue?"
+
+        Args:
+            features_df: Full features at 5min with partial bar channels
+            df: Raw OHLCV DataFrame for price lookups
+            timeframes: List of timeframes (defaults to HIERARCHICAL_TIMEFRAMES)
+            output_dir: Where to save label files
+            cache_suffix: Cache key suffix for file naming
+
+        Returns:
+            Dict mapping timeframe -> file path of saved labels
+        """
+        if timeframes is None:
+            timeframes = HIERARCHICAL_TIMEFRAMES
+        if output_dir is None:
+            output_dir = Path('data/feature_cache')
+        if cache_suffix is None:
+            cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        saved_files = {}
+
+        print(f"\n   🔄 Generating 5min continuation labels for {len(timeframes)} timeframes (v5.4)...")
+        print(f"      Using partial bar channels - labels evolve within each TF period")
+
+        # Get TSLA prices at 5min resolution
+        prices = df['tsla_close'].values if 'tsla_close' in df.columns else features_df.get('tsla_close', pd.Series(dtype=float)).values
+        highs = df['tsla_high'].values if 'tsla_high' in df.columns else prices
+        n_bars = len(features_df)
+
+        for tf in timeframes:
+            print(f"\n      Processing {tf} labels at 5min resolution...")
+
+            # Get channel features for this TF
+            pos_col = f'tsla_channel_{tf}_w50_position'
+            upper_dist_col = f'tsla_channel_{tf}_w50_upper_dist'
+            lower_dist_col = f'tsla_channel_{tf}_w50_lower_dist'
+            r_squared_col = f'tsla_channel_{tf}_w50_close_r_squared'
+            stability_col = f'tsla_channel_{tf}_w50_stability'
+            valid_col = f'tsla_channel_{tf}_w50_is_valid'
+
+            # Check if features exist
+            if pos_col not in features_df.columns:
+                print(f"         ⚠️  Missing channel features for {tf}")
+                continue
+
+            positions = features_df[pos_col].values
+            upper_dists = features_df.get(upper_dist_col, pd.Series(np.zeros(n_bars))).values
+            lower_dists = features_df.get(lower_dist_col, pd.Series(np.zeros(n_bars))).values
+            r_squareds = features_df.get(r_squared_col, pd.Series(np.zeros(n_bars))).values
+            stabilities = features_df.get(stability_col, pd.Series(np.zeros(n_bars))).values
+            is_valids = features_df.get(valid_col, pd.Series(np.zeros(n_bars))).values
+
+            # v5.4.1: Use insufficient_data flag from channel features instead of hardcoded warmup
+            # This flag is set by partial_channel_calc_vectorized when there's not enough historical data
+            insufficient_data_col = f'tsla_channel_{tf}_w50_insufficient_data'
+            insufficient_data = features_df.get(insufficient_data_col, pd.Series(np.ones(n_bars))).values
+
+            # Generate labels for each 5min bar
+            # Skip bars where channel data is insufficient (warmup handled by feature extraction)
+            tf_labels = []
+
+            for i in tqdm(range(n_bars - 10),
+                         desc=f"         {tf} 5min labels", leave=False, ncols=100, ascii=True):
+                # Skip bars with insufficient channel data (this replaces hardcoded warmup)
+                if insufficient_data[i] > 0.5:
+                    continue
+
+                # Get current channel bounds from features
+                current_price = prices[i]
+                if current_price <= 0 or np.isnan(current_price):
+                    continue
+
+                # Reconstruct channel bounds
+                upper = current_price * (1 + upper_dists[i] / 100)
+                lower = current_price * (1 - lower_dists[i] / 100)
+
+                # Skip if invalid channel
+                if upper <= lower or np.isnan(upper) or np.isnan(lower):
+                    continue
+
+                # Scan forward to detect break
+                break_idx = None
+                max_gain = 0.0
+
+                # Scan up to 500 bars ahead (to limit computation)
+                scan_limit = min(500, n_bars - i - 1)
+
+                for j in range(1, scan_limit):
+                    future_price = prices[i + j]
+                    future_high = highs[i + j]
+
+                    if np.isnan(future_price):
+                        continue
+
+                    # Track max gain
+                    gain = (future_high - current_price) / current_price * 100
+                    max_gain = max(max_gain, abs(gain))
+
+                    # Detect break (price exits channel bounds)
+                    if future_price > upper or future_price < lower:
+                        break_idx = j
+                        break
+
+                # Calculate duration
+                duration = break_idx if break_idx is not None else scan_limit
+
+                # Calculate confidence from channel quality
+                r_sq = r_squareds[i]
+                stability = stabilities[i] / 10.0  # Normalize
+                is_valid = is_valids[i]
+                confidence = r_sq * 0.6 + stability * 0.3 + is_valid * 0.1
+                confidence = min(max(confidence, 0.1), 0.99)
+
+                tf_labels.append({
+                    'timestamp': features_df.index[i],
+                    'duration_bars': float(duration),
+                    'max_gain_pct': float(max_gain),
+                    'confidence': float(confidence),
+                    'channel_r_squared': float(r_sq),
+                    'channel_valid': int(is_valid),
+                    'position_at_entry': float(positions[i])
+                })
+
+            if len(tf_labels) == 0:
+                print(f"         ⚠️  No valid labels generated for {tf}")
+                continue
+
+            # Convert to DataFrame
+            labels_df = pd.DataFrame(tf_labels)
+            labels_df.set_index('timestamp', inplace=True)
+
+            # Save to file (use _5min suffix to distinguish from TF-resolution labels)
+            output_path = output_dir / f"continuation_labels_5min_{tf}_{cache_suffix}.pkl"
+            labels_df.to_pickle(output_path)
+
+            saved_files[tf] = output_path
+
+            # Stats
+            avg_duration = labels_df['duration_bars'].mean()
+            avg_confidence = labels_df['confidence'].mean()
+            print(f"         ✓ Saved {len(labels_df):,} 5min labels | avg duration: {avg_duration:.1f} bars | avg conf: {avg_confidence:.2f}")
+
+        print(f"\n   ✓ Generated {len(saved_files)}/{len(timeframes)} timeframe 5min labels")
+        return saved_files
 
     def generate_transition_labels(
         self,
