@@ -255,28 +255,118 @@ def render_main_prediction():
 
         confidence = pred.get('confidence', 0)
 
-        # Main prediction card
-        st.markdown(f"### 📊 SELECTED: **{selected_tf.upper()}**")
+        # v5.7: View mode selector
+        has_geometric = 'v57_geometric' in pred
+        col_title, col_mode = st.columns([3, 1])
 
-        col1, col2, col3, col4 = st.columns(4)
+        with col_title:
+            st.markdown(f"### 📊 SELECTED: **{selected_tf.upper()}**")
 
-        with col1:
-            st.metric("High", f"{pred['predicted_high']:.2f}%")
-
-        with col2:
-            st.metric("Low", f"{pred['predicted_low']:.2f}%")
-
-        with col3:
-            if validity is not None:
-                st.metric("Validity", f"{validity:.0%}", help="Will channel hold?")
+        with col_mode:
+            if has_geometric:
+                view_mode = st.selectbox(
+                    "View",
+                    ["Direct", "Geometric", "Compare"],
+                    key="view_mode",
+                    label_visibility="collapsed"
+                )
             else:
-                st.metric("Validity", "N/A")
+                view_mode = "Direct"
+                st.caption("Direct only")
 
-        with col4:
-            if confidence:
-                st.metric("Confidence", f"{confidence:.0%}", help="Prediction accuracy (calibrated)")
+        # v5.7: Display based on view mode
+        if view_mode == "Compare" and has_geometric:
+            # Side-by-side comparison
+            col_direct, col_geo = st.columns(2)
+
+            with col_direct:
+                st.markdown("**Direct Prediction**")
+                direct_data = pred.get('v57_direct', {}).get(selected_tf, {})
+                d_high = direct_data.get('high', pred['predicted_high'])
+                d_low = direct_data.get('low', pred['predicted_low'])
+                d_conf = direct_data.get('confidence', confidence)
+
+                st.metric("High", f"{d_high:.2f}%")
+                st.metric("Low", f"{d_low:.2f}%")
+                st.metric("Confidence", f"{d_conf:.0%}")
+
+            with col_geo:
+                st.markdown("**Geometric Projection**")
+                geo_data = pred.get('v57_geometric', {}).get(selected_tf, {})
+                if geo_data:
+                    st.metric("High", f"{geo_data['high']:.2f}%")
+                    st.metric("Low", f"{geo_data['low']:.2f}%")
+                    st.metric("Duration", f"{geo_data['duration_bars']:.0f} bars")
+                else:
+                    st.warning("Geometric data not available")
+
+            # Agreement indicator
+            if geo_data and 'high' in geo_data:
+                high_diff = abs(d_high - geo_data['high'])
+                low_diff = abs(d_low - geo_data['low'])
+                avg_diff = (high_diff + low_diff) / 2
+
+                if avg_diff < 0.5:
+                    st.success(f"✓ Methods AGREE (diff: {avg_diff:.2f}%)")
+                elif avg_diff < 1.0:
+                    st.info(f"○ Methods SIMILAR (diff: {avg_diff:.2f}%)")
+                else:
+                    st.warning(f"⚠️ Methods DIVERGE (diff: {avg_diff:.2f}%)")
+
+        elif view_mode == "Geometric" and has_geometric:
+            # Geometric only
+            geo_data = pred.get('v57_geometric', {}).get(selected_tf, {})
+            if geo_data:
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    st.metric("High", f"{geo_data['high']:.2f}%")
+
+                with col2:
+                    st.metric("Low", f"{geo_data['low']:.2f}%")
+
+                with col3:
+                    st.metric("Duration", f"{geo_data['duration_bars']:.0f} bars")
+
+                with col4:
+                    if validity is not None:
+                        st.metric("Validity", f"{validity:.0%}")
+                    else:
+                        st.metric("Validity", "N/A")
+
+                # Channel state details
+                if 'channel_state' in geo_data:
+                    with st.expander("📐 Channel Geometry"):
+                        cs = geo_data['channel_state']
+                        st.write(f"**High slope:** {cs['high_slope_pct']:.4f}%/bar")
+                        st.write(f"**Low slope:** {cs['low_slope_pct']:.4f}%/bar")
+                        st.write(f"**Upper dist:** {cs['upper_dist']:.2f}%")
+                        st.write(f"**Lower dist:** {cs['lower_dist']:.2f}%")
+                        st.caption("High = upper_dist + (high_slope × duration)")
             else:
-                st.metric("Confidence", "N/A")
+                st.warning("Geometric data not available for this TF")
+
+        else:
+            # Direct mode (default)
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                st.metric("High", f"{pred['predicted_high']:.2f}%")
+
+            with col2:
+                st.metric("Low", f"{pred['predicted_low']:.2f}%")
+
+            with col3:
+                if validity is not None:
+                    st.metric("Validity", f"{validity:.0%}", help="Will channel hold?")
+                else:
+                    st.metric("Validity", "N/A")
+
+            with col4:
+                if confidence:
+                    st.metric("Confidence", f"{confidence:.0%}", help="Prediction accuracy (calibrated)")
+                else:
+                    st.metric("Confidence", "N/A")
 
         # Duration display (if available)
         if 'v52_duration' in pred and selected_tf in pred['v52_duration']:
@@ -322,7 +412,7 @@ def render_main_prediction():
 # ═══════════════════════════════════════════════════════════════
 
 def render_all_channels():
-    """Render all 11 timeframe predictions."""
+    """Render all 11 timeframe predictions with v5.7 dual mode support."""
     st.subheader("📊 All Timeframes")
 
     if not st.session_state.last_prediction:
@@ -331,55 +421,119 @@ def render_all_channels():
 
     pred = st.session_state.last_prediction
 
-    # Build table data
+    # v5.7: Check for new all_timeframes format
+    all_tf_data = pred.get('all_timeframes', [])
+    has_geometric = 'v57_geometric' in pred
+
+    # Fallback to old format
+    if not all_tf_data:
+        all_channels = pred.get('all_channels', [])
+        validities = pred.get('v52_validity', {})
+        durations = pred.get('v52_duration', {})
+
+        # Build table data (legacy format)
+        table_data = []
+        for channel in all_channels:
+            tf = channel['timeframe']
+            high = channel['high']
+            low = channel['low']
+            conf = channel['confidence']
+
+            validity = validities.get(tf, 0.5)
+            dur_data = durations.get(tf, {})
+            dur_expected = dur_data.get('expected', 0)
+            dur_conf = dur_data.get('confidence', 0.5)
+            agreement = "✓" if abs(validity - conf) < 0.15 else "⚠️"
+            is_selected = (tf == pred.get('selected_tf'))
+
+            table_data.append({
+                '': '⭐' if is_selected else '',
+                'TF': tf.upper(),
+                'High %': f"{high:.2f}",
+                'Low %': f"{low:.2f}",
+                'Validity': f"{validity:.2f}",
+                'Confidence': f"{conf:.2f}",
+                'Duration': f"{dur_expected:.0f}±{dur_expected*(1-dur_conf):.0f}" if dur_expected > 0 else "N/A",
+                'Agreement': agreement
+            })
+
+        df = pd.DataFrame(table_data)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        return
+
+    # v5.7: New format with both direct and geometric
     table_data = []
-
-    all_channels = pred.get('all_channels', [])
-    validities = pred.get('v52_validity', {})
-    durations = pred.get('v52_duration', {})
-
-    for channel in all_channels:
-        tf = channel['timeframe']
-        high = channel['high']
-        low = channel['low']
-        conf = channel['confidence']
-
-        # Get validity
-        validity = validities.get(tf, 0.5)
-
-        # Get duration
-        dur_data = durations.get(tf, {})
-        dur_expected = dur_data.get('expected', 0)
-        dur_conf = dur_data.get('confidence', 0.5)
-
-        # Agreement
-        agreement = "✓" if abs(validity - conf) < 0.15 else "⚠️"
-
-        # Is this selected?
+    for tf_data in all_tf_data:
+        tf = tf_data['timeframe']
+        rank = tf_data.get('rank', 0)
         is_selected = (tf == pred.get('selected_tf'))
 
-        table_data.append({
+        # Direct prediction
+        direct = tf_data.get('direct', {})
+        d_high = direct.get('high', 0)
+        d_low = direct.get('low', 0)
+        d_conf = direct.get('confidence', 0)
+
+        # Geometric prediction
+        geo = tf_data.get('geometric', {})
+        g_high = geo.get('high', 0) if geo else 0
+        g_low = geo.get('low', 0) if geo else 0
+        g_dur = geo.get('duration_bars', 0) if geo else 0
+
+        # Validity
+        validity = tf_data.get('validity', 0.5)
+
+        # Agreement between methods
+        if geo and d_high != 0:
+            method_diff = abs(d_high - g_high)
+            method_agree = "✓" if method_diff < 0.5 else "○" if method_diff < 1.0 else "⚠️"
+        else:
+            method_agree = "—"
+
+        row = {
             '': '⭐' if is_selected else '',
+            '#': rank,
             'TF': tf.upper(),
-            'High %': f"{high:.2f}",
-            'Low %': f"{low:.2f}",
-            'Validity': f"{validity:.2f}",
-            'Confidence': f"{conf:.2f}",
-            'Duration': f"{dur_expected:.0f}±{dur_expected*(1-dur_conf):.0f}" if dur_expected > 0 else "N/A",
-            'Agreement': agreement
-        })
+            'D.High': f"{d_high:.2f}" if d_high else "—",
+            'D.Low': f"{d_low:.2f}" if d_low else "—",
+            'D.Conf': f"{d_conf:.0%}" if d_conf else "—",
+        }
+
+        # Add geometric columns if available
+        if has_geometric:
+            row['G.High'] = f"{g_high:.2f}" if g_high else "—"
+            row['G.Low'] = f"{g_low:.2f}" if g_low else "—"
+            row['Dur'] = f"{g_dur:.0f}" if g_dur else "—"
+            row['Agree'] = method_agree
+
+        row['Validity'] = f"{validity:.0%}" if validity else "—"
+
+        table_data.append(row)
 
     df = pd.DataFrame(table_data)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     # Legend
-    with st.expander("ℹ️ Column Explanations"):
-        st.write("""
-        - **Validity**: Forward-looking assessment (will channel hold?)
-        - **Confidence**: Calibrated prediction accuracy (historical performance)
-        - **Duration**: Expected bars ± uncertainty
-        - **Agreement**: ✓ if validity and confidence agree (<15% diff)
-        """)
+    with st.expander("ℹ️ Column Legend"):
+        legend_text = """
+        **Direct (D.)**: Model predicts high/low directly
+        - D.High/D.Low: Predicted % move
+        - D.Conf: Model confidence
+
+        **Validity**: Forward-looking channel assessment
+        """
+
+        if has_geometric:
+            legend_text += """
+
+        **Geometric (G.)**: Model predicts duration → calculates high/low
+        - G.High/G.Low: Calculated % move
+        - Dur: Predicted bars until channel break
+
+        **Agree**: ✓ <0.5% diff, ○ <1.0% diff, ⚠️ >1.0% diff
+        """
+
+        st.markdown(legend_text)
 
 
 # ═══════════════════════════════════════════════════════════════

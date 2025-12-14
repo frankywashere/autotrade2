@@ -61,6 +61,133 @@ import config as project_config
 
 
 # =============================================================================
+# v5.7 CHANNEL FEATURE INDEXER
+# =============================================================================
+
+class ChannelFeatureIndexer:
+    """
+    v5.7: Maps channel feature names to tensor indices for extraction during forward pass.
+
+    Built once at model init from tf_meta feature columns.
+    Used by geometric projection to extract channel slope/bounds from input tensors.
+    """
+
+    # Standard channel windows
+    WINDOWS = [100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20, 15, 10]
+
+    def __init__(self, feature_columns: Dict[str, List[str]], timeframes: List[str]):
+        """
+        Build index lookup tables for fast channel feature extraction.
+
+        Args:
+            feature_columns: Dict from tf_meta mapping TF → feature names list
+            timeframes: List of timeframe names
+        """
+        self.indices = {}  # (tf, symbol, window) → {feature_name: index}
+        self.timeframes = timeframes
+
+        for tf in timeframes:
+            if tf not in feature_columns:
+                continue
+            features = feature_columns[tf]
+
+            for symbol in ['tsla', 'spy']:
+                for window in self.WINDOWS:
+                    prefix = f'{symbol}_channel_{tf}_w{window}'
+                    self.indices[(tf, symbol, window)] = {
+                        'high_slope_pct': self._find_idx(features, f'{prefix}_high_slope_pct'),
+                        'low_slope_pct': self._find_idx(features, f'{prefix}_low_slope_pct'),
+                        'high_slope': self._find_idx(features, f'{prefix}_high_slope'),
+                        'low_slope': self._find_idx(features, f'{prefix}_low_slope'),
+                        'upper_dist': self._find_idx(features, f'{prefix}_upper_dist'),
+                        'lower_dist': self._find_idx(features, f'{prefix}_lower_dist'),
+                        'position': self._find_idx(features, f'{prefix}_position'),
+                        'quality_score': self._find_idx(features, f'{prefix}_quality_score'),
+                        'r_squared_avg': self._find_idx(features, f'{prefix}_r_squared_avg'),
+                        'is_valid': self._find_idx(features, f'{prefix}_is_valid'),
+                    }
+
+    def _find_idx(self, features: List[str], name: str) -> int:
+        """Find index of feature name in list, return -1 if not found."""
+        try:
+            return features.index(name)
+        except ValueError:
+            return -1
+
+    def extract(self, x: torch.Tensor, tf: str, symbol: str, window: int) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        Extract channel features from input tensor.
+
+        Args:
+            x: Input tensor [batch, seq, features] or [batch, features]
+            tf: Timeframe name
+            symbol: 'tsla' or 'spy'
+            window: Window size
+
+        Returns:
+            Dict of channel state tensors [batch, 1], or None if not available
+        """
+        key = (tf, symbol, window)
+        if key not in self.indices:
+            return None
+
+        # Take last timestep if sequence
+        if x.dim() == 3:
+            x = x[:, -1, :]  # [batch, features]
+
+        result = {}
+        for feat_name, idx in self.indices[key].items():
+            if idx >= 0 and idx < x.shape[-1]:
+                result[feat_name] = x[:, idx:idx+1]  # [batch, 1]
+            else:
+                result[feat_name] = torch.zeros(x.shape[0], 1, device=x.device)
+
+        return result
+
+    def extract_all_windows(self, x: torch.Tensor, tf: str, symbol: str = 'tsla') -> Dict[str, torch.Tensor]:
+        """
+        Extract channel features for ALL windows in a TF.
+
+        Args:
+            x: Input tensor [batch, seq, features] or [batch, features]
+            tf: Timeframe name
+            symbol: 'tsla' or 'spy'
+
+        Returns:
+            Dict with tensors [batch, num_windows] for each feature type
+        """
+        if x.dim() == 3:
+            x = x[:, -1, :]  # [batch, features]
+
+        batch_size = x.shape[0]
+        device = x.device
+        num_windows = len(self.WINDOWS)
+
+        # Initialize output tensors
+        result = {
+            'high_slope_pct': torch.zeros(batch_size, num_windows, device=device),
+            'low_slope_pct': torch.zeros(batch_size, num_windows, device=device),
+            'upper_dist': torch.zeros(batch_size, num_windows, device=device),
+            'lower_dist': torch.zeros(batch_size, num_windows, device=device),
+            'quality_score': torch.zeros(batch_size, num_windows, device=device),
+            'position': torch.zeros(batch_size, num_windows, device=device),
+        }
+
+        for w_idx, window in enumerate(self.WINDOWS):
+            key = (tf, symbol, window)
+            if key not in self.indices:
+                continue
+
+            indices = self.indices[key]
+            for feat_name in result.keys():
+                idx = indices.get(feat_name, -1)
+                if idx >= 0 and idx < x.shape[-1]:
+                    result[feat_name][:, w_idx] = x[:, idx]
+
+        return result
+
+
+# =============================================================================
 # v5.2 MULTI-PHASE COMPOSITOR
 # =============================================================================
 
@@ -551,6 +678,25 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # v5.6: Removed projection_feature_extractor (projection features no longer in input)
 
         # =========================================================================
+        # v5.7: GEOMETRIC PROJECTION COMPONENTS
+        # =========================================================================
+        # Window selector: learns which of 14 windows to use for geometric projection
+        # Input: hidden state + 14 quality scores → logits for 14 windows
+        num_windows = len(ChannelFeatureIndexer.WINDOWS)  # 14 windows
+        self.window_selectors = nn.ModuleDict({
+            tf: nn.Sequential(
+                nn.Linear(hidden_size + num_windows, 64),  # hidden + quality scores
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(64, num_windows),  # logits for each window
+            ) for tf in self.TIMEFRAMES
+        })
+
+        # Channel feature indexer (initialized lazily on first forward when feature_columns available)
+        self.channel_indexer = None
+        self._feature_columns = None  # Set by training code before first forward
+
+        # =========================================================================
         # v5.2: VIX CfC LAYER
         # =========================================================================
         # Processes 90 days of daily VIX data to capture regime information
@@ -676,6 +822,110 @@ class HierarchicalLNN(nn.Module, ModelBase):
     # Projections are calculated at inference using learned duration predictions
     # See projection_calculator.py
 
+    def _compute_geometric_projection(
+        self,
+        x_tf: torch.Tensor,
+        hidden: torch.Tensor,
+        tf: str,
+        duration_mean: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        v5.7: Compute geometric projection for one timeframe.
+
+        Model predicts duration → Calculate high/low from channel geometry.
+
+        Args:
+            x_tf: Input features for this TF [batch, seq, features]
+            hidden: Hidden state [batch, hidden_size]
+            tf: Timeframe name
+            duration_mean: Predicted duration in bars [batch, 1]
+
+        Returns:
+            Dict with:
+                - high: Projected high % [batch, 1]
+                - low: Projected low % [batch, 1]
+                - duration: Duration prediction [batch, 1]
+                - window_logits: Raw logits [batch, num_windows]
+                - window_weights: Softmax weights [batch, num_windows]
+                - selected_window_idx: Best window index [batch]
+                - channel_state: Dict of channel features used
+        """
+        batch_size = hidden.shape[0]
+        device = hidden.device
+
+        # Check if channel indexer is initialized
+        if self.channel_indexer is None:
+            # Return zeros if not initialized (fallback)
+            return {
+                'high': torch.zeros(batch_size, 1, device=device),
+                'low': torch.zeros(batch_size, 1, device=device),
+                'duration': duration_mean,
+                'window_logits': torch.zeros(batch_size, len(ChannelFeatureIndexer.WINDOWS), device=device),
+                'window_weights': torch.zeros(batch_size, len(ChannelFeatureIndexer.WINDOWS), device=device),
+                'selected_window_idx': torch.zeros(batch_size, dtype=torch.long, device=device),
+                'channel_state': {},
+            }
+
+        # Extract channel features for all windows
+        channel_features = self.channel_indexer.extract_all_windows(x_tf, tf, symbol='tsla')
+        # channel_features: dict with [batch, num_windows] tensors
+
+        qualities = channel_features['quality_score']  # [batch, num_windows]
+        high_slopes = channel_features['high_slope_pct']  # [batch, num_windows]
+        low_slopes = channel_features['low_slope_pct']  # [batch, num_windows]
+        upper_dists = channel_features['upper_dist']  # [batch, num_windows]
+        lower_dists = channel_features['lower_dist']  # [batch, num_windows]
+
+        # Window selection based on hidden state + quality scores
+        selector_input = torch.cat([hidden, qualities], dim=-1)  # [batch, hidden + num_windows]
+        window_logits = self.window_selectors[tf](selector_input)  # [batch, num_windows]
+
+        if self.training:
+            # Soft selection (differentiable) for training
+            window_weights = F.softmax(window_logits, dim=-1)  # [batch, num_windows]
+        else:
+            # Hard selection (interpretable) for inference
+            best_idx = window_logits.argmax(dim=-1)  # [batch]
+            window_weights = F.one_hot(best_idx, num_classes=window_logits.shape[-1]).float()
+
+        # Weighted channel state (weighted sum across windows)
+        high_slope = (high_slopes * window_weights).sum(dim=-1, keepdim=True)  # [batch, 1]
+        low_slope = (low_slopes * window_weights).sum(dim=-1, keepdim=True)  # [batch, 1]
+        upper_dist = (upper_dists * window_weights).sum(dim=-1, keepdim=True)  # [batch, 1]
+        lower_dist = (lower_dists * window_weights).sum(dim=-1, keepdim=True)  # [batch, 1]
+
+        # =====================================================================
+        # GEOMETRIC PROJECTION
+        # =====================================================================
+        # high_slope_pct is in %/bar, duration is in bars
+        # upper_dist is % above current price, lower_dist is % below current price
+        #
+        # geo_high = current channel upper + (slope × duration)
+        #          = upper_dist + (high_slope_pct × duration)
+        #
+        # geo_low = current channel lower + (slope × duration)
+        #         = -lower_dist + (low_slope_pct × duration)
+        #         (negative because lower_dist is stored as positive % below current)
+        # =====================================================================
+
+        geo_high = upper_dist + (high_slope * duration_mean)  # [batch, 1]
+        geo_low = -lower_dist + (low_slope * duration_mean)   # [batch, 1]
+
+        return {
+            'high': geo_high,
+            'low': geo_low,
+            'duration': duration_mean,
+            'window_logits': window_logits,
+            'window_weights': window_weights,
+            'selected_window_idx': window_logits.argmax(dim=-1),
+            'channel_state': {
+                'high_slope_pct': high_slope,
+                'low_slope_pct': low_slope,
+                'upper_dist': upper_dist,
+                'lower_dist': lower_dist,
+            }
+        }
+
     def forward(
         self,
         x: torch.Tensor,
@@ -755,6 +1005,19 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
         # v5.6: Removed projection feature extractor initialization
         # Projection features no longer exist in input - calculated at inference from learned duration
+
+        # =========================================================================
+        # v5.7: CHANNEL INDEXER INITIALIZATION (lazy init on first forward)
+        # =========================================================================
+        if self.channel_indexer is None and self._feature_columns is not None:
+            self.channel_indexer = ChannelFeatureIndexer(
+                feature_columns=self._feature_columns,
+                timeframes=self.TIMEFRAMES
+            )
+
+        # v5.7: Storage for both prediction types
+        direct_predictions = {}      # TF → {'high': tensor, 'low': tensor, 'conf': tensor}
+        geometric_predictions = {}   # TF → {'high': tensor, 'low': tensor, 'duration': tensor, ...}
 
         # =========================================================================
         # v5.3: TWO-PASS ARCHITECTURE
@@ -968,8 +1231,9 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 # If > 24 bars, scale up (clamped to reasonable range)
                 duration_scale = (duration_mean / 24.0).clamp(0.3, 2.0)  # [batch, 1]
 
-            # v5.6: Direct neural net prediction (projection features removed)
-            # Projections are now calculated at inference time using learned duration
+            # =====================================================================
+            # v5.7: DIRECT PREDICTION PATH (learned high/low)
+            # =====================================================================
             pred_high = self.timeframe_heads[f'{tf}_high'](hidden)
             pred_low = self.timeframe_heads[f'{tf}_low'](hidden)
 
@@ -979,17 +1243,32 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 pred_low = pred_low * duration_scale
 
             # =====================================================================
+            # v5.7: GEOMETRIC PROJECTION PATH (duration → calculated high/low)
+            # =====================================================================
+            geo_result = None
+            if tf in duration_outputs:
+                duration_mean = duration_outputs[tf]['mean']
+                geo_result = self._compute_geometric_projection(
+                    x_tf=timeframe_data[tf],
+                    hidden=hidden,
+                    tf=tf,
+                    duration_mean=duration_mean,
+                )
+                geometric_predictions[tf] = geo_result
+
+            # =====================================================================
             # v5.2: VALIDITY PREDICTION for this TF (compute BEFORE using as confidence)
-            # (Duration already computed above before projections)
             # =====================================================================
             validity = None
             if hasattr(self, 'validity_heads') and tf in self.validity_heads:
-                # Get quality score and position from projection features (or use defaults)
-                if proj_features is not None:
-                    quality_score = proj_features['quality_scores'].mean(dim=-1, keepdim=True)  # [batch, 1]
-                    position = proj_features['position'].mean(dim=-1, keepdim=True)  # [batch, 1]
+                # Get quality score and position from geometric projection or defaults
+                if geo_result is not None and 'channel_state' in geo_result:
+                    # Use weighted quality from geometric projection
+                    quality_score = torch.sigmoid(self.timeframe_heads[f'{tf}_conf'](hidden))  # Use conf head as proxy
+                    position = geo_result['channel_state'].get('upper_dist', torch.full((batch_size, 1), 0.5, device=device))
+                    position = position / (position.abs() + 1e-6)  # Normalize to 0-1ish range
                 else:
-                    # Fallback: use old confidence head temporarily, will update below
+                    # Fallback: use old confidence head
                     old_conf = torch.sigmoid(self.timeframe_heads[f'{tf}_conf'](hidden))
                     quality_score = old_conf
                     position = torch.full((batch_size, 1), 0.5, device=device)
@@ -1009,6 +1288,13 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 pred_conf = validity  # NEW: Use forward-looking validity!
             else:
                 pred_conf = torch.sigmoid(self.timeframe_heads[f'{tf}_conf'](hidden))  # Fallback: old confidence
+
+            # v5.7: Store direct predictions
+            direct_predictions[tf] = {
+                'high': pred_high,
+                'low': pred_low,
+                'conf': pred_conf,
+            }
 
             layer_predictions.extend([pred_high, pred_low, pred_conf])
             layer_confidences.append(pred_conf)
@@ -1132,6 +1418,17 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # Add validity outputs (forward-looking)
         if validity_outputs:
             output_dict['validity'] = validity_outputs
+
+        # =========================================================================
+        # v5.7: DUAL PREDICTION OUTPUTS
+        # =========================================================================
+        # Add direct predictions (learned high/low)
+        if direct_predictions:
+            output_dict['direct_predictions'] = direct_predictions
+
+        # Add geometric predictions (duration → calculated high/low)
+        if geometric_predictions:
+            output_dict['geometric_predictions'] = geometric_predictions
 
         # =========================================================================
         # v5.3: HIERARCHICAL CONTAINMENT ANALYSIS (interpretability)
@@ -1752,5 +2049,17 @@ def load_hierarchical_model(model_path: str, device: str = 'cpu') -> Hierarchica
 
     if incompatible.unexpected_keys:
         print(f"  ⚠️ Unexpected keys: {incompatible.unexpected_keys}")
+
+    # v5.7: Restore feature columns for geometric projection
+    feature_columns = checkpoint.get('feature_columns')
+    if feature_columns:
+        model._feature_columns = feature_columns
+        print(f"  ✓ Restored feature columns for geometric projection ({len(feature_columns)} TFs)")
+
+    # v5.7: Store model version info
+    model_version = checkpoint.get('model_version', 'pre-5.7')
+    has_geometric = checkpoint.get('has_geometric_projection', False)
+    if has_geometric:
+        print(f"  ✓ Model version {model_version} with geometric projection support")
 
     return model

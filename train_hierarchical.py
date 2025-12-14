@@ -3313,6 +3313,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler.log_info(f"MODEL_CREATED | params={total_params:,} | device={args.device}")
         profiler.snapshot("post_model_create", 0, force_log=True)
 
+    # v5.7: Set feature columns for geometric projection channel indexer
+    if hasattr(train_dataset, 'tf_columns') and train_dataset.tf_columns:
+        model._feature_columns = train_dataset.tf_columns
+        if is_main_process(rank):
+            print(f"   ✓ Channel indexer feature columns set ({len(train_dataset.tf_columns)} timeframes)")
+
     # Move model to device and wrap with DDP if distributed
     model = model.to(args.device)
 
@@ -3696,9 +3702,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     print(f"\n🚨 NaN/Inf in targets at batch {batch_idx}!")
                     raise ValueError("Non-finite targets detected")
 
-                # Track loss components
+                # Track loss components (v5.7: added geo_price for geometric projection loss)
                 loss_components = {'primary': 0.0, 'multi_task': 0.0, 'duration': 0.0,
-                                  'validity': 0.0, 'transition': 0.0, 'calibration': 0.0}
+                                  'validity': 0.0, 'transition': 0.0, 'calibration': 0.0,
+                                  'geo_price': 0.0}
 
                 primary_loss = F.mse_loss(predictions[:, :2], target_tensor)
                 loss = primary_loss
@@ -3788,6 +3795,34 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 if duration_loss_total > 0:
                     loss = loss + duration_loss_total
                     loss_components['duration'] = duration_loss_total.item()
+
+                # =====================================================================
+                # v5.7: GEOMETRIC PROJECTION LOSS
+                # =====================================================================
+                # Compare geometric projections (duration → calculated high/low) to actual
+                # This validates that the geometric calculation produces correct prices
+                # Combined with duration loss: 0.6 × duration + 0.4 × geo_price
+                geo_price_loss_total = 0.0
+                if 'geometric_predictions' in hidden_states:
+                    for tf, geo_data in hidden_states['geometric_predictions'].items():
+                        if 'high' in geo_data and 'low' in geo_data:
+                            geo_high = geo_data['high'].squeeze()
+                            geo_low = geo_data['low'].squeeze()
+
+                            # Compare to actual high/low targets
+                            target_high = target_tensor[:, 0]  # targets['high']
+                            target_low = target_tensor[:, 1]   # targets['low']
+
+                            # MSE between geometric projection and actual
+                            geo_high_loss = F.mse_loss(geo_high, target_high)
+                            geo_low_loss = F.mse_loss(geo_low, target_low)
+
+                            # Weight: 0.4 (since duration is 0.6, total adds to 1.0)
+                            geo_price_loss_total += 0.4 * (geo_high_loss + geo_low_loss) / 2
+
+                if geo_price_loss_total > 0:
+                    loss = loss + geo_price_loss_total
+                    loss_components['geo_price'] = geo_price_loss_total.item() if hasattr(geo_price_loss_total, 'item') else geo_price_loss_total
 
                 # Validity loss
                 validity_loss_total = 0.0
@@ -4048,6 +4083,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     'multi_task': getattr(args, 'multi_task', True),
                     # v5.3.1: Save information flow (critical!)
                     'information_flow': getattr(args, 'information_flow', 'bottom_up'),
+                    # v5.7: Dual prediction mode (direct + geometric)
+                    'model_version': '5.7',
+                    'has_geometric_projection': True,
+                    'feature_columns': getattr(model_to_save, '_feature_columns', None),
                 }, output_path)
 
                 tqdm.write(f"   ✓ Saved best model (val_loss: {avg_val_loss:.4f})")

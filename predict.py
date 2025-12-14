@@ -1192,6 +1192,87 @@ class LivePredictor:
         if 'containment' in output_dict:
             result['v53_containment'] = output_dict['containment']
 
+        # =====================================================================
+        # v5.7: DUAL PREDICTION MODE (Direct + Geometric)
+        # =====================================================================
+        # Direct predictions: learned high/low from neural net
+        if 'direct_predictions' in output_dict:
+            result['v57_direct'] = {}
+            for tf, direct_data in output_dict['direct_predictions'].items():
+                result['v57_direct'][tf] = {
+                    'high': direct_data['high'][0, 0].item(),
+                    'low': direct_data['low'][0, 0].item(),
+                    'confidence': direct_data['conf'][0, 0].item(),
+                }
+
+        # Geometric predictions: duration → calculated high/low
+        if 'geometric_predictions' in output_dict:
+            result['v57_geometric'] = {}
+            for tf, geo_data in output_dict['geometric_predictions'].items():
+                geo_result = {
+                    'high': geo_data['high'][0, 0].item(),
+                    'low': geo_data['low'][0, 0].item(),
+                    'duration_bars': geo_data['duration'][0, 0].item(),
+                    'selected_window_idx': geo_data['selected_window_idx'][0].item(),
+                }
+
+                # Add channel state if available
+                if 'channel_state' in geo_data:
+                    cs = geo_data['channel_state']
+                    geo_result['channel_state'] = {
+                        'high_slope_pct': cs['high_slope_pct'][0, 0].item(),
+                        'low_slope_pct': cs['low_slope_pct'][0, 0].item(),
+                        'upper_dist': cs['upper_dist'][0, 0].item(),
+                        'lower_dist': cs['lower_dist'][0, 0].item(),
+                    }
+
+                result['v57_geometric'][tf] = geo_result
+
+        # Build comprehensive all_timeframes list with both prediction types
+        if 'v57_direct' in result or 'v57_geometric' in result:
+            timeframes = self.model.TIMEFRAMES
+            all_tf_results = []
+
+            for tf in timeframes:
+                tf_result = {
+                    'timeframe': tf,
+                    'rank': None,  # Set after sorting
+                }
+
+                # Add direct prediction
+                if 'v57_direct' in result and tf in result['v57_direct']:
+                    tf_result['direct'] = result['v57_direct'][tf]
+                else:
+                    # Fallback to layer_predictions
+                    if 'layer_predictions' in result and tf in result['layer_predictions']:
+                        tf_result['direct'] = result['layer_predictions'][tf]
+
+                # Add geometric prediction
+                if 'v57_geometric' in result and tf in result['v57_geometric']:
+                    tf_result['geometric'] = result['v57_geometric'][tf]
+
+                # Add validity
+                if 'v52_validity' in result and tf in result['v52_validity']:
+                    tf_result['validity'] = result['v52_validity'][tf]
+
+                # Add duration details
+                if 'v52_duration' in result and tf in result['v52_duration']:
+                    tf_result['duration'] = result['v52_duration'][tf]
+
+                all_tf_results.append(tf_result)
+
+            # Sort by direct confidence (descending)
+            all_tf_results.sort(
+                key=lambda x: x.get('direct', {}).get('confidence', 0),
+                reverse=True
+            )
+
+            # Assign ranks
+            for i, r in enumerate(all_tf_results):
+                r['rank'] = i + 1
+
+            result['all_timeframes'] = all_tf_results
+
         return result
 
     def get_buffer_status(self) -> Dict[str, Dict]:
