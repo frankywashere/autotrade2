@@ -526,19 +526,20 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # =========================================================================
         if multi_task:
             # Hit Band: Will price enter predicted band? (Binary classification)
+            # NOTE: No Sigmoid here - outputs raw logits for BCEWithLogits loss
+            # Apply sigmoid manually for inference (see forward())
             self.hit_band_head = nn.Sequential(
                 nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
                 nn.ReLU(),
                 nn.Linear(self.fusion_output_dim // 2, 1),
-                nn.Sigmoid()
             )
 
             # Hit Target: Will trade work (target before stop)? (Binary classification)
+            # NOTE: No Sigmoid here - outputs raw logits for BCEWithLogits loss
             self.hit_target_head = nn.Sequential(
                 nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
                 nn.ReLU(),
                 nn.Linear(self.fusion_output_dim // 2, 1),
-                nn.Sigmoid()
             )
 
             # Expected Return: Direct return prediction (Regression)
@@ -780,6 +781,14 @@ class HierarchicalLNN(nn.Module, ModelBase):
             event_size=self.event_embed_dim
         )
 
+        # =========================================================================
+        # v5.7: SOFT SELECTION TEMPERATURE (for Gumbel-Softmax)
+        # =========================================================================
+        # High temp = soft selection (gradients to all TFs)
+        # Low temp = hard selection (approaches argmax)
+        # Annealed from 2.0 → 0.5 over training epochs
+        self.selection_temperature = 2.0
+
         # v5.3: Hierarchical Containment & RSI (static methods, no parameters)
         # =========================================================================
         if HAS_HIERARCHICAL_FEATURES:
@@ -906,10 +915,18 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # geo_low = current channel lower + (slope × duration)
         #         = -lower_dist + (low_slope_pct × duration)
         #         (negative because lower_dist is stored as positive % below current)
+        #
+        # v5.7: CRITICAL - Clamp duration BEFORE geo projection to prevent explosion
+        # Untrained duration heads can output huge values (e.g., 500 bars), which
+        # causes geo_high/geo_low to explode (e.g., 52.5% instead of 2.5%), leading
+        # to massive MSE loss that drowns out the primary high/low learning.
         # =====================================================================
 
-        geo_high = upper_dist + (high_slope * duration_mean)  # [batch, 1]
-        geo_low = -lower_dist + (low_slope * duration_mean)   # [batch, 1]
+        # v5.7: Clamp duration for geo projection (prevents loss explosion)
+        duration_for_geo = duration_mean.clamp(1, 48)  # Reasonable bar range
+
+        geo_high = upper_dist + (high_slope * duration_for_geo)  # [batch, 1]
+        geo_low = -lower_dist + (low_slope * duration_for_geo)   # [batch, 1]
 
         return {
             'high': geo_high,
@@ -1343,14 +1360,35 @@ class HierarchicalLNN(nn.Module, ModelBase):
         per_tf_lows = torch.cat(per_tf_lows, dim=-1)    # [batch, 11]
         per_tf_confs = torch.cat(per_tf_confs, dim=-1)  # [batch, 11]
 
-        # SELECT the most confident TF (not weighted average!)
+        # =========================================================================
+        # v5.7: SOFT SELECTION with Gumbel-Softmax (fixes mode collapse)
+        # =========================================================================
+        # per_tf_confs are sigmoid outputs [0, 1], need logits [-inf, inf] for Gumbel-Softmax
+        # Convert: logit = log(p / (1-p))
+        clamped_confs = per_tf_confs.clamp(1e-6, 1 - 1e-6)  # Avoid log(0)
+        per_tf_logits = torch.log(clamped_confs / (1 - clamped_confs))  # [batch, 11]
+
+        if self.training:
+            # Training: Soft selection - all TFs get gradients weighted by Gumbel-Softmax
+            tf_weights = F.gumbel_softmax(per_tf_logits, tau=self.selection_temperature, hard=False)  # [batch, 11]
+
+            # Weighted combination of all TF predictions (soft blend for gradient flow)
+            final_pred_high = (tf_weights * per_tf_highs).sum(dim=-1, keepdim=True)  # [batch, 1]
+            final_pred_low = (tf_weights * per_tf_lows).sum(dim=-1, keepdim=True)    # [batch, 1]
+            final_pred_conf = (tf_weights * per_tf_confs).sum(dim=-1, keepdim=True)  # [batch, 1]
+        else:
+            # Inference: Hard selection - pick the most confident TF (original behavior)
+            tf_weights = F.softmax(per_tf_logits, dim=-1)  # Regular softmax for inference
+
+        # Always track best_tf_idx for interpretability (argmax of original confidences)
         best_tf_idx = torch.argmax(per_tf_confs, dim=-1)  # [batch]
 
-        # Gather the best TF's predictions for each sample in batch
-        batch_indices = torch.arange(per_tf_highs.shape[0], device=per_tf_highs.device)
-        final_pred_high = per_tf_highs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
-        final_pred_low = per_tf_lows[batch_indices, best_tf_idx].unsqueeze(-1)    # [batch, 1]
-        final_pred_conf = per_tf_confs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
+        if not self.training:
+            # Inference: use hard selection
+            batch_indices = torch.arange(per_tf_highs.shape[0], device=per_tf_highs.device)
+            final_pred_high = per_tf_highs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
+            final_pred_low = per_tf_lows[batch_indices, best_tf_idx].unsqueeze(-1)    # [batch, 1]
+            final_pred_conf = per_tf_confs[batch_indices, best_tf_idx].unsqueeze(-1)  # [batch, 1]
 
         # Store selection info for interpretability
         selection_info = {
@@ -1359,6 +1397,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
             'per_tf_highs': per_tf_highs,
             'per_tf_lows': per_tf_lows,
             'per_tf_confs': per_tf_confs,
+            'tf_weights': tf_weights,  # v5.7: Gumbel-Softmax weights
         }
 
         # For multi-task heads, create fusion_hidden from physics-enhanced states
@@ -1472,26 +1511,46 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # Add event embedding
         output_dict['event_embed'] = event_embed
 
-        # Determine selected TF for compositor (use physics selection if available)
+        # =========================================================================
+        # v5.7: COMPOSITOR - Per-TF during training, selected-only during inference
+        # =========================================================================
+        # Determine selected TF (for interpretability and inference)
         if not self.use_fusion_head and 'selection_info' in locals():
             selected_tf = self.TIMEFRAMES[selection_info['best_tf_idx'][0].item()]
         else:
             # Use highest confidence TF
             conf_tensor = torch.cat(layer_confidences, dim=-1)  # [batch, 11]
-            best_tf_idx = torch.argmax(conf_tensor, dim=-1)[0].item()
-            selected_tf = self.TIMEFRAMES[best_tf_idx]
+            best_tf_idx_scalar = torch.argmax(conf_tensor, dim=-1)[0].item()
+            selected_tf = self.TIMEFRAMES[best_tf_idx_scalar]
 
         # Run Multi-Phase Compositor
         if hasattr(self, 'compositor'):
-            compositor_output = self.compositor(
-                all_hidden=tf_hidden_dict,
-                hidden_vix=hidden_vix,
-                event_embed=event_embed,
-                current_tf=selected_tf,
-                timeframes=self.TIMEFRAMES
-            )
-            output_dict['compositor'] = compositor_output
-            output_dict['selected_tf'] = selected_tf
+            if self.training:
+                # Training: compute compositor for ALL timeframes (for multi-TF loss in Phase 9)
+                for tf in self.TIMEFRAMES:
+                    compositor_output = self.compositor(
+                        all_hidden=tf_hidden_dict,
+                        hidden_vix=hidden_vix,
+                        event_embed=event_embed,
+                        current_tf=tf,  # Each TF gets its own compositor output
+                        timeframes=self.TIMEFRAMES
+                    )
+                    output_dict[f'compositor_{tf}'] = compositor_output
+
+                # Also store the "best" one for backwards compat with existing training code
+                output_dict['compositor'] = output_dict[f'compositor_{selected_tf}']
+                output_dict['selected_tf'] = selected_tf
+            else:
+                # Inference: only compute for selected TF (original behavior, faster)
+                compositor_output = self.compositor(
+                    all_hidden=tf_hidden_dict,
+                    hidden_vix=hidden_vix,
+                    event_embed=event_embed,
+                    current_tf=selected_tf,
+                    timeframes=self.TIMEFRAMES
+                )
+                output_dict['compositor'] = compositor_output
+                output_dict['selected_tf'] = selected_tf
 
         # Store per-layer predictions
         for i, tf in enumerate(self.TIMEFRAMES):
@@ -1501,6 +1560,17 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 layer_predictions[idx + 1],
                 layer_predictions[idx + 2]
             ], dim=-1)
+
+        # =========================================================================
+        # v5.7: EXPOSE PER-TF PREDICTIONS AND WEIGHTS FOR MULTI-TF TRAINING
+        # =========================================================================
+        # These are used by Phase 6 (multi-TF loss) and Phase 7 (entropy regularization)
+        output_dict['per_tf_predictions'] = {
+            'highs': per_tf_highs,   # [batch, 11]
+            'lows': per_tf_lows,     # [batch, 11]
+            'confs': per_tf_confs,   # [batch, 11]
+        }
+        output_dict['tf_weights'] = selection_info['tf_weights']  # [batch, 11] from Gumbel-Softmax
 
         # =========================================================================
         # MULTI-TASK PREDICTIONS
@@ -1536,8 +1606,13 @@ class HierarchicalLNN(nn.Module, ModelBase):
             dominant_layer_idx = torch.argmax(layer_weights, dim=1)
 
             output_dict['multi_task'] = {
-                'hit_band': hit_band_pred,
-                'hit_target': hit_target_pred,
+                # Store raw logits for training (BCEWithLogits expects logits)
+                # Dashboard/inference should apply sigmoid to get probabilities
+                'hit_band': hit_band_pred,  # Raw logits
+                'hit_target': hit_target_pred,  # Raw logits
+                # Also store probabilities for inference convenience
+                'hit_band_prob': torch.sigmoid(hit_band_pred),
+                'hit_target_prob': torch.sigmoid(hit_target_pred),
                 'expected_return': expected_return_pred,
                 'overshoot': overshoot_pred,
                 'continuation_duration': continuation_duration_pred,
@@ -1711,8 +1786,9 @@ class HierarchicalLNN(nn.Module, ModelBase):
             # Add multi-task predictions
             if self.multi_task and 'multi_task' in output_dict:
                 mt = output_dict['multi_task']
-                result['hit_band_pred'] = mt['hit_band'][0, 0].item()
-                result['hit_target_pred'] = mt['hit_target'][0, 0].item()
+                # v5.7.1: Use probability versions (hit_band/hit_target are now logits for BCEWithLogits)
+                result['hit_band_pred'] = mt['hit_band_prob'][0, 0].item()
+                result['hit_target_pred'] = mt['hit_target_prob'][0, 0].item()
                 result['expected_return_pred'] = mt['expected_return'][0, 0].item()
                 result['overshoot_pred'] = mt['overshoot'][0, 0].item()
 
