@@ -3431,7 +3431,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         'validity': [],
         'transition': [],
         'calibration': [],
-        'geo_price': []  # v5.7: geometric projection price loss
+        'geo_price': [],  # v5.7: geometric projection price loss
+        'multi_tf': [],   # v5.7: multi-timeframe loss
+        'entropy': [],    # v5.7: entropy regularization
     }
 
     # v5.3: Diagnostic tracking for transition loss issue
