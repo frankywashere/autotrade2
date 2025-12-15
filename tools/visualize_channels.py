@@ -428,7 +428,7 @@ def main():
     print(f"  Total timestamps: {stats['total_timestamps']:,}")
     print(f"  Sampled: {stats['sample_size']:,} for statistics\n")
 
-    print("  Metrics (1h window=168 sample):")
+    print("  Metrics (1h window=100 sample):")
     for metric, values in stats['metrics'].items():
         print(f"    {metric:20s}: mean={values['mean']:.2f}, "
               f"median={values['median']:.2f}, "
@@ -492,9 +492,9 @@ def main():
                 window = inquirer.select(
                     message="Window size:",
                     choices=[
-                        Choice(168, '168 bars (1 week for hourly)'),
-                        Choice(120, '120 bars'),
+                        Choice(100, '100 bars (max available)'),
                         Choice(90, '90 bars'),
+                        Choice(80, '80 bars'),
                         Choice(60, '60 bars'),
                         Choice(30, '30 bars')
                     ]
@@ -559,7 +559,7 @@ def main():
             elif action == 'high_quality':
                 symbol = 'tsla'
                 timeframe = '1h'
-                window = 168
+                window = 100  # v5.7: max available window
 
                 print(f"  Finding high-quality {symbol} {timeframe} channels (window={window})...")
 
@@ -612,7 +612,7 @@ def main():
 
                 symbol = 'tsla'
                 timeframe = '1h'
-                window = 168
+                window = 100  # v5.7: max available window
 
                 # Get all and filter
                 all_results = loader.find_high_quality_timestamps(

@@ -174,7 +174,8 @@ class ChannelLoader:
         shard_idx, local_idx = self._find_shard_for_index(idx)
 
         # Extract all metrics for this channel
-        prefix = f'{symbol}_channel_{timeframe}'
+        # v5.7: Feature naming format is now {symbol}_channel_{tf}_w{window}_{metric}
+        prefix = f'{symbol}_channel_{timeframe}_w{window}'
         metrics = [
             'position', 'upper_dist', 'lower_dist',
             'close_slope', 'high_slope', 'low_slope',
@@ -199,7 +200,8 @@ class ChannelLoader:
             shard_array = self.channel_mmaps[shard_idx]
 
         for metric in metrics:
-            feature_name = f'{prefix}_{metric}_w{window}'
+            # v5.7: New format: {symbol}_channel_{tf}_w{window}_{metric}
+            feature_name = f'{prefix}_{metric}'
             if feature_name in feature_map:
                 col_idx = feature_map[feature_name]
                 value = shard_array[local_idx, col_idx]
@@ -300,7 +302,8 @@ class ChannelLoader:
         Returns:
             List of (timestamp, quality_score) tuples
         """
-        feature_name = f'{symbol}_channel_{timeframe}_quality_score_w{window}'
+        # v5.7: New format: {symbol}_channel_{tf}_w{window}_{metric}
+        feature_name = f'{symbol}_channel_{timeframe}_w{window}_quality_score'
 
         if feature_name not in self.feature_to_idx:
             raise ValueError(f"Feature {feature_name} not found in shards")
@@ -348,11 +351,11 @@ class ChannelLoader:
         }
 
         # For each metric, calculate distribution
-        metrics_to_analyze = ['quality_score', 'complete_cycles', 'ping_pongs', 'r_squared', 'is_valid']
+        metrics_to_analyze = ['quality_score', 'complete_cycles', 'ping_pongs', 'r_squared_avg', 'is_valid']
 
         for metric in metrics_to_analyze:
-            # Get feature for tsla_1h_w168 as example
-            feature_name = f'tsla_channel_1h_{metric}_w168'
+            # v5.7: Get feature for tsla_1h_w100 as example (new format, max window=100)
+            feature_name = f'tsla_channel_1h_w100_{metric}'
 
             if feature_name in self.feature_to_idx:
                 col_idx = self.feature_to_idx[feature_name]
@@ -383,29 +386,23 @@ class ChannelLoader:
         if hasattr(self, '_labels_loaded') and self._labels_loaded:
             return
 
+        import pickle
+
         self._continuation_labels = {}  # tf -> {'timestamps': array, 'duration_bars': array, 'max_gain_pct': array}
         self._transition_labels = {}    # tf -> {'timestamps': array, 'transition_type': array, 'new_direction': array}
 
-        # Look for labels directory
-        labels_dir = self.shard_path / 'continuation_labels'
-        if not labels_dir.exists():
-            # Try parent directory
-            labels_dir = self.shard_path.parent / 'continuation_labels'
-
-        if not labels_dir.exists():
-            print(f"  ⚠️ Labels directory not found at {labels_dir}")
-            self._labels_loaded = True
-            return
-
-        # Load continuation labels for each TF
+        # v5.7: Labels are now pkl files in the shard_path directly (not a subdirectory)
+        # Format: continuation_labels_{tf}_v5.*.pkl and transition_labels_{tf}_v5.*.pkl
         timeframes = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
 
         for tf in timeframes:
-            # Continuation labels
-            cont_file = labels_dir / f'{tf}_labels.parquet'
-            if cont_file.exists():
+            # Continuation labels - find versioned pkl file
+            cont_files = list(self.shard_path.glob(f'continuation_labels_{tf}_v*.pkl'))
+            if cont_files:
+                cont_file = cont_files[0]  # Use first match
                 try:
-                    df = pd.read_parquet(cont_file)
+                    with open(cont_file, 'rb') as f:
+                        df = pickle.load(f)
                     self._continuation_labels[tf] = {
                         'timestamps': df.index.values,
                         'duration_bars': df['duration_bars'].values if 'duration_bars' in df.columns else None,
@@ -414,11 +411,13 @@ class ChannelLoader:
                 except Exception as e:
                     print(f"  ⚠️ Could not load {cont_file.name}: {e}")
 
-            # Transition labels
-            trans_file = labels_dir / f'transition_{tf}_labels.parquet'
-            if trans_file.exists():
+            # Transition labels - find versioned pkl file
+            trans_files = list(self.shard_path.glob(f'transition_labels_{tf}_v*.pkl'))
+            if trans_files:
+                trans_file = trans_files[0]  # Use first match
                 try:
-                    df = pd.read_parquet(trans_file)
+                    with open(trans_file, 'rb') as f:
+                        df = pickle.load(f)
                     self._transition_labels[tf] = {
                         'timestamps': df.index.values,
                         'transition_type': df['transition_type'].values if 'transition_type' in df.columns else None,
@@ -431,6 +430,8 @@ class ChannelLoader:
         loaded_trans = len(self._transition_labels)
         if loaded_cont > 0 or loaded_trans > 0:
             print(f"  ✓ Loaded labels: {loaded_cont} continuation, {loaded_trans} transition TFs")
+        else:
+            print(f"  ⚠️ No label files found in {self.shard_path}")
 
         self._labels_loaded = True
 
