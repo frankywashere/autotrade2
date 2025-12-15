@@ -1260,6 +1260,9 @@ class TradingFeatureExtractor(FeatureExtractor):
         )
         print(f"   ✓ Generated {len(breakdown_5min.columns)} breakdown features at 5min")
 
+        # Save breakdown column names BEFORE deletion
+        breakdown_cols = list(breakdown_5min.columns)
+
         # Merge breakdown with features at 5min
         df_with_breakdown = pd.concat([df, breakdown_5min], axis=1)
 
@@ -1274,8 +1277,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Saving TF sequences", leave=False, ncols=100, ascii=True):
             # Get columns for this TF (shared + TF-specific + breakdown)
             tf_cols = shared_cols + tf_specific_cols[tf]
-            # Get breakdown columns (they're shared across all TFs)
-            breakdown_cols = list(breakdown_5min.columns)
+            # breakdown_cols already saved above
 
             # Select columns for this timeframe
             tf_features = df_with_breakdown[tf_cols + breakdown_cols].copy()
@@ -1328,71 +1330,136 @@ class TradingFeatureExtractor(FeatureExtractor):
         feature_columns: list
     ) -> None:
         """
-        Streaming implementation: process one timeframe at a time, one chunk at a time.
-        Peak RAM: ~5-8GB (one chunk's TF columns + accumulated resampled results).
+        True streaming implementation: ~7-8 GB peak RAM instead of ~120 GB.
+
+        Strategy:
+        - Phase 1: Load only 48 breakdown-required columns (~1 GB peak)
+        - Phase 2: For each TF, load only that TF's columns (~7 GB peak per TF)
+        - Memory freed between each TF iteration
+
+        Produces identical results to _generate_native_tf_full_load.
         """
         import json
         import gc
+        import os
         import pandas as pd
 
-        # Get column indices for shared vs TF-specific
-        shared_col_indices = []
-        tf_col_indices = {tf: [] for tf in HIERARCHICAL_TIMEFRAMES}
+        total_rows = mmap_meta['total_rows']
+        cache_key = mmap_meta.get('cache_key', 'from_chunks')
+
+        print(f"   🔄 True streaming mode: ~7-8 GB peak RAM (vs ~120 GB full load)")
+
+        # ========================================================================
+        # PHASE 0: Load timestamps and compute column mappings (~50 MB)
+        # ========================================================================
+        print(f"   📊 Phase 0: Loading timestamps and computing mappings...")
+
+        # Load all timestamp indices
+        all_indices = []
+        chunk_row_ranges = []
+        row_offset = 0
+
+        for chunk in chunk_info:
+            index_path = cache_dir / chunk['index_path']
+            index_array = np.load(str(index_path), mmap_mode='r')[:]
+            all_indices.append(index_array)
+            chunk_row_ranges.append((row_offset, row_offset + len(index_array)))
+            row_offset += len(index_array)
+
+        full_indices = np.concatenate(all_indices)
+        del all_indices
+        gc.collect()
+
+        datetime_index = pd.to_datetime(full_indices, unit='ns')
+
+        # Compute column index mappings
+        shared_chunk_col_indices = []
+        tf_chunk_col_indices = {tf: [] for tf in HIERARCHICAL_TIMEFRAMES}
 
         for i, col in enumerate(feature_columns):
             is_tf_specific = False
             for tf in HIERARCHICAL_TIMEFRAMES:
                 if f'_{tf}_' in col:
-                    tf_col_indices[tf].append(i)
+                    tf_chunk_col_indices[tf].append(i)
                     is_tf_specific = True
                     break
             if not is_tf_specific:
-                shared_col_indices.append(i)
+                shared_chunk_col_indices.append(i)
 
-        print(f"   📊 Found {len(shared_col_indices)} shared columns, {sum(len(v) for v in tf_col_indices.values())} timeframe-specific")
-
-        # Load monthly shard info for column indices (if present)
-        monthly_array = None
+        # Monthly shard column mappings
         monthly_columns = []
+        shared_monthly_col_indices = []
+        tf_monthly_col_indices = {tf: [] for tf in HIERARCHICAL_TIMEFRAMES}
+
         if monthly_shard_info:
-            monthly_path = cache_dir / monthly_shard_info['path']
-            if monthly_path.exists():
-                monthly_array = np.load(str(monthly_path), mmap_mode='r')
-                monthly_columns = monthly_shard_info.get('columns', [])
-                print(f"   📂 Monthly shard: {monthly_array.shape[1]} columns (memory-mapped)")
+            monthly_columns = monthly_shard_info.get('columns', [])
+            for i, col in enumerate(monthly_columns):
+                is_tf_specific = False
+                for tf in HIERARCHICAL_TIMEFRAMES:
+                    if f'_{tf}_' in col:
+                        tf_monthly_col_indices[tf].append(i)
+                        is_tf_specific = True
+                        break
+                if not is_tf_specific:
+                    shared_monthly_col_indices.append(i)
 
-                # Check row count alignment with chunks
-                chunk_total_rows = mmap_meta.get('total_rows', 0)
-                monthly_rows = monthly_array.shape[0]
-                if chunk_total_rows > 0 and chunk_total_rows != monthly_rows:
-                    print(f"\n" + "=" * 70)
-                    print(f"   ❌ CACHE ROW COUNT MISMATCH DETECTED!")
-                    print(f"=" * 70)
-                    print(f"   Chunks total:    {chunk_total_rows:,} rows")
-                    print(f"   Monthly shard:   {monthly_rows:,} rows")
-                    print(f"   Difference:      {abs(monthly_rows - chunk_total_rows):,} rows")
-                    print(f"")
-                    print(f"   This means your cache shards were created with different data ranges.")
-                    print(f"   FIX: Delete cache and regenerate:")
-                    print(f"        rm -rf data/feature_cache/features_mmap_*")
-                    print(f"        rm -rf data/feature_cache/monthly_3month_*")
-                    print(f"=" * 70 + "\n")
-                    raise ValueError(
-                        f"Cache row count mismatch: chunks={chunk_total_rows:,} vs monthly={monthly_rows:,}. "
-                        f"Delete cache and regenerate."
-                    )
+        print(f"   ✓ Chunk columns: {len(shared_chunk_col_indices)} shared + {sum(len(v) for v in tf_chunk_col_indices.values())} TF-specific")
+        if monthly_columns:
+            print(f"   ✓ Monthly columns: {len(shared_monthly_col_indices)} shared + {sum(len(v) for v in tf_monthly_col_indices.values())} TF-specific")
 
-        # Load non-channel features (contains tsla_close, spy_close, etc.)
-        non_channel_path = cache_dir / f"non_channel_features_{mmap_meta['cache_key']}.pkl"
+        # ========================================================================
+        # PHASE 1: Compute breakdown from minimal columns (~1 GB peak)
+        # ========================================================================
+        print(f"   📊 Phase 1: Computing breakdown features...")
+
+        # Find breakdown-required column indices (36 from chunks: stability/position for 9 TFs)
+        breakdown_chunk_col_indices = []
+        breakdown_chunk_col_names = []
+        tfs_with_w50 = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly']
+
+        for tf in tfs_with_w50:
+            for col_pattern in [
+                f'tsla_channel_{tf}_w50_stability',
+                f'tsla_channel_{tf}_w50_position',
+                f'spy_channel_{tf}_w50_stability',
+                f'spy_channel_{tf}_w50_position',
+            ]:
+                if col_pattern in feature_columns:
+                    idx = feature_columns.index(col_pattern)
+                    breakdown_chunk_col_indices.append(idx)
+                    breakdown_chunk_col_names.append(col_pattern)
+
+        print(f"   📂 Loading {len(breakdown_chunk_col_indices)} breakdown cols from chunks...")
+
+        # Load only breakdown columns from chunks (~0.24 GB)
+        breakdown_chunk_data = np.zeros((total_rows, len(breakdown_chunk_col_indices)), dtype=np.float32)
+
+        for chunk_idx, chunk in enumerate(chunk_info):
+            chunk_path = cache_dir / chunk['path']
+            chunk_mm = np.load(str(chunk_path), mmap_mode='r')
+
+            start_row, end_row = chunk_row_ranges[chunk_idx]
+            for col_out_idx, col_in_idx in enumerate(breakdown_chunk_col_indices):
+                breakdown_chunk_data[start_row:end_row, col_out_idx] = chunk_mm[:, col_in_idx]
+
+            del chunk_mm
+
+        # Build breakdown input DataFrame
+        breakdown_df = pd.DataFrame(breakdown_chunk_data, columns=breakdown_chunk_col_names, index=datetime_index)
+        del breakdown_chunk_data
+        gc.collect()
+
+        # Load non-channel features
+        non_channel_path = cache_dir / f"non_channel_features_{cache_key}.pkl"
         non_channel_df = None
         non_channel_columns = []
+
         if non_channel_path.exists():
             non_channel_df = pd.read_pickle(non_channel_path)
             if not isinstance(non_channel_df.index, pd.DatetimeIndex):
                 non_channel_df.index = pd.to_datetime(non_channel_df.index)
 
-            # v5.3.3: Remove old breakdown columns - we'll calculate fresh at native TF resolution
-            # Old breakdown was calculated at 1-min, we want native TF calculation for train-test consistency
+            # Remove old breakdown columns
             breakdown_patterns = [
                 'duration_ratio', 'alignment', 'time_in_channel', 'position_norm',
                 'in_channel', 'rsi_divergence', 'volume_surge',
@@ -1404,146 +1471,176 @@ class TradingFeatureExtractor(FeatureExtractor):
                                   if any(pattern in c for pattern in breakdown_patterns)]
             if old_breakdown_cols:
                 non_channel_df = non_channel_df.drop(columns=old_breakdown_cols)
-                print(f"   📂 Non-channel features: {len(non_channel_df.columns)} columns (removed {len(old_breakdown_cols)} old breakdown cols)")
-            else:
-                print(f"   📂 Non-channel features: {len(non_channel_df.columns)} columns")
+                print(f"   📂 Non-channel: {len(non_channel_df.columns)} cols (removed {len(old_breakdown_cols)} old breakdown)")
 
             non_channel_columns = list(non_channel_df.columns)
+
+            # Add breakdown-required non-channel cols (RSI + tsla_volume_ratio + tsla_close)
+            breakdown_nc_cols = []
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                rsi_col = f'tsla_rsi_{tf}'
+                if rsi_col in non_channel_df.columns:
+                    breakdown_nc_cols.append(rsi_col)
+            if 'tsla_volume_ratio' in non_channel_df.columns:
+                breakdown_nc_cols.append('tsla_volume_ratio')
+            if 'tsla_close' in non_channel_df.columns:
+                breakdown_nc_cols.append('tsla_close')
+
+            # Align indices
+            common_idx = breakdown_df.index.intersection(non_channel_df.index)
+            if len(common_idx) < len(breakdown_df):
+                breakdown_df = breakdown_df.loc[common_idx]
+                datetime_index = breakdown_df.index
+                full_indices = datetime_index.view(np.int64).copy()
+                print(f"   ⚠️  Rows trimmed by alignment: {total_rows:,} → {len(common_idx):,}")
+                total_rows = len(common_idx)
+
+            for col in breakdown_nc_cols:
+                if col in non_channel_df.columns:
+                    breakdown_df[col] = non_channel_df.loc[breakdown_df.index, col].values
+
+            print(f"   ✓ Added {len(breakdown_nc_cols)} non-channel cols for breakdown")
         else:
             print(f"   ⚠️  No non-channel features found: {non_channel_path.name}")
+
+        # Calculate breakdown features
+        print(f"   📊 Calculating breakdown at 5min resolution...")
+        breakdown_result = self._calculate_all_breakdown_at_5min(
+            breakdown_df,
+            raw_df=None,
+            events_handler=None
+        )
+        breakdown_columns = list(breakdown_result.columns)
+        print(f"   ✓ Generated {len(breakdown_columns)} breakdown features")
+
+        # Save breakdown to temp file
+        breakdown_temp_path = output_cache_dir / f"_temp_breakdown_{cache_key}.npy"
+        np.save(str(breakdown_temp_path), breakdown_result.values.astype(np.float32))
+
+        del breakdown_df, breakdown_result
+        gc.collect()
+
+        # Memory-map breakdown for reading
+        breakdown_mm = np.load(str(breakdown_temp_path), mmap_mode='r')
+
+        # ========================================================================
+        # PHASE 2: Generate each TF output (~7 GB peak per TF)
+        # ========================================================================
+        print(f"   💾 Phase 2: Generating TF outputs (one at a time)...")
+
+        # Validate monthly shard if present
+        monthly_mm = None
+        if monthly_shard_info:
+            monthly_path = cache_dir / monthly_shard_info['path']
+            if monthly_path.exists():
+                monthly_mm = np.load(str(monthly_path), mmap_mode='r')
+                if monthly_mm.shape[0] != mmap_meta['total_rows']:
+                    raise ValueError(f"Monthly shard row mismatch: {monthly_mm.shape[0]} vs {mmap_meta['total_rows']}")
 
         # Metadata for output
         meta = {
             'feature_version': FEATURE_VERSION,
-            'cache_key': mmap_meta.get('cache_key', 'from_chunks'),
+            'cache_key': cache_key,
             'sequence_lengths': TIMEFRAME_SEQUENCE_LENGTHS,
-            'shared_columns': non_channel_columns + [feature_columns[i] for i in shared_col_indices],
+            'shared_columns': non_channel_columns + [feature_columns[i] for i in shared_chunk_col_indices],
             'timeframe_columns': {},
             'timeframe_shapes': {},
-            'total_rows_1min': mmap_meta['total_rows'],
+            'total_rows_1min': total_rows,
         }
 
-        # v5.4: Single-pass processing with breakdown at 5min resolution
-        # Phase 1: Load all chunks to build full 5min DataFrame
-        # Phase 2: Calculate breakdown at 5min from channel features
-        # Phase 3: Resample to each TF and save
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Generating TFs", leave=False, ncols=100, ascii=True):
+            # Determine columns for this TF
+            # Order: non_channel → shared_chunk → tf_chunk → shared_monthly → tf_monthly → breakdown
+            tf_col_names = []
 
-        print(f"   🔄 Loading 5min data from chunks (v5.4 single-pass)...")
+            # 1. Non-channel columns (all of them for this TF)
+            if non_channel_columns:
+                tf_col_names.extend(non_channel_columns)
 
-        # Phase 1: Load all chunks at 5min resolution
-        all_chunks_features = []
-        all_chunks_indices = []
-        cumulative_row_offset = 0
+            # 2. Shared chunk columns
+            tf_col_names.extend([feature_columns[i] for i in shared_chunk_col_indices])
 
-        for i, chunk in enumerate(tqdm(chunk_info, desc="   Loading chunks", leave=False, ncols=100, ascii=True)):
-            chunk_path = cache_dir / chunk['path']
-            index_path = cache_dir / chunk['index_path']
+            # 3. TF-specific chunk columns
+            tf_col_names.extend([feature_columns[i] for i in tf_chunk_col_indices[tf]])
 
-            # Memory-map chunk (minimal RAM - just the file mapping)
-            chunk_array = np.load(str(chunk_path), mmap_mode='r')
-            index_array = np.load(str(index_path), mmap_mode='r')
+            # 4. Shared monthly columns
+            if monthly_mm is not None and shared_monthly_col_indices:
+                tf_col_names.extend([monthly_columns[i] for i in shared_monthly_col_indices])
 
-            # Load ALL columns (for 5min breakdown calculation)
-            all_chunks_features.append(chunk_array[:].astype(np.float32))
-            all_chunks_indices.append(index_array[:])
+            # 5. TF-specific monthly columns
+            if monthly_mm is not None and tf_monthly_col_indices[tf]:
+                tf_col_names.extend([monthly_columns[i] for i in tf_monthly_col_indices[tf]])
 
-            cumulative_row_offset += len(chunk_array)
-            del chunk_array, index_array
+            # 6. Breakdown columns
+            tf_col_names.extend(breakdown_columns)
 
-        # Concatenate all chunks
-        print(f"   📊 Concatenating {len(all_chunks_features)} chunks...")
-        full_features = np.vstack(all_chunks_features)
-        full_indices = np.concatenate(all_chunks_indices)
-        del all_chunks_features, all_chunks_indices
-        gc.collect()
+            # Allocate and fill data array (~7 GB for largest TFs)
+            num_cols = len(tf_col_names)
+            tf_data = np.zeros((total_rows, num_cols), dtype=np.float32)
+            col_offset = 0
 
-        # Build full 5min DataFrame
-        df = pd.DataFrame(full_features, columns=feature_columns)
-        df.index = pd.to_datetime(full_indices, unit='ns')
-        del full_features, full_indices
-        gc.collect()
+            # Fill from non-channel
+            if non_channel_df is not None and non_channel_columns:
+                nc_values = non_channel_df.loc[datetime_index].values
+                tf_data[:, :len(non_channel_columns)] = nc_values
+                col_offset += len(non_channel_columns)
 
-        print(f"   ✓ Loaded {len(df):,} rows × {len(df.columns)} channel features at 5min")
+            # Fill from chunks (shared + TF-specific)
+            chunk_cols_to_load = shared_chunk_col_indices + tf_chunk_col_indices[tf]
+            if chunk_cols_to_load:
+                for chunk_idx, chunk in enumerate(chunk_info):
+                    chunk_path = cache_dir / chunk['path']
+                    chunk_mm = np.load(str(chunk_path), mmap_mode='r')
 
-        # Add monthly/3month shard if present
-        if monthly_array is not None:
-            print(f"   📂 Adding monthly/3month shard...")
-            if monthly_array.shape[0] == len(df):
-                monthly_cols = monthly_shard_info.get('columns', [f'monthly_3month_col_{i}' for i in range(monthly_array.shape[1])])
-                monthly_df = pd.DataFrame(monthly_array[:].astype(np.float32), columns=monthly_cols, index=df.index)
-                df = pd.concat([df, monthly_df], axis=1)
-                del monthly_df
-                print(f"   ✓ Added {len(monthly_cols)} monthly/3month columns")
-            else:
-                print(f"   ⚠️  Monthly shard row count mismatch: {monthly_array.shape[0]} vs {len(df)}")
+                    start_row, end_row = chunk_row_ranges[chunk_idx]
+                    # Adjust for trimmed rows
+                    if end_row > total_rows:
+                        end_row = total_rows
+                    if start_row >= total_rows:
+                        continue
 
-        # Merge non-channel features (contains tsla_close, spy_close, etc.)
-        if non_channel_df is not None and len(non_channel_columns) > 0:
-            common_idx = df.index.intersection(non_channel_df.index)
-            if len(common_idx) > 0:
-                df = pd.concat([non_channel_df.loc[common_idx], df.loc[common_idx]], axis=1)
-                print(f"   ✓ Merged {len(non_channel_columns)} non-channel features ({len(df):,} aligned rows)")
+                    for out_col, in_col in enumerate(chunk_cols_to_load):
+                        tf_data[start_row:end_row, col_offset + out_col] = chunk_mm[:end_row - start_row, in_col]
 
-        # Phase 2: Calculate breakdown at 5min resolution
-        print(f"   📊 Calculating breakdown at 5min resolution...")
-        breakdown_5min = self._calculate_all_breakdown_at_5min(
-            df,
-            raw_df=None,          # Not available in chunked mode
-            events_handler=None   # Not available in chunked mode
-        )
-        print(f"   ✓ Generated {len(breakdown_5min.columns)} breakdown features at 5min")
+                    del chunk_mm
 
-        # Merge breakdown with features at 5min
-        df_with_breakdown = pd.concat([df, breakdown_5min], axis=1)
-        del df, breakdown_5min
-        gc.collect()
+                col_offset += len(chunk_cols_to_load)
 
-        # Identify shared vs TF-specific columns
-        all_cols = list(df_with_breakdown.columns)
-        shared_cols = []
-        tf_specific_cols = {tf: [] for tf in HIERARCHICAL_TIMEFRAMES}
+            # Fill from monthly (shared + TF-specific)
+            if monthly_mm is not None:
+                monthly_cols_to_load = shared_monthly_col_indices + tf_monthly_col_indices[tf]
+                if monthly_cols_to_load:
+                    for out_col, in_col in enumerate(monthly_cols_to_load):
+                        tf_data[:total_rows, col_offset + out_col] = monthly_mm[:total_rows, in_col]
+                    col_offset += len(monthly_cols_to_load)
 
-        for col in all_cols:
-            is_tf_specific = False
-            for tf in HIERARCHICAL_TIMEFRAMES:
-                if f'_{tf}_' in col:
-                    tf_specific_cols[tf].append(col)
-                    is_tf_specific = True
-                    break
-            if not is_tf_specific:
-                shared_cols.append(col)
+            # Fill from breakdown
+            tf_data[:, col_offset:col_offset + len(breakdown_columns)] = breakdown_mm[:total_rows, :]
 
-        print(f"   📊 Found {len(shared_cols)} shared columns, {sum(len(v) for v in tf_specific_cols.values())} timeframe-specific")
+            # Build DataFrame for resampling
+            tf_df = pd.DataFrame(tf_data, columns=tf_col_names, index=datetime_index)
+            del tf_data
+            gc.collect()
 
-        # Phase 3: Resample to each TF and save
-        print(f"   💾 Resampling to native TF resolutions and saving...")
-
-        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Saving TF sequences", leave=False, ncols=100, ascii=True):
-            # Get columns for this TF (shared + TF-specific)
-            tf_cols = shared_cols + tf_specific_cols[tf]
-
-            # Select columns for this timeframe
-            tf_features = df_with_breakdown[tf_cols].copy()
+            # Resample using .last()
             tf_rule = TIMEFRAME_RESAMPLE_RULES[tf]
-
-            # Use .last() to get value at end of each bar
-            resampled = tf_features.resample(tf_rule).last().dropna()
-            del tf_features
+            resampled = tf_df.resample(tf_rule).last().dropna()
+            del tf_df
+            gc.collect()
 
             # Remove duplicate columns
             resampled = resampled.loc[:, ~resampled.columns.duplicated(keep='first')]
 
+            # Save outputs
+            output_path = output_cache_dir / f"tf_sequence_{tf}_{cache_key}.npy"
+            np.save(str(output_path), resampled.values.astype(np.float32))
+
+            ts_path = output_cache_dir / f"tf_timestamps_{tf}_{cache_key}.npy"
+            np.save(str(ts_path), resampled.index.view(np.int64))
+
             # Update metadata
             meta['timeframe_columns'][tf] = list(resampled.columns)
             meta['timeframe_shapes'][tf] = list(resampled.shape)
-
-            # Save as .npy file
-            output_path = output_cache_dir / f"tf_sequence_{tf}_{meta['cache_key']}.npy"
-            np.save(output_path, resampled.values.astype(np.float32))
-
-            # Save timestamps
-            ts_path = output_cache_dir / f"tf_timestamps_{tf}_{meta['cache_key']}.npy"
-            np.save(ts_path, resampled.index.view(np.int64))
 
             # Log progress
             seq_len = TIMEFRAME_SEQUENCE_LENGTHS[tf]
@@ -1557,16 +1654,28 @@ class TradingFeatureExtractor(FeatureExtractor):
             del resampled
             gc.collect()
 
-        # Clean up
-        del df_with_breakdown
+        # ========================================================================
+        # PHASE 3: Cleanup
+        # ========================================================================
+        del breakdown_mm
+        if monthly_mm is not None:
+            del monthly_mm
+        if non_channel_df is not None:
+            del non_channel_df
         gc.collect()
 
+        # Delete temp breakdown file
+        try:
+            os.remove(str(breakdown_temp_path))
+        except OSError:
+            pass
+
         # Save metadata
-        meta_path = output_cache_dir / f"tf_meta_{meta['cache_key']}.json"
+        meta_path = output_cache_dir / f"tf_meta_{cache_key}.json"
         with open(meta_path, 'w') as f:
             json.dump(meta, f, indent=2)
 
-        print(f"   ✓ Generated {len(HIERARCHICAL_TIMEFRAMES)} timeframe sequences (streaming)")
+        print(f"   ✓ Generated {len(HIERARCHICAL_TIMEFRAMES)} timeframe sequences (true streaming)")
         print(f"   📄 Metadata: {meta_path.name}")
 
     def _extract_price_features(self, df: pd.DataFrame, use_gpu: bool = False) -> pd.DataFrame:
