@@ -1084,10 +1084,11 @@ class TradingFeatureExtractor(FeatureExtractor):
     ) -> None:
         """
         Full load implementation: load all chunks into RAM then resample.
-        Peak RAM: ~50GB for full dataset.
-        Faster than streaming but requires high RAM.
+        Peak RAM: ~120GB during hstack/concat operations (with memory cleanup).
+        Without cleanup: ~245GB peak. With del+gc.collect(): ~120GB peak.
         """
         import json
+        import gc
         import pandas as pd
 
         # Step 1: Load all chunks and timestamps to build full feature DataFrame
@@ -1116,6 +1117,11 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Concatenate all features and indices
         full_features = np.vstack(all_features)
         full_indices = np.concatenate(all_indices)
+
+        # Free chunk list - no longer needed after vstack (saves ~49 GB)
+        del all_features, all_indices
+        gc.collect()
+        print(f"   🗑️  Freed chunk list memory")
 
         # feature_columns is passed as parameter (already validated in main method)
 
@@ -1158,12 +1164,22 @@ class TradingFeatureExtractor(FeatureExtractor):
                 full_features = np.hstack([full_features, monthly_array[:]])
                 feature_columns = feature_columns + monthly_columns
                 print(f"   ✓ Added monthly/3month: {monthly_array.shape[1]} columns")
+
+                # Free monthly array - no longer needed after hstack (saves ~11 GB)
+                del monthly_array
+                gc.collect()
+                print(f"   🗑️  Freed monthly shard memory")
             else:
                 print(f"   ⚠️  Monthly shard not found: {monthly_path}")
 
         # Create DataFrame with timestamps as index and proper column names
         df = pd.DataFrame(full_features, columns=feature_columns)
         df.index = pd.to_datetime(full_indices, unit='ns')
+
+        # Free numpy arrays - DataFrame now owns the data (saves ~60 GB)
+        del full_features, full_indices
+        gc.collect()
+        print(f"   🗑️  Freed numpy array memory")
 
         print(f"   ✓ Loaded {len(df):,} rows × {len(df.columns)} channel features")
 
@@ -1195,8 +1211,14 @@ class TradingFeatureExtractor(FeatureExtractor):
             if len(common_idx) > 0:
                 df = pd.concat([non_channel_df.loc[common_idx], df.loc[common_idx]], axis=1)
                 print(f"   ✓ Merged {len(non_channel_df.columns)} non-channel features ({len(df):,} aligned rows)")
+
+                # Free non-channel DataFrame - no longer needed after concat (saves ~1.2 GB)
+                del non_channel_df
+                gc.collect()
             else:
                 print(f"   ⚠️  No overlapping timestamps between channel and non-channel features")
+                del non_channel_df
+                gc.collect()
         else:
             print(f"   ⚠️  No non-channel features found: {non_channel_path.name}")
 
@@ -1240,6 +1262,11 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Merge breakdown with features at 5min
         df_with_breakdown = pd.concat([df, breakdown_5min], axis=1)
+
+        # Free original df and breakdown - now combined in df_with_breakdown (saves ~62 GB)
+        del df, breakdown_5min
+        gc.collect()
+        print(f"   🗑️  Freed pre-merge DataFrames")
 
         # Now resample to each TF and save
         print(f"   💾 Resampling to native TF resolutions and saving...")
