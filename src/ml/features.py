@@ -1491,7 +1491,6 @@ class TradingFeatureExtractor(FeatureExtractor):
             if len(common_idx) < len(breakdown_df):
                 breakdown_df = breakdown_df.loc[common_idx]
                 datetime_index = breakdown_df.index
-                full_indices = datetime_index.view(np.int64).copy()
                 print(f"   ⚠️  Rows trimmed by alignment: {total_rows:,} → {len(common_idx):,}")
                 total_rows = len(common_idx)
 
@@ -1537,41 +1536,58 @@ class TradingFeatureExtractor(FeatureExtractor):
                 if monthly_mm.shape[0] != mmap_meta['total_rows']:
                     raise ValueError(f"Monthly shard row mismatch: {monthly_mm.shape[0]} vs {mmap_meta['total_rows']}")
 
+        # Categorize non-channel columns into shared vs TF-specific (Bug #1 fix)
+        # Must use SAME pattern as full_load: only _{tf}_ (underscore on both sides)
+        # e.g., tsla_rsi_5min → SHARED, tsla_rsi_5min_oversold → TF-SPECIFIC
+        nc_shared_cols = []
+        nc_tf_cols = {tf: [] for tf in HIERARCHICAL_TIMEFRAMES}
+        for col in non_channel_columns:
+            is_tf_specific = False
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                if f'_{tf}_' in col:  # Must match full_load exactly
+                    nc_tf_cols[tf].append(col)
+                    is_tf_specific = True
+                    break
+            if not is_tf_specific:
+                nc_shared_cols.append(col)
+
+        print(f"   ✓ Non-channel split: {len(nc_shared_cols)} shared + {sum(len(v) for v in nc_tf_cols.values())} TF-specific")
+
+        # Build shared_cols list to match full_load order (nc_shared + chunk_shared + monthly_shared)
+        all_shared_cols = nc_shared_cols + [feature_columns[i] for i in shared_chunk_col_indices]
+        if monthly_mm is not None:
+            all_shared_cols.extend([monthly_columns[i] for i in shared_monthly_col_indices])
+
         # Metadata for output
         meta = {
             'feature_version': FEATURE_VERSION,
             'cache_key': cache_key,
             'sequence_lengths': TIMEFRAME_SEQUENCE_LENGTHS,
-            'shared_columns': non_channel_columns + [feature_columns[i] for i in shared_chunk_col_indices],
+            'shared_columns': all_shared_cols,
             'timeframe_columns': {},
             'timeframe_shapes': {},
             'total_rows_1min': total_rows,
         }
 
         for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="   Generating TFs", leave=False, ncols=100, ascii=True):
-            # Determine columns for this TF
-            # Order: non_channel → shared_chunk → tf_chunk → shared_monthly → tf_monthly → breakdown
+            # Column order must match full_load: shared_cols + tf_specific_cols[tf] + breakdown_cols
+            # Where shared = nc_shared + chunk_shared + monthly_shared
+            # And tf_specific = nc_tf[tf] + chunk_tf[tf] + monthly_tf[tf]
             tf_col_names = []
 
-            # 1. Non-channel columns (all of them for this TF)
-            if non_channel_columns:
-                tf_col_names.extend(non_channel_columns)
-
-            # 2. Shared chunk columns
+            # 1. All shared columns first (matches full_load's shared_cols)
+            tf_col_names.extend(nc_shared_cols)
             tf_col_names.extend([feature_columns[i] for i in shared_chunk_col_indices])
-
-            # 3. TF-specific chunk columns
-            tf_col_names.extend([feature_columns[i] for i in tf_chunk_col_indices[tf]])
-
-            # 4. Shared monthly columns
             if monthly_mm is not None and shared_monthly_col_indices:
                 tf_col_names.extend([monthly_columns[i] for i in shared_monthly_col_indices])
 
-            # 5. TF-specific monthly columns
+            # 2. TF-specific columns (matches full_load's tf_specific_cols[tf])
+            tf_col_names.extend(nc_tf_cols[tf])
+            tf_col_names.extend([feature_columns[i] for i in tf_chunk_col_indices[tf]])
             if monthly_mm is not None and tf_monthly_col_indices[tf]:
                 tf_col_names.extend([monthly_columns[i] for i in tf_monthly_col_indices[tf]])
 
-            # 6. Breakdown columns
+            # 3. Breakdown columns
             tf_col_names.extend(breakdown_columns)
 
             # Allocate and fill data array (~7 GB for largest TFs)
@@ -1579,42 +1595,71 @@ class TradingFeatureExtractor(FeatureExtractor):
             tf_data = np.zeros((total_rows, num_cols), dtype=np.float32)
             col_offset = 0
 
-            # Fill from non-channel
-            if non_channel_df is not None and non_channel_columns:
-                nc_values = non_channel_df.loc[datetime_index].values
-                tf_data[:, :len(non_channel_columns)] = nc_values
-                col_offset += len(non_channel_columns)
+            # Data fill order must match column order exactly:
+            # SHARED: nc_shared → chunk_shared → monthly_shared
+            # TF-SPECIFIC: nc_tf[tf] → chunk_tf[tf] → monthly_tf[tf]
+            # BREAKDOWN
 
-            # Fill from chunks (shared + TF-specific)
-            chunk_cols_to_load = shared_chunk_col_indices + tf_chunk_col_indices[tf]
-            if chunk_cols_to_load:
+            # --- SHARED SECTION ---
+            # 1. nc_shared
+            if non_channel_df is not None and nc_shared_cols:
+                nc_shared_values = non_channel_df.loc[datetime_index, nc_shared_cols].values
+                tf_data[:, col_offset:col_offset + len(nc_shared_cols)] = nc_shared_values
+                col_offset += len(nc_shared_cols)
+
+            # 2. chunk_shared
+            if shared_chunk_col_indices:
                 for chunk_idx, chunk in enumerate(chunk_info):
                     chunk_path = cache_dir / chunk['path']
                     chunk_mm = np.load(str(chunk_path), mmap_mode='r')
-
                     start_row, end_row = chunk_row_ranges[chunk_idx]
-                    # Adjust for trimmed rows
                     if end_row > total_rows:
                         end_row = total_rows
                     if start_row >= total_rows:
+                        del chunk_mm
                         continue
-
-                    for out_col, in_col in enumerate(chunk_cols_to_load):
+                    for out_col, in_col in enumerate(shared_chunk_col_indices):
                         tf_data[start_row:end_row, col_offset + out_col] = chunk_mm[:end_row - start_row, in_col]
-
                     del chunk_mm
+                col_offset += len(shared_chunk_col_indices)
 
-                col_offset += len(chunk_cols_to_load)
+            # 3. monthly_shared
+            if monthly_mm is not None and shared_monthly_col_indices:
+                for out_col, in_col in enumerate(shared_monthly_col_indices):
+                    tf_data[:total_rows, col_offset + out_col] = monthly_mm[:total_rows, in_col]
+                col_offset += len(shared_monthly_col_indices)
 
-            # Fill from monthly (shared + TF-specific)
-            if monthly_mm is not None:
-                monthly_cols_to_load = shared_monthly_col_indices + tf_monthly_col_indices[tf]
-                if monthly_cols_to_load:
-                    for out_col, in_col in enumerate(monthly_cols_to_load):
-                        tf_data[:total_rows, col_offset + out_col] = monthly_mm[:total_rows, in_col]
-                    col_offset += len(monthly_cols_to_load)
+            # --- TF-SPECIFIC SECTION ---
+            # 4. nc_tf[tf]
+            if non_channel_df is not None and nc_tf_cols[tf]:
+                nc_tf_values = non_channel_df.loc[datetime_index, nc_tf_cols[tf]].values
+                tf_data[:, col_offset:col_offset + len(nc_tf_cols[tf])] = nc_tf_values
+                col_offset += len(nc_tf_cols[tf])
 
-            # Fill from breakdown
+            # 5. chunk_tf[tf]
+            if tf_chunk_col_indices[tf]:
+                for chunk_idx, chunk in enumerate(chunk_info):
+                    chunk_path = cache_dir / chunk['path']
+                    chunk_mm = np.load(str(chunk_path), mmap_mode='r')
+                    start_row, end_row = chunk_row_ranges[chunk_idx]
+                    if end_row > total_rows:
+                        end_row = total_rows
+                    if start_row >= total_rows:
+                        del chunk_mm
+                        continue
+                    for out_col, in_col in enumerate(tf_chunk_col_indices[tf]):
+                        tf_data[start_row:end_row, col_offset + out_col] = chunk_mm[:end_row - start_row, in_col]
+                    del chunk_mm
+                col_offset += len(tf_chunk_col_indices[tf])
+
+            # 6. monthly_tf[tf]
+            if monthly_mm is not None and tf_monthly_col_indices[tf]:
+                for out_col, in_col in enumerate(tf_monthly_col_indices[tf]):
+                    tf_data[:total_rows, col_offset + out_col] = monthly_mm[:total_rows, in_col]
+                col_offset += len(tf_monthly_col_indices[tf])
+
+            # --- BREAKDOWN ---
+            # 7. breakdown
             tf_data[:, col_offset:col_offset + len(breakdown_columns)] = breakdown_mm[:total_rows, :]
 
             # Build DataFrame for resampling
