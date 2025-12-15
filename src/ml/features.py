@@ -1449,6 +1449,30 @@ class TradingFeatureExtractor(FeatureExtractor):
         del breakdown_chunk_data
         gc.collect()
 
+        # v5.7 fix: Also load w50 columns for monthly/3month from monthly shard
+        # These TFs have their w50 columns in the monthly shard, not in chunks
+        if monthly_shard_info and monthly_columns:
+            monthly_path = cache_dir / monthly_shard_info['path']
+            if monthly_path.exists():
+                monthly_mm_temp = np.load(str(monthly_path), mmap_mode='r')
+                monthly_breakdown_cols_added = 0
+
+                for tf in ['monthly', '3month']:
+                    for col_pattern in [
+                        f'tsla_channel_{tf}_w50_stability',
+                        f'tsla_channel_{tf}_w50_position',
+                        f'spy_channel_{tf}_w50_stability',
+                        f'spy_channel_{tf}_w50_position',
+                    ]:
+                        if col_pattern in monthly_columns:
+                            col_idx = monthly_columns.index(col_pattern)
+                            breakdown_df[col_pattern] = monthly_mm_temp[:total_rows, col_idx]
+                            monthly_breakdown_cols_added += 1
+
+                del monthly_mm_temp
+                if monthly_breakdown_cols_added > 0:
+                    print(f"   ✓ Added {monthly_breakdown_cols_added} monthly/3month w50 columns for breakdown")
+
         # Load non-channel features
         non_channel_path = cache_dir / f"non_channel_features_{cache_key}.pkl"
         non_channel_df = None
