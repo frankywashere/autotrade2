@@ -3430,7 +3430,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         'duration': [],
         'validity': [],
         'transition': [],
-        'calibration': []
+        'calibration': [],
+        'geo_price': []  # v5.7: geometric projection price loss
     }
 
     # v5.3: Diagnostic tracking for transition loss issue
