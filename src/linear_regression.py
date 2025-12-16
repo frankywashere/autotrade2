@@ -65,7 +65,7 @@ class ChannelData:
 
     # Optional fields with defaults (MUST come last in dataclass!)
     actual_duration: int = 0
-    quality_score: float = 0.0  # Composite quality (0-1): v5.3.2: cycles × (0.5 + 0.5 × r²) - bounces primary
+    quality_score: float = 0.0  # Composite quality: v5.3.2: cycles × (0.5 + 0.5 × r²) - unbounded, higher = more cycles with good fit
     is_valid: float = 0.0  # 1.0 if complete_cycles >= 2, else 0.0
     insufficient_data: float = 0.0  # 1.0 if window > available bars, else 0.0
 
