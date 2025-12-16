@@ -3663,14 +3663,23 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                             weight = tf_weights[:, i].detach()
                             multi_tf_loss = multi_tf_loss + (weight * (tf_high_loss + tf_low_loss) / 2).mean()
 
-                        loss = loss + 0.1 * multi_tf_loss
-                        loss_components['multi_tf'] = multi_tf_loss.item()
+                        # v5.7.2: Log weighted contribution so breakdown sums to total
+                        multi_tf_contribution = 0.1 * multi_tf_loss
+                        loss = loss + multi_tf_contribution
+                        loss_components['multi_tf'] = multi_tf_contribution.item()
 
                         # v5.7: ENTROPY REGULARIZATION (encourages diverse TF selection)
-                        entropy = -(tf_weights * torch.log(tf_weights + 1e-8)).sum(dim=-1).mean()
+                        # v5.7.2: Log actual contribution (negative) + raw for monitoring collapse
+                        entropy_raw = -(tf_weights * torch.log(tf_weights + 1e-8)).sum(dim=-1).mean()
                         entropy_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.05)
-                        loss = loss - entropy_weight * entropy  # Subtract to maximize
-                        loss_components['entropy'] = entropy.item()
+                        entropy_contribution = -entropy_weight * entropy_raw
+                        loss = loss + entropy_contribution
+                        loss_components['entropy'] = entropy_contribution.item()
+                        loss_components['entropy_raw'] = entropy_raw.item()
+
+                        # v5.7.2: Track TF weight distribution entropy (for diagnostics, not loss)
+                        mean_weights = tf_weights.detach().mean(dim=0)  # [11]
+                        loss_components['tf_weights_entropy'] = -(mean_weights * torch.log(mean_weights + 1e-8)).sum().item()
 
                     # Multi-task losses (if enabled)
                     mt_loss_total = 0.0
@@ -3858,9 +3867,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
                                 transition_loss_total += tf_weight * (masked_trans + masked_dir)
 
+                    # v5.7.2: Log weighted contribution so breakdown sums to total
                     if transition_loss_total > 0:
-                        loss = loss + transition_weight * transition_loss_total
-                        loss_components['transition'] = transition_loss_total.item()
+                        transition_contribution = transition_weight * transition_loss_total
+                        loss = loss + transition_contribution
+                        loss_components['transition'] = transition_contribution.item()
 
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -3923,37 +3934,48 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         weight = tf_weights[:, i].detach()
                         multi_tf_loss = multi_tf_loss + (weight * (tf_high_loss + tf_low_loss) / 2).mean()
 
-                    loss = loss + 0.1 * multi_tf_loss
-                    loss_components['multi_tf'] = multi_tf_loss.item()
+                    # v5.7.2: Log weighted contribution so breakdown sums to total
+                    multi_tf_contribution = 0.1 * multi_tf_loss
+                    loss = loss + multi_tf_contribution
+                    loss_components['multi_tf'] = multi_tf_contribution.item()
 
                     # =====================================================================
                     # v5.7: ENTROPY REGULARIZATION (encourages diverse TF selection)
                     # =====================================================================
                     # Entropy = -sum(p * log(p)), higher = more uniform selection
                     # We maximize entropy by subtracting from loss
-                    entropy = -(tf_weights * torch.log(tf_weights + 1e-8)).sum(dim=-1).mean()
+                    # v5.7.2: Log actual contribution (negative) + raw for monitoring collapse
+                    entropy_raw = -(tf_weights * torch.log(tf_weights + 1e-8)).sum(dim=-1).mean()
                     entropy_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.05)
-                    loss = loss - entropy_weight * entropy  # Subtract to maximize
-                    loss_components['entropy'] = entropy.item()
+                    entropy_contribution = -entropy_weight * entropy_raw
+                    loss = loss + entropy_contribution
+                    loss_components['entropy'] = entropy_contribution.item()
+                    loss_components['entropy_raw'] = entropy_raw.item()
+
+                    # v5.7.2: Track TF weight distribution entropy (for diagnostics, not loss)
+                    mean_weights = tf_weights.detach().mean(dim=0)  # [11]
+                    loss_components['tf_weights_entropy'] = -(mean_weights * torch.log(mean_weights + 1e-8)).sum().item()
 
                 # Multi-task losses (if enabled)
+                # v5.7.2: Accumulate ALL multi-task losses before logging (matches AMP path)
                 if args.multi_task and 'multi_task' in hidden_states:
                     mt = hidden_states['multi_task']
-                    mt_loss = (0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band']) +
+                    mt_loss_total = (0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band']) +
                               0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target']) +
                               0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return']))
-                    loss = loss + mt_loss
-                    loss_components['multi_task'] = mt_loss.item()
 
                     # Adaptive projection losses (trains the adaptive_projection network)
                     if 'price_change_pct' in mt and 'price_change_pct' in targets:
-                        loss = loss + 0.4 * F.mse_loss(mt['price_change_pct'].squeeze(), targets['price_change_pct'])
-                        loss = loss + 0.3 * F.mse_loss(mt['horizon_bars_log'].squeeze(), targets['horizon_bars_log'])
+                        mt_loss_total = mt_loss_total + 0.4 * F.mse_loss(mt['price_change_pct'].squeeze(), targets['price_change_pct'])
+                        mt_loss_total = mt_loss_total + 0.3 * F.mse_loss(mt['horizon_bars_log'].squeeze(), targets['horizon_bars_log'])
                         # adaptive_confidence uses BCE (sigmoid output vs 0/1 target)
-                        loss = loss + 0.2 * F.binary_cross_entropy(
+                        mt_loss_total = mt_loss_total + 0.2 * F.binary_cross_entropy(
                             mt['adaptive_confidence'].float().squeeze(),
                             targets['adaptive_confidence'].float()
                         )
+
+                    loss = loss + mt_loss_total
+                    loss_components['multi_task'] = mt_loss_total.item()
 
                 # v5.3: Confidence calibration (ALL samples in batch, every 10th batch)
                 if 'layer_predictions' in hidden_states and batch_idx % 10 == 0:
@@ -4132,9 +4154,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
                             transition_loss_total += tf_weight * (masked_trans + masked_dir)
 
+                # v5.7.2: Log weighted contribution so breakdown sums to total
                 if transition_loss_total > 0:
-                    loss = loss + transition_weight * transition_loss_total
-                    loss_components['transition'] = transition_loss_total.item()
+                    transition_contribution = transition_weight * transition_loss_total
+                    loss = loss + transition_contribution
+                    loss_components['transition'] = transition_contribution.item()
                 else:
                     loss_components['transition'] = 0.0
 
@@ -4170,8 +4194,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             num_batches += 1
 
             # v5.3: Accumulate component losses for epoch averaging
+            # v5.7.2: Use setdefault to handle new keys (e.g. entropy_raw) without KeyError
             for component, value in loss_components.items():
-                epoch_components[component].append(value)
+                epoch_components.setdefault(component, []).append(value)
 
             # v5.3.2: Track duration/validity predictions for diagnostics
             if 'duration' in hidden_states and 'selected_tf' in hidden_states:
@@ -4190,6 +4215,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
                 # Print component breakdown every 100 batches for diagnosis
+                # v5.7.2: All values now reflect actual weighted contributions to loss
                 if batch_idx > 0 and batch_idx % 100 == 0:
                     print(f"\n📊 [{batch_idx}] Loss components:")
                     print(f"   Primary: {loss_components.get('primary', 0):.3f}")
@@ -4202,14 +4228,27 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     print(f"   Entropy: {loss_components.get('entropy', 0):.3f}")
                     print(f"   Multi-TF: {loss_components.get('multi_tf', 0):.3f}")
                     print(f"   ─────────────────────")
-                    print(f"   Total: {loss.item():.3f}")
 
-                    # 🔍 Transition diagnostics
-                    if transition_diagnostics['total_batches'] > 0:
-                        match_rate = transition_diagnostics['matches'] / transition_diagnostics['total_batches']
-                        print(f"\n🔍 Transition Training:")
-                        print(f"   Match rate: {match_rate:.1%} ({transition_diagnostics['matches']}/{transition_diagnostics['total_batches']} batches)")
-                        print(f"   Most selected: {max(transition_diagnostics['selected_tf_counts'], key=transition_diagnostics['selected_tf_counts'].get) if transition_diagnostics['selected_tf_counts'] else 'None'}")
+                    # v5.7.2: Verify tracked components sum to total (Fix 5)
+                    CONTRIBUTION_KEYS = ['primary', 'multi_task', 'duration', 'geo_price',
+                                         'validity', 'transition', 'calibration', 'multi_tf', 'entropy']
+                    tracked_sum = sum(loss_components.get(k, 0) for k in CONTRIBUTION_KEYS)
+                    print(f"   Tracked: {tracked_sum:.3f}")
+                    print(f"   Total: {loss.item():.3f}")
+                    delta = loss.item() - tracked_sum
+                    if abs(delta) > 0.01:
+                        print(f"   ⚠️  Untracked: {delta:.3f}")
+
+                    # 🔍 Multi-TF Training diagnostics (v5.7.2: replaces obsolete match rate)
+                    # Count TFs with at least one valid sample (not just keys existing)
+                    tfs_with_valid = sum(
+                        (labels['valid_mask'].sum() > 0).item()
+                        for labels in transition_labels_tensors.values()
+                    )
+                    print(f"\n🔍 Multi-TF Training:")
+                    print(f"   TFs with valid labels: {tfs_with_valid}/11")
+                    print(f"   TF weight entropy: {loss_components.get('tf_weights_entropy', 0):.3f}")
+                    print(f"   Entropy (raw): {loss_components.get('entropy_raw', 0):.3f}")
 
             if profiler and batch_idx > 0 and batch_idx % profiler.log_every_n == 0:
                 profiler.snapshot(f"batch_{batch_idx}", epoch + 1)
@@ -4219,11 +4258,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         # v5.3: Average component losses for this epoch
         for component, values in epoch_components.items():
+            # v5.7.2: Use setdefault to handle new keys without KeyError
             if len(values) > 0:
                 avg_component = sum(values) / len(values)
-                component_history[component].append(avg_component)
+                component_history.setdefault(component, []).append(avg_component)
             else:
-                component_history[component].append(0.0)
+                component_history.setdefault(component, []).append(0.0)
 
         # Validation phase
         model.eval()
