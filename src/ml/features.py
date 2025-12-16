@@ -365,6 +365,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             'is_first_hour',             # v3.11: Market open hour (9:30-10:30 ET)
             'is_last_hour',              # v3.11: Power hour (15:00-16:00 ET)
             'is_volatile_now',
+            'spy_is_volatile_now',       # v5.8: SPY volatility regime flag
             'is_earnings_week',          # v3.10: Within ±14 days of earnings/delivery
             'days_until_earnings',       # v3.10: -14 to +14 days (0 = day of)
             'days_until_fomc',           # v3.10: -14 to +14 days (0 = day of)
@@ -435,7 +436,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         - 15 VIX features (v3.20): vix_level, percentile_20d/252d, change_1d/5d, regime, tsla/spy_corr,
           momentum_10d, ma_ratio, high_low_range, trend_20d, above_20, above_30, spike
         - 54 breakdown/channel enhancement features
-        - 14 binary feature flags (is_monday, is_friday, is_volatile_now, in_channel flags)
+        - 15 binary feature flags (is_monday, is_friday, is_volatile_now, spy_is_volatile_now, in_channel flags)
         - 4 event features (v3.9): is_earnings_week, days_until_earnings, days_until_fomc, is_high_impact_event
         """
         # Extract multi-resolution data if present (for live mode) and remove from attrs to prevent deep copy recursion
@@ -4355,12 +4356,20 @@ class TradingFeatureExtractor(FeatureExtractor):
         breakdown_features['is_first_hour'] = ((hour >= 9) & (hour < 11)).astype(float)  # 9:30-10:30 ET open
         breakdown_features['is_last_hour'] = ((hour >= 15) & (hour < 16)).astype(float)  # 15:00-16:00 ET power hour
 
-        # Volatility regime (uses PAST volatility only - NO LEAKAGE) - Use features_df
+        # Volatility regime - TSLA (uses PAST volatility only - NO LEAKAGE) - Use features_df
         current_vol_10 = features_df['tsla_volatility_10']  # From base features
         historical_avg_vol = current_vol_10.rolling(200, min_periods=20).mean()  # Past 200 bars
 
         breakdown_features['is_volatile_now'] = (
             current_vol_10 > historical_avg_vol * 1.5
+        ).fillna(0).astype(float)
+
+        # Volatility regime - SPY (v5.8: distinguish TSLA-specific vs market-wide volatility)
+        spy_vol_10 = features_df['spy_volatility_10']  # From base features
+        spy_historical_avg_vol = spy_vol_10.rolling(200, min_periods=20).mean()
+
+        breakdown_features['spy_is_volatile_now'] = (
+            spy_vol_10 > spy_historical_avg_vol * 1.5
         ).fillna(0).astype(float)
 
         # In channel binary flags (for key timeframes)
@@ -4585,7 +4594,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             breakdown_features['is_first_hour'] = np.zeros(num_rows)
             breakdown_features['is_last_hour'] = np.zeros(num_rows)
 
-        # 9. Volatility regime flag
+        # 9. Volatility regime flag - TSLA
         if 'tsla_close' in resampled_df.columns and len(resampled_df) >= 50:
             tsla_close = resampled_df['tsla_close']
             current_vol = tsla_close.pct_change().rolling(10, min_periods=1).std()
@@ -4594,6 +4603,16 @@ class TradingFeatureExtractor(FeatureExtractor):
             breakdown_features['is_volatile_now'] = np.asarray(is_volatile)
         else:
             breakdown_features['is_volatile_now'] = np.zeros(num_rows)
+
+        # 9b. Volatility regime flag - SPY (v5.8)
+        if 'spy_close' in resampled_df.columns and len(resampled_df) >= 50:
+            spy_close = resampled_df['spy_close']
+            spy_vol = spy_close.pct_change().rolling(10, min_periods=1).std()
+            spy_hist_vol = spy_vol.rolling(50, min_periods=10).mean()
+            spy_volatile = (spy_vol > 1.5 * spy_hist_vol).fillna(False).astype(float)
+            breakdown_features['spy_is_volatile_now'] = np.asarray(spy_volatile)
+        else:
+            breakdown_features['spy_is_volatile_now'] = np.zeros(num_rows)
 
         # 10. In-channel binary flags (for THIS TF)
         for symbol in ['tsla', 'spy']:
@@ -4759,7 +4778,7 @@ class TradingFeatureExtractor(FeatureExtractor):
             all_breakdown['is_first_hour'] = np.zeros(num_rows)
             all_breakdown['is_last_hour'] = np.zeros(num_rows)
 
-        # Volatility regime
+        # Volatility regime - TSLA
         if 'tsla_close' in features_df.columns and num_rows >= 50:
             tsla_close = features_df['tsla_close']
             current_vol = tsla_close.pct_change().rolling(10, min_periods=1).std()
@@ -4768,6 +4787,16 @@ class TradingFeatureExtractor(FeatureExtractor):
             all_breakdown['is_volatile_now'] = np.asarray(is_volatile)
         else:
             all_breakdown['is_volatile_now'] = np.zeros(num_rows)
+
+        # Volatility regime - SPY (v5.8: distinguish TSLA-specific vs market-wide volatility)
+        if 'spy_close' in features_df.columns and num_rows >= 50:
+            spy_close = features_df['spy_close']
+            spy_vol = spy_close.pct_change().rolling(10, min_periods=1).std()
+            spy_hist_vol = spy_vol.rolling(50, min_periods=10).mean()
+            spy_volatile = (spy_vol > 1.5 * spy_hist_vol).fillna(False).astype(float)
+            all_breakdown['spy_is_volatile_now'] = np.asarray(spy_volatile)
+        else:
+            all_breakdown['spy_is_volatile_now'] = np.zeros(num_rows)
 
         # Event features (zeros for now - events not critical)
         all_breakdown['is_earnings_week'] = np.zeros(num_rows)

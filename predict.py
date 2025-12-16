@@ -639,7 +639,7 @@ class LiveFeatureExtractor:
                 warnings.warn(f"Feature extraction failed for {tf}: {e}")
                 # Create zero tensor as fallback
                 seq_len = self.sequence_lengths.get(tf, 100)
-                num_features = 1048 if tf in ['monthly', '3month'] else 1104
+                num_features = 1049  # All TFs have 1049 features (v5.8+: added spy_is_volatile_now)
                 tf_features[tf] = torch.zeros(1, seq_len, num_features)
 
         return tf_features
