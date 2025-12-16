@@ -1673,8 +1673,8 @@ def interactive_setup(args, profiler=None):
             print(f"   Effective batch size: {args.batch_size} x {args.num_ddp_gpus} = {args.batch_size * args.num_ddp_gpus}")
             print(f"   Note: DDP forces Full Pre-merge mode (adaptive not compatible)")
 
-    # Consolidated precision menu for CUDA (combines AMP + base precision)
-    args.amp = False  # Default to disabled
+    # Consolidated precision menu for CUDA
+    # v5.7.2: Removed AMP (FP16) - caused NaN issues and duplicated code
     args.precision_mode = 'fp32'  # Track the user's choice
     args.use_tf32 = False  # v5.3: TF32 Tensor Core acceleration
 
@@ -1685,7 +1685,6 @@ def interactive_setup(args, profiler=None):
             choices=[
                 Choice(value='fp32_tf32', name="FP32 with TF32 Tensor Cores ⭐ Recommended (~2x faster)"),
                 Choice(value='fp32', name="FP32 Standard (no acceleration)"),
-                Choice(value='fp16_amp', name="FP16 (AMP) - ⚠️ Causes NaN in v5.3"),
                 Choice(value='fp64', name="FP64 - Double precision (very slow)")
             ],
             default=dflt('precision_mode', 'fp32_tf32')
@@ -1694,7 +1693,6 @@ def interactive_setup(args, profiler=None):
         args.precision_mode = precision_choice
 
         if precision_choice == 'fp32_tf32':
-            args.amp = False
             args.use_tf32 = True
             torch.set_float32_matmul_precision('medium')  # Enable TF32
             project_config.TRAINING_PRECISION = 'float32'
@@ -1704,24 +1702,13 @@ def interactive_setup(args, profiler=None):
             print("   → Ampere+ GPU acceleration (~2x matmul speedup)")
             print("   → Stable (no NaN, same range as FP32)")
         elif precision_choice == 'fp32':
-            args.amp = False
             args.use_tf32 = False
             torch.set_float32_matmul_precision('highest')  # Disable TF32
             project_config.TRAINING_PRECISION = 'float32'
             project_config.NUMPY_DTYPE = np.float32
             project_config._TORCH_DTYPE = torch.float32
             print("   → FP32 Standard - Highest precision (slower)")
-        elif precision_choice == 'fp16_amp':
-            args.amp = True
-            args.use_tf32 = False
-            project_config.TRAINING_PRECISION = 'float32'
-            project_config.NUMPY_DTYPE = np.float32
-            project_config._TORCH_DTYPE = torch.float32
-            print("   ⚠️  FP16 (AMP) - Mixed precision training")
-            print("   → Known issue: Causes NaN in duration NLL loss")
-            print("   → Not recommended for v5.3.1 (use FP32+TF32 instead)")
         else:  # fp64
-            args.amp = False
             args.use_tf32 = False
             project_config.TRAINING_PRECISION = 'float64'
             project_config.NUMPY_DTYPE = np.float64
@@ -1771,7 +1758,6 @@ def interactive_setup(args, profiler=None):
         # MPS only supports float32
         print()
         print("   ℹ️  MPS uses FP32 precision (float64 not supported)")
-        args.amp = False
         project_config.TRAINING_PRECISION = 'float32'
         project_config.NUMPY_DTYPE = np.float32
         project_config._TORCH_DTYPE = torch.float32
@@ -2428,11 +2414,12 @@ def interactive_setup(args, profiler=None):
         chunk_str += f" → {chunk_path}"
 
     # Format precision display
+    # v5.7.2: Removed AMP option
     precision_mode = getattr(args, 'precision_mode', 'fp32')
-    if precision_mode == 'fp16_amp':
-        precision_display = "FP16 (AMP) ⚡"
-    elif precision_mode == 'fp64':
+    if precision_mode == 'fp64':
         precision_display = "FP64"
+    elif precision_mode == 'fp32_tf32':
+        precision_display = "FP32 (TF32) ⚡"
     else:
         precision_display = "FP32"
 
@@ -3368,12 +3355,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         min_lr=1e-6           # Don't go below this
     )
 
-    # AMP scaler for mixed precision
-    scaler = None
-    if args.amp and args.device.startswith('cuda'):
-        scaler = torch.amp.GradScaler('cuda')
-        if is_main_process(rank):
-            print("   ✓ AMP enabled (FP16 training)")
+    # v5.7.2: Removed AMP/GradScaler (caused NaN issues, use TF32 instead)
 
     # =========================================================================
     # RESUME FROM CHECKPOINT (if requested)
@@ -3611,577 +3593,311 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 _progress_thread = threading.Thread(target=_print_compile_progress, daemon=True)
                 _progress_thread.start()
 
-            # Forward pass with optional AMP
-            if scaler is not None:
-                with torch.amp.autocast('cuda'):
-                    # v5.2: Pass VIX sequence and events to model
-                    predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
+            # Forward pass (v5.7.2: removed AMP, use TF32 instead)
+            predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
 
-                    # 🛡️ NaN Check: Predictions
-                    if not torch.isfinite(predictions).all():
-                        print(f"\n🚨 NaN/Inf in predictions at batch {batch_idx}!")
-                        raise ValueError("Non-finite predictions detected")
+            # 🛡️ NaN Check 1: Predictions
+            if not torch.isfinite(predictions).all():
+                print(f"\n🚨 NaN/Inf in predictions at batch {batch_idx}, epoch {epoch}!")
+                print(f"   Min: {predictions.min().item()}, Max: {predictions.max().item()}")
+                raise ValueError("Non-finite predictions - training aborted")
 
-                    # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
-                    target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+            # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
+            target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
 
-                    # 🛡️ NaN Check: Targets
-                    if not torch.isfinite(target_tensor).all():
-                        print(f"\n🚨 NaN/Inf in targets!")
-                        raise ValueError("Non-finite targets")
+            # 🛡️ NaN Check 2: Targets
+            if not torch.isfinite(target_tensor).all():
+                print(f"\n🚨 NaN/Inf in targets at batch {batch_idx}!")
+                raise ValueError("Non-finite targets detected")
 
-                    primary_loss = F.mse_loss(predictions[:, :2], target_tensor)
-                    loss = primary_loss
-                    loss_components['primary'] = primary_loss.item()  # v5.7.1: Track in AMP path
+            # loss_components initialized before if/else block (v5.7)
 
-                    # 🛡️ NaN Check: Loss
-                    if not torch.isfinite(loss):
-                        print(f"\n🚨 NaN/Inf loss at batch {batch_idx}!")
-                        raise ValueError("Non-finite loss")
+            primary_loss = F.mse_loss(predictions[:, :2], target_tensor)
+            loss = primary_loss
+            loss_components['primary'] = primary_loss.item()
 
-                    # Debug: Print target/prediction stats on first batch
-                    if batch_idx == 0 and epoch == 0:
-                        print(f"[DEBUG] targets high: mean={target_tensor[:,0].mean():.2f}%, min={target_tensor[:,0].min():.2f}%, max={target_tensor[:,0].max():.2f}%", flush=True)
-                        print(f"[DEBUG] targets low: mean={target_tensor[:,1].mean():.2f}%, min={target_tensor[:,1].min():.2f}%, max={target_tensor[:,1].max():.2f}%", flush=True)
-                        print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.3f}, std={predictions[:,:2].std():.3f}", flush=True)
-                        print(f"[DEBUG] primary loss (high/low MSE): {loss.item():.4f}", flush=True)
+            # 🛡️ NaN Check 3: Loss
+            if not torch.isfinite(loss):
+                print(f"\n🚨 NaN/Inf loss at batch {batch_idx}!")
+                print(f"   Predictions: mean={predictions[:,:2].mean().item()}, std={predictions[:,:2].std().item()}")
+                print(f"   Targets: mean={target_tensor.mean().item()}, std={target_tensor.std().item()}")
+                raise ValueError("Non-finite loss - check for exploding gradients or bad data")
 
-                    # =====================================================================
-                    # v5.7: MULTI-TF LOSS (all timeframes contribute, fixes mode collapse)
-                    # =====================================================================
-                    if 'per_tf_predictions' in hidden_states and 'tf_weights' in hidden_states:
-                        per_tf_preds = hidden_states['per_tf_predictions']
-                        tf_weights = hidden_states['tf_weights']  # [batch, 11]
+            # Debug: Print target/prediction stats on first batch
+            if batch_idx == 0 and epoch == 0:
+                print(f"[DEBUG] targets high: mean={target_tensor[:,0].mean():.2f}%, min={target_tensor[:,0].min():.2f}%, max={target_tensor[:,0].max():.2f}%", flush=True)
+                print(f"[DEBUG] targets low: mean={target_tensor[:,1].mean():.2f}%, min={target_tensor[:,1].min():.2f}%, max={target_tensor[:,1].max():.2f}%", flush=True)
+                print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.3f}, std={predictions[:,:2].std():.3f}", flush=True)
+                print(f"[DEBUG] primary loss (high/low MSE): {loss.item():.4f}", flush=True)
 
-                        per_tf_highs = per_tf_preds['highs']  # [batch, 11]
-                        per_tf_lows = per_tf_preds['lows']    # [batch, 11]
+            # =====================================================================
+            # v5.7: MULTI-TF LOSS (all timeframes contribute, fixes mode collapse)
+            # =====================================================================
+            # Each TF's predictions are weighted by Gumbel-Softmax confidence
+            if 'per_tf_predictions' in hidden_states and 'tf_weights' in hidden_states:
+                per_tf_preds = hidden_states['per_tf_predictions']
+                tf_weights = hidden_states['tf_weights']  # [batch, 11] from Gumbel-Softmax
 
-                        multi_tf_loss = 0.0
-                        for i in range(11):  # 11 timeframes
-                            tf_high_loss = F.mse_loss(per_tf_highs[:, i], target_tensor[:, 0], reduction='none')
-                            tf_low_loss = F.mse_loss(per_tf_lows[:, i], target_tensor[:, 1], reduction='none')
-                            weight = tf_weights[:, i].detach()
-                            multi_tf_loss = multi_tf_loss + (weight * (tf_high_loss + tf_low_loss) / 2).mean()
+                per_tf_highs = per_tf_preds['highs']  # [batch, 11]
+                per_tf_lows = per_tf_preds['lows']    # [batch, 11]
 
-                        # v5.7.2: Log weighted contribution so breakdown sums to total
-                        multi_tf_contribution = 0.1 * multi_tf_loss
-                        loss = loss + multi_tf_contribution
-                        loss_components['multi_tf'] = multi_tf_contribution.item()
+                multi_tf_loss = 0.0
+                for i in range(11):  # 11 timeframes
+                    # MSE for each TF's high/low predictions
+                    tf_high_loss = F.mse_loss(per_tf_highs[:, i], target_tensor[:, 0], reduction='none')
+                    tf_low_loss = F.mse_loss(per_tf_lows[:, i], target_tensor[:, 1], reduction='none')
+                    # Weight by Gumbel-Softmax confidence (detached to not affect confidence learning)
+                    weight = tf_weights[:, i].detach()
+                    multi_tf_loss = multi_tf_loss + (weight * (tf_high_loss + tf_low_loss) / 2).mean()
 
-                        # v5.7: ENTROPY REGULARIZATION (encourages diverse TF selection)
-                        # v5.7.2: Log actual contribution (negative) + raw for monitoring collapse
-                        entropy_raw = -(tf_weights * torch.log(tf_weights + 1e-8)).sum(dim=-1).mean()
-                        entropy_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.05)
-                        entropy_contribution = -entropy_weight * entropy_raw
-                        loss = loss + entropy_contribution
-                        loss_components['entropy'] = entropy_contribution.item()
-                        loss_components['entropy_raw'] = entropy_raw.item()
-
-                        # v5.7.2: Track TF weight distribution entropy (for diagnostics, not loss)
-                        mean_weights = tf_weights.detach().mean(dim=0)  # [11]
-                        loss_components['tf_weights_entropy'] = -(mean_weights * torch.log(mean_weights + 1e-8)).sum().item()
-
-                    # Multi-task losses (if enabled)
-                    mt_loss_total = 0.0
-                    if args.multi_task and 'multi_task' in hidden_states:
-                        mt = hidden_states['multi_task']
-                        mt_loss_total += 0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band'])
-                        mt_loss_total += 0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target'])
-                        mt_loss_total += 0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return'])
-
-                        # Adaptive projection losses (trains the adaptive_projection network)
-                        if 'price_change_pct' in mt and 'price_change_pct' in targets:
-                            mt_loss_total += 0.4 * F.mse_loss(mt['price_change_pct'].squeeze(), targets['price_change_pct'])
-                            mt_loss_total += 0.3 * F.mse_loss(mt['horizon_bars_log'].squeeze(), targets['horizon_bars_log'])
-                            # adaptive_confidence uses BCE (sigmoid output vs 0/1 target)
-                            mt_loss_total += 0.2 * F.binary_cross_entropy(
-                                mt['adaptive_confidence'].float().squeeze(),
-                                targets['adaptive_confidence'].float()
-                            )
-                        loss = loss + mt_loss_total
-                        loss_components['multi_task'] = mt_loss_total.item()  # v5.7.1: Track in AMP
-
-                    # v5.3: Confidence calibration (ALL samples in batch, every 10th batch)
-                    # v5.7.1: Now inside autocast for consistent gradient flow
-                    if 'layer_predictions' in hidden_states and batch_idx % 10 == 0:
-                        calib_loss_total = 0.0
-                        num_calibrated = 0
-
-                        for tf_name, preds in hidden_states['layer_predictions'].items():
-                            # preds: [batch_size, 3]
-                            for sample_idx in range(preds.shape[0]):
-                                pred_high = preds[sample_idx, 0]
-                                conf = preds[sample_idx, 2]
-                                target_high = target_tensor[sample_idx, 0]
-
-                                error = torch.abs(pred_high - target_high)
-                                accuracy = (1.0 - error / (torch.abs(target_high) + 1e-6).clamp(0, 2)).clamp(0, 1)
-                                calib_loss_total += (conf - accuracy.detach()) ** 2
-                                num_calibrated += 1
-
-                        if num_calibrated > 0:
-                            calib_component = 0.05 * (calib_loss_total / num_calibrated)
-                            loss = loss + calib_component
-                            loss_components['calibration'] = calib_component.item()
-
-                    # =====================================================================
-                    # v5.7.1: GEOMETRIC PROJECTION LOSS (now inside autocast)
-                    # =====================================================================
-                    # Compare geometric projections (duration → calculated high/low) to actual
-                    # This validates that the geometric calculation produces correct prices
-                    geo_price_loss_total = 0.0
-                    if 'geometric_predictions' in hidden_states:
-                        for tf, geo_data in hidden_states['geometric_predictions'].items():
-                            if 'high' in geo_data and 'low' in geo_data:
-                                geo_high = geo_data['high'].squeeze()
-                                geo_low = geo_data['low'].squeeze()
-
-                                # Compare to actual high/low targets
-                                target_high = target_tensor[:, 0]
-                                target_low = target_tensor[:, 1]
-
-                                # MSE between geometric projection and actual
-                                geo_high_loss = F.mse_loss(geo_high, target_high)
-                                geo_low_loss = F.mse_loss(geo_low, target_low)
-
-                                # Apply warmup weight
-                                geo_price_loss_total += geo_price_weight * (geo_high_loss + geo_low_loss) / 2
-
-                    if geo_price_loss_total > 0:
-                        loss = loss + geo_price_loss_total
-                        loss_components['geo_price'] = geo_price_loss_total.item() if hasattr(geo_price_loss_total, 'item') else geo_price_loss_total
-
-                    # =====================================================================
-                    # v5.7.1: PER-SAMPLE VALIDITY MASKS AND LABELS (fixes batch-global bug)
-                    # =====================================================================
-                    # Build per-TF tensors: validity masks [batch], labels [batch]
-                    TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
-                    batch_size = predictions.shape[0]
-
-                    # Transition labels as full tensors (not scalars from [0])
-                    transition_labels_tensors = {}
-                    for tf in TIMEFRAMES:
-                        trans_type_key = f'trans_{tf}_type'
-                        trans_valid_key = f'trans_{tf}_valid'
-                        trans_dir_key = f'trans_{tf}_direction'
-
-                        if trans_type_key in targets:
-                            # Keep as [batch] tensors, not scalars!
-                            trans_valid = targets.get(trans_valid_key, torch.zeros(batch_size, device=args.device))
-                            trans_type = targets[trans_type_key]  # [batch]
-                            trans_dir = targets.get(trans_dir_key, torch.ones(batch_size, device=args.device))  # [batch]
-
-                            transition_labels_tensors[tf] = {
-                                'valid_mask': trans_valid.float(),  # [batch] - 1.0 for valid, 0.0 for invalid
-                                'transition_type': trans_type.long(),  # [batch]
-                                'direction': trans_dir.long(),  # [batch]
-                            }
-
-                    # Duration NLL loss - v5.7.1: per-sample validity
-                    duration_loss_total = 0.0
-                    if 'duration' in hidden_states:
-                        for tf, dur_data in hidden_states['duration'].items():
-                            target_dur_key = f'cont_{tf}_duration'
-                            cont_valid_key = f'cont_{tf}_valid'
-
-                            if target_dur_key in targets:
-                                # Per-sample validity mask
-                                valid_mask = targets.get(cont_valid_key, torch.zeros(batch_size, device=args.device)).float()
-                                num_valid = valid_mask.sum()
-
-                                if num_valid > 0:
-                                    mean = dur_data['mean'].squeeze()
-                                    log_std = dur_data['log_std'].squeeze()
-                                    target_dur = targets[target_dur_key].squeeze()
-                                    variance = torch.exp(2 * log_std) + 1e-6
-
-                                    # Per-sample NLL, then apply mask
-                                    nll = 0.5 * ((target_dur - mean) ** 2 / variance + 2 * log_std)
-                                    masked_nll = (nll * valid_mask).sum() / (num_valid + 1e-8)
-                                    duration_loss_total += duration_weight * masked_nll
-
-                    if duration_loss_total > 0:
-                        loss = loss + duration_loss_total
-                        loss_components['duration'] = duration_loss_total.item()
-
-                    # Validity loss - v5.7.1: per-sample
-                    validity_loss_total = 0.0
-                    if 'validity' in hidden_states:
-                        for tf, validity_pred in hidden_states['validity'].items():
-                            if tf in transition_labels_tensors:
-                                labels = transition_labels_tensors[tf]
-                                valid_mask = labels['valid_mask']  # [batch]
-                                num_valid = valid_mask.sum()
-
-                                if num_valid > 0:
-                                    # Target: 1.0 if transition_type == 0 (CONTINUE), else 0.0
-                                    target_validity = (labels['transition_type'] == 0).float()  # [batch]
-
-                                    # Per-sample BCE, then apply mask
-                                    per_sample_loss = F.binary_cross_entropy(
-                                        validity_pred.squeeze(),
-                                        target_validity,
-                                        reduction='none'
-                                    )
-                                    masked_loss = (per_sample_loss * valid_mask).sum() / (num_valid + 1e-8)
-                                    validity_loss_total += validity_weight * masked_loss
-
-                    if validity_loss_total > 0:
-                        loss = loss + validity_loss_total
-                        loss_components['validity'] = validity_loss_total.item()
-
-                    # =====================================================================
-                    # v5.7.1: COMPOSITOR MULTI-TF TRAINING (per-sample labels)
-                    # =====================================================================
-                    transition_loss_total = 0.0
-                    for tf, labels in transition_labels_tensors.items():
-                        compositor_key = f'compositor_{tf}'
-                        if compositor_key in hidden_states:
-                            comp = hidden_states[compositor_key]
-                            valid_mask = labels['valid_mask']  # [batch]
-                            num_valid = valid_mask.sum()
-
-                            if num_valid > 0:
-                                # Get TF weight from Gumbel-Softmax (detached)
-                                if 'tf_weights' in hidden_states:
-                                    tf_idx = TIMEFRAMES.index(tf)
-                                    tf_weight = hidden_states['tf_weights'][:, tf_idx].mean().detach()
-                                else:
-                                    tf_weight = 1.0 / len(transition_labels_tensors)
-
-                                # Per-sample cross entropy with mask
-                                trans_loss_per_sample = F.cross_entropy(
-                                    comp['transition_logits'],
-                                    labels['transition_type'],  # [batch] - full tensor!
-                                    reduction='none'
-                                )
-                                dir_loss_per_sample = F.cross_entropy(
-                                    comp['direction_logits'],
-                                    labels['direction'],  # [batch] - full tensor!
-                                    reduction='none'
-                                )
-
-                                # Apply validity mask
-                                masked_trans = (trans_loss_per_sample * valid_mask).sum() / (num_valid + 1e-8)
-                                masked_dir = (dir_loss_per_sample * valid_mask).sum() / (num_valid + 1e-8)
-
-                                transition_loss_total += tf_weight * (masked_trans + masked_dir)
-
-                    # v5.7.2: Log weighted contribution so breakdown sums to total
-                    if transition_loss_total > 0:
-                        transition_contribution = transition_weight * transition_loss_total
-                        loss = loss + transition_contribution
-                        loss_components['transition'] = transition_contribution.item()
-
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                # v5.2: Pass VIX sequence and events to model
-                predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
-
-                # 🛡️ NaN Check 1: Predictions
-                if not torch.isfinite(predictions).all():
-                    print(f"\n🚨 NaN/Inf in predictions at batch {batch_idx}, epoch {epoch}!")
-                    print(f"   Min: {predictions.min().item()}, Max: {predictions.max().item()}")
-                    raise ValueError("Non-finite predictions - training aborted")
-
-                # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
-                target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
-
-                # 🛡️ NaN Check 2: Targets
-                if not torch.isfinite(target_tensor).all():
-                    print(f"\n🚨 NaN/Inf in targets at batch {batch_idx}!")
-                    raise ValueError("Non-finite targets detected")
-
-                # loss_components initialized before if/else block (v5.7)
-
-                primary_loss = F.mse_loss(predictions[:, :2], target_tensor)
-                loss = primary_loss
-                loss_components['primary'] = primary_loss.item()
-
-                # 🛡️ NaN Check 3: Loss
-                if not torch.isfinite(loss):
-                    print(f"\n🚨 NaN/Inf loss at batch {batch_idx}!")
-                    print(f"   Predictions: mean={predictions[:,:2].mean().item()}, std={predictions[:,:2].std().item()}")
-                    print(f"   Targets: mean={target_tensor.mean().item()}, std={target_tensor.std().item()}")
-                    raise ValueError("Non-finite loss - check for exploding gradients or bad data")
-
-                # Debug: Print target/prediction stats on first batch
-                if batch_idx == 0 and epoch == 0:
-                    print(f"[DEBUG] targets high: mean={target_tensor[:,0].mean():.2f}%, min={target_tensor[:,0].min():.2f}%, max={target_tensor[:,0].max():.2f}%", flush=True)
-                    print(f"[DEBUG] targets low: mean={target_tensor[:,1].mean():.2f}%, min={target_tensor[:,1].min():.2f}%, max={target_tensor[:,1].max():.2f}%", flush=True)
-                    print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.3f}, std={predictions[:,:2].std():.3f}", flush=True)
-                    print(f"[DEBUG] primary loss (high/low MSE): {loss.item():.4f}", flush=True)
+                # v5.7.2: Log weighted contribution so breakdown sums to total
+                multi_tf_contribution = 0.1 * multi_tf_loss
+                loss = loss + multi_tf_contribution
+                loss_components['multi_tf'] = multi_tf_contribution.item()
 
                 # =====================================================================
-                # v5.7: MULTI-TF LOSS (all timeframes contribute, fixes mode collapse)
+                # v5.7: ENTROPY REGULARIZATION (encourages diverse TF selection)
                 # =====================================================================
-                # Each TF's predictions are weighted by Gumbel-Softmax confidence
-                if 'per_tf_predictions' in hidden_states and 'tf_weights' in hidden_states:
-                    per_tf_preds = hidden_states['per_tf_predictions']
-                    tf_weights = hidden_states['tf_weights']  # [batch, 11] from Gumbel-Softmax
+                # Entropy = -sum(p * log(p)), higher = more uniform selection
+                # We maximize entropy by subtracting from loss
+                # v5.7.2: Log actual contribution (negative) + raw for monitoring collapse
+                entropy_raw = -(tf_weights * torch.log(tf_weights + 1e-8)).sum(dim=-1).mean()
+                entropy_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.05)
+                entropy_contribution = -entropy_weight * entropy_raw
+                loss = loss + entropy_contribution
+                loss_components['entropy'] = entropy_contribution.item()
+                loss_components['entropy_raw'] = entropy_raw.item()
 
-                    per_tf_highs = per_tf_preds['highs']  # [batch, 11]
-                    per_tf_lows = per_tf_preds['lows']    # [batch, 11]
+                # v5.7.2: Track TF weight distribution entropy (for diagnostics, not loss)
+                mean_weights = tf_weights.detach().mean(dim=0)  # [11]
+                loss_components['tf_weights_entropy'] = -(mean_weights * torch.log(mean_weights + 1e-8)).sum().item()
 
-                    multi_tf_loss = 0.0
-                    for i in range(11):  # 11 timeframes
-                        # MSE for each TF's high/low predictions
-                        tf_high_loss = F.mse_loss(per_tf_highs[:, i], target_tensor[:, 0], reduction='none')
-                        tf_low_loss = F.mse_loss(per_tf_lows[:, i], target_tensor[:, 1], reduction='none')
-                        # Weight by Gumbel-Softmax confidence (detached to not affect confidence learning)
-                        weight = tf_weights[:, i].detach()
-                        multi_tf_loss = multi_tf_loss + (weight * (tf_high_loss + tf_low_loss) / 2).mean()
+            # Multi-task losses (if enabled)
+            # v5.7.2: Accumulate ALL multi-task losses before logging (matches AMP path)
+            if args.multi_task and 'multi_task' in hidden_states:
+                mt = hidden_states['multi_task']
+                mt_loss_total = (0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band']) +
+                          0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target']) +
+                          0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return']))
 
-                    # v5.7.2: Log weighted contribution so breakdown sums to total
-                    multi_tf_contribution = 0.1 * multi_tf_loss
-                    loss = loss + multi_tf_contribution
-                    loss_components['multi_tf'] = multi_tf_contribution.item()
+                # Adaptive projection losses (trains the adaptive_projection network)
+                if 'price_change_pct' in mt and 'price_change_pct' in targets:
+                    mt_loss_total = mt_loss_total + 0.4 * F.mse_loss(mt['price_change_pct'].squeeze(), targets['price_change_pct'])
+                    mt_loss_total = mt_loss_total + 0.3 * F.mse_loss(mt['horizon_bars_log'].squeeze(), targets['horizon_bars_log'])
+                    # adaptive_confidence uses BCE (sigmoid output vs 0/1 target)
+                    mt_loss_total = mt_loss_total + 0.2 * F.binary_cross_entropy(
+                        mt['adaptive_confidence'].float().squeeze(),
+                        targets['adaptive_confidence'].float()
+                    )
 
-                    # =====================================================================
-                    # v5.7: ENTROPY REGULARIZATION (encourages diverse TF selection)
-                    # =====================================================================
-                    # Entropy = -sum(p * log(p)), higher = more uniform selection
-                    # We maximize entropy by subtracting from loss
-                    # v5.7.2: Log actual contribution (negative) + raw for monitoring collapse
-                    entropy_raw = -(tf_weights * torch.log(tf_weights + 1e-8)).sum(dim=-1).mean()
-                    entropy_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.05)
-                    entropy_contribution = -entropy_weight * entropy_raw
-                    loss = loss + entropy_contribution
-                    loss_components['entropy'] = entropy_contribution.item()
-                    loss_components['entropy_raw'] = entropy_raw.item()
+                loss = loss + mt_loss_total
+                loss_components['multi_task'] = mt_loss_total.item()
 
-                    # v5.7.2: Track TF weight distribution entropy (for diagnostics, not loss)
-                    mean_weights = tf_weights.detach().mean(dim=0)  # [11]
-                    loss_components['tf_weights_entropy'] = -(mean_weights * torch.log(mean_weights + 1e-8)).sum().item()
+            # v5.3: Confidence calibration (ALL samples in batch, every 10th batch)
+            if 'layer_predictions' in hidden_states and batch_idx % 10 == 0:
+                calib_loss_total = 0.0
+                num_calibrated = 0
 
-                # Multi-task losses (if enabled)
-                # v5.7.2: Accumulate ALL multi-task losses before logging (matches AMP path)
-                if args.multi_task and 'multi_task' in hidden_states:
-                    mt = hidden_states['multi_task']
-                    mt_loss_total = (0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band']) +
-                              0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target']) +
-                              0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return']))
+                for tf_name, preds in hidden_states['layer_predictions'].items():
+                    # preds: [batch_size, 3]
+                    for sample_idx in range(preds.shape[0]):
+                        pred_high = preds[sample_idx, 0]
+                        conf = preds[sample_idx, 2]
+                        target_high = target_tensor[sample_idx, 0]
 
-                    # Adaptive projection losses (trains the adaptive_projection network)
-                    if 'price_change_pct' in mt and 'price_change_pct' in targets:
-                        mt_loss_total = mt_loss_total + 0.4 * F.mse_loss(mt['price_change_pct'].squeeze(), targets['price_change_pct'])
-                        mt_loss_total = mt_loss_total + 0.3 * F.mse_loss(mt['horizon_bars_log'].squeeze(), targets['horizon_bars_log'])
-                        # adaptive_confidence uses BCE (sigmoid output vs 0/1 target)
-                        mt_loss_total = mt_loss_total + 0.2 * F.binary_cross_entropy(
-                            mt['adaptive_confidence'].float().squeeze(),
-                            targets['adaptive_confidence'].float()
-                        )
+                        error = torch.abs(pred_high - target_high)
+                        accuracy = (1.0 - error / (torch.abs(target_high) + 1e-6).clamp(0, 2)).clamp(0, 1)
+                        calib_loss_total += (conf - accuracy.detach()) ** 2
+                        num_calibrated += 1
 
-                    loss = loss + mt_loss_total
-                    loss_components['multi_task'] = mt_loss_total.item()
+                if num_calibrated > 0:
+                    calib_component = 0.05 * (calib_loss_total / num_calibrated)
+                    loss = loss + calib_component
+                    loss_components['calibration'] = calib_component.item()
 
-                # v5.3: Confidence calibration (ALL samples in batch, every 10th batch)
-                if 'layer_predictions' in hidden_states and batch_idx % 10 == 0:
-                    calib_loss_total = 0.0
-                    num_calibrated = 0
+            # =====================================================================
+            # v5.7.1: PER-SAMPLE VALIDITY MASKS AND LABELS (fixes batch-global bug)
+            # =====================================================================
+            TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+            batch_size = predictions.shape[0]
 
-                    for tf_name, preds in hidden_states['layer_predictions'].items():
-                        # preds: [batch_size, 3]
-                        for sample_idx in range(preds.shape[0]):
-                            pred_high = preds[sample_idx, 0]
-                            conf = preds[sample_idx, 2]
-                            target_high = target_tensor[sample_idx, 0]
+            # Transition labels as full tensors (not scalars from [0])
+            transition_labels_tensors = {}
+            for tf in TIMEFRAMES:
+                trans_type_key = f'trans_{tf}_type'
+                trans_valid_key = f'trans_{tf}_valid'
+                trans_dir_key = f'trans_{tf}_direction'
 
-                            error = torch.abs(pred_high - target_high)
-                            accuracy = (1.0 - error / (torch.abs(target_high) + 1e-6).clamp(0, 2)).clamp(0, 1)
-                            calib_loss_total += (conf - accuracy.detach()) ** 2
-                            num_calibrated += 1
+                if trans_type_key in targets:
+                    # Keep as [batch] tensors, not scalars!
+                    trans_valid = targets.get(trans_valid_key, torch.zeros(batch_size, device=args.device))
+                    trans_type = targets[trans_type_key]  # [batch]
+                    trans_dir = targets.get(trans_dir_key, torch.ones(batch_size, device=args.device))  # [batch]
 
-                    if num_calibrated > 0:
-                        calib_component = 0.05 * (calib_loss_total / num_calibrated)
-                        loss = loss + calib_component
-                        loss_components['calibration'] = calib_component.item()
+                    transition_labels_tensors[tf] = {
+                        'valid_mask': trans_valid.float(),  # [batch] - 1.0 for valid, 0.0 for invalid
+                        'transition_type': trans_type.long(),  # [batch]
+                        'direction': trans_dir.long(),  # [batch]
+                    }
 
-                # =====================================================================
-                # v5.7.1: PER-SAMPLE VALIDITY MASKS AND LABELS (fixes batch-global bug)
-                # =====================================================================
-                TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
-                batch_size = predictions.shape[0]
+            # Duration NLL loss - v5.7.1: per-sample validity
+            duration_loss_total = 0.0
+            if 'duration' in hidden_states:
+                for tf, dur_data in hidden_states['duration'].items():
+                    target_dur_key = f'cont_{tf}_duration'
+                    cont_valid_key = f'cont_{tf}_valid'
 
-                # Transition labels as full tensors (not scalars from [0])
-                transition_labels_tensors = {}
-                for tf in TIMEFRAMES:
-                    trans_type_key = f'trans_{tf}_type'
-                    trans_valid_key = f'trans_{tf}_valid'
-                    trans_dir_key = f'trans_{tf}_direction'
+                    if target_dur_key in targets:
+                        # Per-sample validity mask
+                        valid_mask = targets.get(cont_valid_key, torch.zeros(batch_size, device=args.device)).float()
+                        num_valid = valid_mask.sum()
 
-                    if trans_type_key in targets:
-                        # Keep as [batch] tensors, not scalars!
-                        trans_valid = targets.get(trans_valid_key, torch.zeros(batch_size, device=args.device))
-                        trans_type = targets[trans_type_key]  # [batch]
-                        trans_dir = targets.get(trans_dir_key, torch.ones(batch_size, device=args.device))  # [batch]
+                        if num_valid > 0:
+                            mean = dur_data['mean'].squeeze()
+                            log_std = dur_data['log_std'].squeeze()
+                            target_dur = targets[target_dur_key].squeeze()
+                            variance = torch.exp(2 * log_std) + 1e-6
 
-                        transition_labels_tensors[tf] = {
-                            'valid_mask': trans_valid.float(),  # [batch] - 1.0 for valid, 0.0 for invalid
-                            'transition_type': trans_type.long(),  # [batch]
-                            'direction': trans_dir.long(),  # [batch]
-                        }
+                            # Per-sample NLL, then apply mask
+                            nll = 0.5 * ((target_dur - mean) ** 2 / variance + 2 * log_std)
+                            masked_nll = (nll * valid_mask).sum() / (num_valid + 1e-8)
+                            duration_loss_total += duration_weight * masked_nll
 
-                # Duration NLL loss - v5.7.1: per-sample validity
-                duration_loss_total = 0.0
-                if 'duration' in hidden_states:
-                    for tf, dur_data in hidden_states['duration'].items():
-                        target_dur_key = f'cont_{tf}_duration'
-                        cont_valid_key = f'cont_{tf}_valid'
+            if duration_loss_total > 0:
+                loss = loss + duration_loss_total
+                loss_components['duration'] = duration_loss_total.item()
 
-                        if target_dur_key in targets:
-                            # Per-sample validity mask
-                            valid_mask = targets.get(cont_valid_key, torch.zeros(batch_size, device=args.device)).float()
-                            num_valid = valid_mask.sum()
+            # =====================================================================
+            # v5.7: GEOMETRIC PROJECTION LOSS (with warmup)
+            # =====================================================================
+            # Compare geometric projections (duration → calculated high/low) to actual
+            # This validates that the geometric calculation produces correct prices
+            geo_price_loss_total = 0.0
+            if 'geometric_predictions' in hidden_states:
+                for tf, geo_data in hidden_states['geometric_predictions'].items():
+                    if 'high' in geo_data and 'low' in geo_data:
+                        geo_high = geo_data['high'].squeeze()
+                        geo_low = geo_data['low'].squeeze()
 
-                            if num_valid > 0:
-                                mean = dur_data['mean'].squeeze()
-                                log_std = dur_data['log_std'].squeeze()
-                                target_dur = targets[target_dur_key].squeeze()
-                                variance = torch.exp(2 * log_std) + 1e-6
+                        # Compare to actual high/low targets
+                        target_high = target_tensor[:, 0]  # targets['high']
+                        target_low = target_tensor[:, 1]   # targets['low']
 
-                                # Per-sample NLL, then apply mask
-                                nll = 0.5 * ((target_dur - mean) ** 2 / variance + 2 * log_std)
-                                masked_nll = (nll * valid_mask).sum() / (num_valid + 1e-8)
-                                duration_loss_total += duration_weight * masked_nll
+                        # MSE between geometric projection and actual
+                        geo_high_loss = F.mse_loss(geo_high, target_high)
+                        geo_low_loss = F.mse_loss(geo_low, target_low)
 
-                if duration_loss_total > 0:
-                    loss = loss + duration_loss_total
-                    loss_components['duration'] = duration_loss_total.item()
+                        # v5.7: Apply warmup weight
+                        geo_price_loss_total += geo_price_weight * (geo_high_loss + geo_low_loss) / 2
 
-                # =====================================================================
-                # v5.7: GEOMETRIC PROJECTION LOSS (with warmup)
-                # =====================================================================
-                # Compare geometric projections (duration → calculated high/low) to actual
-                # This validates that the geometric calculation produces correct prices
-                geo_price_loss_total = 0.0
-                if 'geometric_predictions' in hidden_states:
-                    for tf, geo_data in hidden_states['geometric_predictions'].items():
-                        if 'high' in geo_data and 'low' in geo_data:
-                            geo_high = geo_data['high'].squeeze()
-                            geo_low = geo_data['low'].squeeze()
+            if geo_price_loss_total > 0:
+                loss = loss + geo_price_loss_total
+                loss_components['geo_price'] = geo_price_loss_total.item() if hasattr(geo_price_loss_total, 'item') else geo_price_loss_total
 
-                            # Compare to actual high/low targets
-                            target_high = target_tensor[:, 0]  # targets['high']
-                            target_low = target_tensor[:, 1]   # targets['low']
-
-                            # MSE between geometric projection and actual
-                            geo_high_loss = F.mse_loss(geo_high, target_high)
-                            geo_low_loss = F.mse_loss(geo_low, target_low)
-
-                            # v5.7: Apply warmup weight
-                            geo_price_loss_total += geo_price_weight * (geo_high_loss + geo_low_loss) / 2
-
-                if geo_price_loss_total > 0:
-                    loss = loss + geo_price_loss_total
-                    loss_components['geo_price'] = geo_price_loss_total.item() if hasattr(geo_price_loss_total, 'item') else geo_price_loss_total
-
-                # Validity loss - v5.7.1: per-sample
-                validity_loss_total = 0.0
-                if 'validity' in hidden_states:
-                    for tf, validity_pred in hidden_states['validity'].items():
-                        if tf in transition_labels_tensors:
-                            labels = transition_labels_tensors[tf]
-                            valid_mask = labels['valid_mask']  # [batch]
-                            num_valid = valid_mask.sum()
-
-                            if num_valid > 0:
-                                # Target: 1.0 if transition_type == 0 (CONTINUE), else 0.0
-                                target_validity = (labels['transition_type'] == 0).float()  # [batch]
-
-                                # Per-sample BCE, then apply mask
-                                per_sample_loss = F.binary_cross_entropy(
-                                    validity_pred.squeeze(),
-                                    target_validity,
-                                    reduction='none'
-                                )
-                                masked_loss = (per_sample_loss * valid_mask).sum() / (num_valid + 1e-8)
-                                validity_loss_total += validity_weight * masked_loss
-
-                if validity_loss_total > 0:
-                    loss = loss + validity_loss_total
-                    loss_components['validity'] = validity_loss_total.item()
-
-                # =====================================================================
-                # v5.7.1: COMPOSITOR MULTI-TF TRAINING (per-sample labels)
-                # =====================================================================
-                transition_loss_total = 0.0
-
-                # Track diagnostics (using selected TF for backwards compat stats)
-                if 'selected_tf' in hidden_states:
-                    selected_tf = hidden_states['selected_tf']
-                    transition_diagnostics['total_batches'] += 1
-                    transition_diagnostics['selected_tf_counts'][selected_tf] = transition_diagnostics['selected_tf_counts'].get(selected_tf, 0) + 1
-
-                    # Check if any samples in batch have valid labels for selected TF
-                    if selected_tf in transition_labels_tensors:
-                        if transition_labels_tensors[selected_tf]['valid_mask'].sum() > 0:
-                            transition_diagnostics['matches'] += 1
-
-                # Train on ALL TFs with valid labels
-                for tf, labels in transition_labels_tensors.items():
-                    compositor_key = f'compositor_{tf}'
-                    if compositor_key in hidden_states:
-                        compositor = hidden_states[compositor_key]
+            # Validity loss - v5.7.1: per-sample
+            validity_loss_total = 0.0
+            if 'validity' in hidden_states:
+                for tf, validity_pred in hidden_states['validity'].items():
+                    if tf in transition_labels_tensors:
+                        labels = transition_labels_tensors[tf]
                         valid_mask = labels['valid_mask']  # [batch]
                         num_valid = valid_mask.sum()
 
                         if num_valid > 0:
-                            # Get TF weight from Gumbel-Softmax (detached)
-                            if 'tf_weights' in hidden_states:
-                                tf_idx = TIMEFRAMES.index(tf)
-                                tf_weight = hidden_states['tf_weights'][:, tf_idx].mean().detach()
-                            else:
-                                tf_weight = 1.0 / len(transition_labels_tensors)
+                            # Target: 1.0 if transition_type == 0 (CONTINUE), else 0.0
+                            target_validity = (labels['transition_type'] == 0).float()  # [batch]
 
-                            # Per-sample cross entropy with mask
-                            trans_loss_per_sample = F.cross_entropy(
-                                compositor['transition_logits'],
-                                labels['transition_type'],  # [batch] - full tensor!
+                            # Per-sample BCE, then apply mask
+                            per_sample_loss = F.binary_cross_entropy(
+                                validity_pred.squeeze(),
+                                target_validity,
                                 reduction='none'
                             )
-                            dir_loss_per_sample = F.cross_entropy(
-                                compositor['direction_logits'],
-                                labels['direction'],  # [batch] - full tensor!
-                                reduction='none'
-                            )
+                            masked_loss = (per_sample_loss * valid_mask).sum() / (num_valid + 1e-8)
+                            validity_loss_total += validity_weight * masked_loss
 
-                            # Apply validity mask
-                            masked_trans = (trans_loss_per_sample * valid_mask).sum() / (num_valid + 1e-8)
-                            masked_dir = (dir_loss_per_sample * valid_mask).sum() / (num_valid + 1e-8)
+            if validity_loss_total > 0:
+                loss = loss + validity_loss_total
+                loss_components['validity'] = validity_loss_total.item()
 
-                            transition_loss_total += tf_weight * (masked_trans + masked_dir)
+            # =====================================================================
+            # v5.7.1: COMPOSITOR MULTI-TF TRAINING (per-sample labels)
+            # =====================================================================
+            transition_loss_total = 0.0
 
-                # v5.7.2: Log weighted contribution so breakdown sums to total
-                if transition_loss_total > 0:
-                    transition_contribution = transition_weight * transition_loss_total
-                    loss = loss + transition_contribution
-                    loss_components['transition'] = transition_contribution.item()
-                else:
-                    loss_components['transition'] = 0.0
+            # Track diagnostics (using selected TF for backwards compat stats)
+            if 'selected_tf' in hidden_states:
+                selected_tf = hidden_states['selected_tf']
+                transition_diagnostics['total_batches'] += 1
+                transition_diagnostics['selected_tf_counts'][selected_tf] = transition_diagnostics['selected_tf_counts'].get(selected_tf, 0) + 1
 
-                loss.backward()
+                # Check if any samples in batch have valid labels for selected TF
+                if selected_tf in transition_labels_tensors:
+                    if transition_labels_tensors[selected_tf]['valid_mask'].sum() > 0:
+                        transition_diagnostics['matches'] += 1
 
-                # v5.3.2: Track gradient norm BEFORE clipping (shows true gradient magnitude)
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        total_norm += p.grad.data.norm(2).item() ** 2
-                total_norm = total_norm ** 0.5
-                epoch_grad_norms.append(total_norm)
+            # Train on ALL TFs with valid labels
+            for tf, labels in transition_labels_tensors.items():
+                compositor_key = f'compositor_{tf}'
+                if compositor_key in hidden_states:
+                    compositor = hidden_states[compositor_key]
+                    valid_mask = labels['valid_mask']  # [batch]
+                    num_valid = valid_mask.sum()
 
-                # 🛡️ Gradient clipping (prevent explosion)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if num_valid > 0:
+                        # Get TF weight from Gumbel-Softmax (detached)
+                        if 'tf_weights' in hidden_states:
+                            tf_idx = TIMEFRAMES.index(tf)
+                            tf_weight = hidden_states['tf_weights'][:, tf_idx].mean().detach()
+                        else:
+                            tf_weight = 1.0 / len(transition_labels_tensors)
 
-                # 🛡️ NaN Check 4: Gradients
-                for name, param in model.named_parameters():
-                    if param.grad is not None and not torch.isfinite(param.grad).all():
-                        print(f"\n🚨 NaN/Inf gradient in {name} at batch {batch_idx}!")
-                        raise ValueError(f"Non-finite gradient in {name}")
+                        # Per-sample cross entropy with mask
+                        trans_loss_per_sample = F.cross_entropy(
+                            compositor['transition_logits'],
+                            labels['transition_type'],  # [batch] - full tensor!
+                            reduction='none'
+                        )
+                        dir_loss_per_sample = F.cross_entropy(
+                            compositor['direction_logits'],
+                            labels['direction'],  # [batch] - full tensor!
+                            reduction='none'
+                        )
 
-                optimizer.step()
+                        # Apply validity mask
+                        masked_trans = (trans_loss_per_sample * valid_mask).sum() / (num_valid + 1e-8)
+                        masked_dir = (dir_loss_per_sample * valid_mask).sum() / (num_valid + 1e-8)
+
+                        transition_loss_total += tf_weight * (masked_trans + masked_dir)
+
+            # v5.7.2: Log weighted contribution so breakdown sums to total
+            if transition_loss_total > 0:
+                transition_contribution = transition_weight * transition_loss_total
+                loss = loss + transition_contribution
+                loss_components['transition'] = transition_contribution.item()
+            else:
+                loss_components['transition'] = 0.0
+
+            loss.backward()
+
+            # v5.3.2: Track gradient norm BEFORE clipping (shows true gradient magnitude)
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    total_norm += p.grad.data.norm(2).item() ** 2
+            total_norm = total_norm ** 0.5
+            epoch_grad_norms.append(total_norm)
+
+            # 🛡️ Gradient clipping (prevent explosion)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # 🛡️ NaN Check 4: Gradients
+            for name, param in model.named_parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    print(f"\n🚨 NaN/Inf gradient in {name} at batch {batch_idx}!")
+                    raise ValueError(f"Non-finite gradient in {name}")
+
+            optimizer.step()
 
             # Report first batch completion time and stop progress thread
             if _is_first_batch_ever and batch_idx == 0 and _first_forward_start is not None:
@@ -4294,19 +4010,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 if vix_batch_val is not None:
                     vix_batch_val = vix_batch_val.to(args.device, non_blocking=True)
 
-                if scaler is not None:
-                    with torch.amp.autocast('cuda'):
-                        # v5.2: Pass VIX and events
-                        predictions, hidden_states = model(features, vix_sequence=vix_batch_val, events=events_batch_val)
-                        # Raw % (data alignment fixed in dataset)
-                        target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
-                        loss = F.mse_loss(predictions[:, :2], target_tensor)
-                else:
-                    # v5.2: Pass VIX and events
-                    predictions, hidden_states = model(features, vix_sequence=vix_batch_val, events=events_batch_val)
-                    # Raw % (data alignment fixed in dataset)
-                    target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
-                    loss = F.mse_loss(predictions[:, :2], target_tensor)
+                # v5.7.2: Forward pass (removed AMP)
+                predictions, hidden_states = model(features, vix_sequence=vix_batch_val, events=events_batch_val)
+                target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                loss = F.mse_loss(predictions[:, :2], target_tensor)
 
                 val_loss += loss.item()
                 val_error += torch.abs(predictions[:, :2] - target_tensor).mean().item()
@@ -4459,16 +4166,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     if vix_batch_test is not None:
                         vix_batch_test = vix_batch_test.to(args.device, non_blocking=True)
 
-                    # Forward pass with VIX/events
-                    if scaler is not None:
-                        with torch.amp.autocast('cuda'):
-                            predictions, _ = model(features, vix_sequence=vix_batch_test, events=events_batch_test)
-                            target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
-                            loss = F.mse_loss(predictions[:, :2], target_tensor)
-                    else:
-                        predictions, _ = model(features, vix_sequence=vix_batch_test, events=events_batch_test)
-                        target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
-                        loss = F.mse_loss(predictions[:, :2], target_tensor)
+                    # Forward pass (v5.7.2: removed AMP)
+                    predictions, _ = model(features, vix_sequence=vix_batch_test, events=events_batch_test)
+                    target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                    loss = F.mse_loss(predictions[:, :2], target_tensor)
 
                     test_loss += loss.item()
                     test_error += torch.abs(predictions[:, :2] - target_tensor).mean().item()
@@ -4701,8 +4402,7 @@ def main():
                         help='Use fusion head for final predictions (default: True)')
     parser.add_argument('--no-fusion-head', dest='use_fusion_head', action='store_false',
                         help='Disable fusion head, use physics-based aggregation instead')
-    parser.add_argument('--amp', action='store_true', default=False,
-                        help='Enable Automatic Mixed Precision (CUDA only, 2-3x faster)')
+    # v5.7.2: Removed --amp flag (AMP caused NaN issues, use TF32 instead)
     parser.add_argument('--use-compile', dest='use_compile', action='store_true', default=False,
                         help='Enable torch.compile JIT compilation (CUDA only, first batch slow but faster afterward)')
     parser.add_argument('--compile-verbose', dest='compile_verbose', action='store_true', default=False,
