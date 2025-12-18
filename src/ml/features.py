@@ -38,7 +38,7 @@ except ImportError:
 VIX_CALC_VERSION = "v1"  # v4.4: Track VIX feature calculation version (increment if VIX logic changes)
 EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
 CHANNEL_PROJECTION_VERSION = "v2"  # v5.6: Removed fixed projections - now calculated at inference from learned duration
-BREAKDOWN_CALC_VERSION = "v2"  # v5.3.3: Track breakdown calculation method (v1=1-min, v2=native TF)
+BREAKDOWN_CALC_VERSION = "v3"  # v5.8: Fixed window sizes for 1min input (was 5x too short in v2)
 PARTIAL_BAR_VERSION = "v4"  # v5.6: Removed projected_high/low/center - projections calculated at inference
 FEATURE_VERSION = f"v5.6.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}"
 # v5.6.0: Removed fixed projection features (31 per window now) - projections calculated at inference using learned duration
@@ -4655,39 +4655,40 @@ class TradingFeatureExtractor(FeatureExtractor):
 
     def _calculate_all_breakdown_at_5min(
         self,
-        features_df: pd.DataFrame,  # Full features at 5min resolution
+        features_df: pd.DataFrame,  # Full features at 1min resolution (name is legacy)
         raw_df: pd.DataFrame = None,
         events_handler = None
     ) -> pd.DataFrame:
         """
-        Calculate breakdown features for ALL TFs at 5min resolution (v5.4).
+        Calculate breakdown features for ALL TFs (v5.4, fixed in v5.8).
 
-        With partial bars, channel features for all TFs are already at 5min.
-        This method calculates breakdown from these 5min channel features,
-        producing breakdown that evolves within each TF period.
+        NOTE: Despite the name, input is at 1min resolution (name is legacy).
+        v5.8 fix: Window sizes now correctly account for 1min input.
 
         Args:
-            features_df: Full features DataFrame at 5min resolution (with partial bar channels)
+            features_df: Full features DataFrame at 1min resolution
             raw_df: Original OHLCV DataFrame (for event features)
             events_handler: Optional event handler
 
         Returns:
-            DataFrame with all breakdown features at 5min resolution
+            DataFrame with all breakdown features at 1min resolution
         """
         all_breakdown = {}
         num_rows = len(features_df)
 
-        # Process each TF's breakdown from its 5min channel features
+        # Process each TF's breakdown from channel features (input is at 1min resolution)
         for tf in HIERARCHICAL_TIMEFRAMES:
-            # Get adaptive window - convert from native TF bars to 5min bars
+            # Get adaptive window - convert from native TF bars to 1min bars
+            # v5.8 FIX: Input data is at 1min resolution, not 5min!
+            # Previous code assumed 5min input, making windows 5x too short.
             native_window = config.ADAPTIVE_WINDOW_BARS_NATIVE.get(tf, 100)
-            # Approximate 5min bars per TF bar
-            bars_per_tf = {
-                '5min': 1, '15min': 3, '30min': 6, '1h': 12,
-                '2h': 24, '3h': 36, '4h': 48, 'daily': 78,
-                'weekly': 78*5, 'monthly': 78*22, '3month': 78*66
+            # 1min bars per native TF bar (not 5min bars!)
+            bars_per_tf_1min = {
+                '5min': 5, '15min': 15, '30min': 30, '1h': 60,
+                '2h': 120, '3h': 180, '4h': 240, 'daily': 390,  # 6.5 hrs * 60
+                'weekly': 390*5, 'monthly': 390*22, '3month': 390*66
             }
-            window = min(native_window * bars_per_tf.get(tf, 1), num_rows // 4)
+            window = min(native_window * bars_per_tf_1min.get(tf, 5), num_rows // 4)
             window = max(window, 10)  # Minimum window
 
             # 1. Duration ratio (current stability vs rolling average)

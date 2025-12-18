@@ -11,9 +11,10 @@ SHARD_DIR = DATA_DIR / "feature_cache"  # Directory for mmap shards and cached f
 CLAUDE_API_KEY = "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"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7978931435:AAGdqdfcbK-GT8Q_BEw7dvmISkN9035FzZQ")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "7910666732")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")  # Optional: add NewsAPI key
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")  # For earnings calendar (free: https://www.alphavantage.co/support/#api-key)
-FRED_API_KEY = os.getenv("FRED_API_KEY", "")  # For economic data (free: https://fred.stlouisfed.org/docs/api/api_key.html)
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "7958854e1a644a109cf28488af5b6d8c")  # NewsAPI.org
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "PYUPDHCVHQQT5I5L")  # For earnings calendar
+FRED_API_KEY = os.getenv("FRED_API_KEY", "8e8fc56308f78390f4b44222c01fd449")  # For economic data (CPI, NFP, rates)
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d4qh0u9r01quli1cimbgd4qh0u9r01quli1cimc0")  # For earnings calendar + company news
 
 # Trading Parameters
 DEFAULT_STOCK = "TSLA"
@@ -88,8 +89,8 @@ USE_EVENT_FEATURES = True
 USE_NEWS_FEATURES = True
 
 # Event Settings
-TSLA_EVENTS_FILE = DATA_DIR / "tsla_events_REAL.csv"  # Complete earnings/deliveries + macro events (483 events, 2015-2025)
-MACRO_EVENTS_API_KEY = os.getenv("MACRO_API_KEY", "")  # For FRED/economic calendar
+TSLA_EVENTS_FILE = DATA_DIR / "events.csv"  # Canonical events file (483 events, 2015-2025) - earnings have Alpha Vantage data
+MACRO_EVENTS_API_KEY = os.getenv("MACRO_API_KEY", "8e8fc56308f78390f4b44222c01fd449")  # FRED API for economic calendar
 EVENT_LOOKBACK_DAYS = 14  # Days before/after event to analyze (expanded for better pattern detection)
 EVENT_LOOKAHEAD_DAYS = 14
 
@@ -330,14 +331,14 @@ MODEL_TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', '
 # SINGLE SOURCE OF TRUTH - features.py imports this
 # These values determine both training data shape AND live inference buffer sizes
 TIMEFRAME_SEQUENCE_LENGTHS = {
-    '5min': 200,    # ~17 hours of 5-min bars (intraday patterns)
-    '15min': 100,   # ~25 hours of 15-min bars (~1 day context)
-    '30min': 80,    # ~40 hours of 30-min bars
-    '1h': 168,      # 1 week of hourly bars (weekly cycles)
-    '2h': 84,       # 1 week of 2-hour bars
-    '3h': 56,       # 1 week of 3-hour bars
-    '4h': 42,       # 1 week of 4-hour bars
-    'daily': 30,    # 30 trading days (monthly patterns)
+    '5min': 300,    # 1 day of 5-min bars (deep intraday patterns)
+    '15min': 300,   # 3.1 days of 15-min bars (multi-day intraday context)
+    '30min': 300,   # 6.2 days of 30-min bars (week-long intraday patterns)
+    '1h': 500,      # 20.8 days of hourly bars (3-week cycles)
+    '2h': 500,      # 41.7 days of 2-hour bars (6-week patterns)
+    '3h': 500,      # 62.5 days of 3-hour bars (2-month patterns)
+    '4h': 500,      # 83.3 days of 4-hour bars (quarterly patterns)
+    'daily': 1200,  # 3.3 years of daily bars (multi-year trends, seasonal patterns)
     'weekly': 20,   # 20 weeks (~5 months, quarterly trends)
     'monthly': 12,  # 12 months (annual cycles)
     '3month': 8,    # 8 quarters (2 years, multi-year trends)

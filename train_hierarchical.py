@@ -3422,7 +3422,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     transition_diagnostics = {
         'matches': 0,           # How many batches had matching selected_tf
         'total_batches': 0,     # Total batches
-        'selected_tf_counts': {},  # Which TFs selected how often
+        'selected_tf_counts': {},  # Which TFs selected how often (hard argmax)
+        # v5.8: Soft attention diagnostics (don't rely on selected_tf proxy alone)
+        'tf_weights_sum': None,    # Accumulated tf_weights for mean calculation
+        'tf_weights_count': 0,     # Number of samples accumulated
     }
 
     # v5.3.2: Enhanced diagnostics (what was missing from history!)
@@ -3485,6 +3488,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         model.train()
         train_loss = 0.0
         num_batches = 0
+
+        # v5.8: Reset TF selector diagnostics for this epoch
+        transition_diagnostics['selected_tf_counts'] = {}
+        transition_diagnostics['total_batches'] = 0
+        transition_diagnostics['matches'] = 0
+        transition_diagnostics['tf_weights_sum'] = None
+        transition_diagnostics['tf_weights_count'] = 0
 
         # v5.7: Calculate warmup weights for this epoch
         duration_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.3)
@@ -3836,6 +3846,16 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     if transition_labels_tensors[selected_tf]['valid_mask'].sum() > 0:
                         transition_diagnostics['matches'] += 1
 
+            # v5.8: Accumulate soft tf_weights for epoch-level mean (not just hard argmax)
+            if 'tf_weights' in hidden_states:
+                tf_weights = hidden_states['tf_weights']  # [batch, 11]
+                batch_sum = tf_weights.sum(dim=0).detach().cpu()  # [11]
+                if transition_diagnostics['tf_weights_sum'] is None:
+                    transition_diagnostics['tf_weights_sum'] = batch_sum
+                else:
+                    transition_diagnostics['tf_weights_sum'] += batch_sum
+                transition_diagnostics['tf_weights_count'] += tf_weights.size(0)
+
             # Train on ALL TFs with valid labels
             for tf, labels in transition_labels_tensors.items():
                 compositor_key = f'compositor_{tf}'
@@ -3966,11 +3986,37 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     print(f"   TF weight entropy: {loss_components.get('tf_weights_entropy', 0):.3f}")
                     print(f"   Entropy (raw): {loss_components.get('entropy_raw', 0):.3f}")
 
+                    # Most picked TF (attention mechanism preference)
+                    if transition_diagnostics['selected_tf_counts']:
+                        mode_tf = max(transition_diagnostics['selected_tf_counts'],
+                                      key=transition_diagnostics['selected_tf_counts'].get)
+                        mode_count = transition_diagnostics['selected_tf_counts'][mode_tf]
+                        total = transition_diagnostics['total_batches']
+                        print(f"   Most picked TF: {mode_tf} ({mode_count}/{total} = {mode_count/total*100:.1f}%)")
+
             if profiler and batch_idx > 0 and batch_idx % profiler.log_every_n == 0:
                 profiler.snapshot(f"batch_{batch_idx}", epoch + 1)
 
         avg_train_loss = train_loss / max(num_batches, 1)
         train_losses.append(avg_train_loss)
+
+        # v5.8: Epoch-level TF selector diagnostics (don't rely on selected_tf proxy alone)
+        if is_main_process(rank) and transition_diagnostics['total_batches'] > 0:
+            total = transition_diagnostics['total_batches']
+            print(f"\n   📊 TF Selector Diagnostics (epoch {epoch + 1}):")
+            # (a) Argmax distribution - how often each TF wins
+            print(f"      Argmax selection distribution:")
+            for tf in sorted(transition_diagnostics['selected_tf_counts'].keys()):
+                count = transition_diagnostics['selected_tf_counts'][tf]
+                print(f"         {tf}: {count}/{total} = {count/total*100:.1f}%")
+            # (b) Mean soft weights - average attention per TF
+            if transition_diagnostics['tf_weights_sum'] is not None and transition_diagnostics['tf_weights_count'] > 0:
+                mean_weights = transition_diagnostics['tf_weights_sum'] / transition_diagnostics['tf_weights_count']
+                print(f"      Mean tf_weights (soft attention):")
+                from src.ml.features import HIERARCHICAL_TIMEFRAMES
+                for i, tf in enumerate(HIERARCHICAL_TIMEFRAMES):
+                    if i < len(mean_weights):
+                        print(f"         {tf}: {mean_weights[i].item():.3f}")
 
         # v5.3: Average component losses for this epoch
         for component, values in epoch_components.items():
@@ -4239,7 +4285,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 'match_rate': match_rate,
                 'matches': transition_diagnostics['matches'],
                 'total_batches': transition_diagnostics['total_batches'],
-                'selected_tf_distribution': transition_diagnostics['selected_tf_counts']
+                'selected_tf_distribution': transition_diagnostics['selected_tf_counts'],
+                # v5.8: Soft attention diagnostics (final epoch only)
+                'mean_tf_weights': (
+                    (transition_diagnostics['tf_weights_sum'] / transition_diagnostics['tf_weights_count']).tolist()
+                    if transition_diagnostics['tf_weights_sum'] is not None and transition_diagnostics['tf_weights_count'] > 0
+                    else None
+                ),
             },
             'best_val_loss': best_val_loss,
             'total_epochs': epoch + 1,

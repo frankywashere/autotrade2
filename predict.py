@@ -242,15 +242,16 @@ class LiveDataBuffer:
 
     # Required history per interval (bars needed for feature extraction + seq_len)
     # v5.3.3: Updated to match yfinance limits and adaptive window requirements
+    # v5.9: Reduced hourly TFs from 730d to 300d (safety margin vs yfinance 730d limit)
     REQUIRED_HISTORY = {
-        '1min': 50000,     # ~35 days (for resampling to higher TFs)
+        '1min': 50000,     # ~35 days (for resampling to higher TFs, uses CSV supplement)
         '5min': 546,       # ~7 days (yfinance intraday limit: 7 days × 78 bars/day)
         '15min': 182,      # ~7 days (7 days × 26 bars/day)
         '30min': 91,       # ~7 days (7 days × 13 bars/day)
-        '1hour': 4745,     # ~730 days (730 days × 6.5 bars/day)
-        '2hour': 2372,     # ~730 days (resampled from 1h)
-        '3hour': 1582,     # ~730 days (resampled from 1h)
-        '4hour': 1186,     # ~730 days (resampled from 1h)
+        '1hour': 1950,     # 300 days (300 days × 6.5 bars/day, was 730d)
+        '2hour': 975,      # 300 days (300 days × 3.25 bars/day, was 730d)
+        '3hour': 651,      # 300 days (300 days × 2.17 bars/day, was 730d)
+        '4hour': 488,      # 300 days (300 days × 1.625 bars/day, was 730d)
         'daily': 3650,     # 10 years (3650 days)
         'weekly': 781,     # ~15 years (5475 days / 7 days/week)
         'monthly': 180,    # ~15 years (5475 days / 30 days/month)
@@ -444,9 +445,13 @@ class LiveDataBuffer:
             '15min': self.buffers.get('15min', pd.DataFrame()),
             '30min': self.buffers.get('30min', pd.DataFrame()),
             '1hour': self.buffers.get('1hour', pd.DataFrame()),
+            '2h': self.buffers.get('2h', pd.DataFrame()),       # Resampled from 1hour
+            '3h': self.buffers.get('3h', pd.DataFrame()),       # Resampled from 1hour
+            '4h': self.buffers.get('4h', pd.DataFrame()),       # Resampled from 1hour
             'daily': self.buffers.get('daily', pd.DataFrame()),
             'weekly': self.buffers.get('weekly', pd.DataFrame()),
             'monthly': self.buffers.get('monthly', pd.DataFrame()),
+            '3month': self.buffers.get('3month', pd.DataFrame()),  # Native from yfinance
         }
 
     def get_status(self) -> Dict[str, Dict]:
