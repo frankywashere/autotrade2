@@ -574,7 +574,7 @@ def compute_event_type_flags(sample_timestamp, events_handler):
 ### EventEmbedding vs Deterministic Features Coordination
 
 **Context:** The model uses TWO event systems:
-1. **Deterministic features (40):** Hand-crafted, precise timing and drift metrics (this plan)
+1. **Deterministic features (46):** Hand-crafted, precise timing and drift metrics (this plan, incl. 6 hours_until_*)
 2. **EventEmbedding:** Neural network that learns event representations (existing)
 
 **Potential concerns:**
@@ -979,7 +979,9 @@ def _compute_hours_until_event(sample_ts, future_events, event_type):
     if len(type_events) == 0:
         return 0.0  # No upcoming event of this type
 
-    next_event = type_events.iloc[0]  # Assuming sorted by date
+    # IMPORTANT: Sort by date + release_time before taking first
+    type_events = type_events.sort_values(by='date')
+    next_event = type_events.iloc[0]
     event_date = next_event['date']
     sample_date = sample_ts.date()
 
@@ -1021,12 +1023,22 @@ def _compute_features_for_timestamp(rep_ts, events_df, price_df):
         (events_df['date'] < sample_date) |
         ((events_df['date'] == sample_date) &
          (events_df['release_time'].apply(_parse_release_time) < sample_time))
-    ]
+    ].sort_values(by='date')  # Oldest first, so .iloc[-1] = most recent past
+
     future_events = events_df[
         (events_df['date'] > sample_date) |
         ((events_df['date'] == sample_date) &
          (events_df['release_time'].apply(_parse_release_time) >= sample_time))
-    ]
+    ].sort_values(by='date')  # Soonest first, so .iloc[0] = next upcoming
+
+    # NOTE: The helper functions below are single-timestamp wrappers.
+    # They extract logic from the full implementations defined earlier in this doc:
+    #   - compute_days_until_event()      → see "Event-Specific Timing" section
+    #   - compute_days_since_event()      → see "Event-Specific Timing" section
+    #   - compute_proximity_flag_single() → see "Multi-Hot 3-Day Flags" section
+    #   - compute_pre_drift_single()      → see "Event-Specific Drift Features" section
+    #   - compute_post_drift_single()     → see "Event-Specific Drift Features" section
+    #   - compute_earnings_features_single() → see "Backward/Forward-Looking Earnings" sections
 
     # Timing features (12): days_until/since for each event type
     for event_type in EVENT_TYPES:  # 6 types
@@ -1162,8 +1174,11 @@ def test_friday_to_monday():
 3. Add duplicate detection on load:
 
 ```python
+# Backward-compatible config accessor (until TSLA_EVENTS_FILE → EVENTS_FILE rename)
+EVENTS_FILE = getattr(config, 'EVENTS_FILE', config.TSLA_EVENTS_FILE)
+
 def load_events(self):
-    df = pd.read_csv(config.EVENTS_FILE)
+    df = pd.read_csv(EVENTS_FILE)
 
     # Validate no duplicates
     duplicates = df[df.duplicated(['date', 'event_type'], keep=False)]
@@ -2107,6 +2122,10 @@ resampled = pd.concat([resampled, breakdown_native], axis=1)  # DUPLICATES
 
 ```python
 # NEW: src/ml/live_event_features.py (separate from EventEmbedding)
+
+# Backward-compatible config accessor (until TSLA_EVENTS_FILE → EVENTS_FILE rename)
+EVENTS_FILE = getattr(config, 'EVENTS_FILE', config.TSLA_EVENTS_FILE)
+
 class LiveEventFeatureProvider:
     """
     Provides deterministic event features for live inference.
@@ -2114,7 +2133,7 @@ class LiveEventFeatureProvider:
     """
 
     def __init__(self):
-        self.events_df = pd.read_csv(config.EVENTS_FILE)
+        self.events_df = pd.read_csv(EVENTS_FILE)
         self.alpha_vantage_key = config.ALPHA_VANTAGE_API_KEY
         self._cache = {}
         self._last_refresh = None
@@ -2291,11 +2310,15 @@ def _extract_for_native_tf(self, native_df, tf, multi_res):
 
 ```python
 # NEW: src/ml/events.py (complete rewrite)
+
+# Backward-compatible config accessor (until TSLA_EVENTS_FILE → EVENTS_FILE rename)
+_DEFAULT_EVENTS_FILE = getattr(config, 'EVENTS_FILE', config.TSLA_EVENTS_FILE)
+
 class UnifiedEventsHandler:
     """Single source of truth: events.csv only. No hardcoded events."""
 
     def __init__(self, events_file=None):
-        self.events_file = events_file or config.EVENTS_FILE
+        self.events_file = events_file or _DEFAULT_EVENTS_FILE
         self.events_df = self._load_and_validate()
 
     def _load_and_validate(self):
@@ -2540,6 +2563,9 @@ events = self.event_fetcher.fetch_upcoming_events()
 ```python
 # src/ml/live_events.py - REWRITE
 
+# Backward-compatible config accessor (until TSLA_EVENTS_FILE → EVENTS_FILE rename)
+_DEFAULT_EVENTS_FILE = getattr(config, 'EVENTS_FILE', config.TSLA_EVENTS_FILE)
+
 class LiveEventFetcher:
     """Fetch events for both training and live inference."""
 
@@ -2550,7 +2576,7 @@ class LiveEventFetcher:
         # self.fomc_dates = [...]       # DELETE
 
         # USE events.csv as single source of truth
-        self.events_df = pd.read_csv(events_file or config.EVENTS_FILE)
+        self.events_df = pd.read_csv(events_file or _DEFAULT_EVENTS_FILE)
         self.events_df['date'] = pd.to_datetime(self.events_df['date']).dt.date
 
         # Event type mapping - MUST match existing src/ml/live_events.py:38-45
@@ -2910,13 +2936,13 @@ Replace `num_features = 1049` with dynamic lookup from meta JSON.
 
 ### Phase 7: Feature Column Updates
 
-**Current columns (4) → REPLACED (not kept):**
-- `is_earnings_week` → kept as-is
-- `days_until_earnings` → **RENAMED** to `days_until_tsla_earnings`
-- `days_until_fomc` → kept as-is
-- `is_high_impact_event` → kept as-is
+**Current columns (4) → SEMANTICS UPDATED:**
+- `is_earnings_week` → **SEMANTICS UPDATED:** Now uses ±14 *trading* days (was calendar days)
+- `days_until_earnings` → **RENAMED** to `days_until_tsla_earnings`, normalized by 14 trading days
+- `days_until_fomc` → **SEMANTICS UPDATED:** Now normalized [0,1] by 14 trading days (was raw count)
+- `is_high_impact_event` → **SEMANTICS UPDATED:** Now uses 3 *trading* days window (was calendar days)
 
-> **Breaking change:** `days_until_earnings` is renamed to `days_until_tsla_earnings` to match the naming convention. Old feature name will not exist. Cache regeneration required.
+> **Breaking change:** All 4 existing features have updated semantics (trading days vs calendar days, normalization). This is intentional - the new semantics better handle weekends/holidays. Cache regeneration required. Model retrain required.
 
 **New columns (46):**
 
@@ -3138,4 +3164,4 @@ Do NOT use these files - all data consolidated into `data/events.csv`:
 
 *Last updated: December 2025*
 *Version: v5.9_events (46 event features, +42 from v5.8)*
-*Comprehensive implementation plan with 7 blockers, 23 fixes, full test coverage*
+*Comprehensive implementation plan with 7 blockers, 23 fixes, test coverage planned*

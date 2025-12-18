@@ -2214,6 +2214,44 @@ def interactive_setup(args, profiler=None):
     total_neurons = int(128 * args.internal_neurons_ratio)
     print(f"   → Total neurons per layer: {total_neurons}, Output neurons: 128")
 
+    # Sequence length presets (temporal context)
+    print()
+    SEQUENCE_LENGTH_PRESETS = {
+        'low': {
+            '5min': 75, '15min': 75, '30min': 75, '1h': 75, '2h': 75,
+            '3h': 75, '4h': 75, 'daily': 75,
+            'weekly': 20, 'monthly': 12, '3month': 8
+        },
+        'medium': {
+            '5min': 200, '15min': 200, '30min': 200, '1h': 300, '2h': 300,
+            '3h': 300, '4h': 300, 'daily': 600,
+            'weekly': 20, 'monthly': 12, '3month': 8
+        },
+        'high': {
+            '5min': 300, '15min': 300, '30min': 300, '1h': 500, '2h': 500,
+            '3h': 500, '4h': 500, 'daily': 1200,
+            'weekly': 20, 'monthly': 12, '3month': 8
+        }
+    }
+
+    seq_preset = inquirer.select(
+        message="Sequence length (temporal context):",
+        choices=[
+            Choice(value='low', name='Low (75 bars) - Fast training, ~3-4x faster ⚡'),
+            Choice(value='medium', name='Medium (200-600 bars) - Balanced ⭐'),
+            Choice(value='high', name='High (300-1200 bars) - Maximum context, slower'),
+        ],
+        default='medium'
+    ).execute()
+
+    # Override config with selected preset
+    project_config.TIMEFRAME_SEQUENCE_LENGTHS = SEQUENCE_LENGTH_PRESETS[seq_preset]
+    args.seq_preset = seq_preset  # Store for summary
+    print(f"   → Sequence lengths: {seq_preset.upper()}")
+    print(f"      5min: {SEQUENCE_LENGTH_PRESETS[seq_preset]['5min']}, "
+          f"1h: {SEQUENCE_LENGTH_PRESETS[seq_preset]['1h']}, "
+          f"daily: {SEQUENCE_LENGTH_PRESETS[seq_preset]['daily']}")
+
     args.epochs = int(inquirer.number(
         message="Number of epochs:",
         default=dflt('epochs', 100),
@@ -2455,6 +2493,11 @@ def interactive_setup(args, profiler=None):
     print(f"  Continuation Mode: {project_config.CONTINUATION_MODE} "
           f"(horizon {project_config.ADAPTIVE_MIN_HORIZON}-{project_config.ADAPTIVE_MAX_HORIZON} bars)")
     print(f"  Model Capacity: internal_ratio={args.internal_neurons_ratio}, hidden_size={args.hidden_size}")
+    seq_preset = getattr(args, 'seq_preset', 'high')  # Default to 'high' if not set
+    print(f"  Sequence Lengths: {seq_preset.upper()} "
+          f"(5min:{project_config.TIMEFRAME_SEQUENCE_LENGTHS['5min']}, "
+          f"1h:{project_config.TIMEFRAME_SEQUENCE_LENGTHS['1h']}, "
+          f"daily:{project_config.TIMEFRAME_SEQUENCE_LENGTHS['daily']})")
     print(f"  Multi-Task: {'Enabled' if args.multi_task else 'Disabled'}")
 
     # v5.3: Architecture (locked to production)
@@ -3044,6 +3087,20 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         use_native_timeframes=args.use_native_timeframes,
         tf_meta_path=args.tf_meta_path
     )
+
+    # v5.8: Override sequence lengths if user selected a preset
+    # Dataset reads from cached tf_meta.json, but user may have chosen different preset
+    if hasattr(args, 'seq_preset') and args.seq_preset:
+        from src.ml.features import HIERARCHICAL_TIMEFRAMES
+        preset_lens = project_config.TIMEFRAME_SEQUENCE_LENGTHS
+
+        # Override all three datasets
+        for dataset in [train_dataset, val_dataset, test_dataset]:
+            if dataset and hasattr(dataset, 'tf_sequence_lengths'):
+                dataset.tf_sequence_lengths = preset_lens.copy()
+
+        if is_main_process(rank):
+            print(f"   ✓ Applied {args.seq_preset.upper()} sequence length preset to datasets")
 
     if profiler:
         profiler.log_info(f"DATASET_CREATED | train_samples={len(train_dataset)} | val_samples={len(val_dataset)}")
@@ -4394,6 +4451,9 @@ def main():
                         help='Batch size')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate')
+    parser.add_argument('--sequence-preset', dest='sequence_preset', type=str,
+                        choices=['low', 'medium', 'high'], default='medium',
+                        help='Sequence length preset: low (75 bars, fast), medium (200-600 bars), high (300-1200 bars)')
     parser.add_argument('--patience', type=int, default=10,
                         help='Early stopping patience')
     # v5.2: Preload removed - native TF mode makes it obsolete
@@ -4477,6 +4537,31 @@ def main():
                         help='Enable verbose debug logging (collate workers, slow batches, etc.)')
 
     args = parser.parse_args()
+
+    # ==========================================================================
+    # APPLY SEQUENCE LENGTH PRESET (from CLI or will be set by interactive)
+    # ==========================================================================
+    if not args.interactive and hasattr(args, 'sequence_preset'):
+        # Apply preset when not in interactive mode (interactive mode will set this)
+        SEQUENCE_LENGTH_PRESETS = {
+            'low': {
+                '5min': 75, '15min': 75, '30min': 75, '1h': 75, '2h': 75,
+                '3h': 75, '4h': 75, 'daily': 75,
+                'weekly': 20, 'monthly': 12, '3month': 8
+            },
+            'medium': {
+                '5min': 200, '15min': 200, '30min': 200, '1h': 300, '2h': 300,
+                '3h': 300, '4h': 300, 'daily': 600,
+                'weekly': 20, 'monthly': 12, '3month': 8
+            },
+            'high': {
+                '5min': 300, '15min': 300, '30min': 300, '1h': 500, '2h': 500,
+                '3h': 500, '4h': 500, 'daily': 1200,
+                'weekly': 20, 'monthly': 12, '3month': 8
+            }
+        }
+        project_config.TIMEFRAME_SEQUENCE_LENGTHS = SEQUENCE_LENGTH_PRESETS[args.sequence_preset]
+        args.seq_preset = args.sequence_preset  # Store for summary
 
     # ==========================================================================
     # CACHE VERIFICATION MODE (v4.4)
