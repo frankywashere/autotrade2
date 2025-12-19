@@ -2571,6 +2571,28 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Reconstruct args namespace from dict
     args = argparse.Namespace(**args_dict)
 
+    # v5.8: Apply sequence length preset in each spawned process
+    # DDP spawns separate processes - each needs to override their own config
+    if hasattr(args, 'seq_preset') and args.seq_preset:
+        SEQUENCE_LENGTH_PRESETS = {
+            'low': {
+                '5min': 75, '15min': 75, '30min': 75, '1h': 75, '2h': 75,
+                '3h': 75, '4h': 75, 'daily': 75,
+                'weekly': 20, 'monthly': 12, '3month': 8
+            },
+            'medium': {
+                '5min': 200, '15min': 200, '30min': 200, '1h': 300, '2h': 300,
+                '3h': 300, '4h': 300, 'daily': 600,
+                'weekly': 20, 'monthly': 12, '3month': 8
+            },
+            'high': {
+                '5min': 300, '15min': 300, '30min': 300, '1h': 500, '2h': 500,
+                '3h': 500, '4h': 500, 'daily': 1200,
+                'weekly': 20, 'monthly': 12, '3month': 8
+            }
+        }
+        project_config.TIMEFRAME_SEQUENCE_LENGTHS = SEQUENCE_LENGTH_PRESETS[args.seq_preset]
+
     # Set debug mode environment variable for child processes (collate workers, dataset)
     if getattr(args, 'debug', False):
         os.environ['TRAIN_DEBUG'] = '1'
