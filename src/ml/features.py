@@ -6008,9 +6008,26 @@ class TradingFeatureExtractor(FeatureExtractor):
             for i in tqdm(range(len(cont_labels) - 20), desc=f"         {current_tf}", leave=False, ncols=100):
                 row = cont_labels.iloc[i]
                 timestamp = row.name if hasattr(row, 'name') else cont_labels.index[i]
-                duration = int(row['duration_bars'])
-                current_slope = row['channel_slope']
-                current_r_squared = row.get('channel_r_squared', 0.5)
+
+                # v5.9: Multi-window format - pick best window's duration
+                # Find window with highest r_squared
+                best_window = None
+                best_r2 = -1
+                for window in config.CHANNEL_WINDOW_SIZES:
+                    if f'w{window}_valid' in row and row[f'w{window}_valid'] > 0:
+                        if f'w{window}_r_squared' in row:
+                            r2 = row[f'w{window}_r_squared']
+                            if r2 > best_r2:
+                                best_r2 = r2
+                                best_window = window
+
+                # Use best window's duration, or skip if no valid windows
+                if best_window is None:
+                    continue  # No valid windows for this timestamp
+
+                duration = int(row[f'w{best_window}_duration'])
+                current_slope = row[f'w{best_window}_slope']
+                current_r_squared = row[f'w{best_window}_r_squared']
                 current_direction = slope_to_direction(current_slope)
 
                 # Look at what happened after the channel ended
@@ -6031,9 +6048,27 @@ class TradingFeatureExtractor(FeatureExtractor):
                     continue
 
                 future_row = cont_labels.iloc[future_idx]
-                future_slope = future_row['channel_slope']
-                future_direction = slope_to_direction(future_slope)
-                future_r_squared = future_row.get('channel_r_squared', 0.5)
+
+                # v5.9: Get future window data (use same best window logic)
+                future_best_window = None
+                future_best_r2 = -1
+                for window in config.CHANNEL_WINDOW_SIZES:
+                    if f'w{window}_valid' in future_row and future_row[f'w{window}_valid'] > 0:
+                        if f'w{window}_r_squared' in future_row:
+                            r2 = future_row[f'w{window}_r_squared']
+                            if r2 > future_best_r2:
+                                future_best_r2 = r2
+                                future_best_window = window
+
+                if future_best_window is None:
+                    # Future has no valid windows - assume continuation
+                    future_slope = current_slope
+                    future_direction = current_direction
+                    future_r_squared = current_r_squared
+                else:
+                    future_slope = future_row[f'w{future_best_window}_slope']
+                    future_direction = slope_to_direction(future_slope)
+                    future_r_squared = future_row[f'w{future_best_window}_r_squared']
 
                 # Determine transition type
                 transition_type = TRANSITION_CONTINUE
