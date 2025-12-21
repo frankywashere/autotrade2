@@ -2879,41 +2879,34 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print(f"   ⚠️  Events handler load failed: {e}")
             print(f"      Event features will be zeros. Check {project_config.TSLA_EVENTS_FILE}")
 
-    # Extract features (handles caching internally)
-    # v5.9: DDP FIX - Only rank 0 should extract features to avoid race conditions
-    if is_main_process(rank):
-        print(f"   Extracting features (use_chunking={args.use_chunking})...")
+    # v5.9: Load features from cache (already extracted in main() before DDP spawn)
+    # OR extract if single-process mode
+    if getattr(args, 'preprocessed_cache_ready', False):
+        # Features already extracted in main() - just load from cache
+        if is_main_process(rank):
+            print(f"   Loading features from cache (preprocessed before DDP)...")
 
         result = extractor.extract_features(
             df,
-            use_cache=True,
+            use_cache=True,  # Always use cache - already extracted
             continuation=True,
             use_chunking=args.use_chunking,
-            use_gpu=args.use_gpu_features,  # Pass user's GPU selection
+            use_gpu=args.use_gpu_features,
             shard_storage_path=str(shard_path),
-            vix_data=vix_data,  # v3.20: VIX features for volatility regime
-            events_handler=events_handler,  # v4.0: Event features for earnings/FOMC patterns
+            vix_data=vix_data,
+            events_handler=events_handler,
         )
-        # Handle variable return: (features_df, continuation_labels_dir) or (features_df, continuation_labels_dir, mmap_meta_path)
-        # v4.3: continuation_labels_dir is a Path to per-TF label files, NOT a DataFrame
         features_df = result[0]
-        continuation_labels_dir = result[1]  # Path to directory with per-TF label files
+        continuation_labels_dir = result[1]
         mmap_meta_path = result[2] if len(result) > 2 else None
 
-        # Sync point: Wait for other ranks before proceeding
-        if world_size > 1:
-            print(f"   ✓ Rank 0 feature extraction complete - syncing with other ranks...")
-            dist.barrier()
+        if is_main_process(rank):
+            print(f"   ✓ Cache loaded instantly")
     else:
-        # Non-main processes: wait for rank 0 to finish, then load from cache
-        print(f"   Rank {rank}: Waiting for rank 0 to complete feature extraction...")
+        # Single-process mode OR torchrun mode - extract here
+        if is_main_process(rank):
+            print(f"   Extracting features (use_chunking={args.use_chunking})...")
 
-        if world_size > 1:
-            # Wait for barrier before proceeding (rank 0 will finish extraction first)
-            dist.barrier()
-
-        # Load cached features (rank 0 just created them)
-        # Re-run with use_cache=True (will load instantly)
         result = extractor.extract_features(
             df,
             use_cache=True,
@@ -4822,6 +4815,74 @@ def main():
             args = interactive_setup(args, profiler=profiler)
 
     # ==========================================================================
+    # v5.9: FEATURE EXTRACTION (Before DDP/Training)
+    # ==========================================================================
+    # Do feature extraction ONCE in main process before launching DDP
+    # This prevents timeout issues and race conditions
+
+    if not is_distributed:  # Only in mp.spawn mode (not torchrun - that handles differently)
+        print("\n" + "=" * 70)
+        print("🔧 PREPROCESSING (CPU - Before GPU Training)")
+        print("=" * 70)
+
+        # Load data
+        print("\n1. Loading data...")
+        data_feed = CSVDataFeed(timeframe=args.input_timeframe)
+        historical_buffer_years = 2
+        load_start_year = max(2010, args.train_start_year - historical_buffer_years)
+
+        df = data_feed.load_aligned_data(
+            start_date=f'{load_start_year}-01-01',
+            end_date=f'{args.train_end_year}-12-31'
+        )
+        print(f"   ✓ Loaded {len(df):,} bars")
+
+        # Load VIX and events
+        print("\n2. Loading VIX and events...")
+        vix_data = None
+        vix_csv_path = Path(project_config.DATA_DIR) / "VIX_History.csv"
+        if vix_csv_path.exists():
+            vix_data = load_vix_data(str(vix_csv_path))
+            print(f"   ✓ VIX: {len(vix_data)} days")
+
+        events_handler = None
+        try:
+            from src.ml.events import CombinedEventsHandler
+            events_handler = CombinedEventsHandler(
+                tsla_file=str(project_config.TSLA_EVENTS_FILE),
+                macro_api_key=project_config.MACRO_EVENTS_API_KEY if hasattr(project_config, 'MACRO_EVENTS_API_KEY') else None
+            )
+            events_df = events_handler.load_events()
+            print(f"   ✓ Events: {len(events_df)} events")
+        except Exception as e:
+            print(f"   ⚠️  Events load failed: {e}")
+
+        # Extract features (CPU work)
+        print("\n3. Extracting features (CPU, 6 workers)...")
+        print("   This happens ONCE before GPUs start")
+
+        extractor = TradingFeatureExtractor()
+        shard_path = Path(args.shard_path) if args.shard_path else Path(project_config.SHARD_DIR)
+
+        result = extractor.extract_features(
+            df,
+            use_cache=not getattr(args, 'regenerate_cache', True),
+            continuation=True,
+            use_chunking=args.use_chunking,
+            use_gpu=args.use_gpu_features,
+            shard_storage_path=str(shard_path),
+            vix_data=vix_data,
+            events_handler=events_handler,
+        )
+
+        print(f"   ✓ Features extracted and cached to {shard_path}")
+        print(f"   ✓ GPU processes will load from cache (instant)")
+
+        # Store cache info in args for DDP processes
+        args.preprocessed_cache_ready = True
+        args.cache_shard_path = str(shard_path)
+
+    # ==========================================================================
     # DISPATCH TO run_training()
     # ==========================================================================
 
@@ -4835,6 +4896,7 @@ def main():
         num_gpus = getattr(args, 'num_ddp_gpus', torch.cuda.device_count())
         print(f"\n🚀 Launching {num_gpus} DDP processes via mp.spawn...")
         print(f"   Each process will use one GPU (cuda:0 to cuda:{num_gpus-1})")
+        print(f"   Features already cached - GPUs will load instantly")
         mp.spawn(run_training, nprocs=num_gpus, args=(num_gpus, vars(args)))
     else:
         # Single GPU/device mode - call directly
