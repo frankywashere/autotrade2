@@ -5422,70 +5422,64 @@ class TradingFeatureExtractor(FeatureExtractor):
             # Generate labels
             tf_labels = []
 
-            # v5.9: Process each timestamp and fit channels for ALL windows
-            for i in tqdm(range(max_window, len(tf_data) - 1),
-                         desc=f"         {tf} labels", leave=False, ncols=100, ascii=True):
+            # v5.9: Parallelize timestamp processing for faster label generation
+            # Define worker function (must be at module level for pickling)
+            def process_timestamp_for_labels(i, tf_data_values, tf_data_index, windows, current_price_col):
+                """Process one timestamp across all windows - parallelizable."""
+                try:
+                    # Reconstruct needed data from arrays (avoid pickling large DataFrames)
+                    current_price = tf_data_values[i, current_price_col]
+                    current_timestamp = tf_data_index[i]
 
-                # Get current price and timestamp
-                current_price = tf_data.iloc[i]['tsla_close']
-                current_timestamp = tf_data.index[i]
+                    # Future data for this timestamp
+                    future_values = tf_data_values[i:]
+                    future_highs = future_values[:, 1]  # high column
+                    future_lows = future_values[:, 2]   # low column
+                    future_closes = future_values[:, 3]  # close column
 
-                # Calculate actual price movement (for monitoring only)
-                future = tf_data.iloc[i:]
-                future_highs = future['tsla_high'].values
-                future_lows = future['tsla_low'].values
-                if len(future_highs) > 0:
-                    max_gain = max(abs((max(future_highs) - current_price) / current_price * 100),
-                                   abs((min(future_lows) - current_price) / current_price * 100))
-                else:
-                    max_gain = 0.0
+                    if len(future_highs) > 0:
+                        max_gain = max(abs((future_highs.max() - current_price) / current_price * 100),
+                                     abs((future_lows.min() - current_price) / current_price * 100))
+                    else:
+                        max_gain = 0.0
 
-                # Dictionary to store this timestamp's labels across all windows
-                label_row = {
-                    'timestamp': current_timestamp,
-                    'max_gain_pct': float(max_gain),  # Actual price (monitoring only)
-                }
+                    label_row = {
+                        'timestamp': current_timestamp,
+                        'max_gain_pct': float(max_gain),
+                    }
 
-                # v5.9: Fit channel for EACH window size
-                for window in config.CHANNEL_WINDOW_SIZES:
-                    try:
-                        # Lookback window for channel fitting
+                    # Fit channel for each window
+                    for window in windows:
                         if i < window:
-                            continue  # Not enough history for this window
+                            continue
 
-                        lookback = tf_data.iloc[i - window:i]
+                        # Get lookback data
+                        lookback_closes = tf_data_values[i - window:i, 3]  # close column
 
-                        # Fit linear regression channel
+                        # Fit linear regression
+                        from scipy import stats
                         x = np.arange(window)
-                        closes = lookback['tsla_close'].values
-                        highs = lookback['tsla_high'].values
-                        lows = lookback['tsla_low'].values
-
-                        # Use scipy for linear regression
-                        slope, intercept, r_value, _, _ = stats.linregress(x, closes)
+                        slope, intercept, r_value, _, _ = stats.linregress(x, lookback_closes)
                         r_squared = r_value ** 2
 
-                        # Calculate residuals and std dev
+                        # Calculate residuals
                         predicted = slope * x + intercept
-                        residuals = closes - predicted
+                        residuals = lookback_closes - predicted
                         residual_std = np.std(residuals)
 
                         if residual_std < 1e-10:
-                            # Degenerate channel - skip this window
                             label_row[f'w{window}_valid'] = 0
                             continue
 
-                        # Calculate channel metrics
+                        # Cycle counting (simplified for parallelization)
                         upper_line = predicted + (2.0 * residual_std)
                         lower_line = predicted - (2.0 * residual_std)
-
-                        # Simple cycle counting
-                        touches_upper = closes >= (predicted + 1.5 * residual_std)
-                        touches_lower = closes <= (predicted - 1.5 * residual_std)
+                        touches_upper = lookback_closes >= (predicted + 1.5 * residual_std)
+                        touches_lower = lookback_closes <= (predicted - 1.5 * residual_std)
 
                         complete_cycles = 0
                         last_touch = None
-                        for j in range(len(closes)):
+                        for j in range(len(lookback_closes)):
                             if touches_upper[j] and last_touch != 'upper':
                                 if last_touch == 'lower':
                                     complete_cycles += 1
@@ -5497,64 +5491,57 @@ class TradingFeatureExtractor(FeatureExtractor):
 
                         is_valid = complete_cycles >= 2 and r_squared > 0.5
 
-                        # Detect when THIS window's channel breaks
-                        break_idx, _ = self._detect_channel_break_structure(
-                            slope=slope,
-                            intercept=intercept,
-                            residual_std=residual_std,
-                            lookback_bars=window,
-                            future_prices=future,
-                            current_price=current_price
-                        )
+                        # Detect break
+                        break_idx = None
+                        for bar_idx in range(len(future_closes)):
+                            x_pos = window + bar_idx
+                            center = slope * x_pos + intercept
+                            upper = center + (2.0 * residual_std)
+                            lower = center - (2.0 * residual_std)
 
-                        # Duration for this specific window
-                        duration_bars = break_idx if break_idx is not None else (len(future) - 1)
+                            if future_closes[bar_idx] > upper or future_closes[bar_idx] < lower:
+                                break_idx = bar_idx
+                                break
 
-                        # Confidence for this window
-                        confidence = self._calculate_continuation_confidence(
-                            r_squared=r_squared,
-                            cycles=complete_cycles,
-                            is_valid=is_valid
-                        )
+                        duration_bars = break_idx if break_idx is not None else (len(future_closes) - 1)
 
-                        # v5.9: Track actual price behavior during channel duration
-                        # For containment loss and hit probability tracking
+                        # Confidence calculation
+                        conf = r_squared * 0.7
+                        cycle_bonus = min(complete_cycles / 5.0, 1.0) * 0.3
+                        confidence = (conf + cycle_bonus) if is_valid else 0.1
 
-                        # Collect actual price sequence (% change from current)
-                        future_bars = min(duration_bars, len(future) - 1)
+                        # Track price behavior
+                        future_bars = min(duration_bars, len(future_closes))
                         price_sequence = []
-
-                        # Calculate bounds at each future bar for hit detection
                         hit_upper = False
                         hit_midline = False
                         hit_lower = False
-                        bars_until_hit_upper = future_bars  # Default: never hit
+                        bars_until_hit_upper = future_bars
                         bars_until_hit_midline = future_bars
                         bars_until_hit_lower = future_bars
-                        time_near_upper = 0.0  # Fraction of time near upper
+                        time_near_upper = 0.0
                         time_near_midline = 0.0
                         time_near_lower = 0.0
 
                         for bar_idx in range(future_bars):
-                            if bar_idx >= len(future):
+                            if bar_idx >= len(future_closes):
                                 break
 
-                            actual_close = future.iloc[bar_idx]['tsla_close']
+                            actual_close = future_closes[bar_idx]
                             actual_pct = (actual_close - current_price) / current_price * 100
                             price_sequence.append(actual_pct)
 
-                            # Project bounds to this bar
+                            # Project bounds
                             x_pos = window + bar_idx
                             center_at_bar = slope * x_pos + intercept
                             upper_at_bar = center_at_bar + (2.0 * residual_std)
                             lower_at_bar = center_at_bar - (2.0 * residual_std)
 
-                            # Convert to % from current price
                             upper_pct = (upper_at_bar - current_price) / current_price * 100
                             midline_pct = (center_at_bar - current_price) / current_price * 100
                             lower_pct = (lower_at_bar - current_price) / current_price * 100
 
-                            # Check proximity (within 10% of bound range)
+                            # Check proximity
                             range_pct = upper_pct - lower_pct
                             threshold = range_pct * 0.1
 
@@ -5576,15 +5563,15 @@ class TradingFeatureExtractor(FeatureExtractor):
                                     hit_lower = True
                                     bars_until_hit_lower = bar_idx
 
-                        # Normalize time fractions
+                        # Normalize
                         if future_bars > 0:
                             time_near_upper /= future_bars
                             time_near_midline /= future_bars
                             time_near_lower /= future_bars
 
-                        # Save all window-specific data
+                        # Save window data
                         label_row[f'w{window}_duration'] = float(duration_bars)
-                        label_row[f'w{window}_price_sequence'] = price_sequence  # List of % changes
+                        label_row[f'w{window}_price_sequence'] = price_sequence
                         label_row[f'w{window}_hit_upper'] = float(hit_upper)
                         label_row[f'w{window}_hit_midline'] = float(hit_midline)
                         label_row[f'w{window}_hit_lower'] = float(hit_lower)
@@ -5601,17 +5588,75 @@ class TradingFeatureExtractor(FeatureExtractor):
                         label_row[f'w{window}_valid'] = int(is_valid)
                         label_row[f'w{window}_width'] = float(residual_std * 4)
 
-                    except Exception:
-                        # Failed for this window - mark as invalid
-                        label_row[f'w{window}_valid'] = 0
-                        continue
+                    # Check if any window is valid
+                    valid_windows = sum(1 for w in windows if label_row.get(f'w{w}_valid', 0) > 0)
+                    if valid_windows > 0:
+                        return label_row
+                    return None
 
-                # Only save if at least ONE window is valid
-                valid_windows = sum(1 for w in config.CHANNEL_WINDOW_SIZES
-                                   if label_row.get(f'w{w}_valid', 0) > 0)
-                if valid_windows > 0:
-                    tf_labels.append(label_row)
+                except Exception:
+                    return None
 
+            # Get number of workers from config
+            # v5.9: Label generation is MUCH lighter than channel extraction (500MB vs 15GB per worker)
+            # So we can safely use more workers even on limited RAM systems
+            max_workers = config.MAX_PARALLEL_WORKERS if hasattr(config, 'MAX_PARALLEL_WORKERS') else 0
+
+            if max_workers > 0:
+                # Adjust for label generation (30x lighter than channel extraction)
+                # If menu recommended 1 worker for channels (16GB RAM), we can use ~6 for labels
+                try:
+                    import psutil
+                    available_gb = psutil.virtual_memory().available / (1024**3)
+                    # Each label worker uses ~500MB, be conservative with 1GB estimate
+                    label_safe_workers = max(1, min(int(available_gb / 1.0), max_workers * 6))
+                    # Also respect CPU core count
+                    import os
+                    cpu_cores = os.cpu_count() or 1
+                    n_jobs = min(label_safe_workers, cpu_cores)
+
+                    if n_jobs > max_workers:
+                        print(f"         💡 Label generation using {n_jobs} workers (vs {max_workers} for channels - labels are lighter)")
+                    else:
+                        n_jobs = max_workers
+                except:
+                    n_jobs = max_workers
+            else:
+                n_jobs = 1
+
+            # Prepare data for parallel processing (convert DataFrame to arrays)
+            tf_data_values = tf_data[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
+            tf_data_index = tf_data.index.values
+            close_col_idx = 3  # Close is 4th column
+
+            timestamps_to_process = range(max_window, len(tf_data) - 1)
+
+            if n_jobs > 1 and len(timestamps_to_process) > 100:
+                # Parallel processing
+                print(f"         🚀 Using {n_jobs} workers for parallel label generation...")
+                from joblib import Parallel, delayed
+
+                results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
+                    delayed(process_timestamp_for_labels)(
+                        i, tf_data_values, tf_data_index, config.CHANNEL_WINDOW_SIZES, close_col_idx
+                    )
+                    for i in tqdm(timestamps_to_process, desc=f"         {tf} labels", leave=False, ncols=100, ascii=True)
+                )
+
+                # Filter out None results
+                tf_labels = [r for r in results if r is not None]
+            else:
+                # Single-threaded fallback
+                print(f"         💾 Using single-threaded processing (set feature_workers>1 for speedup)")
+                tf_labels = []
+                for i in tqdm(timestamps_to_process, desc=f"         {tf} labels", leave=False, ncols=100, ascii=True):
+                    result = process_timestamp_for_labels(
+                        i, tf_data_values, tf_data_index, config.CHANNEL_WINDOW_SIZES, close_col_idx
+                    )
+                    if result is not None:
+                        tf_labels.append(result)
+
+            # Continue with common code (parallel or single-threaded results now in tf_labels)
             if len(tf_labels) == 0:
                 print(f"         ⚠️  No valid labels generated for {tf}")
                 continue
