@@ -863,23 +863,43 @@ class HierarchicalDataset(Dataset):
 
                     if row_idx is not None:
                         cont_data = self._per_tf_continuation[tf]
-                        targets[f'cont_{tf}_duration'] = float(cont_data['duration_bars'][row_idx])
+
+                        # v5.9: Load ALL window targets for this TF
+                        # Store max_gain_pct for monitoring
                         targets[f'cont_{tf}_gain'] = float(cont_data['max_gain_pct'][row_idx])
-                        targets[f'cont_{tf}_confidence'] = float(cont_data['confidence'][row_idx])
-                        targets[f'cont_{tf}_valid'] = 1.0  # Mark as valid
+
+                        # v5.9: Load all window data including price sequences and hit tracking
+                        for window in config.CHANNEL_WINDOW_SIZES:
+                            if f'w{window}_valid' in cont_data:
+                                is_valid = cont_data[f'w{window}_valid'][row_idx] > 0
+                                if is_valid:
+                                    targets[f'cont_{tf}_w{window}_duration'] = float(cont_data[f'w{window}_duration'][row_idx])
+                                    targets[f'cont_{tf}_w{window}_price_sequence'] = cont_data[f'w{window}_price_sequence'][row_idx]  # List
+                                    targets[f'cont_{tf}_w{window}_hit_upper'] = float(cont_data[f'w{window}_hit_upper'][row_idx])
+                                    targets[f'cont_{tf}_w{window}_hit_midline'] = float(cont_data[f'w{window}_hit_midline'][row_idx])
+                                    targets[f'cont_{tf}_w{window}_hit_lower'] = float(cont_data[f'w{window}_hit_lower'][row_idx])
+                                    targets[f'cont_{tf}_w{window}_confidence'] = float(cont_data[f'w{window}_confidence'][row_idx])
+                                    targets[f'cont_{tf}_w{window}_valid'] = 1.0
+                                else:
+                                    # Window invalid - use placeholder
+                                    targets[f'cont_{tf}_w{window}_valid'] = 0.0
+
+                        # Mark TF as having at least some valid windows
+                        targets[f'cont_{tf}_valid'] = 1.0
+
                     else:
-                        # Timestamp not found - use placeholders with invalid flag
-                        targets[f'cont_{tf}_duration'] = 0.0
+                        # Timestamp not found - mark all windows as invalid
                         targets[f'cont_{tf}_gain'] = 0.0
-                        targets[f'cont_{tf}_confidence'] = 0.5
-                        targets[f'cont_{tf}_valid'] = 0.0  # Mark as invalid
+                        targets[f'cont_{tf}_valid'] = 0.0
+                        for window in config.CHANNEL_WINDOW_SIZES:
+                            targets[f'cont_{tf}_w{window}_valid'] = 0.0
 
                 except Exception:
-                    # Error - use placeholders with invalid flag
-                    targets[f'cont_{tf}_duration'] = 0.0
+                    # Error - mark all as invalid
                     targets[f'cont_{tf}_gain'] = 0.0
-                    targets[f'cont_{tf}_confidence'] = 0.5
-                    targets[f'cont_{tf}_valid'] = 0.0  # Mark as invalid
+                    targets[f'cont_{tf}_valid'] = 0.0
+                    for window in config.CHANNEL_WINDOW_SIZES:
+                        targets[f'cont_{tf}_w{window}_valid'] = 0.0
 
         # Legacy fallback: single continuation_labels_df (backward compatibility)
         elif self.include_continuation and self.continuation_labels_df is not None:
@@ -1049,12 +1069,31 @@ class HierarchicalDataset(Dataset):
                     labels_df = pickle.load(f)
 
                 if isinstance(labels_df, pd.DataFrame) and len(labels_df) > 0:
-                    # Extract arrays for O(1) access
-                    self._per_tf_continuation[tf] = {
-                        'duration_bars': labels_df['duration_bars'].values.astype(config.NUMPY_DTYPE),
+                    # v5.9: Extract arrays for ALL windows (w10-w100)
+                    continuation_data = {
                         'max_gain_pct': labels_df['max_gain_pct'].values.astype(config.NUMPY_DTYPE),
-                        'confidence': labels_df['confidence'].values.astype(config.NUMPY_DTYPE),
                     }
+
+                    # v5.9: Load window-specific data for each of the 14 windows
+                    for window in config.CHANNEL_WINDOW_SIZES:
+                        # Check if this window's data exists in labels
+                        if f'w{window}_valid' in labels_df.columns:
+                            continuation_data[f'w{window}_duration'] = labels_df[f'w{window}_duration'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_price_sequence'] = labels_df[f'w{window}_price_sequence'].values  # List of lists
+                            continuation_data[f'w{window}_hit_upper'] = labels_df[f'w{window}_hit_upper'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_hit_midline'] = labels_df[f'w{window}_hit_midline'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_hit_lower'] = labels_df[f'w{window}_hit_lower'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_bars_until_hit_upper'] = labels_df[f'w{window}_bars_until_hit_upper'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_bars_until_hit_midline'] = labels_df[f'w{window}_bars_until_hit_midline'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_bars_until_hit_lower'] = labels_df[f'w{window}_bars_until_hit_lower'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_time_near_upper'] = labels_df[f'w{window}_time_near_upper'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_time_near_midline'] = labels_df[f'w{window}_time_near_midline'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_time_near_lower'] = labels_df[f'w{window}_time_near_lower'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_slope'] = labels_df[f'w{window}_slope'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_confidence'] = labels_df[f'w{window}_confidence'].values.astype(config.NUMPY_DTYPE)
+                            continuation_data[f'w{window}_valid'] = labels_df[f'w{window}_valid'].values.astype(config.NUMPY_DTYPE)
+
+                    self._per_tf_continuation[tf] = continuation_data
 
                     # Build timestamp -> row_idx lookup dict
                     # Note: timestamp is the INDEX, not a column
@@ -1065,7 +1104,17 @@ class HierarchicalDataset(Dataset):
 
                     loaded_count += 1
                     resolution = "5min" if self._uses_5min_labels.get(tf) else "native"
+
+                    # v5.9: Count valid windows
+                    valid_window_counts = []
+                    for window in config.CHANNEL_WINDOW_SIZES:
+                        if f'w{window}_valid' in labels_df.columns:
+                            valid_count = labels_df[f'w{window}_valid'].sum()
+                            valid_window_counts.append(f'w{window}:{int(valid_count)}')
+
                     print(f"     {tf}: {len(labels_df):,} labels ({resolution}) from {label_file.name}")
+                    if valid_window_counts:
+                        print(f"          Windows: {', '.join(valid_window_counts[:5])}{'...' if len(valid_window_counts) > 5 else ''}")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to load {tf} labels: {e}")

@@ -40,8 +40,9 @@ EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
 CHANNEL_PROJECTION_VERSION = "v2"  # v5.6: Removed fixed projections - now calculated at inference from learned duration
 BREAKDOWN_CALC_VERSION = "v3"  # v5.8: Fixed window sizes for 1min input (was 5x too short in v2)
 PARTIAL_BAR_VERSION = "v4"  # v5.6: Removed projected_high/low/center - projections calculated at inference
-FEATURE_VERSION = f"v5.6.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}"
-# v5.6.0: Removed fixed projection features (31 per window now) - projections calculated at inference using learned duration
+CONTINUATION_LABEL_VERSION = "v2"  # v5.9: Multi-window labels (all 14 windows per timestamp, not single w500)
+FEATURE_VERSION = f"v5.9.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}"
+# v5.9.0: Multi-window continuation labels - all 14 channel windows (w10-w100) saved per timestamp for proper geometric target calculation
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
 # IMPORTED FROM config.py (single source of truth)
@@ -5407,104 +5408,209 @@ class TradingFeatureExtractor(FeatureExtractor):
 
             print(f"         Resampled to {len(tf_data):,} {tf} bars")
 
-            # Get lookback for this TF
-            lookback_bars = TIMEFRAME_SEQUENCE_LENGTHS[tf]
+            # v5.9: Generate labels for ALL channel windows (w10-w100)
+            # Previously used TIMEFRAME_SEQUENCE_LENGTHS (500 bars for 1h),
+            # which didn't match feature windows. Now uses CHANNEL_WINDOW_SIZES
+            # to ensure label windows match feature windows.
 
-            if len(tf_data) < lookback_bars + 10:
-                print(f"         ⚠️  Not enough data for {tf} (need {lookback_bars}+ bars, have {len(tf_data)})")
+            # Need enough data for largest window + future scanning
+            max_window = max(config.CHANNEL_WINDOW_SIZES)
+            if len(tf_data) < max_window + 10:
+                print(f"         ⚠️  Not enough data for {tf} (need {max_window}+ bars, have {len(tf_data)})")
                 continue
 
             # Generate labels
             tf_labels = []
 
-            for i in tqdm(range(lookback_bars, len(tf_data) - 1),
+            # v5.9: Process each timestamp and fit channels for ALL windows
+            for i in tqdm(range(max_window, len(tf_data) - 1),
                          desc=f"         {tf} labels", leave=False, ncols=100, ascii=True):
-                # Lookback window for channel fitting
-                lookback = tf_data.iloc[i - lookback_bars:i]
-
-                # Fit linear regression channel on lookback
-                try:
-                    x = np.arange(lookback_bars)
-                    closes = lookback['tsla_close'].values
-                    highs = lookback['tsla_high'].values
-                    lows = lookback['tsla_low'].values
-
-                    # Use scipy for linear regression
-                    slope, intercept, r_value, _, _ = stats.linregress(x, closes)
-                    r_squared = r_value ** 2
-
-                    # Calculate residuals and std dev
-                    predicted = slope * x + intercept
-                    residuals = closes - predicted
-                    residual_std = np.std(residuals)
-
-                    if residual_std < 1e-10:
-                        # Degenerate channel (flat line)
-                        continue
-
-                    # Calculate channel metrics
-                    upper_line = predicted + (2.0 * residual_std)
-                    lower_line = predicted - (2.0 * residual_std)
-
-                    # Simple cycle counting: alternating touches of upper/lower bands
-                    touches_upper = closes >= (predicted + 1.5 * residual_std)
-                    touches_lower = closes <= (predicted - 1.5 * residual_std)
-
-                    complete_cycles = 0
-                    last_touch = None
-                    for j in range(len(closes)):
-                        if touches_upper[j] and last_touch != 'upper':
-                            if last_touch == 'lower':
-                                complete_cycles += 1
-                            last_touch = 'upper'
-                        elif touches_lower[j] and last_touch != 'lower':
-                            if last_touch == 'upper':
-                                complete_cycles += 1
-                            last_touch = 'lower'
-
-                    is_valid = complete_cycles >= 2 and r_squared > 0.5
-
-                except Exception:
-                    continue
 
                 # Get current price and timestamp
                 current_price = tf_data.iloc[i]['tsla_close']
                 current_timestamp = tf_data.index[i]
 
-                # Future window (unlimited - scan until break OR end of data)
+                # Calculate actual price movement (for monitoring only)
                 future = tf_data.iloc[i:]
+                future_highs = future['tsla_high'].values
+                future_lows = future['tsla_low'].values
+                if len(future_highs) > 0:
+                    max_gain = max(abs((max(future_highs) - current_price) / current_price * 100),
+                                   abs((min(future_lows) - current_price) / current_price * 100))
+                else:
+                    max_gain = 0.0
 
-                # Detect continuation vs break using CHANNEL STRUCTURE
-                break_idx, max_gain = self._detect_channel_break_structure(
-                    slope=slope,
-                    intercept=intercept,
-                    residual_std=residual_std,
-                    lookback_bars=lookback_bars,
-                    future_prices=future,
-                    current_price=current_price
-                )
-
-                # Calculate duration (in bars)
-                duration_bars = break_idx if break_idx is not None else (len(future) - 1)
-
-                # Calculate confidence based on channel quality
-                confidence = self._calculate_continuation_confidence(
-                    r_squared=r_squared,
-                    cycles=complete_cycles,
-                    is_valid=is_valid
-                )
-
-                tf_labels.append({
+                # Dictionary to store this timestamp's labels across all windows
+                label_row = {
                     'timestamp': current_timestamp,
-                    'duration_bars': float(duration_bars),
-                    'max_gain_pct': float(max_gain),
-                    'confidence': float(confidence),
-                    'channel_cycles': int(complete_cycles),
-                    'channel_r_squared': float(r_squared),
-                    'channel_valid': int(is_valid),
-                    'channel_slope': float(slope),
-                    'channel_width': float(residual_std * 4)  # Full width (±2σ)
-                })
+                    'max_gain_pct': float(max_gain),  # Actual price (monitoring only)
+                }
+
+                # v5.9: Fit channel for EACH window size
+                for window in config.CHANNEL_WINDOW_SIZES:
+                    try:
+                        # Lookback window for channel fitting
+                        if i < window:
+                            continue  # Not enough history for this window
+
+                        lookback = tf_data.iloc[i - window:i]
+
+                        # Fit linear regression channel
+                        x = np.arange(window)
+                        closes = lookback['tsla_close'].values
+                        highs = lookback['tsla_high'].values
+                        lows = lookback['tsla_low'].values
+
+                        # Use scipy for linear regression
+                        slope, intercept, r_value, _, _ = stats.linregress(x, closes)
+                        r_squared = r_value ** 2
+
+                        # Calculate residuals and std dev
+                        predicted = slope * x + intercept
+                        residuals = closes - predicted
+                        residual_std = np.std(residuals)
+
+                        if residual_std < 1e-10:
+                            # Degenerate channel - skip this window
+                            label_row[f'w{window}_valid'] = 0
+                            continue
+
+                        # Calculate channel metrics
+                        upper_line = predicted + (2.0 * residual_std)
+                        lower_line = predicted - (2.0 * residual_std)
+
+                        # Simple cycle counting
+                        touches_upper = closes >= (predicted + 1.5 * residual_std)
+                        touches_lower = closes <= (predicted - 1.5 * residual_std)
+
+                        complete_cycles = 0
+                        last_touch = None
+                        for j in range(len(closes)):
+                            if touches_upper[j] and last_touch != 'upper':
+                                if last_touch == 'lower':
+                                    complete_cycles += 1
+                                last_touch = 'upper'
+                            elif touches_lower[j] and last_touch != 'lower':
+                                if last_touch == 'upper':
+                                    complete_cycles += 1
+                                last_touch = 'lower'
+
+                        is_valid = complete_cycles >= 2 and r_squared > 0.5
+
+                        # Detect when THIS window's channel breaks
+                        break_idx, _ = self._detect_channel_break_structure(
+                            slope=slope,
+                            intercept=intercept,
+                            residual_std=residual_std,
+                            lookback_bars=window,
+                            future_prices=future,
+                            current_price=current_price
+                        )
+
+                        # Duration for this specific window
+                        duration_bars = break_idx if break_idx is not None else (len(future) - 1)
+
+                        # Confidence for this window
+                        confidence = self._calculate_continuation_confidence(
+                            r_squared=r_squared,
+                            cycles=complete_cycles,
+                            is_valid=is_valid
+                        )
+
+                        # v5.9: Track actual price behavior during channel duration
+                        # For containment loss and hit probability tracking
+
+                        # Collect actual price sequence (% change from current)
+                        future_bars = min(duration_bars, len(future) - 1)
+                        price_sequence = []
+
+                        # Calculate bounds at each future bar for hit detection
+                        hit_upper = False
+                        hit_midline = False
+                        hit_lower = False
+                        bars_until_hit_upper = future_bars  # Default: never hit
+                        bars_until_hit_midline = future_bars
+                        bars_until_hit_lower = future_bars
+                        time_near_upper = 0.0  # Fraction of time near upper
+                        time_near_midline = 0.0
+                        time_near_lower = 0.0
+
+                        for bar_idx in range(future_bars):
+                            if bar_idx >= len(future):
+                                break
+
+                            actual_close = future.iloc[bar_idx]['tsla_close']
+                            actual_pct = (actual_close - current_price) / current_price * 100
+                            price_sequence.append(actual_pct)
+
+                            # Project bounds to this bar
+                            x_pos = window + bar_idx
+                            center_at_bar = slope * x_pos + intercept
+                            upper_at_bar = center_at_bar + (2.0 * residual_std)
+                            lower_at_bar = center_at_bar - (2.0 * residual_std)
+
+                            # Convert to % from current price
+                            upper_pct = (upper_at_bar - current_price) / current_price * 100
+                            midline_pct = (center_at_bar - current_price) / current_price * 100
+                            lower_pct = (lower_at_bar - current_price) / current_price * 100
+
+                            # Check proximity (within 10% of bound range)
+                            range_pct = upper_pct - lower_pct
+                            threshold = range_pct * 0.1
+
+                            if abs(actual_pct - upper_pct) < threshold:
+                                time_near_upper += 1
+                                if not hit_upper:
+                                    hit_upper = True
+                                    bars_until_hit_upper = bar_idx
+
+                            if abs(actual_pct - midline_pct) < threshold:
+                                time_near_midline += 1
+                                if not hit_midline:
+                                    hit_midline = True
+                                    bars_until_hit_midline = bar_idx
+
+                            if abs(actual_pct - lower_pct) < threshold:
+                                time_near_lower += 1
+                                if not hit_lower:
+                                    hit_lower = True
+                                    bars_until_hit_lower = bar_idx
+
+                        # Normalize time fractions
+                        if future_bars > 0:
+                            time_near_upper /= future_bars
+                            time_near_midline /= future_bars
+                            time_near_lower /= future_bars
+
+                        # Save all window-specific data
+                        label_row[f'w{window}_duration'] = float(duration_bars)
+                        label_row[f'w{window}_price_sequence'] = price_sequence  # List of % changes
+                        label_row[f'w{window}_hit_upper'] = float(hit_upper)
+                        label_row[f'w{window}_hit_midline'] = float(hit_midline)
+                        label_row[f'w{window}_hit_lower'] = float(hit_lower)
+                        label_row[f'w{window}_bars_until_hit_upper'] = float(bars_until_hit_upper)
+                        label_row[f'w{window}_bars_until_hit_midline'] = float(bars_until_hit_midline)
+                        label_row[f'w{window}_bars_until_hit_lower'] = float(bars_until_hit_lower)
+                        label_row[f'w{window}_time_near_upper'] = float(time_near_upper)
+                        label_row[f'w{window}_time_near_midline'] = float(time_near_midline)
+                        label_row[f'w{window}_time_near_lower'] = float(time_near_lower)
+                        label_row[f'w{window}_slope'] = float(slope)
+                        label_row[f'w{window}_confidence'] = float(confidence)
+                        label_row[f'w{window}_r_squared'] = float(r_squared)
+                        label_row[f'w{window}_cycles'] = int(complete_cycles)
+                        label_row[f'w{window}_valid'] = int(is_valid)
+                        label_row[f'w{window}_width'] = float(residual_std * 4)
+
+                    except Exception:
+                        # Failed for this window - mark as invalid
+                        label_row[f'w{window}_valid'] = 0
+                        continue
+
+                # Only save if at least ONE window is valid
+                valid_windows = sum(1 for w in config.CHANNEL_WINDOW_SIZES
+                                   if label_row.get(f'w{w}_valid', 0) > 0)
+                if valid_windows > 0:
+                    tf_labels.append(label_row)
 
             if len(tf_labels) == 0:
                 print(f"         ⚠️  No valid labels generated for {tf}")
@@ -5520,10 +5626,21 @@ class TradingFeatureExtractor(FeatureExtractor):
 
             saved_files[tf] = output_path
 
-            # Stats
-            avg_duration = labels_df['duration_bars'].mean()
-            avg_confidence = labels_df['confidence'].mean()
-            print(f"         ✓ Saved {len(labels_df):,} labels | avg duration: {avg_duration:.1f} bars | avg conf: {avg_confidence:.2f}")
+            # v5.9: Stats showing multi-window coverage
+            num_timestamps = len(labels_df)
+            valid_counts = {}
+            for window in config.CHANNEL_WINDOW_SIZES:
+                if f'w{window}_valid' in labels_df.columns:
+                    valid_counts[window] = labels_df[f'w{window}_valid'].sum()
+                else:
+                    valid_counts[window] = 0
+
+            total_valid = sum(valid_counts.values())
+            avg_valid_per_timestamp = total_valid / num_timestamps if num_timestamps > 0 else 0
+
+            print(f"         ✓ Saved {num_timestamps:,} timestamps")
+            print(f"         ✓ Avg valid windows per timestamp: {avg_valid_per_timestamp:.1f}/14")
+            print(f"         ✓ Window coverage: w10={valid_counts.get(10,0):,}, w50={valid_counts.get(50,0):,}, w100={valid_counts.get(100,0):,}")
 
         print(f"\n   ✓ Generated {len(saved_files)}/{len(timeframes)} timeframe continuation labels")
         return saved_files

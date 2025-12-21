@@ -3492,7 +3492,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         'validity': [],
         'transition': [],
         'calibration': [],
-        'geo_price': [],  # v5.7: geometric projection price loss
+        'containment': [],  # v5.9: channel containment loss (replaced geo_price)
+        'hit_probability': [],  # v5.9: hit probability prediction loss
         'multi_tf': [],   # v5.7: multi-timeframe loss
         'entropy': [],    # v5.7: entropy regularization
     }
@@ -3857,31 +3858,123 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 loss_components['duration'] = duration_loss_total.item()
 
             # =====================================================================
-            # v5.7: GEOMETRIC PROJECTION LOSS (with warmup)
+            # v5.9: CONTAINMENT LOSS (channel bounds contain actual price)
             # =====================================================================
-            # Compare geometric projections (duration → calculated high/low) to actual
-            # This validates that the geometric calculation produces correct prices
-            geo_price_loss_total = 0.0
+            # Check if predicted channel bounds successfully contain actual price movement
+            containment_loss_total = 0.0
+            hit_probability_loss_total = 0.0
+
             if 'geometric_predictions' in hidden_states:
                 for tf, geo_data in hidden_states['geometric_predictions'].items():
-                    if 'high' in geo_data and 'low' in geo_data:
-                        geo_high = geo_data['high'].squeeze()
-                        geo_low = geo_data['low'].squeeze()
+                    if 'high' in geo_data and 'low' in geo_data and 'window_weights' in geo_data:
+                        geo_high_pred = geo_data['high'].squeeze()  # [batch]
+                        geo_low_pred = geo_data['low'].squeeze()    # [batch]
+                        window_weights = geo_data['window_weights']  # [batch, 14]
+                        batch_size = geo_high_pred.shape[0]
 
-                        # Compare to actual high/low targets
-                        target_high = target_tensor[:, 0]  # targets['high']
-                        target_low = target_tensor[:, 1]   # targets['low']
+                        # v5.9: For each sample in batch, check containment
+                        containment_scores = []
 
-                        # MSE between geometric projection and actual
-                        geo_high_loss = F.mse_loss(geo_high, target_high)
-                        geo_low_loss = F.mse_loss(geo_low, target_low)
+                        for sample_idx in range(batch_size):
+                            # Get blended price sequence using window weights
+                            sample_weights = window_weights[sample_idx]  # [14]
+                            price_sequences = []
+                            valid_windows = []
 
-                        # v5.7: Apply warmup weight
-                        geo_price_loss_total += geo_price_weight * (geo_high_loss + geo_low_loss) / 2
+                            for win_idx, window in enumerate(project_config.CHANNEL_WINDOW_SIZES):
+                                key = f'cont_{tf}_w{window}_price_sequence'
+                                if key in targets and sample_idx < len(targets[key]):
+                                    price_seq = targets[key][sample_idx]
+                                    if price_seq is not None and len(price_seq) > 0:
+                                        price_sequences.append(price_seq)
+                                        valid_windows.append(win_idx)
 
-            if geo_price_loss_total > 0:
-                loss = loss + geo_price_loss_total
-                loss_components['geo_price'] = geo_price_loss_total.item() if hasattr(geo_price_loss_total, 'item') else geo_price_loss_total
+                            if len(price_sequences) > 0:
+                                # Use price sequence from highest-weighted valid window
+                                if len(valid_windows) > 0:
+                                    max_weight_idx = sample_weights[valid_windows].argmax()
+                                    price_seq = price_sequences[max_weight_idx]
+
+                                    # Check containment for each bar in sequence
+                                    contained_bars = 0
+                                    total_bars = len(price_seq)
+
+                                    for price_pct in price_seq:
+                                        # Check if within predicted bounds
+                                        if geo_low_pred[sample_idx] <= price_pct <= geo_high_pred[sample_idx]:
+                                            contained_bars += 1
+
+                                    # Containment rate for this sample
+                                    containment_rate = contained_bars / max(total_bars, 1)
+                                    containment_scores.append(containment_rate)
+                                else:
+                                    containment_scores.append(0.5)  # Neutral if no valid sequences
+                            else:
+                                containment_scores.append(0.5)  # Neutral
+
+                        if containment_scores:
+                            # Convert to tensor
+                            containment_tensor = torch.tensor(containment_scores, device=args.device)
+                            # Loss = 1 - containment_rate (minimize when containment is high)
+                            containment_loss = (1.0 - containment_tensor).mean()
+                            containment_loss_total += geo_price_weight * containment_loss
+
+                        # v5.9: Hit probability loss (predict if price hits upper/midline/lower)
+                        if 'hit_prob_upper' in geo_data:
+                            hit_prob_upper_pred = geo_data['hit_prob_upper'].squeeze()  # [batch]
+                            hit_prob_midline_pred = geo_data['hit_prob_midline'].squeeze()  # [batch]
+                            hit_prob_lower_pred = geo_data['hit_prob_lower'].squeeze()  # [batch]
+
+                            # Blend hit targets using window weights
+                            for sample_idx in range(batch_size):
+                                sample_weights = window_weights[sample_idx]
+                                hit_upper_target = 0.0
+                                hit_midline_target = 0.0
+                                hit_lower_target = 0.0
+                                total_weight = 0.0
+
+                                for win_idx, window in enumerate(project_config.CHANNEL_WINDOW_SIZES):
+                                    key_hit_upper = f'cont_{tf}_w{window}_hit_upper'
+                                    key_hit_midline = f'cont_{tf}_w{window}_hit_midline'
+                                    key_hit_lower = f'cont_{tf}_w{window}_hit_lower'
+                                    key_valid = f'cont_{tf}_w{window}_valid'
+
+                                    if (key_valid in targets and targets[key_valid][sample_idx] > 0 and
+                                        key_hit_upper in targets):
+                                        weight = sample_weights[win_idx].item()
+                                        hit_upper_target += weight * targets[key_hit_upper][sample_idx].item()
+                                        hit_midline_target += weight * targets[key_hit_midline][sample_idx].item()
+                                        hit_lower_target += weight * targets[key_hit_lower][sample_idx].item()
+                                        total_weight += weight
+
+                                # Normalize if we had valid targets
+                                if total_weight > 0:
+                                    hit_upper_target /= total_weight
+                                    hit_midline_target /= total_weight
+                                    hit_lower_target /= total_weight
+
+                                    # BCE loss for hit probabilities
+                                    target_hit_upper_t = torch.tensor(hit_upper_target, device=args.device)
+                                    target_hit_midline_t = torch.tensor(hit_midline_target, device=args.device)
+                                    target_hit_lower_t = torch.tensor(hit_lower_target, device=args.device)
+
+                                    hit_loss = (
+                                        F.binary_cross_entropy(hit_prob_upper_pred[sample_idx:sample_idx+1], target_hit_upper_t.unsqueeze(0)) +
+                                        F.binary_cross_entropy(hit_prob_midline_pred[sample_idx:sample_idx+1], target_hit_midline_t.unsqueeze(0)) +
+                                        F.binary_cross_entropy(hit_prob_lower_pred[sample_idx:sample_idx+1], target_hit_lower_t.unsqueeze(0))
+                                    ) / 3.0
+
+                                    hit_probability_loss_total += hit_loss
+
+            # Add containment loss (replaces geo_price)
+            if containment_loss_total > 0:
+                loss = loss + containment_loss_total
+                loss_components['containment'] = containment_loss_total.item() if hasattr(containment_loss_total, 'item') else containment_loss_total
+
+            # Add hit probability loss
+            if hit_probability_loss_total > 0:
+                loss = loss + hit_probability_loss_total * 0.1  # Lower weight than containment
+                loss_components['hit_probability'] = (hit_probability_loss_total * 0.1).item() if hasattr(hit_probability_loss_total, 'item') else hit_probability_loss_total * 0.1
 
             # Validity loss - v5.7.1: per-sample
             validity_loss_total = 0.0
@@ -4036,7 +4129,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     print(f"   Primary: {loss_components.get('primary', 0):.3f}")
                     print(f"   Multi-task: {loss_components.get('multi_task', 0):.3f}")
                     print(f"   Duration: {loss_components.get('duration', 0):.3f}")
-                    print(f"   Geo-price: {loss_components.get('geo_price', 0):.3f}")
+                    print(f"   Containment: {loss_components.get('containment', 0):.3f}")
+                    print(f"   Hit-Prob: {loss_components.get('hit_probability', 0):.3f}")
                     print(f"   Validity: {loss_components.get('validity', 0):.3f}")
                     print(f"   Transition: {loss_components.get('transition', 0):.3f}")
                     print(f"   Calibration: {loss_components.get('calibration', 0):.3f}")
@@ -4045,7 +4139,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     print(f"   ─────────────────────")
 
                     # v5.7.2: Verify tracked components sum to total (Fix 5)
-                    CONTRIBUTION_KEYS = ['primary', 'multi_task', 'duration', 'geo_price',
+                    CONTRIBUTION_KEYS = ['primary', 'multi_task', 'duration', 'containment', 'hit_probability',
                                          'validity', 'transition', 'calibration', 'multi_tf', 'entropy']
                     tracked_sum = sum(loss_components.get(k, 0) for k in CONTRIBUTION_KEYS)
                     print(f"   Tracked: {tracked_sum:.3f}")

@@ -197,7 +197,7 @@ date,event_type,release_time,expected,actual,surprise_pct,beat_miss,source
 **Intraday Event Timing (6):** ← NEW: Hour-level granularity for event-day patterns
 | Feature | Type | Range | Description |
 |---------|------|-------|-------------|
-| `hours_until_tsla_earnings` | Continuous | [0, 1] | Hours to event on same day (0-8 normalized), 1.0 if future day, 0 if passed |
+| `hours_until_tsla_earnings` | Continuous | [0, 1] | Hours to event on same day (0-6.5 normalized, RTH_HOURS), 1.0 if future day, 0 if passed |
 | `hours_until_tsla_delivery` | Continuous | [0, 1] | Hours to TSLA delivery report |
 | `hours_until_fomc` | Continuous | [0, 1] | Hours to FOMC (enables "30 min before" patterns) |
 | `hours_until_cpi` | Continuous | [0, 1] | Hours to CPI release |
@@ -316,22 +316,21 @@ def compute_pre_event_drift(sample_timestamp, event_timestamp, price_df):
     drift = (current_price - anchor_price) / anchor_price
     return np.clip(drift, -0.5, 0.5)
 
-def compute_post_event_drift(sample_timestamp, event_timestamp, price_df, use_rth_only=False):
+def compute_post_event_drift(sample_timestamp, event_timestamp, price_df):
     """
     Measure price drift FROM event TO current sample.
     Returns 0 if sample is >14 trading days after event.
 
     CRITICAL: Uses timestamp precision to prevent same-day leakage.
+    Uses get_post_event_anchor_price() for proper RTH/pre-market/after-hours handling.
 
     Args:
         sample_timestamp: Current timestamp
         event_timestamp: Event release timestamp
-        price_df: Price data (includes extended hours)
-        use_rth_only: If True, restrict to Regular Trading Hours (9:30-16:00)
-                      If False, include extended hours (default)
+        price_df: Price data (RTH bars only recommended)
 
-    Design decision: Include extended hours by default.
-    After-hours reaction to events is informative signal, not noise.
+    Design decision: Anchor uses RTH open/close based on event timing.
+    See get_post_event_anchor_price() for three-case logic.
     """
     # HARD GUARD: Prevent leakage if sample is before/at event
     if sample_timestamp <= event_timestamp:
@@ -342,36 +341,94 @@ def compute_post_event_drift(sample_timestamp, event_timestamp, price_df, use_rt
     if days_since < 0 or days_since > 14:
         return 0.0  # Not in post-event window
 
-    # Optional: filter to RTH only (9:30-16:00 ET)
-    working_df = price_df
-    if use_rth_only:
-        # RTH is 9:30-16:00, not 9:00-16:00
-        rth_mask = (
-            ((price_df.index.hour == 9) & (price_df.index.minute >= 30)) |
-            ((price_df.index.hour >= 10) & (price_df.index.hour < 16))
-        )
-        working_df = price_df[rth_mask]
-
-    # Anchor: first bar AFTER event (captures immediate reaction)
-    # BAR CONVENTION NOTE:
-    #   - If bars use END timestamps (14:05 = data from 14:00-14:05):
-    #     Use > (strictly after) to avoid partial pre-event data
-    #   - If bars use START timestamps (14:00 = data from 14:00-14:05):
-    #     Use >= (at or after) is correct
-    # Current: assumes bar-END convention (use > for safety)
-    event_mask = working_df.index > event_timestamp
-    if event_mask.sum() == 0:
+    # Use the anchor helper for proper RTH/pre-market/after-hours handling
+    event_price = get_post_event_anchor_price(event_timestamp, price_df)
+    if event_price is None or event_price == 0:
         return 0.0
-    event_price = working_df[event_mask].iloc[0]['close']
 
     # Current: last bar BEFORE sample (leak-safe)
-    current_mask = working_df.index < sample_timestamp
+    current_mask = price_df.index < sample_timestamp
     if current_mask.sum() == 0:
         return 0.0
-    current_price = working_df[current_mask].iloc[-1]['close']
+    current_price = price_df[current_mask].iloc[-1]['close']
 
     drift = (current_price - event_price) / event_price
     return np.clip(drift, -0.5, 0.5)
+
+
+# ============================================================
+# AFTER-HOURS EVENT ANCHORING RULES
+# ============================================================
+# Earnings often release at 16:30 or 20:00 (after RTH close).
+# When computing drift, we need prices at event_timestamp,
+# but there's no RTH bar at 20:00.
+#
+# EXPLICIT RULES:
+#
+# PRE-EVENT DRIFT (E-14 to event):
+#   - Anchor at E-14: Use close price 14 trading days before event
+#   - Anchor at event: Use LAST RTH close if event is after-hours
+#     Example: Earnings at 20:00 → anchor at 16:00 same day
+#
+# POST-EVENT DRIFT (event to now):
+#   - Anchor at event: Use FIRST AVAILABLE price after event
+#     - If event during RTH: first bar after event_timestamp
+#     - If event after-hours: NEXT DAY OPEN (09:30)
+#   - This captures the market's reaction when it reopens
+#
+# Example: TSLA earnings at 2024-01-24 20:00
+#   - Pre-drift anchor: 2024-01-24 16:00 close (last RTH)
+#   - Post-drift anchor: 2024-01-25 09:30 open (first RTH)
+
+def get_post_event_anchor_price(event_timestamp, price_df):
+    """
+    Get first available price AFTER event for post-event drift anchor.
+
+    Three cases based on event timing:
+    1. Pre-market (00:00-09:30): Same-day 09:30 open (e.g., CPI/NFP at 08:30)
+    2. During RTH (09:30-16:00): First bar after event (e.g., FOMC at 14:00)
+    3. After-hours (16:00-23:59): Next trading day's 09:30 open (e.g., TSLA earnings at 16:05)
+    """
+    import pandas_market_calendars as mcal
+    nyse = mcal.get_calendar('NYSE')
+
+    RTH_START = time(9, 30)
+    RTH_END = time(16, 0)
+
+    event_time = event_timestamp.time()
+    event_date = event_timestamp.date()
+
+    # Three-way classification
+    is_pre_market = event_time < RTH_START
+    is_during_rth = RTH_START <= event_time <= RTH_END
+    # is_after_hours = event_time > RTH_END (implicit else)
+
+    if is_during_rth:
+        # Use first bar after event_timestamp
+        mask = price_df.index > event_timestamp
+    elif is_pre_market:
+        # Pre-market event (e.g., CPI 08:30): use SAME-DAY 09:30 open
+        same_day_open = pd.Timestamp.combine(event_date, RTH_START)
+        mask = price_df.index >= same_day_open
+    else:
+        # After-hours event: use NEXT TRADING DAY's 09:30 open
+        # Handles weekends (Fri → Mon) and holidays correctly
+        schedule = nyse.schedule(
+            start_date=event_date + timedelta(days=1),
+            end_date=event_date + timedelta(days=7)  # Lookahead for long weekends
+        )
+        if len(schedule) == 0:
+            return None  # No trading days in range (shouldn't happen)
+        next_trading_day = schedule.index[0].date()
+        next_open = pd.Timestamp.combine(next_trading_day, RTH_START)
+        mask = price_df.index >= next_open
+
+    if mask.sum() == 0:
+        return None  # No data available
+
+    # Return OPEN price (captures gap reaction), not close
+    return price_df[mask].iloc[0]['open']
+
 
 def compute_all_drift_features(sample_timestamp, events_handler, price_df):
     """
@@ -482,36 +539,41 @@ def compute_all_timing_features(sample_timestamp, events_handler):
         features['days_since_event'] = 1.0
 
     # Event-specific timing
+    # NOTE: Use get_feature_prefix() to map CSV event_type → schema feature name
+    # CSV: 'earnings' → Feature: 'days_until_tsla_earnings'
+    # CSV: 'fomc' → Feature: 'days_until_fomc' (unchanged)
     for event_type in EVENT_TYPES:
+        prefix = get_feature_prefix(event_type)  # 'earnings' → 'tsla_earnings'
+
         # Forward: days until next event of this type
         future_of_type = future_events[future_events['event_type'] == event_type]
         if len(future_of_type) > 0:
             next_event = future_of_type.iloc[0]
             event_ts = build_event_timestamp(next_event['date'], next_event['release_time'])
-            features[f'days_until_{event_type}'] = min(
+            features[f'days_until_{prefix}'] = min(
                 get_trading_days_until(sample_timestamp.date(), event_ts.date()) / 14.0, 1.0
             )
         else:
-            features[f'days_until_{event_type}'] = 1.0
+            features[f'days_until_{prefix}'] = 1.0
 
         # Backward: days since last event of this type
         past_of_type = past_events[past_events['event_type'] == event_type]
         if len(past_of_type) > 0:
             last_event = past_of_type.iloc[-1]
             event_ts = build_event_timestamp(last_event['date'], last_event['release_time'])
-            features[f'days_since_{event_type}'] = min(
+            features[f'days_since_{prefix}'] = min(
                 get_trading_days_since(event_ts.date(), sample_timestamp.date()) / 14.0, 1.0
             )
         else:
-            features[f'days_since_{event_type}'] = 1.0
+            features[f'days_since_{prefix}'] = 1.0
 
     return features
 
-# Example: earnings in 7 days, FOMC in 2 days
+# Example: TSLA earnings in 7 days, FOMC in 2 days
 # days_until_event = 2/14 = 0.14 (generic, nearest)
-# days_until_earnings = 7/14 = 0.5 (specific, ALWAYS visible!)
+# days_until_tsla_earnings = 7/14 = 0.5 (specific, ALWAYS visible!)
 # days_until_fomc = 2/14 = 0.14 (specific)
-# Model can learn: "earnings is 7 days away AND fomc is 2 days away"
+# Model can learn: "TSLA earnings is 7 days away AND FOMC is 2 days away"
 ```
 
 ### Event Type Disambiguation - Multi-Hot Encoding
@@ -563,6 +625,160 @@ def compute_event_type_flags(sample_timestamp, events_handler):
 # Example: earnings in 2 days, FOMC in 3 days, CPI in 3 days
 # Result: event_is_tsla_earnings_3d=1, event_is_fomc_3d=1, event_is_cpi_3d=1
 # All three are visible! Model learns which combinations matter.
+
+
+def compute_is_high_impact_event(sample_timestamp, events_handler):
+    """
+    Binary flag: ANY event within 3 trading days (future OR past).
+
+    This captures the "high volatility regime" near any event.
+    """
+    visible = events_handler.get_visible_events(sample_timestamp)
+    past_events = visible['past']
+    future_events = visible['future']
+
+    nyse = mcal.get_calendar('NYSE')
+    sample_date = sample_timestamp.date()
+
+    # Check future: any event within 3 trading days
+    schedule_future = nyse.schedule(
+        start_date=sample_timestamp,
+        end_date=sample_timestamp + pd.Timedelta(days=10)
+    )
+    if len(schedule_future) >= 4:
+        future_cutoff = schedule_future.index[3].date()
+        has_future = len(future_events[future_events['date'] <= future_cutoff]) > 0
+    else:
+        has_future = False
+
+    # Check past: any event within 3 trading days ago
+    schedule_past = nyse.schedule(
+        start_date=sample_timestamp - pd.Timedelta(days=10),
+        end_date=sample_timestamp
+    )
+    if len(schedule_past) >= 4:
+        past_cutoff = schedule_past.index[-4].date()
+        has_past = len(past_events[past_events['date'] >= past_cutoff]) > 0
+    else:
+        has_past = False
+
+    return 1 if (has_future or has_past) else 0
+
+
+def compute_is_earnings_week(sample_timestamp, events_handler):
+    """
+    Binary flag: TSLA earnings within ±14 trading days.
+
+    Earnings have an extended volatility window compared to other events.
+    """
+    visible = events_handler.get_visible_events(sample_timestamp)
+    past_events = visible['past']
+    future_events = visible['future']
+
+    nyse = mcal.get_calendar('NYSE')
+
+    # Check future: earnings within 14 trading days
+    schedule_future = nyse.schedule(
+        start_date=sample_timestamp,
+        end_date=sample_timestamp + pd.Timedelta(days=25)
+    )
+    if len(schedule_future) >= 15:
+        future_cutoff = schedule_future.index[14].date()
+        earnings_future = future_events[
+            (future_events['event_type'] == 'earnings') &
+            (future_events['date'] <= future_cutoff)
+        ]
+        has_future = len(earnings_future) > 0
+    else:
+        has_future = False
+
+    # Check past: earnings within 14 trading days ago
+    schedule_past = nyse.schedule(
+        start_date=sample_timestamp - pd.Timedelta(days=25),
+        end_date=sample_timestamp
+    )
+    if len(schedule_past) >= 15:
+        past_cutoff = schedule_past.index[-15].date()
+        earnings_past = past_events[
+            (past_events['event_type'] == 'earnings') &
+            (past_events['date'] >= past_cutoff)
+        ]
+        has_past = len(earnings_past) > 0
+    else:
+        has_past = False
+
+    return 1 if (has_future or has_past) else 0
+
+
+def compute_earnings_features(sample_timestamp, past_events, future_events):
+    """
+    Compute 6 earnings-specific features.
+
+    Backward-Looking (4):
+        - last_earnings_surprise_pct: Surprise % with tanh compression
+        - last_earnings_surprise_abs: Absolute EPS difference, clipped [-2, 2]
+        - last_earnings_actual_eps_norm: Actual EPS normalized by tanh
+        - last_earnings_beat_miss: -1=miss, 0=meet, 1=beat
+
+    Forward-Looking (2):
+        - upcoming_earnings_estimate_norm: Consensus EPS (tanh), within 14 days
+        - estimate_trajectory: This quarter vs last quarter estimate
+
+    REQUIRES: events_df to have 'actual', 'expected' columns for earnings events.
+    """
+    features = {
+        'last_earnings_surprise_pct': 0.0,
+        'last_earnings_surprise_abs': 0.0,
+        'last_earnings_actual_eps_norm': 0.0,
+        'last_earnings_beat_miss': 0,
+        'upcoming_earnings_estimate_norm': 0.0,
+        'estimate_trajectory': 0.0,
+    }
+
+    # Last earnings (backward-looking)
+    # CSV columns: 'actual', 'expected', 'surprise_pct', 'beat_miss'
+    past_earnings = past_events[past_events['event_type'] == 'earnings']
+    if len(past_earnings) > 0:
+        last = past_earnings.iloc[-1]  # Most recent past earnings
+
+        actual = last.get('actual', 0.0)      # CSV column name
+        expected = last.get('expected', 0.0)  # CSV column name
+
+        if expected != 0:
+            # Compute surprise as fraction (e.g., 0.25 = 25% surprise)
+            surprise_fraction = (actual - expected) / abs(expected)
+            features['last_earnings_surprise_pct'] = np.tanh(surprise_fraction)
+
+        surprise_abs = actual - expected
+        features['last_earnings_surprise_abs'] = np.clip(surprise_abs, -2, 2)
+        features['last_earnings_actual_eps_norm'] = np.tanh(actual)
+
+        # Beat/miss: USE DATA VALUE, not computed threshold
+        # beat_miss must be populated by API (Alpha Vantage surprisePercentage)
+        # Migration script validates this is never null for earnings events
+        features['last_earnings_beat_miss'] = last.get('beat_miss', 0)
+
+    # Next earnings (forward-looking, only within 14 TRADING days)
+    future_earnings = future_events[future_events['event_type'] == 'earnings']
+    if len(future_earnings) > 0:
+        next_earnings = future_earnings.iloc[0]  # Soonest upcoming
+
+        # Use TRADING days, not calendar days
+        trading_days_until = get_trading_days_until(
+            sample_timestamp.date(), next_earnings['date']
+        )
+        if trading_days_until <= 14:
+            expected = next_earnings.get('expected', 0.0)  # CSV column name
+            features['upcoming_earnings_estimate_norm'] = np.tanh(expected)
+
+            # Trajectory: compare to last quarter's estimate
+            if len(past_earnings) > 0:
+                last_expected = past_earnings.iloc[-1].get('expected', 0.0)
+                if last_expected != 0:
+                    trajectory = (expected - last_expected) / abs(last_expected)
+                    features['estimate_trajectory'] = np.tanh(trajectory)
+
+    return features
 ```
 
 **Analogy:** Instead of a GPS saying "turn left at the next intersection", it says "upcoming: left turn in 100m, right turn in 150m, roundabout in 200m". You see the full picture of what's ahead, not just the single closest thing.
@@ -703,21 +919,31 @@ def compute_estimate_trajectory(this_est, last_est):
 
 **Problem:** `last_earnings_beat_miss` is {-1, 0, 1} but "meet" (0) is undefined.
 
-**Definition:** Use 2% threshold:
+**DEPRECATED - Use API Value Instead:**
+
+The `beat_miss` classification should come directly from the data source (Alpha Vantage `surprisePercentage`), not be computed with an arbitrary threshold. The migration script validates that `beat_miss` is always populated for earnings events.
 
 ```python
-def compute_beat_miss(surprise_pct):
-    """
-    -1 = miss (surprise < -2%)
-     0 = meet (surprise within ±2%)
-     1 = beat (surprise > +2%)
-    """
-    if surprise_pct > 2.0:
-        return 1
-    elif surprise_pct < -2.0:
-        return -1
-    else:
-        return 0
+# DEPRECATED - DO NOT USE
+# This threshold-based approach is inconsistent and obsolete.
+# Use the beat_miss column from the CSV/API instead.
+#
+# def compute_beat_miss(surprise_pct):
+#     """
+#     -1 = miss (surprise < -2%)
+#      0 = meet (surprise within ±2%)
+#      1 = beat (surprise > +2%)
+#     """
+#     if surprise_pct > 2.0:
+#         return 1
+#     elif surprise_pct < -2.0:
+#         return -1
+#     else:
+#         return 0
+
+# CORRECT APPROACH:
+# In compute_earnings_features():
+features['last_earnings_beat_miss'] = last.get('beat_miss', 0)  # From API
 ```
 
 ### Timezone Handling (Training AND Live)
@@ -918,13 +1144,31 @@ def _parse_release_time(release_time_str):
 
     Returns:
         time object (ALL_DAY → 09:30, UNKNOWN → 20:00, else parse HH:MM)
+
+    Raises:
+        ValueError: If release_time_str is not a valid format
+
+    Semantic rationale:
+        - ALL_DAY → 09:30: Event affects whole day, visible from market open
+        - UNKNOWN → 20:00: Conservative, assume late to prevent leakage
+          (if we used 00:00, event would appear "past" almost all day)
     """
     if release_time_str == "ALL_DAY":
         return time(9, 30)   # Observable from market open
     elif release_time_str == "UNKNOWN":
         return time(20, 0)   # Conservative: after extended hours
+    elif release_time_str is None or release_time_str == "":
+        raise ValueError(f"release_time cannot be None or empty")
     else:
-        return datetime.strptime(release_time_str, '%H:%M').time()
+        # Validate HH:MM format explicitly
+        try:
+            parsed = datetime.strptime(release_time_str, '%H:%M').time()
+            return parsed
+        except ValueError:
+            raise ValueError(
+                f"Invalid release_time format: '{release_time_str}'. "
+                f"Expected 'HH:MM', 'ALL_DAY', or 'UNKNOWN'."
+            )
 
 
 def _get_representative_timestamp(date, state, events_by_date):
@@ -970,17 +1214,31 @@ def _compute_hours_until_event(sample_ts, future_events, event_type):
 
     Returns:
         - 0.0 if event already passed (not in future_events)
-        - hours/8.0 if event is same day (normalized to [0, 1])
+        - hours/RTH_HOURS if event is same day (normalized to [0, 1])
         - 1.0 if event is on a future day
+
+    Normalization constant: RTH_HOURS = 6.5 (09:30-16:00)
+    This means [0, 1] = "fraction of trading day until event"
+    - 0.0 = event imminent or passed
+    - 0.5 = ~3.25 hours until event
+    - 1.0 = event on future day (or >6.5 hours away)
+
+    NOTE: Early close days (3.5h) can have values > 0.5 for same-day events,
+    but this is rare (~3 days/year) and acceptable.
 
     This enables the model to learn "30 min before FOMC" patterns.
     """
+    RTH_HOURS = 6.5  # Regular trading hours (09:30-16:00)
+
     type_events = future_events[future_events['event_type'] == event_type]
     if len(type_events) == 0:
         return 0.0  # No upcoming event of this type
 
     # IMPORTANT: Sort by date + release_time before taking first
-    type_events = type_events.sort_values(by='date')
+    # (handles same-day multi-event ordering, e.g., CPI 08:30 + FOMC 14:00)
+    type_events = type_events.copy()
+    type_events['_parsed_time'] = type_events['release_time'].apply(_parse_release_time)
+    type_events = type_events.sort_values(by=['date', '_parsed_time'])
     next_event = type_events.iloc[0]
     event_date = next_event['date']
     sample_date = sample_ts.date()
@@ -996,8 +1254,8 @@ def _compute_hours_until_event(sample_ts, future_events, event_type):
     if hours_diff <= 0:
         return 0.0  # Already passed (shouldn't happen if future_events is correct)
 
-    # Normalize by 8 hours (trading day length), cap at 1.0
-    return min(hours_diff / 8.0, 1.0)
+    # Normalize by RTH hours (6.5h), cap at 1.0
+    return min(hours_diff / RTH_HOURS, 1.0)
 
 
 def _compute_features_for_timestamp(rep_ts, events_df, price_df):
@@ -1019,55 +1277,96 @@ def _compute_features_for_timestamp(rep_ts, events_df, price_df):
     sample_date = rep_ts.date()
     sample_time = rep_ts.time()
 
+    # Add parsed release_time for sorting (handles ALL_DAY, UNKNOWN correctly)
+    events_df = events_df.copy()
+    events_df['_parsed_time'] = events_df['release_time'].apply(_parse_release_time)
+
     past_events = events_df[
         (events_df['date'] < sample_date) |
         ((events_df['date'] == sample_date) &
-         (events_df['release_time'].apply(_parse_release_time) < sample_time))
-    ].sort_values(by='date')  # Oldest first, so .iloc[-1] = most recent past
+         (events_df['_parsed_time'] < sample_time))
+    ].sort_values(by=['date', '_parsed_time'])  # Oldest first, so .iloc[-1] = most recent past
 
     future_events = events_df[
         (events_df['date'] > sample_date) |
         ((events_df['date'] == sample_date) &
-         (events_df['release_time'].apply(_parse_release_time) >= sample_time))
-    ].sort_values(by='date')  # Soonest first, so .iloc[0] = next upcoming
+         (events_df['_parsed_time'] >= sample_time))
+    ].sort_values(by=['date', '_parsed_time'])  # Soonest first, so .iloc[0] = next upcoming
 
-    # NOTE: The helper functions below are single-timestamp wrappers.
-    # They extract logic from the full implementations defined earlier in this doc:
-    #   - compute_days_until_event()      → see "Event-Specific Timing" section
-    #   - compute_days_since_event()      → see "Event-Specific Timing" section
-    #   - compute_proximity_flag_single() → see "Multi-Hot 3-Day Flags" section
-    #   - compute_pre_drift_single()      → see "Event-Specific Drift Features" section
-    #   - compute_post_drift_single()     → see "Event-Specific Drift Features" section
-    #   - compute_earnings_features_single() → see "Backward/Forward-Looking Earnings" sections
+    # Build EventsHandler wrapper for use with existing compute_all_* functions
+    # This allows reuse of the already-defined functions without duplication
+    class _EventsHandlerWrapper:
+        """Thin wrapper to provide get_visible_events() interface."""
+        def __init__(self, past_df, future_df):
+            self.past = past_df
+            self.future = future_df
+        def get_visible_events(self, ts):
+            return {'past': self.past, 'future': self.future}
 
-    # Timing features (12): days_until/since for each event type
-    for event_type in EVENT_TYPES:  # 6 types
-        features[idx] = compute_days_until_event(sample_date, future_events, event_type)
+    events_handler = _EventsHandlerWrapper(past_events, future_events)
+
+    # ============================================================
+    # 46 FEATURES - EXPLICIT BREAKDOWN (matches Final Schema table)
+    # ============================================================
+
+    # 1. Generic Timing (2): days_until_event, days_since_event
+    timing_feats = compute_all_timing_features(rep_ts, events_handler)
+    features[idx] = timing_feats['days_until_event']      # Generic nearest
+    idx += 1
+    features[idx] = timing_feats['days_since_event']      # Generic nearest
+    idx += 1
+
+    # 2-3. Type-Specific Timing (12): days_until/since for each of 6 types
+    for event_type in EVENT_TYPES:
+        prefix = get_feature_prefix(event_type)  # Match writer's naming
+        features[idx] = timing_feats[f'days_until_{prefix}']
         idx += 1
-        features[idx] = compute_days_since_event(sample_date, past_events, event_type)
+        features[idx] = timing_feats[f'days_since_{prefix}']
         idx += 1
 
-    # NEW: Intraday timing features (6): hours_until for each event type
+    # 4. Intraday Timing (6): hours_until for each event type
     for event_type in EVENT_TYPES:
         features[idx] = _compute_hours_until_event(rep_ts, future_events, event_type)
         idx += 1
 
-    # Proximity flags (6): within 3 trading days
+    # 5. Binary Flags (2): is_high_impact_event, is_earnings_week
+    features[idx] = compute_is_high_impact_event(rep_ts, events_handler)
+    idx += 1
+    features[idx] = compute_is_earnings_week(rep_ts, events_handler)
+    idx += 1
+
+    # 6. Multi-Hot 3-Day Flags (6): event_is_*_3d for each type
+    flag_feats = compute_event_type_flags(rep_ts, events_handler)
     for event_type in EVENT_TYPES:
-        features[idx] = compute_proximity_flag_single(sample_date, future_events, event_type)
+        prefix = get_feature_prefix(event_type)
+        features[idx] = flag_feats[f'event_is_{prefix}_3d']
         idx += 1
 
-    # Drift features (12): pre/post drift for each event type
+    # 7-8. Earnings-Specific (6): 4 backward-looking + 2 forward-looking
+    earnings_feats = compute_earnings_features(rep_ts, past_events, future_events)
+    features[idx] = earnings_feats['last_earnings_surprise_pct']
+    idx += 1
+    features[idx] = earnings_feats['last_earnings_surprise_abs']
+    idx += 1
+    features[idx] = earnings_feats['last_earnings_actual_eps_norm']
+    idx += 1
+    features[idx] = earnings_feats['last_earnings_beat_miss']
+    idx += 1
+    features[idx] = earnings_feats['upcoming_earnings_estimate_norm']
+    idx += 1
+    features[idx] = earnings_feats['estimate_trajectory']
+    idx += 1
+
+    # 9-10. Drift Features (12): pre/post drift for each of 6 types
+    drift_feats = compute_all_drift_features(rep_ts, events_handler, price_df)
     for event_type in EVENT_TYPES:
-        features[idx] = compute_pre_drift_single(rep_ts, future_events, price_df, event_type)
+        prefix = get_feature_prefix(event_type)
+        features[idx] = drift_feats[f'pre_{prefix}_drift']
         idx += 1
-        features[idx] = compute_post_drift_single(rep_ts, past_events, price_df, event_type)
+        features[idx] = drift_feats[f'post_{prefix}_drift']
         idx += 1
 
-    # Earnings-specific (10): last result + next consensus
-    earnings_feats = compute_earnings_features_single(rep_ts, past_events, future_events)
-    features[idx:idx+10] = earnings_feats
-
+    assert idx == 46, f"Expected 46 features, got {idx}"
     return features  # 46 features total
 
 
@@ -1112,7 +1411,7 @@ def compute_features_vectorized(timestamps, events_df, price_df):
         buckets[bucket_key].append(i)
         timestamp_to_bucket[i] = bucket_key
 
-    # Compute features ONCE per bucket
+    # Compute features ONCE per bucket (for expensive features)
     bucket_features = {}
     for bucket_key in buckets:
         date, state = bucket_key
@@ -1121,10 +1420,16 @@ def compute_features_vectorized(timestamps, events_df, price_df):
             rep_ts, events_df, price_df
         )
 
-    # Broadcast to all bars
+    # Broadcast bucket features to all bars (all 46 features initially)
     result = np.zeros((len(timestamps), 46))
     for i in range(len(timestamps)):
         result[i] = bucket_features[timestamp_to_bucket[i]]
+
+    # v5.8: Override hours_until_* per-bar for true intraday resolution (6 features)
+    # These are at indices 14-19 (after days_until/since, before flags)
+    # Cheap (O(1) timestamp diff) and need minute-level precision
+    hours_features = _compute_hours_until_vectorized(timestamps, events_df)
+    result[:, 14:20] = hours_features  # Override hours_until_* (indices 14-19)
 
     return result
 
@@ -1138,7 +1443,60 @@ def compute_features_vectorized(timestamps, events_df, price_df):
 # Bucket 3: (date, ('cpi', 'fomc')) - 14:00+ (both released)
 ```
 
-**Performance:** ~252 trading days × ~2 avg buckets/day = ~500 computations instead of ~20,000 bars. **50-100x speedup** while preserving intraday granularity.
+**Performance:** ~252 trading days × ~2 avg buckets/day = ~500 computations instead of ~20,000 bars. **50-100x speedup** while preserving intraday granularity for most features.
+
+**v5.8 HYBRID APPROACH: Bucket for expensive features, per-bar for cheap ones**
+
+- **Bucket features (40):** days_until_*, days_since_*, drift, flags, earnings features
+- **Per-bar features (6):** hours_until_* (cheap, need true intraday precision)
+
+```python
+def _compute_hours_until_vectorized(timestamps, events_df):
+    """
+    Compute hours_until_* for all 6 event types, vectorized per-bar.
+
+    Fast: O(timestamps × 6 event types) ≈ O(20k × 6) = 120k operations
+    Each op is just: (event_ts - bar_ts).total_seconds() / 3600 / RTH_HOURS
+
+    Returns array of shape (len(timestamps), 6) in EVENT_TYPES order.
+    """
+    RTH_HOURS = 6.5
+    result = np.ones((len(timestamps), 6))  # Default: 1.0
+
+    # Map feature names to CSV event_type values
+    EVENT_TYPES_CSV = ['earnings', 'delivery', 'fomc', 'cpi', 'nfp', 'quad_witching']
+
+    # For each event type, compute hours_until for each bar dynamically
+    for idx, csv_event_type in enumerate(EVENT_TYPES_CSV):
+        # Get all events of this type, sorted by date
+        type_events = events_df[events_df['event_type'] == csv_event_type].sort_values('date')
+        if len(type_events) == 0:
+            continue
+
+        # For each bar, find next event from that bar's perspective
+        for i, bar_ts in enumerate(timestamps):
+            # Find next event after/on this bar's date
+            future_for_bar = type_events[type_events['date'] >= bar_ts.date()]
+            if len(future_for_bar) == 0:
+                result[i, idx] = 1.0  # No future events
+                continue
+
+            next_event = future_for_bar.iloc[0]
+            event_ts = build_event_timestamp(next_event['date'], next_event['release_time'])
+
+            # Compute hours_until
+            if bar_ts.date() != event_ts.date():
+                result[i, idx] = 1.0 if bar_ts < event_ts else 0.0
+            elif bar_ts >= event_ts:
+                result[i, idx] = 0.0
+            else:
+                hours_remaining = (event_ts - bar_ts).total_seconds() / 3600
+                result[i, idx] = min(hours_remaining / RTH_HOURS, 1.0)
+
+    return result
+```
+
+**Result:** True minute-level precision for "30 min before FOMC" patterns, while keeping 50-100x speedup for other features.
 
 ### Trading Day Counting - Exclusive Start, Inclusive End
 
@@ -1656,7 +2014,7 @@ def test_no_future_leak():
     features = compute_event_features(sample_date, events_handler)
 
     # last_earnings should be from Q2 2024, not Q3
-    assert features['days_since_earnings'] > 0.5  # More than 7 days ago
+    assert features['days_since_tsla_earnings'] > 0.5  # More than 7 days ago
 
     # upcoming_estimate should be for Q3, not Q4
     # Verify gating works correctly
@@ -1759,7 +2117,109 @@ If event releases at 14:00:00 and bar timestamp is 14:00:00:
 
 **Conservative choice:** Use `>` (strict inequality) — prevents edge case leakage even if timestamps are bar-start. Event at 14:00:00 only visible to 14:01:00+ bars.
 
-**TODO:** Verify your actual timestamp convention by checking market open (9:30 vs 9:31 first bar) and document.
+**ASSUMED (NEEDS VERIFICATION): Bar Timestamp Convention**
+
+Most data providers (yfinance, Polygon, etc.) use **bar START** timestamps. For event gating, we compute the **bar END time** and use that for visibility checks.
+
+⚠️ **Before deployment:** Verify actual data uses bar-start timestamps. See Fix 7 in checklist for assertion function.
+
+| Timeframe | Bar Timestamp (START) | Bar END Time | Example |
+|-----------|----------------------|--------------|---------|
+| 5min | 09:30 | +5min = 09:35 | Bar covers 09:30-09:35 |
+| 15min | 09:30 | +15min = 09:45 | Bar covers 09:30-09:45 |
+| 30min | 09:30 | +30min = 10:00 | Bar covers 09:30-10:00 |
+| 1h | 09:00 | +1h = 10:00 | Bar covers 09:00-10:00 |
+| 2h | 09:00 | +2h = 11:00 | Bar covers 09:00-11:00 |
+| 4h | 09:00 | +4h = 13:00 | Bar covers 09:00-13:00 |
+| daily | 00:00 (midnight) | **Same day market_close*** | Bar covers full RTH |
+| weekly | Monday 00:00 | **Last day's market_close*** | Bar covers Mon-Fri RTH |
+| monthly | 1st 00:00 | **Last trading day's market_close*** | Bar covers month's RTH |
+| 3month | Quarter start 00:00 | **Last trading day's market_close*** | Bar covers quarter's RTH |
+
+*`market_close` is typically 16:00, but 13:00 on early close days (e.g., day after Thanksgiving). Use `nyse.schedule().market_close` to handle correctly.
+
+```python
+import pandas_market_calendars as mcal
+
+def get_bar_end_time(bar_timestamp, tf):
+    """
+    Compute bar END time for event gating.
+
+    For intraday TFs: bar_timestamp + duration
+    For daily+: last RTH close in the period (uses actual market_close, not hardcoded 16:00)
+
+    NOTE: Uses nyse.schedule().market_close to handle early close days correctly
+    (e.g., day after Thanksgiving closes at 13:00, not 16:00).
+    """
+    INTRADAY_DURATIONS = {
+        '5min': pd.Timedelta(minutes=5),
+        '15min': pd.Timedelta(minutes=15),
+        '30min': pd.Timedelta(minutes=30),
+        '1h': pd.Timedelta(hours=1),
+        '2h': pd.Timedelta(hours=2),
+        '3h': pd.Timedelta(hours=3),
+        '4h': pd.Timedelta(hours=4),
+    }
+
+    if tf in INTRADAY_DURATIONS:
+        return bar_timestamp + INTRADAY_DURATIONS[tf]
+
+    # Daily and longer: find last RTH close in period
+    nyse = mcal.get_calendar('NYSE')
+
+    if tf == 'daily':
+        # Same day's actual market close (handles early close days)
+        schedule = nyse.schedule(start_date=bar_timestamp.date(), end_date=bar_timestamp.date())
+        if len(schedule) > 0:
+            # pandas_market_calendars returns UTC or local tz - convert to ET then remove tz
+            return schedule.iloc[0]['market_close'].tz_convert('US/Eastern').tz_localize(None)
+        return bar_timestamp.replace(hour=16, minute=0, second=0)  # Fallback
+
+    elif tf == 'weekly':
+        # Find last trading day of week, use its actual market close
+        week_start = bar_timestamp
+        week_end = week_start + pd.Timedelta(days=6)
+        schedule = nyse.schedule(start_date=week_start, end_date=week_end)
+        if len(schedule) > 0:
+            return schedule.iloc[-1]['market_close'].tz_convert('US/Eastern').tz_localize(None)
+        return bar_timestamp.replace(hour=16, minute=0)  # Fallback
+
+    elif tf == 'monthly':
+        # Last trading day of month, use its actual market close
+        month_end = bar_timestamp + pd.offsets.MonthEnd(0)
+        schedule = nyse.schedule(start_date=bar_timestamp, end_date=month_end)
+        if len(schedule) > 0:
+            return schedule.iloc[-1]['market_close'].tz_convert('US/Eastern').tz_localize(None)
+        return month_end.replace(hour=16, minute=0)  # Fallback
+
+    elif tf == '3month':
+        # Last trading day of quarter, use its actual market close
+        quarter_end = bar_timestamp + pd.offsets.QuarterEnd(0)
+        schedule = nyse.schedule(start_date=bar_timestamp, end_date=quarter_end)
+        if len(schedule) > 0:
+            return schedule.iloc[-1]['market_close'].tz_convert('US/Eastern').tz_localize(None)
+        return quarter_end.replace(hour=16, minute=0)  # Fallback
+
+    raise ValueError(f"Unknown timeframe: {tf}")
+
+
+def get_visible_events_for_bar(bar_timestamp, tf, events_handler):
+    """
+    Get events visible at the END of a bar (not the start).
+
+    This prevents look-ahead: a daily bar shouldn't "see" after-hours events.
+    """
+    bar_end = get_bar_end_time(bar_timestamp, tf)
+    return events_handler.get_visible_events(bar_end)
+```
+
+**Example: Daily bar and after-hours earnings**
+- Daily bar: 2024-01-24 00:00 (timestamp) → bar_end = 2024-01-24 16:00
+- Earnings release: 2024-01-24 20:00 (after hours)
+- Result: Earnings NOT visible to 2024-01-24 bar (20:00 > 16:00)
+- The 2024-01-25 bar WILL see it as "past"
+
+This is correct — the daily bar's features shouldn't include information that wasn't available during that trading session.
 
 ```python
 def can_see_event_result(sample_timestamp, event_date, event_release_time):
@@ -2005,56 +2465,98 @@ def _compute_event_features_vectorized(self, timestamps, events_handler, raw_df)
 
     # Step 3: Compute features ONCE per bucket using _compute_features_for_timestamp()
     bucket_features = {}
+    # Create TSLA price view for drift helpers (expect 'open'/'close', not 'tsla_open'/'tsla_close')
+    price_df = raw_df.rename(columns={'tsla_open': 'open', 'tsla_close': 'close'})[['open', 'close']]
+
     for bucket_key in buckets:
         date, state = bucket_key
         rep_ts = _get_representative_timestamp(date, state, events_by_date)
         # Returns np.array of shape (46,)
         bucket_features[bucket_key] = _compute_features_for_timestamp(
-            rep_ts, events_df, raw_df
+            rep_ts, events_df, price_df  # Pass price_df (not raw_df)
         )
 
-    # Step 4: Broadcast bucket features to all timestamps, convert to dict format
+    # Step 4: Broadcast bucket features to all timestamps
     result_array = np.zeros((n_timestamps, 46))
     for i in range(n_timestamps):
         result_array[i] = bucket_features[timestamp_to_bucket[i]]
 
+    # v5.8: Override hours_until_* per-bar for intraday precision
+    # Note: raw_df is OHLCV, not used for hours_until (only needs timestamps + events)
+    hours_features = _compute_hours_until_vectorized(timestamps, events_df)
+    result_array[:, 14:20] = hours_features  # Override indices 14-19
+
+    # ============================================================
     # Convert to dict of {feature_name: np.array} for all_breakdown.update()
+    # MUST MATCH _compute_features_for_timestamp() ordering exactly!
+    # ============================================================
     features = {}
     idx = 0
-    # Days timing (12 features)
+
+    # 1. Generic Timing (2 features)
+    features['days_until_event'] = result_array[:, idx]
+    idx += 1
+    features['days_since_event'] = result_array[:, idx]
+    idx += 1
+
+    # 2-3. Type-Specific Timing (12 features)
     for event_type in EVENT_TYPES:
         prefix = get_feature_prefix(event_type)  # earnings → tsla_earnings
         features[f'days_until_{prefix}'] = result_array[:, idx]
         idx += 1
         features[f'days_since_{prefix}'] = result_array[:, idx]
         idx += 1
-    # Hours timing - NEW (6 features)
+
+    # 4. Intraday Timing (6 features)
     for event_type in EVENT_TYPES:
         prefix = get_feature_prefix(event_type)
         features[f'hours_until_{prefix}'] = result_array[:, idx]
         idx += 1
-    # Proximity flags (6 features)
+
+    # 5. Binary Flags (2 features)
+    features['is_high_impact_event'] = result_array[:, idx]
+    idx += 1
+    features['is_earnings_week'] = result_array[:, idx]
+    idx += 1
+
+    # 6. Multi-Hot 3-Day Flags (6 features)
     for event_type in EVENT_TYPES:
         prefix = get_feature_prefix(event_type)
         features[f'event_is_{prefix}_3d'] = result_array[:, idx]
         idx += 1
-    # Drift features (12 features)
+
+    # 7-8. Earnings-Specific (6 features)
+    for name in EARNINGS_FEATURE_NAMES:  # 6 names
+        features[name] = result_array[:, idx]
+        idx += 1
+
+    # 9-10. Drift Features (12 features)
     for event_type in EVENT_TYPES:
         prefix = get_feature_prefix(event_type)
         features[f'pre_{prefix}_drift'] = result_array[:, idx]
         idx += 1
         features[f'post_{prefix}_drift'] = result_array[:, idx]
         idx += 1
-    # Earnings-specific (10 features)
-    for i, name in enumerate(EARNINGS_FEATURE_NAMES):  # 10 names
-        features[name] = result_array[:, idx + i]
 
+    assert idx == 46, f"Expected 46 features, got {idx}"
     return features  # 46 features total
 ```
 
 **Key insight:** The wiring is already correct. We just need to implement the computation where zeros are currently hardcoded.
 
-> **Implementation note:** The `_compute_event_features_vectorized()` helper above uses the bucket-based approach from "Hybrid bucket approach" section. Helper functions `_parse_release_time()`, `_get_representative_timestamp()`, `_compute_hours_until_event()`, `get_feature_prefix()`, and `_compute_features_for_timestamp()` are defined there. `EVENT_TYPES` = `['earnings', 'delivery', 'fomc', 'cpi', 'nfp', 'quad_witching']` (CSV values). `get_feature_prefix()` maps `earnings` → `tsla_earnings` for feature names. `EARNINGS_FEATURE_NAMES` = 10 earnings-specific feature names.
+> **Implementation note:** The `_compute_event_features_vectorized()` helper above uses the bucket-based approach from "Hybrid bucket approach" section. Helper functions `_parse_release_time()`, `_get_representative_timestamp()`, `_compute_hours_until_event()`, `get_feature_prefix()`, and `_compute_features_for_timestamp()` are defined there. `EVENT_TYPES` = `['earnings', 'delivery', 'fomc', 'cpi', 'nfp', 'quad_witching']` (CSV values). `get_feature_prefix()` maps `earnings` → `tsla_earnings` for feature names.
+
+**EARNINGS_FEATURE_NAMES** (6 features):
+```python
+EARNINGS_FEATURE_NAMES = [
+    'last_earnings_surprise_pct',
+    'last_earnings_surprise_abs',
+    'last_earnings_actual_eps_norm',
+    'last_earnings_beat_miss',
+    'upcoming_earnings_estimate_norm',
+    'estimate_trajectory',
+]
+```
 
 ### Blocker 2: Live Inference Train/Test Mismatch
 
@@ -2467,13 +2969,26 @@ class UnifiedEventsHandler(EventHandler):
         }
 
     def _parse_release_time(self, rt):
-        """Parse release_time string to time object for proper sorting."""
+        """
+        Parse release_time string to time object for proper sorting.
+
+        Semantic rationale:
+            - ALL_DAY → 09:30: Event affects whole day, visible from market open
+            - UNKNOWN → 20:00: Conservative, assume late to prevent leakage
+        """
         if rt == 'ALL_DAY':
             return time(9, 30)   # Market open
         elif rt == 'UNKNOWN':
             return time(20, 0)   # Conservative: after extended hours
+        elif rt is None or rt == "":
+            raise ValueError("release_time cannot be None or empty")
         else:
-            return datetime.strptime(rt, '%H:%M').time()
+            try:
+                return datetime.strptime(rt, '%H:%M').time()
+            except ValueError:
+                raise ValueError(
+                    f"Invalid release_time: '{rt}'. Expected 'HH:MM', 'ALL_DAY', or 'UNKNOWN'."
+                )
 ```
 
 ### Blocker 5: Data File Blockers
@@ -2486,7 +3001,9 @@ class UnifiedEventsHandler(EventHandler):
 
 ```python
 def migrate_events_csv():
-    """Add release_time column and fix known data issues."""
+    """Add release_time column, normalize weekends, and fix known data issues."""
+    import pandas_market_calendars as mcal
+
     df = pd.read_csv('data/events.csv')
 
     # Add release_time column with CONSERVATIVE defaults per event type
@@ -2504,6 +3021,9 @@ def migrate_events_csv():
     # TODO: Manually verify/update earnings/delivery times from historical data
     # For known releases, look up actual time and update CSV
 
+    # ================================================================
+    # KNOWN DATA FIXES (do BEFORE normalization while dates are strings)
+    # ================================================================
     # Fix quad witching dates (third Friday of Mar/Jun/Sep/Dec)
     # 2024-03-22 should be 2024-03-15
     df.loc[
@@ -2511,6 +3031,74 @@ def migrate_events_csv():
         (df['date'] == '2024-03-22'),
         'date'
     ] = '2024-03-15'
+
+    # Validate beat_miss is populated for all earnings events
+    # (no fallback computation - API must provide this)
+    earnings_rows = df[df['event_type'] == 'earnings']
+    if 'beat_miss' in df.columns:
+        missing_beat_miss = earnings_rows[earnings_rows['beat_miss'].isna()]
+        if len(missing_beat_miss) > 0:
+            raise ValueError(
+                f"beat_miss not populated for {len(missing_beat_miss)} earnings events. "
+                f"Must be provided by API (Alpha Vantage surprisePercentage). "
+                f"Missing dates: {missing_beat_miss['date'].tolist()[:5]}..."
+            )
+
+    # ================================================================
+    # WEEKEND/HOLIDAY NORMALIZATION
+    # ================================================================
+    # Shift non-trading-day events to next valid trading day.
+    # Rationale: data/events.csv has weekend dates (e.g., 2016-01-03 = Sunday).
+    # Computing days_until a non-trading day gives wrong trading-day distances.
+    #
+    # DECISION: When shifted, set release_time to 'ALL_DAY' because:
+    #   - The event info was released on the weekend
+    #   - By Monday open, it's already known
+    #   - ALL_DAY → 09:30 (visible from market open) is correct semantics
+    # ================================================================
+    nyse = mcal.get_calendar('NYSE')
+
+    # Get all trading days in our date range (with buffer)
+    df['date'] = pd.to_datetime(df['date'])
+    date_min = df['date'].min() - pd.Timedelta(days=10)
+    date_max = df['date'].max() + pd.Timedelta(days=10)
+    schedule = nyse.schedule(start_date=date_min, end_date=date_max)
+    trading_days = set(schedule.index.date)
+
+    def normalize_to_trading_day(event_date, original_release_time):
+        """Shift weekend/holiday to next trading day, update release_time."""
+        d = event_date.date() if hasattr(event_date, 'date') else event_date
+        if d in trading_days:
+            return d, original_release_time  # No change needed
+
+        # Find next trading day
+        search_date = d
+        for _ in range(10):  # Max 10 days search (handles long weekends)
+            search_date += pd.Timedelta(days=1)
+            if search_date in trading_days:
+                # Shifted: set release_time to ALL_DAY (known by open)
+                return search_date, 'ALL_DAY'
+
+        raise ValueError(f"Could not find trading day within 10 days of {d}")
+
+    # Apply normalization
+    normalized = df.apply(
+        lambda row: normalize_to_trading_day(row['date'], row['release_time']),
+        axis=1
+    )
+    df['date'] = [n[0] for n in normalized]
+    df['release_time'] = [n[1] for n in normalized]
+
+    # Report shifts
+    shifted = df[df['release_time'] == 'ALL_DAY']
+    original_allday = df['event_type'] == 'quad_witching'  # Quad witching is naturally ALL_DAY
+    weekend_shifts = shifted[~original_allday]
+    if len(weekend_shifts) > 0:
+        print(f"Normalized {len(weekend_shifts)} weekend/holiday events to next trading day:")
+        for _, row in weekend_shifts.iterrows():
+            print(f"  {row['event_type']}: {row['date']}")
+
+    # NOTE: Quad witching date fix moved to BEFORE normalization (while dates are strings)
 
     # Reorder columns
     cols = ['date', 'event_type', 'release_time', 'expected', 'actual',
@@ -3084,7 +3672,7 @@ Do NOT use these files - all data consolidated into `data/events.csv`:
 
 ---
 
-## Complete Fix Checklist (24 Fixes)
+## Complete Fix Checklist (26 Fixes)
 
 ### BLOCKING (Must Fix Before Events Implementation)
 - [x] **Fix 0a:** Training breakdown window bug ~~(multiply window sizes by 5)~~ ✅ Code fixed in v5.8 (features.py:4680-4692)
@@ -3099,7 +3687,16 @@ Do NOT use these files - all data consolidated into `data/events.csv`:
 
 ### HIGH PRIORITY
 - [ ] **Fix 6:** Conservative release time defaults (20:00 for earnings/delivery, not ALL_DAY)
-- [ ] **Fix 7:** Timestamp convention verification (> vs >=, document bar start/end)
+- [ ] **Fix 7:** Timestamp convention verification (> vs >=, document bar start/end) — **NEEDS DATA VERIFICATION**: `get_bar_end_time()` logic is spec'd, but actual bar data convention (bar-start vs bar-end timestamps) must be verified before deployment. Add assertion:
+  ```python
+  # In data loading, verify first bar of day starts at 09:30 (bar-start convention)
+  def verify_bar_timestamp_convention(df, expected='bar_start'):
+      first_bar_time = df.index[0].time()
+      if expected == 'bar_start':
+          assert first_bar_time == time(9, 30), \
+              f"Expected bar-start timestamps (09:30), got {first_bar_time}. Check data source."
+      # If bar-end convention detected, gating logic needs +duration adjustment
+  ```
 - [ ] **Fix 8:** API backward compatibility (optional args in load_events)
 
 ### MEDIUM PRIORITY
@@ -3107,10 +3704,10 @@ Do NOT use these files - all data consolidated into `data/events.csv`:
 - [ ] **Fix 10:** Cache versioning (bump EVENTS_CALC_VERSION to "v2")
 - [ ] **Fix 11:** Alpha Vantage estimate window (add days_until <= 0 check, document caveat)
 - [ ] **Fix 12:** Missing helper functions (get_price_n_trading_days_ago, get_close_price)
-- [ ] **Fix 13:** Trading day rounding for weekend events (normalize_event_date)
+- [ ] **Fix 13:** Trading day rounding for weekend events (normalize_event_date) → **MERGED INTO Fix 14**
 
 ### DATA FIXES
-- [ ] **Fix 14:** Events CSV migration (add release_time, fix quad witching, normalize weekend events)
+- [ ] **Fix 14:** Events CSV migration (add release_time, fix quad witching, normalize weekend events) — **SPEC COMPLETE**: see `migrate_events_csv()` in Blocker 5, includes weekend normalization with documented release_time decision (shifted → ALL_DAY)
 - [ ] **Fix 15:** Data verification (check coverage, backfill gaps from APIs)
 
 ### CODE IMPLEMENTATION
@@ -3119,11 +3716,59 @@ Do NOT use these files - all data consolidated into `data/events.csv`:
 - [ ] **Fix 18:** Create LiveEventFeatureProvider (NEW: src/ml/live_event_features.py)
 - [ ] **Fix 19:** Add skip_breakdown flag (features.py:740)
 - [ ] **Fix 20:** Refactor predict.py (use native TF, single breakdown, fix timezone)
+- [ ] **Fix 24:** Update market_state.py to use UnifiedEventsHandler (calendar-day → trading-day consistency)
+  - `src/ml/market_state.py:182` uses `get_events_for_date()` with calendar-day diffs
+  - Creates inconsistency: model's 46 features use trading days, market_state uses calendar days
+  - Either update to use `UnifiedEventsHandler.get_visible_events(timestamp)` or deprecate `earnings_proximity`/`macro_proximity` if redundant
+- [ ] **Fix 25:** Add config.py backward-compatible alias for EVENTS_FILE
+  ```python
+  # config.py
+  EVENTS_FILE = TSLA_EVENTS_FILE  # Backward compat alias
+  ```
+  - Avoids needing to find/update all call sites (train_hierarchical.py:1173, etc.)
 
 ### TESTING
 - [ ] **Fix 21:** Leak test for estimate gating (use trading-day offsets)
 - [ ] **Fix 22:** Trading day calculation tests (weekends/holidays)
 - [ ] **Fix 23:** Verify embed_events call sites before raising NotImplementedError
+- [ ] **Fix 26:** Train vs live parity regression test (Option B validation)
+  ```python
+  def test_train_live_parity_around_event():
+      """Verify train and live produce same features for known event."""
+      # PINNED EVENT: TSLA earnings 2024-01-24
+      # Release time pinned to 16:05 ET (conservative: right after market close)
+      # This makes the test deterministic - no dependency on variable API data
+      #
+      # NOTE: Use CSV-compatible values:
+      #   - event_type='earnings' (not 'tsla_earnings' - that's the feature prefix)
+      #   - release_time='HH:MM' format (no seconds) to match _parse_release_time()
+      PINNED_TSLA_EARNINGS = {
+          'date': '2024-01-24',
+          'release_time': '16:05',  # HH:MM format (CSV convention)
+          'event_type': 'earnings',  # CSV uses 'earnings', get_feature_prefix() → 'tsla_earnings'
+      }
+
+      # Inject pinned event into test fixture (override any API-sourced time)
+      test_events_df = load_events_for_test()
+      mask = (test_events_df['date'] == '2024-01-24') & \
+             (test_events_df['event_type'] == 'earnings')
+      test_events_df.loc[mask, 'release_time'] = '16:05'
+
+      test_timestamps = [
+          pd.Timestamp('2024-01-23 15:30'),  # Day before
+          pd.Timestamp('2024-01-24 10:00'),  # Day of, pre-event
+          pd.Timestamp('2024-01-24 17:00'),  # Day of, post-event (after pinned 16:05)
+          pd.Timestamp('2024-01-25 10:00'),  # Day after
+      ]
+
+      for ts in test_timestamps:
+          train_features = extract_features_training_path(ts, events_df=test_events_df)
+          live_features = extract_features_live_path(ts, events_df=test_events_df)
+
+          for key in EXPECTED_46_FEATURES:
+              assert np.isclose(train_features[key], live_features[key], atol=1e-6), \
+                  f"Mismatch at {ts}: {key}"
+  ```
   ```bash
   # Search for call sites:
   grep -rn "\.embed_events(" src/
@@ -3135,7 +3780,7 @@ Do NOT use these files - all data consolidated into `data/events.csv`:
 - [ ] Config naming (TSLA_EVENTS_FILE → EVENTS_FILE, add HISTORICAL_CSV_TIMEZONE)
 - [ ] Function name corrections in Phase 3
 - [x] Feature count updates (all references updated to 1091)
-- [ ] Multi-hot note correction
+- [x] Multi-hot note correction (Fix 3 applied - updated schema text)
 
 ---
 
@@ -3157,6 +3802,14 @@ Do NOT use these files - all data consolidated into `data/events.csv`:
 - ✅ Added explicit config (HISTORICAL_CSV_TIMEZONE) preferred over heuristic
 - ✅ Added timestamp convention verification task (> vs >= decision)
 - ✅ Added Phase -1 (fix training bug before events)
+- ✅ Hybrid vectorization: bucket for expensive features, per-bar for hours_until_* (true intraday precision)
+- ✅ Fixed compute_earnings_features docstring ('actual_eps' → 'actual', added surprise_fraction clarity)
+- ✅ Deleted unused get_pre_event_anchor_price() helper (dead code, pre-event drift uses E-14 anchor instead)
+- ✅ Fixed hybrid bucket shape mismatch (result indices 14-19, not 40-45)
+- ✅ Fixed _compute_hours_until_vectorized() to use CSV event types ('earnings' not 'tsla_earnings') with dynamic next-event lookup
+- ✅ Updated Blocker-1 integration with hybrid approach and price_df renaming for drift helpers
+- ✅ Added timezone conversion in get_bar_end_time() (tz_convert before tz_localize)
+- ✅ Updated checklist header (24 → 26 fixes) and marked multi-hot correction complete
 
 **Key Architectural Decision:** Option B (native TFs in live) chosen — training's 1min intermediate data is discarded, model trains on native TF resolution via `.last()` resampling. Live's native TFs should produce equivalent results (pending verification of DST boundaries, bar timestamp conventions, and yfinance partial-bar behavior).
 

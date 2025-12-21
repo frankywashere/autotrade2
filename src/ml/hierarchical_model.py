@@ -752,6 +752,23 @@ class HierarchicalLNN(nn.Module, ModelBase):
             )
 
         # =========================================================================
+        # v5.9: HIT PROBABILITY HEADS (where price will go within channel)
+        # =========================================================================
+        # Predicts probabilities of hitting upper bound, midline, or lower bound
+        # during the predicted duration
+        self.hit_probability_heads = nn.ModuleDict()
+        for tf in self.TIMEFRAMES:
+            # Input: hidden state from CfC
+            # Output: [prob_upper, prob_midline, prob_lower]
+            self.hit_probability_heads[f'{tf}'] = nn.Sequential(
+                nn.Linear(hidden_size, 64),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(64, 3),  # 3 probabilities
+                nn.Sigmoid(),  # Output probabilities [0, 1]
+            )
+
+        # =========================================================================
         # v5.2: VALIDITY HEADS (forward-looking channel assessment)
         # =========================================================================
         # Predicts: Will this channel hold going forward?
@@ -1271,6 +1288,14 @@ class HierarchicalLNN(nn.Module, ModelBase):
                     tf=tf,
                     duration_mean=duration_mean,
                 )
+
+                # v5.9: Add hit probability predictions
+                if hasattr(self, 'hit_probability_heads') and f'{tf}' in self.hit_probability_heads:
+                    hit_probs = self.hit_probability_heads[f'{tf}'](hidden)  # [batch, 3]
+                    geo_result['hit_prob_upper'] = hit_probs[:, 0:1]  # [batch, 1]
+                    geo_result['hit_prob_midline'] = hit_probs[:, 1:2]  # [batch, 1]
+                    geo_result['hit_prob_lower'] = hit_probs[:, 2:3]  # [batch, 1]
+
                 geometric_predictions[tf] = geo_result
 
             # =====================================================================
@@ -1414,6 +1439,18 @@ class HierarchicalLNN(nn.Module, ModelBase):
         else:
             phase_output = None
 
+        # v5.9: Use GEOMETRIC predictions as primary output (channel-based, not naive)
+        # Select geometric prediction from best TF
+        if geometric_predictions and not self.training:
+            # Inference: Use geometric from selected TF
+            selected_tf = self.TIMEFRAMES[best_tf_idx[0].item()] if len(best_tf_idx) > 0 else 'daily'
+            if selected_tf in geometric_predictions:
+                geo_pred = geometric_predictions[selected_tf]
+                final_pred_high = geo_pred['high']  # Geometric high
+                final_pred_low = geo_pred['low']    # Geometric low
+                # Use geometric duration for confidence scaling
+                final_pred_conf = geo_pred.get('hit_prob_midline', final_pred_conf)  # Prob of hitting midline
+
         # Energy-based confidence adjustment
         if hasattr(self, 'energy_scorer') and len(tf_hidden_dict) == len(self.TIMEFRAMES):
             energy_output = self.energy_scorer(
@@ -1426,6 +1463,12 @@ class HierarchicalLNN(nn.Module, ModelBase):
         else:
             energy_output = None
             predictions = torch.cat([final_pred_high, final_pred_low, final_pred_conf], dim=-1)
+
+        # v5.9: Store primary head predictions for comparison (not used as main output)
+        output_dict['primary_predictions'] = {
+            'high': per_tf_highs,  # From direct heads (for baseline comparison)
+            'low': per_tf_lows,
+        }
 
         # Build output dict
         output_dict = {
