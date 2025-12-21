@@ -2880,24 +2880,53 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print(f"      Event features will be zeros. Check {project_config.TSLA_EVENTS_FILE}")
 
     # Extract features (handles caching internally)
+    # v5.9: DDP FIX - Only rank 0 should extract features to avoid race conditions
     if is_main_process(rank):
         print(f"   Extracting features (use_chunking={args.use_chunking})...")
 
-    result = extractor.extract_features(
-        df,
-        use_cache=True,
-        continuation=True,
-        use_chunking=args.use_chunking,
-        use_gpu=args.use_gpu_features,  # Pass user's GPU selection
-        shard_storage_path=str(shard_path),
-        vix_data=vix_data,  # v3.20: VIX features for volatility regime
-        events_handler=events_handler,  # v4.0: Event features for earnings/FOMC patterns
-    )
-    # Handle variable return: (features_df, continuation_labels_dir) or (features_df, continuation_labels_dir, mmap_meta_path)
-    # v4.3: continuation_labels_dir is a Path to per-TF label files, NOT a DataFrame
-    features_df = result[0]
-    continuation_labels_dir = result[1]  # Path to directory with per-TF label files
-    mmap_meta_path = result[2] if len(result) > 2 else None
+        result = extractor.extract_features(
+            df,
+            use_cache=True,
+            continuation=True,
+            use_chunking=args.use_chunking,
+            use_gpu=args.use_gpu_features,  # Pass user's GPU selection
+            shard_storage_path=str(shard_path),
+            vix_data=vix_data,  # v3.20: VIX features for volatility regime
+            events_handler=events_handler,  # v4.0: Event features for earnings/FOMC patterns
+        )
+        # Handle variable return: (features_df, continuation_labels_dir) or (features_df, continuation_labels_dir, mmap_meta_path)
+        # v4.3: continuation_labels_dir is a Path to per-TF label files, NOT a DataFrame
+        features_df = result[0]
+        continuation_labels_dir = result[1]  # Path to directory with per-TF label files
+        mmap_meta_path = result[2] if len(result) > 2 else None
+
+        # Sync point: Wait for other ranks before proceeding
+        if world_size > 1:
+            print(f"   ✓ Rank 0 feature extraction complete - syncing with other ranks...")
+            dist.barrier()
+    else:
+        # Non-main processes: wait for rank 0 to finish, then load from cache
+        print(f"   Rank {rank}: Waiting for rank 0 to complete feature extraction...")
+
+        if world_size > 1:
+            # Wait for barrier before proceeding (rank 0 will finish extraction first)
+            dist.barrier()
+
+        # Load cached features (rank 0 just created them)
+        # Re-run with use_cache=True (will load instantly)
+        result = extractor.extract_features(
+            df,
+            use_cache=True,
+            continuation=True,
+            use_chunking=args.use_chunking,
+            use_gpu=args.use_gpu_features,
+            shard_storage_path=str(shard_path),
+            vix_data=vix_data,
+            events_handler=events_handler,
+        )
+        features_df = result[0]
+        continuation_labels_dir = result[1]
+        mmap_meta_path = result[2] if len(result) > 2 else None
 
     # v5.3.2: Slice features_df to match df_sliced (apply warmup period)
     # Features were extracted on full df for rolling window context, but we only use post-warmup data
