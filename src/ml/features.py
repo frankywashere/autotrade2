@@ -40,9 +40,9 @@ EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
 CHANNEL_PROJECTION_VERSION = "v2"  # v5.6: Removed fixed projections - now calculated at inference from learned duration
 BREAKDOWN_CALC_VERSION = "v3"  # v5.8: Fixed window sizes for 1min input (was 5x too short in v2)
 PARTIAL_BAR_VERSION = "v4"  # v5.6: Removed projected_high/low/center - projections calculated at inference
-CONTINUATION_LABEL_VERSION = "v2"  # v5.9: Multi-window labels (all 14 windows per timestamp, not single w500)
-FEATURE_VERSION = f"v5.9.0_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}"
-# v5.9.0: Multi-window continuation labels - all 14 channel windows (w10-w100) saved per timestamp for proper geometric target calculation
+CONTINUATION_LABEL_VERSION = "v2.1"  # v5.9.1: Partial window support for small TFs (3month gets w10-w30)
+FEATURE_VERSION = f"v5.9.1_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}"
+# v5.9.1: Partial window support - TFs with <100 bars generate labels for windows that DO fit (restores 3month labels)
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
 # IMPORTED FROM config.py (single source of truth)
@@ -514,7 +514,11 @@ class TradingFeatureExtractor(FeatureExtractor):
         validated_meta_path = None
 
         # Check for sharded cache first (new method)
+        # v5.9.1: Accept v5.9.0 channel shards as compatible (only label format changed)
         mmap_meta_files = list(unified_cache_dir.glob(f"features_mmap_meta_{FEATURE_VERSION}_*.json"))
+        if not mmap_meta_files:
+            # Backward compatibility: try v5.9.0 (same channel format)
+            mmap_meta_files = list(unified_cache_dir.glob(f"features_mmap_meta_v5.9.0_*.json"))
         if mmap_meta_files:
             meta_file = mmap_meta_files[0]
             try:
@@ -564,10 +568,18 @@ class TradingFeatureExtractor(FeatureExtractor):
             hierarchical_cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
 
             # Check if all per-TF label files exist
+            # v5.9.1: Also check v5.9.0 labels (backward compatible)
             found_tfs = []
             missing_tfs = []
             for tf in HIERARCHICAL_TIMEFRAMES:
                 tf_label_path = unified_cache_dir / f"continuation_labels_{tf}_{hierarchical_cache_suffix}.pkl"
+                if not tf_label_path.exists():
+                    # Try v5.9.0 format (backward compatible)
+                    suffix_v590 = hierarchical_cache_suffix.replace('v5.9.1', 'v5.9.0').replace('contv2.1', 'contv2')
+                    tf_label_path_v590 = unified_cache_dir / f"continuation_labels_{tf}_{suffix_v590}.pkl"
+                    if tf_label_path_v590.exists():
+                        tf_label_path = tf_label_path_v590
+
                 if tf_label_path.exists():
                     found_tfs.append(tf)
                 else:
@@ -576,15 +588,28 @@ class TradingFeatureExtractor(FeatureExtractor):
             if len(found_tfs) == len(HIERARCHICAL_TIMEFRAMES):
                 # All TFs cached - validate one file to ensure format is correct
                 sample_path = unified_cache_dir / f"continuation_labels_5min_{hierarchical_cache_suffix}.pkl"
+                # v5.9.1: Try v5.9.0 if v5.9.1 not found
+                if not sample_path.exists():
+                    suffix_v590 = hierarchical_cache_suffix.replace('v5.9.1', 'v5.9.0').replace('contv2.1', 'contv2')
+                    sample_path = unified_cache_dir / f"continuation_labels_5min_{suffix_v590}.pkl"
                 try:
                     test_load = pd.read_pickle(sample_path)
-                    if len(test_load) > 0 and 'duration_bars' in test_load.columns:
-                        print(f"   ✓ Continuation labels (hierarchical): Valid ({len(HIERARCHICAL_TIMEFRAMES)} TFs cached)")
+                    # v5.9: Accept both old format (duration_bars) and new format (w50_duration)
+                    has_old_format = 'duration_bars' in test_load.columns
+                    has_new_format = 'w50_duration' in test_load.columns or 'w10_duration' in test_load.columns
+
+                    if len(test_load) > 0 and (has_old_format or has_new_format):
+                        format_type = "v5.6 (single-window)" if has_old_format else "v5.9 (multi-window)"
+                        print(f"   ✓ Continuation labels (hierarchical): Valid ({len(HIERARCHICAL_TIMEFRAMES)} TFs cached, {format_type})")
                         cont_cache_valid = True
                     else:
                         print(f"   ⚠️  Continuation labels: Invalid format - will regenerate")
                 except Exception as e:
                     print(f"   ⚠️  Continuation labels: Corrupted ({type(e).__name__}) - will regenerate")
+            elif len(found_tfs) >= len(HIERARCHICAL_TIMEFRAMES) - 1:
+                # v5.9.1: Accept 10/11 or 11/11 as valid (3month may have partial windows)
+                print(f"   ✓ Continuation labels: Valid ({len(found_tfs)}/{len(HIERARCHICAL_TIMEFRAMES)} TFs, missing: {missing_tfs if missing_tfs else 'none'})")
+                cont_cache_valid = True
             elif len(found_tfs) > 0:
                 print(f"   ⚠️  Continuation labels: Partial ({len(found_tfs)}/{len(HIERARCHICAL_TIMEFRAMES)} TFs) - will regenerate missing")
             else:
@@ -592,6 +617,12 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Check 3: Non-channel features (Price, RSI, Correlation, Cycle, Volume, Time, Breakdown)
         non_channel_cache_path = unified_cache_dir / f"non_channel_features_{cache_key}.pkl"
+        # v5.9.1: Try v5.9.0 cache if v5.9.1 not found (backward compatible)
+        if not non_channel_cache_path.exists():
+            cache_key_v590 = cache_key.replace('v5.9.1', 'v5.9.0').replace('contv2.1', 'contv2')
+            non_channel_cache_path_v590 = unified_cache_dir / f"non_channel_features_{cache_key_v590}.pkl"
+            if non_channel_cache_path_v590.exists():
+                non_channel_cache_path = non_channel_cache_path_v590
         non_channel_cache_valid = False
         if non_channel_cache_path.exists() and use_cache:
             try:
@@ -5413,11 +5444,15 @@ class TradingFeatureExtractor(FeatureExtractor):
             # which didn't match feature windows. Now uses CHANNEL_WINDOW_SIZES
             # to ensure label windows match feature windows.
 
-            # Need enough data for largest window + future scanning
-            max_window = max(config.CHANNEL_WINDOW_SIZES)
-            if len(tf_data) < max_window + 10:
-                print(f"         ⚠️  Not enough data for {tf} (need {max_window}+ bars, have {len(tf_data)})")
+            # v5.9.1: Allow partial window sets for TFs with limited data
+            # Worker function will skip windows that don't fit (line 5462)
+            # This allows 3month (44 bars) to generate labels for w10-w30
+            min_window = min(config.CHANNEL_WINDOW_SIZES)  # 10
+            if len(tf_data) < min_window + 10:
+                print(f"         ⚠️  Not enough data for {tf} (need {min_window}+ bars, have {len(tf_data)})")
                 continue
+            elif len(tf_data) < max(config.CHANNEL_WINDOW_SIZES):
+                print(f"         ℹ️  {tf}: {len(tf_data)} bars (partial windows - larger windows will be skipped)")
 
             # Generate labels
             tf_labels = []

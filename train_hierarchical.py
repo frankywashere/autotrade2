@@ -3048,6 +3048,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     # v5.2: Require native TF mode, no fallback to legacy
                     print(f"\n   ❌ ERROR: Native TF metadata required for v5.2")
                     print(f"   Please regenerate features with native TF generation enabled.")
+                    import sys
                     sys.exit(1)
 
     # =========================================================================
