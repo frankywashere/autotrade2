@@ -568,18 +568,10 @@ class TradingFeatureExtractor(FeatureExtractor):
             hierarchical_cache_suffix = f"{FEATURE_VERSION}_{df.index[0].strftime('%Y%m%d')}_{df.index[-1].strftime('%Y%m%d')}"
 
             # Check if all per-TF label files exist
-            # v5.9.1: Also check v5.9.0 labels (backward compatible)
             found_tfs = []
             missing_tfs = []
             for tf in HIERARCHICAL_TIMEFRAMES:
                 tf_label_path = unified_cache_dir / f"continuation_labels_{tf}_{hierarchical_cache_suffix}.pkl"
-                if not tf_label_path.exists():
-                    # Try v5.9.0 format (backward compatible)
-                    suffix_v590 = hierarchical_cache_suffix.replace('v5.9.1', 'v5.9.0').replace('contv2.1', 'contv2')
-                    tf_label_path_v590 = unified_cache_dir / f"continuation_labels_{tf}_{suffix_v590}.pkl"
-                    if tf_label_path_v590.exists():
-                        tf_label_path = tf_label_path_v590
-
                 if tf_label_path.exists():
                     found_tfs.append(tf)
                 else:
@@ -588,10 +580,6 @@ class TradingFeatureExtractor(FeatureExtractor):
             if len(found_tfs) == len(HIERARCHICAL_TIMEFRAMES):
                 # All TFs cached - validate one file to ensure format is correct
                 sample_path = unified_cache_dir / f"continuation_labels_5min_{hierarchical_cache_suffix}.pkl"
-                # v5.9.1: Try v5.9.0 if v5.9.1 not found
-                if not sample_path.exists():
-                    suffix_v590 = hierarchical_cache_suffix.replace('v5.9.1', 'v5.9.0').replace('contv2.1', 'contv2')
-                    sample_path = unified_cache_dir / f"continuation_labels_5min_{suffix_v590}.pkl"
                 try:
                     test_load = pd.read_pickle(sample_path)
                     # v5.9: Accept both old format (duration_bars) and new format (w50_duration)
@@ -5448,10 +5436,11 @@ class TradingFeatureExtractor(FeatureExtractor):
             # Worker function will skip windows that don't fit (line 5462)
             # This allows 3month (44 bars) to generate labels for w10-w30
             min_window = min(config.CHANNEL_WINDOW_SIZES)  # 10
+            max_window = max(config.CHANNEL_WINDOW_SIZES)  # 100
             if len(tf_data) < min_window + 10:
                 print(f"         ⚠️  Not enough data for {tf} (need {min_window}+ bars, have {len(tf_data)})")
                 continue
-            elif len(tf_data) < max(config.CHANNEL_WINDOW_SIZES):
+            elif len(tf_data) < max_window:
                 print(f"         ℹ️  {tf}: {len(tf_data)} bars (partial windows - larger windows will be skipped)")
 
             # Generate labels
@@ -5664,7 +5653,9 @@ class TradingFeatureExtractor(FeatureExtractor):
             tf_data_index = tf_data.index.values
             close_col_idx = 3  # Close is 4th column
 
-            timestamps_to_process = range(max_window, len(tf_data) - 1)
+            # v5.9.1: Start from min_window to allow partial windows for small TFs
+            # Worker function skips windows that don't fit each timestamp
+            timestamps_to_process = range(min_window, len(tf_data) - 1)
 
             if n_jobs > 1 and len(timestamps_to_process) > 100:
                 # Parallel processing
