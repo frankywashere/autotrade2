@@ -1496,6 +1496,31 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         # Load non-channel features
         non_channel_path = cache_dir / f"non_channel_features_{cache_key}.pkl"
+
+        # v5.9.2: Backward compatibility - try alternate versions if exact match not found
+        if not non_channel_path.exists():
+            # Try v5.9.0 if looking for v5.9.1
+            cache_key_v590 = cache_key.replace('v5.9.1', 'v5.9.0').replace('contv2.1', 'contv2')
+            alt_path = cache_dir / f"non_channel_features_{cache_key_v590}.pkl"
+            if alt_path.exists():
+                non_channel_path = alt_path
+                print(f"   ℹ️  Using v5.9.0 non-channel (backward compat): {alt_path.name}")
+            else:
+                # Try v5.9.1 if looking for v5.9.0
+                cache_key_v591 = cache_key.replace('v5.9.0', 'v5.9.1').replace('contv2', 'contv2.1')
+                alt_path = cache_dir / f"non_channel_features_{cache_key_v591}.pkl"
+                if alt_path.exists():
+                    non_channel_path = alt_path
+                    print(f"   ℹ️  Using v5.9.1 non-channel (forward compat): {alt_path.name}")
+                else:
+                    # Try to find ANY non-channel file and use it (last resort)
+                    nc_files = list(cache_dir.glob("non_channel_features_*.pkl"))
+                    if nc_files:
+                        # Sort by size (larger = more data) and use largest
+                        nc_files_sorted = sorted(nc_files, key=lambda p: p.stat().st_size, reverse=True)
+                        non_channel_path = nc_files_sorted[0]
+                        print(f"   ⚠️  Using fallback non-channel (date mismatch possible): {non_channel_path.name}")
+
         non_channel_df = None
         non_channel_columns = []
 

@@ -1921,7 +1921,21 @@ def interactive_setup(args, profiler=None):
                 m_start = int(str(dr.get('start', ''))[:4])
                 m_end = int(str(dr.get('end', ''))[:4])
             except Exception:
-                m_start, m_end = 2015, 2022
+                # v5.9.2: Extract dates from cache_key when no manifest exists
+                # cache_key format: v5.9.0_..._20150102_20250927_1692233_...
+                cache_key = selected_cache_pair.get('cache_key', '')
+                try:
+                    # Parse dates from cache_key (YYYYMMDD format after version prefix)
+                    import re
+                    date_match = re.search(r'_(\d{8})_(\d{8})_', cache_key)
+                    if date_match:
+                        m_start = int(date_match.group(1)[:4])
+                        m_end = int(date_match.group(2)[:4])
+                        print(f"   ℹ️  No manifest found, extracted dates from cache_key: {m_start}-{m_end}")
+                    else:
+                        m_start, m_end = 2015, 2025  # Updated default
+                except Exception:
+                    m_start, m_end = 2015, 2025  # Updated default
         args.train_start_year = int(m_start)
         args.train_end_year = int(m_end)
         print(f"\n   📅 Using cached date range: {args.train_start_year}-{args.train_end_year}")
