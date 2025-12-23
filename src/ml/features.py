@@ -596,7 +596,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                     print(f"   ⚠️  Continuation labels: Corrupted ({type(e).__name__}) - will regenerate")
             elif len(found_tfs) >= len(HIERARCHICAL_TIMEFRAMES) - 1:
                 # v5.9.1: Accept 10/11 or 11/11 as valid (3month may have partial windows)
-                print(f"   ✓ Continuation labels: Valid ({len(found_tfs)}/{len(HIERARCHICAL_TIMEFRAMES)} TFs, missing: {missing_tfs if missing_tfs else 'none'})")
+                if missing_tfs:
+                    print(f"   ⚠️  Continuation labels: {len(found_tfs)}/{len(HIERARCHICAL_TIMEFRAMES)} TFs (missing: {missing_tfs} - tolerance triggered)")
+                else:
+                    print(f"   ✓ Continuation labels: Valid ({len(found_tfs)}/{len(HIERARCHICAL_TIMEFRAMES)} TFs)")
                 cont_cache_valid = True
             elif len(found_tfs) > 0:
                 print(f"   ⚠️  Continuation labels: Partial ({len(found_tfs)}/{len(HIERARCHICAL_TIMEFRAMES)} TFs) - will regenerate missing")
@@ -809,6 +812,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                         missing_transition_tfs.append(tf)
                 # v5.9.2: Accept 10/11 transition files (3month often has <20 rows, can't generate transitions)
                 all_transition_cached = len(found_transition_tfs) >= len(HIERARCHICAL_TIMEFRAMES) - 1
+                if all_transition_cached and len(missing_transition_tfs) > 0:
+                    print(f"   ⚠️  Transition labels: {len(found_transition_tfs)}/{len(HIERARCHICAL_TIMEFRAMES)} (missing: {missing_transition_tfs} - tolerance triggered)")
             else:
                 all_continuation_cached = False
                 all_transition_cached = False
