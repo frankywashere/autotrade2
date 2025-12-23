@@ -826,11 +826,20 @@ class HierarchicalDataset(Dataset):
         if self.include_continuation and len(self._per_tf_continuation) > 0:
             for tf in HIERARCHICAL_TIMEFRAMES:
                 if tf not in self._per_tf_continuation or tf not in self._per_tf_ts_to_idx:
-                    # No labels for this TF - use placeholders with invalid flag
+                    # No labels for this TF - use placeholders with invalid flag (must set ALL keys for collate)
                     targets[f'cont_{tf}_duration'] = 0.0
                     targets[f'cont_{tf}_gain'] = 0.0
                     targets[f'cont_{tf}_confidence'] = 0.5
                     targets[f'cont_{tf}_valid'] = 0.0  # Mark as invalid
+                    # Also set all window-level keys
+                    for window in config.CHANNEL_WINDOW_SIZES:
+                        targets[f'cont_{tf}_w{window}_duration'] = 0.0
+                        targets[f'cont_{tf}_w{window}_price_sequence'] = [0.0] * 10
+                        targets[f'cont_{tf}_w{window}_hit_upper'] = 0.0
+                        targets[f'cont_{tf}_w{window}_hit_midline'] = 0.0
+                        targets[f'cont_{tf}_w{window}_hit_lower'] = 0.0
+                        targets[f'cont_{tf}_w{window}_confidence'] = 0.0
+                        targets[f'cont_{tf}_w{window}_valid'] = 0.0
                     continue
 
                 try:
@@ -881,24 +890,51 @@ class HierarchicalDataset(Dataset):
                                     targets[f'cont_{tf}_w{window}_confidence'] = float(cont_data[f'w{window}_confidence'][row_idx])
                                     targets[f'cont_{tf}_w{window}_valid'] = 1.0
                                 else:
-                                    # Window invalid - use placeholder
+                                    # Window invalid - use placeholder (must set ALL keys for collate)
+                                    targets[f'cont_{tf}_w{window}_duration'] = 0.0
+                                    targets[f'cont_{tf}_w{window}_price_sequence'] = [0.0] * 10  # Placeholder sequence
+                                    targets[f'cont_{tf}_w{window}_hit_upper'] = 0.0
+                                    targets[f'cont_{tf}_w{window}_hit_midline'] = 0.0
+                                    targets[f'cont_{tf}_w{window}_hit_lower'] = 0.0
+                                    targets[f'cont_{tf}_w{window}_confidence'] = 0.0
                                     targets[f'cont_{tf}_w{window}_valid'] = 0.0
+                            else:
+                                # Window column doesn't exist in labels - use placeholder (must set ALL keys for collate)
+                                targets[f'cont_{tf}_w{window}_duration'] = 0.0
+                                targets[f'cont_{tf}_w{window}_price_sequence'] = [0.0] * 10
+                                targets[f'cont_{tf}_w{window}_hit_upper'] = 0.0
+                                targets[f'cont_{tf}_w{window}_hit_midline'] = 0.0
+                                targets[f'cont_{tf}_w{window}_hit_lower'] = 0.0
+                                targets[f'cont_{tf}_w{window}_confidence'] = 0.0
+                                targets[f'cont_{tf}_w{window}_valid'] = 0.0
 
                         # Mark TF as having at least some valid windows
                         targets[f'cont_{tf}_valid'] = 1.0
 
                     else:
-                        # Timestamp not found - mark all windows as invalid
+                        # Timestamp not found - mark all windows as invalid (must set ALL keys for collate)
                         targets[f'cont_{tf}_gain'] = 0.0
                         targets[f'cont_{tf}_valid'] = 0.0
                         for window in config.CHANNEL_WINDOW_SIZES:
+                            targets[f'cont_{tf}_w{window}_duration'] = 0.0
+                            targets[f'cont_{tf}_w{window}_price_sequence'] = [0.0] * 10
+                            targets[f'cont_{tf}_w{window}_hit_upper'] = 0.0
+                            targets[f'cont_{tf}_w{window}_hit_midline'] = 0.0
+                            targets[f'cont_{tf}_w{window}_hit_lower'] = 0.0
+                            targets[f'cont_{tf}_w{window}_confidence'] = 0.0
                             targets[f'cont_{tf}_w{window}_valid'] = 0.0
 
                 except Exception:
-                    # Error - mark all as invalid
+                    # Error - mark all as invalid (must set ALL keys for collate)
                     targets[f'cont_{tf}_gain'] = 0.0
                     targets[f'cont_{tf}_valid'] = 0.0
                     for window in config.CHANNEL_WINDOW_SIZES:
+                        targets[f'cont_{tf}_w{window}_duration'] = 0.0
+                        targets[f'cont_{tf}_w{window}_price_sequence'] = [0.0] * 10
+                        targets[f'cont_{tf}_w{window}_hit_upper'] = 0.0
+                        targets[f'cont_{tf}_w{window}_hit_midline'] = 0.0
+                        targets[f'cont_{tf}_w{window}_hit_lower'] = 0.0
+                        targets[f'cont_{tf}_w{window}_confidence'] = 0.0
                         targets[f'cont_{tf}_w{window}_valid'] = 0.0
 
         # Legacy fallback: single continuation_labels_df (backward compatibility)
