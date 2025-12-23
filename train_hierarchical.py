@@ -356,17 +356,29 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         x = torch.from_numpy(combined).to(dtype=torch_dtype)
 
     # Build targets tensor dict with proper dtype
+    # v5.9.2: Handle price_sequence separately (variable length - can't be stacked into tensor)
+    price_sequence_data = {}  # {key: [list_sample0, list_sample1, ...]}
     converted_targets = []
+
     for tgt in targets_list:
         ct = {}
         for k, v in tgt.items():
-            if isinstance(v, torch.Tensor):
+            # v5.9.2: price_sequence stays as list (variable length, used in loss loop)
+            if '_price_sequence' in k:
+                if k not in price_sequence_data:
+                    price_sequence_data[k] = []
+                price_sequence_data[k].append(v)  # Keep as list
+            elif isinstance(v, torch.Tensor):
                 ct[k] = v.to(dtype=torch_dtype)
             else:
                 ct[k] = torch.tensor(v, dtype=torch_dtype)
         converted_targets.append(ct)
 
     targets_batch = default_collate(converted_targets)
+
+    # v5.9.2: Add price_sequence lists back (not as tensors - iterated in loss calculation)
+    for k, v in price_sequence_data.items():
+        targets_batch[k] = v  # List of lists, not tensor
 
     if move_to_device and device is not None:
         if is_native_timeframe:
@@ -375,7 +387,9 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         else:
             x = x.to(device, non_blocking=True)
         for k, v in targets_batch.items():
-            targets_batch[k] = v.to(device, non_blocking=True)
+            # v5.9.2: Skip price_sequence (list of lists, not tensor)
+            if isinstance(v, torch.Tensor):
+                targets_batch[k] = v.to(device, non_blocking=True)
 
     # v5.2: Collate VIX sequences
     vix_batch = None
@@ -3674,7 +3688,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 features = features.to(args.device, non_blocking=True)
 
             # Move each tensor in targets dict to device
-            targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
+            # v5.9.2: Skip price_sequence (list of lists, not tensor)
+            targets = {k: (v.to(args.device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in targets.items()}
 
             # v5.2: Move VIX batch to device if present
             if vix_batch is not None:
@@ -3920,7 +3935,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
                             for win_idx, window in enumerate(project_config.CHANNEL_WINDOW_SIZES):
                                 key = f'cont_{tf}_w{window}_price_sequence'
+                                key_valid = f'cont_{tf}_w{window}_valid'
                                 if key in targets and sample_idx < len(targets[key]):
+                                    # v5.9.2: Check validity flag - skip placeholder sequences
+                                    is_valid = (key_valid in targets and
+                                                targets[key_valid][sample_idx].item() > 0)
+                                    if not is_valid:
+                                        continue
+
                                     price_seq = targets[key][sample_idx]
                                     if price_seq is not None and len(price_seq) > 0:
                                         price_sequences.append(price_seq)
@@ -4260,7 +4282,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     features = features.to(args.device, non_blocking=True)
 
                 # Move targets to device
-                targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
+                # v5.9.2: Skip price_sequence (list of lists, not tensor)
+                targets = {k: (v.to(args.device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in targets.items()}
 
                 # v5.2: Move VIX batch to device if present
                 if vix_batch_val is not None:
@@ -4417,7 +4440,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     else:
                         features = features.to(args.device, non_blocking=True)
 
-                    targets = {k: v.to(args.device, non_blocking=True) for k, v in targets.items()}
+                    # v5.9.2: Skip price_sequence (list of lists, not tensor)
+                    targets = {k: (v.to(args.device, non_blocking=True) if isinstance(v, torch.Tensor) else v) for k, v in targets.items()}
 
                     if vix_batch_test is not None:
                         vix_batch_test = vix_batch_test.to(args.device, non_blocking=True)

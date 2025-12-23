@@ -883,7 +883,8 @@ class HierarchicalDataset(Dataset):
                                 is_valid = cont_data[f'w{window}_valid'][row_idx] > 0
                                 if is_valid:
                                     targets[f'cont_{tf}_w{window}_duration'] = float(cont_data[f'w{window}_duration'][row_idx])
-                                    targets[f'cont_{tf}_w{window}_price_sequence'] = cont_data[f'w{window}_price_sequence'][row_idx]  # List
+                                    # v5.9.2: Keep as list (variable length) - collate handles separately
+                                    targets[f'cont_{tf}_w{window}_price_sequence'] = list(cont_data[f'w{window}_price_sequence'][row_idx])
                                     targets[f'cont_{tf}_w{window}_hit_upper'] = float(cont_data[f'w{window}_hit_upper'][row_idx])
                                     targets[f'cont_{tf}_w{window}_hit_midline'] = float(cont_data[f'w{window}_hit_midline'][row_idx])
                                     targets[f'cont_{tf}_w{window}_hit_lower'] = float(cont_data[f'w{window}_hit_lower'][row_idx])

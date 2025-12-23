@@ -1464,16 +1464,16 @@ class HierarchicalLNN(nn.Module, ModelBase):
             energy_output = None
             predictions = torch.cat([final_pred_high, final_pred_low, final_pred_conf], dim=-1)
 
-        # v5.9: Store primary head predictions for comparison (not used as main output)
-        output_dict['primary_predictions'] = {
-            'high': per_tf_highs,  # From direct heads (for baseline comparison)
-            'low': per_tf_lows,
-        }
-
         # Build output dict
         output_dict = {
             'hidden_states': layer_hidden_states,
             'layer_predictions': {},
+        }
+
+        # v5.9: Store primary head predictions for comparison (not used as main output)
+        output_dict['primary_predictions'] = {
+            'high': per_tf_highs,  # From direct heads (for baseline comparison)
+            'low': per_tf_lows,
         }
 
         # v5.0: Add projection metadata (interpretability)
