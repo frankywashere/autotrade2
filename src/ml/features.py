@@ -5500,6 +5500,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                     # Fit channel for each window
                     for window in windows:
                         if i < window:
+                            # Not enough history for this window - mark as invalid
+                            label_row[f'w{window}_valid'] = 0
                             continue
 
                         # Get lookback data
