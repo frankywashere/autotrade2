@@ -790,8 +790,11 @@ class TradingFeatureExtractor(FeatureExtractor):
 
             # Check if all per-TF label files exist (cache check)
             # v5.2: Also check for transition labels
+            # v5.9.2: Accept 10/11 files (3month may not have enough data for transitions)
             all_continuation_cached = True
             all_transition_cached = True
+            found_transition_tfs = []
+            missing_transition_tfs = []
             if use_cache:
                 for tf in HIERARCHICAL_TIMEFRAMES:
                     # Check continuation labels
@@ -800,8 +803,12 @@ class TradingFeatureExtractor(FeatureExtractor):
                         all_continuation_cached = False
                     # Check transition labels (v5.2)
                     tf_transition_path = cache_dir / f"transition_labels_{tf}_{cache_suffix}.pkl"
-                    if not tf_transition_path.exists():
-                        all_transition_cached = False
+                    if tf_transition_path.exists():
+                        found_transition_tfs.append(tf)
+                    else:
+                        missing_transition_tfs.append(tf)
+                # v5.9.2: Accept 10/11 transition files (3month often has <20 rows, can't generate transitions)
+                all_transition_cached = len(found_transition_tfs) >= len(HIERARCHICAL_TIMEFRAMES) - 1
             else:
                 all_continuation_cached = False
                 all_transition_cached = False
@@ -826,7 +833,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             # v5.2: Generate transition labels (uses continuation labels)
             if continuation_labels_dir:
                 if all_transition_cached:
-                    print(f"   📂 Found cached transition labels ({len(HIERARCHICAL_TIMEFRAMES)} TFs)")
+                    missing_info = f", missing: {missing_transition_tfs}" if missing_transition_tfs else ""
+                    print(f"   📂 Found cached transition labels ({len(found_transition_tfs)}/{len(HIERARCHICAL_TIMEFRAMES)} TFs{missing_info})")
                 else:
                     print(f"\n   🔄 Generating transition labels for v5.2 multi-phase compositor...")
                     transition_files = self.generate_transition_labels(
