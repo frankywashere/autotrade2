@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 torch
+einops  # Required for Mamba2 temporal encoder
 numpy
 pandas
 scikit-learn
