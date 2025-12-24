@@ -2751,7 +2751,11 @@ def interactive_setup(args, profiler=None):
     print(f"  Batch Size: {args.batch_size}")
     print(f"  Learning Rate: {args.lr}")
     print(f"  LR Scheduler: ReduceLROnPlateau (adaptive, v5.3.2)")
-    print(f"  Data Loading: mmap + OS page cache (no pre-merge)")
+    # v5.9.3: Show actual data loading mode
+    if getattr(args, 'preload_tf_to_ram', False):
+        print(f"  Data Loading: Preload to RAM (3.2 GB TF sequences) ⚡")
+    else:
+        print(f"  Data Loading: mmap + OS page cache")
     # v5.3.2: Pre-stacking status
     if getattr(args, 'use_prestack', False):
         prestack_mode = getattr(args, 'prestack_mode', 'full_epoch')
@@ -3022,7 +3026,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         print(f"🎯 Horizon: Adaptive (base {args.prediction_horizon} bars)")
         print(f"🔢 Batch size: {args.batch_size}" + (f" x {world_size} GPUs = {args.batch_size * world_size}" if is_distributed else ""))
         print(f"🔄 Epochs: {args.epochs}")
-        print(f"💾 Data mode: mmap + OS page cache")
+        print(f"💾 Data mode: {'Preload to RAM ⚡' if getattr(args, 'preload_tf_to_ram', False) else 'mmap + OS page cache'}")
         print(f"🎭 Multi-task: {'Enabled' if args.multi_task else 'Disabled'}")
         print("=" * 70)
 
