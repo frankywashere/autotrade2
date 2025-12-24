@@ -345,6 +345,9 @@ def segsum(x: Tensor, device: Device = None) -> Tensor:
     Source: https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L23-L32
     """
     T = x.size(-1)
+    # Use input tensor's device if not specified (fixes MPS/CUDA compatibility)
+    if device is None:
+        device = x.device
     x = repeat(x, "... d -> ... d e", e=T)
     mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=-1)
     x = x.masked_fill(~mask, 0)
@@ -373,6 +376,10 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
      2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
     """
     assert x.shape[1] % chunk_size == 0
+
+    # Auto-detect device from input tensor (fixes MPS/CUDA compatibility)
+    if device is None:
+        device = x.device
 
     # Rearrange into chunks
     # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
