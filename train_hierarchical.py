@@ -3980,7 +3980,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         _first_forward_start = None
         _iter_start_time = time.perf_counter() if (_debug_mode and epoch == 0) else None
 
+        # Track batch timing for worker heartbeat
+        _batch_times = [] if _debug_mode else None
+        _last_heartbeat_batch = 0
+
         for batch_idx, batch_data in enumerate(batch_pbar):
+            _batch_start = time.perf_counter() if _debug_mode else None
+
             # v5.9.3: Log when first batch arrives (worker spawn complete)
             if _debug_mode and is_main_process(rank) and batch_idx == 0 and epoch == 0:
                 _iter_elapsed = time.perf_counter() - _iter_start_time if _iter_start_time else 0
@@ -4498,6 +4504,20 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             if batch_idx % 100 == 0:
                 batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
+                # v5.9.3: Worker heartbeat logging (every 100 batches when debug enabled)
+                if _debug_mode and is_main_process(rank) and batch_idx > 0:
+                    if _batch_start and _batch_times is not None:
+                        _batch_elapsed = time.perf_counter() - _batch_start
+                        _batch_times.append(_batch_elapsed)
+
+                    # Calculate stats over last 100 batches
+                    if _batch_times and len(_batch_times) >= 10:
+                        recent_times = _batch_times[-100:] if len(_batch_times) >= 100 else _batch_times
+                        avg_time = sum(recent_times) / len(recent_times)
+                        samples_per_sec = args.batch_size / avg_time if avg_time > 0 else 0
+                        print(f"[HEARTBEAT] Batch {batch_idx}: {avg_time:.2f}s/batch, {samples_per_sec:.0f} samples/sec", flush=True)
+                        _last_heartbeat_batch = batch_idx
+
                 # Print component breakdown every 100 batches for diagnosis
                 # v5.7.2: All values now reflect actual weighted contributions to loss
                 if batch_idx > 0 and batch_idx % 100 == 0:
@@ -4545,6 +4565,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
             if profiler and batch_idx > 0 and batch_idx % profiler.log_every_n == 0:
                 profiler.snapshot(f"batch_{batch_idx}", epoch + 1)
+
+            # Track batch time for heartbeat (outside the batch_idx % 100 block)
+            if _debug_mode and _batch_start and _batch_times is not None:
+                _batch_elapsed = time.perf_counter() - _batch_start
+                _batch_times.append(_batch_elapsed)
 
         avg_train_loss = train_loss / max(num_batches, 1)
         train_losses.append(avg_train_loss)

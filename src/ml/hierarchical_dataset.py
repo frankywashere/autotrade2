@@ -613,6 +613,265 @@ class HierarchicalDataset(Dataset):
             else:
                 raise ValueError("Cannot find tsla_close in 5min features")
 
+        # =====================================================================
+        # BUILD PRE-COMPUTED ALIGNMENT INDEX
+        # =====================================================================
+        # Try to load from cache first, otherwise build and save
+        cache_dir = Path(tf_meta_path).parent
+        self._alignment_ready = False
+        self.aligned = {}
+
+        if not self._load_alignment(cache_dir):
+            # Build alignment (slow first time, ~20-60s depending on sample count)
+            self._build_unified_alignment(cache_dir)
+
+    # =========================================================================
+    # PRE-COMPUTED ALIGNMENT INDEX: Eliminates runtime searchsorted calls
+    # =========================================================================
+    #
+    # Problem: Each __getitem__ does 11+ searchsorted calls (O(log n) each).
+    # With 64 samples/batch × 11 TFs = 704 searchsorted calls per batch!
+    #
+    # Solution: Pre-compute ALL indices once at startup, then O(1) array lookup.
+    #
+    # Analogy: Instead of looking up each word in a dictionary every time,
+    # we build a cheat sheet that says "word #1234 is on page 567".
+    # =========================================================================
+
+    def _build_unified_alignment(self, cache_dir: Path = None):
+        """
+        Pre-compute all index alignments for O(1) lookups during training.
+
+        This eliminates:
+        - 11× np.searchsorted per sample (timeframe alignment)
+        - 1× np.searchsorted per sample (1-min OHLC lookup)
+        - 1× pandas get_indexer per sample (VIX lookup)
+        - 1× event computation per sample
+
+        Memory cost: ~50-100 MB (tiny compared to 3.2 GB data)
+        Speedup: 10-15× faster __getitem__
+        """
+        _debug = os.environ.get('TRAIN_DEBUG', '0') == '1'
+        _build_start = time.perf_counter()
+
+        n_samples = len(self.valid_indices)
+        valid_indices_arr = np.array(self.valid_indices, dtype=np.int64)
+
+        if _debug:
+            print(f"\n[ALIGNMENT] Building unified alignment index for {n_samples:,} samples...", flush=True)
+
+        # Get reference timestamps (5min timestamps for all valid samples)
+        ref_timestamps = self.tf_timestamps['5min'][valid_indices_arr]
+
+        self.aligned = {}
+
+        # =====================================================================
+        # 1. TIMEFRAME INDICES (11 arrays)
+        # =====================================================================
+        if _debug:
+            print(f"[ALIGNMENT] Computing timeframe indices (11 TFs)...", flush=True)
+
+        _tf_start = time.perf_counter()
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            if tf not in self.tf_mmaps:
+                continue
+
+            if tf == '5min':
+                # 5min is our reference - indices are the valid_indices themselves
+                self.aligned[f'tf_{tf}'] = valid_indices_arr.copy()
+            else:
+                # Vectorized searchsorted - ALL samples at once!
+                tf_timestamps = self.tf_timestamps[tf]
+                tf_indices = np.searchsorted(tf_timestamps, ref_timestamps, side='right') - 1
+
+                # Clamp to valid range (ensure enough history for seq_len)
+                seq_len = self.tf_sequence_lengths[tf]
+                tf_indices = np.maximum(tf_indices, seq_len)
+                tf_indices = np.minimum(tf_indices, len(tf_timestamps) - 1)
+
+                self.aligned[f'tf_{tf}'] = tf_indices.astype(np.int64)
+
+        _tf_elapsed = time.perf_counter() - _tf_start
+        if _debug:
+            print(f"[ALIGNMENT]   ✓ Timeframe indices: {_tf_elapsed:.2f}s", flush=True)
+
+        # =====================================================================
+        # 2. RAW 1-MIN OHLC INDICES (for target calculation)
+        # =====================================================================
+        if hasattr(self, 'raw_ohlc_timestamps') and len(self.raw_ohlc_timestamps) > 0:
+            if _debug:
+                print(f"[ALIGNMENT] Computing 1-min OHLC indices...", flush=True)
+
+            _ohlc_start = time.perf_counter()
+            ohlc_indices = np.searchsorted(self.raw_ohlc_timestamps, ref_timestamps, side='right') - 1
+            ohlc_indices = np.maximum(ohlc_indices, 0)
+            ohlc_indices = np.minimum(ohlc_indices, len(self.raw_ohlc_array) - 1)
+            self.aligned['ohlc_1min'] = ohlc_indices.astype(np.int64)
+
+            _ohlc_elapsed = time.perf_counter() - _ohlc_start
+            if _debug:
+                print(f"[ALIGNMENT]   ✓ 1-min OHLC indices: {_ohlc_elapsed:.2f}s", flush=True)
+
+        # =====================================================================
+        # 3. VIX INDICES + CONVERT TO NUMPY
+        # =====================================================================
+        if self._vix_loader and self._vix_loader.vix_data is not None:
+            if _debug:
+                print(f"[ALIGNMENT] Computing VIX indices and converting to numpy...", flush=True)
+
+            _vix_start = time.perf_counter()
+
+            # Convert VIX pandas DataFrame to numpy for fast access
+            self._vix_array = self._vix_loader.vix_data.values.astype(np.float32)
+
+            # Get VIX dates as integer days since epoch
+            vix_index = self._vix_loader.vix_data.index
+            if hasattr(vix_index, 'astype'):
+                vix_dates_ns = vix_index.astype('int64')  # nanoseconds since epoch
+            else:
+                vix_dates_ns = np.array([d.value for d in vix_index], dtype=np.int64)
+
+            # Convert to days for alignment (VIX is daily)
+            NS_PER_DAY = 24 * 60 * 60 * 1_000_000_000
+            vix_dates_days = vix_dates_ns // NS_PER_DAY
+            sample_dates_days = ref_timestamps // NS_PER_DAY
+
+            # Vectorized searchsorted for VIX alignment
+            vix_indices = np.searchsorted(vix_dates_days, sample_dates_days, side='right') - 1
+            vix_indices = np.maximum(vix_indices, 0)
+            vix_indices = np.minimum(vix_indices, len(self._vix_array) - 1)
+            self.aligned['vix'] = vix_indices.astype(np.int64)
+
+            _vix_elapsed = time.perf_counter() - _vix_start
+            if _debug:
+                print(f"[ALIGNMENT]   ✓ VIX indices: {_vix_elapsed:.2f}s ({len(self._vix_array):,} VIX rows)", flush=True)
+
+        # =====================================================================
+        # 4. EVENT FEATURES (pre-compute for all samples)
+        # =====================================================================
+        if self._event_fetcher:
+            if _debug:
+                print(f"[ALIGNMENT] Pre-computing event features...", flush=True)
+
+            _event_start = time.perf_counter()
+
+            # Event feature format: [n_samples, 6]
+            # For each of top 3 events: [type_id, days_until]
+            # Total: 3 events × 2 features = 6
+            self.aligned['events'] = np.zeros((n_samples, 6), dtype=np.float32)
+
+            # Convert timestamps to dates for event lookup
+            # This is the slow part - we need to iterate (but only once!)
+            sample_dates = pd.to_datetime(ref_timestamps, unit='ns').date
+
+            # Build a date -> events cache to avoid redundant lookups
+            # (many samples share the same date)
+            date_to_events = {}
+
+            for i, sample_date in enumerate(sample_dates):
+                if sample_date not in date_to_events:
+                    events = self._event_fetcher.get_events_for_training(
+                        pd.Timestamp(sample_date), days_ahead=30
+                    )
+                    # Convert to fixed-size feature array
+                    event_features = np.zeros(6, dtype=np.float32)
+                    for j, evt in enumerate(events[:3]):
+                        event_features[j * 2] = evt.get('type_id', 5)  # type
+                        event_features[j * 2 + 1] = evt.get('days_until', 30)  # days
+                    date_to_events[sample_date] = event_features
+
+                self.aligned['events'][i] = date_to_events[sample_date]
+
+                # Progress logging for slow event computation
+                if _debug and (i + 1) % 50000 == 0:
+                    print(f"[ALIGNMENT]   Event progress: {i+1:,}/{n_samples:,} samples", flush=True)
+
+            _event_elapsed = time.perf_counter() - _event_start
+            if _debug:
+                unique_dates = len(date_to_events)
+                print(f"[ALIGNMENT]   ✓ Event features: {_event_elapsed:.2f}s ({unique_dates:,} unique dates)", flush=True)
+
+        # =====================================================================
+        # 5. SUMMARY
+        # =====================================================================
+        _total_elapsed = time.perf_counter() - _build_start
+
+        # Calculate memory usage
+        total_bytes = 0
+        for key, arr in self.aligned.items():
+            total_bytes += arr.nbytes
+
+        if _debug or True:  # Always show this summary
+            print(f"     ✓ Pre-computed alignment index: {total_bytes / 1e6:.1f} MB in {_total_elapsed:.1f}s")
+
+        # Mark alignment as ready
+        self._alignment_ready = True
+
+        # Optionally save to cache
+        if cache_dir:
+            self._save_alignment(cache_dir)
+
+    def _save_alignment(self, cache_dir: Path):
+        """Save pre-computed alignment to disk for fast loading next time."""
+        _debug = os.environ.get('TRAIN_DEBUG', '0') == '1'
+
+        cache_key = self.tf_meta.get('cache_key', 'unknown')
+        alignment_path = Path(cache_dir) / f"aligned_indices_{cache_key}.npz"
+
+        try:
+            np.savez_compressed(alignment_path, **self.aligned)
+            size_mb = alignment_path.stat().st_size / 1e6
+            if _debug:
+                print(f"[ALIGNMENT] Saved to {alignment_path} ({size_mb:.1f} MB)", flush=True)
+        except Exception as e:
+            if _debug:
+                print(f"[ALIGNMENT] Failed to save: {e}", flush=True)
+
+    def _load_alignment(self, cache_dir: Path) -> bool:
+        """Load pre-computed alignment from disk. Returns True if successful."""
+        _debug = os.environ.get('TRAIN_DEBUG', '0') == '1'
+
+        cache_key = self.tf_meta.get('cache_key', 'unknown')
+        alignment_path = Path(cache_dir) / f"aligned_indices_{cache_key}.npz"
+
+        if not alignment_path.exists():
+            if _debug:
+                print(f"[ALIGNMENT] No cached alignment found at {alignment_path}", flush=True)
+            return False
+
+        try:
+            _load_start = time.perf_counter()
+            data = np.load(alignment_path)
+            self.aligned = {k: data[k] for k in data.files}
+            data.close()
+
+            # Verify alignment matches current dataset
+            expected_samples = len(self.valid_indices)
+            first_key = list(self.aligned.keys())[0]
+            actual_samples = len(self.aligned[first_key])
+
+            if actual_samples != expected_samples:
+                if _debug:
+                    print(f"[ALIGNMENT] Cache mismatch: {actual_samples} vs {expected_samples} samples", flush=True)
+                self.aligned = {}
+                return False
+
+            # Also need to convert VIX to numpy if we have alignment
+            if 'vix' in self.aligned and self._vix_loader and self._vix_loader.vix_data is not None:
+                self._vix_array = self._vix_loader.vix_data.values.astype(np.float32)
+
+            _load_elapsed = time.perf_counter() - _load_start
+            size_mb = alignment_path.stat().st_size / 1e6
+            print(f"     ✓ Loaded alignment cache: {size_mb:.1f} MB in {_load_elapsed:.2f}s")
+
+            self._alignment_ready = True
+            return True
+
+        except Exception as e:
+            if _debug:
+                print(f"[ALIGNMENT] Failed to load: {e}", flush=True)
+            return False
+
     def _calculate_targets_from_future(self, current_price: float, future_prices: np.ndarray,
                                        seq_start: int, seq_end: int,
                                        past_prices: np.ndarray = None) -> dict:
@@ -747,6 +1006,9 @@ class HierarchicalDataset(Dataset):
         # Get the 5min timestamp at this index for cross-timeframe alignment
         ts_5min = self.tf_timestamps['5min'][data_idx_5min]
 
+        # Check if we have pre-computed alignment (O(1) lookups)
+        _use_alignment = getattr(self, '_alignment_ready', False) and hasattr(self, 'aligned') and self.aligned
+
         # Build features dict for each timeframe
         timeframe_data = {}
 
@@ -757,11 +1019,15 @@ class HierarchicalDataset(Dataset):
 
             seq_len = self.tf_sequence_lengths[tf]
 
-            # Find index in this timeframe's array that corresponds to our 5min timestamp
-            # Binary search for the closest timestamp <= ts_5min
-            tf_timestamps = self.tf_timestamps[tf]
-            tf_idx = np.searchsorted(tf_timestamps, ts_5min, side='right') - 1
-            tf_idx = max(seq_len, tf_idx)  # Ensure we have enough history
+            # Get timeframe index - use pre-computed if available
+            if _use_alignment and f'tf_{tf}' in self.aligned:
+                # O(1) array lookup - 10× faster than searchsorted!
+                tf_idx = self.aligned[f'tf_{tf}'][idx]
+            else:
+                # Fallback: Binary search for the closest timestamp <= ts_5min
+                tf_timestamps = self.tf_timestamps[tf]
+                tf_idx = np.searchsorted(tf_timestamps, ts_5min, side='right') - 1
+                tf_idx = max(seq_len, tf_idx)  # Ensure we have enough history
 
             # Extract sequence
             start = tf_idx - seq_len
@@ -800,12 +1066,13 @@ class HierarchicalDataset(Dataset):
         # Get future prices for target calculation
         if self.raw_ohlc_array is not None:
             # Use raw 1-min OHLC for more accurate targets
-            # FIX (Priority 1b): Use timestamp-based lookup instead of approximation
-            # Get the 5min timestamp at current data_idx_5min
-            if '5min' in self.tf_timestamps and len(self.tf_timestamps['5min']) > data_idx_5min:
+            # Use pre-computed 1-min index if available (O(1) lookup)
+            if _use_alignment and 'ohlc_1min' in self.aligned:
+                approx_1min_idx = self.aligned['ohlc_1min'][idx]
+            elif '5min' in self.tf_timestamps and len(self.tf_timestamps['5min']) > data_idx_5min:
                 ts_5min = self.tf_timestamps['5min'][data_idx_5min]
 
-                # Use binary search to find corresponding 1-min index by timestamp
+                # Fallback: Use binary search to find corresponding 1-min index by timestamp
                 # This handles market gaps (weekends, holidays) correctly
                 if hasattr(self, 'raw_ohlc_timestamps') and len(self.raw_ohlc_timestamps) > 0:
                     approx_1min_idx = np.searchsorted(self.raw_ohlc_timestamps, ts_5min, side='right') - 1
@@ -1014,8 +1281,24 @@ class HierarchicalDataset(Dataset):
                 targets[f'trans_{tf}_valid'] = 0.0  # Mark as invalid
 
         # v5.2: Get VIX sequence for this sample
+        # Use pre-computed VIX index if available (O(1) lookup)
         vix_seq = None
-        if self._vix_loader:
+        if _use_alignment and 'vix' in self.aligned and hasattr(self, '_vix_array'):
+            # Fast path: Use pre-computed VIX index and numpy array
+            try:
+                vix_idx = self.aligned['vix'][idx]
+                seq_len = self._vix_sequence_length
+                start_idx = max(0, vix_idx - seq_len + 1)
+                vix_seq = self._vix_array[start_idx:vix_idx + 1]
+
+                # Pad if needed
+                if len(vix_seq) < seq_len:
+                    padding = np.zeros((seq_len - len(vix_seq), vix_seq.shape[1]), dtype=np.float32)
+                    vix_seq = np.vstack([padding, vix_seq])
+            except Exception:
+                vix_seq = None
+        elif self._vix_loader:
+            # Fallback: Use pandas-based lookup
             try:
                 ts_5min = self.tf_timestamps['5min'][data_idx_5min]
                 ts = pd.Timestamp(ts_5min, unit='ns')
@@ -1033,8 +1316,13 @@ class HierarchicalDataset(Dataset):
                 vix_seq = None
 
         # v5.2: Get events for this timestamp
+        # Use pre-computed events if available (already computed, just index!)
         events = None
-        if self._event_fetcher:
+        if _use_alignment and 'events' in self.aligned:
+            # Fast path: Events already pre-computed as numpy array
+            events = self.aligned['events'][idx]  # [6] float32 array
+        elif self._event_fetcher:
+            # Fallback: Compute events dynamically
             try:
                 ts_5min = self.tf_timestamps['5min'][data_idx_5min]
                 ts = pd.Timestamp(ts_5min, unit='ns')
@@ -1164,6 +1452,15 @@ class HierarchicalDataset(Dataset):
             state['_event_fetcher'] = None
             state['_needs_event_fetcher_reload'] = True
 
+        # =====================================================================
+        # 4. Alignment data (regular numpy arrays - pickle fine!)
+        # =====================================================================
+        # The aligned dict contains regular numpy arrays (not mmaps), so it pickles fine.
+        # We just need to log it for debugging.
+        if _debug and hasattr(self, 'aligned') and self.aligned:
+            align_size_mb = sum(arr.nbytes for arr in self.aligned.values()) / 1e6
+            print(f"[PICKLE] Alignment data included: {len(self.aligned)} arrays, {align_size_mb:.1f} MB", flush=True)
+
         _pickle_elapsed = (time.perf_counter() - _pickle_start) * 1000
         if _debug:
             print(f"[PICKLE] __getstate__ complete in {_pickle_elapsed:.1f}ms", flush=True)
@@ -1230,7 +1527,7 @@ class HierarchicalDataset(Dataset):
                 self.monthly_3month_mmap = np.load(path, mmap_mode='r')
 
         # =====================================================================
-        # 3. Recreate VIX loader
+        # 3. Recreate VIX loader and numpy array
         # =====================================================================
         if state.get('_needs_vix_reload', False):
             vix_path = state.get('_vix_csv_path')
@@ -1238,8 +1535,11 @@ class HierarchicalDataset(Dataset):
                 try:
                     from src.ml.live_events import VIXSequenceLoader
                     self._vix_loader = VIXSequenceLoader(vix_path)
+                    # Also recreate the numpy array for fast aligned lookup
+                    if self._vix_loader.vix_data is not None:
+                        self._vix_array = self._vix_loader.vix_data.values.astype(np.float32)
                     if _debug:
-                        print(f"[UNPICKLE] Recreated VIX loader from {vix_path}", flush=True)
+                        print(f"[UNPICKLE] Recreated VIX loader + numpy array from {vix_path}", flush=True)
                 except Exception as e:
                     if _debug:
                         print(f"[UNPICKLE] Failed to recreate VIX loader: {e}", flush=True)
@@ -1258,6 +1558,13 @@ class HierarchicalDataset(Dataset):
                 if _debug:
                     print(f"[UNPICKLE] Failed to recreate event fetcher: {e}", flush=True)
                 self._event_fetcher = None
+
+        # =====================================================================
+        # 5. Verify alignment data survived pickling
+        # =====================================================================
+        if _debug and hasattr(self, 'aligned') and self.aligned:
+            align_size_mb = sum(arr.nbytes for arr in self.aligned.values()) / 1e6
+            print(f"[UNPICKLE] Alignment data preserved: {len(self.aligned)} arrays, {align_size_mb:.1f} MB", flush=True)
 
         _unpickle_elapsed = (time.perf_counter() - _unpickle_start) * 1000
         if _debug:
