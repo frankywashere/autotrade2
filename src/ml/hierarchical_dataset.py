@@ -19,6 +19,8 @@ from typing import Tuple, Optional, List, Dict, Union
 from pathlib import Path
 import sys
 import json
+import os
+import time
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent.parent
@@ -732,6 +734,13 @@ class HierarchicalDataset(Dataset):
             timeframe_data: Dict mapping timeframe -> features [seq_len, features]
             targets: Dict with prediction targets
         """
+        # Debug: Log first __getitem__ call in worker process
+        if getattr(self, '_unpickled_in_worker', False) and not getattr(self, '_first_getitem_logged', True):
+            _debug = os.environ.get('TRAIN_DEBUG', '0') == '1'
+            if _debug:
+                print(f"[WORKER] First __getitem__(idx={idx}) in PID={os.getpid()}", flush=True)
+            self._first_getitem_logged = True
+
         # Get 5min array index (our reference timeframe)
         data_idx_5min = self.valid_indices[idx]
 
@@ -1034,6 +1043,229 @@ class HierarchicalDataset(Dataset):
                 pass
 
         return timeframe_data, targets, vix_seq, events
+
+    # =========================================================================
+    # MULTIPROCESSING SUPPORT: Pickle/unpickle for DataLoader workers
+    # =========================================================================
+    #
+    # Problem: Memory-mapped numpy arrays have OS-level file handles that are
+    # process-specific. When DataLoader spawns workers (required for CUDA),
+    # it pickles the dataset and unpickles it in each worker. The mmap handles
+    # become invalid in the new process, causing hangs or crashes.
+    #
+    # Solution: Store file PATHS instead of mmap objects when pickling.
+    # Each worker reopens the files with their own mmap handles.
+    # The OS shares the underlying memory pages (zero extra RAM).
+    #
+    # Analogy: Like a library card system - you can't hand someone your physical
+    # library card and expect it to work (it's tied to YOU). Instead, you give
+    # them the library address and they get their own card.
+    # =========================================================================
+
+    def __getstate__(self):
+        """
+        Prepare dataset for pickling (sending to DataLoader workers).
+
+        Replaces mmap objects with their file paths so workers can reopen them.
+        """
+        _pickle_start = time.perf_counter()
+
+        # Debug logging (controlled by TRAIN_DEBUG env var)
+        _debug = os.environ.get('TRAIN_DEBUG', '0') == '1'
+        if _debug:
+            print(f"[PICKLE] __getstate__ called in PID={os.getpid()}", flush=True)
+
+        # Create a copy of __dict__ to modify
+        state = self.__dict__.copy()
+
+        # =====================================================================
+        # 1. Handle native timeframe mmaps (tf_mmaps, tf_timestamps)
+        # =====================================================================
+        if hasattr(self, 'tf_mmaps') and self.tf_mmaps:
+            # Check if already converted to RAM (preload_tf_to_ram=True)
+            first_tf = next(iter(self.tf_mmaps.keys()))
+            is_mmap = hasattr(self.tf_mmaps[first_tf], 'filename')
+
+            if is_mmap:
+                # Store paths instead of mmap objects
+                state['_tf_mmap_paths'] = {}
+                state['_tf_timestamp_paths'] = {}
+
+                for tf, mmap_arr in self.tf_mmaps.items():
+                    if hasattr(mmap_arr, 'filename') and mmap_arr.filename:
+                        state['_tf_mmap_paths'][tf] = mmap_arr.filename
+                    else:
+                        # Fallback: reconstruct path from metadata
+                        if hasattr(self, 'tf_meta') and 'cache_key' in self.tf_meta and hasattr(self, 'tf_meta_path'):
+                            cache_dir = Path(self.tf_meta_path).parent
+                            state['_tf_mmap_paths'][tf] = str(cache_dir / f"tf_sequence_{tf}_{self.tf_meta['cache_key']}.npy")
+
+                for tf, ts_arr in self.tf_timestamps.items():
+                    if hasattr(ts_arr, 'filename') and ts_arr.filename:
+                        state['_tf_timestamp_paths'][tf] = ts_arr.filename
+                    elif hasattr(self, 'tf_meta') and 'cache_key' in self.tf_meta and hasattr(self, 'tf_meta_path'):
+                        cache_dir = Path(self.tf_meta_path).parent
+                        state['_tf_timestamp_paths'][tf] = str(cache_dir / f"tf_timestamps_{tf}_{self.tf_meta['cache_key']}.npy")
+
+                # Remove the actual mmap objects (they can't be pickled properly)
+                state['tf_mmaps'] = None
+                state['tf_timestamps'] = None
+                state['_needs_mmap_reopen'] = True
+
+                if _debug:
+                    print(f"[PICKLE] Stored {len(state['_tf_mmap_paths'])} TF mmap paths for worker reopen", flush=True)
+            else:
+                # Already in RAM (preload_tf_to_ram=True), can pickle directly
+                state['_needs_mmap_reopen'] = False
+                if _debug:
+                    print(f"[PICKLE] TF data already in RAM, no mmap handling needed", flush=True)
+
+        # =====================================================================
+        # 2. Handle legacy channel mmaps (channel_mmaps, monthly_3month_mmap)
+        # =====================================================================
+        if hasattr(self, 'channel_mmaps') and self.channel_mmaps:
+            first_shard = self.channel_mmaps[0]
+            is_mmap = hasattr(first_shard, 'filename')
+
+            if is_mmap:
+                state['_channel_mmap_paths'] = []
+                for mmap_arr in self.channel_mmaps:
+                    if hasattr(mmap_arr, 'filename') and mmap_arr.filename:
+                        state['_channel_mmap_paths'].append(mmap_arr.filename)
+
+                state['channel_mmaps'] = None
+                state['_needs_legacy_mmap_reopen'] = True
+
+                if _debug:
+                    print(f"[PICKLE] Stored {len(state['_channel_mmap_paths'])} legacy channel shard paths", flush=True)
+
+        if hasattr(self, 'monthly_3month_mmap') and self.monthly_3month_mmap is not None:
+            if hasattr(self.monthly_3month_mmap, 'filename'):
+                state['_monthly_mmap_path'] = self.monthly_3month_mmap.filename
+                state['monthly_3month_mmap'] = None
+
+        # =====================================================================
+        # 3. Remove unpicklable objects
+        # =====================================================================
+        # Profiler has file handles and can't be pickled
+        state['_profiler'] = None
+
+        # Store VIX loader path so worker can recreate it
+        if hasattr(self, '_vix_loader') and self._vix_loader is not None:
+            if hasattr(self._vix_loader, 'vix_csv_path'):
+                state['_vix_csv_path'] = self._vix_loader.vix_csv_path
+            # The VIX loader itself might be picklable, but to be safe we'll recreate it
+            state['_vix_loader'] = None
+            state['_needs_vix_reload'] = True
+
+        # Event fetcher should be picklable (just dates and strings), but mark for recreation
+        # to avoid any potential issues with FOMC date fetcher
+        if hasattr(self, '_event_fetcher') and self._event_fetcher is not None:
+            state['_event_fetcher'] = None
+            state['_needs_event_fetcher_reload'] = True
+
+        _pickle_elapsed = (time.perf_counter() - _pickle_start) * 1000
+        if _debug:
+            print(f"[PICKLE] __getstate__ complete in {_pickle_elapsed:.1f}ms", flush=True)
+
+        return state
+
+    def __setstate__(self, state):
+        """
+        Restore dataset after unpickling (in DataLoader worker process).
+
+        Reopens mmap files and recreates unpicklable objects.
+        """
+        _unpickle_start = time.perf_counter()
+
+        # Debug logging
+        _debug = os.environ.get('TRAIN_DEBUG', '0') == '1'
+        if _debug:
+            print(f"[UNPICKLE] __setstate__ called in worker PID={os.getpid()}", flush=True)
+
+        # Restore basic state
+        self.__dict__.update(state)
+
+        # =====================================================================
+        # 1. Reopen native timeframe mmaps
+        # =====================================================================
+        if state.get('_needs_mmap_reopen', False):
+            self.tf_mmaps = {}
+            self.tf_timestamps = {}
+
+            tf_mmap_paths = state.get('_tf_mmap_paths', {})
+            tf_timestamp_paths = state.get('_tf_timestamp_paths', {})
+
+            for tf, path in tf_mmap_paths.items():
+                if path and Path(path).exists():
+                    self.tf_mmaps[tf] = np.load(path, mmap_mode='r')
+                else:
+                    if _debug:
+                        print(f"[UNPICKLE] WARNING: Missing mmap file: {path}", flush=True)
+
+            for tf, path in tf_timestamp_paths.items():
+                if path and Path(path).exists():
+                    self.tf_timestamps[tf] = np.load(path, mmap_mode='r')
+
+            if _debug:
+                print(f"[UNPICKLE] Reopened {len(self.tf_mmaps)} TF mmaps in worker", flush=True)
+
+        # =====================================================================
+        # 2. Reopen legacy channel mmaps
+        # =====================================================================
+        if state.get('_needs_legacy_mmap_reopen', False):
+            channel_paths = state.get('_channel_mmap_paths', [])
+            self.channel_mmaps = []
+
+            for path in channel_paths:
+                if path and Path(path).exists():
+                    self.channel_mmaps.append(np.load(path, mmap_mode='r'))
+
+            if _debug:
+                print(f"[UNPICKLE] Reopened {len(self.channel_mmaps)} legacy channel shards", flush=True)
+
+        if hasattr(self, '_monthly_mmap_path') and self._monthly_mmap_path:
+            path = self._monthly_mmap_path
+            if Path(path).exists():
+                self.monthly_3month_mmap = np.load(path, mmap_mode='r')
+
+        # =====================================================================
+        # 3. Recreate VIX loader
+        # =====================================================================
+        if state.get('_needs_vix_reload', False):
+            vix_path = state.get('_vix_csv_path')
+            if vix_path and Path(vix_path).exists():
+                try:
+                    from src.ml.live_events import VIXSequenceLoader
+                    self._vix_loader = VIXSequenceLoader(vix_path)
+                    if _debug:
+                        print(f"[UNPICKLE] Recreated VIX loader from {vix_path}", flush=True)
+                except Exception as e:
+                    if _debug:
+                        print(f"[UNPICKLE] Failed to recreate VIX loader: {e}", flush=True)
+                    self._vix_loader = None
+
+        # =====================================================================
+        # 4. Recreate event fetcher
+        # =====================================================================
+        if state.get('_needs_event_fetcher_reload', False):
+            try:
+                from src.ml.live_events import LiveEventFetcher
+                self._event_fetcher = LiveEventFetcher()
+                if _debug:
+                    print(f"[UNPICKLE] Recreated event fetcher", flush=True)
+            except Exception as e:
+                if _debug:
+                    print(f"[UNPICKLE] Failed to recreate event fetcher: {e}", flush=True)
+                self._event_fetcher = None
+
+        _unpickle_elapsed = (time.perf_counter() - _unpickle_start) * 1000
+        if _debug:
+            print(f"[UNPICKLE] __setstate__ complete in {_unpickle_elapsed:.1f}ms", flush=True)
+
+        # Track that this instance was unpickled (for first __getitem__ logging)
+        self._unpickled_in_worker = True
+        self._first_getitem_logged = False
 
     def __len__(self) -> int:
         """Return number of valid sequences."""

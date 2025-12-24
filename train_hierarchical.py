@@ -3606,6 +3606,19 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler.snapshot("pre_dataloader_creation", 0, force_log=True)
         profiler.log_info(f"CREATING_DATALOADERS | num_workers={args.num_workers}")
 
+    # v5.9.3: Debug logging for DataLoader creation
+    _debug_mode = os.environ.get('TRAIN_DEBUG', '0') == '1'
+    if _debug_mode and is_main_process(rank):
+        print(f"\n[DATALOADER] Creating DataLoaders with num_workers={args.num_workers}...", flush=True)
+        if args.num_workers > 0:
+            print(f"[DATALOADER] Using multiprocessing with 'spawn' method (CUDA-safe)", flush=True)
+            print(f"[DATALOADER] Dataset will be pickled and sent to each worker", flush=True)
+            preload_mode = getattr(args, 'preload_tf_to_ram', False)
+            if preload_mode:
+                print(f"[DATALOADER] preload_tf_to_ram=True: TF data in RAM (pickle safe)", flush=True)
+            else:
+                print(f"[DATALOADER] preload_tf_to_ram=False: Using mmap (will reopen in workers)", flush=True)
+
     train_loader = DataLoader(train_dataset, **train_loader_kwargs)
     val_loader = DataLoader(val_dataset, **val_loader_kwargs)
 
@@ -3951,13 +3964,28 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         # v5.3.2: Use prestack_loader if enabled, otherwise standard train_loader
         active_loader = prestack_loader if prestack_loader is not None else train_loader
+
+        # v5.9.3: Debug logging for DataLoader iteration start (worker spawn happens here)
+        _debug_mode = os.environ.get('TRAIN_DEBUG', '0') == '1'
+        if _debug_mode and is_main_process(rank) and epoch == 0:
+            print(f"[DATALOADER] Creating iterator for {type(active_loader).__name__}...", flush=True)
+            print(f"[DATALOADER] num_workers={args.num_workers}, batch_size={args.batch_size}", flush=True)
+            if args.num_workers > 0:
+                print(f"[DATALOADER] Workers will spawn on first iteration (may take a few seconds)...", flush=True)
+
         batch_pbar = tqdm(active_loader, desc=f"Epoch {epoch + 1}", leave=False, disable=not is_main_process(rank))
 
         # Track if this is the very first batch (for torch.compile feedback)
         _is_first_batch_ever = (epoch == 0)
         _first_forward_start = None
+        _iter_start_time = time.perf_counter() if (_debug_mode and epoch == 0) else None
 
         for batch_idx, batch_data in enumerate(batch_pbar):
+            # v5.9.3: Log when first batch arrives (worker spawn complete)
+            if _debug_mode and is_main_process(rank) and batch_idx == 0 and epoch == 0:
+                _iter_elapsed = time.perf_counter() - _iter_start_time if _iter_start_time else 0
+                print(f"[DATALOADER] First batch received in {_iter_elapsed:.1f}s (workers ready)", flush=True)
+
             if profiler and batch_idx == 0:
                 profiler.log_info(f"FIRST_BATCH_COMPLETE | time_sec={0}")
                 profiler.snapshot("first_batch_received", epoch + 1, force_log=True)
