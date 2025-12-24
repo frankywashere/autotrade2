@@ -1902,7 +1902,7 @@ def interactive_setup(args, profiler=None):
     args.precision_mode = 'fp32'  # Track the user's choice
     args.use_tf32 = False  # v5.3: TF32 Tensor Core acceleration
 
-    if args.device == 'cuda':
+    if args.device.startswith('cuda'):
         print()
         precision_choice = inquirer.select(
             message="Training precision:",
