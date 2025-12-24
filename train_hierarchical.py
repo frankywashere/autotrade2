@@ -748,10 +748,15 @@ class RollingBufferBatchLoader:
         verbose: bool = True,
         drop_last: bool = True,
         use_pinned: bool = False,
+        num_workers: int = 0,  # v5.9.3: Parallel sample fetching (0 = sequential)
     ):
         from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
 
         self.dataset = dataset
+        self.num_workers = num_workers
+        # Create thread pool for parallel fetching (if workers > 0)
+        self._executor = ThreadPoolExecutor(max_workers=max(1, num_workers)) if num_workers > 0 else None
         self.batch_size = batch_size
         self.buffer_size = buffer_size
         self.collate_fn = collate_fn
@@ -810,8 +815,14 @@ class RollingBufferBatchLoader:
         if len(batch_indices) < self.batch_size and self.drop_last:
             return None
 
-        # Fetch samples
-        samples = [self.dataset[i] for i in batch_indices]
+        # Fetch samples - v5.9.3: Use parallel fetching if workers > 0
+        if self._executor is not None:
+            # Parallel fetch using ThreadPoolExecutor
+            futures = [self._executor.submit(self.dataset.__getitem__, i) for i in batch_indices]
+            samples = [f.result() for f in futures]
+        else:
+            # Sequential fetch (original behavior)
+            samples = [self.dataset[i] for i in batch_indices]
 
         # Collate
         batch = self.collate_fn(samples, suppress_slow_warnings=True)
@@ -927,6 +938,10 @@ class RollingBufferBatchLoader:
         self.stop_background = True
         self.batch_buffer.clear()
         self.epoch_indices.clear()
+        # v5.9.3: Shutdown thread pool
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
 
 
 def load_cache_manifests(cache_dir: Path):
@@ -2947,6 +2962,19 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         project_config._TORCH_DTYPE = torch.float32
         print("   ✓ Switched to float32 for MPS compatibility")
 
+    # v5.9.3: Re-apply TF32 setting in spawned processes (mp.spawn doesn't inherit PyTorch settings)
+    if getattr(args, 'use_tf32', False):
+        torch.set_float32_matmul_precision('medium')
+        if is_main_process(rank):
+            print(f"   ✓ TF32 Tensor Cores enabled (matmul precision: medium)")
+    elif hasattr(args, 'precision_mode') and args.precision_mode == 'fp32':
+        torch.set_float32_matmul_precision('highest')
+    elif hasattr(args, 'precision_mode') and args.precision_mode == 'fp32_tf32':
+        # Fallback if use_tf32 flag missing but precision_mode is set
+        torch.set_float32_matmul_precision('medium')
+        if is_main_process(rank):
+            print(f"   ✓ TF32 Tensor Cores enabled (matmul precision: medium)")
+
     # Auto-set num_workers if not specified
     if args.num_workers is None:
         args.num_workers = {'cuda': 4, 'mps': 0, 'cpu': 2}.get(args.device.split(':')[0], 2)
@@ -3605,6 +3633,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
         if prestack_mode == 'rolling':
             # v5.3.2: Rolling buffer mode - RAM-efficient
+            # v5.9.3: Now supports parallel sample fetching via num_workers
             if is_main_process(rank):
                 print(f"\n   📦 Rolling buffer mode - creating RollingBufferBatchLoader...")
             prestack_loader = RollingBufferBatchLoader(
@@ -3617,10 +3646,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 verbose=is_main_process(rank),
                 drop_last=True,
                 use_pinned=getattr(args, 'use_pinned_prestack', False),
+                num_workers=args.num_workers,  # v5.9.3: Parallel fetching
             )
             if is_main_process(rank):
                 buffer_size = getattr(args, 'prestack_buffer_size', 100)
-                print(f"   ✓ RollingBufferBatchLoader ready ({buffer_size} batch buffer)")
+                workers_msg = f", {args.num_workers} fetch workers" if args.num_workers > 0 else ""
+                print(f"   ✓ RollingBufferBatchLoader ready ({buffer_size} batch buffer{workers_msg})")
         else:
             # Original full epoch mode
             if is_main_process(rank):
