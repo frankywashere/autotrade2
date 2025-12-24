@@ -30,6 +30,13 @@ import json
 from ncps.torch import CfC
 from ncps.wirings import AutoNCP
 
+# v5.9.4: Optional Mamba2 temporal encoder (faster alternative to CfC)
+try:
+    from .mamba_wrapper import MambaWrapper
+    HAS_MAMBA = True
+except ImportError:
+    HAS_MAMBA = False
+
 from .base import ModelBase
 from .physics_attention import (
     CoulombTimeframeAttention,
@@ -425,6 +432,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         use_fusion_head: bool = True,  # v4.1: Can disable for physics-only mode
         use_geometric_base: bool = True,  # v5.0: Use geometric projections or learned approximation
         information_flow: str = 'bottom_up',  # v5.3.2: independent, bottom_up, top_down, bidirectional_bottom, bidirectional_top
+        use_mamba: bool = False,  # v5.9.4: Use Mamba2 instead of CfC for temporal encoding
         # Backward compatibility
         input_size: int = None,  # Deprecated: use input_sizes dict
     ):
@@ -458,6 +466,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # v5.6: Disabled - projection features removed from input, now calculated at inference
         self.use_channel_projections = False  # Always False now
         self.information_flow = information_flow  # v5.3.1: Flow direction
+        self.use_mamba = use_mamba and HAS_MAMBA  # v5.9.4: Mamba2 temporal encoder
 
         # Backward compatibility: if old-style single input_size provided
         if input_size is not None and not input_sizes:
@@ -499,9 +508,21 @@ class HierarchicalLNN(nn.Module, ModelBase):
             # v5.2: Increase total neurons to handle larger input (320 instead of 256)
             layer_total_neurons = int(hidden_size * 2.5)  # 128 * 2.5 = 320
 
-            # Create CfC layer with AutoNCP wiring
-            wiring = AutoNCP(layer_total_neurons, hidden_size)
-            self.timeframe_layers[tf] = CfC(layer_input_size, wiring, batch_first=True)
+            # v5.9.4: Choose between CfC and Mamba2 temporal encoders
+            if self.use_mamba:
+                # Mamba2: ~10x faster training via parallel sequence processing
+                self.timeframe_layers[tf] = MambaWrapper(
+                    input_size=layer_input_size,
+                    units=hidden_size,
+                    d_state=128,  # SSM state dimension
+                    d_conv=4,     # Convolution kernel size
+                    expand=2,     # Expansion factor
+                    n_layers=1,   # Single layer per timeframe
+                )
+            else:
+                # CfC: Continuous-time neural ODE with liquid dynamics
+                wiring = AutoNCP(layer_total_neurons, hidden_size)
+                self.timeframe_layers[tf] = CfC(layer_input_size, wiring, batch_first=True)
 
             # Create output heads for this layer
             self.timeframe_heads[f'{tf}_high'] = nn.Linear(hidden_size, 1)
@@ -706,8 +727,19 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.vix_hidden_size = 128
         self.vix_sequence_length = 90  # Days
 
-        vix_wiring = AutoNCP(256, self.vix_hidden_size)
-        self.vix_layer = CfC(self.vix_input_size, vix_wiring, batch_first=True)
+        # v5.9.4: Choose between CfC and Mamba2 for VIX layer
+        if self.use_mamba:
+            self.vix_layer = MambaWrapper(
+                input_size=self.vix_input_size,
+                units=self.vix_hidden_size,
+                d_state=64,  # Smaller state for simpler VIX sequence
+                d_conv=4,
+                expand=2,
+                n_layers=1,
+            )
+        else:
+            vix_wiring = AutoNCP(256, self.vix_hidden_size)
+            self.vix_layer = CfC(self.vix_input_size, vix_wiring, batch_first=True)
 
         # =========================================================================
         # v5.2: EVENT EMBEDDING

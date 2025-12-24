@@ -1982,6 +1982,28 @@ def interactive_setup(args, profiler=None):
         else:
             args.compile_verbose = False
 
+        # v5.9.4: Mamba2 temporal encoder option (experimental, ~10x faster)
+        print()
+        try:
+            from src.ml.mamba_wrapper import MambaWrapper
+            mamba_available = True
+        except ImportError:
+            mamba_available = False
+
+        if mamba_available:
+            args.use_mamba = inquirer.confirm(
+                message="Use Mamba2 temporal encoder? (EXPERIMENTAL: ~10x faster training, replaces CfC)",
+                default=False
+            ).execute()
+            if args.use_mamba:
+                print("   🚀 Mamba2 enabled - using SSM-based parallel sequence processing")
+                print("   ⚠️  EXPERIMENTAL: Model architecture change, needs full retraining")
+            else:
+                print("   → CfC enabled - using liquid neural network temporal encoding")
+        else:
+            args.use_mamba = False
+            print("   ℹ️  Mamba2 not available (missing dependencies: einops)")
+
         # RAM detection
         try:
             import psutil
@@ -2000,6 +2022,27 @@ def interactive_setup(args, profiler=None):
         project_config.TRAINING_PRECISION = 'float32'
         project_config.NUMPY_DTYPE = np.float32
         project_config._TORCH_DTYPE = torch.float32
+
+        # v5.9.4: Mamba2 temporal encoder option (experimental)
+        print()
+        try:
+            from src.ml.mamba_wrapper import MambaWrapper
+            mamba_available = True
+        except ImportError:
+            mamba_available = False
+
+        if mamba_available:
+            args.use_mamba = inquirer.confirm(
+                message="Use Mamba2 temporal encoder? (EXPERIMENTAL: ~10x faster training, replaces CfC)",
+                default=False
+            ).execute()
+            if args.use_mamba:
+                print("   🚀 Mamba2 enabled - using SSM-based parallel sequence processing")
+            else:
+                print("   → CfC enabled - using liquid neural network temporal encoding")
+        else:
+            args.use_mamba = False
+            print("   ℹ️  Mamba2 not available (missing dependencies: einops)")
 
     else:  # CPU
         print()
@@ -2024,6 +2067,27 @@ def interactive_setup(args, profiler=None):
             project_config.NUMPY_DTYPE = np.float32
             project_config._TORCH_DTYPE = torch.float32
             print("   → FP32 - Standard precision")
+
+        # v5.9.4: Mamba2 temporal encoder option (experimental)
+        print()
+        try:
+            from src.ml.mamba_wrapper import MambaWrapper
+            mamba_available = True
+        except ImportError:
+            mamba_available = False
+
+        if mamba_available:
+            args.use_mamba = inquirer.confirm(
+                message="Use Mamba2 temporal encoder? (EXPERIMENTAL: ~10x faster training, replaces CfC)",
+                default=False
+            ).execute()
+            if args.use_mamba:
+                print("   🚀 Mamba2 enabled - using SSM-based parallel sequence processing")
+            else:
+                print("   → CfC enabled - using liquid neural network temporal encoding")
+        else:
+            args.use_mamba = False
+            print("   ℹ️  Mamba2 not available (missing dependencies: einops)")
 
     # Data loading workers
     print()
@@ -3700,6 +3764,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             use_fusion_head=False,  # v5.3: Locked to Physics-Only
             use_geometric_base=True,  # v5.3: Locked to Geometric
             information_flow=getattr(args, 'information_flow', 'bottom_up'),  # v5.3.1
+            use_mamba=getattr(args, 'use_mamba', False),  # v5.9.4: Mamba2 temporal encoder
         )
     else:
         # Legacy mode - same size for all timeframes
@@ -3712,6 +3777,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             use_fusion_head=False,  # v5.3: Locked to Physics-Only
             use_geometric_base=True,  # v5.3: Locked to Geometric
             information_flow=getattr(args, 'information_flow', 'bottom_up'),  # v5.3.1
+            use_mamba=getattr(args, 'use_mamba', False),  # v5.9.4: Mamba2 temporal encoder
         )
 
     if profiler:
@@ -4985,6 +5051,8 @@ def main():
                         help='Enable torch.compile JIT compilation (CUDA only, first batch slow but faster afterward)')
     parser.add_argument('--compile-verbose', dest='compile_verbose', action='store_true', default=False,
                         help='Enable verbose torch.compile output (sets TORCH_LOGS=dynamo,inductor for debugging graph breaks and kernel fusion)')
+    parser.add_argument('--use-mamba', dest='use_mamba', action='store_true', default=False,
+                        help='Use Mamba2 instead of CfC for temporal encoding (~10x faster training, experimental)')
 
     # Interactive mode
     parser.add_argument('--interactive', action='store_true',
