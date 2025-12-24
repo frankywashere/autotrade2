@@ -216,9 +216,27 @@ class Mamba2(nn.Module):
             device=device,
         )
 
-        self.dt_bias = nn.Parameter(torch.empty(args.nheads, device=device))
-        self.A_log = nn.Parameter(torch.empty(args.nheads, device=device))
-        self.D = nn.Parameter(torch.empty(args.nheads, device=device))
+        # Initialize parameters properly for training from scratch
+        # (torch.empty has garbage values that cause NaN)
+
+        # dt_bias: controls timestep scaling, init to small values
+        # Using inverse softplus of 0.1-1.0 range for stable dt values
+        import math
+        dt_init = torch.exp(
+            torch.linspace(start=math.log(0.001), end=math.log(0.1), steps=args.nheads, device=device)
+        )
+        inv_softplus_dt = dt_init + torch.log(-torch.expm1(-dt_init))  # inverse softplus
+        self.dt_bias = nn.Parameter(inv_softplus_dt)
+
+        # A_log: SSM state matrix diagonal, controls decay
+        # A = -exp(A_log), so A_log ~ log(1..nheads) gives A ~ -1..-nheads
+        self.A_log = nn.Parameter(
+            torch.log(torch.arange(1, args.nheads + 1, dtype=torch.float32, device=device))
+        )
+
+        # D: skip connection weight, init to ones
+        self.D = nn.Parameter(torch.ones(args.nheads, device=device))
+
         self.norm = RMSNorm(args.d_inner, device=device)
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
