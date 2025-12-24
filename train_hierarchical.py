@@ -18,6 +18,14 @@ import argparse
 import pandas as pd
 import numpy as np
 import torch
+import torch.multiprocessing as mp
+
+# v5.9.4: Use file_system sharing to reduce file descriptor usage
+# This helps avoid "Too many open files" with num_workers > 0
+if mp.get_start_method(allow_none=True) is None:
+    mp.set_start_method('spawn', force=True)
+mp.set_sharing_strategy('file_system')
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
