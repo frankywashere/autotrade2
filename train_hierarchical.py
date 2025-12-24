@@ -1029,6 +1029,10 @@ def validate_cache_layers(cache_dir: Path) -> dict:
         'labels_size_gb': 0.0,
         'non_channel_size_gb': 0.0,
         'chunks_size_gb': 0.0,
+        # v5.9.4: Pre-computed alignment
+        'alignment_ready': False,
+        'alignment_path': None,
+        'alignment_size_mb': 0.0,
     }
 
     if not cache_dir.exists():
@@ -1125,6 +1129,13 @@ def validate_cache_layers(cache_dir: Path) -> dict:
 
         except Exception as e:
             pass
+
+    # Layer 5: v5.9.4 Pre-computed alignment
+    alignment_files = list(cache_dir.glob("aligned_indices_*.npz"))
+    if alignment_files:
+        result['alignment_ready'] = True
+        result['alignment_path'] = str(alignment_files[0])
+        result['alignment_size_mb'] = alignment_files[0].stat().st_size / 1e6
 
     return result
 
@@ -1266,6 +1277,12 @@ def pick_cache_pair(caches, layer_status=None):
             print(f"       (Cannot regenerate TF sequences - but training still possible!)")
         else:
             print(f"   ✗ Chunk shards: Not found")
+
+        # v5.9.4: Alignment layer
+        if layer_status.get('alignment_ready'):
+            print(f"   ✓ Pre-computed alignment: Ready ({layer_status['alignment_size_mb']:.1f} MB)")
+        else:
+            print(f"   ⚡ Pre-computed alignment: Will build on first run (~30 sec)")
 
         # Summary
         if layer_status['training_ready'] and layer_status['labels_ready'] and layer_status['features_ready']:
