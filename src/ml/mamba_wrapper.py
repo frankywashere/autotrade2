@@ -11,8 +11,9 @@ Key differences handled:
 
 The wrapper handles:
 1. Input projection (input_size -> d_model)
-2. Sequence padding to meet chunk_size requirements
-3. Interface compatibility with CfC's return signature
+2. LayerNorm for numerical stability
+3. Sequence padding to meet chunk_size requirements
+4. Interface compatibility with CfC's return signature
 """
 
 import math
@@ -130,6 +131,10 @@ class MambaWrapper(nn.Module):
         # This is needed because CfC accepts input_size != units
         self.input_proj = nn.Linear(input_size, units)
 
+        # CRITICAL: LayerNorm after projection to stabilize values
+        # Without this, large input features cause numerical overflow in Mamba's exp() calls
+        self.input_norm = nn.LayerNorm(units)
+
         # Create Mamba2 config
         # Note: vocab_size not used for continuous inputs, but required by config
         self.config = Mamba2Config(
@@ -163,17 +168,22 @@ class MambaWrapper(nn.Module):
         # CfC can have proj_size different from units, but we'll keep it simple
         self.output_proj = nn.Identity()  # Can be nn.Linear(units, proj_size) if needed
 
+        # Initialize input projection with smaller weights for stability
+        nn.init.xavier_uniform_(self.input_proj.weight, gain=0.1)
+        if self.input_proj.bias is not None:
+            nn.init.zeros_(self.input_proj.bias)
+
     def forward(
         self,
         x: Tensor,
-        h: Optional[InferenceCache] = None
+        h=None  # Accept any type for CfC compatibility, but ignore for training
     ) -> Tuple[Tensor, Tensor]:
         """
         Forward pass matching CfC interface.
 
         Args:
             x: Input tensor [batch, seq_len, input_size]
-            h: Hidden state (ignored for Mamba2 training, used for inference)
+            h: Hidden state (ignored for Mamba2 training - only used for step inference)
 
         Returns:
             output: [batch, seq_len, units] - sequence output
@@ -183,6 +193,9 @@ class MambaWrapper(nn.Module):
 
         # Project input: [batch, seq_len, input_size] -> [batch, seq_len, units]
         x = self.input_proj(x)
+
+        # CRITICAL: Normalize after projection to prevent numerical issues
+        x = self.input_norm(x)
 
         # Handle sequence length padding for chunk_size requirement
         # Mamba2 requires seq_len % chunk_size == 0
@@ -203,14 +216,16 @@ class MambaWrapper(nn.Module):
             self.config.chunk_size = chunk_size
 
         # Forward through Mamba
+        # NOTE: Always pass None for h during training - Mamba's h is InferenceCache,
+        # not compatible with CfC's hidden state format
         if self.n_layers == 1:
-            output, new_h = self.mamba(x, h)
+            output, new_h = self.mamba(x, None)
         else:
             # Multi-layer with residual
             output = x
             for i, (mamba_layer, norm) in enumerate(zip(self.mamba_layers, self.layer_norms)):
                 residual = output
-                output, new_h = mamba_layer(norm(output), h)
+                output, new_h = mamba_layer(norm(output), None)
                 output = residual + self.dropout(output)
 
         # Remove padding if added
@@ -239,6 +254,7 @@ class MambaWrapper(nn.Module):
             h: Updated hidden state
         """
         x = self.input_proj(x)
+        x = self.input_norm(x)
 
         if self.n_layers == 1:
             output, h = self.mamba.step(x, h)
