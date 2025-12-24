@@ -1283,6 +1283,13 @@ class HierarchicalDataset(Dataset):
             # VIX settings
             '_vix_sequence_length': getattr(self, '_vix_sequence_length', 90),
 
+            # v5.9.4: Include labels in pickle to avoid workers reopening files
+            # This adds ~50-100 MB but eliminates 21 file opens per worker
+            '_per_tf_continuation': getattr(self, '_per_tf_continuation', {}),
+            '_per_tf_ts_to_idx': getattr(self, '_per_tf_ts_to_idx', {}),
+            '_per_tf_transition': getattr(self, '_per_tf_transition', {}),
+            '_per_tf_trans_ts_to_idx': getattr(self, '_per_tf_trans_ts_to_idx', {}),
+
             # Marker for custom unpickling
             '_pickle_version': 'v5.9.4_mmap_sharing',
         }
@@ -1367,27 +1374,18 @@ class HierarchicalDataset(Dataset):
             for tf in list(self.tf_timestamps.keys()):
                 self.tf_timestamps[tf] = np.array(self.tf_timestamps[tf])
 
-        # Reinitialize VIX loader (lightweight, ~1 MB)
+        # v5.9.4: Skip VIX loader and event fetcher in workers
+        # We have pre-computed _vix_array and aligned['events'] from pickle
+        # This eliminates 2 more file opens per worker
         self._vix_loader = None
         self._event_fetcher = None
-        try:
-            from src.ml.live_events import VIXSequenceLoader, LiveEventFetcher
-            vix_path = Path('data/VIX_History.csv')
-            if vix_path.exists():
-                self._vix_loader = VIXSequenceLoader(str(vix_path))
-            self._event_fetcher = LiveEventFetcher()
-        except ImportError:
-            pass
 
-        # Reload continuation labels from pickle files
-        self._per_tf_continuation = {}
-        self._per_tf_ts_to_idx = {}
-        self._per_tf_transition = {}
-        self._per_tf_trans_ts_to_idx = {}
-
-        if self.continuation_labels_dir is not None:
-            self._load_hierarchical_continuation_labels(self.continuation_labels_dir)
-            self._load_transition_labels(self.continuation_labels_dir)
+        # v5.9.4: Use labels from pickle instead of reopening files
+        # This eliminates 21 file opens per worker
+        self._per_tf_continuation = state.get('_per_tf_continuation', {})
+        self._per_tf_ts_to_idx = state.get('_per_tf_ts_to_idx', {})
+        self._per_tf_transition = state.get('_per_tf_transition', {})
+        self._per_tf_trans_ts_to_idx = state.get('_per_tf_trans_ts_to_idx', {})
 
         # Legacy fields (not used in native TF mode but may be checked)
         self.features_df = None
