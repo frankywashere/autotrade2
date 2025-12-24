@@ -54,7 +54,8 @@ class HierarchicalDataset(Dataset):
         include_continuation: bool = False,
         mmap_meta_path: str = None,
         profiler=None,
-        preload_to_ram: bool = False,
+        preload_to_ram: bool = False,  # Legacy: for old chunked mmap system
+        preload_tf_to_ram: bool = False,  # v5.9.3: Preload native TF sequences to RAM
         # v4.1: Native timeframe mode
         use_native_timeframes: bool = False,
         tf_meta_path: str = None,
@@ -73,13 +74,15 @@ class HierarchicalDataset(Dataset):
             cache_indices: Cache column lookups for speed
             include_continuation: Whether to include continuation prediction targets
             profiler: Optional MemoryProfiler for logging RAM usage
-            preload_to_ram: If True, load all mmap data into RAM at startup for fast access
-                           (requires ~90GB RAM but avoids 400ms/sample disk I/O)
+            preload_to_ram: [Legacy] For old chunked mmap system (not used with native TF mode)
+            preload_tf_to_ram: v5.9.3 - If True, preload native TF sequences to RAM (~3.2 GB)
+                              Eliminates disk I/O during training for faster batching
             use_native_timeframes: If True, return Dict[str, Tensor] where each timeframe
                                    gets its native resolution features (5min layer sees 5-min bars)
             tf_meta_path: Path to tf_meta_*.json file with timeframe sequence metadata
         """
         self._preload_to_ram = preload_to_ram
+        self._preload_tf_to_ram = preload_tf_to_ram
         self._profiler = profiler
         self.features_df = features_df
         self.raw_ohlc_df = raw_ohlc_df
@@ -517,6 +520,26 @@ class HierarchicalDataset(Dataset):
                 print(f"     {tf}: {shape[0]:,} bars × {shape[1]} features (seq_len={seq_len})")
             else:
                 raise FileNotFoundError(f"Missing timeframe sequence file: {mmap_path}")
+
+        # v5.9.3: Optionally preload TF sequences to RAM for faster training
+        if self._preload_tf_to_ram:
+            import time
+            preload_start = time.perf_counter()
+            total_bytes = 0
+
+            print("     📥 Preloading TF sequences to RAM...")
+            for tf in list(self.tf_mmaps.keys()):
+                # Force copy from mmap to contiguous RAM array
+                self.tf_mmaps[tf] = np.array(self.tf_mmaps[tf])
+                total_bytes += self.tf_mmaps[tf].nbytes
+
+            # Also preload timestamps (small, ~6 MB total)
+            for tf in list(self.tf_timestamps.keys()):
+                self.tf_timestamps[tf] = np.array(self.tf_timestamps[tf])
+                total_bytes += self.tf_timestamps[tf].nbytes
+
+            preload_time = time.perf_counter() - preload_start
+            print(f"     ✓ Preloaded {total_bytes/1e9:.2f} GB to RAM in {preload_time:.1f}s")
 
         # Store raw OHLC for target calculation
         if raw_ohlc_df is not None:
@@ -2124,7 +2147,8 @@ def create_hierarchical_dataset(
     include_continuation: bool = False,
     mmap_meta_path: str = None,
     profiler=None,
-    preload_to_ram: bool = False,
+    preload_to_ram: bool = False,  # Legacy: for old chunked mmap system
+    preload_tf_to_ram: bool = False,  # v5.9.3: Preload native TF sequences to RAM
     use_native_timeframes: bool = False,
     tf_meta_path: str = None
 ) -> Tuple[Dataset, Optional[Dataset], Optional[Dataset]]:
@@ -2142,8 +2166,8 @@ def create_hierarchical_dataset(
         validation_split: If provided, split data into train/val or train/val/test
         test_split: If provided, create held-out test set (v4.4)
         profiler: Optional MemoryProfiler for logging RAM usage
-        preload_to_ram: If True, load all mmap data into RAM at startup
-                       (requires ~90GB RAM but avoids 400ms/sample disk I/O)
+        preload_to_ram: [Legacy] For old chunked mmap system (not used with native TF mode)
+        preload_tf_to_ram: v5.9.3 - Preload native TF sequences to RAM (~3.2 GB)
 
     Returns:
         train_dataset: Training dataset
@@ -2194,6 +2218,7 @@ def create_hierarchical_dataset(
                 mmap_meta_path=mmap_meta_path,
                 profiler=profiler,
                 preload_to_ram=preload_to_ram,
+                preload_tf_to_ram=preload_tf_to_ram,
                 use_native_timeframes=use_native_timeframes,
                 tf_meta_path=tf_meta_path
             )
@@ -2286,6 +2311,7 @@ def create_hierarchical_dataset(
                     include_continuation=include_continuation,
                     profiler=profiler,
                     preload_to_ram=preload_to_ram,
+                    preload_tf_to_ram=preload_tf_to_ram,
                     use_native_timeframes=use_native_timeframes,
                     tf_meta_path=tf_meta_path
                 )
@@ -2298,6 +2324,7 @@ def create_hierarchical_dataset(
                     include_continuation=include_continuation,
                     profiler=profiler,
                     preload_to_ram=preload_to_ram,
+                    preload_tf_to_ram=preload_tf_to_ram,
                     use_native_timeframes=use_native_timeframes,
                     tf_meta_path=tf_meta_path
                 )
@@ -2310,6 +2337,7 @@ def create_hierarchical_dataset(
                     include_continuation=include_continuation,
                     profiler=profiler,
                     preload_to_ram=preload_to_ram,
+                    preload_tf_to_ram=preload_tf_to_ram,
                     use_native_timeframes=use_native_timeframes,
                     tf_meta_path=tf_meta_path
                 )
@@ -2345,6 +2373,7 @@ def create_hierarchical_dataset(
                 mmap_meta_path=mmap_meta_path,
                 profiler=profiler,
                 preload_to_ram=preload_to_ram,
+                preload_tf_to_ram=preload_tf_to_ram,
                 use_native_timeframes=use_native_timeframes,
                 tf_meta_path=tf_meta_path
             )
@@ -2397,6 +2426,7 @@ def create_hierarchical_dataset(
                     include_continuation=include_continuation,
                     profiler=profiler,
                     preload_to_ram=preload_to_ram,
+                    preload_tf_to_ram=preload_tf_to_ram,
                     use_native_timeframes=use_native_timeframes,
                     tf_meta_path=tf_meta_path
                 )
@@ -2409,6 +2439,7 @@ def create_hierarchical_dataset(
                     include_continuation=include_continuation,
                     profiler=profiler,
                     preload_to_ram=preload_to_ram,
+                    preload_tf_to_ram=preload_tf_to_ram,
                     use_native_timeframes=use_native_timeframes,
                     tf_meta_path=tf_meta_path
                 )
@@ -2432,6 +2463,7 @@ def create_hierarchical_dataset(
                 mmap_meta_path=mmap_meta_path,
                 profiler=profiler,
                 preload_to_ram=preload_to_ram,
+                preload_tf_to_ram=preload_tf_to_ram,
                 use_native_timeframes=use_native_timeframes,
                 tf_meta_path=tf_meta_path
             )

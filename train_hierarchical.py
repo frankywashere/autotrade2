@@ -978,6 +978,142 @@ def pick_manifest(manifests):
     ).execute()
 
 
+def validate_cache_layers(cache_dir: Path) -> dict:
+    """
+    v5.9.2: Validate cache layers independently.
+
+    Returns status for each layer:
+    - training_ready: tf_sequence_*.npy + tf_timestamps_*.npy + tf_meta_*.json exist
+    - labels_ready: continuation_labels + transition_labels exist
+    - features_ready: non_channel_features_*.pkl exists
+    - can_regenerate_tf: mmap_chunks/ shards exist (can regenerate native TF)
+    - can_regenerate_all: chunks + all extraction dependencies exist
+
+    This allows users to delete 60GB of chunks while still training with
+    existing native TF sequences (~7GB).
+    """
+    cache_dir = Path(cache_dir)
+
+    result = {
+        'training_ready': False,
+        'labels_ready': False,
+        'features_ready': False,
+        'can_regenerate_tf': False,
+        'can_regenerate_all': False,
+        # Detailed info
+        'tf_meta_path': None,
+        'tf_sequence_count': 0,
+        'tf_timestamps_count': 0,
+        'continuation_labels_count': 0,
+        'transition_labels_count': 0,
+        'non_channel_path': None,
+        'chunk_meta_path': None,
+        'chunk_count': 0,
+        'chunks_missing': [],
+        'tf_size_gb': 0.0,
+        'labels_size_gb': 0.0,
+        'non_channel_size_gb': 0.0,
+        'chunks_size_gb': 0.0,
+    }
+
+    if not cache_dir.exists():
+        return result
+
+    import json
+
+    # Layer 1: Training Layer (Native TF sequences)
+    tf_meta_files = list(cache_dir.glob("tf_meta_*.json"))
+    tf_sequence_files = list(cache_dir.glob("tf_sequence_*.npy"))
+    tf_timestamps_files = list(cache_dir.glob("tf_timestamps_*.npy"))
+
+    if tf_meta_files:
+        result['tf_meta_path'] = str(tf_meta_files[0])
+        result['tf_sequence_count'] = len(tf_sequence_files)
+        result['tf_timestamps_count'] = len(tf_timestamps_files)
+
+        # Calculate TF layer size
+        tf_size = sum(f.stat().st_size for f in tf_sequence_files if f.exists())
+        tf_size += sum(f.stat().st_size for f in tf_timestamps_files if f.exists())
+        result['tf_size_gb'] = tf_size / 1e9
+
+        # v5.9.2: Validate tf_meta has all required timeframes
+        try:
+            with open(tf_meta_files[0]) as f:
+                tf_meta = json.load(f)
+            # Check that sequences referenced in meta actually exist
+            # tf_meta uses 'sequence_lengths' dict, not 'timeframes' list
+            sequence_lengths = tf_meta.get('sequence_lengths', {})
+            tf_count = len(sequence_lengths)
+            if tf_count >= 10:  # Allow 10/11 (3month may be missing)
+                result['training_ready'] = True
+        except Exception:
+            pass
+
+    # Layer 2: Labels Layer (continuation + transition labels)
+    continuation_files = list(cache_dir.glob("continuation_labels_*.pkl"))
+    transition_files = list(cache_dir.glob("transition_labels_*.pkl"))
+
+    result['continuation_labels_count'] = len(continuation_files)
+    result['transition_labels_count'] = len(transition_files)
+
+    # Calculate labels size
+    labels_size = sum(f.stat().st_size for f in continuation_files if f.exists())
+    labels_size += sum(f.stat().st_size for f in transition_files if f.exists())
+    result['labels_size_gb'] = labels_size / 1e9
+
+    # Need at least 10/11 TFs for both continuation and transition
+    if len(continuation_files) >= 10 and len(transition_files) >= 10:
+        result['labels_ready'] = True
+
+    # Layer 3: Features Layer (non-channel features)
+    non_channel_files = list(cache_dir.glob("non_channel_features_*.pkl"))
+    if non_channel_files:
+        result['non_channel_path'] = str(non_channel_files[0])
+        result['features_ready'] = True
+        result['non_channel_size_gb'] = non_channel_files[0].stat().st_size / 1e9
+
+    # Layer 4: Generation Layer (chunks for regenerating TF)
+    chunk_meta_files = list(cache_dir.glob("features_mmap_meta_*.json"))
+    if chunk_meta_files:
+        result['chunk_meta_path'] = str(chunk_meta_files[0])
+
+        try:
+            with open(chunk_meta_files[0]) as f:
+                chunk_meta = json.load(f)
+
+            chunk_info = chunk_meta.get('chunk_info', [])
+            result['chunk_count'] = len(chunk_info)
+
+            # Check if all chunks exist
+            cache_base_dir = chunk_meta_files[0].parent
+            chunks_exist = []
+            chunks_missing = []
+            total_chunk_size = 0
+
+            for c in chunk_info:
+                chunk_path = Path(c['path'])
+                if not chunk_path.is_absolute():
+                    chunk_path = cache_base_dir / chunk_path
+                if chunk_path.exists():
+                    chunks_exist.append(str(chunk_path))
+                    total_chunk_size += chunk_path.stat().st_size
+                else:
+                    chunks_missing.append(str(c['path']))
+
+            result['chunks_missing'] = chunks_missing
+            result['chunks_size_gb'] = total_chunk_size / 1e9
+
+            # Can regenerate TF if all chunks exist
+            if len(chunks_missing) == 0 and len(chunk_info) > 0:
+                result['can_regenerate_tf'] = True
+                result['can_regenerate_all'] = True
+
+        except Exception as e:
+            pass
+
+    return result
+
+
 def find_available_caches(cache_dir: Path):
     """Find available cache triplets (meta + continuation labels + non-channel) in a directory.
 
@@ -986,10 +1122,14 @@ def find_available_caches(cache_dir: Path):
     - Non-chunked/pickle mode: rolling_channels_*.pkl (legacy)
 
     v5.2: Also tracks transition labels for multi-phase compositor
+    v5.9.2: Includes layer status from validate_cache_layers()
     """
     cache_dir = Path(cache_dir)
     caches = []
     seen_keys = set()
+
+    # v5.9.2: Get layer status for cache directory
+    layer_status = validate_cache_layers(cache_dir)
 
     # v5.2: Count transition label files (per-TF pattern: transition_labels_{tf}_*.pkl)
     def count_transition_labels(cache_dir: Path) -> int:
@@ -1060,17 +1200,79 @@ def find_available_caches(cache_dir: Path):
             "complete": cont_path is not None  # Pickle has all features, just need continuation
         })
 
-    return caches
+    # v5.9.2: Return both caches and layer_status
+    return caches, layer_status
 
 
-def pick_cache_pair(caches):
-    """Prompt user to select a cache triplet to reuse."""
-    if not caches:
+def pick_cache_pair(caches, layer_status=None):
+    """Prompt user to select a cache triplet to reuse.
+
+    v5.9.2: Added layer_status parameter for context-aware menu options.
+    Shows training readiness even if chunks are deleted.
+    """
+    if not caches and layer_status is None:
         return None
+
     try:
         from InquirerPy import inquirer
         from InquirerPy.base.control import Choice
     except ImportError:
+        return None
+
+    # v5.9.2: Show layer status header
+    if layer_status:
+        print("\n" + "=" * 60)
+        print("  CACHE LAYER STATUS")
+        print("=" * 60)
+
+        # Training layer
+        if layer_status['training_ready']:
+            print(f"   ✓ Native TF sequences: Ready ({layer_status['tf_sequence_count']} files, {layer_status['tf_size_gb']:.1f} GB)")
+        else:
+            print(f"   ✗ Native TF sequences: Not found")
+
+        # Labels layer
+        if layer_status['labels_ready']:
+            print(f"   ✓ Labels: Ready ({layer_status['continuation_labels_count']} cont + {layer_status['transition_labels_count']} trans, {layer_status['labels_size_gb']:.1f} GB)")
+        else:
+            print(f"   ✗ Labels: Incomplete ({layer_status['continuation_labels_count']} cont, {layer_status['transition_labels_count']} trans)")
+
+        # Features layer
+        if layer_status['features_ready']:
+            print(f"   ✓ Non-channel features: Ready ({layer_status['non_channel_size_gb']:.1f} GB)")
+        else:
+            print(f"   ✗ Non-channel features: Not found")
+
+        # Generation layer (chunks)
+        if layer_status['can_regenerate_tf']:
+            print(f"   ✓ Chunk shards: Available ({layer_status['chunk_count']} chunks, {layer_status['chunks_size_gb']:.1f} GB)")
+        elif layer_status['chunk_meta_path']:
+            print(f"   ⚠️  Chunk shards: Metadata found but {len(layer_status['chunks_missing'])} chunks DELETED")
+            print(f"       (Cannot regenerate TF sequences - but training still possible!)")
+        else:
+            print(f"   ✗ Chunk shards: Not found")
+
+        # Summary
+        if layer_status['training_ready'] and layer_status['labels_ready'] and layer_status['features_ready']:
+            total_gb = layer_status['tf_size_gb'] + layer_status['labels_size_gb'] + layer_status['non_channel_size_gb']
+            print(f"\n   ✅ TRAINING READY ({total_gb:.1f} GB total)")
+            if not layer_status['can_regenerate_tf']:
+                print(f"   ℹ️  Chunks deleted - using ~{total_gb:.1f} GB instead of ~{layer_status['chunks_size_gb'] + total_gb:.1f} GB")
+
+        print("=" * 60)
+
+    # Handle case where no caches but layer_status indicates training is ready
+    if not caches and layer_status and layer_status['training_ready'] and layer_status['labels_ready']:
+        print(f"\n✅ Training ready via layer validation (no legacy cache pairs found)")
+        # Return a synthetic cache entry
+        return {
+            'cache_key': 'native_tf_mode',
+            'cache_type': 'native_tf',
+            'training_ready': True,
+            'skip_chunk_validation': True,
+        }
+
+    if not caches:
         return None
 
     # Auto-select when only one cache is available
@@ -1443,17 +1645,16 @@ def interactive_setup(args, profiler=None):
             if cache_exists:
                 # Use existing functions to scan cache
                 manifests = load_cache_manifests(saved_cache_path)
-                cache_pairs = find_available_caches(saved_cache_path)
+                cache_pairs, layer_status = find_available_caches(saved_cache_path)
 
-                # Check for native TF files
-                cache_path = Path(saved_cache_path)
-                tf_meta_files = list(cache_path.glob('tf_meta*.json'))
-                native_tf_files = list(cache_path.glob('tf_sequence*.npy'))
-
+                # v5.9.2: Use layer_status for detailed reporting
                 print(f"   Manifests: {'✓ ' + str(len(manifests)) + ' found' if manifests else '✗ None'}")
                 print(f"   Cache pairs: {'✓ ' + str(len(cache_pairs)) + ' found' if cache_pairs else '✗ None'}")
-                print(f"   TF Meta: {'✓' if tf_meta_files else '✗'}")
-                print(f"   Native TF sequences: {'✓ ' + str(len(native_tf_files)) + ' files' if native_tf_files else '✗ None'}")
+                print(f"   TF Meta: {'✓' if layer_status['tf_meta_path'] else '✗'}")
+                print(f"   Native TF sequences: {'✓ ' + str(layer_status['tf_sequence_count']) + ' files' if layer_status['training_ready'] else '✗ None'}")
+                if layer_status['training_ready'] and not layer_status['can_regenerate_tf']:
+                    print(f"   ⚠️  Chunks deleted - cannot regenerate TF sequences")
+                    print(f"   ✓ Training ready ({layer_status['tf_size_gb']:.1f} GB TF + {layer_status['labels_size_gb']:.1f} GB labels)")
 
             cache_choice = inquirer.select(
                 message="Cache directory:",
@@ -1530,13 +1731,22 @@ def interactive_setup(args, profiler=None):
                 project_config.ADAPTIVE_MIN_HORIZON, project_config.ADAPTIVE_MAX_HORIZON = ah_range
 
     # Scan for cached feature/label pairs in selected directory
-    cache_pairs = find_available_caches(args.shard_path)
+    cache_pairs, layer_status = find_available_caches(args.shard_path)
     selected_cache_pair = None
     if cache_pairs:
-        selected_cache_pair = pick_cache_pair(cache_pairs)
+        selected_cache_pair = pick_cache_pair(cache_pairs, layer_status)
 
     # Default cache behavior: reuse if a cache pair was selected, regenerate otherwise
     args.regenerate_cache = False if selected_cache_pair else True
+
+    # v5.9.2: Set skip_chunk_validation if training layer is ready but generation layer is missing
+    if layer_status['training_ready'] and not layer_status['can_regenerate_tf']:
+        args.skip_chunk_validation = True
+    else:
+        args.skip_chunk_validation = False
+
+    # Store layer_status for later use
+    args.layer_status = layer_status
 
     def dflt(key, fallback):
         return manifest_defaults.get(key, fallback)
@@ -1800,9 +2010,6 @@ def interactive_setup(args, profiler=None):
             project_config._TORCH_DTYPE = torch.float32
             print("   → FP32 - Standard precision")
 
-    # v5.2: Native TF mode is default - preload option removed (obsolete)
-    args.preload_to_ram = False  # Always false
-
     # Data loading workers
     print()
 
@@ -1845,9 +2052,35 @@ def interactive_setup(args, profiler=None):
         default=True
     ).execute()
 
-    # v5.3.2: Pre-stacking option for faster epochs
+    # v5.9.3: Source data loading option (preload TF sequences to RAM)
     print()
     total_ram = hw_info.get('total_ram_gb', 16)
+    tf_sequences_gb = 3.2  # Known size: 11 TF sequence files
+
+    source_choices = [
+        "Memory-mapped (default, ~0 GB extra RAM)",
+        f"Preload to RAM (~{tf_sequences_gb:.1f} GB extra RAM, faster batching)"
+    ]
+
+    # Auto-select preload if system has enough RAM (12+ GB)
+    default_source = source_choices[1] if total_ram >= 12 else source_choices[0]
+
+    source_choice = inquirer.select(
+        message="Source data loading:",
+        choices=source_choices,
+        default=default_source
+    ).execute()
+
+    if "Preload" in source_choice:
+        args.preload_tf_to_ram = True
+        print(f"   📥 Will preload {tf_sequences_gb:.1f} GB TF sequences to RAM at startup")
+        print(f"      → Eliminates disk I/O during training")
+    else:
+        args.preload_tf_to_ram = False
+        print("   → Memory-mapped (OS page cache handles caching)")
+
+    # v5.3.2: Pre-stacking option for faster epochs
+    print()
 
     # v5.3.2: Calculate realistic RAM requirements per mode
     # Native TF mode: ~3.6 MB per sample
@@ -2168,18 +2401,25 @@ def interactive_setup(args, profiler=None):
         # Cache will be loaded - chunking doesn't apply
         args.use_chunking = False
 
-    # Native TF generation option (only show if chunking is enabled OR existing chunks found)
+    # v5.9.2: Native TF generation option - context-aware based on layer_status
     import glob
     chunk_meta_files = glob.glob(str(Path(args.shard_path or 'data/feature_cache') / 'features_mmap_meta_*.json'))
     has_existing_chunks = len(chunk_meta_files) > 0
 
-    if has_existing_chunks or args.use_chunking:
+    # Check layer_status for context-aware menu
+    can_regenerate_tf = layer_status.get('can_regenerate_tf', False) if layer_status else has_existing_chunks
+    training_ready = layer_status.get('training_ready', False) if layer_status else False
+
+    if can_regenerate_tf or args.use_chunking:
+        # Chunks exist - can regenerate TF sequences
         print()
         print("=" * 60)
         print("  NATIVE TIMEFRAME GENERATION")
         print("=" * 60)
         if has_existing_chunks:
             print(f"   Found {len(chunk_meta_files)} existing chunk metadata file(s)")
+            if layer_status:
+                print(f"   Chunk shards: {layer_status.get('chunk_count', 0)} chunks ({layer_status.get('chunks_size_gb', 0):.1f} GB)")
 
         args.generate_native_tf = inquirer.select(
             message="Generate native timeframe sequences from chunk shards?",
@@ -2203,6 +2443,18 @@ def interactive_setup(args, profiler=None):
             print(f"   → Skipping native TF generation")
             args.generate_native_tf = None
             args.native_tf_streaming = True  # Default for CLI usage
+    elif training_ready:
+        # v5.9.2: Chunks deleted but native TF sequences exist - training is ready
+        print()
+        print("=" * 60)
+        print("  NATIVE TIMEFRAME STATUS")
+        print("=" * 60)
+        print(f"   ✓ Native TF sequences: READY ({layer_status.get('tf_sequence_count', 0)} files)")
+        print(f"   ⚠️  Chunk shards: DELETED (cannot regenerate TF sequences)")
+        print(f"   ✓ Training will use existing native TF sequences")
+        print(f"   ℹ️  To regenerate TF sequences, you would need to re-extract features (~5-8 hours)")
+        args.generate_native_tf = None
+        args.native_tf_streaming = True  # Default for CLI usage
     else:
         print(f"\n   ℹ️  No chunk shards found. Native TF will be generated during training if needed.")
         args.generate_native_tf = None
@@ -2923,6 +3175,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             shard_storage_path=str(shard_path),
             vix_data=vix_data,
             events_handler=events_handler,
+            skip_chunk_validation=getattr(args, 'skip_chunk_validation', False),  # v5.9.2
         )
         features_df = result[0]
         continuation_labels_dir = result[1]
@@ -2944,6 +3197,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             shard_storage_path=str(shard_path),
             vix_data=vix_data,
             events_handler=events_handler,
+            skip_chunk_validation=getattr(args, 'skip_chunk_validation', False),  # v5.9.2
         )
         features_df = result[0]
         continuation_labels_dir = result[1]
@@ -3156,7 +3410,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         include_continuation=True,
         mmap_meta_path=mmap_meta_path,
         profiler=dataset_profiler,
-        preload_to_ram=False,  # v5.2: Always false
+        preload_tf_to_ram=args.preload_tf_to_ram,  # v5.9.3: User-selectable
         use_native_timeframes=args.use_native_timeframes,
         tf_meta_path=args.tf_meta_path
     )
@@ -4912,6 +5166,7 @@ def main():
             shard_storage_path=str(shard_path),
             vix_data=vix_data,
             events_handler=events_handler,
+            skip_chunk_validation=getattr(args, 'skip_chunk_validation', False),  # v5.9.2
         )
 
         print(f"   ✓ Features extracted and cached to {shard_path}")

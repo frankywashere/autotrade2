@@ -388,7 +388,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         """Return total number of features"""
         return len(self.feature_names)
 
-    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, continuation_mode: str = 'simple', use_chunking: bool = False, chunk_size_years: int = 1, shard_storage_path: str = None, vix_data: pd.DataFrame = None, skip_native_tf_generation: bool = False, **kwargs) -> tuple:
+    def extract_features(self, df: pd.DataFrame, use_cache: bool = True, use_gpu: str = 'auto', cache_suffix: str = None, events_handler=None, continuation: bool = False, continuation_mode: str = 'simple', use_chunking: bool = False, chunk_size_years: int = 1, shard_storage_path: str = None, vix_data: pd.DataFrame = None, skip_native_tf_generation: bool = False, skip_chunk_validation: bool = False, **kwargs) -> tuple:
         """
         Extract all features from aligned SPY-TSLA data (v3.20: 14,322 channel + 180 non-channel = 14,502 total).
 
@@ -414,6 +414,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                 - If provided: Enables 15 VIX-based features (level, percentile, regime, correlations, etc.)
                 - Expected columns: vix_close (or CLOSE), vix_high, vix_low with DatetimeIndex
                 - If None: VIX features will be zeros/defaults (backward compatible)
+            skip_chunk_validation: Skip validation of mmap chunk shards (default: False)
+                - v5.9.2: Set True when native TF sequences exist but chunks were deleted
+                - Allows training without keeping 60GB of chunk files
+                - Use with use_cache=True when training layer is ready
             **kwargs: Additional arguments (reserved for future use)
 
         df should have columns: spy_open, spy_high, spy_low, spy_close, spy_volume,
@@ -532,19 +536,28 @@ class TradingFeatureExtractor(FeatureExtractor):
                         return path  # Legacy absolute path
                     return cache_base_dir / path  # New relative path
 
-                # Validate all shard files exist
-                all_shards_exist = all(
-                    resolve_shard_path(c['path']).exists() for c in meta['chunk_info']
-                )
-                if all_shards_exist:
-                    total_gb = sum(c['rows'] * c['cols'] * (8 if 'float64' in meta['dtype'] else 4) for c in meta['chunk_info']) / 1e9
-                    print(f"   ✓ Channel shards: Valid ({len(meta['chunk_info'])} shards, {meta['total_rows']:,} rows, {total_gb:.1f} GB, {meta['dtype']})")
+                # v5.9.2: Skip chunk validation if flag is set (native TF sequences exist but chunks deleted)
+                if skip_chunk_validation:
+                    print(f"   ℹ️  Channel shards: Validation SKIPPED (using native TF sequences)")
+                    print(f"       → Chunks not required for training when TF layer is ready")
                     channel_cache_valid = True
                     channel_cache_type = 'mmap'
                     self._mmap_meta_path = str(meta_file)
                     validated_meta_path = meta_file
                 else:
-                    print(f"   ⚠️  Channel shards: Metadata found but shard files missing - will extract")
+                    # Validate all shard files exist
+                    all_shards_exist = all(
+                        resolve_shard_path(c['path']).exists() for c in meta['chunk_info']
+                    )
+                    if all_shards_exist:
+                        total_gb = sum(c['rows'] * c['cols'] * (8 if 'float64' in meta['dtype'] else 4) for c in meta['chunk_info']) / 1e9
+                        print(f"   ✓ Channel shards: Valid ({len(meta['chunk_info'])} shards, {meta['total_rows']:,} rows, {total_gb:.1f} GB, {meta['dtype']})")
+                        channel_cache_valid = True
+                        channel_cache_type = 'mmap'
+                        self._mmap_meta_path = str(meta_file)
+                        validated_meta_path = meta_file
+                    else:
+                        print(f"   ⚠️  Channel shards: Metadata found but shard files missing - will extract")
             except Exception as e:
                 print(f"   ⚠️  Channel shards: Validation failed ({type(e).__name__}) - will extract")
 
