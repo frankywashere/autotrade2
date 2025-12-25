@@ -298,14 +298,19 @@ class EventEmbedding(nn.Module):
         Encode events into embedding.
 
         Args:
-            events: List of event dicts from LiveEventFetcher
+            events: List of event dicts from LiveEventFetcher, or numpy array from alignment
             batch_size: Current batch size
             device: Target device
 
         Returns:
             [batch_size, embed_dim] embedding
         """
-        if not events or len(events) == 0:
+        # Handle pre-computed numpy array from alignment
+        if isinstance(events, np.ndarray):
+            return self._forward_precomputed(events, device)
+
+        # Handle empty/None
+        if events is None or (hasattr(events, '__len__') and len(events) == 0):
             # No events: return learned no-event embedding
             return self.no_event_embed.unsqueeze(0).expand(batch_size, -1)
 
@@ -352,6 +357,15 @@ class EventEmbedding(nn.Module):
         Returns:
             [batch_size, embed_dim] embeddings
         """
+        # Handle pre-computed numpy array from alignment cache
+        # Format: [batch_size, 6] with [type_id1, days1, type_id2, days2, type_id3, days3]
+        if isinstance(events_batch, np.ndarray):
+            return self._forward_precomputed(events_batch, device)
+
+        # Handle torch tensor (same format as numpy)
+        if isinstance(events_batch, torch.Tensor):
+            return self._forward_precomputed(events_batch.cpu().numpy(), device)
+
         if not events_batch:
             return torch.zeros(1, self.embed_dim, device=device)
 
@@ -359,6 +373,12 @@ class EventEmbedding(nn.Module):
         if len(events_batch) > 0 and isinstance(events_batch[0], dict):
             # Inference mode - process single event list
             return self.forward(events_batch, batch_size=1, device=device)
+
+        # Check if first element is numpy array (batched alignment format)
+        if len(events_batch) > 0 and isinstance(events_batch[0], np.ndarray):
+            # Stack into batch and use precomputed path
+            stacked = np.stack(events_batch, axis=0)
+            return self._forward_precomputed(stacked, device)
 
         # Training mode: batch of event lists
         batch_size = len(events_batch)
@@ -368,6 +388,66 @@ class EventEmbedding(nn.Module):
             # Get embedding for single sample
             emb = self.forward(events, batch_size=1, device=device)
             embeddings.append(emb)
+
+        return torch.cat(embeddings, dim=0)  # [batch_size, embed_dim]
+
+    def _forward_precomputed(self, events_array: np.ndarray, device: torch.device) -> torch.Tensor:
+        """
+        Process pre-computed event features from alignment cache.
+
+        Args:
+            events_array: [batch_size, 6] or [6] array with [type_id1, days1, type_id2, days2, type_id3, days3]
+            device: Target device
+
+        Returns:
+            [batch_size, embed_dim] embedding
+        """
+        # Handle single sample
+        if events_array.ndim == 1:
+            events_array = events_array.reshape(1, -1)
+
+        batch_size = events_array.shape[0]
+        embeddings = []
+
+        for i in range(batch_size):
+            sample = events_array[i]  # [6]
+
+            # Check if no events (all zeros or NaN)
+            if np.all(sample == 0) or np.any(np.isnan(sample)):
+                embeddings.append(self.no_event_embed.unsqueeze(0))
+                continue
+
+            # Parse pre-computed format: [type_id1, days1, type_id2, days2, type_id3, days3]
+            event_embeddings = []
+            for j in range(3):  # 3 events max
+                type_id = int(sample[j * 2])
+                days = sample[j * 2 + 1]
+
+                if type_id == 0 and days == 0:
+                    continue  # No event in this slot
+
+                # Type embedding
+                type_id_tensor = torch.tensor([type_id], device=device)
+                type_emb = self.type_embed(type_id_tensor)  # [1, 16]
+
+                # Timing features
+                timing = torch.tensor([[
+                    days / 30.0,                        # Normalized days
+                    1.0 / (abs(days) + 1),              # Urgency
+                    float(np.exp(-abs(days) / 7.0)),    # Decay
+                ]], device=device, dtype=torch.float32)
+                timing_emb = self.timing_net(timing)  # [1, 16]
+
+                # Combine
+                event_emb = type_emb + timing_emb  # [1, 16]
+                event_embeddings.append(event_emb)
+
+            if not event_embeddings:
+                embeddings.append(self.no_event_embed.unsqueeze(0))
+            else:
+                # Average event embeddings
+                combined = torch.mean(torch.cat(event_embeddings, dim=0), dim=0, keepdim=True)
+                embeddings.append(combined)
 
         return torch.cat(embeddings, dim=0)  # [batch_size, embed_dim]
 
