@@ -3984,6 +3984,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         _batch_times = [] if _debug_mode else None
         _last_heartbeat_batch = 0
 
+        # Log that we're about to block waiting for first batch
+        if _debug_mode and is_main_process(rank) and epoch == 0 and args.num_workers > 0:
+            print(f"[DATALOADER] Entering batch loop - waiting for workers to spawn and produce first batch...", flush=True)
+            print(f"[DATALOADER] (8 workers × module imports + 53MB pickle each = may take 30-60s first time)", flush=True)
+
         for batch_idx, batch_data in enumerate(batch_pbar):
             _batch_start = time.perf_counter() if _debug_mode else None
 
