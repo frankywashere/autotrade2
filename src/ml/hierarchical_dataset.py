@@ -1527,9 +1527,18 @@ class HierarchicalDataset(Dataset):
                 self.monthly_3month_mmap = np.load(path, mmap_mode='r')
 
         # =====================================================================
-        # 3. Recreate VIX loader and numpy array
+        # 3. Recreate VIX loader and numpy array (SKIP if alignment present!)
         # =====================================================================
-        if state.get('_needs_vix_reload', False):
+        # With alignment, we have pre-computed VIX indices and _vix_array is pickled.
+        # Skip the slow CSV reload if alignment data exists.
+        _has_vix_alignment = (
+            hasattr(self, 'aligned') and self.aligned and
+            'vix' in self.aligned and
+            hasattr(self, '_vix_array') and self._vix_array is not None
+        )
+
+        if state.get('_needs_vix_reload', False) and not _has_vix_alignment:
+            # Fallback: No alignment, must reload from CSV (slow)
             vix_path = state.get('_vix_csv_path')
             if vix_path and Path(vix_path).exists():
                 try:
@@ -1539,25 +1548,41 @@ class HierarchicalDataset(Dataset):
                     if self._vix_loader.vix_data is not None:
                         self._vix_array = self._vix_loader.vix_data.values.astype(np.float32)
                     if _debug:
-                        print(f"[UNPICKLE] Recreated VIX loader + numpy array from {vix_path}", flush=True)
+                        print(f"[UNPICKLE] Recreated VIX loader from CSV (slow path)", flush=True)
                 except Exception as e:
                     if _debug:
                         print(f"[UNPICKLE] Failed to recreate VIX loader: {e}", flush=True)
                     self._vix_loader = None
+        elif _has_vix_alignment:
+            # Fast path: VIX data already in alignment, no reload needed!
+            self._vix_loader = None  # Not needed with alignment
+            if _debug:
+                print(f"[UNPICKLE] VIX data from alignment (skipped slow CSV reload)", flush=True)
 
         # =====================================================================
-        # 4. Recreate event fetcher
+        # 4. Recreate event fetcher (SKIP if alignment present!)
         # =====================================================================
-        if state.get('_needs_event_fetcher_reload', False):
+        # With alignment, events are pre-computed as numpy array. Skip fetcher.
+        _has_event_alignment = (
+            hasattr(self, 'aligned') and self.aligned and 'events' in self.aligned
+        )
+
+        if state.get('_needs_event_fetcher_reload', False) and not _has_event_alignment:
+            # Fallback: No alignment, must create event fetcher
             try:
                 from src.ml.live_events import LiveEventFetcher
                 self._event_fetcher = LiveEventFetcher()
                 if _debug:
-                    print(f"[UNPICKLE] Recreated event fetcher", flush=True)
+                    print(f"[UNPICKLE] Recreated event fetcher (no alignment)", flush=True)
             except Exception as e:
                 if _debug:
                     print(f"[UNPICKLE] Failed to recreate event fetcher: {e}", flush=True)
                 self._event_fetcher = None
+        elif _has_event_alignment:
+            # Fast path: Events already in alignment
+            self._event_fetcher = None  # Not needed with alignment
+            if _debug:
+                print(f"[UNPICKLE] Events from alignment (skipped fetcher)", flush=True)
 
         # =====================================================================
         # 5. Verify alignment data survived pickling
