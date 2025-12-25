@@ -26,6 +26,17 @@ from pathlib import Path
 import sys
 import os
 import socket
+import resource
+
+# Increase file descriptor limit for mmap + shared memory (fixes "Too many open files")
+try:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = min(65536, hard)
+    if soft < target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        print(f"[INIT] Increased file descriptor limit: {soft} → {target}")
+except Exception as e:
+    print(f"[INIT] Warning: Could not increase file descriptor limit: {e}")
 
 import functools
 from datetime import datetime
