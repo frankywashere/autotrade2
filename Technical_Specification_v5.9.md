@@ -164,7 +164,7 @@ spy_is_volatile_now = spy_vol_20d > (spy_vol_60d_median * 1.5)
 
 **Breaking Changes:**
 - Cache version: v5.9.1
-- Event timestamp format changed (RTH-aligned)
+- Event timestamp format improved (RTH-aligned, fixes timezone issues - requires cache regen)
 - Continuation label version: v2.1 (partial window support)
 
 ---
@@ -1015,10 +1015,10 @@ deprecated_code/backend/        # FastAPI dashboard (incomplete)
    - FP32 only (FP16 unstable)
    - DDP auto-enabled for multi-GPU
 
-4. **Event System Changes**
-   - Events now RTH-aligned (9:30 AM ET)
-   - May shift event timestamps by hours
-   - Recalculate if using custom events
+4. **Event System Improvements**
+   - Events now RTH-aligned (9:30 AM ET) - **FIXES timezone issues from v5.3**
+   - Timestamps more accurate (may shift by hours compared to old buggy version)
+   - Recalculate if using custom events to benefit from fix
 
 **Recommended Upgrade Path:**
 
@@ -1089,7 +1089,7 @@ python tools/compare_predictions.py --old v533 --new v59
 3. **Cache regeneration required** when upgrading from v5.3.3
 4. **TF32 auto-enabled on CUDA** - 1.5x speedup on Ampere GPUs
 5. **DDP recommended for multi-GPU** - Good scaling efficiency
-6. **Event timestamps changed** - RTH-aligned in v5.9
+6. **Event timestamps improved (RTH-aligned)** - Fixes timezone bugs from v5.3 (cache regen needed)
 7. **10/11 transition labels acceptable** - 3month often missing
 8. **Learning rate ≤0.0005** - Higher causes divergence
 9. **ReduceLROnPlateau scheduler** - Cosine caused instability in v5.3
