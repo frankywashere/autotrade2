@@ -1453,13 +1453,24 @@ class HierarchicalDataset(Dataset):
             state['_needs_event_fetcher_reload'] = True
 
         # =====================================================================
-        # 4. Alignment data (regular numpy arrays - pickle fine!)
+        # 4. Alignment data - DON'T pickle it! Load from cache file instead.
         # =====================================================================
-        # The aligned dict contains regular numpy arrays (not mmaps), so it pickles fine.
-        # We just need to log it for debugging.
-        if _debug and hasattr(self, 'aligned') and self.aligned:
-            align_size_mb = sum(arr.nbytes for arr in self.aligned.values()) / 1e6
-            print(f"[PICKLE] Alignment data included: {len(self.aligned)} arrays, {align_size_mb:.1f} MB", flush=True)
+        # Sending 53.4 MB through IPC to each worker causes hangs.
+        # Instead, store the cache path and have workers load from disk.
+        if hasattr(self, 'aligned') and self.aligned:
+            # Store path to alignment cache, not the data itself
+            if hasattr(self, 'tf_meta') and 'cache_key' in self.tf_meta:
+                cache_key = self.tf_meta.get('cache_key', 'unknown')
+                # Find cache directory from mmap paths
+                if hasattr(self, 'tf_meta_path') and self.tf_meta_path:
+                    cache_dir = Path(self.tf_meta_path).parent
+                    state['_alignment_cache_path'] = str(cache_dir / f"aligned_indices_{cache_key}.npz")
+                    state['_alignment_cache_dir'] = str(cache_dir)
+            # Remove the large alignment data from pickle
+            state['aligned'] = None
+            state['_needs_alignment_reload'] = True
+            if _debug:
+                print(f"[PICKLE] Alignment will load from cache (not pickled)", flush=True)
 
         _pickle_elapsed = (time.perf_counter() - _pickle_start) * 1000
         if _debug:
@@ -1533,17 +1544,14 @@ class HierarchicalDataset(Dataset):
                 self.monthly_3month_mmap = np.load(path, mmap_mode='r')
 
         # =====================================================================
-        # 3. Recreate VIX loader and numpy array (SKIP if alignment present!)
+        # 3. Recreate VIX loader and numpy array (SKIP if alignment will be loaded!)
         # =====================================================================
         # With alignment, we have pre-computed VIX indices and _vix_array is pickled.
-        # Skip the slow CSV reload if alignment data exists.
-        _has_vix_alignment = (
-            hasattr(self, 'aligned') and self.aligned and
-            'vix' in self.aligned and
-            hasattr(self, '_vix_array') and self._vix_array is not None
-        )
+        # Skip the slow CSV reload if alignment will be loaded from cache.
+        _will_load_alignment = state.get('_needs_alignment_reload', False)
+        _has_vix_array = hasattr(self, '_vix_array') and self._vix_array is not None
 
-        if state.get('_needs_vix_reload', False) and not _has_vix_alignment:
+        if state.get('_needs_vix_reload', False) and not _will_load_alignment and not _has_vix_array:
             # Fallback: No alignment, must reload from CSV (slow)
             vix_path = state.get('_vix_csv_path')
             if vix_path and Path(vix_path).exists():
@@ -1559,21 +1567,17 @@ class HierarchicalDataset(Dataset):
                     if _debug:
                         print(f"[UNPICKLE] Failed to recreate VIX loader: {e}", flush=True)
                     self._vix_loader = None
-        elif _has_vix_alignment:
-            # Fast path: VIX data already in alignment, no reload needed!
+        elif _will_load_alignment or _has_vix_array:
+            # Fast path: Alignment will be loaded from cache, _vix_array is pickled
             self._vix_loader = None  # Not needed with alignment
             if _debug:
-                print(f"[UNPICKLE] VIX data from alignment (skipped slow CSV reload)", flush=True)
+                print(f"[UNPICKLE] VIX: will load from alignment cache", flush=True)
 
         # =====================================================================
-        # 4. Recreate event fetcher (SKIP if alignment present!)
+        # 4. Recreate event fetcher (SKIP if alignment will be loaded!)
         # =====================================================================
         # With alignment, events are pre-computed as numpy array. Skip fetcher.
-        _has_event_alignment = (
-            hasattr(self, 'aligned') and self.aligned and 'events' in self.aligned
-        )
-
-        if state.get('_needs_event_fetcher_reload', False) and not _has_event_alignment:
+        if state.get('_needs_event_fetcher_reload', False) and not _will_load_alignment:
             # Fallback: No alignment, must create event fetcher
             try:
                 from src.ml.live_events import LiveEventFetcher
@@ -1584,18 +1588,44 @@ class HierarchicalDataset(Dataset):
                 if _debug:
                     print(f"[UNPICKLE] Failed to recreate event fetcher: {e}", flush=True)
                 self._event_fetcher = None
-        elif _has_event_alignment:
-            # Fast path: Events already in alignment
+        elif _will_load_alignment:
+            # Fast path: Events in alignment cache
             self._event_fetcher = None  # Not needed with alignment
             if _debug:
-                print(f"[UNPICKLE] Events from alignment (skipped fetcher)", flush=True)
+                print(f"[UNPICKLE] Events: will load from alignment cache", flush=True)
 
         # =====================================================================
-        # 5. Verify alignment data survived pickling
+        # 5. Load alignment from cache (not pickled to avoid IPC issues)
         # =====================================================================
-        if _debug and hasattr(self, 'aligned') and self.aligned:
-            align_size_mb = sum(arr.nbytes for arr in self.aligned.values()) / 1e6
-            print(f"[UNPICKLE] Alignment data preserved: {len(self.aligned)} arrays, {align_size_mb:.1f} MB", flush=True)
+        if state.get('_needs_alignment_reload', False):
+            alignment_path = state.get('_alignment_cache_path')
+            if alignment_path and Path(alignment_path).exists():
+                try:
+                    _align_start = time.perf_counter()
+                    loaded = np.load(alignment_path)
+                    self.aligned = {key: loaded[key] for key in loaded.files}
+                    _align_elapsed = (time.perf_counter() - _align_start) * 1000
+
+                    if _debug:
+                        align_size_mb = sum(arr.nbytes for arr in self.aligned.values()) / 1e6
+                        print(f"[UNPICKLE] Loaded alignment from cache: {len(self.aligned)} arrays, {align_size_mb:.1f} MB in {_align_elapsed:.1f}ms", flush=True)
+
+                    # _vix_array is pickled (only 0.4 MB), so it should already be restored
+                    # No need to reload from CSV
+
+                except Exception as e:
+                    if _debug:
+                        print(f"[UNPICKLE] Failed to load alignment from cache: {e}", flush=True)
+                    self.aligned = {}
+            else:
+                if _debug:
+                    print(f"[UNPICKLE] Alignment cache not found: {alignment_path}", flush=True)
+                self.aligned = {}
+        elif hasattr(self, 'aligned') and self.aligned:
+            # Alignment was pickled (shouldn't happen with new code)
+            if _debug:
+                align_size_mb = sum(arr.nbytes for arr in self.aligned.values()) / 1e6
+                print(f"[UNPICKLE] Alignment data preserved: {len(self.aligned)} arrays, {align_size_mb:.1f} MB", flush=True)
 
         _unpickle_elapsed = (time.perf_counter() - _unpickle_start) * 1000
         if _debug:
