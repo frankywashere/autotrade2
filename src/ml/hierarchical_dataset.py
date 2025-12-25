@@ -1479,6 +1479,12 @@ class HierarchicalDataset(Dataset):
         _debug = os.environ.get('TRAIN_DEBUG', '0') == '1'
         if _debug:
             print(f"[UNPICKLE] __setstate__ called in worker PID={os.getpid()}", flush=True)
+            # Also write to file (worker stdout may not appear in terminal)
+            try:
+                with open('/tmp/worker_debug.log', 'a') as f:
+                    f.write(f"[{time.strftime('%H:%M:%S')}] UNPICKLE START PID={os.getpid()}\n")
+            except:
+                pass
 
         # Restore basic state
         self.__dict__.update(state)
@@ -1594,6 +1600,12 @@ class HierarchicalDataset(Dataset):
         _unpickle_elapsed = (time.perf_counter() - _unpickle_start) * 1000
         if _debug:
             print(f"[UNPICKLE] __setstate__ complete in {_unpickle_elapsed:.1f}ms", flush=True)
+            # Also write to file
+            try:
+                with open('/tmp/worker_debug.log', 'a') as f:
+                    f.write(f"[{time.strftime('%H:%M:%S')}] UNPICKLE COMPLETE PID={os.getpid()} in {_unpickle_elapsed:.1f}ms\n")
+            except:
+                pass
 
         # Track that this instance was unpickled (for first __getitem__ logging)
         self._unpickled_in_worker = True
@@ -1972,6 +1984,16 @@ class HierarchicalDataset(Dataset):
         import time
         import sys
         _getitem_start = time.perf_counter()
+
+        # Log first getitem in worker (file-based for visibility)
+        _debug = os.environ.get('TRAIN_DEBUG', '0') == '1'
+        if _debug and getattr(self, '_unpickled_in_worker', False) and not getattr(self, '_first_getitem_logged', False):
+            self._first_getitem_logged = True
+            try:
+                with open('/tmp/worker_debug.log', 'a') as f:
+                    f.write(f"[{time.strftime('%H:%M:%S')}] FIRST __getitem__ PID={os.getpid()} idx={idx}\n")
+            except:
+                pass
 
         # v4.1: Native timeframe mode - return Dict[str, np.ndarray]
         if getattr(self, 'using_native_timeframes', False):
