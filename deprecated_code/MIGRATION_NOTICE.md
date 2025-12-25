@@ -30,9 +30,9 @@ The technical specification has been updated to reflect the current stable versi
 - FP32 precision only (FP16 AMP unstable)
 - TF32 auto-enabled on CUDA
 
-### Event System
-- Events now RTH-aligned (9:30 AM ET)
-- Timestamps may shift by hours
+### Event System (IMPROVEMENT)
+- Events now RTH-aligned (9:30 AM ET) - **FIXES timezone bugs from v5.3**
+- Timestamps more accurate (may shift by hours compared to old buggy version)
 
 ## Migration Steps
 
