@@ -1987,17 +1987,40 @@ class HierarchicalDataset(Dataset):
 
         # Log first getitem in worker (file-based for visibility)
         _debug = os.environ.get('TRAIN_DEBUG', '0') == '1'
-        if _debug and getattr(self, '_unpickled_in_worker', False) and not getattr(self, '_first_getitem_logged', False):
-            self._first_getitem_logged = True
-            try:
-                with open('/tmp/worker_debug.log', 'a') as f:
-                    f.write(f"[{time.strftime('%H:%M:%S')}] FIRST __getitem__ PID={os.getpid()} idx={idx}\n")
-            except:
-                pass
+        if _debug and getattr(self, '_unpickled_in_worker', False):
+            # Track call count for progress logging
+            if not hasattr(self, '_getitem_count'):
+                self._getitem_count = 0
+            self._getitem_count += 1
+
+            # Log first call
+            if not getattr(self, '_first_getitem_logged', False):
+                self._first_getitem_logged = True
+                try:
+                    with open('/tmp/worker_debug.log', 'a') as f:
+                        f.write(f"[{time.strftime('%H:%M:%S')}] FIRST __getitem__ START PID={os.getpid()} idx={idx}\n")
+                except:
+                    pass
+            # Log every 64th call (1 batch worth) to show progress
+            elif self._getitem_count % 64 == 0:
+                try:
+                    with open('/tmp/worker_debug.log', 'a') as f:
+                        f.write(f"[{time.strftime('%H:%M:%S')}] __getitem__ #{self._getitem_count} PID={os.getpid()}\n")
+                except:
+                    pass
 
         # v4.1: Native timeframe mode - return Dict[str, np.ndarray]
         if getattr(self, 'using_native_timeframes', False):
-            return self._getitem_native_timeframe(idx)
+            result = self._getitem_native_timeframe(idx)
+            # Log first getitem completion
+            if _debug and getattr(self, '_unpickled_in_worker', False) and self._getitem_count == 1:
+                _elapsed = (time.perf_counter() - _getitem_start) * 1000
+                try:
+                    with open('/tmp/worker_debug.log', 'a') as f:
+                        f.write(f"[{time.strftime('%H:%M:%S')}] FIRST __getitem__ COMPLETE PID={os.getpid()} in {_elapsed:.1f}ms\n")
+                except:
+                    pass
+            return result
 
         # Get actual data index
         data_idx = self.valid_indices[idx]
