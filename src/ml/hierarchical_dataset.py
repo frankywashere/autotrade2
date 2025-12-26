@@ -19,6 +19,7 @@ from typing import Tuple, Optional, List, Dict, Union
 from pathlib import Path
 import sys
 import json
+import os
 
 # Add parent directory to path
 parent_dir = Path(__file__).parent.parent.parent
@@ -986,9 +987,9 @@ class HierarchicalDataset(Dataset):
 
         # v5.9.4: Fast path - use pre-computed targets if available (Fix #1 + #3)
         if self._use_precomputed:
-            # Debug: Uncomment to verify fast path is being used
-            # if idx == 0:
-            #     print("[DEBUG] Using precomputed fast path for __getitem__")
+            # Debug: Show once per epoch that fast path is being used (respects TRAIN_DEBUG)
+            if idx == 0 and os.environ.get('TRAIN_DEBUG', '0') == '1':
+                print("[DEBUG] v5.9.4: Using precomputed fast path for __getitem__")
             return self._getitem_precomputed_path(idx, data_idx_5min, timeframe_data)
 
         # Get current price from 5min features
