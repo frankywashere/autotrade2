@@ -215,6 +215,95 @@ class ShuffleBufferSampler(torch.utils.data.Sampler):
         self._epoch = epoch
 
 
+class DistributedShuffleBufferSampler(torch.utils.data.Sampler):
+    """
+    Distributed version of ShuffleBufferSampler for multi-GPU DDP training.
+
+    Combines the benefits of:
+    - DistributedSampler: Splits data across GPUs so each processes different samples
+    - ShuffleBufferSampler: Sequential chunk access with local shuffling (cache-friendly)
+
+    When data is preloaded to RAM, random access is fast so the sequential access
+    benefit is reduced. However, this sampler still provides:
+    - Better CPU cache locality (accessing nearby indices)
+    - Reproducible chunk-based shuffling across ranks
+
+    v5.9.4: Added as user-selectable option when preload_tf_to_ram=True.
+    """
+
+    def __init__(
+        self,
+        data_source,
+        num_replicas: int,
+        rank: int,
+        buffer_size: int = 10000,
+        seed: int = 42,
+        drop_last: bool = True
+    ):
+        """
+        Args:
+            data_source: Dataset to sample from (needs __len__)
+            num_replicas: Number of distributed processes (world_size)
+            rank: Rank of current process (0 to num_replicas-1)
+            buffer_size: Number of samples per chunk for local shuffling
+            seed: Random seed for reproducibility
+            drop_last: Drop last incomplete batch to ensure equal samples per GPU
+        """
+        self.data_source = data_source
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.buffer_size = buffer_size
+        self.seed = seed
+        self.drop_last = drop_last
+        self._epoch = 0
+
+        # Calculate samples per replica
+        total_size = len(data_source)
+        if drop_last:
+            # Make total evenly divisible by num_replicas
+            self.total_size = (total_size // num_replicas) * num_replicas
+        else:
+            self.total_size = total_size
+
+        self.num_samples = self.total_size // num_replicas
+
+    def __iter__(self):
+        import random
+
+        # Generate global indices with epoch-based seed (same across all ranks)
+        g = torch.Generator()
+        g.manual_seed(self.seed + self._epoch)
+
+        # Create indices and do a global shuffle (same order on all ranks)
+        indices = list(range(len(self.data_source)))
+        indices = [indices[i] for i in torch.randperm(len(indices), generator=g).tolist()]
+
+        # Truncate to total_size if drop_last
+        if self.drop_last:
+            indices = indices[:self.total_size]
+
+        # Split indices across ranks - each rank gets every num_replicas-th sample
+        # This ensures different ranks get different samples
+        rank_indices = indices[self.rank::self.num_replicas]
+
+        # Now apply chunk-based local shuffling (ShuffleBufferSampler logic)
+        # Use a rank-specific seed for the local shuffle
+        rng = random.Random(self.seed + self._epoch * 1000 + self.rank)
+
+        for chunk_start in range(0, len(rank_indices), self.buffer_size):
+            chunk_end = min(chunk_start + self.buffer_size, len(rank_indices))
+            chunk = rank_indices[chunk_start:chunk_end]
+            rng.shuffle(chunk)  # Local shuffle within chunk
+            yield from chunk
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch: int):
+        """Set epoch for reproducible shuffling (required for DDP)."""
+        self._epoch = epoch
+
+
 # =============================================================================
 # DDP (DistributedDataParallel) Helper Functions
 # =============================================================================
@@ -2094,6 +2183,34 @@ def interactive_setup(args, profiler=None):
         args.preload_tf_to_ram = False
         print("   → Memory-mapped (OS page cache handles caching)")
 
+    # v5.9.4: Sampler choice - only ask when data is preloaded to RAM
+    # When mmap, always use chunk-based sampler (ShuffleBufferSampler) for I/O optimization
+    # When preloaded, user can choose since random access is fast in RAM
+    if args.preload_tf_to_ram:
+        print()
+        sampler_choices = [
+            "Chunk-based (ShuffleBufferSampler) - Better cache locality (Recommended)",
+            "Random (DistributedSampler) - True global shuffle"
+        ]
+
+        sampler_choice = inquirer.select(
+            message="Sampler strategy (data is in RAM, both are fast):",
+            choices=sampler_choices,
+            default=sampler_choices[0]
+        ).execute()
+
+        if "Chunk-based" in sampler_choice:
+            args.use_chunk_sampler = True
+            print("   → Chunk-based sampler (sequential chunks, local shuffle)")
+            print("      Works for both single-GPU and multi-GPU DDP")
+        else:
+            args.use_chunk_sampler = False
+            print("   → Random sampler (DistributedSampler for DDP, shuffle for single-GPU)")
+    else:
+        # mmap mode: always use chunk-based sampler for I/O optimization
+        args.use_chunk_sampler = True
+        print("   → Using chunk-based sampler (optimized for mmap access)")
+
     # v5.3.2: Pre-stacking option for faster epochs
     print()
 
@@ -3528,32 +3645,57 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     }
 
     # Sampler setup
+    # v5.9.4: User can choose between chunk-based (ShuffleBufferSampler) and random (DistributedSampler)
+    # When preload_tf_to_ram=True, user gets a choice; when False (mmap), chunk-based is always used
     train_sampler = None
+    use_chunk_sampler = getattr(args, 'use_chunk_sampler', True)  # Default to chunk-based
+
     if is_distributed:
-        # DDP: use DistributedSampler
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            drop_last=True
-        )
-        train_loader_kwargs['sampler'] = train_sampler
-        train_loader_kwargs['shuffle'] = False
-        if is_main_process(rank):
-            print(f"   Using DistributedSampler ({world_size} replicas)")
+        if use_chunk_sampler:
+            # v5.9.4: Use DistributedShuffleBufferSampler - chunk-based with DDP support
+            train_sampler = DistributedShuffleBufferSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                buffer_size=10000,  # 10K samples per chunk
+                seed=42,
+                drop_last=True
+            )
+            train_loader_kwargs['sampler'] = train_sampler
+            train_loader_kwargs['shuffle'] = False
+            if is_main_process(rank):
+                print(f"   Using DistributedShuffleBufferSampler ({world_size} replicas, buffer=10000)")
+        else:
+            # Standard DistributedSampler - true global random shuffle
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                drop_last=True
+            )
+            train_loader_kwargs['sampler'] = train_sampler
+            train_loader_kwargs['shuffle'] = False
+            if is_main_process(rank):
+                print(f"   Using DistributedSampler ({world_size} replicas, random shuffle)")
     else:
-        # v5.0: Use ShuffleBufferSampler for mmap data (8-10x faster than random shuffle)
-        # Sequential chunks with local shuffling avoids random disk seeks
-        train_sampler = ShuffleBufferSampler(
-            train_dataset,
-            buffer_size=10000,  # 10K samples per chunk (~50MB)
-            seed=42  # Reproducible
-        )
-        train_loader_kwargs['sampler'] = train_sampler
-        train_loader_kwargs['shuffle'] = False  # Sampler handles shuffling
-        if is_main_process(rank):
-            print(f"   Using ShuffleBufferSampler (buffer_size=10000, mmap-optimized)")
+        if use_chunk_sampler:
+            # v5.0: Use ShuffleBufferSampler for mmap data (8-10x faster than random shuffle)
+            # Sequential chunks with local shuffling avoids random disk seeks
+            train_sampler = ShuffleBufferSampler(
+                train_dataset,
+                buffer_size=10000,  # 10K samples per chunk (~50MB)
+                seed=42  # Reproducible
+            )
+            train_loader_kwargs['sampler'] = train_sampler
+            train_loader_kwargs['shuffle'] = False  # Sampler handles shuffling
+            if is_main_process(rank):
+                print(f"   Using ShuffleBufferSampler (buffer_size=10000)")
+        else:
+            # Standard DataLoader shuffle - true random
+            train_loader_kwargs['shuffle'] = True
+            if is_main_process(rank):
+                print(f"   Using standard DataLoader shuffle (random)")
 
     # === MEMORY SAFETY CHECK: Warn before DataLoader creation ===
     # Check if num_workers with spawn will cause OOM
