@@ -4353,11 +4353,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 loss_components['duration'] = duration_loss_total.item()
 
             # =====================================================================
-            # v5.9: CONTAINMENT LOSS (channel bounds contain actual price)
+            # v5.9.6: VECTORIZED CONTAINMENT & HIT PROBABILITY LOSS
             # =====================================================================
-            # Check if predicted channel bounds successfully contain actual price movement
+            # Optimized from nested Python loops to batched tensor operations
+            # Original: 128 samples × 11 TFs × 14 windows = ~20,000 loop iterations
+            # Now: ~30 tensor operations per TF
             containment_loss_total = 0.0
             hit_probability_loss_total = 0.0
+
+            # Cache window sizes for this batch
+            _windows = project_config.CHANNEL_WINDOW_SIZES  # [100, 90, 80, ..., 10] (14 values)
+            _num_windows = len(_windows)
 
             if 'geometric_predictions' in hidden_states:
                 for tf, geo_data in hidden_states['geometric_predictions'].items():
@@ -4367,106 +4373,114 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         window_weights = geo_data['window_weights']  # [batch, 14]
                         batch_size = geo_high_pred.shape[0]
 
-                        # v5.9: For each sample in batch, check containment
-                        containment_scores = []
+                        # =============================================================
+                        # Phase 3: Pre-gather all targets into tensors (eliminates dict lookups in loops)
+                        # =============================================================
+                        # Build validity mask tensor [batch, num_windows]
+                        validity_list = []
+                        hit_upper_list = []
+                        hit_midline_list = []
+                        hit_lower_list = []
+
+                        for win_idx, window in enumerate(_windows):
+                            key_valid = f'cont_{tf}_w{window}_valid'
+                            key_hit_upper = f'cont_{tf}_w{window}_hit_upper'
+                            key_hit_midline = f'cont_{tf}_w{window}_hit_midline'
+                            key_hit_lower = f'cont_{tf}_w{window}_hit_lower'
+
+                            if key_valid in targets:
+                                validity_list.append(targets[key_valid])  # [batch]
+                            else:
+                                validity_list.append(torch.zeros(batch_size, device=args.device))
+
+                            if key_hit_upper in targets:
+                                hit_upper_list.append(targets[key_hit_upper])
+                                hit_midline_list.append(targets[key_hit_midline])
+                                hit_lower_list.append(targets[key_hit_lower])
+                            else:
+                                hit_upper_list.append(torch.zeros(batch_size, device=args.device))
+                                hit_midline_list.append(torch.zeros(batch_size, device=args.device))
+                                hit_lower_list.append(torch.zeros(batch_size, device=args.device))
+
+                        # Stack into [batch, num_windows] tensors
+                        validity_mask = torch.stack(validity_list, dim=1) > 0  # [batch, 14] bool
+                        hit_upper_targets = torch.stack(hit_upper_list, dim=1)  # [batch, 14]
+                        hit_midline_targets = torch.stack(hit_midline_list, dim=1)  # [batch, 14]
+                        hit_lower_targets = torch.stack(hit_lower_list, dim=1)  # [batch, 14]
+
+                        # =============================================================
+                        # Phase 2: Vectorized Containment Loss
+                        # =============================================================
+                        # For containment, we still need price sequences (variable length lists)
+                        # But we can vectorize the inner containment check per sample
+                        containment_scores = torch.full((batch_size,), 0.5, device=args.device)  # Default neutral
 
                         for sample_idx in range(batch_size):
-                            # Get blended price sequence using window weights
-                            sample_weights = window_weights[sample_idx]  # [14]
-                            price_sequences = []
-                            valid_windows = []
+                            # Get valid windows for this sample
+                            sample_validity = validity_mask[sample_idx]  # [14]
+                            if not sample_validity.any():
+                                continue  # Keep default 0.5
 
-                            for win_idx, window in enumerate(project_config.CHANNEL_WINDOW_SIZES):
-                                key = f'cont_{tf}_w{window}_price_sequence'
-                                key_valid = f'cont_{tf}_w{window}_valid'
-                                if key in targets and sample_idx < len(targets[key]):
-                                    # v5.9.2: Check validity flag - skip placeholder sequences
-                                    is_valid = (key_valid in targets and
-                                                targets[key_valid][sample_idx].item() > 0)
-                                    if not is_valid:
-                                        continue
+                            # Find highest-weighted valid window
+                            masked_weights = window_weights[sample_idx].clone()  # [14]
+                            masked_weights[~sample_validity] = -float('inf')
+                            best_win_idx = masked_weights.argmax().item()
+                            best_window = _windows[best_win_idx]
 
-                                    price_seq = targets[key][sample_idx]
-                                    if price_seq is not None and len(price_seq) > 0:
-                                        price_sequences.append(price_seq)
-                                        valid_windows.append(win_idx)
+                            # Get price sequence for best window
+                            key = f'cont_{tf}_w{best_window}_price_sequence'
+                            if key in targets and sample_idx < len(targets[key]):
+                                price_seq = targets[key][sample_idx]
+                                if price_seq is not None and len(price_seq) > 0:
+                                    # Vectorized containment check
+                                    price_tensor = torch.tensor(price_seq, device=args.device, dtype=geo_high_pred.dtype)
+                                    low_bound = geo_low_pred[sample_idx]
+                                    high_bound = geo_high_pred[sample_idx]
+                                    contained = (price_tensor >= low_bound) & (price_tensor <= high_bound)
+                                    containment_scores[sample_idx] = contained.float().mean()
 
-                            if len(price_sequences) > 0:
-                                # Use price sequence from highest-weighted valid window
-                                if len(valid_windows) > 0:
-                                    max_weight_idx = sample_weights[valid_windows].argmax()
-                                    price_seq = price_sequences[max_weight_idx]
+                        # Loss = 1 - containment_rate (minimize when containment is high)
+                        containment_loss = (1.0 - containment_scores).mean()
+                        containment_loss_total += geo_price_weight * containment_loss
 
-                                    # Check containment for each bar in sequence
-                                    contained_bars = 0
-                                    total_bars = len(price_seq)
-
-                                    for price_pct in price_seq:
-                                        # Check if within predicted bounds
-                                        if geo_low_pred[sample_idx] <= price_pct <= geo_high_pred[sample_idx]:
-                                            contained_bars += 1
-
-                                    # Containment rate for this sample
-                                    containment_rate = contained_bars / max(total_bars, 1)
-                                    containment_scores.append(containment_rate)
-                                else:
-                                    containment_scores.append(0.5)  # Neutral if no valid sequences
-                            else:
-                                containment_scores.append(0.5)  # Neutral
-
-                        if containment_scores:
-                            # Convert to tensor
-                            containment_tensor = torch.tensor(containment_scores, device=args.device)
-                            # Loss = 1 - containment_rate (minimize when containment is high)
-                            containment_loss = (1.0 - containment_tensor).mean()
-                            containment_loss_total += geo_price_weight * containment_loss
-
-                        # v5.9: Hit probability loss (predict if price hits upper/midline/lower)
+                        # =============================================================
+                        # Phase 1: Vectorized Hit Probability Loss (biggest speedup)
+                        # =============================================================
                         if 'hit_prob_upper' in geo_data:
                             hit_prob_upper_pred = geo_data['hit_prob_upper'].squeeze()  # [batch]
                             hit_prob_midline_pred = geo_data['hit_prob_midline'].squeeze()  # [batch]
                             hit_prob_lower_pred = geo_data['hit_prob_lower'].squeeze()  # [batch]
 
-                            # Blend hit targets using window weights
-                            for sample_idx in range(batch_size):
-                                sample_weights = window_weights[sample_idx]
-                                hit_upper_target = 0.0
-                                hit_midline_target = 0.0
-                                hit_lower_target = 0.0
-                                total_weight = 0.0
+                            # Compute weighted targets using batched operations
+                            # validity_mask: [batch, 14], window_weights: [batch, 14]
+                            valid_weights = window_weights * validity_mask.float()  # [batch, 14]
+                            total_weight = valid_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)  # [batch, 1]
+                            normalized_weights = valid_weights / total_weight  # [batch, 14]
 
-                                for win_idx, window in enumerate(project_config.CHANNEL_WINDOW_SIZES):
-                                    key_hit_upper = f'cont_{tf}_w{window}_hit_upper'
-                                    key_hit_midline = f'cont_{tf}_w{window}_hit_midline'
-                                    key_hit_lower = f'cont_{tf}_w{window}_hit_lower'
-                                    key_valid = f'cont_{tf}_w{window}_valid'
+                            # Weighted average of targets: [batch]
+                            blended_hit_upper = (normalized_weights * hit_upper_targets).sum(dim=1)
+                            blended_hit_midline = (normalized_weights * hit_midline_targets).sum(dim=1)
+                            blended_hit_lower = (normalized_weights * hit_lower_targets).sum(dim=1)
 
-                                    if (key_valid in targets and targets[key_valid][sample_idx] > 0 and
-                                        key_hit_upper in targets):
-                                        weight = sample_weights[win_idx].item()
-                                        hit_upper_target += weight * targets[key_hit_upper][sample_idx].item()
-                                        hit_midline_target += weight * targets[key_hit_midline][sample_idx].item()
-                                        hit_lower_target += weight * targets[key_hit_lower][sample_idx].item()
-                                        total_weight += weight
+                            # Mask for samples with valid targets
+                            has_valid = validity_mask.any(dim=1)  # [batch]
+                            num_valid_samples = has_valid.sum()
 
-                                # Normalize if we had valid targets
-                                if total_weight > 0:
-                                    hit_upper_target /= total_weight
-                                    hit_midline_target /= total_weight
-                                    hit_lower_target /= total_weight
+                            if num_valid_samples > 0:
+                                # Single batched BCE call (replaces 128 individual calls)
+                                # Clamp targets to valid BCE range [0, 1]
+                                blended_hit_upper = blended_hit_upper.clamp(0, 1)
+                                blended_hit_midline = blended_hit_midline.clamp(0, 1)
+                                blended_hit_lower = blended_hit_lower.clamp(0, 1)
 
-                                    # BCE loss for hit probabilities
-                                    target_hit_upper_t = torch.tensor(hit_upper_target, device=args.device)
-                                    target_hit_midline_t = torch.tensor(hit_midline_target, device=args.device)
-                                    target_hit_lower_t = torch.tensor(hit_lower_target, device=args.device)
+                                # Compute BCE for all samples, then mask
+                                bce_upper = F.binary_cross_entropy(hit_prob_upper_pred, blended_hit_upper, reduction='none')
+                                bce_midline = F.binary_cross_entropy(hit_prob_midline_pred, blended_hit_midline, reduction='none')
+                                bce_lower = F.binary_cross_entropy(hit_prob_lower_pred, blended_hit_lower, reduction='none')
 
-                                    hit_loss = (
-                                        F.binary_cross_entropy(hit_prob_upper_pred[sample_idx:sample_idx+1], target_hit_upper_t.unsqueeze(0)) +
-                                        F.binary_cross_entropy(hit_prob_midline_pred[sample_idx:sample_idx+1], target_hit_midline_t.unsqueeze(0)) +
-                                        F.binary_cross_entropy(hit_prob_lower_pred[sample_idx:sample_idx+1], target_hit_lower_t.unsqueeze(0))
-                                    ) / 3.0
-
-                                    hit_probability_loss_total += hit_loss
+                                # Average over 3 hit types, then apply validity mask
+                                hit_loss_per_sample = (bce_upper + bce_midline + bce_lower) / 3.0  # [batch]
+                                hit_probability_loss_total += (hit_loss_per_sample * has_valid.float()).sum()
 
             # Add containment loss (replaces geo_price)
             if containment_loss_total > 0:
