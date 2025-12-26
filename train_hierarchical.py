@@ -4101,7 +4101,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         _is_first_batch_ever = (epoch == 0)
         _first_forward_start = None
 
+        # v5.9.5: Coarse timing to identify bottlenecks
+        _iter_end_time = time.perf_counter()  # Track end of previous iteration
+        _timing_samples = {'data': [], 'forward': [], 'loss': [], 'backward': [], 'optimizer': []}
+
         for batch_idx, batch_data in enumerate(batch_pbar):
+            # Measure data loading time (from end of previous iteration)
+            _data_time = time.perf_counter() - _iter_end_time
+
             if profiler and batch_idx == 0:
                 profiler.log_info(f"FIRST_BATCH_COMPLETE | time_sec={0}")
                 profiler.snapshot("first_batch_received", epoch + 1, force_log=True)
@@ -4169,7 +4176,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 _progress_thread.start()
 
             # Forward pass (v5.7.2: removed AMP, use TF32 instead)
+            _forward_start = time.perf_counter()
             predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
+            _forward_time = time.perf_counter() - _forward_start
+            _loss_start = time.perf_counter()  # Start loss timing
 
             # 🛡️ NaN Check 1: Predictions
             if not torch.isfinite(predictions).all():
@@ -4562,7 +4572,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             else:
                 loss_components['transition'] = 0.0
 
+            _loss_time = time.perf_counter() - _loss_start  # End loss timing
+            _backward_start = time.perf_counter()
             loss.backward()
+            _backward_time = time.perf_counter() - _backward_start
 
             # v5.3.2: Track gradient norm BEFORE clipping (shows true gradient magnitude)
             total_norm = 0.0
@@ -4581,7 +4594,23 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     print(f"\n🚨 NaN/Inf gradient in {name} at batch {batch_idx}!")
                     raise ValueError(f"Non-finite gradient in {name}")
 
+            _optim_start = time.perf_counter()
             optimizer.step()
+            _optim_time = time.perf_counter() - _optim_start
+
+            # v5.9.5: Collect timing samples and print every 5 batches
+            _timing_samples['data'].append(_data_time)
+            _timing_samples['forward'].append(_forward_time)
+            _timing_samples['loss'].append(_loss_time)
+            _timing_samples['backward'].append(_backward_time)
+            _timing_samples['optimizer'].append(_optim_time)
+
+            if batch_idx < 10 or (batch_idx < 50 and batch_idx % 10 == 0):
+                print(f"[TIMING] batch {batch_idx}: data={_data_time*1000:.0f}ms, fwd={_forward_time*1000:.0f}ms, "
+                      f"loss={_loss_time*1000:.0f}ms, bwd={_backward_time*1000:.0f}ms, opt={_optim_time*1000:.0f}ms, "
+                      f"total={(_data_time+_forward_time+_loss_time+_backward_time+_optim_time)*1000:.0f}ms", flush=True)
+
+            _iter_end_time = time.perf_counter()  # Mark end of this iteration
 
             # Report first batch completion time and stop progress thread
             if _is_first_batch_ever and batch_idx == 0 and _first_forward_start is not None:
