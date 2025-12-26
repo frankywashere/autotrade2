@@ -32,6 +32,15 @@ from src.ml.features import (
     HIERARCHICAL_TIMEFRAMES
 )
 
+# v5.9.4: Import precompute functions for auto-generation
+from src.ml.precompute_targets import (
+    load_existing_cache,
+    compute_valid_indices,
+    precompute_breakout_labels,
+    precompute_target_arrays,
+    save_precomputed
+)
+
 
 class HierarchicalDataset(Dataset):
     """
@@ -611,6 +620,220 @@ class HierarchicalDataset(Dataset):
             else:
                 raise ValueError("Cannot find tsla_close in 5min features")
 
+        # v5.9.4: Load pre-computed targets if available (Fix #1 and #3)
+        self._load_precomputed_targets(cache_dir, cache_key)
+
+    def _load_precomputed_targets(self, cache_dir: Path, cache_key: str):
+        """
+        Load pre-computed breakout labels and target arrays if available.
+
+        v5.9.4: Eliminates expensive per-sample computation:
+        - Fix #1: Pre-computed breakout labels (no more linear regression per sample)
+        - Fix #3: Pre-computed target arrays (no more 2,223 dict insertions per sample)
+
+        If pre-computed files don't exist, falls back to original behavior.
+        """
+        self._precomputed_breakout = None
+        self._precomputed_targets = None
+        self._use_precomputed = False
+
+        # Look for pre-computed files
+        breakout_path = cache_dir / f"precomputed_breakout_{cache_key}.npz"
+        targets_path = cache_dir / f"precomputed_targets_{cache_key}.npz"
+        indices_path = cache_dir / f"precomputed_valid_indices_{cache_key}.npy"
+
+        if breakout_path.exists() and targets_path.exists() and indices_path.exists():
+            try:
+                # Verify indices match
+                precomputed_indices = np.load(indices_path)
+                if len(precomputed_indices) != len(self.valid_indices):
+                    print(f"     ⚠️  Pre-computed indices mismatch ({len(precomputed_indices)} vs {len(self.valid_indices)})")
+                    print(f"        Run: python -m src.ml.precompute_targets --cache-dir {cache_dir}")
+                    return
+
+                # Load breakout labels
+                print(f"     📦 Loading pre-computed breakout labels...")
+                breakout_data = dict(np.load(breakout_path))
+                self._precomputed_breakout = breakout_data
+                print(f"        Loaded {len(breakout_data)} breakout fields")
+
+                # Load target arrays
+                print(f"     📦 Loading pre-computed target arrays...")
+                targets_data = dict(np.load(targets_path))
+                self._precomputed_targets = targets_data
+                print(f"        Loaded {len(targets_data)} target fields")
+
+                self._use_precomputed = True
+                print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled)")
+
+            except Exception as e:
+                print(f"     ⚠️  Failed to load pre-computed data: {e}")
+                print(f"        Falling back to per-sample computation")
+                self._precomputed_breakout = None
+                self._precomputed_targets = None
+                self._use_precomputed = False
+        else:
+            # v5.9.4: Auto-generate precomputed files (same pattern as other caches)
+            missing = []
+            if not breakout_path.exists():
+                missing.append("breakout")
+            if not targets_path.exists():
+                missing.append("targets")
+            if not indices_path.exists():
+                missing.append("indices")
+            print(f"     ℹ️  Pre-computed targets not found (missing: {', '.join(missing)})")
+            print(f"     🔄 Auto-generating pre-computed targets for ~10-17 min/epoch speedup...")
+
+            try:
+                # Load existing cache data needed for precomputation
+                cache = load_existing_cache(cache_dir)
+
+                # Compute valid indices (same as this dataset)
+                precomputed_valid_indices = compute_valid_indices(cache, self.prediction_horizon)
+
+                # Validate indices match
+                if len(precomputed_valid_indices) != len(self.valid_indices):
+                    print(f"     ⚠️  Index count mismatch: precomputed {len(precomputed_valid_indices)} vs dataset {len(self.valid_indices)}")
+                    print(f"        This may happen if prediction_horizon differs. Falling back to per-sample computation.")
+                    return
+
+                # Pre-compute breakout labels (Fix #1)
+                breakout_labels = precompute_breakout_labels(
+                    cache, precomputed_valid_indices, self.prediction_horizon
+                )
+
+                # Pre-compute target arrays (Fix #3)
+                target_arrays = precompute_target_arrays(cache, precomputed_valid_indices)
+
+                # Save to cache directory
+                save_precomputed(
+                    cache_dir, cache_key,
+                    precomputed_valid_indices, breakout_labels, target_arrays
+                )
+
+                # Load the generated files
+                print(f"     📦 Loading newly generated pre-computed data...")
+                self._precomputed_breakout = breakout_labels
+                self._precomputed_targets = target_arrays
+                self._use_precomputed = True
+                print(f"     ✓ v5.9.4: Pre-computed targets generated and loaded (Fix #1 + #3 enabled)")
+
+            except Exception as e:
+                print(f"     ⚠️  Failed to auto-generate pre-computed data: {e}")
+                print(f"        Falling back to per-sample computation")
+                print(f"        To retry manually: python -m src.ml.precompute_targets --cache-dir {cache_dir}")
+                self._precomputed_breakout = None
+                self._precomputed_targets = None
+                self._use_precomputed = False
+
+    def _getitem_precomputed_path(
+        self,
+        idx: int,
+        data_idx_5min: int,
+        timeframe_data: Dict[str, np.ndarray]
+    ) -> Tuple[Dict[str, np.ndarray], dict, np.ndarray, dict]:
+        """
+        Fast path for __getitem__ when pre-computed targets are available.
+
+        v5.9.4: Eliminates per-sample computation:
+        - Fix #1: Uses pre-computed breakout labels (no linear regression)
+        - Fix #3: Uses pre-computed target arrays (no dict building loop)
+
+        Base targets (high, low, expected_return, etc.) are still computed per-sample
+        because they depend on future prices and are relatively fast.
+
+        Args:
+            idx: Sample index
+            data_idx_5min: Index into 5min mmap array
+            timeframe_data: Already-loaded feature dict
+
+        Returns:
+            Same as _getitem_native_timeframe: (timeframe_data, targets, vix_seq, events)
+        """
+        # Get current price from 5min features
+        current_price = self.tf_mmaps['5min'][data_idx_5min - 1, self.close_idx_5min]
+
+        # Get actual channel duration for this sample (if available)
+        actual_duration_bars = None
+        if self._per_tf_continuation and '5min' in self._per_tf_continuation:
+            cont_data = self._per_tf_continuation['5min']
+            ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+            ts_idx = cont_data.get('ts_to_idx', {}).get(int(ts_5min))
+            if ts_idx is not None and 'duration_bars' in cont_data:
+                actual_duration_bars = int(cont_data['duration_bars'][ts_idx])
+
+        # Use actual duration if available, otherwise fall back to fixed horizon
+        if actual_duration_bars and actual_duration_bars > 0:
+            horizon_5min = actual_duration_bars
+            horizon_1min = horizon_5min * 5
+        else:
+            horizon_5min = self.prediction_horizon // 5 + 1
+            horizon_1min = self.prediction_horizon
+
+        # Get future prices for target calculation
+        if self.raw_ohlc_array is not None:
+            ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+            if hasattr(self, 'raw_ohlc_timestamps') and len(self.raw_ohlc_timestamps) > 0:
+                approx_1min_idx = np.searchsorted(self.raw_ohlc_timestamps, ts_5min, side='right') - 1
+                approx_1min_idx = max(0, min(approx_1min_idx, len(self.raw_ohlc_array) - 1))
+            else:
+                approx_1min_idx = data_idx_5min * 5
+
+            future_start = approx_1min_idx
+            future_end = min(approx_1min_idx + horizon_1min, len(self.raw_ohlc_array))
+
+            if future_end > future_start:
+                future_ohlc = self.raw_ohlc_array[future_start:future_end]
+                future_prices = future_ohlc[:, 3]
+            else:
+                future_prices = np.array([current_price])
+        else:
+            future_5min_end = min(data_idx_5min + horizon_5min, len(self.tf_mmaps['5min']))
+            future_prices = self.tf_mmaps['5min'][data_idx_5min:future_5min_end, self.close_idx_5min]
+
+        # Compute base targets (pass past_prices=None to skip breakout detection)
+        # Base targets like high, low, expected_return are computed here
+        # Breakout labels will be overridden with pre-computed values below
+        targets = self._calculate_targets_from_future(
+            current_price=current_price,
+            future_prices=future_prices,
+            seq_start=max(0, data_idx_5min - 200),
+            seq_end=data_idx_5min,
+            past_prices=None  # Skip breakout detection - we'll use pre-computed
+        )
+
+        # Override with pre-computed breakout labels (Fix #1 - no linear regression)
+        for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
+            if key in self._precomputed_breakout:
+                targets[key] = float(self._precomputed_breakout[key][idx])
+
+        # Add continuation and transition labels from pre-computed arrays (Fix #3)
+        for key, arr in self._precomputed_targets.items():
+            if key.startswith('cont_') or key.startswith('trans_'):
+                targets[key] = float(arr[idx])
+
+        # v5.2: Get VIX sequence for this sample (still computed per-sample)
+        vix_seq = None
+        if self._vix_loader:
+            try:
+                ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+                ts = pd.Timestamp(ts_5min, unit='ns')
+                vix_seq = self._vix_loader.get_sequence(ts.date(), self._vix_sequence_length)
+            except Exception:
+                pass
+
+        # v5.2: Get events for this timestamp (still computed per-sample)
+        events = None
+        if self._event_fetcher:
+            try:
+                ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+                ts = pd.Timestamp(ts_5min, unit='ns')
+                events = self._event_fetcher.get_events_for_training(ts)
+            except Exception:
+                pass
+
+        return timeframe_data, targets, vix_seq, events
+
     def _calculate_targets_from_future(self, current_price: float, future_prices: np.ndarray,
                                        seq_start: int, seq_end: int,
                                        past_prices: np.ndarray = None) -> dict:
@@ -760,6 +983,13 @@ class HierarchicalDataset(Dataset):
 
             tf_features = self.tf_mmaps[tf][start:end, :]
             timeframe_data[tf] = np.ascontiguousarray(tf_features)
+
+        # v5.9.4: Fast path - use pre-computed targets if available (Fix #1 + #3)
+        if self._use_precomputed:
+            # Debug: Uncomment to verify fast path is being used
+            # if idx == 0:
+            #     print("[DEBUG] Using precomputed fast path for __getitem__")
+            return self._getitem_precomputed_path(idx, data_idx_5min, timeframe_data)
 
         # Get current price from 5min features
         current_price = self.tf_mmaps['5min'][data_idx_5min - 1, self.close_idx_5min]
