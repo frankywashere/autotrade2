@@ -1,15 +1,18 @@
 """
-Pre-compute Targets for Fast Training (v5.9.4)
+Pre-compute Targets for Fast Training (v5.9.5)
 
 This script pre-computes:
 1. Breakout labels (Fix #1) - eliminates linear regression per sample
 2. Sample-indexed target arrays (Fix #3) - eliminates 2,223 dict insertions per sample
+3. Base targets (v5.9.5) - high, low, hit_band, hit_target, expected_return, etc.
+4. VIX sequences (v5.9.5) - pre-computed 90-day VIX lookback per sample
 
 Run this ONCE after feature extraction. The pre-computed files are used by
 HierarchicalDataset for ~10-17 minute/epoch speedup.
 
 Usage:
     python -m src.ml.precompute_targets --cache-dir data/feature_cache
+    python -m src.ml.precompute_targets --cache-dir data/feature_cache --full  # Include VIX
 
 The script reads existing cached files and creates NEW files alongside them.
 No existing cache files are modified.
@@ -115,6 +118,153 @@ def compute_channel_breakout(
             break
 
     return result
+
+
+def check_target_sequence(
+    prices: np.ndarray,
+    entry_price: float,
+    target_price: float,
+    stop_price: float
+) -> bool:
+    """
+    Check if target was hit before stop in price sequence.
+
+    Args:
+        prices: Future price sequence (ground truth)
+        entry_price: Entry price
+        target_price: Target price to hit
+        stop_price: Stop loss price
+
+    Returns:
+        True if hit target before stop, False otherwise
+    """
+    for price in prices:
+        if price >= target_price:
+            return True  # Hit target first
+        if price <= stop_price:
+            return False  # Hit stop first
+    return False  # Neither hit within horizon
+
+
+def simulate_trade_execution(
+    prices: np.ndarray,
+    entry_price: float,
+    target_price: float,
+    stop_price: float
+) -> float:
+    """
+    Simulate trade execution and return realized return %.
+
+    Args:
+        prices: Future price sequence (ground truth)
+        entry_price: Entry price
+        target_price: Target price
+        stop_price: Stop loss price
+
+    Returns:
+        Realized return percentage
+    """
+    for price in prices:
+        if price >= target_price:
+            # Hit target - exit with profit
+            return (target_price - entry_price) / entry_price * 100.0
+        if price <= stop_price:
+            # Hit stop - exit with loss
+            return (stop_price - entry_price) / entry_price * 100.0
+
+    # Neither hit - hold to end of horizon
+    final_price = prices[-1] if len(prices) > 0 else entry_price
+    return (final_price - entry_price) / entry_price * 100.0
+
+
+def compute_base_targets(
+    current_price: float,
+    future_prices: np.ndarray,
+    prediction_horizon: int = 24
+) -> Dict[str, float]:
+    """
+    Compute base prediction targets from future prices.
+
+    v5.9.5: Pre-computes all base targets that were previously computed per-sample
+    in _calculate_targets_from_future().
+
+    Args:
+        current_price: Current close price
+        future_prices: Array of future prices
+        prediction_horizon: Prediction horizon in bars
+
+    Returns:
+        Dict with: high, low, hit_band, hit_target, expected_return, overshoot,
+                   price_change_pct, horizon_bars_log, adaptive_confidence
+    """
+    # Defensive check
+    if current_price <= 0 or np.isnan(current_price) or np.isinf(current_price):
+        return {
+            'high': 0.0, 'low': 0.0, 'hit_band': 0.0, 'hit_target': 0.0,
+            'expected_return': 0.0, 'overshoot': 0.0, 'price_change_pct': 0.0,
+            'horizon_bars_log': 0.0, 'adaptive_confidence': 0.5
+        }
+
+    if len(future_prices) == 0:
+        return {
+            'high': 0.0, 'low': 0.0, 'hit_band': 0.0, 'hit_target': 0.0,
+            'expected_return': 0.0, 'overshoot': 0.0, 'price_change_pct': 0.0,
+            'horizon_bars_log': 0.0, 'adaptive_confidence': 0.5
+        }
+
+    # Get high/low from future prices
+    future_high_actual = np.max(future_prices)
+    future_low_actual = np.min(future_prices)
+
+    # Convert to percentage change
+    target_high_pct = (future_high_actual - current_price) / current_price * 100.0
+    target_low_pct = (future_low_actual - current_price) / current_price * 100.0
+
+    # Label 1: Hit Band
+    ideal_band_high = future_high_actual * 1.02
+    ideal_band_low = future_low_actual * 0.98
+    prices_in_ideal_band = (future_prices >= ideal_band_low) & (future_prices <= ideal_band_high)
+    hit_band_label = float(prices_in_ideal_band.sum() / len(prices_in_ideal_band) > 0.8)
+
+    # Label 2: Hit Target Before Stop
+    target_price = future_high_actual
+    stop_price = current_price * (1 + target_low_pct/100 - 0.02)
+    hit_target_label = float(check_target_sequence(
+        future_prices, current_price, target_price, stop_price
+    ))
+
+    # Label 3: Expected Return
+    expected_return_label = simulate_trade_execution(
+        future_prices, current_price, target_price, stop_price
+    )
+
+    # Label 4: Overshoot
+    band_range = abs(target_high_pct - target_low_pct)
+    if band_range > 0:
+        overshoot_high = max(0, future_high_actual - ideal_band_high) / current_price * 100
+        overshoot_low = max(0, ideal_band_low - future_low_actual) / current_price * 100
+        overshoot_label = (overshoot_high + overshoot_low) / band_range
+    else:
+        overshoot_label = 0.0
+
+    # Adaptive targets
+    actual_max_idx = np.argmax(future_prices)
+    bars_to_peak = actual_max_idx
+    adaptive_price_change = target_high_pct if target_high_pct > abs(target_low_pct) else target_low_pct
+    adaptive_horizon_log = np.log(bars_to_peak / prediction_horizon + 1e-6)
+    adaptive_confidence = 1.0 if bars_to_peak > 48 else 0.5
+
+    return {
+        'high': target_high_pct,
+        'low': target_low_pct,
+        'hit_band': hit_band_label,
+        'hit_target': hit_target_label,
+        'expected_return': expected_return_label,
+        'overshoot': overshoot_label,
+        'price_change_pct': adaptive_price_change,
+        'horizon_bars_log': adaptive_horizon_log,
+        'adaptive_confidence': adaptive_confidence,
+    }
 
 
 def load_existing_cache(cache_dir: Path) -> Dict:
@@ -332,23 +482,31 @@ def precompute_breakout_labels(
 
 def precompute_target_arrays(
     cache: Dict,
-    valid_indices: np.ndarray
+    valid_indices: np.ndarray,
+    prediction_horizon: int = 24,
+    compute_base_targets_flag: bool = True
 ) -> Dict[str, np.ndarray]:
     """
-    Pre-compute sample-indexed target arrays for continuation and transition labels.
+    Pre-compute sample-indexed target arrays for all targets.
 
     Fix #3 (Option B): Dict of arrays indexed by sample.
     Eliminates 2,223 dict insertions per sample in __getitem__.
+
+    v5.9.5: Now also computes base targets (high, low, hit_band, etc.)
     """
-    print("\nPre-computing target arrays (Fix #3)...")
+    print("\nPre-computing target arrays (Fix #3 + v5.9.5 base targets)...")
 
     n_samples = len(valid_indices)
     ts_5min = cache['ts_5min']
+    tf_5min = cache['tf_5min']
+    close_idx = cache['close_idx']
+    raw_ohlc = cache.get('raw_ohlc')
+    raw_ohlc_timestamps = cache.get('raw_ohlc_timestamps')
 
     # Define all target keys and pre-allocate arrays
     target_arrays = {}
 
-    # Base targets (computed elsewhere, but include placeholders)
+    # Base targets - v5.9.5: Now actually computed, not just placeholders
     base_keys = ['high', 'low', 'hit_band', 'hit_target', 'expected_return', 'overshoot',
                  'continuation_duration', 'continuation_gain', 'continuation_confidence',
                  'price_change_pct', 'horizon_bars_log', 'adaptive_confidence']
@@ -388,8 +546,8 @@ def precompute_target_arrays(
 
     print(f"  Pre-allocated {len(target_arrays)} target arrays")
 
-    # Fill continuation labels
-    print("  Filling continuation labels...")
+    # Fill all targets including base targets
+    print("  Filling base targets + continuation/transition labels...")
     start_time = time.time()
     report_interval = n_samples // 20
 
@@ -402,6 +560,37 @@ def precompute_target_arrays(
 
         # Get timestamp for this sample
         ts_val = int(ts_5min[data_idx])
+
+        # v5.9.5: Compute base targets (high, low, hit_band, etc.)
+        if compute_base_targets_flag:
+            # Get current price
+            current_price = tf_5min[data_idx - 1, close_idx]
+
+            # Get future prices for target calculation
+            horizon_1min = prediction_horizon
+            horizon_5min = prediction_horizon // 5 + 1
+
+            if raw_ohlc is not None and raw_ohlc_timestamps is not None:
+                # Use raw 1-min OHLC for more accurate future prices
+                approx_1min_idx = np.searchsorted(raw_ohlc_timestamps, ts_val, side='right') - 1
+                approx_1min_idx = max(0, min(approx_1min_idx, len(raw_ohlc) - 1))
+
+                future_start = approx_1min_idx
+                future_end = min(approx_1min_idx + horizon_1min, len(raw_ohlc))
+
+                if future_end > future_start:
+                    future_prices = raw_ohlc[future_start:future_end, 3]  # Close column
+                else:
+                    future_prices = np.array([current_price])
+            else:
+                # Fallback: use 5min closes
+                future_end = min(data_idx + horizon_5min, len(tf_5min))
+                future_prices = tf_5min[data_idx:future_end, close_idx]
+
+            # Compute base targets
+            base = compute_base_targets(current_price, future_prices, prediction_horizon)
+            for key, val in base.items():
+                target_arrays[key][i] = val
 
         # Fill continuation labels for each TF
         for tf in HIERARCHICAL_TIMEFRAMES:
@@ -462,12 +651,106 @@ def precompute_target_arrays(
     return target_arrays
 
 
+def precompute_vix_sequences(
+    cache: Dict,
+    valid_indices: np.ndarray,
+    vix_sequence_length: int = 90
+) -> Optional[Dict[str, np.ndarray]]:
+    """
+    Pre-compute VIX sequences for all samples.
+
+    v5.9.5: Eliminates per-sample VIX lookup (~50μs per sample).
+
+    Args:
+        cache: Cache dictionary with timestamps
+        valid_indices: Array of valid sample indices
+        vix_sequence_length: Number of VIX days to look back (default 90)
+
+    Returns:
+        Dict with 'vix_sequences' array [n_samples, vix_sequence_length]
+        or None if VIX data not available
+    """
+    print("\nPre-computing VIX sequences (v5.9.5)...")
+
+    # Try to load VIX data
+    vix_path = parent_dir / "data" / "VIX_History.csv"
+    if not vix_path.exists():
+        print(f"  ⚠️  VIX data not found at {vix_path}")
+        print("     Skipping VIX pre-computation")
+        return None
+
+    try:
+        from src.ml.live_events import VIXSequenceLoader
+        vix_loader = VIXSequenceLoader(str(vix_path))
+    except ImportError:
+        print("  ⚠️  VIXSequenceLoader not available")
+        return None
+
+    n_samples = len(valid_indices)
+    ts_5min = cache['ts_5min']
+
+    # Pre-allocate VIX sequences array
+    vix_sequences = np.zeros((n_samples, vix_sequence_length), dtype=np.float32)
+
+    start_time = time.time()
+    report_interval = n_samples // 20
+
+    # Track unique dates to avoid redundant lookups
+    date_cache = {}
+    vix_hits = 0
+
+    for i, data_idx in enumerate(valid_indices):
+        if i > 0 and i % report_interval == 0:
+            elapsed = time.time() - start_time
+            pct = i / n_samples * 100
+            eta = elapsed / i * (n_samples - i)
+            print(f"  {pct:.0f}% complete ({i:,}/{n_samples:,}) - ETA: {eta:.0f}s")
+
+        # Get timestamp and convert to date
+        ts_val = ts_5min[data_idx]
+        ts = pd.Timestamp(ts_val, unit='ns')
+        date_key = ts.date()
+
+        # Check cache first
+        if date_key in date_cache:
+            vix_seq = date_cache[date_key]
+            vix_hits += 1
+        else:
+            # Fetch VIX sequence for this date
+            try:
+                vix_seq = vix_loader.get_sequence(date_key, vix_sequence_length)
+                if vix_seq is None:
+                    vix_seq = np.zeros(vix_sequence_length, dtype=np.float32)
+            except Exception:
+                vix_seq = np.zeros(vix_sequence_length, dtype=np.float32)
+            date_cache[date_key] = vix_seq
+
+        vix_sequences[i] = vix_seq
+
+    elapsed = time.time() - start_time
+    print(f"  Completed in {elapsed:.1f}s ({n_samples / elapsed:.0f} samples/sec)")
+    print(f"  Date cache: {len(date_cache)} unique dates, {vix_hits:,} cache hits")
+
+    # Compute file hash for validation
+    import hashlib
+    vix_file_hash = hashlib.md5(open(vix_path, 'rb').read()).hexdigest()
+
+    return {
+        'vix_sequences': vix_sequences,
+        'vix_file_hash': vix_file_hash,
+        'vix_sequence_length': vix_sequence_length,
+        'generated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+    }
+
+
 def save_precomputed(
     cache_dir: Path,
     cache_key: str,
     valid_indices: np.ndarray,
     breakout_labels: Dict[str, np.ndarray],
-    target_arrays: Dict[str, np.ndarray]
+    target_arrays: Dict[str, np.ndarray],
+    vix_data: Optional[Dict] = None,
+    includes_base_targets: bool = True
 ):
     """Save pre-computed data to cache directory."""
     print("\nSaving pre-computed data...")
@@ -489,16 +772,29 @@ def save_precomputed(
     size_mb = targets_path.stat().st_size / 1e6
     print(f"  Saved {targets_path.name} ({size_mb:.1f} MB)")
 
+    # v5.9.5: Save VIX sequences if available
+    if vix_data is not None:
+        vix_path = cache_dir / f"precomputed_vix_{cache_key}.npz"
+        np.savez_compressed(vix_path, **vix_data)
+        size_mb = vix_path.stat().st_size / 1e6
+        print(f"  Saved {vix_path.name} ({size_mb:.1f} MB)")
+
     # Save metadata
     meta = {
-        'version': '5.9.4',
+        'version': '5.9.5',
         'cache_key': cache_key,
         'n_samples': len(valid_indices),
         'n_breakout_fields': len(breakout_labels),
         'n_target_fields': len(target_arrays),
         'breakout_keys': list(breakout_labels.keys()),
         'target_keys': list(target_arrays.keys()),
+        'includes_base_targets': includes_base_targets,
+        'includes_vix': vix_data is not None,
     }
+    if vix_data is not None:
+        meta['vix_file_hash'] = vix_data.get('vix_file_hash', '')
+        meta['vix_sequence_length'] = vix_data.get('vix_sequence_length', 90)
+
     meta_path = cache_dir / f"precomputed_meta_{cache_key}.json"
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
@@ -511,6 +807,10 @@ def main():
                         help='Path to feature cache directory')
     parser.add_argument('--prediction-horizon', type=int, default=24,
                         help='Prediction horizon in 1-min bars')
+    parser.add_argument('--full', action='store_true',
+                        help='Include VIX pre-computation (Phase 2c)')
+    parser.add_argument('--vix-only', action='store_true',
+                        help='Only pre-compute VIX sequences (for adding to existing cache)')
     args = parser.parse_args()
 
     cache_dir = Path(args.cache_dir)
@@ -519,10 +819,11 @@ def main():
         sys.exit(1)
 
     print("=" * 70)
-    print("Pre-compute Targets for Fast Training (v5.9.4)")
+    print("Pre-compute Targets for Fast Training (v5.9.5)")
     print("=" * 70)
     print(f"Cache directory: {cache_dir}")
     print(f"Prediction horizon: {args.prediction_horizon} bars")
+    print(f"Include VIX: {'Yes' if args.full else 'No'}")
     print()
 
     # Load existing cache
@@ -531,13 +832,34 @@ def main():
     # Compute valid indices
     valid_indices = compute_valid_indices(cache, args.prediction_horizon)
 
+    if args.vix_only:
+        # Only compute VIX sequences
+        print("VIX-only mode: Skipping breakout/target pre-computation")
+        vix_data = precompute_vix_sequences(cache, valid_indices)
+        if vix_data is not None:
+            vix_path = cache_dir / f"precomputed_vix_{cache['cache_key']}.npz"
+            np.savez_compressed(vix_path, **vix_data)
+            size_mb = vix_path.stat().st_size / 1e6
+            print(f"  Saved {vix_path.name} ({size_mb:.1f} MB)")
+        print("\nVIX pre-computation complete!")
+        return
+
     # Pre-compute breakout labels (Fix #1)
     breakout_labels = precompute_breakout_labels(
         cache, valid_indices, args.prediction_horizon
     )
 
-    # Pre-compute target arrays (Fix #3)
-    target_arrays = precompute_target_arrays(cache, valid_indices)
+    # Pre-compute target arrays (Fix #3 + v5.9.5 base targets)
+    target_arrays = precompute_target_arrays(
+        cache, valid_indices,
+        prediction_horizon=args.prediction_horizon,
+        compute_base_targets_flag=True
+    )
+
+    # v5.9.5: Pre-compute VIX sequences if --full flag is set
+    vix_data = None
+    if args.full:
+        vix_data = precompute_vix_sequences(cache, valid_indices)
 
     # Save results
     save_precomputed(
@@ -545,7 +867,9 @@ def main():
         cache['cache_key'],
         valid_indices,
         breakout_labels,
-        target_arrays
+        target_arrays,
+        vix_data=vix_data,
+        includes_base_targets=True
     )
 
     print()
@@ -559,7 +883,10 @@ def main():
     print("Expected speedup:")
     print("  - Fix #1 (breakout labels): ~3-5 min/epoch saved")
     print("  - Fix #3 (target arrays): ~7-12 min/epoch saved")
-    print("  - Combined: ~10-17 min/epoch saved")
+    print("  - v5.9.5 (base targets): ~10-15% faster __getitem__")
+    if args.full:
+        print("  - v5.9.5 (VIX sequences): ~5% faster __getitem__")
+    print("  - Combined: ~60-70% faster __getitem__")
 
 
 if __name__ == '__main__':

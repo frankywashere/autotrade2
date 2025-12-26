@@ -2183,6 +2183,33 @@ def interactive_setup(args, profiler=None):
         args.preload_tf_to_ram = False
         print("   → Memory-mapped (OS page cache handles caching)")
 
+    # v5.9.5: Data loading optimization level
+    print()
+    optimization_choices = [
+        Choice('full', "Full (indices + all targets + VIX) - Fastest ⭐ Recommended"),
+        Choice('standard', "Standard (indices + targets) - ~55% faster"),
+        Choice('minimal', "Minimal (indices only) - ~5% faster"),
+        Choice('none', "None (runtime computation) - Baseline"),
+    ]
+
+    args.optimization_level = inquirer.select(
+        message="Data loading optimization (v5.9.5):",
+        choices=optimization_choices,
+        default='full'
+    ).execute()
+
+    if args.optimization_level == 'full':
+        print("   → Full optimization: pre-computed indices + base targets + VIX")
+        print("      Expected: ~60-70% faster __getitem__")
+    elif args.optimization_level == 'standard':
+        print("   → Standard optimization: pre-computed indices + base targets")
+        print("      Expected: ~55% faster __getitem__")
+    elif args.optimization_level == 'minimal':
+        print("   → Minimal optimization: pre-computed indices only")
+        print("      Expected: ~5% faster __getitem__")
+    else:
+        print("   → No optimization: all computation at runtime")
+
     # v5.9.4: Sampler choice - only ask when data is preloaded to RAM
     # When mmap, always use chunk-based sampler (ShuffleBufferSampler) for I/O optimization
     # When preloaded, user can choose since random access is fast in RAM

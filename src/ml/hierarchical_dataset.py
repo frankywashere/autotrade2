@@ -39,7 +39,16 @@ from src.ml.precompute_targets import (
     compute_valid_indices,
     precompute_breakout_labels,
     precompute_target_arrays,
-    save_precomputed
+    save_precomputed,
+    precompute_vix_sequences,  # v5.9.5
+)
+
+# v5.9.5: Import sample indices functions
+from src.ml.precompute_sample_indices import (
+    load_sample_indices,
+    validate_sample_indices,
+    compute_sample_indices,
+    save_sample_indices,
 )
 
 
@@ -624,6 +633,93 @@ class HierarchicalDataset(Dataset):
         # v5.9.4: Load pre-computed targets if available (Fix #1 and #3)
         self._load_precomputed_targets(cache_dir, cache_key)
 
+        # v5.9.5: Load pre-computed sample indices if available (Phase 1)
+        self._load_sample_indices(cache_dir, cache_key)
+
+        # v5.9.5: Load pre-computed VIX sequences if available (Phase 2c)
+        self._load_precomputed_vix(cache_dir, cache_key)
+
+    def _load_sample_indices(self, cache_dir: Path, cache_key: str):
+        """
+        Load pre-computed sample indices for faster __getitem__.
+
+        v5.9.5 Phase 1: Eliminates np.searchsorted() calls per sample.
+        """
+        self._sample_indices = None
+        self._use_sample_indices = False
+
+        try:
+            data = load_sample_indices(cache_dir, cache_key)
+            if data is not None:
+                # Validate sequence lengths match
+                if validate_sample_indices(data, self.tf_sequence_lengths):
+                    # Also validate sample count
+                    if data['n_samples'] == len(self.valid_indices):
+                        self._sample_indices = data['tf_indices']
+                        self._use_sample_indices = True
+                        print(f"     ✓ v5.9.5: Loaded pre-computed sample indices ({len(self._sample_indices)} TFs)")
+                    else:
+                        print(f"     ⚠️  Sample indices count mismatch ({data['n_samples']} vs {len(self.valid_indices)})")
+                else:
+                    print(f"     ⚠️  Sample indices validation failed, will regenerate")
+        except Exception as e:
+            if os.environ.get('TRAIN_DEBUG', '0') == '1':
+                print(f"     ⚠️  Failed to load sample indices: {e}")
+
+        # Auto-generate if not available
+        if not self._use_sample_indices:
+            try:
+                print(f"     🔄 Auto-generating sample indices for ~5% faster __getitem__...")
+                # Load timestamps
+                from src.ml.precompute_sample_indices import load_timestamps, load_tf_metadata
+                tf_meta, _ = load_tf_metadata(cache_dir)
+                timestamps = {}
+                for tf in HIERARCHICAL_TIMEFRAMES:
+                    if tf in self.tf_timestamps:
+                        timestamps[tf] = self.tf_timestamps[tf]
+
+                data = compute_sample_indices(
+                    cache_dir, cache_key, tf_meta,
+                    timestamps, self.valid_indices, self.tf_sequence_lengths
+                )
+                save_sample_indices(cache_dir, cache_key, data)
+
+                self._sample_indices = data['tf_indices']
+                self._use_sample_indices = True
+                print(f"     ✓ v5.9.5: Generated and loaded sample indices")
+            except Exception as e:
+                print(f"     ⚠️  Failed to generate sample indices: {e}")
+                self._sample_indices = None
+                self._use_sample_indices = False
+
+    def _load_precomputed_vix(self, cache_dir: Path, cache_key: str):
+        """
+        Load pre-computed VIX sequences if available.
+
+        v5.9.5 Phase 2c: Eliminates per-sample VIX lookup (~50μs per sample).
+        """
+        self._precomputed_vix = None
+        self._use_precomputed_vix = False
+
+        vix_path = cache_dir / f"precomputed_vix_{cache_key}.npz"
+        if not vix_path.exists():
+            # VIX precompute is optional - don't auto-generate by default
+            if os.environ.get('TRAIN_DEBUG', '0') == '1':
+                print(f"     ℹ️  Pre-computed VIX not found (optional)")
+            return
+
+        try:
+            print(f"     📦 Loading pre-computed VIX sequences...")
+            vix_data = dict(np.load(vix_path))
+            self._precomputed_vix = vix_data['vix_sequences']
+            self._use_precomputed_vix = True
+            print(f"        Loaded VIX sequences: shape {self._precomputed_vix.shape}")
+            print(f"     ✓ v5.9.5: Using pre-computed VIX (Phase 2c enabled)")
+        except Exception as e:
+            print(f"     ⚠️  Failed to load pre-computed VIX: {e}")
+            self._precomputed_vix = None
+            self._use_precomputed_vix = False
+
     def _load_precomputed_targets(self, cache_dir: Path, cache_key: str):
         """
         Load pre-computed breakout labels and target arrays if available.
@@ -740,8 +836,9 @@ class HierarchicalDataset(Dataset):
         - Fix #1: Uses pre-computed breakout labels (no linear regression)
         - Fix #3: Uses pre-computed target arrays (no dict building loop)
 
-        Base targets (high, low, expected_return, etc.) are still computed per-sample
-        because they depend on future prices and are relatively fast.
+        v5.9.5: Now also uses pre-computed base targets and VIX:
+        - Phase 2b: Pre-computed high, low, hit_band, expected_return, etc.
+        - Phase 2c: Pre-computed VIX sequences
 
         Args:
             idx: Sample index
@@ -751,71 +848,105 @@ class HierarchicalDataset(Dataset):
         Returns:
             Same as _getitem_native_timeframe: (timeframe_data, targets, vix_seq, events)
         """
-        # Get current price from 5min features
-        current_price = self.tf_mmaps['5min'][data_idx_5min - 1, self.close_idx_5min]
+        # v5.9.5: Check if base targets are pre-computed (high, low, etc.)
+        base_target_keys = ['high', 'low', 'hit_band', 'hit_target', 'expected_return',
+                           'overshoot', 'price_change_pct', 'horizon_bars_log', 'adaptive_confidence']
+        has_precomputed_base = all(key in self._precomputed_targets for key in base_target_keys)
 
-        # Get actual channel duration for this sample (if available)
-        actual_duration_bars = None
-        if self._per_tf_continuation and '5min' in self._per_tf_continuation:
-            cont_data = self._per_tf_continuation['5min']
-            ts_5min = self.tf_timestamps['5min'][data_idx_5min]
-            ts_idx = cont_data.get('ts_to_idx', {}).get(int(ts_5min))
-            if ts_idx is not None and 'duration_bars' in cont_data:
-                actual_duration_bars = int(cont_data['duration_bars'][ts_idx])
+        if has_precomputed_base:
+            # v5.9.5 ULTRA-FAST PATH: All targets from pre-computed arrays
+            targets = {}
 
-        # Use actual duration if available, otherwise fall back to fixed horizon
-        if actual_duration_bars and actual_duration_bars > 0:
-            horizon_5min = actual_duration_bars
-            horizon_1min = horizon_5min * 5
+            # Base targets from pre-computed arrays (Phase 2b)
+            for key in base_target_keys:
+                targets[key] = float(self._precomputed_targets[key][idx])
+
+            # Continuation placeholders (overridden below from precomputed arrays)
+            targets['continuation_duration'] = float(self._precomputed_targets.get('continuation_duration', np.zeros(1))[idx] if 'continuation_duration' in self._precomputed_targets else 0.0)
+            targets['continuation_gain'] = float(self._precomputed_targets.get('continuation_gain', np.zeros(1))[idx] if 'continuation_gain' in self._precomputed_targets else 0.0)
+            targets['continuation_confidence'] = float(self._precomputed_targets.get('continuation_confidence', np.full(1, 0.5))[idx] if 'continuation_confidence' in self._precomputed_targets else 0.5)
+
+            # Breakout labels from pre-computed arrays (Fix #1)
+            for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
+                if key in self._precomputed_breakout:
+                    targets[key] = float(self._precomputed_breakout[key][idx])
+                else:
+                    # Defaults
+                    targets[key] = 0.0 if key != 'breakout_direction' else 0.5
+
+            # Continuation and transition labels from pre-computed arrays (Fix #3)
+            for key, arr in self._precomputed_targets.items():
+                if key.startswith('cont_') or key.startswith('trans_'):
+                    targets[key] = float(arr[idx])
+
         else:
-            horizon_5min = self.prediction_horizon // 5 + 1
-            horizon_1min = self.prediction_horizon
+            # v5.9.4 PATH: Compute base targets per-sample, use precomputed for rest
+            current_price = self.tf_mmaps['5min'][data_idx_5min - 1, self.close_idx_5min]
 
-        # Get future prices for target calculation
-        if self.raw_ohlc_array is not None:
-            ts_5min = self.tf_timestamps['5min'][data_idx_5min]
-            if hasattr(self, 'raw_ohlc_timestamps') and len(self.raw_ohlc_timestamps) > 0:
-                approx_1min_idx = np.searchsorted(self.raw_ohlc_timestamps, ts_5min, side='right') - 1
-                approx_1min_idx = max(0, min(approx_1min_idx, len(self.raw_ohlc_array) - 1))
+            # Get actual channel duration for this sample (if available)
+            actual_duration_bars = None
+            if self._per_tf_continuation and '5min' in self._per_tf_continuation:
+                cont_data = self._per_tf_continuation['5min']
+                ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+                ts_idx = cont_data.get('ts_to_idx', {}).get(int(ts_5min))
+                if ts_idx is not None and 'duration_bars' in cont_data:
+                    actual_duration_bars = int(cont_data['duration_bars'][ts_idx])
+
+            # Use actual duration if available, otherwise fall back to fixed horizon
+            if actual_duration_bars and actual_duration_bars > 0:
+                horizon_5min = actual_duration_bars
+                horizon_1min = horizon_5min * 5
             else:
-                approx_1min_idx = data_idx_5min * 5
+                horizon_5min = self.prediction_horizon // 5 + 1
+                horizon_1min = self.prediction_horizon
 
-            future_start = approx_1min_idx
-            future_end = min(approx_1min_idx + horizon_1min, len(self.raw_ohlc_array))
+            # Get future prices for target calculation
+            if self.raw_ohlc_array is not None:
+                ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+                if hasattr(self, 'raw_ohlc_timestamps') and len(self.raw_ohlc_timestamps) > 0:
+                    approx_1min_idx = np.searchsorted(self.raw_ohlc_timestamps, ts_5min, side='right') - 1
+                    approx_1min_idx = max(0, min(approx_1min_idx, len(self.raw_ohlc_array) - 1))
+                else:
+                    approx_1min_idx = data_idx_5min * 5
 
-            if future_end > future_start:
-                future_ohlc = self.raw_ohlc_array[future_start:future_end]
-                future_prices = future_ohlc[:, 3]
+                future_start = approx_1min_idx
+                future_end = min(approx_1min_idx + horizon_1min, len(self.raw_ohlc_array))
+
+                if future_end > future_start:
+                    future_ohlc = self.raw_ohlc_array[future_start:future_end]
+                    future_prices = future_ohlc[:, 3]
+                else:
+                    future_prices = np.array([current_price])
             else:
-                future_prices = np.array([current_price])
-        else:
-            future_5min_end = min(data_idx_5min + horizon_5min, len(self.tf_mmaps['5min']))
-            future_prices = self.tf_mmaps['5min'][data_idx_5min:future_5min_end, self.close_idx_5min]
+                future_5min_end = min(data_idx_5min + horizon_5min, len(self.tf_mmaps['5min']))
+                future_prices = self.tf_mmaps['5min'][data_idx_5min:future_5min_end, self.close_idx_5min]
 
-        # Compute base targets (pass past_prices=None to skip breakout detection)
-        # Base targets like high, low, expected_return are computed here
-        # Breakout labels will be overridden with pre-computed values below
-        targets = self._calculate_targets_from_future(
-            current_price=current_price,
-            future_prices=future_prices,
-            seq_start=max(0, data_idx_5min - 200),
-            seq_end=data_idx_5min,
-            past_prices=None  # Skip breakout detection - we'll use pre-computed
-        )
+            # Compute base targets (pass past_prices=None to skip breakout detection)
+            targets = self._calculate_targets_from_future(
+                current_price=current_price,
+                future_prices=future_prices,
+                seq_start=max(0, data_idx_5min - 200),
+                seq_end=data_idx_5min,
+                past_prices=None  # Skip breakout detection - we'll use pre-computed
+            )
 
-        # Override with pre-computed breakout labels (Fix #1 - no linear regression)
-        for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
-            if key in self._precomputed_breakout:
-                targets[key] = float(self._precomputed_breakout[key][idx])
+            # Override with pre-computed breakout labels (Fix #1)
+            for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
+                if key in self._precomputed_breakout:
+                    targets[key] = float(self._precomputed_breakout[key][idx])
 
-        # Add continuation and transition labels from pre-computed arrays (Fix #3)
-        for key, arr in self._precomputed_targets.items():
-            if key.startswith('cont_') or key.startswith('trans_'):
-                targets[key] = float(arr[idx])
+            # Add continuation and transition labels from pre-computed arrays (Fix #3)
+            for key, arr in self._precomputed_targets.items():
+                if key.startswith('cont_') or key.startswith('trans_'):
+                    targets[key] = float(arr[idx])
 
-        # v5.2: Get VIX sequence for this sample (still computed per-sample)
+        # v5.9.5: Use pre-computed VIX sequences if available (Phase 2c)
         vix_seq = None
-        if self._vix_loader:
+        if self._use_precomputed_vix and self._precomputed_vix is not None:
+            # Ultra-fast: direct array lookup
+            vix_seq = self._precomputed_vix[idx]
+        elif self._vix_loader:
+            # Fallback: per-sample lookup
             try:
                 ts_5min = self.tf_timestamps['5min'][data_idx_5min]
                 ts = pd.Timestamp(ts_5min, unit='ns')
@@ -824,6 +955,7 @@ class HierarchicalDataset(Dataset):
                 pass
 
         # v5.2: Get events for this timestamp (still computed per-sample)
+        # Events are not pre-computed because they're user-editable
         events = None
         if self._event_fetcher:
             try:
@@ -970,17 +1102,18 @@ class HierarchicalDataset(Dataset):
             if tf not in self.tf_mmaps:
                 continue
 
-            seq_len = self.tf_sequence_lengths[tf]
-
-            # Find index in this timeframe's array that corresponds to our 5min timestamp
-            # Binary search for the closest timestamp <= ts_5min
-            tf_timestamps = self.tf_timestamps[tf]
-            tf_idx = np.searchsorted(tf_timestamps, ts_5min, side='right') - 1
-            tf_idx = max(seq_len, tf_idx)  # Ensure we have enough history
-
-            # Extract sequence
-            start = tf_idx - seq_len
-            end = tf_idx
+            # v5.9.5: Use pre-computed indices if available (Phase 1)
+            if self._use_sample_indices and tf in self._sample_indices:
+                # Fast path: O(1) index lookup instead of O(log n) searchsorted
+                start, end = self._sample_indices[tf][idx]
+            else:
+                # Fallback: compute indices via binary search
+                seq_len = self.tf_sequence_lengths[tf]
+                tf_timestamps = self.tf_timestamps[tf]
+                tf_idx = np.searchsorted(tf_timestamps, ts_5min, side='right') - 1
+                tf_idx = max(seq_len, tf_idx)  # Ensure we have enough history
+                start = tf_idx - seq_len
+                end = tf_idx
 
             tf_features = self.tf_mmaps[tf][start:end, :]
             timeframe_data[tf] = np.ascontiguousarray(tf_features)
