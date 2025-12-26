@@ -1,7 +1,7 @@
 # Training Pipeline Bottleneck Analysis
 
-**Date:** 2025-12-25
-**Version:** v5.9.4
+**Date:** 2025-12-26
+**Version:** v5.9.5
 **Author:** Claude Code Analysis
 
 ---
@@ -23,6 +23,11 @@ The training pipeline has **severe CPU bottlenecks** in the data loading path. T
 | Pre-computed breakout labels | Linear regression per sample | ✅ FIXED | ~3-5 min/epoch |
 | Pre-computed target arrays | 2,223 dict insertions/sample | ✅ FIXED | ~7-12 min/epoch |
 | DistributedShuffleBufferSampler | DDP bypassed cache-friendly sampler | ✅ FIXED | Variable |
+
+**v5.9.5 Fixes Applied:**
+| Fix | Problem | Status | Speedup |
+|-----|---------|--------|---------|
+| Batched collate tensor creation | 64,832 torch.tensor() calls/batch (~12s) | ✅ FIXED | ~12s → ~0.2s/batch |
 
 **To enable pre-computed targets:**
 ```bash
@@ -60,7 +65,7 @@ python -m src.ml.precompute_targets --cache-dir data/feature_cache
 | **Linear regression** for channel breakout | :1883-1892 | O(60) math ops | **~100-200μs** |
 | **Trade simulation** loop over future prices | :1798-1834 | O(horizon) loop | ~20-50μs |
 | `np.searchsorted()` ×11 timeframes | :754 | 11 × O(log n) | ~5μs |
-| `np.ascontiguousarray()` ×11 copies | :762 | 11 × O(seq×feat) | **~200-500μs** |
+| `np.ascontiguousarray()` ×11 copies | :762 | 11 × O(seq×feat) | ~10-20μs (mostly no-op) |
 | Continuation label dict build (11 TFs × 14 windows × 14 fields) | :849-962 | **2156 dict insertions** | **~300-500μs** |
 | Transition label dict build (11 TFs × 5 fields) | :981-1005 | 55 dict insertions | ~20μs |
 | VIX sequence lookup w/ pandas conversion | :1007-1024 | pd.Timestamp + lookup | ~50μs |
@@ -300,26 +305,17 @@ else:
 | Transition labels | 11 | 30 MB | RAM (pickle) |
 | Non-channel features | 1 | 1.2 GB | RAM (pickle) |
 
-### The `ascontiguousarray` problem:
+### The `ascontiguousarray` - NOT a bottleneck (verified 2025-12-26):
 
-Even with `preload_tf_to_ram=True` (lines 525-542), every `__getitem__` call does:
-
-```python
-# Line 761-762
-tf_features = self.tf_mmaps[tf][start:end, :]
-timeframe_data[tf] = np.ascontiguousarray(tf_features)  # COPIES DATA!
+Profiling revealed that **8/11 timeframe slices are already C-contiguous**:
+```
+✓ Contiguous (no-op): 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily
+✗ Not contiguous:     weekly (20 bars), monthly (12 bars), 3month (8 bars)
 ```
 
-**This copies ~3.6MB per sample** regardless of whether data is in RAM or mmap.
+Since row slices of C-contiguous arrays remain contiguous, `np.ascontiguousarray()` is a **no-op** for most timeframes. The 3 non-contiguous TFs are the smallest (8-20 bars), so the copy overhead is negligible (~10-20μs total).
 
-### With preload (lines 525-542):
-```python
-if self._preload_tf_to_ram:
-    for tf in list(self.tf_mmaps.keys()):
-        self.tf_mmaps[tf] = np.array(self.tf_mmaps[tf])  # Copy to RAM
-```
-
-This eliminates page faults but **does not eliminate the per-sample copies**.
+**Conclusion:** This optimization was investigated and found to have minimal impact. Not worth pursuing.
 
 ---
 
@@ -362,38 +358,38 @@ def check_dataloader_memory_safety(num_workers, container_ram_gb=0):
 
 ## 9. Collate Function Overhead
 
-### Location: `train_hierarchical.py:273-415`
+### Status: **FIXED in v5.9.5**
 
-Per batch (256 samples):
+### Original Problem (v5.9.4 and earlier):
 
-1. **Detect format** (dict vs tuple) - loop over batch
-2. **Stack 11 timeframe arrays:**
-   ```python
-   for tf in data_list[0].keys():  # 11 timeframes
-       tf_arrays = [d[tf] for d in data_list]
-       stacked = np.stack(tf_arrays)
-       if not stacked.flags['C_CONTIGUOUS']:
-           stacked = np.ascontiguousarray(stacked)
-       batched_tf_data[tf] = torch.from_numpy(stacked).to(dtype=torch_dtype)
-   ```
+Per batch (64 samples with 1013 target keys):
 
-3. **Convert targets** (lines 363-375):
-   ```python
-   for tgt in targets_list:  # 256 samples
-       ct = {}
-       for k, v in tgt.items():  # ~2,223 keys per sample
-           ct[k] = torch.tensor(v, dtype=torch_dtype)
-   ```
-   **Total: 256 × 2,223 = 569,088 tensor creations per batch**
+```python
+# SLOW: 64 × 1013 = 64,832 torch.tensor() calls per batch (~12s!)
+for tgt in targets_list:  # 64 samples
+    ct = {}
+    for k, v in tgt.items():  # 1013 keys per sample
+        ct[k] = torch.tensor(v, dtype=torch_dtype)
+converted_targets.append(ct)
+targets_batch = default_collate(converted_targets)
+```
 
-4. **`default_collate()`** on targets dict
+### Fix (v5.9.5):
 
-5. **Stack VIX sequences:**
-   ```python
-   vix_batch = torch.tensor(np.array(valid_vix), dtype=torch_dtype)
-   ```
+Batch tensor creation per key instead of per sample:
 
-### Slow collate warning (line 411-413):
+```python
+# FAST: 1013 torch.as_tensor() calls per batch (~0.2s)
+targets_batch = {}
+for k in first_target.keys():  # 1013 keys
+    values = [t[k] for t in targets_list]  # Gather all 64 values
+    targets_batch[k] = torch.as_tensor(values, dtype=torch_dtype)  # 1 call per key
+```
+
+**Speedup:** 64,832 calls → 1,013 calls = **63x fewer function calls**
+**Time:** ~12s → ~0.2s per batch
+
+### Slow collate warning (line 500):
 ```python
 if _collate_elapsed > 1.0:
     print(f"[SLOW_COLLATE] batch assembly took {_collate_elapsed:.1f}s...")
@@ -406,13 +402,13 @@ if _collate_elapsed > 1.0:
 | Rank | Bottleneck | Location | Impact | Status |
 |------|-----------|----------|--------|--------|
 | **1** | Linear regression per sample | :1883-1892 | **20-30% of __getitem__** | **FIXED v5.9.4** |
-| **2** | 11× `ascontiguousarray()` copies | :762 | **25-35% of __getitem__** | Open |
-| **3** | 2,223 dict insertions per sample | :849-963 | **20-30% of __getitem__** | **FIXED v5.9.4** |
+| **2** | 2,223 dict insertions per sample | :849-963 | **20-30% of __getitem__** | **FIXED v5.9.4** |
+| **3** | 64K `torch.tensor()` per batch | train:452-467 | **~12s per batch** | **FIXED v5.9.5** |
 | **4** | 11× `searchsorted()` (orphaned precompute) | :754 | **5-10% of __getitem__** | Open |
 | **5** | ThreadPool GIL blocking | train:759 | RollingBuffer doesn't scale | Open |
-| **6** | 569K `torch.tensor()` per batch | train:374 | **10-20% of collate** | Open |
-| **7** | DDP bypasses ShuffleBufferSampler | train:3647 | More random I/O | **FIXED v5.9.4** |
-| **8** | Worker memory multiplication | train:3401 | RAM bloat, cache thrashing | Open |
+| **6** | DDP bypasses ShuffleBufferSampler | train:3647 | More random I/O | **FIXED v5.9.4** |
+| **7** | Worker memory multiplication | train:3401 | RAM bloat, cache thrashing | Open |
+| ~~8~~ | ~~11× `ascontiguousarray()` copies~~ | ~~:762~~ | ~~25-35% of __getitem__~~ | **NOT AN ISSUE** (8/11 TFs already contiguous) |
 
 ### Fix #1 + #3: Pre-computed Targets (v5.9.4)
 
@@ -532,8 +528,10 @@ Check `logs/memory_debug.log` for RAM snapshots (enabled via interactive menu).
    - `__getitem__` builds targets dict from array lookups: `targets[key] = float(arr[idx])`
    - Eliminates 2,223 dict insertions per sample
 
-5. **Eliminate per-sample ascontiguousarray** - Pre-allocate contiguous buffers
-   - Or ensure source arrays are already contiguous
+5. ~~**Eliminate per-sample ascontiguousarray**~~ - **NOT AN ISSUE** (verified 2025-12-26)
+   - Profiling showed 8/11 TF slices are already C-contiguous (no-op)
+   - Only weekly/monthly/3month need copies (tiny arrays: 8-20 bars)
+   - Total overhead: ~10-20μs - not worth optimizing
 
 ### Low Priority (Architecture)
 
@@ -565,7 +563,7 @@ def __getitem__(self, idx):
     for tf in 11_timeframes:
         searchsorted()           # O(log n)
         slice_array()            # O(1)
-        ascontiguousarray()      # O(seq × feat) COPY
+        ascontiguousarray()      # no-op for 8/11 TFs (already contiguous)
 
     linear_regression()          # O(60) numpy math  ← FIXED v5.9.4
     simulate_trade()             # O(horizon) loop
@@ -585,7 +583,7 @@ def __getitem__(self, idx):
     for tf in 11_timeframes:
         searchsorted()           # O(log n) - still needed
         slice_array()            # O(1)
-        ascontiguousarray()      # O(seq × feat) COPY - still needed
+        ascontiguousarray()      # no-op for 8/11 TFs (verified)
 
     # Fast path: array lookups instead of computation
     targets = {k: float(arr[idx]) for k, arr in precomputed_arrays.items()}

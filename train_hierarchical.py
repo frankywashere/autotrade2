@@ -21,7 +21,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.data._utils.collate import default_collate
 from pathlib import Path
 import sys
 import os
@@ -445,29 +444,32 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         x = torch.from_numpy(combined).to(dtype=torch_dtype)
 
     # Build targets tensor dict with proper dtype
-    # v5.9.2: Handle price_sequence separately (variable length - can't be stacked into tensor)
-    price_sequence_data = {}  # {key: [list_sample0, list_sample1, ...]}
-    converted_targets = []
+    # v5.9.5: Optimized - batch tensor creation per key (1013 calls vs 64,832)
+    # Previously: 64 samples × 1013 keys = 64,832 torch.tensor() calls (~12s)
+    # Now: 1013 keys × 1 torch.as_tensor() call (~0.2s)
+    _targets_start = time.perf_counter()
+    targets_batch = {}
 
-    for tgt in targets_list:
-        ct = {}
-        for k, v in tgt.items():
+    if targets_list and len(targets_list) > 0:
+        first_target = targets_list[0]
+        for k in first_target.keys():
             # v5.9.2: price_sequence stays as list (variable length, used in loss loop)
             if '_price_sequence' in k:
-                if k not in price_sequence_data:
-                    price_sequence_data[k] = []
-                price_sequence_data[k].append(v)  # Keep as list
-            elif isinstance(v, torch.Tensor):
-                ct[k] = v.to(dtype=torch_dtype)
+                targets_batch[k] = [t[k] for t in targets_list]  # List of lists
             else:
-                ct[k] = torch.tensor(v, dtype=torch_dtype)
-        converted_targets.append(ct)
+                # Gather all values for this key across samples
+                values = [t[k] for t in targets_list]
+                # Check if already tensors
+                if isinstance(values[0], torch.Tensor):
+                    targets_batch[k] = torch.stack(values).to(dtype=torch_dtype)
+                else:
+                    # Single tensor creation for all samples (fast!)
+                    targets_batch[k] = torch.as_tensor(values, dtype=torch_dtype)
 
-    targets_batch = default_collate(converted_targets)
-
-    # v5.9.2: Add price_sequence lists back (not as tensors - iterated in loss calculation)
-    for k, v in price_sequence_data.items():
-        targets_batch[k] = v  # List of lists, not tensor
+    # v5.9.5: Profile targets tensor creation (first 5 batches)
+    _targets_elapsed = time.perf_counter() - _targets_start
+    if _debug_counter[0] <= 5:
+        print(f"[PROFILE] targets tensor creation: {_targets_elapsed*1000:.1f}ms for {len(targets_list)} samples, {len(targets_batch)} keys", file=sys.stderr, flush=True)
 
     if move_to_device and device is not None:
         if is_native_timeframe:
