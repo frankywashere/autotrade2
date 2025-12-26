@@ -431,6 +431,14 @@ python -m src.ml.precompute_targets --cache-dir data/feature_cache
 
 **Expected speedup:** ~10-17 min/epoch (from eliminating ~700μs per sample)
 
+**Validation:** Run `python scripts/validate_precomputed.py` to verify precomputed values match original calculations. Validated 100% match rate (within float32 precision).
+
+**Edge case note:** The breakout calculation handles near-zero channel width slightly differently:
+- Original (`hierarchical_dataset.py`): `channel_width = std + 1e-10` (always continues)
+- Precompute (`precompute_targets.py`): Returns neutral defaults if `channel_width < 1e-10`
+
+This only affects samples where price is completely flat (std ≈ 0), which is rare in real market data. Validation found 0 edge cases in 1000 random samples.
+
 ---
 
 ## 11. Data Size Summary

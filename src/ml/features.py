@@ -5527,7 +5527,21 @@ class TradingFeatureExtractor(FeatureExtractor):
                     for window in windows:
                         if i < window:
                             # Not enough history for this window - mark as invalid
+                            # v5.9.6: Explicitly set all fields to avoid NaN
                             label_row[f'w{window}_valid'] = 0
+                            label_row[f'w{window}_duration'] = 0.0
+                            label_row[f'w{window}_price_sequence'] = []
+                            label_row[f'w{window}_hit_upper'] = 0.0
+                            label_row[f'w{window}_hit_midline'] = 0.0
+                            label_row[f'w{window}_hit_lower'] = 0.0
+                            label_row[f'w{window}_bars_until_hit_upper'] = 0.0
+                            label_row[f'w{window}_bars_until_hit_midline'] = 0.0
+                            label_row[f'w{window}_bars_until_hit_lower'] = 0.0
+                            label_row[f'w{window}_time_near_upper'] = 0.0
+                            label_row[f'w{window}_time_near_midline'] = 0.0
+                            label_row[f'w{window}_time_near_lower'] = 0.0
+                            label_row[f'w{window}_slope'] = 0.0
+                            label_row[f'w{window}_confidence'] = 0.0
                             continue
 
                         # Get lookback data
@@ -5545,7 +5559,21 @@ class TradingFeatureExtractor(FeatureExtractor):
                         residual_std = np.std(residuals)
 
                         if residual_std < 1e-10:
+                            # v5.9.6: Explicitly set all fields to avoid NaN
                             label_row[f'w{window}_valid'] = 0
+                            label_row[f'w{window}_duration'] = 0.0
+                            label_row[f'w{window}_price_sequence'] = []
+                            label_row[f'w{window}_hit_upper'] = 0.0
+                            label_row[f'w{window}_hit_midline'] = 0.0
+                            label_row[f'w{window}_hit_lower'] = 0.0
+                            label_row[f'w{window}_bars_until_hit_upper'] = 0.0
+                            label_row[f'w{window}_bars_until_hit_midline'] = 0.0
+                            label_row[f'w{window}_bars_until_hit_lower'] = 0.0
+                            label_row[f'w{window}_time_near_upper'] = 0.0
+                            label_row[f'w{window}_time_near_midline'] = 0.0
+                            label_row[f'w{window}_time_near_lower'] = 0.0
+                            label_row[f'w{window}_slope'] = 0.0
+                            label_row[f'w{window}_confidence'] = 0.0
                             continue
 
                         # Cycle counting (simplified for parallelization)

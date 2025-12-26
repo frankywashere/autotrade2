@@ -1138,8 +1138,8 @@ class HierarchicalDataset(Dataset):
                                 is_valid = cont_data[f'w{window}_valid'][row_idx] > 0
                                 if is_valid:
                                     targets[f'cont_{tf}_w{window}_duration'] = float(cont_data[f'w{window}_duration'][row_idx])
-                                    # v5.9.2: Keep as list (variable length) - collate handles separately
-                                    targets[f'cont_{tf}_w{window}_price_sequence'] = list(cont_data[f'w{window}_price_sequence'][row_idx])
+                                    # v5.9.6: Use helper for mmap compatibility
+                                    targets[f'cont_{tf}_w{window}_price_sequence'] = self._get_price_sequence(cont_data, window, row_idx)
                                     targets[f'cont_{tf}_w{window}_hit_upper'] = float(cont_data[f'w{window}_hit_upper'][row_idx])
                                     targets[f'cont_{tf}_w{window}_hit_midline'] = float(cont_data[f'w{window}_hit_midline'][row_idx])
                                     targets[f'cont_{tf}_w{window}_hit_lower'] = float(cont_data[f'w{window}_hit_lower'][row_idx])
@@ -1303,6 +1303,7 @@ class HierarchicalDataset(Dataset):
         """
         Load per-timeframe hierarchical continuation labels from directory.
 
+        v5.9.6: First looks for mmap .npz files (shared across workers, saves RAM)
         v5.4: First looks for 5min-resolution labels (continuation_labels_5min_{tf}_*.pkl)
               Falls back to TF-resolution labels (continuation_labels_{tf}_*.pkl)
 
@@ -1327,9 +1328,43 @@ class HierarchicalDataset(Dataset):
 
         # Track which TFs use 5min labels for direct index lookup
         self._uses_5min_labels = {}
+        # Track mmap usage for logging
+        self._uses_mmap_labels = {}
 
         loaded_count = 0
+        mmap_count = 0
         for tf in HIERARCHICAL_TIMEFRAMES:
+            # v5.9.6: First try mmap directories (preferred - truly shared across workers)
+            mmap_pattern_5min = f"continuation_labels_5min_{tf}_*.mmap"
+            matching_mmap_5min = [p for p in labels_path.glob(mmap_pattern_5min) if p.is_dir()]
+
+            mmap_pattern = f"continuation_labels_{tf}_*.mmap"
+            matching_mmap = [p for p in labels_path.glob(mmap_pattern) if p.is_dir()]
+
+            # Try mmap 5min first, then mmap native, then pickle
+            mmap_file = None
+            if matching_mmap_5min:
+                mmap_file = sorted(matching_mmap_5min)[-1]
+                self._uses_5min_labels[tf] = True
+            elif matching_mmap:
+                mmap_file = sorted(matching_mmap)[-1]
+                self._uses_5min_labels[tf] = False
+
+            if mmap_file is not None:
+                # Load from mmap (shared across workers)
+                try:
+                    loaded = self._load_continuation_from_mmap(tf, mmap_file)
+                    if loaded:
+                        loaded_count += 1
+                        mmap_count += 1
+                        self._uses_mmap_labels[tf] = True
+                        continue
+                except Exception as e:
+                    print(f"     ⚠️  Failed to load mmap for {tf}, falling back to pickle: {e}")
+
+            # Fall back to pickle files
+            self._uses_mmap_labels[tf] = False
+
             # v5.4: First try 5min-resolution labels (preferred)
             pattern_5min = f"continuation_labels_5min_{tf}_*.pkl"
             matching_5min = list(labels_path.glob(pattern_5min))
@@ -1413,13 +1448,144 @@ class HierarchicalDataset(Dataset):
 
         if loaded_count > 0:
             n_5min = sum(1 for v in self._uses_5min_labels.values() if v)
-            print(f"     ✓ Loaded continuation labels for {loaded_count}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes ({n_5min} at 5min resolution)")
+            mmap_info = f", {mmap_count} via mmap" if mmap_count > 0 else ""
+            print(f"     ✓ Loaded continuation labels for {loaded_count}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes ({n_5min} at 5min resolution{mmap_info})")
         else:
             print(f"     ⚠️  No continuation label files found in {labels_dir}")
+
+    def _load_continuation_from_mmap(self, tf: str, mmap_dir: Path) -> bool:
+        """
+        Load continuation labels from mmap directory with .npy files.
+
+        v5.9.6: Memory-mapped loading for multi-worker/multi-GPU efficiency.
+        Each .npy file is truly shared across all workers via OS page cache.
+
+        Args:
+            tf: Timeframe name (e.g., '5min', '1h')
+            mmap_dir: Path to .mmap directory containing .npy files
+
+        Returns:
+            True if loaded successfully
+        """
+        # Build continuation_data dict matching pickle format
+        continuation_data = {}
+
+        # Helper to load mmap'd array if file exists
+        def load_mmap(name):
+            path = mmap_dir / f'{name}.npy'
+            if path.exists():
+                return np.load(path, mmap_mode='r')
+            return None
+
+        # max_gain_pct
+        arr = load_mmap('max_gain_pct')
+        if arr is not None:
+            continuation_data['max_gain_pct'] = arr
+
+        # Per-window data
+        n_windows = 0
+        for window in config.CHANNEL_WINDOW_SIZES:
+            prefix = f'w{window}_'
+
+            # Check if this window exists
+            valid_arr = load_mmap(f'{prefix}valid')
+            if valid_arr is None:
+                continue
+
+            n_windows += 1
+            continuation_data[f'{prefix}valid'] = valid_arr
+
+            # Numeric arrays (direct mmap access)
+            numeric_cols = [
+                'duration', 'hit_upper', 'hit_midline', 'hit_lower',
+                'bars_until_hit_upper', 'bars_until_hit_midline', 'bars_until_hit_lower',
+                'time_near_upper', 'time_near_midline', 'time_near_lower',
+                'slope', 'confidence'
+            ]
+
+            for col_suffix in numeric_cols:
+                arr = load_mmap(prefix + col_suffix)
+                if arr is not None:
+                    continuation_data[prefix + col_suffix] = arr
+
+            # Price sequence (flattened format)
+            flat_arr = load_mmap(f'{prefix}price_sequence_flat')
+            offsets_arr = load_mmap(f'{prefix}price_sequence_offsets')
+            lengths_arr = load_mmap(f'{prefix}price_sequence_lengths')
+
+            if flat_arr is not None and offsets_arr is not None:
+                continuation_data[f'{prefix}price_sequence_flat'] = flat_arr
+                continuation_data[f'{prefix}price_sequence_offsets'] = offsets_arr
+                continuation_data[f'{prefix}price_sequence_lengths'] = lengths_arr
+                # Mark that this uses mmap format (no direct price_sequence array)
+                continuation_data[f'{prefix}price_sequence'] = None  # Sentinel
+
+        self._per_tf_continuation[tf] = continuation_data
+
+        # Build timestamp lookup from mmap'd timestamps array
+        timestamps = load_mmap('timestamps')
+        if timestamps is None:
+            return False
+
+        self._per_tf_ts_to_idx[tf] = {}
+        for i, ts_ns in enumerate(timestamps):
+            self._per_tf_ts_to_idx[tf][int(ts_ns)] = i
+
+        n_samples = len(timestamps)
+        resolution = "5min" if self._uses_5min_labels.get(tf) else "native"
+        print(f"     {tf}: {n_samples:,} labels ({resolution}, mmap) from {mmap_dir.name}/")
+
+        return True
+
+    def _get_price_sequence(self, cont_data: dict, window: int, row_idx: int) -> list:
+        """
+        Get price sequence for a given window and row index.
+
+        v5.9.6: Handles both pickle format (direct array) and mmap format (flattened + offsets).
+
+        Args:
+            cont_data: Continuation data dict for a timeframe
+            window: Window size (e.g., 10, 15, 20, ...)
+            row_idx: Row index in the labels
+
+        Returns:
+            List of price values, or empty list if not available
+        """
+        prefix = f'w{window}_'
+        direct_key = f'{prefix}price_sequence'
+
+        # Check if using mmap format (price_sequence is None sentinel)
+        if cont_data.get(direct_key) is None:
+            # Mmap format: reconstruct from flattened arrays
+            flat_key = f'{prefix}price_sequence_flat'
+            offsets_key = f'{prefix}price_sequence_offsets'
+
+            if flat_key not in cont_data or offsets_key not in cont_data:
+                return []
+
+            flat_arr = cont_data[flat_key]
+            offsets = cont_data[offsets_key]
+
+            start = int(offsets[row_idx])
+            end = int(offsets[row_idx + 1])
+
+            if start >= end:
+                return []
+
+            # Slice from mmap'd array and convert to list
+            return flat_arr[start:end].tolist()
+        else:
+            # Pickle format: direct array access
+            seq = cont_data[direct_key][row_idx]
+            if seq is None:
+                return []
+            return list(seq)
 
     def _load_transition_labels(self, labels_dir: str):
         """
         v5.2: Load per-timeframe transition labels from directory.
+
+        v5.9.6: First looks for mmap .npz files (shared across workers, saves RAM)
 
         Transition labels describe what happens AFTER a channel breaks:
         - transition_type: 0=continue, 1=switch_tf, 2=reverse, 3=sideways
@@ -1441,8 +1607,24 @@ class HierarchicalDataset(Dataset):
         print(f"\n  📂 Loading v5.2 transition labels from {labels_dir}...")
 
         loaded_count = 0
+        mmap_count = 0
         for tf in HIERARCHICAL_TIMEFRAMES:
-            # Look for label files matching pattern
+            # v5.9.6: First try mmap directories (preferred - truly shared across workers)
+            mmap_pattern = f"transition_labels_{tf}_*.mmap"
+            matching_mmap = [p for p in labels_path.glob(mmap_pattern) if p.is_dir()]
+
+            if matching_mmap:
+                mmap_file = sorted(matching_mmap)[-1]
+                try:
+                    loaded = self._load_transition_from_mmap(tf, mmap_file)
+                    if loaded:
+                        loaded_count += 1
+                        mmap_count += 1
+                        continue
+                except Exception as e:
+                    print(f"     ⚠️  Failed to load mmap for {tf}, falling back to pickle: {e}")
+
+            # Fall back to pickle files
             pattern = f"transition_labels_{tf}_*.pkl"
             matching_files = list(labels_path.glob(pattern))
 
@@ -1499,9 +1681,61 @@ class HierarchicalDataset(Dataset):
                 print(f"     ⚠️  Failed to load {tf} transition labels: {e}")
 
         if loaded_count > 0:
-            print(f"     ✓ Loaded transition labels for {loaded_count}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes")
+            mmap_info = f", {mmap_count} via mmap" if mmap_count > 0 else ""
+            print(f"     ✓ Loaded transition labels for {loaded_count}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes{mmap_info}")
         else:
             print(f"     ⚠️  No transition label files found in {labels_dir}")
+
+    def _load_transition_from_mmap(self, tf: str, mmap_dir: Path) -> bool:
+        """
+        Load transition labels from mmap directory with .npy files.
+
+        v5.9.6: Memory-mapped loading for multi-worker/multi-GPU efficiency.
+
+        Args:
+            tf: Timeframe name (e.g., '5min', '1h')
+            mmap_dir: Path to .mmap directory containing .npy files
+
+        Returns:
+            True if loaded successfully
+        """
+        # Helper to load mmap'd array if file exists
+        def load_mmap(name):
+            path = mmap_dir / f'{name}.npy'
+            if path.exists():
+                return np.load(path, mmap_mode='r')
+            return None
+
+        # Load required arrays
+        transition_type = load_mmap('transition_type')
+        if transition_type is None:
+            return False
+
+        self._per_tf_transition[tf] = {
+            'transition_type': transition_type,
+            'current_direction': load_mmap('current_direction'),
+            'new_direction': load_mmap('new_direction'),
+            'new_slope': load_mmap('new_slope'),
+        }
+
+        switch_to_tf = load_mmap('switch_to_tf')
+        if switch_to_tf is not None:
+            self._per_tf_transition[tf]['switch_to_tf'] = switch_to_tf
+
+        # Build timestamp lookup
+        timestamps = load_mmap('timestamps')
+        if timestamps is None:
+            return False
+
+        self._per_tf_trans_ts_to_idx[tf] = {}
+        for i, ts_ns in enumerate(timestamps):
+            self._per_tf_trans_ts_to_idx[tf][int(ts_ns)] = i
+
+        # Stats
+        type_counts = np.bincount(np.asarray(transition_type), minlength=4)
+        print(f"     {tf}: {len(timestamps):,} labels (mmap) | CONT:{type_counts[0]} SWITCH:{type_counts[1]} REV:{type_counts[2]} SIDE:{type_counts[3]}")
+
+        return True
 
     def get_label_mismatch_summary(self) -> dict:
         """

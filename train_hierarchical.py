@@ -4226,14 +4226,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 per_tf_highs = per_tf_preds['highs']  # [batch, 11]
                 per_tf_lows = per_tf_preds['lows']    # [batch, 11]
 
-                multi_tf_loss = 0.0
-                for i in range(11):  # 11 timeframes
-                    # MSE for each TF's high/low predictions
-                    tf_high_loss = F.mse_loss(per_tf_highs[:, i], target_tensor[:, 0], reduction='none')
-                    tf_low_loss = F.mse_loss(per_tf_lows[:, i], target_tensor[:, 1], reduction='none')
-                    # Weight by Gumbel-Softmax confidence (detached to not affect confidence learning)
-                    weight = tf_weights[:, i].detach()
-                    multi_tf_loss = multi_tf_loss + (weight * (tf_high_loss + tf_low_loss) / 2).mean()
+                # v5.9.6: Vectorized multi-TF loss (replaces loop over 11 TFs)
+                # Broadcast targets to [batch, 11]
+                target_highs = target_tensor[:, 0:1].expand(-1, 11)  # [batch, 11]
+                target_lows = target_tensor[:, 1:2].expand(-1, 11)   # [batch, 11]
+
+                # Compute MSE for all TFs in single operation
+                high_mse = (per_tf_highs - target_highs) ** 2  # [batch, 11]
+                low_mse = (per_tf_lows - target_lows) ** 2     # [batch, 11]
+
+                # Weighted average: weight by Gumbel-Softmax (detached), sum across TFs, mean across batch
+                multi_tf_loss = ((high_mse + low_mse) / 2 * tf_weights.detach()).sum(dim=1).mean()
 
                 # v5.7.2: Log weighted contribution so breakdown sums to total
                 multi_tf_contribution = 0.1 * multi_tf_loss
