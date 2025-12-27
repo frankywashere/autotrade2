@@ -477,27 +477,37 @@ def save_precomputed(
     np.save(indices_path, valid_indices)
     print(f"  Saved {indices_path.name} ({len(valid_indices):,} indices)")
 
-    # Save breakout labels
-    breakout_path = cache_dir / f"precomputed_breakout_{cache_key}.npz"
-    np.savez_compressed(breakout_path, **breakout_labels)
-    size_mb = breakout_path.stat().st_size / 1e6
-    print(f"  Saved {breakout_path.name} ({size_mb:.1f} MB)")
+    # v5.9.6: Save as individual .npy files for mmap sharing across workers
+    # Create directories for breakout and targets
+    breakout_dir = cache_dir / f"precomputed_breakout_{cache_key}.mmap"
+    targets_dir = cache_dir / f"precomputed_targets_{cache_key}.mmap"
+    breakout_dir.mkdir(parents=True, exist_ok=True)
+    targets_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save target arrays
-    targets_path = cache_dir / f"precomputed_targets_{cache_key}.npz"
-    np.savez_compressed(targets_path, **target_arrays)
-    size_mb = targets_path.stat().st_size / 1e6
-    print(f"  Saved {targets_path.name} ({size_mb:.1f} MB)")
+    # Save breakout labels as individual .npy files
+    breakout_size = 0
+    for key, arr in breakout_labels.items():
+        np.save(breakout_dir / f'{key}.npy', arr)
+        breakout_size += (breakout_dir / f'{key}.npy').stat().st_size
+    print(f"  Saved {breakout_dir.name}/ ({breakout_size/1e6:.1f} MB, {len(breakout_labels)} fields)")
+
+    # Save target arrays as individual .npy files
+    targets_size = 0
+    for key, arr in target_arrays.items():
+        np.save(targets_dir / f'{key}.npy', arr)
+        targets_size += (targets_dir / f'{key}.npy').stat().st_size
+    print(f"  Saved {targets_dir.name}/ ({targets_size/1e6:.1f} MB, {len(target_arrays)} fields)")
 
     # Save metadata
     meta = {
-        'version': '5.9.4',
+        'version': '5.9.6',
         'cache_key': cache_key,
         'n_samples': len(valid_indices),
         'n_breakout_fields': len(breakout_labels),
         'n_target_fields': len(target_arrays),
         'breakout_keys': list(breakout_labels.keys()),
         'target_keys': list(target_arrays.keys()),
+        'format': 'mmap_npy',  # v5.9.6: Individual .npy files for mmap
     }
     meta_path = cache_dir / f"precomputed_meta_{cache_key}.json"
     with open(meta_path, 'w') as f:
