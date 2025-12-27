@@ -652,10 +652,11 @@ class HierarchicalDataset(Dataset):
         # Get duration for first window (w10) as proxy for channel state
         # If any window shows near-break, include the sample
         boundary_indices = []
+        boundary_precomputed_map = []  # v5.9.6 fix: track original positions for precomputed lookup
 
-        for idx in self.valid_indices:
+        for original_pos, data_idx in enumerate(self.valid_indices):
             # Convert valid_indices (5min positions) to label lookup
-            ts_5min = int(self.tf_timestamps['5min'][idx])
+            ts_5min = int(self.tf_timestamps['5min'][data_idx])
 
             if ts_5min in self._per_tf_ts_to_idx.get('5min', {}):
                 label_idx = self._per_tf_ts_to_idx['5min'][ts_5min]
@@ -674,9 +675,11 @@ class HierarchicalDataset(Dataset):
                                 break
 
                 if is_boundary:
-                    boundary_indices.append(idx)
+                    boundary_indices.append(data_idx)
+                    boundary_precomputed_map.append(original_pos)
 
         self.valid_indices = boundary_indices
+        self._precomputed_idx_map = boundary_precomputed_map  # v5.9.6 fix: mapping for precomputed targets
         filtered_count = len(self.valid_indices)
         reduction_pct = (1 - filtered_count / original_count) * 100
 
@@ -896,15 +899,19 @@ class HierarchicalDataset(Dataset):
             past_prices=None  # Skip breakout detection - we'll use pre-computed
         )
 
+        # v5.9.6 fix: Map filtered idx back to original precomputed position
+        # When boundary sampling is active, idx doesn't match precomputed array indices
+        precomputed_idx = self._precomputed_idx_map[idx] if hasattr(self, '_precomputed_idx_map') else idx
+
         # Override with pre-computed breakout labels (Fix #1 - no linear regression)
         for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
             if key in self._precomputed_breakout:
-                targets[key] = float(self._precomputed_breakout[key][idx])
+                targets[key] = float(self._precomputed_breakout[key][precomputed_idx])
 
         # Add continuation and transition labels from pre-computed arrays (Fix #3)
         for key, arr in self._precomputed_targets.items():
             if key.startswith('cont_') or key.startswith('trans_'):
-                targets[key] = float(arr[idx])
+                targets[key] = float(arr[precomputed_idx])
 
         # v5.2: Get VIX sequence for this sample (still computed per-sample)
         vix_seq = None
