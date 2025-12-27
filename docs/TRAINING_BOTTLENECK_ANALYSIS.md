@@ -1,21 +1,14 @@
 # Training Pipeline Bottleneck Analysis
 
 **Date:** 2025-12-26
-**Version:** v5.9.5
+**Version:** v5.9.6
 **Author:** Claude Code Analysis
 
 ---
 
 ## Executive Summary
 
-The training pipeline has **severe CPU bottlenecks** in the data loading path. The primary issue is that `__getitem__` performs **heavy computation per sample** including linear regression, trade simulation, and massive dict construction - work that should be pre-computed once and cached.
-
-**Key findings:**
-- `__getitem__` takes 1-2ms per sample (should be <0.1ms)
-- Linear regression runs for every single sample
-- 2,223 dictionary insertions per sample for targets
-- ThreadPoolExecutor is GIL-blocked (no parallel speedup)
-- GPU is starving for data
+The training pipeline has been **significantly optimized** through targeted fixes to data loading and loss calculation bottlenecks.
 
 **v5.9.4 Fixes Applied:**
 | Fix | Problem | Status | Speedup |
@@ -29,10 +22,87 @@ The training pipeline has **severe CPU bottlenecks** in the data loading path. T
 |-----|---------|--------|---------|
 | Batched collate tensor creation | 64,832 torch.tensor() calls/batch (~12s) | ✅ FIXED | ~12s → ~0.2s/batch |
 
+**v5.9.6 Fixes Applied:**
+| Fix | Problem | Status | Speedup |
+|-----|---------|--------|---------|
+| Vectorized loss calculation | 20,000+ loop iterations per batch | ✅ FIXED | 5700ms → 700ms (8x) |
+| Memory-mapped label loading | 2.3 GB copied per worker | ✅ FIXED | ~18 GB RAM saved (8 workers) |
+| Label generation NaN bug | Invalid price_sequence data | ✅ FIXED | Data integrity |
+| Single-GPU sampler epoch | ShuffleBufferSampler epoch not updated | ✅ FIXED | Better convergence |
+
+**Current Performance (v5.9.6):**
+```
+Total time per batch: ~7.2s (down from ~12.5s in v5.9.3)
+├── data:     140ms (2%)
+├── forward: 1240ms (17%)
+├── loss:     700ms (10%) ← Was 5700ms before v5.9.6!
+├── backward: 5000ms (69%) ← Now the main bottleneck
+└── optimizer: 65ms (1%)
+```
+
 **To enable pre-computed targets:**
 ```bash
 python -m src.ml.precompute_targets --cache-dir data/feature_cache
 ```
+
+---
+
+## Top 3 Remaining Optimizations
+
+Based on current timing (v5.9.6), ranked by impact:
+
+### 1. Backward Pass Optimization (5000ms, 69% of batch time)
+
+**Problem:** Computing gradients through the complex loss calculation graph takes 5 seconds.
+
+**Current architecture issues:**
+- Multi-TF loss loops (11 timeframes)
+- Validity/transition losses with per-TF masking
+- Large computation graph from geometric predictions
+
+**Potential fixes:**
+- **Model architecture simplification** - Reduce computation graph complexity
+- **Gradient checkpointing** - Trade compute for memory, may help with large graphs
+- **Mixed precision training** - Use AMP (currently disabled, was using TF32)
+- **Reduce loss components** - Remove or simplify low-impact losses
+
+**Expected speedup:** 20-40% (5000ms → 3000-4000ms)
+**Effort:** High (requires architectural changes)
+
+### 2. Forward Pass Optimization (1240ms, 17% of batch time)
+
+**Problem:** Model forward pass through 11 hierarchical timeframe layers.
+
+**Current architecture:**
+- 11 separate LSTM/GRU layers (one per timeframe)
+- Geometric prediction heads per TF
+- Compositor networks
+- VIX CfC integration
+
+**Potential fixes:**
+- **torch.compile()** - JIT compilation (already supported via `--use-compile`)
+- **Reduce hidden_size** - Currently 128, try 96 or 64
+- **Simplify geometric heads** - Fewer projection calculations
+- **Profile which layers are slowest** - Target specific bottlenecks
+
+**Expected speedup:** 10-20% (1240ms → 1000-1100ms)
+**Effort:** Medium
+
+### 3. Data Loading (140ms, 2% of batch time)
+
+**Problem:** Already very fast, but could be faster with more workers.
+
+**Current limitation:**
+- `num_workers=0` (single-threaded) due to MPS device
+- With mmap labels, multi-worker is now RAM-efficient
+
+**Potential fixes:**
+- **Enable workers on CPU-only setup** - Test if mmap sharing works
+- **Increase to 2-4 workers** - Should reduce data time to ~50-70ms
+- **Pre-fetch batches** - Use `prefetch_factor=2` in DataLoader
+
+**Expected speedup:** 50% (140ms → 70ms)
+**Effort:** Low (just enable workers, test RAM usage)
 
 ---
 
@@ -295,15 +365,40 @@ else:
 
 ## 7. Memory-Mapping vs Preloading
 
+### Status: **OPTIMIZED in v5.9.6**
+
 ### Current file sizes in `data/feature_cache/`:
 
-| File Type | Count | Total Size | Default Loading |
-|-----------|-------|-----------|-----------------|
-| TF sequences | 11 | 3.2 GB | mmap |
-| TF timestamps | 11 | 6 MB | mmap |
-| Continuation labels | 11 | 2.3 GB | RAM (pickle) |
-| Transition labels | 11 | 30 MB | RAM (pickle) |
-| Non-channel features | 1 | 1.2 GB | RAM (pickle) |
+| File Type | Count | Total Size | v5.9.6 Loading | Shared across workers? |
+|-----------|-------|-----------|----------------|------------------------|
+| TF sequences | 11 | 3.2 GB | mmap or RAM (user choice) | ✅ Yes (if mmap) |
+| TF timestamps | 11 | 6 MB | mmap | ✅ Yes |
+| Continuation labels | 11 | ~800 MB | **mmap (.mmap/ dirs)** | ✅ Yes (auto-converts) |
+| Transition labels | 11 | ~22 MB | **mmap (.mmap/ dirs)** | ✅ Yes (auto-converts) |
+| Precomputed targets | 2 | ~17 MB | **mmap (.npz)** | ✅ Yes |
+| Non-channel features | 1 | 1.2 GB | Deleted (not used in native TF) | N/A |
+
+### RAM Usage Comparison (4 workers × 2 GPUs = 8 processes):
+
+| Component | Before v5.9.6 | After v5.9.6 | Saved |
+|-----------|---------------|--------------|-------|
+| Continuation labels | 2.3 GB × 8 = 18.4 GB | 2.3 GB (shared) | ~16 GB |
+| Transition labels | 30 MB × 8 = 240 MB | 30 MB (shared) | ~210 MB |
+| Precomputed targets | 17 MB × 8 = 136 MB | 17 MB (shared) | ~120 MB |
+| **Total** | **~18.8 GB** | **~2.4 GB** | **~16.4 GB** |
+
+### Auto-Conversion System (v5.9.6):
+
+When pickle files are loaded (first time or after regeneration):
+1. Dataset loads from pickle
+2. Synchronously converts pickle → `.mmap/` directory with individual `.npy` files
+3. Reloads from mmap for current run
+4. Future runs use mmap directly (skip pickle)
+
+**Benefits:**
+- No manual conversion needed
+- Current training run gets RAM savings
+- mmap files shared via OS page cache across all workers
 
 ### The `ascontiguousarray` - NOT a bottleneck (verified 2025-12-26):
 
@@ -397,18 +492,30 @@ if _collate_elapsed > 1.0:
 
 ---
 
-## 10. Bottleneck Priority Ranking
+## 10. Bottleneck Priority Ranking (v5.9.6 Updated)
+
+### Completed Fixes:
 
 | Rank | Bottleneck | Location | Impact | Status |
 |------|-----------|----------|--------|--------|
-| **1** | Linear regression per sample | :1883-1892 | **20-30% of __getitem__** | **FIXED v5.9.4** |
-| **2** | 2,223 dict insertions per sample | :849-963 | **20-30% of __getitem__** | **FIXED v5.9.4** |
-| **3** | 64K `torch.tensor()` per batch | train:452-467 | **~12s per batch** | **FIXED v5.9.5** |
-| **4** | 11× `searchsorted()` (orphaned precompute) | :754 | **5-10% of __getitem__** | Open |
-| **5** | ThreadPool GIL blocking | train:759 | RollingBuffer doesn't scale | Open |
-| **6** | DDP bypasses ShuffleBufferSampler | train:3647 | More random I/O | **FIXED v5.9.4** |
-| **7** | Worker memory multiplication | train:3401 | RAM bloat, cache thrashing | Open |
-| ~~8~~ | ~~11× `ascontiguousarray()` copies~~ | ~~:762~~ | ~~25-35% of __getitem__~~ | **NOT AN ISSUE** (8/11 TFs already contiguous) |
+| **1** | Nested Python loops in loss | train:4355-4480 | **5700ms → 700ms** | **FIXED v5.9.6** |
+| **2** | Linear regression per sample | dataset:1883-1892 | **20-30% of __getitem__** | **FIXED v5.9.4** |
+| **3** | 2,223 dict insertions per sample | dataset:849-963 | **20-30% of __getitem__** | **FIXED v5.9.4** |
+| **4** | 64K `torch.tensor()` per batch | train:452-467 | **~12s per batch** | **FIXED v5.9.5** |
+| **5** | DDP bypasses ShuffleBufferSampler | train:3647 | More random I/O | **FIXED v5.9.4** |
+| **6** | Worker memory multiplication | dataset init | 2.3 GB × workers | **FIXED v5.9.6** (mmap) |
+| **7** | Single-GPU sampler epoch bug | train:4040 | Same shuffle/epoch | **FIXED v5.9.6** |
+
+### Remaining Bottlenecks:
+
+| Rank | Bottleneck | Location | Impact | Effort |
+|------|-----------|----------|--------|--------|
+| **1** | Backward pass | train:4577 | **5000ms (69%)** | High - Model redesign |
+| **2** | Forward pass | train:4180 | **1240ms (17%)** | Medium - torch.compile or profile |
+| **3** | Data loading | Single-threaded | **140ms (2%)** | Low - Enable workers |
+| ~~4~~ | ~~11× `searchsorted()`~~ | ~~dataset:754~~ | ~~Minimal now~~ | Negligible with preload |
+| ~~5~~ | ~~ThreadPool GIL~~ | ~~train:759~~ | ~~No longer used~~ | Deprecated |
+| ~~6~~ | ~~`ascontiguousarray()`~~ | ~~dataset:762~~ | ~~No-op for 8/11 TFs~~ | **NOT AN ISSUE** |
 
 ### Fix #1 + #3: Pre-computed Targets (v5.9.4)
 
@@ -441,11 +548,72 @@ This only affects samples where price is completely flat (std ≈ 0), which is r
 
 ---
 
-## 11. Data Size Summary
+## 10. Loss Calculation Vectorization (v5.9.6)
+
+### Location: `train_hierarchical.py:4355-4493`
+
+### Problem:
+
+The loss calculation had **massive nested Python loops** creating tensors inside:
+
+```python
+# Original (v5.9.5 and earlier):
+for sample_idx in range(batch_size):        # 128 iterations
+    for win_idx, window in enumerate(WINDOWS):  # 14 iterations
+        for tf in timeframes:                    # 11 iterations
+            # Individual tensor creation:
+            target_hit_upper_t = torch.tensor(hit_upper_target, device=device)  # SLOW!
+            hit_loss = F.binary_cross_entropy(
+                hit_prob_upper_pred[sample_idx:sample_idx+1], ...  # Per-sample call
+            )
+```
+
+**Total operations per batch:**
+- 128 samples × 14 windows × 11 TFs = ~20,000 loop iterations
+- ~20,000 `torch.tensor()` calls
+- ~20,000 `F.binary_cross_entropy()` calls
+
+**Time:** 5700ms per batch (45% of total iteration time)
+
+### Fix:
+
+Vectorized to batched tensor operations:
+
+```python
+# Vectorized (v5.9.6):
+# Phase 1: Pre-gather all targets into [batch, num_windows] tensors
+validity_mask = torch.stack(validity_list, dim=1)  # [128, 14]
+hit_upper_targets = torch.stack(hit_upper_list, dim=1)  # [128, 14]
+
+# Phase 2: Batched weighted blend
+valid_weights = window_weights * validity_mask.float()  # [128, 14]
+normalized_weights = valid_weights / total_weight  # [128, 14]
+blended_hit_upper = (normalized_weights * hit_upper_targets).sum(dim=1)  # [128]
+
+# Phase 3: Single batched BCE call (instead of 128 individual calls)
+bce_upper = F.binary_cross_entropy(hit_prob_upper_pred, blended_hit_upper, reduction='none')
+```
+
+**Result:**
+- 20,000 operations → ~30 tensor operations per TF
+- **5700ms → 700ms (8x speedup)**
+- Backward pass also improved slightly (less computation graph)
+
+### Impact on training:
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Loss calculation | 5700ms | 700ms | 87% faster |
+| Total batch time | ~12,500ms | ~7,200ms | 42% faster |
+| Epoch time (2,375 batches) | ~8.2 hours | ~4.8 hours | **3.4 hours saved** |
+
+---
+
+## 11. Data Size Summary (v5.9.6)
 
 ```
-Feature Cache Total: ~6.5 GB
-├── TF Sequences (11 files)
+Feature Cache Total: ~5.1 GB (down from ~6.5 GB after cleanup)
+├── TF Sequences (11 files)          3.2 GB
 │   ├── tf_sequence_5min_*.npy      1.7 GB
 │   ├── tf_sequence_15min_*.npy     618 MB
 │   ├── tf_sequence_30min_*.npy     326 MB
@@ -460,20 +628,29 @@ Feature Cache Total: ~6.5 GB
 │
 ├── TF Timestamps (11 files)         ~6 MB total
 │
-├── Continuation Labels (11 files)   ~2.3 GB total
-│   └── continuation_labels_5min_*.pkl  1.2 GB (largest)
+├── Continuation Labels (11 .mmap/ dirs + 11 .pkl)   ~3.1 GB
+│   ├── *.mmap/ directories         ~800 MB (used at runtime)
+│   └── *.pkl files                 ~2.3 GB (source, kept for flexibility)
 │
-├── Transition Labels (11 files)     ~30 MB total
+├── Transition Labels (10 .mmap/ dirs + 10 .pkl)     ~52 MB
+│   ├── *.mmap/ directories         ~22 MB (used at runtime)
+│   └── *.pkl files                 ~30 MB (source, kept for flexibility)
 │
-├── Non-channel Features             1.2 GB
+├── Precomputed Targets              ~17 MB
+│   ├── precomputed_breakout_*.npz   382 KB
+│   ├── precomputed_targets_*.npz    16.8 MB
+│   └── precomputed_valid_indices_*.npy  small
 │
-└── Orphaned Files
-    └── aligned_indices_*.npz        1.5 MB (UNUSED)
+└── Metadata
+    ├── tf_meta_*.json               small
+    └── cache_manifest_*.json        small
 
-Training Samples: ~1.4 million
-Batch Size: typically 256
-Batches per Epoch: ~5,500
+Training Samples: ~417,430 (after warmup)
+Batch Size: 128
+Batches per Epoch: ~2,375
 ```
+
+**Note:** Non-channel features (1.2 GB) deleted in v5.9.6 - not used in native TF mode.
 
 ---
 
@@ -514,43 +691,47 @@ Check `logs/memory_debug.log` for RAM snapshots (enabled via interactive menu).
 
 ---
 
-## 13. Recommendations
+## 13. Recommendations (v5.9.6 Updated)
 
-### High Priority (Pre-computation)
+### ✅ Completed Optimizations:
 
 1. ~~**Pre-compute breakout labels**~~ - ✅ **FIXED v5.9.4**
-   - Now in `src/ml/precompute_targets.py`
-   - `__getitem__` does simple array lookup via `_getitem_precomputed_path()`
+2. ~~**Pre-stack target tensors**~~ - ✅ **FIXED v5.9.4**
+3. ~~**Batched collate tensor creation**~~ - ✅ **FIXED v5.9.5**
+4. ~~**DDP-compatible ShuffleBufferSampler**~~ - ✅ **FIXED v5.9.4**
+5. ~~**Vectorize loss calculation**~~ - ✅ **FIXED v5.9.6**
+6. ~~**Memory-mapped labels**~~ - ✅ **FIXED v5.9.6**
+7. ~~**Single-GPU sampler epoch**~~ - ✅ **FIXED v5.9.6**
 
-2. **Pre-compute trade simulation results** - `_check_target_sequence` and `_simulate_trade_execution`
-   - Results are deterministic given future prices
-   - Should be part of label generation, not runtime
+### High Priority (Model Architecture)
 
-3. **Use the orphaned aligned_indices** - Integrate the precomputed index alignments
-   - Eliminates 11 `np.searchsorted()` calls per sample
+1. **Backward pass optimization** - 5000ms (69% of batch time)
+   - Requires model architecture changes to reduce computation graph
+   - Options: Simplify loss components, reduce hidden size, gradient checkpointing
+   - Expected speedup: 20-40%
+   - Effort: High
 
-### Medium Priority (Memory Layout)
+### Medium Priority (Inference Optimization)
 
-4. ~~**Pre-stack target tensors**~~ - ✅ **FIXED v5.9.4**
-   - Now uses dict of pre-computed arrays (Option B)
-   - `__getitem__` builds targets dict from array lookups: `targets[key] = float(arr[idx])`
-   - Eliminates 2,223 dict insertions per sample
+2. **Forward pass optimization** - 1240ms (17% of batch time)
+   - Enable `torch.compile()` for JIT compilation
+   - Profile specific layers to find bottlenecks
+   - Consider reducing hidden_size from 128 to 96
+   - Expected speedup: 10-20%
+   - Effort: Medium
 
-5. ~~**Eliminate per-sample ascontiguousarray**~~ - **NOT AN ISSUE** (verified 2025-12-26)
-   - Profiling showed 8/11 TF slices are already C-contiguous (no-op)
-   - Only weekly/monthly/3month need copies (tiny arrays: 8-20 bars)
-   - Total overhead: ~10-20μs - not worth optimizing
+### Low Priority (Already Fast)
 
-### Low Priority (Architecture)
+3. **Data loading** - 140ms (2% of batch time)
+   - Enable DataLoader workers (test with mmap labels)
+   - Increase from 0 → 2-4 workers
+   - Expected speedup: 50% (140ms → 70ms)
+   - Effort: Low
+   - **Note:** Currently using num_workers=0 due to MPS device
 
-6. **Replace ThreadPoolExecutor with ProcessPoolExecutor** in RollingBufferBatchLoader
-   - Or use standard DataLoader multiprocessing
-
-7. ~~**Create DDP-compatible ShuffleBufferSampler**~~ - ✅ **FIXED v5.9.4**
-   - `DistributedShuffleBufferSampler` class added
-   - Maintains sequential chunk access patterns in multi-GPU
-
-8. **Reduce target dict size** - Do you need all 14 windows × 14 fields at training time?
+4. ~~**Eliminate per-sample ascontiguousarray**~~ - **NOT AN ISSUE**
+5. ~~**Use orphaned aligned_indices**~~ - **Negligible** (with preload to RAM)
+6. ~~**Replace ThreadPoolExecutor**~~ - **Deprecated** (RollingBuffer not used)
 
 ---
 
@@ -563,43 +744,34 @@ def __getitem__(self, idx):
     # O(1) array lookup, ~10μs
 ```
 
-### Current `__getitem__` (v5.9.3 and earlier):
-```python
-def __getitem__(self, idx):
-    # O(n) operations per sample:
-
-    for tf in 11_timeframes:
-        searchsorted()           # O(log n)
-        slice_array()            # O(1)
-        ascontiguousarray()      # no-op for 8/11 TFs (already contiguous)
-
-    linear_regression()          # O(60) numpy math  ← FIXED v5.9.4
-    simulate_trade()             # O(horizon) loop
-
-    for tf in 11_timeframes:
-        for window in 14_windows:
-            for field in 14_fields:
-                targets[key] = value  # Python dict insertion  ← FIXED v5.9.4
-
-    return features_dict, targets_dict
-    # ~1-2ms per sample
-```
-
-### After v5.9.4 (with pre-computed data):
+### Current `__getitem__` (v5.9.6 with all optimizations):
 ```python
 def __getitem__(self, idx):
     for tf in 11_timeframes:
-        searchsorted()           # O(log n) - still needed
-        slice_array()            # O(1)
+        searchsorted()           # O(log n) - negligible with RAM preload
+        slice_array()            # O(1) - mmap'd arrays
         ascontiguousarray()      # no-op for 8/11 TFs (verified)
 
-    # Fast path: array lookups instead of computation
+    # Fast path: array lookups from mmap'd precomputed targets
     targets = {k: float(arr[idx]) for k, arr in precomputed_arrays.items()}
     # O(1) per field, ~200-400μs total
 
     return features_dict, targets_dict
-    # ~400-700μs per sample (~50-65% improvement)
+    # ~400-700μs per sample (data loading is no longer a bottleneck)
 ```
+
+### Training loop timing (v5.9.6):
+```python
+for batch in dataloader:
+    data_load()      # 140ms - Fast ✅
+    forward()        # 1240ms - Medium
+    loss_calc()      # 700ms - Optimized ✅ (was 5700ms)
+    backward()       # 5000ms - BOTTLENECK ❌
+    optimizer()      # 65ms - Fast ✅
+# Total: ~7200ms per batch
+```
+
+**Key insight:** Data loading pipeline is now well-optimized. Further speedups require model architecture changes to reduce backward pass complexity.
 
 ---
 

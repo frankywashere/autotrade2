@@ -4036,7 +4036,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         if prestack_loader is not None:
             # v5.3.2: PreStackedBatchLoader handles its own shuffling
             prestack_loader.set_epoch(epoch)
-        elif is_distributed and train_sampler is not None:
+        elif train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
+            # v5.9.6: Call set_epoch for any sampler (single or multi-GPU)
             train_sampler.set_epoch(epoch)
 
         # v5.3.2: DDP barrier - ensure all ranks finish pre-stacking before training
