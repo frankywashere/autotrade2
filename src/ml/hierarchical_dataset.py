@@ -1133,18 +1133,30 @@ class HierarchicalDataset(Dataset):
                         targets[f'cont_{tf}_gain'] = float(cont_data['max_gain_pct'][row_idx])
 
                         # v5.9: Load all window data including price sequences and hit tracking
+                        # v5.9.6: Track best window for TF-level duration target
+                        best_duration = 0.0
+                        best_confidence = 0.0
+
                         for window in config.CHANNEL_WINDOW_SIZES:
                             if f'w{window}_valid' in cont_data:
                                 is_valid = cont_data[f'w{window}_valid'][row_idx] > 0
                                 if is_valid:
-                                    targets[f'cont_{tf}_w{window}_duration'] = float(cont_data[f'w{window}_duration'][row_idx])
+                                    duration = float(cont_data[f'w{window}_duration'][row_idx])
+                                    confidence = float(cont_data[f'w{window}_confidence'][row_idx])
+
+                                    targets[f'cont_{tf}_w{window}_duration'] = duration
                                     # v5.9.6: Use helper for mmap compatibility
                                     targets[f'cont_{tf}_w{window}_price_sequence'] = self._get_price_sequence(cont_data, window, row_idx)
                                     targets[f'cont_{tf}_w{window}_hit_upper'] = float(cont_data[f'w{window}_hit_upper'][row_idx])
                                     targets[f'cont_{tf}_w{window}_hit_midline'] = float(cont_data[f'w{window}_hit_midline'][row_idx])
                                     targets[f'cont_{tf}_w{window}_hit_lower'] = float(cont_data[f'w{window}_hit_lower'][row_idx])
-                                    targets[f'cont_{tf}_w{window}_confidence'] = float(cont_data[f'w{window}_confidence'][row_idx])
+                                    targets[f'cont_{tf}_w{window}_confidence'] = confidence
                                     targets[f'cont_{tf}_w{window}_valid'] = 1.0
+
+                                    # Track best window for TF-level duration
+                                    if confidence > best_confidence:
+                                        best_confidence = confidence
+                                        best_duration = duration
                                 else:
                                     # Window invalid - use placeholder (must set ALL keys for collate)
                                     targets[f'cont_{tf}_w{window}_duration'] = 0.0
@@ -1163,6 +1175,9 @@ class HierarchicalDataset(Dataset):
                                 targets[f'cont_{tf}_w{window}_hit_lower'] = 0.0
                                 targets[f'cont_{tf}_w{window}_confidence'] = 0.0
                                 targets[f'cont_{tf}_w{window}_valid'] = 0.0
+
+                        # v5.9.6: Set TF-level duration from best window
+                        targets[f'cont_{tf}_duration'] = best_duration
 
                         # Mark TF as having at least some valid windows
                         targets[f'cont_{tf}_valid'] = 1.0

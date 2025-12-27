@@ -365,6 +365,7 @@ def precompute_target_arrays(
     for tf in HIERARCHICAL_TIMEFRAMES:
         target_arrays[f'cont_{tf}_gain'] = np.zeros(n_samples, dtype=np.float32)
         target_arrays[f'cont_{tf}_valid'] = np.zeros(n_samples, dtype=np.float32)
+        target_arrays[f'cont_{tf}_duration'] = np.zeros(n_samples, dtype=np.float32)  # v5.9.6: TF-level duration
 
         for window in windows:
             for field in cont_fields:
@@ -420,16 +421,37 @@ def precompute_target_arrays(
                 target_arrays[f'cont_{tf}_gain'][i] = float(cont_df['max_gain_pct'].iloc[row_idx])
             target_arrays[f'cont_{tf}_valid'][i] = 1.0
 
-            # Window-level fields
+            # Window-level fields + track best window for TF-level duration
+            best_duration = 0.0
+            best_confidence = 0.0
+
             for window in windows:
                 valid_col = f'w{window}_valid'
                 if valid_col in cont_df.columns and cont_df[valid_col].iloc[row_idx] > 0:
                     target_arrays[f'cont_{tf}_w{window}_valid'][i] = 1.0
 
+                    duration = 0.0
+                    confidence = 0.5
+
                     for field in ['duration', 'hit_upper', 'hit_midline', 'hit_lower', 'confidence']:
                         col = f'w{window}_{field}'
                         if col in cont_df.columns:
-                            target_arrays[f'cont_{tf}_w{window}_{field}'][i] = float(cont_df[col].iloc[row_idx])
+                            value = float(cont_df[col].iloc[row_idx])
+                            target_arrays[f'cont_{tf}_w{window}_{field}'][i] = value
+
+                            # Track for best window selection
+                            if field == 'duration':
+                                duration = value
+                            elif field == 'confidence':
+                                confidence = value
+
+                    # Update best window if this has higher confidence
+                    if confidence > best_confidence:
+                        best_confidence = confidence
+                        best_duration = duration
+
+            # v5.9.6: Set TF-level duration from best window
+            target_arrays[f'cont_{tf}_duration'][i] = best_duration
 
         # Fill transition labels for each TF
         for tf in HIERARCHICAL_TIMEFRAMES:
