@@ -653,17 +653,17 @@ class HierarchicalDataset(Dataset):
                     print(f"        Run: python -m src.ml.precompute_targets --cache-dir {cache_dir}")
                     return
 
-                # Load breakout labels
-                print(f"     📦 Loading pre-computed breakout labels...")
-                breakout_data = dict(np.load(breakout_path))
+                # Load breakout labels (v5.9.6: mmap for shared access across workers)
+                print(f"     📦 Loading pre-computed breakout labels (mmap)...")
+                breakout_data = np.load(breakout_path, mmap_mode='r')
                 self._precomputed_breakout = breakout_data
-                print(f"        Loaded {len(breakout_data)} breakout fields")
+                print(f"        Loaded {len(breakout_data)} breakout fields (shared via mmap)")
 
-                # Load target arrays
-                print(f"     📦 Loading pre-computed target arrays...")
-                targets_data = dict(np.load(targets_path))
+                # Load target arrays (v5.9.6: mmap for shared access across workers)
+                print(f"     📦 Loading pre-computed target arrays (mmap)...")
+                targets_data = np.load(targets_path, mmap_mode='r')
                 self._precomputed_targets = targets_data
-                print(f"        Loaded {len(targets_data)} target fields")
+                print(f"        Loaded {len(targets_data)} target fields (shared via mmap)")
 
                 self._use_precomputed = True
                 print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled)")
@@ -1362,8 +1362,9 @@ class HierarchicalDataset(Dataset):
                 except Exception as e:
                     print(f"     ⚠️  Failed to load mmap for {tf}, falling back to pickle: {e}")
 
-            # Fall back to pickle files
+            # Fall back to pickle files (and auto-convert to mmap for next time)
             self._uses_mmap_labels[tf] = False
+            pkl_file = None
 
             # v5.4: First try 5min-resolution labels (preferred)
             pattern_5min = f"continuation_labels_5min_{tf}_*.pkl"
@@ -1442,6 +1443,19 @@ class HierarchicalDataset(Dataset):
                     print(f"     {tf}: {len(labels_df):,} labels ({resolution}) from {label_file.name}")
                     if valid_window_counts:
                         print(f"          Windows: {', '.join(valid_window_counts[:5])}{'...' if len(valid_window_counts) > 5 else ''}")
+
+                    # v5.9.6: Auto-convert to mmap NOW (so this run benefits from shared memory)
+                    mmap_dir = self._convert_to_mmap_sync(label_file, labels_path)
+                    if mmap_dir and mmap_dir.exists():
+                        # Reload from mmap to get shared memory benefits NOW
+                        print(f"     🔄 Reloading {tf} from mmap for shared memory...")
+                        try:
+                            loaded = self._load_continuation_from_mmap(tf, mmap_dir)
+                            if loaded:
+                                mmap_count += 1
+                                self._uses_mmap_labels[tf] = True
+                        except Exception as e:
+                            print(f"     ⚠️  Mmap reload failed, using pickle data: {e}")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to load {tf} labels: {e}")
@@ -1536,6 +1550,72 @@ class HierarchicalDataset(Dataset):
         print(f"     {tf}: {n_samples:,} labels ({resolution}, mmap) from {mmap_dir.name}/")
 
         return True
+
+    def _convert_to_mmap_sync(self, pkl_path: Path, output_dir: Path) -> Path:
+        """
+        Auto-convert pickle file to mmap format synchronously.
+
+        v5.9.6: Converts pickle → mmap immediately so current training run benefits
+        from shared memory across workers.
+
+        Args:
+            pkl_path: Path to source .pkl file
+            output_dir: Directory to write .mmap/ folder
+
+        Returns:
+            Path to .mmap/ directory if successful, None otherwise
+        """
+        import subprocess
+        import sys
+
+        # Check if mmap already exists
+        output_name = pkl_path.stem + ".mmap"
+        output_path = output_dir / output_name
+
+        if output_path.exists():
+            return output_path  # Already converted
+
+        try:
+            # Use the conversion script
+            script_path = Path(__file__).parent.parent.parent / "tools" / "convert_labels_to_mmap.py"
+            if not script_path.exists():
+                return None  # Script not found, skip auto-conversion
+
+            print(f"     🔧 Converting {pkl_path.name} to mmap format...")
+
+            # Run conversion in subprocess (blocking)
+            # Only convert this one file
+            import tempfile
+            import shutil
+
+            # Create a temp directory to isolate conversion
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir_path = Path(tmpdir)
+                tmp_pkl = tmpdir_path / pkl_path.name
+
+                # Copy file to temp
+                shutil.copy2(pkl_path, tmp_pkl)
+
+                # Run conversion on temp file
+                result = subprocess.run(
+                    [sys.executable, str(script_path), "--labels-dir", str(tmpdir)],
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5 min timeout
+                )
+
+                # Move converted directory back
+                converted_dir = tmpdir_path / output_name
+                if converted_dir.exists():
+                    shutil.move(str(converted_dir), str(output_path))
+                    print(f"     ✓ Converted to mmap: {output_path.name}/")
+                    return output_path
+                else:
+                    print(f"     ⚠️  Conversion failed (no output directory)")
+                    return None
+        except Exception as e:
+            print(f"     ⚠️  Conversion failed: {e}")
+            return None
 
     def _get_price_sequence(self, cont_data: dict, window: int, row_idx: int) -> list:
         """
@@ -1676,6 +1756,18 @@ class HierarchicalDataset(Dataset):
                     # Stats
                     type_counts = np.bincount(self._per_tf_transition[tf]['transition_type'], minlength=4)
                     print(f"     {tf}: {len(labels_df):,} labels | CONT:{type_counts[0]} SWITCH:{type_counts[1]} REV:{type_counts[2]} SIDE:{type_counts[3]}")
+
+                    # v5.9.6: Auto-convert to mmap NOW (so this run benefits from shared memory)
+                    mmap_dir = self._convert_to_mmap_sync(label_file, labels_path)
+                    if mmap_dir and mmap_dir.exists():
+                        # Reload from mmap to get shared memory benefits NOW
+                        print(f"     🔄 Reloading {tf} from mmap for shared memory...")
+                        try:
+                            loaded = self._load_transition_from_mmap(tf, mmap_dir)
+                            if loaded:
+                                mmap_count += 1
+                        except Exception as e:
+                            print(f"     ⚠️  Mmap reload failed, using pickle data: {e}")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to load {tf} transition labels: {e}")
