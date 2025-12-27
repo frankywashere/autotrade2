@@ -85,21 +85,21 @@ def flatten_price_sequences(series: pd.Series, dtype=np.float32, strict: bool = 
 
 def convert_continuation_labels(pkl_path: Path, output_dir: Path, force: bool = False) -> bool:
     """
-    Convert a continuation labels pickle file to mmap format.
+    Convert a continuation labels pickle file to uncompressed npz format.
 
-    Output structure (directory with .npy files):
-        - timestamps.npy: int64 array of nanosecond timestamps
-        - max_gain_pct.npy: float32 array
-        - w{window}_duration.npy: float32 array per window
-        - w{window}_hit_upper.npy: float32 array per window
+    Output: Single UNCOMPRESSED .npz file (mmap-able, single file handle)
+        - timestamps: int64 array of nanosecond timestamps
+        - max_gain_pct: float32 array
+        - w{window}_duration: float32 array per window
+        - w{window}_hit_upper: float32 array per window
         - ... (other window columns)
-        - w{window}_price_sequence_flat.npy: float32 array (flattened)
-        - w{window}_price_sequence_offsets.npy: int64 array
-        - w{window}_price_sequence_lengths.npy: int32 array
+        - w{window}_price_sequence_flat: float32 array (flattened)
+        - w{window}_price_sequence_offsets: int64 array
+        - w{window}_price_sequence_lengths: int32 array
     """
-    # Determine output directory
-    # continuation_labels_5min_v5.9.1_xxx.pkl -> continuation_labels_5min_v5.9.1_xxx.mmap/
-    output_name = pkl_path.stem + ".mmap"
+    # Determine output filename
+    # continuation_labels_5min_v5.9.1_xxx.pkl -> continuation_labels_5min_v5.9.1_xxx.npz
+    output_name = pkl_path.stem + ".npz"
     output_path = output_dir / output_name
 
     if output_path.exists() and not force:
@@ -116,21 +116,15 @@ def convert_continuation_labels(pkl_path: Path, output_dir: Path, force: bool = 
         print(f"    ⚠️  Invalid DataFrame, skipping")
         return False
 
-    # Create output directory
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    total_size = 0
+    # Build arrays dict for npz
+    arrays = {}
 
     # Store timestamps from index as int64 nanoseconds
-    timestamps = pd.to_datetime(df.index).astype(np.int64)
-    np.save(output_path / 'timestamps.npy', timestamps)
-    total_size += (output_path / 'timestamps.npy').stat().st_size
+    arrays['timestamps'] = pd.to_datetime(df.index).astype(np.int64).values
 
     # Store max_gain_pct
     if 'max_gain_pct' in df.columns:
-        arr = df['max_gain_pct'].values.astype(np.float32)
-        np.save(output_path / 'max_gain_pct.npy', arr)
-        total_size += (output_path / 'max_gain_pct.npy').stat().st_size
+        arrays['max_gain_pct'] = df['max_gain_pct'].values.astype(np.float32)
 
     # Store per-window data
     windows = config.CHANNEL_WINDOW_SIZES
@@ -148,24 +142,22 @@ def convert_continuation_labels(pkl_path: Path, output_dir: Path, force: bool = 
         for col_suffix in numeric_cols:
             col_name = prefix + col_suffix
             if col_name in df.columns:
-                arr = df[col_name].values.astype(np.float32)
-                np.save(output_path / f'{col_name}.npy', arr)
-                total_size += (output_path / f'{col_name}.npy').stat().st_size
+                arrays[col_name] = df[col_name].values.astype(np.float32)
 
         # Price sequence (variable length - flatten with offsets)
         price_seq_col = prefix + 'price_sequence'
         if price_seq_col in df.columns:
             flat_vals, offsets, lengths = flatten_price_sequences(df[price_seq_col])
-            np.save(output_path / f'{price_seq_col}_flat.npy', flat_vals)
-            np.save(output_path / f'{price_seq_col}_offsets.npy', offsets)
-            np.save(output_path / f'{price_seq_col}_lengths.npy', lengths)
-            total_size += (output_path / f'{price_seq_col}_flat.npy').stat().st_size
-            total_size += (output_path / f'{price_seq_col}_offsets.npy').stat().st_size
-            total_size += (output_path / f'{price_seq_col}_lengths.npy').stat().st_size
+            arrays[f'{price_seq_col}_flat'] = flat_vals
+            arrays[f'{price_seq_col}_offsets'] = offsets
+            arrays[f'{price_seq_col}_lengths'] = lengths
+
+    # Save as UNCOMPRESSED .npz (mmap-able, single file, reduces file handles)
+    np.savez(output_path, **arrays)
 
     # Report size
     orig_size = pkl_path.stat().st_size / 1024**2
-    new_size = total_size / 1024**2
+    new_size = output_path.stat().st_size / 1024**2
     print(f"    ✓ {len(df):,} samples | {orig_size:.1f} MB → {new_size:.1f} MB ({100*new_size/orig_size:.0f}%)")
 
     return True
@@ -173,17 +165,17 @@ def convert_continuation_labels(pkl_path: Path, output_dir: Path, force: bool = 
 
 def convert_transition_labels(pkl_path: Path, output_dir: Path, force: bool = False) -> bool:
     """
-    Convert a transition labels pickle file to mmap format.
+    Convert a transition labels pickle file to uncompressed npz format.
 
-    Output structure (directory with .npy files):
-        - timestamps.npy: int64 array of nanosecond timestamps
-        - transition_type.npy: int64 array
-        - current_direction.npy: int64 array
-        - new_direction.npy: int64 array
-        - new_slope.npy: float32 array
-        - switch_to_tf.npy: int64 array (TF index, -1 for None)
+    Output: Single UNCOMPRESSED .npz file (mmap-able, single file handle)
+        - timestamps: int64 array of nanosecond timestamps
+        - transition_type: int64 array
+        - current_direction: int64 array
+        - new_direction: int64 array
+        - new_slope: float32 array
+        - switch_to_tf: int64 array (TF index, -1 for None)
     """
-    output_name = pkl_path.stem + ".mmap"
+    output_name = pkl_path.stem + ".npz"
     output_path = output_dir / output_name
 
     if output_path.exists() and not force:
@@ -199,22 +191,16 @@ def convert_transition_labels(pkl_path: Path, output_dir: Path, force: bool = Fa
         print(f"    ⚠️  Invalid DataFrame, skipping")
         return False
 
-    # Create output directory
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    total_size = 0
+    # Build arrays dict for npz
+    arrays = {}
 
     # Timestamps
-    timestamps = pd.to_datetime(df.index).astype(np.int64)
-    np.save(output_path / 'timestamps.npy', timestamps)
-    total_size += (output_path / 'timestamps.npy').stat().st_size
+    arrays['timestamps'] = pd.to_datetime(df.index).astype(np.int64).values
 
     # Numeric columns
     for col, dtype in [('transition_type', np.int64), ('current_direction', np.int64),
                        ('new_direction', np.int64), ('new_slope', np.float32)]:
-        arr = df[col].values.astype(dtype)
-        np.save(output_path / f'{col}.npy', arr)
-        total_size += (output_path / f'{col}.npy').stat().st_size
+        arrays[col] = df[col].values.astype(dtype)
 
     # switch_to_tf: convert TF names to indices
     if 'switch_to_tf' in df.columns:
@@ -226,12 +212,13 @@ def convert_transition_labels(pkl_path: Path, output_dir: Path, force: bool = Fa
                 switch_indices.append(-1)
             else:
                 switch_indices.append(tf_to_idx.get(val, -1))
-        arr = np.array(switch_indices, dtype=np.int64)
-        np.save(output_path / 'switch_to_tf.npy', arr)
-        total_size += (output_path / 'switch_to_tf.npy').stat().st_size
+        arrays['switch_to_tf'] = np.array(switch_indices, dtype=np.int64)
+
+    # Save as UNCOMPRESSED .npz (mmap-able, single file)
+    np.savez(output_path, **arrays)
 
     orig_size = pkl_path.stat().st_size / 1024**2
-    new_size = total_size / 1024**2
+    new_size = output_path.stat().st_size / 1024**2
     print(f"    ✓ {len(df):,} samples | {orig_size:.1f} MB → {new_size:.1f} MB")
 
     return True
@@ -280,7 +267,7 @@ def main():
     if total_converted > 0:
         print(f"✅ Conversion complete! {total_converted} files converted")
         print()
-        print("To use mmap loading, the dataset will automatically detect .mmap/ directories")
+        print("To use mmap loading, the dataset will automatically detect .npz files")
     else:
         print("ℹ️  No new files to convert (use --force to reconvert)")
 

@@ -499,26 +499,19 @@ def save_precomputed(
     np.save(indices_path, valid_indices)
     print(f"  Saved {indices_path.name} ({len(valid_indices):,} indices)")
 
-    # v5.9.6: Save as individual .npy files for mmap sharing across workers
-    # Create directories for breakout and targets
-    breakout_dir = cache_dir / f"precomputed_breakout_{cache_key}.mmap"
-    targets_dir = cache_dir / f"precomputed_targets_{cache_key}.mmap"
-    breakout_dir.mkdir(parents=True, exist_ok=True)
-    targets_dir.mkdir(parents=True, exist_ok=True)
+    # v5.9.6: Save as UNCOMPRESSED .npz files (mmap-able, reduces file handles)
+    breakout_path = cache_dir / f"precomputed_breakout_{cache_key}.npz"
+    targets_path = cache_dir / f"precomputed_targets_{cache_key}.npz"
 
-    # Save breakout labels as individual .npy files
-    breakout_size = 0
-    for key, arr in breakout_labels.items():
-        np.save(breakout_dir / f'{key}.npy', arr)
-        breakout_size += (breakout_dir / f'{key}.npy').stat().st_size
-    print(f"  Saved {breakout_dir.name}/ ({breakout_size/1e6:.1f} MB, {len(breakout_labels)} fields)")
+    # Save breakout labels as uncompressed npz
+    np.savez(breakout_path, **breakout_labels)
+    breakout_size = breakout_path.stat().st_size / 1e6
+    print(f"  Saved {breakout_path.name} ({breakout_size:.1f} MB, {len(breakout_labels)} fields)")
 
-    # Save target arrays as individual .npy files
-    targets_size = 0
-    for key, arr in target_arrays.items():
-        np.save(targets_dir / f'{key}.npy', arr)
-        targets_size += (targets_dir / f'{key}.npy').stat().st_size
-    print(f"  Saved {targets_dir.name}/ ({targets_size/1e6:.1f} MB, {len(target_arrays)} fields)")
+    # Save target arrays as uncompressed npz
+    np.savez(targets_path, **target_arrays)
+    targets_size = targets_path.stat().st_size / 1e6
+    print(f"  Saved {targets_path.name} ({targets_size:.1f} MB, {len(target_arrays)} fields)")
 
     # Save metadata
     meta = {
