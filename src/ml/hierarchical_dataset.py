@@ -723,78 +723,73 @@ class HierarchicalDataset(Dataset):
         self._precomputed_targets = None
         self._use_precomputed = False
 
-        # Look for pre-computed files (v5.9.6: uncompressed .npz format)
-        breakout_path = cache_dir / f"precomputed_breakout_{cache_key}.npz"
-        targets_path = cache_dir / f"precomputed_targets_{cache_key}.npz"
+        # Look for pre-computed files
+        # v5.9.6: Try mmap directories first (shared across workers), then fall back to .npz
+        breakout_dir = cache_dir / f"precomputed_breakout_{cache_key}.mmap"
+        targets_dir = cache_dir / f"precomputed_targets_{cache_key}.mmap"
+        breakout_path_npz = cache_dir / f"precomputed_breakout_{cache_key}.npz"
+        targets_path_npz = cache_dir / f"precomputed_targets_{cache_key}.npz"
         indices_path = cache_dir / f"precomputed_valid_indices_{cache_key}.npy"
 
-        # Check if files exist and are valid
-        files_exist = breakout_path.exists() and targets_path.exists() and indices_path.exists()
+        # Try mmap directories first
+        use_mmap = breakout_dir.exists() and targets_dir.exists() and indices_path.exists()
+        use_npz = breakout_path_npz.exists() and targets_path_npz.exists() and indices_path.exists()
 
-        # Validate files are non-empty and have reasonable size
-        files_valid = False
-        if files_exist:
-            breakout_size = breakout_path.stat().st_size
-            targets_size = targets_path.stat().st_size
-            # Breakout should be >1KB, targets should be >1MB
-            if breakout_size > 1000 and targets_size > 1_000_000:
-                files_valid = True
-            else:
-                print(f"     ⚠️  Precomputed files exist but appear empty/corrupt")
-                print(f"        Breakout: {breakout_size} bytes, Targets: {targets_size} bytes")
-                print(f"        Will regenerate...")
-                files_valid = False
-
-        if files_exist and files_valid:
+        if use_mmap or use_npz:
             try:
                 # Verify indices match
                 precomputed_indices = np.load(indices_path)
                 if len(precomputed_indices) != len(self.valid_indices):
                     print(f"     ⚠️  Pre-computed indices mismatch ({len(precomputed_indices)} vs {len(self.valid_indices)})")
-                    print(f"        Will regenerate precomputed targets...")
-                    files_valid = False
-
-                if files_valid:
-                    # Load from uncompressed .npz (mmap-able)
-                    print(f"     📦 Loading pre-computed breakout labels (npz mmap)...")
-                    breakout_npz = np.load(breakout_path, mmap_mode='r', allow_pickle=False)
-                    # Validate has expected keys
-                    if len(breakout_npz.files) < 4:
-                        print(f"     ⚠️  Breakout file has only {len(breakout_npz.files)} fields (expected 4+)")
-                        files_valid = False
-                    else:
-                        self._precomputed_breakout = breakout_npz
-                        print(f"        Loaded {len(breakout_npz.files)} breakout fields (shared via mmap)")
-
-                    if files_valid:
-                        print(f"     📦 Loading pre-computed target arrays (npz mmap)...")
-                        targets_npz = np.load(targets_path, mmap_mode='r', allow_pickle=False)
-                        # Validate has expected number of keys
-                        if len(targets_npz.files) < 100:
-                            print(f"     ⚠️  Targets file has only {len(targets_npz.files)} fields (expected 1000+)")
-                            files_valid = False
-                        else:
-                            self._precomputed_targets = targets_npz
-                            print(f"        Loaded {len(targets_npz.files)} target fields (shared via mmap)")
-
-                if files_valid:
-                    self._use_precomputed = True
-                    print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled, npz mmap)")
+                    print(f"        Run: python -m src.ml.precompute_targets --cache-dir {cache_dir}")
                     return
+
+                if use_mmap:
+                    # Load from mmap directories (shared across workers)
+                    print(f"     📦 Loading pre-computed breakout labels (mmap)...")
+                    breakout_data = {}
+                    for npy_file in breakout_dir.glob('*.npy'):
+                        key = npy_file.stem
+                        breakout_data[key] = np.load(npy_file, mmap_mode='r')
+                    self._precomputed_breakout = breakout_data
+                    print(f"        Loaded {len(breakout_data)} breakout fields (shared via mmap)")
+
+                    print(f"     📦 Loading pre-computed target arrays (mmap)...")
+                    targets_data = {}
+                    for npy_file in targets_dir.glob('*.npy'):
+                        key = npy_file.stem
+                        targets_data[key] = np.load(npy_file, mmap_mode='r')
+                    self._precomputed_targets = targets_data
+                    print(f"        Loaded {len(targets_data)} target fields (shared via mmap)")
+
                 else:
-                    # Validation failed, will regenerate below
-                    pass
+                    # Fall back to compressed .npz (copied per worker, but faster than per-sample computation)
+                    print(f"     📦 Loading pre-computed breakout labels (.npz)...")
+                    breakout_data = dict(np.load(breakout_path_npz))
+                    self._precomputed_breakout = breakout_data
+                    print(f"        Loaded {len(breakout_data)} breakout fields")
+
+                    print(f"     📦 Loading pre-computed target arrays (.npz)...")
+                    targets_data = dict(np.load(targets_path_npz))
+                    self._precomputed_targets = targets_data
+                    print(f"        Loaded {len(targets_data)} target fields")
+
+                self._use_precomputed = True
+                format_str = "mmap" if use_mmap else "npz"
+                print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled, {format_str})")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to load pre-computed data: {e}")
-                files_valid = False
-
-        # Files missing, corrupt, or validation failed - auto-generate
-        if not files_valid:
+                print(f"        Falling back to per-sample computation")
+                self._precomputed_breakout = None
+                self._precomputed_targets = None
+                self._use_precomputed = False
+        else:
+            # v5.9.4: Auto-generate precomputed files (same pattern as other caches)
             missing = []
-            if not breakout_path.exists():
+            if not breakout_dir.exists() and not breakout_path_npz.exists():
                 missing.append("breakout")
-            if not targets_path.exists():
+            if not targets_dir.exists() and not targets_path_npz.exists():
                 missing.append("targets")
             if not indices_path.exists():
                 missing.append("indices")
@@ -828,14 +823,20 @@ class HierarchicalDataset(Dataset):
                     precomputed_valid_indices, breakout_labels, target_arrays
                 )
 
-                # Load the generated files (v5.9.6: now saved as uncompressed .npz)
-                print(f"     📦 Loading newly generated pre-computed data (npz mmap)...")
-                self._precomputed_breakout = np.load(breakout_path, mmap_mode='r', allow_pickle=False)
-                self._precomputed_targets = np.load(targets_path, mmap_mode='r', allow_pickle=False)
+                # Load the generated files (v5.9.6: now saved as .mmap/ directories)
+                print(f"     📦 Loading newly generated pre-computed data (mmap)...")
+                self._precomputed_breakout = {}
+                for npy_file in breakout_dir.glob('*.npy'):
+                    key = npy_file.stem
+                    self._precomputed_breakout[key] = np.load(npy_file, mmap_mode='r')
+
+                self._precomputed_targets = {}
+                for npy_file in targets_dir.glob('*.npy'):
+                    key = npy_file.stem
+                    self._precomputed_targets[key] = np.load(npy_file, mmap_mode='r')
 
                 self._use_precomputed = True
-                print(f"     ✓ v5.9.4: Pre-computed targets generated and loaded (Fix #1 + #3 enabled, npz mmap)")
-                print(f"        Breakout: {len(self._precomputed_breakout.files)} fields, Targets: {len(self._precomputed_targets.files)} fields")
+                print(f"     ✓ v5.9.4: Pre-computed targets generated and loaded (Fix #1 + #3 enabled, mmap)")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to auto-generate pre-computed data: {e}")
@@ -1470,33 +1471,33 @@ class HierarchicalDataset(Dataset):
         loaded_count = 0
         mmap_count = 0
         for tf in HIERARCHICAL_TIMEFRAMES:
-            # v5.9.6: First try uncompressed .npz files (mmap-able, single file handle)
-            mmap_pattern_5min = f"continuation_labels_5min_{tf}_*.npz"
-            matching_mmap_5min = list(labels_path.glob(mmap_pattern_5min))
+            # v5.9.6: First try mmap directories (preferred - truly shared across workers)
+            mmap_pattern_5min = f"continuation_labels_5min_{tf}_*.mmap"
+            matching_mmap_5min = [p for p in labels_path.glob(mmap_pattern_5min) if p.is_dir()]
 
-            mmap_pattern = f"continuation_labels_{tf}_*.npz"
-            matching_mmap = list(labels_path.glob(mmap_pattern))
+            mmap_pattern = f"continuation_labels_{tf}_*.mmap"
+            matching_mmap = [p for p in labels_path.glob(mmap_pattern) if p.is_dir()]
 
-            # Try npz 5min first, then npz native, then pickle
-            npz_file = None
+            # Try mmap 5min first, then mmap native, then pickle
+            mmap_file = None
             if matching_mmap_5min:
-                npz_file = sorted(matching_mmap_5min)[-1]
+                mmap_file = sorted(matching_mmap_5min)[-1]
                 self._uses_5min_labels[tf] = True
             elif matching_mmap:
-                npz_file = sorted(matching_mmap)[-1]
+                mmap_file = sorted(matching_mmap)[-1]
                 self._uses_5min_labels[tf] = False
 
-            if npz_file is not None:
-                # Load from uncompressed npz (shared across workers via mmap)
+            if mmap_file is not None:
+                # Load from mmap (shared across workers)
                 try:
-                    loaded = self._load_continuation_from_npz(tf, npz_file)
+                    loaded = self._load_continuation_from_mmap(tf, mmap_file)
                     if loaded:
                         loaded_count += 1
                         mmap_count += 1
                         self._uses_mmap_labels[tf] = True
                         continue
                 except Exception as e:
-                    print(f"     ⚠️  Failed to load npz for {tf}, falling back to pickle: {e}")
+                    print(f"     ⚠️  Failed to load mmap for {tf}, falling back to pickle: {e}")
 
             # Fall back to pickle files (and auto-convert to mmap for next time)
             self._uses_mmap_labels[tf] = False
@@ -1580,18 +1581,18 @@ class HierarchicalDataset(Dataset):
                     if valid_window_counts:
                         print(f"          Windows: {', '.join(valid_window_counts[:5])}{'...' if len(valid_window_counts) > 5 else ''}")
 
-                    # v5.9.6: Auto-convert to npz NOW (so this run benefits from shared memory)
-                    npz_path = self._convert_to_mmap_sync(label_file, labels_path)
-                    if npz_path and npz_path.exists():
-                        # Reload from npz to get shared memory benefits NOW
-                        print(f"     🔄 Reloading {tf} from npz for shared memory...")
+                    # v5.9.6: Auto-convert to mmap NOW (so this run benefits from shared memory)
+                    mmap_dir = self._convert_to_mmap_sync(label_file, labels_path)
+                    if mmap_dir and mmap_dir.exists():
+                        # Reload from mmap to get shared memory benefits NOW
+                        print(f"     🔄 Reloading {tf} from mmap for shared memory...")
                         try:
-                            loaded = self._load_continuation_from_npz(tf, npz_path)
+                            loaded = self._load_continuation_from_mmap(tf, mmap_dir)
                             if loaded:
                                 mmap_count += 1
                                 self._uses_mmap_labels[tf] = True
                         except Exception as e:
-                            print(f"     ⚠️  npz reload failed, using pickle data: {e}")
+                            print(f"     ⚠️  Mmap reload failed, using pickle data: {e}")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to load {tf} labels: {e}")
@@ -1603,29 +1604,34 @@ class HierarchicalDataset(Dataset):
         else:
             print(f"     ⚠️  No continuation label files found in {labels_dir}")
 
-    def _load_continuation_from_npz(self, tf: str, npz_path: Path) -> bool:
+    def _load_continuation_from_mmap(self, tf: str, mmap_dir: Path) -> bool:
         """
-        Load continuation labels from uncompressed .npz file.
+        Load continuation labels from mmap directory with .npy files.
 
         v5.9.6: Memory-mapped loading for multi-worker/multi-GPU efficiency.
-        Single file reduces file handle count dramatically.
+        Each .npy file is truly shared across all workers via OS page cache.
 
         Args:
             tf: Timeframe name (e.g., '5min', '1h')
-            npz_path: Path to uncompressed .npz file
+            mmap_dir: Path to .mmap directory containing .npy files
 
         Returns:
             True if loaded successfully
         """
-        # Load npz with mmap_mode (works with uncompressed npz)
-        npz = np.load(npz_path, mmap_mode='r', allow_pickle=False)
-
         # Build continuation_data dict matching pickle format
         continuation_data = {}
 
+        # Helper to load mmap'd array if file exists
+        def load_mmap(name):
+            path = mmap_dir / f'{name}.npy'
+            if path.exists():
+                return np.load(path, mmap_mode='r')
+            return None
+
         # max_gain_pct
-        if 'max_gain_pct' in npz:
-            continuation_data['max_gain_pct'] = npz['max_gain_pct']
+        arr = load_mmap('max_gain_pct')
+        if arr is not None:
+            continuation_data['max_gain_pct'] = arr
 
         # Per-window data
         n_windows = 0
@@ -1633,13 +1639,14 @@ class HierarchicalDataset(Dataset):
             prefix = f'w{window}_'
 
             # Check if this window exists
-            if f'{prefix}valid' not in npz:
+            valid_arr = load_mmap(f'{prefix}valid')
+            if valid_arr is None:
                 continue
 
             n_windows += 1
-            continuation_data[f'{prefix}valid'] = npz[f'{prefix}valid']
+            continuation_data[f'{prefix}valid'] = valid_arr
 
-            # Numeric arrays (direct mmap access from npz)
+            # Numeric arrays (direct mmap access)
             numeric_cols = [
                 'duration', 'hit_upper', 'hit_midline', 'hit_lower',
                 'bars_until_hit_upper', 'bars_until_hit_midline', 'bars_until_hit_lower',
@@ -1648,36 +1655,36 @@ class HierarchicalDataset(Dataset):
             ]
 
             for col_suffix in numeric_cols:
-                key = prefix + col_suffix
-                if key in npz:
-                    continuation_data[key] = npz[key]
+                arr = load_mmap(prefix + col_suffix)
+                if arr is not None:
+                    continuation_data[prefix + col_suffix] = arr
 
             # Price sequence (flattened format)
-            flat_key = f'{prefix}price_sequence_flat'
-            offsets_key = f'{prefix}price_sequence_offsets'
-            lengths_key = f'{prefix}price_sequence_lengths'
+            flat_arr = load_mmap(f'{prefix}price_sequence_flat')
+            offsets_arr = load_mmap(f'{prefix}price_sequence_offsets')
+            lengths_arr = load_mmap(f'{prefix}price_sequence_lengths')
 
-            if flat_key in npz and offsets_key in npz:
-                continuation_data[flat_key] = npz[flat_key]
-                continuation_data[offsets_key] = npz[offsets_key]
-                continuation_data[lengths_key] = npz[lengths_key]
+            if flat_arr is not None and offsets_arr is not None:
+                continuation_data[f'{prefix}price_sequence_flat'] = flat_arr
+                continuation_data[f'{prefix}price_sequence_offsets'] = offsets_arr
+                continuation_data[f'{prefix}price_sequence_lengths'] = lengths_arr
                 # Mark that this uses mmap format (no direct price_sequence array)
                 continuation_data[f'{prefix}price_sequence'] = None  # Sentinel
 
         self._per_tf_continuation[tf] = continuation_data
 
         # Build timestamp lookup from mmap'd timestamps array
-        if 'timestamps' not in npz:
+        timestamps = load_mmap('timestamps')
+        if timestamps is None:
             return False
 
-        timestamps = npz['timestamps']
         self._per_tf_ts_to_idx[tf] = {}
         for i, ts_ns in enumerate(timestamps):
             self._per_tf_ts_to_idx[tf][int(ts_ns)] = i
 
         n_samples = len(timestamps)
         resolution = "5min" if self._uses_5min_labels.get(tf) else "native"
-        print(f"     {tf}: {n_samples:,} labels ({resolution}, mmap) from {npz_path.name}")
+        print(f"     {tf}: {n_samples:,} labels ({resolution}, mmap) from {mmap_dir.name}/")
 
         return True
 
@@ -1698,8 +1705,8 @@ class HierarchicalDataset(Dataset):
         import subprocess
         import sys
 
-        # Check if npz already exists
-        output_name = pkl_path.stem + ".npz"
+        # Check if mmap already exists
+        output_name = pkl_path.stem + ".mmap"
         output_path = output_dir / output_name
 
         if output_path.exists():
@@ -1711,7 +1718,7 @@ class HierarchicalDataset(Dataset):
             if not script_path.exists():
                 return None  # Script not found, skip auto-conversion
 
-            print(f"     🔧 Converting {pkl_path.name} to npz format...")
+            print(f"     🔧 Converting {pkl_path.name} to mmap format...")
 
             # Run conversion in subprocess (blocking)
             # Only convert this one file
@@ -1734,14 +1741,14 @@ class HierarchicalDataset(Dataset):
                     timeout=300  # 5 min timeout
                 )
 
-                # Move converted npz file back
-                converted_npz = tmpdir_path / output_name
-                if converted_npz.exists():
-                    shutil.move(str(converted_npz), str(output_path))
-                    print(f"     ✓ Converted to npz: {output_path.name}")
+                # Move converted directory back
+                converted_dir = tmpdir_path / output_name
+                if converted_dir.exists():
+                    shutil.move(str(converted_dir), str(output_path))
+                    print(f"     ✓ Converted to mmap: {output_path.name}/")
                     return output_path
                 else:
-                    print(f"     ⚠️  Conversion failed (no output file)")
+                    print(f"     ⚠️  Conversion failed (no output directory)")
                     return None
         except Exception as e:
             print(f"     ⚠️  Conversion failed: {e}")
@@ -1819,20 +1826,20 @@ class HierarchicalDataset(Dataset):
         loaded_count = 0
         mmap_count = 0
         for tf in HIERARCHICAL_TIMEFRAMES:
-            # v5.9.6: First try uncompressed .npz files (mmap-able, single file handle)
-            npz_pattern = f"transition_labels_{tf}_*.npz"
-            matching_npz = list(labels_path.glob(npz_pattern))
+            # v5.9.6: First try mmap directories (preferred - truly shared across workers)
+            mmap_pattern = f"transition_labels_{tf}_*.mmap"
+            matching_mmap = [p for p in labels_path.glob(mmap_pattern) if p.is_dir()]
 
-            if matching_npz:
-                npz_file = sorted(matching_npz)[-1]
+            if matching_mmap:
+                mmap_file = sorted(matching_mmap)[-1]
                 try:
-                    loaded = self._load_transition_from_npz(tf, npz_file)
+                    loaded = self._load_transition_from_mmap(tf, mmap_file)
                     if loaded:
                         loaded_count += 1
                         mmap_count += 1
                         continue
                 except Exception as e:
-                    print(f"     ⚠️  Failed to load npz for {tf}, falling back to pickle: {e}")
+                    print(f"     ⚠️  Failed to load mmap for {tf}, falling back to pickle: {e}")
 
             # Fall back to pickle files
             pattern = f"transition_labels_{tf}_*.pkl"
@@ -1887,17 +1894,17 @@ class HierarchicalDataset(Dataset):
                     type_counts = np.bincount(self._per_tf_transition[tf]['transition_type'], minlength=4)
                     print(f"     {tf}: {len(labels_df):,} labels | CONT:{type_counts[0]} SWITCH:{type_counts[1]} REV:{type_counts[2]} SIDE:{type_counts[3]}")
 
-                    # v5.9.6: Auto-convert to npz NOW (so this run benefits from shared memory)
-                    npz_path = self._convert_to_mmap_sync(label_file, labels_path)
-                    if npz_path and npz_path.exists():
-                        # Reload from npz to get shared memory benefits NOW
-                        print(f"     🔄 Reloading {tf} from npz for shared memory...")
+                    # v5.9.6: Auto-convert to mmap NOW (so this run benefits from shared memory)
+                    mmap_dir = self._convert_to_mmap_sync(label_file, labels_path)
+                    if mmap_dir and mmap_dir.exists():
+                        # Reload from mmap to get shared memory benefits NOW
+                        print(f"     🔄 Reloading {tf} from mmap for shared memory...")
                         try:
-                            loaded = self._load_transition_from_npz(tf, npz_path)
+                            loaded = self._load_transition_from_mmap(tf, mmap_dir)
                             if loaded:
                                 mmap_count += 1
                         except Exception as e:
-                            print(f"     ⚠️  npz reload failed, using pickle data: {e}")
+                            print(f"     ⚠️  Mmap reload failed, using pickle data: {e}")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to load {tf} transition labels: {e}")
@@ -1908,45 +1915,53 @@ class HierarchicalDataset(Dataset):
         else:
             print(f"     ⚠️  No transition label files found in {labels_dir}")
 
-    def _load_transition_from_npz(self, tf: str, npz_path: Path) -> bool:
+    def _load_transition_from_mmap(self, tf: str, mmap_dir: Path) -> bool:
         """
-        Load transition labels from uncompressed .npz file.
+        Load transition labels from mmap directory with .npy files.
 
         v5.9.6: Memory-mapped loading for multi-worker/multi-GPU efficiency.
-        Single file reduces file handle count.
 
         Args:
             tf: Timeframe name (e.g., '5min', '1h')
-            npz_path: Path to uncompressed .npz file
+            mmap_dir: Path to .mmap directory containing .npy files
 
         Returns:
             True if loaded successfully
         """
-        # Load npz with mmap_mode (works with uncompressed npz)
-        npz = np.load(npz_path, mmap_mode='r', allow_pickle=False)
+        # Helper to load mmap'd array if file exists
+        def load_mmap(name):
+            path = mmap_dir / f'{name}.npy'
+            if path.exists():
+                return np.load(path, mmap_mode='r')
+            return None
 
-        # Check required arrays exist
-        if 'transition_type' not in npz or 'timestamps' not in npz:
+        # Load required arrays
+        transition_type = load_mmap('transition_type')
+        if transition_type is None:
             return False
 
         self._per_tf_transition[tf] = {
-            'transition_type': npz['transition_type'],
-            'current_direction': npz['current_direction'],
-            'new_direction': npz['new_direction'],
-            'new_slope': npz['new_slope'],
+            'transition_type': transition_type,
+            'current_direction': load_mmap('current_direction'),
+            'new_direction': load_mmap('new_direction'),
+            'new_slope': load_mmap('new_slope'),
         }
 
-        if 'switch_to_tf' in npz:
-            self._per_tf_transition[tf]['switch_to_tf'] = npz['switch_to_tf']
+        switch_to_tf = load_mmap('switch_to_tf')
+        if switch_to_tf is not None:
+            self._per_tf_transition[tf]['switch_to_tf'] = switch_to_tf
 
         # Build timestamp lookup
-        timestamps = npz['timestamps']
+        timestamps = load_mmap('timestamps')
+        if timestamps is None:
+            return False
+
         self._per_tf_trans_ts_to_idx[tf] = {}
         for i, ts_ns in enumerate(timestamps):
             self._per_tf_trans_ts_to_idx[tf][int(ts_ns)] = i
 
         # Stats
-        type_counts = np.bincount(np.asarray(npz['transition_type']), minlength=4)
+        type_counts = np.bincount(np.asarray(transition_type), minlength=4)
         print(f"     {tf}: {len(timestamps):,} labels (mmap) | CONT:{type_counts[0]} SWITCH:{type_counts[1]} REV:{type_counts[2]} SIDE:{type_counts[3]}")
 
         return True
