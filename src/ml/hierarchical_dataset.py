@@ -640,11 +640,18 @@ class HierarchicalDataset(Dataset):
         self._use_precomputed = False
 
         # Look for pre-computed files
-        breakout_path = cache_dir / f"precomputed_breakout_{cache_key}.npz"
-        targets_path = cache_dir / f"precomputed_targets_{cache_key}.npz"
+        # v5.9.6: Try mmap directories first (shared across workers), then fall back to .npz
+        breakout_dir = cache_dir / f"precomputed_breakout_{cache_key}.mmap"
+        targets_dir = cache_dir / f"precomputed_targets_{cache_key}.mmap"
+        breakout_path_npz = cache_dir / f"precomputed_breakout_{cache_key}.npz"
+        targets_path_npz = cache_dir / f"precomputed_targets_{cache_key}.npz"
         indices_path = cache_dir / f"precomputed_valid_indices_{cache_key}.npy"
 
-        if breakout_path.exists() and targets_path.exists() and indices_path.exists():
+        # Try mmap directories first
+        use_mmap = breakout_dir.exists() and targets_dir.exists() and indices_path.exists()
+        use_npz = breakout_path_npz.exists() and targets_path_npz.exists() and indices_path.exists()
+
+        if use_mmap or use_npz:
             try:
                 # Verify indices match
                 precomputed_indices = np.load(indices_path)
@@ -653,20 +660,39 @@ class HierarchicalDataset(Dataset):
                     print(f"        Run: python -m src.ml.precompute_targets --cache-dir {cache_dir}")
                     return
 
-                # Load breakout labels (v5.9.6: mmap for shared access across workers)
-                print(f"     📦 Loading pre-computed breakout labels (mmap)...")
-                breakout_data = np.load(breakout_path, mmap_mode='r')
-                self._precomputed_breakout = breakout_data
-                print(f"        Loaded {len(breakout_data)} breakout fields (shared via mmap)")
+                if use_mmap:
+                    # Load from mmap directories (shared across workers)
+                    print(f"     📦 Loading pre-computed breakout labels (mmap)...")
+                    breakout_data = {}
+                    for npy_file in breakout_dir.glob('*.npy'):
+                        key = npy_file.stem
+                        breakout_data[key] = np.load(npy_file, mmap_mode='r')
+                    self._precomputed_breakout = breakout_data
+                    print(f"        Loaded {len(breakout_data)} breakout fields (shared via mmap)")
 
-                # Load target arrays (v5.9.6: mmap for shared access across workers)
-                print(f"     📦 Loading pre-computed target arrays (mmap)...")
-                targets_data = np.load(targets_path, mmap_mode='r')
-                self._precomputed_targets = targets_data
-                print(f"        Loaded {len(targets_data)} target fields (shared via mmap)")
+                    print(f"     📦 Loading pre-computed target arrays (mmap)...")
+                    targets_data = {}
+                    for npy_file in targets_dir.glob('*.npy'):
+                        key = npy_file.stem
+                        targets_data[key] = np.load(npy_file, mmap_mode='r')
+                    self._precomputed_targets = targets_data
+                    print(f"        Loaded {len(targets_data)} target fields (shared via mmap)")
+
+                else:
+                    # Fall back to compressed .npz (copied per worker, but faster than per-sample computation)
+                    print(f"     📦 Loading pre-computed breakout labels (.npz)...")
+                    breakout_data = dict(np.load(breakout_path_npz))
+                    self._precomputed_breakout = breakout_data
+                    print(f"        Loaded {len(breakout_data)} breakout fields")
+
+                    print(f"     📦 Loading pre-computed target arrays (.npz)...")
+                    targets_data = dict(np.load(targets_path_npz))
+                    self._precomputed_targets = targets_data
+                    print(f"        Loaded {len(targets_data)} target fields")
 
                 self._use_precomputed = True
-                print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled)")
+                format_str = "mmap" if use_mmap else "npz"
+                print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled, {format_str})")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to load pre-computed data: {e}")
@@ -677,9 +703,9 @@ class HierarchicalDataset(Dataset):
         else:
             # v5.9.4: Auto-generate precomputed files (same pattern as other caches)
             missing = []
-            if not breakout_path.exists():
+            if not breakout_dir.exists() and not breakout_path_npz.exists():
                 missing.append("breakout")
-            if not targets_path.exists():
+            if not targets_dir.exists() and not targets_path_npz.exists():
                 missing.append("targets")
             if not indices_path.exists():
                 missing.append("indices")
@@ -713,12 +739,20 @@ class HierarchicalDataset(Dataset):
                     precomputed_valid_indices, breakout_labels, target_arrays
                 )
 
-                # Load the generated files
-                print(f"     📦 Loading newly generated pre-computed data...")
-                self._precomputed_breakout = breakout_labels
-                self._precomputed_targets = target_arrays
+                # Load the generated files (v5.9.6: now saved as .mmap/ directories)
+                print(f"     📦 Loading newly generated pre-computed data (mmap)...")
+                self._precomputed_breakout = {}
+                for npy_file in breakout_dir.glob('*.npy'):
+                    key = npy_file.stem
+                    self._precomputed_breakout[key] = np.load(npy_file, mmap_mode='r')
+
+                self._precomputed_targets = {}
+                for npy_file in targets_dir.glob('*.npy'):
+                    key = npy_file.stem
+                    self._precomputed_targets[key] = np.load(npy_file, mmap_mode='r')
+
                 self._use_precomputed = True
-                print(f"     ✓ v5.9.4: Pre-computed targets generated and loaded (Fix #1 + #3 enabled)")
+                print(f"     ✓ v5.9.4: Pre-computed targets generated and loaded (Fix #1 + #3 enabled, mmap)")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to auto-generate pre-computed data: {e}")
