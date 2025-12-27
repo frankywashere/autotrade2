@@ -4698,54 +4698,53 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     val_score = hidden_states['validity'][sel_tf].mean().item()
                     epoch_validity_preds.append(val_score)
 
-            # Debug: Log loss breakdown every 100 batches
-            if batch_idx % 100 == 0:
-                batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            # Update loss display every batch (negligible overhead)
+            batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-                # Print component breakdown every 100 batches for diagnosis
-                # v5.7.2: All values now reflect actual weighted contributions to loss
-                if batch_idx > 0 and batch_idx % 100 == 0:
-                    print(f"\n📊 [{batch_idx}] Loss components:")
-                    print(f"   Primary: {loss_components.get('primary', 0):.3f}")
-                    print(f"   Multi-task: {loss_components.get('multi_task', 0):.3f}")
-                    print(f"   Duration: {loss_components.get('duration', 0):.3f}")
-                    print(f"   Containment: {loss_components.get('containment', 0):.3f}")
-                    print(f"   Hit-Prob: {loss_components.get('hit_probability', 0):.3f}")
-                    print(f"   Validity: {loss_components.get('validity', 0):.3f}")
-                    print(f"   Transition: {loss_components.get('transition', 0):.3f}")
-                    print(f"   Calibration: {loss_components.get('calibration', 0):.3f}")
-                    print(f"   Entropy: {loss_components.get('entropy', 0):.3f}")
-                    print(f"   Multi-TF: {loss_components.get('multi_tf', 0):.3f}")
-                    print(f"   ─────────────────────")
+            # Print component breakdown every 100 batches for diagnosis
+            # v5.7.2: All values now reflect actual weighted contributions to loss
+            if batch_idx > 0 and batch_idx % 100 == 0:
+                print(f"\n📊 [{batch_idx}] Loss components:")
+                print(f"   Primary: {loss_components.get('primary', 0):.3f}")
+                print(f"   Multi-task: {loss_components.get('multi_task', 0):.3f}")
+                print(f"   Duration: {loss_components.get('duration', 0):.3f}")
+                print(f"   Containment: {loss_components.get('containment', 0):.3f}")
+                print(f"   Hit-Prob: {loss_components.get('hit_probability', 0):.3f}")
+                print(f"   Validity: {loss_components.get('validity', 0):.3f}")
+                print(f"   Transition: {loss_components.get('transition', 0):.3f}")
+                print(f"   Calibration: {loss_components.get('calibration', 0):.3f}")
+                print(f"   Entropy: {loss_components.get('entropy', 0):.3f}")
+                print(f"   Multi-TF: {loss_components.get('multi_tf', 0):.3f}")
+                print(f"   ─────────────────────")
 
-                    # v5.7.2: Verify tracked components sum to total (Fix 5)
-                    CONTRIBUTION_KEYS = ['primary', 'multi_task', 'duration', 'containment', 'hit_probability',
-                                         'validity', 'transition', 'calibration', 'multi_tf', 'entropy']
-                    tracked_sum = sum(loss_components.get(k, 0) for k in CONTRIBUTION_KEYS)
-                    print(f"   Tracked: {tracked_sum:.3f}")
-                    print(f"   Total: {loss.item():.3f}")
-                    delta = loss.item() - tracked_sum
-                    if abs(delta) > 0.01:
-                        print(f"   ⚠️  Untracked: {delta:.3f}")
+                # v5.7.2: Verify tracked components sum to total (Fix 5)
+                CONTRIBUTION_KEYS = ['primary', 'multi_task', 'duration', 'containment', 'hit_probability',
+                                     'validity', 'transition', 'calibration', 'multi_tf', 'entropy']
+                tracked_sum = sum(loss_components.get(k, 0) for k in CONTRIBUTION_KEYS)
+                print(f"   Tracked: {tracked_sum:.3f}")
+                print(f"   Total: {loss.item():.3f}")
+                delta = loss.item() - tracked_sum
+                if abs(delta) > 0.01:
+                    print(f"   ⚠️  Untracked: {delta:.3f}")
 
-                    # 🔍 Multi-TF Training diagnostics (v5.7.2: replaces obsolete match rate)
-                    # Count TFs with at least one valid sample (not just keys existing)
-                    tfs_with_valid = sum(
-                        (labels['valid_mask'].sum() > 0).item()
-                        for labels in transition_labels_tensors.values()
-                    )
-                    print(f"\n🔍 Multi-TF Training:")
-                    print(f"   TFs with valid labels: {tfs_with_valid}/11")
-                    print(f"   TF weight entropy: {loss_components.get('tf_weights_entropy', 0):.3f}")
-                    print(f"   Entropy (raw): {loss_components.get('entropy_raw', 0):.3f}")
+                # 🔍 Multi-TF Training diagnostics (v5.7.2: replaces obsolete match rate)
+                # Count TFs with at least one valid sample (not just keys existing)
+                tfs_with_valid = sum(
+                    (labels['valid_mask'].sum() > 0).item()
+                    for labels in transition_labels_tensors.values()
+                )
+                print(f"\n🔍 Multi-TF Training:")
+                print(f"   TFs with valid labels: {tfs_with_valid}/11")
+                print(f"   TF weight entropy: {loss_components.get('tf_weights_entropy', 0):.3f}")
+                print(f"   Entropy (raw): {loss_components.get('entropy_raw', 0):.3f}")
 
-                    # Most picked TF (attention mechanism preference)
-                    if transition_diagnostics['selected_tf_counts']:
-                        mode_tf = max(transition_diagnostics['selected_tf_counts'],
-                                      key=transition_diagnostics['selected_tf_counts'].get)
-                        mode_count = transition_diagnostics['selected_tf_counts'][mode_tf]
-                        total = transition_diagnostics['total_batches']
-                        print(f"   Most picked TF: {mode_tf} ({mode_count}/{total} = {mode_count/total*100:.1f}%)")
+                # Most picked TF (attention mechanism preference)
+                if transition_diagnostics['selected_tf_counts']:
+                    mode_tf = max(transition_diagnostics['selected_tf_counts'],
+                                  key=transition_diagnostics['selected_tf_counts'].get)
+                    mode_count = transition_diagnostics['selected_tf_counts'][mode_tf]
+                    total = transition_diagnostics['total_batches']
+                    print(f"   Most picked TF: {mode_tf} ({mode_count}/{total} = {mode_count/total*100:.1f}%)")
 
             if profiler and batch_idx > 0 and batch_idx % profiler.log_every_n == 0:
                 profiler.snapshot(f"batch_{batch_idx}", epoch + 1)
