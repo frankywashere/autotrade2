@@ -21,4 +21,4 @@ beautifulsoup4
 plotly
 rich
 joblib
-
+py-spy

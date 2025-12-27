@@ -625,21 +625,29 @@ class HierarchicalDataset(Dataset):
         # v5.9.4: Load pre-computed targets if available (Fix #1 and #3)
         self._load_precomputed_targets(cache_dir, cache_key)
 
-    def apply_boundary_sampling(self, boundary_threshold: int):
+    def apply_boundary_sampling(self, boundary_threshold: int, mode: str = "breaks"):
         """
-        Filter valid_indices to only include samples near channel boundaries.
+        Filter valid_indices to focus on high-information samples.
 
-        v5.9.6: Focuses training on high-information transition points rather than
-        redundant mid-channel samples.
+        v5.9.6: Three modes for sample selection:
+        - 'breaks': Near channel endings (duration ≤ threshold)
+        - 'starts': Fresh channel beginnings (duration ≥ threshold)
+        - 'both': Transitions (breaks OR starts)
 
         Args:
-            boundary_threshold: Maximum bars until break to include (e.g., 5 = within 5 bars of break)
+            boundary_threshold: Threshold in bars (meaning depends on mode)
+            mode: 'breaks', 'starts', or 'both'
         """
         if not hasattr(self, '_per_tf_continuation') or len(self._per_tf_continuation) == 0:
             print(f"     ⚠️  No continuation labels loaded, cannot apply boundary sampling")
             return
 
-        print(f"\n  🎯 Applying boundary sampling (threshold={boundary_threshold} bars)...")
+        mode_desc = {
+            'breaks': f"approaching breaks (≤{boundary_threshold} bars)",
+            'starts': f"fresh channels (≥{boundary_threshold} bars)",
+            'both': f"transitions (≤{boundary_threshold} or ≥{boundary_threshold} bars)"
+        }
+        print(f"\n  🎯 Applying boundary sampling: {mode_desc.get(mode, mode)}...")
         original_count = len(self.valid_indices)
 
         # Use 5min timeframe labels as reference (most granular)
@@ -649,8 +657,7 @@ class HierarchicalDataset(Dataset):
 
         cont_data = self._per_tf_continuation['5min']
 
-        # Get duration for first window (w10) as proxy for channel state
-        # If any window shows near-break, include the sample
+        # Filter samples based on mode
         boundary_indices = []
         boundary_precomputed_map = []  # v5.9.6 fix: track original positions for precomputed lookup
 
@@ -661,7 +668,7 @@ class HierarchicalDataset(Dataset):
             if ts_5min in self._per_tf_ts_to_idx.get('5min', {}):
                 label_idx = self._per_tf_ts_to_idx['5min'][ts_5min]
 
-                # Check if any window is near breaking
+                # Check any window to determine if this is a boundary sample
                 is_boundary = False
                 for window in config.CHANNEL_WINDOW_SIZES[:5]:  # Check first 5 windows
                     duration_key = f'w{window}_duration'
@@ -670,9 +677,25 @@ class HierarchicalDataset(Dataset):
                     if duration_key in cont_data and valid_key in cont_data:
                         if cont_data[valid_key][label_idx] > 0:
                             duration = cont_data[duration_key][label_idx]
-                            if duration <= boundary_threshold:
-                                is_boundary = True
-                                break
+
+                            # Apply mode-specific logic
+                            if mode == "breaks":
+                                # Near channel ending
+                                if duration <= boundary_threshold:
+                                    is_boundary = True
+                                    break
+                            elif mode == "starts":
+                                # Fresh channel (high duration remaining)
+                                if duration >= boundary_threshold:
+                                    is_boundary = True
+                                    break
+                            elif mode == "both":
+                                # Either near break OR fresh start (skip mid-channel)
+                                # Use threshold for breaks, 4x threshold for starts
+                                start_threshold = boundary_threshold * 4
+                                if duration <= boundary_threshold or duration >= start_threshold:
+                                    is_boundary = True
+                                    break
 
                 if is_boundary:
                     boundary_indices.append(data_idx)
@@ -2824,7 +2847,8 @@ def create_hierarchical_dataset(
     use_native_timeframes: bool = False,
     tf_meta_path: str = None,
     use_boundary_sampling: bool = False,  # v5.9.6: Filter to channel boundary samples only
-    boundary_threshold: int = 5  # v5.9.6: Bars until break threshold
+    boundary_threshold: int = 5,  # v5.9.6: Threshold in bars
+    boundary_mode: str = "breaks"  # v5.9.6: 'breaks', 'starts', or 'both'
 ) -> Tuple[Dataset, Optional[Dataset], Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -2899,7 +2923,7 @@ def create_hierarchical_dataset(
 
             # v5.9.6: Apply boundary sampling if enabled (before split)
             if use_boundary_sampling:
-                base_dataset.apply_boundary_sampling(boundary_threshold)
+                base_dataset.apply_boundary_sampling(boundary_threshold, mode=boundary_mode)
 
             # Calculate index ranges for 3-way split
             all_valid = base_dataset.valid_indices

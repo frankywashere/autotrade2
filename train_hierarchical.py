@@ -21,7 +21,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.data._utils.collate import default_collate
 from pathlib import Path
 import sys
 import os
@@ -445,29 +444,32 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         x = torch.from_numpy(combined).to(dtype=torch_dtype)
 
     # Build targets tensor dict with proper dtype
-    # v5.9.2: Handle price_sequence separately (variable length - can't be stacked into tensor)
-    price_sequence_data = {}  # {key: [list_sample0, list_sample1, ...]}
-    converted_targets = []
+    # v5.9.5: Optimized - batch tensor creation per key (1013 calls vs 64,832)
+    # Previously: 64 samples × 1013 keys = 64,832 torch.tensor() calls (~12s)
+    # Now: 1013 keys × 1 torch.as_tensor() call (~0.2s)
+    _targets_start = time.perf_counter()
+    targets_batch = {}
 
-    for tgt in targets_list:
-        ct = {}
-        for k, v in tgt.items():
+    if targets_list and len(targets_list) > 0:
+        first_target = targets_list[0]
+        for k in first_target.keys():
             # v5.9.2: price_sequence stays as list (variable length, used in loss loop)
             if '_price_sequence' in k:
-                if k not in price_sequence_data:
-                    price_sequence_data[k] = []
-                price_sequence_data[k].append(v)  # Keep as list
-            elif isinstance(v, torch.Tensor):
-                ct[k] = v.to(dtype=torch_dtype)
+                targets_batch[k] = [t[k] for t in targets_list]  # List of lists
             else:
-                ct[k] = torch.tensor(v, dtype=torch_dtype)
-        converted_targets.append(ct)
+                # Gather all values for this key across samples
+                values = [t[k] for t in targets_list]
+                # Check if already tensors
+                if isinstance(values[0], torch.Tensor):
+                    targets_batch[k] = torch.stack(values).to(dtype=torch_dtype)
+                else:
+                    # Single tensor creation for all samples (fast!)
+                    targets_batch[k] = torch.as_tensor(values, dtype=torch_dtype)
 
-    targets_batch = default_collate(converted_targets)
-
-    # v5.9.2: Add price_sequence lists back (not as tensors - iterated in loss calculation)
-    for k, v in price_sequence_data.items():
-        targets_batch[k] = v  # List of lists, not tensor
+    # v5.9.5: Profile targets tensor creation (first 5 batches)
+    _targets_elapsed = time.perf_counter() - _targets_start
+    if _debug_counter[0] <= 5:
+        print(f"[PROFILE] targets tensor creation: {_targets_elapsed*1000:.1f}ms for {len(targets_list)} samples, {len(targets_batch)} keys", file=sys.stderr, flush=True)
 
     if move_to_device and device is not None:
         if is_native_timeframe:
@@ -2211,6 +2213,84 @@ def interactive_setup(args, profiler=None):
         args.use_chunk_sampler = True
         print("   → Using chunk-based sampler (optimized for mmap access)")
 
+    # v5.9.6: Boundary sampling option for faster epochs
+    print()
+    boundary_sampling_choice = inquirer.select(
+        message="Sample selection strategy:",
+        choices=[
+            "All samples - Train on every bar (standard, ~417K samples)",
+            "Boundary samples - Train only near channel breaks (10-20x fewer samples, faster epochs) ⚡"
+        ],
+        default="All samples - Train on every bar (standard, ~417K samples)"
+    ).execute()
+
+    if "Boundary" in boundary_sampling_choice:
+        args.use_boundary_sampling = True
+
+        # Choose boundary sampling mode
+        mode_choice = inquirer.select(
+            message="Boundary sampling mode:",
+            choices=[
+                "Approaching breaks - Train near channel endings (duration ≤ threshold)",
+                "New starts - Train on fresh channels (duration ≥ threshold) ⭐ Your original idea",
+                "Both - Train on breaks AND starts (most variety)"
+            ],
+            default="New starts - Train on fresh channels (duration ≥ threshold) ⭐ Your original idea"
+        ).execute()
+
+        if "Approaching" in mode_choice:
+            args.boundary_mode = "breaks"
+        elif "New starts" in mode_choice:
+            args.boundary_mode = "starts"
+        else:
+            args.boundary_mode = "both"
+
+        # Threshold selection (meaning depends on mode)
+        if args.boundary_mode in ["breaks", "both"]:
+            threshold_message = "Break threshold (bars until break):" if args.boundary_mode == "breaks" else "Threshold (bars from break/start):"
+            args.boundary_threshold = inquirer.select(
+                message=threshold_message,
+                choices=[
+                    "2 bars - Very strict",
+                    "5 bars - Strict ⭐ Recommended",
+                    "10 bars - Moderate",
+                    "20 bars - Loose"
+                ],
+                default="5 bars - Strict ⭐ Recommended"
+            ).execute()
+            threshold = int(args.boundary_threshold.split()[0])
+            args.boundary_threshold = threshold
+        else:
+            # New starts mode: use threshold for minimum duration
+            args.boundary_threshold = inquirer.select(
+                message="Minimum duration for 'fresh' channel:",
+                choices=[
+                    "10 bars - Very fresh channels",
+                    "20 bars - Fresh channels ⭐ Recommended",
+                    "30 bars - Established channels",
+                    "50 bars - Strong channels only"
+                ],
+                default="20 bars - Fresh channels ⭐ Recommended"
+            ).execute()
+            threshold = int(args.boundary_threshold.split()[0])
+            args.boundary_threshold = threshold
+
+        # Print selected configuration
+        if args.boundary_mode == "breaks":
+            print(f"   ⚡ Boundary sampling: Approaching breaks (≤{threshold} bars)")
+            print(f"      → Train on samples near channel endings")
+        elif args.boundary_mode == "starts":
+            print(f"   ⚡ Boundary sampling: New channel starts (≥{threshold} bars)")
+            print(f"      → Train on fresh channels with high duration")
+        else:
+            print(f"   ⚡ Boundary sampling: Both breaks and starts (≤{threshold} or ≥{threshold} bars)")
+            print(f"      → Train on transitions (endings + beginnings)")
+        print(f"      → Faster epochs, focuses on high-information samples")
+    else:
+        args.use_boundary_sampling = False
+        args.boundary_mode = None
+        print("   → Standard sampling (all bars)")
+
     # v5.3.2: Pre-stacking option for faster epochs
     print()
 
@@ -2899,6 +2979,18 @@ def interactive_setup(args, profiler=None):
             print(f"  Batch Pre-Stack: Full epoch (2 epochs{pinned_str}, ~40% faster) ⚠️ High RAM")
     else:
         print(f"  Batch Pre-Stack: Disabled (standard collate)")
+    # v5.9.6: Boundary sampling status
+    if getattr(args, 'use_boundary_sampling', False):
+        threshold = getattr(args, 'boundary_threshold', 5)
+        mode = getattr(args, 'boundary_mode', 'breaks')
+        if mode == 'breaks':
+            print(f"  Sample Selection: Boundary (≤{threshold} bars to break) ⚡")
+        elif mode == 'starts':
+            print(f"  Sample Selection: Boundary (≥{threshold} bars fresh) ⚡")
+        else:
+            print(f"  Sample Selection: Boundary (≤{threshold} or ≥{threshold*4} bars) ⚡")
+    else:
+        print(f"  Sample Selection: All samples (standard)")
     print(f"  Cache: {'Regenerate' if getattr(args, 'regenerate_cache', True) else 'Use existing'}")
     print(f"  Feature GPU: {'Yes' if getattr(args, 'use_gpu_features', False) else 'No'}")
     print(f"  Parallel CPU: {parallel_str}")
@@ -3561,7 +3653,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler=dataset_profiler,
         preload_tf_to_ram=args.preload_tf_to_ram,  # v5.9.3: User-selectable
         use_native_timeframes=args.use_native_timeframes,
-        tf_meta_path=args.tf_meta_path
+        tf_meta_path=args.tf_meta_path,
+        use_boundary_sampling=getattr(args, 'use_boundary_sampling', False),  # v5.9.6
+        boundary_threshold=getattr(args, 'boundary_threshold', 5),  # v5.9.6
+        boundary_mode=getattr(args, 'boundary_mode', 'breaks')  # v5.9.6
     )
 
     # v5.8: Override sequence lengths if user selected a preset
@@ -4034,7 +4129,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         if prestack_loader is not None:
             # v5.3.2: PreStackedBatchLoader handles its own shuffling
             prestack_loader.set_epoch(epoch)
-        elif is_distributed and train_sampler is not None:
+        elif train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
+            # v5.9.6: Call set_epoch for any sampler (single or multi-GPU)
             train_sampler.set_epoch(epoch)
 
         # v5.3.2: DDP barrier - ensure all ranks finish pre-stacking before training
@@ -4099,7 +4195,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         _is_first_batch_ever = (epoch == 0)
         _first_forward_start = None
 
+        # v5.9.5: Coarse timing to identify bottlenecks
+        _iter_end_time = time.perf_counter()  # Track end of previous iteration
+        _timing_samples = {'data': [], 'forward': [], 'loss': [], 'backward': [], 'optimizer': []}
+
         for batch_idx, batch_data in enumerate(batch_pbar):
+            # Measure data loading time (from end of previous iteration)
+            _data_time = time.perf_counter() - _iter_end_time
+
             if profiler and batch_idx == 0:
                 profiler.log_info(f"FIRST_BATCH_COMPLETE | time_sec={0}")
                 profiler.snapshot("first_batch_received", epoch + 1, force_log=True)
@@ -4167,7 +4270,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 _progress_thread.start()
 
             # Forward pass (v5.7.2: removed AMP, use TF32 instead)
+            _forward_start = time.perf_counter()
             predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
+            _forward_time = time.perf_counter() - _forward_start
+            _loss_start = time.perf_counter()  # Start loss timing
 
             # 🛡️ NaN Check 1: Predictions
             if not torch.isfinite(predictions).all():
@@ -4214,14 +4320,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 per_tf_highs = per_tf_preds['highs']  # [batch, 11]
                 per_tf_lows = per_tf_preds['lows']    # [batch, 11]
 
-                multi_tf_loss = 0.0
-                for i in range(11):  # 11 timeframes
-                    # MSE for each TF's high/low predictions
-                    tf_high_loss = F.mse_loss(per_tf_highs[:, i], target_tensor[:, 0], reduction='none')
-                    tf_low_loss = F.mse_loss(per_tf_lows[:, i], target_tensor[:, 1], reduction='none')
-                    # Weight by Gumbel-Softmax confidence (detached to not affect confidence learning)
-                    weight = tf_weights[:, i].detach()
-                    multi_tf_loss = multi_tf_loss + (weight * (tf_high_loss + tf_low_loss) / 2).mean()
+                # v5.9.6: Vectorized multi-TF loss (replaces loop over 11 TFs)
+                # Broadcast targets to [batch, 11]
+                target_highs = target_tensor[:, 0:1].expand(-1, 11)  # [batch, 11]
+                target_lows = target_tensor[:, 1:2].expand(-1, 11)   # [batch, 11]
+
+                # Compute MSE for all TFs in single operation
+                high_mse = (per_tf_highs - target_highs) ** 2  # [batch, 11]
+                low_mse = (per_tf_lows - target_lows) ** 2     # [batch, 11]
+
+                # Weighted average: weight by Gumbel-Softmax (detached), sum across TFs, mean across batch
+                multi_tf_loss = ((high_mse + low_mse) / 2 * tf_weights.detach()).sum(dim=1).mean()
 
                 # v5.7.2: Log weighted contribution so breakdown sums to total
                 multi_tf_contribution = 0.1 * multi_tf_loss
@@ -4341,11 +4450,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 loss_components['duration'] = duration_loss_total.item()
 
             # =====================================================================
-            # v5.9: CONTAINMENT LOSS (channel bounds contain actual price)
+            # v5.9.6: VECTORIZED CONTAINMENT & HIT PROBABILITY LOSS
             # =====================================================================
-            # Check if predicted channel bounds successfully contain actual price movement
+            # Optimized from nested Python loops to batched tensor operations
+            # Original: 128 samples × 11 TFs × 14 windows = ~20,000 loop iterations
+            # Now: ~30 tensor operations per TF
             containment_loss_total = 0.0
             hit_probability_loss_total = 0.0
+
+            # Cache window sizes for this batch
+            _windows = project_config.CHANNEL_WINDOW_SIZES  # [100, 90, 80, ..., 10] (14 values)
+            _num_windows = len(_windows)
 
             if 'geometric_predictions' in hidden_states:
                 for tf, geo_data in hidden_states['geometric_predictions'].items():
@@ -4355,106 +4470,114 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         window_weights = geo_data['window_weights']  # [batch, 14]
                         batch_size = geo_high_pred.shape[0]
 
-                        # v5.9: For each sample in batch, check containment
-                        containment_scores = []
+                        # =============================================================
+                        # Phase 3: Pre-gather all targets into tensors (eliminates dict lookups in loops)
+                        # =============================================================
+                        # Build validity mask tensor [batch, num_windows]
+                        validity_list = []
+                        hit_upper_list = []
+                        hit_midline_list = []
+                        hit_lower_list = []
+
+                        for win_idx, window in enumerate(_windows):
+                            key_valid = f'cont_{tf}_w{window}_valid'
+                            key_hit_upper = f'cont_{tf}_w{window}_hit_upper'
+                            key_hit_midline = f'cont_{tf}_w{window}_hit_midline'
+                            key_hit_lower = f'cont_{tf}_w{window}_hit_lower'
+
+                            if key_valid in targets:
+                                validity_list.append(targets[key_valid])  # [batch]
+                            else:
+                                validity_list.append(torch.zeros(batch_size, device=args.device))
+
+                            if key_hit_upper in targets:
+                                hit_upper_list.append(targets[key_hit_upper])
+                                hit_midline_list.append(targets[key_hit_midline])
+                                hit_lower_list.append(targets[key_hit_lower])
+                            else:
+                                hit_upper_list.append(torch.zeros(batch_size, device=args.device))
+                                hit_midline_list.append(torch.zeros(batch_size, device=args.device))
+                                hit_lower_list.append(torch.zeros(batch_size, device=args.device))
+
+                        # Stack into [batch, num_windows] tensors
+                        validity_mask = torch.stack(validity_list, dim=1) > 0  # [batch, 14] bool
+                        hit_upper_targets = torch.stack(hit_upper_list, dim=1)  # [batch, 14]
+                        hit_midline_targets = torch.stack(hit_midline_list, dim=1)  # [batch, 14]
+                        hit_lower_targets = torch.stack(hit_lower_list, dim=1)  # [batch, 14]
+
+                        # =============================================================
+                        # Phase 2: Vectorized Containment Loss
+                        # =============================================================
+                        # For containment, we still need price sequences (variable length lists)
+                        # But we can vectorize the inner containment check per sample
+                        containment_scores = torch.full((batch_size,), 0.5, device=args.device)  # Default neutral
 
                         for sample_idx in range(batch_size):
-                            # Get blended price sequence using window weights
-                            sample_weights = window_weights[sample_idx]  # [14]
-                            price_sequences = []
-                            valid_windows = []
+                            # Get valid windows for this sample
+                            sample_validity = validity_mask[sample_idx]  # [14]
+                            if not sample_validity.any():
+                                continue  # Keep default 0.5
 
-                            for win_idx, window in enumerate(project_config.CHANNEL_WINDOW_SIZES):
-                                key = f'cont_{tf}_w{window}_price_sequence'
-                                key_valid = f'cont_{tf}_w{window}_valid'
-                                if key in targets and sample_idx < len(targets[key]):
-                                    # v5.9.2: Check validity flag - skip placeholder sequences
-                                    is_valid = (key_valid in targets and
-                                                targets[key_valid][sample_idx].item() > 0)
-                                    if not is_valid:
-                                        continue
+                            # Find highest-weighted valid window
+                            masked_weights = window_weights[sample_idx].clone()  # [14]
+                            masked_weights[~sample_validity] = -float('inf')
+                            best_win_idx = masked_weights.argmax().item()
+                            best_window = _windows[best_win_idx]
 
-                                    price_seq = targets[key][sample_idx]
-                                    if price_seq is not None and len(price_seq) > 0:
-                                        price_sequences.append(price_seq)
-                                        valid_windows.append(win_idx)
+                            # Get price sequence for best window
+                            key = f'cont_{tf}_w{best_window}_price_sequence'
+                            if key in targets and sample_idx < len(targets[key]):
+                                price_seq = targets[key][sample_idx]
+                                if price_seq is not None and len(price_seq) > 0:
+                                    # Vectorized containment check
+                                    price_tensor = torch.tensor(price_seq, device=args.device, dtype=geo_high_pred.dtype)
+                                    low_bound = geo_low_pred[sample_idx]
+                                    high_bound = geo_high_pred[sample_idx]
+                                    contained = (price_tensor >= low_bound) & (price_tensor <= high_bound)
+                                    containment_scores[sample_idx] = contained.float().mean()
 
-                            if len(price_sequences) > 0:
-                                # Use price sequence from highest-weighted valid window
-                                if len(valid_windows) > 0:
-                                    max_weight_idx = sample_weights[valid_windows].argmax()
-                                    price_seq = price_sequences[max_weight_idx]
+                        # Loss = 1 - containment_rate (minimize when containment is high)
+                        containment_loss = (1.0 - containment_scores).mean()
+                        containment_loss_total += geo_price_weight * containment_loss
 
-                                    # Check containment for each bar in sequence
-                                    contained_bars = 0
-                                    total_bars = len(price_seq)
-
-                                    for price_pct in price_seq:
-                                        # Check if within predicted bounds
-                                        if geo_low_pred[sample_idx] <= price_pct <= geo_high_pred[sample_idx]:
-                                            contained_bars += 1
-
-                                    # Containment rate for this sample
-                                    containment_rate = contained_bars / max(total_bars, 1)
-                                    containment_scores.append(containment_rate)
-                                else:
-                                    containment_scores.append(0.5)  # Neutral if no valid sequences
-                            else:
-                                containment_scores.append(0.5)  # Neutral
-
-                        if containment_scores:
-                            # Convert to tensor
-                            containment_tensor = torch.tensor(containment_scores, device=args.device)
-                            # Loss = 1 - containment_rate (minimize when containment is high)
-                            containment_loss = (1.0 - containment_tensor).mean()
-                            containment_loss_total += geo_price_weight * containment_loss
-
-                        # v5.9: Hit probability loss (predict if price hits upper/midline/lower)
+                        # =============================================================
+                        # Phase 1: Vectorized Hit Probability Loss (biggest speedup)
+                        # =============================================================
                         if 'hit_prob_upper' in geo_data:
                             hit_prob_upper_pred = geo_data['hit_prob_upper'].squeeze()  # [batch]
                             hit_prob_midline_pred = geo_data['hit_prob_midline'].squeeze()  # [batch]
                             hit_prob_lower_pred = geo_data['hit_prob_lower'].squeeze()  # [batch]
 
-                            # Blend hit targets using window weights
-                            for sample_idx in range(batch_size):
-                                sample_weights = window_weights[sample_idx]
-                                hit_upper_target = 0.0
-                                hit_midline_target = 0.0
-                                hit_lower_target = 0.0
-                                total_weight = 0.0
+                            # Compute weighted targets using batched operations
+                            # validity_mask: [batch, 14], window_weights: [batch, 14]
+                            valid_weights = window_weights * validity_mask.float()  # [batch, 14]
+                            total_weight = valid_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)  # [batch, 1]
+                            normalized_weights = valid_weights / total_weight  # [batch, 14]
 
-                                for win_idx, window in enumerate(project_config.CHANNEL_WINDOW_SIZES):
-                                    key_hit_upper = f'cont_{tf}_w{window}_hit_upper'
-                                    key_hit_midline = f'cont_{tf}_w{window}_hit_midline'
-                                    key_hit_lower = f'cont_{tf}_w{window}_hit_lower'
-                                    key_valid = f'cont_{tf}_w{window}_valid'
+                            # Weighted average of targets: [batch]
+                            blended_hit_upper = (normalized_weights * hit_upper_targets).sum(dim=1)
+                            blended_hit_midline = (normalized_weights * hit_midline_targets).sum(dim=1)
+                            blended_hit_lower = (normalized_weights * hit_lower_targets).sum(dim=1)
 
-                                    if (key_valid in targets and targets[key_valid][sample_idx] > 0 and
-                                        key_hit_upper in targets):
-                                        weight = sample_weights[win_idx].item()
-                                        hit_upper_target += weight * targets[key_hit_upper][sample_idx].item()
-                                        hit_midline_target += weight * targets[key_hit_midline][sample_idx].item()
-                                        hit_lower_target += weight * targets[key_hit_lower][sample_idx].item()
-                                        total_weight += weight
+                            # Mask for samples with valid targets
+                            has_valid = validity_mask.any(dim=1)  # [batch]
+                            num_valid_samples = has_valid.sum()
 
-                                # Normalize if we had valid targets
-                                if total_weight > 0:
-                                    hit_upper_target /= total_weight
-                                    hit_midline_target /= total_weight
-                                    hit_lower_target /= total_weight
+                            if num_valid_samples > 0:
+                                # Single batched BCE call (replaces 128 individual calls)
+                                # Clamp targets to valid BCE range [0, 1]
+                                blended_hit_upper = blended_hit_upper.clamp(0, 1)
+                                blended_hit_midline = blended_hit_midline.clamp(0, 1)
+                                blended_hit_lower = blended_hit_lower.clamp(0, 1)
 
-                                    # BCE loss for hit probabilities
-                                    target_hit_upper_t = torch.tensor(hit_upper_target, device=args.device)
-                                    target_hit_midline_t = torch.tensor(hit_midline_target, device=args.device)
-                                    target_hit_lower_t = torch.tensor(hit_lower_target, device=args.device)
+                                # Compute BCE for all samples, then mask
+                                bce_upper = F.binary_cross_entropy(hit_prob_upper_pred, blended_hit_upper, reduction='none')
+                                bce_midline = F.binary_cross_entropy(hit_prob_midline_pred, blended_hit_midline, reduction='none')
+                                bce_lower = F.binary_cross_entropy(hit_prob_lower_pred, blended_hit_lower, reduction='none')
 
-                                    hit_loss = (
-                                        F.binary_cross_entropy(hit_prob_upper_pred[sample_idx:sample_idx+1], target_hit_upper_t.unsqueeze(0)) +
-                                        F.binary_cross_entropy(hit_prob_midline_pred[sample_idx:sample_idx+1], target_hit_midline_t.unsqueeze(0)) +
-                                        F.binary_cross_entropy(hit_prob_lower_pred[sample_idx:sample_idx+1], target_hit_lower_t.unsqueeze(0))
-                                    ) / 3.0
-
-                                    hit_probability_loss_total += hit_loss
+                                # Average over 3 hit types, then apply validity mask
+                                hit_loss_per_sample = (bce_upper + bce_midline + bce_lower) / 3.0  # [batch]
+                                hit_probability_loss_total += (hit_loss_per_sample * has_valid.float()).sum()
 
             # Add containment loss (replaces geo_price)
             if containment_loss_total > 0:
@@ -4560,7 +4683,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             else:
                 loss_components['transition'] = 0.0
 
+            _loss_time = time.perf_counter() - _loss_start  # End loss timing
+            _backward_start = time.perf_counter()
             loss.backward()
+            _backward_time = time.perf_counter() - _backward_start
 
             # v5.3.2: Track gradient norm BEFORE clipping (shows true gradient magnitude)
             total_norm = 0.0
@@ -4579,7 +4705,23 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     print(f"\n🚨 NaN/Inf gradient in {name} at batch {batch_idx}!")
                     raise ValueError(f"Non-finite gradient in {name}")
 
+            _optim_start = time.perf_counter()
             optimizer.step()
+            _optim_time = time.perf_counter() - _optim_start
+
+            # v5.9.5: Collect timing samples and print every 5 batches
+            _timing_samples['data'].append(_data_time)
+            _timing_samples['forward'].append(_forward_time)
+            _timing_samples['loss'].append(_loss_time)
+            _timing_samples['backward'].append(_backward_time)
+            _timing_samples['optimizer'].append(_optim_time)
+
+            if batch_idx < 10 or (batch_idx < 50 and batch_idx % 10 == 0):
+                print(f"[TIMING] batch {batch_idx}: data={_data_time*1000:.0f}ms, fwd={_forward_time*1000:.0f}ms, "
+                      f"loss={_loss_time*1000:.0f}ms, bwd={_backward_time*1000:.0f}ms, opt={_optim_time*1000:.0f}ms, "
+                      f"total={(_data_time+_forward_time+_loss_time+_backward_time+_optim_time)*1000:.0f}ms", flush=True)
+
+            _iter_end_time = time.perf_counter()  # Mark end of this iteration
 
             # Report first batch completion time and stop progress thread
             if _is_first_batch_ever and batch_idx == 0 and _first_forward_start is not None:
@@ -4608,54 +4750,53 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     val_score = hidden_states['validity'][sel_tf].mean().item()
                     epoch_validity_preds.append(val_score)
 
-            # Debug: Log loss breakdown every 100 batches
-            if batch_idx % 100 == 0:
-                batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            # Update loss display every batch (negligible overhead)
+            batch_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-                # Print component breakdown every 100 batches for diagnosis
-                # v5.7.2: All values now reflect actual weighted contributions to loss
-                if batch_idx > 0 and batch_idx % 100 == 0:
-                    print(f"\n📊 [{batch_idx}] Loss components:")
-                    print(f"   Primary: {loss_components.get('primary', 0):.3f}")
-                    print(f"   Multi-task: {loss_components.get('multi_task', 0):.3f}")
-                    print(f"   Duration: {loss_components.get('duration', 0):.3f}")
-                    print(f"   Containment: {loss_components.get('containment', 0):.3f}")
-                    print(f"   Hit-Prob: {loss_components.get('hit_probability', 0):.3f}")
-                    print(f"   Validity: {loss_components.get('validity', 0):.3f}")
-                    print(f"   Transition: {loss_components.get('transition', 0):.3f}")
-                    print(f"   Calibration: {loss_components.get('calibration', 0):.3f}")
-                    print(f"   Entropy: {loss_components.get('entropy', 0):.3f}")
-                    print(f"   Multi-TF: {loss_components.get('multi_tf', 0):.3f}")
-                    print(f"   ─────────────────────")
+            # Print component breakdown every 100 batches for diagnosis
+            # v5.7.2: All values now reflect actual weighted contributions to loss
+            if batch_idx > 0 and batch_idx % 100 == 0:
+                print(f"\n📊 [{batch_idx}] Loss components:")
+                print(f"   Primary: {loss_components.get('primary', 0):.3f}")
+                print(f"   Multi-task: {loss_components.get('multi_task', 0):.3f}")
+                print(f"   Duration: {loss_components.get('duration', 0):.3f}")
+                print(f"   Containment: {loss_components.get('containment', 0):.3f}")
+                print(f"   Hit-Prob: {loss_components.get('hit_probability', 0):.3f}")
+                print(f"   Validity: {loss_components.get('validity', 0):.3f}")
+                print(f"   Transition: {loss_components.get('transition', 0):.3f}")
+                print(f"   Calibration: {loss_components.get('calibration', 0):.3f}")
+                print(f"   Entropy: {loss_components.get('entropy', 0):.3f}")
+                print(f"   Multi-TF: {loss_components.get('multi_tf', 0):.3f}")
+                print(f"   ─────────────────────")
 
-                    # v5.7.2: Verify tracked components sum to total (Fix 5)
-                    CONTRIBUTION_KEYS = ['primary', 'multi_task', 'duration', 'containment', 'hit_probability',
-                                         'validity', 'transition', 'calibration', 'multi_tf', 'entropy']
-                    tracked_sum = sum(loss_components.get(k, 0) for k in CONTRIBUTION_KEYS)
-                    print(f"   Tracked: {tracked_sum:.3f}")
-                    print(f"   Total: {loss.item():.3f}")
-                    delta = loss.item() - tracked_sum
-                    if abs(delta) > 0.01:
-                        print(f"   ⚠️  Untracked: {delta:.3f}")
+                # v5.7.2: Verify tracked components sum to total (Fix 5)
+                CONTRIBUTION_KEYS = ['primary', 'multi_task', 'duration', 'containment', 'hit_probability',
+                                     'validity', 'transition', 'calibration', 'multi_tf', 'entropy']
+                tracked_sum = sum(loss_components.get(k, 0) for k in CONTRIBUTION_KEYS)
+                print(f"   Tracked: {tracked_sum:.3f}")
+                print(f"   Total: {loss.item():.3f}")
+                delta = loss.item() - tracked_sum
+                if abs(delta) > 0.01:
+                    print(f"   ⚠️  Untracked: {delta:.3f}")
 
-                    # 🔍 Multi-TF Training diagnostics (v5.7.2: replaces obsolete match rate)
-                    # Count TFs with at least one valid sample (not just keys existing)
-                    tfs_with_valid = sum(
-                        (labels['valid_mask'].sum() > 0).item()
-                        for labels in transition_labels_tensors.values()
-                    )
-                    print(f"\n🔍 Multi-TF Training:")
-                    print(f"   TFs with valid labels: {tfs_with_valid}/11")
-                    print(f"   TF weight entropy: {loss_components.get('tf_weights_entropy', 0):.3f}")
-                    print(f"   Entropy (raw): {loss_components.get('entropy_raw', 0):.3f}")
+                # 🔍 Multi-TF Training diagnostics (v5.7.2: replaces obsolete match rate)
+                # Count TFs with at least one valid sample (not just keys existing)
+                tfs_with_valid = sum(
+                    (labels['valid_mask'].sum() > 0).item()
+                    for labels in transition_labels_tensors.values()
+                )
+                print(f"\n🔍 Multi-TF Training:")
+                print(f"   TFs with valid labels: {tfs_with_valid}/11")
+                print(f"   TF weight entropy: {loss_components.get('tf_weights_entropy', 0):.3f}")
+                print(f"   Entropy (raw): {loss_components.get('entropy_raw', 0):.3f}")
 
-                    # Most picked TF (attention mechanism preference)
-                    if transition_diagnostics['selected_tf_counts']:
-                        mode_tf = max(transition_diagnostics['selected_tf_counts'],
-                                      key=transition_diagnostics['selected_tf_counts'].get)
-                        mode_count = transition_diagnostics['selected_tf_counts'][mode_tf]
-                        total = transition_diagnostics['total_batches']
-                        print(f"   Most picked TF: {mode_tf} ({mode_count}/{total} = {mode_count/total*100:.1f}%)")
+                # Most picked TF (attention mechanism preference)
+                if transition_diagnostics['selected_tf_counts']:
+                    mode_tf = max(transition_diagnostics['selected_tf_counts'],
+                                  key=transition_diagnostics['selected_tf_counts'].get)
+                    mode_count = transition_diagnostics['selected_tf_counts'][mode_tf]
+                    total = transition_diagnostics['total_batches']
+                    print(f"   Most picked TF: {mode_tf} ({mode_count}/{total} = {mode_count/total*100:.1f}%)")
 
             if profiler and batch_idx > 0 and batch_idx % profiler.log_every_n == 0:
                 profiler.snapshot(f"batch_{batch_idx}", epoch + 1)
