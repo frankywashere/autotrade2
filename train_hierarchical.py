@@ -2213,6 +2213,39 @@ def interactive_setup(args, profiler=None):
         args.use_chunk_sampler = True
         print("   → Using chunk-based sampler (optimized for mmap access)")
 
+    # v5.9.6: Boundary sampling option for faster epochs
+    print()
+    boundary_sampling_choice = inquirer.select(
+        message="Sample selection strategy:",
+        choices=[
+            "All samples - Train on every bar (standard, ~417K samples)",
+            "Boundary samples - Train only near channel breaks (10-20x fewer samples, faster epochs) ⚡"
+        ],
+        default="All samples - Train on every bar (standard, ~417K samples)"
+    ).execute()
+
+    if "Boundary" in boundary_sampling_choice:
+        args.use_boundary_sampling = True
+        args.boundary_threshold = inquirer.select(
+            message="Boundary threshold (bars until break):",
+            choices=[
+                "2 bars - Very strict (only imminent breaks)",
+                "5 bars - Strict (near-term breaks) ⭐ Recommended",
+                "10 bars - Moderate (include approaching breaks)",
+                "20 bars - Loose (include distant breaks)"
+            ],
+            default="5 bars - Strict (near-term breaks) ⭐ Recommended"
+        ).execute()
+        threshold = int(args.boundary_threshold.split()[0])
+        args.boundary_threshold = threshold
+        print(f"   ⚡ Boundary sampling enabled (threshold={threshold} bars)")
+        print(f"      → Will train on samples within {threshold} bars of channel break")
+        print(f"      → Estimated ~{417430 // (20 // max(threshold, 1)):,} samples ({100 / (20 // max(threshold, 1)):.0f}% of data)")
+        print(f"      → Faster epochs, focuses on high-information transitions")
+    else:
+        args.use_boundary_sampling = False
+        print("   → Standard sampling (all bars)")
+
     # v5.3.2: Pre-stacking option for faster epochs
     print()
 
@@ -2901,6 +2934,12 @@ def interactive_setup(args, profiler=None):
             print(f"  Batch Pre-Stack: Full epoch (2 epochs{pinned_str}, ~40% faster) ⚠️ High RAM")
     else:
         print(f"  Batch Pre-Stack: Disabled (standard collate)")
+    # v5.9.6: Boundary sampling status
+    if getattr(args, 'use_boundary_sampling', False):
+        threshold = getattr(args, 'boundary_threshold', 5)
+        print(f"  Sample Selection: Boundary only (≤{threshold} bars to break) ⚡")
+    else:
+        print(f"  Sample Selection: All samples (standard)")
     print(f"  Cache: {'Regenerate' if getattr(args, 'regenerate_cache', True) else 'Use existing'}")
     print(f"  Feature GPU: {'Yes' if getattr(args, 'use_gpu_features', False) else 'No'}")
     print(f"  Parallel CPU: {parallel_str}")
@@ -3563,7 +3602,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler=dataset_profiler,
         preload_tf_to_ram=args.preload_tf_to_ram,  # v5.9.3: User-selectable
         use_native_timeframes=args.use_native_timeframes,
-        tf_meta_path=args.tf_meta_path
+        tf_meta_path=args.tf_meta_path,
+        use_boundary_sampling=getattr(args, 'use_boundary_sampling', False),  # v5.9.6
+        boundary_threshold=getattr(args, 'boundary_threshold', 5)  # v5.9.6
     )
 
     # v5.8: Override sequence lengths if user selected a preset

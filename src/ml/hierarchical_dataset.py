@@ -625,6 +625,64 @@ class HierarchicalDataset(Dataset):
         # v5.9.4: Load pre-computed targets if available (Fix #1 and #3)
         self._load_precomputed_targets(cache_dir, cache_key)
 
+    def apply_boundary_sampling(self, boundary_threshold: int):
+        """
+        Filter valid_indices to only include samples near channel boundaries.
+
+        v5.9.6: Focuses training on high-information transition points rather than
+        redundant mid-channel samples.
+
+        Args:
+            boundary_threshold: Maximum bars until break to include (e.g., 5 = within 5 bars of break)
+        """
+        if not hasattr(self, '_per_tf_continuation') or len(self._per_tf_continuation) == 0:
+            print(f"     ⚠️  No continuation labels loaded, cannot apply boundary sampling")
+            return
+
+        print(f"\n  🎯 Applying boundary sampling (threshold={boundary_threshold} bars)...")
+        original_count = len(self.valid_indices)
+
+        # Use 5min timeframe labels as reference (most granular)
+        if '5min' not in self._per_tf_continuation:
+            print(f"     ⚠️  No 5min continuation labels, cannot apply boundary sampling")
+            return
+
+        cont_data = self._per_tf_continuation['5min']
+
+        # Get duration for first window (w10) as proxy for channel state
+        # If any window shows near-break, include the sample
+        boundary_indices = []
+
+        for idx in self.valid_indices:
+            # Convert valid_indices (5min positions) to label lookup
+            ts_5min = int(self.tf_timestamps['5min'][idx])
+
+            if ts_5min in self._per_tf_ts_to_idx.get('5min', {}):
+                label_idx = self._per_tf_ts_to_idx['5min'][ts_5min]
+
+                # Check if any window is near breaking
+                is_boundary = False
+                for window in config.CHANNEL_WINDOW_SIZES[:5]:  # Check first 5 windows
+                    duration_key = f'w{window}_duration'
+                    valid_key = f'w{window}_valid'
+
+                    if duration_key in cont_data and valid_key in cont_data:
+                        if cont_data[valid_key][label_idx] > 0:
+                            duration = cont_data[duration_key][label_idx]
+                            if duration <= boundary_threshold:
+                                is_boundary = True
+                                break
+
+                if is_boundary:
+                    boundary_indices.append(idx)
+
+        self.valid_indices = boundary_indices
+        filtered_count = len(self.valid_indices)
+        reduction_pct = (1 - filtered_count / original_count) * 100
+
+        print(f"     ✓ Filtered {original_count:,} → {filtered_count:,} samples ({reduction_pct:.1f}% reduction)")
+        print(f"     ✓ Focusing on high-information channel transitions")
+
     def _load_precomputed_targets(self, cache_dir: Path, cache_key: str):
         """
         Load pre-computed breakout labels and target arrays if available.
@@ -2742,7 +2800,9 @@ def create_hierarchical_dataset(
     preload_to_ram: bool = False,  # Legacy: for old chunked mmap system
     preload_tf_to_ram: bool = False,  # v5.9.3: Preload native TF sequences to RAM
     use_native_timeframes: bool = False,
-    tf_meta_path: str = None
+    tf_meta_path: str = None,
+    use_boundary_sampling: bool = False,  # v5.9.6: Filter to channel boundary samples only
+    boundary_threshold: int = 5  # v5.9.6: Bars until break threshold
 ) -> Tuple[Dataset, Optional[Dataset], Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -2814,6 +2874,10 @@ def create_hierarchical_dataset(
                 use_native_timeframes=use_native_timeframes,
                 tf_meta_path=tf_meta_path
             )
+
+            # v5.9.6: Apply boundary sampling if enabled (before split)
+            if use_boundary_sampling:
+                base_dataset.apply_boundary_sampling(boundary_threshold)
 
             # Calculate index ranges for 3-way split
             all_valid = base_dataset.valid_indices
