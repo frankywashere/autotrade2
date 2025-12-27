@@ -2213,6 +2213,83 @@ def interactive_setup(args, profiler=None):
         args.use_chunk_sampler = True
         print("   → Using chunk-based sampler (optimized for mmap access)")
 
+    # v5.9.6: Sample selection strategy (boundary sampling)
+    print()
+    boundary_sampling_choice = inquirer.select(
+        message="Sample selection strategy:",
+        choices=[
+            "All samples - Train on every bar (standard, ~417K samples)",
+            "Boundary samples - Train only near channel breaks (10-20x fewer samples, faster epochs) ⚡"
+        ],
+        default="All samples - Train on every bar (standard, ~417K samples)"
+    ).execute()
+
+    if "Boundary" in boundary_sampling_choice:
+        args.use_boundary_sampling = True
+
+        # Choose boundary sampling mode
+        mode_choice = inquirer.select(
+            message="Boundary sampling mode:",
+            choices=[
+                "Approaching breaks - Train near channel endings (duration ≤ threshold)",
+                "New starts - Train on fresh channels (duration ≥ threshold) ⭐ Your original idea",
+                "Both - Train on breaks AND starts (most variety)"
+            ],
+            default="New starts - Train on fresh channels (duration ≥ threshold) ⭐ Your original idea"
+        ).execute()
+
+        if "Approaching" in mode_choice:
+            args.boundary_mode = "breaks"
+        elif "New starts" in mode_choice:
+            args.boundary_mode = "starts"
+        else:
+            args.boundary_mode = "both"
+
+        # Threshold selection (meaning depends on mode)
+        if args.boundary_mode in ["breaks", "both"]:
+            threshold_message = "Break threshold (bars until break):" if args.boundary_mode == "breaks" else "Threshold (bars from break/start):"
+            threshold_choice = inquirer.select(
+                message=threshold_message,
+                choices=[
+                    "2 bars - Very strict",
+                    "5 bars - Strict ⭐ Recommended",
+                    "10 bars - Moderate",
+                    "20 bars - Loose"
+                ],
+                default="5 bars - Strict ⭐ Recommended"
+            ).execute()
+            args.boundary_threshold = int(threshold_choice.split()[0])
+        else:
+            # New starts mode: use threshold for minimum duration
+            threshold_choice = inquirer.select(
+                message="Minimum duration for 'fresh' channel:",
+                choices=[
+                    "10 bars - Very fresh channels",
+                    "20 bars - Fresh channels ⭐ Recommended",
+                    "30 bars - Established channels",
+                    "50 bars - Strong channels only"
+                ],
+                default="20 bars - Fresh channels ⭐ Recommended"
+            ).execute()
+            args.boundary_threshold = int(threshold_choice.split()[0])
+
+        # Print selected configuration
+        if args.boundary_mode == "breaks":
+            print(f"   ⚡ Boundary sampling: Approaching breaks (≤{args.boundary_threshold} bars)")
+            print(f"      → Train on samples near channel endings")
+        elif args.boundary_mode == "starts":
+            print(f"   ⚡ Boundary sampling: New channel starts (≥{args.boundary_threshold} bars)")
+            print(f"      → Train on fresh channels with high duration")
+        else:
+            print(f"   ⚡ Boundary sampling: Both breaks and starts (≤{args.boundary_threshold} or ≥{args.boundary_threshold} bars)")
+            print(f"      → Train on transitions (endings + beginnings)")
+        print(f"      → Faster epochs, focuses on high-information samples")
+    else:
+        args.use_boundary_sampling = False
+        args.boundary_mode = None
+        args.boundary_threshold = 5
+        print("   → Standard sampling (all bars)")
+
     # v5.3.2: Pre-stacking option for faster epochs
     print()
 
@@ -2901,6 +2978,16 @@ def interactive_setup(args, profiler=None):
             print(f"  Batch Pre-Stack: Full epoch (2 epochs{pinned_str}, ~40% faster) ⚠️ High RAM")
     else:
         print(f"  Batch Pre-Stack: Disabled (standard collate)")
+    # v5.9.6: Sample selection display
+    if getattr(args, 'use_boundary_sampling', False):
+        mode = getattr(args, 'boundary_mode', 'breaks')
+        threshold = getattr(args, 'boundary_threshold', 5)
+        mode_desc = {'breaks': f'near breaks (≤{threshold} bars)',
+                     'starts': f'fresh channels (≥{threshold} bars)',
+                     'both': f'transitions (≤{threshold} or ≥{threshold*4} bars)'}
+        print(f"  Sample Selection: Boundary sampling - {mode_desc.get(mode, mode)} ⚡")
+    else:
+        print(f"  Sample Selection: All samples (standard)")
     print(f"  Cache: {'Regenerate' if getattr(args, 'regenerate_cache', True) else 'Use existing'}")
     print(f"  Feature GPU: {'Yes' if getattr(args, 'use_gpu_features', False) else 'No'}")
     print(f"  Parallel CPU: {parallel_str}")
@@ -3563,7 +3650,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler=dataset_profiler,
         preload_tf_to_ram=args.preload_tf_to_ram,  # v5.9.3: User-selectable
         use_native_timeframes=args.use_native_timeframes,
-        tf_meta_path=args.tf_meta_path
+        tf_meta_path=args.tf_meta_path,
+        use_boundary_sampling=getattr(args, 'use_boundary_sampling', False),  # v5.9.6
+        boundary_threshold=getattr(args, 'boundary_threshold', 5),  # v5.9.6
+        boundary_mode=getattr(args, 'boundary_mode', 'breaks')  # v5.9.6
     )
 
     # v5.8: Override sequence lengths if user selected a preset
@@ -4036,7 +4126,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         if prestack_loader is not None:
             # v5.3.2: PreStackedBatchLoader handles its own shuffling
             prestack_loader.set_epoch(epoch)
-        elif is_distributed and train_sampler is not None:
+        elif train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
+            # v5.9.6: Call set_epoch for any sampler (single or multi-GPU)
             train_sampler.set_epoch(epoch)
 
         # v5.3.2: DDP barrier - ensure all ranks finish pre-stacking before training
@@ -4226,14 +4317,17 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 per_tf_highs = per_tf_preds['highs']  # [batch, 11]
                 per_tf_lows = per_tf_preds['lows']    # [batch, 11]
 
-                multi_tf_loss = 0.0
-                for i in range(11):  # 11 timeframes
-                    # MSE for each TF's high/low predictions
-                    tf_high_loss = F.mse_loss(per_tf_highs[:, i], target_tensor[:, 0], reduction='none')
-                    tf_low_loss = F.mse_loss(per_tf_lows[:, i], target_tensor[:, 1], reduction='none')
-                    # Weight by Gumbel-Softmax confidence (detached to not affect confidence learning)
-                    weight = tf_weights[:, i].detach()
-                    multi_tf_loss = multi_tf_loss + (weight * (tf_high_loss + tf_low_loss) / 2).mean()
+                # v5.9.6: Vectorized multi-TF loss (replaces loop over 11 TFs)
+                # Broadcast targets to [batch, 11]
+                target_highs = target_tensor[:, 0:1].expand(-1, 11)  # [batch, 11]
+                target_lows = target_tensor[:, 1:2].expand(-1, 11)   # [batch, 11]
+
+                # Compute MSE for all TFs in single operation
+                high_mse = (per_tf_highs - target_highs) ** 2  # [batch, 11]
+                low_mse = (per_tf_lows - target_lows) ** 2     # [batch, 11]
+
+                # Weighted average: weight by Gumbel-Softmax (detached), sum across TFs, mean across batch
+                multi_tf_loss = ((high_mse + low_mse) / 2 * tf_weights.detach()).sum(dim=1).mean()
 
                 # v5.7.2: Log weighted contribution so breakdown sums to total
                 multi_tf_contribution = 0.1 * multi_tf_loss
