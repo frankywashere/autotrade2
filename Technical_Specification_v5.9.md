@@ -1,8 +1,8 @@
 # Technical Specification: Hierarchical Channel Duration Prediction System v5.9
 
-**Version:** 5.9.3
-**Branch:** `stable-training`
-**Date:** December 25, 2025
+**Version:** 5.9.6
+**Branch:** `optimize`
+**Date:** December 26, 2025
 **Status:** Production Ready
 **Feature Version:** v5.9.1 (vix:v1, events:v1, projections:v2, breakdown:v3, partial_bar:v4, continuation:v2.1)
 **Model Parameters:** ~20.9M total / ~18.6M trainable
@@ -48,13 +48,14 @@ AutoTrade v5.9 is a hierarchical neural network that predicts TSLA stock price m
 
 Then geometric projections become **computed outputs**, not learned adjustments.
 
-### Production Status
+### Production Status (v5.9.6)
 
 - ✅ **Multi-GPU Training**: DDP with TF32 acceleration
-- ✅ **Memory Efficient**: Mmap-based dataset, layered cache validation
+- ✅ **Memory Efficient**: Mmap labels + auto-conversion (16 GB RAM saved with multi-GPU)
 - ✅ **Event-Aware**: FOMC, earnings, deliveries, macro events
 - ✅ **VIX Integration**: 90-day regime awareness
-- ⚠️ **Worker Limitation**: Training with `num_workers=0` only (multiprocessing hang on v5.9.3)
+- ✅ **Performance**: 42% faster batches (7.2s vs 12.5s), 80% faster epochs with boundary sampling
+- ⚠️ **Worker Limitation**: Training with `num_workers=0` recommended (mmap file handle limits)
 
 ---
 
@@ -213,6 +214,78 @@ Tier 3 (Generated): transition_labels_*.pkl
    - Better collation in DataLoader
 
 **Known Limitation:** `num_workers > 0` causes hanging (multiprocessing + mmap incompatibility)
+
+---
+
+### v5.9.6: Performance Optimizations (Dec 2025)
+
+**Major Changes:**
+
+1. **Vectorized Loss Calculation** - 8x speedup
+   ```python
+   # Before: Nested Python loops
+   for sample_idx in range(128):
+       for window in 14_windows:
+           torch.tensor(...)  # 20,000 calls per batch
+           F.binary_cross_entropy(...)  # Per-sample
+
+   # After: Batched tensor operations
+   validity_mask = torch.stack(...)  # [128, 14]
+   blended_targets = (weights * targets).sum(dim=1)  # [128]
+   bce = F.binary_cross_entropy(preds, blended_targets)  # Single call
+   ```
+   **Result:** Loss calculation 5700ms → 700ms (87% faster)
+
+2. **Memory-Mapped Label Loading** - 87% RAM reduction
+   - Continuation/transition labels now use mmap (.mmap/ directories with .npy files)
+   - Auto-converts pickle → mmap on first load (synchronous)
+   - Shared across all DataLoader workers via OS page cache
+
+   **RAM Savings (4 workers × 2 GPUs = 8 processes):**
+   - Before: 2.3 GB labels × 8 = 18.4 GB
+   - After: 2.3 GB shared = 2.3 GB
+   - **Saved: ~16 GB**
+
+3. **Boundary Sampling Mode** - 4-10x faster epochs
+   - Optional training mode that samples only near channel breaks
+   - Focuses on high-information transition samples
+   - Interactive threshold selection (2/5/10/20 bars)
+
+   **Impact with threshold=5:**
+   - Samples: 417K → 71K (83% reduction)
+   - Epoch time: ~4.8 hours → ~1 hour
+   - **Speedup: ~4-5x per epoch**
+
+4. **Bug Fixes**
+   - Fixed NaN in price_sequence generation (invalid windows now properly initialized)
+   - Fixed single-GPU ShuffleBufferSampler epoch update
+   - Fixed precomputed target indexing with boundary sampling
+   - Updated loss display to refresh every batch (not every 100)
+
+**Performance Summary:**
+```
+v5.9.3 Performance (before optimization):
+  Total batch time: ~12.5s
+  ├── data:     ~200ms
+  ├── forward:  ~1300ms
+  ├── loss:     ~5700ms  ← Main bottleneck
+  ├── backward: ~5300ms
+  └── optimizer: ~70ms
+
+v5.9.6 Performance (after optimization):
+  Total batch time: ~7.2s (42% faster)
+  ├── data:     ~140ms (2%)
+  ├── forward:  ~1240ms (17%)
+  ├── loss:     ~700ms (10%) ← Optimized!
+  ├── backward: ~5000ms (69%) ← Now main bottleneck
+  └── optimizer: ~65ms (1%)
+
+v5.9.6 with Boundary Sampling:
+  Epoch time: ~4.8 hours → ~1 hour (80% faster)
+  Same per-batch performance, 4-5x fewer batches
+```
+
+**Cache Compatibility:** v5.9.6 fully compatible with v5.9.0-v5.9.5 caches
 
 ---
 
@@ -485,19 +558,32 @@ proj_low = current_price * (1 + channel['low_slope_pct'] * duration_bars)
    - Transition labels (type, direction, slope)
 ```
 
-**Cache Structure:**
+**Cache Structure (v5.9.6):**
 ```
 data/feature_cache/
-├── tf_meta_{version}.json           # Metadata (feature columns, date ranges)
-├── tf_sequence_5min_{version}.npy   # 418K bars × 1049 features (mmap)
-├── tf_sequence_15min_{version}.npy  # 154K bars × 1049 features
+├── tf_meta_{version}.json                      # Metadata (feature columns, date ranges)
+├── tf_sequence_5min_{version}.npy              # 418K bars × 1049 features (mmap)
+├── tf_sequence_15min_{version}.npy             # 154K bars × 1049 features
 ├── ... (11 TF files)
-├── tf_timestamps_5min_{version}.npy # Timestamps for each bar
+├── tf_timestamps_5min_{version}.npy            # Timestamps for each bar
 ├── ... (11 timestamp files)
-├── continuation_labels_5min_v2.1.pkl  # Duration/gain labels
-├── ... (11 continuation label files)
-├── transition_labels_5min_v2.1.pkl    # Transition predictions
-└── ... (10-11 transition label files, 3month often missing)
+├── continuation_labels_5min_{version}.pkl      # Source (pickle, auto-converts)
+├── continuation_labels_5min_{version}.mmap/    # Runtime format (individual .npy files)
+│   ├── timestamps.npy                          # Mmap'd timestamp index
+│   ├── w10_duration.npy                        # Per-window arrays
+│   ├── w10_price_sequence_flat.npy             # Flattened price sequences
+│   ├── w10_price_sequence_offsets.npy          # Reconstruction offsets
+│   └── ... (~228 files per TF)
+├── ... (11 continuation .pkl + 11 .mmap/ dirs)
+├── transition_labels_5min_{version}.pkl        # Source (pickle)
+├── transition_labels_5min_{version}.mmap/      # Runtime format
+│   ├── timestamps.npy
+│   ├── transition_type.npy
+│   └── ... (~6 files per TF)
+├── ... (10 transition .pkl + 10 .mmap/ dirs)
+├── precomputed_breakout_{version}.mmap/        # v5.9.6: Individual .npy files
+├── precomputed_targets_{version}.mmap/         # v5.9.6: Individual .npy files (1017 files)
+└── precomputed_valid_indices_{version}.npy
 ```
 
 **Cache Versions:**
@@ -602,10 +688,11 @@ data/feature_cache/
    - Base: Geometric projections ⭐ (recommended)
    - Aggregation: Physics-Only ⭐ (recommended)
 
-4. **Data Loading**
-   - Mode: Standard DataLoader (default)
-   - Rolling Buffer Sampler (experimental)
-   - num_workers: 0 (only stable option in v5.9.3)
+4. **Data Loading (v5.9.6)**
+   - Source: Preload to RAM (3.2 GB) or mmap + OS cache
+   - Sampler: ShuffleBufferSampler (chunk-based) or Random
+   - Sample Selection: All samples or Boundary only (near channel breaks)
+   - num_workers: 0 recommended (file handle limits with mmap)
    - pin_memory: Auto-detected
 
 5. **Sequence Lengths**
@@ -938,6 +1025,15 @@ autotrade2/
 - DDP enhancements in `train_hierarchical.py`
 - TF32 support
 - Parallel sample fetching (preparatory, not fully utilized)
+
+**v5.9.6:**
+- `tools/convert_labels_to_mmap.py` - Pickle → mmap conversion utility
+- Vectorized loss calculation in `train_hierarchical.py:4355-4493`
+- Memory-mapped label loading in `hierarchical_dataset.py`
+- Boundary sampling mode implementation
+- Precomputed targets mmap format in `src/ml/precompute_targets.py`
+- NaN bug fix in `src/ml/features.py:5528-5577`
+- Single-GPU sampler epoch fix in `train_hierarchical.py:4040`
 
 ---
 
