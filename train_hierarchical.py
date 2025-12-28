@@ -402,14 +402,17 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
 
     if is_native_timeframe:
         # v4.1: Native timeframe mode - stack dicts into Dict[str, Tensor]
+        # v5.9.7: Optimized - pre-allocate and direct copy (no intermediate list)
         batched_tf_data = {}
+        batch_size = len(data_list)
         for tf in data_list[0].keys():
-            # Stack all samples for this timeframe
-            tf_arrays = [d[tf] for d in data_list]
-            stacked = np.stack(tf_arrays)  # [batch, seq_len, features]
-
-            if not stacked.flags['C_CONTIGUOUS']:
-                stacked = np.ascontiguousarray(stacked)
+            # Get shape from first sample
+            first_arr = data_list[0][tf]
+            # Pre-allocate output array (C-contiguous by default)
+            stacked = np.empty((batch_size, *first_arr.shape), dtype=first_arr.dtype)
+            # Direct copy into pre-allocated array
+            for i, d in enumerate(data_list):
+                stacked[i] = d[tf]
 
             batched_tf_data[tf] = torch.from_numpy(stacked).to(dtype=torch_dtype)
 
@@ -4305,6 +4308,23 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 print(f"[DEBUG] targets low: mean={target_tensor[:,1].mean():.2f}%, min={target_tensor[:,1].min():.2f}%, max={target_tensor[:,1].max():.2f}%", flush=True)
                 print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.3f}, std={predictions[:,:2].std():.3f}", flush=True)
                 print(f"[DEBUG] primary loss (high/low MSE): {loss.item():.4f}", flush=True)
+                # v5.9.6: Debug duration values to verify fix
+                duration_debug = []
+                for tf in ['5min', '1h', 'daily']:
+                    dur_key = f'cont_{tf}_duration'
+                    valid_key = f'cont_{tf}_valid'
+                    if dur_key in targets:
+                        dur_vals = targets[dur_key]
+                        valid_vals = targets.get(valid_key, torch.zeros_like(dur_vals))
+                        valid_count = (valid_vals > 0).sum().item()
+                        if valid_count > 0:
+                            valid_durs = dur_vals[valid_vals > 0]
+                            duration_debug.append(f"{tf}:{valid_durs.mean():.1f}±{valid_durs.std():.1f}({valid_count})")
+                        else:
+                            duration_debug.append(f"{tf}:no_valid")
+                    else:
+                        duration_debug.append(f"{tf}:missing")
+                print(f"[DEBUG] durations (mean±std, count): {', '.join(duration_debug)}", flush=True)
 
             # =====================================================================
             # v5.7: MULTI-TF LOSS (all timeframes contribute, fixes mode collapse)
