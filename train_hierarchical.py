@@ -447,32 +447,55 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         x = torch.from_numpy(combined).to(dtype=torch_dtype)
 
     # Build targets tensor dict with proper dtype
-    # v5.9.5: Optimized - batch tensor creation per key (1013 calls vs 64,832)
-    # Previously: 64 samples × 1013 keys = 64,832 torch.tensor() calls (~12s)
-    # Now: 1013 keys × 1 torch.as_tensor() call (~0.2s)
+    # v5.9.8: Fast path using stacked targets array (eliminates 1M dict ops per batch)
     _targets_start = time.perf_counter()
     targets_batch = {}
 
     if targets_list and len(targets_list) > 0:
         first_target = targets_list[0]
-        for k in first_target.keys():
-            # v5.9.2: price_sequence stays as list (variable length, used in loss loop)
-            if '_price_sequence' in k:
-                targets_batch[k] = [t[k] for t in targets_list]  # List of lists
-            else:
-                # Gather all values for this key across samples
-                values = [t[k] for t in targets_list]
-                # Check if already tensors
-                if isinstance(values[0], torch.Tensor):
-                    targets_batch[k] = torch.stack(values).to(dtype=torch_dtype)
+
+        # v5.9.8: Check for stacked targets (fast path)
+        if '_stacked_targets' in first_target:
+            # Fast path: stack numpy rows, single tensor conversion
+            stacked_rows = np.stack([t['_stacked_targets'] for t in targets_list])  # [batch, n_keys]
+            stacked_tensor = torch.from_numpy(stacked_rows).to(dtype=torch_dtype)  # [batch, n_keys]
+            key_to_idx = first_target['_target_key_to_idx']
+
+            # Expand stacked tensor into individual keys
+            # Use .clone() to ensure each slice is a full copy (not a view)
+            # Views can cause issues if loss function modifies tensors in-place
+            for key, idx in key_to_idx.items():
+                targets_batch[key] = stacked_tensor[:, idx].clone()  # [batch] - full copy
+
+            # Handle non-stacked keys (base targets, price sequences)
+            for k in first_target.keys():
+                if k in ('_stacked_targets', '_target_key_to_idx'):
+                    continue
+                if '_price_sequence' in k:
+                    targets_batch[k] = [t[k] for t in targets_list]
+                elif k not in key_to_idx:  # Skip keys already in stacked tensor
+                    values = [t[k] for t in targets_list]
+                    if isinstance(values[0], torch.Tensor):
+                        targets_batch[k] = torch.stack(values).to(dtype=torch_dtype)
+                    else:
+                        targets_batch[k] = torch.as_tensor(values, dtype=torch_dtype)
+        else:
+            # Fallback: original slow path (dict-based targets)
+            for k in first_target.keys():
+                if '_price_sequence' in k:
+                    targets_batch[k] = [t[k] for t in targets_list]
                 else:
-                    # Single tensor creation for all samples (fast!)
-                    targets_batch[k] = torch.as_tensor(values, dtype=torch_dtype)
+                    values = [t[k] for t in targets_list]
+                    if isinstance(values[0], torch.Tensor):
+                        targets_batch[k] = torch.stack(values).to(dtype=torch_dtype)
+                    else:
+                        targets_batch[k] = torch.as_tensor(values, dtype=torch_dtype)
 
     # v5.9.5: Profile targets tensor creation (first 5 batches)
     _targets_elapsed = time.perf_counter() - _targets_start
     if _debug_counter[0] <= 5:
-        print(f"[PROFILE] targets tensor creation: {_targets_elapsed*1000:.1f}ms for {len(targets_list)} samples, {len(targets_batch)} keys", file=sys.stderr, flush=True)
+        n_keys = len(targets_batch) if '_stacked' not in targets_batch else targets_batch['_stacked'].shape[1]
+        print(f"[PROFILE] targets tensor creation: {_targets_elapsed*1000:.1f}ms for {len(targets_list)} samples, {n_keys} keys", file=sys.stderr, flush=True)
 
     if move_to_device and device is not None:
         if is_native_timeframe:

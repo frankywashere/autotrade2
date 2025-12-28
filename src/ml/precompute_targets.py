@@ -505,21 +505,39 @@ def save_precomputed(
     size_mb = breakout_path.stat().st_size / 1e6
     print(f"  Saved {breakout_path.name} ({size_mb:.1f} MB)")
 
-    # Save target arrays
+    # Save target arrays (dict format for backward compatibility)
     targets_path = cache_dir / f"precomputed_targets_{cache_key}.npz"
     np.savez_compressed(targets_path, **target_arrays)
     size_mb = targets_path.stat().st_size / 1e6
     print(f"  Saved {targets_path.name} ({size_mb:.1f} MB)")
 
+    # v5.9.8: Save stacked 2D array for fast collate
+    # This eliminates 1M dict operations per batch in collate
+    # IMPORTANT: Only stack cont_/trans_ keys! Base keys (high, low, etc.) are computed per-sample
+    # and the values in target_arrays are just placeholders
+    keys_ordered = sorted([k for k in target_arrays.keys()
+                          if k.startswith('cont_') or k.startswith('trans_')])
+    stacked = np.column_stack([target_arrays[k] for k in keys_ordered])  # [n_samples, n_keys]
+    stacked_path = cache_dir / f"precomputed_targets_stacked_{cache_key}.npy"
+    np.save(stacked_path, stacked)
+    size_mb = stacked_path.stat().st_size / 1e6
+    print(f"  Saved {stacked_path.name} ({size_mb:.1f} MB) - shape {stacked.shape}")
+
+    # Save key order mapping for index-based access
+    keys_path = cache_dir / f"precomputed_targets_keys_{cache_key}.json"
+    with open(keys_path, 'w') as f:
+        json.dump(keys_ordered, f)
+    print(f"  Saved {keys_path.name} ({len(keys_ordered)} keys)")
+
     # Save metadata
     meta = {
-        'version': '5.9.4',
+        'version': '5.9.8',
         'cache_key': cache_key,
         'n_samples': len(valid_indices),
         'n_breakout_fields': len(breakout_labels),
         'n_target_fields': len(target_arrays),
         'breakout_keys': list(breakout_labels.keys()),
-        'target_keys': list(target_arrays.keys()),
+        'target_keys': keys_ordered,  # Now ordered for stacked array
     }
     meta_path = cache_dir / f"precomputed_meta_{cache_key}.json"
     with open(meta_path, 'w') as f:

@@ -658,11 +658,28 @@ class HierarchicalDataset(Dataset):
                 self._precomputed_breakout = breakout_data
                 print(f"        Loaded {len(breakout_data)} breakout fields")
 
-                # Load target arrays
+                # Load target arrays (dict format for backward compatibility)
                 print(f"     📦 Loading pre-computed target arrays...")
                 targets_data = dict(np.load(targets_path))
                 self._precomputed_targets = targets_data
                 print(f"        Loaded {len(targets_data)} target fields")
+
+                # v5.9.8: Load stacked 2D array for fast collate (if available)
+                self._precomputed_targets_stacked = None
+                self._precomputed_target_keys = None
+                stacked_path = cache_dir / f"precomputed_targets_stacked_{cache_key}.npy"
+                keys_path = cache_dir / f"precomputed_targets_keys_{cache_key}.json"
+
+                if stacked_path.exists() and keys_path.exists():
+                    self._precomputed_targets_stacked = np.load(stacked_path, mmap_mode='r')
+                    with open(keys_path) as f:
+                        self._precomputed_target_keys = json.load(f)
+                    # Build key-to-index mapping for loss function
+                    self._target_key_to_idx = {k: i for i, k in enumerate(self._precomputed_target_keys)}
+                    print(f"        ✓ Loaded stacked targets: {self._precomputed_targets_stacked.shape}")
+                else:
+                    print(f"        ℹ️  Stacked targets not found, using dict format (slower)")
+                    print(f"           Run: python -m src.ml.precompute_targets to regenerate")
 
                 self._use_precomputed = True
                 print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled)")
@@ -893,9 +910,18 @@ class HierarchicalDataset(Dataset):
                 targets[key] = float(self._precomputed_breakout[key][idx])
 
         # Add continuation and transition labels from pre-computed arrays (Fix #3)
-        for key, arr in self._precomputed_targets.items():
-            if key.startswith('cont_') or key.startswith('trans_'):
-                targets[key] = float(arr[idx])
+        # v5.9.8: Use stacked array for fast collate if available
+        if self._precomputed_targets_stacked is not None:
+            # Return stacked row - collate will handle it efficiently
+            targets['_stacked_targets'] = np.ascontiguousarray(
+                self._precomputed_targets_stacked[idx, :]
+            )
+            targets['_target_key_to_idx'] = self._target_key_to_idx  # Pass mapping for loss
+        else:
+            # Fallback to dict format (slower)
+            for key, arr in self._precomputed_targets.items():
+                if key.startswith('cont_') or key.startswith('trans_'):
+                    targets[key] = float(arr[idx])
 
         # v5.2: Get VIX sequence for this sample (still computed per-sample)
         vix_seq = None
