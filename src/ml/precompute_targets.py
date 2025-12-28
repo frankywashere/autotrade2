@@ -227,8 +227,18 @@ def load_existing_cache(cache_dir: Path) -> Dict:
     if raw_ohlc_path is not None:
         print(f"  Loading raw OHLC from {raw_ohlc_path.name}")
         raw_df = pd.read_csv(raw_ohlc_path, parse_dates=['timestamp'], index_col='timestamp')
-        cache['raw_ohlc'] = raw_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
+
+        # Handle different column name formats
+        if 'tsla_open' in raw_df.columns:
+            ohlc_cols = ['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']
+        elif 'open' in raw_df.columns:
+            ohlc_cols = ['open', 'high', 'low', 'close']
+        else:
+            raise ValueError(f"Cannot find OHLC columns in {raw_ohlc_path.name}. Columns: {list(raw_df.columns)}")
+
+        cache['raw_ohlc'] = raw_df[ohlc_cols].values
         cache['raw_ohlc_timestamps'] = raw_df.index.values.astype('datetime64[ns]').astype('int64')
+        print(f"  Loaded {len(raw_df):,} rows of 1-min OHLC data")
     else:
         print(f"  WARNING: Raw OHLC not found at {raw_ohlc_path}, breakout labels will use 5min closes")
         cache['raw_ohlc'] = None
