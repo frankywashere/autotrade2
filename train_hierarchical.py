@@ -1079,6 +1079,7 @@ class BatchFetchLoader:
         world_size: int = 1,
         drop_last: bool = True,
         torch_dtype=None,
+        shuffle: bool = True,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -1086,22 +1087,27 @@ class BatchFetchLoader:
         self.world_size = world_size
         self.drop_last = drop_last
         self.torch_dtype = torch_dtype or torch.float32
+        self.shuffle = shuffle
 
         # Verify dataset has batch fetching capability
         if not hasattr(dataset, 'get_batch_features'):
             raise ValueError("Dataset must have get_batch_features method for BatchFetchLoader")
-        if not hasattr(dataset, '_precomputed_targets_stacked'):
-            raise ValueError("Dataset must have precomputed stacked targets for BatchFetchLoader")
+        if not hasattr(dataset, '_precomputed_targets_stacked') or dataset._precomputed_targets_stacked is None:
+            raise ValueError("Dataset must have precomputed stacked targets for BatchFetchLoader. Run: python -m src.ml.precompute_targets")
 
         self.current_epoch = 0
         self._epoch_indices = None
         self._num_batches = 0
 
     def _get_rank_indices(self, epoch: int):
-        """Get shuffled indices for this epoch and rank."""
+        """Get shuffled (or sequential) indices for this epoch and rank."""
         n_samples = len(self.dataset)
-        rng = np.random.RandomState(epoch + 42)
-        indices = rng.permutation(n_samples)
+
+        if self.shuffle:
+            rng = np.random.RandomState(epoch + 42)
+            indices = rng.permutation(n_samples)
+        else:
+            indices = np.arange(n_samples)
 
         # Split across ranks
         if self.world_size > 1:
@@ -2484,6 +2490,7 @@ def interactive_setup(args, profiler=None):
     # Pre-stacking mode selection
     prestack_choices = [
         "Disabled - Standard DataLoader (safe, ~9% slower) ⭐ Recommended",
+        "Batch Fetch - Vectorized batch loading (~50% faster, minimal RAM) ⚡ NEW",
         f"Rolling Buffer - Pre-stack {max_buffer_batches} batches (~{rolling_buffer_ram_gb:.0f}GB RAM, ~9% faster)",
         f"Full Epoch - Pre-stack all batches (~{full_epoch_ram_gb:.0f}GB RAM, ~40% faster) ⚠️ Needs massive RAM"
     ]
@@ -2498,10 +2505,21 @@ def interactive_setup(args, profiler=None):
     if "Disabled" in prestack_choice:
         args.use_prestack = False
         args.prestack_mode = None
+        args.use_batch_fetch = False
         print("   → Standard DataLoader (collate during training)")
+    elif "Batch Fetch" in prestack_choice:
+        args.use_prestack = False
+        args.prestack_mode = None
+        args.use_batch_fetch = True
+        print("   ⚡ Batch fetch mode enabled")
+        print("      → Vectorized batch loading (11 iterations vs 4,224)")
+        print("      → Bypasses standard collate entirely")
+        print("      → ~50% faster than standard DataLoader")
+        print()
     elif "Rolling Buffer" in prestack_choice:
         args.use_prestack = True
         args.prestack_mode = 'rolling'
+        args.use_batch_fetch = False
         args.prestack_buffer_size = max_buffer_batches
         print(f"   📦 Rolling buffer enabled ({max_buffer_batches} batches, {rolling_buffer_ram_gb:.0f} GB RAM)")
         print(f"      → Pre-stacks next {max_buffer_batches} batches ahead")
@@ -2511,6 +2529,7 @@ def interactive_setup(args, profiler=None):
     else:  # Full Epoch
         args.use_prestack = True
         args.prestack_mode = 'full_epoch'
+        args.use_batch_fetch = False
         args.prestack_buffer_size = None
         print(f"   📦 Full epoch pre-stacking enabled")
         print(f"      ⚠️ WARNING: Needs ~{full_epoch_ram_gb:.0f}GB RAM (you have {total_ram:.0f}GB)")
@@ -3138,17 +3157,19 @@ def interactive_setup(args, profiler=None):
         print(f"  Data Loading: Preload to RAM (3.2 GB TF sequences) ⚡")
     else:
         print(f"  Data Loading: mmap + OS page cache")
-    # v5.3.2: Pre-stacking status
-    if getattr(args, 'use_prestack', False):
+    # v5.9.8: Batch loading mode
+    if getattr(args, 'use_batch_fetch', False):
+        print(f"  Batch Loading: Batch Fetch (vectorized, ~50% faster) ⚡")
+    elif getattr(args, 'use_prestack', False):
         prestack_mode = getattr(args, 'prestack_mode', 'full_epoch')
         pinned_str = " + pinned" if getattr(args, 'use_pinned_prestack', False) else ""
         if prestack_mode == 'rolling':
             buffer_size = getattr(args, 'prestack_buffer_size', 100)
-            print(f"  Batch Pre-Stack: Rolling buffer ({buffer_size} batches{pinned_str}, ~9% faster) ⭐")
+            print(f"  Batch Loading: Rolling buffer ({buffer_size} batches{pinned_str}, ~9% faster) ⭐")
         else:
-            print(f"  Batch Pre-Stack: Full epoch (2 epochs{pinned_str}, ~40% faster) ⚠️ High RAM")
+            print(f"  Batch Loading: Full epoch (2 epochs{pinned_str}, ~40% faster) ⚠️ High RAM")
     else:
-        print(f"  Batch Pre-Stack: Disabled (standard collate)")
+        print(f"  Batch Loading: Standard DataLoader")
     # v5.9.6: Sample selection display
     if getattr(args, 'use_boundary_sampling', False):
         mode = getattr(args, 'boundary_mode', 'breaks')
@@ -4013,13 +4034,57 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         profiler.snapshot("pre_dataloader_creation", 0, force_log=True)
         profiler.log_info(f"CREATING_DATALOADERS | num_workers={args.num_workers}")
 
-    train_loader = DataLoader(train_dataset, **train_loader_kwargs)
-    val_loader = DataLoader(val_dataset, **val_loader_kwargs)
+    # v5.9.8: Use BatchFetchLoader if enabled (bypasses standard __getitem__ + collate)
+    if getattr(args, 'use_batch_fetch', False):
+        # Verify dataset supports batch fetching
+        if not hasattr(train_dataset, 'get_batch_features'):
+            if is_main_process(rank):
+                print("   ⚠️  Dataset doesn't support batch fetching, falling back to standard DataLoader")
+            train_loader = DataLoader(train_dataset, **train_loader_kwargs)
+            val_loader = DataLoader(val_dataset, **val_loader_kwargs)
+        else:
+            if is_main_process(rank):
+                print("\n   ⚡ Creating BatchFetchLoader (vectorized batch loading)...")
+
+            train_loader = BatchFetchLoader(
+                dataset=train_dataset,
+                batch_size=args.batch_size,
+                rank=rank if is_distributed else 0,
+                world_size=world_size if is_distributed else 1,
+                drop_last=True,
+                torch_dtype=config.get_torch_dtype(),
+                shuffle=True,
+            )
+            val_loader = BatchFetchLoader(
+                dataset=val_dataset,
+                batch_size=args.batch_size,
+                rank=rank if is_distributed else 0,
+                world_size=world_size if is_distributed else 1,
+                drop_last=False,
+                torch_dtype=config.get_torch_dtype(),
+                shuffle=False,  # Validation doesn't shuffle
+            )
+            if is_main_process(rank):
+                print(f"   ✓ BatchFetchLoader ready (bypasses standard collate)")
+    else:
+        train_loader = DataLoader(train_dataset, **train_loader_kwargs)
+        val_loader = DataLoader(val_dataset, **val_loader_kwargs)
 
     # v4.4: Create test loader if test_dataset exists
     test_loader = None
     if test_dataset is not None:
-        test_loader = DataLoader(test_dataset, **val_loader_kwargs)  # Use val kwargs (no shuffle, no drop_last)
+        if getattr(args, 'use_batch_fetch', False) and hasattr(test_dataset, 'get_batch_features'):
+            test_loader = BatchFetchLoader(
+                dataset=test_dataset,
+                batch_size=args.batch_size,
+                rank=rank if is_distributed else 0,
+                world_size=world_size if is_distributed else 1,
+                drop_last=False,
+                torch_dtype=config.get_torch_dtype(),
+                shuffle=False,  # Test set doesn't shuffle
+            )
+        else:
+            test_loader = DataLoader(test_dataset, **val_loader_kwargs)  # Use val kwargs (no shuffle, no drop_last)
 
     # Log memory after DataLoader creation (measure worker spawn impact)
     if profiler:
@@ -4295,10 +4360,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         # v5.3.2: Track epoch timing
         epoch_start_time = time.perf_counter()
 
-        # Set epoch for distributed sampler OR prestack loader
+        # Set epoch for distributed sampler OR prestack loader OR batch fetch loader
         if prestack_loader is not None:
             # v5.3.2: PreStackedBatchLoader handles its own shuffling
             prestack_loader.set_epoch(epoch)
+        elif hasattr(train_loader, 'set_epoch'):
+            # v5.9.8: BatchFetchLoader also handles its own shuffling
+            train_loader.set_epoch(epoch)
         elif train_sampler is not None and hasattr(train_sampler, 'set_epoch'):
             # v5.9.6: Call set_epoch for any sampler (single or multi-GPU)
             train_sampler.set_epoch(epoch)
