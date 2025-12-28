@@ -791,11 +791,14 @@ class HierarchicalDataset(Dataset):
                             precomp_valid_indices = np.load(precomp_indices_path)
                             # Create dict for fast lookup: {5min_pos: precomp_row}
                             precomp_dict = {int(pos): i for i, pos in enumerate(precomp_valid_indices)}
+                            # Save dict for later (train/val split will need to rebuild the list)
+                            self._precomputed_valid_indices_dict = precomp_dict
                             # Build list mapping current valid_indices to precomputed rows
                             self._precomputed_idx_map = [precomp_dict.get(pos, i)
                                                          for i, pos in enumerate(self.valid_indices)]
                         else:
                             self._precomputed_idx_map = None
+                            self._precomputed_valid_indices_dict = None
 
                         print(f"        ✓ Loaded stacked targets: {self._precomputed_targets_stacked.shape}")
                         stacked_valid = True
@@ -826,10 +829,12 @@ class HierarchicalDataset(Dataset):
                         if precomp_indices_path.exists():
                             precomp_valid_indices = np.load(precomp_indices_path)
                             precomp_dict = {int(pos): i for i, pos in enumerate(precomp_valid_indices)}
+                            self._precomputed_valid_indices_dict = precomp_dict
                             self._precomputed_idx_map = [precomp_dict.get(pos, i)
                                                          for i, pos in enumerate(self.valid_indices)]
                         else:
                             self._precomputed_idx_map = None
+                            self._precomputed_valid_indices_dict = None
 
                         print(f"        ✓ Generated stacked targets: {stacked.shape}")
                     except Exception as e:
@@ -2799,12 +2804,24 @@ def create_hierarchical_dataset(
             val_valid = [i for i in all_valid if train_end_idx_adj <= i < val_end_idx_adj]
             test_valid = [i for i in all_valid if i >= val_end_idx_adj]
 
+            # Helper to rebuild precomputed index map after split
+            def rebuild_precomp_idx_map(dataset):
+                if hasattr(dataset, '_precomputed_targets_stacked') and dataset._precomputed_targets_stacked is not None:
+                    if hasattr(dataset, '_precomputed_valid_indices_dict'):
+                        # Rebuild mapping for the new split's valid_indices
+                        dataset._precomputed_idx_map = [dataset._precomputed_valid_indices_dict.get(pos, i)
+                                                        for i, pos in enumerate(dataset.valid_indices)]
+                        print(f"     ✓ Rebuilt precomp index map for {len(dataset.valid_indices):,} samples")
+                    else:
+                        print(f"     ⚠️  Missing _precomputed_valid_indices_dict, cannot rebuild index map!")
+
             # Train dataset (modify in place)
             train_dataset = base_dataset
             train_dataset.valid_indices = train_valid
             train_dataset.continuation_labels_df = train_continuation_df
             train_dataset.include_continuation = include_continuation
             train_dataset._build_continuation_lookup()
+            rebuild_precomp_idx_map(train_dataset)
 
             # Val dataset (shallow copy)
             val_dataset = copy.copy(base_dataset)
@@ -2812,6 +2829,7 @@ def create_hierarchical_dataset(
             val_dataset.continuation_labels_df = val_continuation_df
             val_dataset.include_continuation = include_continuation
             val_dataset._build_continuation_lookup()
+            rebuild_precomp_idx_map(val_dataset)
 
             # Test dataset (shallow copy)
             test_dataset = copy.copy(base_dataset)
@@ -2819,6 +2837,7 @@ def create_hierarchical_dataset(
             test_dataset.continuation_labels_df = test_continuation_df
             test_dataset.include_continuation = include_continuation
             test_dataset._build_continuation_lookup()
+            rebuild_precomp_idx_map(test_dataset)
 
         else:
             # No mmaps - traditional split

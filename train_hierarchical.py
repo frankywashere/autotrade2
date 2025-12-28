@@ -1154,15 +1154,21 @@ class BatchFetchLoader:
 
     def _fetch_batch(self, batch_indices: np.ndarray):
         """Fetch a complete batch using vectorized operations."""
+        import sys
         batch_size = len(batch_indices)
 
-        # Debug: print once for first batch
-        import sys
-        if batch_indices[0] < 128:  # First batch
-            print(f"[DEBUG BatchFetch] First batch! indices={batch_indices[:3]}", file=sys.stderr, flush=True)
+        # Unconditional debug for first call
+        print(f"[DEBUG _fetch_batch] START - batch_size={batch_size}, indices[0:3]={batch_indices[:3]}", file=sys.stderr, flush=True)
 
         # 1. Batch-fetch features (vectorized - 11 iterations instead of 4,224)
-        features_np = self.dataset.get_batch_features(batch_indices)
+        try:
+            features_np = self.dataset.get_batch_features(batch_indices)
+            print(f"[DEBUG _fetch_batch] Got features for {len(features_np)} TFs", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[DEBUG _fetch_batch] CRASH in get_batch_features: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
 
         # Debug features
         for tf, arr in features_np.items():
@@ -1200,9 +1206,13 @@ class BatchFetchLoader:
             precomp_rows = batch_indices
 
         # 3. Batch-fetch targets from stacked array
+        import sys
+        print(f"[DEBUG _fetch_batch] Fetching targets...", file=sys.stderr, flush=True)
         targets = {}
         if self.dataset._precomputed_targets_stacked is not None:
+            print(f"[DEBUG _fetch_batch] Indexing stacked array with precomp_rows shape={precomp_rows.shape}", file=sys.stderr, flush=True)
             stacked = self.dataset._precomputed_targets_stacked[precomp_rows, :]
+            print(f"[DEBUG _fetch_batch] Got stacked shape={stacked.shape}, checking for bad values...", file=sys.stderr, flush=True)
 
             # Debug: check for bad values
             if np.isnan(stacked).any() or np.isinf(stacked).any():
