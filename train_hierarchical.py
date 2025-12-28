@@ -1099,6 +1099,9 @@ class BatchFetchLoader:
         self._epoch_indices = None
         self._num_batches = 0
 
+        # Initialize for epoch 0 so __len__() works immediately
+        self.set_epoch(0)
+
     def _get_rank_indices(self, epoch: int):
         """Get shuffled (or sequential) indices for this epoch and rank."""
         n_samples = len(self.dataset)
@@ -1128,10 +1131,18 @@ class BatchFetchLoader:
 
     def __iter__(self):
         """Iterate over batches using batch-level fetching."""
+        import sys
+        print(f"[DEBUG BatchFetchLoader] __iter__ called! num_batches={self._num_batches}", file=sys.stderr, flush=True)
+
         if self._epoch_indices is None:
             self.set_epoch(self.current_epoch)
 
+        print(f"[DEBUG BatchFetchLoader] Starting iteration, epoch_indices len={len(self._epoch_indices)}", file=sys.stderr, flush=True)
+
         for batch_idx in range(self._num_batches):
+            if batch_idx == 0:
+                print(f"[DEBUG BatchFetchLoader] Fetching batch 0", file=sys.stderr, flush=True)
+
             start = batch_idx * self.batch_size
             end = min(start + self.batch_size, len(self._epoch_indices))
             batch_sample_indices = self._epoch_indices[start:end]
@@ -1145,19 +1156,64 @@ class BatchFetchLoader:
         """Fetch a complete batch using vectorized operations."""
         batch_size = len(batch_indices)
 
+        # Debug: print once for first batch
+        import sys
+        if batch_indices[0] < 128:  # First batch
+            print(f"[DEBUG BatchFetch] First batch! indices={batch_indices[:3]}", file=sys.stderr, flush=True)
+
         # 1. Batch-fetch features (vectorized - 11 iterations instead of 4,224)
         features_np = self.dataset.get_batch_features(batch_indices)
+
+        # Debug features
+        for tf, arr in features_np.items():
+            if np.isnan(arr).any() or np.isinf(arr).any():
+                print(f"[DEBUG BatchFetch] {tf} features have NaN/Inf!")
+                print(f"  shape: {arr.shape}")
+                print(f"  NaN: {np.isnan(arr).sum()}, Inf: {np.isinf(arr).sum()}")
+                break
 
         # Convert to tensors
         features = {}
         for tf, arr in features_np.items():
             features[tf] = torch.from_numpy(arr).to(dtype=self.torch_dtype)
+            if torch.isnan(features[tf]).any() or torch.isinf(features[tf]).any():
+                print(f"[DEBUG BatchFetch] {tf} TENSOR has NaN/Inf after conversion!")
+                break
 
-        # 2. Batch-fetch targets from stacked array
+        # 2. Compute precomputed row mapping once for this batch
+        # Used for both targets and breakout labels
+        if hasattr(self.dataset, '_precomputed_idx_map') and self.dataset._precomputed_idx_map:
+            # List indexing (compatible with boundary sampling)
+            precomp_rows = np.array([self.dataset._precomputed_idx_map[idx] for idx in batch_indices])
+
+            # Debug: validate precomp_rows
+            if (precomp_rows < 0).any() or (precomp_rows >= len(self.dataset._precomputed_targets_stacked)).any():
+                print(f"[DEBUG BatchFetch] Invalid precomp_rows!")
+                print(f"  batch_indices: {batch_indices[:5]}")
+                print(f"  precomp_rows: {precomp_rows[:5]}")
+                print(f"  precomp_rows range: {precomp_rows.min()} to {precomp_rows.max()}")
+                print(f"  stacked array size: {len(self.dataset._precomputed_targets_stacked)}")
+                print(f"  idx_map length: {len(self.dataset._precomputed_idx_map)}")
+                print(f"  First few idx_map values: {self.dataset._precomputed_idx_map[:5]}")
+        else:
+            # Fallback: direct indexing
+            precomp_rows = batch_indices
+
+        # 3. Batch-fetch targets from stacked array
         targets = {}
         if self.dataset._precomputed_targets_stacked is not None:
-            # Get stacked targets for all samples in batch
-            stacked = self.dataset._precomputed_targets_stacked[batch_indices, :]
+            stacked = self.dataset._precomputed_targets_stacked[precomp_rows, :]
+
+            # Debug: check for bad values
+            if np.isnan(stacked).any() or np.isinf(stacked).any():
+                print(f"[DEBUG BatchFetch] Bad values in stacked array!")
+                print(f"  batch_indices: {batch_indices[:5]}")
+                print(f"  precomp_rows: {precomp_rows[:5]}")
+                print(f"  stacked shape: {stacked.shape}")
+                print(f"  NaN count: {np.isnan(stacked).sum()}")
+                print(f"  Inf count: {np.isinf(stacked).sum()}")
+                print(f"  Sample values at row {precomp_rows[0]}: min={stacked[0].min()}, max={stacked[0].max()}")
+
             stacked_tensor = torch.from_numpy(np.ascontiguousarray(stacked)).to(dtype=self.torch_dtype)
 
             # Expand to dict using key mapping
@@ -1165,19 +1221,53 @@ class BatchFetchLoader:
             for key, idx in key_to_idx.items():
                 targets[key] = stacked_tensor[:, idx]
 
-        # 3. Get base targets (these are per-sample computed, need to fetch individually)
-        # For now, we'll get them via __getitem__ for the first sample to know the keys
-        # Then batch-fetch from precomputed arrays
+            # Debug: check expanded targets
+            for key, tensor in list(targets.items())[:5]:
+                if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                    print(f"[DEBUG] Key '{key}' has NaN/Inf! min={tensor.min()}, max={tensor.max()}")
+
+        # 4. Breakout targets (separate file, not in stacked array)
         if hasattr(self.dataset, '_precomputed_breakout') and self.dataset._precomputed_breakout:
             for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
                 if key in self.dataset._precomputed_breakout:
-                    values = self.dataset._precomputed_breakout[key][batch_indices]
+                    values = self.dataset._precomputed_breakout[key][precomp_rows]
                     targets[key] = torch.from_numpy(np.ascontiguousarray(values)).to(dtype=self.torch_dtype)
 
-        # 4. VIX and events - still per-sample (but usually fast)
-        # For now, skip these in batch mode - they can be added if needed
+        # 4. VIX sequences - fetch for each sample in batch
         vix_batch = None
+        if hasattr(self.dataset, '_vix_loader') and self.dataset._vix_loader is not None:
+            vix_sequences = []
+            # Get data indices for this batch (map from sample indices to 5min array indices)
+            data_indices_5min = [self.dataset.valid_indices[idx] for idx in batch_indices]
+
+            for data_idx_5min in data_indices_5min:
+                try:
+                    ts_5min = self.dataset.tf_timestamps['5min'][data_idx_5min]
+                    ts = pd.Timestamp(ts_5min, unit='ns')
+                    vix_seq = self.dataset._vix_loader.get_sequence(ts.date(), self.dataset._vix_sequence_length)
+                    vix_sequences.append(vix_seq if vix_seq is not None else np.zeros(self.dataset._vix_sequence_length, dtype=np.float32))
+                except Exception:
+                    vix_sequences.append(np.zeros(self.dataset._vix_sequence_length, dtype=np.float32))
+
+            if len(vix_sequences) > 0:
+                vix_batch = torch.tensor(np.array(vix_sequences), dtype=self.torch_dtype)
+
+        # 5. Events - fetch for each sample in batch
         events_batch = None
+        if hasattr(self.dataset, '_event_fetcher') and self.dataset._event_fetcher is not None:
+            events_list = []
+            data_indices_5min = [self.dataset.valid_indices[idx] for idx in batch_indices]
+
+            for data_idx_5min in data_indices_5min:
+                try:
+                    ts_5min = self.dataset.tf_timestamps['5min'][data_idx_5min]
+                    ts = pd.Timestamp(ts_5min, unit='ns')
+                    events = self.dataset._event_fetcher.get_events_for_training(ts)
+                    events_list.append(events)
+                except Exception:
+                    events_list.append(None)
+
+            events_batch = events_list  # Keep as list for EventEmbedding.forward_batch()
 
         return features, targets, vix_batch, events_batch
 
@@ -4052,7 +4142,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 rank=rank if is_distributed else 0,
                 world_size=world_size if is_distributed else 1,
                 drop_last=True,
-                torch_dtype=config.get_torch_dtype(),
+                torch_dtype=project_config.get_torch_dtype(),
                 shuffle=True,
             )
             val_loader = BatchFetchLoader(
@@ -4061,7 +4151,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 rank=rank if is_distributed else 0,
                 world_size=world_size if is_distributed else 1,
                 drop_last=False,
-                torch_dtype=config.get_torch_dtype(),
+                torch_dtype=project_config.get_torch_dtype(),
                 shuffle=False,  # Validation doesn't shuffle
             )
             if is_main_process(rank):
@@ -4080,7 +4170,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 rank=rank if is_distributed else 0,
                 world_size=world_size if is_distributed else 1,
                 drop_last=False,
-                torch_dtype=config.get_torch_dtype(),
+                torch_dtype=project_config.get_torch_dtype(),
                 shuffle=False,  # Test set doesn't shuffle
             )
         else:

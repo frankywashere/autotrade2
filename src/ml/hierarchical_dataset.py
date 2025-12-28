@@ -679,13 +679,16 @@ class HierarchicalDataset(Dataset):
         from 4,224 iterations to 11 iterations per batch.
 
         Args:
-            batch_indices: Array of sample indices (into valid_indices)
+            batch_indices: Array of sample indices (positions in this dataset)
 
         Returns:
             Dict mapping TF name -> features array [batch, seq_len, features]
         """
         batch_size = len(batch_indices)
         timeframe_data = {}
+
+        # Map dataset sample indices to actual 5min array indices
+        data_indices_5min = np.array([self.valid_indices[idx] for idx in batch_indices])
 
         for tf in HIERARCHICAL_TIMEFRAMES:
             if tf not in self.tf_mmaps:
@@ -694,8 +697,16 @@ class HierarchicalDataset(Dataset):
             seq_len = self.tf_sequence_lengths[tf]
             tf_data = self.tf_mmaps[tf]  # [n_bars, n_features]
 
-            # Get pre-computed start indices for this batch
-            starts = self._batch_tf_starts[tf][batch_indices]  # [batch_size]
+            # Get timestamps for these 5min indices
+            ts_5min_batch = self.tf_timestamps['5min'][data_indices_5min]
+
+            # Find corresponding indices in this TF's timestamp array
+            tf_timestamps = self.tf_timestamps[tf]
+            tf_indices = np.searchsorted(tf_timestamps, ts_5min_batch, side='right') - 1
+            tf_indices = np.maximum(tf_indices, seq_len)
+
+            # Calculate start indices for sequences
+            starts = tf_indices - seq_len
 
             # Build row indices for fancy indexing: [batch_size, seq_len]
             # Each row needs indices [start, start+1, ..., start+seq_len-1]
@@ -773,6 +784,19 @@ class HierarchicalDataset(Dataset):
                         self._precomputed_targets_stacked = np.load(stacked_path, mmap_mode='r')
                         self._precomputed_target_keys = keys_loaded
                         self._target_key_to_idx = {k: i for i, k in enumerate(self._precomputed_target_keys)}
+
+                        # Build mapping: sample idx -> precomputed row (list format, compatible with boundary sampling)
+                        precomp_indices_path = cache_dir / f"precomputed_valid_indices_{cache_key}.npy"
+                        if precomp_indices_path.exists():
+                            precomp_valid_indices = np.load(precomp_indices_path)
+                            # Create dict for fast lookup: {5min_pos: precomp_row}
+                            precomp_dict = {int(pos): i for i, pos in enumerate(precomp_valid_indices)}
+                            # Build list mapping current valid_indices to precomputed rows
+                            self._precomputed_idx_map = [precomp_dict.get(pos, i)
+                                                         for i, pos in enumerate(self.valid_indices)]
+                        else:
+                            self._precomputed_idx_map = None
+
                         print(f"        ✓ Loaded stacked targets: {self._precomputed_targets_stacked.shape}")
                         stacked_valid = True
                     else:
@@ -796,6 +820,17 @@ class HierarchicalDataset(Dataset):
                         self._precomputed_targets_stacked = np.load(stacked_path, mmap_mode='r')
                         self._precomputed_target_keys = keys_ordered
                         self._target_key_to_idx = {k: i for i, k in enumerate(keys_ordered)}
+
+                        # Build index mapping (list format)
+                        precomp_indices_path = cache_dir / f"precomputed_valid_indices_{cache_key}.npy"
+                        if precomp_indices_path.exists():
+                            precomp_valid_indices = np.load(precomp_indices_path)
+                            precomp_dict = {int(pos): i for i, pos in enumerate(precomp_valid_indices)}
+                            self._precomputed_idx_map = [precomp_dict.get(pos, i)
+                                                         for i, pos in enumerate(self.valid_indices)]
+                        else:
+                            self._precomputed_idx_map = None
+
                         print(f"        ✓ Generated stacked targets: {stacked.shape}")
                     except Exception as e:
                         print(f"        ⚠️  Failed to generate stacked targets: {e}")
@@ -1024,8 +1059,15 @@ class HierarchicalDataset(Dataset):
             # v5.9.8: All targets (base + cont + trans + breakout) are pre-computed
             # No need to compute anything per-sample!
             targets = {}
+
+            # Map sample idx to precomputed array row (list format)
+            if hasattr(self, '_precomputed_idx_map') and self._precomputed_idx_map:
+                precomp_row = self._precomputed_idx_map[idx]
+            else:
+                precomp_row = idx  # Fallback: direct indexing
+
             targets['_stacked_targets'] = np.ascontiguousarray(
-                self._precomputed_targets_stacked[idx, :]
+                self._precomputed_targets_stacked[precomp_row, :]
             )
             targets['_target_key_to_idx'] = self._target_key_to_idx
         else:
@@ -1038,22 +1080,28 @@ class HierarchicalDataset(Dataset):
                 past_prices=None  # Skip breakout detection - we'll use pre-computed
             )
 
+            # Map sample idx to precomputed array row (list format)
+            if hasattr(self, '_precomputed_idx_map') and self._precomputed_idx_map:
+                precomp_row = self._precomputed_idx_map[idx]
+            else:
+                precomp_row = idx  # Fallback
+
             # Override with pre-computed breakout labels (Fix #1 - no linear regression)
             for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
                 if key in self._precomputed_breakout:
-                    targets[key] = float(self._precomputed_breakout[key][idx])
+                    targets[key] = float(self._precomputed_breakout[key][precomp_row])
 
             # Add continuation and transition labels from pre-computed arrays
             if self._precomputed_targets_stacked is not None:
                 targets['_stacked_targets'] = np.ascontiguousarray(
-                    self._precomputed_targets_stacked[idx, :]
+                    self._precomputed_targets_stacked[precomp_row, :]
                 )
                 targets['_target_key_to_idx'] = self._target_key_to_idx
             else:
                 # Fallback to dict format (slower)
                 for key, arr in self._precomputed_targets.items():
                     if key.startswith('cont_') or key.startswith('trans_'):
-                        targets[key] = float(arr[idx])
+                        targets[key] = float(arr[precomp_row])
 
         # v5.2: Get VIX sequence for this sample (still computed per-sample)
         vix_seq = None

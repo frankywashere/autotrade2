@@ -387,6 +387,8 @@ def precompute_base_targets(
 
     start_time = time.time()
     report_interval = n_samples // 20
+    invalid_count = 0
+    nan_count = 0
 
     for i, data_idx in enumerate(valid_indices):
         if i > 0 and i % report_interval == 0:
@@ -397,6 +399,21 @@ def precompute_base_targets(
 
         # Get current price
         current_price = tf_5min[data_idx - 1, close_idx]
+
+        # Defensive: Skip invalid prices
+        if current_price <= 0 or np.isnan(current_price) or np.isinf(current_price):
+            invalid_count += 1
+            # Use zeros/defaults for invalid samples
+            base_targets['high'][i] = 0.0
+            base_targets['low'][i] = 0.0
+            base_targets['hit_band'][i] = 0.0
+            base_targets['hit_target'][i] = 0.0
+            base_targets['expected_return'][i] = 0.0
+            base_targets['overshoot'][i] = 0.0
+            base_targets['price_change_pct'][i] = 0.0
+            base_targets['horizon_bars_log'][i] = 0.0
+            base_targets['adaptive_confidence'][i] = 0.5
+            continue
 
         # Get future prices (same logic as breakout computation)
         if raw_ohlc is not None and raw_ohlc_timestamps is not None:
@@ -454,19 +471,26 @@ def precompute_base_targets(
         adaptive_horizon_log = np.log(bars_to_peak / 24 + 1e-6)
         adaptive_confidence = 1.0 if bars_to_peak > 48 else 0.5
 
-        # Store in arrays
-        base_targets['high'][i] = target_high_pct
-        base_targets['low'][i] = target_low_pct
-        base_targets['hit_band'][i] = hit_band_label
-        base_targets['hit_target'][i] = hit_target_label
-        base_targets['expected_return'][i] = expected_return_label
-        base_targets['overshoot'][i] = overshoot_label
-        base_targets['price_change_pct'][i] = adaptive_price_change
-        base_targets['horizon_bars_log'][i] = adaptive_horizon_log
-        base_targets['adaptive_confidence'][i] = adaptive_confidence
+        # Store in arrays with NaN/Inf checks
+        if not np.isfinite(target_high_pct):
+            nan_count += 1
+        base_targets['high'][i] = target_high_pct if np.isfinite(target_high_pct) else 0.0
+        base_targets['low'][i] = target_low_pct if np.isfinite(target_low_pct) else 0.0
+        base_targets['hit_band'][i] = hit_band_label if np.isfinite(hit_band_label) else 0.0
+        base_targets['hit_target'][i] = hit_target_label if np.isfinite(hit_target_label) else 0.0
+        base_targets['expected_return'][i] = expected_return_label if np.isfinite(expected_return_label) else 0.0
+        base_targets['overshoot'][i] = overshoot_label if np.isfinite(overshoot_label) else 0.0
+        base_targets['price_change_pct'][i] = adaptive_price_change if np.isfinite(adaptive_price_change) else 0.0
+        base_targets['horizon_bars_log'][i] = adaptive_horizon_log if np.isfinite(adaptive_horizon_log) else 0.0
+        base_targets['adaptive_confidence'][i] = adaptive_confidence if np.isfinite(adaptive_confidence) else 0.5
 
     elapsed = time.time() - start_time
     print(f"  Completed in {elapsed:.1f}s ({n_samples / elapsed:.0f} samples/sec)")
+
+    if invalid_count > 0:
+        print(f"  ⚠️  Skipped {invalid_count:,} samples with invalid prices ({invalid_count/n_samples*100:.2f}%)")
+    if nan_count > 0:
+        print(f"  ⚠️  Found {nan_count:,} NaN/Inf values, replaced with 0 ({nan_count/n_samples*100:.2f}%)")
 
     return base_targets
 
