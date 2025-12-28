@@ -527,8 +527,7 @@ class HierarchicalDataset(Dataset):
                     self.tf_timestamps[tf] = np.load(str(ts_path), mmap_mode='r')
 
                 shape = self.tf_mmaps[tf].shape
-                seq_len = self.tf_sequence_lengths[tf]
-                print(f"     {tf}: {shape[0]:,} bars × {shape[1]} features (seq_len={seq_len})")
+                print(f"     {tf}: {shape[0]:,} bars × {shape[1]} features")
             else:
                 raise FileNotFoundError(f"Missing timeframe sequence file: {mmap_path}")
 

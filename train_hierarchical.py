@@ -3671,7 +3671,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 dataset.tf_sequence_lengths = preset_lens.copy()
 
         if is_main_process(rank):
-            print(f"   ✓ Applied {args.seq_preset.upper()} sequence length preset to datasets")
+            print(f"   ✓ Applied {args.seq_preset.upper()} sequence lengths: "
+                  f"5min={preset_lens.get('5min', '?')}, 1h={preset_lens.get('1h', '?')}, "
+                  f"daily={preset_lens.get('daily', '?')}")
 
     if profiler:
         profiler.log_info(f"DATASET_CREATED | train_samples={len(train_dataset)} | val_samples={len(val_dataset)}")
