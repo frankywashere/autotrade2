@@ -212,8 +212,19 @@ def load_existing_cache(cache_dir: Path) -> Dict:
     print(f"  Loaded transition labels for {len(cache['trans_labels'])} timeframes")
 
     # Load raw OHLC for future prices (breakout computation)
-    raw_ohlc_path = parent_dir / "data" / "tsla_1min_data.csv"
-    if raw_ohlc_path.exists():
+    # Try multiple possible filenames
+    possible_paths = [
+        parent_dir / "data" / "TSLA_1min.csv",
+        parent_dir / "data" / "tsla_1min_data.csv",
+        parent_dir / "data" / "tsla_1min.csv",
+    ]
+    raw_ohlc_path = None
+    for path in possible_paths:
+        if path.exists():
+            raw_ohlc_path = path
+            break
+
+    if raw_ohlc_path is not None:
         print(f"  Loading raw OHLC from {raw_ohlc_path.name}")
         raw_df = pd.read_csv(raw_ohlc_path, parse_dates=['timestamp'], index_col='timestamp')
         cache['raw_ohlc'] = raw_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
