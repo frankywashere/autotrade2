@@ -665,6 +665,16 @@ class HierarchicalDataset(Dataset):
                 print(f"        Loaded {len(targets_data)} target fields")
 
                 self._use_precomputed = True
+
+                # Build index mapping: sample idx -> precomputed row
+                # This is needed because after train/val split, valid_indices changes
+                # but precomputed arrays stay the same size
+                precomputed_indices = np.load(indices_path)
+                precomp_dict = {int(pos): i for i, pos in enumerate(precomputed_indices)}
+                self._precomputed_valid_indices_dict = precomp_dict  # Save for rebuild after split
+                self._precomputed_idx_map = [precomp_dict.get(pos, i)
+                                             for i, pos in enumerate(self.valid_indices)]
+
                 print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled)")
 
             except Exception as e:
@@ -717,6 +727,13 @@ class HierarchicalDataset(Dataset):
                 self._precomputed_breakout = breakout_labels
                 self._precomputed_targets = target_arrays
                 self._use_precomputed = True
+
+                # Build index mapping for split compatibility
+                precomp_dict = {int(pos): i for i, pos in enumerate(precomputed_valid_indices)}
+                self._precomputed_valid_indices_dict = precomp_dict
+                self._precomputed_idx_map = [precomp_dict.get(pos, i)
+                                             for i, pos in enumerate(self.valid_indices)]
+
                 print(f"     ✓ v5.9.4: Pre-computed targets generated and loaded (Fix #1 + #3 enabled)")
 
             except Exception as e:
@@ -887,15 +904,21 @@ class HierarchicalDataset(Dataset):
             past_prices=None  # Skip breakout detection - we'll use pre-computed
         )
 
+        # Map sample idx to precomputed array row
+        if hasattr(self, '_precomputed_idx_map') and self._precomputed_idx_map:
+            precomp_row = self._precomputed_idx_map[idx]
+        else:
+            precomp_row = idx  # Fallback: direct indexing (only valid before split)
+
         # Override with pre-computed breakout labels (Fix #1 - no linear regression)
         for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
             if key in self._precomputed_breakout:
-                targets[key] = float(self._precomputed_breakout[key][idx])
+                targets[key] = float(self._precomputed_breakout[key][precomp_row])
 
         # Add continuation and transition labels from pre-computed arrays (Fix #3)
         for key, arr in self._precomputed_targets.items():
             if key.startswith('cont_') or key.startswith('trans_'):
-                targets[key] = float(arr[idx])
+                targets[key] = float(arr[precomp_row])
 
         # v5.2: Get VIX sequence for this sample (still computed per-sample)
         vix_seq = None
@@ -2593,12 +2616,21 @@ def create_hierarchical_dataset(
             val_valid = [i for i in all_valid if train_end_idx_adj <= i < val_end_idx_adj]
             test_valid = [i for i in all_valid if i >= val_end_idx_adj]
 
+            # Helper to rebuild precomputed index map after split
+            def rebuild_precomp_idx_map(dataset):
+                if hasattr(dataset, '_use_precomputed') and dataset._use_precomputed:
+                    if hasattr(dataset, '_precomputed_valid_indices_dict') and dataset._precomputed_valid_indices_dict:
+                        # Rebuild mapping for the new split's valid_indices
+                        dataset._precomputed_idx_map = [dataset._precomputed_valid_indices_dict.get(pos, i)
+                                                        for i, pos in enumerate(dataset.valid_indices)]
+
             # Train dataset (modify in place)
             train_dataset = base_dataset
             train_dataset.valid_indices = train_valid
             train_dataset.continuation_labels_df = train_continuation_df
             train_dataset.include_continuation = include_continuation
             train_dataset._build_continuation_lookup()
+            rebuild_precomp_idx_map(train_dataset)
 
             # Val dataset (shallow copy)
             val_dataset = copy.copy(base_dataset)
@@ -2606,6 +2638,7 @@ def create_hierarchical_dataset(
             val_dataset.continuation_labels_df = val_continuation_df
             val_dataset.include_continuation = include_continuation
             val_dataset._build_continuation_lookup()
+            rebuild_precomp_idx_map(val_dataset)
 
             # Test dataset (shallow copy)
             test_dataset = copy.copy(base_dataset)
@@ -2613,6 +2646,7 @@ def create_hierarchical_dataset(
             test_dataset.continuation_labels_df = test_continuation_df
             test_dataset.include_continuation = include_continuation
             test_dataset._build_continuation_lookup()
+            rebuild_precomp_idx_map(test_dataset)
 
         else:
             # No mmaps - traditional split
@@ -2724,12 +2758,20 @@ def create_hierarchical_dataset(
             train_valid = [i for i in all_valid if i < split_idx]
             val_valid = [i for i in all_valid if i >= split_idx]
 
+            # Helper to rebuild precomputed index map after split
+            def rebuild_precomp_idx_map(dataset):
+                if hasattr(dataset, '_use_precomputed') and dataset._use_precomputed:
+                    if hasattr(dataset, '_precomputed_valid_indices_dict') and dataset._precomputed_valid_indices_dict:
+                        dataset._precomputed_idx_map = [dataset._precomputed_valid_indices_dict.get(pos, i)
+                                                        for i, pos in enumerate(dataset.valid_indices)]
+
             # Train dataset (modify in place)
             train_dataset = base_dataset
             train_dataset.valid_indices = train_valid
             train_dataset.continuation_labels_df = train_continuation_df
             train_dataset.include_continuation = include_continuation
             train_dataset._build_continuation_lookup()  # Rebuild dict for legacy labels
+            rebuild_precomp_idx_map(train_dataset)
 
             # Val dataset (shallow copy, shares mmap/arrays but different indices)
             # NOTE: per-TF labels are shared (lookup is by timestamp, so safe)
@@ -2738,6 +2780,7 @@ def create_hierarchical_dataset(
             val_dataset.continuation_labels_df = val_continuation_df
             val_dataset.include_continuation = include_continuation
             val_dataset._build_continuation_lookup()  # Rebuild dict for legacy labels
+            rebuild_precomp_idx_map(val_dataset)
 
         else:
             # No mmaps - traditional split
