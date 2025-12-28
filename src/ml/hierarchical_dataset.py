@@ -1010,35 +1010,47 @@ class HierarchicalDataset(Dataset):
             future_5min_end = min(data_idx_5min + horizon_5min, len(self.tf_mmaps['5min']))
             future_prices = self.tf_mmaps['5min'][data_idx_5min:future_5min_end, self.close_idx_5min]
 
-        # Compute base targets (pass past_prices=None to skip breakout detection)
-        # Base targets like high, low, expected_return are computed here
-        # Breakout labels will be overridden with pre-computed values below
-        targets = self._calculate_targets_from_future(
-            current_price=current_price,
-            future_prices=future_prices,
-            seq_start=max(0, data_idx_5min - 200),
-            seq_end=data_idx_5min,
-            past_prices=None  # Skip breakout detection - we'll use pre-computed
+        # v5.9.8: Check if we have full precomputed targets (including base targets)
+        # If stacked array has base keys like 'high', skip per-sample computation
+        has_full_precomputed = (
+            self._precomputed_targets_stacked is not None and
+            'high' in self._target_key_to_idx
         )
 
-        # Override with pre-computed breakout labels (Fix #1 - no linear regression)
-        for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
-            if key in self._precomputed_breakout:
-                targets[key] = float(self._precomputed_breakout[key][idx])
-
-        # Add continuation and transition labels from pre-computed arrays (Fix #3)
-        # v5.9.8: Use stacked array for fast collate if available
-        if self._precomputed_targets_stacked is not None:
-            # Return stacked row - collate will handle it efficiently
+        if has_full_precomputed:
+            # v5.9.8: All targets (base + cont + trans + breakout) are pre-computed
+            # No need to compute anything per-sample!
+            targets = {}
             targets['_stacked_targets'] = np.ascontiguousarray(
                 self._precomputed_targets_stacked[idx, :]
             )
-            targets['_target_key_to_idx'] = self._target_key_to_idx  # Pass mapping for loss
+            targets['_target_key_to_idx'] = self._target_key_to_idx
         else:
-            # Fallback to dict format (slower)
-            for key, arr in self._precomputed_targets.items():
-                if key.startswith('cont_') or key.startswith('trans_'):
-                    targets[key] = float(arr[idx])
+            # Old path: compute base targets, use precomputed cont/trans
+            targets = self._calculate_targets_from_future(
+                current_price=current_price,
+                future_prices=future_prices,
+                seq_start=max(0, data_idx_5min - 200),
+                seq_end=data_idx_5min,
+                past_prices=None  # Skip breakout detection - we'll use pre-computed
+            )
+
+            # Override with pre-computed breakout labels (Fix #1 - no linear regression)
+            for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
+                if key in self._precomputed_breakout:
+                    targets[key] = float(self._precomputed_breakout[key][idx])
+
+            # Add continuation and transition labels from pre-computed arrays
+            if self._precomputed_targets_stacked is not None:
+                targets['_stacked_targets'] = np.ascontiguousarray(
+                    self._precomputed_targets_stacked[idx, :]
+                )
+                targets['_target_key_to_idx'] = self._target_key_to_idx
+            else:
+                # Fallback to dict format (slower)
+                for key, arr in self._precomputed_targets.items():
+                    if key.startswith('cont_') or key.startswith('trans_'):
+                        targets[key] = float(arr[idx])
 
         # v5.2: Get VIX sequence for this sample (still computed per-sample)
         vix_seq = None
