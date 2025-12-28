@@ -30,7 +30,11 @@ parent_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(parent_dir))
 
 import config
-from src.ml.features import HIERARCHICAL_TIMEFRAMES
+from src.ml.features import HIERARCHICAL_TIMEFRAMES, FEATURE_VERSION
+
+# Version for precomputed targets - increment when computation logic changes
+# This ensures old precomputed files are regenerated when the logic changes
+PRECOMPUTE_VERSION = "5.9.9"  # Increment when breakout/target computation changes
 
 
 def compute_channel_breakout(
@@ -484,6 +488,94 @@ def precompute_target_arrays(
     return target_arrays
 
 
+def validate_precomputed_cache(
+    cache_dir: Path,
+    cache_key: str,
+    expected_n_samples: int,
+    cleanup_old: bool = True
+) -> Tuple[bool, str]:
+    """
+    Validate precomputed cache files and optionally clean up old versions.
+
+    Returns:
+        (is_valid, reason): Tuple of validation result and reason string
+    """
+    meta_path = cache_dir / f"precomputed_meta_{cache_key}.json"
+    breakout_path = cache_dir / f"precomputed_breakout_{cache_key}.npz"
+    targets_path = cache_dir / f"precomputed_targets_{cache_key}.npz"
+    indices_path = cache_dir / f"precomputed_valid_indices_{cache_key}.npy"
+
+    # Check if all files exist
+    if not all(p.exists() for p in [meta_path, breakout_path, targets_path, indices_path]):
+        missing = [p.name for p in [meta_path, breakout_path, targets_path, indices_path] if not p.exists()]
+        return False, f"Missing files: {', '.join(missing)}"
+
+    # Load and validate metadata
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+    except Exception as e:
+        return False, f"Failed to load meta: {e}"
+
+    # Check precompute version
+    meta_version = meta.get('precompute_version') or meta.get('version', '0.0.0')
+    if meta_version != PRECOMPUTE_VERSION:
+        return False, f"Version mismatch: cache={meta_version}, current={PRECOMPUTE_VERSION}"
+
+    # Check sample count
+    meta_n_samples = meta.get('n_samples', 0)
+    if meta_n_samples != expected_n_samples:
+        return False, f"Sample count mismatch: cache={meta_n_samples}, expected={expected_n_samples}"
+
+    # Validate indices file
+    try:
+        indices = np.load(indices_path)
+        if len(indices) != expected_n_samples:
+            return False, f"Indices file count mismatch: {len(indices)} vs {expected_n_samples}"
+    except Exception as e:
+        return False, f"Failed to load indices: {e}"
+
+    # Optionally clean up old version files
+    if cleanup_old:
+        cleanup_old_precomputed(cache_dir, cache_key)
+
+    return True, "Valid"
+
+
+def cleanup_old_precomputed(cache_dir: Path, current_cache_key: str):
+    """Remove precomputed files that don't match the current cache key."""
+    patterns = [
+        "precomputed_meta_*.json",
+        "precomputed_breakout_*.npz",
+        "precomputed_breakout_*.mmap",
+        "precomputed_targets_*.npz",
+        "precomputed_targets_*.mmap",
+        "precomputed_targets_stacked_*.npy",
+        "precomputed_targets_keys_*.json",
+        "precomputed_valid_indices_*.npy",
+    ]
+
+    removed_count = 0
+    removed_size = 0
+
+    for pattern in patterns:
+        for path in cache_dir.glob(pattern):
+            # Keep files matching current cache key
+            if current_cache_key in path.name:
+                continue
+
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                removed_count += 1
+                removed_size += size
+            except Exception as e:
+                print(f"     ⚠️  Failed to remove {path.name}: {e}")
+
+    if removed_count > 0:
+        print(f"     🗑️  Cleaned up {removed_count} old precomputed files ({removed_size / 1e6:.1f} MB)")
+
+
 def save_precomputed(
     cache_dir: Path,
     cache_key: str,
@@ -513,7 +605,8 @@ def save_precomputed(
 
     # Save metadata
     meta = {
-        'version': '5.9.4',
+        'precompute_version': PRECOMPUTE_VERSION,
+        'feature_version': FEATURE_VERSION,
         'cache_key': cache_key,
         'n_samples': len(valid_indices),
         'n_breakout_fields': len(breakout_labels),

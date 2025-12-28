@@ -40,7 +40,10 @@ from src.ml.precompute_targets import (
     compute_valid_indices,
     precompute_breakout_labels,
     precompute_target_arrays,
-    save_precomputed
+    save_precomputed,
+    validate_precomputed_cache,
+    cleanup_old_precomputed,
+    PRECOMPUTE_VERSION
 )
 
 
@@ -632,68 +635,59 @@ class HierarchicalDataset(Dataset):
         - Fix #1: Pre-computed breakout labels (no more linear regression per sample)
         - Fix #3: Pre-computed target arrays (no more 2,223 dict insertions per sample)
 
-        If pre-computed files don't exist, falls back to original behavior.
+        v5.9.9: Added version validation and auto-regeneration:
+        - Validates precompute version matches current PRECOMPUTE_VERSION
+        - Auto-regenerates if version mismatch or sample count mismatch
+        - Cleans up old version files automatically
         """
         self._precomputed_breakout = None
         self._precomputed_targets = None
         self._use_precomputed = False
 
-        # Look for pre-computed files
+        # File paths
         breakout_path = cache_dir / f"precomputed_breakout_{cache_key}.npz"
         targets_path = cache_dir / f"precomputed_targets_{cache_key}.npz"
         indices_path = cache_dir / f"precomputed_valid_indices_{cache_key}.npy"
 
-        if breakout_path.exists() and targets_path.exists() and indices_path.exists():
+        # v5.9.9: Validate cache before loading (checks version and sample count)
+        is_valid, reason = validate_precomputed_cache(
+            cache_dir, cache_key,
+            expected_n_samples=len(self.valid_indices),
+            cleanup_old=True  # Remove old version files
+        )
+
+        if is_valid:
+            # Cache is valid - load it
             try:
-                # Verify indices match
-                precomputed_indices = np.load(indices_path)
-                if len(precomputed_indices) != len(self.valid_indices):
-                    print(f"     ⚠️  Pre-computed indices mismatch ({len(precomputed_indices)} vs {len(self.valid_indices)})")
-                    print(f"        Run: python -m src.ml.precompute_targets --cache-dir {cache_dir}")
-                    return
+                print(f"     📦 Loading pre-computed targets (v{PRECOMPUTE_VERSION})...")
 
                 # Load breakout labels
-                print(f"     📦 Loading pre-computed breakout labels...")
                 breakout_data = dict(np.load(breakout_path))
                 self._precomputed_breakout = breakout_data
-                print(f"        Loaded {len(breakout_data)} breakout fields")
 
                 # Load target arrays
-                print(f"     📦 Loading pre-computed target arrays...")
                 targets_data = dict(np.load(targets_path))
                 self._precomputed_targets = targets_data
-                print(f"        Loaded {len(targets_data)} target fields")
 
-                self._use_precomputed = True
-
-                # Build index mapping: sample idx -> precomputed row
-                # This is needed because after train/val split, valid_indices changes
-                # but precomputed arrays stay the same size
+                # Build index mapping for split compatibility
                 precomputed_indices = np.load(indices_path)
                 precomp_dict = {int(pos): i for i, pos in enumerate(precomputed_indices)}
-                self._precomputed_valid_indices_dict = precomp_dict  # Save for rebuild after split
+                self._precomputed_valid_indices_dict = precomp_dict
                 self._precomputed_idx_map = [precomp_dict.get(pos, i)
                                              for i, pos in enumerate(self.valid_indices)]
 
-                print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled)")
+                self._use_precomputed = True
+                print(f"        ✓ Loaded {len(breakout_data)} breakout + {len(targets_data)} target fields")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to load pre-computed data: {e}")
-                print(f"        Falling back to per-sample computation")
-                self._precomputed_breakout = None
-                self._precomputed_targets = None
-                self._use_precomputed = False
-        else:
-            # v5.9.4: Auto-generate precomputed files (same pattern as other caches)
-            missing = []
-            if not breakout_path.exists():
-                missing.append("breakout")
-            if not targets_path.exists():
-                missing.append("targets")
-            if not indices_path.exists():
-                missing.append("indices")
-            print(f"     ℹ️  Pre-computed targets not found (missing: {', '.join(missing)})")
-            print(f"     🔄 Auto-generating pre-computed targets for ~10-17 min/epoch speedup...")
+                is_valid = False
+                reason = str(e)
+
+        if not is_valid:
+            # Cache invalid or missing - regenerate
+            print(f"     ℹ️  Pre-computed cache invalid: {reason}")
+            print(f"     🔄 Auto-generating pre-computed targets (v{PRECOMPUTE_VERSION})...")
 
             try:
                 # Load existing cache data needed for precomputation
@@ -722,8 +716,7 @@ class HierarchicalDataset(Dataset):
                     precomputed_valid_indices, breakout_labels, target_arrays
                 )
 
-                # Load the generated files
-                print(f"     📦 Loading newly generated pre-computed data...")
+                # Use the generated data directly
                 self._precomputed_breakout = breakout_labels
                 self._precomputed_targets = target_arrays
                 self._use_precomputed = True
@@ -734,7 +727,7 @@ class HierarchicalDataset(Dataset):
                 self._precomputed_idx_map = [precomp_dict.get(pos, i)
                                              for i, pos in enumerate(self.valid_indices)]
 
-                print(f"     ✓ v5.9.4: Pre-computed targets generated and loaded (Fix #1 + #3 enabled)")
+                print(f"     ✓ Pre-computed targets generated (v{PRECOMPUTE_VERSION})")
 
             except Exception as e:
                 print(f"     ⚠️  Failed to auto-generate pre-computed data: {e}")
