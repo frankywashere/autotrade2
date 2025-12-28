@@ -763,10 +763,13 @@ class HierarchicalDataset(Dataset):
                     with open(keys_path) as f:
                         keys_loaded = json.load(f)
 
-                    # Validate: all keys should be cont_/trans_ only (v5.9.8 format)
-                    all_valid = all(k.startswith(('cont_', 'trans_')) for k in keys_loaded)
+                    # v5.9.8: Validate format - should have either:
+                    # - Old format: only cont_/trans_ keys (~1012 keys)
+                    # - New format: all targets including base keys (~1024 keys)
+                    has_base_keys = any(k in keys_loaded for k in ['high', 'low', 'expected_return'])
+                    all_valid = len(keys_loaded) > 0  # Any non-empty keys list is valid
 
-                    if all_valid and len(keys_loaded) > 0:
+                    if all_valid:
                         self._precomputed_targets_stacked = np.load(stacked_path, mmap_mode='r')
                         self._precomputed_target_keys = keys_loaded
                         self._target_key_to_idx = {k: i for i, k in enumerate(self._precomputed_target_keys)}
@@ -779,9 +782,9 @@ class HierarchicalDataset(Dataset):
                 if not stacked_valid:
                     print(f"        🔄 Generating stacked targets for fast collate...")
                     try:
-                        # Filter to cont_/trans_ keys only
-                        keys_ordered = sorted([k for k in targets_data.keys()
-                                             if k.startswith('cont_') or k.startswith('trans_')])
+                        # v5.9.8: Include ALL target keys (base + cont_ + trans_)
+                        # This enables full batch fetching without per-sample computation
+                        keys_ordered = sorted(targets_data.keys())
                         stacked = np.column_stack([targets_data[k] for k in keys_ordered])
 
                         # Save stacked array
