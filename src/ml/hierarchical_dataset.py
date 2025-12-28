@@ -621,8 +621,95 @@ class HierarchicalDataset(Dataset):
             else:
                 raise ValueError("Cannot find tsla_close in 5min features")
 
+        # v5.9.8: Pre-compute TF indices for batch-level fetching
+        # This eliminates 4,224 searchsorted calls per batch (384 samples × 11 TFs)
+        self._precompute_tf_indices()
+
         # v5.9.4: Load pre-computed targets if available (Fix #1 and #3)
         self._load_precomputed_targets(cache_dir, cache_key)
+
+    def _precompute_tf_indices(self):
+        """
+        Pre-compute timeframe indices for all valid samples.
+
+        v5.9.8: Eliminates per-sample searchsorted calls during training.
+        For each TF, we pre-compute which row in the TF array corresponds
+        to each valid sample index.
+
+        This is a one-time cost during dataset init that saves:
+        - 4,224 searchsorted calls per batch (384 samples × 11 TFs)
+        - Enables batch-level feature fetching
+        """
+        import time
+        start = time.perf_counter()
+
+        # Convert valid_indices to numpy array for vectorized operations
+        valid_indices_arr = np.array(self.valid_indices, dtype=np.int64)
+        n_samples = len(valid_indices_arr)
+
+        # Get all 5min timestamps for valid samples (vectorized)
+        all_5min_ts = self.tf_timestamps['5min'][valid_indices_arr]
+
+        # Pre-compute tf_idx for each TF
+        self._batch_tf_indices = {}
+        self._batch_tf_starts = {}  # Pre-compute start indices too
+
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            if tf not in self.tf_mmaps:
+                continue
+
+            seq_len = self.tf_sequence_lengths[tf]
+            tf_timestamps = self.tf_timestamps[tf]
+
+            # Vectorized searchsorted for all samples at once
+            tf_indices = np.searchsorted(tf_timestamps, all_5min_ts, side='right') - 1
+            tf_indices = np.maximum(tf_indices, seq_len)  # Ensure enough history
+
+            self._batch_tf_indices[tf] = tf_indices.astype(np.int64)
+            self._batch_tf_starts[tf] = (tf_indices - seq_len).astype(np.int64)
+
+        elapsed = time.perf_counter() - start
+        print(f"     ✓ Pre-computed TF indices for {n_samples:,} samples in {elapsed:.2f}s")
+
+    def get_batch_features(self, batch_indices: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Fetch features for a batch of samples using pre-computed indices.
+
+        v5.9.8: Batch-level feature fetching - reduces Python loop overhead
+        from 4,224 iterations to 11 iterations per batch.
+
+        Args:
+            batch_indices: Array of sample indices (into valid_indices)
+
+        Returns:
+            Dict mapping TF name -> features array [batch, seq_len, features]
+        """
+        batch_size = len(batch_indices)
+        timeframe_data = {}
+
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            if tf not in self.tf_mmaps:
+                continue
+
+            seq_len = self.tf_sequence_lengths[tf]
+            tf_data = self.tf_mmaps[tf]  # [n_bars, n_features]
+
+            # Get pre-computed start indices for this batch
+            starts = self._batch_tf_starts[tf][batch_indices]  # [batch_size]
+
+            # Build row indices for fancy indexing: [batch_size, seq_len]
+            # Each row needs indices [start, start+1, ..., start+seq_len-1]
+            offsets = np.arange(seq_len, dtype=np.int64)  # [seq_len]
+            row_indices = starts[:, np.newaxis] + offsets  # [batch_size, seq_len]
+
+            # Fancy indexing to fetch all sequences at once
+            # Result shape: [batch_size, seq_len, n_features]
+            features = tf_data[row_indices, :]
+
+            # Ensure contiguous (fancy indexing returns a copy, should be contiguous)
+            timeframe_data[tf] = features
+
+        return timeframe_data
 
     def _load_precomputed_targets(self, cache_dir: Path, cache_key: str):
         """

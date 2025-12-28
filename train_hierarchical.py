@@ -1061,6 +1061,125 @@ class RollingBufferBatchLoader:
             self._executor = None
 
 
+class BatchFetchLoader:
+    """
+    v5.9.8: Batch-level feature fetching loader.
+
+    Instead of calling __getitem__ 384 times per batch (4,224 iterations with 11 TFs),
+    uses vectorized batch fetching that reduces to 11 iterations per batch.
+
+    This eliminates ~90% of Python loop overhead in data loading.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        rank: int = 0,
+        world_size: int = 1,
+        drop_last: bool = True,
+        torch_dtype=None,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.rank = rank
+        self.world_size = world_size
+        self.drop_last = drop_last
+        self.torch_dtype = torch_dtype or torch.float32
+
+        # Verify dataset has batch fetching capability
+        if not hasattr(dataset, 'get_batch_features'):
+            raise ValueError("Dataset must have get_batch_features method for BatchFetchLoader")
+        if not hasattr(dataset, '_precomputed_targets_stacked'):
+            raise ValueError("Dataset must have precomputed stacked targets for BatchFetchLoader")
+
+        self.current_epoch = 0
+        self._epoch_indices = None
+        self._num_batches = 0
+
+    def _get_rank_indices(self, epoch: int):
+        """Get shuffled indices for this epoch and rank."""
+        n_samples = len(self.dataset)
+        rng = np.random.RandomState(epoch + 42)
+        indices = rng.permutation(n_samples)
+
+        # Split across ranks
+        if self.world_size > 1:
+            indices = indices[self.rank::self.world_size]
+
+        return indices
+
+    def set_epoch(self, epoch: int):
+        """Set current epoch."""
+        self.current_epoch = epoch
+        self._epoch_indices = self._get_rank_indices(epoch)
+        self._num_batches = len(self._epoch_indices) // self.batch_size
+        if not self.drop_last and len(self._epoch_indices) % self.batch_size > 0:
+            self._num_batches += 1
+
+    def __len__(self):
+        return self._num_batches
+
+    def __iter__(self):
+        """Iterate over batches using batch-level fetching."""
+        if self._epoch_indices is None:
+            self.set_epoch(self.current_epoch)
+
+        for batch_idx in range(self._num_batches):
+            start = batch_idx * self.batch_size
+            end = min(start + self.batch_size, len(self._epoch_indices))
+            batch_sample_indices = self._epoch_indices[start:end]
+
+            # Convert to numpy array
+            batch_indices = np.array(batch_sample_indices, dtype=np.int64)
+
+            yield self._fetch_batch(batch_indices)
+
+    def _fetch_batch(self, batch_indices: np.ndarray):
+        """Fetch a complete batch using vectorized operations."""
+        batch_size = len(batch_indices)
+
+        # 1. Batch-fetch features (vectorized - 11 iterations instead of 4,224)
+        features_np = self.dataset.get_batch_features(batch_indices)
+
+        # Convert to tensors
+        features = {}
+        for tf, arr in features_np.items():
+            features[tf] = torch.from_numpy(arr).to(dtype=self.torch_dtype)
+
+        # 2. Batch-fetch targets from stacked array
+        targets = {}
+        if self.dataset._precomputed_targets_stacked is not None:
+            # Get stacked targets for all samples in batch
+            stacked = self.dataset._precomputed_targets_stacked[batch_indices, :]
+            stacked_tensor = torch.from_numpy(np.ascontiguousarray(stacked)).to(dtype=self.torch_dtype)
+
+            # Expand to dict using key mapping
+            key_to_idx = self.dataset._target_key_to_idx
+            for key, idx in key_to_idx.items():
+                targets[key] = stacked_tensor[:, idx]
+
+        # 3. Get base targets (these are per-sample computed, need to fetch individually)
+        # For now, we'll get them via __getitem__ for the first sample to know the keys
+        # Then batch-fetch from precomputed arrays
+        if hasattr(self.dataset, '_precomputed_breakout') and self.dataset._precomputed_breakout:
+            for key in ['breakout_occurred', 'breakout_direction', 'breakout_bars_log', 'breakout_magnitude']:
+                if key in self.dataset._precomputed_breakout:
+                    values = self.dataset._precomputed_breakout[key][batch_indices]
+                    targets[key] = torch.from_numpy(np.ascontiguousarray(values)).to(dtype=self.torch_dtype)
+
+        # 4. VIX and events - still per-sample (but usually fast)
+        # For now, skip these in batch mode - they can be added if needed
+        vix_batch = None
+        events_batch = None
+
+        return features, targets, vix_batch, events_batch
+
+    def cleanup(self):
+        """Clean up resources."""
+        self._epoch_indices = None
+
+
 def load_cache_manifests(cache_dir: Path):
     """Load cache manifests from a directory."""
     manifests = []
