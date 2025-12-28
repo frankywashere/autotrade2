@@ -670,16 +670,46 @@ class HierarchicalDataset(Dataset):
                 stacked_path = cache_dir / f"precomputed_targets_stacked_{cache_key}.npy"
                 keys_path = cache_dir / f"precomputed_targets_keys_{cache_key}.json"
 
+                stacked_valid = False
                 if stacked_path.exists() and keys_path.exists():
-                    self._precomputed_targets_stacked = np.load(stacked_path, mmap_mode='r')
+                    # Load and validate stacked files
                     with open(keys_path) as f:
-                        self._precomputed_target_keys = json.load(f)
-                    # Build key-to-index mapping for loss function
-                    self._target_key_to_idx = {k: i for i, k in enumerate(self._precomputed_target_keys)}
-                    print(f"        ✓ Loaded stacked targets: {self._precomputed_targets_stacked.shape}")
-                else:
-                    print(f"        ℹ️  Stacked targets not found, using dict format (slower)")
-                    print(f"           Run: python -m src.ml.precompute_targets to regenerate")
+                        keys_loaded = json.load(f)
+
+                    # Validate: all keys should be cont_/trans_ only (v5.9.8 format)
+                    all_valid = all(k.startswith(('cont_', 'trans_')) for k in keys_loaded)
+
+                    if all_valid and len(keys_loaded) > 0:
+                        self._precomputed_targets_stacked = np.load(stacked_path, mmap_mode='r')
+                        self._precomputed_target_keys = keys_loaded
+                        self._target_key_to_idx = {k: i for i, k in enumerate(self._precomputed_target_keys)}
+                        print(f"        ✓ Loaded stacked targets: {self._precomputed_targets_stacked.shape}")
+                        stacked_valid = True
+                    else:
+                        print(f"        ⚠️  Stacked targets have old format ({len(keys_loaded)} keys), regenerating...")
+
+                # Auto-generate stacked files if missing or invalid
+                if not stacked_valid:
+                    print(f"        🔄 Generating stacked targets for fast collate...")
+                    try:
+                        # Filter to cont_/trans_ keys only
+                        keys_ordered = sorted([k for k in targets_data.keys()
+                                             if k.startswith('cont_') or k.startswith('trans_')])
+                        stacked = np.column_stack([targets_data[k] for k in keys_ordered])
+
+                        # Save stacked array
+                        np.save(stacked_path, stacked)
+                        with open(keys_path, 'w') as f:
+                            json.dump(keys_ordered, f)
+
+                        # Load as mmap
+                        self._precomputed_targets_stacked = np.load(stacked_path, mmap_mode='r')
+                        self._precomputed_target_keys = keys_ordered
+                        self._target_key_to_idx = {k: i for i, k in enumerate(keys_ordered)}
+                        print(f"        ✓ Generated stacked targets: {stacked.shape}")
+                    except Exception as e:
+                        print(f"        ⚠️  Failed to generate stacked targets: {e}")
+                        print(f"           Using dict format (slower)")
 
                 self._use_precomputed = True
                 print(f"     ✓ v5.9.4: Using pre-computed targets (Fix #1 + #3 enabled)")

@@ -1146,6 +1146,10 @@ def validate_cache_layers(cache_dir: Path) -> dict:
         'labels_size_gb': 0.0,
         'non_channel_size_gb': 0.0,
         'chunks_size_gb': 0.0,
+        # v5.9.8: Stacked targets for fast collate
+        'stacked_targets_ready': False,
+        'stacked_targets_keys': 0,
+        'stacked_targets_needs_regen': False,
     }
 
     if not cache_dir.exists():
@@ -1242,6 +1246,28 @@ def validate_cache_layers(cache_dir: Path) -> dict:
 
         except Exception as e:
             pass
+
+    # v5.9.8: Check stacked targets for fast collate
+    stacked_files = list(cache_dir.glob("precomputed_targets_stacked_*.npy"))
+    keys_files = list(cache_dir.glob("precomputed_targets_keys_*.json"))
+
+    if stacked_files and keys_files:
+        try:
+            with open(keys_files[0]) as f:
+                keys_loaded = json.load(f)
+            result['stacked_targets_keys'] = len(keys_loaded)
+
+            # Validate format: all keys should be cont_/trans_ only
+            all_valid = all(k.startswith(('cont_', 'trans_')) for k in keys_loaded)
+            if all_valid and len(keys_loaded) > 0:
+                result['stacked_targets_ready'] = True
+            else:
+                result['stacked_targets_needs_regen'] = True
+        except Exception:
+            result['stacked_targets_needs_regen'] = True
+    else:
+        # Will be auto-generated on first training run
+        result['stacked_targets_needs_regen'] = True
 
     return result
 
