@@ -1869,6 +1869,221 @@ def interactive_setup(args, profiler=None):
     # Store layer_status for later use
     args.layer_status = layer_status
 
+    # =========================================================================
+    # v6.0 CACHE VALIDATION
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("📦 v6.0 DURATION-PRIMARY CACHE")
+    print("=" * 70)
+
+    # Get default v6 cache path from config
+    v6_default_path = str(getattr(project_config, 'V6_CACHE_DIR', 'data/feature_cache_v6'))
+    v6_cache_exists = Path(v6_default_path).exists()
+
+    print(f"\n   Default path: {v6_default_path}")
+    print(f"   Status: {'✓ Found' if v6_cache_exists else '✗ Not found'}")
+
+    if v6_cache_exists:
+        # Validate the existing v6 cache
+        try:
+            from src.ml.cache_v6 import validate_v6_cache, load_v6_cache
+            print(f"\n   Validating v6 cache...")
+            v6_valid = validate_v6_cache(v6_default_path)
+            if v6_valid:
+                print(f"   ✓ v6 cache is valid")
+            else:
+                print(f"   ✗ v6 cache validation failed")
+                v6_cache_exists = False
+        except Exception as e:
+            print(f"   ✗ v6 cache validation error: {e}")
+            v6_cache_exists = False
+
+    # Build choices based on current state
+    v6_choices = []
+    if v6_cache_exists:
+        v6_choices.append(Choice(value='use', name=f'Use existing v6 cache ✓'))
+    if layer_status.get('training_ready', False):
+        v6_choices.append(Choice(value='generate', name='Generate v6 cache from v5.9 features (~30-60 min)'))
+    else:
+        # v5.9 doesn't exist - offer to generate everything
+        v6_choices.append(Choice(value='generate_all', name='Generate everything: v5.9 features → v6 cache (~2-3 hours)'))
+    v6_choices.append(Choice(value='specify', name='Specify different v6 cache path'))
+    v6_choices.append(Choice(value='skip', name='Skip v6 (use v5 legacy mode)'))
+
+    v6_action = inquirer.select(
+        message="v6.0 cache action:",
+        choices=v6_choices,
+        default='use' if v6_cache_exists else ('generate' if layer_status.get('training_ready') else 'skip')
+    ).execute()
+
+    args.use_v6_cache = True  # Default
+    args.v6_cache_dir = v6_default_path
+
+    if v6_action == 'use':
+        print(f"   ✓ Using v6 cache: {v6_default_path}")
+
+    elif v6_action == 'generate':
+        print(f"\n   Generating v6 cache from v5.9 features...")
+        print(f"   This may take 30-60 minutes.\n")
+
+        # Find tf_meta file
+        tf_meta_files = list(Path(args.shard_path).glob("tf_meta_v5.9*.json"))
+        if not tf_meta_files:
+            print(f"   ✗ No tf_meta_v5.9*.json found in {args.shard_path}")
+            print(f"   Cannot generate v6 cache without v5.9 features.")
+            args.use_v6_cache = False
+        else:
+            tf_meta_path = str(tf_meta_files[0])
+            print(f"   Using: {tf_meta_path}")
+
+            proceed = inquirer.confirm(
+                message="Generate v6 cache now?",
+                default=True
+            ).execute()
+
+            if proceed:
+                try:
+                    from src.ml.cache_v6 import generate_v6_cache
+                    import pandas as pd
+
+                    # Load raw OHLC
+                    ohlc_path = project_config.RAW_DATA_FILE
+                    print(f"   Loading raw OHLC from {ohlc_path}...")
+                    raw_ohlc_df = pd.read_csv(ohlc_path, parse_dates=['timestamp'])
+                    raw_ohlc_df.set_index('timestamp', inplace=True)
+
+                    # Generate
+                    output_dir = Path(v6_default_path)
+                    output_dir.mkdir(parents=True, exist_ok=True)
+
+                    metadata = generate_v6_cache(
+                        features_df=pd.DataFrame(),  # Empty - will load from v5.9
+                        raw_ohlc_df=raw_ohlc_df,
+                        output_dir=str(output_dir),
+                        v5_cache_dir=args.shard_path,
+                        verbose=True
+                    )
+
+                    print(f"\n   ✓ v6 cache generated successfully!")
+                    print(f"   ✓ {len(metadata.get('timeframes', {}))} timeframes")
+
+                except Exception as e:
+                    print(f"\n   ✗ v6 cache generation failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    args.use_v6_cache = False
+            else:
+                print(f"   Skipping v6 generation. Using v5 legacy mode.")
+                args.use_v6_cache = False
+
+    elif v6_action == 'generate_all':
+        # Generate everything from scratch: v5.9 features → v6 cache
+        print(f"\n   🔨 FULL CACHE GENERATION")
+        print(f"   Step 1: Generate v5.9 features (~1-2 hours)")
+        print(f"   Step 2: Generate v6 cache (~30-60 min)")
+        print(f"\n   Total estimated time: 2-3 hours\n")
+
+        proceed = inquirer.confirm(
+            message="Generate everything now?",
+            default=True
+        ).execute()
+
+        if proceed:
+            try:
+                import pandas as pd
+                from src.ml.features import TradingFeatureExtractor
+                from src.ml.cache_v6 import generate_v6_cache
+
+                # Step 1: Load raw data
+                ohlc_path = project_config.RAW_DATA_FILE
+                print(f"\n   📂 Loading raw OHLC from {ohlc_path}...")
+                raw_df = pd.read_csv(ohlc_path, parse_dates=['timestamp'])
+                raw_df.set_index('timestamp', inplace=True)
+                print(f"   ✓ Loaded {len(raw_df):,} bars")
+
+                # Load VIX data
+                vix_data = None
+                vix_path = getattr(project_config, 'VIX_DATA_FILE', None)
+                if vix_path and Path(vix_path).exists():
+                    print(f"   📂 Loading VIX data from {vix_path}...")
+                    vix_data = load_vix_data(str(vix_path))
+                    print(f"   ✓ Loaded VIX data")
+
+                # Step 2: Generate v5.9 features
+                print(f"\n   ⚙️  STEP 1/2: Generating v5.9 features...")
+                print(f"   This will take 1-2 hours...\n")
+
+                extractor = TradingFeatureExtractor()
+                shard_path = Path(args.shard_path)
+                shard_path.mkdir(parents=True, exist_ok=True)
+
+                result = extractor.extract_features(
+                    raw_df,
+                    use_cache=False,  # Force regeneration
+                    continuation=True,
+                    use_chunking=True,
+                    use_gpu='auto',
+                    shard_storage_path=str(shard_path),
+                    vix_data=vix_data,
+                )
+
+                print(f"\n   ✓ v5.9 features generated!")
+
+                # Step 3: Generate v6 cache
+                print(f"\n   ⚙️  STEP 2/2: Generating v6 cache...")
+
+                output_dir = Path(v6_default_path)
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                metadata = generate_v6_cache(
+                    features_df=pd.DataFrame(),  # Empty - loads from v5.9
+                    raw_ohlc_df=raw_df,
+                    output_dir=str(output_dir),
+                    v5_cache_dir=str(shard_path),
+                    verbose=True
+                )
+
+                print(f"\n   ✓ v6 cache generated successfully!")
+                print(f"   ✓ {len(metadata.get('timeframes', {}))} timeframes")
+
+                # Update layer_status since we just generated everything
+                args.layer_status['training_ready'] = True
+
+            except Exception as e:
+                print(f"\n   ✗ Generation failed: {e}")
+                import traceback
+                traceback.print_exc()
+                args.use_v6_cache = False
+        else:
+            print(f"   Skipping generation. Using v5 legacy mode.")
+            args.use_v6_cache = False
+
+    elif v6_action == 'specify':
+        args.v6_cache_dir = inquirer.text(
+            message="v6 cache directory path:",
+            default=v6_default_path
+        ).execute()
+
+        if Path(args.v6_cache_dir).exists():
+            try:
+                from src.ml.cache_v6 import validate_v6_cache
+                if validate_v6_cache(args.v6_cache_dir):
+                    print(f"   ✓ v6 cache valid: {args.v6_cache_dir}")
+                else:
+                    print(f"   ✗ v6 cache invalid")
+                    args.use_v6_cache = False
+            except Exception as e:
+                print(f"   ✗ v6 cache error: {e}")
+                args.use_v6_cache = False
+        else:
+            print(f"   ✗ Path not found: {args.v6_cache_dir}")
+            args.use_v6_cache = False
+
+    elif v6_action == 'skip':
+        print(f"   Using v5 legacy mode (no v6 cache)")
+        args.use_v6_cache = False
+        args.v6_cache_dir = None
+
     def dflt(key, fallback):
         return manifest_defaults.get(key, fallback)
 
@@ -3651,13 +3866,16 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Don't pass profiler to dataset if using workers (can't be pickled for spawn)
     dataset_profiler = profiler if args.num_workers == 0 else None
 
-    # v6.0: Get v6 cache directory (default mode)
-    if USE_V5_LEGACY:
+    # v6.0: Get v6 cache directory (from interactive menu or config)
+    if USE_V5_LEGACY or not getattr(args, 'use_v6_cache', True):
         v6_cache_dir_path = None
         if is_main_process(rank):
             print(f"   ⚠️  v5 legacy mode: Not loading v6 cache")
     else:
-        v6_cache_dir_path = str(getattr(project_config, 'V6_CACHE_DIR', 'data/feature_cache_v6'))
+        # Use path from interactive menu if available, otherwise fall back to config
+        v6_cache_dir_path = getattr(args, 'v6_cache_dir', None)
+        if v6_cache_dir_path is None:
+            v6_cache_dir_path = str(getattr(project_config, 'V6_CACHE_DIR', 'data/feature_cache_v6'))
         if is_main_process(rank):
             print(f"   ✓ v6.0: Will load duration-primary labels from {v6_cache_dir_path}")
 
