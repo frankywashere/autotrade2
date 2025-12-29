@@ -408,6 +408,58 @@ def detect_transition(
 # CACHE GENERATION
 # =============================================================================
 
+def resample_ohlc_to_tf(raw_ohlc_df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    """
+    Resample 1-min OHLC to a specific timeframe.
+
+    Args:
+        raw_ohlc_df: Raw 1-min OHLC DataFrame (indexed by timestamp)
+        tf: Target timeframe ('5min', '1h', 'daily', etc.)
+
+    Returns:
+        Resampled OHLC DataFrame
+    """
+    # Map TF names to pandas resample rules
+    tf_to_rule = {
+        '5min': '5T',
+        '15min': '15T',
+        '30min': '30T',
+        '1h': '1H',
+        '2h': '2H',
+        '3h': '3H',
+        '4h': '4H',
+        'daily': '1D',
+        'weekly': '1W',
+        'monthly': '1M',
+        '3month': '3M',
+    }
+
+    rule = tf_to_rule.get(tf)
+    if rule is None:
+        raise ValueError(f"Unknown timeframe: {tf}")
+
+    # Determine OHLC column names
+    if 'tsla_open' in raw_ohlc_df.columns:
+        ohlc_cols = {'open': 'tsla_open', 'high': 'tsla_high',
+                     'low': 'tsla_low', 'close': 'tsla_close'}
+    else:
+        ohlc_cols = {'open': 'open', 'high': 'high',
+                     'low': 'low', 'close': 'close'}
+
+    # Resample
+    resampled = raw_ohlc_df.resample(rule).agg({
+        ohlc_cols['open']: 'first',
+        ohlc_cols['high']: 'max',
+        ohlc_cols['low']: 'min',
+        ohlc_cols['close']: 'last',
+    }).dropna()
+
+    # Rename to standard names
+    resampled.columns = ['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']
+
+    return resampled
+
+
 def generate_v6_cache(
     features_df: pd.DataFrame,
     raw_ohlc_df: pd.DataFrame,
@@ -424,9 +476,9 @@ def generate_v6_cache(
 
     Args:
         features_df: DataFrame with computed features (indexed by timestamp)
-        raw_ohlc_df: Raw OHLC DataFrame (indexed by timestamp)
+        raw_ohlc_df: Raw OHLC DataFrame (indexed by timestamp, 1-min frequency)
         output_dir: Output directory for cache files
-        v5_cache_dir: Path to v5.9 cache directory (to load features from .npy files)
+        v5_cache_dir: Path to v5.9 cache directory (to load features and timestamps)
         max_scan_bars: Maximum bars to scan forward for breaks
         return_threshold_bars: Bars inside to count as "returned"
         verbose: Print progress
@@ -442,26 +494,38 @@ def generate_v6_cache(
         print(f"v6.0 Cache Generation")
         print(f"{'='*60}")
         print(f"Output: {output_path}")
-        print(f"Features: {len(features_df):,} rows × {len(features_df.columns)} cols")
-        print(f"OHLC: {len(raw_ohlc_df):,} rows")
+        print(f"Raw OHLC: {len(raw_ohlc_df):,} 1-min bars")
         if v5_cache_dir:
             print(f"v5.9 cache: {v5_cache_dir}")
 
-    # Extract OHLC array
+    # Verify OHLC columns exist
     ohlc_cols = ['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']
-    if all(c in raw_ohlc_df.columns for c in ohlc_cols):
-        ohlc_array = raw_ohlc_df[ohlc_cols].values
-    else:
-        raise ValueError(f"Missing OHLC columns. Expected: {ohlc_cols}")
+    if not all(c in raw_ohlc_df.columns for c in ohlc_cols):
+        # Try alternate column names
+        alt_cols = ['open', 'high', 'low', 'close']
+        if all(c in raw_ohlc_df.columns for c in alt_cols):
+            raw_ohlc_df = raw_ohlc_df.rename(columns=dict(zip(alt_cols, ohlc_cols)))
+        else:
+            raise ValueError(f"Missing OHLC columns. Expected: {ohlc_cols} or {alt_cols}")
+
+    # Load v5.9 cache metadata to get cache_key for timestamp files
+    v5_path = Path(v5_cache_dir) if v5_cache_dir else None
+    cache_key = None
+    if v5_path:
+        meta_files = list(v5_path.glob("tf_meta_*.json"))
+        if meta_files:
+            with open(meta_files[0]) as f:
+                v5_meta = json.load(f)
+                cache_key = v5_meta.get('cache_key')
 
     metadata = {
         'version': VERSION,
         'created': datetime.now().isoformat(),
         'data_range': {
-            'start': str(features_df.index[0]),
-            'end': str(features_df.index[-1]),
+            'start': str(raw_ohlc_df.index[0]),
+            'end': str(raw_ohlc_df.index[-1]),
         },
-        'source_rows': len(features_df),
+        'source_rows': len(raw_ohlc_df),
         'windows': WINDOWS,
         'break_detection': {
             'method': '2sigma_with_return_tracking',
@@ -476,28 +540,77 @@ def generate_v6_cache(
         if verbose:
             print(f"\n  Processing {tf}...")
 
-        # FIX #3: Load v5.9 features if v5_cache_dir provided
+        # Load TF-specific timestamps from v5.9 cache
+        tf_timestamps = None
         features_array = None
-        if v5_cache_dir:
-            v5_path = Path(v5_cache_dir)
-            # Find v5.9 features file for this TF (glob pattern to handle version suffix)
-            pattern = f"tf_sequence_{tf}_v5.9*.npy"
-            matches = list(v5_path.glob(pattern))
-            if matches:
-                features_path = matches[0]
+
+        if v5_path and cache_key:
+            # Load timestamps
+            ts_pattern = f"tf_timestamps_{tf}_{cache_key}.npy"
+            ts_matches = list(v5_path.glob(ts_pattern))
+            if ts_matches:
+                tf_timestamps = np.load(str(ts_matches[0]))
+                if verbose:
+                    print(f"    ✓ Loaded {len(tf_timestamps):,} timestamps from v5.9 cache")
+
+            # Load features
+            feat_pattern = f"tf_sequence_{tf}_v5.9*.npy"
+            feat_matches = list(v5_path.glob(feat_pattern))
+            if feat_matches:
+                features_path = feat_matches[0]
                 if verbose:
                     print(f"    Loading v5.9 features from {features_path.name}...")
                 features_array = np.load(str(features_path), mmap_mode='r')
                 if verbose:
                     print(f"    ✓ Loaded {features_array.shape[0]:,} bars × {features_array.shape[1]} features")
-            else:
-                if verbose:
-                    print(f"    ⚠️  No v5.9 features found for {tf} (pattern: {pattern})")
 
+        # Resample OHLC to this TF's frequency
+        if verbose:
+            print(f"    Resampling OHLC to {tf} frequency...")
+        tf_ohlc_df = resample_ohlc_to_tf(raw_ohlc_df, tf)
+        if verbose:
+            print(f"    ✓ Resampled to {len(tf_ohlc_df):,} bars")
+
+        # If we have v5.9 timestamps, align OHLC to those timestamps
+        if tf_timestamps is not None:
+            # Convert timestamps to datetime index for alignment
+            tf_dt_index = pd.to_datetime(tf_timestamps, unit='ns')
+
+            # Find intersection of timestamps
+            common_idx = tf_ohlc_df.index.intersection(tf_dt_index)
+            if len(common_idx) < len(tf_timestamps):
+                if verbose:
+                    print(f"    ⚠️  Only {len(common_idx):,}/{len(tf_timestamps):,} timestamps match OHLC")
+
+            # Align OHLC to v5.9 timestamps (use v5.9 as authoritative)
+            tf_ohlc_aligned = tf_ohlc_df.reindex(tf_dt_index, method='ffill')
+            tf_ohlc_array = tf_ohlc_aligned[ohlc_cols].values
+
+            # Use v5.9 timestamps
+            final_timestamps = tf_timestamps
+        else:
+            # No v5.9 cache - use resampled OHLC directly
+            tf_ohlc_array = tf_ohlc_df[ohlc_cols].values
+            final_timestamps = tf_ohlc_df.index.values.astype('datetime64[ns]').astype('int64')
+
+            if verbose:
+                print(f"    ⚠️  No v5.9 timestamps found, using resampled OHLC timestamps")
+
+        # Validate alignment
+        if features_array is not None and len(features_array) != len(final_timestamps):
+            if verbose:
+                print(f"    ⚠️  Features ({len(features_array)}) != timestamps ({len(final_timestamps)})")
+                print(f"    Using min length: {min(len(features_array), len(final_timestamps))}")
+            min_len = min(len(features_array), len(final_timestamps), len(tf_ohlc_array))
+            features_array = features_array[:min_len]
+            final_timestamps = final_timestamps[:min_len]
+            tf_ohlc_array = tf_ohlc_array[:min_len]
+
+        # Generate labels for this TF
         tf_labels = generate_tf_labels(
-            features_df=features_df,
-            ohlc_array=ohlc_array,
             tf=tf,
+            tf_timestamps=final_timestamps,
+            tf_ohlc=tf_ohlc_array,
             features_array=features_array,
             max_scan_bars=max_scan_bars,
             return_threshold_bars=return_threshold_bars,
@@ -530,9 +643,9 @@ def generate_v6_cache(
 
 
 def generate_tf_labels(
-    features_df: pd.DataFrame,
-    ohlc_array: np.ndarray,
     tf: str,
+    tf_timestamps: np.ndarray,
+    tf_ohlc: np.ndarray,
     features_array: np.ndarray = None,
     max_scan_bars: int = 500,
     return_threshold_bars: int = 3,
@@ -542,10 +655,10 @@ def generate_tf_labels(
     Generate all labels for one timeframe.
 
     Args:
-        features_df: Features DataFrame
-        ohlc_array: [N, 4] OHLC array
         tf: Timeframe name
-        features_array: [N, 1049] Features array (optional, loaded from v5.9 cache)
+        tf_timestamps: [N_tf] Timestamps for this TF (nanoseconds)
+        tf_ohlc: [N_tf, 4] OHLC array resampled to this TF's frequency
+        features_array: [N_tf, 1049] Features array (optional, loaded from v5.9 cache)
         max_scan_bars: Maximum bars to scan forward
         return_threshold_bars: Bars inside to count as "returned"
         verbose: Print progress
@@ -553,64 +666,63 @@ def generate_tf_labels(
     Returns:
         Dict of numpy arrays for the .npz file
     """
-    n_samples = len(features_df)
+    n_samples = len(tf_timestamps)
     n_windows = len(WINDOWS)
 
     # Initialize unified cache with OHLC + features + labels
     labels = {
-        'timestamps': features_df.index.values.astype('datetime64[ns]').astype('int64'),
-        # FIX #2: Add OHLC to unified cache
-        'ohlc': ohlc_array.astype(np.float32),
+        'timestamps': tf_timestamps.astype('int64'),
+        'ohlc': tf_ohlc.astype(np.float32),
     }
 
     # FIX #3: Add features to unified cache if provided
     if features_array is not None:
         labels['features'] = features_array.astype(np.float32)
 
-    # Per-window labels
+    # Per-window labels (all float32 for consistency with model weights)
     for w_idx, window in enumerate(WINDOWS):
         prefix = f'w{window}'
-        labels[f'{prefix}_valid'] = np.zeros(n_samples, dtype=np.int8)
+        labels[f'{prefix}_valid'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_r_squared'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_slope'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_width'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_first_break_bar'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_final_duration'] = np.zeros(n_samples, dtype=np.float32)
-        labels[f'{prefix}_break_direction'] = np.zeros(n_samples, dtype=np.int8)
-        labels[f'{prefix}_returned'] = np.zeros(n_samples, dtype=np.int8)
+        labels[f'{prefix}_break_direction'] = np.zeros(n_samples, dtype=np.float32)
+        labels[f'{prefix}_returned'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_bars_to_return'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_bars_outside'] = np.zeros(n_samples, dtype=np.float32)
-        labels[f'{prefix}_max_consecutive_outside'] = np.zeros(n_samples, dtype=np.int8)
-        labels[f'{prefix}_hit_upper'] = np.zeros(n_samples, dtype=np.int8)
-        labels[f'{prefix}_hit_midline'] = np.zeros(n_samples, dtype=np.int8)
-        labels[f'{prefix}_hit_lower'] = np.zeros(n_samples, dtype=np.int8)
+        labels[f'{prefix}_max_consecutive_outside'] = np.zeros(n_samples, dtype=np.float32)
+        labels[f'{prefix}_hit_upper'] = np.zeros(n_samples, dtype=np.float32)
+        labels[f'{prefix}_hit_midline'] = np.zeros(n_samples, dtype=np.float32)
+        labels[f'{prefix}_hit_lower'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_bars_to_upper'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_bars_to_midline'] = np.zeros(n_samples, dtype=np.float32)
         labels[f'{prefix}_bars_to_lower'] = np.zeros(n_samples, dtype=np.float32)
         # FIX #1: Add price_sequence storage (variable length, use object array)
         labels[f'{prefix}_price_sequence'] = np.empty(n_samples, dtype=object)
 
-    # Transition labels
-    labels['transition_type'] = np.zeros(n_samples, dtype=np.int8)
-    labels['transition_direction'] = np.zeros(n_samples, dtype=np.int8)
-    labels['transition_next_tf'] = np.zeros(n_samples, dtype=np.int8)
+    # Transition labels (float32 for consistency)
+    labels['transition_type'] = np.zeros(n_samples, dtype=np.float32)
+    labels['transition_direction'] = np.zeros(n_samples, dtype=np.float32)
+    labels['transition_next_tf'] = np.zeros(n_samples, dtype=np.float32)
 
     # Process each sample
     iterator = tqdm(range(n_samples), desc=f"    {tf}", disable=not verbose)
 
     for i in iterator:
-        # Get future OHLC for this sample
+        # Get future OHLC for this sample (using TF-specific OHLC)
         future_start = i + 1
         future_end = min(i + 1 + max_scan_bars, n_samples)
-        future_ohlc = ohlc_array[future_start:future_end]
+        future_ohlc = tf_ohlc[future_start:future_end]
 
         if len(future_ohlc) < 10:
             continue
 
-        # Get current OHLC for channel computation
+        # Get current OHLC for channel computation (using TF-specific OHLC)
         lookback_end = i + 1
         lookback_start = max(0, lookback_end - max(WINDOWS))
-        current_ohlc = ohlc_array[lookback_start:lookback_end]
+        current_ohlc = tf_ohlc[lookback_start:lookback_end]
 
         # Track best window for transition detection
         best_window_duration = 0

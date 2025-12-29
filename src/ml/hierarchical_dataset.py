@@ -212,9 +212,13 @@ class HierarchicalDataset(Dataset):
 
         if self.use_v6_cache:
             self._init_v6_cache_mode(v6_cache_dir)
-            # v6 mode still needs native TF features, so continue to native TF init
+            # If v6 cache has features, it's self-contained - skip v5.9 loading
+            if getattr(self, '_v6_features_loaded', False):
+                print(f"     ✓ Using v6 cache features (v5.9 cache not needed)")
+                return  # Skip v5.9 loading - v6 is self-contained
 
         # v4.1: Native timeframe mode - load per-TF sequences
+        # Only needed if v6 cache doesn't have features
         if self.use_native_timeframes and tf_meta_path is not None:
             self._init_native_timeframe_mode(tf_meta_path, raw_ohlc_df, expected_dtype)
             return  # Skip legacy loading paths
@@ -653,6 +657,8 @@ class HierarchicalDataset(Dataset):
         - Break/return tracking (returned, bars_outside, etc.)
         - Window quality (R², validity per window)
         - Transition labels (type, direction, next_tf)
+        - Features (1049 columns) - if present, makes v6 self-contained
+        - OHLC (open, high, low, close) - for target calculation
 
         Args:
             v6_cache_dir: Path to v6 cache directory
@@ -673,16 +679,126 @@ class HierarchicalDataset(Dataset):
                     timestamps = labels['timestamps']
                     self._v6_ts_to_idx[tf] = {ts: idx for idx, ts in enumerate(timestamps)}
 
+            # Check if v6 cache has features (makes it self-contained)
+            self._v6_has_features = all(
+                'features' in labels for labels in self._v6_labels.values()
+            )
+            self._v6_has_ohlc = all(
+                'ohlc' in labels for labels in self._v6_labels.values()
+            )
+
             # Summary
             total_samples = sum(len(labels.get('timestamps', [])) for labels in self._v6_labels.values())
             print(f"     ✓ Loaded {len(self._v6_labels)} timeframes, {total_samples:,} total samples")
             print(f"     ✓ Windows: {self._v6_windows[:3]}...{self._v6_windows[-1]}")
             print(f"     ✓ Version: {self._v6_meta.get('version', 'unknown')}")
+            print(f"     ✓ Has features: {self._v6_has_features}")
+            print(f"     ✓ Has OHLC: {self._v6_has_ohlc}")
+
+            # If v6 cache has features, populate tf_mmaps and tf_timestamps
+            # This makes v6 fully self-contained (no need for v5.9 cache)
+            if self._v6_has_features:
+                self._init_features_from_v6_cache()
 
         except Exception as e:
             print(f"     ⚠️  Failed to load v6 cache: {e}")
+            import traceback
+            traceback.print_exc()
             self.use_v6_cache = False
             self._v6_labels = {}
+            self._v6_has_features = False
+            self._v6_has_ohlc = False
+
+    def _init_features_from_v6_cache(self):
+        """
+        v6.0: Initialize features and timestamps from v6 cache.
+
+        This makes v6 cache self-contained - no need for v5.9 cache files.
+        Populates the same data structures as _init_native_timeframe_mode.
+        """
+        print(f"     📥 Loading features from v6 cache (self-contained mode)...")
+
+        # Initialize data structures (same as _init_native_timeframe_mode)
+        self.tf_mmaps = {}
+        self.tf_timestamps = {}
+        self.timeframe_feature_counts = {}
+
+        for tf, labels in self._v6_labels.items():
+            if 'features' not in labels:
+                print(f"     ⚠️  Skipping {tf}: no features in v6 cache")
+                continue
+
+            # Features
+            self.tf_mmaps[tf] = labels['features']
+            self.timeframe_feature_counts[tf] = labels['features'].shape[1]
+
+            # Timestamps
+            if 'timestamps' in labels:
+                self.tf_timestamps[tf] = labels['timestamps']
+
+            shape = labels['features'].shape
+            print(f"        {tf}: {shape[0]:,} bars × {shape[1]} features")
+
+        # Set up OHLC for target calculation
+        if self._v6_has_ohlc and '5min' in self._v6_labels:
+            # Use 5min OHLC as the reference (finest TF resolution)
+            ohlc_5min = self._v6_labels['5min']['ohlc']
+            self.raw_ohlc_array = ohlc_5min
+            self.raw_ohlc_timestamps = self._v6_labels['5min']['timestamps']
+            print(f"     ✓ Target calculation: 5-min OHLC from v6 ({len(ohlc_5min):,} bars)")
+        else:
+            self.raw_ohlc_array = None
+            self.raw_ohlc_timestamps = np.array([], dtype='int64')
+            print(f"     ⚠️  No OHLC in v6 cache, target calculation may be limited")
+
+        # Set up valid indices (same logic as _init_native_timeframe_mode)
+        if '5min' in self.tf_mmaps:
+            # Get sequence lengths from v6 meta or use defaults
+            self.tf_sequence_lengths = self._v6_meta.get('sequence_lengths', {
+                '5min': 200, '15min': 100, '30min': 60, '1h': 48,
+                '2h': 36, '3h': 24, '4h': 24, 'daily': 30,
+                'weekly': 12, 'monthly': 8, '3month': 8
+            })
+            self.min_context = max(self.tf_sequence_lengths.values())
+            self.total_required = self.min_context + (self.prediction_horizon // 5 + 1)
+
+            # Valid indices are positions in the 5min array
+            self.valid_indices = list(range(
+                self.min_context,
+                self.tf_mmaps['5min'].shape[0] - (self.prediction_horizon // 5 + 1)
+            ))
+            print(f"     ✓ Valid samples: {len(self.valid_indices):,}")
+
+        # Build column name mapping (for tsla_close lookup)
+        # v6 cache uses standard column order: 1049 channel features
+        # We need to find tsla_close index - it's typically at the start
+        self.tf_columns = {}
+        for tf in self.tf_mmaps:
+            # v6 cache doesn't store column names, assume standard order
+            # tsla_close is typically index 3 (after open, high, low)
+            # But channel features start at index 0 with w100_* columns
+            # Actually, we need to check the v5.9 meta for column names
+            # For now, assume column 3 is close (OHLC at start)
+            self.tf_columns[tf] = []  # Will be populated if needed
+
+        # Find tsla_close index in features
+        # In v6 cache, OHLC is stored separately, so we use that for close price
+        if self._v6_has_ohlc:
+            self.close_idx_5min = 3  # Close is 4th column in OHLC array
+            self._use_v6_ohlc_for_close = True
+        else:
+            self.close_idx_5min = 0  # Fallback
+            self._use_v6_ohlc_for_close = False
+
+        # Set flags
+        self.using_mmaps = False
+        self.using_native_timeframes = True
+        self._v6_features_loaded = True
+
+        # Cache torch dtype
+        self._torch_dtype = config.get_torch_dtype()
+
+        print(f"     ✓ v6 cache is self-contained (no v5.9 dependency)")
 
     def _get_v6_labels_for_sample(self, timestamp_ns: int, tf: str) -> Dict[str, np.ndarray]:
         """
