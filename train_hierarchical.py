@@ -4338,8 +4338,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
             # v6.0: High/low MSE DISABLED (was primary in v5.x, now duration is primary)
             # Kept for logging only - does NOT contribute to loss
-            highlow_mse = F.mse_loss(predictions[:, :2], target_tensor)
-            # loss = loss + 0.0 * highlow_mse  # DISABLED
+            with torch.no_grad():
+                highlow_mse = F.mse_loss(predictions[:, :2], target_tensor)
             loss_components['highlow_mse'] = highlow_mse.item()  # Still logged for comparison
 
             # 🛡️ NaN Check 3: Loss
