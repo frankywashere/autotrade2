@@ -49,6 +49,10 @@ from src.ml.hierarchical_model import HierarchicalLNN
 from src.ml.hierarchical_dataset import create_hierarchical_dataset
 from src.ml.features import TradingFeatureExtractor, FEATURE_VERSION, load_vix_data
 from src.ml.data_feed import CSVDataFeed
+# v6.0: Import duration-primary loss functions
+from src.ml.loss_v6 import (
+    compute_v6_loss, V6LossConfig, get_warmup_weight, get_temperature, format_loss_log
+)
 import yaml
 import config as project_config
 
@@ -457,8 +461,16 @@ def hierarchical_collate(batch, device: str = None, move_to_device: bool = False
         first_target = targets_list[0]
         for k in first_target.keys():
             # v5.9.2: price_sequence stays as list (variable length, used in loss loop)
+            # v6.0: window_r_squared and window_durations are also lists (14 values per sample)
             if '_price_sequence' in k:
                 targets_batch[k] = [t[k] for t in targets_list]  # List of lists
+            elif '_window_r_squared' in k or '_window_durations' in k:
+                # v6.0: Stack into 2D tensor [batch, 14]
+                values = [t[k] for t in targets_list]
+                if isinstance(values[0], list):
+                    targets_batch[k] = torch.tensor(values, dtype=torch_dtype)
+                else:
+                    targets_batch[k] = torch.as_tensor(values, dtype=torch_dtype)
             else:
                 # Gather all values for this key across samples
                 values = [t[k] for t in targets_list]
@@ -3639,6 +3651,16 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Don't pass profiler to dataset if using workers (can't be pickled for spawn)
     dataset_profiler = profiler if args.num_workers == 0 else None
 
+    # v6.0: Get v6 cache directory (default mode)
+    if USE_V5_LEGACY:
+        v6_cache_dir_path = None
+        if is_main_process(rank):
+            print(f"   ⚠️  v5 legacy mode: Not loading v6 cache")
+    else:
+        v6_cache_dir_path = str(getattr(project_config, 'V6_CACHE_DIR', 'data/feature_cache_v6'))
+        if is_main_process(rank):
+            print(f"   ✓ v6.0: Will load duration-primary labels from {v6_cache_dir_path}")
+
     train_dataset, val_dataset, test_dataset = create_hierarchical_dataset(
         features_df=features_df,
         raw_ohlc_df=df,  # Must match features_df length (both from full df)
@@ -3656,7 +3678,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         tf_meta_path=args.tf_meta_path,
         use_boundary_sampling=getattr(args, 'use_boundary_sampling', False),  # v5.9.6
         boundary_threshold=getattr(args, 'boundary_threshold', 5),  # v5.9.6
-        boundary_mode=getattr(args, 'boundary_mode', 'breaks')  # v5.9.6
+        boundary_mode=getattr(args, 'boundary_mode', 'breaks'),  # v5.9.6
+        v6_cache_dir=v6_cache_dir_path,  # v6.0: Duration-primary labels
     )
 
     # v5.8: Override sequence lengths if user selected a preset
@@ -4113,6 +4136,38 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Secondary losses ramp up over warmup_epochs to prevent geo_price explosion
     WARMUP_EPOCHS = 5
 
+    # =========================================================================
+    # v6.0: DURATION-PRIMARY LOSS CONFIGURATION (DEFAULT)
+    # =========================================================================
+    USE_V5_LEGACY = getattr(args, 'use_v5_legacy', False)
+    USE_V6_LOSS = not USE_V5_LEGACY  # v6 is default
+    V6_WARMUP_EPOCHS = getattr(args, 'v6_warmup_epochs', None) or getattr(project_config, 'V6_WARMUP_EPOCHS', 10)
+
+    if USE_V6_LOSS:
+        # Create v6 loss config from project_config
+        v6_weights = getattr(project_config, 'V6_LOSS_WEIGHTS', {})
+        v6_loss_config = V6LossConfig(
+            duration_weight=v6_weights.get('duration', 1.0),
+            window_selection_weight=v6_weights.get('window_selection', 0.3),
+            tf_selection_weight=v6_weights.get('tf_selection', 0.3),
+            containment_weight_final=v6_weights.get('containment_final', 1.0),
+            breakout_timing_weight=v6_weights.get('breakout_timing', 0.5),
+            return_bonus_weight=v6_weights.get('return_bonus', 0.2),
+            transition_weight_final=v6_weights.get('transition_final', 0.5),
+            warmup_epochs=V6_WARMUP_EPOCHS,
+        )
+        if is_main_process(rank):
+            print(f"\n   ✓ v6.0 Duration-Primary Architecture (DEFAULT)")
+            print(f"     Warmup epochs: {V6_WARMUP_EPOCHS}")
+            print(f"     Loss weights: duration={v6_loss_config.duration_weight}, "
+                  f"window={v6_loss_config.window_selection_weight}, "
+                  f"tf={v6_loss_config.tf_selection_weight}")
+    else:
+        v6_loss_config = None
+        if is_main_process(rank):
+            print(f"\n   ⚠️  Using v5.x Legacy Mode (--v5-legacy)")
+            print(f"     This mode predicts high/low directly (old behavior)")
+
     def get_loss_warmup_weight(epoch: int, warmup_epochs: int, final_weight: float) -> float:
         """Quadratic warmup: 0 → final_weight over warmup_epochs."""
         if epoch >= warmup_epochs:
@@ -4162,17 +4217,34 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         validity_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.2)
         transition_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.5)  # 0.3 + 0.2 for trans + direction
 
-        # v5.7: Anneal selection temperature: 2.0 -> 0.5 over 10 epochs
+        # v5.7/v6.0: Anneal selection temperature
         # High temp = soft selection (gradients to all TFs), low temp = approaches hard selection
-        TEMP_ANNEAL_EPOCHS = 10
-        if epoch < TEMP_ANNEAL_EPOCHS:
-            new_temp = 2.0 - (epoch * 0.15)  # 2.0 -> 0.5
-        else:
-            new_temp = 0.5
-        # Handle DDP wrapper
         model_core = model.module if hasattr(model, 'module') else model
-        if hasattr(model_core, 'selection_temperature'):
-            model_core.selection_temperature = new_temp
+
+        if USE_V6_LOSS:
+            # v6.0: Use unified temperature annealing for both TF and window selection
+            v6_temps = getattr(project_config, 'V6_TEMPERATURE', {})
+            if hasattr(model_core, 'set_selection_temperatures'):
+                model_core.set_selection_temperatures(
+                    epoch=epoch,
+                    warmup_epochs=V6_WARMUP_EPOCHS,
+                    tf_start=v6_temps.get('tf_start', 2.0),
+                    tf_end=v6_temps.get('tf_end', 0.5),
+                    window_start=v6_temps.get('window_start', 2.0),
+                    window_end=v6_temps.get('window_end', 0.5),
+                )
+                new_temp = model_core.selection_temperature
+            else:
+                new_temp = get_temperature(epoch, V6_WARMUP_EPOCHS)
+        else:
+            # v5.7: Legacy temperature annealing
+            TEMP_ANNEAL_EPOCHS = 10
+            if epoch < TEMP_ANNEAL_EPOCHS:
+                new_temp = 2.0 - (epoch * 0.15)  # 2.0 -> 0.5
+            else:
+                new_temp = 0.5
+            if hasattr(model_core, 'selection_temperature'):
+                model_core.selection_temperature = new_temp
 
         if epoch < WARMUP_EPOCHS and is_main_process(rank):
             print(f"\n   Warmup epoch {epoch+1}/{WARMUP_EPOCHS}: duration={duration_weight:.3f}, geo={geo_price_weight:.3f}, validity={validity_weight:.3f}, transition={transition_weight:.3f}, temp={new_temp:.2f}")
@@ -4277,25 +4349,184 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             _forward_time = time.perf_counter() - _forward_start
             _loss_start = time.perf_counter()  # Start loss timing
 
-            # 🛡️ NaN Check 1: Predictions
-            if not torch.isfinite(predictions).all():
-                print(f"\n🚨 NaN/Inf in predictions at batch {batch_idx}, epoch {epoch}!")
-                print(f"   Min: {predictions.min().item()}, Max: {predictions.max().item()}")
-                raise ValueError("Non-finite predictions - training aborted")
+            # 🛡️ NaN Check 1: Predictions (v6: check hidden states instead)
+            if USE_V6_LOSS:
+                # v6.0: Check duration outputs for NaN
+                if 'duration' in hidden_states:
+                    for tf, dur_data in hidden_states['duration'].items():
+                        if not torch.isfinite(dur_data['mean']).all():
+                            print(f"\n🚨 NaN/Inf in {tf} duration at batch {batch_idx}, epoch {epoch}!")
+                            raise ValueError("Non-finite duration predictions - training aborted")
+            else:
+                # v5.x: Check predictions tensor
+                if not torch.isfinite(predictions).all():
+                    print(f"\n🚨 NaN/Inf in predictions at batch {batch_idx}, epoch {epoch}!")
+                    print(f"   Min: {predictions.min().item()}, Max: {predictions.max().item()}")
+                    raise ValueError("Non-finite predictions - training aborted")
 
-            # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
-            target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+            # =====================================================================
+            # v6.0: DURATION-PRIMARY LOSS (replaces high/low MSE as primary)
+            # =====================================================================
+            if USE_V6_LOSS:
+                # Extract v6 predictions from model output
+                v6_predictions = model_core.get_v6_output_dict(hidden_states)
 
-            # 🛡️ NaN Check 2: Targets
-            if not torch.isfinite(target_tensor).all():
-                print(f"\n🚨 NaN/Inf in targets at batch {batch_idx}!")
-                raise ValueError("Non-finite targets detected")
+                # Prepare v6 targets from batch targets
+                # v6 cache provides: {tf}_final_duration, {tf}_first_break_bar, {tf}_returned, etc.
+                v6_targets = {}
 
-            # loss_components initialized before if/else block (v5.7)
+                # Per-TF targets (from v6 cache labels)
+                TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+                for tf in TIMEFRAMES:
+                    # v6.0: Use actual v6 cache keys (not approximations)
+                    dur_key = f'{tf}_final_duration'
+                    break_key = f'{tf}_first_break_bar'
+                    valid_key = f'{tf}_v6_valid'
 
-            primary_loss = F.mse_loss(predictions[:, :2], target_tensor)
-            loss = primary_loss
-            loss_components['primary'] = primary_loss.item()
+                    if dur_key in targets:
+                        # Duration and break bar (actual values from v6 cache)
+                        v6_targets[f'{tf}_final_duration'] = targets[dur_key].unsqueeze(-1)
+                        v6_targets[f'{tf}_first_break_bar'] = targets[break_key].unsqueeze(-1)
+                        v6_targets[f'{tf}_valid_mask'] = targets.get(valid_key, torch.ones_like(targets[dur_key]))
+
+                        # Break/return tracking (for return bonus)
+                        if f'{tf}_returned' in targets:
+                            v6_targets[f'{tf}_returned'] = targets[f'{tf}_returned']
+                            v6_targets[f'{tf}_bars_outside'] = targets[f'{tf}_bars_outside']
+                            v6_targets[f'{tf}_max_consecutive_outside'] = targets[f'{tf}_max_consecutive_outside']
+
+                        # Window-level labels (for window selection loss)
+                        if f'{tf}_window_r_squared' in targets:
+                            # These are lists in targets, need to stack to tensors
+                            r2_list = targets[f'{tf}_window_r_squared']
+                            dur_list = targets[f'{tf}_window_durations']
+
+                            # Stack lists to tensors [batch, 14]
+                            if isinstance(r2_list, list) and len(r2_list) > 0:
+                                if isinstance(r2_list[0], list):
+                                    # List of lists -> stack
+                                    v6_targets[f'{tf}_window_r_squared'] = torch.tensor(r2_list, device=device)
+                                    v6_targets[f'{tf}_window_durations'] = torch.tensor(dur_list, device=device)
+                                else:
+                                    # Already a flat tensor
+                                    v6_targets[f'{tf}_window_r_squared'] = torch.tensor(r2_list, device=device).unsqueeze(0)
+                                    v6_targets[f'{tf}_window_durations'] = torch.tensor(dur_list, device=device).unsqueeze(0)
+
+                        # Price sequences for containment loss
+                        if f'{tf}_price_sequence' in targets:
+                            v6_targets[f'{tf}_price_sequences'] = targets[f'{tf}_price_sequence']
+
+                    else:
+                        # Fallback to old format if v6 cache not loaded
+                        old_dur_key = f'cont_{tf}_duration'
+                        if old_dur_key in targets:
+                            v6_targets[f'{tf}_final_duration'] = targets[old_dur_key].unsqueeze(-1)
+                            v6_targets[f'{tf}_first_break_bar'] = targets[old_dur_key].unsqueeze(-1)  # Approximation
+                            v6_targets[f'{tf}_valid_mask'] = targets.get(f'cont_{tf}_valid', torch.ones_like(targets[old_dur_key]))
+
+                # Aggregated TF-level targets (for TF selection loss)
+                tf_durations = []
+                tf_broke_early = []
+                for tf in TIMEFRAMES:
+                    dur_key = f'{tf}_final_duration'
+                    if dur_key in v6_targets:
+                        tf_durations.append(v6_targets[dur_key])
+                        # Broke early if duration < median (50 bars)
+                        tf_broke_early.append((v6_targets[dur_key] < 50).float())
+                    else:
+                        tf_durations.append(torch.zeros(batch_size, 1, device=device))
+                        tf_broke_early.append(torch.ones(batch_size, 1, device=device))
+
+                if tf_durations:
+                    v6_targets['tf_durations'] = torch.cat(tf_durations, dim=-1)  # [batch, 11]
+                    v6_targets['tf_broke_early'] = torch.cat(tf_broke_early, dim=-1)  # [batch, 11]
+
+                # Transition targets (global, from v6 cache)
+                if 'v6_transition_type' in targets:
+                    v6_targets['transition_type'] = targets['v6_transition_type'].long()
+                    v6_targets['transition_direction'] = targets['v6_transition_direction'].long()
+                    v6_targets['transition_next_tf'] = targets['v6_transition_next_tf'].long()
+                elif 'transition_type' in targets:
+                    # Fallback to old format
+                    v6_targets['transition_type'] = targets['transition_type'].long()
+                    v6_targets['transition_direction'] = targets.get('transition_direction', torch.ones_like(targets['transition_type'])).long()
+                    v6_targets['transition_next_tf'] = targets.get('transition_next_tf', torch.zeros_like(targets['transition_type'])).long()
+
+                # Compute v6 loss
+                loss, loss_components = compute_v6_loss(
+                    predictions=v6_predictions,
+                    targets=v6_targets,
+                    epoch=epoch,
+                    config=v6_loss_config,
+                    timeframes=TIMEFRAMES,
+                )
+
+                # Log v6 loss components on first batch
+                if batch_idx == 0 and epoch == 0:
+                    print(f"[v6.0] {format_loss_log(loss_components, epoch)}", flush=True)
+
+                    # v6.0: Debug v6 target stats to verify data pipeline is working
+                    print(f"[v6.0] ===== V6 TARGET VERIFICATION =====", flush=True)
+                    v6_debug_tfs = ['5min', '1h', 'daily']
+                    for tf in v6_debug_tfs:
+                        dur_key = f'{tf}_final_duration'
+                        break_key = f'{tf}_first_break_bar'
+                        valid_key = f'{tf}_valid_mask'
+                        ret_key = f'{tf}_returned'
+                        r2_key = f'{tf}_window_r_squared'
+
+                        if dur_key in v6_targets:
+                            dur_vals = v6_targets[dur_key]
+                            break_vals = v6_targets.get(break_key, torch.zeros_like(dur_vals))
+                            valid_vals = v6_targets.get(valid_key, torch.zeros(dur_vals.shape[0], device=device))
+
+                            # Check for all zeros (bad sign)
+                            is_all_zero = (dur_vals.abs().sum() == 0).item()
+                            mean_dur = dur_vals.mean().item()
+                            mean_break = break_vals.mean().item()
+                            valid_pct = (valid_vals > 0).float().mean().item() * 100
+
+                            status = "❌ ALL ZEROS" if is_all_zero else "✓"
+                            print(f"  {tf}: {status} dur={mean_dur:.1f}, break={mean_break:.1f}, valid={valid_pct:.0f}%", flush=True)
+
+                            # Check return/break tracking
+                            if ret_key in v6_targets:
+                                ret_vals = v6_targets[ret_key]
+                                ret_pct = ret_vals.float().mean().item() * 100
+                                print(f"       returned={ret_pct:.0f}%", flush=True)
+
+                            # Check window-level data
+                            if r2_key in v6_targets:
+                                r2_tensor = v6_targets[r2_key]
+                                mean_r2 = r2_tensor.mean().item()
+                                print(f"       window R²={mean_r2:.3f}", flush=True)
+                        else:
+                            print(f"  {tf}: ❌ MISSING from v6_targets", flush=True)
+
+                    # Check transition targets
+                    if 'transition_type' in v6_targets:
+                        trans_types = v6_targets['transition_type']
+                        print(f"  transitions: types={trans_types[:5].tolist()}...", flush=True)
+                    else:
+                        print(f"  transitions: ❌ MISSING", flush=True)
+
+                    print(f"[v6.0] =====================================", flush=True)
+
+            else:
+                # v5.x: Legacy loss computation
+                # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
+                target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+
+                # 🛡️ NaN Check 2: Targets
+                if not torch.isfinite(target_tensor).all():
+                    print(f"\n🚨 NaN/Inf in targets at batch {batch_idx}!")
+                    raise ValueError("Non-finite targets detected")
+
+                # loss_components initialized before if/else block (v5.7)
+
+                primary_loss = F.mse_loss(predictions[:, :2], target_tensor)
+                loss = primary_loss
+                loss_components['primary'] = primary_loss.item()
 
             # 🛡️ NaN Check 3: Loss
             if not torch.isfinite(loss):
@@ -4374,12 +4605,18 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 loss_components['tf_weights_entropy'] = -(mean_weights * torch.log(mean_weights + 1e-8)).sum().item()
 
             # Multi-task losses (if enabled)
+            # v6.0: Skip hit_band/hit_target/expected_return (removed heads)
             # v5.7.2: Accumulate ALL multi-task losses before logging (matches AMP path)
-            if args.multi_task and 'multi_task' in hidden_states:
+            if not USE_V6_LOSS and args.multi_task and 'multi_task' in hidden_states:
                 mt = hidden_states['multi_task']
-                mt_loss_total = (0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band']) +
-                          0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target']) +
-                          0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return']))
+                # v6.0: hit_band, hit_target, expected_return removed
+                # Only compute these losses in legacy mode
+                if 'hit_band' in mt and 'hit_band' in targets:
+                    mt_loss_total = (0.1 * F.binary_cross_entropy_with_logits(mt['hit_band'].squeeze(), targets['hit_band']) +
+                              0.1 * F.binary_cross_entropy_with_logits(mt['hit_target'].squeeze(), targets['hit_target']) +
+                              0.1 * F.mse_loss(mt['expected_return'].squeeze(), targets['expected_return']))
+                else:
+                    mt_loss_total = torch.tensor(0.0, device=args.device)
 
                 # Adaptive projection losses (trains the adaptive_projection network)
                 if 'price_change_pct' in mt and 'price_change_pct' in targets:
@@ -4418,22 +4655,25 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
             # =====================================================================
             # v5.7.1: PER-SAMPLE VALIDITY MASKS AND LABELS (fixes batch-global bug)
+            # v6.0: Only needed for legacy v5 mode
             # =====================================================================
-            TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
-            batch_size = predictions.shape[0]
+            if not USE_V6_LOSS:
+                TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+                # Get batch_size from targets instead of predictions (v6 doesn't use predictions tensor)
+                batch_size = targets['high'].shape[0] if 'high' in targets else len(targets_list)
 
-            # Transition labels as full tensors (not scalars from [0])
-            transition_labels_tensors = {}
-            for tf in TIMEFRAMES:
-                trans_type_key = f'trans_{tf}_type'
-                trans_valid_key = f'trans_{tf}_valid'
-                trans_dir_key = f'trans_{tf}_direction'
+                # Transition labels as full tensors (not scalars from [0])
+                transition_labels_tensors = {}
+                for tf in TIMEFRAMES:
+                    trans_type_key = f'trans_{tf}_type'
+                    trans_valid_key = f'trans_{tf}_valid'
+                    trans_dir_key = f'trans_{tf}_direction'
 
-                if trans_type_key in targets:
-                    # Keep as [batch] tensors, not scalars!
-                    trans_valid = targets.get(trans_valid_key, torch.zeros(batch_size, device=args.device))
-                    trans_type = targets[trans_type_key]  # [batch]
-                    trans_dir = targets.get(trans_dir_key, torch.ones(batch_size, device=args.device))  # [batch]
+                    if trans_type_key in targets:
+                        # Keep as [batch] tensors, not scalars!
+                        trans_valid = targets.get(trans_valid_key, torch.zeros(batch_size, device=args.device))
+                        trans_type = targets[trans_type_key]  # [batch]
+                        trans_dir = targets.get(trans_dir_key, torch.ones(batch_size, device=args.device))  # [batch]
 
                     transition_labels_tensors[tf] = {
                         'valid_mask': trans_valid.float(),  # [batch] - 1.0 for valid, 0.0 for invalid
@@ -4442,8 +4682,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     }
 
             # Duration NLL loss - v5.7.1: per-sample validity
+            # v6.0: Skip in v6 mode (duration loss handled by compute_v6_loss)
             duration_loss_total = 0.0
-            if 'duration' in hidden_states:
+            if not USE_V6_LOSS and 'duration' in hidden_states:
                 for tf, dur_data in hidden_states['duration'].items():
                     target_dur_key = f'cont_{tf}_duration'
                     cont_valid_key = f'cont_{tf}_valid'
@@ -4609,8 +4850,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 loss_components['hit_probability'] = (hit_probability_loss_total * 0.1).item() if hasattr(hit_probability_loss_total, 'item') else hit_probability_loss_total * 0.1
 
             # Validity loss - v5.7.1: per-sample
+            # v6.0: Skip in v6 mode (validity loss handled by compute_v6_loss)
             validity_loss_total = 0.0
-            if 'validity' in hidden_states:
+            if not USE_V6_LOSS and 'validity' in hidden_states:
                 for tf, validity_pred in hidden_states['validity'].items():
                     if tf in transition_labels_tensors:
                         labels = transition_labels_tensors[tf]
@@ -4636,10 +4878,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
             # =====================================================================
             # v5.7.1: COMPOSITOR MULTI-TF TRAINING (per-sample labels)
+            # v6.0: Skip in v6 mode (transition loss handled by compute_v6_loss)
             # =====================================================================
             transition_loss_total = 0.0
 
-            # Track diagnostics (using selected TF for backwards compat stats)
+            # Track diagnostics (using selected TF for backwards compat stats) - always do this
             if 'selected_tf' in hidden_states:
                 selected_tf = hidden_states['selected_tf']
                 transition_diagnostics['total_batches'] += 1
@@ -4660,8 +4903,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                     transition_diagnostics['tf_weights_sum'] += batch_sum
                 transition_diagnostics['tf_weights_count'] += tf_weights.size(0)
 
-            # Train on ALL TFs with valid labels
-            for tf, labels in transition_labels_tensors.items():
+            # Train on ALL TFs with valid labels (v6.0: skip in v6 mode)
+            if not USE_V6_LOSS:
+              for tf, labels in transition_labels_tensors.items():
                 compositor_key = f'compositor_{tf}'
                 if compositor_key in hidden_states:
                     compositor = hidden_states[compositor_key]
@@ -4882,11 +5126,61 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
                 # v5.7.2: Forward pass (removed AMP)
                 predictions, hidden_states = model(features, vix_sequence=vix_batch_val, events=events_batch_val)
-                target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
-                loss = F.mse_loss(predictions[:, :2], target_tensor)
+
+                if USE_V6_LOSS:
+                    # v6.0: Use v6 loss for validation
+                    v6_predictions = model_core.get_v6_output_dict(hidden_states)
+
+                    # Prepare v6 targets from batch targets
+                    v6_targets = {}
+                    TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+                    for tf in TIMEFRAMES:
+                        dur_key = f'cont_{tf}_duration'
+                        if dur_key in targets:
+                            v6_targets[f'{tf}_final_duration'] = targets[dur_key].unsqueeze(-1)
+                            v6_targets[f'{tf}_first_break_bar'] = targets[dur_key].unsqueeze(-1)
+                            v6_targets[f'{tf}_valid_mask'] = targets.get(f'cont_{tf}_valid', torch.ones_like(targets[dur_key]))
+
+                    if 'transition_type' in targets:
+                        v6_targets['transition_type'] = targets['transition_type']
+                        v6_targets['transition_direction'] = targets.get('transition_direction', torch.ones_like(targets['transition_type']))
+                        v6_targets['transition_next_tf'] = targets.get('transition_next_tf', torch.zeros_like(targets['transition_type']))
+                        v6_targets['transition_valid_mask'] = targets.get('transition_valid', torch.ones_like(targets['transition_type']))
+
+                    # Add window arrays if available
+                    for tf in TIMEFRAMES:
+                        r2_key = f'{tf}_window_r_squared'
+                        dur_key = f'{tf}_window_durations'
+                        if r2_key in targets:
+                            v6_targets[r2_key] = targets[r2_key]
+                        if dur_key in targets:
+                            v6_targets[dur_key] = targets[dur_key]
+
+                    loss, _ = compute_v6_loss(
+                        predictions=v6_predictions,
+                        targets=v6_targets,
+                        epoch=epoch,
+                        config=v6_loss_config,
+                        timeframes=TIMEFRAMES,
+                    )
+
+                    # For error tracking, use duration prediction error
+                    val_error_batch = 0.0
+                    if 'duration' in hidden_states:
+                        for tf in TIMEFRAMES:
+                            dur_key = f'cont_{tf}_duration'
+                            if tf in hidden_states['duration'] and dur_key in targets:
+                                pred_dur = hidden_states['duration'][tf]['mean'].squeeze()
+                                target_dur = targets[dur_key].squeeze()
+                                val_error_batch += torch.abs(pred_dur - target_dur).mean().item()
+                    val_error += val_error_batch / len(TIMEFRAMES)
+                else:
+                    # v5.x: Legacy validation
+                    target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                    loss = F.mse_loss(predictions[:, :2], target_tensor)
+                    val_error += torch.abs(predictions[:, :2] - target_tensor).mean().item()
 
                 val_loss += loss.item()
-                val_error += torch.abs(predictions[:, :2] - target_tensor).mean().item()
                 num_val_batches += 1
 
         avg_val_loss = val_loss / max(num_val_batches, 1)
@@ -5038,45 +5332,125 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         vix_batch_test = vix_batch_test.to(args.device, non_blocking=True)
 
                     # Forward pass (v5.7.2: removed AMP)
-                    predictions, _ = model(features, vix_sequence=vix_batch_test, events=events_batch_test)
-                    target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
-                    loss = F.mse_loss(predictions[:, :2], target_tensor)
+                    predictions, hidden_states = model(features, vix_sequence=vix_batch_test, events=events_batch_test)
+
+                    if USE_V6_LOSS:
+                        # v6.0: Use v6 loss for test evaluation
+                        v6_predictions = model_core.get_v6_output_dict(hidden_states)
+
+                        # Prepare v6 targets
+                        v6_targets = {}
+                        TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+                        for tf in TIMEFRAMES:
+                            dur_key = f'cont_{tf}_duration'
+                            if dur_key in targets:
+                                v6_targets[f'{tf}_final_duration'] = targets[dur_key].unsqueeze(-1)
+                                v6_targets[f'{tf}_first_break_bar'] = targets[dur_key].unsqueeze(-1)
+                                v6_targets[f'{tf}_valid_mask'] = targets.get(f'cont_{tf}_valid', torch.ones_like(targets[dur_key]))
+
+                        if 'transition_type' in targets:
+                            v6_targets['transition_type'] = targets['transition_type']
+                            v6_targets['transition_direction'] = targets.get('transition_direction', torch.ones_like(targets['transition_type']))
+                            v6_targets['transition_next_tf'] = targets.get('transition_next_tf', torch.zeros_like(targets['transition_type']))
+                            v6_targets['transition_valid_mask'] = targets.get('transition_valid', torch.ones_like(targets['transition_type']))
+
+                        # Add window arrays if available
+                        for tf in TIMEFRAMES:
+                            r2_key = f'{tf}_window_r_squared'
+                            dur_key = f'{tf}_window_durations'
+                            if r2_key in targets:
+                                v6_targets[r2_key] = targets[r2_key]
+                            if dur_key in targets:
+                                v6_targets[dur_key] = targets[dur_key]
+
+                        loss, _ = compute_v6_loss(
+                            predictions=v6_predictions,
+                            targets=v6_targets,
+                            epoch=epoch,
+                            config=v6_loss_config,
+                            timeframes=TIMEFRAMES,
+                        )
+
+                        # For error tracking, use duration prediction error
+                        test_error_batch = 0.0
+                        if 'duration' in hidden_states:
+                            for tf in TIMEFRAMES:
+                                dur_key = f'cont_{tf}_duration'
+                                if tf in hidden_states['duration'] and dur_key in targets:
+                                    pred_dur = hidden_states['duration'][tf]['mean'].squeeze()
+                                    target_dur = targets[dur_key].squeeze()
+                                    test_error_batch += torch.abs(pred_dur - target_dur).mean().item()
+                        test_error += test_error_batch / len(TIMEFRAMES)
+
+                        # For detailed analysis, collect duration predictions
+                        if 'duration' in hidden_states:
+                            duration_preds = []
+                            duration_targets = []
+                            for tf in TIMEFRAMES:
+                                dur_key = f'cont_{tf}_duration'
+                                if tf in hidden_states['duration'] and dur_key in targets:
+                                    duration_preds.append(hidden_states['duration'][tf]['mean'].cpu())
+                                    duration_targets.append(targets[dur_key].cpu())
+                            if duration_preds:
+                                test_predictions_list.append(torch.stack(duration_preds, dim=-1))
+                                test_targets_list.append(torch.stack(duration_targets, dim=-1))
+                    else:
+                        # v5.x: Legacy test
+                        target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
+                        loss = F.mse_loss(predictions[:, :2], target_tensor)
+                        test_error += torch.abs(predictions[:, :2] - target_tensor).mean().item()
+
+                        # Collect for detailed analysis
+                        test_predictions_list.append(predictions[:, :2].cpu())
+                        test_targets_list.append(target_tensor.cpu())
 
                     test_loss += loss.item()
-                    test_error += torch.abs(predictions[:, :2] - target_tensor).mean().item()
                     num_test_batches += 1
-
-                    # Collect for detailed analysis
-                    test_predictions_list.append(predictions[:, :2].cpu())
-                    test_targets_list.append(target_tensor.cpu())
 
             avg_test_loss = test_loss / max(num_test_batches, 1)
             avg_test_error = test_error / max(num_test_batches, 1)
 
             # Combine all predictions for analysis
-            all_test_preds = torch.cat(test_predictions_list, dim=0).numpy()
-            all_test_targets = torch.cat(test_targets_list, dim=0).numpy()
+            if test_predictions_list:
+                all_test_preds = torch.cat(test_predictions_list, dim=0).numpy()
+                all_test_targets = torch.cat(test_targets_list, dim=0).numpy()
 
-            # Calculate metrics
-            high_mae = np.abs(all_test_preds[:, 0] - all_test_targets[:, 0]).mean()
-            low_mae = np.abs(all_test_preds[:, 1] - all_test_targets[:, 1]).mean()
-            high_rmse = np.sqrt(np.mean((all_test_preds[:, 0] - all_test_targets[:, 0])**2))
-            low_rmse = np.sqrt(np.mean((all_test_preds[:, 1] - all_test_targets[:, 1])**2))
+                print(f"\n📊 Test Set Results:")
+                print(f"   Test Loss: {avg_test_loss:.4f}")
+                print(f"   Test Error: {avg_test_error:.4f}")
 
-            print(f"\n📊 Test Set Results:")
-            print(f"   Test Loss (MSE): {avg_test_loss:.4f}")
-            print(f"   Test MAE: {avg_test_error:.4f}%")
-            print(f"   ")
-            print(f"   High Predictions:")
-            print(f"     MAE:  {high_mae:.4f}%")
-            print(f"     RMSE: {high_rmse:.4f}%")
-            print(f"   Low Predictions:")
-            print(f"     MAE:  {low_mae:.4f}%")
-            print(f"     RMSE: {low_rmse:.4f}%")
-            print(f"   ")
-            print(f"   Samples evaluated: {len(all_test_preds):,}")
-            print(f"   ⚠️  This is your TRUE performance on unseen data")
-            print("=" * 70)
+                if USE_V6_LOSS:
+                    # v6.0: Duration prediction metrics
+                    print(f"\n   Duration Predictions (per TF):")
+                    print(f"     MAE: {avg_test_error:.2f} bars")
+                    if all_test_preds.shape[1] >= 11:
+                        # Show per-TF metrics
+                        TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+                        for i, tf in enumerate(TIMEFRAMES[:min(11, all_test_preds.shape[1])]):
+                            mae = np.abs(all_test_preds[:, i] - all_test_targets[:, i]).mean()
+                            print(f"       {tf}: {mae:.2f} bars MAE")
+                else:
+                    # v5.x: High/low prediction metrics
+                    high_mae = np.abs(all_test_preds[:, 0] - all_test_targets[:, 0]).mean()
+                    low_mae = np.abs(all_test_preds[:, 1] - all_test_targets[:, 1]).mean()
+                    high_rmse = np.sqrt(np.mean((all_test_preds[:, 0] - all_test_targets[:, 0])**2))
+                    low_rmse = np.sqrt(np.mean((all_test_preds[:, 1] - all_test_targets[:, 1])**2))
+
+                    print(f"\n   High Predictions:")
+                    print(f"     MAE:  {high_mae:.4f}%")
+                    print(f"     RMSE: {high_rmse:.4f}%")
+                    print(f"   Low Predictions:")
+                    print(f"     MAE:  {low_mae:.4f}%")
+                    print(f"     RMSE: {low_rmse:.4f}%")
+
+                print(f"\n   Samples evaluated: {len(all_test_preds):,}")
+                print(f"   ⚠️  This is your TRUE performance on unseen data")
+                print("=" * 70)
+            else:
+                print(f"\n📊 Test Set Results:")
+                print(f"   Test Loss: {avg_test_loss:.4f}")
+                print(f"   No predictions collected")
+                print("=" * 70)
 
             # v5.3.2: Save test results (previously computed but not saved!)
             test_results = {
@@ -5303,6 +5677,12 @@ def main():
     # Debug mode
     parser.add_argument('--debug', action='store_true', default=False,
                         help='Enable verbose debug logging (collate workers, slow batches, etc.)')
+
+    # v6.0 Duration-Primary Architecture (DEFAULT)
+    parser.add_argument('--v5-legacy', dest='use_v5_legacy', action='store_true', default=False,
+                        help='Use legacy v5.x architecture (predicts high/low directly). Default is v6.0 duration-primary.')
+    parser.add_argument('--v6-warmup-epochs', dest='v6_warmup_epochs', type=int, default=None,
+                        help='Warmup epochs for v6 containment/transition losses (default: config.V6_WARMUP_EPOCHS)')
 
     args = parser.parse_args()
 

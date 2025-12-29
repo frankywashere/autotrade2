@@ -358,3 +358,57 @@ CONTINUATION_MODE = 'adaptive_labels'  # 'simple', 'adaptive_labels', 'adaptive_
 # Adaptive mode settings (used when CONTINUATION_MODE contains 'adaptive')
 ADAPTIVE_MIN_HORIZON = 20  # Minimum prediction horizon (bars) - 20 minutes at 1-min resolution
 ADAPTIVE_MAX_HORIZON = 40  # Maximum prediction horizon (bars) - 40 minutes at 1-min resolution
+
+# ======================================================================
+# v6.0 DURATION-PRIMARY ARCHITECTURE CONFIGURATION
+# ======================================================================
+# v6.0 predicts DURATION as primary output, not high/low prices directly.
+# Channel projections are COMPUTED from duration × channel geometry.
+
+# Cache settings
+V6_CACHE_DIR = DATA_DIR / "feature_cache_v6"
+V6_CACHE_VERSION = "6.0.0"
+
+# Break detection settings
+V6_MAX_SCAN_BARS = 500  # Maximum bars to scan forward for channel breaks
+V6_RETURN_THRESHOLD_BARS = 3  # Bars inside to count as "returned" after break
+
+# Loss weights
+V6_LOSS_WEIGHTS = {
+    'duration': 1.0,              # PRIMARY loss (always 1.0)
+    'window_selection': 0.3,      # Punish bad window choices
+    'tf_selection': 0.3,          # Punish trusting bad TFs
+    'containment_final': 1.0,     # Validate duration via price bounds (ramped)
+    'breakout_timing': 0.5,       # Punish if channel breaks before predicted
+    'return_bonus': 0.2,          # Reward temporary breaks that return (negative)
+    'transition_final': 0.5,      # Punish wrong transition predictions (ramped)
+}
+
+# Warmup settings
+V6_WARMUP_EPOCHS = 10  # Epochs for containment/transition warmup
+
+# Gumbel-Softmax temperature annealing for selection
+V6_TEMPERATURE = {
+    'tf_start': 2.0,       # Starting temperature for TF selection
+    'tf_end': 0.5,         # Final temperature for TF selection
+    'window_start': 2.0,   # Starting temperature for window selection
+    'window_end': 0.5,     # Final temperature for window selection
+}
+
+# Channel windows for v6 (same as existing CHANNEL_WINDOW_SIZES)
+V6_WINDOWS = CHANNEL_WINDOW_SIZES  # [100, 90, 80, 70, 60, 50, 45, 40, 35, 30, 25, 20, 15, 10]
+
+# Transition types
+V6_TRANSITION_TYPES = {
+    'CONTINUE': 0,    # Same channel extends
+    'SWITCH_TF': 1,   # Different TF's channel takes over
+    'REVERSE': 2,     # Direction reverses
+    'SIDEWAYS': 3,    # Price consolidates
+}
+
+# Direction types
+V6_DIRECTIONS = {
+    'BEAR': 0,
+    'BULL': 1,
+    'SIDEWAYS': 2,
+}

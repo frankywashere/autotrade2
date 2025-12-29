@@ -1,21 +1,28 @@
 """
-Hierarchical Liquid Neural Network for Multi-Scale Stock Prediction (v5.2)
+Hierarchical Liquid Neural Network for Multi-Scale Stock Prediction (v6.0)
 
 Architecture:
 - 11 CfC layers (one per timeframe: 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly, 3month)
-- VIX CfC layer: 90-day daily VIX sequence processing (v5.2)
-- Event embedding: FOMC, earnings, deliveries (v5.2)
+- VIX CfC layer: 90-day daily VIX sequence processing
+- Event embedding: FOMC, earnings, deliveries
 - Each layer receives NATIVE OHLC data at its timeframe (not downsampled 1-min)
 - Bottom-up hidden state passing (fast → slow)
-- Fusion Head: 33 layer predictions + 12 market_state = 45 dims
 
-v5.2 Key Features:
-- VIX CfC layer for regime-aware predictions
-- Event embedding for catalyst-aware duration predictions
-- Probabilistic duration (mean + std)
-- Validity heads (forward-looking channel assessment)
-- Multi-Phase Compositor (transition type + direction prediction)
-- Dual output (raw geometric + adjusted)
+v6.0 Key Changes (Duration-Primary Architecture):
+- REMOVED: High/low prediction heads (no longer learns price targets)
+- REMOVED: hit_band_head, hit_target_head, expected_return_head
+- PRIMARY: Duration prediction is now the main output
+- COMPUTED: Channel bounds projected from duration × channel geometry
+- ENHANCED: Window selector with R² guidance and Gumbel-Softmax
+- KEPT: Validity heads, transition compositor, hit probability heads
+
+The model now predicts:
+1. Duration: How many bars until channel breaks
+2. Window selection: Which lookback window best fits current price
+3. Validity: Should we trust this timeframe's channel
+4. Transitions: What happens when the channel breaks
+
+Channel projections are COMPUTED from duration × geometry, not learned.
 """
 
 import torch
@@ -411,9 +418,11 @@ class HierarchicalLNN(nn.Module, ModelBase):
     # Class-level constants for architecture
     TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
     NUM_LAYERS = 11
-    PREDICTIONS_PER_LAYER = 3  # high, low, confidence
+    # v6.0: Only confidence per layer (high/low removed, computed from geometry)
+    PREDICTIONS_PER_LAYER = 1  # confidence only (high/low removed in v6.0)
     MARKET_STATE_DIM = 12
-    FUSION_INPUT_DIM = NUM_LAYERS * PREDICTIONS_PER_LAYER + MARKET_STATE_DIM  # 33 + 12 = 45
+    # v6.0: Update fusion input: 11 confs + 11 durations + 11 validities + market_state
+    FUSION_INPUT_DIM = NUM_LAYERS * 3 + MARKET_STATE_DIM  # 33 + 12 = 45 (same size, different content)
 
     def __init__(
         self,
@@ -503,9 +512,8 @@ class HierarchicalLNN(nn.Module, ModelBase):
             wiring = AutoNCP(layer_total_neurons, hidden_size)
             self.timeframe_layers[tf] = CfC(layer_input_size, wiring, batch_first=True)
 
-            # Create output heads for this layer
-            self.timeframe_heads[f'{tf}_high'] = nn.Linear(hidden_size, 1)
-            self.timeframe_heads[f'{tf}_low'] = nn.Linear(hidden_size, 1)
+            # v6.0: REMOVED high/low heads (now computed from duration × channel geometry)
+            # Only keep conf head for validity-derived confidence
             self.timeframe_heads[f'{tf}_conf'] = nn.Linear(hidden_size, 1)
 
         # =========================================================================
@@ -523,29 +531,15 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
         # =========================================================================
         # MULTI-TASK HEADS
+        # v6.0: REMOVED hit_band_head, hit_target_head, expected_return_head
+        # These are no longer needed since we don't predict price targets directly
         # =========================================================================
         if multi_task:
-            # Hit Band: Will price enter predicted band? (Binary classification)
-            # NOTE: No Sigmoid here - outputs raw logits for BCEWithLogits loss
-            # Apply sigmoid manually for inference (see forward())
-            self.hit_band_head = nn.Sequential(
-                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
-                nn.ReLU(),
-                nn.Linear(self.fusion_output_dim // 2, 1),
-            )
+            # v6.0: Removed hit_band_head (no longer predicting bands)
+            # v6.0: Removed hit_target_head (no longer predicting targets)
+            # v6.0: Removed expected_return_head (no longer predicting returns)
 
-            # Hit Target: Will trade work (target before stop)? (Binary classification)
-            # NOTE: No Sigmoid here - outputs raw logits for BCEWithLogits loss
-            self.hit_target_head = nn.Sequential(
-                nn.Linear(self.fusion_output_dim, self.fusion_output_dim // 2),
-                nn.ReLU(),
-                nn.Linear(self.fusion_output_dim // 2, 1),
-            )
-
-            # Expected Return: Direct return prediction (Regression)
-            self.expected_return_head = nn.Linear(self.fusion_output_dim, 1)
-
-            # Overshoot: How far price overshoots band (Regression)
+            # Overshoot: How far price overshoots band (Regression) - kept for analysis
             self.overshoot_head = nn.Linear(self.fusion_output_dim, 1)
 
             # Continuation: Channel continuation duration and gain (Regression)
@@ -679,19 +673,26 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # v5.6: Removed projection_feature_extractor (projection features no longer in input)
 
         # =========================================================================
-        # v5.7: GEOMETRIC PROJECTION COMPONENTS
+        # v6.0: ENHANCED WINDOW SELECTOR WITH R² GUIDANCE
         # =========================================================================
         # Window selector: learns which of 14 windows to use for geometric projection
-        # Input: hidden state + 14 quality scores → logits for 14 windows
+        # Input: hidden state + 14 quality scores (R²) → logits for 14 windows
+        # Uses Gumbel-Softmax with temperature annealing for differentiable selection
         num_windows = len(ChannelFeatureIndexer.WINDOWS)  # 14 windows
         self.window_selectors = nn.ModuleDict({
             tf: nn.Sequential(
-                nn.Linear(hidden_size + num_windows, 64),  # hidden + quality scores
+                nn.Linear(hidden_size + num_windows, 64),  # hidden + R² scores
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(64, num_windows),  # logits for each window
             ) for tf in self.TIMEFRAMES
         })
+
+        # v6.0: Window selection temperature for Gumbel-Softmax
+        # High temp (2.0) = soft selection (explore all windows)
+        # Low temp (0.5) = hard selection (commit to best window)
+        # Annealed from 2.0 → 0.5 over training epochs
+        self.window_selection_temperature = 2.0
 
         # Channel feature indexer (initialized lazily on first forward when feature_columns available)
         self.channel_indexer = None
@@ -902,13 +903,19 @@ class HierarchicalLNN(nn.Module, ModelBase):
         upper_dists = channel_features['upper_dist']  # [batch, num_windows]
         lower_dists = channel_features['lower_dist']  # [batch, num_windows]
 
-        # Window selection based on hidden state + quality scores
+        # Window selection based on hidden state + R² scores (quality)
         selector_input = torch.cat([hidden, qualities], dim=-1)  # [batch, hidden + num_windows]
         window_logits = self.window_selectors[tf](selector_input)  # [batch, num_windows]
 
         if self.training:
-            # Soft selection (differentiable) for training
-            window_weights = F.softmax(window_logits, dim=-1)  # [batch, num_windows]
+            # v6.0: Gumbel-Softmax with temperature annealing for differentiable selection
+            # Higher temperature = softer selection (explore all windows)
+            # Lower temperature = harder selection (commit to best window)
+            window_weights = F.gumbel_softmax(
+                window_logits,
+                tau=self.window_selection_temperature,
+                hard=False
+            )  # [batch, num_windows]
         else:
             # Hard selection (interpretable) for inference
             best_idx = window_logits.argmax(dim=-1)  # [batch]
@@ -1260,24 +1267,13 @@ class HierarchicalLNN(nn.Module, ModelBase):
                     'confidence': duration_confidence,
                 }
 
-                # v5.2: Duration-aware projection scaling
-                # If predicted duration < 24 bars, scale down projections proportionally
-                # If > 24 bars, scale up (clamped to reasonable range)
-                duration_scale = (duration_mean / 24.0).clamp(0.3, 2.0)  # [batch, 1]
+                # v6.0: Duration output stored, no scaling needed
+                # (scaling was for learned heads which are now removed)
 
             # =====================================================================
-            # v5.7: DIRECT PREDICTION PATH (learned high/low)
-            # =====================================================================
-            pred_high = self.timeframe_heads[f'{tf}_high'](hidden)
-            pred_low = self.timeframe_heads[f'{tf}_low'](hidden)
-
-            # v5.2: Apply duration-aware scaling
-            if isinstance(duration_scale, torch.Tensor):
-                pred_high = pred_high * duration_scale
-                pred_low = pred_low * duration_scale
-
-            # =====================================================================
-            # v5.7: GEOMETRIC PROJECTION PATH (duration → calculated high/low)
+            # v6.0: GEOMETRIC PROJECTION (duration → calculated high/low)
+            # This is now the PRIMARY and ONLY path for high/low predictions
+            # High/low are COMPUTED from duration × channel geometry, not learned
             # =====================================================================
             geo_result = None
             if tf in duration_outputs:
@@ -1325,19 +1321,30 @@ class HierarchicalLNN(nn.Module, ModelBase):
                 validity = self.validity_heads[tf](validity_input)
                 validity_outputs[tf] = validity
 
-            # v5.2: Use validity as confidence if available, otherwise old confidence head
+            # v6.0: Use validity as confidence (forward-looking channel assessment)
             if validity is not None:
-                pred_conf = validity  # NEW: Use forward-looking validity!
+                pred_conf = validity
             else:
-                pred_conf = torch.sigmoid(self.timeframe_heads[f'{tf}_conf'](hidden))  # Fallback: old confidence
+                pred_conf = torch.sigmoid(self.timeframe_heads[f'{tf}_conf'](hidden))
 
-            # v5.7: Store direct predictions
-            direct_predictions[tf] = {
+            # v6.0: Get high/low from geometric projection (computed, not learned)
+            if geo_result is not None:
+                pred_high = geo_result['high']
+                pred_low = geo_result['low']
+            else:
+                # Fallback: zero if no geometric projection available
+                pred_high = torch.zeros(batch_size, 1, device=device)
+                pred_low = torch.zeros(batch_size, 1, device=device)
+
+            # v6.0: Store geometric predictions (high/low now come from geometry)
+            geometric_predictions[tf] = geo_result if geo_result is not None else {
                 'high': pred_high,
                 'low': pred_low,
-                'conf': pred_conf,
+                'duration': torch.zeros(batch_size, 1, device=device),
             }
 
+            # v6.0: layer_predictions still has 3 values for compatibility
+            # but high/low now come from geometric projection
             layer_predictions.extend([pred_high, pred_low, pred_conf])
             layer_confidences.append(pred_conf)
 
@@ -1463,6 +1470,13 @@ class HierarchicalLNN(nn.Module, ModelBase):
         else:
             energy_output = None
             predictions = torch.cat([final_pred_high, final_pred_low, final_pred_conf], dim=-1)
+
+        # =====================================================================
+        # v6.0 NOTE: predictions tensor is GEOMETRIC (not learned) in v6 mode
+        # - high/low come from geo_result (duration × channel geometry)
+        # - NOT used by v6 training loss (uses output_dict instead)
+        # - Only used for inference/dashboards
+        # =====================================================================
 
         # Build output dict
         output_dict = {
@@ -1617,11 +1631,11 @@ class HierarchicalLNN(nn.Module, ModelBase):
 
         # =========================================================================
         # MULTI-TASK PREDICTIONS
+        # v6.0: Removed hit_band, hit_target, expected_return (no longer predict prices)
         # =========================================================================
         if self.multi_task:
-            hit_band_pred = self.hit_band_head(fusion_hidden)
-            hit_target_pred = self.hit_target_head(fusion_hidden)
-            expected_return_pred = self.expected_return_head(fusion_hidden)
+            # v6.0: Removed hit_band_head, hit_target_head, expected_return_head
+            # These are no longer meaningful without price target predictions
             overshoot_pred = self.overshoot_head(fusion_hidden)
 
             continuation_duration_pred = self.continuation_duration_head(fusion_hidden)
@@ -1649,14 +1663,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
             dominant_layer_idx = torch.argmax(layer_weights, dim=1)
 
             output_dict['multi_task'] = {
-                # Store raw logits for training (BCEWithLogits expects logits)
-                # Dashboard/inference should apply sigmoid to get probabilities
-                'hit_band': hit_band_pred,  # Raw logits
-                'hit_target': hit_target_pred,  # Raw logits
-                # Also store probabilities for inference convenience
-                'hit_band_prob': torch.sigmoid(hit_band_pred),
-                'hit_target_prob': torch.sigmoid(hit_target_pred),
-                'expected_return': expected_return_pred,
+                # v6.0: Removed hit_band, hit_target, expected_return
                 'overshoot': overshoot_pred,
                 'continuation_duration': continuation_duration_pred,
                 'continuation_gain': continuation_gain_pred,
@@ -1765,6 +1772,79 @@ class HierarchicalLNN(nn.Module, ModelBase):
         self.last_inputs = {}
         self.last_market_state = None
 
+    def set_selection_temperatures(self, epoch: int, warmup_epochs: int = 10,
+                                   tf_start: float = 2.0, tf_end: float = 0.5,
+                                   window_start: float = 2.0, window_end: float = 0.5):
+        """
+        v6.0: Set Gumbel-Softmax temperatures for selection annealing.
+
+        High temp = soft selection (explore all options)
+        Low temp = hard selection (commit to best option)
+
+        Args:
+            epoch: Current training epoch
+            warmup_epochs: Epochs over which to anneal
+            tf_start: Starting temperature for TF selection
+            tf_end: Final temperature for TF selection
+            window_start: Starting temperature for window selection
+            window_end: Final temperature for window selection
+        """
+        if epoch >= warmup_epochs:
+            self.selection_temperature = tf_end
+            self.window_selection_temperature = window_end
+        else:
+            progress = epoch / warmup_epochs
+            self.selection_temperature = tf_start - (tf_start - tf_end) * progress
+            self.window_selection_temperature = window_start - (window_start - window_end) * progress
+
+    def get_v6_output_dict(self, output_dict: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """
+        v6.0: Extract outputs in format expected by v6 loss functions.
+
+        This helper organizes model outputs for compute_v6_loss().
+
+        Args:
+            output_dict: Raw output dict from forward()
+
+        Returns:
+            Dict with keys matching v6 loss function expectations
+        """
+        v6_outputs = {}
+
+        # Duration outputs per TF
+        if 'duration' in output_dict:
+            for tf, dur_data in output_dict['duration'].items():
+                v6_outputs[f'{tf}_duration_mean'] = dur_data['mean']
+                v6_outputs[f'{tf}_duration_log_std'] = dur_data['log_std']
+
+        # Geometric predictions per TF
+        if 'geometric_predictions' in output_dict:
+            for tf, geo_data in output_dict['geometric_predictions'].items():
+                if geo_data is not None:
+                    v6_outputs[f'{tf}_projected_upper'] = geo_data.get('high', torch.zeros(1))
+                    v6_outputs[f'{tf}_projected_lower'] = geo_data.get('low', torch.zeros(1))
+                    v6_outputs[f'{tf}_window_weights'] = geo_data.get('window_weights', torch.zeros(1, 14))
+                    v6_outputs[f'{tf}_window_logits'] = geo_data.get('window_logits', torch.zeros(1, 14))
+
+        # Validity outputs
+        if 'validity' in output_dict:
+            validities = []
+            for tf in self.TIMEFRAMES:
+                if tf in output_dict['validity']:
+                    validities.append(output_dict['validity'][tf])
+                else:
+                    validities.append(torch.zeros(1, 1))
+            v6_outputs['tf_validity_scores'] = torch.cat(validities, dim=-1)
+
+        # Transition outputs
+        if 'compositor' in output_dict:
+            comp = output_dict['compositor']
+            v6_outputs['transition_type_logits'] = comp.get('transition_logits', torch.zeros(1, 4))
+            v6_outputs['transition_direction_logits'] = comp.get('direction_logits', torch.zeros(1, 3))
+            v6_outputs['transition_next_tf_logits'] = comp.get('tf_switch_logits', torch.zeros(1, 11))
+
+        return v6_outputs
+
     def predict(
         self,
         x: torch.Tensor,
@@ -1829,10 +1909,7 @@ class HierarchicalLNN(nn.Module, ModelBase):
             # Add multi-task predictions
             if self.multi_task and 'multi_task' in output_dict:
                 mt = output_dict['multi_task']
-                # v5.7.1: Use probability versions (hit_band/hit_target are now logits for BCEWithLogits)
-                result['hit_band_pred'] = mt['hit_band_prob'][0, 0].item()
-                result['hit_target_pred'] = mt['hit_target_prob'][0, 0].item()
-                result['expected_return_pred'] = mt['expected_return'][0, 0].item()
+                # v6.0: Removed hit_band, hit_target, expected_return (no longer predicted)
                 result['overshoot_pred'] = mt['overshoot'][0, 0].item()
 
             # Add breakout predictions

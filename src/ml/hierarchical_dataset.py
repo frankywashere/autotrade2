@@ -53,6 +53,8 @@ class HierarchicalDataset(Dataset):
 
     Loads 1-min data on-demand, caches column indices for performance.
     Now includes raw OHLC data and continuation prediction labels.
+
+    v6.0: Supports unified v6 cache format with duration-primary labels.
     """
 
     def __init__(
@@ -73,6 +75,8 @@ class HierarchicalDataset(Dataset):
         # v4.1: Native timeframe mode
         use_native_timeframes: bool = False,
         tf_meta_path: str = None,
+        # v6.0: Duration-primary cache mode
+        v6_cache_dir: str = None,  # Path to v6 cache directory (e.g., data/feature_cache_v6)
     ):
         """
         Initialize dataset.
@@ -94,6 +98,8 @@ class HierarchicalDataset(Dataset):
             use_native_timeframes: If True, return Dict[str, Tensor] where each timeframe
                                    gets its native resolution features (5min layer sees 5-min bars)
             tf_meta_path: Path to tf_meta_*.json file with timeframe sequence metadata
+            v6_cache_dir: v6.0 - Path to unified v6 cache directory. If provided, loads
+                         duration-primary labels from .npz files per timeframe.
         """
         self._preload_to_ram = preload_to_ram
         self._preload_tf_to_ram = preload_tf_to_ram
@@ -198,6 +204,15 @@ class HierarchicalDataset(Dataset):
 
         # Dtype validation - ensure data matches config precision
         expected_dtype = config.NUMPY_DTYPE
+
+        # v6.0: Duration-primary cache mode
+        self.v6_cache_dir = v6_cache_dir
+        self.use_v6_cache = v6_cache_dir is not None
+        self._v6_labels = {}  # Dict[tf, Dict[str, np.ndarray]] - per-TF v6 labels
+
+        if self.use_v6_cache:
+            self._init_v6_cache_mode(v6_cache_dir)
+            # v6 mode still needs native TF features, so continue to native TF init
 
         # v4.1: Native timeframe mode - load per-TF sequences
         if self.use_native_timeframes and tf_meta_path is not None:
@@ -629,6 +644,99 @@ class HierarchicalDataset(Dataset):
         # v5.9.4: Load pre-computed targets if available (Fix #1 and #3)
         self._load_precomputed_targets(cache_dir, cache_key)
 
+    def _init_v6_cache_mode(self, v6_cache_dir: str):
+        """
+        v6.0: Initialize duration-primary cache mode.
+
+        Loads per-TF .npz files containing:
+        - Duration labels (first_break_bar, final_duration)
+        - Break/return tracking (returned, bars_outside, etc.)
+        - Window quality (R², validity per window)
+        - Transition labels (type, direction, next_tf)
+
+        Args:
+            v6_cache_dir: Path to v6 cache directory
+        """
+        from src.ml.cache_v6 import load_v6_cache, TIMEFRAMES, WINDOWS
+
+        print(f"\n  📂 Loading v6.0 duration-primary cache...")
+
+        try:
+            self._v6_labels, self._v6_meta = load_v6_cache(v6_cache_dir)
+            self._v6_windows = WINDOWS  # [100, 90, 80, ..., 10]
+            self._v6_timeframes = TIMEFRAMES
+
+            # Build timestamp → index mapping for each TF
+            self._v6_ts_to_idx = {}
+            for tf, labels in self._v6_labels.items():
+                if 'timestamps' in labels:
+                    timestamps = labels['timestamps']
+                    self._v6_ts_to_idx[tf] = {ts: idx for idx, ts in enumerate(timestamps)}
+
+            # Summary
+            total_samples = sum(len(labels.get('timestamps', [])) for labels in self._v6_labels.values())
+            print(f"     ✓ Loaded {len(self._v6_labels)} timeframes, {total_samples:,} total samples")
+            print(f"     ✓ Windows: {self._v6_windows[:3]}...{self._v6_windows[-1]}")
+            print(f"     ✓ Version: {self._v6_meta.get('version', 'unknown')}")
+
+        except Exception as e:
+            print(f"     ⚠️  Failed to load v6 cache: {e}")
+            self.use_v6_cache = False
+            self._v6_labels = {}
+
+    def _get_v6_labels_for_sample(self, timestamp_ns: int, tf: str) -> Dict[str, np.ndarray]:
+        """
+        v6.0: Get v6 labels for a specific sample.
+
+        Args:
+            timestamp_ns: Timestamp in nanoseconds
+            tf: Timeframe name
+
+        Returns:
+            Dict with all v6 labels for this sample, or empty dict if not found
+        """
+        if not self.use_v6_cache or tf not in self._v6_labels:
+            return {}
+
+        # Look up index
+        ts_map = self._v6_ts_to_idx.get(tf, {})
+        idx = ts_map.get(timestamp_ns)
+
+        if idx is None:
+            return {}
+
+        labels = self._v6_labels[tf]
+        result = {}
+
+        # Extract all per-window labels
+        for window in self._v6_windows:
+            prefix = f'w{window}'
+            for key in ['valid', 'r_squared', 'slope', 'width',
+                       'first_break_bar', 'final_duration',
+                       'break_direction', 'returned',
+                       'bars_to_return', 'bars_outside', 'max_consecutive_outside',
+                       'hit_upper', 'hit_midline', 'hit_lower',
+                       'bars_to_upper', 'bars_to_midline', 'bars_to_lower']:
+                full_key = f'{prefix}_{key}'
+                if full_key in labels:
+                    result[full_key] = labels[full_key][idx]
+
+            # price_sequence is an object array (variable length list)
+            price_seq_key = f'{prefix}_price_sequence'
+            if price_seq_key in labels:
+                price_seq = labels[price_seq_key][idx]
+                if price_seq is not None and len(price_seq) > 0:
+                    result[price_seq_key] = price_seq
+                else:
+                    result[price_seq_key] = np.array([], dtype=np.float32)
+
+        # Transition labels
+        for key in ['transition_type', 'transition_direction', 'transition_next_tf']:
+            if key in labels:
+                result[key] = labels[key][idx]
+
+        return result
+
     def _load_precomputed_targets(self, cache_dir: Path, cache_key: str):
         """
         Load pre-computed breakout labels and target arrays if available.
@@ -922,6 +1030,105 @@ class HierarchicalDataset(Dataset):
         for key, arr in self._precomputed_targets.items():
             if key.startswith('cont_') or key.startswith('trans_'):
                 targets[key] = float(arr[precomp_row])
+
+        # =====================================================================
+        # v6.0: Add duration-primary labels if v6 cache is loaded
+        # =====================================================================
+        if getattr(self, 'use_v6_cache', False) and self._v6_labels:
+            ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+            ts_5min_int = int(ts_5min)
+
+            # Import HIERARCHICAL_TIMEFRAMES for iteration
+            from src.ml.features import HIERARCHICAL_TIMEFRAMES
+
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                v6_labels = self._get_v6_labels_for_sample(ts_5min_int, tf)
+
+                if v6_labels:
+                    # =========================================================
+                    # Per-window labels: used for window selection loss
+                    # =========================================================
+                    r2_scores = []
+                    window_durations = []
+                    first_break_bars = []
+                    returned_flags = []
+                    bars_outside_list = []
+                    max_consec_outside_list = []
+                    price_sequences = []
+
+                    for window in getattr(self, '_v6_windows', []):
+                        # Extract per-window data
+                        r2_key = f'w{window}_r_squared'
+                        dur_key = f'w{window}_final_duration'
+                        break_key = f'w{window}_first_break_bar'
+                        ret_key = f'w{window}_returned'
+                        outside_key = f'w{window}_bars_outside'
+                        consec_key = f'w{window}_max_consecutive_outside'
+                        price_seq_key = f'w{window}_price_sequence'
+
+                        r2_scores.append(float(v6_labels.get(r2_key, 0.0)))
+                        window_durations.append(float(v6_labels.get(dur_key, 0.0)))
+                        first_break_bars.append(float(v6_labels.get(break_key, 0.0)))
+                        returned_flags.append(float(v6_labels.get(ret_key, 0.0)))
+                        bars_outside_list.append(float(v6_labels.get(outside_key, 0.0)))
+                        max_consec_outside_list.append(float(v6_labels.get(consec_key, 0.0)))
+
+                        # Price sequence (variable length)
+                        price_seq = v6_labels.get(price_seq_key, np.array([]))
+                        if isinstance(price_seq, np.ndarray):
+                            price_sequences.append(price_seq.tolist())
+                        else:
+                            price_sequences.append(list(price_seq) if price_seq else [])
+
+                    # Store aggregated window arrays for loss computation
+                    targets[f'{tf}_window_r_squared'] = r2_scores
+                    targets[f'{tf}_window_durations'] = window_durations
+
+                    # =========================================================
+                    # TF-level aggregates: use best window (highest R²)
+                    # =========================================================
+                    if r2_scores:
+                        best_idx = max(range(len(r2_scores)), key=lambda i: r2_scores[i])
+
+                        # Duration-primary targets
+                        targets[f'{tf}_final_duration'] = window_durations[best_idx]
+                        targets[f'{tf}_first_break_bar'] = first_break_bars[best_idx]
+                        targets[f'{tf}_returned'] = returned_flags[best_idx]
+                        targets[f'{tf}_bars_outside'] = bars_outside_list[best_idx]
+                        targets[f'{tf}_max_consecutive_outside'] = max_consec_outside_list[best_idx]
+
+                        # Price sequence for containment loss
+                        targets[f'{tf}_price_sequence'] = price_sequences[best_idx]
+
+                        # Mark as valid
+                        targets[f'{tf}_v6_valid'] = 1.0
+                    else:
+                        # No valid windows
+                        targets[f'{tf}_final_duration'] = 0.0
+                        targets[f'{tf}_first_break_bar'] = 0.0
+                        targets[f'{tf}_returned'] = 0.0
+                        targets[f'{tf}_bars_outside'] = 0.0
+                        targets[f'{tf}_max_consecutive_outside'] = 0.0
+                        targets[f'{tf}_price_sequence'] = []
+                        targets[f'{tf}_v6_valid'] = 0.0
+
+                    # Transition labels (global, not per-TF)
+                    if 'transition_type' in v6_labels:
+                        targets['v6_transition_type'] = float(v6_labels['transition_type'])
+                        targets['v6_transition_direction'] = float(v6_labels.get('transition_direction', 0))
+                        targets['v6_transition_next_tf'] = float(v6_labels.get('transition_next_tf', 0))
+
+                else:
+                    # No v6 labels for this TF/timestamp - mark as invalid
+                    targets[f'{tf}_v6_valid'] = 0.0
+                    targets[f'{tf}_final_duration'] = 0.0
+                    targets[f'{tf}_first_break_bar'] = 0.0
+                    targets[f'{tf}_returned'] = 0.0
+                    targets[f'{tf}_bars_outside'] = 0.0
+                    targets[f'{tf}_max_consecutive_outside'] = 0.0
+                    targets[f'{tf}_price_sequence'] = []
+                    targets[f'{tf}_window_r_squared'] = [0.0] * len(getattr(self, '_v6_windows', [100]))
+                    targets[f'{tf}_window_durations'] = [0.0] * len(getattr(self, '_v6_windows', [100]))
 
         # v5.2: Get VIX sequence for this sample (still computed per-sample)
         vix_seq = None
@@ -1359,6 +1566,102 @@ class HierarchicalDataset(Dataset):
                 targets[f'trans_{tf}_direction'] = 1.0  # BEAR (neutral default)
                 targets[f'trans_{tf}_slope'] = 0.0  # No slope change
                 targets[f'trans_{tf}_valid'] = 0.0  # Mark as invalid
+
+        # =====================================================================
+        # v6.0: Add duration-primary labels if v6 cache is loaded
+        # =====================================================================
+        if getattr(self, 'use_v6_cache', False) and self._v6_labels:
+            ts_5min = self.tf_timestamps['5min'][data_idx_5min]
+            ts_5min_int = int(ts_5min)
+
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                v6_labels = self._get_v6_labels_for_sample(ts_5min_int, tf)
+
+                if v6_labels:
+                    # =========================================================
+                    # Per-window labels: used for window selection loss
+                    # =========================================================
+                    r2_scores = []
+                    window_durations = []
+                    first_break_bars = []
+                    returned_flags = []
+                    bars_outside_list = []
+                    max_consec_outside_list = []
+                    price_sequences = []
+
+                    for window in getattr(self, '_v6_windows', []):
+                        # Extract per-window data
+                        r2_key = f'w{window}_r_squared'
+                        dur_key = f'w{window}_final_duration'
+                        break_key = f'w{window}_first_break_bar'
+                        ret_key = f'w{window}_returned'
+                        outside_key = f'w{window}_bars_outside'
+                        consec_key = f'w{window}_max_consecutive_outside'
+                        price_seq_key = f'w{window}_price_sequence'
+
+                        r2_scores.append(float(v6_labels.get(r2_key, 0.0)))
+                        window_durations.append(float(v6_labels.get(dur_key, 0.0)))
+                        first_break_bars.append(float(v6_labels.get(break_key, 0.0)))
+                        returned_flags.append(float(v6_labels.get(ret_key, 0.0)))
+                        bars_outside_list.append(float(v6_labels.get(outside_key, 0.0)))
+                        max_consec_outside_list.append(float(v6_labels.get(consec_key, 0.0)))
+
+                        # Price sequence (variable length)
+                        price_seq = v6_labels.get(price_seq_key, np.array([]))
+                        if isinstance(price_seq, np.ndarray):
+                            price_sequences.append(price_seq.tolist())
+                        else:
+                            price_sequences.append(list(price_seq) if price_seq else [])
+
+                    # Store aggregated window arrays for loss computation
+                    targets[f'{tf}_window_r_squared'] = r2_scores
+                    targets[f'{tf}_window_durations'] = window_durations
+
+                    # =========================================================
+                    # TF-level aggregates: use best window (highest R²)
+                    # =========================================================
+                    if r2_scores:
+                        best_idx = max(range(len(r2_scores)), key=lambda i: r2_scores[i])
+
+                        # Duration-primary targets
+                        targets[f'{tf}_final_duration'] = window_durations[best_idx]
+                        targets[f'{tf}_first_break_bar'] = first_break_bars[best_idx]
+                        targets[f'{tf}_returned'] = returned_flags[best_idx]
+                        targets[f'{tf}_bars_outside'] = bars_outside_list[best_idx]
+                        targets[f'{tf}_max_consecutive_outside'] = max_consec_outside_list[best_idx]
+
+                        # Price sequence for containment loss
+                        targets[f'{tf}_price_sequence'] = price_sequences[best_idx]
+
+                        # Mark as valid
+                        targets[f'{tf}_v6_valid'] = 1.0
+                    else:
+                        # No valid windows
+                        targets[f'{tf}_final_duration'] = 0.0
+                        targets[f'{tf}_first_break_bar'] = 0.0
+                        targets[f'{tf}_returned'] = 0.0
+                        targets[f'{tf}_bars_outside'] = 0.0
+                        targets[f'{tf}_max_consecutive_outside'] = 0.0
+                        targets[f'{tf}_price_sequence'] = []
+                        targets[f'{tf}_v6_valid'] = 0.0
+
+                    # Transition labels (global, not per-TF)
+                    if 'transition_type' in v6_labels:
+                        targets['v6_transition_type'] = float(v6_labels['transition_type'])
+                        targets['v6_transition_direction'] = float(v6_labels.get('transition_direction', 0))
+                        targets['v6_transition_next_tf'] = float(v6_labels.get('transition_next_tf', 0))
+
+                else:
+                    # No v6 labels for this TF/timestamp - mark as invalid
+                    targets[f'{tf}_v6_valid'] = 0.0
+                    targets[f'{tf}_final_duration'] = 0.0
+                    targets[f'{tf}_first_break_bar'] = 0.0
+                    targets[f'{tf}_returned'] = 0.0
+                    targets[f'{tf}_bars_outside'] = 0.0
+                    targets[f'{tf}_max_consecutive_outside'] = 0.0
+                    targets[f'{tf}_price_sequence'] = []
+                    targets[f'{tf}_window_r_squared'] = [0.0] * len(getattr(self, '_v6_windows', [100]))
+                    targets[f'{tf}_window_durations'] = [0.0] * len(getattr(self, '_v6_windows', [100]))
 
         # v5.2: Get VIX sequence for this sample
         vix_seq = None
@@ -2509,7 +2812,8 @@ def create_hierarchical_dataset(
     tf_meta_path: str = None,
     use_boundary_sampling: bool = False,  # v5.9.6: Filter to channel boundary samples only
     boundary_threshold: int = 5,  # v5.9.6: Threshold in bars
-    boundary_mode: str = "breaks"  # v5.9.6: 'breaks', 'starts', or 'both'
+    boundary_mode: str = "breaks",  # v5.9.6: 'breaks', 'starts', or 'both'
+    v6_cache_dir: str = None,  # v6.0: Path to unified v6 cache directory
 ) -> Tuple[Dataset, Optional[Dataset], Optional[Dataset]]:
     """
     Factory function to create hierarchical dataset(s).
@@ -2687,7 +2991,8 @@ def create_hierarchical_dataset(
                     preload_to_ram=preload_to_ram,
                     preload_tf_to_ram=preload_tf_to_ram,
                     use_native_timeframes=use_native_timeframes,
-                    tf_meta_path=tf_meta_path
+                    tf_meta_path=tf_meta_path,
+                    v6_cache_dir=v6_cache_dir,  # v6.0
                 )
                 val_dataset = HierarchicalDataset(
                     val_df, val_raw_ohlc, val_continuation_df,
@@ -2700,7 +3005,8 @@ def create_hierarchical_dataset(
                     preload_to_ram=preload_to_ram,
                     preload_tf_to_ram=preload_tf_to_ram,
                     use_native_timeframes=use_native_timeframes,
-                    tf_meta_path=tf_meta_path
+                    tf_meta_path=tf_meta_path,
+                    v6_cache_dir=v6_cache_dir,  # v6.0
                 )
                 test_dataset = HierarchicalDataset(
                     test_df, test_raw_ohlc, test_continuation_df,
@@ -2713,7 +3019,8 @@ def create_hierarchical_dataset(
                     preload_to_ram=preload_to_ram,
                     preload_tf_to_ram=preload_tf_to_ram,
                     use_native_timeframes=use_native_timeframes,
-                    tf_meta_path=tf_meta_path
+                    tf_meta_path=tf_meta_path,
+                    v6_cache_dir=v6_cache_dir,  # v6.0
                 )
 
         return train_dataset, val_dataset, test_dataset
@@ -2749,7 +3056,8 @@ def create_hierarchical_dataset(
                 preload_to_ram=preload_to_ram,
                 preload_tf_to_ram=preload_tf_to_ram,
                 use_native_timeframes=use_native_timeframes,
-                tf_meta_path=tf_meta_path
+                tf_meta_path=tf_meta_path,
+                v6_cache_dir=v6_cache_dir,  # v6.0
             )
 
             # v5.9.6: Apply boundary sampling if enabled (before split)
