@@ -1505,12 +1505,15 @@ class HierarchicalLNN(nn.Module, ModelBase):
             # If adjustment = 0.0: confidence zeroed (severe violation)
             per_tf_confs_adjusted = per_tf_confs * containment_adjustments
 
-            # Store for diagnostics
-            output_dict['containment_adjustments'] = containment_adjustments
-            output_dict['per_tf_confs_raw'] = per_tf_confs  # Before adjustment
+            # Store for diagnostics (will add to output_dict later)
+            _containment_adjustments = containment_adjustments
+            _per_tf_confs_raw = per_tf_confs  # Before adjustment
 
             # Use adjusted confidences for selection
             per_tf_confs = per_tf_confs_adjusted
+        else:
+            _containment_adjustments = None
+            _per_tf_confs_raw = None
 
         # =========================================================================
         # v5.7: SOFT SELECTION with Gumbel-Softmax (fixes mode collapse)
@@ -1612,6 +1615,11 @@ class HierarchicalLNN(nn.Module, ModelBase):
             output_dict['phase'] = phase_output
         if energy_output is not None:
             output_dict['energy'] = energy_output
+
+        # v6.0: Add containment adjustment diagnostics
+        if _containment_adjustments is not None:
+            output_dict['containment_adjustments'] = _containment_adjustments
+            output_dict['per_tf_confs_raw'] = _per_tf_confs_raw
 
         # v5.1: Add channel selection info (Physics-Only mode)
         if not self.use_fusion_head:
