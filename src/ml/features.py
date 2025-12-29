@@ -5568,19 +5568,59 @@ class TradingFeatureExtractor(FeatureExtractor):
 
                         is_valid = complete_cycles >= 2 and r_squared > 0.5
 
-                        # Detect break
-                        break_idx = None
-                        for bar_idx in range(len(future_closes)):
+                        # v6.0: Enhanced break detection with return-after-break tracking
+                        # Instead of stopping at first break, continue scanning to detect:
+                        # - Temporary excursions (price returns inside channel)
+                        # - True breaks (price stays outside)
+                        first_break_bar = None
+                        break_direction = 0  # -1=below, 0=none, 1=above
+                        returned = False
+                        bars_to_return = None
+                        total_bars_outside = 0
+                        max_consecutive_outside = 0
+                        consecutive_outside = 0
+                        consecutive_inside_after_break = 0
+                        RETURN_THRESHOLD = 3  # Must stay inside for N bars to count as "returned"
+
+                        scan_limit = min(len(future_closes), 500)  # Cap at 500 bars
+
+                        for bar_idx in range(scan_limit):
                             x_pos = window + bar_idx
                             center = slope * x_pos + intercept
                             upper = center + (2.0 * residual_std)
                             lower = center - (2.0 * residual_std)
 
-                            if future_closes[bar_idx] > upper or future_closes[bar_idx] < lower:
-                                break_idx = bar_idx
-                                break
+                            price = future_closes[bar_idx]
+                            is_outside = (price > upper) or (price < lower)
 
-                        duration_bars = break_idx if break_idx is not None else (len(future_closes) - 1)
+                            if is_outside:
+                                total_bars_outside += 1
+                                consecutive_outside += 1
+                                consecutive_inside_after_break = 0
+                                max_consecutive_outside = max(max_consecutive_outside, consecutive_outside)
+
+                                if first_break_bar is None:
+                                    first_break_bar = bar_idx
+                                    break_direction = 1 if price > upper else -1
+                            else:
+                                consecutive_outside = 0
+
+                                if first_break_bar is not None and not returned:
+                                    consecutive_inside_after_break += 1
+                                    if consecutive_inside_after_break >= RETURN_THRESHOLD:
+                                        returned = True
+                                        bars_to_return = bar_idx - first_break_bar
+
+                        # Calculate final duration (accounting for returns)
+                        if first_break_bar is None:
+                            final_duration = scan_limit  # Never broke - channel lasted entire scan
+                        elif returned:
+                            final_duration = scan_limit  # Broke but returned - channel still valid
+                        else:
+                            final_duration = first_break_bar  # Broke and never returned
+
+                        # Backward compatibility: duration_bars = first break (old behavior)
+                        duration_bars = first_break_bar if first_break_bar is not None else (scan_limit - 1)
 
                         # Confidence calculation
                         conf = r_squared * 0.7
@@ -5664,6 +5704,15 @@ class TradingFeatureExtractor(FeatureExtractor):
                         label_row[f'w{window}_cycles'] = int(complete_cycles)
                         label_row[f'w{window}_valid'] = int(is_valid)
                         label_row[f'w{window}_width'] = float(residual_std * 4)
+
+                        # v6.0: Return-after-break tracking labels
+                        label_row[f'w{window}_first_break_bar'] = float(first_break_bar) if first_break_bar is not None else -1.0
+                        label_row[f'w{window}_break_direction'] = int(break_direction)
+                        label_row[f'w{window}_returned'] = int(returned)
+                        label_row[f'w{window}_bars_to_return'] = float(bars_to_return) if bars_to_return is not None else -1.0
+                        label_row[f'w{window}_bars_outside'] = float(total_bars_outside)
+                        label_row[f'w{window}_max_consecutive_outside'] = int(max_consecutive_outside)
+                        label_row[f'w{window}_final_duration'] = float(final_duration)
 
                     # Check if any window is valid
                     valid_windows = sum(1 for w in windows if label_row.get(f'w{w}_valid', 0) > 0)
@@ -5940,9 +5989,17 @@ class TradingFeatureExtractor(FeatureExtractor):
                 if upper <= lower or np.isnan(upper) or np.isnan(lower):
                     continue
 
-                # Scan forward to detect break
-                break_idx = None
+                # v6.0: Enhanced break detection with return-after-break tracking
+                first_break_bar = None
+                break_direction = 0  # -1=below, 0=none, 1=above
+                returned = False
+                bars_to_return = None
+                total_bars_outside = 0
+                max_consecutive_outside = 0
+                consecutive_outside = 0
+                consecutive_inside_after_break = 0
                 max_gain = 0.0
+                RETURN_THRESHOLD = 3
 
                 # Scan up to 500 bars ahead (to limit computation)
                 scan_limit = min(500, n_bars - i - 1)
@@ -5958,13 +6015,37 @@ class TradingFeatureExtractor(FeatureExtractor):
                     gain = (future_high - current_price) / current_price * 100
                     max_gain = max(max_gain, abs(gain))
 
-                    # Detect break (price exits channel bounds)
-                    if future_price > upper or future_price < lower:
-                        break_idx = j
-                        break
+                    # Check if outside bounds
+                    is_outside = (future_price > upper) or (future_price < lower)
 
-                # Calculate duration
-                duration = break_idx if break_idx is not None else scan_limit
+                    if is_outside:
+                        total_bars_outside += 1
+                        consecutive_outside += 1
+                        consecutive_inside_after_break = 0
+                        max_consecutive_outside = max(max_consecutive_outside, consecutive_outside)
+
+                        if first_break_bar is None:
+                            first_break_bar = j
+                            break_direction = 1 if future_price > upper else -1
+                    else:
+                        consecutive_outside = 0
+
+                        if first_break_bar is not None and not returned:
+                            consecutive_inside_after_break += 1
+                            if consecutive_inside_after_break >= RETURN_THRESHOLD:
+                                returned = True
+                                bars_to_return = j - first_break_bar
+
+                # Calculate final duration (accounting for returns)
+                if first_break_bar is None:
+                    final_duration = scan_limit
+                elif returned:
+                    final_duration = scan_limit
+                else:
+                    final_duration = first_break_bar
+
+                # Backward compatibility
+                duration = first_break_bar if first_break_bar is not None else scan_limit
 
                 # Calculate confidence from channel quality
                 r_sq = r_squareds[i]
@@ -5980,7 +6061,15 @@ class TradingFeatureExtractor(FeatureExtractor):
                     'confidence': float(confidence),
                     'channel_r_squared': float(r_sq),
                     'channel_valid': int(is_valid),
-                    'position_at_entry': float(positions[i])
+                    'position_at_entry': float(positions[i]),
+                    # v6.0: Return-after-break tracking
+                    'first_break_bar': float(first_break_bar) if first_break_bar is not None else -1.0,
+                    'break_direction': int(break_direction),
+                    'returned': int(returned),
+                    'bars_to_return': float(bars_to_return) if bars_to_return is not None else -1.0,
+                    'bars_outside': float(total_bars_outside),
+                    'max_consecutive_outside': int(max_consecutive_outside),
+                    'final_duration': float(final_duration),
                 })
 
             if len(tf_labels) == 0:

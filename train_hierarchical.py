@@ -4156,11 +4156,15 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         transition_diagnostics['tf_weights_sum'] = None
         transition_diagnostics['tf_weights_count'] = 0
 
-        # v5.7: Calculate warmup weights for this epoch
-        duration_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.3)
-        geo_price_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.4)
-        validity_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.2)
-        transition_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.5)  # 0.3 + 0.2 for trans + direction
+        # v6.0: DURATION-PRIMARY loss weights
+        # Duration is the main loss (always 1.0), containment validates it (ramps up slower)
+        CONTAINMENT_WARMUP_EPOCHS = 10  # Longer warmup for containment
+
+        duration_weight = 1.0  # PRIMARY: always full weight, no warmup
+        containment_weight = get_loss_warmup_weight(epoch, CONTAINMENT_WARMUP_EPOCHS, 0.8)  # Ramps up slower
+        validity_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.3)
+        transition_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.5)
+        return_bonus_weight = get_loss_warmup_weight(epoch, WARMUP_EPOCHS, 0.2)  # NEW: reward quick returns
 
         # v5.7: Anneal selection temperature: 2.0 -> 0.5 over 10 epochs
         # High temp = soft selection (gradients to all TFs), low temp = approaches hard selection
@@ -4174,8 +4178,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
         if hasattr(model_core, 'selection_temperature'):
             model_core.selection_temperature = new_temp
 
-        if epoch < WARMUP_EPOCHS and is_main_process(rank):
-            print(f"\n   Warmup epoch {epoch+1}/{WARMUP_EPOCHS}: duration={duration_weight:.3f}, geo={geo_price_weight:.3f}, validity={validity_weight:.3f}, transition={transition_weight:.3f}, temp={new_temp:.2f}")
+        if epoch < CONTAINMENT_WARMUP_EPOCHS and is_main_process(rank):
+            print(f"\n   v6.0 Warmup epoch {epoch+1}/{CONTAINMENT_WARMUP_EPOCHS}: duration={duration_weight:.3f} (PRIMARY), containment={containment_weight:.3f}, validity={validity_weight:.3f}, transition={transition_weight:.3f}, return_bonus={return_bonus_weight:.3f}, temp={new_temp:.2f}")
 
         # v5.3: Accumulate components for this epoch
         epoch_components = {k: [] for k in component_history.keys()}
@@ -4233,10 +4237,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
             optimizer.zero_grad()
 
-            # Track loss components (v5.7: init outside AMP/non-AMP paths)
+            # Track loss components (v6.0: added highlow_mse, return_bonus)
             loss_components = {'primary': 0.0, 'multi_task': 0.0, 'duration': 0.0,
                               'validity': 0.0, 'transition': 0.0, 'calibration': 0.0,
-                              'geo_price': 0.0, 'multi_tf': 0.0, 'entropy': 0.0}
+                              'containment': 0.0, 'multi_tf': 0.0, 'entropy': 0.0,
+                              'highlow_mse': 0.0, 'return_bonus': 0.0, 'hit_probability': 0.0}
 
             # Feedback for first batch (torch.compile takes time)
             # Use a background thread to print progress while compiling
@@ -4283,7 +4288,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 print(f"   Min: {predictions.min().item()}, Max: {predictions.max().item()}")
                 raise ValueError("Non-finite predictions - training aborted")
 
-            # Primary loss: high/low predictions (raw % - data alignment fixed in dataset)
+            # v6.0: DURATION-PRIMARY loss structure
+            # Duration NLL is the main loss; high/low MSE is secondary (for debugging/backwards compat)
             target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
 
             # 🛡️ NaN Check 2: Targets
@@ -4291,11 +4297,14 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 print(f"\n🚨 NaN/Inf in targets at batch {batch_idx}!")
                 raise ValueError("Non-finite targets detected")
 
-            # loss_components initialized before if/else block (v5.7)
+            # v6.0: Initialize loss as 0 - duration will be added as primary
+            loss = torch.tensor(0.0, device=args.device, requires_grad=True)
+            loss_components['primary'] = 0.0  # Will be set to duration loss
 
-            primary_loss = F.mse_loss(predictions[:, :2], target_tensor)
-            loss = primary_loss
-            loss_components['primary'] = primary_loss.item()
+            # v6.0: High/low MSE demoted to secondary (0.1 weight for debugging)
+            highlow_mse = F.mse_loss(predictions[:, :2], target_tensor)
+            loss = loss + 0.1 * highlow_mse
+            loss_components['highlow_mse'] = highlow_mse.item()
 
             # 🛡️ NaN Check 3: Loss
             if not torch.isfinite(loss):
@@ -4306,10 +4315,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
             # Debug: Print target/prediction stats on first batch
             if batch_idx == 0 and epoch == 0:
+                print(f"[DEBUG] v6.0 DURATION-PRIMARY loss structure", flush=True)
                 print(f"[DEBUG] targets high: mean={target_tensor[:,0].mean():.2f}%, min={target_tensor[:,0].min():.2f}%, max={target_tensor[:,0].max():.2f}%", flush=True)
                 print(f"[DEBUG] targets low: mean={target_tensor[:,1].mean():.2f}%, min={target_tensor[:,1].min():.2f}%, max={target_tensor[:,1].max():.2f}%", flush=True)
                 print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.3f}, std={predictions[:,:2].std():.3f}", flush=True)
-                print(f"[DEBUG] primary loss (high/low MSE): {loss.item():.4f}", flush=True)
+                print(f"[DEBUG] high/low MSE (SECONDARY, 0.1 weight): {highlow_mse.item():.4f}", flush=True)
                 # v5.9.6: Debug duration values to verify fix
                 duration_debug = []
                 for tf in ['5min', '1h', 'daily']:
@@ -4467,6 +4477,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             if duration_loss_total > 0:
                 loss = loss + duration_loss_total
                 loss_components['duration'] = duration_loss_total.item()
+                loss_components['primary'] = duration_loss_total.item()  # v6.0: Duration IS the primary loss
 
             # =====================================================================
             # v5.9.6: VECTORIZED CONTAINMENT & HIT PROBABILITY LOSS
@@ -4557,7 +4568,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
                         # Loss = 1 - containment_rate (minimize when containment is high)
                         containment_loss = (1.0 - containment_scores).mean()
-                        containment_loss_total += geo_price_weight * containment_loss
+                        containment_loss_total += containment_weight * containment_loss  # v6.0: use containment_weight
 
                         # =============================================================
                         # Phase 1: Vectorized Hit Probability Loss (biggest speedup)
@@ -4607,6 +4618,39 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             if hit_probability_loss_total > 0:
                 loss = loss + hit_probability_loss_total * 0.1  # Lower weight than containment
                 loss_components['hit_probability'] = (hit_probability_loss_total * 0.1).item() if hasattr(hit_probability_loss_total, 'item') else hit_probability_loss_total * 0.1
+
+            # =====================================================================
+            # v6.0: RETURN BONUS (reward quick returns after temporary breaks)
+            # =====================================================================
+            # This is a NEGATIVE loss - subtracts from total when channels return after breaks
+            return_bonus_total = 0.0
+            if return_bonus_weight > 0:
+                for tf in project_config.HIERARCHICAL_TIMEFRAMES:
+                    returned_key = f'cont_{tf}_returned'
+                    bars_outside_key = f'cont_{tf}_bars_outside'
+                    valid_key = f'cont_{tf}_valid'
+
+                    if returned_key in targets and bars_outside_key in targets:
+                        returned = targets[returned_key].float()  # [batch] 1.0 if returned
+                        bars_outside = targets[bars_outside_key].float()  # [batch] count of bars outside
+                        valid_mask = targets.get(valid_key, torch.ones(batch_size, device=args.device)).float()
+
+                        # Bonus for quick returns: higher bonus for fewer bars outside
+                        # returned * exp(-bars_outside/5) gives:
+                        #   - 1.0 bonus if returned in 0 bars (never really broke)
+                        #   - 0.82 bonus if returned in 1 bar
+                        #   - 0.37 bonus if returned in 5 bars
+                        #   - 0.14 bonus if returned in 10 bars
+                        bonus = returned * torch.exp(-bars_outside / 5.0)
+                        masked_bonus = (bonus * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+                        return_bonus_total += masked_bonus
+
+                return_bonus_total = return_bonus_total / len(project_config.HIERARCHICAL_TIMEFRAMES)
+
+            if return_bonus_total > 0:
+                # Subtract from loss (negative loss component = reward)
+                loss = loss - return_bonus_weight * return_bonus_total
+                loss_components['return_bonus'] = (return_bonus_weight * return_bonus_total).item() if hasattr(return_bonus_total, 'item') else return_bonus_weight * return_bonus_total
 
             # Validity loss - v5.7.1: per-sample
             validity_loss_total = 0.0

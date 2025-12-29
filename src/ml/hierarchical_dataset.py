@@ -1195,6 +1195,14 @@ class HierarchicalDataset(Dataset):
                     targets[f'cont_{tf}_gain'] = 0.0
                     targets[f'cont_{tf}_confidence'] = 0.5
                     targets[f'cont_{tf}_valid'] = 0.0  # Mark as invalid
+                    # v6.0: Set TF-level return-after-break defaults
+                    targets[f'cont_{tf}_first_break_bar'] = -1.0
+                    targets[f'cont_{tf}_break_direction'] = 0
+                    targets[f'cont_{tf}_returned'] = 0
+                    targets[f'cont_{tf}_bars_to_return'] = -1.0
+                    targets[f'cont_{tf}_bars_outside'] = 0.0
+                    targets[f'cont_{tf}_max_consecutive_outside'] = 0
+                    targets[f'cont_{tf}_final_duration'] = 0.0
                     # Also set all window-level keys
                     for window in config.CHANNEL_WINDOW_SIZES:
                         targets[f'cont_{tf}_w{window}_duration'] = 0.0
@@ -1245,6 +1253,14 @@ class HierarchicalDataset(Dataset):
                         # v5.9.6: Track best window for TF-level duration target
                         best_duration = 0.0
                         best_confidence = 0.0
+                        # v6.0: Track return-after-break values from best window
+                        best_first_break_bar = -1.0
+                        best_break_direction = 0
+                        best_returned = 0
+                        best_bars_to_return = -1.0
+                        best_bars_outside = 0.0
+                        best_max_consecutive_outside = 0
+                        best_final_duration = 0.0
 
                         for window in config.CHANNEL_WINDOW_SIZES:
                             if f'w{window}_valid' in cont_data:
@@ -1262,10 +1278,29 @@ class HierarchicalDataset(Dataset):
                                     targets[f'cont_{tf}_w{window}_confidence'] = confidence
                                     targets[f'cont_{tf}_w{window}_valid'] = 1.0
 
+                                    # v6.0: Return-after-break tracking labels
+                                    if f'w{window}_first_break_bar' in cont_data:
+                                        targets[f'cont_{tf}_w{window}_first_break_bar'] = float(cont_data[f'w{window}_first_break_bar'][row_idx])
+                                        targets[f'cont_{tf}_w{window}_break_direction'] = int(cont_data[f'w{window}_break_direction'][row_idx])
+                                        targets[f'cont_{tf}_w{window}_returned'] = int(cont_data[f'w{window}_returned'][row_idx])
+                                        targets[f'cont_{tf}_w{window}_bars_to_return'] = float(cont_data[f'w{window}_bars_to_return'][row_idx])
+                                        targets[f'cont_{tf}_w{window}_bars_outside'] = float(cont_data[f'w{window}_bars_outside'][row_idx])
+                                        targets[f'cont_{tf}_w{window}_max_consecutive_outside'] = int(cont_data[f'w{window}_max_consecutive_outside'][row_idx])
+                                        targets[f'cont_{tf}_w{window}_final_duration'] = float(cont_data[f'w{window}_final_duration'][row_idx])
+
                                     # Track best window for TF-level duration
                                     if confidence > best_confidence:
                                         best_confidence = confidence
                                         best_duration = duration
+                                        # v6.0: Also track return-after-break values from best window
+                                        if f'w{window}_first_break_bar' in cont_data:
+                                            best_first_break_bar = float(cont_data[f'w{window}_first_break_bar'][row_idx])
+                                            best_break_direction = int(cont_data[f'w{window}_break_direction'][row_idx])
+                                            best_returned = int(cont_data[f'w{window}_returned'][row_idx])
+                                            best_bars_to_return = float(cont_data[f'w{window}_bars_to_return'][row_idx])
+                                            best_bars_outside = float(cont_data[f'w{window}_bars_outside'][row_idx])
+                                            best_max_consecutive_outside = int(cont_data[f'w{window}_max_consecutive_outside'][row_idx])
+                                            best_final_duration = float(cont_data[f'w{window}_final_duration'][row_idx])
                                 else:
                                     # Window invalid - use placeholder (must set ALL keys for collate)
                                     targets[f'cont_{tf}_w{window}_duration'] = 0.0
@@ -1288,6 +1323,15 @@ class HierarchicalDataset(Dataset):
                         # v5.9.6: Set TF-level duration from best window
                         targets[f'cont_{tf}_duration'] = best_duration
 
+                        # v6.0: Set TF-level return-after-break labels from best window
+                        targets[f'cont_{tf}_first_break_bar'] = best_first_break_bar
+                        targets[f'cont_{tf}_break_direction'] = best_break_direction
+                        targets[f'cont_{tf}_returned'] = best_returned
+                        targets[f'cont_{tf}_bars_to_return'] = best_bars_to_return
+                        targets[f'cont_{tf}_bars_outside'] = best_bars_outside
+                        targets[f'cont_{tf}_max_consecutive_outside'] = best_max_consecutive_outside
+                        targets[f'cont_{tf}_final_duration'] = best_final_duration
+
                         # Mark TF as having at least some valid windows
                         targets[f'cont_{tf}_valid'] = 1.0
 
@@ -1295,6 +1339,15 @@ class HierarchicalDataset(Dataset):
                         # Timestamp not found - mark all windows as invalid (must set ALL keys for collate)
                         targets[f'cont_{tf}_gain'] = 0.0
                         targets[f'cont_{tf}_valid'] = 0.0
+                        targets[f'cont_{tf}_duration'] = 0.0
+                        # v6.0: Set TF-level return-after-break defaults
+                        targets[f'cont_{tf}_first_break_bar'] = -1.0
+                        targets[f'cont_{tf}_break_direction'] = 0
+                        targets[f'cont_{tf}_returned'] = 0
+                        targets[f'cont_{tf}_bars_to_return'] = -1.0
+                        targets[f'cont_{tf}_bars_outside'] = 0.0
+                        targets[f'cont_{tf}_max_consecutive_outside'] = 0
+                        targets[f'cont_{tf}_final_duration'] = 0.0
                         for window in config.CHANNEL_WINDOW_SIZES:
                             targets[f'cont_{tf}_w{window}_duration'] = 0.0
                             targets[f'cont_{tf}_w{window}_price_sequence'] = [0.0] * 10
@@ -1308,6 +1361,15 @@ class HierarchicalDataset(Dataset):
                     # Error - mark all as invalid (must set ALL keys for collate)
                     targets[f'cont_{tf}_gain'] = 0.0
                     targets[f'cont_{tf}_valid'] = 0.0
+                    targets[f'cont_{tf}_duration'] = 0.0
+                    # v6.0: Set TF-level return-after-break defaults
+                    targets[f'cont_{tf}_first_break_bar'] = -1.0
+                    targets[f'cont_{tf}_break_direction'] = 0
+                    targets[f'cont_{tf}_returned'] = 0
+                    targets[f'cont_{tf}_bars_to_return'] = -1.0
+                    targets[f'cont_{tf}_bars_outside'] = 0.0
+                    targets[f'cont_{tf}_max_consecutive_outside'] = 0
+                    targets[f'cont_{tf}_final_duration'] = 0.0
                     for window in config.CHANNEL_WINDOW_SIZES:
                         targets[f'cont_{tf}_w{window}_duration'] = 0.0
                         targets[f'cont_{tf}_w{window}_price_sequence'] = [0.0] * 10
