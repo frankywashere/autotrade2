@@ -105,6 +105,8 @@ class ChannelFeatureIndexer:
                         'quality_score': self._find_idx(features, f'{prefix}_quality_score'),
                         'r_squared_avg': self._find_idx(features, f'{prefix}_r_squared_avg'),
                         'is_valid': self._find_idx(features, f'{prefix}_is_valid'),
+                        # v6.0: Add complete_cycles for bounce-based window selection
+                        'complete_cycles': self._find_idx(features, f'{prefix}_complete_cycles'),
                     }
 
     def _find_idx(self, features: List[str], name: str) -> int:
@@ -171,6 +173,8 @@ class ChannelFeatureIndexer:
             'lower_dist': torch.zeros(batch_size, num_windows, device=device),
             'quality_score': torch.zeros(batch_size, num_windows, device=device),
             'position': torch.zeros(batch_size, num_windows, device=device),
+            # v6.0: Add complete_cycles for bounce-based window selection
+            'complete_cycles': torch.zeros(batch_size, num_windows, device=device),
         }
 
         for w_idx, window in enumerate(self.WINDOWS):
@@ -682,11 +686,11 @@ class HierarchicalLNN(nn.Module, ModelBase):
         # v5.7: GEOMETRIC PROJECTION COMPONENTS
         # =========================================================================
         # Window selector: learns which of 14 windows to use for geometric projection
-        # Input: hidden state + 14 quality scores → logits for 14 windows
+        # v6.0: Input: hidden state + 14 cycles (PRIMARY) + 14 quality scores → logits for 14 windows
         num_windows = len(ChannelFeatureIndexer.WINDOWS)  # 14 windows
         self.window_selectors = nn.ModuleDict({
             tf: nn.Sequential(
-                nn.Linear(hidden_size + num_windows, 64),  # hidden + quality scores
+                nn.Linear(hidden_size + 2 * num_windows, 64),  # hidden + cycles + quality scores
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(64, num_windows),  # logits for each window
@@ -901,9 +905,13 @@ class HierarchicalLNN(nn.Module, ModelBase):
         low_slopes = channel_features['low_slope_pct']  # [batch, num_windows]
         upper_dists = channel_features['upper_dist']  # [batch, num_windows]
         lower_dists = channel_features['lower_dist']  # [batch, num_windows]
+        # v6.0: Extract complete_cycles for bounce-based window selection
+        cycles = channel_features['complete_cycles']  # [batch, num_windows]
 
-        # Window selection based on hidden state + quality scores
-        selector_input = torch.cat([hidden, qualities], dim=-1)  # [batch, hidden + num_windows]
+        # v6.0: Window selection based on hidden state + cycles (PRIMARY) + quality
+        # Cycles normalized to 0-1 range (typically 0-10 cycles)
+        cycles_normalized = (cycles / 5.0).clamp(0, 1)  # 5+ cycles = max score
+        selector_input = torch.cat([hidden, cycles_normalized, qualities], dim=-1)  # [batch, hidden + 2*num_windows]
         window_logits = self.window_selectors[tf](selector_input)  # [batch, num_windows]
 
         if self.training:
