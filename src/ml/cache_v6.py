@@ -518,6 +518,25 @@ def generate_v6_cache(
                 v5_meta = json.load(f)
                 cache_key = v5_meta.get('cache_key')
 
+    # Default sequence lengths (can be overridden by training)
+    default_sequence_lengths = {
+        '5min': 200, '15min': 100, '30min': 60, '1h': 48,
+        '2h': 36, '3h': 24, '4h': 24, 'daily': 30,
+        'weekly': 12, 'monthly': 8, '3month': 8
+    }
+
+    # Try to get sequence lengths from v5.9 metadata
+    if v5_path:
+        try:
+            v5_meta_files = list(v5_path.glob("tf_meta_*.json"))
+            if v5_meta_files:
+                with open(v5_meta_files[0]) as f:
+                    v5_full_meta = json.load(f)
+                    if 'sequence_lengths' in v5_full_meta:
+                        default_sequence_lengths = v5_full_meta['sequence_lengths']
+        except Exception:
+            pass
+
     metadata = {
         'version': VERSION,
         'created': datetime.now().isoformat(),
@@ -527,6 +546,7 @@ def generate_v6_cache(
         },
         'source_rows': len(raw_ohlc_df),
         'windows': WINDOWS,
+        'sequence_lengths': default_sequence_lengths,  # v6.0: Store for self-contained mode
         'break_detection': {
             'method': '2sigma_with_return_tracking',
             'return_threshold_bars': return_threshold_bars,
@@ -810,6 +830,25 @@ def generate_tf_labels(
 # =============================================================================
 # CACHE LOADING
 # =============================================================================
+
+def load_v6_metadata(cache_dir: str = "data/feature_cache_v6") -> Dict[str, Any]:
+    """
+    Load only v6.0 cache metadata (fast, no data loading).
+
+    Args:
+        cache_dir: Cache directory
+
+    Returns:
+        metadata: Dict from cache_meta.json
+    """
+    cache_path = Path(cache_dir)
+    meta_files = list(cache_path.glob("cache_meta_*.json"))
+    if not meta_files:
+        raise FileNotFoundError(f"No cache metadata found in {cache_dir}")
+
+    with open(meta_files[0]) as f:
+        return json.load(f)
+
 
 def load_v6_cache(
     cache_dir: str = "data/feature_cache_v6",

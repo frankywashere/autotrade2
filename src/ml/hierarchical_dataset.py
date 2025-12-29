@@ -794,9 +794,30 @@ class HierarchicalDataset(Dataset):
         self.using_mmaps = False
         self.using_native_timeframes = True
         self._v6_features_loaded = True
+        self._use_precomputed = False  # v6 has its own labels, no precomputed targets
 
         # Cache torch dtype
         self._torch_dtype = config.get_torch_dtype()
+
+        # v6.0: Preload to RAM if requested (same as native TF mode)
+        if self._preload_tf_to_ram:
+            import time
+            preload_start = time.perf_counter()
+            total_bytes = 0
+
+            print("     📥 Preloading v6 features to RAM...")
+            for tf in list(self.tf_mmaps.keys()):
+                # Force copy to contiguous RAM array
+                self.tf_mmaps[tf] = np.array(self.tf_mmaps[tf])
+                total_bytes += self.tf_mmaps[tf].nbytes
+
+            # Also copy timestamps
+            for tf in list(self.tf_timestamps.keys()):
+                self.tf_timestamps[tf] = np.array(self.tf_timestamps[tf])
+                total_bytes += self.tf_timestamps[tf].nbytes
+
+            preload_time = time.perf_counter() - preload_start
+            print(f"     ✓ Preloaded {total_bytes/1e9:.2f} GB to RAM in {preload_time:.1f}s")
 
         print(f"     ✓ v6 cache is self-contained (no v5.9 dependency)")
 
@@ -817,6 +838,15 @@ class HierarchicalDataset(Dataset):
         # Look up index
         ts_map = self._v6_ts_to_idx.get(tf, {})
         idx = ts_map.get(timestamp_ns)
+
+        # v6.0 fix: For non-5min TFs, use binary search if exact match fails
+        # 5min bars don't always align with 1h/2h/3h/4h/daily boundaries
+        if idx is None and tf != '5min' and tf in self._v6_labels and 'timestamps' in self._v6_labels[tf]:
+            tf_timestamps = self._v6_labels[tf]['timestamps']
+            # Find the largest timestamp <= query timestamp (most recent bar at or before query time)
+            search_idx = np.searchsorted(tf_timestamps, timestamp_ns, side='right') - 1
+            if 0 <= search_idx < len(tf_timestamps):
+                idx = search_idx
 
         if idx is None:
             return {}
@@ -2955,6 +2985,68 @@ def create_hierarchical_dataset(
     """
     # v4.4: Support for 3-way split (train/val/test)
     if test_split is not None and validation_split is not None:
+        # v6.0: Self-contained mode - features_df is None, load from v6 cache
+        if v6_cache_dir is not None and features_df is None:
+            import copy
+
+            # Create base dataset - v6 cache will load features internally
+            base_dataset = HierarchicalDataset(
+                features_df=None,  # v6 cache is self-contained
+                raw_ohlc_df=None,  # v6 cache has OHLC
+                continuation_labels_df=None,
+                continuation_labels_dir=None,  # v6 cache has labels
+                sequence_length=sequence_length,
+                prediction_horizon=prediction_horizon,
+                mode=mode,
+                include_continuation=include_continuation,
+                profiler=profiler,
+                use_native_timeframes=True,  # v6 always uses native TFs
+                v6_cache_dir=v6_cache_dir,
+            )
+
+            # Get length and timestamps from v6 cache's 5-min data
+            tf_timestamps = base_dataset.tf_timestamps['5min']
+            total_len = len(tf_timestamps)
+            train_split_ratio = 1.0 - validation_split - test_split
+            train_end_idx = int(total_len * train_split_ratio)
+            val_end_idx = int(total_len * (train_split_ratio + validation_split))
+
+            # Calculate date ranges from timestamps (nanoseconds -> datetime)
+            train_start_date = pd.Timestamp(tf_timestamps[0], unit='ns').date()
+            train_end_date = pd.Timestamp(tf_timestamps[min(train_end_idx - 1, total_len - 1)], unit='ns').date()
+            val_start_date = pd.Timestamp(tf_timestamps[train_end_idx], unit='ns').date()
+            val_end_date = pd.Timestamp(tf_timestamps[min(val_end_idx - 1, total_len - 1)], unit='ns').date()
+            test_start_date = pd.Timestamp(tf_timestamps[val_end_idx], unit='ns').date()
+            test_end_date = pd.Timestamp(tf_timestamps[total_len - 1], unit='ns').date()
+
+            print(f"\n📊 3-Way Split (v6 self-contained):")
+            print(f"   Train: {train_end_idx:,} samples ({train_start_date} to {train_end_date}) [{train_split_ratio*100:.0f}%]")
+            print(f"   Val:   {val_end_idx - train_end_idx:,} samples ({val_start_date} to {val_end_date}) [{validation_split*100:.0f}%]")
+            print(f"   Test:  {total_len - val_end_idx:,} samples ({test_start_date} to {test_end_date}) [{test_split*100:.0f}%]")
+            print(f"   ⚠️  Test set will NOT be used during training (held-out evaluation only)\n")
+
+            # Split valid_indices based on position in 5-min array
+            all_valid = base_dataset.valid_indices
+            train_valid = [i for i in all_valid if i < train_end_idx]
+            val_valid = [i for i in all_valid if train_end_idx <= i < val_end_idx]
+            test_valid = [i for i in all_valid if i >= val_end_idx]
+
+            # Train dataset (modify base in place)
+            train_dataset = base_dataset
+            train_dataset.valid_indices = train_valid
+
+            # Val dataset (shallow copy, share v6 cache data)
+            val_dataset = copy.copy(base_dataset)
+            val_dataset.valid_indices = val_valid
+
+            # Test dataset (shallow copy, share v6 cache data)
+            test_dataset = copy.copy(base_dataset)
+            test_dataset.valid_indices = test_valid
+
+            print(f"   ✓ Split valid indices: train={len(train_valid):,}, val={len(val_valid):,}, test={len(test_valid):,}")
+
+            return train_dataset, val_dataset, test_dataset
+
         # 3-way split (e.g., 85/10/5)
         total_len = len(features_df)
         train_split_ratio = 1.0 - validation_split - test_split
@@ -3142,6 +3234,57 @@ def create_hierarchical_dataset(
         return train_dataset, val_dataset, test_dataset
 
     elif validation_split is not None:
+        # v6.0: Self-contained mode - features_df is None, load from v6 cache
+        if v6_cache_dir is not None and features_df is None:
+            import copy
+
+            # Create base dataset - v6 cache will load features internally
+            base_dataset = HierarchicalDataset(
+                features_df=None,  # v6 cache is self-contained
+                raw_ohlc_df=None,  # v6 cache has OHLC
+                continuation_labels_df=None,
+                continuation_labels_dir=None,  # v6 cache has labels
+                sequence_length=sequence_length,
+                prediction_horizon=prediction_horizon,
+                mode=mode,
+                include_continuation=include_continuation,
+                profiler=profiler,
+                use_native_timeframes=True,  # v6 always uses native TFs
+                v6_cache_dir=v6_cache_dir,
+            )
+
+            # Get length and timestamps from v6 cache's 5-min data
+            tf_timestamps = base_dataset.tf_timestamps['5min']
+            total_len = len(tf_timestamps)
+            split_idx = int(total_len * (1 - validation_split))
+
+            # Calculate date ranges from timestamps (nanoseconds -> datetime)
+            train_start_date = pd.Timestamp(tf_timestamps[0], unit='ns').date()
+            train_end_date = pd.Timestamp(tf_timestamps[split_idx - 1], unit='ns').date()
+            val_start_date = pd.Timestamp(tf_timestamps[split_idx], unit='ns').date()
+            val_end_date = pd.Timestamp(tf_timestamps[-1], unit='ns').date()
+
+            print(f"\n📊 2-Way Split (v6 self-contained):")
+            print(f"   Train: {split_idx:,} samples ({train_start_date} to {train_end_date})")
+            print(f"   Val:   {total_len - split_idx:,} samples ({val_start_date} to {val_end_date})\n")
+
+            # Split valid_indices based on position in 5-min array
+            all_valid = base_dataset.valid_indices
+            train_valid = [i for i in all_valid if i < split_idx]
+            val_valid = [i for i in all_valid if i >= split_idx]
+
+            # Train dataset (modify base in place)
+            train_dataset = base_dataset
+            train_dataset.valid_indices = train_valid
+
+            # Val dataset (shallow copy, share v6 cache data)
+            val_dataset = copy.copy(base_dataset)
+            val_dataset.valid_indices = val_valid
+
+            print(f"   ✓ Split valid indices: train={len(train_valid):,}, val={len(val_valid):,}")
+
+            return train_dataset, val_dataset, None
+
         # 2-way split (backward compatible)
         split_idx = int(len(features_df) * (1 - validation_split))
         print(f"Split data: {split_idx:,} train rows, {len(features_df) - split_idx:,} val rows")
@@ -3258,6 +3401,23 @@ def create_hierarchical_dataset(
         return train_dataset, val_dataset, None  # v4.4: Return None for test_dataset (2-way split)
     else:
         # No validation split
+        # v6.0: Self-contained mode - features_df is None, load from v6 cache
+        if v6_cache_dir is not None and features_df is None:
+            dataset = HierarchicalDataset(
+                features_df=None,  # v6 cache is self-contained
+                raw_ohlc_df=None,  # v6 cache has OHLC
+                continuation_labels_df=None,
+                continuation_labels_dir=None,  # v6 cache has labels
+                sequence_length=sequence_length,
+                prediction_horizon=prediction_horizon,
+                mode=mode,
+                include_continuation=include_continuation,
+                profiler=profiler,
+                use_native_timeframes=True,  # v6 always uses native TFs
+                v6_cache_dir=v6_cache_dir,
+            )
+            return dataset, None, None
+
         if preload:
             dataset = PreloadHierarchicalDataset(
                 features_df, raw_ohlc_df, continuation_labels_df,
@@ -3276,7 +3436,8 @@ def create_hierarchical_dataset(
                 preload_to_ram=preload_to_ram,
                 preload_tf_to_ram=preload_tf_to_ram,
                 use_native_timeframes=use_native_timeframes,
-                tf_meta_path=tf_meta_path
+                tf_meta_path=tf_meta_path,
+                v6_cache_dir=v6_cache_dir,  # v6.0
             )
 
         return dataset, None, None  # v4.4: Return None for val_dataset and test_dataset (no split)

@@ -1824,7 +1824,7 @@ def interactive_setup(args, profiler=None):
 
     # Initial cache directory selection
     print("\n📂 Cache Directory Selection")
-    cache_dir_default = getattr(args, 'shard_path', 'data/feature_cache') or 'data/feature_cache'
+    cache_dir_default = getattr(args, 'shard_path', 'data/feature_cache_v6') or 'data/feature_cache_v6'
     args.shard_path = inquirer.text(
         message="Cache directory for features/labels:",
         default=cache_dir_default
@@ -1858,6 +1858,7 @@ def interactive_setup(args, profiler=None):
         selected_cache_pair = pick_cache_pair(cache_pairs, layer_status)
 
     # Default cache behavior: reuse if a cache pair was selected, regenerate otherwise
+    # v6.0: Also don't regenerate if v6 cache is selected (set later in menu)
     args.regenerate_cache = False if selected_cache_pair else True
 
     # v5.9.2: Set skip_chunk_validation if training layer is ready but generation layer is missing
@@ -1884,19 +1885,31 @@ def interactive_setup(args, profiler=None):
     print(f"   Status: {'✓ Found' if v6_cache_exists else '✗ Not found'}")
 
     if v6_cache_exists:
-        # Validate the existing v6 cache
-        try:
-            from src.ml.cache_v6 import validate_v6_cache, load_v6_cache
-            print(f"\n   Validating v6 cache...")
-            v6_valid = validate_v6_cache(v6_default_path)
-            if v6_valid:
-                print(f"   ✓ v6 cache is valid")
-            else:
-                print(f"   ✗ v6 cache validation failed")
+        # Ask whether to validate
+        validate_choice = inquirer.select(
+            message="Validate v6 cache?",
+            choices=[
+                Choice(value='skip', name='Skip validation (faster) ⚡'),
+                Choice(value='validate', name='Validate cache integrity (~30s)'),
+            ],
+            default='skip'
+        ).execute()
+
+        if validate_choice == 'validate':
+            try:
+                from src.ml.cache_v6 import validate_v6_cache, load_v6_cache
+                print(f"\n   Validating v6 cache...")
+                v6_valid = validate_v6_cache(v6_default_path)
+                if v6_valid:
+                    print(f"   ✓ v6 cache is valid")
+                else:
+                    print(f"   ✗ v6 cache validation failed")
+                    v6_cache_exists = False
+            except Exception as e:
+                print(f"   ✗ v6 cache validation error: {e}")
                 v6_cache_exists = False
-        except Exception as e:
-            print(f"   ✗ v6 cache validation error: {e}")
-            v6_cache_exists = False
+        else:
+            print(f"   ⚡ Skipping validation")
 
     # Build choices based on current state
     v6_choices = []
@@ -1921,6 +1934,7 @@ def interactive_setup(args, profiler=None):
 
     if v6_action == 'use':
         print(f"   ✓ Using v6 cache: {v6_default_path}")
+        args.regenerate_cache = False  # v6 cache is ready - don't regenerate
 
     elif v6_action == 'generate':
         print(f"\n   Generating v6 cache from v5.9 features...")
@@ -2598,7 +2612,51 @@ def interactive_setup(args, profiler=None):
 
     # Training data range
     print()
-    if selected_cache_pair:
+    # v6.0: If using self-contained v6 cache, skip date questions (data is in cache)
+    v6_self_contained = getattr(args, 'use_v6_cache', False) and getattr(args, 'v6_cache_dir', None)
+    if v6_self_contained:
+        # v6.0: Extract date range from v6 cache metadata (fast, metadata only)
+        try:
+            from src.ml.cache_v6 import load_v6_metadata
+            v6_meta = load_v6_metadata(args.v6_cache_dir)
+            v6_date_range = v6_meta.get('data_range', {})
+            cache_start = int(str(v6_date_range.get('start', '2015'))[:4])
+            cache_end = int(str(v6_date_range.get('end', '2025'))[:4])
+        except Exception:
+            cache_start, cache_end = 2015, 2025
+
+        print(f"\n   📅 v6 cache covers: {cache_start}-{cache_end}")
+
+        # Let user choose full range or subset
+        date_range_choice = inquirer.select(
+            message="Training date range:",
+            choices=[
+                Choice(value='full', name=f'Full range ({cache_start}-{cache_end}) - Maximum data'),
+                Choice(value='subset', name='Custom range - Select start/end within cache'),
+            ],
+            default='full'
+        ).execute()
+
+        if date_range_choice == 'full':
+            args.train_start_year = cache_start
+            args.train_end_year = cache_end
+            print(f"   ✓ Using full range: {cache_start}-{cache_end}")
+        else:
+            args.train_start_year = int(inquirer.number(
+                message="Training start year:",
+                default=cache_start,
+                min_allowed=cache_start,
+                max_allowed=cache_end - 1
+            ).execute())
+
+            args.train_end_year = int(inquirer.number(
+                message="Training end year:",
+                default=cache_end,
+                min_allowed=args.train_start_year + 1,
+                max_allowed=cache_end
+            ).execute())
+            print(f"   ✓ Using custom range: {args.train_start_year}-{args.train_end_year}")
+    elif selected_cache_pair:
         # Lock to cached date range to avoid regenerating
         m_start = manifest_defaults.get('train_start_year', None)
         m_end = manifest_defaults.get('train_end_year', None)
@@ -2643,7 +2701,7 @@ def interactive_setup(args, profiler=None):
         ).execute())
 
     # Validate and notify about warmup impact
-    if not selected_cache_pair:
+    if not selected_cache_pair and not v6_self_contained:
         warmup_years = project_config.MIN_LOOKBACK_MONTHS / 12 if hasattr(project_config, 'MIN_LOOKBACK_MONTHS') else 2.5
         requested_years = args.train_end_year - args.train_start_year
         effective_start_year = args.train_start_year + warmup_years
@@ -2676,9 +2734,14 @@ def interactive_setup(args, profiler=None):
 
     # GPU Acceleration option (skip if using cached features)
     print()
-    will_use_cache = not getattr(args, 'regenerate_cache', True)
+    # v6.0: Include v6_self_contained in will_use_cache check
+    will_use_cache = not getattr(args, 'regenerate_cache', True) or v6_self_contained
     gpu_available = torch.cuda.is_available() or torch.backends.mps.is_available()
-    if selected_cache_pair and will_use_cache:
+    if v6_self_contained:
+        # v6 cache is self-contained - no feature extraction needed
+        args.use_gpu_features = False
+        print("⚡ GPU Acceleration: Skipped (v6 cache is self-contained)")
+    elif selected_cache_pair and will_use_cache:
         args.use_gpu_features = False
         print("⚡ GPU Acceleration: Skipped (using cached features/labels)")
     else:
@@ -2851,7 +2914,12 @@ def interactive_setup(args, profiler=None):
     can_regenerate_tf = layer_status.get('can_regenerate_tf', False) if layer_status else has_existing_chunks
     training_ready = layer_status.get('training_ready', False) if layer_status else False
 
-    if can_regenerate_tf or args.use_chunking:
+    # v6.0: Skip native TF generation menu when v6 cache is self-contained
+    if v6_self_contained:
+        print(f"\n   ✓ Native TF: Using v6 cache (self-contained)")
+        args.generate_native_tf = None
+        args.native_tf_streaming = True
+    elif can_regenerate_tf or args.use_chunking:
         # Chunks exist - can regenerate TF sequences
         print()
         print("=" * 60)
@@ -3627,9 +3695,18 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             print(f"   ⚠️  Events handler load failed: {e}")
             print(f"      Event features will be zeros. Check {project_config.TSLA_EVENTS_FILE}")
 
-    # v5.9: Load features from cache (already extracted in main() before DDP spawn)
-    # OR extract if single-process mode
-    if getattr(args, 'preprocessed_cache_ready', False):
+    # v6.0: Check if v6 cache is self-contained (skip feature extraction entirely)
+    v6_self_contained = getattr(args, 'use_v6_cache', False) and getattr(args, 'v6_cache_dir', None)
+
+    if v6_self_contained:
+        # v6 cache has features embedded - skip all feature extraction
+        if is_main_process(rank):
+            print(f"   ✓ v6 cache is self-contained - skipping feature extraction")
+            print(f"   ✓ Features, OHLC, and labels will load from v6 cache")
+        features_df = None  # Dataset will load from v6 cache
+        continuation_labels_dir = None  # v6 cache has labels
+        mmap_meta_path = None
+    elif getattr(args, 'preprocessed_cache_ready', False):
         # Features already extracted in main() - just load from cache
         if is_main_process(rank):
             print(f"   Loading features from cache (preprocessed before DDP)...")
@@ -3762,7 +3839,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # =========================================================================
     # AUTO-DISCOVER TF_META PATH FOR NATIVE TIMEFRAME MODE
     # =========================================================================
-    if args.use_native_timeframes and args.tf_meta_path is None:
+    # v6.0: Skip if v6 cache is self-contained (doesn't need tf_meta)
+    if v6_self_contained:
+        if is_main_process(rank):
+            print(f"   ✓ v6 cache provides tf_meta (self-contained)")
+        args.tf_meta_path = None  # Not needed for v6
+    elif args.use_native_timeframes and args.tf_meta_path is None:
         # Auto-discover tf_meta_*.json in cache directory
         cache_dir = extractor._unified_cache_dir if hasattr(extractor, '_unified_cache_dir') else shard_path
         cache_key = extractor._cache_key if hasattr(extractor, '_cache_key') else None
@@ -3867,7 +3949,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     dataset_profiler = profiler if args.num_workers == 0 else None
 
     # v6.0: Get v6 cache directory (from interactive menu or config)
-    if USE_V5_LEGACY or not getattr(args, 'use_v6_cache', True):
+    if not getattr(args, 'use_v6_cache', True):
         v6_cache_dir_path = None
         if is_main_process(rank):
             print(f"   ⚠️  v5 legacy mode: Not loading v6 cache")
@@ -4593,6 +4675,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 # v6 cache provides: {tf}_final_duration, {tf}_first_break_bar, {tf}_returned, etc.
                 v6_targets = {}
 
+                # v6.0: Define batch_size and device for fallback paths
+                batch_size = next(iter(targets.values())).shape[0] if targets else 1
+                device = args.device
+
                 # Per-TF targets (from v6 cache labels)
                 TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
                 for tf in TIMEFRAMES:
@@ -4696,7 +4782,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         if dur_key in v6_targets:
                             dur_vals = v6_targets[dur_key]
                             break_vals = v6_targets.get(break_key, torch.zeros_like(dur_vals))
-                            valid_vals = v6_targets.get(valid_key, torch.zeros(dur_vals.shape[0], device=device))
+                            valid_vals = v6_targets.get(valid_key, torch.zeros(dur_vals.shape[0], device=dur_vals.device))
 
                             # Check for all zeros (bad sign)
                             is_all_zero = (dur_vals.abs().sum() == 0).item()
@@ -4750,11 +4836,12 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             if not torch.isfinite(loss):
                 print(f"\n🚨 NaN/Inf loss at batch {batch_idx}!")
                 print(f"   Predictions: mean={predictions[:,:2].mean().item()}, std={predictions[:,:2].std().item()}")
-                print(f"   Targets: mean={target_tensor.mean().item()}, std={target_tensor.std().item()}")
+                if not USE_V6_LOSS:
+                    print(f"   Targets: mean={target_tensor.mean().item()}, std={target_tensor.std().item()}")
                 raise ValueError("Non-finite loss - check for exploding gradients or bad data")
 
-            # Debug: Print target/prediction stats on first batch
-            if batch_idx == 0 and epoch == 0:
+            # Debug: Print target/prediction stats on first batch (v5.x legacy only)
+            if batch_idx == 0 and epoch == 0 and not USE_V6_LOSS:
                 print(f"[DEBUG] targets high: mean={target_tensor[:,0].mean():.2f}%, min={target_tensor[:,0].min():.2f}%, max={target_tensor[:,0].max():.2f}%", flush=True)
                 print(f"[DEBUG] targets low: mean={target_tensor[:,1].mean():.2f}%, min={target_tensor[:,1].min():.2f}%, max={target_tensor[:,1].max():.2f}%", flush=True)
                 print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.3f}, std={predictions[:,:2].std():.3f}", flush=True)
@@ -4779,9 +4866,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
             # =====================================================================
             # v5.7: MULTI-TF LOSS (all timeframes contribute, fixes mode collapse)
+            # v6.0: Only needed for legacy v5 mode (uses target_tensor)
             # =====================================================================
             # Each TF's predictions are weighted by Gumbel-Softmax confidence
-            if 'per_tf_predictions' in hidden_states and 'tf_weights' in hidden_states:
+            if not USE_V6_LOSS and 'per_tf_predictions' in hidden_states and 'tf_weights' in hidden_states:
                 per_tf_preds = hidden_states['per_tf_predictions']
                 tf_weights = hidden_states['tf_weights']  # [batch, 11] from Gumbel-Softmax
 
@@ -4850,7 +4938,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 loss_components['multi_task'] = mt_loss_total.item()
 
             # v5.3: Confidence calibration (ALL samples in batch, every 10th batch)
-            if 'layer_predictions' in hidden_states and batch_idx % 10 == 0:
+            # v6.0: Only needed for legacy v5 mode (uses target_tensor)
+            if not USE_V6_LOSS and 'layer_predictions' in hidden_states and batch_idx % 10 == 0:
                 calib_loss_total = 0.0
                 num_calibrated = 0
 
@@ -5107,7 +5196,8 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 transition_diagnostics['selected_tf_counts'][selected_tf] = transition_diagnostics['selected_tf_counts'].get(selected_tf, 0) + 1
 
                 # Check if any samples in batch have valid labels for selected TF
-                if selected_tf in transition_labels_tensors:
+                # v6.0: transition_labels_tensors only exists in v5.x mode
+                if not USE_V6_LOSS and selected_tf in transition_labels_tensors:
                     if transition_labels_tensors[selected_tf]['valid_mask'].sum() > 0:
                         transition_diagnostics['matches'] += 1
 
@@ -6086,30 +6176,37 @@ def main():
             print(f"   ⚠️  Events load failed: {e}")
 
         # Extract features (CPU work)
-        print("\n3. Extracting features (CPU, 6 workers)...")
-        print("   This happens ONCE before GPUs start")
+        # v6.0: Skip if v6 cache is self-contained
+        if getattr(args, 'use_v6_cache', False) and getattr(args, 'v6_cache_dir', None):
+            print("\n3. Loading from v6 cache...")
+            print("   ✓ v6 cache is self-contained (features embedded)")
+            print("   ✓ Skipping feature extraction")
+            args.preprocessed_cache_ready = False  # Will load from v6 directly
+        else:
+            print("\n3. Extracting features (CPU, 6 workers)...")
+            print("   This happens ONCE before GPUs start")
 
-        extractor = TradingFeatureExtractor()
-        shard_path = Path(args.shard_path) if args.shard_path else Path(project_config.SHARD_DIR)
+            extractor = TradingFeatureExtractor()
+            shard_path = Path(args.shard_path) if args.shard_path else Path(project_config.SHARD_DIR)
 
-        result = extractor.extract_features(
-            df,
-            use_cache=not getattr(args, 'regenerate_cache', True),
-            continuation=True,
-            use_chunking=args.use_chunking,
-            use_gpu=args.use_gpu_features,
-            shard_storage_path=str(shard_path),
-            vix_data=vix_data,
-            events_handler=events_handler,
-            skip_chunk_validation=getattr(args, 'skip_chunk_validation', False),  # v5.9.2
-        )
+            result = extractor.extract_features(
+                df,
+                use_cache=not getattr(args, 'regenerate_cache', True),
+                continuation=True,
+                use_chunking=args.use_chunking,
+                use_gpu=args.use_gpu_features,
+                shard_storage_path=str(shard_path),
+                vix_data=vix_data,
+                events_handler=events_handler,
+                skip_chunk_validation=getattr(args, 'skip_chunk_validation', False),  # v5.9.2
+            )
 
-        print(f"   ✓ Features extracted and cached to {shard_path}")
-        print(f"   ✓ GPU processes will load from cache (instant)")
+            print(f"   ✓ Features extracted and cached to {shard_path}")
+            print(f"   ✓ GPU processes will load from cache (instant)")
 
-        # Store cache info in args for DDP processes
-        args.preprocessed_cache_ready = True
-        args.cache_shard_path = str(shard_path)
+            # Store cache info in args for DDP processes
+            args.preprocessed_cache_ready = True
+            args.cache_shard_path = str(shard_path)
 
     # ==========================================================================
     # DISPATCH TO run_training()
