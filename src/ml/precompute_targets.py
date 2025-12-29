@@ -34,7 +34,7 @@ from src.ml.features import HIERARCHICAL_TIMEFRAMES, FEATURE_VERSION
 
 # Version for precomputed targets - increment when computation logic changes
 # This ensures old precomputed files are regenerated when the logic changes
-PRECOMPUTE_VERSION = "5.9.9"  # Increment when breakout/target computation changes
+PRECOMPUTE_VERSION = "5.9.10"  # Fixed: now uses TSLA_1min.csv for accurate targets
 
 
 def compute_channel_breakout(
@@ -216,14 +216,32 @@ def load_existing_cache(cache_dir: Path) -> Dict:
     print(f"  Loaded transition labels for {len(cache['trans_labels'])} timeframes")
 
     # Load raw OHLC for future prices (breakout computation)
-    raw_ohlc_path = parent_dir / "data" / "tsla_1min_data.csv"
-    if raw_ohlc_path.exists():
+    # Try multiple possible filenames
+    raw_ohlc_candidates = [
+        parent_dir / "data" / "TSLA_1min.csv",  # Standard format
+        parent_dir / "data" / "tsla_1min_data.csv",  # Legacy format
+    ]
+
+    raw_ohlc_path = None
+    for candidate in raw_ohlc_candidates:
+        if candidate.exists():
+            raw_ohlc_path = candidate
+            break
+
+    if raw_ohlc_path is not None:
         print(f"  Loading raw OHLC from {raw_ohlc_path.name}")
         raw_df = pd.read_csv(raw_ohlc_path, parse_dates=['timestamp'], index_col='timestamp')
-        cache['raw_ohlc'] = raw_df[['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']].values
+        # Handle both column naming conventions
+        if 'tsla_open' in raw_df.columns:
+            ohlc_cols = ['tsla_open', 'tsla_high', 'tsla_low', 'tsla_close']
+        else:
+            ohlc_cols = ['open', 'high', 'low', 'close']
+        cache['raw_ohlc'] = raw_df[ohlc_cols].values
         cache['raw_ohlc_timestamps'] = raw_df.index.values.astype('datetime64[ns]').astype('int64')
+        print(f"  Loaded {len(cache['raw_ohlc']):,} 1-min bars for accurate target calculation")
     else:
-        print(f"  WARNING: Raw OHLC not found at {raw_ohlc_path}, breakout labels will use 5min closes")
+        print(f"  WARNING: Raw OHLC not found, tried: {[p.name for p in raw_ohlc_candidates]}")
+        print(f"           Breakout labels will use 5min closes (less accurate)")
         cache['raw_ohlc'] = None
 
     return cache

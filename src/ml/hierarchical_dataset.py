@@ -561,9 +561,11 @@ class HierarchicalDataset(Dataset):
                 self.raw_ohlc_array = self.raw_ohlc_array.astype(expected_dtype)
             # Store timestamps for Priority 1b: timestamp-based index conversion
             self.raw_ohlc_timestamps = raw_ohlc_df.index.values.astype('datetime64[ns]').astype('int64')
+            print(f"     ✓ Target calculation: 1-min OHLC ({len(self.raw_ohlc_array):,} bars)")
         else:
             self.raw_ohlc_array = None
             self.raw_ohlc_timestamps = np.array([], dtype='int64')
+            print(f"     ⚠️  Target calculation: 5-min fallback (no raw_ohlc_df provided)")
 
         # Use 1-min timestamps from 5min array (first timeframe, most granular)
         # Actually we need 1-min timestamps for index conversion
@@ -882,9 +884,17 @@ class HierarchicalDataset(Dataset):
                 future_prices = future_ohlc[:, 3]
             else:
                 future_prices = np.array([current_price])
+
+            # Debug: log data source once per epoch
+            if idx == 0 and os.environ.get('TRAIN_DEBUG', '0') == '1':
+                print(f"[DEBUG] Target calc using 1-MIN data: {len(future_prices)} bars, horizon_1min={horizon_1min}")
         else:
             future_5min_end = min(data_idx_5min + horizon_5min, len(self.tf_mmaps['5min']))
             future_prices = self.tf_mmaps['5min'][data_idx_5min:future_5min_end, self.close_idx_5min]
+
+            # Debug: warn about fallback to 5-min
+            if idx == 0 and os.environ.get('TRAIN_DEBUG', '0') == '1':
+                print(f"[DEBUG] ⚠️  Target calc using 5-MIN FALLBACK: {len(future_prices)} bars (raw_ohlc_array is None!)")
 
         # Compute base targets (pass past_prices=None to skip breakout detection)
         # Base targets like high, low, expected_return are computed here
