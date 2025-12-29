@@ -4113,6 +4113,9 @@ def run_training(rank: int, world_size: int, args_dict: dict):
     # Secondary losses ramp up over warmup_epochs to prevent geo_price explosion
     WARMUP_EPOCHS = 5
 
+    # v6.0: Ensure HIERARCHICAL_TIMEFRAMES is available for return bonus calculation
+    from src.ml.features import HIERARCHICAL_TIMEFRAMES
+
     def get_loss_warmup_weight(epoch: int, warmup_epochs: int, final_weight: float) -> float:
         """Quadratic warmup: 0 → final_weight over warmup_epochs."""
         if epoch >= warmup_epochs:
@@ -4626,7 +4629,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             # This is a NEGATIVE loss - subtracts from total when channels return after breaks
             return_bonus_total = 0.0
             if return_bonus_weight > 0:
-                for tf in project_config.HIERARCHICAL_TIMEFRAMES:
+                for tf in HIERARCHICAL_TIMEFRAMES:
                     returned_key = f'cont_{tf}_returned'
                     bars_outside_key = f'cont_{tf}_bars_outside'
                     valid_key = f'cont_{tf}_valid'
@@ -4646,7 +4649,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         masked_bonus = (bonus * valid_mask).sum() / (valid_mask.sum() + 1e-8)
                         return_bonus_total += masked_bonus
 
-                return_bonus_total = return_bonus_total / len(project_config.HIERARCHICAL_TIMEFRAMES)
+                return_bonus_total = return_bonus_total / len(HIERARCHICAL_TIMEFRAMES)
 
             if return_bonus_total > 0:
                 # Subtract from loss (negative loss component = reward)
