@@ -4491,6 +4491,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             # Now: ~30 tensor operations per TF
             containment_loss_total = 0.0
             hit_probability_loss_total = 0.0
+            hit_probability_tf_count = 0  # v6.0: Track TFs for proper averaging
 
             # Cache window sizes for this batch
             _windows = project_config.CHANNEL_WINDOW_SIZES  # [100, 90, 80, ..., 10] (14 values)
@@ -4611,7 +4612,10 @@ def run_training(rank: int, world_size: int, args_dict: dict):
 
                                 # Average over 3 hit types, then apply validity mask
                                 hit_loss_per_sample = (bce_upper + bce_midline + bce_lower) / 3.0  # [batch]
-                                hit_probability_loss_total += (hit_loss_per_sample * has_valid.float()).sum()
+                                # v6.0: Per-TF mean (not sum) for proper averaging
+                                tf_hit_loss = (hit_loss_per_sample * has_valid.float()).sum() / num_valid_samples
+                                hit_probability_loss_total += tf_hit_loss
+                                hit_probability_tf_count += 1
 
             # Add containment loss (replaces geo_price)
             if containment_loss_total > 0:
@@ -4619,9 +4623,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 loss_components['containment'] = containment_loss_total.item() if hasattr(containment_loss_total, 'item') else containment_loss_total
 
             # Add hit probability loss
-            if hit_probability_loss_total > 0:
-                loss = loss + hit_probability_loss_total * 0.1  # Lower weight than containment
-                loss_components['hit_probability'] = (hit_probability_loss_total * 0.1).item() if hasattr(hit_probability_loss_total, 'item') else hit_probability_loss_total * 0.1
+            # v6.0: Average across TFs (Option C) - each TF contributes equally
+            if hit_probability_loss_total > 0 and hit_probability_tf_count > 0:
+                hit_probability_loss_avg = hit_probability_loss_total / hit_probability_tf_count
+                loss = loss + hit_probability_loss_avg * 0.1  # Lower weight than containment
+                loss_components['hit_probability'] = (hit_probability_loss_avg * 0.1).item() if hasattr(hit_probability_loss_avg, 'item') else hit_probability_loss_avg * 0.1
 
             # =====================================================================
             # v6.0: RETURN BONUS (reward quick returns after temporary breaks)
@@ -4834,11 +4840,13 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 print(f"   Calibration: {loss_components.get('calibration', 0):.3f}")
                 print(f"   Entropy: {loss_components.get('entropy', 0):.3f}")
                 print(f"   Multi-TF: {loss_components.get('multi_tf', 0):.3f}")
+                print(f"   Return-Bonus: -{loss_components.get('return_bonus', 0):.3f}")  # v6.0: negative (reward)
                 print(f"   ─────────────────────")
 
                 # v5.7.2: Verify tracked components sum to total (Fix 5)
-                CONTRIBUTION_KEYS = ['primary', 'multi_task', 'duration', 'containment', 'hit_probability',
-                                     'validity', 'transition', 'calibration', 'multi_tf', 'entropy']
+                # v6.0: Removed 'primary' (duplicates 'duration'), added 'return_bonus'
+                CONTRIBUTION_KEYS = ['multi_task', 'duration', 'containment', 'hit_probability',
+                                     'validity', 'transition', 'calibration', 'multi_tf', 'entropy', 'return_bonus']
                 tracked_sum = sum(loss_components.get(k, 0) for k in CONTRIBUTION_KEYS)
                 print(f"   Tracked: {tracked_sum:.3f}")
                 print(f"   Total: {loss.item():.3f}")
