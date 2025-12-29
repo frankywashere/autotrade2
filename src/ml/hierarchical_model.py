@@ -821,6 +821,29 @@ class HierarchicalLNN(nn.Module, ModelBase):
             self.rsi_extractor = None
             self.rsi_validator = None
 
+        # =========================================================================
+        # v6.0: LEARNED CONTAINMENT CONFIDENCE ADJUSTMENT (Option C)
+        # =========================================================================
+        # Small network that learns: "Given containment violation features,
+        # how much should I adjust this TF's confidence?"
+        #
+        # If violations HELP predict duration → network learns to use them
+        # If violations DON'T help → network learns to ignore them (low weight)
+        #
+        # Input features per TF (8 features):
+        #   - violation_parent1_high, violation_parent1_low, containment_score_parent1, parent1_validity
+        #   - violation_parent2_high, violation_parent2_low, containment_score_parent2, parent2_validity
+        # Output: confidence multiplier [0, 1] where 1 = no change, 0 = zero confidence
+        self.containment_confidence_head = nn.Sequential(
+            nn.Linear(8, 32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid()  # Output [0, 1] multiplier
+        )
+
         # v5.3.1: Refinement Networks (for bidirectional modes)
         # =========================================================================
         # Small networks that combine current hidden + neighbor hidden in Pass 2
@@ -1392,6 +1415,102 @@ class HierarchicalLNN(nn.Module, ModelBase):
         per_tf_highs = torch.cat(per_tf_highs, dim=-1)  # [batch, 11]
         per_tf_lows = torch.cat(per_tf_lows, dim=-1)    # [batch, 11]
         per_tf_confs = torch.cat(per_tf_confs, dim=-1)  # [batch, 11]
+
+        # =========================================================================
+        # v6.0: LEARNED CONTAINMENT CONFIDENCE ADJUSTMENT
+        # =========================================================================
+        # For each TF, check if its projection violates larger TF boundaries.
+        # If violations hurt prediction accuracy, network learns to reduce confidence.
+        # If violations don't matter, network learns to ignore them.
+        #
+        # Example: 5min projects +2%, but 4hr upper bound is +1.5%
+        #          → violation = 0.5%, network might reduce 5min confidence
+        #
+        if geometric_predictions and hasattr(self, 'containment_confidence_head'):
+            containment_adjustments = []
+
+            for tf_idx, tf in enumerate(self.TIMEFRAMES):
+                # Get this TF's projection (if available)
+                if tf not in geometric_predictions:
+                    # No projection for this TF - neutral adjustment
+                    containment_adjustments.append(torch.ones(batch_size, 1, device=device))
+                    continue
+
+                tf_high = geometric_predictions[tf].get('high', torch.zeros(batch_size, 1, device=device))
+                tf_low = geometric_predictions[tf].get('low', torch.zeros(batch_size, 1, device=device))
+
+                # Get containment features against ALL larger TFs (parents)
+                # Features: [violation_high, violation_low, containment_score, parent_validity] × 2 parents
+                parent_features = []
+
+                for parent_offset in range(1, 3):  # Check 2 immediate parents
+                    parent_idx = tf_idx + parent_offset
+
+                    if parent_idx < len(self.TIMEFRAMES):
+                        parent_tf = self.TIMEFRAMES[parent_idx]
+
+                        if parent_tf in geometric_predictions:
+                            parent_high = geometric_predictions[parent_tf].get('high', torch.zeros(batch_size, 1, device=device))
+                            parent_low = geometric_predictions[parent_tf].get('low', torch.zeros(batch_size, 1, device=device))
+
+                            # Compute violations (differentiable)
+                            # violation_high: how much TF exceeds parent's upper bound
+                            violation_high = F.relu(tf_high - parent_high)  # [batch, 1]
+                            # violation_low: how much TF exceeds parent's lower bound
+                            violation_low = F.relu(parent_low - tf_low)     # [batch, 1]
+
+                            # Containment score (1 = perfect fit, 0 = total violation)
+                            parent_range = (parent_high - parent_low).clamp(min=1e-6)
+                            total_violation = violation_high + violation_low
+                            containment_score = (1.0 - total_violation / parent_range).clamp(0, 1)  # [batch, 1]
+
+                            # Parent validity (if available)
+                            if parent_tf in validity_outputs:
+                                parent_validity = validity_outputs[parent_tf]  # [batch, 1]
+                            else:
+                                parent_validity = torch.full((batch_size, 1), 0.5, device=device)
+
+                            parent_features.extend([violation_high, violation_low, containment_score, parent_validity])
+                        else:
+                            # Parent not in geometric_predictions - neutral features
+                            parent_features.extend([
+                                torch.zeros(batch_size, 1, device=device),  # No violation high
+                                torch.zeros(batch_size, 1, device=device),  # No violation low
+                                torch.ones(batch_size, 1, device=device),   # Perfect containment
+                                torch.full((batch_size, 1), 0.5, device=device)  # Neutral validity
+                            ])
+                    else:
+                        # No parent at this level (e.g., 3month has no parents)
+                        parent_features.extend([
+                            torch.zeros(batch_size, 1, device=device),
+                            torch.zeros(batch_size, 1, device=device),
+                            torch.ones(batch_size, 1, device=device),
+                            torch.full((batch_size, 1), 0.5, device=device)
+                        ])
+
+                # Stack features: [batch, 8] (4 features × 2 parents)
+                containment_features = torch.cat(parent_features, dim=-1)  # [batch, 8]
+
+                # Apply learned adjustment head
+                # Output: [batch, 1] multiplier in [0, 1]
+                adjustment = self.containment_confidence_head(containment_features)  # [batch, 1]
+                containment_adjustments.append(adjustment)
+
+            # Stack all adjustments: [batch, 11]
+            containment_adjustments = torch.cat(containment_adjustments, dim=-1)
+
+            # Apply adjustments to confidences (multiplicative)
+            # If adjustment = 1.0: confidence unchanged (no violation or network ignores it)
+            # If adjustment = 0.5: confidence halved (violation matters)
+            # If adjustment = 0.0: confidence zeroed (severe violation)
+            per_tf_confs_adjusted = per_tf_confs * containment_adjustments
+
+            # Store for diagnostics
+            output_dict['containment_adjustments'] = containment_adjustments
+            output_dict['per_tf_confs_raw'] = per_tf_confs  # Before adjustment
+
+            # Use adjusted confidences for selection
+            per_tf_confs = per_tf_confs_adjusted
 
         # =========================================================================
         # v5.7: SOFT SELECTION with Gumbel-Softmax (fixes mode collapse)
