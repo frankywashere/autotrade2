@@ -4301,10 +4301,11 @@ def run_training(rank: int, world_size: int, args_dict: dict):
             loss = torch.tensor(0.0, device=args.device, requires_grad=True)
             loss_components['primary'] = 0.0  # Will be set to duration loss
 
-            # v6.0: High/low MSE demoted to secondary (0.1 weight for debugging)
+            # v6.0: High/low MSE DISABLED (was primary in v5.x, now duration is primary)
+            # Kept for logging only - does NOT contribute to loss
             highlow_mse = F.mse_loss(predictions[:, :2], target_tensor)
-            loss = loss + 0.1 * highlow_mse
-            loss_components['highlow_mse'] = highlow_mse.item()
+            # loss = loss + 0.0 * highlow_mse  # DISABLED
+            loss_components['highlow_mse'] = highlow_mse.item()  # Still logged for comparison
 
             # 🛡️ NaN Check 3: Loss
             if not torch.isfinite(loss):

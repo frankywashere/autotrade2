@@ -9,9 +9,16 @@ Analogy: Train schedule showing known disruptions ahead.
 
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional
+from pathlib import Path
 import torch
 import torch.nn as nn
 import numpy as np
+
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
 
 try:
     import requests
@@ -44,16 +51,21 @@ class LiveEventFetcher:
         'other': 5,
     }
 
-    def __init__(self, finnhub_api_key: Optional[str] = None):
+    def __init__(self, finnhub_api_key: Optional[str] = None, events_csv_path: Optional[str] = None):
         """
         Initialize event fetcher.
 
         Args:
             finnhub_api_key: Optional Finnhub API key for earnings data
+            events_csv_path: Path to events.csv for historical training (default: data/events.csv)
         """
         self.finnhub_key = finnhub_api_key
 
-        # FOMC dates from scraper
+        # v6.0: Load historical events from CSV for training
+        self.historical_events = None
+        self._load_historical_events(events_csv_path)
+
+        # FOMC dates from scraper (for LIVE inference only)
         if HAS_FOMC:
             try:
                 self.fomc_dates = get_all_fomc_dates_2025()
@@ -62,7 +74,7 @@ class LiveEventFetcher:
         else:
             self.fomc_dates = []
 
-        # TSLA delivery dates (predictable quarterly: early Jan/Apr/Jul/Oct)
+        # TSLA delivery dates (for LIVE inference only)
         # Update these annually
         self.delivery_dates = [
             date(2025, 1, 2), date(2025, 4, 2),
@@ -70,7 +82,7 @@ class LiveEventFetcher:
             date(2026, 1, 2), date(2026, 4, 2),
         ]
 
-        # CPI release dates (usually mid-month)
+        # CPI release dates (for LIVE inference only)
         # These are approximate - actual dates vary
         self.cpi_dates = [
             date(2025, 1, 15), date(2025, 2, 12), date(2025, 3, 12),
@@ -78,6 +90,46 @@ class LiveEventFetcher:
             date(2025, 7, 11), date(2025, 8, 13), date(2025, 9, 11),
             date(2025, 10, 10), date(2025, 11, 13), date(2025, 12, 11),
         ]
+
+    def _load_historical_events(self, events_csv_path: Optional[str] = None):
+        """
+        Load historical events from CSV for training.
+
+        v6.0: This enables the model to learn from events during 2015-2024 training,
+        not just the hardcoded 2025-2026 dates.
+        """
+        if not HAS_PANDAS:
+            print("Warning: pandas not available, historical events disabled")
+            return
+
+        # Find events.csv
+        if events_csv_path is None:
+            # Try common locations
+            possible_paths = [
+                Path('data/events.csv'),
+                Path('../data/events.csv'),
+                Path(__file__).parent.parent.parent / 'data' / 'events.csv',
+            ]
+            for p in possible_paths:
+                if p.exists():
+                    events_csv_path = str(p)
+                    break
+
+        if events_csv_path is None or not Path(events_csv_path).exists():
+            print(f"Warning: events.csv not found, historical events disabled")
+            return
+
+        try:
+            df = pd.read_csv(events_csv_path)
+            df['date'] = pd.to_datetime(df['date']).dt.date
+
+            # Map event types to IDs
+            df['type_id'] = df['event_type'].map(self.EVENT_TYPES).fillna(5).astype(int)
+
+            self.historical_events = df
+            print(f"   ✓ Loaded {len(df)} historical events from {events_csv_path}")
+        except Exception as e:
+            print(f"Warning: Failed to load events.csv: {e}")
 
     def fetch_upcoming_events(
         self,
@@ -198,18 +250,41 @@ class LiveEventFetcher:
         """
         Get events relative to a historical timestamp (for training).
 
-        Uses stored event dates rather than live fetching.
+        v6.0: Uses events.csv for historical training data (2015-2024).
+        Falls back to hardcoded dates only if CSV not available.
 
         Args:
             timestamp: Historical datetime
             days_ahead: How many days to look ahead
 
         Returns:
-            List of event dicts
+            List of event dicts (up to 3 nearest events)
         """
         ref_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
         events = []
 
+        # v6.0: Use historical events from CSV if available
+        if self.historical_events is not None:
+            # Filter events within [ref_date, ref_date + days_ahead]
+            end_date = ref_date + timedelta(days=days_ahead)
+
+            mask = (self.historical_events['date'] >= ref_date) & \
+                   (self.historical_events['date'] <= end_date)
+            future_events = self.historical_events[mask]
+
+            for _, row in future_events.iterrows():
+                days = (row['date'] - ref_date).days
+                events.append({
+                    'type': row['event_type'],
+                    'type_id': int(row['type_id']),
+                    'date': row['date'].isoformat(),
+                    'days_until': days,
+                })
+
+            events.sort(key=lambda x: x['days_until'])
+            return events[:3]  # Top 3 nearest events
+
+        # Fallback: use hardcoded dates (only works for 2025-2026)
         # FOMC dates
         for fomc_date in self.fomc_dates:
             if isinstance(fomc_date, str):

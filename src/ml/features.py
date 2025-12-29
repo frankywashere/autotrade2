@@ -40,7 +40,7 @@ EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
 CHANNEL_PROJECTION_VERSION = "v2"  # v5.6: Removed fixed projections - now calculated at inference from learned duration
 BREAKDOWN_CALC_VERSION = "v3"  # v5.8: Fixed window sizes for 1min input (was 5x too short in v2)
 PARTIAL_BAR_VERSION = "v4"  # v5.6: Removed projected_high/low/center - projections calculated at inference
-CONTINUATION_LABEL_VERSION = "v2.1"  # v5.9.1: Partial window support for small TFs (3month gets w10-w30)
+CONTINUATION_LABEL_VERSION = "v3.0"  # v6.0: Return-after-break tracking (first_break_bar, returned, bars_outside, final_duration)
 FEATURE_VERSION = f"v5.9.1_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}"
 # v5.9.1: Partial window support - TFs with <100 bars generate labels for windows that DO fit (restores 3month labels)
 
