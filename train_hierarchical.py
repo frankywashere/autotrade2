@@ -2008,8 +2008,10 @@ def interactive_setup(args, profiler=None):
 
     # Consolidated precision menu for CUDA
     # v5.7.2: Removed AMP (FP16) - caused NaN issues and duplicated code
+    # v6.0: Added BFloat16 support
     args.precision_mode = 'fp32'  # Track the user's choice
     args.use_tf32 = False  # v5.3: TF32 Tensor Core acceleration
+    args.use_bfloat16 = False  # v6.0: BFloat16 mixed precision
 
     if args.device.startswith('cuda'):
         print()
@@ -2017,6 +2019,7 @@ def interactive_setup(args, profiler=None):
             message="Training precision:",
             choices=[
                 Choice(value='fp32_tf32', name="FP32 with TF32 Tensor Cores ⭐ Recommended (~2x faster)"),
+                Choice(value='bfloat16', name="BFloat16 Mixed Precision (fastest, ~50% memory savings)"),
                 Choice(value='fp32', name="FP32 Standard (no acceleration)"),
                 Choice(value='fp64', name="FP64 - Double precision (very slow)")
             ],
@@ -2027,6 +2030,7 @@ def interactive_setup(args, profiler=None):
 
         if precision_choice == 'fp32_tf32':
             args.use_tf32 = True
+            args.use_bfloat16 = False
             torch.set_float32_matmul_precision('medium')  # Enable TF32
             project_config.TRAINING_PRECISION = 'float32'
             project_config.NUMPY_DTYPE = np.float32
@@ -2034,8 +2038,26 @@ def interactive_setup(args, profiler=None):
             print("   ⭐ FP32 with TF32 Tensor Cores")
             print("   → Ampere+ GPU acceleration (~2x matmul speedup)")
             print("   → Stable (no NaN, same range as FP32)")
+        elif precision_choice == 'bfloat16':
+            args.use_tf32 = False
+            args.use_bfloat16 = True
+            torch.set_float32_matmul_precision('highest')
+            project_config.TRAINING_PRECISION = 'bfloat16'
+            project_config.NUMPY_DTYPE = np.float32  # Data loading stays float32
+            project_config._TORCH_DTYPE = torch.bfloat16
+            # Check GPU capability
+            gpu_cap = torch.cuda.get_device_capability()
+            if gpu_cap[0] >= 8:  # Ampere+
+                print("   ⚡ BFloat16 Mixed Precision")
+                print(f"   → GPU compute capability {gpu_cap[0]}.{gpu_cap[1]} - native BF16 support")
+            else:
+                print("   ⚠️  BFloat16 Mixed Precision (may be slower on pre-Ampere GPUs)")
+                print(f"   → GPU compute capability {gpu_cap[0]}.{gpu_cap[1]} - BF16 emulated")
+            print("   → ~50% memory savings, ~2x faster training")
+            print("   → Same exponent range as FP32 (no loss scaling needed)")
         elif precision_choice == 'fp32':
             args.use_tf32 = False
+            args.use_bfloat16 = False
             torch.set_float32_matmul_precision('highest')  # Disable TF32
             project_config.TRAINING_PRECISION = 'float32'
             project_config.NUMPY_DTYPE = np.float32
@@ -2043,6 +2065,7 @@ def interactive_setup(args, profiler=None):
             print("   → FP32 Standard - Highest precision (slower)")
         else:  # fp64
             args.use_tf32 = False
+            args.use_bfloat16 = False
             project_config.TRAINING_PRECISION = 'float64'
             project_config.NUMPY_DTYPE = np.float64
             project_config._TORCH_DTYPE = torch.float64
@@ -4280,10 +4303,19 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 _progress_thread.start()
 
             # Forward pass (v5.7.2: removed AMP, use TF32 instead)
-            _forward_start = time.perf_counter()
-            predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
-            _forward_time = time.perf_counter() - _forward_start
-            _loss_start = time.perf_counter()  # Start loss timing
+            # v6.0: Added BFloat16 autocast support - covers forward + loss computation
+
+            # Create autocast context for bfloat16 (no GradScaler needed - same exponent range as fp32)
+            if getattr(args, 'use_bfloat16', False) and args.device.startswith('cuda'):
+                autocast_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+            else:
+                autocast_ctx = torch.amp.autocast(device_type='cuda', enabled=False)  # No-op context
+
+            with autocast_ctx:
+                _forward_start = time.perf_counter()
+                predictions, hidden_states = model(features, vix_sequence=vix_batch, events=events_batch)
+                _forward_time = time.perf_counter() - _forward_start
+                _loss_start = time.perf_counter()  # Start loss timing
 
             # 🛡️ NaN Check 1: Predictions
             if not torch.isfinite(predictions).all():
@@ -4936,8 +4968,15 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 if vix_batch_val is not None:
                     vix_batch_val = vix_batch_val.to(args.device, non_blocking=True)
 
-                # v5.7.2: Forward pass (removed AMP)
-                predictions, hidden_states = model(features, vix_sequence=vix_batch_val, events=events_batch_val)
+                # v6.0: Create validation autocast context (same as training)
+                if getattr(args, 'use_bfloat16', False) and args.device.startswith('cuda'):
+                    val_autocast_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+                else:
+                    val_autocast_ctx = torch.amp.autocast(device_type='cuda', enabled=False)
+
+                # v5.7.2: Forward pass (v6.0: added bfloat16 autocast)
+                with val_autocast_ctx:
+                    predictions, hidden_states = model(features, vix_sequence=vix_batch_val, events=events_batch_val)
                 target_tensor = torch.stack([targets['high'], targets['low']], dim=1)
                 loss = F.mse_loss(predictions[:, :2], target_tensor)
 

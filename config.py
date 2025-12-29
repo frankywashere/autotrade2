@@ -286,12 +286,15 @@ HISTORICAL_BUFFER_YEARS = 3    # Years of data to load before training start (in
 # Numerical precision for training
 # - 'float64': Maximum precision (8 bytes), best for training, ~10% more memory
 # - 'float32': Standard precision (4 bytes), faster, uses half memory, required for MPS
+# - 'bfloat16': Brain floating point (2 bytes), fastest on Ampere+ GPUs, ~50% memory savings
 #
-# NOTE: MPS (Apple Silicon) requires float32. float64 unsupported on MPS devices.
-TRAINING_PRECISION = 'float32'  # 'float64' or 'float32' (MPS requires float32)
+# NOTE: MPS (Apple Silicon) requires float32. float64/bfloat16 unsupported on MPS devices.
+# NOTE: bfloat16 best on NVIDIA Ampere+ (RTX 30/40 series, A100, H100)
+TRAINING_PRECISION = 'float32'  # 'float64', 'float32', or 'bfloat16'
 
 # Derived dtypes (auto-set from TRAINING_PRECISION - don't modify directly)
 import numpy as np
+# NumPy doesn't support bfloat16 natively - use float32 for data loading, bfloat16 for compute
 NUMPY_DTYPE = np.float64 if TRAINING_PRECISION == 'float64' else np.float32
 
 # Lazy-loaded torch dtype - avoids importing torch in multiprocessing workers
@@ -304,8 +307,31 @@ def get_torch_dtype():
     global _TORCH_DTYPE
     if _TORCH_DTYPE is None:
         import torch
-        _TORCH_DTYPE = torch.float64 if TRAINING_PRECISION == 'float64' else torch.float32
+        if TRAINING_PRECISION == 'float64':
+            _TORCH_DTYPE = torch.float64
+        elif TRAINING_PRECISION == 'bfloat16':
+            _TORCH_DTYPE = torch.bfloat16
+        else:
+            _TORCH_DTYPE = torch.float32
     return _TORCH_DTYPE
+
+def set_precision(precision: str):
+    """Set training precision at runtime. Call before model creation."""
+    global TRAINING_PRECISION, NUMPY_DTYPE, _TORCH_DTYPE
+    import torch
+
+    if precision not in ('float64', 'float32', 'bfloat16'):
+        raise ValueError(f"Invalid precision: {precision}. Must be 'float64', 'float32', or 'bfloat16'")
+
+    TRAINING_PRECISION = precision
+    NUMPY_DTYPE = np.float64 if precision == 'float64' else np.float32
+
+    if precision == 'float64':
+        _TORCH_DTYPE = torch.float64
+    elif precision == 'bfloat16':
+        _TORCH_DTYPE = torch.bfloat16
+    else:
+        _TORCH_DTYPE = torch.float32
 
 # ======================================================================
 # CHANNEL WINDOW CONFIGURATION
