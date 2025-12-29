@@ -135,6 +135,11 @@ def detect_break_with_return(
     consecutive_inside_after_break = 0
     price_sequence = []
 
+    # Track the LAST break that doesn't return (the "real" break)
+    last_real_break_bar = None
+    current_break_bar = None
+    current_break_direction = 0
+
     # Hit tracking
     hit_upper = False
     hit_midline = False
@@ -183,26 +188,40 @@ def detect_break_with_return(
             consecutive_inside_after_break = 0
             max_consecutive_outside = max(max_consecutive_outside, current_consecutive_outside)
 
+            # Track first break ever (for legacy compatibility)
             if first_break_bar is None:
                 first_break_bar = bar_idx
                 break_direction = 1 if price > upper else -1
+
+            # Start a new break if we're not currently tracking one
+            if current_break_bar is None:
+                current_break_bar = bar_idx
+                current_break_direction = 1 if price > upper else -1
         else:
             current_consecutive_outside = 0
 
-            if first_break_bar is not None and not returned:
+            # Check if we returned from a break
+            if current_break_bar is not None:
                 consecutive_inside_after_break += 1
 
                 if consecutive_inside_after_break >= return_threshold_bars:
-                    returned = True
-                    bars_to_return = bar_idx - first_break_bar
+                    # This break was a fake-out - reset and keep looking
+                    returned = True  # At least one return occurred
+                    bars_to_return = bar_idx - current_break_bar  # Track last return time
+                    current_break_bar = None  # Reset to detect next break
+                    current_break_direction = 0
+                    consecutive_inside_after_break = 0
 
-    # Calculate final duration
-    if first_break_bar is None:
+    # Determine final duration: when did the channel REALLY break (no return)?
+    if current_break_bar is not None:
+        # Currently broken and hasn't returned - this is the real break
+        final_duration = current_break_bar
+    elif first_break_bar is None:
+        # Never broke at all
         final_duration = scan_length
-    elif returned:
-        final_duration = scan_length  # Channel effectively still valid
     else:
-        final_duration = first_break_bar
+        # Broke one or more times but all returned - channel is still valid
+        final_duration = scan_length
 
     return {
         'first_break_bar': first_break_bar if first_break_bar is not None else scan_length,
