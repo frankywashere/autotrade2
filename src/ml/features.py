@@ -41,7 +41,8 @@ CHANNEL_PROJECTION_VERSION = "v2"  # v5.6: Removed fixed projections - now calcu
 BREAKDOWN_CALC_VERSION = "v3"  # v5.8: Fixed window sizes for 1min input (was 5x too short in v2)
 PARTIAL_BAR_VERSION = "v4"  # v5.6: Removed projected_high/low/center - projections calculated at inference
 CONTINUATION_LABEL_VERSION = "v3.0"  # v3.0: Return-after-break tracking (first_break_bar, returned, bars_outside, final_duration)
-FEATURE_VERSION = f"v5.9.1_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}"
+CHANNEL_HISTORY_VERSION = "v1.0"  # v6.0: Channel history features (prev_duration, prev_direction, duration_trend, etc.)
+FEATURE_VERSION = f"v5.9.1_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}_hist{CHANNEL_HISTORY_VERSION}"
 # v5.9.1: Partial window support - TFs with <100 bars generate labels for windows that DO fit (restores 3month labels)
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
@@ -377,6 +378,20 @@ class TradingFeatureExtractor(FeatureExtractor):
         for tf in ['1h', '4h', 'daily']:
             features.append(f'tsla_in_channel_{tf}')
             features.append(f'spy_in_channel_{tf}')
+
+        # v6.0: Channel history features (from transition labels)
+        # These encode what happened in PREVIOUS channels to provide context
+        # for predicting current channel duration and transition type
+        for tf in timeframes:
+            features.extend([
+                f'prev_channel_duration_{tf}',      # Duration of last completed channel (bars)
+                f'prev_channel_direction_{tf}',     # Direction: 0=bull, 1=bear, 2=sideways
+                f'prev_transition_type_{tf}',       # How it ended: 0=continue, 1=switch, 2=reverse, 3=sideways
+                f'channel_duration_trend_{tf}',     # Slope of last 5 durations (normalized -1 to +1)
+                f'channels_count_500bars_{tf}',     # Number of transitions in last 500 bars
+                f'consecutive_same_direction_{tf}', # Streak of same-direction channels
+                f'avg_recent_duration_{tf}',        # Mean of last 5 channel durations
+            ])
 
         self.feature_names = features
 
@@ -862,6 +877,30 @@ class TradingFeatureExtractor(FeatureExtractor):
                     )
                     if transition_files:
                         print(f"   ✓ Transition labels saved to: {cache_dir}")
+
+                # v6.0: Generate channel history features from transition labels
+                history_cache_path = cache_dir / f"channel_history_features_{cache_suffix}.pkl"
+                if history_cache_path.exists() and use_cache:
+                    print(f"   📂 Loading cached channel history features: {history_cache_path.name}")
+                    history_df = pd.read_pickle(history_cache_path)
+                    # Align to current features_df index
+                    common_idx = features_df.index.intersection(history_df.index)
+                    if len(common_idx) > 0:
+                        for col in history_df.columns:
+                            features_df[col] = 0.0  # Initialize
+                            features_df.loc[common_idx, col] = history_df.loc[common_idx, col]
+                        print(f"   ✓ Loaded {len(history_df.columns)} channel history features ({len(common_idx):,} aligned rows)")
+                else:
+                    print(f"\n   🔄 Generating channel history features (v6.0)...")
+                    history_df = self.generate_channel_history_features(
+                        transition_labels_dir=cache_dir,
+                        feature_index=features_df.index,
+                        cache_suffix=cache_suffix,
+                        output_dir=cache_dir
+                    )
+                    # Merge into features_df
+                    for col in history_df.columns:
+                        features_df[col] = history_df[col]
 
         # Fill NaNs (only if we extracted - cached data already has NaNs filled)
         if not skip_all_extraction:
@@ -6323,6 +6362,190 @@ class TradingFeatureExtractor(FeatureExtractor):
 
         print(f"\n   ✓ Generated transition labels for {len(saved_files)}/{len(HIERARCHICAL_TIMEFRAMES)} timeframes")
         return saved_files
+
+    def generate_channel_history_features(
+        self,
+        transition_labels_dir: Path,
+        feature_index: pd.DatetimeIndex,
+        cache_suffix: str = None,
+        output_dir: Path = None,
+    ) -> pd.DataFrame:
+        """
+        Generate channel history features from transition labels (v6.0).
+
+        These features encode what happened in PREVIOUS channels to provide
+        context for predicting current channel behavior.
+
+        Features per timeframe (7 × 11 = 77 total):
+        - prev_channel_duration_{tf}: Duration of last completed channel
+        - prev_channel_direction_{tf}: Direction (0=bull, 1=bear, 2=sideways)
+        - prev_transition_type_{tf}: How it ended (0=continue, 1=switch, 2=reverse, 3=sideways)
+        - channel_duration_trend_{tf}: Slope of last 5 durations (normalized)
+        - channels_count_500bars_{tf}: Transitions in last 500 bars
+        - consecutive_same_direction_{tf}: Same-direction channel streak
+        - avg_recent_duration_{tf}: Mean of last 5 durations
+
+        Args:
+            transition_labels_dir: Directory containing transition_labels_{tf}_*.pkl files
+            feature_index: DatetimeIndex to align features to (from main feature DataFrame)
+            cache_suffix: Optional cache suffix for file naming
+            output_dir: Where to save (defaults to transition_labels_dir)
+
+        Returns:
+            DataFrame with 77 channel history features, indexed by feature_index
+        """
+        from tqdm import tqdm
+        import numpy as np
+
+        transition_labels_dir = Path(transition_labels_dir)
+        if output_dir is None:
+            output_dir = transition_labels_dir
+        output_dir = Path(output_dir)
+
+        print(f"\n   🔄 Generating channel history features (v6.0)...")
+        print(f"      Source: {transition_labels_dir}")
+        print(f"      Target index: {len(feature_index):,} timestamps")
+
+        # Load all transition labels
+        all_trans_labels = {}
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            pattern = f"transition_labels_{tf}_*.pkl"
+            files = list(transition_labels_dir.glob(pattern))
+            if files:
+                # Use most recent file if multiple exist
+                trans_df = pd.read_pickle(files[0])
+                all_trans_labels[tf] = trans_df.sort_index()
+                print(f"      ✓ Loaded {tf}: {len(trans_df):,} transitions")
+            else:
+                print(f"      ⚠️  No transition labels found for {tf}")
+
+        if not all_trans_labels:
+            print(f"      ❌ No transition labels found - returning empty DataFrame")
+            # Return DataFrame with all zeros
+            columns = []
+            for tf in HIERARCHICAL_TIMEFRAMES:
+                columns.extend([
+                    f'prev_channel_duration_{tf}',
+                    f'prev_channel_direction_{tf}',
+                    f'prev_transition_type_{tf}',
+                    f'channel_duration_trend_{tf}',
+                    f'channels_count_500bars_{tf}',
+                    f'consecutive_same_direction_{tf}',
+                    f'avg_recent_duration_{tf}',
+                ])
+            return pd.DataFrame(0.0, index=feature_index, columns=columns)
+
+        # Initialize result arrays
+        n_samples = len(feature_index)
+        result_data = {}
+
+        for tf in HIERARCHICAL_TIMEFRAMES:
+            result_data[f'prev_channel_duration_{tf}'] = np.zeros(n_samples, dtype=np.float32)
+            result_data[f'prev_channel_direction_{tf}'] = np.full(n_samples, 2.0, dtype=np.float32)  # Default: sideways
+            result_data[f'prev_transition_type_{tf}'] = np.zeros(n_samples, dtype=np.float32)  # Default: continue
+            result_data[f'channel_duration_trend_{tf}'] = np.zeros(n_samples, dtype=np.float32)
+            result_data[f'channels_count_500bars_{tf}'] = np.zeros(n_samples, dtype=np.float32)
+            result_data[f'consecutive_same_direction_{tf}'] = np.zeros(n_samples, dtype=np.float32)
+            result_data[f'avg_recent_duration_{tf}'] = np.zeros(n_samples, dtype=np.float32)
+
+        # Convert feature_index to numpy for faster lookup
+        feature_timestamps = feature_index.values
+
+        # Process each timeframe with VECTORIZED operations (v6.0 optimization)
+        for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="      Processing TFs"):
+            if tf not in all_trans_labels:
+                continue
+
+            trans_df = all_trans_labels[tf]
+            trans_timestamps = trans_df.index.values
+            trans_durations = trans_df['duration_bars'].values.astype(np.float32)
+            trans_directions = trans_df['current_direction'].values.astype(np.float32)
+            trans_types = trans_df['transition_type'].values.astype(np.float32)
+
+            # VECTORIZED: Use searchsorted to find insertion points
+            # This gives us the index where each feature_timestamp would be inserted
+            # to maintain sorted order - i.e., the index of the first transition >= timestamp
+            # We want the transition BEFORE, so subtract 1
+            insertion_indices = np.searchsorted(trans_timestamps, feature_timestamps, side='left')
+
+            # For each sample, the most recent transition is at insertion_indices - 1
+            # Handle edge case: if insertion_index is 0, there's no prior transition
+            has_history = insertion_indices > 0
+            last_trans_idx = np.clip(insertion_indices - 1, 0, len(trans_timestamps) - 1)
+
+            # Fill most recent transition values (vectorized)
+            result_data[f'prev_channel_duration_{tf}'][has_history] = trans_durations[last_trans_idx[has_history]]
+            result_data[f'prev_channel_direction_{tf}'][has_history] = trans_directions[last_trans_idx[has_history]]
+            result_data[f'prev_transition_type_{tf}'][has_history] = trans_types[last_trans_idx[has_history]]
+
+            # For trend/avg/streak calculations, we need the last 5 transitions
+            # This requires a loop but only over samples with history
+            samples_with_history = np.where(has_history)[0]
+
+            # Process in batches for memory efficiency
+            batch_size = 50000
+            for batch_start in range(0, len(samples_with_history), batch_size):
+                batch_end = min(batch_start + batch_size, len(samples_with_history))
+                batch_indices = samples_with_history[batch_start:batch_end]
+
+                for i in batch_indices:
+                    last_idx = last_trans_idx[i]
+
+                    # Get last 5 transitions
+                    start_idx = max(0, last_idx - 4)
+                    recent_durations = trans_durations[start_idx:last_idx + 1]
+
+                    # Average recent duration
+                    result_data[f'avg_recent_duration_{tf}'][i] = np.mean(recent_durations)
+
+                    # Duration trend (normalized slope)
+                    if len(recent_durations) >= 2:
+                        x = np.arange(len(recent_durations))
+                        slope = np.polyfit(x, recent_durations, 1)[0]
+                        mean_dur = np.mean(recent_durations)
+                        if mean_dur > 0:
+                            normalized_slope = np.clip(slope / mean_dur, -1.0, 1.0)
+                            result_data[f'channel_duration_trend_{tf}'][i] = normalized_slope
+
+                    # Count transitions in last 500 minutes
+                    ts = feature_timestamps[i]
+                    lookback_ns = np.timedelta64(500, 'm')
+                    cutoff_ts = ts - lookback_ns
+                    # Count transitions between cutoff and current timestamp
+                    count_start = np.searchsorted(trans_timestamps, cutoff_ts, side='left')
+                    result_data[f'channels_count_500bars_{tf}'][i] = last_idx - count_start + 1
+
+                    # Consecutive same-direction streak
+                    last_dir = trans_directions[last_idx]
+                    streak = 1
+                    for j in range(last_idx - 1, -1, -1):
+                        if trans_directions[j] == last_dir:
+                            streak += 1
+                        else:
+                            break
+                    result_data[f'consecutive_same_direction_{tf}'][i] = streak
+
+        # Create DataFrame
+        result_df = pd.DataFrame(result_data, index=feature_index)
+
+        # Save to cache
+        if cache_suffix:
+            cache_path = output_dir / f"channel_history_features_{cache_suffix}.pkl"
+        else:
+            cache_path = output_dir / "channel_history_features.pkl"
+
+        result_df.to_pickle(cache_path)
+        print(f"\n   ✓ Generated {len(result_df.columns)} channel history features")
+        print(f"   💾 Saved to: {cache_path.name}")
+
+        # Print sample stats
+        for tf in ['5min', 'daily']:  # Sample TFs
+            if tf in all_trans_labels:
+                col = f'prev_channel_duration_{tf}'
+                nonzero = (result_df[col] > 0).sum()
+                print(f"      {tf}: {nonzero:,}/{n_samples:,} samples have history ({100*nonzero/n_samples:.1f}%)")
+
+        return result_df
 
     def create_sequences(self, features_df: pd.DataFrame, sequence_length: int = 168,
                         target_horizon: int = 24) -> Tuple[torch.Tensor, torch.Tensor]:
