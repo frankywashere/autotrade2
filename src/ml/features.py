@@ -41,7 +41,7 @@ CHANNEL_PROJECTION_VERSION = "v2"  # v5.6: Removed fixed projections - now calcu
 BREAKDOWN_CALC_VERSION = "v3"  # v5.8: Fixed window sizes for 1min input (was 5x too short in v2)
 PARTIAL_BAR_VERSION = "v4"  # v5.6: Removed projected_high/low/center - projections calculated at inference
 CONTINUATION_LABEL_VERSION = "v3.0"  # v3.0: Return-after-break tracking (first_break_bar, returned, bars_outside, final_duration)
-CHANNEL_HISTORY_VERSION = "v1.0"  # v6.0: Channel history features (separate cache, NOT in FEATURE_VERSION)
+CHANNEL_HISTORY_VERSION = "v1.1"  # v6.0: Added bounce count features (prev_channel_bounce_count, bounce_count_trend)
 FEATURE_VERSION = f"v5.9.1_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}"
 # v5.9.1: Partial window support - TFs with <100 bars generate labels for windows that DO fit (restores 3month labels)
 
@@ -391,6 +391,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                 f'channels_count_500bars_{tf}',     # Number of transitions in last 500 bars
                 f'consecutive_same_direction_{tf}', # Streak of same-direction channels
                 f'avg_recent_duration_{tf}',        # Mean of last 5 channel durations
+                f'prev_channel_bounce_count_{tf}',  # Bounce count (cycles) in previous channel
+                f'bounce_count_trend_{tf}',         # Slope of last 5 bounce counts (normalized -1 to +1)
             ])
 
         self.feature_names = features
@@ -6238,6 +6240,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                 current_slope = row[f'w{best_window}_slope']
                 current_r_squared = row[f'w{best_window}_r_squared']
                 current_direction = slope_to_direction(current_slope)
+                # v6.0: Capture cycle count for bounce history features
+                current_cycles = row.get(f'w{best_window}_cycles', 0)
+                if pd.isna(current_cycles):
+                    current_cycles = 0
 
                 # Look at what happened after the channel ended
                 future_idx = i + max(1, duration) + 5  # Look 5 bars after break
@@ -6253,6 +6259,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                         'new_direction': current_direction,
                         'new_slope': current_slope,
                         'current_r_squared': current_r_squared,
+                        'current_cycles': current_cycles,  # v6.0: bounce count
                     })
                     continue
 
@@ -6329,6 +6336,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                     'new_direction': future_direction,
                     'new_slope': future_slope,
                     'current_r_squared': current_r_squared,
+                    'current_cycles': current_cycles,  # v6.0: bounce count
                 })
 
             if len(transition_labels) == 0:
@@ -6434,6 +6442,8 @@ class TradingFeatureExtractor(FeatureExtractor):
                     f'channels_count_500bars_{tf}',
                     f'consecutive_same_direction_{tf}',
                     f'avg_recent_duration_{tf}',
+                    f'prev_channel_bounce_count_{tf}',
+                    f'bounce_count_trend_{tf}',
                 ])
             return pd.DataFrame(0.0, index=feature_index, columns=columns)
 
@@ -6449,6 +6459,9 @@ class TradingFeatureExtractor(FeatureExtractor):
             result_data[f'channels_count_500bars_{tf}'] = np.zeros(n_samples, dtype=np.float32)
             result_data[f'consecutive_same_direction_{tf}'] = np.zeros(n_samples, dtype=np.float32)
             result_data[f'avg_recent_duration_{tf}'] = np.zeros(n_samples, dtype=np.float32)
+            # v6.0: Bounce count history
+            result_data[f'prev_channel_bounce_count_{tf}'] = np.zeros(n_samples, dtype=np.float32)
+            result_data[f'bounce_count_trend_{tf}'] = np.zeros(n_samples, dtype=np.float32)
 
         # Convert feature_index to numpy for faster lookup
         feature_timestamps = feature_index.values
@@ -6463,6 +6476,11 @@ class TradingFeatureExtractor(FeatureExtractor):
             trans_durations = trans_df['duration_bars'].values.astype(np.float32)
             trans_directions = trans_df['current_direction'].values.astype(np.float32)
             trans_types = trans_df['transition_type'].values.astype(np.float32)
+            # v6.0: Load cycles (with fallback for old transition labels)
+            if 'current_cycles' in trans_df.columns:
+                trans_cycles = trans_df['current_cycles'].fillna(0).values.astype(np.float32)
+            else:
+                trans_cycles = np.zeros(len(trans_df), dtype=np.float32)
             n_trans = len(trans_timestamps)
 
             # VECTORIZED: Use searchsorted to find insertion points
@@ -6476,6 +6494,8 @@ class TradingFeatureExtractor(FeatureExtractor):
             result_data[f'prev_channel_duration_{tf}'][has_history] = trans_durations[last_trans_idx[has_history]]
             result_data[f'prev_channel_direction_{tf}'][has_history] = trans_directions[last_trans_idx[has_history]]
             result_data[f'prev_transition_type_{tf}'][has_history] = trans_types[last_trans_idx[has_history]]
+            # v6.0: Previous channel bounce count
+            result_data[f'prev_channel_bounce_count_{tf}'][has_history] = trans_cycles[last_trans_idx[has_history]]
 
             # =====================================================================
             # VECTORIZED: Channels count in last 500 minutes
@@ -6548,6 +6568,27 @@ class TradingFeatureExtractor(FeatureExtractor):
                     streaks[i] = 1
 
             result_data[f'consecutive_same_direction_{tf}'][has_history] = streaks[last_trans_idx[has_history]]
+
+            # =====================================================================
+            # VECTORIZED: Bounce count trend (v6.0)
+            # =====================================================================
+            # Pre-compute slope of cycle counts over last 5 channels
+            cycle_slopes = np.zeros(n_trans, dtype=np.float32)
+            for i in range(n_trans):
+                start = max(0, i - window_size + 1)
+                n = i - start + 1
+                if n >= 2:
+                    local_cycles = trans_cycles[start:i+1]
+                    local_x = np.arange(n)
+                    x_mean = (n - 1) / 2.0
+                    y_mean = np.mean(local_cycles)
+                    numerator = np.sum((local_x - x_mean) * (local_cycles - y_mean))
+                    denominator = np.sum((local_x - x_mean) ** 2)
+                    if denominator > 0 and y_mean > 0:
+                        slope = numerator / denominator
+                        cycle_slopes[i] = np.clip(slope / y_mean, -1.0, 1.0)
+
+            result_data[f'bounce_count_trend_{tf}'][has_history] = cycle_slopes[last_trans_idx[has_history]]
 
         # Create DataFrame
         result_df = pd.DataFrame(result_data, index=feature_index)

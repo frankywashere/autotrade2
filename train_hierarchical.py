@@ -4355,7 +4355,7 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                 print(f"[DEBUG] targets high: mean={target_tensor[:,0].mean():.2f}%, min={target_tensor[:,0].min():.2f}%, max={target_tensor[:,0].max():.2f}%", flush=True)
                 print(f"[DEBUG] targets low: mean={target_tensor[:,1].mean():.2f}%, min={target_tensor[:,1].min():.2f}%, max={target_tensor[:,1].max():.2f}%", flush=True)
                 print(f"[DEBUG] predictions: mean={predictions[:,:2].mean():.3f}, std={predictions[:,:2].std():.3f}", flush=True)
-                print(f"[DEBUG] high/low MSE (SECONDARY, 0.1 weight): {highlow_mse.item():.4f}", flush=True)
+                print(f"[DEBUG] high/low MSE (DISABLED, logging only): {highlow_mse.item():.4f}", flush=True)
                 # v5.9.6: Debug duration values to verify fix
                 duration_debug = []
                 for tf in ['5min', '1h', 'daily']:
