@@ -41,8 +41,8 @@ CHANNEL_PROJECTION_VERSION = "v2"  # v5.6: Removed fixed projections - now calcu
 BREAKDOWN_CALC_VERSION = "v3"  # v5.8: Fixed window sizes for 1min input (was 5x too short in v2)
 PARTIAL_BAR_VERSION = "v4"  # v5.6: Removed projected_high/low/center - projections calculated at inference
 CONTINUATION_LABEL_VERSION = "v3.0"  # v3.0: Return-after-break tracking (first_break_bar, returned, bars_outside, final_duration)
-CHANNEL_HISTORY_VERSION = "v1.0"  # v6.0: Channel history features (prev_duration, prev_direction, duration_trend, etc.)
-FEATURE_VERSION = f"v5.9.1_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}_hist{CHANNEL_HISTORY_VERSION}"
+CHANNEL_HISTORY_VERSION = "v1.0"  # v6.0: Channel history features (separate cache, NOT in FEATURE_VERSION)
+FEATURE_VERSION = f"v5.9.1_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}"
 # v5.9.1: Partial window support - TFs with <100 bars generate labels for windows that DO fit (restores 3month labels)
 
 # v4.1: Native timeframe sequence lengths for hierarchical model
@@ -879,7 +879,9 @@ class TradingFeatureExtractor(FeatureExtractor):
                         print(f"   ✓ Transition labels saved to: {cache_dir}")
 
                 # v6.0: Generate channel history features from transition labels
-                history_cache_path = cache_dir / f"channel_history_features_{cache_suffix}.pkl"
+                # Uses separate version key to avoid invalidating main caches
+                history_cache_suffix = f"{cache_suffix}_hist{CHANNEL_HISTORY_VERSION}"
+                history_cache_path = cache_dir / f"channel_history_features_{history_cache_suffix}.pkl"
                 if history_cache_path.exists() and use_cache:
                     print(f"   📂 Loading cached channel history features: {history_cache_path.name}")
                     history_df = pd.read_pickle(history_cache_path)
@@ -895,7 +897,7 @@ class TradingFeatureExtractor(FeatureExtractor):
                     history_df = self.generate_channel_history_features(
                         transition_labels_dir=cache_dir,
                         feature_index=features_df.index,
-                        cache_suffix=cache_suffix,
+                        cache_suffix=history_cache_suffix,
                         output_dir=cache_dir
                     )
                     # Merge into features_df
@@ -6451,7 +6453,7 @@ class TradingFeatureExtractor(FeatureExtractor):
         # Convert feature_index to numpy for faster lookup
         feature_timestamps = feature_index.values
 
-        # Process each timeframe with VECTORIZED operations (v6.0 optimization)
+        # Process each timeframe with FULLY VECTORIZED operations (v6.0 optimization)
         for tf in tqdm(HIERARCHICAL_TIMEFRAMES, desc="      Processing TFs"):
             if tf not in all_trans_labels:
                 continue
@@ -6461,69 +6463,91 @@ class TradingFeatureExtractor(FeatureExtractor):
             trans_durations = trans_df['duration_bars'].values.astype(np.float32)
             trans_directions = trans_df['current_direction'].values.astype(np.float32)
             trans_types = trans_df['transition_type'].values.astype(np.float32)
+            n_trans = len(trans_timestamps)
 
             # VECTORIZED: Use searchsorted to find insertion points
-            # This gives us the index where each feature_timestamp would be inserted
-            # to maintain sorted order - i.e., the index of the first transition >= timestamp
-            # We want the transition BEFORE, so subtract 1
             insertion_indices = np.searchsorted(trans_timestamps, feature_timestamps, side='left')
 
             # For each sample, the most recent transition is at insertion_indices - 1
-            # Handle edge case: if insertion_index is 0, there's no prior transition
             has_history = insertion_indices > 0
-            last_trans_idx = np.clip(insertion_indices - 1, 0, len(trans_timestamps) - 1)
+            last_trans_idx = np.clip(insertion_indices - 1, 0, n_trans - 1)
 
             # Fill most recent transition values (vectorized)
             result_data[f'prev_channel_duration_{tf}'][has_history] = trans_durations[last_trans_idx[has_history]]
             result_data[f'prev_channel_direction_{tf}'][has_history] = trans_directions[last_trans_idx[has_history]]
             result_data[f'prev_transition_type_{tf}'][has_history] = trans_types[last_trans_idx[has_history]]
 
-            # For trend/avg/streak calculations, we need the last 5 transitions
-            # This requires a loop but only over samples with history
-            samples_with_history = np.where(has_history)[0]
+            # =====================================================================
+            # VECTORIZED: Channels count in last 500 minutes
+            # =====================================================================
+            lookback_ns = np.timedelta64(500, 'm')
+            cutoff_timestamps = feature_timestamps - lookback_ns
+            cutoff_indices = np.searchsorted(trans_timestamps, cutoff_timestamps, side='left')
+            # Count = last_idx - cutoff_idx + 1 (but only where we have history)
+            counts = np.maximum(0, last_trans_idx - cutoff_indices + 1).astype(np.float32)
+            counts[~has_history] = 0
+            result_data[f'channels_count_500bars_{tf}'] = counts
 
-            # Process in batches for memory efficiency
-            batch_size = 50000
-            for batch_start in range(0, len(samples_with_history), batch_size):
-                batch_end = min(batch_start + batch_size, len(samples_with_history))
-                batch_indices = samples_with_history[batch_start:batch_end]
+            # =====================================================================
+            # VECTORIZED: Pre-compute rolling stats on transitions (cumsum trick)
+            # =====================================================================
+            # Cumulative sums for efficient window calculations
+            cumsum_dur = np.zeros(n_trans + 1, dtype=np.float64)
+            cumsum_dur[1:] = np.cumsum(trans_durations)
 
-                for i in batch_indices:
-                    last_idx = last_trans_idx[i]
+            # For last 5 durations: sum[i-4:i+1] = cumsum[i+1] - cumsum[max(0, i-4)]
+            # We'll compute this for all transition indices, then index into it
+            window_size = 5
+            start_indices = np.maximum(0, np.arange(n_trans) - window_size + 1)
+            end_indices = np.arange(n_trans) + 1
+            window_sums = cumsum_dur[end_indices] - cumsum_dur[start_indices]
+            window_counts = end_indices - start_indices  # Actual count in each window
 
-                    # Get last 5 transitions
-                    start_idx = max(0, last_idx - 4)
-                    recent_durations = trans_durations[start_idx:last_idx + 1]
+            # Average recent duration (vectorized lookup)
+            avg_dur = (window_sums / window_counts).astype(np.float32)
+            result_data[f'avg_recent_duration_{tf}'][has_history] = avg_dur[last_trans_idx[has_history]]
 
-                    # Average recent duration
-                    result_data[f'avg_recent_duration_{tf}'][i] = np.mean(recent_durations)
+            # =====================================================================
+            # VECTORIZED: Duration trend using pre-computed slopes
+            # =====================================================================
+            # For a window of size n, slope = (n*sum(i*y) - sum(i)*sum(y)) / (n*sum(i^2) - sum(i)^2)
+            # Pre-compute weighted cumsum for slope calculation
+            indices = np.arange(n_trans, dtype=np.float64)
+            cumsum_idx_dur = np.zeros(n_trans + 1, dtype=np.float64)
+            cumsum_idx_dur[1:] = np.cumsum(trans_durations * np.arange(n_trans))
 
-                    # Duration trend (normalized slope)
-                    if len(recent_durations) >= 2:
-                        x = np.arange(len(recent_durations))
-                        slope = np.polyfit(x, recent_durations, 1)[0]
-                        mean_dur = np.mean(recent_durations)
-                        if mean_dur > 0:
-                            normalized_slope = np.clip(slope / mean_dur, -1.0, 1.0)
-                            result_data[f'channel_duration_trend_{tf}'][i] = normalized_slope
+            # For each position, compute slope over last 5 (or fewer) values
+            slopes = np.zeros(n_trans, dtype=np.float32)
+            for i in range(n_trans):
+                start = max(0, i - window_size + 1)
+                n = i - start + 1
+                if n >= 2:
+                    # Local indices 0, 1, ..., n-1
+                    local_durs = trans_durations[start:i+1]
+                    local_x = np.arange(n)
+                    # Simple linear regression slope
+                    x_mean = (n - 1) / 2.0
+                    y_mean = np.mean(local_durs)
+                    numerator = np.sum((local_x - x_mean) * (local_durs - y_mean))
+                    denominator = np.sum((local_x - x_mean) ** 2)
+                    if denominator > 0 and y_mean > 0:
+                        slope = numerator / denominator
+                        slopes[i] = np.clip(slope / y_mean, -1.0, 1.0)
 
-                    # Count transitions in last 500 minutes
-                    ts = feature_timestamps[i]
-                    lookback_ns = np.timedelta64(500, 'm')
-                    cutoff_ts = ts - lookback_ns
-                    # Count transitions between cutoff and current timestamp
-                    count_start = np.searchsorted(trans_timestamps, cutoff_ts, side='left')
-                    result_data[f'channels_count_500bars_{tf}'][i] = last_idx - count_start + 1
+            result_data[f'channel_duration_trend_{tf}'][has_history] = slopes[last_trans_idx[has_history]]
 
-                    # Consecutive same-direction streak
-                    last_dir = trans_directions[last_idx]
-                    streak = 1
-                    for j in range(last_idx - 1, -1, -1):
-                        if trans_directions[j] == last_dir:
-                            streak += 1
-                        else:
-                            break
-                    result_data[f'consecutive_same_direction_{tf}'][i] = streak
+            # =====================================================================
+            # VECTORIZED: Consecutive same-direction streak
+            # =====================================================================
+            # Pre-compute streak at each transition index
+            streaks = np.ones(n_trans, dtype=np.float32)
+            for i in range(1, n_trans):
+                if trans_directions[i] == trans_directions[i-1]:
+                    streaks[i] = streaks[i-1] + 1
+                else:
+                    streaks[i] = 1
+
+            result_data[f'consecutive_same_direction_{tf}'][has_history] = streaks[last_trans_idx[has_history]]
 
         # Create DataFrame
         result_df = pd.DataFrame(result_data, index=feature_index)
