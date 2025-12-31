@@ -13,6 +13,8 @@ def calculate_rsi(prices: Union[np.ndarray, pd.Series], period: int = 14) -> flo
     """
     Calculate RSI for the most recent bar.
 
+    Uses exponential smoothing to match calculate_rsi_series() methodology.
+
     Args:
         prices: Array of close prices (most recent last)
         period: RSI period (default 14)
@@ -24,13 +26,22 @@ def calculate_rsi(prices: Union[np.ndarray, pd.Series], period: int = 14) -> flo
         return 50.0  # Neutral if not enough data
 
     prices = np.asarray(prices)
-    deltas = np.diff(prices[-(period + 1):])
+    deltas = np.diff(prices)
 
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
 
-    avg_gain = np.mean(gains)
-    avg_loss = np.mean(losses)
+    # Use exponential moving average for consistency with calculate_rsi_series
+    alpha = 1.0 / period
+
+    # Initialize with simple average of first period
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+
+    # Exponential smoothing for remaining bars
+    for i in range(period, len(gains)):
+        avg_gain = alpha * gains[i] + (1 - alpha) * avg_gain
+        avg_loss = alpha * losses[i] + (1 - alpha) * avg_loss
 
     if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
@@ -78,9 +89,15 @@ def calculate_rsi_series(prices: Union[np.ndarray, pd.Series], period: int = 14)
         avg_gain[i] = alpha * gains[i] + (1 - alpha) * avg_gain[i - 1]
         avg_loss[i] = alpha * losses[i] + (1 - alpha) * avg_loss[i - 1]
 
-    # Calculate RSI
-    rs = np.divide(avg_gain, avg_loss, out=np.ones_like(avg_gain), where=avg_loss != 0)
-    rsi = 100 - (100 / (1 + rs))
+    # Calculate RSI with proper handling of edge cases
+    rsi = np.zeros_like(avg_gain)
+    for i in range(len(avg_gain)):
+        if avg_loss[i] == 0:
+            # No losses: RSI = 100 if gains exist, else 50
+            rsi[i] = 100.0 if avg_gain[i] > 0 else 50.0
+        else:
+            rs = avg_gain[i] / avg_loss[i]
+            rsi[i] = 100 - (100 / (1 + rs))
 
     # Pad with NaN for first period
     result = np.full(n, np.nan)
