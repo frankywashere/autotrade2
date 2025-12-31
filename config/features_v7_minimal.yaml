@@ -1,0 +1,279 @@
+# AutoTrade v7.0 - Minimal Viable Feature Configuration
+# 63% reduction from v6.0 (9,829 → 3,630 features)
+# Design: Minimal viable + production-ready + config-driven
+
+version: "v7.0_minimal"
+description: "Minimal viable feature set for production trading"
+
+# ============================================================================
+# CHANNEL FEATURES (3,410 features: 5 windows × 11 TFs × 31 metrics × 2 stocks)
+# ============================================================================
+channel_features:
+  enabled: true
+
+  # CRITICAL REDUCTION: 14 windows → 5 windows (64% reduction)
+  # Rationale: High correlation between nearby windows (w90 ≈ w100, r>0.95)
+  # Coverage: 10× range with strategic spacing
+  windows: [100, 50, 30, 15, 10]
+  # w100: Long-term trend (quarterly patterns, 20-week on daily)
+  # w50:  Medium-term channels (4-8 week cycles) - REFERENCE window
+  # w30:  Short-term oscillations (6-week on daily)
+  # w15:  Micro patterns (3-week on daily)
+  # w10:  Ultra-short breakout detection (minimum viable channel)
+
+  # ALL 11 timeframes (hierarchical architecture requirement)
+  timeframes:
+    - 5min
+    - 15min
+    - 30min
+    - 1h
+    - 2h
+    - 3h
+    - 4h
+    - daily
+    - weekly
+    - monthly
+    - 3month
+
+  symbols: [tsla, spy]
+
+  # All 31 metrics per window (DO NOT REDUCE - each provides unique signal)
+  metrics:
+    # Position metrics (3)
+    position: true              # 0-1 normalized position in channel
+    upper_dist: true            # Distance to upper bound
+    lower_dist: true            # Distance to lower bound
+
+    # Raw slopes (3) - $/bar
+    slopes_raw: true            # close_slope, high_slope, low_slope
+
+    # Normalized slopes (3) - %/bar (scale-invariant)
+    slopes_normalized: true     # close_slope_pct, high_slope_pct, low_slope_pct
+
+    # R-squared (4) - linear fit quality
+    r_squared: true             # close_r², high_r², low_r², avg_r²
+
+    # Channel metrics (3)
+    channel_metrics: true       # width_pct, slope_convergence, stability
+
+    # Ping-pongs (4 thresholds) - alternating touches
+    ping_pongs: true            # 0.5%, 1.0%, 2.0%, 3.0%
+
+    # Complete cycles (4 thresholds) - v6.0 CORE INNOVATION
+    cycles: true                # Full round-trips (lower→upper→lower)
+
+    # Direction flags (3)
+    direction: true             # is_bull, is_bear, is_sideways
+
+    # Quality metrics (3)
+    quality: true               # quality_score, is_valid, insufficient_data
+
+    # Duration (1)
+    duration: true              # Bars in current channel
+
+# ============================================================================
+# CHANNEL HISTORY FEATURES (99 features: 11 TFs × 9 metrics)
+# v6.0 Innovation - Temporal context across channels
+# ============================================================================
+channel_history:
+  enabled: true
+
+  # All 9 metrics provide unique temporal signal
+  metrics:
+    - prev_channel_duration      # Last channel length
+    - prev_channel_direction     # 0=bull, 1=bear, 2=sideways
+    - prev_transition_type       # 0=continue, 1=switch, 2=reverse, 3=sideways
+    - channel_duration_trend     # Slope of last 5 durations
+    - channels_count_500bars     # Transition frequency
+    - consecutive_same_direction # Directional streak
+    - avg_recent_duration        # Mean of last 5 channels
+    - prev_channel_bounce_count  # v6.0: Cycles in previous channel
+    - bounce_count_trend         # v6.0: Slope of last 5 bounce counts
+
+  lookback_channels: 5  # Number of historical channels for trend calculations
+
+# ============================================================================
+# MARKET FEATURES (64 features - REDUCED from 114)
+# ============================================================================
+market_features:
+  # Price features (12) - KEEP ALL
+  price_features: true
+  # tsla: close, close_norm, returns, log_returns, volatility_10, volatility_50
+  # spy:  close, close_norm, returns, log_returns, volatility_10, volatility_50
+
+  # RSI features (24) - REDUCED from 66
+  rsi:
+    enabled: true
+    # CRITICAL REDUCTION: 11 TFs → 4 TFs (strategic timeframes only)
+    timeframes: [5min, 1h, 4h, daily]
+    # 5min: Intraday signals
+    # 1h: Short-term momentum
+    # 4h: Swing trading signals
+    # daily: Trend confirmation
+    metrics: [value, oversold, overbought]
+    symbols: [tsla, spy]
+    # 4 TFs × 3 metrics × 2 symbols = 24 features
+
+  # Correlation features (5) - KEEP ALL
+  correlation:
+    enabled: true
+    windows: [10, 50, 200]
+    include_divergence: true
+    # correlation_10, correlation_50, correlation_200, divergence, divergence_magnitude
+
+  # Cycle features (4) - KEEP ALL
+  cycle_features: true
+  # distance_from_52w_high, distance_from_52w_low, within_mega_channel, mega_channel_position
+
+  # Volume features (2) - KEEP ALL
+  volume_features: true
+  # tsla_volume_ratio, spy_volume_ratio
+
+  # Time features (4) - KEEP ALL
+  time_features: true
+  # hour_of_day, day_of_week, day_of_month, month_of_year
+
+  # Binary flags (13) - KEEP ALL
+  binary_flags: true
+  # is_monday, is_tuesday, is_wednesday, is_thursday, is_friday
+  # is_first_hour, is_last_hour
+  # is_volatile_tsla, is_volatile_spy, is_volatile_both
+  # (plus 3 more from original spec)
+
+# ============================================================================
+# VIX FEATURES (15 features) - KEEP ALL
+# External regime signal, high value
+# ============================================================================
+vix_features:
+  enabled: true
+  csv_path: "data/VIX_History.csv"
+
+  metrics:
+    - vix_level
+    - vix_percentile_20d
+    - vix_percentile_252d
+    - vix_change_1d
+    - vix_change_5d
+    - vix_regime
+    - vix_tsla_corr_20d
+    - vix_spy_corr_20d
+    - vix_momentum_10d
+    - vix_ma_ratio
+    - vix_high_low_range
+    - vix_trend_20d
+    - vix_above_20
+    - vix_above_30
+    - vix_spike
+
+# ============================================================================
+# EVENT FEATURES (4 features) - KEEP ALL
+# Earnings/FOMC proximity - minimal but high value
+# ============================================================================
+event_features:
+  enabled: true
+  events_file: "data/events.csv"
+  lookback_days: 14
+  lookahead_days: 14
+
+  metrics:
+    - is_earnings_week
+    - days_until_earnings
+    - days_until_fomc
+    - is_high_impact_event
+
+# ============================================================================
+# BREAKDOWN FEATURES (38 features - REDUCED from 49)
+# Channel breakdown indicators
+# ============================================================================
+breakdown_features:
+  enabled: true
+
+  # REDUCED: 11 TFs → 4 TFs (actionable timeframes only)
+  timeframes: [5min, 1h, 4h, daily]
+  # 5min: Intraday breakdowns
+  # 1h: Short-term breakdowns
+  # 4h: Swing trade breakdowns
+  # daily: Position trade breakdowns
+
+  metrics:
+    - channel_duration_ratio
+    - channel_alignment_spy_tsla
+    - tsla_time_in_channel
+    - spy_time_in_channel
+    - tsla_rsi_divergence
+  # 1 volume_surge + (4 TFs × 4 metrics) + (4 TFs × 2 time_in_channel) = 38
+
+  volume_surge: true
+
+# ============================================================================
+# VALIDITY CRITERIA (v6.0 - Bounce-Focused Philosophy)
+# ============================================================================
+validity_criteria:
+  version: "v3.1"
+
+  # v6.0: RELAXED from v3.0 (cycles≥2, r²>0.5)
+  # Philosophy shift: Channels are oscillation zones, not trendlines
+  min_cycles: 1          # Minimum complete cycles (round-trips)
+  min_r_squared: 0.1     # Minimum R² for linear fit
+
+  philosophy: "bounce_focused"  # vs "trend_focused"
+  # A channel with 3 bounces and r²=0.3 is more actionable than
+  # a perfect line (r²=0.99) with 0 bounces
+
+# ============================================================================
+# PERFORMANCE SETTINGS
+# ============================================================================
+performance:
+  # Parallel processing
+  parallel_workers: 0  # 0 = auto-detect from RAM (RAM_GB - 5) / 15
+  backend: "loky"      # joblib backend
+
+  # GPU acceleration (CUDA only, not MPS)
+  use_gpu: false       # Enable GPU for bounce counting (experimental)
+
+  # Cache mode
+  cache_mode: "mmap"   # "mmap" (disk, memory-efficient) or "ram" (preload)
+
+  # Chunking (for systems with limited RAM)
+  use_chunking: false  # Split feature extraction into 1-year chunks
+
+# ============================================================================
+# COMPONENT VERSIONING (for cache invalidation)
+# Increment sub-versions when calculation logic changes
+# ============================================================================
+component_versions:
+  config: "v7.0_minimal"             # Config version
+  vix: "v1"                          # VIX calculation version
+  events: "v1"                       # Events calculation version
+  breakdown: "v3"                    # Breakdown features version
+  partial_bar: "v4"                  # Partial bar support version
+  continuation_labels: "v3.1"        # Continuation label version (relaxed validity)
+  channel_history: "v1.1"            # Channel history version (v6.0 bounce counts)
+
+  # Composite version string format:
+  # v7.0_minimal_vixv1_evv1_bdv3_pbv4_contv3.1_histv1.1
+
+# ============================================================================
+# EXPECTED FEATURE COUNTS (for validation)
+# ============================================================================
+expected_counts:
+  channel: 3410        # 5 windows × 11 TFs × 31 metrics × 2 symbols
+  channel_history: 99  # 11 TFs × 9 metrics
+  market: 64           # Price (12) + RSI (24) + Correlation (5) + Cycle (4) + Volume (2) + Time (4) + Flags (13)
+  vix: 15
+  events: 4
+  breakdown: 38
+  total: 3630          # 63% reduction from v6.0 (9,829)
+
+# ============================================================================
+# MIGRATION NOTES
+# ============================================================================
+# v6.0 → v7.0 changes:
+# - Windows: 14 → 5 (removed: 90, 80, 70, 60, 45, 40, 35, 30, 25, 20)
+# - RSI timeframes: 11 → 4 (removed: 15min, 30min, 2h, 3h, weekly, monthly, 3month)
+# - Breakdown timeframes: 11 → 4 (same as RSI)
+# - All other features KEPT (channel history, VIX, events, all metrics)
+#
+# Rollback plan:
+# - If model underperforms, add back windows: [100, 70, 50, 30, 20, 15, 10]
+# - Hypothesis: 5-window model performs within 2% of 14-window model

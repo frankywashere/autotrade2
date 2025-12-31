@@ -40,7 +40,7 @@ EVENTS_CALC_VERSION = "v1"  # v4.4: Track events calculation version
 CHANNEL_PROJECTION_VERSION = "v2"  # v5.6: Removed fixed projections - now calculated at inference from learned duration
 BREAKDOWN_CALC_VERSION = "v3"  # v5.8: Fixed window sizes for 1min input (was 5x too short in v2)
 PARTIAL_BAR_VERSION = "v4"  # v5.6: Removed projected_high/low/center - projections calculated at inference
-CONTINUATION_LABEL_VERSION = "v3.0"  # v3.0: Return-after-break tracking (first_break_bar, returned, bars_outside, final_duration)
+CONTINUATION_LABEL_VERSION = "v3.1"  # v3.1: Relaxed validity (cycles>=1, r²>0.1) - focus on bounces not linear fit
 CHANNEL_HISTORY_VERSION = "v1.1"  # v6.0: Added bounce count features (prev_channel_bounce_count, bounce_count_trend)
 FEATURE_VERSION = f"v5.9.1_vix{VIX_CALC_VERSION}_ev{EVENTS_CALC_VERSION}_proj{CHANNEL_PROJECTION_VERSION}_bd{BREAKDOWN_CALC_VERSION}_pb{PARTIAL_BAR_VERSION}_cont{CONTINUATION_LABEL_VERSION}"
 # v5.9.1: Partial window support - TFs with <100 bars generate labels for windows that DO fit (restores 3month labels)
@@ -5609,7 +5609,10 @@ class TradingFeatureExtractor(FeatureExtractor):
                                     complete_cycles += 1
                                 last_touch = 'lower'
 
-                        is_valid = complete_cycles >= 2 and r_squared > 0.5
+                        # v6.0: Validity based on CYCLES (bounces), not linear fit
+                        # Channels are about oscillating between bounds, not trending
+                        # R² threshold lowered to 0.1 (just filter garbage, not require trend)
+                        is_valid = complete_cycles >= 1 and r_squared > 0.1
 
                         # v6.0: Enhanced break detection with return-after-break tracking
                         # Instead of stopping at first break, continue scanning to detect:
