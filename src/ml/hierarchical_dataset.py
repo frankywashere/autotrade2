@@ -1242,6 +1242,18 @@ class HierarchicalDataset(Dataset):
                             # Lookup in per-TF dict
                             row_idx = self._per_tf_ts_to_idx[tf].get(int(tf_ts))
 
+                            # v6.0 DEBUG: Track lookup failures for daily TF
+                            if tf == 'daily' and row_idx is None:
+                                if not hasattr(self, '_daily_lookup_debug_count'):
+                                    self._daily_lookup_debug_count = 0
+                                self._daily_lookup_debug_count += 1
+                                if self._daily_lookup_debug_count <= 3:
+                                    # Log first 3 failures with details
+                                    dict_keys = list(self._per_tf_ts_to_idx[tf].keys())[:5]
+                                    print(f"[DEBUG] Daily lookup FAILED: tf_ts={tf_ts}, int(tf_ts)={int(tf_ts)}", flush=True)
+                                    print(f"[DEBUG]   Dict sample keys: {dict_keys}", flush=True)
+                                    print(f"[DEBUG]   ts_5min={ts_5min}, tf_idx={tf_idx}", flush=True)
+
                     if row_idx is not None:
                         cont_data = self._per_tf_continuation[tf]
 
@@ -1332,8 +1344,23 @@ class HierarchicalDataset(Dataset):
                         targets[f'cont_{tf}_max_consecutive_outside'] = best_max_consecutive_outside
                         targets[f'cont_{tf}_final_duration'] = best_final_duration
 
-                        # Mark TF as having at least some valid windows
-                        targets[f'cont_{tf}_valid'] = 1.0
+                        # Mark TF as valid ONLY if at least one window had valid data
+                        # BUG FIX: Previously set to 1.0 unconditionally, causing inflated valid counts
+                        targets[f'cont_{tf}_valid'] = 1.0 if best_confidence > 0.0 else 0.0
+
+                        # v6.0 DEBUG: Track daily validity details
+                        if tf == 'daily':
+                            if not hasattr(self, '_daily_valid_debug_count'):
+                                self._daily_valid_debug_count = 0
+                                self._daily_invalid_window_count = 0
+                            if best_confidence > 0.0:
+                                self._daily_valid_debug_count += 1
+                                if self._daily_valid_debug_count <= 3:
+                                    print(f"[DEBUG] Daily VALID: row_idx={row_idx}, best_conf={best_confidence:.3f}, best_dur={best_duration:.1f}", flush=True)
+                            else:
+                                self._daily_invalid_window_count += 1
+                                if self._daily_invalid_window_count <= 3:
+                                    print(f"[DEBUG] Daily row found but NO valid windows: row_idx={row_idx}", flush=True)
 
                     else:
                         # Timestamp not found - mark all windows as invalid (must set ALL keys for collate)

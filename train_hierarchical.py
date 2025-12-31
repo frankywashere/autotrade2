@@ -4374,6 +4374,18 @@ def run_training(rank: int, world_size: int, args_dict: dict):
                         duration_debug.append(f"{tf}:missing")
                 print(f"[DEBUG] durations (mean±std, count): {', '.join(duration_debug)}", flush=True)
 
+                # v6.0 DEBUG: Detailed daily analysis
+                if 'cont_daily_valid' in targets and 'cont_daily_duration' in targets:
+                    daily_valid = targets['cont_daily_valid']
+                    daily_dur = targets['cont_daily_duration']
+                    n_valid = (daily_valid > 0).sum().item()
+                    n_invalid = (daily_valid == 0).sum().item()
+                    # Check if invalid samples have non-zero duration (lookup succeeded but no valid windows)
+                    invalid_mask = daily_valid == 0
+                    invalid_durs = daily_dur[invalid_mask]
+                    n_invalid_with_dur = (invalid_durs > 0).sum().item()
+                    print(f"[DEBUG] Daily breakdown: valid={n_valid}, invalid={n_invalid}, invalid_with_dur>0={n_invalid_with_dur}", flush=True)
+
             # =====================================================================
             # v5.7: MULTI-TF LOSS (all timeframes contribute, fixes mode collapse)
             # =====================================================================
