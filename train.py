@@ -74,6 +74,7 @@ PRESETS = {
         "step": 50,
         "hidden_dim": 64,
         "cfc_units": 96,
+        "attention_heads": 4,  # Simple configuration
         "num_epochs": 10,
         "batch_size": 32,
         "learning_rate": 0.001,
@@ -88,6 +89,7 @@ PRESETS = {
         "step": 25,
         "hidden_dim": 128,
         "cfc_units": 192,
+        "attention_heads": 8,  # Balanced configuration
         "num_epochs": 50,
         "batch_size": 64,
         "learning_rate": 0.0005,
@@ -102,6 +104,7 @@ PRESETS = {
         "step": 10,
         "hidden_dim": 256,
         "cfc_units": 384,
+        "attention_heads": 8,  # Same as Standard
         "num_epochs": 100,
         "batch_size": 128,
         "learning_rate": 0.0003,
@@ -447,17 +450,88 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
     if preset:
         hidden_dim = preset["hidden_dim"]
         cfc_units = preset["cfc_units"]
-        console.print(f"  Using preset: hidden_dim={hidden_dim}, cfc_units={cfc_units}")
+        num_attention_heads = preset["attention_heads"]
+        console.print(f"  Using preset: hidden_dim={hidden_dim}, cfc_units={cfc_units}, attention_heads={num_attention_heads}")
     else:
-        hidden_dim = inquirer.select(
-            message="Hidden dimension:",
+        # First, select attention heads to determine valid hidden_dim choices
+        num_attention_heads = inquirer.select(
+            message="Number of attention heads:",
             choices=[
+                {"name": "2 heads (minimal)", "value": 2},
+                {"name": "4 heads (light)", "value": 4},
+                {"name": "8 heads (balanced)", "value": 8},
+                {"name": "11 heads (custom)", "value": 11},
+                {"name": "16 heads (large)", "value": 16},
+            ],
+            default=8,
+        ).execute()
+
+        # Calculate valid hidden_dim options based on attention heads
+        # hidden_dim must be divisible by num_attention_heads
+        console.print(f"\n[dim]Selected {num_attention_heads} attention heads[/dim]")
+        console.print(f"[dim]Hidden dimension must be divisible by {num_attention_heads}[/dim]\n")
+
+        # Generate valid hidden_dim choices
+        valid_dims = []
+        if num_attention_heads == 2:
+            valid_dims = [
                 {"name": "64 (fast, small model)", "value": 64},
                 {"name": "128 (balanced)", "value": 128},
                 {"name": "256 (large, slow)", "value": 256},
-            ],
-            default=128,
+            ]
+        elif num_attention_heads == 4:
+            valid_dims = [
+                {"name": "64 (fast, small model)", "value": 64},
+                {"name": "128 (balanced)", "value": 128},
+                {"name": "256 (large, slow)", "value": 256},
+            ]
+        elif num_attention_heads == 8:
+            valid_dims = [
+                {"name": "64 (fast, small model)", "value": 64},
+                {"name": "128 (balanced)", "value": 128},
+                {"name": "256 (large, slow)", "value": 256},
+            ]
+        elif num_attention_heads == 11:
+            valid_dims = [
+                {"name": "132 (12 per head)", "value": 132},
+                {"name": "176 (16 per head)", "value": 176},
+                {"name": "220 (20 per head)", "value": 220},
+                {"name": "264 (24 per head)", "value": 264},
+            ]
+        elif num_attention_heads == 16:
+            valid_dims = [
+                {"name": "64 (4 per head)", "value": 64},
+                {"name": "128 (8 per head)", "value": 128},
+                {"name": "256 (16 per head)", "value": 256},
+            ]
+        else:
+            # Fallback: generate divisible options
+            valid_dims = [
+                {"name": f"{dim} ({dim // num_attention_heads} per head)", "value": dim}
+                for dim in [64, 128, 256]
+                if dim % num_attention_heads == 0
+            ]
+
+        if not valid_dims:
+            # If no standard options work, generate custom ones
+            valid_dims = [
+                {"name": f"{num_attention_heads * mult} ({mult} per head)", "value": num_attention_heads * mult}
+                for mult in [4, 8, 16, 32]
+            ]
+
+        hidden_dim = inquirer.select(
+            message=f"Hidden dimension (divisible by {num_attention_heads}):",
+            choices=valid_dims,
+            default=valid_dims[1]["value"] if len(valid_dims) > 1 else valid_dims[0]["value"],
         ).execute()
+
+        # Validate that hidden_dim is divisible by num_attention_heads
+        if hidden_dim % num_attention_heads != 0:
+            console.print(f"[red]ERROR: hidden_dim ({hidden_dim}) must be divisible by num_attention_heads ({num_attention_heads})[/red]")
+            console.print(f"[yellow]Adjusting hidden_dim to {(hidden_dim // num_attention_heads + 1) * num_attention_heads}[/yellow]")
+            hidden_dim = (hidden_dim // num_attention_heads + 1) * num_attention_heads
+
+        console.print(f"[green]✓ Each attention head will have {hidden_dim // num_attention_heads} dimensions[/green]\n")
 
         # CfC units must be > hidden_dim + 2
         min_cfc = hidden_dim + 3
@@ -468,12 +542,6 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
             default=hidden_dim * 2,
             validate=NumberValidator(),
         ).execute()
-
-    num_attention_heads = inquirer.select(
-        message="Number of attention heads:",
-        choices=[2, 4, 8],
-        default=4,
-    ).execute()
 
     dropout = inquirer.select(
         message="Dropout rate:",
