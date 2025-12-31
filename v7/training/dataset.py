@@ -18,17 +18,14 @@ from pathlib import Path
 import pickle
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
-import sys
 from tqdm import tqdm
 import json
 from datetime import datetime
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from core.channel import detect_channel, Channel
-from core.timeframe import resample_ohlc, TIMEFRAMES
-from features.full_features import extract_full_features, features_to_tensor_dict, FullFeatures
-from training.labels import generate_labels, ChannelLabels, labels_to_dict, labels_to_array
+from ..core.channel import detect_channel, Channel
+from ..core.timeframe import resample_ohlc, TIMEFRAMES
+from ..features.full_features import extract_full_features, features_to_tensor_dict, FullFeatures
+from .labels import generate_labels, ChannelLabels, labels_to_dict, labels_to_array
 
 
 @dataclass

@@ -16,10 +16,8 @@ import torch.nn as nn
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from training.dataset import load_market_data, scan_valid_channels, ChannelDataset, collate_fn
-from training.trainer import MultiTaskLoss
+from .dataset import load_market_data, scan_valid_channels, ChannelDataset, collate_fn
+from .losses import CombinedLoss
 
 
 class DummyModel(nn.Module):
@@ -149,7 +147,7 @@ def test_pipeline():
         print(f"  Break direction pred shape: {predictions['break_direction'].shape}")
 
         # Calculate loss
-        criterion = MultiTaskLoss()
+        criterion = CombinedLoss(num_timeframes=1, use_learnable_weights=False)
         loss, loss_dict = criterion(predictions, batched_labels)
         print(f"  Total loss: {loss.item():.4f}")
         print(f"  Loss components: {loss_dict}")

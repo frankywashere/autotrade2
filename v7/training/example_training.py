@@ -16,10 +16,8 @@ import torch.nn as nn
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from training.dataset import prepare_dataset_from_scratch, create_dataloaders
-from training.trainer import Trainer, TrainingConfig
+from .dataset import prepare_dataset_from_scratch, create_dataloaders
+from .trainer import Trainer, TrainingConfig
 
 
 class SimpleChannelPredictor(nn.Module):

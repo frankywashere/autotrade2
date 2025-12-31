@@ -34,7 +34,14 @@ from .dataset import (
 from .trainer import (
     Trainer,
     TrainingConfig,
-    MultiTaskLoss,
+)
+
+from .losses import (
+    CombinedLoss,
+    GaussianNLLLoss,
+    DirectionLoss,
+    NextChannelDirectionLoss,
+    MetricsCalculator,
 )
 
 __all__ = [
@@ -62,5 +69,11 @@ __all__ = [
     # Trainer
     'Trainer',
     'TrainingConfig',
-    'MultiTaskLoss',
+
+    # Losses
+    'CombinedLoss',
+    'GaussianNLLLoss',
+    'DirectionLoss',
+    'NextChannelDirectionLoss',
+    'MetricsCalculator',
 ]
