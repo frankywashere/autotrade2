@@ -384,6 +384,31 @@ class Trainer:
 
         print(f"Loaded checkpoint from epoch {self.current_epoch}")
 
+    def reset_training_state(self):
+        """Reset training state for next walk-forward window."""
+        self.current_epoch = 0
+        self.global_step = 0
+        self.epochs_without_improvement = 0
+        self.best_val_metric = float('inf') if self.config.early_stopping_mode == 'min' else float('-inf')
+        self.train_metrics_history = []
+        self.val_metrics_history = []
+
+    def update_dataloaders(self, train_loader, val_loader, test_loader=None):
+        """Update dataloaders for next walk-forward window."""
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        if test_loader:
+            self.test_loader = test_loader
+
+    def get_fold_metrics(self) -> Dict:
+        """Get current fold metrics for walk-forward tracking."""
+        return {
+            'best_val_metric': self.best_val_metric,
+            'train_history': self.train_metrics_history,
+            'val_history': self.val_metrics_history,
+            'epochs_trained': self.current_epoch,
+        }
+
     def train(self) -> Dict[str, List[Dict]]:
         """Main training loop."""
         print(f"Starting training on {self.device}")

@@ -46,6 +46,18 @@ from .losses import (
     MetricsCalculator,
 )
 
+from .walk_forward import (
+    WalkForwardWindow,
+    generate_walk_forward_windows,
+    split_samples_by_window,
+    validate_windows,
+)
+
+from .walk_forward_results import (
+    WindowMetrics,
+    WalkForwardResults,
+)
+
 __all__ = [
     # Labels
     'ChannelLabels',
@@ -80,4 +92,14 @@ __all__ = [
     'DirectionLoss',
     'NextChannelDirectionLoss',
     'MetricsCalculator',
+
+    # Walk-Forward Validation
+    'WalkForwardWindow',
+    'generate_walk_forward_windows',
+    'split_samples_by_window',
+    'validate_windows',
+
+    # Walk-Forward Results
+    'WindowMetrics',
+    'WalkForwardResults',
 ]

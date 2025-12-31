@@ -282,7 +282,8 @@ def generate_labels(
     current_tf: str = '5min',
     window: int = 50,
     max_scan: int = 500,
-    return_threshold: int = 20
+    return_threshold: int = 20,
+    fold_end_idx: Optional[int] = None
 ) -> ChannelLabels:
     """
     Generate labels for a channel by scanning forward.
@@ -303,13 +304,19 @@ def generate_labels(
         window: Window size for channel detection
         max_scan: Maximum bars to scan forward
         return_threshold: Bars outside needed to confirm permanent break
+        fold_end_idx: Optional end index for walk-forward validation fold.
+                     When provided, prevents lookahead bias by limiting
+                     forward scan to the fold boundary.
 
     Returns:
         ChannelLabels object with all label information
     """
     # Get forward data
     forward_start = channel_end_idx + 1
-    forward_end = min(forward_start + max_scan, len(df))
+    if fold_end_idx is not None:
+        forward_end = min(forward_start + max_scan, fold_end_idx)
+    else:
+        forward_end = min(forward_start + max_scan, len(df))
 
     if forward_start >= len(df):
         # No forward data available
