@@ -122,7 +122,7 @@ def detect_bounces_with_rsi(
 
 def scan_channel_history(
     df: pd.DataFrame,
-    window: int = 50,
+    window: int = 20,
     max_channels: int = 10,
     scan_bars: int = 5000
 ) -> List[ChannelRecord]:

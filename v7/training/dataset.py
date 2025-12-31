@@ -13,6 +13,7 @@ The dataset yields (features_dict, labels_dict) tuples ready for model training.
 import numpy as np
 import pandas as pd
 import torch
+import warnings
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import pickle
@@ -26,6 +27,99 @@ from ..core.channel import detect_channel, Channel
 from ..core.timeframe import resample_ohlc, TIMEFRAMES
 from ..features.full_features import extract_full_features, features_to_tensor_dict, FullFeatures
 from .labels import generate_labels, ChannelLabels, labels_to_dict, labels_to_array
+
+
+# =============================================================================
+# Date Range Validation Helpers
+# =============================================================================
+
+def validate_date_range(
+    date_str: str,
+    min_date: Optional[str] = None,
+    max_date: Optional[str] = None
+) -> Tuple[bool, str]:
+    """
+    Validate if a date string falls within an optional min/max range.
+
+    Args:
+        date_str: Date string to validate
+        min_date: Optional minimum date
+        max_date: Optional maximum date
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    try:
+        timestamp = pd.Timestamp(date_str)
+    except Exception as e:
+        return False, f"Invalid date format '{date_str}': {str(e)}"
+
+    if min_date is not None:
+        try:
+            min_timestamp = pd.Timestamp(min_date)
+            if timestamp < min_timestamp:
+                return False, f"Date {date_str} is before minimum {min_date}"
+        except Exception as e:
+            return False, f"Invalid min_date format '{min_date}': {str(e)}"
+
+    if max_date is not None:
+        try:
+            max_timestamp = pd.Timestamp(max_date)
+            if timestamp > max_timestamp:
+                return False, f"Date {date_str} exceeds maximum {max_date}"
+        except Exception as e:
+            return False, f"Invalid max_date format '{max_date}': {str(e)}"
+
+    return True, ""
+
+
+def get_data_date_range(
+    data_dir: Path,
+    file_prefix: str = "TSLA"
+) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    Quickly load first and last timestamp from a CSV file.
+
+    Args:
+        data_dir: Directory containing CSV files
+        file_prefix: File prefix - "TSLA", "SPY", or "VIX"
+
+    Returns:
+        Tuple of (start_date, end_date) as pd.Timestamp objects
+    """
+    if file_prefix in ["TSLA", "SPY"]:
+        file_path = data_dir / f"{file_prefix}_1min.csv"
+        date_col = "timestamp"
+    elif file_prefix == "VIX":
+        file_path = data_dir / "VIX_History.csv"
+        date_col = "DATE"
+    else:
+        raise ValueError(f"Unknown file_prefix: {file_prefix}")
+
+    if not file_path.exists():
+        raise FileNotFoundError(f"CSV file not found: {file_path}")
+
+    # Read first row
+    first_chunk = pd.read_csv(
+        file_path,
+        usecols=[date_col],
+        nrows=1,
+        parse_dates=[date_col]
+    )
+    start_date = first_chunk[date_col].iloc[0]
+
+    # Read last rows efficiently
+    last_date = None
+    for chunk in pd.read_csv(
+        file_path,
+        usecols=[date_col],
+        chunksize=100000,
+        parse_dates=[date_col]
+    ):
+        if not chunk.empty:
+            last_date = chunk[date_col].iloc[-1]
+
+    return start_date, last_date
 
 
 @dataclass
@@ -154,26 +248,28 @@ class ChannelDataset(Dataset):
 def load_market_data(
     data_dir: Path,
     start_date: Optional[str] = None,
-    end_date: Optional[str] = None
+    end_date: Optional[str] = None,
+    verbose: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Load TSLA, SPY, and VIX data from CSV files.
+    Load TSLA, SPY, and VIX data with proper date alignment.
+
+    Ensures all dataframes align to TSLA's index via reindexing.
 
     Args:
         data_dir: Directory containing CSV files
         start_date: Optional start date filter (YYYY-MM-DD)
         end_date: Optional end date filter (YYYY-MM-DD)
+        verbose: Print alignment information
 
     Returns:
-        Tuple of (tsla_df, spy_df, vix_df)
+        Tuple of (tsla_df, spy_df, vix_df) - all with aligned indices
     """
     # Load TSLA 1min data
     tsla_path = data_dir / "TSLA_1min.csv"
     tsla_df = pd.read_csv(tsla_path, parse_dates=['timestamp'])
     tsla_df.set_index('timestamp', inplace=True)
     tsla_df.columns = [c.lower() for c in tsla_df.columns]
-
-    # Resample to 5min (base timeframe)
     tsla_df = resample_ohlc(tsla_df, '5min')
 
     # Load SPY 1min data
@@ -181,8 +277,6 @@ def load_market_data(
     spy_df = pd.read_csv(spy_path, parse_dates=['timestamp'])
     spy_df.set_index('timestamp', inplace=True)
     spy_df.columns = [c.lower() for c in spy_df.columns]
-
-    # Resample to 5min
     spy_df = resample_ohlc(spy_df, '5min')
 
     # Load VIX daily data
@@ -191,7 +285,13 @@ def load_market_data(
     vix_df.set_index('DATE', inplace=True)
     vix_df.columns = [c.lower() for c in vix_df.columns]
 
-    # Filter by date range if provided
+    if verbose:
+        print("Raw data loaded:")
+        print(f"  TSLA: {len(tsla_df)} bars ({tsla_df.index[0]} to {tsla_df.index[-1]})")
+        print(f"  SPY:  {len(spy_df)} bars ({spy_df.index[0]} to {spy_df.index[-1]})")
+        print(f"  VIX:  {len(vix_df)} bars ({vix_df.index[0]} to {vix_df.index[-1]})")
+
+    # Apply user filters
     if start_date:
         tsla_df = tsla_df[tsla_df.index >= start_date]
         spy_df = spy_df[spy_df.index >= start_date]
@@ -202,14 +302,48 @@ def load_market_data(
         spy_df = spy_df[spy_df.index <= end_date]
         vix_df = vix_df[vix_df.index <= end_date]
 
-    return tsla_df, spy_df, vix_df
+    # Find intersection of date ranges
+    tsla_dates = set(tsla_df.index.date)
+    spy_dates = set(spy_df.index.date)
+    vix_dates = set(vix_df.index.date)
+
+    common_dates = tsla_dates & spy_dates & vix_dates
+
+    if not common_dates:
+        raise ValueError("No overlapping dates between TSLA, SPY, and VIX")
+
+    intersection_start = min(common_dates)
+    intersection_end = max(common_dates)
+
+    # Filter to intersection
+    tsla_df = tsla_df[(tsla_df.index.date >= intersection_start) & (tsla_df.index.date <= intersection_end)]
+    spy_df = spy_df[(spy_df.index.date >= intersection_start) & (spy_df.index.date <= intersection_end)]
+    vix_df = vix_df[(vix_df.index.date >= intersection_start) & (vix_df.index.date <= intersection_end)]
+
+    # Reindex SPY and VIX to TSLA's index
+    spy_aligned = spy_df.reindex(tsla_df.index, method='ffill')
+    vix_aligned = vix_df.reindex(tsla_df.index, method='ffill')
+
+    # Drop NaNs
+    combined = pd.concat([tsla_df, spy_aligned, vix_aligned], axis=1)
+    valid_mask = ~combined.isna().any(axis=1)
+
+    tsla_aligned = tsla_df[valid_mask].copy()
+    spy_aligned = spy_aligned[valid_mask].copy()
+    vix_aligned = vix_aligned[valid_mask].copy()
+
+    if verbose:
+        print(f"\nAligned data:")
+        print(f"  All series: {len(tsla_aligned)} bars ({tsla_aligned.index[0]} to {tsla_aligned.index[-1]})")
+
+    return tsla_aligned, spy_aligned, vix_aligned
 
 
 def scan_valid_channels(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    window: int = 50,
+    window: int = 20,
     step: int = 10,
     min_cycles: int = 1,
     max_scan: int = 500,
@@ -249,6 +383,9 @@ def scan_valid_channels(
     min_required = window + max_scan
 
     # Align SPY and VIX with TSLA timestamps
+    # For SPY (5min), reindex to match TSLA timestamps and forward-fill gaps
+    spy_aligned = spy_df.reindex(tsla_df.index, method='ffill')
+
     # For VIX (daily), forward-fill to match 5min timestamps
     vix_aligned = vix_df.reindex(tsla_df.index, method='ffill')
 
@@ -263,7 +400,7 @@ def scan_valid_channels(
     for i in indices:
         # Get data window
         tsla_window = tsla_df.iloc[:i]
-        spy_window = spy_df.iloc[:i]
+        spy_window = spy_aligned.iloc[:i]
         vix_window = vix_aligned.iloc[:i]
 
         if len(tsla_window) < window or len(spy_window) < window:

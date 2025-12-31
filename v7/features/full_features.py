@@ -114,7 +114,7 @@ class FullFeatures:
 def extract_tsla_channel_features(
     tsla_df: pd.DataFrame,
     timeframe: str,
-    window: int = 50,
+    window: int = 20,
     longer_tf_channels: Optional[Dict[str, Channel]] = None,
     lookforward_bars: int = 200
 ) -> TSLAChannelFeatures:
@@ -194,7 +194,7 @@ def extract_full_features(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    window: int = 50,
+    window: int = 20,
     include_history: bool = True,
     lookforward_bars: int = 200,
     events_handler: Optional[EventsHandler] = None

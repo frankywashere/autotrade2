@@ -97,7 +97,7 @@ def check_containment(
 def check_all_containments(
     df_base: pd.DataFrame,
     current_tf: str,
-    window: int = 50
+    window: int = 20
 ) -> Dict[str, ContainmentInfo]:
     """
     Check containment against all longer timeframes.

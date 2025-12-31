@@ -29,6 +29,8 @@ from .dataset import (
     collate_fn,
     create_dataloaders,
     prepare_dataset_from_scratch,
+    validate_date_range,
+    get_data_date_range,
 )
 
 from .trainer import (
@@ -65,6 +67,8 @@ __all__ = [
     'collate_fn',
     'create_dataloaders',
     'prepare_dataset_from_scratch',
+    'validate_date_range',
+    'get_data_date_range',
 
     # Trainer
     'Trainer',

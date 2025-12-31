@@ -20,7 +20,8 @@ from pathlib import Path
 import json
 import torch
 import numpy as np
-from datetime import datetime
+import pandas as pd
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import traceback
 
@@ -69,7 +70,7 @@ console = Console()
 PRESETS = {
     "Quick Start": {
         "desc": "Fast training for testing (small window, few epochs)",
-        "window": 50,
+        "window": 20,
         "step": 50,
         "hidden_dim": 64,
         "cfc_units": 96,
@@ -79,7 +80,7 @@ PRESETS = {
     },
     "Standard": {
         "desc": "Balanced configuration for typical training",
-        "window": 50,
+        "window": 20,
         "step": 25,
         "hidden_dim": 128,
         "cfc_units": 192,
@@ -89,7 +90,7 @@ PRESETS = {
     },
     "Full Training": {
         "desc": "Maximum quality (slow, requires good GPU)",
-        "window": 50,
+        "window": 20,
         "step": 10,
         "hidden_dim": 256,
         "cfc_units": 384,
@@ -139,10 +140,73 @@ def select_mode() -> str:
     return mode
 
 
+def load_data_date_range(data_dir: Path) -> Tuple[str, str]:
+    """
+    Quick load of TSLA data to determine actual date range.
+
+    Args:
+        data_dir: Path to data directory
+
+    Returns:
+        Tuple of (min_date_str, max_date_str) in format 'YYYY-MM-DD'
+    """
+    tsla_path = data_dir / "TSLA_1min.csv"
+
+    try:
+        # Read only timestamp column to determine date range
+        tsla_timestamps = pd.read_csv(
+            tsla_path,
+            parse_dates=['timestamp'],
+            usecols=['timestamp']
+        )
+
+        min_date = tsla_timestamps['timestamp'].min()
+        max_date = tsla_timestamps['timestamp'].max()
+
+        min_date_str = min_date.strftime('%Y-%m-%d')
+        max_date_str = max_date.strftime('%Y-%m-%d')
+
+        return min_date_str, max_date_str
+
+    except Exception as e:
+        console.print(f"[red]Error reading data dates: {e}[/red]")
+        return "2015-01-02", "2025-12-31"
+
+
+def validate_date_format(date_str: str) -> bool:
+    """Validate date string is YYYY-MM-DD format."""
+    try:
+        datetime.strptime(date_str, '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+
+def validate_date_in_range(date_str: str, min_date: str, max_date: str) -> bool:
+    """Validate date is within available range."""
+    try:
+        date = datetime.strptime(date_str, '%Y-%m-%d')
+        date_min = datetime.strptime(min_date, '%Y-%m-%d')
+        date_max = datetime.strptime(max_date, '%Y-%m-%d')
+        return date_min <= date <= date_max
+    except ValueError:
+        return False
+
+
 def configure_data(preset: Optional[Dict] = None) -> Dict:
-    """Configure data preparation settings."""
+    """Configure data preparation settings with date validation."""
     console.print("\n[bold cyan]Data Configuration[/bold cyan]")
 
+    # Load actual data date range FIRST
+    data_dir = Path(__file__).parent / "data"
+    min_available_date, max_available_date = load_data_date_range(data_dir)
+
+    # Display available data range
+    console.print(f"\n[green]✓ Data Available:[/green]")
+    console.print(f"  From: [cyan]{min_available_date}[/cyan] (earliest)")
+    console.print(f"  To:   [cyan]{max_available_date}[/cyan] (latest)\n")
+
+    # Window configuration
     if preset:
         window = preset["window"]
         step = preset["step"]
@@ -152,7 +216,7 @@ def configure_data(preset: Optional[Dict] = None) -> Dict:
             message="Channel detection window size:",
             min_allowed=20,
             max_allowed=200,
-            default=50,
+            default=20,
             validate=NumberValidator(),
         ).execute()
 
@@ -164,7 +228,7 @@ def configure_data(preset: Optional[Dict] = None) -> Dict:
             validate=NumberValidator(),
         ).execute()
 
-    # Date ranges
+    # Date ranges with validation
     use_full_data = inquirer.confirm(
         message="Use full dataset (all available dates)?", default=True
     ).execute()
@@ -172,26 +236,62 @@ def configure_data(preset: Optional[Dict] = None) -> Dict:
     if use_full_data:
         start_date = None
         end_date = None
+        console.print(f"  [dim]Using all data: {min_available_date} to {max_available_date}[/dim]\n")
     else:
-        start_date = inquirer.text(
-            message="Start date (YYYY-MM-DD) or leave empty for all:",
-            default="",
-        ).execute()
-        end_date = inquirer.text(
-            message="End date (YYYY-MM-DD) or leave empty for all:", default=""
-        ).execute()
-        start_date = start_date or None
-        end_date = end_date or None
+        # Custom start date with validation
+        while True:
+            start_date = inquirer.text(
+                message=f"Start date (YYYY-MM-DD) [{min_available_date} to {max_available_date}]:",
+                default=min_available_date,
+            ).execute().strip()
+
+            if not validate_date_format(start_date):
+                console.print("[red]✗ Invalid format. Use YYYY-MM-DD[/red]")
+                continue
+
+            if not validate_date_in_range(start_date, min_available_date, max_available_date):
+                console.print(f"[red]✗ Date outside available range[/red]")
+                continue
+
+            console.print(f"[green]✓ Start: {start_date}[/green]")
+            break
+
+        # Custom end date with validation
+        while True:
+            end_date = inquirer.text(
+                message=f"End date (YYYY-MM-DD) [{min_available_date} to {max_available_date}]:",
+                default=max_available_date,
+            ).execute().strip()
+
+            if not validate_date_format(end_date):
+                console.print("[red]✗ Invalid format. Use YYYY-MM-DD[/red]")
+                continue
+
+            if not validate_date_in_range(end_date, min_available_date, max_available_date):
+                console.print(f"[red]✗ Date outside available range[/red]")
+                continue
+
+            if end_date < start_date:
+                console.print("[red]✗ End date must be after start date[/red]")
+                continue
+
+            console.print(f"[green]✓ End: {end_date}[/green]")
+            break
+
+    # Smart defaults for train/val split based on actual data
+    max_dt = datetime.strptime(max_available_date, '%Y-%m-%d')
+    two_years_ago = (max_dt - timedelta(days=730)).strftime('%Y-%m-%d')
+    one_year_ago = (max_dt - timedelta(days=365)).strftime('%Y-%m-%d')
 
     # Train/val/test split
     train_end = inquirer.text(
         message="Training period end date (YYYY-MM-DD):",
-        default="2022-12-31",
+        default=two_years_ago,
     ).execute()
 
     val_end = inquirer.text(
         message="Validation period end date (YYYY-MM-DD):",
-        default="2023-12-31",
+        default=one_year_ago,
     ).execute()
 
     # History features
@@ -199,6 +299,16 @@ def configure_data(preset: Optional[Dict] = None) -> Dict:
         message="Include channel history features? (slower but richer features)",
         default=False,
     ).execute()
+
+    # Summary
+    console.print("\n[bold cyan]Configuration Summary:[/bold cyan]")
+    console.print(f"  Window: {window} bars, Step: {step} bars")
+    if start_date and end_date:
+        console.print(f"  Date range: {start_date} to {end_date}")
+    else:
+        console.print(f"  Date range: All ({min_available_date} to {max_available_date})")
+    console.print(f"  Train/Val split: {train_end} / {val_end}")
+    console.print(f"  History features: {'Yes' if include_history else 'No'}\n")
 
     return {
         "window": window,

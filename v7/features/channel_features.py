@@ -50,7 +50,7 @@ class BarFeatures:
 
 def extract_channel_features(
     df: pd.DataFrame,
-    window: int = 50,
+    window: int = 20,
     timeframe: str = '5min',
     include_containment: bool = True
 ) -> BarFeatures:
@@ -150,7 +150,7 @@ def features_to_dict(features: BarFeatures) -> Dict[str, Any]:
 
 def extract_features_for_all_timeframes(
     df_base: pd.DataFrame,
-    window: int = 50
+    window: int = 20
 ) -> Dict[str, BarFeatures]:
     """
     Extract features for all timeframes from base data.

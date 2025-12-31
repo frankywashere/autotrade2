@@ -25,7 +25,7 @@ from features.full_features import extract_tsla_channel_features, extract_full_f
 # Example 1: Basic Integration
 # ============================================================================
 
-def extract_features_without_cache(df: pd.DataFrame, window: int = 50) -> Dict:
+def extract_features_without_cache(df: pd.DataFrame, window: int = 20) -> Dict:
     """Traditional approach - no caching."""
     features = {}
 
@@ -55,7 +55,7 @@ def extract_features_without_cache(df: pd.DataFrame, window: int = 50) -> Dict:
 
 def extract_features_with_cache(
     df: pd.DataFrame,
-    window: int = 50,
+    window: int = 20,
     cache: FeatureCache = None
 ) -> Dict:
     """Cached approach - transparently caches expensive operations."""

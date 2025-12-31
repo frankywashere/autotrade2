@@ -156,7 +156,7 @@ def calculate_cross_asset_containment(
 
 def extract_spy_features(
     spy_df: pd.DataFrame,
-    window: int = 50,
+    window: int = 20,
     timeframe: str = '5min'
 ) -> SPYFeatures:
     """
@@ -253,7 +253,7 @@ def extract_all_cross_asset_features(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    window: int = 50
+    window: int = 20
 ) -> Dict:
     """
     Extract all cross-asset features for all timeframes.
