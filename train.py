@@ -58,6 +58,7 @@ from v7.training import (
     Trainer,
     TrainingConfig,
 )
+from v7.training.dataset import get_cache_summary, validate_cache_params
 from v7.models import create_model, create_loss
 
 console = Console()
@@ -102,6 +103,156 @@ PRESETS = {
         "learning_rate": 0.0003,
     },
 }
+
+
+# =============================================================================
+# Cache Detection and Display
+# =============================================================================
+
+
+def display_cache_status(cache_dir: Path) -> Optional[Dict]:
+    """
+    Display cache status to user and return cache summary if exists.
+
+    Args:
+        cache_dir: Path to cache directory
+
+    Returns:
+        Cache summary dict if cache exists, None otherwise
+    """
+    cache_path = cache_dir / "channel_samples.pkl"
+    summary = get_cache_summary(cache_path)
+
+    if summary is None:
+        console.print("\n[yellow]No existing cache found.[/yellow]")
+        console.print("[dim]A new cache will be built when training starts.[/dim]\n")
+        return None
+
+    # Display cache info
+    console.print("\n[bold cyan]Existing Cache Detected[/bold cyan]\n")
+
+    # Status indicator
+    if summary['version_valid']:
+        console.print(f"  [green]✓[/green] Version: {summary['cache_version']} (current)")
+    else:
+        console.print(f"  [red]✗[/red] Version: {summary['cache_version']} (outdated)")
+
+    console.print(f"  [green]✓[/green] Samples: {summary['num_samples']:,}")
+    console.print(f"  [green]✓[/green] Size: {summary['file_size_mb']} MB")
+
+    # Date range
+    console.print(f"\n  [bold]Data Range:[/bold]")
+    console.print(f"    From: [cyan]{summary['start_date']}[/cyan]")
+    console.print(f"    To:   [cyan]{summary['end_date']}[/cyan]")
+
+    # Cache parameters
+    console.print(f"\n  [bold]Cache Parameters:[/bold]")
+    console.print(f"    window={summary['window']}, step={summary['step']}, min_cycles={summary['min_cycles']}")
+    if summary.get('max_scan'):
+        console.print(f"    max_scan={summary['max_scan']}, return_threshold={summary['return_threshold']}")
+    if summary.get('lookforward_bars'):
+        console.print(f"    lookforward_bars={summary['lookforward_bars']}")
+    console.print(f"    include_history={summary['include_history']}")
+
+    # Created timestamp
+    console.print(f"\n  [dim]Created: {summary['created_at']}[/dim]\n")
+
+    return summary
+
+
+def prompt_cache_action(cache_summary: Dict) -> str:
+    """
+    Prompt user for what to do with existing cache.
+
+    Args:
+        cache_summary: Summary of existing cache
+
+    Returns:
+        One of: 'use', 'rebuild', 'configure'
+    """
+    choices = [
+        {"name": "Use this cache (fast start)", "value": "use"},
+        {"name": "Rebuild cache with same parameters", "value": "rebuild"},
+        {"name": "Configure new parameters (may trigger rebuild)", "value": "configure"},
+    ]
+
+    action = inquirer.select(
+        message="What would you like to do?",
+        choices=choices,
+        default="use",
+    ).execute()
+
+    return action
+
+
+def display_safe_vs_unsafe_settings(cache_summary: Dict):
+    """Display which settings are safe to change vs which require rebuild."""
+    console.print("\n[bold cyan]Settings Guide[/bold cyan]\n")
+
+    # Safe to change
+    safe_table = Table(title="[green]✓ Safe to Change[/green] (no rebuild)", box=box.SIMPLE)
+    safe_table.add_column("Category", style="green")
+    safe_table.add_column("Settings")
+    safe_table.add_row("Model", "hidden_dim, cfc_units, attention_heads, dropout")
+    safe_table.add_row("Training", "epochs, batch_size, learning_rate, optimizer")
+    safe_table.add_row("Loss", "all weights (duration, direction, next_channel)")
+    safe_table.add_row("Split", "train_end, val_end (just re-splits cached samples)")
+    console.print(safe_table)
+
+    # Will trigger rebuild
+    console.print("")
+    rebuild_table = Table(title="[yellow]⚠ Will Rebuild Cache[/yellow] (~30-60 min)", box=box.SIMPLE)
+    rebuild_table.add_column("Parameter", style="yellow")
+    rebuild_table.add_column("Cached Value", style="cyan")
+    rebuild_table.add_row("window", str(cache_summary.get('window', 'N/A')))
+    rebuild_table.add_row("step", str(cache_summary.get('step', 'N/A')))
+    rebuild_table.add_row("min_cycles", str(cache_summary.get('min_cycles', 'N/A')))
+    rebuild_table.add_row("max_scan", str(cache_summary.get('max_scan', 'N/A')))
+    rebuild_table.add_row("return_threshold", str(cache_summary.get('return_threshold', 'N/A')))
+    rebuild_table.add_row("include_history", str(cache_summary.get('include_history', 'N/A')))
+    rebuild_table.add_row("lookforward_bars", str(cache_summary.get('lookforward_bars', 'N/A')))
+    console.print(rebuild_table)
+    console.print("")
+
+
+def check_params_will_rebuild(
+    cache_summary: Dict,
+    window: int,
+    step: int,
+    min_cycles: int = 1,
+    include_history: bool = False,
+    max_scan: int = 500,
+    return_threshold: int = 20,
+    lookforward_bars: int = 200
+) -> Tuple[bool, List[str]]:
+    """
+    Check if the given parameters will trigger a cache rebuild.
+
+    Returns:
+        Tuple of (will_rebuild, list_of_differences)
+    """
+    differences = []
+
+    checks = [
+        ('window', window, cache_summary.get('window')),
+        ('step', step, cache_summary.get('step')),
+        ('min_cycles', min_cycles, cache_summary.get('min_cycles')),
+        ('include_history', include_history, cache_summary.get('include_history')),
+    ]
+
+    # Only check these if they exist in cache (for backward compatibility)
+    if cache_summary.get('max_scan') is not None:
+        checks.append(('max_scan', max_scan, cache_summary.get('max_scan')))
+    if cache_summary.get('return_threshold') is not None:
+        checks.append(('return_threshold', return_threshold, cache_summary.get('return_threshold')))
+    if cache_summary.get('lookforward_bars') is not None:
+        checks.append(('lookforward_bars', lookforward_bars, cache_summary.get('lookforward_bars')))
+
+    for param_name, new_val, cached_val in checks:
+        if cached_val is not None and new_val != cached_val:
+            differences.append(f"{param_name}: {cached_val} → {new_val}")
+
+    return len(differences) > 0, differences
 
 
 # =============================================================================
@@ -1817,6 +1968,34 @@ def main():
         resume_training(save_dir, data_dir, cache_dir)
         return
 
+    # =========================================================================
+    # CACHE DETECTION - Show existing cache status before configuration
+    # =========================================================================
+    cache_summary = display_cache_status(cache_dir)
+    use_cached_params = False
+    force_rebuild = False
+
+    if cache_summary is not None and cache_summary.get('version_valid', False):
+        # Cache exists and is valid - ask user what to do
+        cache_action = prompt_cache_action(cache_summary)
+
+        if cache_action == 'use':
+            # Use cache with its existing parameters
+            use_cached_params = True
+            display_safe_vs_unsafe_settings(cache_summary)
+            console.print("[green]✓ Will use existing cache. Only safe settings will be prompted.[/green]\n")
+
+        elif cache_action == 'rebuild':
+            # Force rebuild with same parameters
+            force_rebuild = True
+            use_cached_params = True
+            console.print("[yellow]⚠ Cache will be rebuilt with the same parameters.[/yellow]\n")
+
+        else:  # 'configure'
+            # User wants to configure new parameters
+            display_safe_vs_unsafe_settings(cache_summary)
+            console.print("[dim]Proceeding to configuration. Changes to cache parameters will trigger rebuild.[/dim]\n")
+
     # Build configuration
     config = {
         "mode": mode,
@@ -1824,6 +2003,9 @@ def main():
         "model": {},
         "training": {},
         "device": None,
+        "_cache_summary": cache_summary,  # Pass cache info for reference
+        "_use_cached_params": use_cached_params,
+        "_force_rebuild": force_rebuild,
     }
 
     # Get preset if applicable
@@ -1863,7 +2045,53 @@ def main():
             preset = PRESETS.get(mode)
 
     # Interactive configuration
-    config["data"] = configure_data(preset, walk_forward_config)
+    # If using cached params, use them for data config
+    if use_cached_params and cache_summary:
+        config["data"] = {
+            "window": cache_summary.get('window', 20),
+            "step": cache_summary.get('step', 25),
+            "min_cycles": cache_summary.get('min_cycles', 1),
+            "max_scan": cache_summary.get('max_scan', 500),
+            "return_threshold": cache_summary.get('return_threshold', 20),
+            "lookforward_bars": cache_summary.get('lookforward_bars', 200),
+            "include_history": cache_summary.get('include_history', False),
+            "start_date": None,  # Use full cached data
+            "end_date": None,
+            "train_end": "2022-12-31",  # Will prompt for these
+            "val_end": "2023-12-31",
+        }
+        # Still prompt for train/val split dates and walk-forward if applicable
+        console.print("[bold cyan]Data Split Configuration[/bold cyan]")
+        console.print(f"[dim]Using cached data parameters: window={config['data']['window']}, step={config['data']['step']}[/dim]\n")
+
+        # Load data range for split date prompts
+        min_date, max_date = load_data_date_range(data_dir)
+
+        # Smart defaults
+        from datetime import timedelta
+        min_dt = datetime.strptime(min_date, '%Y-%m-%d')
+        max_dt = datetime.strptime(max_date, '%Y-%m-%d')
+        total_days = (max_dt - min_dt).days
+        train_days = int(total_days * 0.70)
+        val_days = int(total_days * 0.85)
+        default_train_end = (min_dt + timedelta(days=train_days)).strftime('%Y-%m-%d')
+        default_val_end = (min_dt + timedelta(days=val_days)).strftime('%Y-%m-%d')
+
+        config["data"]["train_end"] = inquirer.text(
+            message=f"Training ends on:",
+            default=default_train_end,
+        ).execute()
+
+        config["data"]["val_end"] = inquirer.text(
+            message=f"Validation ends on:",
+            default=default_val_end,
+        ).execute()
+
+        if walk_forward_config:
+            config["data"]["walk_forward"] = walk_forward_config
+    else:
+        config["data"] = configure_data(preset, walk_forward_config)
+
     config["model"] = configure_model(preset)
     config["training"] = configure_training(preset)
     config["device"] = configure_device()
@@ -1903,12 +2131,16 @@ def main():
                 cache_dir=cache_dir,
                 window=config["data"]["window"],
                 step=config["data"]["step"],
+                min_cycles=config["data"].get("min_cycles", 1),
+                max_scan=config["data"].get("max_scan", 500),
+                return_threshold=config["data"].get("return_threshold", 20),
+                lookforward_bars=config["data"].get("lookforward_bars", 200),
                 train_end=config["data"]["train_end"],
                 val_end=config["data"]["val_end"],
                 start_date=config["data"]["start_date"],
                 end_date=config["data"]["end_date"],
                 include_history=config["data"]["include_history"],
-                force_rebuild=False,
+                force_rebuild=config.get("_force_rebuild", False),
             )
 
         console.print(

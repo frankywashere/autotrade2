@@ -667,10 +667,9 @@ class HierarchicalCfCModel(nn.Module):
         tf_embeddings = []
 
         # Initialize hidden states if needed (list of None or previous states)
-        if not hasattr(self, 'hx_states') or self.hx_states is None or len(self.hx_states) == 0:
-            hx_states = [None] * self.n_timeframes
-        else:
-            hx_states = self.hx_states
+        # CRITICAL: For training on shuffled batches, we should NOT carry state between batches
+        # For now, always start fresh (stateless processing)
+        hx_states = [None] * self.n_timeframes
 
         new_hx_states = []
 
@@ -679,21 +678,21 @@ class HierarchicalCfCModel(nn.Module):
             start, end = self.config.get_tf_slice(tf_idx)
             per_tf_features = x[:, start:end]  # [batch, 51]
 
-            # Process through branch with hidden state
+            # Process through branch with NO hidden state (stateless for shuffled batches)
             embedding, new_hx = self.tf_branches[tf_idx](
                 per_tf_features,
                 shared_features,
-                hx=hx_states[tf_idx]  # Pass previous hidden state
+                hx=hx_states[tf_idx]  # Always None for stateless training
             )
 
             tf_embeddings.append(embedding)
             new_hx_states.append(new_hx)
 
-        # Store updated hidden states for next forward pass
-        # Note: Can't use buffer for list, store as instance variable
-        if not hasattr(self, 'hx_states'):
-            self.hx_states = []
-        self.hx_states = new_hx_states
+        # Don't store hidden states - each batch is independent
+        # This prevents gradient graph from linking across batches
+        # If you need stateful processing, detach states before storing:
+        # self.hx_states = [h.detach() if h is not None else None for h in new_hx_states]
+        self.hx_states = None
 
         # Stack embeddings: [batch, n_tf, hidden_dim]
         tf_embeddings_stacked = torch.stack(tf_embeddings, dim=1)

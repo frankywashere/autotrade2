@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Any
 from dataclasses import dataclass, field
@@ -115,6 +115,8 @@ class Trainer:
             use_learnable_weights=config.use_learnable_weights,
             fixed_weights=config.fixed_weights
         )
+        # Move criterion to device (critical for learnable weights)
+        self.criterion.to(self.device)
 
         # Setup optimizer
         self.optimizer = self._create_optimizer()
@@ -123,7 +125,11 @@ class Trainer:
         self.scheduler = self._create_scheduler()
 
         # Mixed precision scaler
-        self.scaler = GradScaler() if config.use_amp else None
+        if config.use_amp:
+            # Use device type directly (supports cuda, mps, cpu)
+            self.scaler = GradScaler(self.device.type)
+        else:
+            self.scaler = None
 
         # Tracking
         self.current_epoch = 0
@@ -202,6 +208,9 @@ class Trainer:
 
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
+        # Reset hidden states for fresh start (critical for CfC models)
+        if hasattr(self.model, 'reset_hidden_states'):
+            self.model.reset_hidden_states()
         self.model.train()
 
         epoch_losses = {
@@ -217,55 +226,65 @@ class Trainer:
         for batch_idx, (features, labels) in enumerate(pbar):
             # Move to device
             features = {k: v.to(self.device) for k, v in features.items()}
+
+            # Concatenate feature dict into single tensor [batch_size, 626]
+            x = torch.cat([features[k] for k in sorted(features.keys())], dim=1)
+
             # Remap labels to match CombinedLoss expectations
             targets = {
-                'duration': labels['duration_bars'].to(self.device),
-                'direction': labels['break_direction'].to(self.device),
-                'next_channel': labels['new_channel_direction'].to(self.device),
+                'duration': labels['duration'].to(self.device),
+                'direction': labels['direction'].to(self.device),
+                'next_channel': labels['next_channel'].to(self.device),
             }
 
             # Forward pass with mixed precision
             self.optimizer.zero_grad()
 
             if self.config.use_amp:
-                with autocast():
-                    predictions = self.model(features)
+                # Use device type directly (supports cuda, mps, cpu)
+                with autocast(self.device.type):
+                    predictions = self.model(x)
                     loss, loss_dict = self.criterion(predictions, targets)
 
                 # Backward pass
                 self.scaler.scale(loss).backward()
 
-                # Gradient clipping
+                # Gradient clipping (include both model and criterion parameters)
                 if self.config.gradient_clip > 0:
                     self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                    all_params = list(self.model.parameters()) + list(self.criterion.parameters())
+                    torch.nn.utils.clip_grad_norm_(all_params, self.config.gradient_clip)
 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                predictions = self.model(features)
+                predictions = self.model(x)
                 loss, loss_dict = self.criterion(predictions, targets)
 
                 # Backward pass
                 loss.backward()
 
-                # Gradient clipping
+                # Gradient clipping (include both model and criterion parameters)
                 if self.config.gradient_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                    all_params = list(self.model.parameters()) + list(self.criterion.parameters())
+                    torch.nn.utils.clip_grad_norm_(all_params, self.config.gradient_clip)
 
                 self.optimizer.step()
 
-            # Track losses
+            # Track losses (skip nested dicts like 'weights')
             for k, v in loss_dict.items():
+                if isinstance(v, dict):
+                    continue  # Skip nested dicts
                 epoch_losses[k].append(v)
 
             # Update progress bar
             pbar.set_postfix({'loss': loss_dict['total']})
 
-            # Log to tensorboard
+            # Log to tensorboard (skip nested dicts)
             if self.writer and self.global_step % self.config.log_every_n_steps == 0:
                 for k, v in loss_dict.items():
-                    self.writer.add_scalar(f'train/{k}_loss', v, self.global_step)
+                    if not isinstance(v, dict):
+                        self.writer.add_scalar(f'train/{k}_loss', v, self.global_step)
                 self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
 
             self.global_step += 1
@@ -296,24 +315,31 @@ class Trainer:
             for features, labels in tqdm(self.val_loader, desc="Validation"):
                 # Move to device
                 features = {k: v.to(self.device) for k, v in features.items()}
+
+                # Concatenate feature dict into single tensor [batch_size, 626]
+                x = torch.cat([features[k] for k in sorted(features.keys())], dim=1)
+
                 # Remap labels to match CombinedLoss expectations
                 targets = {
-                    'duration': labels['duration_bars'].to(self.device),
-                    'direction': labels['break_direction'].to(self.device),
-                    'next_channel': labels['new_channel_direction'].to(self.device),
+                    'duration': labels['duration'].to(self.device),
+                    'direction': labels['direction'].to(self.device),
+                    'next_channel': labels['next_channel'].to(self.device),
                 }
 
                 # Forward pass
                 if self.config.use_amp:
-                    with autocast():
-                        predictions = self.model(features)
+                    # Use device type directly (supports cuda, mps, cpu)
+                    with autocast(self.device.type):
+                        predictions = self.model(x)
                         loss, loss_dict = self.criterion(predictions, targets)
                 else:
-                    predictions = self.model(features)
+                    predictions = self.model(x)
                     loss, loss_dict = self.criterion(predictions, targets)
 
-                # Track losses
+                # Track losses (skip nested dicts like 'weights')
                 for k, v in loss_dict.items():
+                    if isinstance(v, dict):
+                        continue  # Skip nested dicts
                     if k in epoch_losses:
                         epoch_losses[k].append(v)
 

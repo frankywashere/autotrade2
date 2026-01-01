@@ -26,20 +26,20 @@ class DummyModel(nn.Module):
     def __init__(self, input_dim=300):
         super().__init__()
         self.fc = nn.Linear(input_dim, 128)
-        self.duration_head = nn.Linear(128, 1)
-        self.break_direction_head = nn.Linear(128, 2)
-        self.new_direction_head = nn.Linear(128, 3)
-        self.permanent_break_head = nn.Linear(128, 1)
+        self.duration_mean_head = nn.Linear(128, 1)
+        self.duration_log_std_head = nn.Linear(128, 1)
+        self.direction_head = nn.Linear(128, 1)
+        self.next_channel_head = nn.Linear(128, 3)
 
     def forward(self, features):
         # Concatenate all features
         x = torch.cat([v for v in features.values()], dim=1)
         x = self.fc(x)
         return {
-            'duration': self.duration_head(x),
-            'break_direction': self.break_direction_head(x),
-            'new_direction': self.new_direction_head(x),
-            'permanent_break': self.permanent_break_head(x)
+            'duration_mean': self.duration_mean_head(x),
+            'duration_log_std': self.duration_log_std_head(x),
+            'direction_logits': self.direction_head(x),
+            'next_channel_logits': self.next_channel_head(x)
         }
 
 
@@ -143,8 +143,8 @@ def test_pipeline():
         # Forward pass
         predictions = model(batched_features)
         print(f"  Predictions keys: {list(predictions.keys())}")
-        print(f"  Duration pred shape: {predictions['duration'].shape}")
-        print(f"  Break direction pred shape: {predictions['break_direction'].shape}")
+        print(f"  Duration mean shape: {predictions['duration_mean'].shape}")
+        print(f"  Direction logits shape: {predictions['direction_logits'].shape}")
 
         # Calculate loss
         criterion = CombinedLoss(num_timeframes=1, use_learnable_weights=False)

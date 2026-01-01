@@ -46,9 +46,32 @@ def get_cache_metadata_path(cache_path: Path) -> Path:
     return cache_path.with_suffix('.json')
 
 
+def get_cache_metadata(cache_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Load cache metadata from JSON file.
+
+    Args:
+        cache_path: Path to cache file (.pkl)
+
+    Returns:
+        Metadata dict or None if not found/invalid
+    """
+    meta_path = get_cache_metadata_path(cache_path)
+    if not meta_path.exists():
+        return None
+
+    try:
+        with open(meta_path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def is_cache_valid(cache_path: Path) -> bool:
     """
-    Check if cached data is valid by comparing version.
+    Check if cached data exists and has valid version.
+
+    NOTE: This only checks version. Use validate_cache_params() for full validation.
 
     Args:
         cache_path: Path to cache file
@@ -77,6 +100,95 @@ def is_cache_valid(cache_path: Path) -> bool:
     except Exception as e:
         print(f"Error reading cache metadata: {e}")
         return False
+
+
+def validate_cache_params(
+    cache_path: Path,
+    window: int,
+    step: int,
+    min_cycles: int = 1,
+    max_scan: int = 500,
+    return_threshold: int = 20,
+    include_history: bool = False,
+    lookforward_bars: int = 200
+) -> Tuple[bool, List[str]]:
+    """
+    Validate that cache parameters match requested parameters.
+
+    Args:
+        cache_path: Path to cache file
+        window, step, etc: Requested parameters to validate against cache
+
+    Returns:
+        Tuple of (is_valid, list_of_mismatches)
+        - is_valid: True if all params match (or cache doesn't exist)
+        - list_of_mismatches: Human-readable list of parameter mismatches
+    """
+    metadata = get_cache_metadata(cache_path)
+    if metadata is None:
+        return True, []  # No cache = no mismatch
+
+    mismatches = []
+
+    # Check each parameter
+    param_checks = [
+        ('window', window, metadata.get('window')),
+        ('step', step, metadata.get('step')),
+        ('min_cycles', min_cycles, metadata.get('min_cycles')),
+        ('max_scan', max_scan, metadata.get('max_scan')),
+        ('return_threshold', return_threshold, metadata.get('return_threshold')),
+        ('include_history', include_history, metadata.get('include_history')),
+        ('lookforward_bars', lookforward_bars, metadata.get('lookforward_bars')),
+    ]
+
+    for param_name, requested, cached in param_checks:
+        if cached is not None and cached != requested:
+            mismatches.append(f"{param_name}: cached={cached}, requested={requested}")
+
+    return len(mismatches) == 0, mismatches
+
+
+def get_cache_summary(cache_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Get a summary of cached data for display.
+
+    Args:
+        cache_path: Path to cache file
+
+    Returns:
+        Dict with cache summary info, or None if cache doesn't exist
+    """
+    if not cache_path.exists():
+        return None
+
+    metadata = get_cache_metadata(cache_path)
+    if metadata is None:
+        return None
+
+    # Get file size
+    try:
+        file_size_mb = cache_path.stat().st_size / (1024 * 1024)
+    except Exception:
+        file_size_mb = 0
+
+    return {
+        'exists': True,
+        'path': str(cache_path),
+        'file_size_mb': round(file_size_mb, 1),
+        'cache_version': metadata.get('cache_version', 'unknown'),
+        'version_valid': metadata.get('cache_version') == CACHE_VERSION,
+        'num_samples': metadata.get('num_samples', 0),
+        'window': metadata.get('window'),
+        'step': metadata.get('step'),
+        'min_cycles': metadata.get('min_cycles'),
+        'max_scan': metadata.get('max_scan'),
+        'return_threshold': metadata.get('return_threshold'),
+        'include_history': metadata.get('include_history'),
+        'lookforward_bars': metadata.get('lookforward_bars'),
+        'start_date': metadata.get('start_date'),
+        'end_date': metadata.get('end_date'),
+        'created_at': metadata.get('created_at'),
+    }
 
 
 # =============================================================================
@@ -707,12 +819,16 @@ def prepare_dataset_from_scratch(
     window: int = 50,
     step: int = 10,
     min_cycles: int = 1,
+    max_scan: int = 500,
+    return_threshold: int = 20,
+    lookforward_bars: int = 200,
     train_end: str = "2022-12-31",
     val_end: str = "2023-12-31",
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     include_history: bool = False,
-    force_rebuild: bool = False
+    force_rebuild: bool = False,
+    warn_on_mismatch: bool = True
 ) -> Tuple[List[ChannelSample], List[ChannelSample], List[ChannelSample]]:
     """
     Complete pipeline to prepare dataset from raw data.
@@ -729,12 +845,16 @@ def prepare_dataset_from_scratch(
         window: Channel detection window
         step: Sliding window step
         min_cycles: Minimum cycles for valid channel
+        max_scan: Maximum bars to scan forward for labels
+        return_threshold: Bars outside channel to confirm break
+        lookforward_bars: Bars to look forward for exit tracking
         train_end: End of training period
         val_end: End of validation period
         start_date: Optional start date for data
         end_date: Optional end date for data
         include_history: Include channel history features
         force_rebuild: Force rebuild cache even if exists
+        warn_on_mismatch: Print warning if cache params don't match requested
 
     Returns:
         Tuple of (train_samples, val_samples, test_samples)
@@ -742,16 +862,43 @@ def prepare_dataset_from_scratch(
     cache_path = cache_dir / "channel_samples.pkl"
 
     # Check if cache exists and is valid
-    if is_cache_valid(cache_path) and not force_rebuild:
+    cache_usable = is_cache_valid(cache_path) and not force_rebuild
+
+    if cache_usable:
+        # Validate parameters match cached values
+        params_match, mismatches = validate_cache_params(
+            cache_path,
+            window=window,
+            step=step,
+            min_cycles=min_cycles,
+            max_scan=max_scan,
+            return_threshold=return_threshold,
+            include_history=include_history,
+            lookforward_bars=lookforward_bars
+        )
+
+        if not params_match:
+            if warn_on_mismatch:
+                print(f"\n⚠️  Cache parameter mismatch detected:")
+                for mismatch in mismatches:
+                    print(f"   - {mismatch}")
+                print(f"   Cache will be rebuilt with new parameters.\n")
+            cache_usable = False
+
+    if cache_usable:
         print(f"Loading cached samples from {cache_path}")
         samples = load_cached_samples(cache_path)
     else:
-        if cache_path.exists() and not is_cache_valid(cache_path):
+        if cache_path.exists():
+            if not is_cache_valid(cache_path):
+                reason = "version mismatch"
+            else:
+                reason = "parameter mismatch"
             # Backup old cache before rebuilding
             backup_path = cache_path.with_name(f"{cache_path.stem}_old.pkl")
             old_meta_path = get_cache_metadata_path(cache_path)
 
-            print(f"Cache version mismatch - backing up old cache to {backup_path}")
+            print(f"Cache {reason} - backing up old cache to {backup_path}")
             if backup_path.exists():
                 print(f"  Removing existing backup: {backup_path}")
                 backup_path.unlink()
@@ -762,6 +909,7 @@ def prepare_dataset_from_scratch(
                 if old_meta_backup.exists():
                     old_meta_backup.unlink()
                 old_meta_path.rename(old_meta_backup)
+
         print("Building dataset from scratch...")
 
         # Load data
@@ -785,20 +933,26 @@ def prepare_dataset_from_scratch(
             window=window,
             step=step,
             min_cycles=min_cycles,
-            include_history=include_history
+            max_scan=max_scan,
+            return_threshold=return_threshold,
+            include_history=include_history,
+            lookforward_bars=lookforward_bars
         )
 
         print(f"\nFound {len(samples)} valid channel samples")
 
-        # Cache to disk
+        # Cache to disk with ALL parameters
         metadata = {
             'window': window,
             'step': step,
             'min_cycles': min_cycles,
+            'max_scan': max_scan,
+            'return_threshold': return_threshold,
+            'lookforward_bars': lookforward_bars,
+            'include_history': include_history,
             'num_samples': len(samples),
             'start_date': str(tsla_df.index[0]),
             'end_date': str(tsla_df.index[-1]),
-            'include_history': include_history,
             'created_at': str(datetime.now()),
         }
         cache_samples(samples, cache_path, metadata)
@@ -858,8 +1012,8 @@ if __name__ == '__main__':
 
     print(f"\nLabels:")
     print(f"  duration_bars: {labels['duration_bars'].shape}")
-    print(f"  break_direction: {labels['break_direction'].shape}")
-    print(f"  new_channel_direction: {labels['new_channel_direction'].shape}")
+    print(f"  direction: {labels['direction'].shape}")
+    print(f"  next_channel: {labels['next_channel'].shape}")
     print(f"  permanent_break: {labels['permanent_break'].shape}")
 
     print(f"\nDataloader sizes:")
