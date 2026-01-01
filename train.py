@@ -109,6 +109,150 @@ PRESETS = {
 # =============================================================================
 
 
+def show_preset_confirmation(preset_name: str, preset: Dict) -> bool:
+    """
+    Display preset confirmation screen.
+
+    Args:
+        preset_name: Name of the preset (e.g., "Quick Start")
+        preset: Preset dictionary with all values
+
+    Returns:
+        True if user accepts preset as-is, False if they want to modify
+    """
+    console.print(f"\n[bold cyan]{preset_name} Preset Configuration[/bold cyan]\n")
+
+    # Create summary table
+    table = Table(title="Preset Values", box=box.ROUNDED)
+    table.add_column("Category", style="cyan")
+    table.add_column("Parameter", style="green")
+    table.add_column("Value", style="yellow")
+
+    # Data parameters
+    table.add_row("Data", "Window", str(preset.get("window", "N/A")))
+    table.add_row("", "Step", str(preset.get("step", "N/A")))
+
+    # Model parameters
+    table.add_row("Model", "Hidden Dim", str(preset.get("hidden_dim", "N/A")))
+    table.add_row("", "CfC Units", str(preset.get("cfc_units", "N/A")))
+    table.add_row("", "Attention Heads", str(preset.get("attention_heads", "N/A")))
+
+    # Training parameters
+    table.add_row("Training", "Epochs", str(preset.get("num_epochs", "N/A")))
+    table.add_row("", "Batch Size", str(preset.get("batch_size", "N/A")))
+    table.add_row("", "Learning Rate", str(preset.get("learning_rate", "N/A")))
+
+    console.print(table)
+
+    # Confirmation
+    accept = inquirer.confirm(
+        message="\nAccept preset as-is?",
+        default=True,
+    ).execute()
+
+    return accept
+
+
+def modify_preset_checklist(preset: Dict) -> Dict:
+    """
+    Show checklist for selecting which parameters to modify.
+
+    Args:
+        preset: Original preset dictionary
+
+    Returns:
+        Modified preset dictionary
+    """
+    console.print("\n[bold cyan]Select Parameters to Modify[/bold cyan]\n")
+
+    # Checkbox selection
+    params_to_modify = inquirer.checkbox(
+        message="Which parameters would you like to modify? (Space to select, Enter to confirm)",
+        choices=[
+            "window",
+            "step",
+            "hidden_dim",
+            "cfc_units",
+            "attention_heads",
+            "num_epochs",
+            "batch_size",
+            "learning_rate",
+        ],
+    ).execute()
+
+    if not params_to_modify:
+        console.print("[dim]No modifications selected[/dim]")
+        return preset
+
+    modified = preset.copy()
+
+    console.print(f"\n[bold cyan]Enter New Values ({len(params_to_modify)} parameter(s))[/bold cyan]\n")
+
+    # Prompt for each selected parameter
+    if "window" in params_to_modify:
+        modified["window"] = int(inquirer.number(
+            message=f"Window size (current: {preset['window']}):",
+            min_allowed=20, max_allowed=200,
+            default=preset["window"],
+            validate=NumberValidator(),
+        ).execute())
+
+    if "step" in params_to_modify:
+        modified["step"] = int(inquirer.number(
+            message=f"Step size (current: {preset['step']}):",
+            min_allowed=1, max_allowed=100,
+            default=preset["step"],
+            validate=NumberValidator(),
+        ).execute())
+
+    if "hidden_dim" in params_to_modify:
+        modified["hidden_dim"] = int(inquirer.number(
+            message=f"Hidden dimension (current: {preset['hidden_dim']}):",
+            min_allowed=64, max_allowed=512,
+            default=preset["hidden_dim"],
+            validate=NumberValidator(),
+        ).execute())
+
+    if "cfc_units" in params_to_modify:
+        modified["cfc_units"] = int(inquirer.number(
+            message=f"CfC units (current: {preset['cfc_units']}):",
+            min_allowed=100, max_allowed=1024,
+            default=preset["cfc_units"],
+            validate=NumberValidator(),
+        ).execute())
+
+    if "attention_heads" in params_to_modify:
+        modified["attention_heads"] = inquirer.select(
+            message=f"Attention heads (current: {preset['attention_heads']}):",
+            choices=[2, 4, 8, 16],  # Removed 11
+            default=preset["attention_heads"],
+        ).execute()
+
+    if "num_epochs" in params_to_modify:
+        modified["num_epochs"] = int(inquirer.number(
+            message=f"Epochs (current: {preset['num_epochs']}):",
+            min_allowed=1, max_allowed=500,
+            default=preset["num_epochs"],
+            validate=NumberValidator(),
+        ).execute())
+
+    if "batch_size" in params_to_modify:
+        modified["batch_size"] = inquirer.select(
+            message=f"Batch size (current: {preset['batch_size']}):",
+            choices=[16, 32, 64, 128, 256],
+            default=preset["batch_size"],
+        ).execute()
+
+    if "learning_rate" in params_to_modify:
+        modified["learning_rate"] = float(inquirer.number(
+            message=f"Learning rate (current: {preset['learning_rate']}):",
+            default=preset["learning_rate"],
+            float_allowed=True,
+        ).execute())
+
+    return modified
+
+
 def banner():
     """Display welcome banner."""
     console.print()
@@ -492,7 +636,6 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
                 {"name": "2 heads (minimal)", "value": 2},
                 {"name": "4 heads (light)", "value": 4},
                 {"name": "8 heads (balanced)", "value": 8},
-                {"name": "11 heads (custom)", "value": 11},
                 {"name": "16 heads (large)", "value": 16},
             ],
             default=8,
@@ -522,13 +665,6 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
                 {"name": "64 (fast, small model)", "value": 64},
                 {"name": "128 (balanced)", "value": 128},
                 {"name": "256 (large, slow)", "value": 256},
-            ]
-        elif num_attention_heads == 11:
-            valid_dims = [
-                {"name": "132 (12 per head)", "value": 132},
-                {"name": "176 (16 per head)", "value": 176},
-                {"name": "220 (20 per head)", "value": 220},
-                {"name": "264 (24 per head)", "value": 264},
             ]
         elif num_attention_heads == 16:
             valid_dims = [
@@ -755,6 +891,50 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         "fixed_weights": fixed_weights,
         "weight_mode": weight_mode,
     }
+
+
+def show_modification_summary(original: Dict, modified: Dict) -> bool:
+    """
+    Show side-by-side comparison of original vs modified values.
+
+    Args:
+        original: Original preset dictionary
+        modified: Modified preset dictionary
+
+    Returns:
+        True if user confirms modifications, False to reject
+    """
+    console.print("\n[bold cyan]Modification Summary[/bold cyan]\n")
+
+    # Find what changed
+    changes = {k: (original[k], modified[k])
+               for k in original.keys()
+               if k in modified and original[k] != modified[k]}
+
+    if not changes:
+        console.print("[dim]No changes made[/dim]\n")
+        return True
+
+    # Show comparison table
+    table = Table(title="Changes", box=box.ROUNDED)
+    table.add_column("Parameter", style="cyan")
+    table.add_column("Original", style="yellow")
+    table.add_column("→", justify="center")
+    table.add_column("New", style="green")
+
+    for param, (old_val, new_val) in changes.items():
+        table.add_row(param, str(old_val), "→", str(new_val))
+
+    console.print(table)
+    console.print(f"\n[yellow]Total modifications: {len(changes)}[/yellow]\n")
+
+    # Final confirmation
+    confirm = inquirer.confirm(
+        message="Proceed with these modifications?",
+        default=True,
+    ).execute()
+
+    return confirm
 
 
 def configure_device() -> str:
@@ -1647,7 +1827,30 @@ def main():
     }
 
     # Get preset if applicable
-    preset = PRESETS.get(mode) if mode != "Custom" else None
+    preset = None
+    if mode != "Custom" and mode != "Resume" and mode != "Walk-Forward":
+        # Get base preset
+        base_preset = PRESETS.get(mode)
+
+        # Show confirmation screen
+        accepted = show_preset_confirmation(mode, base_preset)
+
+        if accepted:
+            preset = base_preset
+        else:
+            # User wants to modify
+            modified_preset = modify_preset_checklist(base_preset)
+
+            # Show summary and confirm
+            if show_modification_summary(base_preset, modified_preset):
+                preset = modified_preset
+            else:
+                # User rejected modifications, ask what to do
+                retry = inquirer.confirm(
+                    message="Use original preset instead?",
+                    default=True,
+                ).execute()
+                preset = base_preset if retry else None
 
     # Handle walk-forward mode
     walk_forward_config = None
