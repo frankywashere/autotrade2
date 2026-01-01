@@ -71,6 +71,28 @@ def check_containment(
         width = upper - lower
 
         if width <= 0:
+            result[tf] = ContainmentInfo(
+                longer_tf=tf,
+                near_upper=False,
+                near_lower=False,
+                distance_to_upper=0.0,
+                distance_to_lower=0.0,
+                longer_direction=channel.direction.name,
+                longer_valid=False,
+            )
+            continue
+
+        # Skip if current_price is invalid (prevents division by zero)
+        if current_price <= 0:
+            result[tf] = ContainmentInfo(
+                longer_tf=tf,
+                near_upper=False,
+                near_lower=False,
+                distance_to_upper=0.0,
+                distance_to_lower=0.0,
+                longer_direction=channel.direction.name,
+                longer_valid=False,
+            )
             continue
 
         # Calculate distances

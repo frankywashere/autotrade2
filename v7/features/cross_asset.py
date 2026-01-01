@@ -125,8 +125,13 @@ def calculate_cross_asset_containment(
     # For direct containment, use percentage-based comparison
     # Is TSLA's % move similar to being at SPY's upper/lower?
 
-    spy_upper_pct = (spy_upper - spy_price) / spy_price * 100
-    spy_lower_pct = (spy_price - spy_lower) / spy_price * 100
+    # Guard against division by zero (spy_price <= 0)
+    if spy_price > 0:
+        spy_upper_pct = (spy_upper - spy_price) / spy_price * 100
+        spy_lower_pct = (spy_price - spy_lower) / spy_price * 100
+    else:
+        spy_upper_pct = 0.0
+        spy_lower_pct = 0.0
 
     # Check if TSLA is "aligned" with SPY boundaries
     # This is more about regime than literal price containment
@@ -214,13 +219,17 @@ def extract_vix_features(vix_df: pd.DataFrame) -> VIXFeatures:
 
     current = vix_df['close'].iloc[-1]
 
-    # Trends
+    # Trends (with guards against division by zero)
     trend_5d = 0.0
     trend_20d = 0.0
     if len(vix_df) >= 5:
-        trend_5d = (current - vix_df['close'].iloc[-5]) / vix_df['close'].iloc[-5] * 100
+        vix_5d_ago = vix_df['close'].iloc[-5]
+        if vix_5d_ago > 0:
+            trend_5d = (current - vix_5d_ago) / vix_5d_ago * 100
     if len(vix_df) >= 20:
-        trend_20d = (current - vix_df['close'].iloc[-20]) / vix_df['close'].iloc[-20] * 100
+        vix_20d_ago = vix_df['close'].iloc[-20]
+        if vix_20d_ago > 0:
+            trend_20d = (current - vix_20d_ago) / vix_20d_ago * 100
 
     # Percentile in last year
     last_252 = vix_df['close'].iloc[-252:].values

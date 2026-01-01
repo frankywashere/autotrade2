@@ -330,16 +330,17 @@ def _calculate_features(
         exits_accelerating = second_half_exits > first_half_exits
 
     # Return speed (inverse of bars_outside for returned exits)
+    # Note: bars_outside is guaranteed >= 1 at creation (line 249), but we use max() defensively
     returned_events = [e for e in exit_events if e.did_return]
     if returned_events:
-        return_speeds = [1.0 / e.bars_outside for e in returned_events]
+        return_speeds = [1.0 / max(e.bars_outside, 1) for e in returned_events]
         avg_return_speed = float(np.mean(return_speeds))
 
         # Check if returns are slowing (compare first half to second half)
         if len(returned_events) >= 2:
             mid = len(returned_events) // 2
-            first_half_speed = np.mean([1.0 / e.bars_outside for e in returned_events[:mid]])
-            second_half_speed = np.mean([1.0 / e.bars_outside for e in returned_events[mid:]])
+            first_half_speed = np.mean([1.0 / max(e.bars_outside, 1) for e in returned_events[:mid]])
+            second_half_speed = np.mean([1.0 / max(e.bars_outside, 1) for e in returned_events[mid:]])
             return_speed_slowing = second_half_speed < first_half_speed
         else:
             return_speed_slowing = False

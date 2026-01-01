@@ -38,7 +38,7 @@ from .labels import generate_labels, ChannelLabels, labels_to_dict, labels_to_ar
 # - Changes to label generation
 # - Changes to ChannelSample structure
 # - Changes to warmup period or timeframe handling
-CACHE_VERSION = "v7.1.0"  # Added 500-bar warmup, 11 TF validation, quality scores
+CACHE_VERSION = "v7.3.0"  # Increased to 32,760-bar warmup (420 days) for monthly window=20, fixed division guards
 
 
 def get_cache_metadata_path(cache_path: Path) -> Path:
@@ -542,8 +542,10 @@ def scan_valid_channels(
     samples = []
 
     # Warmup period: ensure adequate data for all timeframes
-    # Need ~500 bars of 5min data for proper daily/weekly channels
-    min_warmup_bars = max(window, 500)  # At least 500 bars or window, whichever larger
+    # Need ~32,760 bars (420 trading days) for monthly channels to have window=20 native monthly bars
+    # This ensures monthly timeframes have proper statistical validity (20 bars for regression)
+    # 3-month will still be weak (~6.7 bars) but acceptable with quality scoring
+    min_warmup_bars = max(window, 32760)  # At least 32,760 bars (20 months) or window, whichever larger
 
     # Need enough data for warmup + forward scan
     min_required = min_warmup_bars + max_scan
