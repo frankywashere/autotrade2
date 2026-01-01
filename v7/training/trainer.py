@@ -47,6 +47,7 @@ class TrainingConfig:
     # Loss configuration
     num_timeframes: int = 11  # Number of timeframes being predicted
     use_learnable_weights: bool = True  # Use uncertainty-based learnable task weights
+    fixed_weights: Optional[Dict[str, float]] = None  # Fixed weights when use_learnable_weights=False
 
     # Optimization
     optimizer: str = 'adam'  # 'adam', 'adamw', 'sgd'
@@ -108,10 +109,11 @@ class Trainer:
         self.device = torch.device(config.device)
         self.model.to(self.device)
 
-        # Setup loss - use CombinedLoss with learnable uncertainty-based weights
+        # Setup loss - use CombinedLoss with learnable or fixed weights
         self.criterion = CombinedLoss(
             num_timeframes=config.num_timeframes,
-            use_learnable_weights=config.use_learnable_weights
+            use_learnable_weights=config.use_learnable_weights,
+            fixed_weights=config.fixed_weights
         )
 
         # Setup optimizer

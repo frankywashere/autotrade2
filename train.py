@@ -78,10 +78,6 @@ PRESETS = {
         "num_epochs": 10,
         "batch_size": 32,
         "learning_rate": 0.001,
-        "duration_weight": 2.0,  # Duration is PRIMARY task
-        "break_direction_weight": 1.0,
-        "new_direction_weight": 0.8,  # Tertiary task
-        "confidence_weight": 0.5,  # Regularization
     },
     "Standard": {
         "desc": "Balanced configuration for typical training",
@@ -93,10 +89,6 @@ PRESETS = {
         "num_epochs": 50,
         "batch_size": 64,
         "learning_rate": 0.0005,
-        "duration_weight": 2.5,  # PRIMARY focus for production
-        "break_direction_weight": 1.0,
-        "new_direction_weight": 0.8,
-        "confidence_weight": 0.5,
     },
     "Full Training": {
         "desc": "Maximum quality (slow, requires good GPU)",
@@ -108,10 +100,6 @@ PRESETS = {
         "num_epochs": 100,
         "batch_size": 128,
         "learning_rate": 0.0003,
-        "duration_weight": 2.5,  # PRIMARY focus
-        "break_direction_weight": 1.0,
-        "new_direction_weight": 0.8,
-        "confidence_weight": 0.5,
     },
 }
 
@@ -227,23 +215,29 @@ def configure_walkforward() -> Optional[Dict]:
     if not use_walkforward:
         return None
 
+    # Important warning about walk-forward behavior
+    console.print("\n[yellow]ℹ  Walk-Forward Behavior:[/yellow]")
+    console.print("[dim]  • Walk-forward will calculate its own train/val splits[/dim]")
+    console.print("[dim]  • Your configured train_end and val_end will be ignored[/dim]")
+    console.print("[dim]  • Windows will be generated based on num_windows and val_months parameters[/dim]\n")
+
     # Number of windows
-    num_windows = inquirer.number(
+    num_windows = int(inquirer.number(
         message="Number of walk-forward windows:",
         min_allowed=2,
         max_allowed=10,
         default=3,
         validate=NumberValidator(),
-    ).execute()
+    ).execute())
 
     # Validation period in months
-    val_months = inquirer.number(
+    val_months = int(inquirer.number(
         message="Validation period (months):",
         min_allowed=1,
         max_allowed=12,
         default=3,
         validate=NumberValidator(),
-    ).execute()
+    ).execute())
 
     # Window type
     window_type = inquirer.select(
@@ -255,11 +249,24 @@ def configure_walkforward() -> Optional[Dict]:
         default="expanding",
     ).execute()
 
+    # For sliding window, get training window size
+    train_window_months = None
+    if window_type == "sliding":
+        train_window_months = int(inquirer.number(
+            message="Training window size (months):",
+            min_allowed=3,
+            max_allowed=36,
+            default=12,
+            validate=NumberValidator(),
+        ).execute())
+
     # Show preview
     console.print("\n[bold cyan]Walk-Forward Window Preview:[/bold cyan]")
     console.print(f"  Type: [yellow]{window_type}[/yellow]")
     console.print(f"  Windows: [yellow]{num_windows}[/yellow]")
     console.print(f"  Validation: [yellow]{val_months} months[/yellow] per window")
+    if train_window_months:
+        console.print(f"  Training window: [yellow]{train_window_months} months[/yellow] (fixed size)")
     console.print()
 
     # Show example timeline
@@ -273,8 +280,13 @@ def configure_walkforward() -> Optional[Dict]:
             train_desc = f"Start → Month {(i+1) * val_months}"
             val_desc = f"Month {(i+1) * val_months} → {(i+2) * val_months}"
         else:
-            train_desc = f"Month {i * val_months} → {(i+1) * val_months}"
-            val_desc = f"Month {(i+1) * val_months} → {(i+2) * val_months}"
+            # Sliding window with fixed training size
+            train_start_month = i * val_months
+            train_end_month = train_start_month + train_window_months
+            val_start_month = train_end_month
+            val_end_month = val_start_month + val_months
+            train_desc = f"Month {train_start_month} → {train_end_month}"
+            val_desc = f"Month {val_start_month} → {val_end_month}"
 
         table.add_row(f"Window {i+1}", train_desc, val_desc)
 
@@ -286,6 +298,7 @@ def configure_walkforward() -> Optional[Dict]:
         "num_windows": num_windows,
         "val_months": val_months,
         "window_type": window_type,
+        "train_window_months": train_window_months,
     }
 
 
@@ -308,21 +321,21 @@ def configure_data(preset: Optional[Dict] = None, walk_forward_config: Optional[
         step = preset["step"]
         console.print(f"  Using preset: window={window}, step={step}")
     else:
-        window = inquirer.number(
+        window = int(inquirer.number(
             message="Channel detection window size:",
             min_allowed=20,
             max_allowed=200,
             default=20,
             validate=NumberValidator(),
-        ).execute()
+        ).execute())
 
-        step = inquirer.number(
+        step = int(inquirer.number(
             message="Sliding window step (smaller = more samples, slower):",
             min_allowed=1,
             max_allowed=100,
             default=25,
             validate=NumberValidator(),
-        ).execute()
+        ).execute())
 
     # Date ranges with validation
     use_full_data = inquirer.confirm(
@@ -386,20 +399,31 @@ def configure_data(preset: Optional[Dict] = None, walk_forward_config: Optional[
     default_train_end = (min_dt + timedelta(days=train_days)).strftime('%Y-%m-%d')
     default_val_end = (min_dt + timedelta(days=val_days)).strftime('%Y-%m-%d')
 
-    console.print("\n[bold cyan]Train/Val/Test Split[/bold cyan]")
-    console.print("[dim]Split determines how data is divided chronologically[/dim]")
-    console.print(f"[dim]Recommended: 70% train / 15% val / 15% test[/dim]\n")
+    # Handle train/val split differently for walk-forward mode
+    if walk_forward_config:
+        # In walk-forward mode, we don't need train_end/val_end from user
+        console.print("\n[bold cyan]Train/Val/Test Split[/bold cyan]")
+        console.print("[yellow]⚠  Walk-forward mode: train_end and val_end will be auto-calculated[/yellow]")
+        console.print("[dim]   Each window will generate its own splits based on num_windows and val_months[/dim]\n")
 
-    # Train/val/test split with clearer prompts
-    train_end = inquirer.text(
-        message=f"Training ends on (data from {min_available_date} to DATE):",
-        default=default_train_end,
-    ).execute()
+        # Set placeholder values (won't be used in walk-forward)
+        train_end = default_train_end
+        val_end = default_val_end
+    else:
+        console.print("\n[bold cyan]Train/Val/Test Split[/bold cyan]")
+        console.print("[dim]Split determines how data is divided chronologically[/dim]")
+        console.print(f"[dim]Recommended: 70% train / 15% val / 15% test[/dim]\n")
 
-    val_end = inquirer.text(
-        message=f"Validation ends on (data from after training to DATE):",
-        default=default_val_end,
-    ).execute()
+        # Train/val/test split with clearer prompts
+        train_end = inquirer.text(
+            message=f"Training ends on (data from {min_available_date} to DATE):",
+            default=default_train_end,
+        ).execute()
+
+        val_end = inquirer.text(
+            message=f"Validation ends on (data from after training to DATE):",
+            default=default_val_end,
+        ).execute()
 
     # History features
     include_history = inquirer.confirm(
@@ -412,19 +436,27 @@ def configure_data(preset: Optional[Dict] = None, walk_forward_config: Optional[
     console.print(f"  Window: {window} bars, Step: {step} bars")
     console.print(f"  History features: {'Yes' if include_history else 'No'}")
 
-    # Show actual splits
-    data_start = start_date if start_date else min_available_date
-    data_end = end_date if end_date else max_available_date
+    if walk_forward_config:
+        # Show walk-forward configuration instead of single split
+        console.print(f"\n  [bold]Walk-Forward Mode:[/bold]")
+        console.print(f"    Windows: [cyan]{walk_forward_config['num_windows']}[/cyan]")
+        console.print(f"    Val months per window: [cyan]{walk_forward_config['val_months']}[/cyan]")
+        console.print(f"    Window type: [cyan]{walk_forward_config['window_type']}[/cyan]")
+        console.print(f"    [dim](Individual splits will be calculated automatically)[/dim]\n")
+    else:
+        # Show actual splits for standard training
+        data_start = start_date if start_date else min_available_date
+        data_end = end_date if end_date else max_available_date
 
-    train_end_dt = datetime.strptime(train_end, '%Y-%m-%d')
-    val_end_dt = datetime.strptime(val_end, '%Y-%m-%d')
-    train_next = (train_end_dt + timedelta(days=1)).strftime('%Y-%m-%d')
-    val_next = (val_end_dt + timedelta(days=1)).strftime('%Y-%m-%d')
+        train_end_dt = datetime.strptime(train_end, '%Y-%m-%d')
+        val_end_dt = datetime.strptime(val_end, '%Y-%m-%d')
+        train_next = (train_end_dt + timedelta(days=1)).strftime('%Y-%m-%d')
+        val_next = (val_end_dt + timedelta(days=1)).strftime('%Y-%m-%d')
 
-    console.print(f"\n  [bold]Data Splits:[/bold]")
-    console.print(f"    Training:   [cyan]{data_start}[/cyan] to [cyan]{train_end}[/cyan]")
-    console.print(f"    Validation: [cyan]{train_next}[/cyan] to [cyan]{val_end}[/cyan]")
-    console.print(f"    Test:       [cyan]{val_next}[/cyan] to [cyan]{data_end}[/cyan]\n")
+        console.print(f"\n  [bold]Data Splits:[/bold]")
+        console.print(f"    Training:   [cyan]{data_start}[/cyan] to [cyan]{train_end}[/cyan]")
+        console.print(f"    Validation: [cyan]{train_next}[/cyan] to [cyan]{val_end}[/cyan]")
+        console.print(f"    Test:       [cyan]{val_next}[/cyan] to [cyan]{data_end}[/cyan]\n")
 
     config = {
         "window": window,
@@ -535,13 +567,13 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
 
         # CfC units must be > hidden_dim + 2
         min_cfc = hidden_dim + 3
-        cfc_units = inquirer.number(
+        cfc_units = int(inquirer.number(
             message=f"CfC units (must be > {hidden_dim + 2}):",
             min_allowed=min_cfc,
             max_allowed=1024,
             default=hidden_dim * 2,
             validate=NumberValidator(),
-        ).execute()
+        ).execute())
 
     dropout = inquirer.select(
         message="Dropout rate:",
@@ -570,29 +602,20 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         num_epochs = preset["num_epochs"]
         batch_size = preset["batch_size"]
         learning_rate = preset["learning_rate"]
-        # Get loss weights from preset
-        duration_weight = preset.get("duration_weight", 2.0)
-        break_direction_weight = preset.get("break_direction_weight", 1.0)
-        new_direction_weight = preset.get("new_direction_weight", 0.8)
-        confidence_weight = preset.get("confidence_weight", 0.5)
         # Advanced params use standard defaults
         weight_decay = 0.0001
         gradient_clip = 1.0
         console.print(
             f"  Using preset: epochs={num_epochs}, batch_size={batch_size}, lr={learning_rate}"
         )
-        console.print(
-            f"  Loss weights: duration={duration_weight}, break={break_direction_weight}, "
-            f"new_dir={new_direction_weight}, confidence={confidence_weight}"
-        )
     else:
-        num_epochs = inquirer.number(
+        num_epochs = int(inquirer.number(
             message="Number of epochs:",
             min_allowed=1,
             max_allowed=500,
             default=50,
             validate=NumberValidator(),
-        ).execute()
+        ).execute())
 
         batch_size = inquirer.select(
             message="Batch size:",
@@ -620,43 +643,105 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         default="cosine",
     ).execute()
 
+    # Loss weight mode selection
+    console.print("\n[bold cyan]Loss Weight Configuration[/bold cyan]")
+    console.print("[dim]Choose how multi-task loss weights are determined:[/dim]\n")
+
+    weight_mode = inquirer.select(
+        message="Loss weight mode:",
+        choices=[
+            {
+                "name": "Learnable (model learns optimal weights during training)",
+                "value": "learnable"
+            },
+            {
+                "name": "Fixed - Duration Focus (duration=2.5, direction=1.0, next=0.8, calibration=0.5) [Recommended]",
+                "value": "fixed_duration_focus"
+            },
+            {
+                "name": "Fixed - Balanced (all weights = 1.0)",
+                "value": "fixed_balanced"
+            },
+            {
+                "name": "Fixed - Custom (configure each weight manually)",
+                "value": "fixed_custom"
+            },
+        ],
+        default="fixed_duration_focus" if not preset else "fixed_duration_focus",
+    ).execute()
+
+    # Set weights based on mode
+    use_learnable_weights = False
+    fixed_weights = None
+
+    if weight_mode == "learnable":
+        use_learnable_weights = True
+        console.print("[green]  Using learnable weights (uncertainty-based, Kendall et al. 2018)[/green]")
+        console.print("[dim]  Model will automatically learn optimal task weights during training[/dim]")
+    elif weight_mode == "fixed_duration_focus":
+        fixed_weights = {
+            'duration': 2.5,      # PRIMARY task
+            'direction': 1.0,     # Secondary
+            'next_channel': 0.8,  # Tertiary
+            'calibration': 0.5    # Regularization
+        }
+        console.print("[green]  Using Duration Focus weights (your original vision):[/green]")
+        console.print(f"    Duration: [cyan]2.5[/cyan] (PRIMARY)")
+        console.print(f"    Direction: [cyan]1.0[/cyan]")
+        console.print(f"    Next Channel: [cyan]0.8[/cyan]")
+        console.print(f"    Calibration: [cyan]0.5[/cyan]")
+    elif weight_mode == "fixed_balanced":
+        fixed_weights = {
+            'duration': 1.0,
+            'direction': 1.0,
+            'next_channel': 1.0,
+            'calibration': 1.0
+        }
+        console.print("[green]  Using Balanced weights (all tasks equal):[/green]")
+        console.print("    All weights: [cyan]1.0[/cyan]")
+    elif weight_mode == "fixed_custom":
+        console.print("\n[dim]Configure custom loss weights:[/dim]")
+        console.print("[dim]  (Duration is PRIMARY - should be weighted higher)[/dim]")
+        duration_w = float(inquirer.number(
+            message="  Duration loss weight:", default=2.5, float_allowed=True
+        ).execute())
+        direction_w = float(inquirer.number(
+            message="  Direction loss weight:", default=1.0, float_allowed=True
+        ).execute())
+        next_channel_w = float(inquirer.number(
+            message="  Next channel loss weight:", default=0.8, float_allowed=True
+        ).execute())
+        calibration_w = float(inquirer.number(
+            message="  Calibration loss weight:", default=0.5, float_allowed=True
+        ).execute())
+        fixed_weights = {
+            'duration': duration_w,
+            'direction': direction_w,
+            'next_channel': next_channel_w,
+            'calibration': calibration_w
+        }
+        console.print(f"\n[green]  Using Custom weights:[/green]")
+        console.print(f"    Duration: [cyan]{duration_w}[/cyan]")
+        console.print(f"    Direction: [cyan]{direction_w}[/cyan]")
+        console.print(f"    Next Channel: [cyan]{next_channel_w}[/cyan]")
+        console.print(f"    Calibration: [cyan]{calibration_w}[/cyan]")
+
     # Advanced options
     configure_advanced = inquirer.confirm(
-        message="Configure advanced options?", default=False
+        message="\nConfigure advanced options (weight decay, gradient clipping)?", default=False
     ).execute()
 
     if configure_advanced:
-        weight_decay = inquirer.number(
+        weight_decay = float(inquirer.number(
             message="Weight decay:", default=0.0001, float_allowed=True
-        ).execute()
+        ).execute())
 
-        gradient_clip = inquirer.number(
+        gradient_clip = float(inquirer.number(
             message="Gradient clipping:", default=1.0, float_allowed=True
-        ).execute()
-
-        # Loss weights
-        console.print("\n[dim]Loss weights for multi-task learning:[/dim]")
-        console.print("[dim]  (Duration is PRIMARY - should be weighted higher)[/dim]")
-        duration_weight = inquirer.number(
-            message="  Duration loss weight:", default=2.5, float_allowed=True
-        ).execute()
-        break_direction_weight = inquirer.number(
-            message="  Break direction loss weight:", default=1.0, float_allowed=True
-        ).execute()
-        new_direction_weight = inquirer.number(
-            message="  New direction loss weight:", default=0.8, float_allowed=True
-        ).execute()
-        confidence_weight = inquirer.number(
-            message="  Confidence loss weight:", default=0.5, float_allowed=True
-        ).execute()
+        ).execute())
     else:
-        # Use Standard preset defaults for non-advanced config
         weight_decay = 0.0001
         gradient_clip = 1.0
-        duration_weight = 2.5  # PRIMARY task
-        break_direction_weight = 1.0
-        new_direction_weight = 0.8  # Tertiary
-        confidence_weight = 0.5
 
     return {
         "num_epochs": num_epochs,
@@ -666,10 +751,9 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         "scheduler": scheduler,
         "weight_decay": weight_decay,
         "gradient_clip": gradient_clip,
-        "duration_weight": duration_weight,
-        "break_direction_weight": break_direction_weight,
-        "new_direction_weight": new_direction_weight,
-        "confidence_weight": confidence_weight,
+        "use_learnable_weights": use_learnable_weights,
+        "fixed_weights": fixed_weights,
+        "weight_mode": weight_mode,
     }
 
 
@@ -830,6 +914,19 @@ def display_config_summary(config: Dict):
     train_tree.add(f"Scheduler: {config['training']['scheduler']}")
     train_tree.add(f"Device: {config['device']}")
 
+    # Add weight mode info
+    weight_mode = config['training'].get('weight_mode', 'unknown')
+    if weight_mode == 'learnable':
+        train_tree.add("Loss weights: Learnable (uncertainty-based)")
+    elif weight_mode == 'fixed_duration_focus':
+        train_tree.add("Loss weights: Duration Focus (2.5/1.0/0.8/0.5)")
+    elif weight_mode == 'fixed_balanced':
+        train_tree.add("Loss weights: Balanced (all 1.0)")
+    elif weight_mode == 'fixed_custom':
+        fixed_weights = config['training'].get('fixed_weights', {})
+        weights_str = f"Custom ({fixed_weights.get('duration', '?')}/{fixed_weights.get('direction', '?')}/{fixed_weights.get('next_channel', '?')}/{fixed_weights.get('calibration', '?')})"
+        train_tree.add(f"Loss weights: {weights_str}")
+
     layout["data"].update(Panel(data_tree, border_style="cyan"))
     layout["model"].update(Panel(model_tree, border_style="magenta"))
     layout["training"].update(Panel(train_tree, border_style="green"))
@@ -872,48 +969,43 @@ class TrainingMonitor:
         # Total loss
         table.add_row(
             "Total Loss",
-            f"{train_metrics['total']:.4f}",
-            f"{val_metrics['total']:.4f}",
+            f"{train_metrics.get('total', 0):.4f}",
+            f"{val_metrics.get('total', 0):.4f}",
         )
 
-        # Component losses
+        # Component losses (using CombinedLoss keys)
         table.add_row(
             "Duration",
-            f"{train_metrics['duration']:.4f}",
-            f"{val_metrics['duration']:.4f}",
+            f"{train_metrics.get('duration', 0):.4f}",
+            f"{val_metrics.get('duration', 0):.4f}",
         )
         table.add_row(
-            "Break Direction",
-            f"{train_metrics['break_direction']:.4f}",
-            f"{val_metrics['break_direction']:.4f}",
+            "Direction",
+            f"{train_metrics.get('direction', 0):.4f}",
+            f"{val_metrics.get('direction', 0):.4f}",
         )
         table.add_row(
-            "New Direction",
-            f"{train_metrics['new_direction']:.4f}",
-            f"{val_metrics['new_direction']:.4f}",
+            "Next Channel",
+            f"{train_metrics.get('next_channel', 0):.4f}",
+            f"{val_metrics.get('next_channel', 0):.4f}",
         )
         table.add_row(
-            "Confidence",
-            f"{train_metrics['confidence']:.4f}",
-            f"{val_metrics['confidence']:.4f}",
+            "Calibration",
+            f"{train_metrics.get('calibration', 0):.4f}",
+            f"{val_metrics.get('calibration', 0):.4f}",
         )
 
         # Accuracies
         table.add_section()
         table.add_row(
-            "Break Dir Acc",
+            "Direction Acc",
             "-",
-            f"{val_metrics['break_direction_acc']:.1%}",
+            f"{val_metrics.get('direction_acc', 0):.1%}",
         )
         table.add_row(
-            "New Dir Acc",
+            "Next Ch Acc",
             "-",
-            f"{val_metrics['new_direction_acc']:.1%}",
-        )
-        table.add_row(
-            "Perm Break Acc",
-            "-",
-            f"{val_metrics['permanent_break_acc']:.1%}",
+            f"{val_metrics.get('next_channel_acc', 0):.1%}",
         )
 
         return table
@@ -1060,14 +1152,138 @@ def run_walk_forward_training(
     num_windows = wf_config["num_windows"]
     val_months = wf_config["val_months"]
     window_type = wf_config["window_type"]
+    train_window_months = wf_config.get("train_window_months")
 
     # Load data date range
     min_available_date, max_available_date = load_data_date_range(data_dir)
     min_dt = datetime.strptime(min_available_date, '%Y-%m-%d')
     max_dt = datetime.strptime(max_available_date, '%Y-%m-%d')
 
-    # Calculate window boundaries
+    # Import the walk-forward module for proper date handling
+    from v7.training.walk_forward import generate_walk_forward_windows
+
+    # =============================================================================
+    # VALIDATION 1: Pre-Window Loop Validation
+    # =============================================================================
+    console.print("\n[bold cyan]Validating Walk-Forward Configuration...[/bold cyan]\n")
+
+    # Calculate total months in available data
     total_months = (max_dt.year - min_dt.year) * 12 + (max_dt.month - min_dt.month)
+    console.print(f"  Available data range: [cyan]{min_available_date}[/cyan] to [cyan]{max_available_date}[/cyan]")
+    console.print(f"  Total months in data: [yellow]{total_months}[/yellow]")
+
+    # Validation 1.1: Check if num_windows * val_months fits within available data range
+    # For expanding windows: need (num_windows + 1) * val_months minimum
+    # Window 1: 0 to val_months (train), val_months to 2*val_months (val)
+    # Window 2: 0 to 2*val_months (train), 2*val_months to 3*val_months (val)
+    # Window N: 0 to N*val_months (train), N*val_months to (N+1)*val_months (val)
+    min_training_months = 6  # Minimum 6 months for training
+
+    if window_type == "expanding":
+        # Need at least min_training_months + (num_windows) * val_months
+        total_required_months = min_training_months + (num_windows) * val_months
+        console.print(f"  Minimum months needed (expanding): [yellow]{total_required_months}[/yellow]")
+        console.print(f"    = {min_training_months} months (min training) + {num_windows} windows × {val_months} months (val)")
+    else:
+        # Sliding windows
+        if train_window_months is None:
+            console.print("[bold red]ERROR: train_window_months must be specified for sliding windows![/bold red]")
+            raise ValueError("train_window_months required for sliding window mode")
+
+        # For sliding: need train_window_months + (num_windows) * val_months
+        total_required_months = train_window_months + (num_windows) * val_months
+        console.print(f"  Minimum months needed (sliding): [yellow]{total_required_months}[/yellow]")
+        console.print(f"    = {train_window_months} months (training) + {num_windows} windows × {val_months} months (val)")
+
+    # Validation 1.2: Check if we have enough data
+    if total_required_months > total_months:
+        console.print(f"\n[bold red]ERROR: Insufficient data for walk-forward validation![/bold red]")
+        console.print(f"  Required: {total_required_months} months")
+        console.print(f"  Available: {total_months} months")
+        console.print(f"  Shortfall: {total_required_months - total_months} months")
+        console.print(f"\n[yellow]Suggestions:[/yellow]")
+        if window_type == "expanding":
+            max_windows = max(1, (total_months - min_training_months) // val_months)
+            console.print(f"  1. Reduce number of windows from {num_windows} to {max_windows}")
+            console.print(f"  2. Reduce validation period from {val_months} to {max(1, (total_months - min_training_months) // num_windows)} months")
+        else:
+            max_windows = max(1, (total_months - train_window_months) // val_months)
+            console.print(f"  1. Reduce number of windows from {num_windows} to {max_windows}")
+            console.print(f"  2. Reduce validation period from {val_months} months")
+            console.print(f"  3. Reduce training window from {train_window_months} months")
+        console.print(f"  4. Obtain more historical data")
+        raise ValueError(
+            f"Walk-forward configuration requires {total_required_months} months, "
+            f"but only {total_months} months available in data"
+        )
+
+    console.print(f"[green]✓ Sufficient data available ({total_months} >= {total_required_months} months)[/green]")
+
+    # Validate configuration
+    if window_type == "sliding":
+        console.print("[yellow]Warning: Sliding windows not yet supported by walk_forward module.[/yellow]")
+        console.print("[yellow]Falling back to expanding window mode.[/yellow]\n")
+        window_type = "expanding"
+
+    # Generate windows using the proper walk-forward module
+    # This handles calendar months correctly using pd.DateOffset
+    console.print("\n[bold cyan]Generating Walk-Forward Windows...[/bold cyan]")
+    try:
+        windows = generate_walk_forward_windows(
+            data_start=min_available_date,
+            data_end=max_available_date,
+            num_windows=num_windows,
+            validation_period_months=val_months
+        )
+    except ValueError as e:
+        console.print(f"\n[bold red]ERROR generating walk-forward windows: {e}[/bold red]")
+        raise
+
+    # Validation 1.3: Validate each calculated window
+    console.print(f"\n[bold cyan]Validating Generated Windows...[/bold cyan]")
+    for window_idx in range(num_windows):
+        train_start_dt, train_end_dt, val_start_dt, val_end_dt = windows[window_idx]
+
+        # Validation 1.3.1: Check if validation end exceeds max_available_date
+        if val_end_dt > max_dt:
+            console.print(f"\n[bold red]ERROR: Window {window_idx + 1} exceeds available data![/bold red]")
+            console.print(f"  Window validation end: [red]{val_end_dt.strftime('%Y-%m-%d')}[/red]")
+            console.print(f"  Max available date:    [cyan]{max_available_date}[/cyan]")
+            console.print(f"  Excess:                {(val_end_dt - max_dt).days} days")
+            raise ValueError(
+                f"Window {window_idx + 1} validation end ({val_end_dt.strftime('%Y-%m-%d')}) "
+                f"exceeds maximum available data ({max_available_date})"
+            )
+
+        # Validation 1.3.2: Check minimum training data (at least 6 months)
+        train_duration_months = ((train_end_dt.year - train_start_dt.year) * 12 +
+                                (train_end_dt.month - train_start_dt.month))
+
+        if train_duration_months < min_training_months:
+            console.print(f"\n[bold red]ERROR: Window {window_idx + 1} has insufficient training data![/bold red]")
+            console.print(f"  Training period: [red]{train_start_dt.strftime('%Y-%m-%d')} to {train_end_dt.strftime('%Y-%m-%d')}[/red]")
+            console.print(f"  Training duration: [red]{train_duration_months} months[/red]")
+            console.print(f"  Minimum required: [yellow]{min_training_months} months[/yellow]")
+            raise ValueError(
+                f"Window {window_idx + 1} has only {train_duration_months} months of training data, "
+                f"but minimum required is {min_training_months} months"
+            )
+
+        # Validation 1.3.3: Check that train_end < val_start (no overlap)
+        if train_end_dt >= val_start_dt:
+            console.print(f"\n[bold red]ERROR: Window {window_idx + 1} has overlapping train/validation periods![/bold red]")
+            console.print(f"  Training end:    [red]{train_end_dt.strftime('%Y-%m-%d')}[/red]")
+            console.print(f"  Validation start: [yellow]{val_start_dt.strftime('%Y-%m-%d')}[/yellow]")
+            raise ValueError(
+                f"Window {window_idx + 1}: train_end ({train_end_dt.strftime('%Y-%m-%d')}) "
+                f"must be before val_start ({val_start_dt.strftime('%Y-%m-%d')})"
+            )
+
+        console.print(f"  Window {window_idx + 1}: [green]✓ Valid[/green] "
+                     f"(train: {train_duration_months} months, "
+                     f"val: {val_start_dt.strftime('%Y-%m-%d')} to {val_end_dt.strftime('%Y-%m-%d')})")
+
+    console.print(f"\n[bold green]✓ All {num_windows} windows validated successfully![/bold green]\n")
 
     # Store results for each window
     window_results = []
@@ -1079,30 +1295,72 @@ def run_walk_forward_training(
         console.print(f"[bold cyan]Window {window_idx + 1}/{num_windows}[/bold cyan]")
         console.print(f"{'=' * 80}\n")
 
-        # Calculate dates for this window
-        if window_type == "expanding":
-            # Training: start to current window end
-            train_start = min_dt
-            val_start_dt = min_dt + timedelta(days=(window_idx + 1) * val_months * 30)
-            val_end_dt = min_dt + timedelta(days=(window_idx + 2) * val_months * 30)
-        else:
-            # Sliding: fixed window size
-            train_start_dt = min_dt + timedelta(days=window_idx * val_months * 30)
-            val_start_dt = min_dt + timedelta(days=(window_idx + 1) * val_months * 30)
-            val_end_dt = min_dt + timedelta(days=(window_idx + 2) * val_months * 30)
-            train_start = train_start_dt
+        # Get window dates from the generated windows (already properly calculated)
+        train_start_dt, train_end_dt, val_start_dt, val_end_dt = windows[window_idx]
 
-        # Format dates
-        train_start_str = train_start.strftime('%Y-%m-%d')
+        # Format dates for display and dataset preparation
+        train_start_str = train_start_dt.strftime('%Y-%m-%d')
+        train_end_str = train_end_dt.strftime('%Y-%m-%d')
         val_start_str = val_start_dt.strftime('%Y-%m-%d')
         val_end_str = val_end_dt.strftime('%Y-%m-%d')
 
-        # Calculate train_end (day before validation starts)
-        train_end_dt = val_start_dt - timedelta(days=1)
-        train_end_str = train_end_dt.strftime('%Y-%m-%d')
+        # Validate windows don't overlap
+        if window_idx > 0 and window_type == "sliding":
+            prev_result = window_results[-1]
+            prev_val_end = datetime.strptime(prev_result["val_end"], '%Y-%m-%d')
+            if train_start_dt < prev_val_end:
+                console.print(f"[yellow]Warning: Window {window_idx + 1} training period overlaps with previous validation period[/yellow]")
 
         console.print(f"  [green]Training:[/green]   {train_start_str} → {train_end_str}")
         console.print(f"  [yellow]Validation:[/yellow] {val_start_str} → {val_end_str}")
+
+        # Calculate and display window sizes
+        train_days = (train_end_dt - train_start_dt).days + 1
+        val_days = (val_end_dt - val_start_dt).days
+        console.print(f"  [dim]Train size: {train_days} days (~{train_days/30:.1f} months), Val size: {val_days} days (~{val_days/30:.1f} months)[/dim]")
+
+        # =============================================================================
+        # VALIDATION 2: Inside-Loop Validation (before prepare_dataset_from_scratch)
+        # =============================================================================
+
+        # Validation 2.1: Check if val_end_dt > max_available_date
+        if val_end_dt > max_dt:
+            excess_days = (val_end_dt - max_dt).days
+            console.print(f"\n[yellow]WARNING: Window {window_idx + 1} validation end exceeds available data![/yellow]")
+            console.print(f"  Requested val_end: [yellow]{val_end_str}[/yellow]")
+            console.print(f"  Max available:     [cyan]{max_available_date}[/cyan]")
+            console.print(f"  Excess:            {excess_days} days")
+
+            # Truncate to max_available_date
+            val_end_dt = max_dt
+            val_end_str = max_available_date
+            console.print(f"  [yellow]→ Truncating validation end to {val_end_str}[/yellow]\n")
+
+            # Check if truncation leaves enough validation data (at least 1 month)
+            truncated_val_days = (val_end_dt - val_start_dt).days
+            if truncated_val_days < 30:
+                console.print(f"[yellow]WARNING: After truncation, validation period is only {truncated_val_days} days (< 1 month)[/yellow]")
+                console.print(f"[yellow]Skipping window {window_idx + 1} due to insufficient validation data[/yellow]\n")
+                continue
+
+        # Validation 2.2: Verify train_end < val_start (no overlap)
+        if train_end_dt >= val_start_dt:
+            console.print(f"\n[bold red]ERROR: Window {window_idx + 1} has overlapping periods![/bold red]")
+            console.print(f"  Training end:     [red]{train_end_str}[/red]")
+            console.print(f"  Validation start: [yellow]{val_start_str}[/yellow]")
+            console.print(f"  Overlap:          {(train_end_dt - val_start_dt).days + 1} days")
+            console.print(f"[yellow]Skipping window {window_idx + 1}[/yellow]\n")
+            continue
+
+        # Validation 2.3: Final check that all dates are within available range
+        if train_start_dt < min_dt:
+            console.print(f"\n[yellow]WARNING: Window {window_idx + 1} train_start before available data![/yellow]")
+            console.print(f"  Requested:    [yellow]{train_start_str}[/yellow]")
+            console.print(f"  Min available: [cyan]{min_available_date}[/cyan]")
+            console.print(f"  [yellow]→ Adjusting train_start to {min_available_date}[/yellow]\n")
+            train_start_dt = min_dt
+            train_start_str = min_available_date
+
         console.print()
 
         # Prepare dataset for this window
@@ -1160,10 +1418,8 @@ def run_walk_forward_training(
                 scheduler=config["training"]["scheduler"],
                 weight_decay=config["training"]["weight_decay"],
                 gradient_clip=config["training"]["gradient_clip"],
-                duration_weight=config["training"]["duration_weight"],
-                break_direction_weight=config["training"]["break_direction_weight"],
-                new_direction_weight=config["training"]["new_direction_weight"],
-                permanent_break_weight=config["training"]["confidence_weight"],
+                use_learnable_weights=config["training"]["use_learnable_weights"],
+                fixed_weights=config["training"]["fixed_weights"],
                 device=config["device"],
                 save_dir=window_save_dir,
                 log_dir=log_dir / f"window_{window_idx + 1}",
@@ -1171,22 +1427,13 @@ def run_walk_forward_training(
                 early_stopping_patience=15,
             )
 
-            # Create trainer
+            # Create trainer (CombinedLoss handles weights internally)
             trainer = Trainer(
                 model=model,
                 config=trainer_config,
                 train_loader=train_loader,
                 val_loader=val_loader,
                 test_loader=test_loader,
-            )
-
-            # Replace with HierarchicalLoss
-            from v7.models import HierarchicalLoss
-            trainer.criterion = HierarchicalLoss(
-                duration_weight=config["training"]["duration_weight"],
-                break_direction_weight=config["training"]["break_direction_weight"],
-                next_direction_weight=config["training"]["new_direction_weight"],
-                confidence_weight=config["training"]["confidence_weight"],
             )
 
             # Train this window
@@ -1506,10 +1753,8 @@ def main():
             scheduler=config["training"]["scheduler"],
             weight_decay=config["training"]["weight_decay"],
             gradient_clip=config["training"]["gradient_clip"],
-            duration_weight=config["training"]["duration_weight"],
-            break_direction_weight=config["training"]["break_direction_weight"],
-            new_direction_weight=config["training"]["new_direction_weight"],
-            permanent_break_weight=config["training"]["confidence_weight"],
+            use_learnable_weights=config["training"]["use_learnable_weights"],
+            fixed_weights=config["training"]["fixed_weights"],
             device=config["device"],
             save_dir=save_dir,
             log_dir=log_dir,
@@ -1517,25 +1762,13 @@ def main():
             early_stopping_patience=15,
         )
 
-        # Create loss function (for the v7 hierarchical model)
-        # We need to adapt the trainer to use HierarchicalLoss instead of MultiTaskLoss
-        from v7.models import HierarchicalLoss
-
-        # Create trainer
+        # Create trainer (CombinedLoss handles weights based on config)
         trainer = Trainer(
             model=model,
             config=trainer_config,
             train_loader=train_loader,
             val_loader=val_loader,
             test_loader=test_loader,
-        )
-
-        # Replace the criterion with HierarchicalLoss
-        trainer.criterion = HierarchicalLoss(
-            duration_weight=config["training"]["duration_weight"],
-            break_direction_weight=config["training"]["break_direction_weight"],
-            next_direction_weight=config["training"]["new_direction_weight"],
-            confidence_weight=config["training"]["confidence_weight"],
         )
 
         # Train
