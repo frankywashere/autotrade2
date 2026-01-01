@@ -7,18 +7,20 @@ This model predicts channel break timing, direction, and post-break channel dire
 using a hierarchical architecture that processes each timeframe independently before
 combining insights across timeframes.
 
-Input Features: 582 dimensions
+Input Features: 626 dimensions
 ------------------------------
-- TSLA per-TF features: 28 features × 11 timeframes (5min to 3month)
+- TSLA per-TF features: 30 features × 11 timeframes (5min to 3month)
   * Channel geometry: direction, position, width, slope, R²
   * Bounce metrics: count, cycles, bars since bounce
   * RSI: current, divergence, at upper/lower bounces
   * Exit tracking: exit counts, frequency, acceleration
   * Break triggers: distance to longer TF boundaries
+  * Quality scores: channel_quality, rsi_confidence
 
-- SPY per-TF features: 11 features × 11 timeframes
+- SPY per-TF features: 13 features × 11 timeframes
   * Channel geometry and position relative to TSLA
   * Cross-asset containment metrics
+  * Quality scores: channel_quality, rsi_confidence
 
 - Cross-asset: 8 features × 11 timeframes (88 total)
   * TSLA position in SPY channels
@@ -36,7 +38,7 @@ Input Features: 582 dimensions
 
 Architecture Flow:
 =================
-1. Input Layer (582 dims) → Feature Decomposition
+1. Input Layer (626 dims) → Feature Decomposition
    ├─ Per-TF features extracted for each of 11 timeframes
    ├─ Shared features (VIX, history, alignment) replicated
 
@@ -100,9 +102,9 @@ class FeatureConfig:
     """Configuration defining input feature dimensions."""
 
     # Per-timeframe feature counts
-    tsla_per_tf: int = 28  # Including exit tracking (10) + break trigger (2)
-    spy_per_tf: int = 11
-    cross_per_tf: int = 8
+    tsla_per_tf: int = 30  # +1 channel_quality, +1 rsi_confidence (was 28)
+    spy_per_tf: int = 13   # +1 channel_quality, +1 rsi_confidence (was 11)
+    cross_per_tf: int = 8  # unchanged
 
     # Shared features (same across all TFs)
     vix_features: int = 6
@@ -118,7 +120,7 @@ class FeatureConfig:
         """Calculate total input dimension."""
         per_tf = (self.tsla_per_tf + self.spy_per_tf + self.cross_per_tf) * self.n_timeframes
         shared = self.vix_features + self.tsla_history_features + self.spy_history_features + self.alignment_features
-        return per_tf + shared  # Should be 582
+        return per_tf + shared  # = (30+13+8)*11 + (6+28+28+3) = 561 + 65 = 626
 
     @property
     def shared_features(self) -> int:
@@ -189,7 +191,7 @@ class TFBranch(nn.Module):
         Initialize timeframe branch.
 
         Args:
-            per_tf_dim: Dimension of per-timeframe features (47 for TSLA+SPY+cross)
+            per_tf_dim: Dimension of per-timeframe features (51 for TSLA+SPY+cross)
             shared_dim: Dimension of shared features (65 for VIX+history+alignment)
             hidden_dim: Output embedding dimension
             cfc_units: Number of CfC units (neurons in liquid network, must be > hidden_dim + 2)
@@ -542,7 +544,7 @@ class HierarchicalCfCModel(nn.Module):
     Complete hierarchical CfC model for multi-timeframe channel prediction.
 
     Architecture:
-    1. Decompose 482-dim input into per-TF and shared features
+    1. Decompose 626-dim input into per-TF and shared features
     2. Process each TF through dedicated CfC branch
     3. Attend over TF embeddings to create unified context
     4. Predict duration, break direction, next channel direction, confidence
@@ -579,8 +581,8 @@ class HierarchicalCfCModel(nn.Module):
         self.n_timeframes = self.config.n_timeframes
 
         # Validate total input dimension
-        assert self.config.total_features == 582, \
-            f"Expected 582 features, got {self.config.total_features}"
+        assert self.config.total_features == 626, \
+            f"Expected 626 features, got {self.config.total_features}"
 
         # Validate CfC configuration
         assert cfc_units > hidden_dim + 2, \
@@ -642,7 +644,7 @@ class HierarchicalCfCModel(nn.Module):
         Forward pass through hierarchical model.
 
         Args:
-            x: [batch_size, 582] - full feature vector
+            x: [batch_size, 626] - full feature vector
             return_attention: If True, return attention weights
 
         Returns:
@@ -675,7 +677,7 @@ class HierarchicalCfCModel(nn.Module):
         for tf_idx in range(self.n_timeframes):
             # Extract per-TF features
             start, end = self.config.get_tf_slice(tf_idx)
-            per_tf_features = x[:, start:end]  # [batch, 47]
+            per_tf_features = x[:, start:end]  # [batch, 51]
 
             # Process through branch with hidden state
             embedding, new_hx = self.tf_branches[tf_idx](
@@ -766,7 +768,7 @@ class HierarchicalCfCModel(nn.Module):
         Make predictions in evaluation mode with per-timeframe breakdown.
 
         Args:
-            x: [batch_size, 582] - input features
+            x: [batch_size, 626] - input features
 
         Returns:
             Dictionary with:
@@ -1095,9 +1097,9 @@ if __name__ == '__main__':
     model = create_model(hidden_dim=64, cfc_units=96, num_attention_heads=4)
 
     # Create dummy input
-    print("\n[2] Creating dummy input (batch_size=4, features=582)...")
+    print("\n[2] Creating dummy input (batch_size=4, features=626)...")
     batch_size = 4
-    x_dummy = torch.randn(batch_size, 582)
+    x_dummy = torch.randn(batch_size, 626)
 
     # Forward pass
     print("\n[3] Running forward pass...")

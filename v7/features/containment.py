@@ -117,9 +117,10 @@ def check_all_containments(
     longer_channels = {}
     for tf in longer_tfs:
         df_tf = resample_ohlc(df_base, tf)
-        if len(df_tf) >= window:
+        try:
             longer_channels[tf] = detect_channel(df_tf, window=window)
-        else:
+        except (ValueError, IndexError):
+            # Insufficient data - set to None
             longer_channels[tf] = None
 
     return check_containment(current_price, current_tf, longer_channels)

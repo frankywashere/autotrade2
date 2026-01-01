@@ -44,7 +44,9 @@ from v7.training.dataset import (
     prepare_dataset_from_scratch,
     create_dataloaders,
     split_by_date,
-    ChannelSample
+    ChannelSample,
+    load_cached_samples,
+    is_cache_valid
 )
 from v7.training.trainer import Trainer, TrainingConfig
 from v7.models.hierarchical_cfc import HierarchicalCfCModel
@@ -191,9 +193,8 @@ def run_walk_forward_validation(
     all_samples = []
     cache_path = cache_dir / "channel_samples.pkl"
 
-    if cache_path.exists():
+    if is_cache_valid(cache_path):
         print(f"Loading cached samples from {cache_path}")
-        from v7.training.dataset import load_cached_samples
         all_samples = load_cached_samples(cache_path)
     else:
         # Prepare dataset covering all folds

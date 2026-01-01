@@ -69,6 +69,7 @@ class Channel:
     bounce_count: int
     width_pct: float
     window: int
+    quality_score: float = 0.0
 
     # Optional: store the OHLC data used
     close: np.ndarray = field(default=None, repr=False)
@@ -293,13 +294,31 @@ def detect_channel(
     )
 
 
+def calculate_channel_quality_score(channel: Channel) -> float:
+    """
+    Calculate continuous quality score emphasizing bounces.
+
+    Score = bounce_count × (R² + 0.3)
+
+    More bounces always results in higher score.
+    R² adds quality weighting but doesn't dominate.
+
+    Returns:
+        float: Quality score (0.0+, unbounded but typically 0-10)
+    """
+    fit_quality = channel.r_squared + 0.3
+    quality = channel.bounce_count * fit_quality
+
+    return float(quality)
+
+
 def detect_channels_multi_window(
     df: pd.DataFrame,
     windows: List[int] = None,
     **kwargs
-) -> Dict[int, Channel]:
+) -> Channel:
     """
-    Detect channels at multiple window sizes.
+    Detect channels at multiple window sizes and return the best one.
 
     Args:
         df: OHLCV DataFrame
@@ -307,7 +326,7 @@ def detect_channels_multi_window(
         **kwargs: Additional arguments passed to detect_channel
 
     Returns:
-        Dict mapping window size to Channel
+        Best Channel (bounce-first sorting)
     """
     if windows is None:
         windows = [10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100]
@@ -317,7 +336,13 @@ def detect_channels_multi_window(
         if len(df) >= w:
             channels[w] = detect_channel(df, window=w, **kwargs)
 
-    return channels
+    if not channels:
+        return None
+
+    # Bounce-first sorting: more bounces always wins
+    best = max(channels.values(), key=lambda c: (c.bounce_count, c.r_squared))
+
+    return best
 
 
 def find_best_channel(

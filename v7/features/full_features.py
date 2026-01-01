@@ -65,6 +65,10 @@ class TSLAChannelFeatures:
     rsi_at_last_upper: float      # RSI when last touched upper
     rsi_at_last_lower: float      # RSI when last touched lower
 
+    # Quality metrics
+    channel_quality: float        # Composite quality score (0-1)
+    rsi_confidence: float         # RSI reliability score (0-1)
+
     # Containment against longer TFs
     containments: Dict[str, ContainmentInfo] = field(default_factory=dict)
 
@@ -166,6 +170,59 @@ def extract_tsla_channel_features(
             rsi
         )
 
+    # Calculate channel quality score (0-1)
+    # Combines: r_squared, bounce_count, cycles, and validity
+    channel_quality = 0.0
+    if channel.valid:
+        # R-squared component (0-1, already normalized)
+        r2_component = channel.r_squared
+
+        # Bounce count component (normalize to 0-1, saturates at 5 bounces)
+        bounce_component = min(channel.bounce_count / 5.0, 1.0)
+
+        # Cycles component (normalize to 0-1, saturates at 2 cycles)
+        cycles_component = min(channel.complete_cycles / 2.0, 1.0)
+
+        # Weighted average: r_squared=40%, bounces=35%, cycles=25%
+        channel_quality = (0.40 * r2_component +
+                          0.35 * bounce_component +
+                          0.25 * cycles_component)
+
+    # Calculate RSI confidence score (0-1)
+    # Based on RSI divergence from extreme zones and historical bounce consistency
+    rsi_confidence = 0.5  # Default neutral confidence
+
+    # RSI zone reliability: Higher confidence when RSI is in clear zones
+    if rsi < 30:
+        # Oversold zone - very reliable
+        rsi_confidence = 0.9
+    elif rsi < 40:
+        # Approaching oversold - reliable
+        rsi_confidence = 0.75
+    elif rsi > 70:
+        # Overbought zone - very reliable
+        rsi_confidence = 0.9
+    elif rsi > 60:
+        # Approaching overbought - reliable
+        rsi_confidence = 0.75
+    elif 45 <= rsi <= 55:
+        # Neutral zone - less reliable
+        rsi_confidence = 0.3
+    else:
+        # Moderate zones
+        rsi_confidence = 0.5
+
+    # Boost confidence if RSI divergence is detected
+    if divergence != 0:
+        rsi_confidence = min(rsi_confidence * 1.2, 1.0)
+
+    # Adjust confidence based on consistency of RSI at bounce points
+    if rsi_at_last_upper != 50.0 or rsi_at_last_lower != 50.0:
+        # We have actual bounce data
+        if rsi_at_last_upper > 60 or rsi_at_last_lower < 40:
+            # Good RSI behavior at bounces
+            rsi_confidence = min(rsi_confidence * 1.1, 1.0)
+
     return TSLAChannelFeatures(
         timeframe=timeframe,
         channel_valid=channel.valid,
@@ -184,6 +241,8 @@ def extract_tsla_channel_features(
         rsi_divergence=divergence,
         rsi_at_last_upper=rsi_at_last_upper,
         rsi_at_last_lower=rsi_at_last_lower,
+        channel_quality=channel_quality,
+        rsi_confidence=rsi_confidence,
         containments=containments,
         exit_tracking=exit_features,
         break_trigger=break_trigger,
@@ -224,8 +283,11 @@ def extract_full_features(
         else:
             df_tf = resample_ohlc(tsla_df, tf)
 
-        if len(df_tf) >= window:
+        try:
             tsla_channels_dict[tf] = detect_channel(df_tf, window=window)
+        except (ValueError, IndexError):
+            # Skip if insufficient data
+            pass
 
     # Second pass: extract features with longer TF context
     tsla_features = {}
@@ -235,7 +297,7 @@ def extract_full_features(
         else:
             df_tf = resample_ohlc(tsla_df, tf)
 
-        if len(df_tf) >= window:
+        try:
             # Get longer TF channels for this timeframe
             longer_tfs = get_longer_timeframes(tf)
             longer_channels = {ltf: tsla_channels_dict.get(ltf) for ltf in longer_tfs if ltf in tsla_channels_dict}
@@ -245,6 +307,9 @@ def extract_full_features(
                 longer_tf_channels=longer_channels,
                 lookforward_bars=lookforward_bars
             )
+        except (ValueError, IndexError):
+            # Skip if insufficient data
+            pass
 
     # SPY features for all timeframes
     spy_features = {}
@@ -254,8 +319,11 @@ def extract_full_features(
         else:
             df_tf = resample_ohlc(spy_df, tf)
 
-        if len(df_tf) >= window:
+        try:
             spy_features[tf] = extract_spy_features(df_tf, window, tf)
+        except (ValueError, IndexError):
+            # Skip if insufficient data
+            pass
 
     # Cross-asset containment
     cross_asset = extract_all_cross_asset_features(tsla_df, spy_df, vix_df, window)
@@ -309,7 +377,8 @@ def extract_full_features(
         position=0.5, upper_dist=0, lower_dist=0, width_pct=0,
         slope_pct=0, r_squared=0, bounce_count=0, cycles=0,
         bars_since_bounce=0, last_touch=-1, rsi=50, rsi_divergence=0,
-        rsi_at_last_upper=50, rsi_at_last_lower=50
+        rsi_at_last_upper=50, rsi_at_last_lower=50,
+        channel_quality=0.0, rsi_confidence=0.5
     )).direction
 
     spy_dir = spy_features.get(primary_tf, SPYFeatures(
@@ -354,7 +423,7 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
     """
     arrays = {}
 
-    # TSLA channel features per TF
+    # TSLA channel features per TF - ALWAYS include all 11 timeframes
     for tf in TIMEFRAMES:
         if tf in features.tsla:
             f = features.tsla[tf]
@@ -375,6 +444,8 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 f.rsi_divergence,
                 f.rsi_at_last_upper,
                 f.rsi_at_last_lower,
+                f.channel_quality,
+                f.rsi_confidence,
             ]
 
             # Add exit tracking features
@@ -407,8 +478,35 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 base_features.extend([0.0, 0.0])
 
             arrays[f'tsla_{tf}'] = np.array(base_features, dtype=np.float32)
+        else:
+            # Provide default invalid features for this TF (30 total features)
+            # All zeros with channel_valid=0.0, direction=1 (sideways), position=0.5, rsi=50.0
+            arrays[f'tsla_{tf}'] = np.array([
+                0.0,   # channel_valid
+                1.0,   # direction (sideways)
+                0.5,   # position
+                0.0,   # upper_dist
+                0.0,   # lower_dist
+                0.0,   # width_pct
+                0.0,   # slope_pct
+                0.0,   # r_squared
+                0.0,   # bounce_count
+                0.0,   # cycles
+                0.0,   # bars_since_bounce
+                -1.0,  # last_touch (none)
+                50.0,  # rsi
+                0.0,   # rsi_divergence
+                50.0,  # rsi_at_last_upper
+                50.0,  # rsi_at_last_lower
+                0.0,   # channel_quality
+                0.5,   # rsi_confidence
+                # Exit tracking defaults (10)
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                # Break trigger defaults (2)
+                0.0, 0.0,
+            ], dtype=np.float32)
 
-    # SPY channel features per TF
+    # SPY channel features per TF - ALWAYS include all 11 timeframes
     for tf in TIMEFRAMES:
         if tf in features.spy:
             f = features.spy[tf]
@@ -425,8 +523,23 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 f.cycles,
                 f.rsi,
             ], dtype=np.float32)
+        else:
+            # Provide default invalid features for this TF (11 total features)
+            arrays[f'spy_{tf}'] = np.array([
+                0.0,   # channel_valid
+                1.0,   # direction (sideways)
+                0.5,   # position
+                0.0,   # upper_dist
+                0.0,   # lower_dist
+                0.0,   # width_pct
+                0.0,   # slope_pct
+                0.0,   # r_squared
+                0.0,   # bounce_count
+                0.0,   # cycles
+                50.0,  # rsi
+            ], dtype=np.float32)
 
-    # Cross containment
+    # Cross containment - ALWAYS include all 11 timeframes
     for tf in TIMEFRAMES:
         if tf in features.cross_containment:
             c = features.cross_containment[tf]
@@ -439,6 +552,18 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 c.tsla_dist_to_spy_upper,
                 c.tsla_dist_to_spy_lower,
                 c.alignment,
+            ], dtype=np.float32)
+        else:
+            # Provide default invalid features for this TF (8 total features)
+            arrays[f'cross_{tf}'] = np.array([
+                0.0,   # spy_channel_valid
+                1.0,   # spy_direction (sideways)
+                0.5,   # spy_position
+                0.0,   # tsla_in_spy_upper
+                0.0,   # tsla_in_spy_lower
+                0.0,   # tsla_dist_to_spy_upper
+                0.0,   # tsla_dist_to_spy_lower
+                0.0,   # alignment
             ], dtype=np.float32)
 
     # VIX

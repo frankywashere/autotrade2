@@ -171,12 +171,15 @@ def extract_features_for_all_timeframes(
         else:
             df_tf = resample_ohlc(df_base, tf)
 
-        if len(df_tf) >= window:
+        try:
             result[tf] = extract_channel_features(
                 df_tf,
                 window=window,
                 timeframe=tf,
                 include_containment=True
             )
+        except (ValueError, IndexError):
+            # Skip if insufficient data
+            pass
 
     return result

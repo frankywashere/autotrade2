@@ -30,6 +30,56 @@ from .labels import generate_labels, ChannelLabels, labels_to_dict, labels_to_ar
 
 
 # =============================================================================
+# Cache Version Management
+# =============================================================================
+
+# Increment this version when cache format changes:
+# - Changes to feature extraction logic
+# - Changes to label generation
+# - Changes to ChannelSample structure
+# - Changes to warmup period or timeframe handling
+CACHE_VERSION = "v7.1.0"  # Added 500-bar warmup, 11 TF validation, quality scores
+
+
+def get_cache_metadata_path(cache_path: Path) -> Path:
+    """Get the metadata path for a cache file."""
+    return cache_path.with_suffix('.json')
+
+
+def is_cache_valid(cache_path: Path) -> bool:
+    """
+    Check if cached data is valid by comparing version.
+
+    Args:
+        cache_path: Path to cache file
+
+    Returns:
+        True if cache exists and version matches, False otherwise
+    """
+    if not cache_path.exists():
+        return False
+
+    meta_path = get_cache_metadata_path(cache_path)
+    if not meta_path.exists():
+        print(f"Cache metadata missing at {meta_path}")
+        return False
+
+    try:
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+
+        cached_version = metadata.get('cache_version', 'unknown')
+        if cached_version != CACHE_VERSION:
+            print(f"Cache version mismatch: found {cached_version}, expected {CACHE_VERSION}")
+            return False
+
+        return True
+    except Exception as e:
+        print(f"Error reading cache metadata: {e}")
+        return False
+
+
+# =============================================================================
 # Date Range Validation Helpers
 # =============================================================================
 
@@ -379,8 +429,12 @@ def scan_valid_channels(
     """
     samples = []
 
-    # Need enough data for channel window + forward scan
-    min_required = window + max_scan
+    # Warmup period: ensure adequate data for all timeframes
+    # Need ~500 bars of 5min data for proper daily/weekly channels
+    min_warmup_bars = max(window, 500)  # At least 500 bars or window, whichever larger
+
+    # Need enough data for warmup + forward scan
+    min_required = min_warmup_bars + max_scan
 
     # Align SPY and VIX with TSLA timestamps
     # For SPY (5min), reindex to match TSLA timestamps and forward-fill gaps
@@ -390,7 +444,7 @@ def scan_valid_channels(
     vix_aligned = vix_df.reindex(tsla_df.index, method='ffill')
 
     # Scan through data with sliding window
-    start_idx = window
+    start_idx = min_warmup_bars
     end_idx = len(tsla_df) - max_scan
 
     indices = range(start_idx, end_idx, step)
@@ -478,20 +532,23 @@ def cache_samples(
     with open(cache_path, 'wb') as f:
         pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    # Save metadata as JSON
+    # Save metadata as JSON with cache version
+    meta_path = get_cache_metadata_path(cache_path)
+    meta_serializable = {'cache_version': CACHE_VERSION}
+
     if metadata:
-        meta_path = cache_path.with_suffix('.json')
-        with open(meta_path, 'w') as f:
-            # Convert datetime objects to strings for JSON
-            meta_serializable = {}
-            for k, v in metadata.items():
-                if isinstance(v, (datetime, pd.Timestamp)):
-                    meta_serializable[k] = str(v)
-                else:
-                    meta_serializable[k] = v
-            json.dump(meta_serializable, f, indent=2)
+        # Convert datetime objects to strings for JSON
+        for k, v in metadata.items():
+            if isinstance(v, (datetime, pd.Timestamp)):
+                meta_serializable[k] = str(v)
+            else:
+                meta_serializable[k] = v
+
+    with open(meta_path, 'w') as f:
+        json.dump(meta_serializable, f, indent=2)
 
     print(f"Cached {len(samples)} samples to {cache_path}")
+    print(f"Cache version: {CACHE_VERSION}")
 
 
 def load_cached_samples(cache_path: Path) -> List[ChannelSample]:
@@ -684,11 +741,27 @@ def prepare_dataset_from_scratch(
     """
     cache_path = cache_dir / "channel_samples.pkl"
 
-    # Check if cache exists
-    if cache_path.exists() and not force_rebuild:
+    # Check if cache exists and is valid
+    if is_cache_valid(cache_path) and not force_rebuild:
         print(f"Loading cached samples from {cache_path}")
         samples = load_cached_samples(cache_path)
     else:
+        if cache_path.exists() and not is_cache_valid(cache_path):
+            # Backup old cache before rebuilding
+            backup_path = cache_path.with_name(f"{cache_path.stem}_old.pkl")
+            old_meta_path = get_cache_metadata_path(cache_path)
+
+            print(f"Cache version mismatch - backing up old cache to {backup_path}")
+            if backup_path.exists():
+                print(f"  Removing existing backup: {backup_path}")
+                backup_path.unlink()
+            cache_path.rename(backup_path)
+
+            if old_meta_path.exists():
+                old_meta_backup = backup_path.with_suffix('.json')
+                if old_meta_backup.exists():
+                    old_meta_backup.unlink()
+                old_meta_path.rename(old_meta_backup)
         print("Building dataset from scratch...")
 
         # Load data
