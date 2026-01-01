@@ -405,7 +405,9 @@ class DurationHead(nn.Module):
         mean = F.softplus(mean) + 1.0  # Ensure positive, minimum 1 bar
 
         log_std = self.logstd_head(h)
-        log_std = log_std.clamp(-5, 2)  # Bounded for numerical stability
+        # Bounded for numerical stability. Range [-2, 4] gives std in [0.14, 54.6]
+        # which is appropriate for duration data ranging from 1 to 500 bars
+        log_std = log_std.clamp(-2, 4)
 
         return mean, log_std
 
@@ -434,7 +436,7 @@ class DirectionHead(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(hidden_dim // 2, 2)  # 2 classes: down, up
+            nn.Linear(hidden_dim // 2, 1)  # 1 logit for binary classification (UP probability)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -445,7 +447,7 @@ class DirectionHead(nn.Module):
             x: [batch_size, input_dim]
 
         Returns:
-            logits: [batch_size, 2] - class logits
+            logits: [batch_size, 1] - single logit for BCEWithLogitsLoss
         """
         return self.net(x)
 
@@ -713,9 +715,9 @@ class HierarchicalCfCModel(nn.Module):
             per_tf_durations_mean.append(dur_mean)
             per_tf_durations_log_std.append(dur_log_std)
 
-            # Direction head outputs [batch, 2] - take only UP class logit
+            # Direction head outputs [batch, 1] - single binary logit for UP
             dir_logits = self.per_tf_direction_head(embedding)
-            per_tf_directions.append(dir_logits[:, 1:2])  # [batch, 1] - UP class only
+            per_tf_directions.append(dir_logits)  # [batch, 1] - binary logit for UP
 
             per_tf_next_channels.append(self.per_tf_next_channel_head(embedding))
             per_tf_confidences.append(self.per_tf_confidence_head(embedding))
@@ -751,7 +753,7 @@ class HierarchicalCfCModel(nn.Module):
             'aggregate': {
                 'duration_mean': agg_dur_mean,                 # [batch, 1]
                 'duration_log_std': agg_dur_log_std,           # [batch, 1]
-                'direction_logits': agg_direction,             # [batch, 2]
+                'direction_logits': agg_direction,             # [batch, 1] - binary logit
                 'next_channel_logits': agg_next_channel,       # [batch, 3]
                 'confidence': agg_confidence,                  # [batch, 1]
             }
@@ -785,7 +787,7 @@ class HierarchicalCfCModel(nn.Module):
             next_channel_probs = F.softmax(outputs['next_channel_logits'], dim=-1)  # [batch, 11, 3]
 
             # Convert aggregate logits to probabilities
-            agg_direction_probs = torch.sigmoid(outputs['aggregate']['direction_logits'])  # [batch, 2]
+            agg_direction_probs = torch.sigmoid(outputs['aggregate']['direction_logits'])  # [batch, 1]
             agg_next_channel_probs = F.softmax(outputs['aggregate']['next_channel_logits'], dim=-1)  # [batch, 3]
 
             # Get class predictions for per-timeframe
@@ -793,7 +795,7 @@ class HierarchicalCfCModel(nn.Module):
             next_channel = next_channel_probs.argmax(dim=-1)                     # [batch, 11]
 
             # Get aggregate class predictions
-            agg_direction = (agg_direction_probs > 0.5).long()                   # [batch, 2]
+            agg_direction = (agg_direction_probs > 0.5).long()                   # [batch, 1]
             agg_next_channel = agg_next_channel_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
 
             # Compute std from log_std
@@ -819,8 +821,8 @@ class HierarchicalCfCModel(nn.Module):
                 'aggregate': {
                     'duration_mean': outputs['aggregate']['duration_mean'],
                     'duration_std': agg_duration_std,
-                    'direction': agg_direction[:, 1:2],                 # [batch, 1] - take UP class
-                    'direction_probs': agg_direction_probs,
+                    'direction': agg_direction,                         # [batch, 1] - binary
+                    'direction_probs': agg_direction_probs,             # [batch, 1]
                     'next_channel': agg_next_channel,
                     'next_channel_probs': agg_next_channel_probs,
                     'confidence': outputs['aggregate']['confidence'],

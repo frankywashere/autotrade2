@@ -72,14 +72,17 @@ class GaussianNLLLoss(nn.Module):
         # Convert log_std to std and clamp for stability
         pred_std = torch.exp(pred_log_std).clamp(self.min_std, self.max_std)
 
-        # Compute squared normalized error
+        # Compute squared normalized error (clamp to prevent explosion)
         squared_error = ((target - pred_mean) / (pred_std + self.eps)) ** 2
+        squared_error = torch.clamp(squared_error, max=1000.0)  # Prevent extreme values
 
         # Compute log probability: -0.5 * (log(2π) + log(std²) + squared_error)
         # Simplified: -0.5 * (log(std²) + squared_error) + constant
         # Which is: -(log(std) + 0.5 * squared_error) + constant
         # Since we want NLL (negative), we have: log(std) + 0.5 * squared_error
-        nll = 0.5 * squared_error + pred_log_std
+        # CRITICAL: Clamp pred_log_std to prevent NaN from extreme values
+        pred_log_std_clamped = torch.clamp(pred_log_std, min=-5.0, max=5.0)
+        nll = 0.5 * squared_error + pred_log_std_clamped
 
         # Apply mask if provided
         if mask is not None:
@@ -435,16 +438,18 @@ class CombinedLoss(nn.Module):
         if self.use_learnable_weights:
             # Uncertainty-based weighting: (1 / 2σ²) * L + log(σ)
             # log_vars = log(σ²), so exp(-log_vars) = 1/σ²
-            precision_duration = torch.exp(-self.log_vars[0])
-            precision_direction = torch.exp(-self.log_vars[1])
-            precision_next_channel = torch.exp(-self.log_vars[2])
-            precision_calibration = torch.exp(-self.log_vars[3])
+            # CRITICAL: Clamp log_vars to prevent precision from exploding to inf or 0
+            log_vars_clamped = torch.clamp(self.log_vars, min=-4.0, max=4.0)
+            precision_duration = torch.exp(-log_vars_clamped[0])
+            precision_direction = torch.exp(-log_vars_clamped[1])
+            precision_next_channel = torch.exp(-log_vars_clamped[2])
+            precision_calibration = torch.exp(-log_vars_clamped[3])
 
             total_loss = (
-                0.5 * precision_duration * loss_duration + 0.5 * self.log_vars[0] +
-                0.5 * precision_direction * loss_direction + 0.5 * self.log_vars[1] +
-                0.5 * precision_next_channel * loss_next_channel + 0.5 * self.log_vars[2] +
-                0.5 * precision_calibration * loss_calibration + 0.5 * self.log_vars[3]
+                0.5 * precision_duration * loss_duration + 0.5 * log_vars_clamped[0] +
+                0.5 * precision_direction * loss_direction + 0.5 * log_vars_clamped[1] +
+                0.5 * precision_next_channel * loss_next_channel + 0.5 * log_vars_clamped[2] +
+                0.5 * precision_calibration * loss_calibration + 0.5 * log_vars_clamped[3]
             )
 
             # Store learned weights for logging

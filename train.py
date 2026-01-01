@@ -1015,10 +1015,20 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
 
     # Advanced options
     configure_advanced = inquirer.confirm(
-        message="\nConfigure advanced options (weight decay, gradient clipping)?", default=False
+        message="\nConfigure advanced options (precision, weight decay, gradient clipping)?", default=False
     ).execute()
 
     if configure_advanced:
+        # Precision / Mixed Precision (AMP)
+        use_amp = inquirer.select(
+            message="Numerical precision:",
+            choices=[
+                {"name": "float32 (Standard - most stable, recommended for MPS)", "value": False},
+                {"name": "float16 + AMP (Faster, less memory, can be unstable)", "value": True},
+            ],
+            default=False,
+        ).execute()
+
         weight_decay = float(inquirer.number(
             message="Weight decay:", default=0.0001, float_allowed=True
         ).execute())
@@ -1027,6 +1037,7 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
             message="Gradient clipping:", default=1.0, float_allowed=True
         ).execute())
     else:
+        use_amp = False  # Default to stable float32
         weight_decay = 0.0001
         gradient_clip = 1.0
 
@@ -1036,6 +1047,7 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         "learning_rate": learning_rate,
         "optimizer": optimizer,
         "scheduler": scheduler,
+        "use_amp": use_amp,
         "weight_decay": weight_decay,
         "gradient_clip": gradient_clip,
         "use_learnable_weights": use_learnable_weights,
@@ -1244,6 +1256,11 @@ def display_config_summary(config: Dict):
     train_tree.add(f"Optimizer: {config['training']['optimizer']}")
     train_tree.add(f"Scheduler: {config['training']['scheduler']}")
     train_tree.add(f"Device: {config['device']}")
+
+    # Add precision info
+    use_amp = config['training'].get('use_amp', False)
+    precision_str = "float16 + AMP (fast)" if use_amp else "float32 (stable)"
+    train_tree.add(f"Precision: {precision_str}")
 
     # Add weight mode info
     weight_mode = config['training'].get('weight_mode', 'unknown')
@@ -1747,6 +1764,7 @@ def run_walk_forward_training(
                 batch_size=config["training"]["batch_size"],
                 optimizer=config["training"]["optimizer"],
                 scheduler=config["training"]["scheduler"],
+                use_amp=config["training"].get("use_amp", False),
                 weight_decay=config["training"]["weight_decay"],
                 gradient_clip=config["training"]["gradient_clip"],
                 use_learnable_weights=config["training"]["use_learnable_weights"],
@@ -2186,6 +2204,7 @@ def main():
             batch_size=config["training"]["batch_size"],
             optimizer=config["training"]["optimizer"],
             scheduler=config["training"]["scheduler"],
+            use_amp=config["training"].get("use_amp", False),
             weight_decay=config["training"]["weight_decay"],
             gradient_clip=config["training"]["gradient_clip"],
             use_learnable_weights=config["training"]["use_learnable_weights"],
