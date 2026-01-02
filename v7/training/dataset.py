@@ -513,9 +513,14 @@ def scan_valid_channels(
     include_history: bool = False,
     lookforward_bars: int = 200,
     progress: bool = True
-) -> List[ChannelSample]:
+) -> Tuple[List[ChannelSample], int]:
     """
     Scan through historical data to find all valid channels and generate samples.
+
+    Returns:
+        Tuple of (samples, min_warmup_bars)
+        - samples: List of ChannelSample objects
+        - min_warmup_bars: Minimum warmup bars used (for cache metadata)
 
     This is the main data preparation function. It:
     1. Slides through time with a rolling window
@@ -624,7 +629,7 @@ def scan_valid_channels(
 
         samples.append(sample)
 
-    return samples
+    return samples, min_warmup_bars
 
 
 def cache_samples(
@@ -759,31 +764,83 @@ def create_dataloaders(
     val_samples: List[ChannelSample],
     test_samples: List[ChannelSample],
     batch_size: int = 32,
-    num_workers: int = 4,
+    num_workers: Optional[int] = None,
     augment_train: bool = True,
-    pin_memory: bool = True
+    pin_memory: Optional[bool] = None,
+    device: Optional[str] = None
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Create PyTorch DataLoaders for train/val/test sets.
+    Create device-aware PyTorch DataLoaders for train/val/test sets.
+
+    Automatically optimizes num_workers and pin_memory based on target device.
+    Handles high-core-count systems (96+ cores) with intelligent scaling.
 
     Args:
         train_samples: Training samples
         val_samples: Validation samples
         test_samples: Test samples
         batch_size: Batch size
-        num_workers: Number of workers for data loading
+        num_workers: Number of workers (None = auto-detect based on device/CPU count)
         augment_train: Whether to augment training data
-        pin_memory: Pin memory for faster GPU transfer
+        pin_memory: Pin memory for faster GPU transfer (None = auto-detect based on device)
+        device: Target device ('cuda', 'mps', 'cpu', or None for auto-detect)
 
     Returns:
         Tuple of (train_loader, val_loader, test_loader)
     """
+    import os
+    import torch
+
+    # Auto-detect device if not specified
+    if device is None:
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
+
+    # Auto-configure num_workers if not specified
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 8
+
+        if device == 'cuda':
+            # Smart scaling for GPU training
+            # Formula: min(cpu_count // 4, 24) for high-core systems
+            # Caps at 24 workers (practical limit)
+            if cpu_count >= 96:
+                num_workers = 20  # 96-core systems: 20 workers
+            elif cpu_count >= 64:
+                num_workers = 16  # 64-core systems: 16 workers
+            elif cpu_count >= 32:
+                num_workers = 12  # 32-core systems: 12 workers
+            elif cpu_count >= 16:
+                num_workers = 6   # 16-core systems: 6 workers
+            elif cpu_count >= 8:
+                num_workers = 4   # 8-core systems: 4 workers
+            else:
+                num_workers = 2   # Low-core systems: 2 workers
+        elif device == 'mps':
+            # Apple Silicon: no multiprocessing benefit
+            num_workers = 0
+        else:  # CPU
+            # CPU-only: minimal workers to avoid overhead
+            num_workers = 0
+
+    # Auto-configure pin_memory if not specified
+    if pin_memory is None:
+        pin_memory = (device == 'cuda')  # Only beneficial for CUDA
+
+    # Print configuration for visibility
+    print(f"DataLoader config: device={device}, num_workers={num_workers}, "
+          f"pin_memory={pin_memory}, batch_size={batch_size}")
+
     # Create datasets
     train_dataset = ChannelDataset(train_samples, augment=augment_train)
     val_dataset = ChannelDataset(val_samples, augment=False)
     test_dataset = ChannelDataset(test_samples, augment=False)
 
-    # Create dataloaders
+    # Create dataloaders with device-aware settings
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -791,7 +848,8 @@ def create_dataloaders(
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=pin_memory,
-        drop_last=True  # Drop last incomplete batch for stable training
+        persistent_workers=(num_workers > 0),  # CRITICAL: Prevents file descriptor leaks
+        drop_last=True
     )
 
     val_loader = DataLoader(
@@ -800,7 +858,8 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=pin_memory
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0)  # CRITICAL: Prevents file descriptor leaks
     )
 
     test_loader = DataLoader(
@@ -809,7 +868,8 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_fn,
-        pin_memory=pin_memory
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0)  # CRITICAL: Prevents file descriptor leaks
     )
 
     return train_loader, val_loader, test_loader
@@ -928,7 +988,7 @@ def prepare_dataset_from_scratch(
 
         # Scan for valid channels
         print(f"\nScanning for valid channels (window={window}, step={step})...")
-        samples = scan_valid_channels(
+        samples, min_warmup_bars = scan_valid_channels(
             tsla_df,
             spy_df,
             vix_df,
@@ -943,7 +1003,7 @@ def prepare_dataset_from_scratch(
 
         print(f"\nFound {len(samples)} valid channel samples")
 
-        # Cache to disk with ALL parameters
+        # Cache to disk with ALL parameters (including warmup)
         metadata = {
             'window': window,
             'step': step,
@@ -952,6 +1012,7 @@ def prepare_dataset_from_scratch(
             'return_threshold': return_threshold,
             'lookforward_bars': lookforward_bars,
             'include_history': include_history,
+            'min_warmup_bars': min_warmup_bars,
             'num_samples': len(samples),
             'start_date': str(tsla_df.index[0]),
             'end_date': str(tsla_df.index[-1]),

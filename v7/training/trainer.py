@@ -28,6 +28,9 @@ from datetime import datetime
 # Import the sophisticated CombinedLoss with learnable weights
 from v7.training.losses import CombinedLoss
 
+# Import canonical feature ordering - CRITICAL for correct feature concatenation!
+from v7.features.feature_ordering import FEATURE_ORDER, TOTAL_FEATURES
+
 
 @dataclass
 class TrainingConfig:
@@ -227,8 +230,11 @@ class Trainer:
             # Move to device
             features = {k: v.to(self.device) for k, v in features.items()}
 
-            # Concatenate feature dict into single tensor [batch_size, 626]
-            x = torch.cat([features[k] for k in sorted(features.keys())], dim=1)
+            # Concatenate feature dict into single tensor using CANONICAL ordering
+            # CRITICAL: Must use FEATURE_ORDER, NOT sorted()! This ensures:
+            # - Timeframe-grouped layout: [TF0_features][TF1_features]...[shared_features]
+            # - Model's TF branches receive coherent feature blocks
+            x = torch.cat([features[k] for k in FEATURE_ORDER if k in features], dim=1)
 
             # Remap labels to match CombinedLoss expectations
             targets = {
@@ -316,8 +322,9 @@ class Trainer:
                 # Move to device
                 features = {k: v.to(self.device) for k, v in features.items()}
 
-                # Concatenate feature dict into single tensor [batch_size, 626]
-                x = torch.cat([features[k] for k in sorted(features.keys())], dim=1)
+                # Concatenate feature dict into single tensor using CANONICAL ordering
+                # CRITICAL: Must use FEATURE_ORDER, NOT sorted()!
+                x = torch.cat([features[k] for k in FEATURE_ORDER if k in features], dim=1)
 
                 # Remap labels to match CombinedLoss expectations
                 targets = {
@@ -389,10 +396,30 @@ class Trainer:
             print(f"Saved best model to {best_path}")
 
     def load_checkpoint(self, checkpoint_path: Path):
-        """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        """Load model checkpoint with graceful handling of architecture mismatches."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Load model state with strict=False to handle architecture mismatches
+        incompatible_keys = self.model.load_state_dict(
+            checkpoint['model_state_dict'],
+            strict=False
+        )
+
+        # Log warnings about missing/extra keys
+        if incompatible_keys.missing_keys:
+            print(f"WARNING: {len(incompatible_keys.missing_keys)} missing keys in checkpoint")
+            for key in incompatible_keys.missing_keys[:3]:
+                print(f"  - {key}")
+            if len(incompatible_keys.missing_keys) > 3:
+                print(f"  ... and {len(incompatible_keys.missing_keys) - 3} more")
+
+        if incompatible_keys.unexpected_keys:
+            print(f"WARNING: {len(incompatible_keys.unexpected_keys)} unexpected keys in checkpoint")
+            for key in incompatible_keys.unexpected_keys[:3]:
+                print(f"  - {key}")
+            if len(incompatible_keys.unexpected_keys) > 3:
+                print(f"  ... and {len(incompatible_keys.unexpected_keys) - 3} more")
+
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
@@ -402,7 +429,13 @@ class Trainer:
 
         # Load learnable loss weights if present
         if 'loss_state_dict' in checkpoint:
-            self.criterion.load_state_dict(checkpoint['loss_state_dict'])
+            incompatible_loss_keys = self.criterion.load_state_dict(
+                checkpoint['loss_state_dict'],
+                strict=False
+            )
+            if incompatible_loss_keys.missing_keys or incompatible_loss_keys.unexpected_keys:
+                print(f"WARNING: Loss state has {len(incompatible_loss_keys.missing_keys)} missing, "
+                      f"{len(incompatible_loss_keys.unexpected_keys)} unexpected keys")
 
         if self.scheduler and 'scheduler_state_dict' in checkpoint:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])

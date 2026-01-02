@@ -424,15 +424,35 @@ class CombinedLoss(nn.Module):
             masks.get('next_channel')
         )
 
-        # Calibration loss (using direction predictions as example)
-        direction_probs = torch.sigmoid(predictions['direction_logits'])
-        direction_preds = (direction_probs > 0.5).long()
-        loss_calibration = self.ece(
-            direction_probs,
-            direction_preds,
-            targets['direction'].long(),
-            masks.get('direction')
-        )
+        # Calibration loss (train confidence head to match actual correctness)
+        if 'confidence' in predictions:
+            # Compute actual correctness from predictions vs targets
+            direction_probs = torch.sigmoid(predictions['direction_logits'])
+            direction_correct = ((direction_probs > 0.5).long() == targets['direction']).float()
+
+            next_channel_preds = predictions['next_channel_logits'].argmax(dim=-1)
+            next_channel_correct = (next_channel_preds == targets['next_channel']).float()
+
+            # Weighted correctness (60% direction, 40% next_channel)
+            # Direction is primary trading signal, next_channel is secondary
+            overall_correct = 0.6 * direction_correct + 0.4 * next_channel_correct
+
+            # Train confidence head with Brier score: (confidence - correctness)²
+            loss_calibration = self.brier(
+                predictions['confidence'],
+                overall_correct,
+                masks.get('direction')  # Use direction mask as proxy
+            )
+        else:
+            # Fallback: use direction ECE if no confidence head (backward compatibility)
+            direction_probs = torch.sigmoid(predictions['direction_logits'])
+            direction_preds = (direction_probs > 0.5).long()
+            loss_calibration = self.ece(
+                direction_probs,
+                direction_preds,
+                targets['direction'].long(),
+                masks.get('direction')
+            )
 
         # Combine losses
         if self.use_learnable_weights:

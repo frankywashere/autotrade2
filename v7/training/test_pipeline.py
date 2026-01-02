@@ -18,6 +18,7 @@ import sys
 
 from .dataset import load_market_data, scan_valid_channels, ChannelDataset, collate_fn
 from .losses import CombinedLoss
+from ..features.feature_ordering import FEATURE_ORDER
 
 
 class DummyModel(nn.Module):
@@ -32,8 +33,9 @@ class DummyModel(nn.Module):
         self.next_channel_head = nn.Linear(128, 3)
 
     def forward(self, features):
-        # Concatenate all features
-        x = torch.cat([v for v in features.values()], dim=1)
+        # Concatenate all features using CANONICAL ordering
+        # CRITICAL: Must use FEATURE_ORDER, NOT features.values()!
+        x = torch.cat([features[k] for k in FEATURE_ORDER if k in features], dim=1)
         x = self.fc(x)
         return {
             'duration_mean': self.duration_mean_head(x),
@@ -71,7 +73,7 @@ def test_pipeline():
     # Test 2: Scan channels
     print("\n[2/6] Testing channel scanning...")
     try:
-        samples = scan_valid_channels(
+        samples, _ = scan_valid_channels(
             tsla_df,
             spy_df,
             vix_df,

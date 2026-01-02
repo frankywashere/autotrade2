@@ -1015,7 +1015,7 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
 
     # Advanced options
     configure_advanced = inquirer.confirm(
-        message="\nConfigure advanced options (precision, weight decay, gradient clipping)?", default=False
+        message="\nConfigure advanced options (precision, early stopping, weight decay, gradient clipping)?", default=False
     ).execute()
 
     if configure_advanced:
@@ -1029,6 +1029,37 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
             default=False,
         ).execute()
 
+        # Early Stopping Configuration
+        console.print("\n[bold cyan]Early Stopping Configuration[/bold cyan]")
+        console.print("[dim]Controls when training stops if validation doesn't improve[/dim]\n")
+
+        early_stopping_patience = inquirer.select(
+            message="Early stopping patience:",
+            choices=[
+                {"name": "15 epochs (default - stops quickly if not improving)", "value": 15},
+                {"name": "30 epochs (moderate - balanced approach)", "value": 30},
+                {"name": "50 epochs (patient - allows long plateaus)", "value": 50},
+                {"name": "100 epochs (very patient - almost disabled)", "value": 100},
+            ],
+            default=15,
+        ).execute()
+
+        early_stopping_metric = inquirer.select(
+            message="Metric to monitor:",
+            choices=[
+                {"name": "val_loss (total validation loss)", "value": "val_loss"},
+                {"name": "next_channel_acc (next channel accuracy - often improves longer)", "value": "next_channel_acc"},
+                {"name": "direction_acc (direction accuracy)", "value": "direction_acc"},
+            ],
+            default="val_loss",
+        ).execute()
+
+        # Auto-set mode based on metric
+        if early_stopping_metric in ['next_channel_acc', 'direction_acc']:
+            early_stopping_mode = 'max'  # Maximize accuracy
+        else:
+            early_stopping_mode = 'min'  # Minimize loss
+
         weight_decay = float(inquirer.number(
             message="Weight decay:", default=0.0001, float_allowed=True
         ).execute())
@@ -1038,6 +1069,9 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         ).execute())
     else:
         use_amp = False  # Default to stable float32
+        early_stopping_patience = 15
+        early_stopping_metric = 'val_loss'
+        early_stopping_mode = 'min'
         weight_decay = 0.0001
         gradient_clip = 1.0
 
@@ -1048,6 +1082,9 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         "optimizer": optimizer,
         "scheduler": scheduler,
         "use_amp": use_amp,
+        "early_stopping_patience": early_stopping_patience,
+        "early_stopping_metric": early_stopping_metric,
+        "early_stopping_mode": early_stopping_mode,
         "weight_decay": weight_decay,
         "gradient_clip": gradient_clip,
         "use_learnable_weights": use_learnable_weights,
@@ -1739,7 +1776,7 @@ def run_walk_forward_training(
                     val_samples,
                     test_samples,
                     batch_size=config["training"]["batch_size"],
-                    num_workers=4,
+                    device=config["device"],  # Auto-detects num_workers and pin_memory
                     augment_train=True,
                 )
 
@@ -1769,11 +1806,13 @@ def run_walk_forward_training(
                 gradient_clip=config["training"]["gradient_clip"],
                 use_learnable_weights=config["training"]["use_learnable_weights"],
                 fixed_weights=config["training"]["fixed_weights"],
+                early_stopping_patience=config["training"].get("early_stopping_patience", 15),
+                early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
+                early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
                 device=config["device"],
                 save_dir=window_save_dir,
                 log_dir=log_dir / f"window_{window_idx + 1}",
                 save_every_n_epochs=10,
-                early_stopping_patience=15,
             )
 
             # Create trainer (CombinedLoss handles weights internally)
@@ -1953,7 +1992,7 @@ def resume_training(save_dir: Path, data_dir: Path, cache_dir: Path):
     console.print(f"\n[green]Loading checkpoint: {checkpoint_path}[/green]")
 
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     old_config = checkpoint["config"]
 
     console.print(
@@ -2173,7 +2212,7 @@ def main():
                 val_samples,
                 test_samples,
                 batch_size=config["training"]["batch_size"],
-                num_workers=4,
+                device=config["device"],  # Auto-detects num_workers and pin_memory
                 augment_train=True,
             )
 
@@ -2209,11 +2248,13 @@ def main():
             gradient_clip=config["training"]["gradient_clip"],
             use_learnable_weights=config["training"]["use_learnable_weights"],
             fixed_weights=config["training"]["fixed_weights"],
+            early_stopping_patience=config["training"].get("early_stopping_patience", 15),
+            early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
+            early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
             device=config["device"],
             save_dir=save_dir,
             log_dir=log_dir,
             save_every_n_epochs=5,
-            early_stopping_patience=15,
         )
 
         # Create trainer (CombinedLoss handles weights based on config)

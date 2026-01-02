@@ -7,40 +7,46 @@ This model predicts channel break timing, direction, and post-break channel dire
 using a hierarchical architecture that processes each timeframe independently before
 combining insights across timeframes.
 
-Input Features: 626 dimensions
-------------------------------
-- TSLA per-TF features: 30 features × 11 timeframes (5min to 3month)
+Input Features: 644 dimensions (TIMEFRAME-GROUPED ordering)
+------------------------------------------------------------
+The input tensor is ordered by timeframe, NOT alphabetically!
+Each TF block contains: [tsla_{tf}, spy_{tf}, cross_{tf}] = 49 features
+Followed by shared features at the end.
+
+- TSLA per-TF features: 30 features × 11 timeframes = 330 total
   * Channel geometry: direction, position, width, slope, R²
   * Bounce metrics: count, cycles, bars since bounce
   * RSI: current, divergence, at upper/lower bounces
-  * Exit tracking: exit counts, frequency, acceleration
-  * Break triggers: distance to longer TF boundaries
+  * Exit tracking: exit counts, frequency, acceleration (10 features)
+  * Break triggers: distance to longer TF boundaries (2 features)
   * Quality scores: channel_quality, rsi_confidence
 
-- SPY per-TF features: 13 features × 11 timeframes
-  * Channel geometry and position relative to TSLA
-  * Cross-asset containment metrics
-  * Quality scores: channel_quality, rsi_confidence
+- SPY per-TF features: 11 features × 11 timeframes = 121 total
+  * Channel geometry and position
+  * Bounce metrics and RSI
 
-- Cross-asset: 8 features × 11 timeframes (88 total)
+- Cross-asset: 8 features × 11 timeframes = 88 total
   * TSLA position in SPY channels
   * Alignment scores
 
 - VIX regime: 6 features
   * Level, normalized level, trends, percentile, regime
 
-- History features: 28 features (TSLA) + 28 features (SPY)
-  * Past channel directions, durations, break patterns
-  * RSI statistics at bounces
+- History features: 25 features (TSLA) + 25 features (SPY) = 50 total
+  * Last 5 directions, durations, break directions (5+5+5 = 15)
+  * Summary stats: avg duration, streak, counts, RSI stats (10)
 
 - Alignment: 3 features
   * Direction match, both near upper/lower
 
+- Events: 46 features (zeros if not provided)
+  * Timing, earnings context, pre/post event drift
+
 Architecture Flow:
 =================
-1. Input Layer (626 dims) → Feature Decomposition
-   ├─ Per-TF features extracted for each of 11 timeframes
-   ├─ Shared features (VIX, history, alignment) replicated
+1. Input Layer (644 dims) → Feature Decomposition
+   ├─ Per-TF features extracted for each of 11 timeframes (49 features each)
+   ├─ Shared features (VIX, history, alignment, events) extracted from end
 
 2. TF Branch Processing (11 parallel branches)
    ├─ Each branch: Linear projection → LayerNorm → CfC → Dropout
@@ -97,35 +103,60 @@ from ncps.wirings import AutoNCP
 # Feature Configuration
 # =============================================================================
 
+# Import canonical feature dimensions from feature_ordering module
+from v7.features.feature_ordering import (
+    TSLA_PER_TF, SPY_PER_TF, CROSS_PER_TF,
+    VIX_FEATURES, TSLA_HISTORY_FEATURES, SPY_HISTORY_FEATURES,
+    ALIGNMENT_FEATURES, EVENT_FEATURES,
+    PER_TF_FEATURES, SHARED_FEATURES, N_TIMEFRAMES, TOTAL_FEATURES,
+    get_tf_index_range, get_shared_index_range
+)
+
+
 @dataclass
 class FeatureConfig:
-    """Configuration defining input feature dimensions."""
+    """
+    Configuration defining input feature dimensions.
 
-    # Per-timeframe feature counts
-    tsla_per_tf: int = 30  # +1 channel_quality, +1 rsi_confidence (was 28)
-    spy_per_tf: int = 13   # +1 channel_quality, +1 rsi_confidence (was 11)
-    cross_per_tf: int = 8  # unchanged
+    IMPORTANT: These values must match v7/features/feature_ordering.py!
+    The canonical source of truth is feature_ordering.py. This dataclass
+    uses those constants to ensure consistency.
+
+    Feature Layout (TIMEFRAME-GROUPED ordering):
+    - Per-TF block: [tsla_{tf}(30), spy_{tf}(11), cross_{tf}(8)] = 49 features
+    - 11 timeframes × 49 = 539 per-TF features
+    - Shared: [vix(6), tsla_history(25), spy_history(25), alignment(3), events(46)] = 105 features
+    - Total: 539 + 105 = 644 features
+    """
+
+    # Per-timeframe feature counts (from feature_ordering.py)
+    tsla_per_tf: int = TSLA_PER_TF    # 30 (18 base + 10 exit_tracking + 2 break_trigger)
+    spy_per_tf: int = SPY_PER_TF      # 11 (channel metrics + RSI)
+    cross_per_tf: int = CROSS_PER_TF  # 8 (TSLA-in-SPY containment)
 
     # Shared features (same across all TFs)
-    vix_features: int = 6
-    tsla_history_features: int = 28
-    spy_history_features: int = 28
-    alignment_features: int = 3
+    vix_features: int = VIX_FEATURES                      # 6
+    tsla_history_features: int = TSLA_HISTORY_FEATURES    # 25 (5+5+5 lists + 10 scalars)
+    spy_history_features: int = SPY_HISTORY_FEATURES      # 25 (same structure)
+    alignment_features: int = ALIGNMENT_FEATURES          # 3
+    event_features: int = EVENT_FEATURES                  # 46 (zeros if not provided)
 
     # Number of timeframes
-    n_timeframes: int = 11  # 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly, 3month
+    n_timeframes: int = N_TIMEFRAMES  # 11: 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly, 3month
 
     @property
     def total_features(self) -> int:
         """Calculate total input dimension."""
         per_tf = (self.tsla_per_tf + self.spy_per_tf + self.cross_per_tf) * self.n_timeframes
-        shared = self.vix_features + self.tsla_history_features + self.spy_history_features + self.alignment_features
-        return per_tf + shared  # = (30+13+8)*11 + (6+28+28+3) = 561 + 65 = 626
+        shared = (self.vix_features + self.tsla_history_features +
+                  self.spy_history_features + self.alignment_features + self.event_features)
+        return per_tf + shared  # = (30+11+8)*11 + (6+25+25+3+46) = 539 + 105 = 644
 
     @property
     def shared_features(self) -> int:
         """Total shared feature dimension."""
-        return self.vix_features + self.tsla_history_features + self.spy_history_features + self.alignment_features
+        return (self.vix_features + self.tsla_history_features +
+                self.spy_history_features + self.alignment_features + self.event_features)
 
     @property
     def per_tf_features(self) -> int:
@@ -136,26 +167,26 @@ class FeatureConfig:
         """
         Get start and end indices for a timeframe's features.
 
+        Uses canonical indexing from feature_ordering module.
+
         Args:
             tf_idx: Timeframe index (0-10)
 
         Returns:
             (start_idx, end_idx) for slicing input tensor
         """
-        start = tf_idx * self.per_tf_features
-        end = start + self.per_tf_features
-        return start, end
+        return get_tf_index_range(tf_idx)
 
     def get_shared_slice(self) -> Tuple[int, int]:
         """
         Get start and end indices for shared features.
 
+        Uses canonical indexing from feature_ordering module.
+
         Returns:
             (start_idx, end_idx) for slicing input tensor
         """
-        start = self.n_timeframes * self.per_tf_features
-        end = start + self.shared_features
-        return start, end
+        return get_shared_index_range()
 
 
 # =============================================================================
@@ -546,10 +577,16 @@ class HierarchicalCfCModel(nn.Module):
     Complete hierarchical CfC model for multi-timeframe channel prediction.
 
     Architecture:
-    1. Decompose 626-dim input into per-TF and shared features
+    1. Decompose 644-dim input into per-TF (49 features each) and shared features (105)
     2. Process each TF through dedicated CfC branch
     3. Attend over TF embeddings to create unified context
     4. Predict duration, break direction, next channel direction, confidence
+
+    CRITICAL: Input must use TIMEFRAME-GROUPED ordering from feature_ordering.py!
+    - Indices 0-48: TF0 (5min) = tsla_5min(30) + spy_5min(11) + cross_5min(8)
+    - Indices 49-97: TF1 (15min) = tsla_15min(30) + spy_15min(11) + cross_15min(8)
+    - ... (11 timeframes total)
+    - Indices 539-643: Shared = vix(6) + tsla_history(25) + spy_history(25) + alignment(3) + events(46)
 
     This design allows the model to:
     - Learn timeframe-specific temporal dynamics
@@ -582,9 +619,9 @@ class HierarchicalCfCModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_timeframes = self.config.n_timeframes
 
-        # Validate total input dimension
-        assert self.config.total_features == 626, \
-            f"Expected 626 features, got {self.config.total_features}"
+        # Validate total input dimension against canonical value from feature_ordering
+        assert self.config.total_features == TOTAL_FEATURES, \
+            f"Expected {TOTAL_FEATURES} features, got {self.config.total_features}"
 
         # Validate CfC configuration
         assert cfc_units > hidden_dim + 2, \
@@ -646,24 +683,33 @@ class HierarchicalCfCModel(nn.Module):
         Forward pass through hierarchical model.
 
         Args:
-            x: [batch_size, 626] - full feature vector
+            x: [batch_size, 644] - full feature vector (TIMEFRAME-GROUPED ordering!)
             return_attention: If True, return attention weights
 
         Returns:
             Dictionary with:
-                - duration_mean: [batch_size, 1]
-                - duration_std: [batch_size, 1]
-                - break_direction_logits: [batch_size, 2]
-                - next_direction_logits: [batch_size, 3]
-                - confidence: [batch_size, 1]
+                - duration_mean: [batch_size, 11]
+                - duration_log_std: [batch_size, 11]
+                - direction_logits: [batch_size, 11]
+                - next_channel_logits: [batch_size, 11, 3]
+                - confidence: [batch_size, 11]
                 - attention_weights: [batch_size, n_tf, n_tf] (if return_attention=True)
         """
         batch_size = x.size(0)
         device = x.device
 
+        # Validate input shape
+        expected_features = self.config.total_features
+        actual_features = x.size(1)
+        if actual_features != expected_features:
+            raise ValueError(
+                f"Input feature dimension mismatch: expected {expected_features}, got {actual_features}. "
+                f"Ensure features are concatenated using FEATURE_ORDER from v7/features/feature_ordering.py"
+            )
+
         # Extract shared features (same for all TFs)
         shared_start, shared_end = self.config.get_shared_slice()
-        shared_features = x[:, shared_start:shared_end]  # [batch, 65]
+        shared_features = x[:, shared_start:shared_end]  # [batch, 105]
 
         # Process each timeframe through its branch
         tf_embeddings = []
@@ -769,7 +815,7 @@ class HierarchicalCfCModel(nn.Module):
         Make predictions in evaluation mode with per-timeframe breakdown.
 
         Args:
-            x: [batch_size, 626] - input features
+            x: [batch_size, 644] - input features (TIMEFRAME-GROUPED ordering!)
 
         Returns:
             Dictionary with:
@@ -905,9 +951,14 @@ class HierarchicalLoss(nn.Module):
         target: torch.Tensor
     ) -> torch.Tensor:
         """
-        Gaussian negative log-likelihood loss.
+        Gaussian negative log-likelihood loss with numerical stability guards.
 
         Loss = 0.5 * (log(2π) + 2*log(std) + ((target - mean) / std)^2)
+
+        Includes safety clamping to prevent NaN/Inf:
+        - Clamps std to prevent division by zero
+        - Clamps squared error to max=1000 (prevents explosion from outliers)
+        - Matches CombinedLoss clamping strategy for consistency
 
         Args:
             mean: Predicted mean [batch, 1]
@@ -917,8 +968,17 @@ class HierarchicalLoss(nn.Module):
         Returns:
             Scalar loss
         """
-        var = std ** 2
-        loss = 0.5 * (torch.log(2 * torch.pi * var) + ((target - mean) ** 2) / var)
+        # Guard 1: Clamp std to prevent division by zero and extreme log values
+        eps = 1e-6
+        std_clamped = torch.clamp(std, min=eps, max=1000.0)
+
+        # Guard 2: Clamp squared error to prevent explosion
+        squared_error = ((target - mean) / std_clamped) ** 2
+        squared_error = torch.clamp(squared_error, max=1000.0)
+
+        # Compute NLL with clamped values
+        var = std_clamped ** 2
+        loss = 0.5 * (torch.log(2 * torch.pi * var) + squared_error)
         return loss.mean()
 
     def confidence_calibration_loss(
@@ -1098,9 +1158,9 @@ if __name__ == '__main__':
     model = create_model(hidden_dim=64, cfc_units=96, num_attention_heads=4)
 
     # Create dummy input
-    print("\n[2] Creating dummy input (batch_size=4, features=626)...")
+    print(f"\n[2] Creating dummy input (batch_size=4, features={TOTAL_FEATURES})...")
     batch_size = 4
-    x_dummy = torch.randn(batch_size, 626)
+    x_dummy = torch.randn(batch_size, TOTAL_FEATURES)
 
     # Forward pass
     print("\n[3] Running forward pass...")
