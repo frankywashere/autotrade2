@@ -349,8 +349,8 @@ class CombinedLoss(nn.Module):
                          Keys: 'duration', 'direction', 'next_channel', 'calibration'
             calibration_mode: How to compute calibration loss:
                 - 'ece_direction': ECE on direction probabilities (calibrates direction directly)
-                - 'brier_per_tf': Brier on per-TF confidence head (separate confidence head)
-                - 'brier_aggregate': Brier on aggregate confidence head (single cross-TF confidence)
+                - 'brier_per_tf': Brier on per-TF confidence head (predictions['confidence'])
+                - 'brier_aggregate': Brier on aggregate confidence (predictions['aggregate']['confidence'])
         """
         super().__init__()
         self.num_timeframes = num_timeframes
@@ -461,9 +461,10 @@ class CombinedLoss(nn.Module):
                 overall_correct,
                 masks.get('direction')
             )
-        elif self.calibration_mode == 'brier_aggregate' and 'aggregate_confidence' in predictions:
+        elif self.calibration_mode == 'brier_aggregate' and 'aggregate' in predictions and 'confidence' in predictions.get('aggregate', {}):
             # Mode 3: Brier on aggregate confidence head (cross-TF attention output)
             # Uses single confidence value that weighs all timeframes
+            # Note: Model outputs predictions['aggregate']['confidence'], not predictions['aggregate_confidence']
             direction_correct = (direction_preds == targets['direction']).float()
             next_channel_preds = predictions['next_channel_logits'].argmax(dim=-1)
             next_channel_correct = (next_channel_preds == targets['next_channel']).float()
@@ -474,7 +475,7 @@ class CombinedLoss(nn.Module):
             overall_correct_mean = overall_correct.mean(dim=-1, keepdim=True)
 
             loss_calibration = self.brier(
-                predictions['aggregate_confidence'],
+                predictions['aggregate']['confidence'],
                 overall_correct_mean,
                 None  # No mask for aggregate
             )
