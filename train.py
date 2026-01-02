@@ -1013,6 +1013,43 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         console.print(f"    Next Channel: [cyan]{next_channel_w}[/cyan]")
         console.print(f"    Calibration: [cyan]{calibration_w}[/cyan]")
 
+    # Calibration mode selection
+    console.print("\n[bold cyan]Calibration Mode[/bold cyan]")
+    console.print("[dim]How should confidence/calibration be trained?[/dim]\n")
+
+    calibration_mode = inquirer.select(
+        message="Calibration mode:",
+        choices=[
+            {
+                "name": "Brier on Per-TF Confidence (default - trains separate confidence head per timeframe)",
+                "value": "brier_per_tf"
+            },
+            {
+                "name": "ECE on Direction (old way - calibrates direction probabilities directly)",
+                "value": "ece_direction"
+            },
+            {
+                "name": "Brier on Aggregate Confidence (single cross-TF confidence from attention)",
+                "value": "brier_aggregate"
+            },
+        ],
+        default="brier_per_tf",
+    ).execute()
+
+    # Display calibration mode explanation
+    if calibration_mode == "brier_per_tf":
+        console.print("[green]  Using per-timeframe confidence heads[/green]")
+        console.print("[dim]  • Separate confidence prediction for each timeframe[/dim]")
+        console.print("[dim]  • Direction can be extreme (0.99) while confidence is calibrated[/dim]")
+    elif calibration_mode == "ece_direction":
+        console.print("[green]  Using ECE on direction probabilities[/green]")
+        console.print("[dim]  • Direction probabilities become calibrated (60% = 60% correct)[/dim]")
+        console.print("[dim]  • Classic approach - no separate confidence head[/dim]")
+    elif calibration_mode == "brier_aggregate":
+        console.print("[green]  Using aggregate confidence from cross-TF attention[/green]")
+        console.print("[dim]  • Single confidence value weighing all timeframes[/dim]")
+        console.print("[dim]  • Requires model with aggregate_confidence output[/dim]")
+
     # Advanced options
     configure_advanced = inquirer.confirm(
         message="\nConfigure advanced options (precision, early stopping, weight decay, gradient clipping)?", default=False
@@ -1090,6 +1127,7 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         "use_learnable_weights": use_learnable_weights,
         "fixed_weights": fixed_weights,
         "weight_mode": weight_mode,
+        "calibration_mode": calibration_mode,
     }
 
 
@@ -1311,6 +1349,15 @@ def display_config_summary(config: Dict):
         fixed_weights = config['training'].get('fixed_weights', {})
         weights_str = f"Custom ({fixed_weights.get('duration', '?')}/{fixed_weights.get('direction', '?')}/{fixed_weights.get('next_channel', '?')}/{fixed_weights.get('calibration', '?')})"
         train_tree.add(f"Loss weights: {weights_str}")
+
+    # Add calibration mode info
+    calibration_mode = config['training'].get('calibration_mode', 'brier_per_tf')
+    if calibration_mode == 'ece_direction':
+        train_tree.add("Calibration: ECE on direction (calibrates probs directly)")
+    elif calibration_mode == 'brier_per_tf':
+        train_tree.add("Calibration: Brier on per-TF confidence")
+    elif calibration_mode == 'brier_aggregate':
+        train_tree.add("Calibration: Brier on aggregate confidence")
 
     layout["data"].update(Panel(data_tree, border_style="cyan"))
     layout["model"].update(Panel(model_tree, border_style="magenta"))
@@ -1806,6 +1853,7 @@ def run_walk_forward_training(
                 gradient_clip=config["training"]["gradient_clip"],
                 use_learnable_weights=config["training"]["use_learnable_weights"],
                 fixed_weights=config["training"]["fixed_weights"],
+                calibration_mode=config["training"].get("calibration_mode", "brier_per_tf"),
                 early_stopping_patience=config["training"].get("early_stopping_patience", 15),
                 early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
                 early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
@@ -2248,6 +2296,7 @@ def main():
             gradient_clip=config["training"]["gradient_clip"],
             use_learnable_weights=config["training"]["use_learnable_weights"],
             fixed_weights=config["training"]["fixed_weights"],
+            calibration_mode=config["training"].get("calibration_mode", "brier_per_tf"),
             early_stopping_patience=config["training"].get("early_stopping_patience", 15),
             early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
             early_stopping_mode=config["training"].get("early_stopping_mode", "min"),

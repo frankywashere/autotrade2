@@ -52,6 +52,12 @@ class TrainingConfig:
     use_learnable_weights: bool = True  # Use uncertainty-based learnable task weights
     fixed_weights: Optional[Dict[str, float]] = None  # Fixed weights when use_learnable_weights=False
 
+    # Calibration mode: how to train calibration
+    # - 'ece_direction': ECE on direction probs (calibrates direction probabilities directly)
+    # - 'brier_per_tf': Brier on per-TF confidence head (default, separate confidence head)
+    # - 'brier_aggregate': Brier on aggregate confidence head (single cross-TF confidence)
+    calibration_mode: str = 'brier_per_tf'
+
     # Optimization
     optimizer: str = 'adam'  # 'adam', 'adamw', 'sgd'
     scheduler: str = 'cosine'  # 'cosine', 'step', 'plateau', 'none'
@@ -116,7 +122,8 @@ class Trainer:
         self.criterion = CombinedLoss(
             num_timeframes=config.num_timeframes,
             use_learnable_weights=config.use_learnable_weights,
-            fixed_weights=config.fixed_weights
+            fixed_weights=config.fixed_weights,
+            calibration_mode=config.calibration_mode
         )
         # Move criterion to device (critical for learnable weights)
         self.criterion.to(self.device)

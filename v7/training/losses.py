@@ -338,7 +338,8 @@ class CombinedLoss(nn.Module):
         self,
         num_timeframes: int,
         use_learnable_weights: bool = True,
-        fixed_weights: Optional[Dict[str, float]] = None
+        fixed_weights: Optional[Dict[str, float]] = None,
+        calibration_mode: str = 'brier_per_tf'
     ):
         """
         Args:
@@ -346,10 +347,15 @@ class CombinedLoss(nn.Module):
             use_learnable_weights: If True, learn task weights; otherwise use fixed
             fixed_weights: Fixed weights for each loss component if not learning
                          Keys: 'duration', 'direction', 'next_channel', 'calibration'
+            calibration_mode: How to compute calibration loss:
+                - 'ece_direction': ECE on direction probabilities (calibrates direction directly)
+                - 'brier_per_tf': Brier on per-TF confidence head (separate confidence head)
+                - 'brier_aggregate': Brier on aggregate confidence head (single cross-TF confidence)
         """
         super().__init__()
         self.num_timeframes = num_timeframes
         self.use_learnable_weights = use_learnable_weights
+        self.calibration_mode = calibration_mode
 
         # Initialize loss components
         self.duration_loss = GaussianNLLLoss()
@@ -424,29 +430,56 @@ class CombinedLoss(nn.Module):
             masks.get('next_channel')
         )
 
-        # Calibration loss (train confidence head to match actual correctness)
-        if 'confidence' in predictions:
-            # Compute actual correctness from predictions vs targets
-            direction_probs = torch.sigmoid(predictions['direction_logits'])
-            direction_correct = ((direction_probs > 0.5).long() == targets['direction']).float()
+        # Calibration loss - 3 modes depending on configuration
+        # Precompute direction probabilities (used by all modes)
+        direction_probs = torch.sigmoid(predictions['direction_logits'])
+        direction_preds = (direction_probs > 0.5).long()
 
+        if self.calibration_mode == 'ece_direction':
+            # Mode 1: ECE on direction probabilities
+            # Calibrates direction predictions directly - the direction probabilities
+            # themselves become calibrated (60% means 60% correct historically)
+            loss_calibration = self.ece(
+                direction_probs,
+                direction_preds,
+                targets['direction'].long(),
+                masks.get('direction')
+            )
+        elif self.calibration_mode == 'brier_per_tf' and 'confidence' in predictions:
+            # Mode 2: Brier on per-TF confidence head (default)
+            # Trains separate confidence head to predict correctness
+            # Direction can be extreme (0.99) while confidence is calibrated separately
+            direction_correct = (direction_preds == targets['direction']).float()
             next_channel_preds = predictions['next_channel_logits'].argmax(dim=-1)
             next_channel_correct = (next_channel_preds == targets['next_channel']).float()
 
             # Weighted correctness (60% direction, 40% next_channel)
-            # Direction is primary trading signal, next_channel is secondary
             overall_correct = 0.6 * direction_correct + 0.4 * next_channel_correct
 
-            # Train confidence head with Brier score: (confidence - correctness)²
             loss_calibration = self.brier(
                 predictions['confidence'],
                 overall_correct,
-                masks.get('direction')  # Use direction mask as proxy
+                masks.get('direction')
+            )
+        elif self.calibration_mode == 'brier_aggregate' and 'aggregate_confidence' in predictions:
+            # Mode 3: Brier on aggregate confidence head (cross-TF attention output)
+            # Uses single confidence value that weighs all timeframes
+            direction_correct = (direction_preds == targets['direction']).float()
+            next_channel_preds = predictions['next_channel_logits'].argmax(dim=-1)
+            next_channel_correct = (next_channel_preds == targets['next_channel']).float()
+
+            # Average correctness across timeframes for aggregate target
+            overall_correct = 0.6 * direction_correct + 0.4 * next_channel_correct
+            # Mean across timeframes to get single target per sample
+            overall_correct_mean = overall_correct.mean(dim=-1, keepdim=True)
+
+            loss_calibration = self.brier(
+                predictions['aggregate_confidence'],
+                overall_correct_mean,
+                None  # No mask for aggregate
             )
         else:
-            # Fallback: use direction ECE if no confidence head (backward compatibility)
-            direction_probs = torch.sigmoid(predictions['direction_logits'])
-            direction_preds = (direction_probs > 0.5).long()
+            # Fallback: use ECE on direction if confidence heads not available
             loss_calibration = self.ece(
                 direction_probs,
                 direction_preds,
