@@ -20,6 +20,7 @@ from training import (
     Trainer,
     TrainingConfig
 )
+from features.feature_ordering import FEATURE_ORDER
 
 
 class SimpleModel(nn.Module):
@@ -44,8 +45,9 @@ class SimpleModel(nn.Module):
         self.initialized = True
 
     def forward(self, features):
-        # Concatenate all features
-        x = torch.cat([v for v in features.values()], dim=1)
+        # Concatenate all features using CANONICAL ordering
+        # CRITICAL: Must use FEATURE_ORDER, NOT features.values()!
+        x = torch.cat([features[k] for k in FEATURE_ORDER if k in features], dim=1)
 
         # Initialize on first forward pass
         if not self.initialized:

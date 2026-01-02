@@ -46,6 +46,7 @@ from v7.core.timeframe import TIMEFRAMES, resample_ohlc
 from v7.core.channel import detect_channel, Direction, Channel
 from v7.features.full_features import extract_full_features, features_to_tensor_dict
 from v7.features.events import EventsHandler, extract_event_features
+from v7.features.feature_ordering import FEATURE_ORDER
 from v7.models.hierarchical_cfc import HierarchicalCfCModel, FeatureConfig
 
 
@@ -66,6 +67,67 @@ DIR_COLORS = {0: 'red', 1: 'yellow', 2: 'green'}
 DIR_ARROWS = {0: '\u2193', 1: '\u2194', 2: '\u2191'}  # ↓ ↔ ↑
 
 console = Console()
+
+
+# Safe access helpers
+def safe_get_latest(df: pd.DataFrame, column: str, default: float = 0.0) -> float:
+    """
+    Safely get the latest value from a DataFrame column.
+
+    Args:
+        df: DataFrame to access
+        column: Column name
+        default: Default value if DataFrame is empty
+
+    Returns:
+        Latest value or default
+    """
+    if df is None or len(df) == 0:
+        return default
+    try:
+        return float(df[column].iloc[-1])
+    except (IndexError, KeyError):
+        return default
+
+
+def safe_get_timestamp(df: pd.DataFrame) -> Optional[pd.Timestamp]:
+    """
+    Safely get the latest timestamp from a DataFrame index.
+
+    Args:
+        df: DataFrame with DatetimeIndex
+
+    Returns:
+        Latest timestamp or None if DataFrame is empty
+    """
+    if df is None or len(df) == 0:
+        return None
+    try:
+        return df.index[-1]
+    except IndexError:
+        return None
+
+
+def get_data_date_range(df: pd.DataFrame) -> str:
+    """
+    Get human-readable date range from DataFrame.
+
+    Args:
+        df: DataFrame with DatetimeIndex
+
+    Returns:
+        Date range string (e.g., "2025-12-01 to 2026-01-02")
+    """
+    if df is None or len(df) == 0:
+        return "No data"
+    try:
+        start = df.index[0].strftime('%Y-%m-%d')
+        end = df.index[-1].strftime('%Y-%m-%d')
+        if start == end:
+            return f"{start}"
+        return f"{start} to {end}"
+    except (IndexError, AttributeError):
+        return "Invalid data"
 
 
 class DashboardData:
@@ -97,18 +159,18 @@ def load_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, pd.D
     console.print(f"\n[cyan]Loading data (last {lookback_days} days)...[/cyan]")
 
     # Load TSLA
-    tsla = pd.read_csv(TSLA_CSV, parse_dates=['Datetime'])
-    tsla.set_index('Datetime', inplace=True)
+    tsla = pd.read_csv(TSLA_CSV, parse_dates=['timestamp'])
+    tsla.set_index('timestamp', inplace=True)
     tsla.columns = tsla.columns.str.lower()
 
     # Load SPY
-    spy = pd.read_csv(SPY_CSV, parse_dates=['Datetime'])
-    spy.set_index('Datetime', inplace=True)
+    spy = pd.read_csv(SPY_CSV, parse_dates=['timestamp'])
+    spy.set_index('timestamp', inplace=True)
     spy.columns = spy.columns.str.lower()
 
     # Load VIX
-    vix = pd.read_csv(VIX_CSV, parse_dates=['Date'])
-    vix.set_index('Date', inplace=True)
+    vix = pd.read_csv(VIX_CSV, parse_dates=['DATE'])
+    vix.set_index('DATE', inplace=True)
     vix.columns = vix.columns.str.lower()
 
     # Resample to 5min (from 1min)
@@ -132,11 +194,31 @@ def load_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, pd.D
     cutoff = datetime.now() - timedelta(days=lookback_days)
     tsla_5min = tsla_5min[tsla_5min.index >= cutoff]
     spy_5min = spy_5min[spy_5min.index >= cutoff]
-    vix = vix[vix.index >= cutoff.date()]
+    vix = vix[vix.index >= cutoff]
 
-    console.print(f"  TSLA: {len(tsla_5min)} bars, latest: {tsla_5min.index[-1]}")
-    console.print(f"  SPY:  {len(spy_5min)} bars, latest: {spy_5min.index[-1]}")
-    console.print(f"  VIX:  {len(vix)} bars, latest: {vix.index[-1]}")
+    # Check for empty DataFrames
+    if len(tsla_5min) == 0:
+        raise ValueError(f"No TSLA data available after {cutoff.strftime('%Y-%m-%d')}. Check data files.")
+    if len(spy_5min) == 0:
+        raise ValueError(f"No SPY data available after {cutoff.strftime('%Y-%m-%d')}. Check data files.")
+    if len(vix) == 0:
+        raise ValueError(f"No VIX data available after {cutoff.strftime('%Y-%m-%d')}. Check data files.")
+
+    # Display data info with safe access
+    tsla_latest = safe_get_timestamp(tsla_5min)
+    spy_latest = safe_get_timestamp(spy_5min)
+    vix_latest = safe_get_timestamp(vix)
+
+    console.print(f"  TSLA: {len(tsla_5min)} bars, range: {get_data_date_range(tsla_5min)}")
+    console.print(f"  SPY:  {len(spy_5min)} bars, range: {get_data_date_range(spy_5min)}")
+    console.print(f"  VIX:  {len(vix)} bars, range: {get_data_date_range(vix)}")
+
+    # Check for stale data (older than 7 days)
+    now = datetime.now()
+    if tsla_latest and (now - tsla_latest.to_pydatetime()).days > 7:
+        console.print(f"[yellow]WARNING: TSLA data is stale (latest: {tsla_latest.strftime('%Y-%m-%d %H:%M')})[/yellow]")
+    if spy_latest and (now - spy_latest.to_pydatetime()).days > 7:
+        console.print(f"[yellow]WARNING: SPY data is stale (latest: {spy_latest.strftime('%Y-%m-%d %H:%M')})[/yellow]")
 
     return tsla_5min, spy_5min, vix
 
@@ -151,6 +233,11 @@ def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame, window: int
     tsla_channels = {}
     spy_channels = {}
 
+    # Check for empty input DataFrames
+    if len(tsla_df) == 0 or len(spy_df) == 0:
+        console.print("[yellow]WARNING: Empty DataFrame provided to channel detection[/yellow]")
+        return tsla_channels, spy_channels
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -160,23 +247,33 @@ def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame, window: int
 
         for tf in TIMEFRAMES:
             # TSLA
-            if tf == '5min':
-                df_tf = tsla_df
-            else:
-                df_tf = resample_ohlc(tsla_df, tf)
+            try:
+                if tf == '5min':
+                    df_tf = tsla_df
+                else:
+                    df_tf = resample_ohlc(tsla_df, tf)
 
-            if len(df_tf) >= window:
-                tsla_channels[tf] = detect_channel(df_tf, window=window)
+                if len(df_tf) >= window:
+                    tsla_channels[tf] = detect_channel(df_tf, window=window)
+                else:
+                    console.print(f"[dim]Skipping TSLA {tf}: insufficient data ({len(df_tf)} < {window})[/dim]")
+            except Exception as e:
+                console.print(f"[red]Error detecting TSLA {tf} channel: {e}[/red]")
             progress.update(task, advance=1)
 
             # SPY
-            if tf == '5min':
-                df_tf = spy_df
-            else:
-                df_tf = resample_ohlc(spy_df, tf)
+            try:
+                if tf == '5min':
+                    df_tf = spy_df
+                else:
+                    df_tf = resample_ohlc(spy_df, tf)
 
-            if len(df_tf) >= window:
-                spy_channels[tf] = detect_channel(df_tf, window=window)
+                if len(df_tf) >= window:
+                    spy_channels[tf] = detect_channel(df_tf, window=window)
+                else:
+                    console.print(f"[dim]Skipping SPY {tf}: insufficient data ({len(df_tf)} < {window})[/dim]")
+            except Exception as e:
+                console.print(f"[red]Error detecting SPY {tf} channel: {e}[/red]")
             progress.update(task, advance=1)
 
     return tsla_channels, spy_channels
@@ -217,24 +314,12 @@ def make_predictions(
     if model is not None:
         console.print("[cyan]Running model inference...[/cyan]")
 
-        # Concatenate all features in correct order
+        # Concatenate all features using CANONICAL ordering from FEATURE_ORDER
+        # CRITICAL: Must use FEATURE_ORDER for correct model input!
         feature_list = []
-        for tf in TIMEFRAMES:
-            if f'tsla_{tf}' in feature_arrays:
-                feature_list.append(feature_arrays[f'tsla_{tf}'])
-        for tf in TIMEFRAMES:
-            if f'spy_{tf}' in feature_arrays:
-                feature_list.append(feature_arrays[f'spy_{tf}'])
-        for tf in TIMEFRAMES:
-            if f'cross_{tf}' in feature_arrays:
-                feature_list.append(feature_arrays[f'cross_{tf}'])
-
-        feature_list.extend([
-            feature_arrays['vix'],
-            feature_arrays['tsla_history'],
-            feature_arrays['spy_history'],
-            feature_arrays['alignment']
-        ])
+        for key in FEATURE_ORDER:
+            if key in feature_arrays:
+                feature_list.append(feature_arrays[key])
 
         # Combine into single tensor
         x = torch.from_numpy(np.concatenate(feature_list)).float().unsqueeze(0)
@@ -292,6 +377,19 @@ def create_channel_table(data: DashboardData) -> Table:
     table.add_column("Bounces", width=8, justify="center")
     table.add_column("RSI", width=6, justify="right")
     table.add_column("Width%", width=7, justify="right")
+
+    # Check if we have any channels
+    if not data.tsla_channels:
+        table.add_row(
+            "[dim]No data[/dim]",
+            "[dim]-[/dim]",
+            "[dim]-[/dim]",
+            "[dim]-[/dim]",
+            "[dim]-[/dim]",
+            "[dim]-[/dim]",
+            "[dim]-[/dim]"
+        )
+        return table
 
     for tf in TIMEFRAMES:
         if tf not in data.tsla_channels:
@@ -496,7 +594,16 @@ def create_events_panel(data: DashboardData) -> Panel:
 
 def create_header(data: DashboardData) -> Panel:
     """Create header panel."""
-    time_str = data.timestamp.strftime('%Y-%m-%d %H:%M:%S') if data.timestamp else "N/A"
+    if data.timestamp:
+        time_str = data.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        # Check for stale data
+        age_hours = (datetime.now() - data.timestamp.to_pydatetime()).total_seconds() / 3600
+        if age_hours > 24:
+            time_str = f"{time_str} [yellow](Stale: {age_hours/24:.1f} days old)[/yellow]"
+        elif age_hours > 2:
+            time_str = f"{time_str} [yellow]({age_hours:.1f}h old)[/yellow]"
+    else:
+        time_str = "[red]No data available[/red]"
 
     content = f"""
 [bold cyan]Real-Time Channel Prediction Dashboard v7.0[/bold cyan]
@@ -552,12 +659,17 @@ def export_predictions(data: DashboardData, output_dir: Path):
     """Export predictions to CSV."""
     output_dir.mkdir(exist_ok=True, parents=True)
 
-    timestamp_str = data.timestamp.strftime('%Y%m%d_%H%M%S')
+    # Check if we have a valid timestamp
+    if not data.timestamp:
+        console.print("[yellow]WARNING: No timestamp available, using current time for export[/yellow]")
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    else:
+        timestamp_str = data.timestamp.strftime('%Y%m%d_%H%M%S')
 
     # Predictions summary
     if data.predictions:
         pred_df = pd.DataFrame([{
-            'timestamp': data.timestamp,
+            'timestamp': data.timestamp if data.timestamp else datetime.now(),
             'duration_mean': data.predictions['duration_mean'],
             'duration_std': data.predictions['duration_std'],
             'break_direction': data.predictions['break_direction'],
@@ -572,12 +684,14 @@ def export_predictions(data: DashboardData, output_dir: Path):
         pred_file = output_dir / f'prediction_{timestamp_str}.csv'
         pred_df.to_csv(pred_file, index=False)
         console.print(f"[green]Saved prediction to {pred_file}[/green]")
+    else:
+        console.print("[yellow]No predictions to export[/yellow]")
 
     # Channel status
     channels_data = []
     for tf, ch in data.tsla_channels.items():
         channels_data.append({
-            'timestamp': data.timestamp,
+            'timestamp': data.timestamp if data.timestamp else datetime.now(),
             'timeframe': tf,
             'valid': ch.valid,
             'direction': int(ch.direction),
@@ -594,6 +708,8 @@ def export_predictions(data: DashboardData, output_dir: Path):
         channels_file = output_dir / f'channels_{timestamp_str}.csv'
         channels_df.to_csv(channels_file, index=False)
         console.print(f"[green]Saved channels to {channels_file}[/green]")
+    else:
+        console.print("[yellow]No channels to export[/yellow]")
 
 
 def main():
@@ -610,7 +726,7 @@ def main():
     if args.model and Path(args.model).exists():
         console.print(f"[cyan]Loading model from {args.model}...[/cyan]")
         model = HierarchicalCfCModel(feature_config=FeatureConfig())
-        checkpoint = torch.load(args.model, map_location='cpu')
+        checkpoint = torch.load(args.model, map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         console.print("[green]Model loaded successfully[/green]")
@@ -623,46 +739,74 @@ def main():
     # Main loop
     try:
         while True:
-            # Load fresh data
-            tsla_df, spy_df, vix_df = load_data(args.lookback)
+            try:
+                # Load fresh data
+                tsla_df, spy_df, vix_df = load_data(args.lookback)
 
-            # Update timestamp
-            data.timestamp = tsla_df.index[-1]
-            data.price_tsla = float(tsla_df['close'].iloc[-1])
-            data.price_spy = float(spy_df['close'].iloc[-1])
-            data.vix = float(vix_df['close'].iloc[-1])
+                # Update timestamp and prices with safe access
+                data.timestamp = safe_get_timestamp(tsla_df)
+                data.price_tsla = safe_get_latest(tsla_df, 'close', 0.0)
+                data.price_spy = safe_get_latest(spy_df, 'close', 0.0)
+                data.vix = safe_get_latest(vix_df, 'close', 0.0)
 
-            # Detect channels
-            data.tsla_channels, data.spy_channels = detect_all_channels(tsla_df, spy_df)
+                # Detect channels
+                data.tsla_channels, data.spy_channels = detect_all_channels(tsla_df, spy_df)
 
-            # Load events
-            if EVENTS_CSV.exists():
-                data.events_handler = EventsHandler(str(EVENTS_CSV))
-                data.upcoming_events = get_upcoming_events(data.events_handler, data.timestamp)
+                # Load events (only if timestamp is valid)
+                if EVENTS_CSV.exists() and data.timestamp:
+                    try:
+                        data.events_handler = EventsHandler(str(EVENTS_CSV))
+                        data.upcoming_events = get_upcoming_events(data.events_handler, data.timestamp)
+                    except Exception as e:
+                        console.print(f"[yellow]Warning: Could not load events: {e}[/yellow]")
+                        data.upcoming_events = []
 
-            # Make predictions
-            data.predictions, data.features = make_predictions(tsla_df, spy_df, vix_df, model)
+                # Make predictions
+                data.predictions, data.features = make_predictions(tsla_df, spy_df, vix_df, model)
 
-            # Export if requested
-            if args.export:
-                export_predictions(data, Path(args.export))
+                # Export if requested
+                if args.export:
+                    export_predictions(data, Path(args.export))
 
-            # Display dashboard
-            console.clear()
-            layout = create_dashboard(data)
-            console.print(layout)
+                # Display dashboard
+                console.clear()
+                layout = create_dashboard(data)
+                console.print(layout)
 
-            # Check for refresh
-            if args.refresh > 0:
-                console.print(f"\n[dim]Next refresh in {args.refresh} seconds...[/dim]")
+                # Check for refresh
+                if args.refresh > 0:
+                    console.print(f"\n[dim]Next refresh in {args.refresh} seconds...[/dim]")
+                    time.sleep(args.refresh)
+                else:
+                    break
+
+            except ValueError as e:
+                # Handle data loading errors with informative messages
+                console.clear()
+                error_panel = Panel(
+                    f"[red bold]Data Loading Error[/red bold]\n\n{str(e)}\n\n"
+                    f"Please check:\n"
+                    f"  1. Data files exist: {TSLA_CSV}, {SPY_CSV}, {VIX_CSV}\n"
+                    f"  2. Files contain recent data\n"
+                    f"  3. File format is correct (CSV with timestamp column)\n\n"
+                    f"[dim]Try reducing --lookback days or updating your data files[/dim]",
+                    title="Dashboard Error",
+                    border_style="red",
+                    box=box.DOUBLE
+                )
+                console.print(error_panel)
+
+                # Don't retry if not in refresh mode
+                if args.refresh <= 0:
+                    break
+
+                console.print(f"\n[yellow]Retrying in {args.refresh} seconds...[/yellow]")
                 time.sleep(args.refresh)
-            else:
-                break
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Dashboard stopped by user[/yellow]")
     except Exception as e:
-        console.print(f"\n[red]Error: {e}[/red]")
+        console.print(f"\n[red]Unexpected error: {e}[/red]")
         import traceback
         traceback.print_exc()
 

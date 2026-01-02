@@ -1,0 +1,174 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        VIX FETCHER CHEAT SHEET                               ║
+║                         x6 v7 Trading System                                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ QUICK START                                                                  │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+# Simplest usage
+from v7.data import fetch_vix_data
+vix_df = fetch_vix_data(start_date="2023-01-01", end_date="2023-12-31")
+
+# With FRED API (recommended)
+import os
+os.environ['FRED_API_KEY'] = 'your_key'
+vix_df = fetch_vix_data(start_date="2023-01-01", fred_api_key=os.getenv('FRED_API_KEY'))
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ DATA SOURCES (Automatic Fallback)                                           │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+Priority  Source      Speed       Reliability  API Key?   
+──────────────────────────────────────────────────────────
+   1      FRED API    1-2 sec     Excellent    Yes (free)
+   2      yfinance    2-3 sec     Good         No
+   3      Local CSV   <0.1 sec    Very High    No
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ COMMON USAGE PATTERNS                                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+# Training pipeline
+from v7.data import fetch_vix_data
+from v7.features import extract_vix_features
+
+vix_df = fetch_vix_data(start_date="2020-01-01", end_date="2023-12-31")
+vix_features = extract_vix_features(vix_df)
+
+# With local CSV fallback
+vix_df = fetch_vix_data(
+    start_date="2023-01-01",
+    csv_path="data/VIX_History.csv"
+)
+
+# Without forward-fill (trading days only)
+vix_df = fetch_vix_data(start_date="2023-01-01", forward_fill=False)
+
+# Advanced configuration
+from v7.data import FREDVixFetcher
+fetcher = FREDVixFetcher(fred_api_key="key", csv_path="path")
+vix_df = fetcher.fetch(start_date="2023-01-01")
+source_info = fetcher.get_source_info()
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ OUTPUT FORMAT                                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+pd.DataFrame:
+    Index: DatetimeIndex (no timezone)
+    Columns: ['open', 'high', 'low', 'close']
+    Frequency: Daily (forward-filled by default)
+
+Example:
+                 open   high    low  close
+2023-01-03  23.090000  23.76  22.73  22.90
+2023-01-04  22.930000  23.27  21.94  22.01
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ SETUP FRED API KEY (Recommended)                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+1. Get key: https://fred.stlouisfed.org/docs/api/api_key.html
+2. Set env: export FRED_API_KEY='your_key'
+3. Persist:  echo 'export FRED_API_KEY="key"' >> ~/.bashrc
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ TESTING                                                                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+# Run test suite
+python v7/data/test_vix_fetcher.py
+
+# View examples
+python v7/data/example_vix_usage.py
+
+# Quick test
+python -c "from v7.data import fetch_vix_data; print(fetch_vix_data('2023-01-01', '2023-01-10').head())"
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ ERROR HANDLING                                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+# Graceful error handling
+try:
+    vix_df = fetch_vix_data(start_date, end_date)
+except RuntimeError as e:
+    print(f"VIX fetch failed: {e}")
+    vix_df = None  # Handle gracefully
+
+Common Errors:
+  ModuleNotFoundError → pip install fredapi yfinance
+  RuntimeError        → Check network or provide CSV path
+  ValueError          → Check date range is valid
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ DOCUMENTATION                                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+File                       Purpose
+────────────────────────────────────────────────────────────────
+VIX_QUICK_START.md         Quick start guide
+VIX_FETCHER_README.md      Complete documentation
+INTEGRATION_GUIDE.md       Integration examples
+VIX_FETCHER_SUMMARY.md     Implementation summary
+example_vix_usage.py       Code examples
+test_vix_fetcher.py        Test suite
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ KEY FEATURES                                                                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+✓ Automatic fallback chain (FRED → yfinance → CSV)
+✓ Forward-fill missing dates for complete coverage
+✓ Comprehensive data validation
+✓ Timezone-aware (removes timezone for consistency)
+✓ Error handling with detailed messages
+✓ No new dependencies (uses existing packages)
+✓ Production-ready and tested
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ INTEGRATION EXAMPLES                                                         │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+# Training pipeline
+from v7.data import fetch_vix_data
+from v7.training.dataset import load_market_data
+
+tsla_df, spy_df, _ = load_market_data(data_dir, start, end, use_vix_api=False)
+vix_df = fetch_vix_data(start_date=start, end_date=end)
+# Now train with tsla_df, spy_df, vix_df
+
+# Dashboard
+from v7.data import fetch_vix_data
+from datetime import datetime, timedelta
+
+end = datetime.now().strftime("%Y-%m-%d")
+start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+vix_df = fetch_vix_data(start_date=start, end_date=end)
+current_vix = vix_df['close'].iloc[-1]
+
+# Feature extraction
+from v7.features import extract_vix_features
+
+vix_df = fetch_vix_data(start_date="2023-01-01", end_date="2023-12-31")
+vix_features = extract_vix_features(vix_df)
+print(f"VIX Level: {vix_features.level:.2f}")
+print(f"VIX Regime: {vix_features.regime}")  # 0=low, 1=normal, 2=high, 3=extreme
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ PERFORMANCE                                                                  │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+FRED API:    ~1-2 seconds, excellent data quality
+yfinance:    ~2-3 seconds, good data quality  
+Local CSV:   <0.1 seconds, depends on file freshness
+
+Recommendation: Use FRED for production, keep CSV as offline fallback
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ STATUS: Production Ready ✓                                                  ║
+║ Version: 1.0.0 (2026-01-02)                                                 ║
+║ Location: /Users/frank/Desktop/CodingProjects/x6/v7/data/                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝

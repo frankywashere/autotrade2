@@ -18,6 +18,7 @@ import sys
 
 from .dataset import prepare_dataset_from_scratch, create_dataloaders
 from .trainer import Trainer, TrainingConfig
+from ..features.feature_ordering import FEATURE_ORDER
 
 
 class SimpleChannelPredictor(nn.Module):
@@ -109,10 +110,12 @@ class SimpleChannelPredictor(nn.Module):
                 - 'new_direction': [batch_size, 3]
                 - 'permanent_break': [batch_size, 1]
         """
-        # Concatenate all features
+        # Concatenate all features using CANONICAL ordering
+        # CRITICAL: Must use FEATURE_ORDER, NOT sorted()!
         feature_list = []
-        for key in sorted(features.keys()):  # Sort for consistent ordering
-            feature_list.append(features[key])
+        for key in FEATURE_ORDER:
+            if key in features:
+                feature_list.append(features[key])
 
         x = torch.cat(feature_list, dim=1)
 

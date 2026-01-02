@@ -38,6 +38,9 @@ from features.events import (
     EventFeatures, EventsHandler, extract_event_features,
     event_features_to_dict, EVENT_FEATURE_NAMES
 )
+from features.feature_ordering import (
+    FEATURE_ORDER, validate_feature_dict, get_expected_dimensions
+)
 
 
 @dataclass
@@ -683,5 +686,12 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
     else:
         # Default zeros if no events
         arrays['events'] = np.zeros(46, dtype=np.float32)
+
+    # Validate feature dimensions match expected values
+    # This catches bugs early before they propagate to training
+    errors = validate_feature_dict(arrays, raise_on_error=False)
+    if errors:
+        import warnings
+        warnings.warn(f"Feature validation warnings: {errors}")
 
     return arrays
