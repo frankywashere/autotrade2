@@ -3,6 +3,7 @@
 
 # Models folder (too large for GitHub)
 /models/
+/checkpoints/
 *.pth
 
 # Python

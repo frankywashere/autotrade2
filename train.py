@@ -910,11 +910,11 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
             default=64,
         ).execute()
 
-        learning_rate = inquirer.number(
+        learning_rate = float(inquirer.number(
             message="Learning rate:",
             default=0.001,
             float_allowed=True,
-        ).execute()
+        ).execute())
 
     # Optimizer
     optimizer = inquirer.select(
@@ -1841,8 +1841,9 @@ def run_walk_forward_training(
             window_save_dir = save_dir / f"window_{window_idx + 1}"
             window_save_dir.mkdir(parents=True, exist_ok=True)
 
-            # Create trainer config
+            # Create trainer config (include model_kwargs for checkpoint reconstruction)
             trainer_config = TrainingConfig(
+                model_kwargs=config["model"],  # Save model hyperparams for checkpoint reconstruction
                 num_epochs=config["training"]["num_epochs"],
                 learning_rate=config["training"]["learning_rate"],
                 batch_size=config["training"]["batch_size"],
@@ -1877,8 +1878,8 @@ def run_walk_forward_training(
 
             if success:
                 # Get best validation metrics
-                best_val_loss = min([m["total"] for m in trainer.val_metrics_history])
-                best_epoch = np.argmin([m["total"] for m in trainer.val_metrics_history]) + 1
+                best_val_loss = float(min([m["total"] for m in trainer.val_metrics_history]))
+                best_epoch = int(np.argmin([m["total"] for m in trainer.val_metrics_history])) + 1
 
                 window_results.append({
                     "window": window_idx + 1,
@@ -1974,8 +1975,8 @@ def post_training_summary(trainer: Trainer, config: Dict, save_dir: Path):
     console.print("=" * 80 + "\n")
 
     # Best model info
-    best_epoch = np.argmin([m["total"] for m in trainer.val_metrics_history]) + 1
-    best_val_loss = min([m["total"] for m in trainer.val_metrics_history])
+    best_epoch = int(np.argmin([m["total"] for m in trainer.val_metrics_history])) + 1
+    best_val_loss = float(min([m["total"] for m in trainer.val_metrics_history]))
 
     info_table = Table(box=box.ROUNDED, show_header=False)
     info_table.add_column("Metric", style="cyan")
@@ -2284,8 +2285,9 @@ def main():
             f"[green]✓[/green] Model created: {model.get_num_parameters()['total']:,} parameters\n"
         )
 
-        # Create trainer config
+        # Create trainer config (include model_kwargs for checkpoint reconstruction)
         trainer_config = TrainingConfig(
+            model_kwargs=config["model"],  # Save model hyperparams for checkpoint reconstruction
             num_epochs=config["training"]["num_epochs"],
             learning_rate=config["training"]["learning_rate"],
             batch_size=config["training"]["batch_size"],
