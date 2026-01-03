@@ -86,15 +86,41 @@ def find_checkpoints() -> List[Dict]:
     if not CHECKPOINTS_DIR.exists():
         return checkpoints
 
+    def extract_metrics(path: Path) -> Dict:
+        """Extract training metrics from a checkpoint file."""
+        metrics = {
+            'best_val_loss': None,
+            'best_epoch': None,
+            'direction_acc': None,
+            'next_channel_acc': None,
+            'modified_time': path.stat().st_mtime
+        }
+        try:
+            checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+            if isinstance(checkpoint, dict):
+                metrics['best_val_loss'] = checkpoint.get('best_val_metric')
+                metrics['best_epoch'] = checkpoint.get('epoch')
+                val_metrics_history = checkpoint.get('val_metrics_history')
+                if val_metrics_history and len(val_metrics_history) > 0:
+                    last_entry = val_metrics_history[-1]
+                    if isinstance(last_entry, dict):
+                        metrics['direction_acc'] = last_entry.get('direction_acc')
+                        metrics['next_channel_acc'] = last_entry.get('next_channel_acc')
+        except Exception:
+            pass
+        return metrics
+
     # Check for root best_model.pt
     root_model = CHECKPOINTS_DIR / "best_model.pt"
     if root_model.exists():
         config = extract_config_from_checkpoint(root_model)
+        metrics = extract_metrics(root_model)
         checkpoints.append({
             "name": "best_model (root)",
             "path": root_model,
             "config": config,
-            "size_mb": root_model.stat().st_size / (1024 * 1024)
+            "size_mb": root_model.stat().st_size / (1024 * 1024),
+            **metrics
         })
 
     # Check for walk-forward window models
@@ -103,11 +129,13 @@ def find_checkpoints() -> List[Dict]:
             model_path = window_dir / "best_model.pt"
             if model_path.exists():
                 config = extract_config_from_checkpoint(model_path)
+                metrics = extract_metrics(model_path)
                 checkpoints.append({
                     "name": f"{window_dir.name}/best_model",
                     "path": model_path,
                     "config": config,
-                    "size_mb": model_path.stat().st_size / (1024 * 1024)
+                    "size_mb": model_path.stat().st_size / (1024 * 1024),
+                    **metrics
                 })
 
     return checkpoints
@@ -132,16 +160,21 @@ def _load_training_config_json(checkpoint_path: Path) -> Optional[Dict]:
     return None
 
 
-def extract_config_from_checkpoint(checkpoint_path: Path) -> Optional[Dict]:
+def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[Dict] = None) -> Optional[Dict]:
     """Extract config from checkpoint file.
 
     Config sources (in priority order):
     1. TrainingConfig.model_kwargs embedded in checkpoint (best - exact match)
     2. training_config.json file in checkpoint directory (reliable - saved at training time)
     3. Heuristic inference from tensor shapes (fallback - may not match custom configs)
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+        checkpoint: Optional pre-loaded checkpoint dict to avoid redundant loading
     """
     try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        if checkpoint is None:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         config_dict = {}
 
         if isinstance(checkpoint, dict):
@@ -214,7 +247,13 @@ def load_model(checkpoint_path: str) -> Optional[HierarchicalCfCModel]:
     """Load model from checkpoint with proper architecture."""
     try:
         path = Path(checkpoint_path)
-        config = extract_config_from_checkpoint(path)
+
+        # Load checkpoint once and reuse for both config extraction and model loading
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+
+        # Extract config from the already-loaded checkpoint (pass checkpoint to avoid re-loading)
+        config = extract_config_from_checkpoint(path, checkpoint=checkpoint)
 
         if config and 'model' in config:
             model_config = config['model']
@@ -236,10 +275,7 @@ def load_model(checkpoint_path: str) -> Optional[HierarchicalCfCModel]:
             hidden_dim, cfc_units, num_heads, dropout, shared_heads = 64, 96, 4, 0.1, True
             st.warning("⚠️ No config found, using defaults: hidden_dim=64, cfc_units=96")
 
-        # Infer shared_heads from state_dict keys if not in config
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-        state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        # Check if separate heads exist (per_tf_duration_heads vs per_tf_duration_head)
+        # Infer shared_heads from state_dict keys (overrides config if separate heads detected)
         has_separate_heads = any('per_tf_duration_heads' in k for k in state_dict.keys())
         if has_separate_heads:
             shared_heads = False
@@ -575,6 +611,33 @@ def main():
                 st.caption(f"hidden_dim: {cfg.get('hidden_dim', '?')}")
                 st.caption(f"cfc_units: {cfg.get('cfc_units', '?')}")
 
+            # Show training metrics if available
+            val_loss = selected_cp.get('val_loss')
+            if val_loss is not None:
+                st.caption(f"Val Loss: {val_loss:.4f}")
+
+            best_epoch = selected_cp.get('best_epoch')
+            if best_epoch is not None:
+                st.caption(f"Best Epoch: {best_epoch}")
+
+            dir_acc = selected_cp.get('direction_accuracy')
+            if dir_acc is not None:
+                st.caption(f"Dir Acc: {dir_acc*100:.1f}%")
+
+            next_ch_acc = selected_cp.get('next_channel_accuracy')
+            if next_ch_acc is not None:
+                st.caption(f"Next Ch Acc: {next_ch_acc*100:.1f}%")
+
+            # Visual indicator for model quality based on direction accuracy
+            if dir_acc is not None:
+                if dir_acc >= 0.6:
+                    st.markdown(":green[Quality: Good]")
+                elif dir_acc >= 0.5:
+                    st.markdown(":orange[Quality: Fair]")
+                else:
+                    st.markdown(":red[Quality: Poor]")
+                st.progress(min(dir_acc, 1.0))
+
             # Load button
             if st.button("Load Model", type="primary"):
                 with st.spinner("Loading model..."):
@@ -832,13 +895,103 @@ def main():
         - Historical bounce patterns
         """)
 
-        st.subheader("Checkpoints Found")
-        for cp in find_checkpoints():
-            with st.expander(cp['name']):
-                st.write(f"Path: {cp['path']}")
-                st.write(f"Size: {cp['size_mb']:.1f} MB")
-                if cp.get('config'):
-                    st.json(cp['config'])
+        st.subheader("Model Comparison")
+
+        # Build comparison data from all checkpoints
+        checkpoints = find_checkpoints()
+        if checkpoints:
+            comparison_rows = []
+            for cp in checkpoints:
+                row = {
+                    'Model Name': cp['name'],
+                    'Val Loss': None,
+                    'Best Epoch': None,
+                    'Dir Acc %': None,
+                    'Next Ch Acc %': None,
+                    'Size MB': cp['size_mb']
+                }
+
+                # Try to extract metrics from checkpoint
+                try:
+                    checkpoint = torch.load(cp['path'], map_location='cpu', weights_only=False)
+                    if isinstance(checkpoint, dict):
+                        # Get best_val_metric (this is the best validation loss)
+                        if 'best_val_metric' in checkpoint:
+                            row['Val Loss'] = checkpoint['best_val_metric']
+
+                        # Get epoch
+                        if 'epoch' in checkpoint:
+                            row['Best Epoch'] = checkpoint['epoch']
+
+                        # Get metrics from val_metrics_history
+                        val_history = checkpoint.get('val_metrics_history', [])
+                        if val_history:
+                            # Find the epoch with best (lowest) total loss
+                            best_idx = 0
+                            best_loss = float('inf')
+                            for i, metrics in enumerate(val_history):
+                                total = metrics.get('total', float('inf'))
+                                if total < best_loss:
+                                    best_loss = total
+                                    best_idx = i
+
+                            best_metrics = val_history[best_idx]
+                            row['Best Epoch'] = best_idx + 1  # epochs are 1-indexed
+
+                            if row['Val Loss'] is None:
+                                row['Val Loss'] = best_metrics.get('total')
+
+                            if 'direction_acc' in best_metrics:
+                                row['Dir Acc %'] = best_metrics['direction_acc'] * 100
+
+                            if 'next_channel_acc' in best_metrics:
+                                row['Next Ch Acc %'] = best_metrics['next_channel_acc'] * 100
+                except Exception:
+                    pass  # Keep None values for missing metrics
+
+                comparison_rows.append(row)
+
+            if comparison_rows:
+                # Create DataFrame
+                df = pd.DataFrame(comparison_rows)
+
+                # Sort by Val Loss (ascending) - best model at top
+                df = df.sort_values('Val Loss', ascending=True, na_position='last')
+
+                # Add star prefix to best model name (first row after sorting)
+                if len(df) > 0 and pd.notna(df.iloc[0]['Val Loss']):
+                    df.iloc[0, df.columns.get_loc('Model Name')] = '\u2605 ' + str(df.iloc[0]['Model Name'])
+
+                # Format numeric columns and handle None values
+                def format_value(val, decimals=4, is_percentage=False):
+                    if val is None or (isinstance(val, float) and pd.isna(val)):
+                        return '\u2014'  # em-dash
+                    if is_percentage:
+                        return f'{val:.1f}'
+                    return f'{val:.{decimals}f}'
+
+                # Create display DataFrame with formatted values
+                display_df = pd.DataFrame({
+                    'Model Name': df['Model Name'],
+                    'Val Loss': df['Val Loss'].apply(lambda x: format_value(x, 4)),
+                    'Best Epoch': df['Best Epoch'].apply(lambda x: format_value(x, 0) if x is None or pd.isna(x) else str(int(x))),
+                    'Dir Acc %': df['Dir Acc %'].apply(lambda x: format_value(x, 1, True)),
+                    'Next Ch Acc %': df['Next Ch Acc %'].apply(lambda x: format_value(x, 1, True)),
+                    'Size MB': df['Size MB'].apply(lambda x: format_value(x, 1))
+                })
+
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                # Show expandable details for each checkpoint
+                st.subheader("Checkpoint Details")
+                for cp in checkpoints:
+                    with st.expander(cp['name']):
+                        st.write(f"Path: {cp['path']}")
+                        st.write(f"Size: {cp['size_mb']:.1f} MB")
+                        if cp.get('config'):
+                            st.json(cp['config'])
+        else:
+            st.info("No checkpoints found in checkpoints/")
 
 
 def create_channel_chart(
