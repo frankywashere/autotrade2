@@ -26,7 +26,7 @@ from datetime import datetime
 from ..core.channel import detect_channel, Channel
 from ..core.timeframe import resample_ohlc, TIMEFRAMES, BARS_PER_TF
 from ..features.full_features import extract_full_features, features_to_tensor_dict, FullFeatures
-from .labels import generate_labels, ChannelLabels, labels_to_dict, labels_to_array
+from .labels import generate_labels, generate_labels_per_tf, ChannelLabels, labels_to_dict, labels_to_array
 
 
 # =============================================================================
@@ -38,7 +38,21 @@ from .labels import generate_labels, ChannelLabels, labels_to_dict, labels_to_ar
 # - Changes to label generation
 # - Changes to ChannelSample structure
 # - Changes to warmup period or timeframe handling
-CACHE_VERSION = "v7.3.0"  # Increased to 32,760-bar warmup (420 days) for monthly window=20, fixed division guards
+#
+# Version History:
+# - v7.0.0: Initial v7 cache format
+# - v7.1.0: Added lookforward_bars parameter
+# - v7.2.0: Fixed label generation edge cases
+# - v7.3.0: Increased to 32,760-bar warmup (420 days) for monthly window=20
+# - v8.0.0: Native per-TF labels - labels generated independently for each timeframe
+#           using generate_labels_per_tf(). Each TF has its own duration_bars in native
+#           TF resolution (not scaled from 5min). labels is now Dict[str, ChannelLabels].
+#           Dataset __getitem__ includes 'labels_valid' mask for TFs with valid labels.
+CACHE_VERSION = "v8.0.0"
+
+# Supported cache versions for migration (read-only compatibility)
+# These older versions can be loaded but will trigger rebuild recommendation
+COMPATIBLE_CACHE_VERSIONS = ["v7.3.0", "v7.2.0", "v7.1.0"]
 
 
 def get_cache_metadata_path(cache_path: Path) -> Path:
@@ -67,7 +81,7 @@ def get_cache_metadata(cache_path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def is_cache_valid(cache_path: Path) -> bool:
+def is_cache_valid(cache_path: Path, strict: bool = True) -> bool:
     """
     Check if cached data exists and has valid version.
 
@@ -75,6 +89,8 @@ def is_cache_valid(cache_path: Path) -> bool:
 
     Args:
         cache_path: Path to cache file
+        strict: If True, only exact version match is valid.
+                If False, also accept COMPATIBLE_CACHE_VERSIONS (with warning).
 
     Returns:
         True if cache exists and version matches, False otherwise
@@ -92,14 +108,67 @@ def is_cache_valid(cache_path: Path) -> bool:
             metadata = json.load(f)
 
         cached_version = metadata.get('cache_version', 'unknown')
-        if cached_version != CACHE_VERSION:
-            print(f"Cache version mismatch: found {cached_version}, expected {CACHE_VERSION}")
-            return False
 
-        return True
+        # Exact match - always valid
+        if cached_version == CACHE_VERSION:
+            return True
+
+        # Compatible version check (only if not strict)
+        if not strict and cached_version in COMPATIBLE_CACHE_VERSIONS:
+            print(f"Cache version {cached_version} is compatible but outdated.")
+            print(f"  Current version: {CACHE_VERSION}")
+            print(f"  Recommend rebuilding cache for native per-TF labels.")
+            return True
+
+        # Version mismatch
+        print(f"Cache version mismatch: found {cached_version}, expected {CACHE_VERSION}")
+        if cached_version in COMPATIBLE_CACHE_VERSIONS:
+            print(f"  (This version is loadable with strict=False, but rebuild recommended)")
+        return False
+
     except Exception as e:
         print(f"Error reading cache metadata: {e}")
         return False
+
+
+def is_cache_compatible(cache_path: Path) -> Tuple[bool, str, bool]:
+    """
+    Check cache compatibility for v7->v8 migration.
+
+    Returns:
+        Tuple of (is_loadable, cached_version, needs_migration)
+        - is_loadable: True if cache can be loaded at all
+        - cached_version: Version string found in cache
+        - needs_migration: True if cache should be rebuilt for v8 features
+    """
+    if not cache_path.exists():
+        return False, "not_found", False
+
+    meta_path = get_cache_metadata_path(cache_path)
+    if not meta_path.exists():
+        return False, "no_metadata", False
+
+    try:
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+
+        cached_version = metadata.get('cache_version', 'unknown')
+
+        # Exact v8.0.0 match - no migration needed
+        if cached_version == CACHE_VERSION:
+            # Check if it has native per-TF labels
+            has_native_labels = metadata.get('native_per_tf_labels', False)
+            return True, cached_version, not has_native_labels
+
+        # Compatible older versions - loadable but needs migration
+        if cached_version in COMPATIBLE_CACHE_VERSIONS:
+            return True, cached_version, True
+
+        # Unknown/incompatible version
+        return False, cached_version, False
+
+    except Exception as e:
+        return False, f"error: {e}", False
 
 
 def validate_cache_params(
@@ -110,7 +179,8 @@ def validate_cache_params(
     max_scan: int = 500,
     return_threshold: int = 20,
     include_history: bool = False,
-    lookforward_bars: int = 200
+    lookforward_bars: int = 200,
+    native_per_tf_labels: bool = True  # v8.0.0: Native per-TF label generation
 ) -> Tuple[bool, List[str]]:
     """
     Validate that cache parameters match requested parameters.
@@ -118,6 +188,7 @@ def validate_cache_params(
     Args:
         cache_path: Path to cache file
         window, step, etc: Requested parameters to validate against cache
+        native_per_tf_labels: v8.0.0 feature - whether labels are generated per-TF
 
     Returns:
         Tuple of (is_valid, list_of_mismatches)
@@ -145,6 +216,13 @@ def validate_cache_params(
         if cached is not None and cached != requested:
             mismatches.append(f"{param_name}: cached={cached}, requested={requested}")
 
+    # v8.0.0: Check native per-TF labels flag
+    cached_native_labels = metadata.get('native_per_tf_labels', False)
+    if native_per_tf_labels and not cached_native_labels:
+        mismatches.append(
+            f"native_per_tf_labels: cached={cached_native_labels}, requested={native_per_tf_labels}"
+        )
+
     return len(mismatches) == 0, mismatches
 
 
@@ -171,12 +249,16 @@ def get_cache_summary(cache_path: Path) -> Optional[Dict[str, Any]]:
     except Exception:
         file_size_mb = 0
 
+    cached_version = metadata.get('cache_version', 'unknown')
+
     return {
         'exists': True,
         'path': str(cache_path),
         'file_size_mb': round(file_size_mb, 1),
-        'cache_version': metadata.get('cache_version', 'unknown'),
-        'version_valid': metadata.get('cache_version') == CACHE_VERSION,
+        'cache_version': cached_version,
+        'version_valid': cached_version == CACHE_VERSION,
+        'version_compatible': cached_version in COMPATIBLE_CACHE_VERSIONS,
+        'needs_migration': cached_version in COMPATIBLE_CACHE_VERSIONS,
         'num_samples': metadata.get('num_samples', 0),
         'window': metadata.get('window'),
         'step': metadata.get('step'),
@@ -188,6 +270,10 @@ def get_cache_summary(cache_path: Path) -> Optional[Dict[str, Any]]:
         'start_date': metadata.get('start_date'),
         'end_date': metadata.get('end_date'),
         'created_at': metadata.get('created_at'),
+        # v8.0.0 fields
+        'native_per_tf_labels': metadata.get('native_per_tf_labels', False),
+        'valid_tf_labels': metadata.get('valid_tf_labels', []),
+        'label_generation_mode': metadata.get('label_generation_mode', 'legacy'),
     }
 
 
@@ -294,13 +380,22 @@ class ChannelSample:
         channel_end_idx: Index in the full dataset where channel ends
         channel: The detected Channel object
         features: FullFeatures extracted at channel end
-        labels: ChannelLabels from forward scan
+        labels: Dict mapping TF names to ChannelLabels (native per-TF labels).
+                Each TF has independently generated labels with proper scaling.
+                Some TFs may have None if channel detection failed at that TF.
+
+    Note:
+        Native per-TF labels are generated by:
+        1. Resampling OHLC to each timeframe
+        2. Detecting channel at that TF's native resolution
+        3. Scanning forward at that TF's bar count
+        This means duration_bars is in native TF bars (not 5min bars scaled).
     """
     timestamp: pd.Timestamp
     channel_end_idx: int
     channel: Channel
     features: FullFeatures
-    labels: ChannelLabels
+    labels: Dict[str, ChannelLabels]  # Keyed by TF name; None values for failed TFs
 
 
 class ChannelDataset(Dataset):
@@ -359,24 +454,55 @@ class ChannelDataset(Dataset):
         if self.augment:
             features_tensors = self._augment_features(features_tensors)
 
-        # Convert labels to dict
-        # Duration is SCALED per TF: scaled_duration[tf] = original_5min_duration / BARS_PER_TF[tf]
-        # This converts 5min bars to the equivalent number of bars in each TF
-        # Example: 390 5min bars = 390/3=130 15min bars = 390/78=5 daily bars
+        # Convert per-TF labels to tensors
+        # sample.labels is Dict[str, ChannelLabels] keyed by TF name
+        # Extract native per-TF labels (no scaling - each TF has its own native duration)
+        duration_list = []
+        direction_list = []
+        next_channel_list = []
+        labels_valid_list = []
+
+        # Default values for missing TF labels
+        default_duration = 0.0
+        default_direction = 0  # DOWN
+        default_next_channel = 1  # SIDEWAYS
+
+        for tf in TIMEFRAMES:
+            tf_labels = sample.labels.get(tf)
+            if tf_labels is not None:
+                # Native per-TF labels - duration is already in the TF's native bars
+                duration_list.append(float(tf_labels.duration_bars))
+                direction_list.append(int(tf_labels.break_direction))
+                next_channel_list.append(int(tf_labels.new_channel_direction))
+                labels_valid_list.append(1.0)  # Valid label for this TF
+            else:
+                # Missing TF label - use defaults and mark as invalid
+                duration_list.append(default_duration)
+                direction_list.append(default_direction)
+                next_channel_list.append(default_next_channel)
+                labels_valid_list.append(0.0)  # Invalid label for this TF
+
         labels_dict = {
-            'duration': torch.tensor([
-                sample.labels.duration_bars / BARS_PER_TF[tf]
-                for tf in TIMEFRAMES
-            ], dtype=torch.float32),  # [11] - scaled per TF
+            # Per-timeframe labels (native, not scaled)
+            'duration': torch.tensor(duration_list, dtype=torch.float32),  # [11]
+            'direction': torch.tensor(direction_list, dtype=torch.long),  # [11]
+            'next_channel': torch.tensor(next_channel_list, dtype=torch.long),  # [11]
 
-            # Direction and next_channel are categorical, so replicate (same for all TFs)
-            'direction': torch.tensor([sample.labels.break_direction] * 11, dtype=torch.long),  # [11]
-            'next_channel': torch.tensor([sample.labels.new_channel_direction] * 11, dtype=torch.long),  # [11]
+            # Validity mask - indicates which TFs have valid labels
+            'labels_valid': torch.tensor(labels_valid_list, dtype=torch.float32),  # [11]
 
-            # Keep originals for reference/logging
-            'duration_bars': torch.tensor(sample.labels.duration_bars, dtype=torch.float32),
-            'break_trigger_tf': sample.labels.break_trigger_tf,  # String, not tensor
-            'permanent_break': torch.tensor(int(sample.labels.permanent_break), dtype=torch.long),
+            # Keep 5min originals for reference/logging (use 5min if available, else first valid)
+            'duration_bars': torch.tensor(
+                sample.labels.get('5min').duration_bars if sample.labels.get('5min') else duration_list[0],
+                dtype=torch.float32
+            ),
+            'break_trigger_tf': (
+                sample.labels.get('5min').break_trigger_tf if sample.labels.get('5min') else None
+            ),  # String, not tensor
+            'permanent_break': torch.tensor(
+                int(sample.labels.get('5min').permanent_break) if sample.labels.get('5min') else 0,
+                dtype=torch.long
+            ),
         }
 
         # Apply transform if provided
@@ -606,13 +732,10 @@ def scan_valid_channels(
                 tqdm.write(f"Feature extraction failed at {i}: {e}")
             continue
 
-        # Generate labels by scanning forward
+        # Generate native per-TF labels by scanning forward at each timeframe
         try:
-            labels = generate_labels(
-                df=tsla_df,
-                channel=channel,
-                channel_end_idx=i - 1,
-                current_tf='5min',
+            labels_per_tf = generate_labels_per_tf(
+                df=tsla_df.iloc[:i + max_scan],  # Include forward data for label generation
                 window=window,
                 max_scan=max_scan,
                 return_threshold=return_threshold
@@ -623,13 +746,19 @@ def scan_valid_channels(
                 tqdm.write(f"Label generation failed at {i}: {e}")
             continue
 
-        # Create sample
+        # Skip if no valid labels were generated for any TF
+        if not labels_per_tf or all(v is None for v in labels_per_tf.values()):
+            if progress:
+                tqdm.write(f"No valid labels generated at {i}")
+            continue
+
+        # Create sample with per-TF labels dict
         sample = ChannelSample(
             timestamp=tsla_df.index[i - 1],
             channel_end_idx=i - 1,
             channel=channel,
             features=features,
-            labels=labels
+            labels=labels_per_tf
         )
 
         samples.append(sample)
@@ -675,21 +804,73 @@ def cache_samples(
     print(f"Cache version: {CACHE_VERSION}")
 
 
-def load_cached_samples(cache_path: Path) -> List[ChannelSample]:
+def load_cached_samples(
+    cache_path: Path,
+    migrate_labels: bool = False
+) -> Tuple[List[ChannelSample], Dict[str, Any]]:
     """
-    Load cached samples from disk.
+    Load cached samples from disk with version-aware handling.
+
+    For v7.x caches loaded into v8.0.0, can optionally migrate labels format.
+    Migration converts single ChannelLabels to Dict[str, ChannelLabels] format.
 
     Args:
         cache_path: Path to cache file (.pkl)
+        migrate_labels: If True and loading v7.x cache, convert labels to per-TF dict
 
     Returns:
-        List of ChannelSample objects
+        Tuple of (samples, load_info)
+        - samples: List of ChannelSample objects
+        - load_info: Dict with version info and any migration warnings
     """
+    # Get version info before loading
+    metadata = get_cache_metadata(cache_path)
+    cached_version = metadata.get('cache_version', 'unknown') if metadata else 'unknown'
+    native_labels = metadata.get('native_per_tf_labels', False) if metadata else False
+
     with open(cache_path, 'rb') as f:
         samples = pickle.load(f)
 
+    load_info = {
+        'cached_version': cached_version,
+        'native_per_tf_labels': native_labels,
+        'migrated': False,
+        'migration_warnings': []
+    }
+
+    # Check if migration is needed (v7.x -> v8.0.0)
+    if cached_version in COMPATIBLE_CACHE_VERSIONS and not native_labels:
+        if migrate_labels:
+            print(f"Migrating {len(samples)} samples from {cached_version} to v8.0.0 format...")
+            migrated_count = 0
+            for sample in samples:
+                # v7.x samples have sample.labels as single ChannelLabels
+                # v8.0.0 expects Dict[str, ChannelLabels]
+                if isinstance(sample.labels, ChannelLabels):
+                    # Wrap in dict with '5min' key (the base TF in v7)
+                    sample.labels = {'5min': sample.labels}
+                    migrated_count += 1
+            load_info['migrated'] = True
+            load_info['migration_warnings'].append(
+                f"Migrated {migrated_count} samples to per-TF label format. "
+                "Labels are only available for '5min' TF. "
+                "Rebuild cache for native per-TF labels."
+            )
+            print(f"  Migrated {migrated_count} samples (labels wrapped for '5min' TF only)")
+        else:
+            load_info['migration_warnings'].append(
+                f"Cache version {cached_version} uses legacy label format. "
+                "Set migrate_labels=True or rebuild cache for native per-TF labels."
+            )
+
     print(f"Loaded {len(samples)} samples from {cache_path}")
-    return samples
+    print(f"  Cache version: {cached_version}")
+    if native_labels:
+        print(f"  Native per-TF labels: Yes")
+    elif cached_version in COMPATIBLE_CACHE_VERSIONS:
+        print(f"  Native per-TF labels: No (v7.x format)")
+
+    return samples, load_info
 
 
 def split_by_date(
@@ -754,6 +935,9 @@ def collate_fn(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor],
         'duration': torch.stack([l['duration'] for l in labels_list]),
         'direction': torch.stack([l['direction'] for l in labels_list]),
         'next_channel': torch.stack([l['next_channel'] for l in labels_list]),
+
+        # Validity mask - indicates which TFs have valid labels - [batch, 11]
+        'labels_valid': torch.stack([l['labels_valid'] for l in labels_list]),
 
         # Original labels for reference/logging
         'duration_bars': torch.stack([l['duration_bars'] for l in labels_list]),
@@ -954,7 +1138,10 @@ def prepare_dataset_from_scratch(
 
     if cache_usable:
         print(f"Loading cached samples from {cache_path}")
-        samples = load_cached_samples(cache_path)
+        samples, load_info = load_cached_samples(cache_path, migrate_labels=True)
+        # Show migration warnings if any
+        for warning in load_info.get('migration_warnings', []):
+            print(f"  Warning: {warning}")
     else:
         if cache_path.exists():
             if not is_cache_valid(cache_path):
@@ -1008,7 +1195,15 @@ def prepare_dataset_from_scratch(
 
         print(f"\nFound {len(samples)} valid channel samples")
 
-        # Cache to disk with ALL parameters (including warmup)
+        # Collect which TFs have valid labels across all samples
+        valid_tf_set = set()
+        for sample in samples:
+            if isinstance(sample.labels, dict):
+                for tf, label in sample.labels.items():
+                    if label is not None:
+                        valid_tf_set.add(tf)
+
+        # Cache to disk with ALL parameters (including warmup and v8 fields)
         metadata = {
             'window': window,
             'step': step,
@@ -1022,6 +1217,10 @@ def prepare_dataset_from_scratch(
             'start_date': str(tsla_df.index[0]),
             'end_date': str(tsla_df.index[-1]),
             'created_at': str(datetime.now()),
+            # v8.0.0 fields for native per-TF labels
+            'native_per_tf_labels': True,
+            'valid_tf_labels': sorted(list(valid_tf_set)),
+            'label_generation_mode': 'per_tf_native',
         }
         cache_samples(samples, cache_path, metadata)
 

@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.channel import detect_channel, Channel, Direction
-from core.timeframe import resample_ohlc, get_longer_timeframes, TIMEFRAMES
+from core.timeframe import resample_ohlc, get_longer_timeframes, TIMEFRAMES, BARS_PER_TF
 from features.containment import check_containment, get_closest_boundary, ContainmentInfo
 
 
@@ -486,3 +486,114 @@ def labels_to_array(labels: ChannelLabels, tf_encoding: dict = None) -> np.ndarr
         labels.new_channel_direction,
         int(labels.permanent_break)
     ], dtype=np.float32)
+
+
+def scale_label_params_for_tf(
+    tf: str,
+    max_scan: int,
+    return_threshold: int
+) -> Tuple[int, int]:
+    """
+    Scale label generation parameters for a specific timeframe.
+
+    Keeps the same time horizon by dividing by the number of base bars per TF bar.
+
+    Args:
+        tf: Target timeframe (e.g., '15min', '1h', 'daily')
+        max_scan: Base max_scan value (in 5min bars)
+        return_threshold: Base return_threshold value (in 5min bars)
+
+    Returns:
+        Tuple of (scaled_max_scan, scaled_return_threshold)
+    """
+    bars_per_tf = BARS_PER_TF.get(tf, 1)
+
+    scaled_max_scan = max_scan // bars_per_tf
+    scaled_return_threshold = max(1, return_threshold // bars_per_tf)
+
+    return scaled_max_scan, scaled_return_threshold
+
+
+def generate_labels_per_tf(
+    df: pd.DataFrame,
+    window: int = 50,
+    max_scan: int = 500,
+    return_threshold: int = 20,
+    fold_end_idx: Optional[int] = None
+) -> Dict[str, Optional[ChannelLabels]]:
+    """
+    Generate labels for each timeframe by resampling and detecting channels.
+
+    For each TF in TIMEFRAMES:
+    1. Resamples base 5min data using resample_ohlc()
+    2. Detects a channel at that TF
+    3. Calls generate_labels() with scaled parameters
+
+    Args:
+        df: Base 5min OHLCV DataFrame with DatetimeIndex
+        window: Window size for channel detection
+        max_scan: Maximum bars to scan forward (in 5min bars, will be scaled)
+        return_threshold: Bars outside needed to confirm permanent break (will be scaled)
+        fold_end_idx: Optional end index for walk-forward validation fold
+
+    Returns:
+        Dict mapping TF name to ChannelLabels (None if channel detection failed)
+    """
+    labels_per_tf: Dict[str, Optional[ChannelLabels]] = {}
+
+    for tf in TIMEFRAMES:
+        try:
+            # Resample data to this timeframe
+            if tf == '5min':
+                df_tf = df
+            else:
+                df_tf = resample_ohlc(df, tf)
+
+            # Need enough data for channel detection
+            if len(df_tf) < window:
+                labels_per_tf[tf] = None
+                continue
+
+            # Detect channel at this timeframe
+            # Use the most recent window of data for channel detection
+            channel_start_idx = len(df_tf) - window
+            df_channel = df_tf.iloc[channel_start_idx:channel_start_idx + window]
+            channel = detect_channel(df_channel, window=window)
+
+            if not channel.valid:
+                labels_per_tf[tf] = None
+                continue
+
+            # Scale parameters for this timeframe
+            scaled_max_scan, scaled_return_threshold = scale_label_params_for_tf(
+                tf, max_scan, return_threshold
+            )
+
+            # Scale fold_end_idx if provided
+            scaled_fold_end_idx = None
+            if fold_end_idx is not None:
+                bars_per_tf = BARS_PER_TF.get(tf, 1)
+                scaled_fold_end_idx = fold_end_idx // bars_per_tf
+
+            # Channel ends at the last bar of the detection window
+            channel_end_idx = len(df_tf) - 1
+
+            # Generate labels for this TF
+            tf_labels = generate_labels(
+                df=df_tf,
+                channel=channel,
+                channel_end_idx=channel_end_idx,
+                current_tf=tf,
+                window=window,
+                max_scan=scaled_max_scan,
+                return_threshold=scaled_return_threshold,
+                fold_end_idx=scaled_fold_end_idx
+            )
+
+            labels_per_tf[tf] = tf_labels
+
+        except Exception:
+            # Channel detection failed for this TF
+            labels_per_tf[tf] = None
+
+    return labels_per_tf

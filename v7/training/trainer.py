@@ -250,6 +250,25 @@ class Trainer:
                 'next_channel': labels['next_channel'].to(self.device),
             }
 
+            # Extract validity masks if present (for per-TF native labels)
+            # Masks are 1.0 for valid labels, 0.0 for invalid/missing labels
+            masks = None
+            if 'validity_mask' in labels:
+                # Single mask applies to all label types
+                mask = labels['validity_mask'].to(self.device)
+                masks = {
+                    'duration': mask,
+                    'direction': mask,
+                    'next_channel': mask,
+                }
+            elif 'duration_mask' in labels:
+                # Separate masks per label type
+                masks = {
+                    'duration': labels['duration_mask'].to(self.device),
+                    'direction': labels.get('direction_mask', labels['duration_mask']).to(self.device),
+                    'next_channel': labels.get('next_channel_mask', labels['duration_mask']).to(self.device),
+                }
+
             # Forward pass with mixed precision
             self.optimizer.zero_grad()
 
@@ -257,7 +276,7 @@ class Trainer:
                 # Use device type directly (supports cuda, mps, cpu)
                 with autocast(self.device.type):
                     predictions = self.model(x)
-                    loss, loss_dict = self.criterion(predictions, targets)
+                    loss, loss_dict = self.criterion(predictions, targets, masks)
 
                 # Backward pass
                 self.scaler.scale(loss).backward()
@@ -272,7 +291,7 @@ class Trainer:
                 self.scaler.update()
             else:
                 predictions = self.model(x)
-                loss, loss_dict = self.criterion(predictions, targets)
+                loss, loss_dict = self.criterion(predictions, targets, masks)
 
                 # Backward pass
                 loss.backward()
@@ -319,10 +338,10 @@ class Trainer:
             'calibration': []
         }
 
-        # Track accuracy metrics
-        direction_correct = 0
-        next_channel_correct = 0
-        total_samples = 0
+        # Track accuracy metrics (weighted by mask if present)
+        direction_correct = 0.0
+        next_channel_correct = 0.0
+        total_valid_samples = 0.0  # Float for mask weighting
 
         with torch.no_grad():
             for features, labels in tqdm(self.val_loader, desc="Validation"):
@@ -340,15 +359,34 @@ class Trainer:
                     'next_channel': labels['next_channel'].to(self.device),
                 }
 
+                # Extract validity masks if present (for per-TF native labels)
+                masks = None
+                direction_mask = None
+                if 'validity_mask' in labels:
+                    mask = labels['validity_mask'].to(self.device)
+                    masks = {
+                        'duration': mask,
+                        'direction': mask,
+                        'next_channel': mask,
+                    }
+                    direction_mask = mask
+                elif 'duration_mask' in labels:
+                    masks = {
+                        'duration': labels['duration_mask'].to(self.device),
+                        'direction': labels.get('direction_mask', labels['duration_mask']).to(self.device),
+                        'next_channel': labels.get('next_channel_mask', labels['duration_mask']).to(self.device),
+                    }
+                    direction_mask = masks['direction']
+
                 # Forward pass
                 if self.config.use_amp:
                     # Use device type directly (supports cuda, mps, cpu)
                     with autocast(self.device.type):
                         predictions = self.model(x)
-                        loss, loss_dict = self.criterion(predictions, targets)
+                        loss, loss_dict = self.criterion(predictions, targets, masks)
                 else:
                     predictions = self.model(x)
-                    loss, loss_dict = self.criterion(predictions, targets)
+                    loss, loss_dict = self.criterion(predictions, targets, masks)
 
                 # Track losses (skip nested dicts like 'weights')
                 for k, v in loss_dict.items():
@@ -358,19 +396,29 @@ class Trainer:
                         epoch_losses[k].append(v)
 
                 # Calculate accuracies (direction is binary, next_channel is 3-class)
+                # Apply mask if present to only count valid predictions
                 direction_probs = torch.sigmoid(predictions['direction_logits'])
                 direction_pred = (direction_probs > 0.5).long()
-                direction_correct += (direction_pred == targets['direction']).sum().item()
+                direction_matches = (direction_pred == targets['direction']).float()
 
                 next_channel_pred = predictions['next_channel_logits'].argmax(dim=-1)
-                next_channel_correct += (next_channel_pred == targets['next_channel']).sum().item()
+                next_channel_matches = (next_channel_pred == targets['next_channel']).float()
 
-                total_samples += targets['duration'].numel()
+                if direction_mask is not None:
+                    # Weight by mask - only count valid samples
+                    direction_correct += (direction_matches * direction_mask).sum().item()
+                    next_channel_correct += (next_channel_matches * masks['next_channel']).sum().item()
+                    total_valid_samples += direction_mask.sum().item()
+                else:
+                    # No mask - count all samples
+                    direction_correct += direction_matches.sum().item()
+                    next_channel_correct += next_channel_matches.sum().item()
+                    total_valid_samples += targets['duration'].numel()
 
         # Average losses and accuracies
         epoch_metrics = {k: np.mean(v) if v else 0.0 for k, v in epoch_losses.items()}
-        epoch_metrics['direction_acc'] = direction_correct / total_samples if total_samples > 0 else 0.0
-        epoch_metrics['next_channel_acc'] = next_channel_correct / total_samples if total_samples > 0 else 0.0
+        epoch_metrics['direction_acc'] = direction_correct / total_valid_samples if total_valid_samples > 0 else 0.0
+        epoch_metrics['next_channel_acc'] = next_channel_correct / total_valid_samples if total_valid_samples > 0 else 0.0
 
         return epoch_metrics
 
