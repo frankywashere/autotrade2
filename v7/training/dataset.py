@@ -24,7 +24,7 @@ import json
 from datetime import datetime
 
 from ..core.channel import detect_channel, Channel
-from ..core.timeframe import resample_ohlc, TIMEFRAMES
+from ..core.timeframe import resample_ohlc, TIMEFRAMES, BARS_PER_TF
 from ..features.full_features import extract_full_features, features_to_tensor_dict, FullFeatures
 from .labels import generate_labels, ChannelLabels, labels_to_dict, labels_to_array
 
@@ -360,11 +360,16 @@ class ChannelDataset(Dataset):
             features_tensors = self._augment_features(features_tensors)
 
         # Convert labels to dict
-        # NOTE: Currently we have one label per sample (5min channel)
-        # We replicate it to all 11 timeframes for per-TF training
-        # TODO Future: generate labels for each TF separately
+        # Duration is SCALED per TF: scaled_duration[tf] = original_5min_duration / BARS_PER_TF[tf]
+        # This converts 5min bars to the equivalent number of bars in each TF
+        # Example: 390 5min bars = 390/3=130 15min bars = 390/78=5 daily bars
         labels_dict = {
-            'duration': torch.tensor([sample.labels.duration_bars] * 11, dtype=torch.float32),  # [11]
+            'duration': torch.tensor([
+                sample.labels.duration_bars / BARS_PER_TF[tf]
+                for tf in TIMEFRAMES
+            ], dtype=torch.float32),  # [11] - scaled per TF
+
+            # Direction and next_channel are categorical, so replicate (same for all TFs)
             'direction': torch.tensor([sample.labels.break_direction] * 11, dtype=torch.long),  # [11]
             'next_channel': torch.tensor([sample.labels.new_channel_direction] * 11, dtype=torch.long),  # [11]
 

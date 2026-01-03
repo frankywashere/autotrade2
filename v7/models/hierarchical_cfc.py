@@ -601,7 +601,8 @@ class HierarchicalCfCModel(nn.Module):
         hidden_dim: int = 64,
         cfc_units: int = 96,  # Must be > hidden_dim + 2
         num_attention_heads: int = 4,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        shared_heads: bool = True
     ):
         """
         Initialize hierarchical CfC model.
@@ -612,12 +613,15 @@ class HierarchicalCfCModel(nn.Module):
             cfc_units: Number of units in each CfC layer (must be > hidden_dim + 2)
             num_attention_heads: Number of attention heads
             dropout: Dropout probability
+            shared_heads: If True (default), use single shared heads for all TFs.
+                         If False, create separate heads per timeframe (11x more head params).
         """
         super().__init__()
 
         self.config = feature_config or FeatureConfig()
         self.hidden_dim = hidden_dim
         self.n_timeframes = self.config.n_timeframes
+        self.shared_heads = shared_heads
 
         # Validate total input dimension against canonical value from feature_ordering
         assert self.config.total_features == TOTAL_FEATURES, \
@@ -649,13 +653,33 @@ class HierarchicalCfCModel(nn.Module):
         # Prediction heads (dual output design)
         context_dim = hidden_dim * 2  # From attention output projection
 
-        # Per-timeframe prediction heads (lightweight, use individual embeddings)
-        self.per_tf_duration_head = DurationHead(hidden_dim, hidden_dim // 2)
-        self.per_tf_direction_head = DirectionHead(hidden_dim, hidden_dim // 2)
-        self.per_tf_next_channel_head = NextChannelDirectionHead(hidden_dim, hidden_dim // 2)
-        self.per_tf_confidence_head = ConfidenceHead(hidden_dim, hidden_dim // 2)
+        # Per-timeframe prediction heads
+        if self.shared_heads:
+            # SHARED: Single set of heads for all TFs (default, fewer parameters)
+            self.per_tf_duration_head = DurationHead(hidden_dim, hidden_dim // 2)
+            self.per_tf_direction_head = DirectionHead(hidden_dim, hidden_dim // 2)
+            self.per_tf_next_channel_head = NextChannelDirectionHead(hidden_dim, hidden_dim // 2)
+            self.per_tf_confidence_head = ConfidenceHead(hidden_dim, hidden_dim // 2)
+        else:
+            # SEPARATE: 11 separate heads per prediction type (more parameters, TF-specific)
+            self.per_tf_duration_heads = nn.ModuleList([
+                DurationHead(hidden_dim, hidden_dim // 2)
+                for _ in range(self.n_timeframes)
+            ])
+            self.per_tf_direction_heads = nn.ModuleList([
+                DirectionHead(hidden_dim, hidden_dim // 2)
+                for _ in range(self.n_timeframes)
+            ])
+            self.per_tf_next_channel_heads = nn.ModuleList([
+                NextChannelDirectionHead(hidden_dim, hidden_dim // 2)
+                for _ in range(self.n_timeframes)
+            ])
+            self.per_tf_confidence_heads = nn.ModuleList([
+                ConfidenceHead(hidden_dim, hidden_dim // 2)
+                for _ in range(self.n_timeframes)
+            ])
 
-        # Aggregate prediction heads (richer, use full attention context)
+        # Aggregate prediction heads (richer, use full attention context) - always shared
         self.agg_duration_head = DurationHead(context_dim, hidden_dim)
         self.agg_direction_head = DirectionHead(context_dim, hidden_dim)
         self.agg_next_channel_head = NextChannelDirectionHead(context_dim, hidden_dim)
@@ -755,18 +779,26 @@ class HierarchicalCfCModel(nn.Module):
         per_tf_next_channels = []
         per_tf_confidences = []
 
-        for embedding in tf_embeddings:
-            # Each timeframe makes independent prediction using lightweight heads
-            dur_mean, dur_log_std = self.per_tf_duration_head(embedding)
+        for tf_idx, embedding in enumerate(tf_embeddings):
+            # Each timeframe makes independent prediction
+            if self.shared_heads:
+                # Single shared head for all TFs
+                dur_mean, dur_log_std = self.per_tf_duration_head(embedding)
+                dir_logits = self.per_tf_direction_head(embedding)
+                next_ch = self.per_tf_next_channel_head(embedding)
+                conf = self.per_tf_confidence_head(embedding)
+            else:
+                # Separate head per TF (TF-specific learned parameters)
+                dur_mean, dur_log_std = self.per_tf_duration_heads[tf_idx](embedding)
+                dir_logits = self.per_tf_direction_heads[tf_idx](embedding)
+                next_ch = self.per_tf_next_channel_heads[tf_idx](embedding)
+                conf = self.per_tf_confidence_heads[tf_idx](embedding)
+
             per_tf_durations_mean.append(dur_mean)
             per_tf_durations_log_std.append(dur_log_std)
-
-            # Direction head outputs [batch, 1] - single binary logit for UP
-            dir_logits = self.per_tf_direction_head(embedding)
             per_tf_directions.append(dir_logits)  # [batch, 1] - binary logit for UP
-
-            per_tf_next_channels.append(self.per_tf_next_channel_head(embedding))
-            per_tf_confidences.append(self.per_tf_confidence_head(embedding))
+            per_tf_next_channels.append(next_ch)
+            per_tf_confidences.append(conf)
 
         # Stack to [batch, num_timeframes] or [batch, num_timeframes, classes]
         duration_mean = torch.cat(per_tf_durations_mean, dim=1)           # [batch, 11]
@@ -889,13 +921,22 @@ class HierarchicalCfCModel(nn.Module):
         def count_params(module):
             return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
+        # Handle both shared and separate head architectures
+        if self.shared_heads:
+            per_tf_heads_count = (count_params(self.per_tf_duration_head) +
+                                  count_params(self.per_tf_direction_head) +
+                                  count_params(self.per_tf_next_channel_head) +
+                                  count_params(self.per_tf_confidence_head))
+        else:
+            per_tf_heads_count = (sum(count_params(h) for h in self.per_tf_duration_heads) +
+                                  sum(count_params(h) for h in self.per_tf_direction_heads) +
+                                  sum(count_params(h) for h in self.per_tf_next_channel_heads) +
+                                  sum(count_params(h) for h in self.per_tf_confidence_heads))
+
         return {
             'tf_branches': sum(count_params(branch) for branch in self.tf_branches),
             'cross_tf_attention': count_params(self.cross_tf_attention),
-            'per_tf_heads': (count_params(self.per_tf_duration_head) +
-                           count_params(self.per_tf_direction_head) +
-                           count_params(self.per_tf_next_channel_head) +
-                           count_params(self.per_tf_confidence_head)),
+            'per_tf_heads': per_tf_heads_count,
             'aggregate_heads': (count_params(self.agg_duration_head) +
                               count_params(self.agg_direction_head) +
                               count_params(self.agg_next_channel_head) +
@@ -1085,6 +1126,7 @@ def create_model(
     cfc_units: int = 96,  # Must be > hidden_dim + 2
     num_attention_heads: int = 4,
     dropout: float = 0.1,
+    shared_heads: bool = True,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> HierarchicalCfCModel:
     """
@@ -1095,6 +1137,8 @@ def create_model(
         cfc_units: CfC units per branch (must be > hidden_dim + 2)
         num_attention_heads: Attention heads
         dropout: Dropout probability
+        shared_heads: If True, use single shared heads for all TFs (default).
+                     If False, create separate prediction heads per timeframe.
         device: Device to place model on
 
     Returns:
@@ -1105,7 +1149,8 @@ def create_model(
         hidden_dim=hidden_dim,
         cfc_units=cfc_units,
         num_attention_heads=num_attention_heads,
-        dropout=dropout
+        dropout=dropout,
+        shared_heads=shared_heads
     )
 
     model = model.to(device)

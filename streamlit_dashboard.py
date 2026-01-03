@@ -222,6 +222,7 @@ def load_model(checkpoint_path: str) -> Optional[HierarchicalCfCModel]:
             cfc_units = model_config.get('cfc_units', 96)
             num_heads = model_config.get('num_attention_heads', 4)
             dropout = model_config.get('dropout', 0.1)
+            shared_heads = model_config.get('shared_heads', True)  # Default to shared for backward compat
 
             # Show config source status
             source = model_config.get('_source', 'unknown')
@@ -232,20 +233,28 @@ def load_model(checkpoint_path: str) -> Optional[HierarchicalCfCModel]:
             elif source == 'heuristic_inference':
                 st.warning(f"⚠️ Config inferred from tensor shapes: hidden_dim={hidden_dim}, cfc_units={cfc_units}")
         else:
-            hidden_dim, cfc_units, num_heads, dropout = 64, 96, 4, 0.1
+            hidden_dim, cfc_units, num_heads, dropout, shared_heads = 64, 96, 4, 0.1, True
             st.warning("⚠️ No config found, using defaults: hidden_dim=64, cfc_units=96")
+
+        # Infer shared_heads from state_dict keys if not in config
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        # Check if separate heads exist (per_tf_duration_heads vs per_tf_duration_head)
+        has_separate_heads = any('per_tf_duration_heads' in k for k in state_dict.keys())
+        if has_separate_heads:
+            shared_heads = False
+            st.info("Detected separate per-TF heads architecture")
 
         model = create_model(
             hidden_dim=hidden_dim,
             cfc_units=cfc_units,
             num_attention_heads=num_heads,
             dropout=dropout,
+            shared_heads=shared_heads,
             device='cpu'
         )
 
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-        # Handle both wrapped checkpoints (with 'model_state_dict' key) and raw state_dicts
-        state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        # state_dict already loaded above for shared_heads inference
         incompatible = model.load_state_dict(state_dict, strict=False)
         if incompatible.missing_keys:
             st.warning(f"Checkpoint missing {len(incompatible.missing_keys)} keys")
@@ -853,11 +862,15 @@ def create_channel_chart(
 
     # Get last window bars
     window = channel.window
-    df_window = df_resampled.iloc[-window:]
+    df_window = df_resampled.iloc[-window:].copy()
 
-    # Create candlestick
+    # Use bar indices instead of datetime to avoid gaps (kinked lines during market closures)
+    bar_indices = list(range(len(df_window)))
+    timestamps = df_window.index.tolist()
+
+    # Create candlestick with bar indices
     fig = go.Figure(data=[go.Candlestick(
-        x=df_window.index,
+        x=bar_indices,
         open=df_window['open'],
         high=df_window['high'],
         low=df_window['low'],
@@ -865,9 +878,9 @@ def create_channel_chart(
         name=symbol
     )])
 
-    # Add channel lines
+    # Add channel lines using bar indices (ensures straight lines with no gaps)
     fig.add_trace(go.Scatter(
-        x=df_window.index,
+        x=bar_indices,
         y=channel.center_line,
         mode='lines',
         name='Center',
@@ -875,7 +888,7 @@ def create_channel_chart(
     ))
 
     fig.add_trace(go.Scatter(
-        x=df_window.index,
+        x=bar_indices,
         y=channel.upper_line,
         mode='lines',
         name='Upper',
@@ -884,7 +897,7 @@ def create_channel_chart(
     ))
 
     fig.add_trace(go.Scatter(
-        x=df_window.index,
+        x=bar_indices,
         y=channel.lower_line,
         mode='lines',
         name='Lower',
@@ -893,16 +906,27 @@ def create_channel_chart(
         fillcolor='rgba(0, 100, 200, 0.1)'
     ))
 
-    # Update layout
+    # Format tick labels to show dates at regular intervals
+    tick_step = max(1, len(bar_indices) // 6)  # ~6 ticks
+    tickvals = bar_indices[::tick_step]
+    ticktext = [ts.strftime('%m/%d %H:%M') if hasattr(ts, 'strftime') else str(ts)
+                for ts in timestamps[::tick_step]]
+
+    # Update layout with bar index x-axis and formatted tick labels
     fig.update_layout(
         title=f"{symbol} {timeframe} - {channel.direction.name} Channel",
         yaxis_title="Price ($)",
-        xaxis_title="Time",
+        xaxis_title="Bar Index (Time)",
         height=500,
         hovermode='x unified',
         xaxis_rangeslider_visible=False,
         template='plotly_white',
-        legend=dict(x=0.01, y=0.99)
+        legend=dict(x=0.01, y=0.99),
+        xaxis=dict(
+            tickvals=tickvals,
+            ticktext=ticktext,
+            tickangle=-45
+        )
     )
 
     return fig

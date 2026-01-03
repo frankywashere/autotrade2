@@ -873,11 +873,22 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
         default=0.1,
     ).execute()
 
+    # Shared vs separate heads option
+    shared_heads = inquirer.select(
+        message="Prediction head architecture:",
+        choices=[
+            {"name": "Shared heads (default, fewer params)", "value": True},
+            {"name": "Separate heads per TF (11x head params)", "value": False},
+        ],
+        default=True,
+    ).execute()
+
     return {
         "hidden_dim": hidden_dim,
         "cfc_units": cfc_units,
         "num_attention_heads": num_attention_heads,
         "dropout": dropout,
+        "shared_heads": shared_heads,
     }
 
 
@@ -1322,6 +1333,8 @@ def display_config_summary(config: Dict):
     model_tree.add(f"CfC units: {config['model']['cfc_units']}")
     model_tree.add(f"Attention heads: {config['model']['num_attention_heads']}")
     model_tree.add(f"Dropout: {config['model']['dropout']}")
+    shared_heads = config['model'].get('shared_heads', True)
+    model_tree.add(f"Head architecture: {'Shared' if shared_heads else 'Separate per TF'}")
 
     # Training config
     train_tree = Tree("[bold]Training Configuration[/bold]")
@@ -1834,6 +1847,7 @@ def run_walk_forward_training(
                     cfc_units=config["model"]["cfc_units"],
                     num_attention_heads=config["model"]["num_attention_heads"],
                     dropout=config["model"]["dropout"],
+                    shared_heads=config["model"].get("shared_heads", True),
                     device=config["device"],
                 )
 
@@ -2278,6 +2292,7 @@ def main():
                 cfc_units=config["model"]["cfc_units"],
                 num_attention_heads=config["model"]["num_attention_heads"],
                 dropout=config["model"]["dropout"],
+                shared_heads=config["model"].get("shared_heads", True),
                 device=config["device"],
             )
 
