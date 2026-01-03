@@ -180,12 +180,15 @@ Per sample input:
 
 ### Label Structure
 
-Per sample output:
-- `duration_bars`: int (regression target)
-- `break_direction`: 0/1 (binary classification)
-- `new_channel_direction`: 0/1/2 (3-class classification)
-- `permanent_break`: 0/1 (binary classification)
-- `break_trigger_tf`: string (metadata, not used in loss)
+Per sample output (native per-TF labels, v8.0.0+):
+- `duration`: [batch, 11] float (regression target per TF, in native TF bars)
+- `direction`: [batch, 11] int (binary classification per TF)
+- `next_channel`: [batch, 11] int (3-class classification per TF)
+- `labels_valid`: [batch, 11] float (1.0=valid, 0.0=invalid/missing TF)
+
+Each of the 11 timeframes gets independently generated labels from channels
+detected at that TF's native resolution. The validity mask indicates which
+TFs have valid labels (some may be missing if channel detection fails).
 
 ## Usage Examples
 

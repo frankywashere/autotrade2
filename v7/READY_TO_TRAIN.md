@@ -101,8 +101,9 @@ Small parameter increase for significant functionality gain.
 - ✅ All keys match
 
 ### Dataset ↔ Loss
-- ✅ Labels replicated to [batch, 11]
+- ✅ Native per-TF labels: [batch, 11] with per-TF validity mask
 - ✅ Keys renamed: duration_bars → duration, etc.
+- ✅ labels_valid mask for missing timeframe labels
 - ✅ collate_fn stacks properly
 
 ### Trainer ↔ All

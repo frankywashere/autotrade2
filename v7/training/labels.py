@@ -38,6 +38,69 @@ class NewChannelDirection(IntEnum):
     BULL = 2
 
 
+class BreakTriggerTF(IntEnum):
+    """
+    Classification of which longer timeframe boundary triggered a channel break.
+
+    Each timeframe has upper/lower variants since the direction of the triggering
+    boundary carries important predictive information (bullish vs bearish context).
+
+    Total classes: 21 (1 no_trigger + 10 timeframes x 2 directions)
+    """
+    NO_TRIGGER = 0
+    TF_15MIN_UPPER = 1
+    TF_15MIN_LOWER = 2
+    TF_30MIN_UPPER = 3
+    TF_30MIN_LOWER = 4
+    TF_1H_UPPER = 5
+    TF_1H_LOWER = 6
+    TF_2H_UPPER = 7
+    TF_2H_LOWER = 8
+    TF_3H_UPPER = 9
+    TF_3H_LOWER = 10
+    TF_4H_UPPER = 11
+    TF_4H_LOWER = 12
+    TF_DAILY_UPPER = 13
+    TF_DAILY_LOWER = 14
+    TF_WEEKLY_UPPER = 15
+    TF_WEEKLY_LOWER = 16
+    TF_MONTHLY_UPPER = 17
+    TF_MONTHLY_LOWER = 18
+    TF_3MONTH_UPPER = 19
+    TF_3MONTH_LOWER = 20
+
+
+# Encoding map for string to int conversion
+TF_TRIGGER_ENCODING = {
+    None: 0,
+    '15min_upper': 1, '15min_lower': 2,
+    '30min_upper': 3, '30min_lower': 4,
+    '1h_upper': 5, '1h_lower': 6,
+    '2h_upper': 7, '2h_lower': 8,
+    '3h_upper': 9, '3h_lower': 10,
+    '4h_upper': 11, '4h_lower': 12,
+    'daily_upper': 13, 'daily_lower': 14,
+    'weekly_upper': 15, 'weekly_lower': 16,
+    'monthly_upper': 17, 'monthly_lower': 18,
+    '3month_upper': 19, '3month_lower': 20,
+}
+
+# Reverse mapping for decoding
+TF_TRIGGER_DECODING = {v: k for k, v in TF_TRIGGER_ENCODING.items()}
+
+NUM_TRIGGER_TF_CLASSES = 21  # Total classes (0-20)
+
+
+def encode_trigger_tf(trigger_tf: Optional[str]) -> int:
+    """Encode break_trigger_tf string to integer class."""
+    return TF_TRIGGER_ENCODING.get(trigger_tf, 0)
+
+
+def decode_trigger_tf(trigger_tf_encoded: int) -> Optional[str]:
+    """Decode integer class back to trigger_tf string."""
+    return TF_TRIGGER_DECODING.get(trigger_tf_encoded)
+
+
 @dataclass
 class ChannelLabels:
     """
@@ -46,15 +109,27 @@ class ChannelLabels:
     Attributes:
         duration_bars: Number of bars until permanent break
         break_direction: Direction of break (0=DOWN, 1=UP)
-        break_trigger_tf: Which longer TF boundary was nearest at break time
+        break_trigger_tf: Encoded trigger TF class (0-20, see BreakTriggerTF)
         new_channel_direction: Direction of next channel (0=BEAR, 1=SIDEWAYS, 2=BULL)
         permanent_break: Whether a permanent break was found within scan window
+
+    Validity flags (which labels are from actual observation vs defaults):
+        duration_valid: True if duration was observed (always True for valid samples)
+        direction_valid: True only if permanent_break=True
+        trigger_tf_valid: True only if trigger TF was found
+        new_channel_valid: True only if new channel was detected
     """
     duration_bars: int
     break_direction: int  # 0=DOWN, 1=UP
-    break_trigger_tf: Optional[str]  # e.g., "1h_upper", "daily_lower"
+    break_trigger_tf: int  # Encoded class 0-20 (see TF_TRIGGER_ENCODING)
     new_channel_direction: int  # 0=BEAR, 1=SIDEWAYS, 2=BULL
     permanent_break: bool
+
+    # Validity flags - which labels are from actual observation vs defaults
+    duration_valid: bool = True       # Duration is always valid for valid samples
+    direction_valid: bool = False     # True only if permanent_break=True
+    trigger_tf_valid: bool = False    # True only if trigger found
+    new_channel_valid: bool = False   # True only if new channel detected
 
 
 def project_channel_bounds(
@@ -323,9 +398,13 @@ def generate_labels(
         return ChannelLabels(
             duration_bars=max_scan,
             break_direction=BreakDirection.UP,  # Default
-            break_trigger_tf=None,
+            break_trigger_tf=0,  # NO_TRIGGER
             new_channel_direction=NewChannelDirection.SIDEWAYS,
-            permanent_break=False
+            permanent_break=False,
+            duration_valid=False,  # No forward data means duration not observed
+            direction_valid=False,
+            trigger_tf_valid=False,
+            new_channel_valid=False
         )
 
     df_forward = df.iloc[forward_start:forward_end].copy()
@@ -335,9 +414,13 @@ def generate_labels(
         return ChannelLabels(
             duration_bars=max_scan,
             break_direction=BreakDirection.UP,
-            break_trigger_tf=None,
+            break_trigger_tf=0,  # NO_TRIGGER
             new_channel_direction=NewChannelDirection.SIDEWAYS,
-            permanent_break=False
+            permanent_break=False,
+            duration_valid=False,  # No forward data
+            direction_valid=False,
+            trigger_tf_valid=False,
+            new_channel_valid=False
         )
 
     # Project channel bounds forward
@@ -349,13 +432,17 @@ def generate_labels(
     )
 
     if break_idx is None:
-        # No break found within scan window
+        # No break found within scan window - but duration IS valid (channel survived this long)
         return ChannelLabels(
             duration_bars=n_forward,
-            break_direction=BreakDirection.UP,  # Default
-            break_trigger_tf=None,
+            break_direction=BreakDirection.UP,  # Default - unknown
+            break_trigger_tf=0,  # NO_TRIGGER
             new_channel_direction=NewChannelDirection.SIDEWAYS,
-            permanent_break=False
+            permanent_break=False,
+            duration_valid=True,   # Duration IS observed (survived scan window)
+            direction_valid=False,  # Direction unknown
+            trigger_tf_valid=False,
+            new_channel_valid=False
         )
 
     # Calculate duration
@@ -385,9 +472,13 @@ def generate_labels(
     return ChannelLabels(
         duration_bars=duration_bars,
         break_direction=int(break_direction),
-        break_trigger_tf=break_trigger_tf,
+        break_trigger_tf=encode_trigger_tf(break_trigger_tf),  # Encode string to int
         new_channel_direction=new_channel_direction,
-        permanent_break=True
+        permanent_break=True,
+        duration_valid=True,
+        direction_valid=True,
+        trigger_tf_valid=(break_trigger_tf is not None),
+        new_channel_valid=(new_channel is not None)
     )
 
 
@@ -439,52 +530,44 @@ def labels_to_dict(labels: ChannelLabels) -> dict:
         labels: ChannelLabels object
 
     Returns:
-        Dictionary with all label fields
+        Dictionary with all label fields including validity flags
     """
     return {
         'duration_bars': labels.duration_bars,
         'break_direction': labels.break_direction,
-        'break_trigger_tf': labels.break_trigger_tf,
+        'break_trigger_tf': labels.break_trigger_tf,  # Already encoded as int
+        'break_trigger_tf_str': decode_trigger_tf(labels.break_trigger_tf),  # For debugging
         'new_channel_direction': labels.new_channel_direction,
-        'permanent_break': labels.permanent_break
+        'permanent_break': labels.permanent_break,
+        # Validity flags
+        'duration_valid': labels.duration_valid,
+        'direction_valid': labels.direction_valid,
+        'trigger_tf_valid': labels.trigger_tf_valid,
+        'new_channel_valid': labels.new_channel_valid,
     }
 
 
-def labels_to_array(labels: ChannelLabels, tf_encoding: dict = None) -> np.ndarray:
+def labels_to_array(labels: ChannelLabels) -> np.ndarray:
     """
     Convert ChannelLabels to numpy array for model training.
 
     Args:
         labels: ChannelLabels object
-        tf_encoding: Optional dict mapping TF strings to integers
 
     Returns:
-        Numpy array: [duration, break_dir, trigger_tf_encoded, new_dir, permanent]
+        Numpy array: [duration, break_dir, trigger_tf, new_dir, permanent,
+                      duration_valid, direction_valid, trigger_tf_valid, new_channel_valid]
     """
-    if tf_encoding is None:
-        # Default encoding for timeframe strings
-        tf_encoding = {
-            None: 0,
-            '15min_upper': 1, '15min_lower': 2,
-            '30min_upper': 3, '30min_lower': 4,
-            '1h_upper': 5, '1h_lower': 6,
-            '2h_upper': 7, '2h_lower': 8,
-            '3h_upper': 9, '3h_lower': 10,
-            '4h_upper': 11, '4h_lower': 12,
-            'daily_upper': 13, 'daily_lower': 14,
-            'weekly_upper': 15, 'weekly_lower': 16,
-            'monthly_upper': 17, 'monthly_lower': 18,
-            '3month_upper': 19, '3month_lower': 20,
-        }
-
-    trigger_encoded = tf_encoding.get(labels.break_trigger_tf, 0)
-
     return np.array([
         labels.duration_bars,
         labels.break_direction,
-        trigger_encoded,
+        labels.break_trigger_tf,  # Already encoded as int
         labels.new_channel_direction,
-        int(labels.permanent_break)
+        int(labels.permanent_break),
+        int(labels.duration_valid),
+        int(labels.direction_valid),
+        int(labels.trigger_tf_valid),
+        int(labels.new_channel_valid),
     ], dtype=np.float32)
 
 

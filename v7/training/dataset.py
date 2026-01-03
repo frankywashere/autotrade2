@@ -48,11 +48,15 @@ from .labels import generate_labels, generate_labels_per_tf, ChannelLabels, labe
 #           using generate_labels_per_tf(). Each TF has its own duration_bars in native
 #           TF resolution (not scaled from 5min). labels is now Dict[str, ChannelLabels].
 #           Dataset __getitem__ includes 'labels_valid' mask for TFs with valid labels.
-CACHE_VERSION = "v8.0.0"
+# - v9.0.0: Added trigger_tf as prediction target with separate validity masks.
+#           ChannelLabels now has: break_trigger_tf as int (0-20), and per-label validity
+#           flags (duration_valid, direction_valid, trigger_tf_valid, new_channel_valid).
+#           Dataset returns separate masks for each label type.
+CACHE_VERSION = "v9.0.0"
 
 # Supported cache versions for migration (read-only compatibility)
 # These older versions can be loaded but will trigger rebuild recommendation
-COMPATIBLE_CACHE_VERSIONS = ["v7.3.0", "v7.2.0", "v7.1.0"]
+COMPATIBLE_CACHE_VERSIONS = ["v8.0.0", "v7.3.0", "v7.2.0", "v7.1.0"]
 
 
 def get_cache_metadata_path(cache_path: Path) -> Path:
@@ -129,46 +133,6 @@ def is_cache_valid(cache_path: Path, strict: bool = True) -> bool:
     except Exception as e:
         print(f"Error reading cache metadata: {e}")
         return False
-
-
-def is_cache_compatible(cache_path: Path) -> Tuple[bool, str, bool]:
-    """
-    Check cache compatibility for v7->v8 migration.
-
-    Returns:
-        Tuple of (is_loadable, cached_version, needs_migration)
-        - is_loadable: True if cache can be loaded at all
-        - cached_version: Version string found in cache
-        - needs_migration: True if cache should be rebuilt for v8 features
-    """
-    if not cache_path.exists():
-        return False, "not_found", False
-
-    meta_path = get_cache_metadata_path(cache_path)
-    if not meta_path.exists():
-        return False, "no_metadata", False
-
-    try:
-        with open(meta_path, 'r') as f:
-            metadata = json.load(f)
-
-        cached_version = metadata.get('cache_version', 'unknown')
-
-        # Exact v8.0.0 match - no migration needed
-        if cached_version == CACHE_VERSION:
-            # Check if it has native per-TF labels
-            has_native_labels = metadata.get('native_per_tf_labels', False)
-            return True, cached_version, not has_native_labels
-
-        # Compatible older versions - loadable but needs migration
-        if cached_version in COMPATIBLE_CACHE_VERSIONS:
-            return True, cached_version, True
-
-        # Unknown/incompatible version
-        return False, cached_version, False
-
-    except Exception as e:
-        return False, f"error: {e}", False
 
 
 def validate_cache_params(
@@ -438,6 +402,24 @@ class ChannelDataset(Dataset):
             Tuple of (features_dict, labels_dict)
             - features_dict: Dict mapping feature names to tensors
             - labels_dict: Dict with label values (duration, break_dir, etc.)
+
+        v9.0.0 labels_dict structure:
+            Per-TF labels (shape [11]):
+                - duration: float, native TF bars
+                - direction: long, 0=DOWN, 1=UP
+                - next_channel: long, 0=BEAR, 1=SIDEWAYS, 2=BULL
+                - trigger_tf: long, 0-20 (NO_TRIGGER or TF+boundary)
+
+            Per-label validity masks (shape [11]):
+                - duration_valid: float, 1.0 if duration is valid
+                - direction_valid: float, 1.0 if direction is valid
+                - next_channel_valid: float, 1.0 if next_channel is valid
+                - trigger_tf_valid: float, 1.0 if trigger_tf is valid
+                - labels_valid: float, LEGACY alias for duration_valid
+
+            Aggregate labels (scalars):
+                - duration_bars: float, 5min reference
+                - permanent_break: long, 0 or 1
         """
         sample = self.samples[idx]
 
@@ -456,16 +438,23 @@ class ChannelDataset(Dataset):
 
         # Convert per-TF labels to tensors
         # sample.labels is Dict[str, ChannelLabels] keyed by TF name
-        # Extract native per-TF labels (no scaling - each TF has its own native duration)
+        # Extract native per-TF labels with separate validity masks
         duration_list = []
         direction_list = []
         next_channel_list = []
-        labels_valid_list = []
+        trigger_tf_list = []
+
+        # Separate validity masks for each label type
+        duration_valid_list = []
+        direction_valid_list = []
+        next_channel_valid_list = []
+        trigger_tf_valid_list = []
 
         # Default values for missing TF labels
         default_duration = 0.0
         default_direction = 0  # DOWN
         default_next_channel = 1  # SIDEWAYS
+        default_trigger_tf = 0  # NO_TRIGGER
 
         for tf in TIMEFRAMES:
             tf_labels = sample.labels.get(tf)
@@ -474,31 +463,72 @@ class ChannelDataset(Dataset):
                 duration_list.append(float(tf_labels.duration_bars))
                 direction_list.append(int(tf_labels.break_direction))
                 next_channel_list.append(int(tf_labels.new_channel_direction))
-                labels_valid_list.append(1.0)  # Valid label for this TF
+
+                # trigger_tf is now int (0-20) after v9.0.0 encoding
+                trigger_tf_val = getattr(tf_labels, 'break_trigger_tf', 0)
+                if isinstance(trigger_tf_val, str):
+                    # Legacy: string format - use encoding dict
+                    from .labels import TF_TRIGGER_ENCODING
+                    trigger_tf_list.append(TF_TRIGGER_ENCODING.get(trigger_tf_val, 0))
+                else:
+                    trigger_tf_list.append(int(trigger_tf_val) if trigger_tf_val is not None else 0)
+
+                # Per-label validity flags (v9.0.0)
+                # Check for new validity attributes, fall back to permanent_break for legacy
+                if hasattr(tf_labels, 'duration_valid'):
+                    duration_valid_list.append(1.0 if tf_labels.duration_valid else 0.0)
+                else:
+                    duration_valid_list.append(1.0)  # Legacy: assume valid if TF exists
+
+                if hasattr(tf_labels, 'direction_valid'):
+                    direction_valid_list.append(1.0 if tf_labels.direction_valid else 0.0)
+                else:
+                    # Legacy fallback: direction valid only if permanent_break
+                    direction_valid_list.append(1.0 if tf_labels.permanent_break else 0.0)
+
+                if hasattr(tf_labels, 'new_channel_valid'):
+                    next_channel_valid_list.append(1.0 if tf_labels.new_channel_valid else 0.0)
+                else:
+                    # Legacy fallback: next_channel valid only if permanent_break
+                    next_channel_valid_list.append(1.0 if tf_labels.permanent_break else 0.0)
+
+                if hasattr(tf_labels, 'trigger_tf_valid'):
+                    trigger_tf_valid_list.append(1.0 if tf_labels.trigger_tf_valid else 0.0)
+                else:
+                    # Legacy fallback: trigger_tf valid only if we have a non-zero trigger
+                    trigger_tf_valid_list.append(1.0 if trigger_tf_list[-1] > 0 else 0.0)
             else:
-                # Missing TF label - use defaults and mark as invalid
+                # Missing TF label - use defaults and mark all as invalid
                 duration_list.append(default_duration)
                 direction_list.append(default_direction)
                 next_channel_list.append(default_next_channel)
-                labels_valid_list.append(0.0)  # Invalid label for this TF
+                trigger_tf_list.append(default_trigger_tf)
+                duration_valid_list.append(0.0)
+                direction_valid_list.append(0.0)
+                next_channel_valid_list.append(0.0)
+                trigger_tf_valid_list.append(0.0)
 
         labels_dict = {
-            # Per-timeframe labels (native, not scaled)
-            'duration': torch.tensor(duration_list, dtype=torch.float32),  # [11]
-            'direction': torch.tensor(direction_list, dtype=torch.long),  # [11]
-            'next_channel': torch.tensor(next_channel_list, dtype=torch.long),  # [11]
+            # Per-timeframe labels (native, not scaled) - [11]
+            'duration': torch.tensor(duration_list, dtype=torch.float32),
+            'direction': torch.tensor(direction_list, dtype=torch.long),
+            'next_channel': torch.tensor(next_channel_list, dtype=torch.long),
+            'trigger_tf': torch.tensor(trigger_tf_list, dtype=torch.long),
 
-            # Validity mask - indicates which TFs have valid labels
-            'labels_valid': torch.tensor(labels_valid_list, dtype=torch.float32),  # [11]
+            # Per-label validity masks - [11]
+            'duration_valid': torch.tensor(duration_valid_list, dtype=torch.float32),
+            'direction_valid': torch.tensor(direction_valid_list, dtype=torch.float32),
+            'next_channel_valid': torch.tensor(next_channel_valid_list, dtype=torch.float32),
+            'trigger_tf_valid': torch.tensor(trigger_tf_valid_list, dtype=torch.float32),
+
+            # Legacy compatibility: labels_valid = duration_valid
+            'labels_valid': torch.tensor(duration_valid_list, dtype=torch.float32),
 
             # Keep 5min originals for reference/logging (use 5min if available, else first valid)
             'duration_bars': torch.tensor(
                 sample.labels.get('5min').duration_bars if sample.labels.get('5min') else duration_list[0],
                 dtype=torch.float32
             ),
-            'break_trigger_tf': (
-                sample.labels.get('5min').break_trigger_tf if sample.labels.get('5min') else None
-            ),  # String, not tensor
             'permanent_break': torch.tensor(
                 int(sample.labels.get('5min').permanent_break) if sample.labels.get('5min') else 0,
                 dtype=torch.long
@@ -677,6 +707,16 @@ def scan_valid_channels(
     """
     samples = []
 
+    # Statistics for summary (instead of per-position spam)
+    stats = {
+        'total_scanned': 0,
+        'invalid_channel': 0,
+        'feature_failed': 0,
+        'label_failed': 0,
+        'no_valid_labels': 0,
+        'valid_samples': 0,
+    }
+
     # Warmup period: ensure adequate data for all timeframes
     # Need ~32,760 bars (420 trading days) for monthly channels to have window=20 native monthly bars
     # This ensures monthly timeframes have proper statistical validity (20 bars for regression)
@@ -702,6 +742,8 @@ def scan_valid_channels(
         indices = tqdm(indices, desc="Scanning channels")
 
     for i in indices:
+        stats['total_scanned'] += 1
+
         # Get data window
         tsla_window = tsla_df.iloc[:i]
         spy_window = spy_aligned.iloc[:i]
@@ -714,6 +756,7 @@ def scan_valid_channels(
         channel = detect_channel(tsla_window, window=window, min_cycles=min_cycles)
 
         if not channel.valid:
+            stats['invalid_channel'] += 1
             continue
 
         # Extract features at this point
@@ -727,9 +770,10 @@ def scan_valid_channels(
                 lookforward_bars=lookforward_bars
             )
         except Exception as e:
-            # Skip if feature extraction fails
-            if progress:
-                tqdm.write(f"Feature extraction failed at {i}: {e}")
+            # Skip if feature extraction fails (only log first occurrence)
+            stats['feature_failed'] += 1
+            if stats['feature_failed'] == 1 and progress:
+                tqdm.write(f"Feature extraction failed (first error): {e}")
             continue
 
         # Generate native per-TF labels by scanning forward at each timeframe
@@ -741,15 +785,15 @@ def scan_valid_channels(
                 return_threshold=return_threshold
             )
         except Exception as e:
-            # Skip if label generation fails
-            if progress:
-                tqdm.write(f"Label generation failed at {i}: {e}")
+            # Skip if label generation fails (only log first occurrence)
+            stats['label_failed'] += 1
+            if stats['label_failed'] == 1 and progress:
+                tqdm.write(f"Label generation failed (first error): {e}")
             continue
 
         # Skip if no valid labels were generated for any TF
         if not labels_per_tf or all(v is None for v in labels_per_tf.values()):
-            if progress:
-                tqdm.write(f"No valid labels generated at {i}")
+            stats['no_valid_labels'] += 1
             continue
 
         # Create sample with per-TF labels dict
@@ -762,6 +806,21 @@ def scan_valid_channels(
         )
 
         samples.append(sample)
+        stats['valid_samples'] += 1
+
+    # Print summary statistics instead of per-position spam
+    if progress and stats['total_scanned'] > 0:
+        print(f"\nChannel scanning summary:")
+        print(f"  Total positions scanned: {stats['total_scanned']}")
+        print(f"  Valid samples created:   {stats['valid_samples']} ({100*stats['valid_samples']/stats['total_scanned']:.1f}%)")
+        if stats['invalid_channel'] > 0:
+            print(f"  Invalid channels:        {stats['invalid_channel']} ({100*stats['invalid_channel']/stats['total_scanned']:.1f}%)")
+        if stats['feature_failed'] > 0:
+            print(f"  Feature extraction failed: {stats['feature_failed']}")
+        if stats['label_failed'] > 0:
+            print(f"  Label generation failed: {stats['label_failed']}")
+        if stats['no_valid_labels'] > 0:
+            print(f"  No valid TF labels:      {stats['no_valid_labels']} ({100*stats['no_valid_labels']/stats['total_scanned']:.1f}%)")
 
     return samples, min_warmup_bars
 
@@ -919,6 +978,15 @@ def collate_fn(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor],
         Tuple of (batched_features, batched_labels)
         - batched_features: Dict with stacked tensors of shape [batch_size, feature_dim]
         - batched_labels: Dict with stacked label tensors
+
+    v9.0.0 batched_labels structure:
+        Per-TF labels [batch, 11]:
+            - duration, direction, next_channel, trigger_tf
+        Per-label validity masks [batch, 11]:
+            - duration_valid, direction_valid, next_channel_valid, trigger_tf_valid
+            - labels_valid (legacy alias for duration_valid)
+        Aggregate [batch]:
+            - duration_bars, permanent_break
     """
     # Separate features and labels
     features_list = [item[0] for item in batch]
@@ -929,19 +997,25 @@ def collate_fn(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor],
     for key in features_list[0].keys():
         batched_features[key] = torch.stack([f[key] for f in features_list])
 
-    # Stack labels (handle both per-TF and original formats)
+    # Stack labels (v9.0.0 format with separate validity masks)
     batched_labels = {
-        # Per-timeframe labels for CombinedLoss - [batch, 11]
+        # Per-timeframe labels - [batch, 11]
         'duration': torch.stack([l['duration'] for l in labels_list]),
         'direction': torch.stack([l['direction'] for l in labels_list]),
         'next_channel': torch.stack([l['next_channel'] for l in labels_list]),
+        'trigger_tf': torch.stack([l['trigger_tf'] for l in labels_list]),
 
-        # Validity mask - indicates which TFs have valid labels - [batch, 11]
+        # Per-label validity masks - [batch, 11]
+        'duration_valid': torch.stack([l['duration_valid'] for l in labels_list]),
+        'direction_valid': torch.stack([l['direction_valid'] for l in labels_list]),
+        'next_channel_valid': torch.stack([l['next_channel_valid'] for l in labels_list]),
+        'trigger_tf_valid': torch.stack([l['trigger_tf_valid'] for l in labels_list]),
+
+        # Legacy compatibility: labels_valid = duration_valid
         'labels_valid': torch.stack([l['labels_valid'] for l in labels_list]),
 
-        # Original labels for reference/logging
+        # Aggregate labels for reference/logging - [batch]
         'duration_bars': torch.stack([l['duration_bars'] for l in labels_list]),
-        'break_trigger_tf': [l['break_trigger_tf'] for l in labels_list],  # Keep as list
         'permanent_break': torch.stack([l['permanent_break'] for l in labels_list]),
     }
 

@@ -558,7 +558,10 @@ def make_predictions(
                 'direction_probs': agg['direction_probs'][0].numpy(),
                 'next_channel': int(agg['next_channel'][0, 0]),
                 'next_channel_probs': agg['next_channel_probs'][0].numpy(),
-                'confidence': float(agg['confidence'][0, 0])
+                'confidence': float(agg['confidence'][0, 0]),
+                # v9.0.0: Trigger TF predictions (backward compatible)
+                'trigger_tf': int(agg['trigger_tf'][0, 0]) if 'trigger_tf' in agg else 0,
+                'trigger_tf_probs': agg['trigger_tf_probs'][0].numpy() if 'trigger_tf_probs' in agg else None
             }
         }
     except Exception as e:
@@ -757,6 +760,32 @@ def main():
                     st.warning("⚠️ **MODERATE CONFIDENCE** - Consider waiting for stronger signal")
                 else:
                     st.info("ℹ️ **LOW CONFIDENCE** - No clear trading signal")
+
+                # v9.0.0: Display trigger TF prediction if available
+                agg = predictions.get('aggregate', {})
+                trigger_tf = agg.get('trigger_tf', 0)
+                trigger_tf_probs = agg.get('trigger_tf_probs', None)
+
+                if trigger_tf_probs is not None:
+                    TRIGGER_TF_NAMES = [
+                        'NO_TRIGGER',
+                        '15min↑', '15min↓', '30min↑', '30min↓',
+                        '1h↑', '1h↓', '2h↑', '2h↓',
+                        '3h↑', '3h↓', '4h↑', '4h↓',
+                        'daily↑', 'daily↓', 'weekly↑', 'weekly↓',
+                        'monthly↑', 'monthly↓', '3month↑', '3month↓'
+                    ]
+                    trigger_name = TRIGGER_TF_NAMES[trigger_tf] if trigger_tf < len(TRIGGER_TF_NAMES) else f'Class_{trigger_tf}'
+                    trigger_conf = trigger_tf_probs[trigger_tf] if trigger_tf < len(trigger_tf_probs) else 0.0
+
+                    st.divider()
+                    st.subheader("Trigger TF Prediction (v9.0.0)")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if trigger_tf == 0:
+                            st.info(f"**{trigger_name}** (prob: {trigger_conf:.0%})")
+                        else:
+                            st.warning(f"**{trigger_name}** boundary may cause break (prob: {trigger_conf:.0%})")
 
                 # Per-timeframe breakdown table
                 st.divider()

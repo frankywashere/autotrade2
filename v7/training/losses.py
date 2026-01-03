@@ -204,6 +204,74 @@ class NextChannelDirectionLoss(nn.Module):
         return loss
 
 
+class TriggerTimeframeLoss(nn.Module):
+    """
+    Multi-class cross-entropy loss for trigger TF prediction (v9.0.0).
+
+    Predicts which longer timeframe boundary triggered the channel break.
+    21-class classification:
+    - Class 0: NO_TRIGGER (break without hitting longer TF boundary)
+    - Classes 1-20: TF + boundary combinations (15min-3month × upper/lower)
+
+    This is an AGGREGATE-ONLY prediction (not per-TF), computed from the
+    cross-TF attention context vector.
+    """
+
+    NUM_CLASSES = 21
+
+    def __init__(self, class_weights: Optional[torch.Tensor] = None):
+        """
+        Args:
+            class_weights: Optional weights for each class [21] to handle imbalance
+                          Class 0 (NO_TRIGGER) may be very common, so consider
+                          down-weighting it or up-weighting trigger classes.
+        """
+        super().__init__()
+        self.class_weights = class_weights
+
+    def forward(
+        self,
+        pred_logits: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute multi-class cross-entropy loss for trigger TF.
+
+        Args:
+            pred_logits: Predicted logits [batch_size, 21]
+            target: Class labels (0-20) [batch_size] or [batch_size, 1]
+            mask: Optional mask for valid predictions [batch_size] or [batch_size, 1]
+
+        Returns:
+            Scalar loss value
+        """
+        # Handle both [batch] and [batch, 1] shapes for target
+        if target.dim() > 1:
+            target = target.squeeze(-1)
+
+        target = target.long()
+
+        # Compute cross-entropy
+        loss = F.cross_entropy(
+            pred_logits,
+            target,
+            weight=self.class_weights,
+            reduction='none'
+        )
+
+        # Apply mask if provided
+        if mask is not None:
+            if mask.dim() > 1:
+                mask = mask.squeeze(-1)
+            loss = loss * mask
+            loss = loss.sum() / (mask.sum() + 1e-6)
+        else:
+            loss = loss.mean()
+
+        return loss
+
+
 class ExpectedCalibrationError(nn.Module):
     """
     Expected Calibration Error (ECE) for confidence calibration.
@@ -332,6 +400,8 @@ class CombinedLoss(nn.Module):
 
     where σ_i is a learned parameter representing task uncertainty.
     This automatically balances tasks without manual tuning.
+
+    v9.0.0: Added trigger_tf as 5th task (21-class aggregate prediction).
     """
 
     def __init__(
@@ -346,7 +416,7 @@ class CombinedLoss(nn.Module):
             num_timeframes: Number of timeframes being predicted
             use_learnable_weights: If True, learn task weights; otherwise use fixed
             fixed_weights: Fixed weights for each loss component if not learning
-                         Keys: 'duration', 'direction', 'next_channel', 'calibration'
+                         Keys: 'duration', 'direction', 'next_channel', 'calibration', 'trigger_tf'
             calibration_mode: How to compute calibration loss:
                 - 'ece_direction': ECE on direction probabilities (calibrates direction directly)
                 - 'brier_per_tf': Brier on per-TF confidence head (predictions['confidence'])
@@ -361,13 +431,14 @@ class CombinedLoss(nn.Module):
         self.duration_loss = GaussianNLLLoss()
         self.direction_loss = DirectionLoss()
         self.next_channel_loss = NextChannelDirectionLoss()
+        self.trigger_tf_loss = TriggerTimeframeLoss()  # v9.0.0
         self.ece = ExpectedCalibrationError()
         self.brier = BrierScore()
 
         if use_learnable_weights:
             # Learnable log(σ²) for each task
             # Initialize to log(1) = 0, meaning equal weighting initially
-            self.log_vars = nn.Parameter(torch.zeros(4))  # 4 tasks
+            self.log_vars = nn.Parameter(torch.zeros(5))  # 5 tasks (v9.0.0: added trigger_tf)
         else:
             # Use fixed weights
             if fixed_weights is None:
@@ -375,12 +446,14 @@ class CombinedLoss(nn.Module):
                     'duration': 1.0,
                     'direction': 1.0,
                     'next_channel': 1.0,
-                    'calibration': 0.1  # Typically smaller weight for calibration
+                    'calibration': 0.1,  # Typically smaller weight for calibration
+                    'trigger_tf': 1.0,   # v9.0.0: 21-class trigger TF prediction
                 }
             self.register_buffer('duration_weight', torch.tensor(fixed_weights['duration']))
             self.register_buffer('direction_weight', torch.tensor(fixed_weights['direction']))
             self.register_buffer('next_channel_weight', torch.tensor(fixed_weights['next_channel']))
             self.register_buffer('calibration_weight', torch.tensor(fixed_weights['calibration']))
+            self.register_buffer('trigger_tf_weight', torch.tensor(fixed_weights.get('trigger_tf', 1.0)))
 
     def forward(
         self,
@@ -397,11 +470,15 @@ class CombinedLoss(nn.Module):
                 - 'duration_log_std': [batch, num_timeframes]
                 - 'direction_logits': [batch, num_timeframes]
                 - 'next_channel_logits': [batch, num_timeframes, 3]
+                - 'aggregate': {'trigger_tf_logits': [batch, 21], ...}  (v9.0.0)
             targets: Dictionary containing:
                 - 'duration': [batch, num_timeframes]
                 - 'direction': [batch, num_timeframes] (0 or 1)
                 - 'next_channel': [batch, num_timeframes] (0, 1, or 2)
+                - 'trigger_tf': [batch, num_timeframes] (0-20, aggregate uses first TF with valid) (v9.0.0)
             masks: Optional dictionary of masks for each prediction type
+                - v9.0.0: Use 'duration_valid', 'direction_valid', 'trigger_tf_valid', etc.
+                          for per-label masking. Fallback to 'duration' key for legacy.
 
         Returns:
             total_loss: Combined scalar loss
@@ -410,25 +487,67 @@ class CombinedLoss(nn.Module):
         if masks is None:
             masks = {}
 
+        # v9.0.0: Support both new separate masks and legacy single mask
+        duration_mask = masks.get('duration_valid', masks.get('duration'))
+        direction_mask = masks.get('direction_valid', masks.get('direction'))
+        next_channel_mask = masks.get('next_channel_valid', masks.get('next_channel'))
+        trigger_tf_mask = masks.get('trigger_tf_valid')  # Only v9.0.0+ will have this
+
         # Compute individual losses
         loss_duration = self.duration_loss(
             predictions['duration_mean'],
             predictions['duration_log_std'],
             targets['duration'],
-            masks.get('duration')
+            duration_mask
         )
 
         loss_direction = self.direction_loss(
             predictions['direction_logits'],
             targets['direction'],
-            masks.get('direction')
+            direction_mask
         )
 
         loss_next_channel = self.next_channel_loss(
             predictions['next_channel_logits'],
             targets['next_channel'],
-            masks.get('next_channel')
+            next_channel_mask
         )
+
+        # v9.0.0: Trigger TF loss (21-class, aggregate-only)
+        # Use aggregate predictions from cross-TF attention context
+        if ('aggregate' in predictions and
+            'trigger_tf_logits' in predictions.get('aggregate', {}) and
+            'trigger_tf' in targets):
+            # Get aggregate trigger_tf prediction and per-sample target
+            # Target: Use mean of valid TFs or first TF's trigger_tf
+            trigger_tf_target = targets['trigger_tf']
+
+            # If target is per-TF [batch, 11], take first valid or use mode
+            if trigger_tf_target.dim() > 1 and trigger_tf_target.size(1) > 1:
+                # Use trigger_tf from first TF (5min baseline) or valid TF
+                # For simplicity, just take [:, 0] which is the 5min TF
+                trigger_tf_target_agg = trigger_tf_target[:, 0]
+            else:
+                trigger_tf_target_agg = trigger_tf_target.squeeze(-1) if trigger_tf_target.dim() > 1 else trigger_tf_target
+
+            # Get mask for aggregate trigger_tf (use first TF's validity or mean)
+            if trigger_tf_mask is not None:
+                if trigger_tf_mask.dim() > 1 and trigger_tf_mask.size(1) > 1:
+                    # Use first TF's validity for aggregate
+                    trigger_tf_mask_agg = trigger_tf_mask[:, 0]
+                else:
+                    trigger_tf_mask_agg = trigger_tf_mask.squeeze(-1) if trigger_tf_mask.dim() > 1 else trigger_tf_mask
+            else:
+                trigger_tf_mask_agg = None
+
+            loss_trigger_tf = self.trigger_tf_loss(
+                predictions['aggregate']['trigger_tf_logits'],
+                trigger_tf_target_agg,
+                trigger_tf_mask_agg
+            )
+        else:
+            # No trigger_tf predictions/targets - use zero loss
+            loss_trigger_tf = torch.tensor(0.0, device=predictions['duration_mean'].device)
 
         # Calibration loss - 3 modes depending on configuration
         # Precompute direction probabilities (used by all modes)
@@ -443,7 +562,7 @@ class CombinedLoss(nn.Module):
                 direction_probs,
                 direction_preds,
                 targets['direction'].long(),
-                masks.get('direction')
+                direction_mask
             )
         elif self.calibration_mode == 'brier_per_tf' and 'confidence' in predictions:
             # Mode 2: Brier on per-TF confidence head (default)
@@ -459,7 +578,7 @@ class CombinedLoss(nn.Module):
             loss_calibration = self.brier(
                 predictions['confidence'],
                 overall_correct,
-                masks.get('direction')
+                direction_mask
             )
         elif self.calibration_mode == 'brier_aggregate' and 'aggregate' in predictions and 'confidence' in predictions.get('aggregate', {}):
             # Mode 3: Brier on aggregate confidence head (cross-TF attention output)
@@ -485,7 +604,7 @@ class CombinedLoss(nn.Module):
                 direction_probs,
                 direction_preds,
                 targets['direction'].long(),
-                masks.get('direction')
+                direction_mask
             )
 
         # Combine losses
@@ -498,12 +617,14 @@ class CombinedLoss(nn.Module):
             precision_direction = torch.exp(-log_vars_clamped[1])
             precision_next_channel = torch.exp(-log_vars_clamped[2])
             precision_calibration = torch.exp(-log_vars_clamped[3])
+            precision_trigger_tf = torch.exp(-log_vars_clamped[4])  # v9.0.0
 
             total_loss = (
                 0.5 * precision_duration * loss_duration + 0.5 * log_vars_clamped[0] +
                 0.5 * precision_direction * loss_direction + 0.5 * log_vars_clamped[1] +
                 0.5 * precision_next_channel * loss_next_channel + 0.5 * log_vars_clamped[2] +
-                0.5 * precision_calibration * loss_calibration + 0.5 * log_vars_clamped[3]
+                0.5 * precision_calibration * loss_calibration + 0.5 * log_vars_clamped[3] +
+                0.5 * precision_trigger_tf * loss_trigger_tf + 0.5 * log_vars_clamped[4]  # v9.0.0
             )
 
             # Store learned weights for logging
@@ -511,7 +632,8 @@ class CombinedLoss(nn.Module):
                 'duration': precision_duration.item(),
                 'direction': precision_direction.item(),
                 'next_channel': precision_next_channel.item(),
-                'calibration': precision_calibration.item()
+                'calibration': precision_calibration.item(),
+                'trigger_tf': precision_trigger_tf.item()  # v9.0.0
             }
         else:
             # Fixed weights
@@ -519,7 +641,8 @@ class CombinedLoss(nn.Module):
                 self.duration_weight * loss_duration +
                 self.direction_weight * loss_direction +
                 self.next_channel_weight * loss_next_channel +
-                self.calibration_weight * loss_calibration
+                self.calibration_weight * loss_calibration +
+                self.trigger_tf_weight * loss_trigger_tf  # v9.0.0
             )
             learned_weights = None
 
@@ -529,7 +652,8 @@ class CombinedLoss(nn.Module):
             'duration': loss_duration.item(),
             'direction': loss_direction.item(),
             'next_channel': loss_next_channel.item(),
-            'calibration': loss_calibration.item()
+            'calibration': loss_calibration.item(),
+            'trigger_tf': loss_trigger_tf.item() if isinstance(loss_trigger_tf, torch.Tensor) else loss_trigger_tf  # v9.0.0
         }
 
         if learned_weights is not None:

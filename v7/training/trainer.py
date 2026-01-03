@@ -228,7 +228,8 @@ class Trainer:
             'duration': [],
             'direction': [],
             'next_channel': [],
-            'calibration': []
+            'calibration': [],
+            'trigger_tf': []  # v9.0.0
         }
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1}/{self.config.num_epochs}")
@@ -250,19 +251,33 @@ class Trainer:
                 'next_channel': labels['next_channel'].to(self.device),
             }
 
+            # v9.0.0: Add trigger_tf target if present
+            if 'trigger_tf' in labels:
+                targets['trigger_tf'] = labels['trigger_tf'].to(self.device)
+
             # Extract validity masks if present (for per-TF native labels)
             # Masks are 1.0 for valid labels, 0.0 for invalid/missing labels
             masks = None
-            if 'validity_mask' in labels:
-                # Single mask applies to all label types
-                mask = labels['validity_mask'].to(self.device)
+
+            # v9.0.0: Check for separate validity masks first
+            if 'duration_valid' in labels:
+                masks = {
+                    'duration_valid': labels['duration_valid'].to(self.device),
+                    'direction_valid': labels['direction_valid'].to(self.device),
+                    'next_channel_valid': labels['next_channel_valid'].to(self.device),
+                }
+                if 'trigger_tf_valid' in labels:
+                    masks['trigger_tf_valid'] = labels['trigger_tf_valid'].to(self.device)
+            elif 'labels_valid' in labels:
+                # Legacy: single mask applies to all label types
+                mask = labels['labels_valid'].to(self.device)
                 masks = {
                     'duration': mask,
                     'direction': mask,
                     'next_channel': mask,
                 }
             elif 'duration_mask' in labels:
-                # Separate masks per label type
+                # Legacy: separate masks per label type (old naming)
                 masks = {
                     'duration': labels['duration_mask'].to(self.device),
                     'direction': labels.get('direction_mask', labels['duration_mask']).to(self.device),
@@ -335,13 +350,16 @@ class Trainer:
             'duration': [],
             'direction': [],
             'next_channel': [],
-            'calibration': []
+            'calibration': [],
+            'trigger_tf': []  # v9.0.0
         }
 
         # Track accuracy metrics (weighted by mask if present)
         direction_correct = 0.0
         next_channel_correct = 0.0
+        trigger_tf_correct = 0.0  # v9.0.0
         total_valid_samples = 0.0  # Float for mask weighting
+        total_trigger_tf_samples = 0.0  # v9.0.0
 
         with torch.no_grad():
             for features, labels in tqdm(self.val_loader, desc="Validation"):
@@ -359,24 +377,47 @@ class Trainer:
                     'next_channel': labels['next_channel'].to(self.device),
                 }
 
+                # v9.0.0: Add trigger_tf target if present
+                if 'trigger_tf' in labels:
+                    targets['trigger_tf'] = labels['trigger_tf'].to(self.device)
+
                 # Extract validity masks if present (for per-TF native labels)
                 masks = None
                 direction_mask = None
-                if 'validity_mask' in labels:
-                    mask = labels['validity_mask'].to(self.device)
+                next_channel_mask = None
+                trigger_tf_mask = None
+
+                # v9.0.0: Check for separate validity masks first
+                if 'duration_valid' in labels:
+                    masks = {
+                        'duration_valid': labels['duration_valid'].to(self.device),
+                        'direction_valid': labels['direction_valid'].to(self.device),
+                        'next_channel_valid': labels['next_channel_valid'].to(self.device),
+                    }
+                    direction_mask = masks['direction_valid']
+                    next_channel_mask = masks['next_channel_valid']
+                    if 'trigger_tf_valid' in labels:
+                        masks['trigger_tf_valid'] = labels['trigger_tf_valid'].to(self.device)
+                        trigger_tf_mask = masks['trigger_tf_valid']
+                elif 'labels_valid' in labels:
+                    # Legacy: single mask applies to all label types
+                    mask = labels['labels_valid'].to(self.device)
                     masks = {
                         'duration': mask,
                         'direction': mask,
                         'next_channel': mask,
                     }
                     direction_mask = mask
+                    next_channel_mask = mask
                 elif 'duration_mask' in labels:
+                    # Legacy: separate masks per label type (old naming)
                     masks = {
                         'duration': labels['duration_mask'].to(self.device),
                         'direction': labels.get('direction_mask', labels['duration_mask']).to(self.device),
                         'next_channel': labels.get('next_channel_mask', labels['duration_mask']).to(self.device),
                     }
                     direction_mask = masks['direction']
+                    next_channel_mask = masks['next_channel']
 
                 # Forward pass
                 if self.config.use_amp:
@@ -407,7 +448,7 @@ class Trainer:
                 if direction_mask is not None:
                     # Weight by mask - only count valid samples
                     direction_correct += (direction_matches * direction_mask).sum().item()
-                    next_channel_correct += (next_channel_matches * masks['next_channel']).sum().item()
+                    next_channel_correct += (next_channel_matches * next_channel_mask).sum().item()
                     total_valid_samples += direction_mask.sum().item()
                 else:
                     # No mask - count all samples
@@ -415,10 +456,37 @@ class Trainer:
                     next_channel_correct += next_channel_matches.sum().item()
                     total_valid_samples += targets['duration'].numel()
 
+                # v9.0.0: Calculate trigger_tf accuracy (aggregate-only, 21-class)
+                if ('aggregate' in predictions and
+                    'trigger_tf_logits' in predictions.get('aggregate', {}) and
+                    'trigger_tf' in targets):
+                    trigger_tf_pred = predictions['aggregate']['trigger_tf_logits'].argmax(dim=-1)  # [batch]
+                    trigger_tf_target = targets['trigger_tf']
+                    # Use first TF's target if per-TF shaped
+                    if trigger_tf_target.dim() > 1 and trigger_tf_target.size(1) > 1:
+                        trigger_tf_target = trigger_tf_target[:, 0]
+                    elif trigger_tf_target.dim() > 1:
+                        trigger_tf_target = trigger_tf_target.squeeze(-1)
+
+                    trigger_tf_matches = (trigger_tf_pred == trigger_tf_target).float()
+
+                    if trigger_tf_mask is not None:
+                        # Use first TF's validity for aggregate
+                        if trigger_tf_mask.dim() > 1 and trigger_tf_mask.size(1) > 1:
+                            trigger_tf_mask_agg = trigger_tf_mask[:, 0]
+                        else:
+                            trigger_tf_mask_agg = trigger_tf_mask.squeeze(-1) if trigger_tf_mask.dim() > 1 else trigger_tf_mask
+                        trigger_tf_correct += (trigger_tf_matches * trigger_tf_mask_agg).sum().item()
+                        total_trigger_tf_samples += trigger_tf_mask_agg.sum().item()
+                    else:
+                        trigger_tf_correct += trigger_tf_matches.sum().item()
+                        total_trigger_tf_samples += trigger_tf_matches.numel()
+
         # Average losses and accuracies
         epoch_metrics = {k: np.mean(v) if v else 0.0 for k, v in epoch_losses.items()}
         epoch_metrics['direction_acc'] = direction_correct / total_valid_samples if total_valid_samples > 0 else 0.0
         epoch_metrics['next_channel_acc'] = next_channel_correct / total_valid_samples if total_valid_samples > 0 else 0.0
+        epoch_metrics['trigger_tf_acc'] = trigger_tf_correct / total_trigger_tf_samples if total_trigger_tf_samples > 0 else 0.0  # v9.0.0
 
         return epoch_metrics
 
@@ -562,8 +630,10 @@ class Trainer:
             print(f"\nEpoch {epoch + 1}/{self.config.num_epochs} ({epoch_time:.1f}s):")
             print(f"  Train Loss: {train_metrics['total']:.4f}")
             print(f"  Val Loss: {val_metrics['total']:.4f}")
+            # v9.0.0: Include trigger_tf accuracy if present
+            trigger_tf_str = f", TrigTF={val_metrics.get('trigger_tf_acc', 0):.3f}" if 'trigger_tf_acc' in val_metrics else ""
             print(f"  Val Accuracies: Dir={val_metrics['direction_acc']:.3f}, "
-                  f"NextCh={val_metrics['next_channel_acc']:.3f}")
+                  f"NextCh={val_metrics['next_channel_acc']:.3f}{trigger_tf_str}")
 
             # Check if this is the best model
             current_metric = val_metrics[self.config.early_stopping_metric]

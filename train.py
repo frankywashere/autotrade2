@@ -953,7 +953,7 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
                 "value": "learnable"
             },
             {
-                "name": "Fixed - Duration Focus (duration=2.5, direction=1.0, next=0.8, calibration=0.5) [Recommended]",
+                "name": "Fixed - Duration Focus (duration=2.5, direction=1.0, next=0.8, trigger_tf=1.5, calibration=0.5) [Recommended]",
                 "value": "fixed_duration_focus"
             },
             {
@@ -981,18 +981,21 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
             'duration': 2.5,      # PRIMARY task
             'direction': 1.0,     # Secondary
             'next_channel': 0.8,  # Tertiary
+            'trigger_tf': 1.5,    # v9.0.0: 21-class TF trigger prediction
             'calibration': 0.5    # Regularization
         }
         console.print("[green]  Using Duration Focus weights (your original vision):[/green]")
         console.print(f"    Duration: [cyan]2.5[/cyan] (PRIMARY)")
         console.print(f"    Direction: [cyan]1.0[/cyan]")
         console.print(f"    Next Channel: [cyan]0.8[/cyan]")
+        console.print(f"    Trigger TF: [cyan]1.5[/cyan] (v9.0.0)")
         console.print(f"    Calibration: [cyan]0.5[/cyan]")
     elif weight_mode == "fixed_balanced":
         fixed_weights = {
             'duration': 1.0,
             'direction': 1.0,
             'next_channel': 1.0,
+            'trigger_tf': 1.0,    # v9.0.0
             'calibration': 1.0
         }
         console.print("[green]  Using Balanced weights (all tasks equal):[/green]")
@@ -1009,6 +1012,9 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         next_channel_w = float(inquirer.number(
             message="  Next channel loss weight:", default=0.8, float_allowed=True
         ).execute())
+        trigger_tf_w = float(inquirer.number(
+            message="  Trigger TF loss weight (v9.0.0):", default=1.5, float_allowed=True
+        ).execute())
         calibration_w = float(inquirer.number(
             message="  Calibration loss weight:", default=0.5, float_allowed=True
         ).execute())
@@ -1016,12 +1022,14 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
             'duration': duration_w,
             'direction': direction_w,
             'next_channel': next_channel_w,
+            'trigger_tf': trigger_tf_w,
             'calibration': calibration_w
         }
         console.print(f"\n[green]  Using Custom weights:[/green]")
         console.print(f"    Duration: [cyan]{duration_w}[/cyan]")
         console.print(f"    Direction: [cyan]{direction_w}[/cyan]")
         console.print(f"    Next Channel: [cyan]{next_channel_w}[/cyan]")
+        console.print(f"    Trigger TF: [cyan]{trigger_tf_w}[/cyan]")
         console.print(f"    Calibration: [cyan]{calibration_w}[/cyan]")
 
     # Calibration mode selection
@@ -1355,12 +1363,12 @@ def display_config_summary(config: Dict):
     if weight_mode == 'learnable':
         train_tree.add("Loss weights: Learnable (uncertainty-based)")
     elif weight_mode == 'fixed_duration_focus':
-        train_tree.add("Loss weights: Duration Focus (2.5/1.0/0.8/0.5)")
+        train_tree.add("Loss weights: Duration Focus (2.5/1.0/0.8/1.5/0.5)")  # v9.0.0: +trigger_tf
     elif weight_mode == 'fixed_balanced':
         train_tree.add("Loss weights: Balanced (all 1.0)")
     elif weight_mode == 'fixed_custom':
         fixed_weights = config['training'].get('fixed_weights', {})
-        weights_str = f"Custom ({fixed_weights.get('duration', '?')}/{fixed_weights.get('direction', '?')}/{fixed_weights.get('next_channel', '?')}/{fixed_weights.get('calibration', '?')})"
+        weights_str = f"Custom ({fixed_weights.get('duration', '?')}/{fixed_weights.get('direction', '?')}/{fixed_weights.get('next_channel', '?')}/{fixed_weights.get('trigger_tf', '?')}/{fixed_weights.get('calibration', '?')})"
         train_tree.add(f"Loss weights: {weights_str}")
 
     # Add calibration mode info

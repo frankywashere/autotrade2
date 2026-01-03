@@ -195,7 +195,8 @@ def run_walk_forward_validation(
 
     if is_cache_valid(cache_path):
         print(f"Loading cached samples from {cache_path}")
-        all_samples = load_cached_samples(cache_path)
+        all_samples, load_info = load_cached_samples(cache_path)
+        print(f"Cache info: {load_info.get('label_generation_mode', 'legacy')}")
     else:
         # Prepare dataset covering all folds
         print("Building dataset from scratch...")
@@ -315,8 +316,15 @@ def run_walk_forward_validation(
         print(f"  Epochs trained: {results['epochs_trained']}")
         print(f"  Best val loss: {results['best_val_metric']:.4f}")
         print(f"  Val direction acc: {results['val_metrics']['direction_acc']:.3f}")
+        # v9.0.0: Print trigger_tf accuracy if available
+        trigger_tf_acc = results['val_metrics'].get('trigger_tf_acc', None)
+        if trigger_tf_acc is not None:
+            print(f"  Val trigger_tf acc: {trigger_tf_acc:.3f}")
         if results['test_metrics']:
             print(f"  Test direction acc: {results['test_metrics']['direction_acc']:.3f}")
+            test_trigger_tf_acc = results['test_metrics'].get('trigger_tf_acc', None)
+            if test_trigger_tf_acc is not None:
+                print(f"  Test trigger_tf acc: {test_trigger_tf_acc:.3f}")
 
     # Step 4: Aggregate results across folds
     # =======================================
@@ -330,10 +338,19 @@ def run_walk_forward_validation(
     avg_val_loss = np.mean([r['best_val_metric'] for r in fold_results])
     avg_val_dir_acc = np.mean([r['val_metrics']['direction_acc'] for r in fold_results])
 
+    # v9.0.0: Average trigger_tf accuracy if available
+    trigger_tf_available = any(r['val_metrics'].get('trigger_tf_acc') is not None for r in fold_results)
+    if trigger_tf_available:
+        avg_val_trigger_tf_acc = np.mean([r['val_metrics'].get('trigger_tf_acc', 0) for r in fold_results])
+        print(f"Average Validation Trigger TF Accuracy: {avg_val_trigger_tf_acc:.3f}")
+
     test_metrics_available = all(r['test_metrics'] is not None for r in fold_results)
     if test_metrics_available:
         avg_test_dir_acc = np.mean([r['test_metrics']['direction_acc'] for r in fold_results])
         print(f"\nAverage Test Direction Accuracy: {avg_test_dir_acc:.3f}")
+        if trigger_tf_available:
+            avg_test_trigger_tf_acc = np.mean([r['test_metrics'].get('trigger_tf_acc', 0) for r in fold_results if r['test_metrics']])
+            print(f"Average Test Trigger TF Accuracy: {avg_test_trigger_tf_acc:.3f}")
 
     print(f"\nAverage Validation Loss: {avg_val_loss:.4f}")
     print(f"Average Validation Direction Accuracy: {avg_val_dir_acc:.3f}")
@@ -343,8 +360,12 @@ def run_walk_forward_validation(
     print("-" * 80)
     for result in fold_results:
         test_acc = result['test_metrics']['direction_acc'] if result['test_metrics'] else 0.0
+        val_trigger_tf = result['val_metrics'].get('trigger_tf_acc', 0)
+        test_trigger_tf = result['test_metrics'].get('trigger_tf_acc', 0) if result['test_metrics'] else 0.0
+        # v9.0.0: Include trigger_tf if available
+        trigger_str = f" | TrigTF: {val_trigger_tf:.3f}/{test_trigger_tf:.3f}" if trigger_tf_available else ""
         print(f"Fold {result['fold']} | Val: {result['val_metrics']['direction_acc']:.3f} | "
-              f"Test: {test_acc:.3f} | Epochs: {result['epochs_trained']}")
+              f"Test: {test_acc:.3f}{trigger_str} | Epochs: {result['epochs_trained']}")
 
     # Step 5: Save results
     # ====================
@@ -368,6 +389,9 @@ def run_walk_forward_validation(
                     'best_val_metric': float(r['best_val_metric']),
                     'val_direction_acc': float(r['val_metrics']['direction_acc']),
                     'test_direction_acc': float(r['test_metrics']['direction_acc']) if r['test_metrics'] else None,
+                    # v9.0.0: trigger_tf accuracy if available
+                    'val_trigger_tf_acc': float(r['val_metrics'].get('trigger_tf_acc', 0)) if r['val_metrics'].get('trigger_tf_acc') is not None else None,
+                    'test_trigger_tf_acc': float(r['test_metrics'].get('trigger_tf_acc', 0)) if r['test_metrics'] and r['test_metrics'].get('trigger_tf_acc') is not None else None,
                 }
                 for r in fold_results
             ],
@@ -375,6 +399,9 @@ def run_walk_forward_validation(
                 'avg_val_loss': float(avg_val_loss),
                 'avg_val_direction_acc': float(avg_val_dir_acc),
                 'avg_test_direction_acc': float(avg_test_dir_acc) if test_metrics_available else None,
+                # v9.0.0: trigger_tf accuracy averages
+                'avg_val_trigger_tf_acc': float(avg_val_trigger_tf_acc) if trigger_tf_available else None,
+                'avg_test_trigger_tf_acc': float(avg_test_trigger_tf_acc) if test_metrics_available and trigger_tf_available else None,
                 'num_folds': len(fold_results),
             }
         }

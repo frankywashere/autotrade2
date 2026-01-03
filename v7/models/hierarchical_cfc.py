@@ -568,6 +568,92 @@ class ConfidenceHead(nn.Module):
         return self.net(x)
 
 
+class TriggerTFHead(nn.Module):
+    """
+    Predicts which longer timeframe boundary triggered the channel break.
+
+    21-class classification:
+    - Class 0: NO_TRIGGER (break occurred without hitting a longer TF boundary)
+    - Classes 1-20: TF + boundary combinations
+      * 1-2: 15min (upper, lower)
+      * 3-4: 30min (upper, lower)
+      * 5-6: 1h (upper, lower)
+      * 7-8: 2h (upper, lower)
+      * 9-10: 3h (upper, lower)
+      * 11-12: 4h (upper, lower)
+      * 13-14: daily (upper, lower)
+      * 15-16: weekly (upper, lower)
+      * 17-18: monthly (upper, lower)
+      * 19-20: 3month (upper, lower)
+
+    This is an AGGREGATE-ONLY prediction (not per-TF) since it answers
+    "which longer TF triggered the break for this channel?"
+    """
+
+    # Class constants for decoding predictions
+    NUM_CLASSES = 21
+    CLASS_NAMES = [
+        'NO_TRIGGER',
+        '15min_upper', '15min_lower',
+        '30min_upper', '30min_lower',
+        '1h_upper', '1h_lower',
+        '2h_upper', '2h_lower',
+        '3h_upper', '3h_lower',
+        '4h_upper', '4h_lower',
+        'daily_upper', 'daily_lower',
+        'weekly_upper', 'weekly_lower',
+        'monthly_upper', 'monthly_lower',
+        '3month_upper', '3month_lower',
+    ]
+
+    def __init__(self, input_dim: int, hidden_dim: int = 64):
+        """
+        Initialize trigger TF head.
+
+        Args:
+            input_dim: Input dimension (from attention context)
+            hidden_dim: Hidden layer dimension
+        """
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, self.NUM_CLASSES)  # 21 classes
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: [batch_size, input_dim]
+
+        Returns:
+            logits: [batch_size, 21] - class logits for trigger TF
+        """
+        return self.net(x)
+
+    @staticmethod
+    def decode_prediction(class_idx: int) -> str:
+        """
+        Decode a class index to human-readable trigger TF string.
+
+        Args:
+            class_idx: Predicted class (0-20)
+
+        Returns:
+            String like 'NO_TRIGGER', '1h_upper', 'daily_lower', etc.
+        """
+        if 0 <= class_idx < TriggerTFHead.NUM_CLASSES:
+            return TriggerTFHead.CLASS_NAMES[class_idx]
+        return f'UNKNOWN_{class_idx}'
+
+
 # =============================================================================
 # Full Hierarchical Model
 # =============================================================================
@@ -684,6 +770,7 @@ class HierarchicalCfCModel(nn.Module):
         self.agg_direction_head = DirectionHead(context_dim, hidden_dim)
         self.agg_next_channel_head = NextChannelDirectionHead(context_dim, hidden_dim)
         self.agg_confidence_head = ConfidenceHead(context_dim, hidden_dim)
+        self.agg_trigger_tf_head = TriggerTFHead(context_dim, hidden_dim)  # v9.0.0: 21-class trigger TF
 
         # Store hidden states for sequential processing
         self.register_buffer('_hx_states', None)
@@ -817,6 +904,7 @@ class HierarchicalCfCModel(nn.Module):
         agg_direction = self.agg_direction_head(context)
         agg_next_channel = self.agg_next_channel_head(context)
         agg_confidence = self.agg_confidence_head(context)
+        agg_trigger_tf = self.agg_trigger_tf_head(context)  # v9.0.0: 21-class trigger TF
 
         # Build output dictionary (keys match CombinedLoss expectations)
         output = {
@@ -834,6 +922,7 @@ class HierarchicalCfCModel(nn.Module):
                 'direction_logits': agg_direction,             # [batch, 1] - binary logit
                 'next_channel_logits': agg_next_channel,       # [batch, 3]
                 'confidence': agg_confidence,                  # [batch, 1]
+                'trigger_tf_logits': agg_trigger_tf,           # [batch, 21] - v9.0.0
             }
         }
 
@@ -867,6 +956,7 @@ class HierarchicalCfCModel(nn.Module):
             # Convert aggregate logits to probabilities
             agg_direction_probs = torch.sigmoid(outputs['aggregate']['direction_logits'])  # [batch, 1]
             agg_next_channel_probs = F.softmax(outputs['aggregate']['next_channel_logits'], dim=-1)  # [batch, 3]
+            agg_trigger_tf_probs = F.softmax(outputs['aggregate']['trigger_tf_logits'], dim=-1)  # [batch, 21] v9.0.0
 
             # Get class predictions for per-timeframe
             direction = (direction_probs > 0.5).long()                           # [batch, 11]
@@ -875,6 +965,7 @@ class HierarchicalCfCModel(nn.Module):
             # Get aggregate class predictions
             agg_direction = (agg_direction_probs > 0.5).long()                   # [batch, 1]
             agg_next_channel = agg_next_channel_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
+            agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)   # [batch, 1] v9.0.0
 
             # Compute std from log_std
             duration_std = torch.exp(outputs['duration_log_std'])                # [batch, 11]
@@ -904,6 +995,9 @@ class HierarchicalCfCModel(nn.Module):
                     'next_channel': agg_next_channel,
                     'next_channel_probs': agg_next_channel_probs,
                     'confidence': outputs['aggregate']['confidence'],
+                    # v9.0.0: Trigger TF predictions (21-class)
+                    'trigger_tf': agg_trigger_tf,                       # [batch, 1] - class 0-20
+                    'trigger_tf_probs': agg_trigger_tf_probs,           # [batch, 21] - probabilities
                 },
 
                 # Metadata
@@ -940,7 +1034,8 @@ class HierarchicalCfCModel(nn.Module):
             'aggregate_heads': (count_params(self.agg_duration_head) +
                               count_params(self.agg_direction_head) +
                               count_params(self.agg_next_channel_head) +
-                              count_params(self.agg_confidence_head)),
+                              count_params(self.agg_confidence_head) +
+                              count_params(self.agg_trigger_tf_head)),  # v9.0.0
             'total': count_params(self)
         }
 
