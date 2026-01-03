@@ -47,7 +47,6 @@ from .labels import generate_labels, generate_labels_per_tf, ChannelLabels, labe
 # - v8.0.0: Native per-TF labels - labels generated independently for each timeframe
 #           using generate_labels_per_tf(). Each TF has its own duration_bars in native
 #           TF resolution (not scaled from 5min). labels is now Dict[str, ChannelLabels].
-#           Dataset __getitem__ includes 'labels_valid' mask for TFs with valid labels.
 # - v9.0.0: Added trigger_tf as prediction target with separate validity masks.
 #           ChannelLabels now has: break_trigger_tf as int (0-20), and per-label validity
 #           flags (duration_valid, direction_valid, trigger_tf_valid, new_channel_valid).
@@ -415,7 +414,6 @@ class ChannelDataset(Dataset):
                 - direction_valid: float, 1.0 if direction is valid
                 - next_channel_valid: float, 1.0 if next_channel is valid
                 - trigger_tf_valid: float, 1.0 if trigger_tf is valid
-                - labels_valid: float, LEGACY alias for duration_valid
 
             Aggregate labels (scalars):
                 - duration_bars: float, 5min reference
@@ -464,39 +462,15 @@ class ChannelDataset(Dataset):
                 direction_list.append(int(tf_labels.break_direction))
                 next_channel_list.append(int(tf_labels.new_channel_direction))
 
-                # trigger_tf is now int (0-20) after v9.0.0 encoding
-                trigger_tf_val = getattr(tf_labels, 'break_trigger_tf', 0)
-                if isinstance(trigger_tf_val, str):
-                    # Legacy: string format - use encoding dict
-                    from .labels import TF_TRIGGER_ENCODING
-                    trigger_tf_list.append(TF_TRIGGER_ENCODING.get(trigger_tf_val, 0))
-                else:
-                    trigger_tf_list.append(int(trigger_tf_val) if trigger_tf_val is not None else 0)
+                # trigger_tf is int (0-20) in v9.0.0 format
+                trigger_tf_val = tf_labels.break_trigger_tf
+                trigger_tf_list.append(int(trigger_tf_val) if trigger_tf_val is not None else 0)
 
-                # Per-label validity flags (v9.0.0)
-                # Check for new validity attributes, fall back to permanent_break for legacy
-                if hasattr(tf_labels, 'duration_valid'):
-                    duration_valid_list.append(1.0 if tf_labels.duration_valid else 0.0)
-                else:
-                    duration_valid_list.append(1.0)  # Legacy: assume valid if TF exists
-
-                if hasattr(tf_labels, 'direction_valid'):
-                    direction_valid_list.append(1.0 if tf_labels.direction_valid else 0.0)
-                else:
-                    # Legacy fallback: direction valid only if permanent_break
-                    direction_valid_list.append(1.0 if tf_labels.permanent_break else 0.0)
-
-                if hasattr(tf_labels, 'new_channel_valid'):
-                    next_channel_valid_list.append(1.0 if tf_labels.new_channel_valid else 0.0)
-                else:
-                    # Legacy fallback: next_channel valid only if permanent_break
-                    next_channel_valid_list.append(1.0 if tf_labels.permanent_break else 0.0)
-
-                if hasattr(tf_labels, 'trigger_tf_valid'):
-                    trigger_tf_valid_list.append(1.0 if tf_labels.trigger_tf_valid else 0.0)
-                else:
-                    # Legacy fallback: trigger_tf valid only if we have a non-zero trigger
-                    trigger_tf_valid_list.append(1.0 if trigger_tf_list[-1] > 0 else 0.0)
+                # Per-label validity flags (v9.0.0 format required)
+                duration_valid_list.append(1.0 if tf_labels.duration_valid else 0.0)
+                direction_valid_list.append(1.0 if tf_labels.direction_valid else 0.0)
+                next_channel_valid_list.append(1.0 if tf_labels.new_channel_valid else 0.0)
+                trigger_tf_valid_list.append(1.0 if tf_labels.trigger_tf_valid else 0.0)
             else:
                 # Missing TF label - use defaults and mark all as invalid
                 duration_list.append(default_duration)
@@ -520,9 +494,6 @@ class ChannelDataset(Dataset):
             'direction_valid': torch.tensor(direction_valid_list, dtype=torch.float32),
             'next_channel_valid': torch.tensor(next_channel_valid_list, dtype=torch.float32),
             'trigger_tf_valid': torch.tensor(trigger_tf_valid_list, dtype=torch.float32),
-
-            # Legacy compatibility: labels_valid = duration_valid
-            'labels_valid': torch.tensor(duration_valid_list, dtype=torch.float32),
 
             # Keep 5min originals for reference/logging (use 5min if available, else first valid)
             'duration_bars': torch.tensor(
@@ -984,7 +955,6 @@ def collate_fn(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor],
             - duration, direction, next_channel, trigger_tf
         Per-label validity masks [batch, 11]:
             - duration_valid, direction_valid, next_channel_valid, trigger_tf_valid
-            - labels_valid (legacy alias for duration_valid)
         Aggregate [batch]:
             - duration_bars, permanent_break
     """
@@ -1010,9 +980,6 @@ def collate_fn(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor],
         'direction_valid': torch.stack([l['direction_valid'] for l in labels_list]),
         'next_channel_valid': torch.stack([l['next_channel_valid'] for l in labels_list]),
         'trigger_tf_valid': torch.stack([l['trigger_tf_valid'] for l in labels_list]),
-
-        # Legacy compatibility: labels_valid = duration_valid
-        'labels_valid': torch.stack([l['labels_valid'] for l in labels_list]),
 
         # Aggregate labels for reference/logging - [batch]
         'duration_bars': torch.stack([l['duration_bars'] for l in labels_list]),

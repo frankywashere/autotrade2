@@ -559,9 +559,9 @@ def make_predictions(
                 'next_channel': int(agg['next_channel'][0, 0]),
                 'next_channel_probs': agg['next_channel_probs'][0].numpy(),
                 'confidence': float(agg['confidence'][0, 0]),
-                # v9.0.0: Trigger TF predictions (backward compatible)
-                'trigger_tf': int(agg['trigger_tf'][0, 0]) if 'trigger_tf' in agg else 0,
-                'trigger_tf_probs': agg['trigger_tf_probs'][0].numpy() if 'trigger_tf_probs' in agg else None
+                # v9.0.0: Trigger TF predictions
+                'trigger_tf': int(agg['trigger_tf'][0, 0]),
+                'trigger_tf_probs': agg['trigger_tf_probs'][0].numpy()
             }
         }
     except Exception as e:

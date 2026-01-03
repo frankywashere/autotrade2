@@ -477,8 +477,8 @@ class CombinedLoss(nn.Module):
                 - 'next_channel': [batch, num_timeframes] (0, 1, or 2)
                 - 'trigger_tf': [batch, num_timeframes] (0-20, aggregate uses first TF with valid) (v9.0.0)
             masks: Optional dictionary of masks for each prediction type
-                - v9.0.0: Use 'duration_valid', 'direction_valid', 'trigger_tf_valid', etc.
-                          for per-label masking. Fallback to 'duration' key for legacy.
+                - v9.0.0+: Requires 'duration_valid', 'direction_valid', 'next_channel_valid',
+                           'trigger_tf_valid' keys. Legacy keys are not supported.
 
         Returns:
             total_loss: Combined scalar loss
@@ -487,11 +487,11 @@ class CombinedLoss(nn.Module):
         if masks is None:
             masks = {}
 
-        # v9.0.0: Support both new separate masks and legacy single mask
-        duration_mask = masks.get('duration_valid', masks.get('duration'))
-        direction_mask = masks.get('direction_valid', masks.get('direction'))
-        next_channel_mask = masks.get('next_channel_valid', masks.get('next_channel'))
-        trigger_tf_mask = masks.get('trigger_tf_valid')  # Only v9.0.0+ will have this
+        # v9.0.0+: Use explicit per-label validity masks only (no backwards compatibility)
+        duration_mask = masks.get('duration_valid')
+        direction_mask = masks.get('direction_valid')
+        next_channel_mask = masks.get('next_channel_valid')
+        trigger_tf_mask = masks.get('trigger_tf_valid')
 
         # Compute individual losses
         loss_duration = self.duration_loss(
