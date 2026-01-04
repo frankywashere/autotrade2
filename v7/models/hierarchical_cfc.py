@@ -7,7 +7,7 @@ This model predicts channel break timing, direction, and post-break channel dire
 using a hierarchical architecture that processes each timeframe independently before
 combining insights across timeframes.
 
-Input Features: 644 dimensions (TIMEFRAME-GROUPED ordering)
+Input Features: 684 dimensions (TIMEFRAME-GROUPED ordering)
 ------------------------------------------------------------
 The input tensor is ordered by timeframe, NOT alphabetically!
 Each TF block contains: [tsla_{tf}, spy_{tf}, cross_{tf}] = 49 features
@@ -42,11 +42,15 @@ Followed by shared features at the end.
 - Events: 46 features (zeros if not provided)
   * Timing, earnings context, pre/post event drift
 
+- Window Scores: 40 features
+  * 8 windows × 5 metrics (bounce_count, r_squared, quality, alternation_ratio, width)
+
 Architecture Flow:
 =================
-1. Input Layer (644 dims) → Feature Decomposition
+1. Input Layer (684 dims) → Feature Decomposition
    ├─ Per-TF features extracted for each of 11 timeframes (49 features each)
-   ├─ Shared features (VIX, history, alignment, events) extracted from end
+   ├─ Shared features (VIX, history, alignment, events, window_scores) extracted from end
+   ├─ Window scores (last 40 of shared) used for per-TF window selection
 
 2. TF Branch Processing (11 parallel branches)
    ├─ Each branch: Linear projection → LayerNorm → CfC → Dropout
@@ -107,7 +111,7 @@ from ncps.wirings import AutoNCP
 from v7.features.feature_ordering import (
     TSLA_PER_TF, SPY_PER_TF, CROSS_PER_TF,
     VIX_FEATURES, TSLA_HISTORY_FEATURES, SPY_HISTORY_FEATURES,
-    ALIGNMENT_FEATURES, EVENT_FEATURES,
+    ALIGNMENT_FEATURES, EVENT_FEATURES, WINDOW_SCORE_FEATURES,
     PER_TF_FEATURES, SHARED_FEATURES, N_TIMEFRAMES, TOTAL_FEATURES,
     get_tf_index_range, get_shared_index_range
 )
@@ -125,8 +129,8 @@ class FeatureConfig:
     Feature Layout (TIMEFRAME-GROUPED ordering):
     - Per-TF block: [tsla_{tf}(30), spy_{tf}(11), cross_{tf}(8)] = 49 features
     - 11 timeframes × 49 = 539 per-TF features
-    - Shared: [vix(6), tsla_history(25), spy_history(25), alignment(3), events(46)] = 105 features
-    - Total: 539 + 105 = 644 features
+    - Shared: [vix(6), tsla_history(25), spy_history(25), alignment(3), events(46), window_scores(40)] = 145 features
+    - Total: 539 + 145 = 684 features
     """
 
     # Per-timeframe feature counts (from feature_ordering.py)
@@ -140,23 +144,30 @@ class FeatureConfig:
     spy_history_features: int = SPY_HISTORY_FEATURES      # 25 (same structure)
     alignment_features: int = ALIGNMENT_FEATURES          # 3
     event_features: int = EVENT_FEATURES                  # 46 (zeros if not provided)
+    window_score_features: int = WINDOW_SCORE_FEATURES    # 40 (8 windows x 5 metrics)
 
     # Number of timeframes
     n_timeframes: int = N_TIMEFRAMES  # 11: 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly, 3month
+
+    # Window selection constants
+    num_windows: int = 8              # Number of windows per timeframe
+    window_metrics: int = 5           # Metrics per window (bounce_count, r_squared, quality, alternation_ratio, width)
 
     @property
     def total_features(self) -> int:
         """Calculate total input dimension."""
         per_tf = (self.tsla_per_tf + self.spy_per_tf + self.cross_per_tf) * self.n_timeframes
         shared = (self.vix_features + self.tsla_history_features +
-                  self.spy_history_features + self.alignment_features + self.event_features)
-        return per_tf + shared  # = (30+11+8)*11 + (6+25+25+3+46) = 539 + 105 = 644
+                  self.spy_history_features + self.alignment_features +
+                  self.event_features + self.window_score_features)
+        return per_tf + shared  # = (30+11+8)*11 + (6+25+25+3+46+40) = 539 + 145 = 684
 
     @property
     def shared_features(self) -> int:
         """Total shared feature dimension."""
         return (self.vix_features + self.tsla_history_features +
-                self.spy_history_features + self.alignment_features + self.event_features)
+                self.spy_history_features + self.alignment_features +
+                self.event_features + self.window_score_features)
 
     @property
     def per_tf_features(self) -> int:
@@ -379,6 +390,74 @@ class CrossTFAttention(nn.Module):
         context = self.output_proj(context)  # [batch, embed_dim * 2]
 
         return context, attn_weights
+
+
+# =============================================================================
+# Window Selection
+# =============================================================================
+
+class PerTFWindowSelector(nn.Module):
+    """
+    Per-timeframe window selector head.
+
+    Learns to select the optimal lookback window for each timeframe based on:
+    - TF embedding (learned representation of market state for this TF)
+    - Window scores (8 windows × 5 metrics = 40 features)
+
+    During training, uses soft selection (softmax) to allow gradient flow.
+    During inference, uses hard selection (argmax) for discrete window choice.
+
+    The window scores contain per-window metrics:
+    - bounce_count: Number of bounces in the window
+    - r_squared: Channel quality metric
+    - quality: Overall channel quality
+    - alternation_ratio: Upper/lower bounce alternation
+    - width: Channel width
+    """
+
+    def __init__(self, hidden_dim: int = 64, num_windows: int = 8, window_metrics: int = 5):
+        """
+        Initialize window selector.
+
+        Args:
+            hidden_dim: Dimension of TF embeddings
+            num_windows: Number of window options (default 8)
+            window_metrics: Number of metrics per window (default 5)
+        """
+        super().__init__()
+
+        self.num_windows = num_windows
+        self.window_metrics = window_metrics
+
+        # Input: TF embedding (hidden_dim) + window_scores (num_windows * window_metrics)
+        input_dim = hidden_dim + num_windows * window_metrics
+
+        self.selector = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, num_windows)
+        )
+
+    def forward(
+        self,
+        tf_embedding: torch.Tensor,
+        window_scores: torch.Tensor,
+        hard_select: bool = False
+    ) -> torch.Tensor:
+        """
+        Compute window selection logits.
+
+        Args:
+            tf_embedding: [batch, hidden_dim] - embedding for one TF
+            window_scores: [batch, num_windows * window_metrics] - flattened window scores
+
+        Returns:
+            window_logits: [batch, num_windows] - selection logits
+        """
+        x = torch.cat([tf_embedding, window_scores], dim=-1)
+        logits = self.selector(x)
+        return logits
 
 
 # =============================================================================
@@ -663,22 +742,30 @@ class HierarchicalCfCModel(nn.Module):
     Complete hierarchical CfC model for multi-timeframe channel prediction.
 
     Architecture:
-    1. Decompose 644-dim input into per-TF (49 features each) and shared features (105)
+    1. Decompose 684-dim input into per-TF (49 features each) and shared features (145)
     2. Process each TF through dedicated CfC branch
     3. Attend over TF embeddings to create unified context
     4. Predict duration, break direction, next channel direction, confidence
+    5. Select optimal window per timeframe using PerTFWindowSelector
 
     CRITICAL: Input must use TIMEFRAME-GROUPED ordering from feature_ordering.py!
     - Indices 0-48: TF0 (5min) = tsla_5min(30) + spy_5min(11) + cross_5min(8)
     - Indices 49-97: TF1 (15min) = tsla_15min(30) + spy_15min(11) + cross_15min(8)
     - ... (11 timeframes total)
-    - Indices 539-643: Shared = vix(6) + tsla_history(25) + spy_history(25) + alignment(3) + events(46)
+    - Indices 539-683: Shared = vix(6) + tsla_history(25) + spy_history(25) + alignment(3) + events(46) + window_scores(40)
+
+    Window Selection:
+    - Last 40 features of shared are window_scores (8 windows x 5 metrics)
+    - PerTFWindowSelector uses TF embeddings + window_scores to select optimal window
+    - Training: soft selection (softmax) for gradient flow
+    - Inference: hard selection (argmax) for discrete choice
 
     This design allows the model to:
     - Learn timeframe-specific temporal dynamics
     - Adaptively weight timeframes based on context
     - Share prediction logic across scales
     - Provide calibrated uncertainty estimates
+    - Dynamically select optimal lookback windows
     """
 
     def __init__(
@@ -772,6 +859,13 @@ class HierarchicalCfCModel(nn.Module):
         self.agg_confidence_head = ConfidenceHead(context_dim, hidden_dim)
         self.agg_trigger_tf_head = TriggerTFHead(context_dim, hidden_dim)  # v9.0.0: 21-class trigger TF
 
+        # Per-TF window selector (shared across all TFs)
+        self.window_selector = PerTFWindowSelector(
+            hidden_dim=hidden_dim,
+            num_windows=self.config.num_windows,
+            window_metrics=self.config.window_metrics
+        )
+
         # Store hidden states for sequential processing
         self.register_buffer('_hx_states', None)
 
@@ -794,7 +888,7 @@ class HierarchicalCfCModel(nn.Module):
         Forward pass through hierarchical model.
 
         Args:
-            x: [batch_size, 644] - full feature vector (TIMEFRAME-GROUPED ordering!)
+            x: [batch_size, 684] - full feature vector (TIMEFRAME-GROUPED ordering!)
             return_attention: If True, return attention weights
 
         Returns:
@@ -804,6 +898,8 @@ class HierarchicalCfCModel(nn.Module):
                 - direction_logits: [batch_size, 11]
                 - next_channel_logits: [batch_size, 11, 3]
                 - confidence: [batch_size, 11]
+                - window_logits: [batch_size, 11, 8] - per-TF window selection logits
+                - window_probs: [batch_size, 11, 8] - softmax of window_logits
                 - attention_weights: [batch_size, n_tf, n_tf] (if return_attention=True)
         """
         batch_size = x.size(0)
@@ -820,7 +916,12 @@ class HierarchicalCfCModel(nn.Module):
 
         # Extract shared features (same for all TFs)
         shared_start, shared_end = self.config.get_shared_slice()
-        shared_features = x[:, shared_start:shared_end]  # [batch, 105]
+        shared_features = x[:, shared_start:shared_end]  # [batch, 145]
+
+        # Extract window scores (last 40 features of shared)
+        # Window scores: 8 windows × 5 metrics = 40 features
+        window_scores_start = shared_end - self.config.window_score_features
+        window_scores = x[:, window_scores_start:shared_end]  # [batch, 40]
 
         # Process each timeframe through its branch
         tf_embeddings = []
@@ -906,6 +1007,20 @@ class HierarchicalCfCModel(nn.Module):
         agg_confidence = self.agg_confidence_head(context)
         agg_trigger_tf = self.agg_trigger_tf_head(context)  # v9.0.0: 21-class trigger TF
 
+        # =====================================================================
+        # WINDOW SELECTION (per-TF)
+        # =====================================================================
+        # After TF attention, use embeddings + window_scores to select optimal window
+        window_logits_list = []
+        for tf_idx, embedding in enumerate(tf_embeddings):
+            # Each TF uses shared window selector with its own embedding
+            logits = self.window_selector(embedding, window_scores)
+            window_logits_list.append(logits)
+
+        # Stack: [batch, num_tfs, num_windows]
+        window_logits = torch.stack(window_logits_list, dim=1)  # [batch, 11, 8]
+        window_probs = F.softmax(window_logits, dim=-1)         # [batch, 11, 8]
+
         # Build output dictionary (keys match CombinedLoss expectations)
         output = {
             # Per-timeframe predictions (primary - used for training)
@@ -914,6 +1029,10 @@ class HierarchicalCfCModel(nn.Module):
             'direction_logits': direction_logits,              # [batch, 11]
             'next_channel_logits': next_channel_logits,        # [batch, 11, 3]
             'confidence': confidence,                          # [batch, 11]
+
+            # Window selection (per-TF)
+            'window_logits': window_logits,                    # [batch, 11, 8]
+            'window_probs': window_probs,                      # [batch, 11, 8]
 
             # Aggregate predictions (optional - for dashboard summary)
             'aggregate': {
@@ -936,11 +1055,12 @@ class HierarchicalCfCModel(nn.Module):
         Make predictions in evaluation mode with per-timeframe breakdown.
 
         Args:
-            x: [batch_size, 644] - input features (TIMEFRAME-GROUPED ordering!)
+            x: [batch_size, 684] - input features (TIMEFRAME-GROUPED ordering!)
 
         Returns:
             Dictionary with:
                 - Per-timeframe predictions (duration, direction, confidence for each of 11 TFs)
+                - Window selection (per-TF window choices)
                 - Aggregate predictions (weighted combination)
                 - Attention weights
                 - Recommended timeframe (highest confidence)
@@ -971,6 +1091,9 @@ class HierarchicalCfCModel(nn.Module):
             duration_std = torch.exp(outputs['duration_log_std'])                # [batch, 11]
             agg_duration_std = torch.exp(outputs['aggregate']['duration_log_std'])  # [batch, 1]
 
+            # Window selection: use argmax during inference (hard selection)
+            window_selection = outputs['window_logits'].argmax(dim=-1)           # [batch, 11]
+
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
 
@@ -984,6 +1107,13 @@ class HierarchicalCfCModel(nn.Module):
                     'next_channel': next_channel,                       # [batch, 11]
                     'next_channel_probs': next_channel_probs,           # [batch, 11, 3]
                     'confidence': outputs['confidence'],                # [batch, 11]
+                },
+
+                # Window selection (per-TF)
+                'window_selection': {
+                    'selected_window': window_selection,                # [batch, 11] - argmax indices
+                    'window_probs': outputs['window_probs'],            # [batch, 11, 8] - softmax probs
+                    'window_logits': outputs['window_logits'],          # [batch, 11, 8] - raw logits
                 },
 
                 # Aggregate prediction (for simple signal)
@@ -1036,6 +1166,7 @@ class HierarchicalCfCModel(nn.Module):
                               count_params(self.agg_next_channel_head) +
                               count_params(self.agg_confidence_head) +
                               count_params(self.agg_trigger_tf_head)),  # v9.0.0
+            'window_selector': count_params(self.window_selector),
             'total': count_params(self)
         }
 
@@ -1308,7 +1439,12 @@ if __name__ == '__main__':
 
     print("\nOutput shapes:")
     for key, value in outputs.items():
-        print(f"  {key}: {value.shape}")
+        if isinstance(value, dict):
+            print(f"  {key}: (nested dict)")
+            for k, v in value.items():
+                print(f"    {k}: {v.shape}")
+        elif isinstance(value, torch.Tensor):
+            print(f"  {key}: {value.shape}")
 
     # Test prediction
     print("\n[4] Testing prediction mode...")
@@ -1316,11 +1452,22 @@ if __name__ == '__main__':
 
     print("\nPrediction outputs:")
     for key, value in predictions.items():
-        if 'attention' not in key:
+        if isinstance(value, dict):
+            print(f"  {key}: (nested dict)")
+            for k, v in value.items():
+                if isinstance(v, torch.Tensor):
+                    print(f"    {k}: {v.shape}")
+        elif isinstance(value, torch.Tensor) and 'attention' not in key:
             print(f"  {key}: {value.shape}")
 
+    # Test window selection
+    print("\n[5] Testing window selection...")
+    print(f"  window_logits shape: {outputs['window_logits'].shape}")
+    print(f"  window_probs shape: {outputs['window_probs'].shape}")
+    print(f"  window_probs sum per TF: {outputs['window_probs'][0].sum(dim=-1)}")  # Should be 1.0 per TF
+
     # Test loss
-    print("\n[5] Testing loss computation...")
+    print("\n[6] Testing loss computation...")
     loss_fn = create_loss()
 
     targets = {

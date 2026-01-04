@@ -20,7 +20,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.channel import detect_channel, Channel, Direction
+from core.channel import (
+    detect_channel, detect_channels_multi_window, Channel, Direction,
+    STANDARD_WINDOWS
+)
 from core.timeframe import resample_ohlc, TIMEFRAMES, get_longer_timeframes
 from features.rsi import calculate_rsi, calculate_rsi_series, detect_rsi_divergence
 from features.containment import check_all_containments, ContainmentInfo
@@ -39,8 +42,63 @@ from features.events import (
     event_features_to_dict, EVENT_FEATURE_NAMES
 )
 from features.feature_ordering import (
-    FEATURE_ORDER, validate_feature_dict, get_expected_dimensions
+    FEATURE_ORDER, validate_feature_dict, get_expected_dimensions,
+    WINDOW_SCORE_FEATURES
 )
+
+
+# Number of metrics extracted per window
+NUM_WINDOW_METRICS = 5  # bounce_count, r_squared, quality_score, alternation_ratio, width_pct
+
+
+def channel_to_scores(channel: Channel) -> np.ndarray:
+    """
+    Extract key scores from a channel as numpy array.
+
+    Returns array of 5 metrics:
+    - bounce_count: Number of alternating touches
+    - r_squared: Quality of linear fit (0-1)
+    - quality_score: Composite quality score
+    - alternation_ratio: Bounce cleanliness (0-1)
+    - width_pct: Channel width as percentage of price
+
+    Args:
+        channel: Channel object from detect_channel()
+
+    Returns:
+        np.ndarray of shape (5,) with float32 dtype
+    """
+    return np.array([
+        channel.bounce_count,
+        channel.r_squared,
+        channel.quality_score,
+        channel.alternation_ratio,
+        channel.width_pct
+    ], dtype=np.float32)
+
+
+def extract_multi_window_scores(channels: Dict[int, Channel]) -> np.ndarray:
+    """
+    Extract per-window channel scores from multi-window channel detection.
+
+    Args:
+        channels: Dict mapping window size to Channel, from detect_channels_multi_window()
+                 Expected windows: STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80]
+
+    Returns:
+        np.ndarray of shape (num_windows, num_metrics) = (8, 5) = 40 features
+        Metrics per window: bounce_count, r_squared, quality_score, alternation_ratio, width_pct
+        Windows are in ascending order: 10, 20, 30, 40, 50, 60, 70, 80
+    """
+    num_windows = len(STANDARD_WINDOWS)
+    scores = np.zeros((num_windows, NUM_WINDOW_METRICS), dtype=np.float32)
+
+    for i, window in enumerate(STANDARD_WINDOWS):
+        if window in channels:
+            scores[i] = channel_to_scores(channels[window])
+        # else: keep zeros for missing windows
+
+    return scores
 
 
 @dataclass
@@ -116,6 +174,11 @@ class FullFeatures:
 
     # Event features (46 features)
     events: Optional[EventFeatures] = None
+
+    # Multi-window channel scores for TSLA (8 windows x 5 metrics = 40 features)
+    # Windows: [10, 20, 30, 40, 50, 60, 70, 80]
+    # Metrics per window: bounce_count, r_squared, quality_score, alternation_ratio, width_pct
+    tsla_window_scores: Optional[np.ndarray] = None
 
 
 def extract_tsla_channel_features(
@@ -403,6 +466,18 @@ def extract_full_features(
             import warnings
             warnings.warn(f"Failed to extract event features: {e}")
 
+    # Multi-window channel scores for TSLA (8 windows x 5 metrics = 40 features)
+    # Uses STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80]
+    tsla_window_scores = None
+    try:
+        multi_window_channels = detect_channels_multi_window(tsla_df, windows=STANDARD_WINDOWS)
+        tsla_window_scores = extract_multi_window_scores(multi_window_channels)
+    except (ValueError, IndexError):
+        # Fall back to zeros if insufficient data
+        tsla_window_scores = np.zeros(
+            (len(STANDARD_WINDOWS), NUM_WINDOW_METRICS), dtype=np.float32
+        )
+
     return FullFeatures(
         timestamp=timestamp,
         tsla=tsla_features,
@@ -415,6 +490,7 @@ def extract_full_features(
         both_near_upper=(tsla_pos > 0.8 and spy_pos > 0.8),
         both_near_lower=(tsla_pos < 0.2 and spy_pos < 0.2),
         events=event_features,
+        tsla_window_scores=tsla_window_scores,
     )
 
 
@@ -686,6 +762,15 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
     else:
         # Default zeros if no events
         arrays['events'] = np.zeros(46, dtype=np.float32)
+
+    # Multi-window channel scores (8 windows x 5 metrics = 40 features)
+    # Shape: [num_windows, num_metrics] flattened to [40]
+    if features.tsla_window_scores is not None:
+        # Flatten from (8, 5) to (40,)
+        arrays['window_scores'] = features.tsla_window_scores.flatten()
+    else:
+        # Default zeros if not available
+        arrays['window_scores'] = np.zeros(WINDOW_SCORE_FEATURES, dtype=np.float32)
 
     # Validate feature dimensions match expected values
     # This catches bugs early before they propagate to training

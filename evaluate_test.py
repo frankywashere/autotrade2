@@ -124,22 +124,25 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'auto'):
         cfc_units = model_config.get('cfc_units', 192)
         num_attention_heads = model_config.get('num_attention_heads', 8)
         dropout = model_config.get('dropout', 0.1)
+        shared_heads = model_config.get('shared_heads', True)
 
         console.print(f"  Loaded config from training_config.json")
-        console.print(f"  Architecture: hidden_dim={hidden_dim}, cfc_units={cfc_units}, heads={num_attention_heads}")
+        console.print(f"  Architecture: hidden_dim={hidden_dim}, cfc_units={cfc_units}, heads={num_attention_heads}, shared_heads={shared_heads}")
     else:
         console.print("  [yellow]Warning: training_config.json not found, using defaults[/yellow]")
         hidden_dim = 128
         cfc_units = 192
         num_attention_heads = 8
         dropout = 0.1
+        shared_heads = True
 
     # Create model with inferred architecture
     model = create_model(
         hidden_dim=hidden_dim,
         cfc_units=cfc_units,
         num_attention_heads=num_attention_heads,
-        dropout=0.1,
+        dropout=dropout,
+        shared_heads=shared_heads,
         device=device
     )
 

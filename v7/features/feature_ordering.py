@@ -8,7 +8,7 @@ must use this ordering to ensure consistency.
 CRITICAL: The ordering is TIMEFRAME-GROUPED, not alphabetical!
 - Each timeframe's features are contiguous: [tsla_tf, spy_tf, cross_tf]
 - This allows the model's TF branches to process coherent feature blocks
-- Shared features come last: [vix, tsla_history, spy_history, alignment, events]
+- Shared features come last: [vix, tsla_history, spy_history, alignment, events, window_scores]
 
 Feature Dimensions:
 - TSLA per TF: 30 features (18 base + 10 exit_tracking + 2 break_trigger)
@@ -19,8 +19,9 @@ Feature Dimensions:
 - SPY History: 25 features (same structure)
 - Alignment: 3 features
 - Events: 46 features (optional, zeros if not provided)
+- Window Scores: 40 features (8 windows x 5 metrics per window)
 
-Total: (30+11+8) × 11 + (6+25+25+3+46) = 49×11 + 105 = 539 + 105 = 644
+Total: (30+11+8) × 11 + (6+25+25+3+46+40) = 49×11 + 145 = 539 + 145 = 684
 """
 
 from typing import List, Dict
@@ -45,12 +46,13 @@ TSLA_HISTORY_FEATURES = 25  # 5+5+5 lists + 10 scalars
 SPY_HISTORY_FEATURES = 25   # Same structure as TSLA
 ALIGNMENT_FEATURES = 3
 EVENT_FEATURES = 46
+WINDOW_SCORE_FEATURES = 40  # 8 windows x 5 metrics (bounce_count, r_squared, quality, alternation_ratio, width)
 
 # Derived constants
 PER_TF_FEATURES = TSLA_PER_TF + SPY_PER_TF + CROSS_PER_TF  # 49
-SHARED_FEATURES = VIX_FEATURES + TSLA_HISTORY_FEATURES + SPY_HISTORY_FEATURES + ALIGNMENT_FEATURES + EVENT_FEATURES  # 105
+SHARED_FEATURES = VIX_FEATURES + TSLA_HISTORY_FEATURES + SPY_HISTORY_FEATURES + ALIGNMENT_FEATURES + EVENT_FEATURES + WINDOW_SCORE_FEATURES  # 145
 N_TIMEFRAMES = len(TIMEFRAMES)  # 11
-TOTAL_FEATURES = PER_TF_FEATURES * N_TIMEFRAMES + SHARED_FEATURES  # 644
+TOTAL_FEATURES = PER_TF_FEATURES * N_TIMEFRAMES + SHARED_FEATURES  # 49*11 + 145 = 684
 
 
 # =============================================================================
@@ -82,11 +84,12 @@ def build_feature_order() -> List[str]:
 
     # Shared features: same for all timeframes
     order.extend([
-        'vix',           # 6 features
-        'tsla_history',  # 25 features
-        'spy_history',   # 25 features
-        'alignment',     # 3 features
-        'events',        # 46 features (zeros if not provided)
+        'vix',            # 6 features
+        'tsla_history',   # 25 features
+        'spy_history',    # 25 features
+        'alignment',      # 3 features
+        'events',         # 46 features (zeros if not provided)
+        'window_scores',  # 40 features (8 windows x 5 metrics)
     ])
 
     return order
@@ -135,6 +138,8 @@ def get_feature_dim(key: str) -> int:
         return ALIGNMENT_FEATURES
     elif key == 'events':
         return EVENT_FEATURES
+    elif key == 'window_scores':
+        return WINDOW_SCORE_FEATURES
     else:
         raise ValueError(f"Unknown feature key: {key}")
 
@@ -247,6 +252,7 @@ if __name__ == '__main__':
     print(f"  SPY History: {SPY_HISTORY_FEATURES}")
     print(f"  Alignment: {ALIGNMENT_FEATURES}")
     print(f"  Events: {EVENT_FEATURES}")
+    print(f"  Window Scores: {WINDOW_SCORE_FEATURES}")
     print(f"  Total shared: {SHARED_FEATURES}")
 
     print(f"\nTotal features: {PER_TF_FEATURES} × {N_TIMEFRAMES} + {SHARED_FEATURES} = {TOTAL_FEATURES}")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Interactive CLI for Training v7 Channel Prediction Model
+Interactive CLI for Training v10 Channel Prediction Model
 
 A production-quality training interface with:
 - Interactive configuration wizards
@@ -9,6 +9,9 @@ A production-quality training interface with:
 - Real-time metrics display
 - Graceful error handling
 - Post-training analysis
+
+v10.0: Multi-window channel detection - automatically detects at 8 window sizes
+       STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80]
 
 Usage:
     python train.py
@@ -68,10 +71,13 @@ console = Console()
 # Configuration Presets
 # =============================================================================
 
+# v10.0: Multi-window detection uses all 8 standard windows automatically
+# Window parameter kept for backward compatibility but ignored in multi-window mode
+STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80]
+
 PRESETS = {
     "Quick Start": {
-        "desc": "Fast training for testing (small window, few epochs)",
-        "window": 20,
+        "desc": "Fast training for testing (few epochs)",
         "step": 50,
         "hidden_dim": 64,
         "cfc_units": 96,
@@ -82,7 +88,6 @@ PRESETS = {
     },
     "Standard": {
         "desc": "Balanced configuration for typical training",
-        "window": 20,
         "step": 25,
         "hidden_dim": 128,
         "cfc_units": 192,
@@ -93,7 +98,6 @@ PRESETS = {
     },
     "Full Training": {
         "desc": "Maximum quality (slow, requires good GPU)",
-        "window": 20,
         "step": 10,
         "hidden_dim": 256,
         "cfc_units": 384,
@@ -147,7 +151,7 @@ def display_cache_status(cache_dir: Path) -> Optional[Dict]:
 
     # Cache parameters
     console.print(f"\n  [bold]Cache Parameters:[/bold]")
-    console.print(f"    window={summary['window']}, step={summary['step']}, min_cycles={summary['min_cycles']}")
+    console.print(f"    multi-window={STANDARD_WINDOWS}, step={summary['step']}, min_cycles={summary['min_cycles']}")
     if summary.get('max_scan'):
         console.print(f"    max_scan={summary['max_scan']}, return_threshold={summary['return_threshold']}")
     if summary.get('lookforward_bars'):
@@ -204,7 +208,7 @@ def display_safe_vs_unsafe_settings(cache_summary: Dict):
     rebuild_table = Table(title="[yellow]⚠ Will Rebuild Cache[/yellow] (~30-60 min)", box=box.SIMPLE)
     rebuild_table.add_column("Parameter", style="yellow")
     rebuild_table.add_column("Cached Value", style="cyan")
-    rebuild_table.add_row("window", str(cache_summary.get('window', 'N/A')))
+    rebuild_table.add_row("multi-window", f"{STANDARD_WINDOWS} (v10.0 automatic)")
     rebuild_table.add_row("step", str(cache_summary.get('step', 'N/A')))
     rebuild_table.add_row("min_cycles", str(cache_summary.get('min_cycles', 'N/A')))
     rebuild_table.add_row("max_scan", str(cache_summary.get('max_scan', 'N/A')))
@@ -217,7 +221,6 @@ def display_safe_vs_unsafe_settings(cache_summary: Dict):
 
 def check_params_will_rebuild(
     cache_summary: Dict,
-    window: int,
     step: int,
     min_cycles: int = 1,
     include_history: bool = False,
@@ -228,13 +231,16 @@ def check_params_will_rebuild(
     """
     Check if the given parameters will trigger a cache rebuild.
 
+    Note: v10.0 uses multi-window detection automatically (STANDARD_WINDOWS).
+    Window parameter is no longer checked since all 8 windows are used.
+
     Returns:
         Tuple of (will_rebuild, list_of_differences)
     """
     differences = []
 
+    # v10.0: Window is no longer checked - multi-window uses all STANDARD_WINDOWS
     checks = [
-        ('window', window, cache_summary.get('window')),
         ('step', step, cache_summary.get('step')),
         ('min_cycles', min_cycles, cache_summary.get('min_cycles')),
         ('include_history', include_history, cache_summary.get('include_history')),
@@ -273,15 +279,19 @@ def show_preset_confirmation(preset_name: str, preset: Dict) -> bool:
     """
     console.print(f"\n[bold cyan]{preset_name} Preset Configuration[/bold cyan]\n")
 
+    # v10.0: Show multi-window info
+    console.print("[green]Multi-window detection enabled:[/green]")
+    console.print(f"  Windows: [cyan]{STANDARD_WINDOWS}[/cyan]")
+    console.print("[dim]  System automatically detects channels at all 8 window sizes[/dim]\n")
+
     # Create summary table
     table = Table(title="Preset Values", box=box.ROUNDED)
     table.add_column("Category", style="cyan")
     table.add_column("Parameter", style="green")
     table.add_column("Value", style="yellow")
 
-    # Data parameters
-    table.add_row("Data", "Window", str(preset.get("window", "N/A")))
-    table.add_row("", "Step", str(preset.get("step", "N/A")))
+    # Data parameters (no window - it's automatic now)
+    table.add_row("Data", "Step", str(preset.get("step", "N/A")))
 
     # Model parameters
     table.add_row("Model", "Hidden Dim", str(preset.get("hidden_dim", "N/A")))
@@ -316,11 +326,13 @@ def modify_preset_checklist(preset: Dict) -> Dict:
     """
     console.print("\n[bold cyan]Select Parameters to Modify[/bold cyan]\n")
 
-    # Checkbox selection
+    # v10.0: Show note about multi-window (window is not modifiable)
+    console.print("[dim]Note: Window sizes are automatic in v10.0 (multi-window detection)[/dim]\n")
+
+    # Checkbox selection (window removed - it's automatic now)
     params_to_modify = inquirer.checkbox(
         message="Which parameters would you like to modify? (Space to select, Enter to confirm)",
         choices=[
-            "window",
             "step",
             "hidden_dim",
             "cfc_units",
@@ -338,15 +350,6 @@ def modify_preset_checklist(preset: Dict) -> Dict:
     modified = preset.copy()
 
     console.print(f"\n[bold cyan]Enter New Values ({len(params_to_modify)} parameter(s))[/bold cyan]\n")
-
-    # Prompt for each selected parameter
-    if "window" in params_to_modify:
-        modified["window"] = int(inquirer.number(
-            message=f"Window size (current: {preset['window']}):",
-            min_allowed=20, max_allowed=200,
-            default=preset["window"],
-            validate=NumberValidator(),
-        ).execute())
 
     if "step" in params_to_modify:
         modified["step"] = int(inquirer.number(
@@ -409,8 +412,9 @@ def banner():
     console.print()
     console.print(
         Panel.fit(
-            "[bold cyan]v7 Channel Prediction Training[/bold cyan]\n"
-            "[dim]Hierarchical CfC Model with Multi-Timeframe Features[/dim]",
+            "[bold cyan]v10 Channel Prediction Training[/bold cyan]\n"
+            "[dim]Hierarchical CfC Model with Multi-Timeframe Features[/dim]\n"
+            "[yellow]v10.0: Multi-window detection - 8 window sizes automatic[/yellow]",
             border_style="cyan",
             padding=(1, 2),
         )
@@ -610,20 +614,19 @@ def configure_data(preset: Optional[Dict] = None, walk_forward_config: Optional[
     console.print(f"  From: [cyan]{min_available_date}[/cyan] (earliest)")
     console.print(f"  To:   [cyan]{max_available_date}[/cyan] (latest)\n")
 
-    # Window configuration
-    if preset:
-        window = preset["window"]
-        step = preset["step"]
-        console.print(f"  Using preset: window={window}, step={step}")
-    else:
-        window = int(inquirer.number(
-            message="Channel detection window size:",
-            min_allowed=20,
-            max_allowed=200,
-            default=20,
-            validate=NumberValidator(),
-        ).execute())
+    # v10.0: Multi-window is automatic
+    console.print("[green]Multi-window detection enabled:[/green]")
+    console.print(f"  Windows: [cyan]{STANDARD_WINDOWS}[/cyan]")
+    console.print("[dim]  Channels automatically detected at all 8 window sizes[/dim]\n")
 
+    # Window is fixed for multi-window mode, only step is configurable
+    window = 20  # Kept for backward compatibility, but multi-window uses all sizes
+
+    # Step configuration
+    if preset:
+        step = preset["step"]
+        console.print(f"  Using preset: step={step}")
+    else:
         step = int(inquirer.number(
             message="Sliding window step (smaller = more samples, slower):",
             min_allowed=1,
@@ -728,7 +731,7 @@ def configure_data(preset: Optional[Dict] = None, walk_forward_config: Optional[
 
     # Summary with clear date ranges for each split
     console.print("\n[bold cyan]Configuration Summary:[/bold cyan]")
-    console.print(f"  Window: {window} bars, Step: {step} bars")
+    console.print(f"  Multi-window: {STANDARD_WINDOWS}, Step: {step} bars")
     console.print(f"  History features: {'Yes' if include_history else 'No'}")
 
     if walk_forward_config:
@@ -1329,7 +1332,7 @@ def display_config_summary(config: Dict):
 
     # Data config
     data_tree = Tree("[bold]Data Configuration[/bold]")
-    data_tree.add(f"Window: {config['data']['window']}")
+    data_tree.add(f"Multi-window: {STANDARD_WINDOWS}")
     data_tree.add(f"Step: {config['data']['step']}")
     data_tree.add(f"Train end: {config['data']['train_end']}")
     data_tree.add(f"Val end: {config['data']['val_end']}")
@@ -2176,7 +2179,7 @@ def main():
     # If using cached params, use them for data config
     if use_cached_params and cache_summary:
         config["data"] = {
-            "window": cache_summary.get('window', 20),
+            "window": 20,  # v10.0: Kept for backward compatibility, multi-window uses STANDARD_WINDOWS
             "step": cache_summary.get('step', 25),
             "min_cycles": cache_summary.get('min_cycles', 1),
             "max_scan": cache_summary.get('max_scan', 500),
@@ -2190,7 +2193,7 @@ def main():
         }
         # Still prompt for train/val split dates and walk-forward if applicable
         console.print("[bold cyan]Data Split Configuration[/bold cyan]")
-        console.print(f"[dim]Using cached data parameters: window={config['data']['window']}, step={config['data']['step']}[/dim]\n")
+        console.print(f"[dim]Using cached data: multi-window={STANDARD_WINDOWS}, step={config['data']['step']}[/dim]\n")
 
         # Load data range for split date prompts
         min_date, max_date = load_data_date_range(data_dir)

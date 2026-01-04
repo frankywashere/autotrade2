@@ -591,7 +591,7 @@ def scale_label_params_for_tf(
     """
     bars_per_tf = BARS_PER_TF.get(tf, 1)
 
-    scaled_max_scan = max_scan // bars_per_tf
+    scaled_max_scan = max(1, max_scan // bars_per_tf)
     scaled_return_threshold = max(1, return_threshold // bars_per_tf)
 
     return scaled_max_scan, scaled_return_threshold
@@ -599,49 +599,91 @@ def scale_label_params_for_tf(
 
 def generate_labels_per_tf(
     df: pd.DataFrame,
+    channel_end_idx_5min: int,
     window: int = 50,
     max_scan: int = 500,
     return_threshold: int = 20,
-    fold_end_idx: Optional[int] = None
+    fold_end_idx: Optional[int] = None,
+    min_cycles: int = 1,
+    channel: Optional[Channel] = None
 ) -> Dict[str, Optional[ChannelLabels]]:
     """
     Generate labels for each timeframe by resampling and detecting channels.
 
     For each TF in TIMEFRAMES:
     1. Resamples base 5min data using resample_ohlc()
-    2. Detects a channel at that TF
+    2. Detects a channel at the equivalent position in that TF
     3. Calls generate_labels() with scaled parameters
 
     Args:
-        df: Base 5min OHLCV DataFrame with DatetimeIndex
+        df: Base 5min OHLCV DataFrame with DatetimeIndex (includes forward data for scanning)
+        channel_end_idx_5min: Index in 5min data where the channel ends. This is the
+                              position of the detected channel - data after this is
+                              forward data for label scanning.
         window: Window size for channel detection
         max_scan: Maximum bars to scan forward (in 5min bars, will be scaled)
         return_threshold: Bars outside needed to confirm permanent break (will be scaled)
         fold_end_idx: Optional end index for walk-forward validation fold
+        min_cycles: Minimum cycles required for valid channel detection
+        channel: Optional pre-detected Channel object for 5min timeframe. If provided,
+                 the window parameter is overridden by channel.window for consistency.
 
     Returns:
         Dict mapping TF name to ChannelLabels (None if channel detection failed)
     """
+    # If a channel is provided, use its window size for consistency
+    if channel is not None:
+        window = channel.window
     labels_per_tf: Dict[str, Optional[ChannelLabels]] = {}
+
+    # Get the timestamp at the channel end position for TF alignment
+    if channel_end_idx_5min >= len(df):
+        # Invalid index
+        return {tf: None for tf in TIMEFRAMES}
+
+    channel_end_timestamp = df.index[channel_end_idx_5min]
+
+    # Split data: historical (up to sample time) vs full (includes forward bars)
+    # This prevents future data leakage in channel detection for longer timeframes
+    df_historical = df.iloc[:channel_end_idx_5min + 1]  # Only up to sample time
 
     for tf in TIMEFRAMES:
         try:
             # Resample data to this timeframe
+            # Use separate dataframes for channel detection (historical) vs label scanning (full)
             if tf == '5min':
-                df_tf = df
+                df_tf_for_channel = df_historical
+                df_tf_full = df
+                channel_end_idx_tf = channel_end_idx_5min
             else:
-                df_tf = resample_ohlc(df, tf)
+                # Resample historical-only for channel detection (no future leakage)
+                df_tf_for_channel = resample_ohlc(df_historical, tf)
 
-            # Need enough data for channel detection
-            if len(df_tf) < window:
+                # Resample full data for label scanning (forward bars intentional)
+                df_tf_full = resample_ohlc(df, tf)
+
+                # Channel ends at last bar of historical resampled data
+                channel_end_idx_tf = len(df_tf_for_channel) - 1
+
+                if channel_end_idx_tf < 0:
+                    labels_per_tf[tf] = None
+                    continue
+
+            # Need enough data before channel_end for channel detection
+            if channel_end_idx_tf < window - 1:
                 labels_per_tf[tf] = None
                 continue
 
-            # Detect channel at this timeframe
-            # Use the most recent window of data for channel detection
-            channel_start_idx = len(df_tf) - window
-            df_channel = df_tf.iloc[channel_start_idx:channel_start_idx + window]
-            channel = detect_channel(df_channel, window=window)
+            # Detect channel at this timeframe using window ending at channel_end_idx_tf
+            # Use historical-only data for channel detection to avoid future leakage
+            channel_start_idx = channel_end_idx_tf - window + 1
+            df_channel = df_tf_for_channel.iloc[channel_start_idx:channel_end_idx_tf + 1]
+
+            if len(df_channel) < window:
+                labels_per_tf[tf] = None
+                continue
+
+            channel = detect_channel(df_channel, window=window, min_cycles=min_cycles)
 
             if not channel.valid:
                 labels_per_tf[tf] = None
@@ -658,14 +700,11 @@ def generate_labels_per_tf(
                 bars_per_tf = BARS_PER_TF.get(tf, 1)
                 scaled_fold_end_idx = fold_end_idx // bars_per_tf
 
-            # Channel ends at the last bar of the detection window
-            channel_end_idx = len(df_tf) - 1
-
-            # Generate labels for this TF
+            # Generate labels for this TF using full data (includes forward bars for scanning)
             tf_labels = generate_labels(
-                df=df_tf,
+                df=df_tf_full,
                 channel=channel,
-                channel_end_idx=channel_end_idx,
+                channel_end_idx=channel_end_idx_tf,
                 current_tf=tf,
                 window=window,
                 max_scan=scaled_max_scan,
@@ -680,3 +719,96 @@ def generate_labels_per_tf(
             labels_per_tf[tf] = None
 
     return labels_per_tf
+
+
+def generate_labels_multi_window(
+    df: pd.DataFrame,
+    channels: Dict[int, Channel],
+    channel_end_idx_5min: int,
+    max_scan: int = 500,
+    return_threshold: int = 20,
+    fold_end_idx: Optional[int] = None,
+    min_cycles: int = 1
+) -> Dict[int, Dict[str, Optional[ChannelLabels]]]:
+    """
+    Generate labels for multiple window sizes.
+
+    For each window's channel, calls generate_labels_per_tf() with the
+    appropriate window size from the channel object.
+
+    Args:
+        df: Base 5min OHLCV DataFrame with DatetimeIndex (includes forward data for scanning)
+        channels: Dict mapping window_size -> Channel object
+        channel_end_idx_5min: Index in 5min data where the channel ends. This is the
+                              position of the detected channel - data after this is
+                              forward data for label scanning.
+        max_scan: Maximum bars to scan forward (in 5min bars, will be scaled)
+        return_threshold: Bars outside needed to confirm permanent break (will be scaled)
+        fold_end_idx: Optional end index for walk-forward validation fold
+        min_cycles: Minimum cycles required for valid channel detection
+
+    Returns:
+        Dict mapping window_size -> {tf_name -> ChannelLabels}
+    """
+    labels_per_window: Dict[int, Dict[str, Optional[ChannelLabels]]] = {}
+
+    for window_size, channel in channels.items():
+        if channel is None or not channel.valid:
+            # Invalid channel - return None for all timeframes
+            labels_per_window[window_size] = {tf: None for tf in TIMEFRAMES}
+            continue
+
+        # Generate labels for this window's channel
+        labels_per_window[window_size] = generate_labels_per_tf(
+            df=df,
+            channel_end_idx_5min=channel_end_idx_5min,
+            window=window_size,
+            max_scan=max_scan,
+            return_threshold=return_threshold,
+            fold_end_idx=fold_end_idx,
+            min_cycles=min_cycles,
+            channel=channel
+        )
+
+    return labels_per_window
+
+
+def select_best_window_by_labels(
+    labels_per_window: Dict[int, Dict[str, Optional[ChannelLabels]]]
+) -> int:
+    """
+    Select the best window size based on label validity.
+
+    Selects the window with the most valid TF labels. A label is considered
+    valid if it is not None.
+
+    Args:
+        labels_per_window: Dict mapping window_size -> {tf_name -> ChannelLabels}
+
+    Returns:
+        Window size with the most valid TF labels. If there's a tie, returns
+        the smallest window size. If all windows have zero valid labels,
+        returns the first window size in the dict.
+    """
+    if not labels_per_window:
+        raise ValueError("labels_per_window cannot be empty")
+
+    best_window = None
+    best_valid_count = -1
+
+    # Sort by window size to prefer smaller windows on ties
+    for window_size in sorted(labels_per_window.keys()):
+        tf_labels = labels_per_window[window_size]
+
+        # Count valid (non-None) labels
+        valid_count = sum(1 for labels in tf_labels.values() if labels is not None)
+
+        if valid_count > best_valid_count:
+            best_valid_count = valid_count
+            best_window = window_size
+
+    # If no window found (shouldn't happen), return first
+    if best_window is None:
+        best_window = next(iter(labels_per_window.keys()))
+
+    return best_window
