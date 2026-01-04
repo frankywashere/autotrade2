@@ -577,7 +577,8 @@ def labels_to_array(labels: ChannelLabels) -> np.ndarray:
 def scale_label_params_for_tf(
     tf: str,
     max_scan: int,
-    return_threshold: int
+    return_threshold: int,
+    custom_return_thresholds: Optional[Dict[str, int]] = None
 ) -> Tuple[int, int]:
     """
     Scale label generation parameters for a specific timeframe.
@@ -596,12 +597,13 @@ def scale_label_params_for_tf(
         tf: Target timeframe (e.g., '15min', '1h', 'daily')
         max_scan: Base max_scan value (used for 5min)
         return_threshold: Base return_threshold value (in 5min bars)
+        custom_return_thresholds: Optional dict mapping TF names to custom return threshold
+                                  values. If provided and tf is in the dict, that value is
+                                  used instead of the default. Example: {'5min': 10, '1h': 2}
 
     Returns:
         Tuple of (scaled_max_scan, scaled_return_threshold)
     """
-    bars_per_tf = BARS_PER_TF.get(tf, 1)
-
     # max_scan per TF - aligned with FORWARD_BARS_PER_TF in label_inspector.py
     tf_max_scan = {
         '5min': 100,    # ~8 hours
@@ -618,8 +620,29 @@ def scale_label_params_for_tf(
     }
     scaled_max_scan = tf_max_scan.get(tf, min(max_scan, 50))
 
-    # Scale return_threshold to keep consistent percentage behavior
-    scaled_return_threshold = max(1, return_threshold // bars_per_tf)
+    # Explicit return_threshold per TF
+    # These control how many bars outside channel before declaring "permanent" break
+    # Lower = more sensitive, Higher = more tolerant of temporary excursions
+    # The old formula (return_threshold // bars_per_tf) collapsed to 1 for daily+
+    tf_return_threshold = {
+        '5min': 20,     # ~1.5 hours - allows for short-term noise
+        '15min': 6,     # ~1.5 hours equivalent
+        '30min': 4,     # ~2 hours
+        '1h': 3,        # ~3 hours
+        '2h': 3,        # ~6 hours
+        '3h': 3,        # ~9 hours
+        '4h': 3,        # ~12 hours (half trading day)
+        'daily': 5,     # ~1 week - tolerates daily noise
+        'weekly': 2,    # ~2 weeks
+        'monthly': 1,   # Immediate - monthly breaks are significant
+        '3month': 1,    # Immediate - quarterly breaks are significant
+    }
+
+    # Check for custom threshold first, then fall back to defaults
+    if custom_return_thresholds is not None and tf in custom_return_thresholds:
+        scaled_return_threshold = custom_return_thresholds[tf]
+    else:
+        scaled_return_threshold = tf_return_threshold.get(tf, max(1, return_threshold // BARS_PER_TF.get(tf, 1)))
 
     return scaled_max_scan, scaled_return_threshold
 
@@ -632,7 +655,8 @@ def generate_labels_per_tf(
     return_threshold: int = 20,
     fold_end_idx: Optional[int] = None,
     min_cycles: int = 1,
-    channel: Optional[Channel] = None
+    channel: Optional[Channel] = None,
+    custom_return_thresholds: Optional[Dict[str, int]] = None
 ) -> Dict[str, Optional[ChannelLabels]]:
     """
     Generate labels for each timeframe by resampling and detecting channels.
@@ -654,6 +678,9 @@ def generate_labels_per_tf(
         min_cycles: Minimum cycles required for valid channel detection
         channel: Optional pre-detected Channel object for 5min timeframe. If provided,
                  the window parameter is overridden by channel.window for consistency.
+        custom_return_thresholds: Optional dict mapping TF names to custom return threshold
+                                  values. If provided and a TF is in the dict, that value is
+                                  used instead of the default. Example: {'5min': 10, '1h': 2}
 
     Returns:
         Dict mapping TF name to ChannelLabels (None if channel detection failed)
@@ -720,7 +747,7 @@ def generate_labels_per_tf(
 
             # Scale parameters for this timeframe
             scaled_max_scan, scaled_return_threshold = scale_label_params_for_tf(
-                tf, max_scan, return_threshold
+                tf, max_scan, return_threshold, custom_return_thresholds
             )
 
             # Scale fold_end_idx if provided
@@ -757,7 +784,8 @@ def generate_labels_multi_window(
     max_scan: int = 500,
     return_threshold: int = 20,
     fold_end_idx: Optional[int] = None,
-    min_cycles: int = 1
+    min_cycles: int = 1,
+    custom_return_thresholds: Optional[Dict[str, int]] = None
 ) -> Dict[int, Dict[str, Optional[ChannelLabels]]]:
     """
     Generate labels for multiple window sizes.
@@ -775,6 +803,9 @@ def generate_labels_multi_window(
         return_threshold: Bars outside needed to confirm permanent break (will be scaled)
         fold_end_idx: Optional end index for walk-forward validation fold
         min_cycles: Minimum cycles required for valid channel detection
+        custom_return_thresholds: Optional dict mapping TF names to custom return threshold
+                                  values. If provided and a TF is in the dict, that value is
+                                  used instead of the default. Example: {'5min': 10, '1h': 2}
 
     Returns:
         Dict mapping window_size -> {tf_name -> ChannelLabels}
@@ -795,7 +826,8 @@ def generate_labels_multi_window(
             return_threshold=return_threshold,
             fold_end_idx=fold_end_idx,
             min_cycles=min_cycles,
-            channel=channel
+            channel=channel,
+            custom_return_thresholds=custom_return_thresholds
         )
 
     return labels_per_window

@@ -729,6 +729,54 @@ def configure_data(preset: Optional[Dict] = None, walk_forward_config: Optional[
         default=False,
     ).execute()
 
+    # Return threshold configuration
+    console.print("\n[bold cyan]Return Threshold Configuration[/bold cyan]")
+    console.print("[dim]Return threshold = bars outside channel to confirm a break[/dim]")
+    console.print("[dim]Higher values = more conservative break detection[/dim]\n")
+
+    use_custom_thresholds = inquirer.confirm(
+        message="Customize return thresholds per timeframe? (defaults: daily=5, weekly=2, monthly=1)",
+        default=False,
+    ).execute()
+
+    custom_return_thresholds = None
+    if use_custom_thresholds:
+        console.print("\n[dim]Enter return threshold values for key timeframes:[/dim]")
+
+        daily_threshold = int(inquirer.number(
+            message="Daily timeframe threshold:",
+            min_allowed=1,
+            max_allowed=20,
+            default=5,
+            validate=NumberValidator(),
+        ).execute())
+
+        weekly_threshold = int(inquirer.number(
+            message="Weekly timeframe threshold:",
+            min_allowed=1,
+            max_allowed=10,
+            default=2,
+            validate=NumberValidator(),
+        ).execute())
+
+        monthly_threshold = int(inquirer.number(
+            message="Monthly timeframe threshold:",
+            min_allowed=1,
+            max_allowed=5,
+            default=1,
+            validate=NumberValidator(),
+        ).execute())
+
+        custom_return_thresholds = {
+            "daily": daily_threshold,
+            "weekly": weekly_threshold,
+            "monthly": monthly_threshold,
+        }
+
+        console.print(f"\n[green]Custom thresholds:[/green] daily={daily_threshold}, weekly={weekly_threshold}, monthly={monthly_threshold}")
+    else:
+        console.print("[dim]Using default thresholds (daily=5, weekly=2, monthly=1)[/dim]")
+
     # Summary with clear date ranges for each split
     console.print("\n[bold cyan]Configuration Summary:[/bold cyan]")
     console.print(f"  Multi-window: {STANDARD_WINDOWS}, Step: {step} bars")
@@ -765,6 +813,10 @@ def configure_data(preset: Optional[Dict] = None, walk_forward_config: Optional[
         "val_end": val_end,
         "include_history": include_history,
     }
+
+    # Add custom return thresholds if configured
+    if custom_return_thresholds:
+        config["custom_return_thresholds"] = custom_return_thresholds
 
     # Add walk-forward config if provided
     if walk_forward_config:
@@ -1833,6 +1885,7 @@ def run_walk_forward_training(
                     end_date=val_end_str,
                     include_history=config["data"]["include_history"],
                     force_rebuild=False,
+                    custom_return_thresholds=config["data"].get("custom_return_thresholds"),
                 )
 
             console.print(
@@ -2272,6 +2325,7 @@ def main():
                 end_date=config["data"]["end_date"],
                 include_history=config["data"]["include_history"],
                 force_rebuild=config.get("_force_rebuild", False),
+                custom_return_thresholds=config["data"].get("custom_return_thresholds"),
             )
 
         console.print(

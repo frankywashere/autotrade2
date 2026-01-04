@@ -163,7 +163,8 @@ def validate_cache_params(
     return_threshold: int = 20,
     include_history: bool = False,
     lookforward_bars: int = 200,
-    native_per_tf_labels: bool = True  # v8.0.0: Native per-TF label generation
+    native_per_tf_labels: bool = True,  # v8.0.0: Native per-TF label generation
+    custom_return_thresholds: Optional[Dict[str, int]] = None
 ) -> Tuple[bool, List[str]]:
     """
     Validate that cache parameters match requested parameters.
@@ -172,6 +173,7 @@ def validate_cache_params(
         cache_path: Path to cache file
         window, step, etc: Requested parameters to validate against cache
         native_per_tf_labels: v8.0.0 feature - whether labels are generated per-TF
+        custom_return_thresholds: Optional dict mapping TF names to custom return thresholds
 
     Returns:
         Tuple of (is_valid, list_of_mismatches)
@@ -204,6 +206,13 @@ def validate_cache_params(
     if native_per_tf_labels and not cached_native_labels:
         mismatches.append(
             f"native_per_tf_labels: cached={cached_native_labels}, requested={native_per_tf_labels}"
+        )
+
+    # Check custom_return_thresholds - warn if different from cached
+    cached_custom_thresholds = metadata.get('custom_return_thresholds')
+    if custom_return_thresholds != cached_custom_thresholds:
+        mismatches.append(
+            f"custom_return_thresholds: cached={cached_custom_thresholds}, requested={custom_return_thresholds}"
         )
 
     return len(mismatches) == 0, mismatches
@@ -766,7 +775,8 @@ def scan_valid_channels(
     return_threshold: int = 20,
     include_history: bool = False,
     lookforward_bars: int = 200,
-    progress: bool = True
+    progress: bool = True,
+    custom_return_thresholds: Optional[Dict[str, int]] = None
 ) -> Tuple[List[ChannelSample], int]:
     """
     Scan through historical data to find all valid channels and generate samples.
@@ -816,8 +826,15 @@ def scan_valid_channels(
     # 3-month will still be weak (~6.7 bars) but acceptable with quality scoring
     min_warmup_bars = max(window, 32760)  # At least 32,760 bars (20 months) or window, whichever larger
 
+    # Calculate forward 5min bars needed for longest timeframe label generation
+    # Daily needs 50 daily bars of forward data for label scanning
+    # Data includes extended hours (~150-190 5min bars/day, not just 78 regular hours)
+    # Use 8000 5min bars to safely get 50+ daily bars with margin for holidays
+    # This ensures all TFs (5min through daily) have enough forward data
+    max_forward_5min_bars = 8000  # ~50-55 daily bars with extended hours data
+
     # Need enough data for warmup + forward scan
-    min_required = min_warmup_bars + max_scan
+    min_required = min_warmup_bars + max_forward_5min_bars
 
     # Align SPY and VIX with TSLA timestamps
     # For SPY (5min), reindex to match TSLA timestamps and forward-fill gaps
@@ -828,7 +845,7 @@ def scan_valid_channels(
 
     # Scan through data with sliding window
     start_idx = min_warmup_bars
-    end_idx = len(tsla_df) - max_scan
+    end_idx = len(tsla_df) - max_forward_5min_bars  # Reserve enough forward data for all TFs
 
     indices = range(start_idx, end_idx, step)
     if progress:
@@ -875,12 +892,13 @@ def scan_valid_channels(
         # Generate native per-TF labels for all window sizes
         try:
             labels_per_window = generate_labels_multi_window(
-                df=tsla_df.iloc[:i + max_scan],  # Include forward data for label generation
+                df=tsla_df.iloc[:i + max_forward_5min_bars],  # Include enough forward data for all TFs
                 channels=channels,
                 channel_end_idx_5min=i - 1,  # Channel ends at the last bar of tsla_window
                 max_scan=max_scan,
                 return_threshold=return_threshold,
-                min_cycles=min_cycles
+                min_cycles=min_cycles,
+                custom_return_thresholds=custom_return_thresholds
             )
             best_labels_window = select_best_window_by_labels(labels_per_window)
             labels_per_tf = labels_per_window[best_labels_window]
@@ -1287,7 +1305,8 @@ def prepare_dataset_from_scratch(
     end_date: Optional[str] = None,
     include_history: bool = False,
     force_rebuild: bool = False,
-    warn_on_mismatch: bool = True
+    warn_on_mismatch: bool = True,
+    custom_return_thresholds: Optional[Dict[str, int]] = None
 ) -> Tuple[List[ChannelSample], List[ChannelSample], List[ChannelSample]]:
     """
     Complete pipeline to prepare dataset from raw data.
@@ -1314,6 +1333,9 @@ def prepare_dataset_from_scratch(
         include_history: Include channel history features
         force_rebuild: Force rebuild cache even if exists
         warn_on_mismatch: Print warning if cache params don't match requested
+        custom_return_thresholds: Optional dict mapping TF names to custom return thresholds.
+            If provided, overrides the default return_threshold for specific timeframes.
+            Example: {'5min': 10, '15min': 15, '1hour': 25}
 
     Returns:
         Tuple of (train_samples, val_samples, test_samples)
@@ -1333,7 +1355,8 @@ def prepare_dataset_from_scratch(
             max_scan=max_scan,
             return_threshold=return_threshold,
             include_history=include_history,
-            lookforward_bars=lookforward_bars
+            lookforward_bars=lookforward_bars,
+            custom_return_thresholds=custom_return_thresholds
         )
 
         if not params_match:
@@ -1398,7 +1421,8 @@ def prepare_dataset_from_scratch(
             max_scan=max_scan,
             return_threshold=return_threshold,
             include_history=include_history,
-            lookforward_bars=lookforward_bars
+            lookforward_bars=lookforward_bars,
+            custom_return_thresholds=custom_return_thresholds
         )
 
         print(f"\nFound {len(samples)} valid channel samples")
@@ -1419,6 +1443,7 @@ def prepare_dataset_from_scratch(
             'min_cycles': min_cycles,
             'max_scan': max_scan,
             'return_threshold': return_threshold,
+            'custom_return_thresholds': custom_return_thresholds,
             'lookforward_bars': lookforward_bars,
             'include_history': include_history,
             'min_warmup_bars': min_warmup_bars,
