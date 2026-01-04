@@ -20,7 +20,10 @@ from pathlib import Path
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.channel import detect_channel, Channel, Direction
+from core.channel import (
+    detect_channel, detect_channels_multi_window, select_best_channel,
+    Channel, Direction, STANDARD_WINDOWS
+)
 from core.timeframe import resample_ohlc, get_longer_timeframes, TIMEFRAMES, BARS_PER_TF
 from features.containment import check_containment, get_closest_boundary, ContainmentInfo
 
@@ -579,11 +582,19 @@ def scale_label_params_for_tf(
     """
     Scale label generation parameters for a specific timeframe.
 
-    Keeps the same time horizon by dividing by the number of base bars per TF bar.
+    These values are aligned with the visual forward bars in label_inspector.py
+    to ensure label generation matches what is visually displayed.
+
+    Forward look by TF:
+    - 5min: 100 bars (~8 hours)
+    - 15min: 100 bars (~25 hours)
+    - 30min-weekly: 50 bars
+    - monthly: 10 bars
+    - 3month: 10 bars
 
     Args:
         tf: Target timeframe (e.g., '15min', '1h', 'daily')
-        max_scan: Base max_scan value (in 5min bars)
+        max_scan: Base max_scan value (used for 5min)
         return_threshold: Base return_threshold value (in 5min bars)
 
     Returns:
@@ -591,7 +602,23 @@ def scale_label_params_for_tf(
     """
     bars_per_tf = BARS_PER_TF.get(tf, 1)
 
-    scaled_max_scan = max(1, max_scan // bars_per_tf)
+    # max_scan per TF - aligned with FORWARD_BARS_PER_TF in label_inspector.py
+    tf_max_scan = {
+        '5min': 100,    # ~8 hours
+        '15min': 100,   # ~25 hours
+        '30min': 50,    # ~25 hours
+        '1h': 50,       # ~50 hours (~2 days)
+        '2h': 50,       # ~100 hours (~4 days)
+        '3h': 50,       # ~150 hours (~6 days)
+        '4h': 50,       # ~200 hours (~8 days)
+        'daily': 50,    # ~50 trading days (~2.5 months)
+        'weekly': 50,   # ~50 weeks (~1 year)
+        'monthly': 10,  # ~10 months
+        '3month': 10,   # ~30 months (~2.5 years)
+    }
+    scaled_max_scan = tf_max_scan.get(tf, min(max_scan, 50))
+
+    # Scale return_threshold to keep consistent percentage behavior
     scaled_return_threshold = max(1, return_threshold // bars_per_tf)
 
     return scaled_max_scan, scaled_return_threshold
@@ -669,23 +696,25 @@ def generate_labels_per_tf(
                     labels_per_tf[tf] = None
                     continue
 
-            # Need enough data before channel_end for channel detection
-            if channel_end_idx_tf < window - 1:
-                labels_per_tf[tf] = None
-                continue
-
-            # Detect channel at this timeframe using window ending at channel_end_idx_tf
+            # Detect channels at MULTIPLE window sizes for this TF (matches inspector behavior)
             # Use historical-only data for channel detection to avoid future leakage
-            channel_start_idx = channel_end_idx_tf - window + 1
-            df_channel = df_tf_for_channel.iloc[channel_start_idx:channel_end_idx_tf + 1]
-
-            if len(df_channel) < window:
+            # Need enough data for at least the smallest standard window
+            min_window = min(STANDARD_WINDOWS)
+            if channel_end_idx_tf < min_window - 1 or len(df_tf_for_channel) < min_window:
                 labels_per_tf[tf] = None
                 continue
 
-            channel = detect_channel(df_channel, window=window, min_cycles=min_cycles)
+            # Detect channels at all standard windows for this TF
+            tf_channels = detect_channels_multi_window(
+                df_tf_for_channel.iloc[:channel_end_idx_tf + 1],
+                windows=STANDARD_WINDOWS,
+                min_cycles=min_cycles
+            )
 
-            if not channel.valid:
+            # Select the best channel by bounces (same logic as inspector)
+            tf_channel, best_tf_window = select_best_channel(tf_channels)
+
+            if tf_channel is None or not tf_channel.valid:
                 labels_per_tf[tf] = None
                 continue
 
@@ -703,10 +732,10 @@ def generate_labels_per_tf(
             # Generate labels for this TF using full data (includes forward bars for scanning)
             tf_labels = generate_labels(
                 df=df_tf_full,
-                channel=channel,
+                channel=tf_channel,  # Use the best channel for this TF
                 channel_end_idx=channel_end_idx_tf,
                 current_tf=tf,
-                window=window,
+                window=best_tf_window,  # Use the window that gave the best channel
                 max_scan=scaled_max_scan,
                 return_threshold=scaled_return_threshold,
                 fold_end_idx=scaled_fold_end_idx
@@ -753,10 +782,9 @@ def generate_labels_multi_window(
     labels_per_window: Dict[int, Dict[str, Optional[ChannelLabels]]] = {}
 
     for window_size, channel in channels.items():
-        if channel is None or not channel.valid:
-            # Invalid channel - return None for all timeframes
-            labels_per_window[window_size] = {tf: None for tf in TIMEFRAMES}
-            continue
+        # Always call generate_labels_per_tf even if 5min channel is invalid,
+        # because it does its own multi-window detection per TF now.
+        # A valid 1h channel might exist even if the 5min channel at this window is invalid.
 
         # Generate labels for this window's channel
         labels_per_window[window_size] = generate_labels_per_tf(

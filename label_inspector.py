@@ -47,6 +47,25 @@ BREAK_NAMES = {0: 'DOWN', 1: 'UP'}
 # Timeframes for 2x2 grid
 DISPLAY_TIMEFRAMES = ['5min', '15min', '1h', 'daily']
 
+# Forward look bars per TF for visualization
+FORWARD_BARS_PER_TF = {
+    '5min': 100,    # ~8 hours
+    '15min': 100,   # ~25 hours
+    '30min': 50,    # ~25 hours
+    '1h': 50,       # ~50 hours (~2 days)
+    '2h': 50,       # ~100 hours (~4 days)
+    '3h': 50,       # ~150 hours (~6 days)
+    '4h': 50,       # ~200 hours (~8 days)
+    'daily': 50,    # ~50 trading days (~2.5 months)
+    'weekly': 50,   # ~50 weeks (~1 year)
+    'monthly': 10,  # ~10 months
+    '3month': 10,   # ~30 months (~2.5 years)
+}
+
+def get_forward_bars_for_tf(tf: str) -> int:
+    """Get the number of forward bars to display for a timeframe."""
+    return FORWARD_BARS_PER_TF.get(tf, 50)
+
 
 def load_tsla_data() -> pd.DataFrame:
     """Load and prepare TSLA 5min data."""
@@ -74,7 +93,6 @@ def get_sample_data_window(
     sample: ChannelSample,
     tf: str,
     window: int = 50,
-    forward_bars: int = 100,
     min_cycles: int = 1,
     use_multi_window: bool = True
 ) -> tuple:
@@ -89,7 +107,6 @@ def get_sample_data_window(
         sample: The ChannelSample being inspected
         tf: Timeframe name (e.g., '5min', '1h')
         window: Channel detection window size (used if not multi-window)
-        forward_bars: Bars of forward data to include for visualization
         min_cycles: Minimum bounces for valid channel (from cache metadata)
         use_multi_window: Whether to use multi-window detection
 
@@ -101,21 +118,27 @@ def get_sample_data_window(
         - df_forward: Forward data for visualization
         - channels_dict: Dict[int, Channel] mapping window sizes to channels (if multi-window)
     """
-    # Get sample timestamp and find its position in the data
-    sample_time = sample.timestamp
+    # Use timestamp to find position in raw data, NOT the cached index.
+    # The cached index was computed against SPY/VIX-aligned data which may have
+    # different row counts than raw TSLA data loaded by the inspector.
+    try:
+        channel_end_idx_5min = tsla_df.index.get_loc(sample.timestamp)
+    except KeyError:
+        # Exact timestamp not found, find closest
+        idx = tsla_df.index.searchsorted(sample.timestamp)
+        channel_end_idx_5min = min(idx, len(tsla_df) - 1)
 
-    # Get data up to and past the sample point
-    mask = tsla_df.index <= sample_time
-    channel_end_idx_5min = mask.sum() - 1
-
-    if channel_end_idx_5min < 0:
+    if channel_end_idx_5min < 0 or channel_end_idx_5min >= len(tsla_df):
         return None, None, None, None, None
 
     # Historical data (up to sample time) - for channel detection
     df_historical = tsla_df.iloc[:channel_end_idx_5min + 1]
 
-    # Forward bars for visualization
-    forward_end_5min = min(channel_end_idx_5min + forward_bars + 1, len(tsla_df))
+    # Forward bars for visualization - scale by TF (need more 5min bars for longer TFs)
+    tf_forward_bars = get_forward_bars_for_tf(tf)
+    bars_per_tf = BARS_PER_TF.get(tf, 1)
+    forward_bars_5min = tf_forward_bars * bars_per_tf  # Convert TF bars to 5min bars
+    forward_end_5min = min(channel_end_idx_5min + forward_bars_5min + 1, len(tsla_df))
 
     if tf == '5min':
         df_tf = tsla_df.iloc[:forward_end_5min].copy()
@@ -169,7 +192,8 @@ def plot_tf_panel(
     window: int = 50,
     channels_dict: dict = None,
     best_window: int = None,
-    display_window: int = None
+    display_window: int = None,
+    labels_in_cache: bool = False
 ):
     """
     Plot a single timeframe panel with channel, bounds, and labels.
@@ -192,9 +216,10 @@ def plot_tf_panel(
         ax.set_title(tf_name)
         return
 
-    # Determine plot range
+    # Determine plot range - use TF-specific forward bars
     channel_start_idx = max(0, channel_end_idx - window + 1)
-    forward_bars = min(100, len(df_tf) - channel_end_idx - 1)
+    tf_forward_bars = get_forward_bars_for_tf(tf_name)
+    forward_bars = min(tf_forward_bars, len(df_tf) - channel_end_idx - 1)
     plot_end_idx = channel_end_idx + forward_bars + 1
 
     # Get data slice for plotting
@@ -334,9 +359,13 @@ def plot_tf_panel(
         if validity_parts:
             label_text += f"\nValid: [{', '.join(validity_parts)}]"
     else:
-        # Distinguish between fresh detection success vs cached labels missing
+        # Distinguish between: cache has None vs key missing vs invalid channel
         if channel.valid:
-            label_text += f"\nNo cached labels (cache stale?)"
+            if labels_in_cache:
+                # Labels were computed but are None (resampled channel failed or insufficient data)
+                label_text += f"\nNo labels (TF channel invalid)"
+            else:
+                label_text += f"\nNo cached labels (cache stale?)"
         else:
             label_text += f"\nNo labels (bounces < min_cycles)"
 
@@ -407,7 +436,20 @@ def create_multi_tf_figure(
             best_window = window
 
         # Get labels for this timeframe
-        labels = sample.labels.get(tf) if isinstance(sample.labels, dict) else None
+        # IMPORTANT: labels_per_window is keyed by the 5min window (sample.best_window),
+        # NOT by the TF-specific window we just detected. The cache was generated using
+        # the 5min best_window to key the outer dict, then generate_labels_per_tf
+        # internally does its own per-TF multi-window detection.
+        labels = None
+        labels_in_cache = False
+        cache_window = sample.best_window  # Use the 5min window from cache, not TF-specific
+        if sample.labels_per_window and cache_window and cache_window in sample.labels_per_window:
+            window_labels = sample.labels_per_window[cache_window]
+            labels_in_cache = tf in window_labels
+            labels = window_labels.get(tf)
+        elif isinstance(sample.labels, dict):
+            labels_in_cache = tf in sample.labels
+            labels = sample.labels.get(tf)
 
         # Plot panel with multi-window info
         plot_tf_panel(
@@ -415,7 +457,8 @@ def create_multi_tf_figure(
             window=best_window or window,
             channels_dict=channels_dict,
             best_window=best_window,
-            display_window=best_window  # Initially display the best window
+            display_window=best_window,  # Initially display the best window
+            labels_in_cache=labels_in_cache
         )
 
     plt.tight_layout()
@@ -618,7 +661,20 @@ class SampleBrowser:
                 actual_display_window = self.window
 
             # Get labels for this timeframe
-            labels = sample.labels.get(tf) if isinstance(sample.labels, dict) else None
+            # IMPORTANT: labels_per_window is keyed by the 5min window (sample.best_window),
+            # NOT by the TF-specific window we just detected. The cache was generated using
+            # the 5min best_window to key the outer dict, then generate_labels_per_tf
+            # internally does its own per-TF multi-window detection.
+            labels = None
+            labels_in_cache = False
+            cache_window = sample.best_window  # Use the 5min window from cache, not TF-specific
+            if sample.labels_per_window and cache_window and cache_window in sample.labels_per_window:
+                window_labels = sample.labels_per_window[cache_window]
+                labels_in_cache = tf in window_labels
+                labels = window_labels.get(tf)
+            elif isinstance(sample.labels, dict):
+                labels_in_cache = tf in sample.labels
+                labels = sample.labels.get(tf)
 
             # Plot panel with multi-window info
             plot_tf_panel(
@@ -626,7 +682,8 @@ class SampleBrowser:
                 window=actual_display_window or self.window,
                 channels_dict=channels_dict,
                 best_window=best_window,
-                display_window=actual_display_window
+                display_window=actual_display_window,
+                labels_in_cache=labels_in_cache
             )
 
             # Add red border if this TF has flags
