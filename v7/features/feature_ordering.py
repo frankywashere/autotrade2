@@ -11,9 +11,18 @@ CRITICAL: The ordering is TIMEFRAME-GROUPED, not alphabetical!
 - Shared features come last: [vix, tsla_history, spy_history, alignment, events, window_scores]
 
 Feature Dimensions:
-- TSLA per TF: 30 features (18 base + 10 exit_tracking + 2 break_trigger)
+- TSLA per TF: 35 features (18 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking)
+    Return tracking features (5):
+      - return_rate (float)
+      - channel_resilience_score (float)
+      - avg_duration_after_return (float)
+      - max_duration_after_return (int)
+      - returns_leading_to_new_channel (int)
 - SPY per TF: 11 features (channel metrics + RSI)
-- Cross per TF: 8 features (TSLA-in-SPY containment)
+- Cross per TF: 10 features (TSLA-in-SPY containment + RSI correlation)
+    RSI correlation features (2):
+      - rsi_correlation (float)
+      - rsi_correlation_trend (int)
 - VIX: 6 features
 - TSLA History: 25 features (5+5+5 lists + 10 scalars)
 - SPY History: 25 features (same structure)
@@ -21,7 +30,7 @@ Feature Dimensions:
 - Events: 46 features (optional, zeros if not provided)
 - Window Scores: 40 features (8 windows x 5 metrics per window)
 
-Total: (30+11+8) × 11 + (6+25+25+3+46+40) = 49×11 + 145 = 539 + 145 = 684
+Total: (35+11+10) × 11 + (6+25+25+3+46+40) = 56×11 + 145 = 616 + 145 = 761
 """
 
 from typing import List, Dict
@@ -36,9 +45,28 @@ from v7.core.timeframe import TIMEFRAMES
 # =============================================================================
 
 # Per-timeframe feature dimensions
-TSLA_PER_TF = 30    # 18 base + 10 exit_tracking + 2 break_trigger
+TSLA_PER_TF = 35    # 18 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking
 SPY_PER_TF = 11     # channel_valid, direction, position, upper/lower_dist, width, slope, r2, bounces, cycles, rsi
-CROSS_PER_TF = 8    # spy_valid, spy_dir, spy_pos, tsla_in_upper/lower, dist_to_upper/lower, alignment
+CROSS_PER_TF = 10   # spy_valid, spy_dir, spy_pos, tsla_in_upper/lower, dist_to_upper/lower, alignment + rsi_correlation (2)
+
+# TSLA per-TF feature breakdown (35 total):
+#   Base channel features (18):
+#     channel_valid, direction, position, upper_dist, lower_dist, width_pct, slope_pct, r2,
+#     bounces, cycles, touch_density, alternation, last_touch_dist, bar_depth, rsi, ...
+#   Exit tracking features (10):
+#     exit_count, avg_bars_outside, max_bars_outside, exit_frequency, exits_accelerating,
+#     exits_up_count, exits_down_count, avg_return_speed, return_speed_slowing, bounces_after_last_return
+#   Break trigger features (2):
+#     break_trigger_up, break_trigger_down
+#   Return tracking features (5):
+#     return_rate, channel_resilience_score, avg_duration_after_return,
+#     max_duration_after_return, returns_leading_to_new_channel
+
+# Cross-asset per-TF feature breakdown (10 total):
+#   TSLA-in-SPY containment (8):
+#     spy_valid, spy_dir, spy_pos, tsla_in_upper, tsla_in_lower, dist_to_upper, dist_to_lower, alignment
+#   RSI correlation features (2):
+#     rsi_correlation, rsi_correlation_trend
 
 # Shared feature dimensions
 VIX_FEATURES = 6
@@ -49,10 +77,10 @@ EVENT_FEATURES = 46
 WINDOW_SCORE_FEATURES = 40  # 8 windows x 5 metrics (bounce_count, r_squared, quality, alternation_ratio, width)
 
 # Derived constants
-PER_TF_FEATURES = TSLA_PER_TF + SPY_PER_TF + CROSS_PER_TF  # 49
+PER_TF_FEATURES = TSLA_PER_TF + SPY_PER_TF + CROSS_PER_TF  # 35 + 11 + 10 = 56
 SHARED_FEATURES = VIX_FEATURES + TSLA_HISTORY_FEATURES + SPY_HISTORY_FEATURES + ALIGNMENT_FEATURES + EVENT_FEATURES + WINDOW_SCORE_FEATURES  # 145
 N_TIMEFRAMES = len(TIMEFRAMES)  # 11
-TOTAL_FEATURES = PER_TF_FEATURES * N_TIMEFRAMES + SHARED_FEATURES  # 49*11 + 145 = 684
+TOTAL_FEATURES = PER_TF_FEATURES * N_TIMEFRAMES + SHARED_FEATURES  # 56*11 + 145 = 761
 
 
 # =============================================================================
@@ -67,7 +95,7 @@ def build_feature_order() -> List[str]:
     - For each timeframe: [tsla_{tf}, spy_{tf}, cross_{tf}]
     - Then shared: [vix, tsla_history, spy_history, alignment, events]
 
-    This produces contiguous 49-feature blocks per timeframe that the model's
+    This produces contiguous 56-feature blocks per timeframe that the model's
     TF branches can slice directly.
 
     Returns:
@@ -76,7 +104,9 @@ def build_feature_order() -> List[str]:
     order = []
 
     # Per-timeframe features: grouped by timeframe (TF0, TF1, ..., TF10)
-    # Each TF block has: tsla (30) + spy (11) + cross (8) = 49 features
+    # Each TF block has: tsla (35) + spy (11) + cross (10) = 56 features
+    # TSLA includes: 18 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking
+    # Cross includes: 8 containment + 2 RSI correlation
     for tf in TIMEFRAMES:
         order.append(f'tsla_{tf}')
         order.append(f'spy_{tf}')
@@ -225,8 +255,8 @@ def get_shared_index_range() -> tuple:
     Returns:
         Tuple of (start_idx, end_idx) for slicing
     """
-    start = N_TIMEFRAMES * PER_TF_FEATURES  # 11 * 49 = 539
-    end = start + SHARED_FEATURES           # 539 + 105 = 644
+    start = N_TIMEFRAMES * PER_TF_FEATURES  # 11 * 56 = 616
+    end = start + SHARED_FEATURES           # 616 + 145 = 761
     return start, end
 
 
@@ -269,6 +299,16 @@ if __name__ == '__main__':
 
     shared_start, shared_end = get_shared_index_range()
     print(f"  Shared:         indices {shared_start:3d}-{shared_end-1:3d} ({shared_end-shared_start} features)")
+
+    print(f"\n  Note: TSLA per-TF includes:")
+    print(f"    - 18 base channel features")
+    print(f"    - 10 exit tracking features")
+    print(f"    - 2 break trigger features")
+    print(f"    - 5 return tracking features (return_rate, channel_resilience_score,")
+    print(f"        avg_duration_after_return, max_duration_after_return, returns_leading_to_new_channel)")
+    print(f"\n  Note: Cross per-TF includes:")
+    print(f"    - 8 TSLA-in-SPY containment features")
+    print(f"    - 2 RSI correlation features (rsi_correlation, rsi_correlation_trend)")
 
     print("\n" + "=" * 60)
     print("Feature ordering module loaded successfully.")

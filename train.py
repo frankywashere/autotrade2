@@ -1306,9 +1306,10 @@ def check_data_files(data_dir: Path) -> Dict[str, bool]:
 def estimate_dataset_size(window: int, step: int) -> Tuple[int, float]:
     """Rough estimate of dataset size and memory."""
     # Rough estimate: ~100k bars in dataset
-    # Each sample is ~582 features * 4 bytes = ~2.3 KB
+    # Each sample is 761 features * 4 bytes = ~3.0 KB
+    # Feature breakdown: (35+11+10)*11 TF features + 145 shared = 616 + 145 = 761
     estimated_samples = (100000 - window) // step
-    estimated_memory_mb = (estimated_samples * 582 * 4) / (1024 * 1024)
+    estimated_memory_mb = (estimated_samples * 761 * 4) / (1024 * 1024)
 
     return estimated_samples, estimated_memory_mb
 
@@ -1879,6 +1880,10 @@ def run_walk_forward_training(
                     cache_dir=cache_dir,
                     window=config["data"]["window"],
                     step=config["data"]["step"],
+                    min_cycles=config["data"].get("min_cycles", 1),
+                    max_scan=config["data"].get("max_scan", 500),
+                    return_threshold=config["data"].get("return_threshold", 20),
+                    lookforward_bars=config["data"].get("lookforward_bars", 200),
                     train_end=train_end_str,
                     val_end=val_end_str,
                     start_date=train_start_str,

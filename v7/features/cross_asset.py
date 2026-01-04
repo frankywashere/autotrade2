@@ -21,6 +21,90 @@ from core.channel import detect_channel, Channel, Direction
 from core.timeframe import resample_ohlc, TIMEFRAMES
 
 
+def calculate_rsi_correlation(
+    tsla_rsi_series: np.ndarray,
+    spy_rsi_series: np.ndarray,
+    window: int = 20
+) -> Tuple[float, int]:
+    """
+    Calculate rolling Pearson correlation between TSLA and SPY RSI.
+
+    Args:
+        tsla_rsi_series: Array of TSLA RSI values (most recent last)
+        spy_rsi_series: Array of SPY RSI values (most recent last)
+        window: Rolling window size for correlation calculation (default 20)
+
+    Returns:
+        Tuple of:
+            - rsi_correlation: Current correlation value (-1 to 1), 0.0 if insufficient data
+            - rsi_correlation_trend: 1=strengthening, 0=stable, -1=weakening
+    """
+    tsla_rsi = np.asarray(tsla_rsi_series)
+    spy_rsi = np.asarray(spy_rsi_series)
+
+    # Ensure same length
+    min_len = min(len(tsla_rsi), len(spy_rsi))
+    if min_len < window:
+        # Insufficient data for correlation calculation
+        return (0.0, 0)
+
+    # Use the last min_len values from both series
+    tsla_rsi = tsla_rsi[-min_len:]
+    spy_rsi = spy_rsi[-min_len:]
+
+    # Calculate current correlation using the last 'window' values
+    tsla_window = tsla_rsi[-window:]
+    spy_window = spy_rsi[-window:]
+
+    # Check for zero variance (constant values)
+    tsla_std = np.std(tsla_window)
+    spy_std = np.std(spy_window)
+
+    if tsla_std == 0 or spy_std == 0:
+        # Zero variance - correlation undefined
+        return (0.0, 0)
+
+    # Calculate Pearson correlation
+    tsla_centered = tsla_window - np.mean(tsla_window)
+    spy_centered = spy_window - np.mean(spy_window)
+    correlation = np.dot(tsla_centered, spy_centered) / (window * tsla_std * spy_std)
+
+    # Clip to valid range (numerical precision can cause slight overflows)
+    correlation = float(np.clip(correlation, -1.0, 1.0))
+
+    # Calculate trend by comparing current correlation to previous
+    trend = 0
+    if min_len >= window + 5:  # Need at least 5 more bars for trend comparison
+        # Calculate correlation from 5 bars ago
+        tsla_prev_window = tsla_rsi[-(window + 5):-5]
+        spy_prev_window = spy_rsi[-(window + 5):-5]
+
+        tsla_prev_std = np.std(tsla_prev_window)
+        spy_prev_std = np.std(spy_prev_window)
+
+        if tsla_prev_std > 0 and spy_prev_std > 0:
+            tsla_prev_centered = tsla_prev_window - np.mean(tsla_prev_window)
+            spy_prev_centered = spy_prev_window - np.mean(spy_prev_window)
+            prev_correlation = np.dot(tsla_prev_centered, spy_prev_centered) / (
+                window * tsla_prev_std * spy_prev_std
+            )
+            prev_correlation = float(np.clip(prev_correlation, -1.0, 1.0))
+
+            # Determine trend based on absolute correlation change
+            # Strengthening: |current| > |previous| (moving towards +/-1)
+            # Weakening: |current| < |previous| (moving towards 0)
+            abs_diff = abs(correlation) - abs(prev_correlation)
+            threshold = 0.05  # Minimum change to consider as trend
+
+            if abs_diff > threshold:
+                trend = 1  # Strengthening
+            elif abs_diff < -threshold:
+                trend = -1  # Weakening
+            # else: trend = 0 (stable)
+
+    return (correlation, trend)
+
+
 @dataclass
 class CrossAssetContainment:
     """Where is TSLA relative to SPY's channel?"""
@@ -33,6 +117,8 @@ class CrossAssetContainment:
     tsla_dist_to_spy_upper: float # % distance (normalized)
     tsla_dist_to_spy_lower: float # % distance (normalized)
     alignment: int                # 1=both near upper, -1=both near lower, 0=diverging
+    rsi_correlation: float = 0.0  # Current TSLA-SPY RSI correlation (-1 to 1)
+    rsi_correlation_trend: int = 0  # 1=strengthening, 0=stable, -1=weakening
 
 
 @dataclass
@@ -68,7 +154,10 @@ def calculate_cross_asset_containment(
     spy_df: pd.DataFrame,
     spy_channel: Channel,
     timeframe: str,
-    threshold: float = 0.15
+    threshold: float = 0.15,
+    tsla_rsi_series: Optional[np.ndarray] = None,
+    spy_rsi_series: Optional[np.ndarray] = None,
+    rsi_correlation_window: int = 20
 ) -> CrossAssetContainment:
     """
     Calculate where TSLA is relative to SPY's channel.
@@ -81,10 +170,21 @@ def calculate_cross_asset_containment(
         spy_channel: SPY's detected channel
         timeframe: Timeframe name
         threshold: Threshold for "near" boundary
+        tsla_rsi_series: Optional TSLA RSI series for correlation calculation
+        spy_rsi_series: Optional SPY RSI series for correlation calculation
+        rsi_correlation_window: Window for RSI correlation (default 20)
 
     Returns:
         CrossAssetContainment object
     """
+    # Calculate RSI correlation if series are provided
+    rsi_correlation = 0.0
+    rsi_correlation_trend = 0
+    if tsla_rsi_series is not None and spy_rsi_series is not None:
+        rsi_correlation, rsi_correlation_trend = calculate_rsi_correlation(
+            tsla_rsi_series, spy_rsi_series, window=rsi_correlation_window
+        )
+
     if spy_channel is None or not spy_channel.valid:
         return CrossAssetContainment(
             timeframe=timeframe,
@@ -96,6 +196,8 @@ def calculate_cross_asset_containment(
             tsla_dist_to_spy_upper=0.0,
             tsla_dist_to_spy_lower=0.0,
             alignment=0,
+            rsi_correlation=rsi_correlation,
+            rsi_correlation_trend=rsi_correlation_trend,
         )
 
     spy_price = spy_df['close'].iloc[-1]
@@ -156,6 +258,8 @@ def calculate_cross_asset_containment(
         tsla_dist_to_spy_upper=spy_upper_pct,
         tsla_dist_to_spy_lower=spy_lower_pct,
         alignment=alignment,
+        rsi_correlation=rsi_correlation,
+        rsi_correlation_trend=rsi_correlation_trend,
     )
 
 
@@ -262,7 +366,8 @@ def extract_all_cross_asset_features(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    window: int = 20
+    window: int = 20,
+    rsi_correlation_window: int = 20
 ) -> Dict:
     """
     Extract all cross-asset features for all timeframes.
@@ -272,6 +377,7 @@ def extract_all_cross_asset_features(
         spy_df: SPY 5min OHLCV data
         vix_df: VIX daily data
         window: Window for channel detection
+        rsi_correlation_window: Window for RSI correlation calculation
 
     Returns:
         Dict with:
@@ -279,26 +385,40 @@ def extract_all_cross_asset_features(
             - 'cross_containment': Dict[tf, CrossAssetContainment]
             - 'vix': VIXFeatures
     """
+    from features.rsi import calculate_rsi_series
+
     tsla_price = tsla_df['close'].iloc[-1]
 
     spy_features = {}
     cross_containment = {}
 
     for tf in TIMEFRAMES:
-        # Resample SPY to this timeframe
+        # Resample both TSLA and SPY to this timeframe
         if tf == '5min':
             spy_tf = spy_df
+            tsla_tf = tsla_df
         else:
             spy_tf = resample_ohlc(spy_df, tf)
+            tsla_tf = resample_ohlc(tsla_df, tf)
 
         if len(spy_tf) >= window:
             # SPY's own features
             spy_features[tf] = extract_spy_features(spy_tf, window, tf)
 
+            # Calculate RSI series for correlation
+            tsla_rsi_series = None
+            spy_rsi_series = None
+            if len(tsla_tf) >= rsi_correlation_window and len(spy_tf) >= rsi_correlation_window:
+                tsla_rsi_series = calculate_rsi_series(tsla_tf['close'].values, period=14)
+                spy_rsi_series = calculate_rsi_series(spy_tf['close'].values, period=14)
+
             # Cross containment (where is TSLA relative to SPY's channel)
             spy_channel = detect_channel(spy_tf, window=window)
             cross_containment[tf] = calculate_cross_asset_containment(
-                tsla_price, spy_tf, spy_channel, tf
+                tsla_price, spy_tf, spy_channel, tf,
+                tsla_rsi_series=tsla_rsi_series,
+                spy_rsi_series=spy_rsi_series,
+                rsi_correlation_window=rsi_correlation_window
             )
 
     # VIX features

@@ -917,11 +917,18 @@ def main():
 
         st.subheader("Feature Set")
         st.write("""
-        - **644 input features** per prediction
-        - TSLA channel features (geometry, bounces, RSI)
-        - SPY channel features for cross-asset analysis
-        - VIX for volatility context
-        - Historical bounce patterns
+        - **761 input features** per prediction
+        - Per-timeframe features (56 features x 11 TFs = 616):
+          - TSLA channel features (geometry, bounces, RSI): 35 per TF
+          - SPY channel features for cross-asset analysis: 11 per TF
+          - Cross-asset containment features: 10 per TF
+        - Shared features (145 total):
+          - VIX regime and volatility: 6 features
+          - TSLA historical patterns: 25 features
+          - SPY historical patterns: 25 features
+          - Cross-asset alignment: 3 features
+          - Event awareness: 46 features
+          - Window quality scores: 40 features (8 windows x 5 metrics)
         """)
 
         st.subheader("Model Comparison")

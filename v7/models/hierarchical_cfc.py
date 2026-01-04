@@ -7,27 +7,27 @@ This model predicts channel break timing, direction, and post-break channel dire
 using a hierarchical architecture that processes each timeframe independently before
 combining insights across timeframes.
 
-Input Features: 684 dimensions (TIMEFRAME-GROUPED ordering)
+Input Features: 761 dimensions (TIMEFRAME-GROUPED ordering)
 ------------------------------------------------------------
 The input tensor is ordered by timeframe, NOT alphabetically!
-Each TF block contains: [tsla_{tf}, spy_{tf}, cross_{tf}] = 49 features
+Each TF block contains: [tsla_{tf}, spy_{tf}, cross_{tf}] = 56 features
 Followed by shared features at the end.
 
-- TSLA per-TF features: 30 features × 11 timeframes = 330 total
-  * Channel geometry: direction, position, width, slope, R²
+- TSLA per-TF features: 35 features × 11 timeframes = 385 total
+  * Channel geometry: direction, position, width, slope, R² (18 base features)
   * Bounce metrics: count, cycles, bars since bounce
   * RSI: current, divergence, at upper/lower bounces
   * Exit tracking: exit counts, frequency, acceleration (10 features)
   * Break triggers: distance to longer TF boundaries (2 features)
-  * Quality scores: channel_quality, rsi_confidence
+  * Return tracking: return_rate, resilience, duration after return (5 features)
 
 - SPY per-TF features: 11 features × 11 timeframes = 121 total
   * Channel geometry and position
   * Bounce metrics and RSI
 
-- Cross-asset: 8 features × 11 timeframes = 88 total
-  * TSLA position in SPY channels
-  * Alignment scores
+- Cross-asset: 10 features × 11 timeframes = 110 total
+  * TSLA position in SPY channels (8 features)
+  * RSI correlation features (2 features)
 
 - VIX regime: 6 features
   * Level, normalized level, trends, percentile, regime
@@ -47,8 +47,8 @@ Followed by shared features at the end.
 
 Architecture Flow:
 =================
-1. Input Layer (684 dims) → Feature Decomposition
-   ├─ Per-TF features extracted for each of 11 timeframes (49 features each)
+1. Input Layer (761 dims) → Feature Decomposition
+   ├─ Per-TF features extracted for each of 11 timeframes (56 features each)
    ├─ Shared features (VIX, history, alignment, events, window_scores) extracted from end
    ├─ Window scores (last 40 of shared) used for per-TF window selection
 
@@ -127,16 +127,16 @@ class FeatureConfig:
     uses those constants to ensure consistency.
 
     Feature Layout (TIMEFRAME-GROUPED ordering):
-    - Per-TF block: [tsla_{tf}(30), spy_{tf}(11), cross_{tf}(8)] = 49 features
-    - 11 timeframes × 49 = 539 per-TF features
+    - Per-TF block: [tsla_{tf}(35), spy_{tf}(11), cross_{tf}(10)] = 56 features
+    - 11 timeframes × 56 = 616 per-TF features
     - Shared: [vix(6), tsla_history(25), spy_history(25), alignment(3), events(46), window_scores(40)] = 145 features
-    - Total: 539 + 145 = 684 features
+    - Total: 616 + 145 = 761 features
     """
 
     # Per-timeframe feature counts (from feature_ordering.py)
-    tsla_per_tf: int = TSLA_PER_TF    # 30 (18 base + 10 exit_tracking + 2 break_trigger)
+    tsla_per_tf: int = TSLA_PER_TF    # 35 (18 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking)
     spy_per_tf: int = SPY_PER_TF      # 11 (channel metrics + RSI)
-    cross_per_tf: int = CROSS_PER_TF  # 8 (TSLA-in-SPY containment)
+    cross_per_tf: int = CROSS_PER_TF  # 10 (TSLA-in-SPY containment + 2 RSI correlation)
 
     # Shared features (same across all TFs)
     vix_features: int = VIX_FEATURES                      # 6
@@ -160,7 +160,7 @@ class FeatureConfig:
         shared = (self.vix_features + self.tsla_history_features +
                   self.spy_history_features + self.alignment_features +
                   self.event_features + self.window_score_features)
-        return per_tf + shared  # = (30+11+8)*11 + (6+25+25+3+46+40) = 539 + 145 = 684
+        return per_tf + shared  # = (35+11+10)*11 + (6+25+25+3+46+40) = 616 + 145 = 761
 
     @property
     def shared_features(self) -> int:
@@ -233,7 +233,7 @@ class TFBranch(nn.Module):
         Initialize timeframe branch.
 
         Args:
-            per_tf_dim: Dimension of per-timeframe features (51 for TSLA+SPY+cross)
+            per_tf_dim: Dimension of per-timeframe features (56 for TSLA+SPY+cross)
             shared_dim: Dimension of shared features (65 for VIX+history+alignment)
             hidden_dim: Output embedding dimension
             cfc_units: Number of CfC units (neurons in liquid network, must be > hidden_dim + 2)
@@ -742,17 +742,17 @@ class HierarchicalCfCModel(nn.Module):
     Complete hierarchical CfC model for multi-timeframe channel prediction.
 
     Architecture:
-    1. Decompose 684-dim input into per-TF (49 features each) and shared features (145)
+    1. Decompose 761-dim input into per-TF (56 features each) and shared features (145)
     2. Process each TF through dedicated CfC branch
     3. Attend over TF embeddings to create unified context
     4. Predict duration, break direction, next channel direction, confidence
     5. Select optimal window per timeframe using PerTFWindowSelector
 
     CRITICAL: Input must use TIMEFRAME-GROUPED ordering from feature_ordering.py!
-    - Indices 0-48: TF0 (5min) = tsla_5min(30) + spy_5min(11) + cross_5min(8)
-    - Indices 49-97: TF1 (15min) = tsla_15min(30) + spy_15min(11) + cross_15min(8)
+    - Indices 0-55: TF0 (5min) = tsla_5min(35) + spy_5min(11) + cross_5min(10)
+    - Indices 56-111: TF1 (15min) = tsla_15min(35) + spy_15min(11) + cross_15min(10)
     - ... (11 timeframes total)
-    - Indices 539-683: Shared = vix(6) + tsla_history(25) + spy_history(25) + alignment(3) + events(46) + window_scores(40)
+    - Indices 616-760: Shared = vix(6) + tsla_history(25) + spy_history(25) + alignment(3) + events(46) + window_scores(40)
 
     Window Selection:
     - Last 40 features of shared are window_scores (8 windows x 5 metrics)
@@ -888,7 +888,7 @@ class HierarchicalCfCModel(nn.Module):
         Forward pass through hierarchical model.
 
         Args:
-            x: [batch_size, 684] - full feature vector (TIMEFRAME-GROUPED ordering!)
+            x: [batch_size, 761] - full feature vector (TIMEFRAME-GROUPED ordering!)
             return_attention: If True, return attention weights
 
         Returns:
@@ -1055,7 +1055,7 @@ class HierarchicalCfCModel(nn.Module):
         Make predictions in evaluation mode with per-timeframe breakdown.
 
         Args:
-            x: [batch_size, 684] - input features (TIMEFRAME-GROUPED ordering!)
+            x: [batch_size, 761] - input features (TIMEFRAME-GROUPED ordering!)
 
         Returns:
             Dictionary with:

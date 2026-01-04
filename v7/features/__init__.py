@@ -8,7 +8,8 @@ from .containment import check_containment, ContainmentInfo
 # Cross-asset and history
 from .cross_asset import (
     CrossAssetContainment, VIXFeatures, SPYFeatures,
-    extract_all_cross_asset_features
+    extract_all_cross_asset_features,
+    calculate_rsi_correlation,
 )
 from .history import (
     ChannelHistoryFeatures, extract_history_features

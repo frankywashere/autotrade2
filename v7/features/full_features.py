@@ -527,7 +527,7 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 f.rsi_confidence,
             ]
 
-            # Add exit tracking features
+            # Add exit tracking features (15 total: 10 original + 5 new return tracking)
             if f.exit_tracking:
                 et = f.exit_tracking
                 base_features.extend([
@@ -541,10 +541,16 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                     et.avg_return_speed,
                     float(et.return_speed_slowing),
                     et.bounces_after_last_return,
+                    # New return tracking features (5)
+                    et.return_rate,
+                    et.channel_resilience_score,
+                    et.avg_duration_after_return,
+                    et.max_duration_after_return,
+                    et.returns_leading_to_new_channel,
                 ])
             else:
-                # Default values if no exit tracking
-                base_features.extend([0.0] * 10)
+                # Default values if no exit tracking (15 features)
+                base_features.extend([0.0] * 15)
 
             # Add break trigger features
             if f.break_trigger:
@@ -558,7 +564,7 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
 
             arrays[f'tsla_{tf}'] = np.array(base_features, dtype=np.float32)
         else:
-            # Provide default invalid features for this TF (30 total features)
+            # Provide default invalid features for this TF (35 total features)
             # All zeros with channel_valid=0.0, direction=1 (sideways), position=0.5, rsi=50.0
             arrays[f'tsla_{tf}'] = np.array([
                 0.0,   # channel_valid
@@ -579,8 +585,9 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 50.0,  # rsi_at_last_lower
                 0.0,   # channel_quality
                 0.5,   # rsi_confidence
-                # Exit tracking defaults (10)
+                # Exit tracking defaults (15: 10 original + 5 new return tracking)
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0,
                 # Break trigger defaults (2)
                 0.0, 0.0,
             ], dtype=np.float32)
@@ -631,9 +638,11 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 c.tsla_dist_to_spy_upper,
                 c.tsla_dist_to_spy_lower,
                 c.alignment,
+                c.rsi_correlation,
+                c.rsi_correlation_trend,
             ], dtype=np.float32)
         else:
-            # Provide default invalid features for this TF (8 total features)
+            # Provide default invalid features for this TF (10 total features)
             arrays[f'cross_{tf}'] = np.array([
                 0.0,   # spy_channel_valid
                 1.0,   # spy_direction (sideways)
@@ -643,6 +652,8 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 0.0,   # tsla_dist_to_spy_upper
                 0.0,   # tsla_dist_to_spy_lower
                 0.0,   # alignment
+                0.0,   # rsi_correlation
+                0.0,   # rsi_correlation_trend
             ], dtype=np.float32)
 
     # VIX

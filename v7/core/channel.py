@@ -82,6 +82,10 @@ class Channel:
     upper_touches: int = 0
     lower_touches: int = 0
     quality_score: float = 0.0
+    # False break tracking fields
+    false_break_count: int = 0  # Number of temporary exits that returned
+    false_break_rate: float = 0.0  # false_breaks / total_exits (0-1, higher = more resilient)
+    channel_durability_score: float = 0.0  # Composite score including false break resilience
 
     # Optional: store the OHLC data used
     close: np.ndarray = field(default=None, repr=False)
@@ -326,23 +330,34 @@ def detect_channel(
     return channel
 
 
-def calculate_channel_quality_score(channel: Channel) -> float:
+def calculate_channel_quality_score(
+    channel: Channel,
+    false_break_rate: Optional[float] = None
+) -> float:
     """
     Calculate quality score emphasizing alternating bounces.
 
-    Score = alternations × (1 + alternation_ratio)
+    Score = alternations × (1 + alternation_ratio) × (1 + 0.2 × false_break_rate)
 
     This rewards:
     - More alternations (bounces) - primary factor
     - Cleaner alternation pattern (higher ratio) - secondary factor
+    - Higher false break resilience (optional) - tertiary factor
 
     Examples:
-    - 5 alternations with ratio 1.0 → score = 5 × 2.0 = 10.0
+    - 5 alternations with ratio 1.0, no false break data → score = 5 × 2.0 = 10.0
+    - 5 alternations with ratio 1.0, false_break_rate 0.5 → score = 5 × 2.0 × 1.1 = 11.0
     - 5 alternations with ratio 0.5 → score = 5 × 1.5 = 7.5
     - 2 alternations with ratio 1.0 → score = 2 × 2.0 = 4.0
 
     R² is deliberately NOT used - a channel with many bounces is valid
     regardless of how well a linear regression fits.
+
+    Args:
+        channel: Channel object to score
+        false_break_rate: Optional false break rate (0-1). If provided, incorporates
+                         durability bonus. If None, uses original formula for
+                         backwards compatibility.
 
     Returns:
         float: Quality score (0.0+, typically 0-20)
@@ -352,7 +367,88 @@ def calculate_channel_quality_score(channel: Channel) -> float:
     ratio = channel.alternation_ratio
 
     quality = alternations * (1 + ratio)
+
+    # Optionally incorporate false break resilience
+    if false_break_rate is not None:
+        quality = quality * (1 + 0.2 * false_break_rate)
+
     return float(quality)
+
+
+@dataclass
+class ExitEvent:
+    """
+    Record of a channel exit event.
+
+    Attributes:
+        bar_index: Bar index when exit occurred
+        exit_type: 'upper' or 'lower' indicating which boundary was breached
+        returned: Whether price returned to channel after exit
+        bars_outside: Number of bars spent outside channel before return (if returned)
+    """
+    bar_index: int
+    exit_type: str  # 'upper' or 'lower'
+    returned: bool
+    bars_outside: int = 0
+
+
+def calculate_channel_durability(
+    channel: Channel,
+    exit_events: List[ExitEvent]
+) -> Tuple[int, float, float]:
+    """
+    Calculate channel durability based on false break analysis.
+
+    A false break occurs when price temporarily exits the channel but returns.
+    Channels that survive many false breaks are more durable/reliable.
+
+    Args:
+        channel: Channel object to analyze
+        exit_events: List of ExitEvent objects representing channel exits
+
+    Returns:
+        Tuple of (false_break_count, false_break_rate, durability_score)
+        - false_break_count: Number of exits that returned (false breaks)
+        - false_break_rate: false_breaks / total_exits (0-1, higher = more resilient)
+        - durability_score: Composite durability score
+
+    Examples:
+        - 3 exits, all returned → rate = 1.0, very durable channel
+        - 5 exits, 2 returned → rate = 0.4, moderately durable
+        - 2 exits, 0 returned → rate = 0.0, breaks are real breakouts
+    """
+    if not exit_events:
+        return 0, 0.0, 0.0
+
+    total_exits = len(exit_events)
+    false_break_count = sum(1 for e in exit_events if e.returned)
+
+    # Calculate false break rate (higher = more resilient)
+    false_break_rate = false_break_count / total_exits if total_exits > 0 else 0.0
+
+    # Durability score combines:
+    # 1. Base: false_break_rate (0-1)
+    # 2. Volume bonus: more false breaks survived = more proven durability
+    # 3. Quick return bonus: if exits return quickly, channel is stronger
+    avg_bars_outside = 0.0
+    if false_break_count > 0:
+        avg_bars_outside = sum(
+            e.bars_outside for e in exit_events if e.returned
+        ) / false_break_count
+
+    # Quick return factor: faster returns = more durable (decay with bars outside)
+    # Uses exponential decay: e^(-0.1 * avg_bars) so 0 bars = 1.0, 10 bars = 0.37
+    quick_return_factor = np.exp(-0.1 * avg_bars_outside) if false_break_count > 0 else 0.0
+
+    # Volume factor: more false breaks survived = more confidence
+    # Uses log scaling to prevent runaway values
+    volume_factor = np.log1p(false_break_count) / np.log1p(10)  # Normalized to ~1.0 at 10 breaks
+
+    # Composite durability score
+    # Base rate contributes most, with bonuses for quick returns and high volume
+    durability_score = false_break_rate * (1 + 0.3 * quick_return_factor + 0.2 * volume_factor)
+
+    return false_break_count, false_break_rate, float(durability_score)
 
 
 def detect_channels_multi_window(

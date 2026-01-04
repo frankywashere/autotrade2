@@ -696,7 +696,9 @@ class MetricsCalculator:
         Args:
             predictions: Dictionary of predictions
             targets: Dictionary of targets
-            masks: Optional dictionary of masks
+            masks: Optional dictionary of masks. Supports both v9.0.0 format
+                   (with _valid suffix: 'duration_valid', 'direction_valid', etc.)
+                   and legacy format ('duration', 'direction', etc.)
 
         Returns:
             Dictionary of computed metrics
@@ -704,24 +706,28 @@ class MetricsCalculator:
         if masks is None:
             masks = {}
 
+        # Helper to get mask with backward compatibility (v9.0.0 _valid suffix or legacy)
+        def get_mask(key: str) -> Optional[torch.Tensor]:
+            """Get mask supporting both 'key_valid' (v9.0.0) and 'key' (legacy) formats."""
+            return masks.get(f'{key}_valid', masks.get(key))
+
         metrics = {}
 
         # Duration MAE
         duration_error = torch.abs(
             predictions['duration_mean'] - targets['duration']
         )
-        if 'duration' in masks:
-            mask = masks['duration']
-            duration_mae = (duration_error * mask).sum() / (mask.sum() + 1e-6)
+        duration_mask = get_mask('duration')
+        if duration_mask is not None:
+            duration_mae = (duration_error * duration_mask).sum() / (duration_mask.sum() + 1e-6)
         else:
             duration_mae = duration_error.mean()
         metrics['duration_mae'] = duration_mae.item()
 
         # Duration uncertainty (average predicted std)
         duration_std = torch.exp(predictions['duration_log_std'])
-        if 'duration' in masks:
-            mask = masks['duration']
-            avg_std = (duration_std * mask).sum() / (mask.sum() + 1e-6)
+        if duration_mask is not None:
+            avg_std = (duration_std * duration_mask).sum() / (duration_mask.sum() + 1e-6)
         else:
             avg_std = duration_std.mean()
         metrics['duration_std'] = avg_std.item()
@@ -730,9 +736,9 @@ class MetricsCalculator:
         direction_probs = torch.sigmoid(predictions['direction_logits'])
         direction_preds = (direction_probs > 0.5).long()
         direction_correct = (direction_preds == targets['direction'].long()).float()
-        if 'direction' in masks:
-            mask = masks['direction']
-            direction_acc = (direction_correct * mask).sum() / (mask.sum() + 1e-6)
+        direction_mask = get_mask('direction')
+        if direction_mask is not None:
+            direction_acc = (direction_correct * direction_mask).sum() / (direction_mask.sum() + 1e-6)
         else:
             direction_acc = direction_correct.mean()
         metrics['direction_accuracy'] = direction_acc.item()
@@ -741,9 +747,9 @@ class MetricsCalculator:
         next_channel_probs = F.softmax(predictions['next_channel_logits'], dim=-1)
         next_channel_preds = next_channel_probs.argmax(dim=-1)
         next_channel_correct = (next_channel_preds == targets['next_channel'].long()).float()
-        if 'next_channel' in masks:
-            mask = masks['next_channel']
-            next_channel_acc = (next_channel_correct * mask).sum() / (mask.sum() + 1e-6)
+        next_channel_mask = get_mask('next_channel')
+        if next_channel_mask is not None:
+            next_channel_acc = (next_channel_correct * next_channel_mask).sum() / (next_channel_mask.sum() + 1e-6)
         else:
             next_channel_acc = next_channel_correct.mean()
         metrics['next_channel_accuracy'] = next_channel_acc.item()
@@ -753,14 +759,14 @@ class MetricsCalculator:
             direction_probs,
             direction_preds,
             targets['direction'].long(),
-            masks.get('direction')
+            direction_mask
         )
         metrics['direction_ece'] = ece.item()
 
         brier = self.brier_calculator(
             direction_probs,
             targets['direction'],
-            masks.get('direction')
+            direction_mask
         )
         metrics['direction_brier'] = brier.item()
 
@@ -770,8 +776,8 @@ class MetricsCalculator:
             for i, tf_name in enumerate(self.timeframe_names):
                 # Duration MAE
                 tf_error = duration_error[:, i]
-                if 'duration' in masks:
-                    tf_mask = masks['duration'][:, i]
+                if duration_mask is not None:
+                    tf_mask = duration_mask[:, i]
                     tf_mae = (tf_error * tf_mask).sum() / (tf_mask.sum() + 1e-6)
                 else:
                     tf_mae = tf_error.mean()
@@ -779,8 +785,8 @@ class MetricsCalculator:
 
                 # Direction accuracy
                 tf_correct = direction_correct[:, i]
-                if 'direction' in masks:
-                    tf_mask = masks['direction'][:, i]
+                if direction_mask is not None:
+                    tf_mask = direction_mask[:, i]
                     tf_acc = (tf_correct * tf_mask).sum() / (tf_mask.sum() + 1e-6)
                 else:
                     tf_acc = tf_correct.mean()
@@ -861,16 +867,18 @@ def example_usage():
         'next_channel': torch.randint(0, 3, (batch_size, num_timeframes), device=device)
     }
 
-    # Create masks (e.g., for handling variable-length sequences)
+    # Create validity masks (v9.0.0 format with _valid suffix)
     masks = {
-        'duration': torch.ones(batch_size, num_timeframes, device=device),
-        'direction': torch.ones(batch_size, num_timeframes, device=device),
-        'next_channel': torch.ones(batch_size, num_timeframes, device=device)
+        'duration_valid': torch.ones(batch_size, num_timeframes, device=device),
+        'direction_valid': torch.ones(batch_size, num_timeframes, device=device),
+        'next_channel_valid': torch.ones(batch_size, num_timeframes, device=device),
+        'trigger_tf_valid': torch.ones(batch_size, num_timeframes, device=device)
     }
     # Mask out last timeframe for some samples
-    masks['duration'][::3, -1] = 0
-    masks['direction'][::3, -1] = 0
-    masks['next_channel'][::3, -1] = 0
+    masks['duration_valid'][::3, -1] = 0
+    masks['direction_valid'][::3, -1] = 0
+    masks['next_channel_valid'][::3, -1] = 0
+    masks['trigger_tf_valid'][::3, -1] = 0
 
     print("\n1. Individual Loss Functions")
     print("-" * 80)
@@ -881,7 +889,7 @@ def example_usage():
         predictions['duration_mean'],
         predictions['duration_log_std'],
         targets['duration'],
-        masks['duration']
+        masks['duration_valid']
     )
     print(f"Duration Loss (Gaussian NLL): {duration_loss.item():.4f}")
 
@@ -890,7 +898,7 @@ def example_usage():
     direction_loss = direction_loss_fn(
         predictions['direction_logits'],
         targets['direction'],
-        masks['direction']
+        masks['direction_valid']
     )
     print(f"Direction Loss (BCE): {direction_loss.item():.4f}")
 
@@ -899,7 +907,7 @@ def example_usage():
     next_channel_loss = next_channel_loss_fn(
         predictions['next_channel_logits'],
         targets['next_channel'],
-        masks['next_channel']
+        masks['next_channel_valid']
     )
     print(f"Next Channel Loss (CE): {next_channel_loss.item():.4f}")
 
@@ -932,7 +940,8 @@ def example_usage():
         'duration': 2.0,
         'direction': 1.0,
         'next_channel': 1.0,
-        'calibration': 0.1
+        'calibration': 0.1,
+        'trigger_tf': 1.0  # v9.0.0: 21-class trigger TF prediction
     }
 
     combined_loss_fixed = CombinedLoss(
@@ -987,11 +996,11 @@ def example_usage():
     print("\n6. Training Loop Example")
     print("-" * 80)
 
-    print("\nTypical training loop:")
+    print("\nTypical training loop (v9.0.0 format):")
     print("""
     # Initialize
     model = ChannelPredictionModel(...)
-    loss_fn = CombinedLoss(num_timeframes=4, use_learnable_weights=True)
+    loss_fn = CombinedLoss(num_timeframes=11, use_learnable_weights=True)
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(loss_fn.parameters()),
         lr=1e-4
@@ -999,16 +1008,28 @@ def example_usage():
 
     # Training
     for epoch in range(num_epochs):
-        for batch in dataloader:
+        for features, labels in dataloader:
             # Forward pass
-            predictions = model(batch['features'])
+            predictions = model(features)
+
+            # Extract v9.0.0 validity masks (with _valid suffix)
+            masks = {
+                'duration_valid': labels['duration_valid'],
+                'direction_valid': labels['direction_valid'],
+                'next_channel_valid': labels['next_channel_valid'],
+                'trigger_tf_valid': labels['trigger_tf_valid'],
+            }
+
+            # Extract targets
+            targets = {
+                'duration': labels['duration'],
+                'direction': labels['direction'],
+                'next_channel': labels['next_channel'],
+                'trigger_tf': labels['trigger_tf'],
+            }
 
             # Compute loss
-            total_loss, loss_dict = loss_fn(
-                predictions,
-                batch['targets'],
-                batch['masks']
-            )
+            total_loss, loss_dict = loss_fn(predictions, targets, masks)
 
             # Backward pass
             optimizer.zero_grad()
@@ -1017,11 +1038,7 @@ def example_usage():
 
             # Log metrics
             if step % log_interval == 0:
-                metrics = metrics_calc.compute_metrics(
-                    predictions,
-                    batch['targets'],
-                    batch['masks']
-                )
+                metrics = metrics_calc.compute_metrics(predictions, targets, masks)
                 print(f"Step {step}: Loss={loss_dict['total']:.4f}, "
                       f"Dir Acc={metrics['direction_accuracy']:.2%}")
     """)

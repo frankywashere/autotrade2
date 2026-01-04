@@ -63,6 +63,11 @@ class ExitTrackingFeatures:
         avg_return_speed: Average 1/bars_outside for returned exits (higher = faster)
         return_speed_slowing: Whether returns are taking longer recently
         bounces_after_last_return: Number of bounces since last return event
+        return_rate: Percentage of exits that resulted in returns (0-1)
+        channel_resilience_score: Composite score rewarding more returns, faster returns (0-1)
+        avg_duration_after_return: Average bars channel remained valid after returns
+        max_duration_after_return: Maximum bars channel lasted after a return
+        returns_leading_to_new_channel: Count of returns that led to channel reformation (>20 bars inside)
     """
     exit_count: int
     avg_bars_outside: float
@@ -74,6 +79,11 @@ class ExitTrackingFeatures:
     avg_return_speed: float
     return_speed_slowing: bool
     bounces_after_last_return: int
+    return_rate: float
+    channel_resilience_score: float
+    avg_duration_after_return: float
+    max_duration_after_return: int
+    returns_leading_to_new_channel: int
 
 
 def _project_channel_bounds(
@@ -273,6 +283,11 @@ def _empty_features() -> ExitTrackingFeatures:
         avg_return_speed=0.0,
         return_speed_slowing=False,
         bounces_after_last_return=0,
+        return_rate=0.0,
+        channel_resilience_score=0.0,
+        avg_duration_after_return=0.0,
+        max_duration_after_return=0,
+        returns_leading_to_new_channel=0,
     )
 
 
@@ -293,7 +308,7 @@ def _calculate_features(
         ExitTrackingFeatures with all metrics
     """
     if not exit_events:
-        # No exits detected
+        # No exits detected - perfect resilience (no exits means channel held)
         return ExitTrackingFeatures(
             exit_count=0,
             avg_bars_outside=0.0,
@@ -305,6 +320,11 @@ def _calculate_features(
             avg_return_speed=0.0,
             return_speed_slowing=False,
             bounces_after_last_return=channel.bounce_count,
+            return_rate=1.0,  # No exits means no failures, treat as perfect
+            channel_resilience_score=1.0,  # Maximum resilience
+            avg_duration_after_return=0.0,
+            max_duration_after_return=0,
+            returns_leading_to_new_channel=0,
         )
 
     exit_count = len(exit_events)
@@ -365,6 +385,54 @@ def _calculate_features(
         # No returns, so all bounces count
         bounces_after_last_return = channel.bounce_count
 
+    # Calculate return rate: percentage of exits that resulted in returns (0-1)
+    return_rate = len(returned_events) / exit_count if exit_count > 0 else 0.0
+
+    # Calculate channel_resilience_score as a composite metric:
+    # resilience = return_rate * 0.4 + (1 - avg_normalized_bars_outside) * 0.3 + (bounces_after_returns / max_bounces) * 0.3
+    # Where avg_normalized_bars_outside = min(avg_bars_outside / 50, 1.0)
+    avg_normalized_bars_outside = min(avg_bars_outside / 50.0, 1.0)
+
+    # For the bounce component, use a reasonable max (e.g., 10 bounces as "excellent")
+    max_bounces = 10.0
+    bounce_component = min(bounces_after_last_return / max_bounces, 1.0)
+
+    channel_resilience_score = (
+        return_rate * 0.4 +
+        (1.0 - avg_normalized_bars_outside) * 0.3 +
+        bounce_component * 0.3
+    )
+
+    # Calculate post-return durability metrics
+    # For each return event, track how many bars until the next exit or end of data
+    durations_after_return: List[int] = []
+    returns_leading_to_new_channel = 0
+
+    for i, event in enumerate(exit_events):
+        if event.did_return and event.return_bar is not None:
+            return_bar = event.return_bar
+
+            # Find the next exit bar, or use end of data
+            next_exit_bar = n_bars  # Default to end of data
+            for next_event in exit_events[i + 1:]:
+                next_exit_bar = next_event.bar_index
+                break
+
+            # Duration is bars from return until next exit (or end of data)
+            duration = next_exit_bar - return_bar
+            durations_after_return.append(duration)
+
+            # Count if this return led to sustained channel behavior (>20 bars inside)
+            if duration > 20:
+                returns_leading_to_new_channel += 1
+
+    if durations_after_return:
+        avg_duration_after_return = float(np.mean(durations_after_return))
+        max_duration_after_return = int(np.max(durations_after_return))
+    else:
+        avg_duration_after_return = 0.0
+        max_duration_after_return = 0
+
     return ExitTrackingFeatures(
         exit_count=exit_count,
         avg_bars_outside=avg_bars_outside,
@@ -376,6 +444,11 @@ def _calculate_features(
         avg_return_speed=avg_return_speed,
         return_speed_slowing=return_speed_slowing,
         bounces_after_last_return=bounces_after_last_return,
+        return_rate=return_rate,
+        channel_resilience_score=channel_resilience_score,
+        avg_duration_after_return=avg_duration_after_return,
+        max_duration_after_return=max_duration_after_return,
+        returns_leading_to_new_channel=returns_leading_to_new_channel,
     )
 
 
@@ -402,4 +475,9 @@ def features_to_dict(features: ExitTrackingFeatures) -> dict:
         'avg_return_speed': features.avg_return_speed,
         'return_speed_slowing': int(features.return_speed_slowing),
         'bounces_after_last_return': features.bounces_after_last_return,
+        'return_rate': features.return_rate,
+        'channel_resilience_score': features.channel_resilience_score,
+        'avg_duration_after_return': features.avg_duration_after_return,
+        'max_duration_after_return': features.max_duration_after_return,
+        'returns_leading_to_new_channel': features.returns_leading_to_new_channel,
     }

@@ -545,6 +545,7 @@ class Trainer:
     def train(self) -> Dict[str, List[Dict]]:
         """Main training loop."""
         print(f"Starting training on {self.device}")
+        print(f"Expected feature dimensions: {TOTAL_FEATURES}")
         print(f"Training samples: {len(self.train_loader.dataset)}")
         print(f"Validation samples: {len(self.val_loader.dataset)}")
 
