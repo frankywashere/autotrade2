@@ -48,47 +48,32 @@ def calculate_rsi_correlation(
         # Insufficient data for correlation calculation
         return (0.0, 0)
 
-    # Use the last min_len values from both series
-    tsla_rsi = tsla_rsi[-min_len:]
-    spy_rsi = spy_rsi[-min_len:]
+    # Align arrays to the same length (use last min_len values)
+    tsla_aligned = tsla_rsi[-min_len:]
+    spy_aligned = spy_rsi[-min_len:]
 
-    # Calculate current correlation using the last 'window' values
-    tsla_window = tsla_rsi[-window:]
-    spy_window = spy_rsi[-window:]
+    # Get windows for current correlation
+    tsla_window = tsla_aligned[-window:]
+    spy_window = spy_aligned[-window:]
 
     # Check for zero variance (constant values)
-    tsla_std = np.std(tsla_window)
-    spy_std = np.std(spy_window)
-
-    if tsla_std == 0 or spy_std == 0:
-        # Zero variance - correlation undefined
+    if np.std(tsla_window) == 0 or np.std(spy_window) == 0:
         return (0.0, 0)
 
-    # Calculate Pearson correlation
-    tsla_centered = tsla_window - np.mean(tsla_window)
-    spy_centered = spy_window - np.mean(spy_window)
-    correlation = np.dot(tsla_centered, spy_centered) / (window * tsla_std * spy_std)
-
-    # Clip to valid range (numerical precision can cause slight overflows)
-    correlation = float(np.clip(correlation, -1.0, 1.0))
+    # Calculate Pearson correlation using numpy's optimized corrcoef
+    corr_matrix = np.corrcoef(tsla_window, spy_window)
+    correlation = float(np.clip(corr_matrix[0, 1], -1.0, 1.0))
 
     # Calculate trend by comparing current correlation to previous
     trend = 0
     if min_len >= window + 5:  # Need at least 5 more bars for trend comparison
-        # Calculate correlation from 5 bars ago
-        tsla_prev_window = tsla_rsi[-(window + 5):-5]
-        spy_prev_window = spy_rsi[-(window + 5):-5]
+        # Get window from 5 bars ago
+        tsla_prev = tsla_aligned[-(window + 5):-5]
+        spy_prev = spy_aligned[-(window + 5):-5]
 
-        tsla_prev_std = np.std(tsla_prev_window)
-        spy_prev_std = np.std(spy_prev_window)
-
-        if tsla_prev_std > 0 and spy_prev_std > 0:
-            tsla_prev_centered = tsla_prev_window - np.mean(tsla_prev_window)
-            spy_prev_centered = spy_prev_window - np.mean(spy_prev_window)
-            prev_correlation = np.dot(tsla_prev_centered, spy_prev_centered) / (
-                window * tsla_prev_std * spy_prev_std
-            )
-            prev_correlation = float(np.clip(prev_correlation, -1.0, 1.0))
+        if np.std(tsla_prev) > 0 and np.std(spy_prev) > 0:
+            prev_corr_matrix = np.corrcoef(tsla_prev, spy_prev)
+            prev_correlation = float(np.clip(prev_corr_matrix[0, 1], -1.0, 1.0))
 
             # Determine trend based on absolute correlation change
             # Strengthening: |current| > |previous| (moving towards +/-1)
@@ -100,7 +85,6 @@ def calculate_rsi_correlation(
                 trend = 1  # Strengthening
             elif abs_diff < -threshold:
                 trend = -1  # Weakening
-            # else: trend = 0 (stable)
 
     return (correlation, trend)
 
@@ -392,6 +376,10 @@ def extract_all_cross_asset_features(
     spy_features = {}
     cross_containment = {}
 
+    # Cache for RSI series to avoid redundant calculations
+    # Key: (symbol, timeframe), Value: RSI series array
+    rsi_cache: Dict[Tuple[str, str], np.ndarray] = {}
+
     for tf in TIMEFRAMES:
         # Resample both TSLA and SPY to this timeframe
         if tf == '5min':
@@ -405,12 +393,21 @@ def extract_all_cross_asset_features(
             # SPY's own features
             spy_features[tf] = extract_spy_features(spy_tf, window, tf)
 
-            # Calculate RSI series for correlation
+            # Calculate RSI series for correlation (with caching)
             tsla_rsi_series = None
             spy_rsi_series = None
             if len(tsla_tf) >= rsi_correlation_window and len(spy_tf) >= rsi_correlation_window:
-                tsla_rsi_series = calculate_rsi_series(tsla_tf['close'].values, period=14)
-                spy_rsi_series = calculate_rsi_series(spy_tf['close'].values, period=14)
+                # Check cache for TSLA RSI
+                tsla_cache_key = ('tsla', tf)
+                if tsla_cache_key not in rsi_cache:
+                    rsi_cache[tsla_cache_key] = calculate_rsi_series(tsla_tf['close'].values, period=14)
+                tsla_rsi_series = rsi_cache[tsla_cache_key]
+
+                # Check cache for SPY RSI
+                spy_cache_key = ('spy', tf)
+                if spy_cache_key not in rsi_cache:
+                    rsi_cache[spy_cache_key] = calculate_rsi_series(spy_tf['close'].values, period=14)
+                spy_rsi_series = rsi_cache[spy_cache_key]
 
             # Cross containment (where is TSLA relative to SPY's channel)
             spy_channel = detect_channel(spy_tf, window=window)

@@ -119,7 +119,9 @@ def check_containment(
 def check_all_containments(
     df_base: pd.DataFrame,
     current_tf: str,
-    window: int = 20
+    window: int = 20,
+    resample_cache: Optional[Dict[str, pd.DataFrame]] = None,
+    channel_cache: Optional[Dict[str, Channel]] = None,
 ) -> Dict[str, ContainmentInfo]:
     """
     Check containment against all longer timeframes.
@@ -128,6 +130,10 @@ def check_all_containments(
         df_base: Base OHLCV data (e.g., 5min bars)
         current_tf: Current timeframe
         window: Window size for channel detection
+        resample_cache: Optional cache dict for resampled DataFrames (keyed by timeframe).
+                        If provided, will use cached data and store new resamples.
+        channel_cache: Optional cache dict for detected Channels (keyed by timeframe).
+                       If provided, will use cached channels and skip re-detection.
 
     Returns:
         Dict mapping longer TF names to ContainmentInfo
@@ -135,15 +141,35 @@ def check_all_containments(
     current_price = df_base['close'].iloc[-1]
     longer_tfs = get_longer_timeframes(current_tf)
 
+    # Initialize local caches if not provided
+    if resample_cache is None:
+        resample_cache = {}
+    if channel_cache is None:
+        channel_cache = {}
+
     # Detect channels at each longer timeframe
     longer_channels = {}
     for tf in longer_tfs:
-        df_tf = resample_ohlc(df_base, tf)
+        # Check channel cache first
+        if tf in channel_cache:
+            longer_channels[tf] = channel_cache[tf]
+            continue
+
+        # Check resample cache or compute
+        if tf in resample_cache:
+            df_tf = resample_cache[tf]
+        else:
+            df_tf = resample_ohlc(df_base, tf)
+            resample_cache[tf] = df_tf
+
         try:
-            longer_channels[tf] = detect_channel(df_tf, window=window)
+            channel = detect_channel(df_tf, window=window)
+            longer_channels[tf] = channel
+            channel_cache[tf] = channel
         except (ValueError, IndexError):
             # Insufficient data - set to None
             longer_channels[tf] = None
+            channel_cache[tf] = None
 
     return check_containment(current_price, current_tf, longer_channels)
 

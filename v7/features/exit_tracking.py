@@ -223,36 +223,55 @@ def track_exits_in_channel(
     upper = upper[:n_bars]
     lower = lower[:n_bars]
 
-    # Scan for exits and returns
+    # Vectorized computation of inside/outside status for all bars
+    # A bar is "outside up" if high > upper, "outside down" if low < lower
+    # A bar is "inside" if high <= upper AND low >= lower
+    outside_up = highs > upper
+    outside_down = lows < lower
+    is_outside = outside_up | outside_down
+    is_inside = (highs <= upper) & (lows >= lower)
+
+    # Find exit transitions: bar where we go from inside (or start) to outside
+    # Prepend True to represent "inside" state before first bar
+    was_inside_or_start = np.concatenate([[True], is_inside[:-1]])
+    exit_mask = was_inside_or_start & is_outside
+    exit_indices = np.where(exit_mask)[0]
+
+    # For each exit, determine direction (UP takes priority if both conditions met)
+    # and find the next return (first bar that is fully inside after the exit)
     exit_events: List[ExitEvent] = []
-    i = 0
 
-    while i < n_bars:
-        is_out, direction = _is_outside_channel(highs[i], lows[i], upper[i], lower[i])
+    # Pre-compute indices where bars are inside for fast return lookup
+    inside_indices = np.where(is_inside)[0]
 
-        if is_out and direction is not None:
-            # Found an exit, now look for return
-            exit_bar = i
+    # Process exits - skip exits that occur before a previous exit's return
+    skip_until = -1
+    for exit_bar in exit_indices:
+        if exit_bar <= skip_until:
+            continue
+
+        # Determine exit direction (UP takes priority, matching original logic)
+        if outside_up[exit_bar]:
+            direction = ExitDirection.UP
+        else:
+            direction = ExitDirection.DOWN
+
+        # Find next return: first inside bar after exit_bar
+        # Use searchsorted for O(log n) lookup instead of linear scan
+        search_pos = np.searchsorted(inside_indices, exit_bar, side='right')
+
+        if search_pos < len(inside_indices):
+            return_bar = int(inside_indices[search_pos])
+            did_return = True
+            bars_outside = return_bar - exit_bar
+            skip_until = return_bar  # Skip to after return
+        else:
+            # No return found - this is the last exit event
+            # Original code would terminate loop after scanning to end
             return_bar = None
-            bars_outside = 0
             did_return = False
-
-            # Scan forward to find return
-            j = i + 1
-            while j < n_bars:
-                bars_outside += 1
-
-                # Check if fully back inside
-                if _is_inside_channel(highs[j], lows[j], upper[j], lower[j]):
-                    did_return = True
-                    return_bar = j
-                    break
-                j += 1
-
-            # If we hit end without returning, count remaining bars as outside
-            if not did_return:
-                bars_outside = n_bars - exit_bar - 1
-
+            bars_outside = n_bars - exit_bar - 1
+            # Record this exit and break - no more exits after an unreturned exit
             exit_events.append(ExitEvent(
                 bar_index=exit_bar,
                 exit_direction=direction,
@@ -260,11 +279,15 @@ def track_exits_in_channel(
                 did_return=did_return,
                 return_bar=return_bar,
             ))
+            break
 
-            # Skip to after return (or continue from last checked bar)
-            i = return_bar + 1 if return_bar is not None else j
-        else:
-            i += 1
+        exit_events.append(ExitEvent(
+            bar_index=exit_bar,
+            exit_direction=direction,
+            bars_outside=max(bars_outside, 1),
+            did_return=did_return,
+            return_bar=return_bar,
+        ))
 
     # Calculate features from exit events
     return _calculate_features(exit_events, channel, n_bars)

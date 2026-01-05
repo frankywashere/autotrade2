@@ -7,6 +7,7 @@ Key insight: Use HIGHS for upper touches, LOWS for lower touches.
 
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from scipy import stats
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
@@ -454,14 +455,18 @@ def calculate_channel_durability(
 def detect_channels_multi_window(
     df: pd.DataFrame,
     windows: List[int] = None,
+    max_workers: int = 4,
     **kwargs
 ) -> Dict[int, Channel]:
     """
     Detect channels at multiple window sizes and return all of them.
 
+    Uses parallel execution via ThreadPoolExecutor for improved performance.
+
     Args:
         df: OHLCV DataFrame
         windows: List of window sizes to try (defaults to STANDARD_WINDOWS)
+        max_workers: Maximum number of parallel workers (default 4)
         **kwargs: Additional arguments passed to detect_channel
 
     Returns:
@@ -470,10 +475,16 @@ def detect_channels_multi_window(
     if windows is None:
         windows = STANDARD_WINDOWS
 
+    valid_windows = [w for w in windows if len(df) >= w]
+
+    def detect_for_window(w):
+        return w, detect_channel(df, window=w, **kwargs)
+
     channels = {}
-    for w in windows:
-        if len(df) >= w:
-            channels[w] = detect_channel(df, window=w, **kwargs)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = executor.map(detect_for_window, valid_windows)
+        for w, channel in results:
+            channels[w] = channel
 
     return channels
 

@@ -341,13 +341,23 @@ def extract_full_features(
     """
     timestamp = tsla_df.index[-1]
 
+    # Cache for resampled data to avoid redundant resampling
+    resample_cache = {}
+
+    def get_resampled(df, tf, cache_key_prefix):
+        """Get resampled data, using cache to avoid redundant resampling."""
+        cache_key = f"{cache_key_prefix}_{tf}"
+        if cache_key not in resample_cache:
+            if tf == '5min':
+                resample_cache[cache_key] = df
+            else:
+                resample_cache[cache_key] = resample_ohlc(df, tf)
+        return resample_cache[cache_key]
+
     # First pass: detect channels at all timeframes for TSLA
     tsla_channels_dict = {}
     for tf in TIMEFRAMES:
-        if tf == '5min':
-            df_tf = tsla_df
-        else:
-            df_tf = resample_ohlc(tsla_df, tf)
+        df_tf = get_resampled(tsla_df, tf, 'tsla')
 
         try:
             tsla_channels_dict[tf] = detect_channel(df_tf, window=window)
@@ -358,10 +368,7 @@ def extract_full_features(
     # Second pass: extract features with longer TF context
     tsla_features = {}
     for tf in TIMEFRAMES:
-        if tf == '5min':
-            df_tf = tsla_df
-        else:
-            df_tf = resample_ohlc(tsla_df, tf)
+        df_tf = get_resampled(tsla_df, tf, 'tsla')
 
         try:
             # Get longer TF channels for this timeframe
@@ -380,10 +387,7 @@ def extract_full_features(
     # SPY features for all timeframes
     spy_features = {}
     for tf in TIMEFRAMES:
-        if tf == '5min':
-            df_tf = spy_df
-        else:
-            df_tf = resample_ohlc(spy_df, tf)
+        df_tf = get_resampled(spy_df, tf, 'spy')
 
         try:
             spy_features[tf] = extract_spy_features(df_tf, window, tf)

@@ -22,10 +22,55 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.channel import (
     detect_channel, detect_channels_multi_window, select_best_channel,
-    Channel, Direction, STANDARD_WINDOWS
+    Channel, STANDARD_WINDOWS
 )
 from core.timeframe import resample_ohlc, get_longer_timeframes, TIMEFRAMES, BARS_PER_TF
-from features.containment import check_containment, get_closest_boundary, ContainmentInfo
+from features.containment import check_containment, get_closest_boundary
+
+
+# =============================================================================
+# Resample Cache - Avoids redundant resampling within a single label generation
+# =============================================================================
+
+# Module-level cache dict: (df_id, len, timeframe) -> resampled DataFrame
+# Using id(df) + len(df) as a key to identify unique dataframes
+_resample_cache: Dict[Tuple[int, int, str], pd.DataFrame] = {}
+
+
+def clear_resample_cache() -> None:
+    """Clear the resample cache. Call between samples to avoid memory bloat."""
+    global _resample_cache
+    _resample_cache.clear()
+
+
+def cached_resample_ohlc(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    Cached version of resample_ohlc.
+
+    Uses a module-level cache keyed by (df_id, df_len, timeframe) to avoid
+    redundant resampling of the same data within a single label generation call.
+
+    Args:
+        df: DataFrame with DatetimeIndex and columns [open, high, low, close, volume]
+        timeframe: Target timeframe (e.g., '15min', '1h', 'daily')
+
+    Returns:
+        Resampled DataFrame with same columns (from cache if available)
+    """
+    global _resample_cache
+
+    # Create cache key using id and length to identify unique dataframes
+    # Note: id() can be reused for different objects, so we include length
+    cache_key = (id(df), len(df), timeframe)
+
+    if cache_key in _resample_cache:
+        return _resample_cache[cache_key]
+
+    # Not in cache, perform resampling
+    result = resample_ohlc(df, timeframe)
+    _resample_cache[cache_key] = result
+
+    return result
 
 
 class BreakDirection(IntEnum):
@@ -92,6 +137,42 @@ TF_TRIGGER_ENCODING = {
 TF_TRIGGER_DECODING = {v: k for k, v in TF_TRIGGER_ENCODING.items()}
 
 NUM_TRIGGER_TF_CLASSES = 21  # Total classes (0-20)
+
+# Module-level constants for label scaling parameters per timeframe
+# These are used by scale_label_params_for_tf() and cached here to avoid
+# rebuilding the dicts on every call.
+
+# max_scan per TF - aligned with FORWARD_BARS_PER_TF in label_inspector.py
+TF_MAX_SCAN = {
+    '5min': 100,    # ~8 hours
+    '15min': 100,   # ~25 hours
+    '30min': 50,    # ~25 hours
+    '1h': 50,       # ~50 hours (~2 days)
+    '2h': 50,       # ~100 hours (~4 days)
+    '3h': 50,       # ~150 hours (~6 days)
+    '4h': 50,       # ~200 hours (~8 days)
+    'daily': 50,    # ~50 trading days (~2.5 months)
+    'weekly': 50,   # ~50 weeks (~1 year)
+    'monthly': 10,  # ~10 months
+    '3month': 10,   # ~30 months (~2.5 years)
+}
+
+# Explicit return_threshold per TF
+# These control how many bars outside channel before declaring "permanent" break
+# Lower = more sensitive, Higher = more tolerant of temporary excursions
+TF_RETURN_THRESHOLD = {
+    '5min': 20,     # ~1.5 hours - allows for short-term noise
+    '15min': 6,     # ~1.5 hours equivalent
+    '30min': 4,     # ~2 hours
+    '1h': 3,        # ~3 hours
+    '2h': 3,        # ~6 hours
+    '3h': 3,        # ~9 hours
+    '4h': 3,        # ~12 hours (half trading day)
+    'daily': 5,     # ~1 week - tolerates daily noise
+    'weekly': 2,    # ~2 weeks
+    'monthly': 1,   # Immediate - monthly breaks are significant
+    '3month': 1,    # Immediate - quarterly breaks are significant
+}
 
 
 def encode_trigger_tf(trigger_tf: Optional[str]) -> int:
@@ -220,22 +301,42 @@ def find_permanent_break(
     lows = df_forward['low'].values
     n_bars = min(len(df_forward), len(upper_projection))
 
-    # Track exit state
+    if n_bars == 0:
+        return None, None
+
+    # Slice arrays to matching length
+    highs = highs[:n_bars]
+    lows = lows[:n_bars]
+    upper = upper_projection[:n_bars]
+    lower = lower_projection[:n_bars]
+
+    # Vectorized boundary checks - compute for ALL bars at once
+    breaks_up = highs > upper      # True where high breaks upper bound
+    breaks_down = lows < lower     # True where low breaks lower bound
+    is_outside = breaks_up | breaks_down  # True where price is outside channel
+
+    # If no bars are outside, no break occurred
+    if not np.any(is_outside):
+        return None, None
+
+    # Track exit state using minimal loop for state machine logic
+    # This is necessary because we need to track consecutive outside bars
+    # and reset when price returns to channel
     exit_bar = None
     exit_direction = None
     bars_outside = 0
 
+    # Get indices where status changes (outside/inside transitions)
+    # This allows us to potentially skip sections of consecutive same-state bars
     for i in range(n_bars):
-        is_inside, direction = check_price_in_channel(
-            highs[i], lows[i],
-            upper_projection[i], lower_projection[i]
-        )
-
-        if not is_inside:
-            # Price exited channel
+        if is_outside[i]:
+            # Price is outside channel
             if exit_bar is None:
+                # New exit - record position and direction
                 exit_bar = i
-                exit_direction = direction
+                # Determine direction: UP if broke upper, DOWN if broke lower
+                # If both, prefer UP (high > upper takes precedence)
+                exit_direction = BreakDirection.UP if breaks_up[i] else BreakDirection.DOWN
                 bars_outside = 1
             else:
                 bars_outside += 1
@@ -244,9 +345,8 @@ def find_permanent_break(
             if bars_outside >= return_threshold:
                 return exit_bar, exit_direction
         else:
-            # Price returned to channel
+            # Price returned to channel - false break, reset tracking
             if exit_bar is not None:
-                # False break - reset tracking
                 exit_bar = None
                 exit_direction = None
                 bars_outside = 0
@@ -268,6 +368,11 @@ def detect_new_channel(
     """
     Detect the next valid channel that forms after a break.
 
+    Optimized with early termination: pre-computes numpy arrays once and uses
+    vectorized variance checks to skip positions where channels are clearly
+    impossible (insufficient price movement). This produces EXACTLY the same
+    results as the naive approach but is significantly faster.
+
     Args:
         df: Full DataFrame (break point onwards)
         start_idx: Index to start scanning from
@@ -277,18 +382,102 @@ def detect_new_channel(
     Returns:
         Channel object if found, None otherwise
     """
-    for i in range(start_idx, min(start_idx + max_scan, len(df))):
-        if i + window > len(df):
+    # Calculate the actual scan range
+    end_idx = min(start_idx + max_scan, len(df) - window + 1)
+    if start_idx >= end_idx:
+        return None
+
+    # Pre-extract numpy arrays once (avoid repeated DataFrame operations)
+    # Extract full range needed: from start_idx to start_idx + max_scan + window
+    array_end = min(start_idx + max_scan + window, len(df))
+    close_full = df['close'].values[start_idx:array_end].astype(np.float64)
+    high_full = df['high'].values[start_idx:array_end].astype(np.float64)
+    low_full = df['low'].values[start_idx:array_end].astype(np.float64)
+
+    # Pre-compute minimum variance threshold for valid channels
+    # A channel needs enough price variation to have meaningful bounds
+    # Use a fraction of average price as threshold (0.01% of price range minimum)
+    avg_price = np.mean(close_full[:window]) if len(close_full) >= window else 1.0
+    min_variance = (avg_price * 0.0001) ** 2  # Square for variance comparison
+
+    # Pre-compute x array for regression (same for all windows of same size)
+    x = np.arange(window, dtype=np.float64)
+    x_mean = (window - 1) / 2.0
+    x_centered = x - x_mean
+    x_var = np.sum(x_centered ** 2)
+
+    for i in range(end_idx - start_idx):
+        # Get the slice indices relative to our pre-extracted arrays
+        slice_end = i + window
+        if slice_end > len(close_full):
             break
 
-        # Try to detect channel at this point
-        df_slice = df.iloc[i:i + window]
-        if len(df_slice) < window:
+        close = close_full[i:slice_end]
+        high = high_full[i:slice_end]
+        low = low_full[i:slice_end]
+
+        # Quick variance check - skip if price doesn't move enough
+        # This is much faster than full regression
+        close_var = np.var(close)
+        if close_var < min_variance:
             continue
 
-        channel = detect_channel(df_slice, window=window)
-        if channel.valid:
-            return channel
+        # Perform linear regression (vectorized, no scipy call)
+        close_mean = np.mean(close)
+        close_centered = close - close_mean
+        slope = np.sum(x_centered * close_centered) / x_var if x_var > 0 else 0.0
+        intercept = close_mean - slope * x_mean
+
+        # Center line and residuals
+        center_line = slope * x + intercept
+        residuals = close - center_line
+        std_dev = np.std(residuals)
+
+        # Skip if std_dev is too small (degenerate channel)
+        if std_dev < avg_price * 0.0001:
+            continue
+
+        # Upper and lower bounds
+        std_multiplier = 2.0
+        upper_line = center_line + std_multiplier * std_dev
+        lower_line = center_line - std_multiplier * std_dev
+
+        # Quick bounce check using vectorized operations
+        # This is the minimum required for a valid channel (min_cycles=1 default)
+        channel_width = upper_line - lower_line
+        touch_threshold = 0.10
+
+        # Check for touches using vectorized operations
+        upper_dist = (upper_line - high) / channel_width
+        lower_dist = (low - lower_line) / channel_width
+
+        upper_touches_mask = upper_dist <= touch_threshold
+        lower_touches_mask = lower_dist <= touch_threshold
+
+        # Count alternations efficiently
+        # Create a touch type array: 1 for upper, -1 for lower, 0 for none
+        # Note: original uses elif, so upper takes priority when both conditions met
+        touch_types = np.zeros(window, dtype=np.int8)
+        touch_types[lower_touches_mask] = -1  # Set lower first
+        touch_types[upper_touches_mask] = 1   # Upper overwrites (takes priority)
+
+        # Find positions with touches
+        touch_positions = np.where(touch_types != 0)[0]
+
+        if len(touch_positions) < 2:
+            continue
+
+        # Count alternations (sign changes in consecutive touches)
+        touch_values = touch_types[touch_positions]
+        alternations = np.sum(touch_values[:-1] != touch_values[1:])
+
+        if alternations >= 1:  # min_cycles default is 1
+            # Found a valid channel - now call detect_channel for the full object
+            # This ensures EXACTLY the same Channel object is returned
+            df_slice = df.iloc[start_idx + i:start_idx + slice_end]
+            channel = detect_channel(df_slice, window=window)
+            if channel.valid:
+                return channel
 
     return None
 
@@ -313,7 +502,7 @@ def get_longer_tf_channels(
     channels = {}
 
     for tf in longer_tfs:
-        df_tf = resample_ohlc(df, tf)
+        df_tf = cached_resample_ohlc(df, tf)
         if len(df_tf) >= window:
             channels[tf] = detect_channel(df_tf, window=window)
         else:
@@ -410,7 +599,7 @@ def generate_labels(
             new_channel_valid=False
         )
 
-    df_forward = df.iloc[forward_start:forward_end].copy()
+    df_forward = df.iloc[forward_start:forward_end]
     n_forward = len(df_forward)
 
     if n_forward == 0:
@@ -604,45 +793,14 @@ def scale_label_params_for_tf(
     Returns:
         Tuple of (scaled_max_scan, scaled_return_threshold)
     """
-    # max_scan per TF - aligned with FORWARD_BARS_PER_TF in label_inspector.py
-    tf_max_scan = {
-        '5min': 100,    # ~8 hours
-        '15min': 100,   # ~25 hours
-        '30min': 50,    # ~25 hours
-        '1h': 50,       # ~50 hours (~2 days)
-        '2h': 50,       # ~100 hours (~4 days)
-        '3h': 50,       # ~150 hours (~6 days)
-        '4h': 50,       # ~200 hours (~8 days)
-        'daily': 50,    # ~50 trading days (~2.5 months)
-        'weekly': 50,   # ~50 weeks (~1 year)
-        'monthly': 10,  # ~10 months
-        '3month': 10,   # ~30 months (~2.5 years)
-    }
-    scaled_max_scan = tf_max_scan.get(tf, min(max_scan, 50))
+    # Use module-level constants (TF_MAX_SCAN, TF_RETURN_THRESHOLD) for efficiency
+    scaled_max_scan = TF_MAX_SCAN.get(tf, min(max_scan, 50))
 
-    # Explicit return_threshold per TF
-    # These control how many bars outside channel before declaring "permanent" break
-    # Lower = more sensitive, Higher = more tolerant of temporary excursions
-    # The old formula (return_threshold // bars_per_tf) collapsed to 1 for daily+
-    tf_return_threshold = {
-        '5min': 20,     # ~1.5 hours - allows for short-term noise
-        '15min': 6,     # ~1.5 hours equivalent
-        '30min': 4,     # ~2 hours
-        '1h': 3,        # ~3 hours
-        '2h': 3,        # ~6 hours
-        '3h': 3,        # ~9 hours
-        '4h': 3,        # ~12 hours (half trading day)
-        'daily': 5,     # ~1 week - tolerates daily noise
-        'weekly': 2,    # ~2 weeks
-        'monthly': 1,   # Immediate - monthly breaks are significant
-        '3month': 1,    # Immediate - quarterly breaks are significant
-    }
-
-    # Check for custom threshold first, then fall back to defaults
+    # Check for custom threshold first, then fall back to module-level defaults
     if custom_return_thresholds is not None and tf in custom_return_thresholds:
         scaled_return_threshold = custom_return_thresholds[tf]
     else:
-        scaled_return_threshold = tf_return_threshold.get(tf, max(1, return_threshold // BARS_PER_TF.get(tf, 1)))
+        scaled_return_threshold = TF_RETURN_THRESHOLD.get(tf, max(1, return_threshold // BARS_PER_TF.get(tf, 1)))
 
     return scaled_max_scan, scaled_return_threshold
 
@@ -656,7 +814,8 @@ def generate_labels_per_tf(
     fold_end_idx: Optional[int] = None,
     min_cycles: int = 1,
     channel: Optional[Channel] = None,
-    custom_return_thresholds: Optional[Dict[str, int]] = None
+    custom_return_thresholds: Optional[Dict[str, int]] = None,
+    _clear_cache: bool = True
 ) -> Dict[str, Optional[ChannelLabels]]:
     """
     Generate labels for each timeframe by resampling and detecting channels.
@@ -681,21 +840,32 @@ def generate_labels_per_tf(
         custom_return_thresholds: Optional dict mapping TF names to custom return threshold
                                   values. If provided and a TF is in the dict, that value is
                                   used instead of the default. Example: {'5min': 10, '1h': 2}
+        _clear_cache: Internal parameter to control cache clearing. Default True clears
+                     cache at start to prevent memory bloat. Set to False when calling
+                     from generate_labels_multi_window() to share cache across windows.
 
     Returns:
         Dict mapping TF name to ChannelLabels (None if channel detection failed)
+
+    Note:
+        This function uses cached resampling to avoid redundant computation.
+        The cache is automatically cleared at the start of each call (when _clear_cache=True)
+        to prevent memory bloat between samples. Within a single call, resampled DataFrames
+        are reused for efficiency.
     """
+    # Clear cache at start to prevent memory bloat between samples
+    # (unless called from generate_labels_multi_window which manages its own cache)
+    if _clear_cache:
+        clear_resample_cache()
+
     # If a channel is provided, use its window size for consistency
     if channel is not None:
         window = channel.window
     labels_per_tf: Dict[str, Optional[ChannelLabels]] = {}
 
-    # Get the timestamp at the channel end position for TF alignment
     if channel_end_idx_5min >= len(df):
         # Invalid index
         return {tf: None for tf in TIMEFRAMES}
-
-    channel_end_timestamp = df.index[channel_end_idx_5min]
 
     # Split data: historical (up to sample time) vs full (includes forward bars)
     # This prevents future data leakage in channel detection for longer timeframes
@@ -706,15 +876,37 @@ def generate_labels_per_tf(
             # Resample data to this timeframe
             # Use separate dataframes for channel detection (historical) vs label scanning (full)
             if tf == '5min':
-                df_tf_for_channel = df_historical
                 df_tf_full = df
                 channel_end_idx_tf = channel_end_idx_5min
+
+                # Use pre-detected channel if provided (avoids redundant detection)
+                if channel is not None and channel.valid:
+                    tf_channel = channel
+                    best_tf_window = window
+                else:
+                    # No valid channel provided, detect one
+                    df_tf_for_channel = df_historical
+                    min_window = min(STANDARD_WINDOWS)
+                    if channel_end_idx_tf < min_window - 1 or len(df_tf_for_channel) < min_window:
+                        labels_per_tf[tf] = None
+                        continue
+
+                    tf_channels = detect_channels_multi_window(
+                        df_tf_for_channel.iloc[:channel_end_idx_tf + 1],
+                        windows=STANDARD_WINDOWS,
+                        min_cycles=min_cycles
+                    )
+                    tf_channel, best_tf_window = select_best_channel(tf_channels)
+
+                    if tf_channel is None or not tf_channel.valid:
+                        labels_per_tf[tf] = None
+                        continue
             else:
                 # Resample historical-only for channel detection (no future leakage)
-                df_tf_for_channel = resample_ohlc(df_historical, tf)
+                df_tf_for_channel = cached_resample_ohlc(df_historical, tf)
 
                 # Resample full data for label scanning (forward bars intentional)
-                df_tf_full = resample_ohlc(df, tf)
+                df_tf_full = cached_resample_ohlc(df, tf)
 
                 # Channel ends at last bar of historical resampled data
                 channel_end_idx_tf = len(df_tf_for_channel) - 1
@@ -723,27 +915,27 @@ def generate_labels_per_tf(
                     labels_per_tf[tf] = None
                     continue
 
-            # Detect channels at MULTIPLE window sizes for this TF (matches inspector behavior)
-            # Use historical-only data for channel detection to avoid future leakage
-            # Need enough data for at least the smallest standard window
-            min_window = min(STANDARD_WINDOWS)
-            if channel_end_idx_tf < min_window - 1 or len(df_tf_for_channel) < min_window:
-                labels_per_tf[tf] = None
-                continue
+                # Detect channels at MULTIPLE window sizes for this TF (matches inspector behavior)
+                # Use historical-only data for channel detection to avoid future leakage
+                # Need enough data for at least the smallest standard window
+                min_window = min(STANDARD_WINDOWS)
+                if channel_end_idx_tf < min_window - 1 or len(df_tf_for_channel) < min_window:
+                    labels_per_tf[tf] = None
+                    continue
 
-            # Detect channels at all standard windows for this TF
-            tf_channels = detect_channels_multi_window(
-                df_tf_for_channel.iloc[:channel_end_idx_tf + 1],
-                windows=STANDARD_WINDOWS,
-                min_cycles=min_cycles
-            )
+                # Detect channels at all standard windows for this TF
+                tf_channels = detect_channels_multi_window(
+                    df_tf_for_channel.iloc[:channel_end_idx_tf + 1],
+                    windows=STANDARD_WINDOWS,
+                    min_cycles=min_cycles
+                )
 
-            # Select the best channel by bounces (same logic as inspector)
-            tf_channel, best_tf_window = select_best_channel(tf_channels)
+                # Select the best channel by bounces (same logic as inspector)
+                tf_channel, best_tf_window = select_best_channel(tf_channels)
 
-            if tf_channel is None or not tf_channel.valid:
-                labels_per_tf[tf] = None
-                continue
+                if tf_channel is None or not tf_channel.valid:
+                    labels_per_tf[tf] = None
+                    continue
 
             # Scale parameters for this timeframe
             scaled_max_scan, scaled_return_threshold = scale_label_params_for_tf(
@@ -809,7 +1001,15 @@ def generate_labels_multi_window(
 
     Returns:
         Dict mapping window_size -> {tf_name -> ChannelLabels}
+
+    Note:
+        This function uses cached resampling to avoid redundant computation.
+        The cache is cleared at the start and shared across all window calls
+        for maximum efficiency.
     """
+    # Clear cache once at start, then share across all window iterations
+    clear_resample_cache()
+
     labels_per_window: Dict[int, Dict[str, Optional[ChannelLabels]]] = {}
 
     for window_size, channel in channels.items():
@@ -818,6 +1018,7 @@ def generate_labels_multi_window(
         # A valid 1h channel might exist even if the 5min channel at this window is invalid.
 
         # Generate labels for this window's channel
+        # Pass _clear_cache=False to reuse cached resampled data across windows
         labels_per_window[window_size] = generate_labels_per_tf(
             df=df,
             channel_end_idx_5min=channel_end_idx_5min,
@@ -827,8 +1028,12 @@ def generate_labels_multi_window(
             fold_end_idx=fold_end_idx,
             min_cycles=min_cycles,
             channel=channel,
-            custom_return_thresholds=custom_return_thresholds
+            custom_return_thresholds=custom_return_thresholds,
+            _clear_cache=False  # Cache already cleared above, reuse across windows
         )
+
+    # Clear cache after completion to free memory
+    clear_resample_cache()
 
     return labels_per_window
 

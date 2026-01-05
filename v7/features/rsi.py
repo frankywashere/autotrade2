@@ -90,14 +90,14 @@ def calculate_rsi_with_confidence(
 
 def calculate_rsi_series(prices: Union[np.ndarray, pd.Series], period: int = 14) -> np.ndarray:
     """
-    Calculate RSI for all bars (vectorized).
+    Calculate RSI for all bars (optimized).
 
     Args:
         prices: Array of close prices
         period: RSI period (default 14)
 
     Returns:
-        Array of RSI values (first `period` values will be NaN)
+        Array of RSI values (first `period` values will be 50.0)
     """
     prices = np.asarray(prices)
     n = len(prices)
@@ -107,40 +107,54 @@ def calculate_rsi_series(prices: Union[np.ndarray, pd.Series], period: int = 14)
 
     deltas = np.diff(prices)
 
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
+    # Use maximum/minimum with 0 instead of np.where for efficiency
+    gains = np.maximum(deltas, 0)
+    losses = np.maximum(-deltas, 0)
 
     # Use exponential moving average for smoother RSI
     alpha = 1.0 / period
+    decay = 1.0 - alpha
 
-    # Initialize with simple average
-    avg_gain = np.zeros(n - 1)
-    avg_loss = np.zeros(n - 1)
+    # Number of RSI values to compute (from period-1 onwards in gains/losses)
+    num_rsi = n - period
 
-    avg_gain[period - 1] = np.mean(gains[:period])
-    avg_loss[period - 1] = np.mean(losses[:period])
+    # Pre-allocate only what we need for the output portion
+    avg_gain_out = np.empty(num_rsi)
+    avg_loss_out = np.empty(num_rsi)
 
-    # Exponential smoothing
-    for i in range(period, n - 1):
-        avg_gain[i] = alpha * gains[i] + (1 - alpha) * avg_gain[i - 1]
-        avg_loss[i] = alpha * losses[i] + (1 - alpha) * avg_loss[i - 1]
+    # Initialize with simple average of first `period` values
+    avg_gain_prev = np.mean(gains[:period])
+    avg_loss_prev = np.mean(losses[:period])
+    avg_gain_out[0] = avg_gain_prev
+    avg_loss_out[0] = avg_loss_prev
 
-    # Calculate RSI with proper handling of edge cases
-    rsi = np.zeros_like(avg_gain)
-    for i in range(len(avg_gain)):
-        if avg_loss[i] == 0:
-            # No losses: RSI = 100 if gains exist, else 50
-            rsi[i] = 100.0 if avg_gain[i] > 0 else 50.0
-        else:
-            rs = avg_gain[i] / avg_loss[i]
-            rsi[i] = 100 - (100 / (1 + rs))
+    # Exponential smoothing - only compute values we need
+    for i in range(1, num_rsi):
+        idx = period - 1 + i  # Index into gains/losses arrays
+        avg_gain_prev = alpha * gains[idx] + decay * avg_gain_prev
+        avg_loss_prev = alpha * losses[idx] + decay * avg_loss_prev
+        avg_gain_out[i] = avg_gain_prev
+        avg_loss_out[i] = avg_loss_prev
 
-    # Pad with NaN for first period
-    result = np.full(n, np.nan)
-    result[period:] = rsi[period - 1:]
+    # Vectorized RSI calculation with edge case handling
+    # Handle division by zero: where avg_loss == 0
+    zero_loss_mask = avg_loss_out == 0
+    has_gain_mask = avg_gain_out > 0
 
-    # Replace NaN with neutral 50
-    result = np.nan_to_num(result, nan=50.0)
+    # Default RSI calculation (safe division)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rs = np.divide(avg_gain_out, avg_loss_out, out=np.zeros_like(avg_gain_out), where=~zero_loss_mask)
+    rsi_values = 100.0 - (100.0 / (1.0 + rs))
+
+    # Handle edge cases: zero loss
+    # RSI = 100 if gains > 0 and loss == 0, else 50 if both zero
+    rsi_values[zero_loss_mask & has_gain_mask] = 100.0
+    rsi_values[zero_loss_mask & ~has_gain_mask] = 50.0
+
+    # Build result array: first `period` values are 50.0
+    result = np.empty(n)
+    result[:period] = 50.0
+    result[period:] = rsi_values
 
     return result
 
