@@ -16,6 +16,7 @@ from typing import Dict, Optional, Tuple
 from enum import IntEnum
 import sys
 from pathlib import Path
+import threading
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -30,46 +31,130 @@ from features.containment import check_containment, get_closest_boundary
 
 # =============================================================================
 # Resample Cache - Avoids redundant resampling within a single label generation
+# Per-thread cache ensures thread safety without locks
 # =============================================================================
 
-# Module-level cache dict: (df_id, len, timeframe) -> resampled DataFrame
-# Using id(df) + len(df) as a key to identify unique dataframes
-_resample_cache: Dict[Tuple[int, int, str], pd.DataFrame] = {}
+# Thread-local cache storage: (df_id, len, timeframe) -> resampled DataFrame
+_resample_cache_local = threading.local()
+
+def _get_resample_cache() -> Dict[Tuple[int, int, str], pd.DataFrame]:
+    """Get or create the resample cache for the current thread."""
+    cache = getattr(_resample_cache_local, "cache", None)
+    if cache is None:
+        cache = {}
+        _resample_cache_local.cache = cache
+    return cache
 
 
 def clear_resample_cache() -> None:
-    """Clear the resample cache. Call between samples to avoid memory bloat."""
-    global _resample_cache
-    _resample_cache.clear()
+    """Clear the resample cache for the current thread."""
+    cache = getattr(_resample_cache_local, "cache", None)
+    if cache is not None:
+        cache.clear()
+
+
+# =============================================================================
+# Cache Performance Monitoring (Optional - Zero Overhead When Disabled)
+# =============================================================================
+
+# Module-level flag to enable/disable cache statistics tracking
+# Set to True to enable monitoring: labels.ENABLE_CACHE_STATS = True
+ENABLE_CACHE_STATS = False
+
+# Thread-local storage for per-thread cache statistics
+_cache_stats_local = threading.local()
+
+
+def _get_cache_stats() -> Dict[str, int]:
+    """Get or create cache stats dict for the current thread."""
+    stats = getattr(_cache_stats_local, "stats", None)
+    if stats is None:
+        stats = {"hits": 0, "misses": 0, "total": 0}
+        _cache_stats_local.stats = stats
+    return stats
+
+
+def get_cache_stats() -> Dict[str, int]:
+    """
+    Get cache statistics for the current thread.
+
+    Returns:
+        Dictionary with keys:
+        - hits: Number of cache hits
+        - misses: Number of cache misses
+        - total: Total cache lookups (hits + misses)
+        - hit_rate: Cache hit rate as a percentage (0.0-100.0)
+    """
+    stats = _get_cache_stats()
+    total = stats["total"]
+    hit_rate = (stats["hits"] / total * 100.0) if total > 0 else 0.0
+
+    return {
+        "hits": stats["hits"],
+        "misses": stats["misses"],
+        "total": total,
+        "hit_rate": hit_rate
+    }
+
+
+def reset_cache_stats() -> None:
+    """Reset cache statistics for the current thread."""
+    stats = getattr(_cache_stats_local, "stats", None)
+    if stats is not None:
+        stats["hits"] = 0
+        stats["misses"] = 0
+        stats["total"] = 0
+
+
+def print_cache_stats() -> None:
+    """
+    Print cache statistics for the current thread in a human-readable format.
+
+    Example output:
+        Cache Statistics:
+          Total calls:  1250
+          Cache hits:   1000 (80.0%)
+          Cache misses: 250 (20.0%)
+    """
+    stats = get_cache_stats()
+
+    print("Cache Statistics:")
+    print(f"  Total calls:  {stats['total']}")
+    print(f"  Cache hits:   {stats['hits']} ({stats['hit_rate']:.1f}%)")
+    print(f"  Cache misses: {stats['misses']} ({100.0 - stats['hit_rate']:.1f}%)")
 
 
 def cached_resample_ohlc(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
-    Cached version of resample_ohlc.
+    Cached version of resample_ohlc (per-thread cache).
 
-    Uses a module-level cache keyed by (df_id, df_len, timeframe) to avoid
-    redundant resampling of the same data within a single label generation call.
+    Uses id(df) + len(df) as cache key to avoid hashing large DataFrames.
+    Cache is scoped to the current thread to ensure thread safety.
 
-    Args:
-        df: DataFrame with DatetimeIndex and columns [open, high, low, close, volume]
-        timeframe: Target timeframe (e.g., '15min', '1h', 'daily')
-
-    Returns:
-        Resampled DataFrame with same columns (from cache if available)
+    When ENABLE_CACHE_STATS is True, tracks hit/miss statistics per thread.
     """
-    global _resample_cache
-
-    # Create cache key using id and length to identify unique dataframes
-    # Note: id() can be reused for different objects, so we include length
+    cache = _get_resample_cache()
     cache_key = (id(df), len(df), timeframe)
 
-    if cache_key in _resample_cache:
-        return _resample_cache[cache_key]
+    cached = cache.get(cache_key)
 
-    # Not in cache, perform resampling
+    # Track statistics if enabled (zero overhead when disabled)
+    if ENABLE_CACHE_STATS:
+        stats = _get_cache_stats()
+        stats["total"] += 1
+
+        if cached is not None:
+            stats["hits"] += 1
+            return cached
+        else:
+            stats["misses"] += 1
+    else:
+        # Fast path when stats disabled
+        if cached is not None:
+            return cached
+
     result = resample_ohlc(df, timeframe)
-    _resample_cache[cache_key] = result
-
+    cache[cache_key] = result
     return result
 
 
