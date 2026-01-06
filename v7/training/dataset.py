@@ -27,6 +27,7 @@ from ..core.channel import detect_channel, Channel, detect_channels_multi_window
 from ..core.timeframe import resample_ohlc, TIMEFRAMES, BARS_PER_TF
 from ..features.full_features import extract_full_features, features_to_tensor_dict, FullFeatures
 from .labels import generate_labels, generate_labels_per_tf, generate_labels_multi_window, select_best_window_by_labels, ChannelLabels, labels_to_dict, labels_to_array
+from ..core.window_strategy import get_strategy, SelectionStrategy, WindowSelectionStrategy
 
 # Import parallel scanner (preferred over local sequential implementation)
 from .scanning import scan_valid_channels as _parallel_scan_valid_channels
@@ -54,11 +55,15 @@ from .scanning import scan_valid_channels as _parallel_scan_valid_channels
 #           ChannelLabels now has: break_trigger_tf as int (0-20), and per-label validity
 #           flags (duration_valid, direction_valid, trigger_tf_valid, new_channel_valid).
 #           Dataset returns separate masks for each label type.
-CACHE_VERSION = "v10.0.0"
+# - v10.0.0: Thread-safe resample cache with performance monitoring and granular
+#            progress tracking for parallel scanner. Improved cache performance.
+# - v11.0.0: Multi-window cache architecture with per-window feature extraction.
+#            Supports both single-window (v10.0.0 compatible) and multi-window modes.
+CACHE_VERSION = "v11.0.0"
 
 # Supported cache versions for migration (read-only compatibility)
 # These older versions can be loaded but will trigger rebuild recommendation
-COMPATIBLE_CACHE_VERSIONS = ["v8.0.0", "v7.3.0", "v7.2.0", "v7.1.0"]
+COMPATIBLE_CACHE_VERSIONS = ["v10.0.0", "v9.0.0", "v8.0.0", "v7.3.0", "v7.2.0", "v7.1.0"]
 
 
 def get_cache_metadata_path(cache_path: Path) -> Path:
@@ -425,6 +430,14 @@ class ChannelDataset(Dataset):
         samples: List of ChannelSample objects
         transform: Optional transform to apply to features
         augment: Whether to apply data augmentation
+        strategy: Window selection strategy (default: "bounce_first").
+                 Can be a SelectionStrategy enum value or string name:
+                 - "bounce_first": Use sample.best_window (v7-v9 default)
+                 - "label_validity": Select window with most valid TF labels
+                 - "balanced_score": Weighted combination (40% bounce, 60% labels)
+                 - "quality_score": Use pre-computed channel.quality_score
+        strategy_kwargs: Additional kwargs for strategy initialization
+                        (e.g., bounce_weight=0.3, label_weight=0.7)
     """
 
     def __init__(
@@ -433,7 +446,9 @@ class ChannelDataset(Dataset):
         transform: Optional[callable] = None,
         augment: bool = False,
         augment_noise_std: float = 0.01,
-        augment_time_shift: int = 0
+        augment_time_shift: int = 0,
+        strategy: Optional[str] = "bounce_first",
+        **strategy_kwargs
     ):
         self.samples = samples
         self.transform = transform
@@ -441,8 +456,164 @@ class ChannelDataset(Dataset):
         self.augment_noise_std = augment_noise_std
         self.augment_time_shift = augment_time_shift
 
+        # Initialize window selection strategy
+        if isinstance(strategy, str):
+            # Convert string to enum
+            strategy_map = {
+                "bounce_first": SelectionStrategy.BOUNCE_FIRST,
+                "label_validity": SelectionStrategy.LABEL_VALIDITY,
+                "balanced_score": SelectionStrategy.BALANCED_SCORE,
+                "quality_score": SelectionStrategy.QUALITY_SCORE,
+                # learned_selection: The actual window selection happens in the neural network
+                # (PerTFWindowSelector head), not in the dataset. The dataset provides all
+                # window information via window_scores, and the model learns which to use.
+                # During data loading, we use bounce_first to pick a consistent window.
+                "learned_selection": SelectionStrategy.BOUNCE_FIRST,
+            }
+            if strategy not in strategy_map:
+                raise ValueError(
+                    f"Unknown strategy: {strategy}. "
+                    f"Available: {list(strategy_map.keys())}"
+                )
+            strategy_enum = strategy_map[strategy]
+        elif isinstance(strategy, SelectionStrategy):
+            strategy_enum = strategy
+        else:
+            raise TypeError(
+                f"strategy must be str or SelectionStrategy, got {type(strategy)}"
+            )
+
+        self.strategy = get_strategy(strategy_enum, **strategy_kwargs)
+
     def __len__(self) -> int:
         return len(self.samples)
+
+    def _is_window_valid(
+        self,
+        window_size: int,
+        channels: Dict[int, Channel],
+        labels_per_window: Optional[Dict[int, Dict[str, ChannelLabels]]]
+    ) -> bool:
+        """
+        Check if a window has valid channel and labels.
+
+        Args:
+            window_size: Window size to check
+            channels: Dict mapping window_size -> Channel
+            labels_per_window: Dict mapping window_size -> {tf_name -> ChannelLabels}
+
+        Returns:
+            True if window has valid channel and at least one valid label
+        """
+        # Check if window exists in channels
+        if window_size not in channels:
+            return False
+
+        # Check if channel is valid
+        channel = channels[window_size]
+        if not channel or not channel.valid:
+            return False
+
+        # Check if labels exist and at least one is valid
+        if labels_per_window is None:
+            return True  # No labels to check
+
+        if window_size not in labels_per_window:
+            return False
+
+        tf_labels = labels_per_window[window_size]
+        has_valid_label = any(label is not None for label in tf_labels.values())
+
+        return has_valid_label
+
+    def _select_window(
+        self,
+        sample: ChannelSample
+    ) -> Tuple[Optional[int], Optional[Channel], Optional[Dict[str, ChannelLabels]]]:
+        """
+        Select the best window for a sample using the configured strategy.
+
+        This method handles both multi-window samples (v10+) and legacy single-window
+        samples (v7-v9) for backward compatibility.
+
+        Args:
+            sample: ChannelSample with channels and labels
+
+        Returns:
+            Tuple of (window_size, channel, labels_per_tf):
+                - window_size: Selected window size (int)
+                - channel: Selected Channel object
+                - labels_per_tf: Selected labels dict {tf_name -> ChannelLabels}
+            Returns (None, None, None) if no valid window found
+
+        Backward Compatibility:
+            - If sample.channels is None (old cache), uses sample.channel and sample.labels
+            - If sample.labels_per_window is None, creates it from sample.labels
+        """
+        # Handle legacy single-window samples (v7-v9 caches)
+        if sample.channels is None or not isinstance(sample.channels, dict):
+            # Old cache format - single channel only
+            # Use pre-selected window from cache
+            if sample.channel and sample.channel.valid:
+                window_size = sample.best_window if sample.best_window else sample.channel.window
+                return window_size, sample.channel, sample.labels
+            else:
+                return None, None, None
+
+        # Multi-window sample (v10+ format)
+        channels = sample.channels
+        labels_per_window = sample.labels_per_window
+
+        # Validate that we have channels
+        if not channels:
+            return None, None, None
+
+        # Filter to valid windows only
+        valid_windows = {
+            w: ch for w, ch in channels.items()
+            if self._is_window_valid(w, channels, labels_per_window)
+        }
+
+        if not valid_windows:
+            # No valid windows - fall back to best_window if available
+            if sample.best_window and sample.best_window in channels:
+                fallback_window = sample.best_window
+                return fallback_window, channels[fallback_window], sample.labels
+            return None, None, None
+
+        # Use strategy to select window
+        try:
+            selected_window, confidence = self.strategy.select_window(
+                channels=valid_windows,
+                labels_per_window=labels_per_window
+            )
+        except Exception as e:
+            # Strategy failed - fall back to sample.best_window
+            warnings.warn(
+                f"Window selection strategy failed: {e}. "
+                f"Falling back to sample.best_window."
+            )
+            selected_window = sample.best_window
+
+        # Validate selection
+        if selected_window is None:
+            # Strategy returned None - fall back to best_window
+            selected_window = sample.best_window
+
+        if selected_window not in channels:
+            # Invalid selection - fall back to first valid window
+            selected_window = min(valid_windows.keys())
+
+        # Get channel and labels for selected window
+        selected_channel = channels[selected_window]
+
+        if labels_per_window and selected_window in labels_per_window:
+            selected_labels = labels_per_window[selected_window]
+        else:
+            # Labels not available for this window - use sample.labels as fallback
+            selected_labels = sample.labels
+
+        return selected_window, selected_channel, selected_labels
 
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
@@ -471,10 +642,11 @@ class ChannelDataset(Dataset):
                 - permanent_break: long, 0 or 1
 
             Multi-window labels (v10 format):
-                - window_scores: [num_windows, 3] tensor with (bounce_count, r_squared, quality_score)
-                  for each window in STANDARD_WINDOWS. Shape is [8, 3] for 8 standard windows.
+                - window_scores: [num_windows, 4] tensor with (bounce_count, r_squared, quality_score, valid)
+                  for each window in STANDARD_WINDOWS. Shape is [8, 4] for 8 standard windows.
                 - window_valid: [num_windows] bool tensor indicating which windows have valid channels
                 - best_window: long scalar, index of best window in STANDARD_WINDOWS (0-7)
+                - selected_window: long scalar, index of window selected by strategy (0-7)
 
             Backward Compatibility:
                 If sample.channels is None (old cache format), window_scores and window_valid
@@ -482,8 +654,47 @@ class ChannelDataset(Dataset):
         """
         sample = self.samples[idx]
 
-        # Convert features to tensor dict
-        features_dict = features_to_tensor_dict(sample.features)
+        # =========================================================================
+        # Window Selection using Strategy
+        # =========================================================================
+        # Select the best window using the configured strategy
+        selected_window_size, selected_channel, selected_labels = self._select_window(sample)
+
+        # If selection failed, skip this sample (shouldn't happen with valid data)
+        if selected_window_size is None or selected_labels is None:
+            # Fallback to sample.labels if available
+            selected_labels = sample.labels if sample.labels else {}
+            selected_window_size = sample.best_window if sample.best_window else STANDARD_WINDOWS[0]
+
+        # =========================================================================
+        # Feature Alignment - CRITICAL for correct training (v11.0.0)
+        # =========================================================================
+        # We MUST use the features from the selected window, not the best_window.
+        # sample.features contains features computed from best_window, but when
+        # training with window selection strategies, we may select a different
+        # window (e.g., random_undersampling selects underrepresented windows).
+        # The labels come from selected_window_size, so features must match.
+        # Using mismatched features/labels causes ~86.7% of training samples
+        # to have incorrect feature-label pairs, severely degrading model quality.
+        # =========================================================================
+
+        # Use selected window's features if available (v11.0.0)
+        if sample.per_window_features and selected_window_size in sample.per_window_features:
+            selected_window_features = sample.per_window_features[selected_window_size]
+            features_dict = features_to_tensor_dict(selected_window_features)
+        else:
+            # Selected window features not available - select a fallback window
+            # We must also use that fallback's labels to maintain alignment!
+            if sample.per_window_features:
+                # Pick any available window (prefer best_window if available)
+                fallback_window = sample.best_window if sample.best_window in sample.per_window_features else next(iter(sample.per_window_features.keys()))
+                selected_window_size = fallback_window
+                selected_labels = sample.labels_per_window.get(fallback_window, sample.labels)
+                features_dict = features_to_tensor_dict(sample.per_window_features[fallback_window])
+            else:
+                # No per_window_features at all - use best_window for both
+                features_dict = features_to_tensor_dict(sample.features)
+                # selected_labels already set from _select_window
 
         # Convert to PyTorch tensors
         features_tensors = {
@@ -495,8 +706,11 @@ class ChannelDataset(Dataset):
         if self.augment:
             features_tensors = self._augment_features(features_tensors)
 
+        # =========================================================================
+        # Extract Labels from Selected Window
+        # =========================================================================
         # Convert per-TF labels to tensors
-        # sample.labels is Dict[str, ChannelLabels] keyed by TF name
+        # selected_labels is Dict[str, ChannelLabels] keyed by TF name
         # Extract native per-TF labels with separate validity masks
         duration_list = []
         direction_list = []
@@ -516,7 +730,7 @@ class ChannelDataset(Dataset):
         default_trigger_tf = 0  # NO_TRIGGER
 
         for tf in TIMEFRAMES:
-            tf_labels = sample.labels.get(tf)
+            tf_labels = selected_labels.get(tf)
             if tf_labels is not None:
                 # Native per-TF labels - duration is already in the TF's native bars
                 duration_list.append(float(tf_labels.duration_bars))
@@ -558,11 +772,11 @@ class ChannelDataset(Dataset):
 
             # Keep 5min originals for reference/logging (use 5min if available, else first valid)
             'duration_bars': torch.tensor(
-                sample.labels.get('5min').duration_bars if sample.labels.get('5min') else duration_list[0],
+                selected_labels.get('5min').duration_bars if selected_labels.get('5min') else duration_list[0],
                 dtype=torch.float32
             ),
             'permanent_break': torch.tensor(
-                int(sample.labels.get('5min').permanent_break) if sample.labels.get('5min') else 0,
+                int(selected_labels.get('5min').permanent_break) if selected_labels.get('5min') else 0,
                 dtype=torch.long
             ),
         }
@@ -576,19 +790,23 @@ class ChannelDataset(Dataset):
             window_scores = []
             window_valid = []
 
+            # Include ALL channels (valid and invalid) so model can learn patterns like
+            # "short windows invalid but long windows valid = breaks imminent"
             for w in STANDARD_WINDOWS:
                 if w in sample.channels and sample.channels[w] is not None:
                     ch = sample.channels[w]
-                    # Extract (bounce_count, r_squared, quality_score) for this window
+                    # Extract (bounce_count, r_squared, quality_score, valid) for this window
+                    # The valid flag lets model learn from quality-failed channels too
                     window_scores.append([
                         float(ch.bounce_count),
                         float(ch.r_squared),
-                        float(ch.quality_score)
+                        float(ch.quality_score),
+                        float(ch.valid)  # 4th metric: is this channel "quality approved"?
                     ])
-                    window_valid.append(True)
+                    window_valid.append(True)  # Channel data exists (even if ch.valid=False)
                 else:
                     # Window not available - use zeros and mark invalid
-                    window_scores.append([0.0, 0.0, 0.0])
+                    window_scores.append([0.0, 0.0, 0.0, 0.0])
                     window_valid.append(False)
 
             labels_dict['window_scores'] = torch.tensor(window_scores, dtype=torch.float32)
@@ -607,6 +825,16 @@ class ChannelDataset(Dataset):
 
             labels_dict['best_window'] = torch.tensor(best_window_idx, dtype=torch.long)
 
+            # Selected window index (position in STANDARD_WINDOWS) - v11.0.0
+            # This is the window actually selected by the strategy
+            if selected_window_size is not None and selected_window_size in STANDARD_WINDOWS:
+                selected_window_idx = STANDARD_WINDOWS.index(selected_window_size)
+            else:
+                # Fallback to best_window
+                selected_window_idx = best_window_idx
+
+            labels_dict['selected_window'] = torch.tensor(selected_window_idx, dtype=torch.long)
+
         else:
             # Old cache format (backward compatibility): single channel only
             # Create scores from the single channel and mark only one window as valid
@@ -622,11 +850,12 @@ class ChannelDataset(Dataset):
                     window_scores.append([
                         float(ch.bounce_count),
                         float(ch.r_squared),
-                        float(ch.quality_score)
+                        float(ch.quality_score),
+                        float(ch.valid)  # Add 4th metric for consistency
                     ])
                     window_valid.append(True)
                 else:
-                    window_scores.append([0.0, 0.0, 0.0])
+                    window_scores.append([0.0, 0.0, 0.0, 0.0])
                     window_valid.append(False)
 
             labels_dict['window_scores'] = torch.tensor(window_scores, dtype=torch.float32)
@@ -639,6 +868,9 @@ class ChannelDataset(Dataset):
                 best_window_idx = 0
 
             labels_dict['best_window'] = torch.tensor(best_window_idx, dtype=torch.long)
+
+            # Selected window is the same as best_window for old caches (v11.0.0 compat)
+            labels_dict['selected_window'] = torch.tensor(best_window_idx, dtype=torch.long)
 
         # Apply transform if provided
         if self.transform:
@@ -1144,7 +1376,7 @@ def collate_fn(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor],
             - duration_bars, permanent_break
 
     v10 multi-window labels:
-        - window_scores: [batch, num_windows, 3] - (bounce_count, r_squared, quality_score) per window
+        - window_scores: [batch, num_windows, 4] - (bounce_count, r_squared, quality_score, valid) per window
         - window_valid: [batch, num_windows] - bool mask for valid windows
         - best_window: [batch] - index of best window in STANDARD_WINDOWS
     """
@@ -1179,6 +1411,7 @@ def collate_fn(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor],
         'window_scores': torch.stack([l['window_scores'] for l in labels_list]),
         'window_valid': torch.stack([l['window_valid'] for l in labels_list]),
         'best_window': torch.stack([l['best_window'] for l in labels_list]),
+        'selected_window': torch.stack([l['selected_window'] for l in labels_list]),  # v11.0.0
     }
 
     return batched_features, batched_labels
@@ -1192,7 +1425,9 @@ def create_dataloaders(
     num_workers: Optional[int] = None,
     augment_train: bool = True,
     pin_memory: Optional[bool] = None,
-    device: Optional[str] = None
+    device: Optional[str] = None,
+    strategy: Optional[str] = "bounce_first",
+    **strategy_kwargs
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create device-aware PyTorch DataLoaders for train/val/test sets.
@@ -1209,6 +1444,13 @@ def create_dataloaders(
         augment_train: Whether to augment training data
         pin_memory: Pin memory for faster GPU transfer (None = auto-detect based on device)
         device: Target device ('cuda', 'mps', 'cpu', or None for auto-detect)
+        strategy: Window selection strategy for ChannelDataset. Options:
+            - "bounce_first": Use sample.best_window (v7-v9 default)
+            - "label_validity": Select window with most valid TF labels
+            - "balanced_score": Weighted combination (40% bounce, 60% labels)
+            - "quality_score": Use pre-computed channel.quality_score
+        **strategy_kwargs: Additional kwargs passed to strategy initialization
+            (e.g., bounce_weight=0.3, label_weight=0.7 for balanced_score)
 
     Returns:
         Tuple of (train_loader, val_loader, test_loader)
@@ -1258,12 +1500,12 @@ def create_dataloaders(
 
     # Print configuration for visibility
     print(f"DataLoader config: device={device}, num_workers={num_workers}, "
-          f"pin_memory={pin_memory}, batch_size={batch_size}")
+          f"pin_memory={pin_memory}, batch_size={batch_size}, strategy={strategy}")
 
-    # Create datasets
-    train_dataset = ChannelDataset(train_samples, augment=augment_train)
-    val_dataset = ChannelDataset(val_samples, augment=False)
-    test_dataset = ChannelDataset(test_samples, augment=False)
+    # Create datasets with window selection strategy
+    train_dataset = ChannelDataset(train_samples, augment=augment_train, strategy=strategy, **strategy_kwargs)
+    val_dataset = ChannelDataset(val_samples, augment=False, strategy=strategy, **strategy_kwargs)
+    test_dataset = ChannelDataset(test_samples, augment=False, strategy=strategy, **strategy_kwargs)
 
     # Create dataloaders with device-aware settings
     train_loader = DataLoader(

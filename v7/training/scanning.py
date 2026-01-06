@@ -118,18 +118,38 @@ def _process_single_position(
     if not best_channel or not best_channel.valid:
         return None
 
-    # Extract features at this point
-    try:
-        features = extract_full_features(
-            tsla_window_df,
-            spy_window_df,
-            vix_window_df,
-            window=best_window,
-            include_history=include_history,
-            lookforward_bars=lookforward_bars
-        )
-    except Exception:
+    # Extract features for all valid windows (multi-window feature extraction)
+    # This enables the model to see features from all windows simultaneously
+    features_per_window = {}
+    for window_size in STANDARD_WINDOWS:
+        # Only extract features for windows where we have a valid channel
+        if window_size not in channels:
+            continue
+
+        try:
+            window_features = extract_full_features(
+                tsla_window_df,
+                spy_window_df,
+                vix_window_df,
+                window=window_size,
+                include_history=include_history,
+                lookforward_bars=lookforward_bars
+            )
+            features_per_window[window_size] = window_features
+        except Exception:
+            # Skip this window if feature extraction fails
+            # Continue with other windows
+            continue
+
+    # If no windows succeeded, return None
+    if not features_per_window:
         return None
+
+    # For backward compatibility, keep the 'features' field as best_window features
+    features = features_per_window.get(best_window)
+    if features is None:
+        # If best_window failed, use any available window
+        features = next(iter(features_per_window.values()))
 
     # Generate native per-TF labels for all window sizes
     # Need forward data for label generation
@@ -159,7 +179,7 @@ def _process_single_position(
     if not labels_per_tf or all(v is None for v in labels_per_tf.values()):
         return None
 
-    # Create sample with multi-window channels and labels
+    # Create sample with multi-window channels, labels, and features
     sample = ChannelSample(
         timestamp=tsla_index[i - 1],
         channel_end_idx=i - 1,
@@ -168,7 +188,8 @@ def _process_single_position(
         labels=labels_per_tf,
         channels=channels,
         best_window=best_window,
-        labels_per_window=labels_per_window
+        labels_per_window=labels_per_window,
+        per_window_features=features_per_window  # NEW: Multi-window features
     )
 
     return (i, sample)
@@ -301,22 +322,42 @@ def _scan_sequential(
             stats['invalid_channel'] += 1
             continue
 
-        # Extract features at this point (use best_window for feature extraction)
-        try:
-            features = extract_full_features(
-                tsla_window,
-                spy_window,
-                vix_window,
-                window=best_window,
-                include_history=include_history,
-                lookforward_bars=lookforward_bars
-            )
-        except Exception as e:
-            # Skip if feature extraction fails (only log first occurrence)
+        # Extract features for all valid windows (multi-window feature extraction)
+        # This enables the model to see features from all windows simultaneously
+        features_per_window = {}
+        for window_size in STANDARD_WINDOWS:
+            # Only extract features for windows where we have a valid channel
+            if window_size not in channels:
+                continue
+
+            try:
+                window_features = extract_full_features(
+                    tsla_window,
+                    spy_window,
+                    vix_window,
+                    window=window_size,
+                    include_history=include_history,
+                    lookforward_bars=lookforward_bars
+                )
+                features_per_window[window_size] = window_features
+            except Exception as e:
+                # Skip this window if feature extraction fails
+                # Only log first occurrence per window
+                if stats['feature_failed'] == 0 and progress:
+                    tqdm.write(f"Feature extraction failed for window {window_size} (first error): {e}")
+                stats['feature_failed'] += 1
+                continue
+
+        # If no windows succeeded, skip this position
+        if not features_per_window:
             stats['feature_failed'] += 1
-            if stats['feature_failed'] == 1 and progress:
-                tqdm.write(f"Feature extraction failed (first error): {e}")
             continue
+
+        # For backward compatibility, keep the 'features' field as best_window features
+        features = features_per_window.get(best_window)
+        if features is None:
+            # If best_window failed, use any available window
+            features = next(iter(features_per_window.values()))
 
         # Generate native per-TF labels for all window sizes
         try:
@@ -343,7 +384,7 @@ def _scan_sequential(
             stats['no_valid_labels'] += 1
             continue
 
-        # Create sample with multi-window channels and labels
+        # Create sample with multi-window channels, labels, and features
         sample = ChannelSample(
             timestamp=tsla_df.index[i - 1],
             channel_end_idx=i - 1,
@@ -352,7 +393,8 @@ def _scan_sequential(
             labels=labels_per_tf,  # Best window's labels for backward compat
             channels=channels,  # All channels from multi-window detection
             best_window=best_window,  # Best window size
-            labels_per_window=labels_per_window  # All labels for all windows
+            labels_per_window=labels_per_window,  # All labels for all windows
+            per_window_features=features_per_window  # NEW: Multi-window features
         )
 
         samples.append(sample)

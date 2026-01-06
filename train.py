@@ -63,6 +63,7 @@ from v7.training import (
 )
 from v7.training.dataset import get_cache_summary, validate_cache_params
 from v7.models import create_model, create_loss
+from v7.core.window_strategy import SelectionStrategy
 
 console = Console()
 
@@ -1282,6 +1283,179 @@ def configure_device() -> str:
     return device
 
 
+def configure_window_selection_strategy(cache_dir: Path) -> Tuple[str, Dict]:
+    """
+    Configure window selection strategy for multi-window training.
+
+    This menu allows users to choose how the best window size is selected
+    when channels are detected at multiple window sizes (v11+ multi-window mode).
+
+    Args:
+        cache_dir: Path to cache directory (to check cache version)
+
+    Returns:
+        Tuple of (strategy_name, strategy_config) where:
+        - strategy_name: str to save in config["data"]["window_selection_strategy"]
+        - strategy_config: Dict with additional config (e.g., {"use_window_selection_loss": True})
+    """
+    console.print("\n[bold cyan]Window Selection Strategy[/bold cyan]")
+
+    # Check cache version to determine multi-window support
+    cache_path = cache_dir / "channel_samples.pkl"
+    cache_summary = get_cache_summary(cache_path)
+
+    # Determine if multi-window is supported
+    multi_window_supported = False
+    cache_version = "unknown"
+
+    if cache_summary is not None:
+        cache_version = cache_summary.get('cache_version', 'unknown')
+        # v11.0.0+ supports multi-window architecture
+        if cache_version.startswith('v11.') or cache_version.startswith('v12.'):
+            multi_window_supported = True
+
+    # Display cache status and compatibility
+    if multi_window_supported:
+        console.print(f"[green]✓ Multi-window support detected (cache version: {cache_version})[/green]")
+        console.print(f"[dim]  Channels detected at multiple window sizes: {STANDARD_WINDOWS}[/dim]\n")
+    else:
+        console.print(f"[yellow]⚠ Limited multi-window support (cache version: {cache_version})[/yellow]")
+        console.print("[dim]  Cache version < v11.0.0 has partial multi-window features[/dim]")
+        console.print("[dim]  Strategy will be saved but may have limited effect[/dim]\n")
+
+    # Display strategy comparison table
+    console.print("[bold]Available Strategies:[/bold]\n")
+
+    strategy_table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+    strategy_table.add_column("Strategy", style="cyan", width=20)
+    strategy_table.add_column("Selection Criteria", width=35)
+    strategy_table.add_column("Best For", width=30)
+
+    # Strategy names match dataset.py SelectionStrategy enum values:
+    # bounce_first, label_validity, balanced_score, quality_score
+    strategy_table.add_row(
+        "bounce_first",
+        "Most bounces → best r²\n(current v7-v9 default)",
+        "Maximizing channel quality\nProven production strategy"
+    )
+    strategy_table.add_row(
+        "label_validity",
+        "Most valid TF labels\nacross timeframes",
+        "Label-focused training\nMaximize valid targets"
+    )
+    strategy_table.add_row(
+        "balanced_score",
+        "40% bounce quality +\n60% label validity",
+        "Balanced approach\nGood channel + valid labels"
+    )
+    strategy_table.add_row(
+        "quality_score",
+        "Pre-computed quality\n(bounces × r² composite)",
+        "Simple quality metric\nFast, deterministic"
+    )
+    strategy_table.add_row(
+        "learned_selection",
+        "Model learns optimal window\nper timeframe during training",
+        "Research/adaptive learning\nRequires v11.0.0 cache"
+    )
+
+    console.print(strategy_table)
+    console.print("")
+
+    # Display trade-offs panel
+    # Strategy names match dataset.py: bounce_first, label_validity, balanced_score, quality_score
+    tradeoffs_panel = Panel(
+        "[bold yellow]Strategy Trade-offs:[/bold yellow]\n\n"
+        "[cyan]bounce_first:[/cyan]\n"
+        "  + Proven production performance\n"
+        "  + Prioritizes clean oscillation patterns\n"
+        "  - May ignore label validity\n\n"
+        "[cyan]label_validity:[/cyan]\n"
+        "  + Maximizes valid training targets\n"
+        "  + Best when label quality matters most\n"
+        "  - May select lower-quality channels\n\n"
+        "[cyan]balanced_score:[/cyan]\n"
+        "  + Balanced optimization\n"
+        "  + Considers both quality and utility\n"
+        "  - May compromise on either metric\n\n"
+        "[cyan]quality_score:[/cyan]\n"
+        "  + Uses pre-computed composite score\n"
+        "  + Fast and deterministic\n"
+        "  - Less flexible than other strategies\n\n"
+        "[cyan]learned_selection:[/cyan]\n"
+        "  + Model adapts to market regime\n"
+        "  + Can outperform heuristics\n"
+        "  + Per-timeframe optimization\n"
+        "  - Adds training complexity\n"
+        "  - Requires multi-window features",
+        title="Trade-offs Analysis",
+        border_style="yellow",
+        box=box.ROUNDED
+    )
+    console.print(tradeoffs_panel)
+    console.print("")
+
+    # Strategy selection menu
+    # Values must match dataset.py SelectionStrategy enum: bounce_first, label_validity, balanced_score, quality_score
+    strategy_choices = [
+        {
+            "name": "bounce_first - Maximize bounce quality (recommended for production)",
+            "value": "bounce_first"  # Maps to SelectionStrategy.BOUNCE_FIRST
+        },
+        {
+            "name": "label_validity - Select windows with most valid TF labels",
+            "value": "label_validity"  # Maps to SelectionStrategy.LABEL_VALIDITY
+        },
+        {
+            "name": "balanced_score - Balance bounce quality + label validity",
+            "value": "balanced_score"  # Maps to SelectionStrategy.BALANCED_SCORE
+        },
+        {
+            "name": "quality_score - Use pre-computed channel quality score",
+            "value": "quality_score"  # Maps to SelectionStrategy.QUALITY_SCORE
+        },
+        {
+            "name": "learned_selection - Let model learn optimal window (EXPERIMENTAL)",
+            "value": "learned_selection"
+        },
+    ]
+
+    # Default to proven production strategy
+    default_strategy = "bounce_first"
+
+    selected_strategy = inquirer.select(
+        message="Select window selection strategy:",
+        choices=strategy_choices,
+        default=default_strategy
+    ).execute()
+
+    # Display confirmation
+    console.print(f"\n[green]✓ Selected strategy: {selected_strategy}[/green]")
+
+    # Show what this means in practice
+    # Messages match the strategy values expected by dataset.py
+    if selected_strategy == "bounce_first":
+        console.print("[dim]  Will select window with most bounces and best r²[/dim]")
+    elif selected_strategy == "label_validity":
+        console.print("[dim]  Will select window with most valid TF labels[/dim]")
+    elif selected_strategy == "balanced_score":
+        console.print("[dim]  Will optimize 40% bounce quality + 60% label validity[/dim]")
+    elif selected_strategy == "quality_score":
+        console.print("[dim]  Will use pre-computed channel.quality_score[/dim]")
+    elif selected_strategy == "learned_selection":
+        console.print("[dim]  Model will learn to select optimal window via PerTFWindowSelector head[/dim]")
+        console.print("[yellow]  Note: Adds window_selection_loss to training objective[/yellow]")
+
+    console.print("")
+
+    # If learned_selection chosen, enable window selection loss
+    if selected_strategy == "learned_selection":
+        # This will be used later to configure CombinedLoss
+        return selected_strategy, {"use_window_selection_loss": True}
+    else:
+        return selected_strategy, {}
+
+
 # =============================================================================
 # Pre-flight Checks
 # =============================================================================
@@ -1390,6 +1564,10 @@ def display_config_summary(config: Dict):
     data_tree.add(f"Train end: {config['data']['train_end']}")
     data_tree.add(f"Val end: {config['data']['val_end']}")
     data_tree.add(f"Include history: {config['data']['include_history']}")
+    # Add window selection strategy if configured
+    if 'window_selection_strategy' in config['data']:
+        strategy = config['data']['window_selection_strategy']
+        data_tree.add(f"Window selection: {strategy}")
 
     # Model config
     model_tree = Tree("[bold]Model Configuration[/bold]")
@@ -1435,6 +1613,11 @@ def display_config_summary(config: Dict):
         train_tree.add("Calibration: Brier on per-TF confidence")
     elif calibration_mode == 'brier_aggregate':
         train_tree.add("Calibration: Brier on aggregate confidence")
+
+    # Add window selection loss info (learned_selection strategy)
+    if config['training'].get('use_window_selection_loss', False):
+        weight = config['training'].get('window_selection_weight', 0.1)
+        train_tree.add(f"[yellow]Window Selection Loss: ENABLED (weight={weight})[/yellow]")
 
     layout["data"].update(Panel(data_tree, border_style="cyan"))
     layout["model"].update(Panel(model_tree, border_style="magenta"))
@@ -1907,6 +2090,7 @@ def run_walk_forward_training(
                     batch_size=config["training"]["batch_size"],
                     device=config["device"],  # Auto-detects num_workers and pin_memory
                     augment_train=True,
+                    strategy=config["data"].get("window_selection_strategy", "bounce_first"),
                 )
 
             # Create model for this window
@@ -1938,6 +2122,8 @@ def run_walk_forward_training(
                 use_learnable_weights=config["training"]["use_learnable_weights"],
                 fixed_weights=config["training"]["fixed_weights"],
                 calibration_mode=config["training"].get("calibration_mode", "brier_per_tf"),
+                use_window_selection_loss=config["training"].get("use_window_selection_loss", False),
+                window_selection_weight=config["training"].get("window_selection_weight", 0.1),
                 early_stopping_patience=config["training"].get("early_stopping_patience", 15),
                 early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
                 early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
@@ -2288,6 +2474,16 @@ def main():
     # Pre-flight checks
     preflight_checks(config, data_dir, cache_dir)
 
+    # Window selection strategy configuration (v11+ multi-window support)
+    window_selection_strategy, strategy_config = configure_window_selection_strategy(cache_dir)
+    config["data"]["window_selection_strategy"] = window_selection_strategy
+    # Merge any strategy-specific config (e.g., use_window_selection_loss for learned_selection)
+    # Window selection loss goes in training config, not data config
+    if strategy_config:
+        if "use_window_selection_loss" in strategy_config:
+            config["training"]["use_window_selection_loss"] = strategy_config["use_window_selection_loss"]
+            config["training"]["window_selection_weight"] = strategy_config.get("window_selection_weight", 0.1)
+
     # Display summary
     display_config_summary(config)
 
@@ -2347,6 +2543,7 @@ def main():
                 batch_size=config["training"]["batch_size"],
                 device=config["device"],  # Auto-detects num_workers and pin_memory
                 augment_train=True,
+                strategy=config["data"].get("window_selection_strategy", "bounce_first"),
             )
 
         console.print(
@@ -2384,6 +2581,8 @@ def main():
             use_learnable_weights=config["training"]["use_learnable_weights"],
             fixed_weights=config["training"]["fixed_weights"],
             calibration_mode=config["training"].get("calibration_mode", "brier_per_tf"),
+            use_window_selection_loss=config["training"].get("use_window_selection_loss", False),
+            window_selection_weight=config["training"].get("window_selection_weight", 0.1),
             early_stopping_patience=config["training"].get("early_stopping_patience", 15),
             early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
             early_stopping_mode=config["training"].get("early_stopping_mode", "min"),

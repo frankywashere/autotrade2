@@ -48,6 +48,8 @@ from .losses import (
     MetricsCalculator,
 )
 
+from .window_selection_loss import WindowSelectionLoss
+
 from .walk_forward import (
     WalkForwardWindow,
     generate_walk_forward_windows,
@@ -94,6 +96,7 @@ __all__ = [
     'DirectionLoss',
     'NextChannelDirectionLoss',
     'MetricsCalculator',
+    'WindowSelectionLoss',
 
     # Walk-Forward Validation
     'WalkForwardWindow',

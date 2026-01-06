@@ -352,13 +352,23 @@ def main():
         model, checkpoint, device = load_model_from_checkpoint(checkpoint_path, args.device)
 
         # 3. Create test dataloader
+        # Load strategy from training config if available
+        config_path = checkpoint_dir / "training_config.json"
+        strategy = "bounce_first"  # Default
+        if config_path.exists():
+            with open(config_path) as f:
+                training_config = json.load(f)
+            strategy = training_config.get("data", {}).get("window_selection_strategy", "bounce_first")
+
         console.print("\n[cyan]Creating test dataloader...[/cyan]")
+        console.print(f"  Window selection strategy: {strategy}")
         _, _, test_loader = create_dataloaders(
             train_samples,  # Dummy (not used)
             val_samples,    # Dummy (not used)
             test_samples,
             batch_size=args.batch_size,
-            device=device
+            device=device,
+            strategy=strategy,
         )
 
         console.print(f"  Test batches: {len(test_loader)}")

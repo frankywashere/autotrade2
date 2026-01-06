@@ -58,6 +58,11 @@ class TrainingConfig:
     # - 'brier_aggregate': Brier on aggregate confidence head (single cross-TF confidence)
     calibration_mode: str = 'brier_per_tf'
 
+    # Window selection loss (for learned_selection strategy)
+    # When enabled, trains the model's window_selector head to pick optimal windows
+    use_window_selection_loss: bool = False
+    window_selection_weight: float = 0.1  # Weight for window selection loss in total loss
+
     # Optimization
     optimizer: str = 'adam'  # 'adam', 'adamw', 'sgd'
     scheduler: str = 'cosine'  # 'cosine', 'step', 'plateau', 'none'
@@ -123,7 +128,9 @@ class Trainer:
             num_timeframes=config.num_timeframes,
             use_learnable_weights=config.use_learnable_weights,
             fixed_weights=config.fixed_weights,
-            calibration_mode=config.calibration_mode
+            calibration_mode=config.calibration_mode,
+            use_window_selection_loss=config.use_window_selection_loss,
+            window_selection_weight=config.window_selection_weight,
         )
         # Move criterion to device (critical for learnable weights)
         self.criterion.to(self.device)
@@ -229,7 +236,8 @@ class Trainer:
             'direction': [],
             'next_channel': [],
             'calibration': [],
-            'trigger_tf': []  # v9.0.0
+            'trigger_tf': [],  # v9.0.0
+            'window_selection': [],  # For learned_selection strategy
         }
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1}/{self.config.num_epochs}")
@@ -254,6 +262,13 @@ class Trainer:
             # v9.0.0: Add trigger_tf target if present
             if 'trigger_tf' in labels:
                 targets['trigger_tf'] = labels['trigger_tf'].to(self.device)
+
+            # Window selection targets (for learned_selection strategy)
+            if self.config.use_window_selection_loss:
+                if 'best_window' in labels:
+                    targets['best_window'] = labels['best_window'].to(self.device)
+                if 'window_scores' in labels:
+                    targets['window_scores'] = labels['window_scores'].to(self.device)
 
             # Extract validity masks (v9.0.0 format required)
             # Masks are 1.0 for valid labels, 0.0 for invalid/missing labels
@@ -332,14 +347,16 @@ class Trainer:
             'direction': [],
             'next_channel': [],
             'calibration': [],
-            'trigger_tf': []  # v9.0.0
+            'trigger_tf': [],  # v9.0.0
+            'window_selection': [],  # For learned_selection strategy
         }
 
         # Track accuracy metrics (weighted by mask if present)
         direction_correct = 0.0
         next_channel_correct = 0.0
         trigger_tf_correct = 0.0  # v9.0.0
-        total_valid_samples = 0.0  # Float for mask weighting
+        total_valid_samples = 0.0  # Float for mask weighting (direction)
+        total_next_channel_samples = 0.0  # Separate counter for next_channel
         total_trigger_tf_samples = 0.0  # v9.0.0
 
         with torch.no_grad():
@@ -361,6 +378,13 @@ class Trainer:
                 # v9.0.0: Add trigger_tf target if present
                 if 'trigger_tf' in labels:
                     targets['trigger_tf'] = labels['trigger_tf'].to(self.device)
+
+                # Window selection targets (for learned_selection strategy)
+                if self.config.use_window_selection_loss:
+                    if 'best_window' in labels:
+                        targets['best_window'] = labels['best_window'].to(self.device)
+                    if 'window_scores' in labels:
+                        targets['window_scores'] = labels['window_scores'].to(self.device)
 
                 # Extract validity masks (v9.0.0 format required)
                 masks = {
@@ -404,6 +428,7 @@ class Trainer:
                 direction_correct += (direction_matches * direction_mask).sum().item()
                 next_channel_correct += (next_channel_matches * next_channel_mask).sum().item()
                 total_valid_samples += direction_mask.sum().item()
+                total_next_channel_samples += next_channel_mask.sum().item()
 
                 # v9.0.0: Calculate trigger_tf accuracy (aggregate-only, 21-class)
                 if ('aggregate' in predictions and
@@ -434,7 +459,7 @@ class Trainer:
         # Average losses and accuracies
         epoch_metrics = {k: np.mean(v) if v else 0.0 for k, v in epoch_losses.items()}
         epoch_metrics['direction_acc'] = direction_correct / total_valid_samples if total_valid_samples > 0 else 0.0
-        epoch_metrics['next_channel_acc'] = next_channel_correct / total_valid_samples if total_valid_samples > 0 else 0.0
+        epoch_metrics['next_channel_acc'] = next_channel_correct / total_next_channel_samples if total_next_channel_samples > 0 else 0.0
         epoch_metrics['trigger_tf_acc'] = trigger_tf_correct / total_trigger_tf_samples if total_trigger_tf_samples > 0 else 0.0  # v9.0.0
 
         return epoch_metrics

@@ -204,6 +204,258 @@ class NextChannelDirectionLoss(nn.Module):
         return loss
 
 
+class WindowSelectionLoss(nn.Module):
+    """
+    Loss for training the per-TF window selector head.
+
+    Teaches the model to select windows that lead to better duration predictions.
+    Uses the best_window from cache as soft supervision - windows with
+    similar quality should have similar selection probabilities.
+
+    The window selector head outputs logits for 8 possible resample windows
+    (e.g., different starting points or window sizes) for each of the 11
+    timeframes. This loss trains the model to learn which windows
+    historically produce better predictions.
+
+    Supports three target types:
+    - "best_window": Hard target using cache's best_window index (cross-entropy)
+    - "soft": Soft targets based on window quality scores (KL divergence)
+    - "oracle": Reserved for future per-window duration loss computation
+
+    Args:
+        target_type: Type of supervision signal to use
+            - "best_window": Use cache's best_window as hard target (cross-entropy)
+            - "soft": Soft targets based on window quality scores (KL divergence)
+            - "oracle": Use per-window duration loss (future work, raises NotImplementedError)
+
+    Example:
+        >>> loss_fn = WindowSelectionLoss(target_type="best_window")
+        >>> window_logits = torch.randn(32, 11, 8)  # [batch, TFs, windows]
+        >>> targets = torch.randint(0, 8, (32,))  # best window per sample
+        >>> loss = loss_fn(window_logits, targets)
+    """
+
+    NUM_TIMEFRAMES = 11
+    NUM_WINDOWS = 8
+
+    def __init__(self, target_type: str = "best_window"):
+        """
+        Initialize WindowSelectionLoss.
+
+        Args:
+            target_type: Type of supervision signal
+                - "best_window": Hard target using cache's best_window index
+                - "soft": Soft targets based on window quality scores
+                - "oracle": Per-window duration loss (not yet implemented)
+
+        Raises:
+            ValueError: If target_type is not one of the supported types
+        """
+        super().__init__()
+
+        valid_types = {"best_window", "soft", "oracle"}
+        if target_type not in valid_types:
+            raise ValueError(
+                f"Invalid target_type: {target_type}. "
+                f"Must be one of: {valid_types}"
+            )
+
+        self.target_type = target_type
+
+    def forward(
+        self,
+        window_logits: torch.Tensor,
+        targets: torch.Tensor,
+        window_scores: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute window selection loss.
+
+        Args:
+            window_logits: Model's predicted window selection logits
+                Shape: [batch_size, num_timeframes (11), num_windows (8)]
+            targets: Best window indices from cache (for hard targets)
+                Shape: [batch_size] with values in range [0, 7]
+            window_scores: Quality scores for each window (for soft targets)
+                Shape: [batch_size, num_windows (8), num_features (4)]
+                where features are typically [start_idx, end_idx, quality_score, ...]
+                Column 2 (index 2) should contain the quality_score
+
+        Returns:
+            Scalar loss value (torch.Tensor with shape [])
+
+        Raises:
+            ValueError: If target_type is "oracle" (not yet implemented)
+            RuntimeError: If tensor shapes are incompatible
+        """
+        # Validate input shapes
+        if window_logits.dim() != 3:
+            raise RuntimeError(
+                f"window_logits must be 3D [batch, TFs, windows], "
+                f"got shape {window_logits.shape}"
+            )
+
+        batch_size, num_tfs, num_windows = window_logits.shape
+
+        if num_tfs != self.NUM_TIMEFRAMES:
+            raise RuntimeError(
+                f"Expected {self.NUM_TIMEFRAMES} timeframes, got {num_tfs}"
+            )
+
+        if num_windows != self.NUM_WINDOWS:
+            raise RuntimeError(
+                f"Expected {self.NUM_WINDOWS} windows, got {num_windows}"
+            )
+
+        if targets.dim() != 1 or targets.size(0) != batch_size:
+            raise RuntimeError(
+                f"targets must have shape [{batch_size}], "
+                f"got shape {targets.shape}"
+            )
+
+        if self.target_type == "best_window":
+            return self._compute_hard_target_loss(window_logits, targets)
+
+        elif self.target_type == "soft":
+            return self._compute_soft_target_loss(
+                window_logits, targets, window_scores
+            )
+
+        elif self.target_type == "oracle":
+            raise NotImplementedError(
+                "Oracle target type (per-window duration loss) is reserved "
+                "for future work. Use 'best_window' or 'soft' instead."
+            )
+
+        else:
+            # Should not reach here due to __init__ validation
+            raise ValueError(f"Unknown target_type: {self.target_type}")
+
+    def _compute_hard_target_loss(
+        self,
+        window_logits: torch.Tensor,
+        targets: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute cross-entropy loss with hard targets.
+
+        The same best_window target is used for all 11 timeframes, teaching
+        the model that the optimal window choice is consistent across TFs.
+
+        Args:
+            window_logits: Shape [batch_size, 11, 8]
+            targets: Shape [batch_size] with values in [0, 7]
+
+        Returns:
+            Scalar cross-entropy loss
+        """
+        batch_size = window_logits.size(0)
+
+        # Expand targets to [batch, 11] - same target for all TFs
+        # This assumes the best window choice is consistent across timeframes
+        targets_expanded = targets.unsqueeze(1).expand(-1, self.NUM_TIMEFRAMES)
+
+        # Flatten for cross entropy: [batch * 11, 8]
+        logits_flat = window_logits.view(-1, self.NUM_WINDOWS)
+        targets_flat = targets_expanded.contiguous().view(-1)
+
+        # Ensure targets are long type for cross_entropy
+        targets_flat = targets_flat.long()
+
+        # Validate target range
+        if targets_flat.min() < 0 or targets_flat.max() >= self.NUM_WINDOWS:
+            raise RuntimeError(
+                f"Target values must be in range [0, {self.NUM_WINDOWS - 1}], "
+                f"got range [{targets_flat.min()}, {targets_flat.max()}]"
+            )
+
+        loss = F.cross_entropy(logits_flat, targets_flat)
+        return loss
+
+    def _compute_soft_target_loss(
+        self,
+        window_logits: torch.Tensor,
+        targets: torch.Tensor,
+        window_scores: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """
+        Compute KL divergence loss with soft targets based on window quality.
+
+        Higher quality windows get higher target probabilities. This allows
+        the model to learn that multiple windows may be good choices, with
+        smooth gradients between them.
+
+        Args:
+            window_logits: Shape [batch_size, 11, 8]
+            targets: Shape [batch_size] - fallback if window_scores is None
+            window_scores: Shape [batch_size, 8, 4] where column 2 is quality
+
+        Returns:
+            Scalar KL divergence loss
+        """
+        if window_scores is None:
+            # Fall back to hard targets if no quality scores available
+            return self._compute_hard_target_loss(window_logits, targets)
+
+        # Validate window_scores shape
+        if window_scores.dim() != 3:
+            raise RuntimeError(
+                f"window_scores must be 3D [batch, windows, features], "
+                f"got shape {window_scores.shape}"
+            )
+
+        batch_size = window_logits.size(0)
+        if window_scores.size(0) != batch_size:
+            raise RuntimeError(
+                f"window_scores batch size {window_scores.size(0)} "
+                f"doesn't match window_logits batch size {batch_size}"
+            )
+
+        if window_scores.size(1) != self.NUM_WINDOWS:
+            raise RuntimeError(
+                f"window_scores must have {self.NUM_WINDOWS} windows, "
+                f"got {window_scores.size(1)}"
+            )
+
+        if window_scores.size(2) < 3:
+            raise RuntimeError(
+                f"window_scores must have at least 3 features (need column 2 "
+                f"for quality_score), got {window_scores.size(2)} features"
+            )
+
+        # Extract quality scores (column 2: quality_score)
+        qualities = window_scores[:, :, 2]  # [batch, 8]
+
+        # Handle edge cases in quality scores
+        # Replace NaN/Inf with minimum quality to avoid softmax issues
+        qualities = torch.where(
+            torch.isfinite(qualities),
+            qualities,
+            torch.full_like(qualities, float('-inf'))
+        )
+
+        # Convert to target probabilities via softmax
+        # Higher quality -> higher probability
+        target_probs = F.softmax(qualities, dim=-1)  # [batch, 8]
+
+        # Expand to all TFs: [batch, 11, 8]
+        target_probs = target_probs.unsqueeze(1).expand(-1, self.NUM_TIMEFRAMES, -1)
+
+        # Compute KL divergence: KL(target || predicted)
+        # log_softmax for numerical stability
+        log_probs = F.log_softmax(window_logits, dim=-1)
+
+        # KL divergence with batchmean reduction
+        # F.kl_div expects log_probs as input, target_probs as target
+        loss = F.kl_div(log_probs, target_probs, reduction='batchmean')
+
+        return loss
+
+    def extra_repr(self) -> str:
+        """Return extra representation string for print/repr."""
+        return f"target_type={self.target_type}"
+
+
 class TriggerTimeframeLoss(nn.Module):
     """
     Multi-class cross-entropy loss for trigger TF prediction (v9.0.0).
@@ -406,10 +658,18 @@ class CombinedLoss(nn.Module):
 
     def __init__(
         self,
-        num_timeframes: int,
+        num_timeframes: int = 11,
         use_learnable_weights: bool = True,
         fixed_weights: Optional[Dict[str, float]] = None,
-        calibration_mode: str = 'brier_per_tf'
+        calibration_mode: str = 'brier_per_tf',
+        duration_weight: float = 1.0,
+        direction_weight: float = 1.0,
+        next_channel_weight: float = 1.0,
+        calibration_weight: float = 1.0,
+        trigger_tf_weight: float = 1.0,
+        use_window_selection_loss: bool = False,
+        window_selection_weight: float = 0.1,
+        window_selection_target: str = "best_window",
     ):
         """
         Args:
@@ -421,6 +681,14 @@ class CombinedLoss(nn.Module):
                 - 'ece_direction': ECE on direction probabilities (calibrates direction directly)
                 - 'brier_per_tf': Brier on per-TF confidence head (predictions['confidence'])
                 - 'brier_aggregate': Brier on aggregate confidence (predictions['aggregate']['confidence'])
+            duration_weight: Fixed weight for duration loss (used when use_learnable_weights=False)
+            direction_weight: Fixed weight for direction loss (used when use_learnable_weights=False)
+            next_channel_weight: Fixed weight for next channel loss (used when use_learnable_weights=False)
+            calibration_weight: Fixed weight for calibration loss (used when use_learnable_weights=False)
+            trigger_tf_weight: Fixed weight for trigger TF loss (used when use_learnable_weights=False)
+            use_window_selection_loss: If True, include window selection loss
+            window_selection_weight: Weight for window selection loss
+            window_selection_target: Target type for window selection ('best_window' or 'selected_window')
         """
         super().__init__()
         self.num_timeframes = num_timeframes
@@ -434,6 +702,16 @@ class CombinedLoss(nn.Module):
         self.trigger_tf_loss = TriggerTimeframeLoss()  # v9.0.0
         self.ece = ExpectedCalibrationError()
         self.brier = BrierScore()
+
+        # Window selection loss (optional)
+        self.use_window_selection_loss = use_window_selection_loss
+        self.window_selection_weight = window_selection_weight
+        if use_window_selection_loss:
+            # Lazy import to avoid circular dependency
+            from v7.training.window_selection_loss import WindowSelectionLoss
+            self.window_selection_loss_fn = WindowSelectionLoss(target_type=window_selection_target)
+        else:
+            self.window_selection_loss_fn = None
 
         if use_learnable_weights:
             # Learnable log(σ²) for each task
@@ -607,6 +885,18 @@ class CombinedLoss(nn.Module):
                 direction_mask
             )
 
+        # Window selection loss (optional)
+        loss_window_selection = None
+        if self.use_window_selection_loss and self.window_selection_loss_fn is not None:
+            if 'window_logits' in predictions:
+                window_target = targets.get('best_window', targets.get('selected_window'))
+                if window_target is not None:
+                    loss_window_selection = self.window_selection_loss_fn(
+                        predictions['window_logits'],  # [batch, 11, 8]
+                        target_indices=window_target,  # [batch]
+                        window_scores=targets.get('window_scores')  # [batch, 8, 4]
+                    )
+
         # Combine losses
         if self.use_learnable_weights:
             # Uncertainty-based weighting: (1 / 2σ²) * L + log(σ)
@@ -646,6 +936,10 @@ class CombinedLoss(nn.Module):
             )
             learned_weights = None
 
+        # Add window selection loss if computed (uses fixed weight, not learnable)
+        if loss_window_selection is not None:
+            total_loss = total_loss + self.window_selection_weight * loss_window_selection
+
         # Build loss dictionary for logging
         loss_dict = {
             'total': total_loss.item(),
@@ -655,6 +949,10 @@ class CombinedLoss(nn.Module):
             'calibration': loss_calibration.item(),
             'trigger_tf': loss_trigger_tf.item() if isinstance(loss_trigger_tf, torch.Tensor) else loss_trigger_tf  # v9.0.0
         }
+
+        # Add window selection loss to loss_dict if computed
+        if loss_window_selection is not None:
+            loss_dict['window_selection'] = loss_window_selection.item()
 
         if learned_weights is not None:
             loss_dict['weights'] = learned_weights
