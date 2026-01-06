@@ -15,7 +15,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 import time
 import threading
-import queue
 
 from .types import ChannelSample
 
@@ -178,9 +177,7 @@ def _process_position_batch(
     include_history: bool,
     lookforward_bars: int,
     max_forward_5min_bars: int,
-    custom_return_thresholds: Optional[Dict[str, int]],
-    progress_queue: Optional[multiprocessing.Queue] = None,
-    progress_every: int = 10
+    custom_return_thresholds: Optional[Dict[str, int]]
 ) -> List[Tuple[int, ChannelSample]]:
     """
     Process a batch of positions. Used by parallel workers.
@@ -189,16 +186,11 @@ def _process_position_batch(
     instead of receiving them as parameters, reducing serialization overhead.
 
     Returns list of (index, sample) tuples for valid samples.
-
-    Args:
-        progress_queue: Optional queue to send progress updates to main process
-        progress_every: Send progress update every N positions processed
     """
     # Read from worker globals (set by _init_scan_worker)
     global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES
 
     results = []
-    processed_count = 0
     for i in indices:
         result = _process_single_position(
             i=i,
@@ -217,16 +209,6 @@ def _process_position_batch(
         )
         if result is not None:
             results.append(result)
-
-        processed_count += 1
-
-        # Send progress updates
-        if progress_queue and (processed_count % progress_every == 0):
-            progress_queue.put(progress_every)
-
-    # Send remainder if not aligned with progress_every
-    if progress_queue and processed_count % progress_every != 0:
-        progress_queue.put(processed_count % progress_every)
 
     return results
 
@@ -427,34 +409,16 @@ def _scan_parallel(
     if progress:
         print(f"Parallel scanning: {total_positions} positions using {max_workers} workers ({len(chunks)} chunks)")
 
-    # Create progress queue for granular updates
-    progress_queue = multiprocessing.Queue()
-
     # Process chunks in parallel
     all_results = []
 
-    # Start daemon thread to read progress queue and update tqdm
+    # Progress bar updated when each future completes (no queue needed)
     pbar = None
-    progress_thread = None
-    stop_progress = threading.Event()
-
     if progress:
         pbar = tqdm(total=total_positions, desc="Scanning channels (parallel)")
 
-        def progress_updater():
-            """Daemon thread that reads progress updates from queue."""
-            while not stop_progress.is_set():
-                try:
-                    # Get progress update with timeout
-                    count = progress_queue.get(timeout=0.1)
-                    if count is None:  # Sentinel value to stop
-                        break
-                    pbar.update(count)
-                except queue.Empty:
-                    continue
-
-        progress_thread = threading.Thread(target=progress_updater, daemon=True)
-        progress_thread.start()
+    # Track chunk sizes for progress updates
+    chunk_sizes = {i: len(chunk) for i, chunk in enumerate(chunks)}
 
     with ProcessPoolExecutor(
         max_workers=max_workers,
@@ -462,7 +426,6 @@ def _scan_parallel(
         initargs=(tsla_values, tsla_index, spy_values, vix_values)
     ) as executor:
         # Submit all chunks (arrays are now in worker globals, not passed per-task)
-        # Pass progress_queue to workers for granular progress updates
         futures = {
             executor.submit(
                 _process_position_batch,
@@ -474,9 +437,7 @@ def _scan_parallel(
                 include_history,
                 lookforward_bars,
                 max_forward_5min_bars,
-                custom_return_thresholds,
-                progress_queue,  # progress queue for granular updates
-                10  # progress_every
+                custom_return_thresholds
             ): i for i, chunk in enumerate(chunks)
         }
 
@@ -513,14 +474,21 @@ def _scan_parallel(
         # Collect results
         try:
             for future in as_completed(futures):
+                chunk_idx = futures[future]
                 try:
                     batch_results = future.result()
                     all_results.extend(batch_results)
+                    # Update progress bar with chunk size
+                    if pbar is not None:
+                        pbar.update(chunk_sizes[chunk_idx])
                     # Update heartbeat timestamp on progress
                     last_progress_time = time.monotonic()
                 except Exception as e:
                     if progress:
                         tqdm.write(f"Worker error: {e}")
+                    # Update progress even on error
+                    if pbar is not None:
+                        pbar.update(chunk_sizes[chunk_idx])
                     # Update heartbeat even on error to avoid false timeout
                     last_progress_time = time.monotonic()
         finally:
@@ -529,13 +497,9 @@ def _scan_parallel(
                 stop_monitoring.set()
                 monitor_thread.join(timeout=1.0)
 
-    # Signal progress thread to stop and wait
-    if progress and progress_thread is not None:
-        stop_progress.set()
-        progress_queue.put(None)  # Sentinel
-        progress_thread.join(timeout=1.0)
-        if pbar is not None:
-            pbar.close()
+    # Close progress bar
+    if pbar is not None:
+        pbar.close()
 
 
     # Sort results by index to maintain deterministic order
