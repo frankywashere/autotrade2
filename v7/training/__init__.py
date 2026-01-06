@@ -22,7 +22,6 @@ from .dataset import (
     ChannelDataset,
     ChannelSample,
     load_market_data,
-    scan_valid_channels,
     cache_samples,
     load_cached_samples,
     split_by_date,
@@ -32,6 +31,9 @@ from .dataset import (
     validate_date_range,
     get_data_date_range,
 )
+
+# Use parallel scanner from scanning.py (not the sequential one in dataset.py)
+from .scanning import scan_valid_channels
 
 from .trainer import (
     Trainer,

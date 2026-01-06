@@ -28,6 +28,9 @@ from ..core.timeframe import resample_ohlc, TIMEFRAMES, BARS_PER_TF
 from ..features.full_features import extract_full_features, features_to_tensor_dict, FullFeatures
 from .labels import generate_labels, generate_labels_per_tf, generate_labels_multi_window, select_best_window_by_labels, ChannelLabels, labels_to_dict, labels_to_array
 
+# Import parallel scanner (preferred over local sequential implementation)
+from .scanning import scan_valid_channels as _parallel_scan_valid_channels
+
 
 # =============================================================================
 # Cache Version Management
@@ -764,7 +767,7 @@ def load_market_data(
     return tsla_aligned, spy_aligned, vix_aligned
 
 
-def scan_valid_channels(
+def _scan_valid_channels_sequential_legacy(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
@@ -776,9 +779,16 @@ def scan_valid_channels(
     include_history: bool = False,
     lookforward_bars: int = 200,
     progress: bool = True,
-    custom_return_thresholds: Optional[Dict[str, int]] = None
+    custom_return_thresholds: Optional[Dict[str, int]] = None,
+    parallel: bool = True,
+    max_workers: Optional[int] = None
 ) -> Tuple[List[ChannelSample], int]:
     """
+    DEPRECATED: Sequential scanner - use scanning.scan_valid_channels() instead.
+
+    This function is kept for reference but is no longer used. The parallel
+    implementation in scanning.py is significantly faster on multi-core systems.
+
     Scan through historical data to find all valid channels and generate samples.
 
     Returns:
@@ -1306,7 +1316,9 @@ def prepare_dataset_from_scratch(
     include_history: bool = False,
     force_rebuild: bool = False,
     warn_on_mismatch: bool = True,
-    custom_return_thresholds: Optional[Dict[str, int]] = None
+    custom_return_thresholds: Optional[Dict[str, int]] = None,
+    parallel: bool = True,
+    max_workers: Optional[int] = None
 ) -> Tuple[List[ChannelSample], List[ChannelSample], List[ChannelSample]]:
     """
     Complete pipeline to prepare dataset from raw data.
@@ -1336,6 +1348,8 @@ def prepare_dataset_from_scratch(
         custom_return_thresholds: Optional dict mapping TF names to custom return thresholds.
             If provided, overrides the default return_threshold for specific timeframes.
             Example: {'5min': 10, '15min': 15, '1hour': 25}
+        parallel: Enable parallel processing (default True)
+        max_workers: Number of worker processes (default None = auto-detect)
 
     Returns:
         Tuple of (train_samples, val_samples, test_samples)
@@ -1409,9 +1423,9 @@ def prepare_dataset_from_scratch(
         print(f"SPY: {len(spy_df)} bars ({spy_df.index[0]} to {spy_df.index[-1]})")
         print(f"VIX: {len(vix_df)} bars ({vix_df.index[0]} to {vix_df.index[-1]})")
 
-        # Scan for valid channels
+        # Scan for valid channels (using parallel scanner from scanning.py)
         print(f"\nScanning for valid channels (window={window}, step={step})...")
-        samples, min_warmup_bars = scan_valid_channels(
+        samples, min_warmup_bars = _parallel_scan_valid_channels(
             tsla_df,
             spy_df,
             vix_df,
@@ -1422,7 +1436,9 @@ def prepare_dataset_from_scratch(
             return_threshold=return_threshold,
             include_history=include_history,
             lookforward_bars=lookforward_bars,
-            custom_return_thresholds=custom_return_thresholds
+            custom_return_thresholds=custom_return_thresholds,
+            parallel=parallel,
+            max_workers=max_workers
         )
 
         print(f"\nFound {len(samples)} valid channel samples")
