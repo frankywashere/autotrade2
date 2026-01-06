@@ -11,7 +11,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 import multiprocessing
 import time
 import threading
@@ -28,14 +28,20 @@ _WORKER_TSLA_VALUES = None
 _WORKER_TSLA_INDEX = None
 _WORKER_SPY_VALUES = None
 _WORKER_VIX_VALUES = None
+_WORKER_PROGRESS_COUNTER = None  # Shared counter for progress updates
 
-def _init_scan_worker(tsla_values, tsla_index, spy_values, vix_values):
-    """Initialize worker process with shared data arrays."""
-    global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES
+# Progress update stride - flush to shared counter every N positions
+PROGRESS_STRIDE = 10
+
+
+def _init_scan_worker(tsla_values, tsla_index, spy_values, vix_values, progress_counter=None):
+    """Initialize worker process with shared data arrays and progress counter."""
+    global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES, _WORKER_PROGRESS_COUNTER
     _WORKER_TSLA_VALUES = tsla_values
     _WORKER_TSLA_INDEX = tsla_index
     _WORKER_SPY_VALUES = spy_values
     _WORKER_VIX_VALUES = vix_values
+    _WORKER_PROGRESS_COUNTER = progress_counter
 
 
 def _process_single_position(
@@ -188,9 +194,11 @@ def _process_position_batch(
     Returns list of (index, sample) tuples for valid samples.
     """
     # Read from worker globals (set by _init_scan_worker)
-    global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES
+    global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES, _WORKER_PROGRESS_COUNTER
 
     results = []
+    local_processed = 0  # Local counter to batch progress updates
+
     for i in indices:
         result = _process_single_position(
             i=i,
@@ -209,6 +217,19 @@ def _process_position_batch(
         )
         if result is not None:
             results.append(result)
+
+        local_processed += 1
+
+        # Flush progress to shared counter every PROGRESS_STRIDE positions
+        if _WORKER_PROGRESS_COUNTER is not None and local_processed >= PROGRESS_STRIDE:
+            with _WORKER_PROGRESS_COUNTER.get_lock():
+                _WORKER_PROGRESS_COUNTER.value += local_processed
+            local_processed = 0
+
+    # Flush any remaining progress
+    if _WORKER_PROGRESS_COUNTER is not None and local_processed > 0:
+        with _WORKER_PROGRESS_COUNTER.get_lock():
+            _WORKER_PROGRESS_COUNTER.value += local_processed
 
     return results
 
@@ -412,18 +433,21 @@ def _scan_parallel(
     # Process chunks in parallel
     all_results = []
 
-    # Progress bar updated when each future completes (no queue needed)
+    # Create shared progress counter using multiprocessing context for cross-platform safety
+    # Use 'q' type for 64-bit signed integer to handle large position counts
+    ctx = multiprocessing.get_context()
+    progress_counter = ctx.Value('q', 0) if progress else None
+
+    # Progress bar with granular updates via shared counter
     pbar = None
     if progress:
         pbar = tqdm(total=total_positions, desc="Scanning channels (parallel)")
 
-    # Track chunk sizes for progress updates
-    chunk_sizes = {i: len(chunk) for i, chunk in enumerate(chunks)}
-
     with ProcessPoolExecutor(
         max_workers=max_workers,
+        mp_context=ctx,
         initializer=_init_scan_worker,
-        initargs=(tsla_values, tsla_index, spy_values, vix_values)
+        initargs=(tsla_values, tsla_index, spy_values, vix_values, progress_counter)
     ) as executor:
         # Submit all chunks (arrays are now in worker globals, not passed per-task)
         futures = {
@@ -443,11 +467,13 @@ def _scan_parallel(
 
         # Set up heartbeat monitoring if timeout is specified
         last_progress_time = time.monotonic()
+        last_counter_value = 0
         monitor_thread = None
         stop_monitoring = threading.Event()
 
         def heartbeat_monitor():
             """Monitor thread that checks for progress timeout."""
+            nonlocal last_progress_time
             while not stop_monitoring.is_set():
                 time.sleep(heartbeat_interval_sec)
                 if heartbeat_timeout_sec is not None:
@@ -471,26 +497,42 @@ def _scan_parallel(
             monitor_thread = threading.Thread(target=heartbeat_monitor, daemon=True)
             monitor_thread.start()
 
-        # Collect results
+        # Collect results using wait() with timeout for polling progress
         try:
-            for future in as_completed(futures):
-                chunk_idx = futures[future]
-                try:
-                    batch_results = future.result()
-                    all_results.extend(batch_results)
-                    # Update progress bar with chunk size
-                    if pbar is not None:
-                        pbar.update(chunk_sizes[chunk_idx])
-                    # Update heartbeat timestamp on progress
-                    last_progress_time = time.monotonic()
-                except Exception as e:
-                    if progress:
-                        tqdm.write(f"Worker error: {e}")
-                    # Update progress even on error
-                    if pbar is not None:
-                        pbar.update(chunk_sizes[chunk_idx])
-                    # Update heartbeat even on error to avoid false timeout
-                    last_progress_time = time.monotonic()
+            pending = set(futures.keys())
+            poll_interval = 0.1  # Poll shared counter every 100ms
+
+            while pending:
+                # Wait for any future to complete, with timeout for progress polling
+                done, pending = wait(pending, timeout=poll_interval, return_when=FIRST_COMPLETED)
+
+                # Poll shared counter and update progress bar
+                if progress_counter is not None and pbar is not None:
+                    with progress_counter.get_lock():
+                        current_count = progress_counter.value
+                    delta = current_count - last_counter_value
+                    if delta > 0:
+                        pbar.update(delta)
+                        last_counter_value = current_count
+                        last_progress_time = time.monotonic()
+
+                # Process completed futures
+                for future in done:
+                    try:
+                        batch_results = future.result()
+                        all_results.extend(batch_results)
+                    except Exception as e:
+                        if progress:
+                            tqdm.write(f"Worker error: {e}")
+
+            # Final progress sync - catch any remaining counts
+            if progress_counter is not None and pbar is not None:
+                with progress_counter.get_lock():
+                    final_count = progress_counter.value
+                remaining = total_positions - pbar.n
+                if remaining > 0:
+                    pbar.update(remaining)
+
         finally:
             # Stop monitoring thread
             if monitor_thread is not None:
