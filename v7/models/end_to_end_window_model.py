@@ -207,6 +207,7 @@ class DifferentiableWindowSelector(nn.Module):
         self,
         window_embeddings: torch.Tensor,
         window_scores: Optional[torch.Tensor] = None,
+        window_valid: Optional[torch.Tensor] = None,
         hard_select: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -231,6 +232,12 @@ class DifferentiableWindowSelector(nn.Module):
             - alternation_ratio: Upper/lower bounce alternation
             - width: Channel width in price units
             If provided, these bias selection toward higher-quality channels.
+
+        window_valid : torch.Tensor, optional
+            Shape [batch, num_windows]. Boolean mask indicating which windows
+            have valid channel data. Invalid windows will have their selection
+            probabilities set to zero. This prevents the model from selecting
+            windows where no channel was detected.
 
         hard_select : bool, optional
             If True, use argmax (discrete selection) instead of softmax.
@@ -314,6 +321,13 @@ class DifferentiableWindowSelector(nn.Module):
 
             logits = torch.cat(combined_logits, dim=-1)  # [batch, num_windows]
 
+        # Apply window validity mask (if provided)
+        # Invalid windows get -inf logits so they have zero probability after softmax
+        if window_valid is not None:
+            # window_valid: [batch, num_windows] boolean
+            invalid_mask = ~window_valid  # True where invalid
+            logits = logits.masked_fill(invalid_mask, float('-inf'))
+
         # Selection mechanism
         if hard_select:
             # Discrete selection (inference mode)
@@ -321,9 +335,9 @@ class DifferentiableWindowSelector(nn.Module):
             indices = logits.argmax(dim=-1)  # [batch]
             selection_probs = F.one_hot(indices, self.num_windows).float()  # [batch, num_windows]
         elif self.use_gumbel and self.training:
-            # Gumbel-softmax for differentiable discrete selection during training
+            # Gumbel-softmax for differentiable selection during training
             # This adds noise that enables sampling from categorical distribution
-            # while maintaining gradient flow through the straight-through estimator
+            # while maintaining smooth gradient flow (soft relaxation, not straight-through)
             selection_probs = F.gumbel_softmax(logits, tau=self.temperature, hard=False)
         else:
             # Standard soft selection (default training mode)
@@ -529,6 +543,7 @@ class EndToEndWindowModel(nn.Module):
         self,
         per_window_features: torch.Tensor,
         window_scores: Optional[torch.Tensor] = None,
+        window_valid: Optional[torch.Tensor] = None,
         hard_select: bool = False,
         return_attention: bool = False,
     ) -> Dict[str, torch.Tensor]:
@@ -550,6 +565,12 @@ class EndToEndWindowModel(nn.Module):
             Shape [batch, num_windows, 5]. Channel quality metrics per window.
             If provided, used to bias window selection toward higher-quality
             detected channels.
+
+        window_valid : torch.Tensor, optional
+            Shape [batch, num_windows]. Boolean mask indicating which windows
+            have valid channel data. Invalid windows will have their selection
+            probabilities set to zero, preventing the model from selecting
+            windows where no channel was detected.
 
         hard_select : bool, optional
             If True, use argmax (discrete) window selection.
@@ -632,6 +653,7 @@ class EndToEndWindowModel(nn.Module):
         selected_embedding, selection_probs = self.window_selector(
             window_embeddings,
             window_scores=window_scores,
+            window_valid=window_valid,
             hard_select=hard_select,
         )
 
@@ -665,6 +687,7 @@ class EndToEndWindowModel(nn.Module):
         self,
         per_window_features: torch.Tensor,
         window_scores: Optional[torch.Tensor] = None,
+        window_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Make predictions in evaluation mode with hard window selection.
@@ -679,6 +702,9 @@ class EndToEndWindowModel(nn.Module):
 
         window_scores : torch.Tensor, optional
             Shape [batch, num_windows, 5]. Channel quality metrics.
+
+        window_valid : torch.Tensor, optional
+            Shape [batch, num_windows]. Boolean mask for valid windows.
 
         Returns:
         -------
@@ -696,6 +722,7 @@ class EndToEndWindowModel(nn.Module):
             outputs = self.forward(
                 per_window_features,
                 window_scores=window_scores,
+                window_valid=window_valid,
                 hard_select=True,  # Discrete selection for inference
                 return_attention=True,
             )

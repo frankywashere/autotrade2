@@ -403,19 +403,20 @@ class ChannelSample:
         This means duration_bars is in native TF bars (not 5min bars scaled).
 
     Backward Compatibility:
-        The `channel` and `labels` fields are maintained for backward compatibility.
-        They always contain the best window's channel and labels respectively.
-        New code should use `channels`, `best_window`, and `labels_per_window`
-        for full multi-window support.
+        The `channel`, `features`, and `labels` fields are maintained for backward compatibility.
+        They always contain the best window's channel, features, and labels respectively.
+        New code should use `channels`, `best_window`, `labels_per_window`, and
+        `per_window_features` for full multi-window support.
     """
     timestamp: pd.Timestamp
     channel_end_idx: int
     channel: Channel  # Best channel (same as channels[best_window])
-    features: FullFeatures
+    features: FullFeatures  # Best window features (same as per_window_features[best_window])
     labels: Dict[str, ChannelLabels]  # Best window labels (same as labels_per_window[best_window])
     channels: Dict[int, Channel] = None  # All channels keyed by window size
     best_window: int = None  # Which window was selected as best
     labels_per_window: Dict[int, Dict[str, ChannelLabels]] = None  # Labels for each window
+    per_window_features: Dict[int, FullFeatures] = None  # Features for each window (v11.0.0+)
 
 
 class ChannelDataset(Dataset):
@@ -844,18 +845,20 @@ class ChannelDataset(Dataset):
             for w in STANDARD_WINDOWS:
                 if w in sample.channels and sample.channels[w] is not None:
                     ch = sample.channels[w]
-                    # Extract (bounce_count, r_squared, quality_score, valid) for this window
-                    # The valid flag lets model learn from quality-failed channels too
+                    # Extract 5 metrics per window to match EndToEndWindowModel expectations:
+                    # (bounce_count, r_squared, quality_score, alternation_ratio, width_pct)
+                    # These metrics help the model learn which windows produce better predictions
                     window_scores.append([
                         float(ch.bounce_count),
                         float(ch.r_squared),
                         float(ch.quality_score),
-                        float(ch.valid)  # 4th metric: is this channel "quality approved"?
+                        float(ch.alternation_ratio),
+                        float(ch.width_pct)
                     ])
                     window_valid.append(True)  # Channel data exists (even if ch.valid=False)
                 else:
                     # Window not available - use zeros and mark invalid
-                    window_scores.append([0.0, 0.0, 0.0, 0.0])
+                    window_scores.append([0.0, 0.0, 0.0, 0.0, 0.0])
                     window_valid.append(False)
 
             labels_dict['window_scores'] = torch.tensor(window_scores, dtype=torch.float32)

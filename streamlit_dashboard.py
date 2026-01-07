@@ -31,7 +31,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Import v7 components
 from v7.models import create_model
 from v7.models.hierarchical_cfc import HierarchicalCfCModel
-from v7.core.channel import detect_channel, Channel, Direction
+from v7.core.channel import detect_channel, Channel, Direction, detect_channels_multi_window, STANDARD_WINDOWS
+
+# Try to import end-to-end window model components
+try:
+    from v7.models.end_to_end_window_model import EndToEndWindowModel, create_end_to_end_model
+    END_TO_END_AVAILABLE = True
+except ImportError:
+    END_TO_END_AVAILABLE = False
+    EndToEndWindowModel = None
 
 # Try to import live data module
 try:
@@ -243,14 +251,21 @@ def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[D
 
 
 @st.cache_resource
-def load_model(checkpoint_path: str) -> Optional[HierarchicalCfCModel]:
-    """Load model from checkpoint with proper architecture."""
+def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
+    """Load model from checkpoint with proper architecture detection.
+
+    Supports both HierarchicalCfCModel (standard) and EndToEndWindowModel (Phase 2b).
+    Model type is auto-detected from checkpoint keys.
+    """
     try:
         path = Path(checkpoint_path)
 
         # Load checkpoint once and reuse for both config extraction and model loading
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+
+        # Detect model type from state_dict keys
+        is_end_to_end = any('window_encoder' in k or 'window_selector' in k for k in state_dict.keys())
 
         # Extract config from the already-loaded checkpoint (pass checkpoint to avoid re-loading)
         config = extract_config_from_checkpoint(path, checkpoint=checkpoint)
@@ -281,14 +296,31 @@ def load_model(checkpoint_path: str) -> Optional[HierarchicalCfCModel]:
             shared_heads = False
             st.info("Detected separate per-TF heads architecture")
 
-        model = create_model(
-            hidden_dim=hidden_dim,
-            cfc_units=cfc_units,
-            num_attention_heads=num_heads,
-            dropout=dropout,
-            shared_heads=shared_heads,
-            device='cpu'
-        )
+        # Create appropriate model type
+        if is_end_to_end and END_TO_END_AVAILABLE:
+            st.info("🔄 Detected EndToEndWindowModel (Phase 2b)")
+            model = create_end_to_end_model(
+                feature_dim=761,
+                window_embed_dim=128,
+                num_windows=8,
+                hidden_dim=hidden_dim,
+                cfc_units=cfc_units,
+                num_attention_heads=num_heads,
+                dropout=dropout,
+                shared_heads=shared_heads,
+                device='cpu'
+            )
+        else:
+            if is_end_to_end:
+                st.warning("⚠️ EndToEndWindowModel checkpoint detected but module not available")
+            model = create_model(
+                hidden_dim=hidden_dim,
+                cfc_units=cfc_units,
+                num_attention_heads=num_heads,
+                dropout=dropout,
+                shared_heads=shared_heads,
+                device='cpu'
+            )
 
         # state_dict already loaded above for shared_heads inference
         incompatible = model.load_state_dict(state_dict, strict=False)
@@ -488,9 +520,12 @@ def make_predictions(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    model: HierarchicalCfCModel
+    model: torch.nn.Module
 ) -> Optional[Dict]:
-    """Make predictions using the model - returns per-TF predictions."""
+    """Make predictions using the model - returns per-TF predictions.
+
+    Supports both HierarchicalCfCModel (single-window) and EndToEndWindowModel (multi-window).
+    """
     if model is None:
         return None
 
@@ -499,34 +534,91 @@ def make_predictions(
         from v7.features.full_features import extract_full_features, features_to_tensor_dict
         from v7.features.feature_ordering import FEATURE_ORDER
 
-        # Extract features (pass vix_df, not vix_value)
-        features = extract_full_features(
-            tsla_df=tsla_df,
-            spy_df=spy_df,
-            vix_df=vix_df,
-            window=50,
-            include_history=False  # Faster without history
-        )
+        # Check if model is end-to-end (multi-window)
+        is_end_to_end = END_TO_END_AVAILABLE and isinstance(model, EndToEndWindowModel)
 
-        if features is None:
-            return None
+        if is_end_to_end:
+            # Extract features for ALL 8 windows
+            per_window_features = []
+            window_scores_list = []
+            window_valid_list = []
 
-        # Convert FullFeatures to dict of arrays
-        feature_arrays = features_to_tensor_dict(features)
+            for window in STANDARD_WINDOWS:  # [10, 20, 30, 40, 50, 60, 70, 80]
+                features = extract_full_features(
+                    tsla_df=tsla_df,
+                    spy_df=spy_df,
+                    vix_df=vix_df,
+                    window=window,
+                    include_history=False
+                )
 
-        # Concatenate using canonical FEATURE_ORDER
-        feature_list = []
-        for key in FEATURE_ORDER:
-            if key in feature_arrays:
-                feature_list.append(feature_arrays[key])
+                if features is not None:
+                    feature_arrays = features_to_tensor_dict(features)
+                    feature_list = [feature_arrays[k] for k in FEATURE_ORDER if k in feature_arrays]
+                    feature_array = np.concatenate(feature_list)
+                    per_window_features.append(feature_array)
 
-        # Combine into single array then convert to tensor
-        feature_array = np.concatenate(feature_list)
-        feature_tensor = torch.from_numpy(feature_array).float().unsqueeze(0)
+                    # Extract channel quality scores if available
+                    if features.channel is not None:
+                        ch = features.channel
+                        window_scores_list.append([
+                            float(ch.bounce_count),
+                            float(ch.r_squared),
+                            float(ch.quality_score) if hasattr(ch, 'quality_score') else 0.0,
+                            float(ch.alternation_ratio) if hasattr(ch, 'alternation_ratio') else 0.0,
+                            float(ch.width_pct) if hasattr(ch, 'width_pct') else 0.0
+                        ])
+                        window_valid_list.append(True)
+                    else:
+                        window_scores_list.append([0.0, 0.0, 0.0, 0.0, 0.0])
+                        window_valid_list.append(False)
+                else:
+                    # Use zeros for missing windows
+                    per_window_features.append(np.zeros(761, dtype=np.float32))
+                    window_scores_list.append([0.0, 0.0, 0.0, 0.0, 0.0])
+                    window_valid_list.append(False)
 
-        # Run inference
-        with torch.no_grad():
-            outputs = model.predict(feature_tensor)
+            # Stack into tensors: [1, 8, 761]
+            per_window_tensor = torch.from_numpy(np.stack(per_window_features)).float().unsqueeze(0)
+            window_scores_tensor = torch.tensor([window_scores_list], dtype=torch.float32)
+            window_valid_tensor = torch.tensor([window_valid_list], dtype=torch.bool)
+
+            # Run inference with multi-window input
+            with torch.no_grad():
+                outputs = model.predict(
+                    per_window_tensor,
+                    window_scores=window_scores_tensor,
+                    window_valid=window_valid_tensor
+                )
+        else:
+            # Standard single-window inference
+            features = extract_full_features(
+                tsla_df=tsla_df,
+                spy_df=spy_df,
+                vix_df=vix_df,
+                window=50,
+                include_history=False  # Faster without history
+            )
+
+            if features is None:
+                return None
+
+            # Convert FullFeatures to dict of arrays
+            feature_arrays = features_to_tensor_dict(features)
+
+            # Concatenate using canonical FEATURE_ORDER
+            feature_list = []
+            for key in FEATURE_ORDER:
+                if key in feature_arrays:
+                    feature_list.append(feature_arrays[key])
+
+            # Combine into single array then convert to tensor
+            feature_array = np.concatenate(feature_list)
+            feature_tensor = torch.from_numpy(feature_array).float().unsqueeze(0)
+
+            # Run inference
+            with torch.no_grad():
+                outputs = model.predict(feature_tensor)
 
         # Extract per-TF and aggregate predictions
         per_tf = outputs['per_tf']
@@ -536,7 +628,7 @@ def make_predictions(
         # TF names for indexing
         TF_NAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', '1d', '1w', '1M', '3M']
 
-        return {
+        result = {
             # Per-timeframe predictions (all 11 TFs)
             'per_tf': {
                 'duration_mean': per_tf['duration_mean'][0].numpy(),  # [11]
@@ -564,6 +656,16 @@ def make_predictions(
                 'trigger_tf_probs': agg['trigger_tf_probs'][0].numpy()
             }
         }
+
+        # Add window selection info if available (Phase 2b)
+        if is_end_to_end and 'window_selection_probs' in outputs:
+            result['window_selection'] = {
+                'probs': outputs['window_selection_probs'][0].numpy(),  # [8]
+                'selected_idx': int(outputs.get('selected_window_idx', [0])[0]),
+                'confidence': float(outputs.get('selection_confidence', [0.5])[0])
+            }
+
+        return result
     except Exception as e:
         st.error(f"Prediction error: {e}")
         return None
@@ -786,6 +888,38 @@ def main():
                             st.info(f"**{trigger_name}** (prob: {trigger_conf:.0%})")
                         else:
                             st.warning(f"**{trigger_name}** boundary may cause break (prob: {trigger_conf:.0%})")
+
+                # Window Selection info (Phase 2b - EndToEndWindowModel only)
+                if 'window_selection' in predictions:
+                    window_sel = predictions['window_selection']
+                    st.divider()
+                    st.subheader("Window Selection (Phase 2b)")
+
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        selected_idx = window_sel['selected_idx']
+                        selected_window = STANDARD_WINDOWS[selected_idx] if selected_idx < len(STANDARD_WINDOWS) else 0
+                        st.metric("Selected Window", f"{selected_window} bars")
+
+                    with col2:
+                        st.metric("Selection Confidence", f"{window_sel['confidence']:.1%}")
+
+                    with col3:
+                        # Show top-2 windows by probability
+                        probs = window_sel['probs']
+                        sorted_indices = np.argsort(probs)[::-1][:2]
+                        top_windows = [f"{STANDARD_WINDOWS[i]}({probs[i]:.0%})" for i in sorted_indices]
+                        st.metric("Top Windows", " / ".join(top_windows))
+
+                    # Window probability distribution
+                    with st.expander("Window Probability Distribution"):
+                        window_df = pd.DataFrame({
+                            "Window": [f"{w} bars" for w in STANDARD_WINDOWS],
+                            "Probability": [f"{p:.1%}" for p in probs],
+                            "Raw": probs
+                        })
+                        st.dataframe(window_df, hide_index=True)
 
                 # Per-timeframe breakdown table
                 st.divider()
