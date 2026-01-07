@@ -26,12 +26,17 @@ from features.rsi import calculate_rsi, calculate_rsi_series
 
 @dataclass
 class BounceRecord:
-    """Record of a single bounce with RSI context."""
+    """Record of a single bounce with RSI and VIX context."""
     bar_index: int
     touch_type: int          # 0=lower, 1=upper
     price: float
     rsi_at_bounce: float     # RSI value when this bounce occurred
     channel_position: float  # Position in channel at bounce (0-1)
+    # VIX context at bounce time
+    absolute_bar_index: int = 0      # Global bar index in dataset
+    timestamp: Optional[pd.Timestamp] = None  # Timestamp of bounce
+    vix_at_bounce: float = 20.0      # VIX level when bounce occurred
+    vix_regime_at_bounce: int = 1    # 0=low, 1=normal, 2=high, 3=extreme
 
 
 @dataclass
@@ -75,21 +80,70 @@ class ChannelHistoryFeatures:
     break_down_after_bull_pct: float   # % of bull channels that broke down
 
 
+def _get_vix_at_timestamp(vix_df: Optional[pd.DataFrame], timestamp: pd.Timestamp) -> Tuple[float, int]:
+    """
+    Get VIX level and regime at a specific timestamp.
+
+    Args:
+        vix_df: VIX daily data with DatetimeIndex
+        timestamp: Timestamp to lookup
+
+    Returns:
+        Tuple of (vix_level, vix_regime)
+    """
+    if vix_df is None or len(vix_df) == 0:
+        return 20.0, 1  # Default: normal regime
+
+    # Get the date from timestamp
+    target_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
+
+    # Find the closest VIX value at or before this timestamp
+    try:
+        if hasattr(vix_df.index, 'date'):
+            # DatetimeIndex - find closest date
+            mask = vix_df.index.date <= target_date
+            if mask.any():
+                vix_level = float(vix_df.loc[mask, 'close'].iloc[-1])
+            else:
+                vix_level = float(vix_df['close'].iloc[0])
+        else:
+            # Use iloc for fallback
+            vix_level = float(vix_df['close'].iloc[-1])
+    except (KeyError, IndexError):
+        vix_level = 20.0
+
+    # Determine regime
+    if vix_level < 15:
+        regime = 0  # Low volatility
+    elif vix_level < 25:
+        regime = 1  # Normal
+    elif vix_level < 35:
+        regime = 2  # High
+    else:
+        regime = 3  # Extreme
+
+    return vix_level, regime
+
+
 def detect_bounces_with_rsi(
     df: pd.DataFrame,
     channel: Channel,
-    rsi_series: np.ndarray
+    rsi_series: np.ndarray,
+    vix_df: Optional[pd.DataFrame] = None,
+    base_bar_index: int = 0
 ) -> List[BounceRecord]:
     """
-    Detect bounces and record RSI at each bounce.
+    Detect bounces and record RSI and VIX at each bounce.
 
     Args:
         df: OHLCV data used for channel
         channel: Detected channel
         rsi_series: RSI values for each bar
+        vix_df: Optional VIX daily data for VIX context at bounces
+        base_bar_index: Base index for calculating absolute bar positions
 
     Returns:
-        List of BounceRecord objects
+        List of BounceRecord objects with RSI and VIX context
     """
     bounces = []
 
@@ -109,12 +163,31 @@ def detect_bounces_with_rsi(
         lower = channel.lower_line[bar_idx]
         position = (close - lower) / (upper - lower) if upper != lower else 0.5
 
+        # Get absolute bar index and timestamp
+        absolute_idx = base_bar_index + rsi_idx
+        timestamp = None
+        if hasattr(df, 'index') and 0 <= rsi_idx < len(df):
+            try:
+                timestamp = df.index[rsi_idx]
+            except (IndexError, KeyError):
+                pass
+
+        # Get VIX at bounce time
+        vix_at_bounce = 20.0
+        vix_regime = 1
+        if timestamp is not None and vix_df is not None:
+            vix_at_bounce, vix_regime = _get_vix_at_timestamp(vix_df, timestamp)
+
         bounces.append(BounceRecord(
             bar_index=bar_idx,
             touch_type=int(touch.touch_type),
             price=touch.price,
             rsi_at_bounce=float(rsi_at_bounce),
             channel_position=float(np.clip(position, 0, 1)),
+            absolute_bar_index=absolute_idx,
+            timestamp=timestamp,
+            vix_at_bounce=vix_at_bounce,
+            vix_regime_at_bounce=vix_regime,
         ))
 
     return bounces
@@ -124,7 +197,8 @@ def scan_channel_history(
     df: pd.DataFrame,
     window: int = 20,
     max_channels: int = 10,
-    scan_bars: int = 5000
+    scan_bars: int = 5000,
+    vix_df: Optional[pd.DataFrame] = None
 ) -> List[ChannelRecord]:
     """
     Scan historical data to find past channels.
@@ -137,6 +211,7 @@ def scan_channel_history(
         window: Window size for channel detection
         max_channels: Maximum channels to return
         scan_bars: How many bars back to scan
+        vix_df: Optional VIX daily data for VIX context at bounces
 
     Returns:
         List of ChannelRecord objects (most recent first)
@@ -185,7 +260,7 @@ def scan_channel_history(
             rsi_start_idx = current_idx - window
             rsi_end_idx = break_idx
 
-            bounces = detect_bounces_with_rsi(df_slice, channel, rsi_series)
+            bounces = detect_bounces_with_rsi(df_slice, channel, rsi_series, vix_df=vix_df)
 
             # Get RSI values
             rsi_at_start = rsi_series[rsi_start_idx] if rsi_start_idx >= 0 else 50.0

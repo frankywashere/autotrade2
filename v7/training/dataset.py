@@ -60,11 +60,13 @@ from .scanning import scan_valid_channels as _parallel_scan_valid_channels
 #            progress tracking for parallel scanner. Improved cache performance.
 # - v11.0.0: Multi-window cache architecture with per-window feature extraction.
 #            Supports both single-window (v10.0.0 compatible) and multi-window modes.
-CACHE_VERSION = "v11.0.0"
+# - v12.0.0: Added 15 VIX-channel interaction features (VIX_FEATURES 6→21, TOTAL_FEATURES 761→776).
+#            BounceRecord now captures VIX context at bounces. New VIXChannelFeatures dataclass.
+CACHE_VERSION = "v12.0.0"
 
 # Supported cache versions for migration (read-only compatibility)
 # These older versions can be loaded but will trigger rebuild recommendation
-COMPATIBLE_CACHE_VERSIONS = ["v10.0.0", "v9.0.0", "v8.0.0", "v7.3.0", "v7.2.0", "v7.1.0"]
+COMPATIBLE_CACHE_VERSIONS = ["v11.0.0", "v10.0.0", "v9.0.0", "v8.0.0", "v7.3.0", "v7.2.0", "v7.1.0"]
 
 
 def get_cache_metadata_path(cache_path: Path) -> Path:

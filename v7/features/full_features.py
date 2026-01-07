@@ -29,7 +29,8 @@ from features.rsi import calculate_rsi, calculate_rsi_series, detect_rsi_diverge
 from features.containment import check_all_containments, ContainmentInfo
 from features.cross_asset import (
     extract_spy_features, extract_vix_features, extract_all_cross_asset_features,
-    SPYFeatures, VIXFeatures, CrossAssetContainment
+    extract_vix_channel_features,
+    SPYFeatures, VIXFeatures, VIXChannelFeatures, CrossAssetContainment
 )
 from features.history import (
     scan_channel_history, extract_history_features,
@@ -154,7 +155,7 @@ class SharedFeatures:
     tsla_resampled: Dict[str, pd.DataFrame]
     spy_resampled: Dict[str, pd.DataFrame]
 
-    # VIX regime features (6 features)
+    # VIX regime features (6 basic features)
     vix: VIXFeatures
 
     # Channel history features (window=20 standard) - 25 features each
@@ -165,6 +166,11 @@ class SharedFeatures:
     tsla_spy_direction_match: bool
     both_near_upper: bool
     both_near_lower: bool
+
+    # Fields with defaults must come after non-default fields (dataclass requirement)
+
+    # VIX-channel interaction features (15 features)
+    vix_channel: Optional[VIXChannelFeatures] = None
 
     # RSI series for each TF (reusable for divergence/bounce detection)
     rsi_series_per_tf: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -207,7 +213,7 @@ class FullFeatures:
     # Cross-asset containment (TSLA in SPY's channels)
     cross_containment: Dict[str, CrossAssetContainment]
 
-    # VIX regime
+    # VIX regime (6 basic features)
     vix: VIXFeatures
 
     # Channel history (TSLA)
@@ -220,6 +226,11 @@ class FullFeatures:
     tsla_spy_direction_match: bool  # Same direction on primary TF?
     both_near_upper: bool           # Both near upper bounds?
     both_near_lower: bool           # Both near lower bounds?
+
+    # Fields with defaults must come after non-default fields (dataclass requirement)
+
+    # VIX-channel interaction features (15 features)
+    vix_channel: Optional[VIXChannelFeatures] = None
 
     # Event features (46 features)
     events: Optional[EventFeatures] = None
@@ -481,6 +492,7 @@ def extract_window_features(
         spy=spy_features,
         cross_containment=cross_containment,
         vix=shared.vix,
+        vix_channel=shared.vix_channel,
         tsla_history=shared.tsla_history,
         spy_history=shared.spy_history,
         tsla_spy_direction_match=(tsla_dir == spy_dir),
@@ -609,12 +621,34 @@ def extract_full_features(
         break_down_after_bull_pct=0.5,
     )
 
-    if include_history:
-        tsla_records = scan_channel_history(tsla_df, window=window, max_channels=10)
-        tsla_history = extract_history_features(tsla_records)
+    # Track bounces for VIX-channel features
+    all_tsla_bounces: List[BounceRecord] = []
+    channel_start_timestamp = None
 
-        spy_records = scan_channel_history(spy_df, window=window, max_channels=10)
+    if include_history:
+        tsla_records = scan_channel_history(tsla_df, window=window, max_channels=10, vix_df=vix_df)
+        tsla_history = extract_history_features(tsla_records)
+        # Collect bounces from most recent channel for VIX-channel features
+        if tsla_records:
+            all_tsla_bounces = tsla_records[0].bounces
+            if tsla_records[0].start_idx >= 0 and tsla_records[0].start_idx < len(tsla_df):
+                channel_start_timestamp = tsla_df.index[tsla_records[0].start_idx]
+
+        spy_records = scan_channel_history(spy_df, window=window, max_channels=10, vix_df=vix_df)
         spy_history = extract_history_features(spy_records)
+
+    # Extract VIX-channel interaction features
+    vix_channel = None
+    try:
+        vix_channel = extract_vix_channel_features(
+            vix_df=vix_df,
+            bounces=all_tsla_bounces,
+            channel_start_timestamp=channel_start_timestamp,
+            current_timestamp=timestamp
+        )
+    except (ValueError, IndexError, AttributeError) as e:
+        import warnings
+        warnings.warn(f"Failed to extract VIX-channel features: {e}")
 
     # Alignment features
     primary_tf = '5min'
@@ -664,6 +698,7 @@ def extract_full_features(
         spy=spy_features,
         cross_containment=cross_containment,
         vix=vix,
+        vix_channel=vix_channel,
         tsla_history=tsla_history,
         spy_history=spy_history,
         tsla_spy_direction_match=(tsla_dir == spy_dir),
@@ -784,17 +819,40 @@ def extract_shared_features(
         break_down_after_bull_pct=0.5,
     )
 
+    # Track all bounces for VIX-channel features
+    all_tsla_bounces: List[BounceRecord] = []
+    channel_start_timestamp = None
+
     try:
-        tsla_records = scan_channel_history(tsla_df, window=20, max_channels=10)
+        tsla_records = scan_channel_history(tsla_df, window=20, max_channels=10, vix_df=vix_df)
         tsla_history = extract_history_features(tsla_records)
+        # Collect bounces from most recent channel for VIX-channel features
+        if tsla_records:
+            all_tsla_bounces = tsla_records[0].bounces
+            # Get channel start timestamp from the most recent channel
+            if tsla_records[0].start_idx >= 0 and tsla_records[0].start_idx < len(tsla_df):
+                channel_start_timestamp = tsla_df.index[tsla_records[0].start_idx]
     except (ValueError, IndexError):
         pass
 
     try:
-        spy_records = scan_channel_history(spy_df, window=20, max_channels=10)
+        spy_records = scan_channel_history(spy_df, window=20, max_channels=10, vix_df=vix_df)
         spy_history = extract_history_features(spy_records)
     except (ValueError, IndexError):
         pass
+
+    # Step 6b: Extract VIX-channel interaction features
+    vix_channel = None
+    try:
+        vix_channel = extract_vix_channel_features(
+            vix_df=vix_df,
+            bounces=all_tsla_bounces,
+            channel_start_timestamp=channel_start_timestamp,
+            current_timestamp=timestamp
+        )
+    except (ValueError, IndexError, AttributeError) as e:
+        import warnings
+        warnings.warn(f"Failed to extract VIX-channel features: {e}")
 
     # Step 7: Alignment features (using primary TF with standard window=20)
     primary_tf = '5min'
@@ -833,6 +891,7 @@ def extract_shared_features(
         tsla_resampled=tsla_resampled,
         spy_resampled=spy_resampled,
         vix=vix,
+        vix_channel=vix_channel,
         tsla_history=tsla_history,
         spy_history=spy_history,
         tsla_spy_direction_match=(tsla_dir == spy_dir),
@@ -963,6 +1022,7 @@ def extract_window_features(
         spy=spy_features,
         cross_containment=cross_containment,
         vix=shared.vix,
+        vix_channel=shared.vix_channel,
         tsla_history=tsla_history,
         spy_history=spy_history,
         tsla_spy_direction_match=(tsla_dir == spy_dir),
@@ -1200,15 +1260,61 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 0.0,   # rsi_correlation_trend
             ], dtype=np.float32)
 
-    # VIX
-    arrays['vix'] = np.array([
+    # VIX (6 basic + 15 channel interaction = 21 features)
+    vix_basic = [
         features.vix.level,
         features.vix.level_normalized,
         features.vix.trend_5d,
         features.vix.trend_20d,
         features.vix.percentile_252d,
         features.vix.regime,
-    ], dtype=np.float32)
+    ]
+
+    # VIX-channel interaction features (15)
+    if features.vix_channel is not None:
+        vc = features.vix_channel
+        vix_channel_features = [
+            # VIX at Channel Events (5)
+            vc.vix_at_channel_start,
+            vc.vix_at_last_bounce,
+            vc.vix_change_during_channel,
+            vc.vix_regime_at_start,
+            vc.vix_regime_at_current,
+            # VIX-Bounce Relationships (4)
+            vc.avg_vix_at_upper_bounces,
+            vc.avg_vix_at_lower_bounces,
+            vc.vix_upper_minus_lower,
+            vc.pct_bounces_high_vix,
+            # VIX Dynamics (3)
+            vc.vix_trend_during_channel,
+            vc.vix_volatility_during_channel,
+            vc.vix_regime_changes_count,
+            # Bounce Resilience by VIX (3)
+            vc.bounce_hold_rate_low_vix,
+            vc.bounce_hold_rate_high_vix,
+            vc.vix_bounce_quality_diff,
+        ]
+    else:
+        # Default values (15 features)
+        vix_channel_features = [
+            20.0,  # vix_at_channel_start
+            20.0,  # vix_at_last_bounce
+            0.0,   # vix_change_during_channel
+            1,     # vix_regime_at_start (normal)
+            1,     # vix_regime_at_current (normal)
+            20.0,  # avg_vix_at_upper_bounces
+            20.0,  # avg_vix_at_lower_bounces
+            0.0,   # vix_upper_minus_lower
+            0.0,   # pct_bounces_high_vix
+            0,     # vix_trend_during_channel
+            0.0,   # vix_volatility_during_channel
+            0,     # vix_regime_changes_count
+            0.5,   # bounce_hold_rate_low_vix
+            0.5,   # bounce_hold_rate_high_vix
+            0.0,   # vix_bounce_quality_diff
+        ]
+
+    arrays['vix'] = np.array(vix_basic + vix_channel_features, dtype=np.float32)
 
     # TSLA history
     h = features.tsla_history

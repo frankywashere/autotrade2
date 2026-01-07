@@ -117,6 +117,218 @@ class VIXFeatures:
 
 
 @dataclass
+class VIXChannelFeatures:
+    """
+    VIX-Channel Interaction Features (15 features).
+
+    These features capture how VIX relates to channel formation, bounces, and breaks.
+    They help the model understand volatility context during channel events.
+    """
+    # VIX at Channel Events (5 features)
+    vix_at_channel_start: float      # VIX level when current channel formed
+    vix_at_last_bounce: float        # VIX level at most recent bounce
+    vix_change_during_channel: float # % change in VIX since channel formed
+    vix_regime_at_start: int         # Regime when channel formed (0-3)
+    vix_regime_at_current: int       # Current VIX regime (0-3)
+
+    # VIX-Bounce Relationships (4 features)
+    avg_vix_at_upper_bounces: float  # Avg VIX when price hit upper channel
+    avg_vix_at_lower_bounces: float  # Avg VIX when price hit lower channel
+    vix_upper_minus_lower: float     # Diff between upper/lower bounce VIX levels
+    pct_bounces_high_vix: float      # % of bounces in high/extreme VIX (regime 2+)
+
+    # VIX Dynamics (3 features)
+    vix_trend_during_channel: int    # rising (+1), stable (0), or falling (-1)
+    vix_volatility_during_channel: float  # std of VIX changes during channel
+    vix_regime_changes_count: int    # Number of regime transitions during channel
+
+    # Bounce Resilience by VIX (3 features)
+    bounce_hold_rate_low_vix: float  # Approx success rate of bounces in low VIX
+    bounce_hold_rate_high_vix: float # Approx success rate of bounces in high VIX
+    vix_bounce_quality_diff: float   # Diff: low_vix_success - high_vix_success
+
+
+def _get_vix_regime(vix_level: float) -> int:
+    """Get VIX regime from level."""
+    if vix_level < 15:
+        return 0  # Low
+    elif vix_level < 25:
+        return 1  # Normal
+    elif vix_level < 35:
+        return 2  # High
+    else:
+        return 3  # Extreme
+
+
+def extract_vix_channel_features(
+    vix_df: Optional[pd.DataFrame],
+    bounces: List,  # List[BounceRecord] - imported at call site
+    channel_start_timestamp: Optional[pd.Timestamp] = None,
+    current_timestamp: Optional[pd.Timestamp] = None
+) -> VIXChannelFeatures:
+    """
+    Extract VIX-channel interaction features from bounce history and VIX data.
+
+    Args:
+        vix_df: VIX daily OHLCV data with DatetimeIndex
+        bounces: List of BounceRecord objects with VIX context
+        channel_start_timestamp: When the current channel started
+        current_timestamp: Current bar timestamp
+
+    Returns:
+        VIXChannelFeatures with 15 interaction features
+    """
+    # Default values for when VIX data unavailable
+    default_vix = 20.0
+    default_regime = 1
+
+    if vix_df is None or len(vix_df) == 0:
+        return VIXChannelFeatures(
+            vix_at_channel_start=default_vix,
+            vix_at_last_bounce=default_vix,
+            vix_change_during_channel=0.0,
+            vix_regime_at_start=default_regime,
+            vix_regime_at_current=default_regime,
+            avg_vix_at_upper_bounces=default_vix,
+            avg_vix_at_lower_bounces=default_vix,
+            vix_upper_minus_lower=0.0,
+            pct_bounces_high_vix=0.0,
+            vix_trend_during_channel=0,
+            vix_volatility_during_channel=0.0,
+            vix_regime_changes_count=0,
+            bounce_hold_rate_low_vix=0.5,
+            bounce_hold_rate_high_vix=0.5,
+            vix_bounce_quality_diff=0.0,
+        )
+
+    # Get current VIX
+    current_vix = float(vix_df['close'].iloc[-1])
+    current_regime = _get_vix_regime(current_vix)
+
+    # Get VIX at channel start
+    vix_at_start = current_vix
+    regime_at_start = current_regime
+    if channel_start_timestamp is not None:
+        try:
+            start_date = channel_start_timestamp.date() if hasattr(channel_start_timestamp, 'date') else channel_start_timestamp
+            if hasattr(vix_df.index, 'date'):
+                mask = vix_df.index.date <= start_date
+                if mask.any():
+                    vix_at_start = float(vix_df.loc[mask, 'close'].iloc[-1])
+                    regime_at_start = _get_vix_regime(vix_at_start)
+        except (KeyError, IndexError, AttributeError):
+            pass
+
+    # VIX change during channel
+    vix_change = 0.0
+    if vix_at_start > 0:
+        vix_change = ((current_vix - vix_at_start) / vix_at_start) * 100
+
+    # Analyze bounces for VIX context
+    upper_vixes = []
+    lower_vixes = []
+    high_vix_bounces = 0
+    total_bounces = len(bounces) if bounces else 0
+    bounce_regimes = []
+
+    vix_at_last_bounce = default_vix
+    for bounce in (bounces or []):
+        vix_level = getattr(bounce, 'vix_at_bounce', default_vix)
+        vix_regime = getattr(bounce, 'vix_regime_at_bounce', default_regime)
+        bounce_regimes.append(vix_regime)
+
+        if bounce.touch_type == 1:  # Upper bounce
+            upper_vixes.append(vix_level)
+        else:  # Lower bounce
+            lower_vixes.append(vix_level)
+
+        if vix_regime >= 2:  # High or extreme
+            high_vix_bounces += 1
+
+        vix_at_last_bounce = vix_level
+
+    # Calculate averages
+    avg_upper = np.mean(upper_vixes) if upper_vixes else default_vix
+    avg_lower = np.mean(lower_vixes) if lower_vixes else default_vix
+    vix_upper_minus_lower = avg_upper - avg_lower
+    pct_high_vix = high_vix_bounces / total_bounces if total_bounces > 0 else 0.0
+
+    # VIX dynamics during channel
+    vix_trend = 0
+    vix_volatility = 0.0
+    regime_changes = 0
+
+    if channel_start_timestamp is not None and len(vix_df) > 1:
+        try:
+            start_date = channel_start_timestamp.date() if hasattr(channel_start_timestamp, 'date') else channel_start_timestamp
+            if hasattr(vix_df.index, 'date'):
+                mask = vix_df.index.date >= start_date
+                channel_vix = vix_df.loc[mask, 'close'].values
+                if len(channel_vix) > 1:
+                    # Trend: compare first half to second half
+                    mid = len(channel_vix) // 2
+                    first_half_avg = np.mean(channel_vix[:mid]) if mid > 0 else channel_vix[0]
+                    second_half_avg = np.mean(channel_vix[mid:])
+                    diff_pct = (second_half_avg - first_half_avg) / first_half_avg * 100 if first_half_avg > 0 else 0
+
+                    if diff_pct > 5:
+                        vix_trend = 1  # Rising
+                    elif diff_pct < -5:
+                        vix_trend = -1  # Falling
+                    # else: stable (0)
+
+                    # Volatility
+                    vix_volatility = float(np.std(np.diff(channel_vix)))
+
+                    # Regime changes
+                    regimes = [_get_vix_regime(v) for v in channel_vix]
+                    for i in range(1, len(regimes)):
+                        if regimes[i] != regimes[i-1]:
+                            regime_changes += 1
+        except (KeyError, IndexError, AttributeError):
+            pass
+
+    # Bounce resilience by VIX regime
+    # Approximate: bounces closer to channel center are "better" quality
+    low_vix_qualities = []
+    high_vix_qualities = []
+
+    for bounce in (bounces or []):
+        vix_regime = getattr(bounce, 'vix_regime_at_bounce', default_regime)
+        # Quality based on position: closer to 0.5 = better bounce
+        position = getattr(bounce, 'channel_position', 0.5)
+        quality = 1.0 - abs(position - 0.5) * 2  # 1.0 at center, 0.0 at edges
+
+        if vix_regime < 2:  # Low VIX (regime 0-1)
+            low_vix_qualities.append(quality)
+        else:  # High VIX (regime 2-3)
+            high_vix_qualities.append(quality)
+
+    # Use average quality as proxy for "hold rate"
+    bounce_hold_low = np.mean(low_vix_qualities) if low_vix_qualities else 0.5
+    bounce_hold_high = np.mean(high_vix_qualities) if high_vix_qualities else 0.5
+    quality_diff = bounce_hold_low - bounce_hold_high
+
+    return VIXChannelFeatures(
+        vix_at_channel_start=float(vix_at_start),
+        vix_at_last_bounce=float(vix_at_last_bounce),
+        vix_change_during_channel=float(vix_change),
+        vix_regime_at_start=regime_at_start,
+        vix_regime_at_current=current_regime,
+        avg_vix_at_upper_bounces=float(avg_upper),
+        avg_vix_at_lower_bounces=float(avg_lower),
+        vix_upper_minus_lower=float(vix_upper_minus_lower),
+        pct_bounces_high_vix=float(pct_high_vix),
+        vix_trend_during_channel=vix_trend,
+        vix_volatility_during_channel=float(vix_volatility),
+        vix_regime_changes_count=regime_changes,
+        bounce_hold_rate_low_vix=float(bounce_hold_low),
+        bounce_hold_rate_high_vix=float(bounce_hold_high),
+        vix_bounce_quality_diff=float(quality_diff),
+    )
+
+
+@dataclass
 class SPYFeatures:
     """SPY's own channel features at a timeframe."""
     timeframe: str

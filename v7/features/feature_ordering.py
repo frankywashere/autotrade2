@@ -23,14 +23,22 @@ Feature Dimensions:
     RSI correlation features (2):
       - rsi_correlation (float)
       - rsi_correlation_trend (int)
-- VIX: 6 features
+- VIX: 21 features (6 basic + 15 channel interaction)
+    Basic VIX features (6):
+      - level, level_normalized, trend_5d, trend_20d, percentile_252d, regime
+    VIX-Channel interaction features (15):
+      - vix_at_channel_start, vix_at_last_bounce, vix_change_during_channel
+      - vix_regime_at_start, vix_regime_at_current
+      - avg_vix_at_upper_bounces, avg_vix_at_lower_bounces, vix_upper_minus_lower, pct_bounces_high_vix
+      - vix_trend_during_channel, vix_volatility_during_channel, vix_regime_changes_count
+      - bounce_hold_rate_low_vix, bounce_hold_rate_high_vix, vix_bounce_quality_diff
 - TSLA History: 25 features (5+5+5 lists + 10 scalars)
 - SPY History: 25 features (same structure)
 - Alignment: 3 features
 - Events: 46 features (optional, zeros if not provided)
 - Window Scores: 40 features (8 windows x 5 metrics per window)
 
-Total: (35+11+10) × 11 + (6+25+25+3+46+40) = 56×11 + 145 = 616 + 145 = 761
+Total: (35+11+10) × 11 + (21+25+25+3+46+40) = 56×11 + 160 = 616 + 160 = 776
 """
 
 from typing import List, Dict
@@ -69,7 +77,7 @@ CROSS_PER_TF = 10   # spy_valid, spy_dir, spy_pos, tsla_in_upper/lower, dist_to_
 #     rsi_correlation, rsi_correlation_trend
 
 # Shared feature dimensions
-VIX_FEATURES = 6
+VIX_FEATURES = 21  # 6 basic + 15 channel interaction features
 TSLA_HISTORY_FEATURES = 25  # 5+5+5 lists + 10 scalars
 SPY_HISTORY_FEATURES = 25   # Same structure as TSLA
 ALIGNMENT_FEATURES = 3
