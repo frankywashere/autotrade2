@@ -636,8 +636,8 @@ class Trainer:
                 else:
                     self.save_checkpoint(f'checkpoint_epoch_{epoch + 1}.pt', is_best=is_best)
 
-            # Early stopping
-            if self.epochs_without_improvement >= self.config.early_stopping_patience:
+            # Early stopping (skip if patience is 0 = disabled)
+            if self.config.early_stopping_patience > 0 and self.epochs_without_improvement >= self.config.early_stopping_patience:
                 print(f"\nEarly stopping triggered after {epoch + 1} epochs")
                 break
 

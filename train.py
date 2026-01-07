@@ -386,7 +386,7 @@ def modify_preset_checklist(preset: Dict) -> Dict:
     if "num_epochs" in params_to_modify:
         modified["num_epochs"] = int(inquirer.number(
             message=f"Epochs (current: {preset['num_epochs']}):",
-            min_allowed=1, max_allowed=500,
+            min_allowed=1,
             default=preset["num_epochs"],
             validate=NumberValidator(),
         ).execute())
@@ -727,7 +727,7 @@ def configure_data(preset: Optional[Dict] = None, walk_forward_config: Optional[
     # History features
     include_history = inquirer.confirm(
         message="Include channel history features? (slower but richer features)",
-        default=False,
+        default=True,
     ).execute()
 
     # Return threshold configuration
@@ -933,10 +933,10 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
     shared_heads = inquirer.select(
         message="Prediction head architecture:",
         choices=[
-            {"name": "Shared heads (default, fewer params)", "value": True},
             {"name": "Separate heads per TF (11x head params)", "value": False},
+            {"name": "Shared heads (fewer params)", "value": True},
         ],
-        default=True,
+        default=False,
     ).execute()
 
     return {
@@ -966,7 +966,6 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         num_epochs = int(inquirer.number(
             message="Number of epochs:",
             min_allowed=1,
-            max_allowed=500,
             default=50,
             validate=NumberValidator(),
         ).execute())
@@ -1148,12 +1147,13 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         early_stopping_patience = inquirer.select(
             message="Early stopping patience:",
             choices=[
+                {"name": "Disabled (train full epochs - for grokking)", "value": 0},
                 {"name": "15 epochs (default - stops quickly if not improving)", "value": 15},
                 {"name": "30 epochs (moderate - balanced approach)", "value": 30},
                 {"name": "50 epochs (patient - allows long plateaus)", "value": 50},
                 {"name": "100 epochs (very patient - almost disabled)", "value": 100},
             ],
-            default=15,
+            default=0,
         ).execute()
 
         early_stopping_metric = inquirer.select(
@@ -1771,7 +1771,7 @@ def train_with_progress(
                     trainer.save_checkpoint(f"checkpoint_epoch_{epoch + 1}.pt")
                     console.print(f"[dim]Checkpoint saved[/dim]")
 
-            # Early stopping check
+            # Early stopping check (skip if patience is 0 = disabled)
             if current_val_loss < trainer.best_val_metric:
                 trainer.best_val_metric = current_val_loss
                 trainer.epochs_without_improvement = 0
@@ -1779,7 +1779,8 @@ def train_with_progress(
                 trainer.epochs_without_improvement += 1
 
             if (
-                trainer.epochs_without_improvement
+                trainer.config.early_stopping_patience > 0
+                and trainer.epochs_without_improvement
                 >= trainer.config.early_stopping_patience
             ):
                 console.print(
