@@ -62,7 +62,7 @@ from v7.training import (
     TrainingConfig,
 )
 from v7.training.dataset import get_cache_summary, validate_cache_params
-from v7.models import create_model, create_loss
+from v7.models import create_model, create_loss, create_end_to_end_model
 from v7.core.window_strategy import SelectionStrategy
 
 console = Console()
@@ -2095,15 +2095,27 @@ def run_walk_forward_training(
                 )
 
             # Create model for this window
+            # Use EndToEndWindowModel for learned_selection, otherwise HierarchicalCfCModel
+            strategy = config["data"].get("window_selection_strategy", "bounce_first")
             with console.status("[bold green]Creating model...", spinner="dots"):
-                model = create_model(
-                    hidden_dim=config["model"]["hidden_dim"],
-                    cfc_units=config["model"]["cfc_units"],
-                    num_attention_heads=config["model"]["num_attention_heads"],
-                    dropout=config["model"]["dropout"],
-                    shared_heads=config["model"].get("shared_heads", True),
-                    device=config["device"],
-                )
+                if strategy == "learned_selection":
+                    model = create_end_to_end_model(
+                        hidden_dim=config["model"]["hidden_dim"],
+                        cfc_units=config["model"]["cfc_units"],
+                        num_attention_heads=config["model"]["num_attention_heads"],
+                        dropout=config["model"]["dropout"],
+                        shared_heads=config["model"].get("shared_heads", True),
+                        device=config["device"],
+                    )
+                else:
+                    model = create_model(
+                        hidden_dim=config["model"]["hidden_dim"],
+                        cfc_units=config["model"]["cfc_units"],
+                        num_attention_heads=config["model"]["num_attention_heads"],
+                        dropout=config["model"]["dropout"],
+                        shared_heads=config["model"].get("shared_heads", True),
+                        device=config["device"],
+                    )
 
             # Create window-specific save directory
             window_save_dir = save_dir / f"window_{window_idx + 1}"
@@ -2553,16 +2565,29 @@ def main():
         )
 
         # Create model
+        # Use EndToEndWindowModel for learned_selection, otherwise HierarchicalCfCModel
+        strategy = config["data"].get("window_selection_strategy", "bounce_first")
         console.print("[bold cyan]Creating Model...[/bold cyan]\n")
         with console.status("[bold green]Initializing model...", spinner="dots"):
-            model = create_model(
-                hidden_dim=config["model"]["hidden_dim"],
-                cfc_units=config["model"]["cfc_units"],
-                num_attention_heads=config["model"]["num_attention_heads"],
-                dropout=config["model"]["dropout"],
-                shared_heads=config["model"].get("shared_heads", True),
-                device=config["device"],
-            )
+            if strategy == "learned_selection":
+                model = create_end_to_end_model(
+                    hidden_dim=config["model"]["hidden_dim"],
+                    cfc_units=config["model"]["cfc_units"],
+                    num_attention_heads=config["model"]["num_attention_heads"],
+                    dropout=config["model"]["dropout"],
+                    shared_heads=config["model"].get("shared_heads", True),
+                    device=config["device"],
+                )
+                console.print("[yellow]ℹ[/yellow] Using EndToEndWindowModel for learned_selection strategy\n")
+            else:
+                model = create_model(
+                    hidden_dim=config["model"]["hidden_dim"],
+                    cfc_units=config["model"]["cfc_units"],
+                    num_attention_heads=config["model"]["num_attention_heads"],
+                    dropout=config["model"]["dropout"],
+                    shared_heads=config["model"].get("shared_heads", True),
+                    device=config["device"],
+                )
 
         console.print(
             f"[green]✓[/green] Model created: {model.get_num_parameters()['total']:,} parameters\n"

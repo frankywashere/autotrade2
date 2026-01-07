@@ -246,11 +246,29 @@ class Trainer:
             # Move to device
             features = {k: v.to(self.device) for k, v in features.items()}
 
-            # Concatenate feature dict into single tensor using CANONICAL ordering
-            # CRITICAL: Must use FEATURE_ORDER, NOT sorted()! This ensures:
-            # - Timeframe-grouped layout: [TF0_features][TF1_features]...[shared_features]
-            # - Model's TF branches receive coherent feature blocks
-            x = torch.cat([features[k] for k in FEATURE_ORDER if k in features], dim=1)
+            # Handle feature input based on mode:
+            # - End-to-end mode (learned_selection): features contains 'per_window_features' [batch, 8, 761]
+            # - Standard mode: features contains individual keys matching FEATURE_ORDER
+            is_end_to_end = 'per_window_features' in features
+
+            if is_end_to_end:
+                # End-to-end mode: use per_window_features directly
+                x = features['per_window_features']  # [batch, 8, 761]
+                window_valid = features.get('window_valid')  # [batch, 8]
+                window_scores = labels.get('window_scores')
+                if window_scores is not None:
+                    window_scores = window_scores.to(self.device)
+            else:
+                # Standard mode: concatenate using CANONICAL ordering
+                # CRITICAL: Must use FEATURE_ORDER, NOT sorted()! This ensures:
+                # - Timeframe-grouped layout: [TF0_features][TF1_features]...[shared_features]
+                # - Model's TF branches receive coherent feature blocks
+                feature_tensors = [features[k] for k in FEATURE_ORDER if k in features]
+                if not feature_tensors:
+                    raise ValueError(f"No FEATURE_ORDER keys found in features. Got keys: {list(features.keys())}")
+                x = torch.cat(feature_tensors, dim=1)
+                window_valid = None
+                window_scores = None
 
             # Remap labels to match CombinedLoss expectations
             targets = {
@@ -286,7 +304,10 @@ class Trainer:
             if self.config.use_amp:
                 # Use device type directly (supports cuda, mps, cpu)
                 with autocast(self.device.type):
-                    predictions = self.model(x)
+                    if is_end_to_end:
+                        predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
+                    else:
+                        predictions = self.model(x)
                     loss, loss_dict = self.criterion(predictions, targets, masks)
 
                 # Backward pass
@@ -301,7 +322,10 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                predictions = self.model(x)
+                if is_end_to_end:
+                    predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
+                else:
+                    predictions = self.model(x)
                 loss, loss_dict = self.criterion(predictions, targets, masks)
 
                 # Backward pass
@@ -364,9 +388,27 @@ class Trainer:
                 # Move to device
                 features = {k: v.to(self.device) for k, v in features.items()}
 
-                # Concatenate feature dict into single tensor using CANONICAL ordering
-                # CRITICAL: Must use FEATURE_ORDER, NOT sorted()!
-                x = torch.cat([features[k] for k in FEATURE_ORDER if k in features], dim=1)
+                # Handle feature input based on mode:
+                # - End-to-end mode (learned_selection): features contains 'per_window_features' [batch, 8, 761]
+                # - Standard mode: features contains individual keys matching FEATURE_ORDER
+                is_end_to_end = 'per_window_features' in features
+
+                if is_end_to_end:
+                    # End-to-end mode: use per_window_features directly
+                    x = features['per_window_features']  # [batch, 8, 761]
+                    window_valid = features.get('window_valid')  # [batch, 8]
+                    window_scores = labels.get('window_scores')
+                    if window_scores is not None:
+                        window_scores = window_scores.to(self.device)
+                else:
+                    # Standard mode: concatenate using CANONICAL ordering
+                    # CRITICAL: Must use FEATURE_ORDER, NOT sorted()!
+                    feature_tensors = [features[k] for k in FEATURE_ORDER if k in features]
+                    if not feature_tensors:
+                        raise ValueError(f"No FEATURE_ORDER keys found in features. Got keys: {list(features.keys())}")
+                    x = torch.cat(feature_tensors, dim=1)
+                    window_valid = None
+                    window_scores = None
 
                 # Remap labels to match CombinedLoss expectations
                 targets = {
@@ -403,10 +445,16 @@ class Trainer:
                 if self.config.use_amp:
                     # Use device type directly (supports cuda, mps, cpu)
                     with autocast(self.device.type):
-                        predictions = self.model(x)
+                        if is_end_to_end:
+                            predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
+                        else:
+                            predictions = self.model(x)
                         loss, loss_dict = self.criterion(predictions, targets, masks)
                 else:
-                    predictions = self.model(x)
+                    if is_end_to_end:
+                        predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
+                    else:
+                        predictions = self.model(x)
                     loss, loss_dict = self.criterion(predictions, targets, masks)
 
                 # Track losses (skip nested dicts like 'weights')
