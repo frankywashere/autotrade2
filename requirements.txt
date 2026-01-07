@@ -3,6 +3,7 @@ uvicorn
 torch
 numpy
 pandas
+pandas_market_calendars
 scikit-learn
 sqlalchemy
 alembic
