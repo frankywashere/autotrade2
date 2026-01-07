@@ -25,8 +25,8 @@ from tqdm import tqdm
 import numpy as np
 from datetime import datetime
 
-# Import the sophisticated CombinedLoss with learnable weights
-from v7.training.losses import CombinedLoss
+# Import loss classes
+from v7.training.losses import CombinedLoss, EndToEndLoss
 
 # Import canonical feature ordering - CRITICAL for correct feature concatenation!
 from v7.features.feature_ordering import FEATURE_ORDER, TOTAL_FEATURES
@@ -62,6 +62,10 @@ class TrainingConfig:
     # When enabled, trains the model's window_selector head to pick optimal windows
     use_window_selection_loss: bool = False
     window_selection_weight: float = 0.1  # Weight for window selection loss in total loss
+
+    # End-to-end loss (for learned_selection with EndToEndWindowModel)
+    # Uses EndToEndLoss instead of CombinedLoss - designed for Phase 2b with gradient flow
+    use_end_to_end_loss: bool = False
 
     # Optimization
     optimizer: str = 'adam'  # 'adam', 'adamw', 'sgd'
@@ -123,15 +127,29 @@ class Trainer:
         self.device = torch.device(config.device)
         self.model.to(self.device)
 
-        # Setup loss - use CombinedLoss with learnable or fixed weights
-        self.criterion = CombinedLoss(
-            num_timeframes=config.num_timeframes,
-            use_learnable_weights=config.use_learnable_weights,
-            fixed_weights=config.fixed_weights,
-            calibration_mode=config.calibration_mode,
-            use_window_selection_loss=config.use_window_selection_loss,
-            window_selection_weight=config.window_selection_weight,
-        )
+        # Setup loss - select based on training mode
+        if config.use_end_to_end_loss:
+            # Phase 2b: EndToEndLoss for learned_selection with EndToEndWindowModel
+            # Designed for gradient flow through window selection
+            self.criterion = EndToEndLoss(
+                num_timeframes=config.num_timeframes,
+                duration_weight=config.fixed_weights.get('duration', 1.0) if config.fixed_weights else 1.0,
+                direction_weight=config.fixed_weights.get('direction', 1.0) if config.fixed_weights else 1.0,
+                next_channel_weight=config.fixed_weights.get('next_channel', 1.0) if config.fixed_weights else 1.0,
+                calibration_weight=0.5,
+                entropy_weight=0.1,  # Encourages decisive window selection
+                consistency_weight=0.05,  # Helps warm-start with heuristic best_window
+            )
+        else:
+            # Phase 2a: CombinedLoss with learnable or fixed weights
+            self.criterion = CombinedLoss(
+                num_timeframes=config.num_timeframes,
+                use_learnable_weights=config.use_learnable_weights,
+                fixed_weights=config.fixed_weights,
+                calibration_mode=config.calibration_mode,
+                use_window_selection_loss=config.use_window_selection_loss,
+                window_selection_weight=config.window_selection_weight,
+            )
         # Move criterion to device (critical for learnable weights)
         self.criterion.to(self.device)
 
@@ -237,7 +255,11 @@ class Trainer:
             'next_channel': [],
             'calibration': [],
             'trigger_tf': [],  # v9.0.0
-            'window_selection': [],  # For learned_selection strategy
+            'window_selection': [],  # For learned_selection strategy (CombinedLoss)
+            'entropy': [],  # For EndToEndLoss
+            'consistency': [],  # For EndToEndLoss
+            'window_max_prob': [],  # For EndToEndLoss debugging
+            'window_mode': [],  # For EndToEndLoss debugging
         }
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1}/{self.config.num_epochs}")
@@ -342,7 +364,11 @@ class Trainer:
             for k, v in loss_dict.items():
                 if isinstance(v, dict):
                     continue  # Skip nested dicts
-                epoch_losses[k].append(v)
+                if k in epoch_losses:
+                    epoch_losses[k].append(v)
+                else:
+                    # Warn about unknown keys - helps catch mismatches between loss and trainer
+                    print(f"⚠️ Warning: Unknown loss key '{k}' ignored (value={v})")
 
             # Update progress bar
             pbar.set_postfix({'loss': loss_dict['total']})
@@ -372,7 +398,11 @@ class Trainer:
             'next_channel': [],
             'calibration': [],
             'trigger_tf': [],  # v9.0.0
-            'window_selection': [],  # For learned_selection strategy
+            'window_selection': [],  # For learned_selection strategy (CombinedLoss)
+            'entropy': [],  # For EndToEndLoss
+            'consistency': [],  # For EndToEndLoss
+            'window_max_prob': [],  # For EndToEndLoss debugging
+            'window_mode': [],  # For EndToEndLoss debugging
         }
 
         # Track accuracy metrics (weighted by mask if present)
@@ -463,6 +493,9 @@ class Trainer:
                         continue  # Skip nested dicts
                     if k in epoch_losses:
                         epoch_losses[k].append(v)
+                    else:
+                        # Warn about unknown keys - helps catch mismatches between loss and trainer
+                        print(f"⚠️ Warning: Unknown loss key '{k}' ignored in validation (value={v})")
 
                 # Calculate accuracies (direction is binary, next_channel is 3-class)
                 # Weight by mask - only count valid samples

@@ -61,7 +61,13 @@ from v7.training import (
     Trainer,
     TrainingConfig,
 )
-from v7.training.dataset import get_cache_summary, validate_cache_params
+from v7.training.dataset import (
+    get_cache_summary,
+    validate_cache_params,
+    load_cached_samples,
+    filter_samples_for_walk_forward,
+    is_cache_valid,
+)
 from v7.models import create_model, create_loss, create_end_to_end_model
 from v7.core.window_strategy import SelectionStrategy
 
@@ -428,6 +434,7 @@ def select_mode() -> str:
     mode = inquirer.select(
         message="Select training mode:",
         choices=[
+            {"name": "Walk-Forward Validation - Time-series cross-validation", "value": "Walk-Forward"},
             {"name": "Quick Start - Fast training for testing", "value": "Quick Start"},
             {"name": "Standard - Balanced configuration", "value": "Standard"},
             {
@@ -435,10 +442,9 @@ def select_mode() -> str:
                 "value": "Full Training",
             },
             {"name": "Custom - Configure everything manually", "value": "Custom"},
-            {"name": "Walk-Forward Validation - Time-series cross-validation", "value": "Walk-Forward"},
             {"name": "Resume - Continue from checkpoint", "value": "Resume"},
         ],
-        default="Standard",
+        default="Walk-Forward",
     ).execute()
 
     return mode
@@ -1399,6 +1405,10 @@ def configure_window_selection_strategy(cache_dir: Path) -> Tuple[str, Dict]:
     # Values must match dataset.py SelectionStrategy enum: bounce_first, label_validity, balanced_score, quality_score
     strategy_choices = [
         {
+            "name": "learned_selection - Let model learn optimal window (EXPERIMENTAL)",
+            "value": "learned_selection"
+        },
+        {
             "name": "bounce_first - Maximize bounce quality (recommended for production)",
             "value": "bounce_first"  # Maps to SelectionStrategy.BOUNCE_FIRST
         },
@@ -1414,14 +1424,10 @@ def configure_window_selection_strategy(cache_dir: Path) -> Tuple[str, Dict]:
             "name": "quality_score - Use pre-computed channel quality score",
             "value": "quality_score"  # Maps to SelectionStrategy.QUALITY_SCORE
         },
-        {
-            "name": "learned_selection - Let model learn optimal window (EXPERIMENTAL)",
-            "value": "learned_selection"
-        },
     ]
 
-    # Default to proven production strategy
-    default_strategy = "bounce_first"
+    # Default to learned_selection for experimentation
+    default_strategy = "learned_selection"
 
     selected_strategy = inquirer.select(
         message="Select window selection strategy:",
@@ -1978,6 +1984,67 @@ def run_walk_forward_training(
 
     console.print(f"\n[bold green]✓ All {num_windows} windows validated successfully![/bold green]\n")
 
+    # =============================================================================
+    # CACHE LOADING: Load full cache ONCE before iterating windows
+    # =============================================================================
+    # This prevents walk-forward from overwriting the main cache with limited date ranges.
+    # We load ALL samples from the cache and filter per-window in memory.
+
+    cache_path = cache_dir / "channel_samples.pkl"
+
+    # Check if a valid cache exists
+    if is_cache_valid(cache_path):
+        console.print("[bold cyan]Loading cached samples (read-only for walk-forward)...[/bold cyan]")
+        all_samples, load_info = load_cached_samples(cache_path, migrate_labels=True)
+
+        # Check cache date range - warn if it seems limited
+        if all_samples:
+            sample_timestamps = [s.timestamp for s in all_samples]
+            cache_min_date = min(sample_timestamps)
+            cache_max_date = max(sample_timestamps)
+            console.print(f"  Cache contains {len(all_samples)} samples")
+            console.print(f"  Date range: {cache_min_date} to {cache_max_date}")
+
+            # Warn if cache seems too limited for walk-forward windows
+            last_window_val_end = windows[-1][3]  # val_end of last window
+            if cache_max_date < last_window_val_end:
+                console.print(f"\n[bold yellow]WARNING: Cache may be outdated![/bold yellow]")
+                console.print(f"  Cache ends at:         {cache_max_date}")
+                console.print(f"  Last window val_end:   {last_window_val_end}")
+                console.print(f"  Consider rebuilding cache with: --force-rebuild\n")
+    else:
+        # Cache doesn't exist or is invalid - build it ONCE with full data range (no end_date limit)
+        console.print("[bold cyan]Building full cache for walk-forward (one-time operation)...[/bold cyan]")
+        console.print("  This cache will be reused for all windows without date filtering.\n")
+
+        # Build cache with NO end_date limit to get full data range
+        # Use the last window's val_end for train_end/val_end split (doesn't affect cache contents)
+        last_window = windows[-1]
+        _, last_train_end, _, last_val_end = last_window
+
+        with console.status("[bold green]Scanning and caching full data range...", spinner="dots"):
+            _, _, _ = prepare_dataset_from_scratch(
+                data_dir=data_dir,
+                cache_dir=cache_dir,
+                window=config["data"]["window"],
+                step=config["data"]["step"],
+                min_cycles=config["data"].get("min_cycles", 1),
+                max_scan=config["data"].get("max_scan", 500),
+                return_threshold=config["data"].get("return_threshold", 20),
+                lookforward_bars=config["data"].get("lookforward_bars", 200),
+                train_end=last_train_end.strftime('%Y-%m-%d'),
+                val_end=last_val_end.strftime('%Y-%m-%d'),
+                start_date=None,  # No start date filter - use all data
+                end_date=None,    # No end date filter - use all data
+                include_history=config["data"]["include_history"],
+                force_rebuild=True,  # Force rebuild to ensure full range
+                custom_return_thresholds=config["data"].get("custom_return_thresholds"),
+            )
+
+        # Now load the newly created cache
+        all_samples, load_info = load_cached_samples(cache_path, migrate_labels=True)
+        console.print(f"\n[green]✓[/green] Cache built with {len(all_samples)} samples")
+
     # Store results for each window
     window_results = []
 
@@ -2056,25 +2123,14 @@ def run_walk_forward_training(
 
         console.print()
 
-        # Prepare dataset for this window
+        # Filter pre-loaded samples for this window (read-only, no cache writes)
         try:
-            with console.status("[bold green]Preparing data for window...", spinner="dots"):
-                train_samples, val_samples, test_samples = prepare_dataset_from_scratch(
-                    data_dir=data_dir,
-                    cache_dir=cache_dir,
-                    window=config["data"]["window"],
-                    step=config["data"]["step"],
-                    min_cycles=config["data"].get("min_cycles", 1),
-                    max_scan=config["data"].get("max_scan", 500),
-                    return_threshold=config["data"].get("return_threshold", 20),
-                    lookforward_bars=config["data"].get("lookforward_bars", 200),
+            with console.status("[bold green]Filtering samples for window...", spinner="dots"):
+                train_samples, val_samples, test_samples = filter_samples_for_walk_forward(
+                    samples=all_samples,
+                    train_start=train_start_str,
                     train_end=train_end_str,
                     val_end=val_end_str,
-                    start_date=train_start_str,
-                    end_date=val_end_str,
-                    include_history=config["data"]["include_history"],
-                    force_rebuild=False,
-                    custom_return_thresholds=config["data"].get("custom_return_thresholds"),
                 )
 
             console.print(
@@ -2137,6 +2193,7 @@ def run_walk_forward_training(
                 calibration_mode=config["training"].get("calibration_mode", "brier_per_tf"),
                 use_window_selection_loss=config["training"].get("use_window_selection_loss", False),
                 window_selection_weight=config["training"].get("window_selection_weight", 0.1),
+                use_end_to_end_loss=(strategy == "learned_selection"),  # Use EndToEndLoss for Phase 2b
                 early_stopping_patience=config["training"].get("early_stopping_patience", 15),
                 early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
                 early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
@@ -2609,6 +2666,7 @@ def main():
             calibration_mode=config["training"].get("calibration_mode", "brier_per_tf"),
             use_window_selection_loss=config["training"].get("use_window_selection_loss", False),
             window_selection_weight=config["training"].get("window_selection_weight", 0.1),
+            use_end_to_end_loss=(strategy == "learned_selection"),  # Use EndToEndLoss for Phase 2b
             early_stopping_patience=config["training"].get("early_stopping_patience", 15),
             early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
             early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
@@ -2618,7 +2676,7 @@ def main():
             save_every_n_epochs=5,
         )
 
-        # Create trainer (CombinedLoss handles weights based on config)
+        # Create trainer (uses EndToEndLoss for learned_selection, CombinedLoss otherwise)
         trainer = Trainer(
             model=model,
             config=trainer_config,

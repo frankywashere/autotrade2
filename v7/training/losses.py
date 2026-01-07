@@ -885,16 +885,33 @@ class CombinedLoss(nn.Module):
             )
 
         # Window selection loss (optional)
+        # Phase 2a (HierarchicalCfCModel): Uses window_logits [batch, 11, 8] with hard supervision
+        # Phase 2b (EndToEndWindowModel): Uses window_selection_probs [batch, 8] - learned end-to-end
         loss_window_selection = None
         if self.use_window_selection_loss and self.window_selection_loss_fn is not None:
             if 'window_logits' in predictions:
+                # Phase 2a: Per-TF window selection with hard targets
                 window_target = targets.get('best_window', targets.get('selected_window'))
                 if window_target is not None:
                     loss_window_selection = self.window_selection_loss_fn(
                         predictions['window_logits'],  # [batch, 11, 8]
-                        target_indices=window_target,  # [batch]
-                        window_scores=targets.get('window_scores')  # [batch, 8, 4]
+                        targets=window_target,  # [batch]
+                        window_scores=targets.get('window_scores')  # [batch, 8, 5]
                     )
+            elif 'window_selection_probs' in predictions:
+                # Phase 2b: End-to-end window selection - use entropy regularization
+                # Encourages confident selections as training progresses
+                # Low entropy = model is confident about which window to use
+                if 'window_selection_entropy' in predictions:
+                    # Use pre-computed entropy from model
+                    entropy = predictions['window_selection_entropy']  # [batch]
+                else:
+                    # Compute entropy: H = -sum(p * log(p))
+                    probs = predictions['window_selection_probs']  # [batch, num_windows]
+                    eps = 1e-10
+                    entropy = -(probs * (probs + eps).log()).sum(dim=-1)  # [batch]
+                # Mean entropy as loss (lower is better = more confident)
+                loss_window_selection = entropy.mean() * 0.1  # Scale down entropy loss
 
         # Combine losses
         if self.use_learnable_weights:

@@ -656,9 +656,9 @@ class ChannelDataset(Dataset):
                 - duration_bars: float, 5min reference
                 - permanent_break: long, 0 or 1
 
-            Multi-window labels (v10 format):
-                - window_scores: [num_windows, 4] tensor with (bounce_count, r_squared, quality_score, valid)
-                  for each window in STANDARD_WINDOWS. Shape is [8, 4] for 8 standard windows.
+            Multi-window labels (v10/v11 format):
+                - window_scores: [num_windows, 5] tensor with (bounce_count, r_squared, quality_score,
+                  alternation_ratio, width_pct) for each window in STANDARD_WINDOWS. Shape is [8, 5].
                 - window_valid: [num_windows] bool tensor indicating which windows have valid channels
                 - best_window: long scalar, index of best window in STANDARD_WINDOWS (0-7)
                 - selected_window: long scalar, index of window selected by strategy (0-7)
@@ -899,15 +899,18 @@ class ChannelDataset(Dataset):
             for w in STANDARD_WINDOWS:
                 if w == single_window and sample.channel is not None:
                     ch = sample.channel
+                    # Use all 5 metrics to match EndToEndWindowModel expectations:
+                    # (bounce_count, r_squared, quality_score, alternation_ratio, width_pct)
                     window_scores.append([
                         float(ch.bounce_count),
                         float(ch.r_squared),
                         float(ch.quality_score),
-                        float(ch.valid)  # Add 4th metric for consistency
+                        float(getattr(ch, 'alternation_ratio', 0.0)),
+                        float(getattr(ch, 'width_pct', 0.0))
                     ])
                     window_valid.append(True)
                 else:
-                    window_scores.append([0.0, 0.0, 0.0, 0.0])
+                    window_scores.append([0.0, 0.0, 0.0, 0.0, 0.0])
                     window_valid.append(False)
 
             labels_dict['window_scores'] = torch.tensor(window_scores, dtype=torch.float32)
@@ -1436,11 +1439,55 @@ def split_by_date(
     train_end_dt = pd.Timestamp(train_end)
     val_end_dt = pd.Timestamp(val_end)
 
+    # Debug: Show actual timestamp range in samples
+    if samples:
+        timestamps = [s.timestamp for s in samples]
+        min_ts = min(timestamps)
+        max_ts = max(timestamps)
+        print(f"  Sample timestamps: {min_ts} to {max_ts}")
+        print(f"  Requested split: train_end={train_end}, val_end={val_end}")
+        if max_ts <= train_end_dt:
+            print(f"  ⚠️ WARNING: All samples are before train_end! Need to rebuild cache with newer data.")
+
     train_samples = [s for s in samples if s.timestamp <= train_end_dt]
     val_samples = [s for s in samples if train_end_dt < s.timestamp <= val_end_dt]
     test_samples = [s for s in samples if s.timestamp > val_end_dt]
 
     print(f"Split: {len(train_samples)} train, {len(val_samples)} val, {len(test_samples)} test")
+
+    return train_samples, val_samples, test_samples
+
+
+def filter_samples_for_walk_forward(
+    samples: List[ChannelSample],
+    train_start: str,
+    train_end: str,
+    val_end: str
+) -> Tuple[List[ChannelSample], List[ChannelSample], List[ChannelSample]]:
+    """
+    Filter samples for a walk-forward window with explicit train_start.
+
+    Unlike split_by_date() which uses all samples before train_end for training,
+    this function filters training samples to only include those >= train_start.
+    This is needed for sliding window walk-forward validation.
+
+    Args:
+        samples: List of all cached samples
+        train_start: Start date for training set (inclusive)
+        train_end: End date for training set (inclusive)
+        val_end: End date for validation set (inclusive)
+
+    Returns:
+        Tuple of (train_samples, val_samples, test_samples)
+    """
+    train_start_dt = pd.Timestamp(train_start)
+    train_end_dt = pd.Timestamp(train_end)
+    val_end_dt = pd.Timestamp(val_end)
+
+    # Filter with explicit train_start (sliding window)
+    train_samples = [s for s in samples if train_start_dt <= s.timestamp <= train_end_dt]
+    val_samples = [s for s in samples if train_end_dt < s.timestamp <= val_end_dt]
+    test_samples = [s for s in samples if s.timestamp > val_end_dt]
 
     return train_samples, val_samples, test_samples
 
@@ -1467,8 +1514,8 @@ def collate_fn(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor],
         Aggregate [batch]:
             - duration_bars, permanent_break
 
-    v10 multi-window labels:
-        - window_scores: [batch, num_windows, 4] - (bounce_count, r_squared, quality_score, valid) per window
+    v10/v11 multi-window labels:
+        - window_scores: [batch, num_windows, 5] - (bounce_count, r_squared, quality_score, alternation_ratio, width_pct) per window
         - window_valid: [batch, num_windows] - bool mask for valid windows
         - best_window: [batch] - index of best window in STANDARD_WINDOWS
     """
