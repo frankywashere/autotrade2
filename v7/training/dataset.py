@@ -26,6 +26,7 @@ from datetime import datetime
 from ..core.channel import detect_channel, Channel, detect_channels_multi_window, select_best_channel, STANDARD_WINDOWS
 from ..core.timeframe import resample_ohlc, TIMEFRAMES, BARS_PER_TF
 from ..features.full_features import extract_full_features, features_to_tensor_dict, FullFeatures
+from ..features.feature_ordering import FEATURE_ORDER, TOTAL_FEATURES, concatenate_features_in_order
 from .labels import generate_labels, generate_labels_per_tf, generate_labels_multi_window, select_best_window_by_labels, ChannelLabels, labels_to_dict, labels_to_array
 from ..core.window_strategy import get_strategy, SelectionStrategy, WindowSelectionStrategy
 
@@ -456,6 +457,9 @@ class ChannelDataset(Dataset):
         self.augment_noise_std = augment_noise_std
         self.augment_time_shift = augment_time_shift
 
+        # Store original strategy string for end-to-end mode detection
+        self.strategy_name = strategy if isinstance(strategy, str) else None
+
         # Initialize window selection strategy
         if isinstance(strategy, str):
             # Convert string to enum
@@ -624,6 +628,16 @@ class ChannelDataset(Dataset):
             - features_dict: Dict mapping feature names to tensors
             - labels_dict: Dict with label values (duration, break_dir, etc.)
 
+        features_dict structure (depends on mode):
+            Standard Mode (default):
+                - Per-feature-group tensors: tsla_5min, spy_5min, cross_5min, etc.
+                - Each key maps to a tensor of that feature group's dimensions
+
+            End-to-End Mode (strategy="learned_selection" or Phase 2b):
+                - per_window_features: [8, 761] stacked tensor with features for all windows
+                - window_valid: [8] bool tensor indicating which windows have valid features
+                Uses _get_per_window_features_tensor() to convert per_window_features dict.
+
         v9.0.0 labels_dict structure:
             Per-TF labels (shape [11]):
                 - duration: float, native TF bars
@@ -678,33 +692,68 @@ class ChannelDataset(Dataset):
         # to have incorrect feature-label pairs, severely degrading model quality.
         # =========================================================================
 
-        # Use selected window's features if available (v11.0.0)
-        if sample.per_window_features and selected_window_size in sample.per_window_features:
-            selected_window_features = sample.per_window_features[selected_window_size]
-            features_dict = features_to_tensor_dict(selected_window_features)
+        # Check if we're in end-to-end mode (learned_selection strategy)
+        is_end_to_end = self.strategy_name == "learned_selection" or hasattr(self, '_use_end_to_end')
+
+        if is_end_to_end and sample.per_window_features:
+            # =========================================================================
+            # End-to-End Mode: Return ALL windows' features stacked as [8, 761]
+            # =========================================================================
+            # This enables the model to see all windows simultaneously and learn
+            # which window to select based on downstream task performance.
+            # Use _get_per_window_features_tensor for canonical feature ordering.
+            stacked_features = self._get_per_window_features_tensor(sample)  # [8, 761]
+
+            # Build window validity mask
+            window_valid_mask = [
+                sample.per_window_features is not None and w in sample.per_window_features
+                for w in STANDARD_WINDOWS
+            ]
+
+            features_tensors = {
+                'per_window_features': stacked_features,  # [8, 761]
+                'window_valid': torch.tensor(window_valid_mask, dtype=torch.bool),  # [8]
+            }
+
+            # Apply augmentation if enabled (to each window)
+            if self.augment:
+                augmented_per_window = []
+                for w_idx in range(len(STANDARD_WINDOWS)):
+                    w_features = {'features': features_tensors['per_window_features'][w_idx]}
+                    w_features = self._augment_features(w_features)
+                    augmented_per_window.append(w_features['features'])
+                features_tensors['per_window_features'] = torch.stack(augmented_per_window, dim=0)
         else:
-            # Selected window features not available - select a fallback window
-            # We must also use that fallback's labels to maintain alignment!
-            if sample.per_window_features:
-                # Pick any available window (prefer best_window if available)
-                fallback_window = sample.best_window if sample.best_window in sample.per_window_features else next(iter(sample.per_window_features.keys()))
-                selected_window_size = fallback_window
-                selected_labels = sample.labels_per_window.get(fallback_window, sample.labels)
-                features_dict = features_to_tensor_dict(sample.per_window_features[fallback_window])
+            # =========================================================================
+            # Standard Mode: Single window features (current behavior)
+            # =========================================================================
+            # Use selected window's features if available (v11.0.0)
+            if sample.per_window_features and selected_window_size in sample.per_window_features:
+                selected_window_features = sample.per_window_features[selected_window_size]
+                features_dict = features_to_tensor_dict(selected_window_features)
             else:
-                # No per_window_features at all - use best_window for both
-                features_dict = features_to_tensor_dict(sample.features)
-                # selected_labels already set from _select_window
+                # Selected window features not available - select a fallback window
+                # We must also use that fallback's labels to maintain alignment!
+                if sample.per_window_features:
+                    # Pick any available window (prefer best_window if available)
+                    fallback_window = sample.best_window if sample.best_window in sample.per_window_features else next(iter(sample.per_window_features.keys()))
+                    selected_window_size = fallback_window
+                    selected_labels = sample.labels_per_window.get(fallback_window, sample.labels)
+                    features_dict = features_to_tensor_dict(sample.per_window_features[fallback_window])
+                else:
+                    # No per_window_features at all - use best_window for both
+                    features_dict = features_to_tensor_dict(sample.features)
+                    # selected_labels already set from _select_window
 
-        # Convert to PyTorch tensors
-        features_tensors = {
-            k: torch.from_numpy(v).float()
-            for k, v in features_dict.items()
-        }
+            # Convert to PyTorch tensors
+            features_tensors = {
+                k: torch.from_numpy(v).float()
+                for k, v in features_dict.items()
+            }
 
-        # Apply augmentation if enabled
-        if self.augment:
-            features_tensors = self._augment_features(features_tensors)
+            # Apply augmentation if enabled
+            if self.augment:
+                features_tensors = self._augment_features(features_tensors)
 
         # =========================================================================
         # Extract Labels from Selected Window
@@ -903,6 +952,46 @@ class ChannelDataset(Dataset):
                 augmented[key] = tensor
 
         return augmented
+
+    def _get_per_window_features_tensor(self, sample) -> torch.Tensor:
+        """
+        Convert per_window_features dict to stacked tensor for Phase 2b.
+
+        For each window in STANDARD_WINDOWS, retrieves the features from
+        sample.per_window_features, converts to tensor dict, and concatenates
+        in canonical order. Missing windows are filled with zeros.
+
+        This method supports the end-to-end window selection model where
+        the model receives all windows' features simultaneously and learns
+        to select the best window.
+
+        Args:
+            sample: ChannelSample with per_window_features attribute
+
+        Returns:
+            Stacked tensor of shape [8, 761] where:
+            - 8 is len(STANDARD_WINDOWS)
+            - 761 is TOTAL_FEATURES (the concatenated feature dimension)
+            Each row contains features for one window size.
+
+        Note:
+            If sample.per_window_features is None or empty, returns all zeros.
+        """
+        per_window_tensors = []
+
+        for window_size in STANDARD_WINDOWS:
+            if sample.per_window_features and window_size in sample.per_window_features:
+                features = sample.per_window_features[window_size]
+                features_dict = features_to_tensor_dict(features)
+                # Concatenate in canonical order using FEATURE_ORDER
+                tensor_array = concatenate_features_in_order(features_dict)
+                tensor = torch.from_numpy(tensor_array).float()  # [761]
+            else:
+                # Missing window - use zeros
+                tensor = torch.zeros(TOTAL_FEATURES, dtype=torch.float32)  # [761]
+            per_window_tensors.append(tensor)
+
+        return torch.stack(per_window_tensors, dim=0)  # [8, 761]
 
 
 def load_market_data(

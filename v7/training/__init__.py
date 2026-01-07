@@ -46,9 +46,8 @@ from .losses import (
     DirectionLoss,
     NextChannelDirectionLoss,
     MetricsCalculator,
+    WindowSelectionLoss,
 )
-
-from .window_selection_loss import WindowSelectionLoss
 
 from .walk_forward import (
     WalkForwardWindow,

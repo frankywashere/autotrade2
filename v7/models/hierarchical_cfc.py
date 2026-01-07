@@ -734,6 +734,573 @@ class TriggerTFHead(nn.Module):
 
 
 # =============================================================================
+# Shared Window Encoder
+# =============================================================================
+
+class SharedWindowEncoder(nn.Module):
+    """
+    Encodes features from a single window into an embedding.
+
+    This encoder is shared across all 8 windows, processing each window's
+    761-dim features into a compact embedding. The shared weights ensure
+    the model learns a consistent representation across different window sizes.
+
+    Architecture:
+    ------------
+    The encoder uses a two-layer MLP with LayerNorm and GELU activation:
+
+        Input (761 dims)
+            -> Linear(761, 256)
+            -> LayerNorm(256)
+            -> GELU
+            -> Dropout(0.1)
+            -> Linear(256, embed_dim)
+            -> LayerNorm(embed_dim)
+            -> Output (embed_dim dims)
+
+    Design Rationale:
+    ----------------
+    1. **Shared weights**: Using the same encoder for all windows enables:
+       - Transfer learning across window sizes
+       - Consistent feature extraction regardless of lookback period
+       - Reduced parameter count (1 encoder vs 8 separate encoders)
+
+    2. **LayerNorm**: Stabilizes training and helps with varying input distributions
+       across different window sizes (smaller windows may have different statistics
+       than larger ones).
+
+    3. **GELU activation**: Smoother than ReLU, tends to perform better in
+       transformer-style architectures.
+
+    4. **Dropout**: Regularization to prevent overfitting, especially important
+       since the same encoder processes all window types.
+
+    Usage:
+    ------
+    The SharedWindowEncoder is used in the end-to-end window selection pipeline:
+
+    1. For each of the 8 windows, extract 761-dim features
+    2. Pass each window's features through this shared encoder
+    3. Get 8 embeddings of shape [batch, embed_dim]
+    4. Use these embeddings for window selection or downstream processing
+
+    Example:
+    --------
+        >>> encoder = SharedWindowEncoder(input_dim=761, embed_dim=128)
+        >>>
+        >>> # Process features from one window
+        >>> window_features = torch.randn(32, 761)  # batch=32
+        >>> embedding = encoder(window_features)     # [32, 128]
+        >>>
+        >>> # Process all 8 windows
+        >>> all_window_features = torch.randn(32, 8, 761)  # [batch, windows, features]
+        >>> embeddings = []
+        >>> for w in range(8):
+        ...     emb = encoder(all_window_features[:, w, :])
+        ...     embeddings.append(emb)
+        >>> all_embeddings = torch.stack(embeddings, dim=1)  # [32, 8, 128]
+
+    Attributes:
+    ----------
+    input_dim : int
+        Dimension of input features (default: 761, matching TOTAL_FEATURES)
+    embed_dim : int
+        Dimension of output embeddings (default: 128)
+    encoder : nn.Sequential
+        The MLP encoder network
+    """
+
+    def __init__(self, input_dim: int = 761, embed_dim: int = 128):
+        """
+        Initialize the SharedWindowEncoder.
+
+        Parameters:
+        ----------
+        input_dim : int, optional
+            Dimension of input features per window. Default is 761, which matches
+            the canonical TOTAL_FEATURES from v7/features/feature_ordering.py.
+            This includes:
+            - Per-TF features: 616 (56 features x 11 timeframes)
+            - Shared features: 145 (VIX, history, alignment, events, window_scores)
+
+        embed_dim : int, optional
+            Dimension of output embeddings. Default is 128, providing a good
+            balance between expressiveness and computational efficiency.
+            Common choices:
+            - 64: Lightweight, suitable for limited compute
+            - 128: Balanced (default)
+            - 256: Higher capacity, may need more regularization
+
+        Note:
+        ----
+        The intermediate hidden dimension of 256 is hardcoded as it provides
+        a good compression ratio (761 -> 256 -> embed_dim) while being
+        computationally efficient.
+        """
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, embed_dim),
+            nn.LayerNorm(embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode window features into a compact embedding.
+
+        Parameters:
+        ----------
+        x : torch.Tensor
+            Input tensor of shape [batch, input_dim] containing features
+            from a single window. The features should follow the canonical
+            ordering from v7/features/feature_ordering.py:
+            - Indices 0-615: Per-timeframe features (11 TFs x 56 features)
+            - Indices 616-760: Shared features
+
+        Returns:
+        -------
+        torch.Tensor
+            Output tensor of shape [batch, embed_dim] containing the
+            encoded representation of the window.
+
+        Raises:
+        ------
+        RuntimeError
+            If input dimension does not match self.input_dim (implicit via Linear layer)
+
+        Example:
+        --------
+            >>> encoder = SharedWindowEncoder(input_dim=761, embed_dim=128)
+            >>> features = torch.randn(16, 761)
+            >>> embedding = encoder(features)
+            >>> print(embedding.shape)
+            torch.Size([16, 128])
+        """
+        return self.encoder(x)
+
+
+# =============================================================================
+# Differentiable Window Selector (Phase 2b)
+# =============================================================================
+
+class DifferentiableWindowSelector(nn.Module):
+    """
+    Produces soft window selection probabilities based on window embeddings.
+
+    This component enables end-to-end training where the duration prediction loss
+    backpropagates through the window selection mechanism, allowing the model to
+    learn which window is most predictive for each sample.
+
+    Architecture:
+    -------------
+    The selector uses a context-based attention mechanism:
+
+    1. **Context Aggregation**: Mean-pool all window embeddings to create a
+       global context vector representing the overall state across all windows.
+
+    2. **Per-Window Scoring**: For each window, concatenate its embedding with
+       the context and pass through a scoring network to produce a scalar score.
+
+    3. **Selection Mechanism**: Convert scores to probabilities via:
+       - Softmax with temperature (default training)
+       - Gumbel-softmax (optional, for differentiable discrete selection)
+       - Argmax (inference, for hard discrete selection)
+
+    4. **Weighted Combination**: Use probabilities to compute weighted sum of
+       window embeddings: selected = sum(prob_i * embedding_i)
+
+    Gradient Flow:
+    -------------
+    The key insight is that all operations are differentiable:
+
+        Duration Loss
+             |
+             v
+        duration_pred = DurationHead(selected_embedding)
+             |
+             v
+        selected_embedding = einsum('bw,bwd->bd', probs, embeddings)
+             |
+             +---> probs = softmax(scores / temperature)
+             |            |
+             |            +-- gradient flows to score_net params
+             |
+             +---> embeddings (from SharedWindowEncoder)
+                         |
+                         +-- gradient flows to encoder params
+
+    This allows the model to learn which windows minimize duration prediction error,
+    rather than relying on heuristic window selection.
+
+    Training Strategies:
+    -------------------
+    1. **Soft Selection (default)**: Standard softmax produces a probability
+       distribution. All windows contribute to the output, weighted by probability.
+       Most stable for gradient flow.
+
+    2. **Gumbel-Softmax**: Adds Gumbel noise before softmax, approximating
+       categorical sampling while maintaining differentiability. Useful when
+       you want more discrete-like behavior during training.
+
+    3. **Temperature Annealing**: Start with high temperature (soft, exploratory)
+       and anneal to low temperature (sharp, near-discrete). This encourages
+       exploration early and commitment late in training.
+
+    Regularization:
+    --------------
+    The `compute_entropy()` method returns the entropy of the selection distribution:
+    - High entropy = uncertain (probabilities spread across windows)
+    - Low entropy = confident (probability concentrated on one window)
+
+    Use entropy as a regularization term:
+    - Minimize entropy to encourage decisive selection
+    - Or maximize entropy early in training for exploration
+
+    Example:
+    --------
+        >>> selector = DifferentiableWindowSelector(embed_dim=128, num_windows=8)
+        >>>
+        >>> # Training: soft selection
+        >>> window_embeddings = torch.randn(32, 8, 128)  # [batch, windows, embed]
+        >>> selected, probs = selector(window_embeddings, hard_select=False)
+        >>> print(selected.shape)  # [32, 128]
+        >>> print(probs.shape)     # [32, 8]
+        >>>
+        >>> # Inference: hard selection
+        >>> selected, probs = selector(window_embeddings, hard_select=True)
+        >>> print(probs.sum(dim=-1))  # All 1.0 (one-hot)
+        >>>
+        >>> # Entropy for regularization
+        >>> entropy = selector.compute_entropy(probs)
+        >>> print(entropy.shape)  # [32]
+
+    Attributes:
+    ----------
+    embed_dim : int
+        Dimension of window embeddings (default: 128)
+    num_windows : int
+        Number of windows to select from (default: 8)
+    temperature : float
+        Softmax temperature (default: 1.0). Lower = sharper distribution.
+    use_gumbel : bool
+        If True, use Gumbel-softmax during training (default: False)
+    context_proj : nn.Linear
+        Projects mean-pooled context
+    score_net : nn.Sequential
+        Scores each window given context
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        num_windows: int = 8,
+        temperature: float = 1.0,
+        use_gumbel: bool = False,
+    ):
+        """
+        Initialize the DifferentiableWindowSelector.
+
+        Parameters:
+        ----------
+        embed_dim : int, optional
+            Dimension of window embeddings from SharedWindowEncoder. Default is 128.
+
+        num_windows : int, optional
+            Number of windows to select from. Default is 8, matching STANDARD_WINDOWS:
+            [10, 20, 30, 40, 50, 75, 100, 150]
+
+        temperature : float, optional
+            Softmax temperature controlling distribution sharpness. Default is 1.0.
+            - temperature > 1.0: softer distribution (more uniform)
+            - temperature < 1.0: sharper distribution (more peaked)
+            - temperature -> 0: approaches argmax
+
+            Typical annealing schedule:
+            - Start: 5.0 (exploratory)
+            - End: 0.1 (near-discrete)
+
+        use_gumbel : bool, optional
+            If True, use Gumbel-softmax during training for stochastic discrete
+            selection while maintaining differentiability. Default is False.
+
+            Gumbel-softmax adds random noise to logits before softmax:
+                probs = softmax((logits + gumbel_noise) / temperature)
+
+            This approximates sampling from a categorical distribution.
+        """
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_windows = num_windows
+        self.temperature = temperature
+        self.use_gumbel = use_gumbel
+
+        # Context aggregation: project mean-pooled embeddings
+        # This creates a "global view" of all windows to inform selection
+        self.context_proj = nn.Linear(embed_dim, embed_dim)
+
+        # Per-window scoring network
+        # Input: [context (embed_dim), window_embed (embed_dim)] = embed_dim * 2
+        # Output: scalar score for this window
+        self.score_net = nn.Sequential(
+            nn.Linear(embed_dim * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1),
+        )
+
+    def forward(
+        self,
+        window_embeddings: torch.Tensor,
+        hard_select: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute soft or hard window selection.
+
+        This method produces a weighted combination of window embeddings based on
+        learned selection probabilities. During training, gradients flow from the
+        downstream loss (e.g., duration prediction) back through the selection
+        weights to the scoring network.
+
+        Parameters:
+        ----------
+        window_embeddings : torch.Tensor
+            Tensor of shape [batch, num_windows, embed_dim] containing embeddings
+            for each window, produced by SharedWindowEncoder.
+
+        hard_select : bool, optional
+            Selection mode. Default is False.
+            - False: Soft selection (training) - returns weighted combination
+            - True: Hard selection (inference) - returns one-hot selection
+
+        Returns:
+        -------
+        selected_embedding : torch.Tensor
+            Tensor of shape [batch, embed_dim] containing the selected/weighted
+            window embedding. This feeds into downstream prediction heads.
+
+        selection_probs : torch.Tensor
+            Tensor of shape [batch, num_windows] containing selection probabilities.
+            - Soft selection: probabilities sum to 1
+            - Hard selection: one-hot vectors
+
+        Notes:
+        -----
+        - During training (hard_select=False), all windows contribute to the output
+          proportionally to their selection probability. This allows gradients to
+          flow to the scoring network for all windows.
+
+        - During inference (hard_select=True), only the highest-probability window
+          contributes. This provides a discrete, interpretable window choice.
+
+        - When use_gumbel=True and training, Gumbel noise is added to logits before
+          softmax, approximating categorical sampling while remaining differentiable.
+
+        Example:
+        --------
+            >>> selector = DifferentiableWindowSelector(embed_dim=128)
+            >>> embeddings = torch.randn(16, 8, 128)
+            >>>
+            >>> # Soft selection for training
+            >>> selected, probs = selector(embeddings, hard_select=False)
+            >>> loss = criterion(prediction_head(selected), target)
+            >>> loss.backward()  # Gradients flow to selector
+            >>>
+            >>> # Hard selection for inference
+            >>> with torch.no_grad():
+            ...     selected, probs = selector(embeddings, hard_select=True)
+            ...     chosen_window = probs.argmax(dim=-1)  # Discrete choice
+        """
+        batch_size = window_embeddings.size(0)
+        device = window_embeddings.device
+
+        # Step 1: Create context from all windows (mean pooling)
+        # context: [batch, embed_dim]
+        context = window_embeddings.mean(dim=1)
+        context = self.context_proj(context)
+
+        # Step 2: Score each window using context + window embedding
+        # This vectorized approach is more efficient than a loop
+        # Expand context to match window dimension
+        context_expanded = context.unsqueeze(1).expand(-1, self.num_windows, -1)
+        # context_expanded: [batch, num_windows, embed_dim]
+
+        # Concatenate context with each window embedding
+        combined = torch.cat([context_expanded, window_embeddings], dim=-1)
+        # combined: [batch, num_windows, embed_dim * 2]
+
+        # Score all windows at once
+        logits = self.score_net(combined).squeeze(-1)
+        # logits: [batch, num_windows]
+
+        # Step 3: Convert scores to selection probabilities
+        if hard_select:
+            # Discrete selection (inference)
+            # Create one-hot vectors from argmax indices
+            indices = logits.argmax(dim=-1)  # [batch]
+            selection_probs = F.one_hot(indices, self.num_windows).float()
+            # selection_probs: [batch, num_windows] (one-hot)
+
+        elif self.use_gumbel and self.training:
+            # Gumbel-softmax for differentiable discrete selection
+            # This adds noise to encourage exploration while remaining differentiable
+            selection_probs = F.gumbel_softmax(
+                logits,
+                tau=self.temperature,
+                hard=False,  # Keep soft for gradient flow
+                dim=-1
+            )
+            # selection_probs: [batch, num_windows]
+
+        else:
+            # Soft selection (standard training)
+            selection_probs = F.softmax(logits / self.temperature, dim=-1)
+            # selection_probs: [batch, num_windows]
+
+        # Step 4: Weighted combination of embeddings
+        # This is the key differentiable operation:
+        # selected = sum_w(prob_w * embedding_w)
+        # Equivalent to: bmm(probs.unsqueeze(1), embeddings).squeeze(1)
+        selected_embedding = torch.einsum('bw,bwd->bd', selection_probs, window_embeddings)
+        # selected_embedding: [batch, embed_dim]
+
+        return selected_embedding, selection_probs
+
+    def compute_entropy(self, selection_probs: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the entropy of selection probabilities.
+
+        Entropy measures the uncertainty in window selection:
+        - High entropy = model is uncertain (probabilities spread evenly)
+        - Low entropy = model is confident (probability concentrated on one window)
+
+        This can be used for regularization:
+        - **Minimize entropy** to encourage decisive selection (commitment)
+        - **Maximize entropy** early in training for exploration
+
+        The entropy is computed as:
+            H = -sum(p * log(p))
+
+        where p is the selection probability for each window.
+
+        Parameters:
+        ----------
+        selection_probs : torch.Tensor
+            Tensor of shape [batch, num_windows] containing selection probabilities.
+            Each row should sum to 1.
+
+        Returns:
+        -------
+        entropy : torch.Tensor
+            Tensor of shape [batch] containing per-sample entropy values.
+
+            Bounds:
+            - Minimum: 0 (one-hot, perfectly confident)
+            - Maximum: log(num_windows) = log(8) = 2.08 (uniform, maximally uncertain)
+
+        Example:
+        --------
+            >>> selector = DifferentiableWindowSelector(num_windows=8)
+            >>> probs = torch.softmax(torch.randn(16, 8), dim=-1)
+            >>> entropy = selector.compute_entropy(probs)
+            >>> print(entropy.shape)  # [16]
+            >>>
+            >>> # Use for regularization (minimize entropy)
+            >>> entropy_loss = entropy.mean()
+            >>> total_loss = prediction_loss + 0.1 * entropy_loss
+        """
+        # Add small epsilon to prevent log(0) = -inf
+        eps = 1e-10
+        log_probs = (selection_probs + eps).log()
+        entropy = -(selection_probs * log_probs).sum(dim=-1)
+        # entropy: [batch]
+        return entropy
+
+    def get_selection_confidence(self, selection_probs: torch.Tensor) -> torch.Tensor:
+        """
+        Convert selection probabilities to a confidence score.
+
+        This provides a normalized confidence measure [0, 1] based on how
+        concentrated the selection distribution is:
+        - Confidence 1.0 = one-hot (certain about window choice)
+        - Confidence 0.0 = uniform (uncertain, all windows equally likely)
+
+        The confidence is computed as:
+            confidence = 1 - (entropy / max_entropy)
+
+        where max_entropy = log(num_windows).
+
+        Parameters:
+        ----------
+        selection_probs : torch.Tensor
+            Tensor of shape [batch, num_windows] containing selection probabilities.
+
+        Returns:
+        -------
+        confidence : torch.Tensor
+            Tensor of shape [batch] containing confidence scores in [0, 1].
+
+        Example:
+        --------
+            >>> selector = DifferentiableWindowSelector(num_windows=8)
+            >>>
+            >>> # High confidence (peaked distribution)
+            >>> probs_peaked = torch.tensor([[0.9, 0.05, 0.02, 0.01, 0.01, 0.005, 0.003, 0.002]])
+            >>> conf = selector.get_selection_confidence(probs_peaked)
+            >>> print(conf)  # ~0.8
+            >>>
+            >>> # Low confidence (uniform distribution)
+            >>> probs_uniform = torch.ones(1, 8) / 8
+            >>> conf = selector.get_selection_confidence(probs_uniform)
+            >>> print(conf)  # ~0.0
+        """
+        entropy = self.compute_entropy(selection_probs)
+        max_entropy = torch.log(torch.tensor(float(self.num_windows), device=entropy.device))
+        confidence = 1.0 - (entropy / max_entropy)
+        return confidence.clamp(0.0, 1.0)
+
+    def set_temperature(self, temperature: float) -> None:
+        """
+        Update the softmax temperature.
+
+        This allows dynamic temperature annealing during training:
+        - Start with high temperature (e.g., 5.0) for exploration
+        - Anneal to low temperature (e.g., 0.1) for commitment
+
+        Parameters:
+        ----------
+        temperature : float
+            New temperature value. Must be positive.
+
+        Example:
+        --------
+            >>> selector = DifferentiableWindowSelector(temperature=5.0)
+            >>>
+            >>> # Anneal temperature during training
+            >>> for epoch in range(100):
+            ...     progress = epoch / 100
+            ...     temp = 5.0 * (0.1 / 5.0) ** progress  # Exponential decay
+            ...     selector.set_temperature(temp)
+            ...     # ... training step ...
+
+        Raises:
+        ------
+        ValueError
+            If temperature is not positive.
+        """
+        if temperature <= 0:
+            raise ValueError(f"Temperature must be positive, got {temperature}")
+        self.temperature = temperature
+
+
+# =============================================================================
 # Full Hierarchical Model
 # =============================================================================
 
@@ -1481,6 +2048,114 @@ if __name__ == '__main__':
     print("\nLoss components:")
     for key, value in loss_dict.items():
         print(f"  {key}: {value:.4f}")
+
+    # ==========================================================================
+    # Test DifferentiableWindowSelector (Phase 2b)
+    # ==========================================================================
+    print("\n" + "=" * 80)
+    print("Testing DifferentiableWindowSelector (Phase 2b)")
+    print("=" * 80)
+
+    # Create selector and encoder
+    print("\n[7] Creating SharedWindowEncoder and DifferentiableWindowSelector...")
+    encoder = SharedWindowEncoder(input_dim=TOTAL_FEATURES, embed_dim=128)
+    selector = DifferentiableWindowSelector(embed_dim=128, num_windows=8, temperature=1.0)
+
+    print(f"  Encoder params: {sum(p.numel() for p in encoder.parameters()):,}")
+    print(f"  Selector params: {sum(p.numel() for p in selector.parameters()):,}")
+
+    # Create per-window features [batch, 8, 761]
+    print(f"\n[8] Creating per-window features (batch=4, windows=8, features={TOTAL_FEATURES})...")
+    per_window_features = torch.randn(batch_size, 8, TOTAL_FEATURES)
+
+    # Encode each window
+    print("\n[9] Encoding windows through SharedWindowEncoder...")
+    window_embeddings = []
+    for w in range(8):
+        emb = encoder(per_window_features[:, w, :])
+        window_embeddings.append(emb)
+    window_embeddings = torch.stack(window_embeddings, dim=1)  # [batch, 8, embed_dim]
+    print(f"  window_embeddings shape: {window_embeddings.shape}")
+
+    # Test soft selection (training mode)
+    print("\n[10] Testing SOFT selection (training)...")
+    selector.train()
+    selected_emb, probs = selector(window_embeddings, hard_select=False)
+    print(f"  selected_embedding shape: {selected_emb.shape}")
+    print(f"  selection_probs shape: {probs.shape}")
+    print(f"  probs sum (should be 1.0): {probs.sum(dim=-1)}")
+    print(f"  probs[0]: {probs[0].detach().numpy().round(3)}")
+
+    # Test hard selection (inference mode)
+    print("\n[11] Testing HARD selection (inference)...")
+    selector.eval()
+    selected_emb_hard, probs_hard = selector(window_embeddings, hard_select=True)
+    print(f"  selected_embedding shape: {selected_emb_hard.shape}")
+    print(f"  probs (one-hot): {probs_hard[0].detach().numpy()}")
+    print(f"  selected window: {probs_hard[0].argmax().item()}")
+
+    # Test entropy computation
+    print("\n[12] Testing entropy computation...")
+    entropy = selector.compute_entropy(probs)
+    print(f"  entropy shape: {entropy.shape}")
+    print(f"  entropy values: {entropy.detach().numpy().round(4)}")
+    print(f"  max possible entropy: {torch.log(torch.tensor(8.0)).item():.4f}")
+
+    # Test confidence computation
+    print("\n[13] Testing selection confidence...")
+    confidence = selector.get_selection_confidence(probs)
+    print(f"  confidence shape: {confidence.shape}")
+    print(f"  confidence values: {confidence.detach().numpy().round(4)}")
+
+    # Test temperature annealing
+    print("\n[14] Testing temperature annealing...")
+    selector.set_temperature(5.0)
+    _, probs_hot = selector(window_embeddings, hard_select=False)
+    print(f"  temp=5.0: probs[0] = {probs_hot[0].detach().numpy().round(3)}")
+
+    selector.set_temperature(0.1)
+    _, probs_cold = selector(window_embeddings, hard_select=False)
+    print(f"  temp=0.1: probs[0] = {probs_cold[0].detach().numpy().round(3)}")
+
+    # Test gradient flow
+    print("\n[15] Testing gradient flow (key for end-to-end training)...")
+    selector.set_temperature(1.0)
+    selector.train()
+
+    # Create a simple prediction head
+    prediction_head = nn.Linear(128, 1)
+
+    # Forward pass
+    selected_emb, probs = selector(window_embeddings, hard_select=False)
+    prediction = prediction_head(selected_emb)
+    target = torch.randn(batch_size, 1)
+    loss = F.mse_loss(prediction, target)
+
+    # Backward pass
+    loss.backward()
+
+    # Check gradients exist in selector
+    has_grads = all(p.grad is not None for p in selector.parameters())
+    print(f"  Loss: {loss.item():.4f}")
+    print(f"  Gradients exist in selector: {has_grads}")
+
+    # Check gradient magnitudes
+    total_grad_norm = 0
+    for p in selector.parameters():
+        if p.grad is not None:
+            total_grad_norm += p.grad.norm().item() ** 2
+    total_grad_norm = total_grad_norm ** 0.5
+    print(f"  Total gradient norm in selector: {total_grad_norm:.6f}")
+
+    # Test Gumbel-softmax mode
+    print("\n[16] Testing Gumbel-softmax mode...")
+    gumbel_selector = DifferentiableWindowSelector(
+        embed_dim=128, num_windows=8, temperature=1.0, use_gumbel=True
+    )
+    gumbel_selector.train()
+    _, gumbel_probs = gumbel_selector(window_embeddings, hard_select=False)
+    print(f"  Gumbel probs[0]: {gumbel_probs[0].detach().numpy().round(3)}")
+    print(f"  (Note: Gumbel adds stochasticity for exploration)")
 
     print("\n" + "=" * 80)
     print("All tests passed!")

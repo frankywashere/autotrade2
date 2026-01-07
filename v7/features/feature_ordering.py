@@ -261,6 +261,53 @@ def get_shared_index_range() -> tuple:
 
 
 # =============================================================================
+# Feature Concatenation
+# =============================================================================
+
+def concatenate_features_in_order(features_dict: Dict[str, np.ndarray]) -> np.ndarray:
+    """
+    Concatenate feature dict into single array using canonical ordering.
+
+    Uses FEATURE_ORDER to ensure consistent ordering across all code paths.
+    This is the canonical way to convert a features dict to a flat tensor.
+
+    Args:
+        features_dict: Output from features_to_tensor_dict(), mapping feature
+                       keys (e.g., 'tsla_5min', 'vix') to numpy arrays
+
+    Returns:
+        Concatenated numpy array of shape (TOTAL_FEATURES,) = (761,)
+
+    Raises:
+        KeyError: If a required feature key is missing from features_dict
+
+    Example:
+        features = FullFeatures(...)
+        features_dict = features_to_tensor_dict(features)
+        # features_dict = {'tsla_5min': array([...]), 'spy_5min': array([...]), ...}
+
+        features_array = concatenate_features_in_order(features_dict)
+        # features_array.shape = (761,)
+    """
+    arrays = []
+    for key in FEATURE_ORDER:
+        if key not in features_dict:
+            raise KeyError(f"Missing required feature key: '{key}'")
+        arrays.append(features_dict[key])
+
+    result = np.concatenate(arrays)
+
+    # Validate output shape
+    if result.shape[0] != TOTAL_FEATURES:
+        raise ValueError(
+            f"Concatenated features have wrong shape: expected ({TOTAL_FEATURES},), "
+            f"got ({result.shape[0]},)"
+        )
+
+    return result
+
+
+# =============================================================================
 # Self-Test
 # =============================================================================
 

@@ -707,8 +707,7 @@ class CombinedLoss(nn.Module):
         self.use_window_selection_loss = use_window_selection_loss
         self.window_selection_weight = window_selection_weight
         if use_window_selection_loss:
-            # Lazy import to avoid circular dependency
-            from v7.training.window_selection_loss import WindowSelectionLoss
+            # Use the WindowSelectionLoss class defined above in this file
             self.window_selection_loss_fn = WindowSelectionLoss(target_type=window_selection_target)
         else:
             self.window_selection_loss_fn = None
@@ -958,6 +957,302 @@ class CombinedLoss(nn.Module):
             loss_dict['weights'] = learned_weights
 
         return total_loss, loss_dict
+
+
+class EndToEndLoss(nn.Module):
+    """
+    Combined loss for end-to-end window selection training.
+
+    Unlike CombinedLoss, this allows gradients from duration loss to flow
+    through window selection, enabling the model to learn which windows
+    improve predictions.
+
+    Key differences from CombinedLoss:
+    1. Expects 'window_selection_probs' in predictions (not just logits)
+    2. Adds entropy regularization (encourage decisive selection)
+    3. Optional consistency loss (match heuristic best_window)
+    4. Duration loss gradients flow to window selector
+
+    The window selection is expected to be differentiable (using soft selection
+    via weighted combination of window features, or Gumbel-Softmax).
+    """
+
+    def __init__(
+        self,
+        num_timeframes: int = 11,
+        duration_weight: float = 1.0,
+        direction_weight: float = 1.0,
+        next_channel_weight: float = 1.0,
+        calibration_weight: float = 0.5,
+        entropy_weight: float = 0.1,
+        consistency_weight: float = 0.05,
+    ):
+        """
+        Initialize EndToEndLoss.
+
+        Args:
+            num_timeframes: Number of timeframes being predicted (default: 11)
+            duration_weight: Weight for duration prediction loss (default: 1.0)
+            direction_weight: Weight for direction prediction loss (default: 1.0)
+            next_channel_weight: Weight for next channel prediction loss (default: 1.0)
+            calibration_weight: Weight for calibration loss (default: 0.5)
+            entropy_weight: Weight for entropy regularization on window selection.
+                           Positive values encourage decisive (low entropy) selection.
+                           (default: 0.1)
+            consistency_weight: Weight for consistency loss with heuristic best_window.
+                               Helps warm-start training. (default: 0.05)
+        """
+        super().__init__()
+        self.num_timeframes = num_timeframes
+
+        # Task weights (fixed, not learnable for simplicity in end-to-end training)
+        self.duration_weight = duration_weight
+        self.direction_weight = direction_weight
+        self.next_channel_weight = next_channel_weight
+        self.calibration_weight = calibration_weight
+        self.entropy_weight = entropy_weight
+        self.consistency_weight = consistency_weight
+
+        # Initialize loss components
+        self.duration_loss = GaussianNLLLoss()
+        self.direction_loss = DirectionLoss()
+        self.next_channel_loss = NextChannelDirectionLoss()
+        self.brier = BrierScore()
+
+    def _compute_entropy(self, probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """
+        Compute entropy of probability distribution.
+
+        Lower entropy means more decisive selection (concentrated on fewer windows).
+
+        Args:
+            probs: Probability distribution [batch_size, num_timeframes, num_windows]
+                   or [batch_size, num_windows]
+            eps: Small constant for numerical stability
+
+        Returns:
+            Mean entropy across batch (scalar)
+        """
+        # H = -sum(p * log(p))
+        log_probs = torch.log(probs + eps)
+        entropy = -torch.sum(probs * log_probs, dim=-1)
+        return entropy.mean()
+
+    def _compute_consistency_loss(
+        self,
+        window_probs: torch.Tensor,
+        best_window: torch.Tensor,
+        eps: float = 1e-8
+    ) -> torch.Tensor:
+        """
+        Compute consistency loss between learned selection and heuristic best_window.
+
+        Uses cross-entropy to encourage the model to match the heuristic selection,
+        especially early in training. This provides a curriculum learning effect.
+
+        Args:
+            window_probs: Window selection probabilities
+                         [batch_size, num_timeframes, num_windows] or [batch_size, num_windows]
+            best_window: Heuristic best window indices [batch_size]
+            eps: Small constant for numerical stability
+
+        Returns:
+            Cross-entropy loss (scalar)
+        """
+        # Handle both 2D and 3D window_probs
+        if window_probs.dim() == 3:
+            # [batch, num_timeframes, num_windows] -> use mean across TFs
+            batch_size, num_tfs, num_windows = window_probs.shape
+            # Average probabilities across timeframes
+            window_probs_avg = window_probs.mean(dim=1)  # [batch, num_windows]
+        else:
+            # [batch, num_windows]
+            window_probs_avg = window_probs
+            num_windows = window_probs.size(-1)
+
+        # Ensure best_window is in valid range
+        best_window = best_window.long().clamp(0, num_windows - 1)
+
+        # Cross-entropy loss: -log(p[best_window])
+        # Gather the probability assigned to the best window
+        best_window_expanded = best_window.unsqueeze(-1)  # [batch, 1]
+        prob_at_best = torch.gather(window_probs_avg, dim=-1, index=best_window_expanded)
+
+        # Negative log probability
+        loss = -torch.log(prob_at_best + eps).mean()
+
+        return loss
+
+    def forward(
+        self,
+        predictions: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        masks: Optional[Dict[str, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute combined end-to-end loss with gradient flow through window selection.
+
+        Args:
+            predictions: Dictionary containing:
+                - 'duration_mean': [batch, num_timeframes] - Duration predictions
+                - 'duration_log_std': [batch, num_timeframes] - Duration uncertainty
+                - 'direction_logits': [batch, num_timeframes] - Direction logits
+                - 'next_channel_logits': [batch, num_timeframes, 3] - Next channel logits
+                - 'window_selection_probs': [batch, num_timeframes, num_windows] or
+                                            [batch, num_windows] - Differentiable window probs
+                - 'confidence': [batch, num_timeframes] (optional) - Calibration predictions
+            targets: Dictionary containing:
+                - 'duration': [batch, num_timeframes] - Target durations
+                - 'direction': [batch, num_timeframes] - Target directions (0 or 1)
+                - 'next_channel': [batch, num_timeframes] - Target next channel (0, 1, 2)
+                - 'best_window': [batch] (optional) - Heuristic best window for consistency
+            masks: Optional dictionary of masks:
+                - 'duration_valid': [batch, num_timeframes]
+                - 'direction_valid': [batch, num_timeframes]
+                - 'next_channel_valid': [batch, num_timeframes]
+
+        Returns:
+            total_loss: Combined scalar loss (gradients flow through window selection)
+            loss_dict: Dictionary of individual loss components for logging
+        """
+        if masks is None:
+            masks = {}
+
+        # Get masks (v9.0.0 format with _valid suffix)
+        duration_mask = masks.get('duration_valid')
+        direction_mask = masks.get('direction_valid')
+        next_channel_mask = masks.get('next_channel_valid')
+
+        # ========================================
+        # Core prediction losses (gradients flow through window selection)
+        # ========================================
+
+        # Duration loss - THIS IS THE KEY: gradients from this loss flow back
+        # through the window selection via the differentiable soft selection
+        loss_duration = self.duration_loss(
+            predictions['duration_mean'],
+            predictions['duration_log_std'],
+            targets['duration'],
+            duration_mask
+        )
+
+        # Direction loss
+        loss_direction = self.direction_loss(
+            predictions['direction_logits'],
+            targets['direction'],
+            direction_mask
+        )
+
+        # Next channel loss
+        loss_next_channel = self.next_channel_loss(
+            predictions['next_channel_logits'],
+            targets['next_channel'],
+            next_channel_mask
+        )
+
+        # ========================================
+        # Calibration loss
+        # ========================================
+        if 'confidence' in predictions:
+            # Compute correctness for calibration target
+            direction_probs = torch.sigmoid(predictions['direction_logits'])
+            direction_preds = (direction_probs > 0.5).long()
+            direction_correct = (direction_preds == targets['direction']).float()
+
+            next_channel_preds = predictions['next_channel_logits'].argmax(dim=-1)
+            next_channel_correct = (next_channel_preds == targets['next_channel']).float()
+
+            # Weighted correctness
+            overall_correct = 0.6 * direction_correct + 0.4 * next_channel_correct
+
+            loss_calibration = self.brier(
+                predictions['confidence'],
+                overall_correct,
+                direction_mask  # Use direction mask for calibration
+            )
+        else:
+            loss_calibration = torch.tensor(0.0, device=predictions['duration_mean'].device)
+
+        # ========================================
+        # Window selection regularization losses
+        # ========================================
+
+        loss_entropy = torch.tensor(0.0, device=predictions['duration_mean'].device)
+        loss_consistency = torch.tensor(0.0, device=predictions['duration_mean'].device)
+
+        if 'window_selection_probs' in predictions:
+            window_probs = predictions['window_selection_probs']
+
+            # Entropy regularization: encourage decisive selection
+            # We want LOW entropy (decisive), so we add entropy to the loss
+            # (minimizing loss = minimizing entropy = more decisive)
+            if self.entropy_weight > 0:
+                entropy = self._compute_entropy(window_probs)
+                loss_entropy = entropy  # Will be weighted by entropy_weight
+
+            # Consistency loss: match heuristic best_window
+            if self.consistency_weight > 0 and 'best_window' in targets:
+                loss_consistency = self._compute_consistency_loss(
+                    window_probs,
+                    targets['best_window']
+                )
+
+        # ========================================
+        # Combine all losses
+        # ========================================
+        total_loss = (
+            self.duration_weight * loss_duration +
+            self.direction_weight * loss_direction +
+            self.next_channel_weight * loss_next_channel +
+            self.calibration_weight * loss_calibration +
+            self.entropy_weight * loss_entropy +
+            self.consistency_weight * loss_consistency
+        )
+
+        # Build loss dictionary for logging
+        loss_dict = {
+            'total': total_loss.item(),
+            'duration': loss_duration.item(),
+            'direction': loss_direction.item(),
+            'next_channel': loss_next_channel.item(),
+            'calibration': loss_calibration.item() if isinstance(loss_calibration, torch.Tensor) else loss_calibration,
+            'entropy': loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else loss_entropy,
+            'consistency': loss_consistency.item() if isinstance(loss_consistency, torch.Tensor) else loss_consistency,
+        }
+
+        # Add window selection statistics for debugging
+        if 'window_selection_probs' in predictions:
+            window_probs = predictions['window_selection_probs']
+            # Selection concentration: how peaked is the distribution?
+            # Max prob across windows, averaged over batch
+            if window_probs.dim() == 3:
+                max_prob = window_probs.max(dim=-1)[0].mean()
+            else:
+                max_prob = window_probs.max(dim=-1)[0].mean()
+            loss_dict['window_max_prob'] = max_prob.item()
+
+            # Most selected window (mode of argmax)
+            if window_probs.dim() == 3:
+                selected_windows = window_probs.mean(dim=1).argmax(dim=-1)
+            else:
+                selected_windows = window_probs.argmax(dim=-1)
+            # Compute mode (most common selection)
+            window_counts = torch.bincount(selected_windows.flatten(), minlength=window_probs.size(-1))
+            loss_dict['window_mode'] = window_counts.argmax().item()
+
+        return total_loss, loss_dict
+
+    def extra_repr(self) -> str:
+        """Return extra representation string for print/repr."""
+        return (
+            f"num_timeframes={self.num_timeframes}, "
+            f"duration_weight={self.duration_weight}, "
+            f"direction_weight={self.direction_weight}, "
+            f"next_channel_weight={self.next_channel_weight}, "
+            f"calibration_weight={self.calibration_weight}, "
+            f"entropy_weight={self.entropy_weight}, "
+            f"consistency_weight={self.consistency_weight}"
+        )
 
 
 class MetricsCalculator:

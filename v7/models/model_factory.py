@@ -1,0 +1,128 @@
+"""
+Model Factory for v7 Channel Prediction Models
+
+Provides a unified factory function that creates either:
+- Standard HierarchicalCfCModel (Phase 2a): Single-window input, auxiliary window selection
+- EndToEndWindowModel (Phase 2b): Multi-window input, differentiable window selection
+
+This enables easy switching between model architectures via configuration.
+"""
+
+import torch
+import torch.nn as nn
+from typing import Dict, Optional, Union
+
+
+def create_model_with_window_selection(
+    config: dict,
+    use_end_to_end_selection: bool = False,
+) -> nn.Module:
+    """
+    Create model with optional end-to-end window selection.
+
+    This factory function enables easy switching between Phase 2a and 2b models:
+
+    Phase 2a (use_end_to_end_selection=False):
+        - Uses HierarchicalCfCModel
+        - Input: [batch, 761] single-window features
+        - Window selection is auxiliary (predicts but doesn't use)
+        - No gradient flow from duration loss to window selection
+
+    Phase 2b (use_end_to_end_selection=True):
+        - Uses EndToEndWindowModel
+        - Input: [batch, 8, 761] per-window features
+        - Window selection is differentiable
+        - Duration loss backprops through window selection
+
+    Args:
+        config: Model configuration dict with keys:
+            - hidden_dim: Hidden dimension for TF branches (default: 64)
+            - cfc_units: CfC units per branch (default: 96)
+            - num_attention_heads: Number of attention heads (default: 4)
+            - dropout: Dropout probability (default: 0.1)
+
+            For EndToEndWindowModel only:
+            - window_embed_dim: Window embedding dimension (default: 128)
+            - temperature: Softmax temperature for window selection (default: 1.0)
+            - use_gumbel: Use Gumbel-softmax for discrete training (default: False)
+            - num_windows: Number of windows (default: 8)
+            - feature_dim: Input feature dimension (default: 761)
+
+        use_end_to_end_selection: If True, use EndToEndWindowModel (Phase 2b)
+                                   If False, use standard HierarchicalCfCModel (Phase 2a)
+
+    Returns:
+        Model instance (either HierarchicalCfCModel or EndToEndWindowModel)
+
+    Examples:
+        # Create standard model (Phase 2a)
+        config = {
+            'hidden_dim': 64,
+            'cfc_units': 96,
+            'num_attention_heads': 4,
+            'dropout': 0.1,
+        }
+        model = create_model_with_window_selection(config, use_end_to_end_selection=False)
+
+        # Create end-to-end model (Phase 2b)
+        config = {
+            'hidden_dim': 64,
+            'cfc_units': 96,
+            'num_attention_heads': 4,
+            'dropout': 0.1,
+            'window_embed_dim': 128,
+            'temperature': 1.0,
+        }
+        model = create_model_with_window_selection(config, use_end_to_end_selection=True)
+    """
+    if use_end_to_end_selection:
+        # Phase 2b: End-to-end selection
+        from v7.models.end_to_end_window_model import EndToEndWindowModel
+        model = EndToEndWindowModel(
+            hidden_dim=config['hidden_dim'],
+            cfc_units=config['cfc_units'],
+            num_attention_heads=config['num_attention_heads'],
+            dropout=config['dropout'],
+            window_embed_dim=config.get('window_embed_dim', 128),
+            temperature=config.get('temperature', 1.0),
+            use_gumbel=config.get('use_gumbel', False),
+            num_windows=config.get('num_windows', 8),
+            feature_dim=config.get('feature_dim', 761),
+        )
+    else:
+        # Standard model (Phase 2a)
+        from v7.models.hierarchical_cfc import HierarchicalCfCModel
+        model = HierarchicalCfCModel(
+            hidden_dim=config['hidden_dim'],
+            cfc_units=config['cfc_units'],
+            num_attention_heads=config['num_attention_heads'],
+            dropout=config['dropout'],
+        )
+
+    return model
+
+
+def get_model_input_format(use_end_to_end_selection: bool) -> Dict[str, str]:
+    """
+    Get expected input format for the selected model type.
+
+    Args:
+        use_end_to_end_selection: Model selection flag
+
+    Returns:
+        Dict describing expected input tensor shapes
+    """
+    if use_end_to_end_selection:
+        return {
+            'input_key': 'per_window_features',
+            'shape': '[batch, num_windows, feature_dim]',
+            'example': '[32, 8, 761]',
+            'description': 'Stacked features from all 8 windows',
+        }
+    else:
+        return {
+            'input_key': 'features',
+            'shape': '[batch, feature_dim]',
+            'example': '[32, 761]',
+            'description': 'Features from best/selected window only',
+        }

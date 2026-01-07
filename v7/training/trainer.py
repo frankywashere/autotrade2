@@ -333,7 +333,7 @@ class Trainer:
             self.global_step += 1
 
         # Average losses for epoch
-        epoch_metrics = {k: np.mean(v) for k, v in epoch_losses.items()}
+        epoch_metrics = {k: np.mean(v) if v else 0.0 for k, v in epoch_losses.items()}
 
         return epoch_metrics
 
