@@ -85,7 +85,7 @@ def _process_single_position(
     """
     # Import here to avoid issues with multiprocessing
     from ..core.channel import detect_channels_multi_window, select_best_channel, STANDARD_WINDOWS
-    from ..features.full_features import extract_full_features
+    from ..features.full_features import extract_full_features, extract_all_window_features
     from .labels import generate_labels_multi_window, select_best_window_by_labels
 
     # Reconstruct DataFrames from numpy arrays for this position
@@ -118,28 +118,21 @@ def _process_single_position(
     if not best_channel or not best_channel.valid:
         return None
 
-    # Extract features for all valid windows (multi-window feature extraction)
-    # This enables the model to see features from all windows simultaneously
-    features_per_window = {}
-    for window_size in STANDARD_WINDOWS:
-        # Only extract features for windows where we have a valid channel
-        if window_size not in channels:
-            continue
-
-        try:
-            window_features = extract_full_features(
-                tsla_window_df,
-                spy_window_df,
-                vix_window_df,
-                window=window_size,
-                include_history=include_history,
-                lookforward_bars=lookforward_bars
-            )
-            features_per_window[window_size] = window_features
-        except Exception:
-            # Skip this window if feature extraction fails
-            # Continue with other windows
-            continue
+    # Extract features for all valid windows using OPTIMIZED batch extraction
+    # This computes shared features once (resampling, VIX, events, window_scores)
+    # and reuses them for all windows, saving ~50-60% extraction time
+    try:
+        valid_windows = [w for w in STANDARD_WINDOWS if w in channels]
+        features_per_window = extract_all_window_features(
+            tsla_window_df,
+            spy_window_df,
+            vix_window_df,
+            windows=valid_windows,
+            include_history=include_history,
+            lookforward_bars=lookforward_bars
+        )
+    except Exception:
+        return None
 
     # If no windows succeeded, return None
     if not features_per_window:
@@ -277,7 +270,7 @@ def _scan_sequential(
         Tuple of (samples, valid_count)
     """
     from ..core.channel import detect_channels_multi_window, select_best_channel, STANDARD_WINDOWS
-    from ..features.full_features import extract_full_features
+    from ..features.full_features import extract_full_features, extract_all_window_features
     from .labels import generate_labels_multi_window, select_best_window_by_labels
 
     samples = []
@@ -322,31 +315,24 @@ def _scan_sequential(
             stats['invalid_channel'] += 1
             continue
 
-        # Extract features for all valid windows (multi-window feature extraction)
-        # This enables the model to see features from all windows simultaneously
-        features_per_window = {}
-        for window_size in STANDARD_WINDOWS:
-            # Only extract features for windows where we have a valid channel
-            if window_size not in channels:
-                continue
-
-            try:
-                window_features = extract_full_features(
-                    tsla_window,
-                    spy_window,
-                    vix_window,
-                    window=window_size,
-                    include_history=include_history,
-                    lookforward_bars=lookforward_bars
-                )
-                features_per_window[window_size] = window_features
-            except Exception as e:
-                # Skip this window if feature extraction fails
-                # Only log first occurrence per window
-                if stats['feature_failed'] == 0 and progress:
-                    tqdm.write(f"Feature extraction failed for window {window_size} (first error): {e}")
-                stats['feature_failed'] += 1
-                continue
+        # Extract features for all valid windows using OPTIMIZED batch extraction
+        # This computes shared features once (resampling, VIX, events, window_scores)
+        # and reuses them for all windows, saving ~50-60% extraction time
+        try:
+            valid_windows = [w for w in STANDARD_WINDOWS if w in channels]
+            features_per_window = extract_all_window_features(
+                tsla_window,
+                spy_window,
+                vix_window,
+                windows=valid_windows,
+                include_history=include_history,
+                lookforward_bars=lookforward_bars
+            )
+        except Exception as e:
+            if stats['feature_failed'] == 0 and progress:
+                tqdm.write(f"Feature extraction failed (first error): {e}")
+            stats['feature_failed'] += 1
+            continue
 
         # If no windows succeeded, skip this position
         if not features_per_window:

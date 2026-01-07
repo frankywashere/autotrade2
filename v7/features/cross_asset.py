@@ -349,7 +349,7 @@ def extract_vix_features(vix_df: pd.DataFrame) -> VIXFeatures:
 def extract_all_cross_asset_features(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
-    vix_df: pd.DataFrame,
+    vix_df: Optional[pd.DataFrame],
     window: int = 20,
     rsi_correlation_window: int = 20
 ) -> Dict:
@@ -418,8 +418,8 @@ def extract_all_cross_asset_features(
                 rsi_correlation_window=rsi_correlation_window
             )
 
-    # VIX features
-    vix = extract_vix_features(vix_df)
+    # VIX features (skip if vix_df is None - optimization for per-window extraction)
+    vix = extract_vix_features(vix_df) if vix_df is not None else None
 
     return {
         'spy_features': spy_features,
