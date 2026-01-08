@@ -1,0 +1,152 @@
+═══════════════════════════════════════════════════════════════════════════════
+CHANNEL DETECTION OPTIMIZATION ANALYSIS - QUICK SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+QUESTION 1: Does detect_channels_multi_window() detect all 8 windows at once?
+───────────────────────────────────────────────────────────────────────────────
+ANSWER: YES - but it runs detect_channel() 8 SEPARATE TIMES in parallel
+
+Implementation (v7/core/channel.py lines 455-489):
+- Uses ThreadPoolExecutor(max_workers=4) for parallel execution
+- Each worker calls detect_channel(df, window=w) independently
+- Returns Dict[int, Channel] with all 8 window results
+
+RESULT: 8 separate regressions (good: parallel, bad: redundant)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+QUESTION 2: What operations does channel detection involve?
+───────────────────────────────────────────────────────────────────────────────
+ANSWER: For EACH of 8 windows, detect_channel() performs:
+
+1. Linear regression on OHLC (scipy.stats.linregress) - MOST EXPENSIVE
+2. Residual calculation: close - center_line
+3. Standard deviation: std(residuals)
+4. Upper/Lower bounds: center ± 2σ
+5. Bounce detection (detect_bounces):
+   - Loop through all bars
+   - Check HIGH vs upper boundary
+   - Check LOW vs lower boundary
+   - Count alternations, cycles, touches
+6. Quality metrics: alternation_ratio, slope_pct, width_pct
+
+PER-WINDOW COST: O(n) linear regression + O(n) bounce detection = O(n)
+TOTAL FOR 8 WINDOWS: 8 × O(n) = expensive!
+
+═══════════════════════════════════════════════════════════════════════════════
+
+QUESTION 3: Is channel detection run multiple times per position?
+───────────────────────────────────────────────────────────────────────────────
+ANSWER: YES - MASSIVELY REDUNDANT
+
+Call stack per position during dataset building:
+
+scanning.py:_process_single_position(i)
+  ↓
+  Call 1: detect_channels_multi_window() [Line 113]
+    └─ 8 regressions ✓ (necessary)
+
+  Call 2: extract_all_window_features() [Line 126]
+    ├─ extract_shared_features()
+    │   └─ detect_channels_multi_window() [Line 753]
+    │       └─ 8 MORE regressions ✗ (REDUNDANT!)
+    │
+    └─ extract_window_features()
+        └─ for window in STANDARD_WINDOWS:
+            └─ detect_channel(df, window=window) [Line 811]
+                └─ 8 MORE regressions ✗ (REDUNDANT!)
+
+  Call 3: generate_labels_multi_window() [Line 157]
+    └─ Reuses channels from Call 1 ✓ (efficient)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+OPTIMIZATION STATUS SUMMARY
+───────────────────────────────────────────────────────────────────────────────
+
+Total regressions per position:  24 (8 + 8 + 8)
+Necessary regressions:           8
+Redundant regressions:          16 (67% WASTE)
+
+Computational Overhead: 3x (24 ÷ 8 = 3)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+REDUNDANCY BREAKDOWN
+───────────────────────────────────────────────────────────────────────────────
+
+Problem 1: extract_shared_features() Line 753
+  ├─ Calls detect_channels_multi_window(tsla_df)
+  ├─ Already computed in scanning phase!
+  └─ Impact: 8 redundant regressions per position
+
+Problem 2: extract_window_features() Line 811
+  ├─ for window in STANDARD_WINDOWS: detect_channel(df, window=window)
+  ├─ Channel dict already exists!
+  └─ Impact: 8 redundant regressions per position
+
+Problem 3: generate_labels_per_tf() Line 1012
+  ├─ Per-timeframe: detect_channels_multi_window() in loop
+  ├─ 11 TFs × 8 windows = 88 detections per position
+  ├─ Some reuse occurs but inefficient
+  └─ Impact: Medium - per-TF detection necessary but loop inefficient
+
+═══════════════════════════════════════════════════════════════════════════════
+
+OPTIMIZATION RECOMMENDATIONS
+───────────────────────────────────────────────────────────────────────────────
+
+PRIORITY 1 - Quick Win (Low Effort, High Impact):
+  Eliminate Problems 1 & 2 by passing pre-computed channels
+  ├─ Modify extract_all_window_features() signature
+  ├─ Pass channels parameter from scanning.py
+  ├─ Remove detect_channels_multi_window() calls
+  └─ Impact: 16 regressions eliminated (67% reduction) per position
+
+PRIORITY 2 - Medium Win (Medium Effort):
+  Cache per-timeframe channel detections
+  ├─ Add caching layer to detect_channels_multi_window()
+  ├─ Cache key: (df_id, timeframe, len(df))
+  └─ Impact: Reduce Problem 3 redundancy
+
+PRIORITY 3 - Advanced Optimization (High Effort):
+  Vectorize bounce detection
+  ├─ Replace detect_bounces() loop with numpy vectorization
+  ├─ Compute all 8 window boundaries simultaneously
+  └─ Impact: 50-70% speedup in bounce detection
+
+═══════════════════════════════════════════════════════════════════════════════
+
+CONCLUSION: IS CHANNEL DETECTION OPTIMIZED?
+───────────────────────────────────────────────────────────────────────────────
+
+NO - Channel detection is NOT optimized.
+
+While detect_channels_multi_window() uses parallel execution (good), there are
+16 COMPLETELY REDUNDANT REGRESSIONS per position (bad).
+
+This represents a 3× COMPUTATIONAL OVERHEAD for channel detection.
+
+Quick wins could eliminate most redundancy with minimal code changes.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+KEY FILES FOR INVESTIGATION
+───────────────────────────────────────────────────────────────────────────────
+
+v7/core/channel.py (243 lines)
+  - detect_channel(): Lines 229-331
+  - detect_bounces(): Lines 155-226
+  - detect_channels_multi_window(): Lines 455-489
+
+v7/training/scanning.py
+  - _process_single_position(): Lines 47-188 (Problems 1 & 2 here)
+
+v7/features/full_features.py (850+ lines)
+  - extract_shared_features(): Lines 584-775 (Problem 1: Line 753)
+  - extract_window_features(): Lines 778-846 (Problem 2: Line 811)
+
+v7/training/labels.py (1165 lines)
+  - generate_labels_per_tf(): Lines 893-1054 (Problem 3: Line 1012)
+
+═══════════════════════════════════════════════════════════════════════════════

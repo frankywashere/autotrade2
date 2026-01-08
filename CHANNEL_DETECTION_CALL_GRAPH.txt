@@ -1,0 +1,211 @@
+═══════════════════════════════════════════════════════════════════════════════
+CHANNEL DETECTION CALL GRAPH - REDUNDANCY VISUALIZATION
+═══════════════════════════════════════════════════════════════════════════════
+
+DATASET BUILDING PHASE (scanning.py: _process_single_position)
+═══════════════════════════════════════════════════════════════════════════════
+
+Position: i=1000, window=50
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ _process_single_position(i=1000)                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+         │
+         ├─ [LINE 113] detect_channels_multi_window(tsla_window_df)
+         │              windows=[10,20,30,40,50,60,70,80]
+         │              │
+         │              ├─ detect_channel(df, window=10) → regression + bounce ✓
+         │              ├─ detect_channel(df, window=20) → regression + bounce ✓
+         │              ├─ detect_channel(df, window=30) → regression + bounce ✓
+         │              ├─ detect_channel(df, window=40) → regression + bounce ✓
+         │              ├─ detect_channel(df, window=50) → regression + bounce ✓
+         │              ├─ detect_channel(df, window=60) → regression + bounce ✓
+         │              ├─ detect_channel(df, window=70) → regression + bounce ✓
+         │              └─ detect_channel(df, window=80) → regression + bounce ✓
+         │                 Result: channels = {10:Ch10, 20:Ch20, ..., 80:Ch80}
+         │
+         ├─ [LINE 126] extract_all_window_features(tsla_window_df, spy_window_df, ...)
+         │              │
+         │              ├─────────────────────────────────────────────────────┐
+         │              │ extract_shared_features(tsla_df, spy_df, vix_df)   │
+         │              │ │                                                   │
+         │              │ ├─ Resample 11 TIMEFRAMES ✓                         │
+         │              │ ├─ Extract RSI series ✓                             │
+         │              │ ├─ [LINE 753] detect_channels_multi_window(tsla_df) │
+         │              │              windows=[10,20,30,40,50,60,70,80]      │
+         │              │              │                                       │
+         │              │              ├─ detect_channel(df, window=10) ✗ REDUNDANT
+         │              │              ├─ detect_channel(df, window=20) ✗ REDUNDANT
+         │              │              ├─ detect_channel(df, window=30) ✗ REDUNDANT
+         │              │              ├─ detect_channel(df, window=40) ✗ REDUNDANT
+         │              │              ├─ detect_channel(df, window=50) ✗ REDUNDANT
+         │              │              ├─ detect_channel(df, window=60) ✗ REDUNDANT
+         │              │              ├─ detect_channel(df, window=70) ✗ REDUNDANT
+         │              │              └─ detect_channel(df, window=80) ✗ REDUNDANT
+         │              │                 WASTE: We already have channels dict!
+         │              │
+         │              └─────────────────────────────────────────────────────┐
+         │                 extract_window_features(shared, window=W)           │
+         │                 FOR W in [10,20,30,40,50,60,70,80]:                │
+         │                 │                                                   │
+         │                 ├─ [LINE 811] FOR window in STANDARD_WINDOWS:      │
+         │                 │              detect_channel(df_tf, window=w)      │
+         │                 │              │                                     │
+         │                 │              ├─ detect_channel(df, window=10) ✗ REDUNDANT
+         │                 │              ├─ detect_channel(df, window=20) ✗ REDUNDANT
+         │                 │              ├─ detect_channel(df, window=30) ✗ REDUNDANT
+         │                 │              ├─ detect_channel(df, window=40) ✗ REDUNDANT
+         │                 │              ├─ detect_channel(df, window=50) ✗ REDUNDANT
+         │                 │              ├─ detect_channel(df, window=60) ✗ REDUNDANT
+         │                 │              ├─ detect_channel(df, window=70) ✗ REDUNDANT
+         │                 │              └─ detect_channel(df, window=80) ✗ REDUNDANT
+         │                 │                 WASTE: Already have channels!
+         │                 │
+         │                 ├─ Extract TSLA channel features (per window) ✓
+         │                 ├─ Extract SPY channel features (per window) ✓
+         │                 └─ Return FullFeatures
+         │
+         └─ [LINE 157] generate_labels_multi_window(df, channels=channels, ...)
+                        Result: labels = {10: {5min:L, 15min:L, ...}, ...}
+                        Note: Reuses channels from Line 113 ✓
+
+═══════════════════════════════════════════════════════════════════════════════
+
+REGRESSION COUNT SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+Level 1: detect_channels_multi_window @ Line 113
+  └─ 8 regressions (1 per window) ✓ NECESSARY
+
+Level 2: extract_shared_features @ Line 753
+  └─ 8 regressions (REDUNDANT - WASTE!)
+
+Level 3: extract_window_features @ Line 811
+  └─ 8 regressions in loop (REDUNDANT - WASTE!)
+
+───────────────────────────────────────────────────────────────────────────────
+TOTAL: 24 regressions per position
+NECESSARY: 8 regressions
+WASTE: 16 regressions (67% OVERHEAD)
+───────────────────────────────────────────────────────────────────────────────
+
+═══════════════════════════════════════════════════════════════════════════════
+
+PER-TIMEFRAME LABEL GENERATION PHASE (labels.py)
+═══════════════════════════════════════════════════════════════════════════════
+
+generate_labels_per_tf(df, channel_end_idx_5min=999, ...)
+│
+├─ FOR tf in TIMEFRAMES:  (11 timeframes: 5min, 15min, 30min, 1h, ..., 3month)
+│  │
+│  ├─ Resample to tf ✓
+│  │
+│  └─ [LINE 1012] detect_channels_multi_window(df_tf, windows=STANDARD_WINDOWS)
+│     # For each non-5min timeframe, detect all 8 windows
+│     │
+│     ├─ tf=15min: detect_channels_multi_window(df_15min)
+│     │   └─ 8 regressions (at 15min resolution)
+│     │
+│     ├─ tf=30min: detect_channels_multi_window(df_30min)
+│     │   └─ 8 regressions (at 30min resolution)
+│     │
+│     ├─ tf=1h: detect_channels_multi_window(df_1h)
+│     │   └─ 8 regressions (at 1h resolution)
+│     │
+│     ... (10 more timeframes)
+│
+└─ FOR W in windows:  (8 windows)
+   └─ [LINE 1037] generate_labels()  (scan forward)
+
+───────────────────────────────────────────────────────────────────────────────
+PER-TF-LEVEL REGRESSIONS: 11 TFs × 8 windows = 88 regressions
+Note: Some inter-TF reuse possible but not implemented
+───────────────────────────────────────────────────────────────────────────────
+
+═══════════════════════════════════════════════════════════════════════════════
+
+OPTIMIZATION STRATEGY
+═══════════════════════════════════════════════════════════════════════════════
+
+CURRENT FLOW (Inefficient):
+┌──────────────────────────────────────────────────────────────────────────┐
+│ _process_single_position()                                               │
+│  ├─ channels = detect_channels_multi_window()  [8 regressions]         │
+│  ├─ features = extract_all_window_features()   [REDETECTS 8+8]         │
+│  │             └─ Internally calls detect_channels_multi_window()       │
+│  └─ labels = generate_labels_multi_window(channels)                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+OPTIMIZED FLOW (Efficient):
+┌──────────────────────────────────────────────────────────────────────────┐
+│ _process_single_position()                                               │
+│  ├─ channels = detect_channels_multi_window()  [8 regressions]         │
+│  ├─ features = extract_all_window_features(    [PASS channels - 0 NEW]│
+│  │               channels=channels)  ← PASS PRE-COMPUTED CHANNELS      │
+│  └─ labels = generate_labels_multi_window(channels)                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+CHANGES REQUIRED:
+1. Add 'channels' parameter to extract_all_window_features()
+2. Pass channels to extract_shared_features()
+3. Pass channels to extract_window_features()
+4. Remove detect_channels_multi_window() calls from above functions
+
+IMPACT: 16 regressions eliminated (67% reduction)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+PROBLEM LOCATIONS IN CODE
+═══════════════════════════════════════════════════════════════════════════════
+
+PROBLEM 1: Redundant detection in extract_shared_features
+File: v7/features/full_features.py
+Lines: 753-759
+Code:  multi_window_channels = detect_channels_multi_window(tsla_df, ...)
+Fix:   Accept channels parameter instead
+Impact: 8 regressions eliminated
+
+PROBLEM 2: Redundant loop detection in extract_window_features
+File: v7/features/full_features.py
+Lines: 811-813
+Code:  for window in STANDARD_WINDOWS:
+           tsla_channels_dict[window] = detect_channel(df_tf, window=w)
+Fix:   Extract from channels parameter instead
+Impact: 8 regressions eliminated
+
+PROBLEM 3: Per-TF detection in label generation
+File: v7/training/labels.py
+Lines: 1012-1016
+Code:  tf_channels = detect_channels_multi_window(df_tf, windows=...)
+Why:   Different resolution per timeframe (necessary)
+Status: Acceptable but could be cached
+
+═══════════════════════════════════════════════════════════════════════════════
+
+DETAILED OPERATION BREAKDOWN (detect_channel)
+═══════════════════════════════════════════════════════════════════════════════
+
+detect_channel(df, window=50):
+
+Input:  df with close/high/low prices, window=50
+Cost:   O(50) operations
+
+1. df_slice = df.iloc[-50:]                    # DataFrame slice O(1)
+2. close = df_slice['close'].values            # Memory copy O(50)
+3. x = np.arange(50)                           # Create x array O(50)
+4. slope, intercept, r_value, ... =            # LINEAR REGRESSION O(50)
+   stats.linregress(x, close)                  # ← MOST EXPENSIVE
+5. center_line = slope * x + intercept         # Array ops O(50)
+6. residuals = close - center_line             # Array ops O(50)
+7. std_dev = np.std(residuals)                 # Std calc O(50)
+8. upper_line = center_line + 2 * std_dev      # Array ops O(50)
+9. lower_line = center_line - 2 * std_dev      # Array ops O(50)
+10. touches, bounces, ... =                     # BOUNCE DETECTION O(50)
+    detect_bounces(high, low, upper, lower)    # Loop through 50 bars
+
+Total per window: ~2000-3000 CPU operations
+
+For 8 windows (8 separate calls):
+Total: ~16000-24000 CPU operations
+
+═══════════════════════════════════════════════════════════════════════════════
