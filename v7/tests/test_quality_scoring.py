@@ -20,9 +20,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.channel import (
     Channel, Direction, TouchType, Touch,
     calculate_channel_quality_score,
-    detect_channels_multi_window
+    detect_channels_multi_window,
+    detect_channel,
 )
 from core.timeframe import TIMEFRAMES
+from features.rsi import calculate_rsi_series
 from features.full_features import (
     extract_tsla_channel_features,
     features_to_tensor_dict,
@@ -306,13 +308,19 @@ class TestRSIConfidenceScores:
         df.index = pd.date_range('2024-01-01', periods=len(close_prices), freq='5min')
         return df
 
+    def extract_features_with_precompute(self, df: pd.DataFrame, window: int = 20):
+        """Helper to extract features with pre-computed channel and RSI."""
+        channel = detect_channel(df, window=window)
+        rsi_series = calculate_rsi_series(df['close'].values, period=14)
+        return extract_tsla_channel_features(df, '5min', channel, rsi_series, window=window)
+
     def test_rsi_confidence_oversold_zone(self):
         """RSI < 30 should give confidence = 0.9."""
         # Create price data that will result in low RSI
         prices = [100.0] * 30 + [95.0] * 20  # Decline to push RSI low
         df = self.create_mock_df(prices, window=20)
 
-        features = extract_tsla_channel_features(df, '5min', window=20)
+        features = self.extract_features_with_precompute(df, window=20)
 
         # RSI should be low, confidence should be high
         if features.rsi < 30:
@@ -325,7 +333,7 @@ class TestRSIConfidenceScores:
         prices = [100.0] * 30 + [105.0] * 20  # Rise to push RSI high
         df = self.create_mock_df(prices, window=20)
 
-        features = extract_tsla_channel_features(df, '5min', window=20)
+        features = self.extract_features_with_precompute(df, window=20)
 
         # RSI should be high, confidence should be high
         if features.rsi > 70:
@@ -337,7 +345,7 @@ class TestRSIConfidenceScores:
         prices = [100.0 + np.sin(i * 0.1) for i in range(50)]
         df = self.create_mock_df(prices, window=20)
 
-        features = extract_tsla_channel_features(df, '5min', window=20)
+        features = self.extract_features_with_precompute(df, window=20)
 
         # If RSI is in neutral zone, confidence should be lower
         if 45 <= features.rsi <= 55:
@@ -350,7 +358,7 @@ class TestRSIConfidenceScores:
         prices = list(range(100, 150)) + list(range(150, 100, -1))
         df = self.create_mock_df(prices, window=20)
 
-        features = extract_tsla_channel_features(df, '5min', window=20)
+        features = self.extract_features_with_precompute(df, window=20)
 
         assert 0.0 <= features.rsi_confidence <= 1.0
 

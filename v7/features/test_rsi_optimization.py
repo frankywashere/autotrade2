@@ -145,11 +145,14 @@ def test_full_integration():
         'volume': np.random.randint(1000000, 5000000, 500)
     }, index=dates)
 
-    # Extract features (this uses the optimized code)
-    features = extract_tsla_channel_features(tsla_df, timeframe='5min', window=50)
+    # Pre-compute channel and RSI (required by extract_tsla_channel_features)
+    channel = detect_channel(tsla_df, window=50)
+    rsi_series = calculate_rsi_series(tsla_df['close'].values, period=14)
+
+    # Extract features with pre-computed channel and RSI
+    features = extract_tsla_channel_features(tsla_df, '5min', channel, rsi_series, window=50)
 
     # Manually verify RSI calculation
-    rsi_series = calculate_rsi_series(tsla_df['close'].values, period=14)
     rsi_manual = calculate_rsi(tsla_df['close'].values, period=14)
     rsi_from_series = float(rsi_series[-1])
 

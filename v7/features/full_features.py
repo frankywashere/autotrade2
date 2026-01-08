@@ -244,19 +244,36 @@ class FullFeatures:
 def extract_tsla_channel_features(
     tsla_df: pd.DataFrame,
     timeframe: str,
+    channel: Channel,
+    rsi_series: np.ndarray,
     window: int = 20,
     longer_tf_channels: Optional[Dict[str, Channel]] = None,
-    lookforward_bars: int = 200
+    lookforward_bars: int = 200,
 ) -> TSLAChannelFeatures:
-    """Extract TSLA channel features for one timeframe."""
-    channel = detect_channel(tsla_df, window=window)
+    """Extract TSLA channel features for one timeframe.
 
-    # OPTIMIZATION: Calculate RSI series once and reuse
-    # - rsi_series: full array of RSI values for all bars (used for divergence and bounce detection)
-    # - rsi: current RSI (extracted from series[-1])
-    # - divergence: uses the full series
-    rsi_series = calculate_rsi_series(tsla_df['close'].values, period=14)
-    rsi = float(rsi_series[-1])  # Extract current RSI from series (equivalent to calculate_rsi)
+    IMPORTANT: channel and rsi_series are REQUIRED parameters.
+    These must be pre-computed by the caller to avoid redundant computation.
+    This function will NOT silently fall back to computing them.
+
+    Args:
+        tsla_df: TSLA OHLCV data for this timeframe
+        timeframe: Timeframe string (e.g., '5min', '15min')
+        channel: Pre-computed channel from detect_channel() - REQUIRED
+        rsi_series: Pre-computed RSI series from calculate_rsi_series() - REQUIRED
+        window: Channel detection window size (for exit tracking context)
+        longer_tf_channels: Pre-computed channels from longer timeframes
+        lookforward_bars: Bars to look forward for exit tracking
+
+    Raises:
+        ValueError: If channel or rsi_series is None
+    """
+    if channel is None:
+        raise ValueError("channel is required - must be pre-computed by caller")
+    if rsi_series is None:
+        raise ValueError("rsi_series is required - must be pre-computed by caller")
+
+    rsi = float(rsi_series[-1])  # Extract current RSI from series
     divergence = detect_rsi_divergence(tsla_df['close'].values, rsi_series, lookback=10)
 
     # RSI at bounce points
@@ -278,7 +295,13 @@ def extract_tsla_channel_features(
         last_touch = int(channel.last_touch)
 
     # Containment against longer TFs
-    containments = check_all_containments(tsla_df, timeframe, window)
+    # OPTIMIZATION: Pass pre-computed longer_tf_channels to avoid redundant channel detection
+    # This was the main bottleneck - check_all_containments was re-detecting channels
+    # for all longer TFs on every call (11 TFs × 8 windows = 88 redundant detection sets)
+    containments = check_all_containments(
+        tsla_df, timeframe, window,
+        channel_cache=longer_tf_channels if longer_tf_channels else None
+    )
 
     # Exit/Return tracking
     exit_features = None
@@ -414,21 +437,33 @@ def extract_full_features(
                 resample_cache[cache_key] = resample_ohlc(df, tf)
         return resample_cache[cache_key]
 
-    # First pass: detect channels at all timeframes for TSLA
+    # First pass: detect channels and compute RSI at all timeframes for TSLA
     tsla_channels_dict = {}
+    rsi_series_per_tf = {}
     for tf in TIMEFRAMES:
         df_tf = get_resampled(tsla_df, tf, 'tsla')
 
         try:
             tsla_channels_dict[tf] = detect_channel(df_tf, window=window)
         except (ValueError, IndexError):
-            # Skip if insufficient data
+            pass
+
+        try:
+            rsi_series_per_tf[tf] = calculate_rsi_series(df_tf['close'].values, period=14)
+        except (ValueError, IndexError):
             pass
 
     # Second pass: extract features with longer TF context
+    # Channel and RSI series are REQUIRED - skip TFs that don't have them
     tsla_features = {}
     for tf in TIMEFRAMES:
         df_tf = get_resampled(tsla_df, tf, 'tsla')
+        channel = tsla_channels_dict.get(tf)
+        rsi_series = rsi_series_per_tf.get(tf)
+
+        # Skip if we don't have required data
+        if channel is None or rsi_series is None:
+            continue
 
         try:
             # Get longer TF channels for this timeframe
@@ -436,12 +471,12 @@ def extract_full_features(
             longer_channels = {ltf: tsla_channels_dict.get(ltf) for ltf in longer_tfs if ltf in tsla_channels_dict}
 
             tsla_features[tf] = extract_tsla_channel_features(
-                df_tf, tf, window,
+                df_tf, tf, channel, rsi_series,
+                window=window,
                 longer_tf_channels=longer_channels,
-                lookforward_bars=lookforward_bars
+                lookforward_bars=lookforward_bars,
             )
         except (ValueError, IndexError):
-            # Skip if insufficient data
             pass
 
     # SPY features for all timeframes
@@ -813,10 +848,18 @@ def extract_window_features(
             pass
 
     # Step 2: Extract TSLA channel features for each TF
+    # Channel and RSI series are REQUIRED - skip TFs that don't have them
     tsla_features = {}
     for tf in TIMEFRAMES:
         df_tf = shared.tsla_resampled.get(tf)
         if df_tf is None:
+            continue
+
+        channel = tsla_channels_dict.get(tf)
+        rsi_series = shared.rsi_series_per_tf.get(tf)
+
+        # Skip if we don't have required data
+        if channel is None or rsi_series is None:
             continue
 
         try:
@@ -825,9 +868,10 @@ def extract_window_features(
             longer_channels = {ltf: tsla_channels_dict.get(ltf) for ltf in longer_tfs if ltf in tsla_channels_dict}
 
             tsla_features[tf] = extract_tsla_channel_features(
-                df_tf, tf, window,
+                df_tf, tf, channel, rsi_series,
+                window=window,
                 longer_tf_channels=longer_channels,
-                lookforward_bars=lookforward_bars
+                lookforward_bars=lookforward_bars,
             )
         except (ValueError, IndexError):
             pass
