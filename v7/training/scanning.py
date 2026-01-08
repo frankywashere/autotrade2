@@ -30,18 +30,32 @@ _WORKER_SPY_VALUES = None
 _WORKER_VIX_VALUES = None
 _WORKER_PROGRESS_COUNTER = None  # Shared counter for progress updates
 
+# Pre-computed resampled DataFrames to avoid redundant resampling across positions
+# Key: timeframe string, Value: resampled DataFrame
+_WORKER_PRECOMPUTED_TSLA = None  # Dict[str, pd.DataFrame]
+_WORKER_PRECOMPUTED_SPY = None   # Dict[str, pd.DataFrame]
+
 # Progress update stride - flush to shared counter every N positions
 PROGRESS_STRIDE = 10
 
 
-def _init_scan_worker(tsla_values, tsla_index, spy_values, vix_values, progress_counter=None):
-    """Initialize worker process with shared data arrays and progress counter."""
+def _init_scan_worker(tsla_values, tsla_index, spy_values, vix_values, progress_counter=None,
+                       precomputed_tsla=None, precomputed_spy=None):
+    """Initialize worker process with shared data arrays, progress counter, and pre-computed resampled data."""
     global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES, _WORKER_PROGRESS_COUNTER
+    global _WORKER_PRECOMPUTED_TSLA, _WORKER_PRECOMPUTED_SPY
     _WORKER_TSLA_VALUES = tsla_values
     _WORKER_TSLA_INDEX = tsla_index
     _WORKER_SPY_VALUES = spy_values
     _WORKER_VIX_VALUES = vix_values
     _WORKER_PROGRESS_COUNTER = progress_counter
+    _WORKER_PRECOMPUTED_TSLA = precomputed_tsla
+    _WORKER_PRECOMPUTED_SPY = precomputed_spy
+
+    # Register pre-computed data with the labels module for cache optimization
+    if precomputed_tsla is not None or precomputed_spy is not None:
+        from .labels import set_precomputed_resampled_data
+        set_precomputed_resampled_data(precomputed_tsla, precomputed_spy)
 
 
 def _process_single_position(
@@ -458,6 +472,37 @@ def _scan_parallel(
     if progress:
         print(f"Parallel scanning: {total_positions} positions using {max_workers} workers ({len(chunks)} chunks)")
 
+    # Pre-compute resampled DataFrames for all timeframes ONCE
+    # This avoids each worker redundantly resampling the same data
+    # Each worker will slice these pre-computed DataFrames to the position timestamp
+    from ..core.timeframe import TIMEFRAMES, resample_ohlc
+
+    if progress:
+        print("Pre-computing resampled data for all timeframes...")
+
+    # Create full DataFrames for resampling (need proper index for time-based resampling)
+    tsla_full_df = pd.DataFrame(
+        tsla_values,
+        index=tsla_index,
+        columns=['open', 'high', 'low', 'close', 'volume']
+    )
+    spy_full_df = pd.DataFrame(
+        spy_values,
+        index=tsla_index,
+        columns=['open', 'high', 'low', 'close', 'volume']
+    )
+
+    # Pre-compute all resampled versions (skip 5min as it's the base)
+    precomputed_tsla = {'5min': tsla_full_df}  # 5min is identity
+    precomputed_spy = {'5min': spy_full_df}
+    for tf in TIMEFRAMES:
+        if tf != '5min':
+            precomputed_tsla[tf] = resample_ohlc(tsla_full_df, tf)
+            precomputed_spy[tf] = resample_ohlc(spy_full_df, tf)
+
+    if progress:
+        print(f"  Pre-computed {len(TIMEFRAMES)} timeframes for TSLA and SPY")
+
     # Process chunks in parallel
     all_results = []
 
@@ -475,7 +520,8 @@ def _scan_parallel(
         max_workers=max_workers,
         mp_context=ctx,
         initializer=_init_scan_worker,
-        initargs=(tsla_values, tsla_index, spy_values, vix_values, progress_counter)
+        initargs=(tsla_values, tsla_index, spy_values, vix_values, progress_counter,
+                  precomputed_tsla, precomputed_spy)
     ) as executor:
         # Submit all chunks (arrays are now in worker globals, not passed per-task)
         futures = {
