@@ -36,8 +36,8 @@ def create_model_with_window_selection(
 
     Args:
         config: Model configuration dict with keys:
-            - hidden_dim: Hidden dimension for TF branches (default: 64)
-            - cfc_units: CfC units per branch (default: 96)
+            - hidden_dim: Hidden dimension for TF branches (default: 128, v9.2)
+            - cfc_units: CfC units per branch (default: 192, v9.2)
             - num_attention_heads: Number of attention heads (default: 4)
             - dropout: Dropout probability (default: 0.1)
 
@@ -55,10 +55,10 @@ def create_model_with_window_selection(
         Model instance (either HierarchicalCfCModel or EndToEndWindowModel)
 
     Examples:
-        # Create standard model (Phase 2a)
+        # Create standard model (Phase 2a) with v9.2 defaults
         config = {
-            'hidden_dim': 64,
-            'cfc_units': 96,
+            'hidden_dim': 128,   # v9.2: widened from 64
+            'cfc_units': 192,    # v9.2: increased from 96
             'num_attention_heads': 4,
             'dropout': 0.1,
         }
@@ -66,8 +66,8 @@ def create_model_with_window_selection(
 
         # Create end-to-end model (Phase 2b)
         config = {
-            'hidden_dim': 64,
-            'cfc_units': 96,
+            'hidden_dim': 128,   # v9.2: widened from 64
+            'cfc_units': 192,    # v9.2: increased from 96
             'num_attention_heads': 4,
             'dropout': 0.1,
             'window_embed_dim': 128,

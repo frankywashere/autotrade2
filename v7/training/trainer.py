@@ -67,10 +67,16 @@ class TrainingConfig:
     # Uses EndToEndLoss instead of CombinedLoss - designed for Phase 2b with gradient flow
     use_end_to_end_loss: bool = False
 
+    # Duration loss tuning (v9.1 fixes)
+    # These settings prevent the model from "gaming" the loss by predicting high uncertainty
+    uncertainty_penalty: float = 0.1  # Penalizes "I don't know" predictions (0 = disabled)
+    min_duration_precision: float = 0.25  # Floor for duration task weight (prevents abandonment)
+
     # Optimization
     optimizer: str = 'adam'  # 'adam', 'adamw', 'sgd'
-    scheduler: str = 'cosine'  # 'cosine', 'step', 'plateau', 'none'
-    scheduler_kwargs: Dict = field(default_factory=dict)
+    scheduler: str = 'cosine_restarts'  # 'cosine', 'cosine_restarts', 'step', 'plateau', 'none'
+    # FIX: Default to warm restarts instead of pure cosine (which decays to zero)
+    scheduler_kwargs: Dict = field(default_factory=lambda: {'T_0': 50, 'T_mult': 1})
 
     # Mixed precision training
     use_amp: bool = True
@@ -149,6 +155,9 @@ class Trainer:
                 calibration_mode=config.calibration_mode,
                 use_window_selection_loss=config.use_window_selection_loss,
                 window_selection_weight=config.window_selection_weight,
+                # v9.1 duration loss tuning
+                uncertainty_penalty=config.uncertainty_penalty,
+                min_duration_precision=config.min_duration_precision,
             )
         # Move criterion to device (critical for learnable weights)
         self.criterion.to(self.device)
@@ -218,10 +227,36 @@ class Trainer:
             raise ValueError(f"Unknown optimizer: {self.config.optimizer}")
 
     def _create_scheduler(self) -> Optional[Any]:
-        """Create learning rate scheduler based on config."""
+        """Create learning rate scheduler based on config.
+
+        FIX: Added 'cosine_restarts' option which prevents LR from decaying to zero.
+        The old 'cosine' scheduler would decay LR to ~0 by the end of training,
+        causing the model to stop learning after ~200-300 epochs.
+
+        ANALOGY: Regular cosine is like a car running out of gas - it slows down
+        and eventually stops. Cosine with warm restarts is like refueling every
+        N miles - the car keeps going at full speed periodically.
+        """
         if self.config.scheduler.lower() == 'none':
             return None
+        elif self.config.scheduler.lower() == 'cosine_restarts':
+            # FIX: Use warm restarts instead of decay-to-zero
+            # T_0 = epochs until first restart (default 50)
+            # T_mult = multiplier for subsequent periods (1 = same period each time)
+            # eta_min = minimum LR (10% of initial by default)
+            kwargs = {
+                'T_0': self.config.scheduler_kwargs.get('T_0', 50),
+                'T_mult': self.config.scheduler_kwargs.get('T_mult', 1),
+                'eta_min': self.config.scheduler_kwargs.get('eta_min', self.config.learning_rate * 0.1)
+            }
+            print(f"Using CosineAnnealingWarmRestarts: restart every {kwargs['T_0']} epochs")
+            return optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer,
+                **kwargs
+            )
         elif self.config.scheduler.lower() == 'cosine':
+            # WARNING: This decays LR to zero - not recommended for long training
+            print("WARNING: 'cosine' scheduler decays LR to zero. Consider 'cosine_restarts' instead.")
             return optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.config.num_epochs,

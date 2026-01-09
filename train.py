@@ -84,10 +84,10 @@ STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80]
 
 PRESETS = {
     "Quick Start": {
-        "desc": "Fast training for testing (few epochs)",
+        "desc": "Fast training for testing (smaller model, few epochs)",
         "step": 50,
-        "hidden_dim": 64,
-        "cfc_units": 96,
+        "hidden_dim": 64,  # Smaller for speed - use Standard for production
+        "cfc_units": 96,   # Smaller for speed
         "attention_heads": 4,  # Simple configuration
         "num_epochs": 10,
         "batch_size": 32,
@@ -996,11 +996,22 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
     ).execute()
 
     # Scheduler
+    # FIX: Added "cosine_restarts" as default - prevents LR decay to zero
+    # "cosine" decays LR to ~0 by end of training, causing model to stop learning
+    # "cosine_restarts" periodically resets LR to prevent this
     scheduler = inquirer.select(
         message="Learning rate scheduler:",
-        choices=["cosine", "step", "plateau", "none"],
-        default="cosine",
+        choices=[
+            "cosine_restarts (recommended - periodic LR resets)",
+            "cosine (decays to zero - NOT recommended)",
+            "step",
+            "plateau",
+            "none"
+        ],
+        default="cosine_restarts (recommended - periodic LR resets)",
     ).execute()
+    # Extract just the scheduler name (remove description)
+    scheduler = scheduler.split(" ")[0]
 
     # Loss weight mode selection
     console.print("\n[bold cyan]Loss Weight Configuration[/bold cyan]")
@@ -1185,6 +1196,26 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         gradient_clip = float(inquirer.number(
             message="Gradient clipping:", default=1.0, float_allowed=True
         ).execute())
+
+        # Duration Loss Tuning (v9.1 fixes)
+        console.print("\n[bold cyan]Duration Loss Tuning (v9.1)[/bold cyan]")
+        console.print("[dim]These settings prevent the model from 'giving up' on duration prediction[/dim]\n")
+
+        uncertainty_penalty = float(inquirer.number(
+            message="Uncertainty penalty (penalizes 'I don't know' predictions):",
+            default=0.1,
+            float_allowed=True
+        ).execute())
+
+        min_duration_precision = float(inquirer.number(
+            message="Min duration precision (floor for duration task weight):",
+            default=0.25,
+            float_allowed=True
+        ).execute())
+
+        console.print(f"\n[green]  Duration loss tuning:[/green]")
+        console.print(f"    Uncertainty penalty: [cyan]{uncertainty_penalty}[/cyan] (0 = disabled, 0.1 = default)")
+        console.print(f"    Min duration precision: [cyan]{min_duration_precision}[/cyan] (0.25 = 25% minimum weight)")
     else:
         use_amp = False  # Default to stable float32
         early_stopping_patience = 15
@@ -1192,6 +1223,8 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         early_stopping_mode = 'min'
         weight_decay = 0.0001
         gradient_clip = 1.0
+        uncertainty_penalty = 0.1  # v9.1 default
+        min_duration_precision = 0.25  # v9.1 default
 
     return {
         "num_epochs": num_epochs,
@@ -1209,6 +1242,9 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         "fixed_weights": fixed_weights,
         "weight_mode": weight_mode,
         "calibration_mode": calibration_mode,
+        # v9.1 duration loss tuning
+        "uncertainty_penalty": uncertainty_penalty,
+        "min_duration_precision": min_duration_precision,
     }
 
 
@@ -2197,6 +2233,9 @@ def run_walk_forward_training(
                 early_stopping_patience=config["training"].get("early_stopping_patience", 15),
                 early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
                 early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
+                # v9.1 duration loss tuning
+                uncertainty_penalty=config["training"].get("uncertainty_penalty", 0.1),
+                min_duration_precision=config["training"].get("min_duration_precision", 0.25),
                 device=config["device"],
                 save_dir=window_save_dir,
                 log_dir=log_dir / f"window_{window_idx + 1}",
@@ -2666,6 +2705,9 @@ def main():
             calibration_mode=config["training"].get("calibration_mode", "brier_per_tf"),
             use_window_selection_loss=config["training"].get("use_window_selection_loss", False),
             window_selection_weight=config["training"].get("window_selection_weight", 0.1),
+            # v9.1 duration loss tuning
+            uncertainty_penalty=config["training"].get("uncertainty_penalty", 0.1),
+            min_duration_precision=config["training"].get("min_duration_precision", 0.25),
             use_end_to_end_loss=(strategy == "learned_selection"),  # Use EndToEndLoss for Phase 2b
             early_stopping_patience=config["training"].get("early_stopping_patience", 15),
             early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),

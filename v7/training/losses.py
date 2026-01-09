@@ -31,24 +31,41 @@ class GaussianNLLLoss(nn.Module):
     This loss encourages:
     - Accurate mean predictions (minimizes squared error)
     - Calibrated uncertainty (penalizes overconfident or underconfident predictions)
+
+    FIX v9.1: Added uncertainty_penalty to prevent the model from "gaming" the loss
+    by predicting high uncertainty instead of accurate means. Without this, the model
+    could reduce loss by saying "I'm very uncertain" rather than learning to predict well.
+
+    ANALOGY: It's like a student who says "I don't know" to every question to avoid
+    being wrong. The uncertainty_penalty is like grading "I don't know" as partially
+    wrong, encouraging the student to actually try to answer.
     """
 
     def __init__(
         self,
         min_std: float = 1e-6,
         max_std: float = 1000.0,
-        eps: float = 1e-6
+        eps: float = 1e-6,
+        uncertainty_penalty: float = 0.1,  # FIX: Penalize high uncertainty
+        max_log_std: float = 3.0,  # FIX: Lower cap on uncertainty
     ):
         """
         Args:
             min_std: Minimum standard deviation (for numerical stability)
             max_std: Maximum standard deviation (prevent extreme uncertainties)
             eps: Small constant for numerical stability
+            uncertainty_penalty: FIX - Extra penalty for high predicted uncertainty.
+                                This prevents the model from gaming the loss by
+                                predicting "I'm very uncertain" to reduce loss.
+            max_log_std: FIX - Maximum log_std allowed. Lower than before (3.0 vs 5.0)
+                        to prevent excessive uncertainty predictions.
         """
         super().__init__()
         self.min_std = min_std
         self.max_std = max_std
         self.eps = eps
+        self.uncertainty_penalty = uncertainty_penalty
+        self.max_log_std = max_log_std
 
     def forward(
         self,
@@ -58,7 +75,7 @@ class GaussianNLLLoss(nn.Module):
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Compute Gaussian NLL loss.
+        Compute Gaussian NLL loss with uncertainty penalty.
 
         Args:
             pred_mean: Predicted mean values [batch_size, num_timeframes]
@@ -69,20 +86,25 @@ class GaussianNLLLoss(nn.Module):
         Returns:
             Scalar loss value
         """
+        # FIX: Tighter clamp on log_std to prevent uncertainty gaming
+        pred_log_std_clamped = torch.clamp(pred_log_std, min=-5.0, max=self.max_log_std)
+
         # Convert log_std to std and clamp for stability
-        pred_std = torch.exp(pred_log_std).clamp(self.min_std, self.max_std)
+        pred_std = torch.exp(pred_log_std_clamped).clamp(self.min_std, self.max_std)
 
-        # Compute squared normalized error (clamp to prevent explosion)
+        # Compute squared normalized error
+        # FIX: Removed aggressive clamping at 1000 - this was hiding gradient info
         squared_error = ((target - pred_mean) / (pred_std + self.eps)) ** 2
-        squared_error = torch.clamp(squared_error, max=1000.0)  # Prevent extreme values
+        squared_error = torch.clamp(squared_error, max=100.0)  # FIX: Tighter clamp
 
-        # Compute log probability: -0.5 * (log(2π) + log(std²) + squared_error)
-        # Simplified: -0.5 * (log(std²) + squared_error) + constant
-        # Which is: -(log(std) + 0.5 * squared_error) + constant
-        # Since we want NLL (negative), we have: log(std) + 0.5 * squared_error
-        # CRITICAL: Clamp pred_log_std to prevent NaN from extreme values
-        pred_log_std_clamped = torch.clamp(pred_log_std, min=-5.0, max=5.0)
+        # Standard NLL: log(std) + 0.5 * squared_error
         nll = 0.5 * squared_error + pred_log_std_clamped
+
+        # FIX: Add uncertainty penalty to discourage high log_std predictions
+        # This makes it costly to "give up" by predicting high uncertainty
+        # penalty = uncertainty_penalty * max(0, log_std - threshold)
+        uncertainty_excess = F.relu(pred_log_std_clamped - 1.0)  # Penalize log_std > 1.0
+        nll = nll + self.uncertainty_penalty * uncertainty_excess
 
         # Apply mask if provided
         if mask is not None:
@@ -92,6 +114,59 @@ class GaussianNLLLoss(nn.Module):
             loss = nll.mean()
 
         return loss
+
+
+class SimpleDurationLoss(nn.Module):
+    """
+    Simple MSE/Huber loss for duration prediction without uncertainty modeling.
+
+    Use this when you want to verify the task is learnable without the complexity
+    of Gaussian NLL. This is a good baseline before moving to uncertainty-aware losses.
+
+    FIX: This loss doesn't have the "uncertainty gaming" problem because it doesn't
+    model uncertainty at all - it just predicts the mean directly.
+
+    ANALOGY: Instead of asking "what's your answer and how confident are you?",
+    this just asks "what's your answer?" - simpler and more direct.
+    """
+
+    def __init__(self, use_huber: bool = True, huber_delta: float = 1.0):
+        """
+        Args:
+            use_huber: If True, use Huber loss (robust to outliers). If False, use MSE.
+            huber_delta: Delta for Huber loss (errors < delta use MSE, > delta use MAE)
+        """
+        super().__init__()
+        self.use_huber = use_huber
+        self.huber_delta = huber_delta
+
+    def forward(
+        self,
+        pred_mean: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Compute loss.
+
+        Args:
+            pred_mean: Predicted mean values [batch_size, num_timeframes]
+            target: Actual duration values [batch_size, num_timeframes]
+            mask: Optional mask for valid predictions [batch_size, num_timeframes]
+
+        Returns:
+            Scalar loss value
+        """
+        if self.use_huber:
+            loss = F.huber_loss(pred_mean, target, reduction='none', delta=self.huber_delta)
+        else:
+            loss = F.mse_loss(pred_mean, target, reduction='none')
+
+        if mask is not None:
+            loss = loss * mask
+            return loss.sum() / (mask.sum() + 1e-8)
+
+        return loss.mean()
 
 
 class DirectionLoss(nn.Module):
@@ -670,6 +745,9 @@ class CombinedLoss(nn.Module):
         use_window_selection_loss: bool = False,
         window_selection_weight: float = 0.1,
         window_selection_target: str = "best_window",
+        # v9.1 duration loss tuning
+        uncertainty_penalty: float = 0.1,
+        min_duration_precision: float = 0.25,
     ):
         """
         Args:
@@ -689,14 +767,20 @@ class CombinedLoss(nn.Module):
             use_window_selection_loss: If True, include window selection loss
             window_selection_weight: Weight for window selection loss
             window_selection_target: Target type for window selection ('best_window' or 'selected_window')
+            uncertainty_penalty: v9.1 - Penalizes high uncertainty predictions to prevent
+                               the model from "gaming" the loss by saying "I don't know"
+            min_duration_precision: v9.1 - Minimum precision floor for duration task weight
+                                   (prevents learnable weights from abandoning duration)
         """
         super().__init__()
         self.num_timeframes = num_timeframes
         self.use_learnable_weights = use_learnable_weights
         self.calibration_mode = calibration_mode
+        self.min_duration_precision = min_duration_precision  # v9.1
 
         # Initialize loss components
-        self.duration_loss = GaussianNLLLoss()
+        # v9.1: Pass uncertainty_penalty to GaussianNLLLoss
+        self.duration_loss = GaussianNLLLoss(uncertainty_penalty=uncertainty_penalty)
         self.direction_loss = DirectionLoss()
         self.next_channel_loss = NextChannelDirectionLoss()
         self.trigger_tf_loss = TriggerTimeframeLoss()  # v9.0.0
@@ -917,13 +1001,26 @@ class CombinedLoss(nn.Module):
         if self.use_learnable_weights:
             # Uncertainty-based weighting: (1 / 2σ²) * L + log(σ)
             # log_vars = log(σ²), so exp(-log_vars) = 1/σ²
-            # CRITICAL: Clamp log_vars to prevent precision from exploding to inf or 0
-            log_vars_clamped = torch.clamp(self.log_vars, min=-4.0, max=4.0)
+            #
+            # FIX v9.1: Tighter clamp range to prevent task abandonment
+            # Old range: [-4.0, 4.0] allowed precision to drop to 0.018 (98% reduction!)
+            # New range: [-2.0, 2.0] limits precision to [0.135, 7.4] (max 87% reduction)
+            #
+            # ANALOGY: It's like a team project where one person (duration) was allowed
+            # to do only 2% of the work. Now everyone must do at least 13% minimum.
+            # This ensures duration keeps learning even when it's the hardest task.
+            log_vars_clamped = torch.clamp(self.log_vars, min=-2.0, max=2.0)  # FIX: Tighter clamp
+
             precision_duration = torch.exp(-log_vars_clamped[0])
             precision_direction = torch.exp(-log_vars_clamped[1])
             precision_next_channel = torch.exp(-log_vars_clamped[2])
             precision_calibration = torch.exp(-log_vars_clamped[3])
             precision_trigger_tf = torch.exp(-log_vars_clamped[4])  # v9.0.0
+
+            # FIX v9.1: Enforce minimum precision for duration (most important task)
+            # This ensures duration always gets at least min_duration_precision of its nominal weight
+            # even if the learnable weight tries to reduce it further
+            precision_duration = torch.maximum(precision_duration, torch.tensor(self.min_duration_precision, device=precision_duration.device))
 
             total_loss = (
                 0.5 * precision_duration * loss_duration + 0.5 * log_vars_clamped[0] +

@@ -1339,8 +1339,8 @@ class HierarchicalCfCModel(nn.Module):
     def __init__(
         self,
         feature_config: Optional[FeatureConfig] = None,
-        hidden_dim: int = 64,
-        cfc_units: int = 96,  # Must be > hidden_dim + 2
+        hidden_dim: int = 128,  # v9.2: Widened from 64 to preserve more feature info
+        cfc_units: int = 192,   # v9.2: Increased from 96 (must be > hidden_dim + 2)
         num_attention_heads: int = 4,
         dropout: float = 0.1,
         shared_heads: bool = True
@@ -1350,7 +1350,7 @@ class HierarchicalCfCModel(nn.Module):
 
         Args:
             feature_config: Feature dimension configuration
-            hidden_dim: Hidden dimension for branches and heads
+            hidden_dim: Hidden dimension for branches and heads (v9.2: default 128, was 64)
             cfc_units: Number of units in each CfC layer (must be > hidden_dim + 2)
             num_attention_heads: Number of attention heads
             dropout: Dropout probability
@@ -1393,6 +1393,14 @@ class HierarchicalCfCModel(nn.Module):
 
         # Prediction heads (dual output design)
         context_dim = hidden_dim * 2  # From attention output projection
+
+        # v9.2: Project context back to hidden_dim for per-TF enrichment
+        # This allows cross-TF attention to influence per-TF duration predictions
+        self.context_proj = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
 
         # Per-timeframe prediction heads
         if self.shared_heads:
@@ -1526,9 +1534,20 @@ class HierarchicalCfCModel(nn.Module):
         tf_embeddings_stacked = torch.stack(tf_embeddings, dim=1)
 
         # =====================================================================
+        # CROSS-TF ATTENTION (v9.2: moved BEFORE per-TF predictions)
+        # =====================================================================
+        # Compute cross-TF attention to get global context
+        context, attn_weights = self.cross_tf_attention(tf_embeddings_stacked)
+
+        # v9.2: Project context to hidden_dim for per-TF enrichment
+        # This allows duration predictions to leverage cross-TF information
+        context_projected = self.context_proj(context)  # [batch, hidden_dim]
+
+        # =====================================================================
         # PER-TIMEFRAME PREDICTIONS (one prediction per TF)
         # =====================================================================
-        # Each TF embedding gets its own prediction
+        # v9.2: Duration predictions use ENRICHED embeddings (TF + cross-TF context)
+        # Other heads use raw embeddings to minimize parameter changes
         per_tf_durations_mean = []
         per_tf_durations_log_std = []
         per_tf_directions = []
@@ -1536,16 +1555,24 @@ class HierarchicalCfCModel(nn.Module):
         per_tf_confidences = []
 
         for tf_idx, embedding in enumerate(tf_embeddings):
+            # v9.2: Enrich embedding with cross-TF context for DURATION prediction
+            # Uses residual addition so cross-TF info flows into duration heads
+            enriched_embedding = embedding + context_projected  # [batch, hidden_dim]
+
             # Each timeframe makes independent prediction
             if self.shared_heads:
                 # Single shared head for all TFs
-                dur_mean, dur_log_std = self.per_tf_duration_head(embedding)
+                # v9.2: Duration uses ENRICHED embedding (with cross-TF context)
+                dur_mean, dur_log_std = self.per_tf_duration_head(enriched_embedding)
+                # Other heads use raw embedding (unchanged)
                 dir_logits = self.per_tf_direction_head(embedding)
                 next_ch = self.per_tf_next_channel_head(embedding)
                 conf = self.per_tf_confidence_head(embedding)
             else:
                 # Separate head per TF (TF-specific learned parameters)
-                dur_mean, dur_log_std = self.per_tf_duration_heads[tf_idx](embedding)
+                # v9.2: Duration uses ENRICHED embedding (with cross-TF context)
+                dur_mean, dur_log_std = self.per_tf_duration_heads[tf_idx](enriched_embedding)
+                # Other heads use raw embedding (unchanged)
                 dir_logits = self.per_tf_direction_heads[tf_idx](embedding)
                 next_ch = self.per_tf_next_channel_heads[tf_idx](embedding)
                 conf = self.per_tf_confidence_heads[tf_idx](embedding)
@@ -1564,10 +1591,8 @@ class HierarchicalCfCModel(nn.Module):
         confidence = torch.cat(per_tf_confidences, dim=1)                 # [batch, 11]
 
         # =====================================================================
-        # AGGREGATE PREDICTION (optional - for dashboard summary)
+        # AGGREGATE PREDICTION (uses full attention context)
         # =====================================================================
-        # Use cross-TF attention to create weighted aggregate
-        context, attn_weights = self.cross_tf_attention(tf_embeddings_stacked)
 
         agg_dur_mean, agg_dur_log_std = self.agg_duration_head(context)
         agg_direction = self.agg_direction_head(context)
@@ -1916,8 +1941,8 @@ class HierarchicalLoss(nn.Module):
 # =============================================================================
 
 def create_model(
-    hidden_dim: int = 64,
-    cfc_units: int = 96,  # Must be > hidden_dim + 2
+    hidden_dim: int = 128,   # v9.2: Widened from 64 to preserve more feature info
+    cfc_units: int = 192,    # v9.2: Increased from 96 (must be > hidden_dim + 2)
     num_attention_heads: int = 4,
     dropout: float = 0.1,
     shared_heads: bool = True,
@@ -1927,7 +1952,7 @@ def create_model(
     Factory function to create and initialize model.
 
     Args:
-        hidden_dim: Hidden dimension for branches
+        hidden_dim: Hidden dimension for branches (v9.2: default 128, was 64)
         cfc_units: CfC units per branch (must be > hidden_dim + 2)
         num_attention_heads: Attention heads
         dropout: Dropout probability
@@ -1994,7 +2019,7 @@ if __name__ == '__main__':
 
     # Create model
     print("\n[1] Creating model...")
-    model = create_model(hidden_dim=64, cfc_units=96, num_attention_heads=4)
+    model = create_model(hidden_dim=128, cfc_units=192, num_attention_heads=4)
 
     # Create dummy input
     print(f"\n[2] Creating dummy input (batch_size=4, features={TOTAL_FEATURES})...")
