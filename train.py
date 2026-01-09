@@ -1220,12 +1220,12 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         early_stopping_metric = inquirer.select(
             message="Metric to monitor:",
             choices=[
-                {"name": "val_loss (total validation loss)", "value": "total"},
                 {"name": "val_duration_loss (duration prediction loss)", "value": "duration"},
+                {"name": "val_loss (total validation loss)", "value": "total"},
                 {"name": "next_channel_acc (next channel accuracy - often improves longer)", "value": "next_channel_acc"},
                 {"name": "direction_acc (direction accuracy)", "value": "direction_acc"},
             ],
-            default="total",
+            default="duration",
         ).execute()
 
         # Auto-set mode based on metric
