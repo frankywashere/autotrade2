@@ -1402,6 +1402,10 @@ class HierarchicalCfCModel(nn.Module):
             nn.GELU(),
         )
 
+        # v9.2.1: LayerNorm after residual addition to fix scale mismatch
+        # (embedding is not normalized, context_projected is - this balances them)
+        self.enriched_norm = nn.LayerNorm(hidden_dim)
+
         # Per-timeframe prediction heads
         if self.shared_heads:
             # SHARED: Single set of heads for all TFs (default, fewer parameters)
@@ -1557,7 +1561,8 @@ class HierarchicalCfCModel(nn.Module):
         for tf_idx, embedding in enumerate(tf_embeddings):
             # v9.2: Enrich embedding with cross-TF context for DURATION prediction
             # Uses residual addition so cross-TF info flows into duration heads
-            enriched_embedding = embedding + context_projected  # [batch, hidden_dim]
+            # v9.2.1: Apply LayerNorm after addition to fix scale mismatch
+            enriched_embedding = self.enriched_norm(embedding + context_projected)  # [batch, hidden_dim]
 
             # Each timeframe makes independent prediction
             if self.shared_heads:
