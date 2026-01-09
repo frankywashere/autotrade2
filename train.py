@@ -68,6 +68,7 @@ from v7.training.dataset import (
     filter_samples_for_walk_forward,
     is_cache_valid,
 )
+from v7.training.walk_forward_results import WalkForwardResults, WindowMetrics
 from v7.models import create_model, create_loss, create_end_to_end_model
 from v7.core.window_strategy import SelectionStrategy
 
@@ -945,12 +946,40 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
         default=False,
     ).execute()
 
+    # SE-blocks (Squeeze-and-Excitation) for feature reweighting
+    console.print("\n[dim]SE-blocks learn which features matter for each sample (adaptive feature selection)[/dim]")
+    use_se_blocks = inquirer.select(
+        message="Feature reweighting (SE-blocks):",
+        choices=[
+            {"name": "Disabled (default - no feature reweighting)", "value": False},
+            {"name": "Enabled (learn per-sample feature importance, +~46K params)", "value": True},
+        ],
+        default=False,
+    ).execute()
+
+    # SE reduction ratio (only if SE-blocks enabled)
+    se_reduction_ratio = 8  # Default
+    if use_se_blocks:
+        se_reduction_ratio = inquirer.select(
+            message="SE-block reduction ratio:",
+            choices=[
+                {"name": "4 (larger bottleneck, more expressive)", "value": 4},
+                {"name": "8 (balanced, recommended)", "value": 8},
+                {"name": "16 (smaller bottleneck, lighter)", "value": 16},
+            ],
+            default=8,
+        ).execute()
+        console.print(f"[green]✓ SE-blocks enabled with reduction ratio {se_reduction_ratio} "
+                      f"({hidden_dim}→{max(hidden_dim // se_reduction_ratio, 4)}→{hidden_dim})[/green]")
+
     return {
         "hidden_dim": hidden_dim,
         "cfc_units": cfc_units,
         "num_attention_heads": num_attention_heads,
         "dropout": dropout,
         "shared_heads": shared_heads,
+        "use_se_blocks": use_se_blocks,
+        "se_reduction_ratio": se_reduction_ratio,
     }
 
 
@@ -1176,18 +1205,21 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         early_stopping_metric = inquirer.select(
             message="Metric to monitor:",
             choices=[
-                {"name": "val_loss (total validation loss)", "value": "val_loss"},
+                {"name": "val_loss (total validation loss)", "value": "total"},
+                {"name": "val_duration_loss (duration prediction loss)", "value": "duration"},
                 {"name": "next_channel_acc (next channel accuracy - often improves longer)", "value": "next_channel_acc"},
                 {"name": "direction_acc (direction accuracy)", "value": "direction_acc"},
             ],
-            default="val_loss",
+            default="total",
         ).execute()
 
         # Auto-set mode based on metric
+        # Loss metrics: lower is better (mode='min')
+        # Accuracy metrics: higher is better (mode='max')
         if early_stopping_metric in ['next_channel_acc', 'direction_acc']:
             early_stopping_mode = 'max'  # Maximize accuracy
         else:
-            early_stopping_mode = 'min'  # Minimize loss
+            early_stopping_mode = 'min'  # Minimize loss (total, duration, etc.)
 
         weight_decay = float(inquirer.number(
             message="Weight decay:", default=0.0001, float_allowed=True
@@ -1219,7 +1251,7 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
     else:
         use_amp = False  # Default to stable float32
         early_stopping_patience = 15
-        early_stopping_metric = 'val_loss'
+        early_stopping_metric = 'total'  # Use actual metric key from val_metrics
         early_stopping_mode = 'min'
         weight_decay = 0.0001
         gradient_clip = 1.0
@@ -1619,6 +1651,15 @@ def display_config_summary(config: Dict):
     model_tree.add(f"Dropout: {config['model']['dropout']}")
     shared_heads = config['model'].get('shared_heads', True)
     model_tree.add(f"Head architecture: {'Shared' if shared_heads else 'Separate per TF'}")
+    # SE-blocks info
+    use_se_blocks = config['model'].get('use_se_blocks', False)
+    if use_se_blocks:
+        se_ratio = config['model'].get('se_reduction_ratio', 8)
+        hidden_dim = config['model']['hidden_dim']
+        bottleneck = max(hidden_dim // se_ratio, 4)
+        model_tree.add(f"[yellow]SE-blocks: Enabled (ratio={se_ratio}, {hidden_dim}→{bottleneck}→{hidden_dim})[/yellow]")
+    else:
+        model_tree.add("SE-blocks: Disabled")
 
     # Training config
     train_tree = Tree("[bold]Training Configuration[/bold]")
@@ -1690,6 +1731,8 @@ class TrainingMonitor:
         self.console = console
         self.best_val_loss = float("inf")
         self.best_epoch = 0
+        self.best_duration_loss = float("inf")
+        self.best_duration_epoch = 0
 
     def create_metrics_table(
         self, epoch: int, train_metrics: Dict, val_metrics: Dict
@@ -1744,6 +1787,62 @@ class TrainingMonitor:
 
         return table
 
+    def create_progression_summary(self, epoch: int, val_metrics: Dict) -> str:
+        """Create a concise progression summary showing trends from best to current.
+
+        Format: Progression: Val Loss X.XX->Y.YY (^Z.Z%) | Duration X.XX->Y.YY (^Z.Z%) | Best: Epoch N
+
+        Only shown when current epoch is not the best (i.e., we have regressed from best).
+        """
+        current_val_loss = val_metrics.get('total', 0)
+        current_duration_loss = val_metrics.get('duration', 0)
+        current_epoch = epoch + 1  # 1-indexed
+
+        # Don't show progression when current epoch is the best
+        # (when it's the best, "New best model!" message is already shown)
+        if current_epoch == self.best_epoch:
+            return ""
+
+        parts = []
+
+        # Val Loss progression (from best to current)
+        if self.best_val_loss < float("inf") and self.best_val_loss > 0:
+            val_change_pct = ((current_val_loss - self.best_val_loss) / self.best_val_loss) * 100
+            arrow = "\u2191" if val_change_pct > 0 else "\u2193"
+            parts.append(f"Val Loss {self.best_val_loss:.2f}\u2192{current_val_loss:.2f} ({arrow}{abs(val_change_pct):.1f}%)")
+
+        # Duration loss progression (from best to current)
+        if self.best_duration_loss < float("inf") and self.best_duration_loss > 0:
+            dur_change_pct = ((current_duration_loss - self.best_duration_loss) / self.best_duration_loss) * 100
+            arrow = "\u2191" if dur_change_pct > 0 else "\u2193"
+            parts.append(f"Duration {self.best_duration_loss:.2f}\u2192{current_duration_loss:.2f} ({arrow}{abs(dur_change_pct):.1f}%)")
+
+        # Best epoch
+        if self.best_epoch > 0:
+            parts.append(f"Best: Epoch {self.best_epoch}")
+
+        if parts:
+            return "Progression: " + " | ".join(parts)
+        return ""
+
+    def update_best_metrics(self, epoch: int, val_metrics: Dict) -> bool:
+        """Update best metrics tracking. Returns True if this is a new best val loss."""
+        current_val_loss = val_metrics.get('total', 0)
+        current_duration_loss = val_metrics.get('duration', 0)
+
+        is_best = current_val_loss < self.best_val_loss
+
+        if is_best:
+            self.best_val_loss = current_val_loss
+            self.best_epoch = epoch + 1  # 1-indexed
+
+        # Track best duration loss separately
+        if current_duration_loss < self.best_duration_loss:
+            self.best_duration_loss = current_duration_loss
+            self.best_duration_epoch = epoch + 1
+
+        return is_best
+
 
 def train_with_progress(
     trainer: Trainer,
@@ -1794,13 +1893,16 @@ def train_with_progress(
             )
             console.print(metrics_table)
 
-            # Check if best model
+            # Check if best model and update tracking (before progression summary)
+            is_best = monitor.update_best_metrics(epoch, val_metrics)
             current_val_loss = val_metrics["total"]
-            is_best = current_val_loss < monitor.best_val_loss
+
+            # Display progression summary (after first epoch when we have history)
+            progression_summary = monitor.create_progression_summary(epoch, val_metrics)
+            if progression_summary:
+                console.print(f"[dim]{progression_summary}[/dim]")
 
             if is_best:
-                monitor.best_val_loss = current_val_loss
-                monitor.best_epoch = epoch + 1
                 trainer.save_checkpoint(
                     f"checkpoint_epoch_{epoch + 1}.pt", is_best=True
                 )
@@ -1814,8 +1916,19 @@ def train_with_progress(
                     console.print(f"[dim]Checkpoint saved[/dim]")
 
             # Early stopping check (skip if patience is 0 = disabled)
-            if current_val_loss < trainer.best_val_metric:
-                trainer.best_val_metric = current_val_loss
+            # Use the configured early_stopping_metric and early_stopping_mode
+            es_metric = trainer.config.early_stopping_metric
+            es_mode = trainer.config.early_stopping_mode
+            current_es_metric = val_metrics.get(es_metric, current_val_loss)
+
+            # Determine if current metric is better based on mode
+            if es_mode == 'min':
+                is_better = current_es_metric < trainer.best_val_metric
+            else:  # max mode
+                is_better = current_es_metric > trainer.best_val_metric
+
+            if is_better:
+                trainer.best_val_metric = current_es_metric
                 trainer.epochs_without_improvement = 0
             else:
                 trainer.epochs_without_improvement += 1
@@ -2081,7 +2194,24 @@ def run_walk_forward_training(
         all_samples, load_info = load_cached_samples(cache_path, migrate_labels=True)
         console.print(f"\n[green]✓[/green] Cache built with {len(all_samples)} samples")
 
-    # Store results for each window
+    # Determine the metric being optimized and its mode
+    early_stopping_metric = config["training"].get("early_stopping_metric", "total")
+
+    # Determine mode: 'min' for losses, 'max' for accuracies
+    metric_mode = "max" if early_stopping_metric in ("direction_acc", "next_channel_acc") else "min"
+
+    # Create WalkForwardResults object to aggregate all windows
+    walk_forward_results = WalkForwardResults(
+        num_windows=num_windows,
+        window_type=window_type,
+        best_metric_name=early_stopping_metric,  # Use the raw metric name (e.g., 'duration', 'total')
+        metric_mode=metric_mode,  # 'min' for losses, 'max' for accuracies
+        metadata={
+            "config": wf_config,
+        }
+    )
+
+    # Store results for each window (legacy format for backward compatibility)
     window_results = []
 
     console.print(f"[bold]Starting {num_windows} walk-forward windows...[/bold]\n")
@@ -2206,6 +2336,8 @@ def run_walk_forward_training(
                         num_attention_heads=config["model"]["num_attention_heads"],
                         dropout=config["model"]["dropout"],
                         shared_heads=config["model"].get("shared_heads", True),
+                        use_se_blocks=config["model"].get("use_se_blocks", False),
+                        se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                         device=config["device"],
                     )
 
@@ -2231,11 +2363,14 @@ def run_walk_forward_training(
                 window_selection_weight=config["training"].get("window_selection_weight", 0.1),
                 use_end_to_end_loss=(strategy == "learned_selection"),  # Use EndToEndLoss for Phase 2b
                 early_stopping_patience=config["training"].get("early_stopping_patience", 15),
-                early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
+                early_stopping_metric=config["training"].get("early_stopping_metric", "total"),
                 early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
                 # v9.1 duration loss tuning
                 uncertainty_penalty=config["training"].get("uncertainty_penalty", 0.1),
                 min_duration_precision=config["training"].get("min_duration_precision", 0.25),
+                # SE-blocks config (stored in model config)
+                use_se_blocks=config["model"].get("use_se_blocks", False),
+                se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                 device=config["device"],
                 save_dir=window_save_dir,
                 log_dir=log_dir / f"window_{window_idx + 1}",
@@ -2255,10 +2390,50 @@ def run_walk_forward_training(
             success = train_with_progress(trainer, config, window_save_dir)
 
             if success:
-                # Get best validation metrics
-                best_val_loss = float(min([m["total"] for m in trainer.val_metrics_history]))
-                best_epoch = int(np.argmin([m["total"] for m in trainer.val_metrics_history])) + 1
+                # Get best validation metrics based on the configured metric
+                # Map early_stopping_metric to the key in val_metrics_history
+                metric_key = early_stopping_metric  # e.g., 'total', 'duration', 'direction_acc', 'next_channel_acc'
 
+                # Extract metric values from history
+                metric_values = [m.get(metric_key, m.get("total", float('inf'))) for m in trainer.val_metrics_history]
+
+                # Find best value and epoch based on mode
+                if metric_mode == "max":
+                    best_val_metric = float(max(metric_values))
+                    best_epoch = int(np.argmax(metric_values))
+                else:
+                    best_val_metric = float(min(metric_values))
+                    best_epoch = int(np.argmin(metric_values))
+
+                # Also get best_val_loss for backward compatibility (always use 'total')
+                best_val_loss = float(min([m["total"] for m in trainer.val_metrics_history]))
+
+                # Create WindowMetrics object
+                checkpoint_path = str(window_save_dir / "best_model.pt")
+                window_metric = WindowMetrics(
+                    window_id=window_idx,
+                    train_start=train_start_str,
+                    train_end=train_end_str,
+                    val_start=val_start_str,
+                    val_end=val_end_str,
+                    best_val_metric=best_val_metric,
+                    best_val_metric_name=early_stopping_metric,  # Use raw metric name (e.g., 'duration', 'total')
+                    metric_mode=metric_mode,
+                    epochs_trained=len(trainer.train_metrics_history),
+                    best_epoch=best_epoch,
+                    train_history=trainer.train_metrics_history,
+                    val_history=trainer.val_metrics_history,
+                    checkpoint_path=checkpoint_path,
+                    metadata={
+                        "num_train_samples": len(train_samples),
+                        "num_val_samples": len(val_samples),
+                    }
+                )
+
+                # Add to WalkForwardResults
+                walk_forward_results.add_window(window_metric)
+
+                # Legacy format for backward compatibility
                 window_results.append({
                     "window": window_idx + 1,
                     "train_start": train_start_str,
@@ -2266,14 +2441,15 @@ def run_walk_forward_training(
                     "val_start": val_start_str,
                     "val_end": val_end_str,
                     "best_val_loss": best_val_loss,
-                    "best_epoch": best_epoch,
+                    "best_val_metric": best_val_metric,
+                    "best_epoch": best_epoch + 1,  # 1-indexed for display
                     "num_train_samples": len(train_samples),
                     "num_val_samples": len(val_samples),
                 })
 
                 console.print(
                     f"\n[green]✓ Window {window_idx + 1} complete:[/green] "
-                    f"Best val loss = {best_val_loss:.4f} at epoch {best_epoch}\n"
+                    f"Best {early_stopping_metric} = {best_val_metric:.4f} at epoch {best_epoch + 1}\n"
                 )
             else:
                 console.print(f"\n[yellow]⚠ Window {window_idx + 1} failed or interrupted[/yellow]\n")
@@ -2288,55 +2464,90 @@ def run_walk_forward_training(
     console.print("[bold green]Walk-Forward Validation Complete![/bold green]", justify="center")
     console.print("=" * 80 + "\n")
 
-    if window_results:
-        # Summary table
+    if walk_forward_results.window_metrics:
+        # Use WalkForwardResults print_summary for detailed output
+        walk_forward_results.print_summary()
+
+        # Summary table (using window_metrics from WalkForwardResults)
         summary_table = Table(title="Walk-Forward Results Summary", box=box.ROUNDED)
         summary_table.add_column("Window", style="cyan")
         summary_table.add_column("Train Period", style="green")
         summary_table.add_column("Val Period", style="yellow")
-        summary_table.add_column("Best Val Loss", justify="right", style="magenta")
+        summary_table.add_column(f"Best {early_stopping_metric}", justify="right", style="magenta")
         summary_table.add_column("Best Epoch", justify="right", style="blue")
 
-        for result in window_results:
+        for wm in walk_forward_results.window_metrics:
             summary_table.add_row(
-                f"{result['window']}",
-                f"{result['train_start']} → {result['train_end']}",
-                f"{result['val_start']} → {result['val_end']}",
-                f"{result['best_val_loss']:.4f}",
-                f"{result['best_epoch']}",
+                f"{wm.window_id + 1}",
+                f"{wm.train_start} → {wm.train_end}",
+                f"{wm.val_start} → {wm.val_end}",
+                f"{wm.best_val_metric:.4f}",
+                f"{wm.best_epoch + 1}",  # 1-indexed for display
             )
 
         console.print(summary_table)
 
-        # Aggregate statistics
-        avg_val_loss = np.mean([r["best_val_loss"] for r in window_results])
-        std_val_loss = np.std([r["best_val_loss"] for r in window_results])
+        # Get aggregated statistics from WalkForwardResults
+        agg_metrics = walk_forward_results.get_aggregated_metrics()
+        time_stats = walk_forward_results.get_training_time_stats()
 
         console.print(f"\n[bold cyan]Aggregate Statistics:[/bold cyan]")
-        console.print(f"  Average Best Val Loss: [yellow]{avg_val_loss:.4f}[/yellow]")
-        console.print(f"  Std Dev Val Loss:      [yellow]{std_val_loss:.4f}[/yellow]")
-        console.print(f"  Total Windows:         [yellow]{len(window_results)}/{num_windows}[/yellow]\n")
+        if early_stopping_metric in agg_metrics:
+            stats = agg_metrics[early_stopping_metric]
+            console.print(f"  Average Best {early_stopping_metric}: [yellow]{stats['mean']:.4f} +/- {stats['std']:.4f}[/yellow]")
+            console.print(f"  Range: [yellow][{stats['min']:.4f}, {stats['max']:.4f}][/yellow]")
+        console.print(f"  Total Windows:         [yellow]{walk_forward_results.num_windows}/{num_windows}[/yellow]")
 
-        # Save results
+        if time_stats:
+            console.print(f"  Total Training Time:   [yellow]{time_stats.get('total', 0):.1f}s ({time_stats.get('total', 0)/60:.1f} min)[/yellow]\n")
+
+        # Identify the best window using get_best_window()
+        best_window = walk_forward_results.get_best_window(mode=metric_mode)
+        if best_window:
+            # Build human-readable metric description
+            mode_display = "lower is better" if metric_mode == "min" else "higher is better"
+
+            # Build checkpoint path display
+            checkpoint_display = best_window.checkpoint_path or f"{save_dir}/window_{best_window.window_id + 1}/best_model.pt"
+
+            # Create Best Model Summary panel
+            summary_lines = [
+                f"  Best Window: [bold cyan]{best_window.window_id + 1}[/bold cyan] of [cyan]{num_windows}[/cyan]",
+                f"  Metric: [yellow]{early_stopping_metric}[/yellow] ({mode_display})",
+                f"  Best Value: [bold green]{best_window.best_val_metric:.4f}[/bold green]",
+                f"  Best Epoch: [blue]{best_window.best_epoch + 1}[/blue]",
+                f"  Checkpoint: [dim]{checkpoint_display}[/dim]",
+                "",
+                "  To load this model:",
+                f"  [bold]python dashboard.py --model {checkpoint_display}[/bold]",
+            ]
+
+            console.print(Panel(
+                "\n".join(summary_lines),
+                title="[bold green]BEST MODEL SUMMARY[/bold green]",
+                border_style="green",
+                padding=(1, 2),
+            ))
+            console.print()
+
+        # Save results using WalkForwardResults.save()
         results_path = save_dir / "walk_forward_results.json"
-        with open(results_path, "w") as f:
-            json.dump({
-                "config": wf_config,
-                "window_results": window_results,
-                "aggregate": {
-                    "avg_val_loss": float(avg_val_loss),
-                    "std_val_loss": float(std_val_loss),
-                    "num_windows": len(window_results),
-                }
-            }, f, indent=2)
+        walk_forward_results.save(results_path)
 
-        console.print(f"[dim]Results saved to: {results_path}[/dim]\n")
+        # Also maintain backward compatibility with legacy format
+        avg_val_loss = np.mean([r["best_val_loss"] for r in window_results]) if window_results else None
+        std_val_loss = np.std([r["best_val_loss"] for r in window_results]) if window_results else None
+    else:
+        avg_val_loss = None
+        std_val_loss = None
+        console.print("[yellow]No windows completed successfully.[/yellow]\n")
 
     return {
         "window_results": window_results,
+        "walk_forward_results": walk_forward_results,
         "aggregate": {
-            "avg_val_loss": avg_val_loss if window_results else None,
-            "std_val_loss": std_val_loss if window_results else None,
+            "avg_val_loss": avg_val_loss,
+            "std_val_loss": std_val_loss,
         }
     }
 
@@ -2682,6 +2893,8 @@ def main():
                     num_attention_heads=config["model"]["num_attention_heads"],
                     dropout=config["model"]["dropout"],
                     shared_heads=config["model"].get("shared_heads", True),
+                    use_se_blocks=config["model"].get("use_se_blocks", False),
+                    se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                     device=config["device"],
                 )
 
@@ -2710,8 +2923,11 @@ def main():
             min_duration_precision=config["training"].get("min_duration_precision", 0.25),
             use_end_to_end_loss=(strategy == "learned_selection"),  # Use EndToEndLoss for Phase 2b
             early_stopping_patience=config["training"].get("early_stopping_patience", 15),
-            early_stopping_metric=config["training"].get("early_stopping_metric", "val_loss"),
+            early_stopping_metric=config["training"].get("early_stopping_metric", "total"),
             early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
+            # SE-blocks config (stored in model config)
+            use_se_blocks=config["model"].get("use_se_blocks", False),
+            se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
             device=config["device"],
             save_dir=save_dir,
             log_dir=log_dir,

@@ -36,6 +36,7 @@ class WindowMetrics:
         val_end: End date of validation period (YYYY-MM-DD)
         best_val_metric: Best validation metric achieved during training
         best_val_metric_name: Name of the metric (e.g., 'val_loss', 'val_accuracy')
+        metric_mode: Whether 'min' or 'max' is better for this metric
         epochs_trained: Total number of epochs trained
         best_epoch: Epoch number where best validation metric was achieved
         train_history: Per-epoch training metrics (list of dicts)
@@ -52,6 +53,7 @@ class WindowMetrics:
     val_end: str
     best_val_metric: float
     best_val_metric_name: str = 'val_loss'
+    metric_mode: str = 'min'  # 'min' for losses, 'max' for accuracies
     epochs_trained: int = 0
     best_epoch: int = 0
     train_history: List[Dict[str, float]] = field(default_factory=list)
@@ -87,6 +89,16 @@ class WindowMetrics:
             return {}
         return self.val_history[self.best_epoch]
 
+    def get_metric_description(self) -> str:
+        """
+        Get a human-readable description of the metric and its optimization direction.
+
+        Returns:
+            String like "duration (lower is better)" or "direction_acc (higher is better)"
+        """
+        direction = "lower is better" if self.metric_mode == 'min' else "higher is better"
+        return f"{self.best_val_metric_name} ({direction})"
+
 
 @dataclass
 class WalkForwardResults:
@@ -101,6 +113,7 @@ class WalkForwardResults:
         window_type: Type of windowing scheme ('expanding', 'rolling', 'anchored')
         window_metrics: List of WindowMetrics objects, one per window
         best_metric_name: Name of metric used for selecting best models
+        metric_mode: Whether 'min' or 'max' is better for the best_metric_name
         creation_timestamp: ISO timestamp when results were created
         metadata: Additional global metadata
     """
@@ -109,6 +122,7 @@ class WalkForwardResults:
     window_type: str = 'rolling'  # 'rolling', 'expanding', or 'anchored'
     window_metrics: List[WindowMetrics] = field(default_factory=list)
     best_metric_name: str = 'val_loss'
+    metric_mode: str = 'min'  # 'min' for losses, 'max' for accuracies
     creation_timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -185,12 +199,13 @@ class WalkForwardResults:
             'total': float(np.sum(times_array)),
         }
 
-    def get_best_window(self, mode: str = 'min') -> Optional[WindowMetrics]:
+    def get_best_window(self, mode: Optional[str] = None) -> Optional[WindowMetrics]:
         """
         Find the window with the best validation metric.
 
         Args:
-            mode: 'min' for metrics where lower is better, 'max' for higher is better
+            mode: 'min' for metrics where lower is better, 'max' for higher is better.
+                  If None (default), uses self.metric_mode.
 
         Returns:
             WindowMetrics object for the best window, or None if no windows
@@ -198,27 +213,97 @@ class WalkForwardResults:
         if not self.window_metrics:
             return None
 
-        if mode == 'min':
+        # Use stored metric_mode if not explicitly provided
+        effective_mode = mode if mode is not None else self.metric_mode
+
+        if effective_mode == 'min':
             return min(self.window_metrics, key=lambda w: w.best_val_metric)
         else:
             return max(self.window_metrics, key=lambda w: w.best_val_metric)
+
+    def get_metric_description(self) -> str:
+        """
+        Get a human-readable description of the metric and its optimization direction.
+
+        Returns:
+            String like "duration (lower is better)" or "direction_acc (higher is better)"
+        """
+        direction = "lower is better" if self.metric_mode == 'min' else "higher is better"
+        return f"{self.best_metric_name} ({direction})"
 
     def to_dict(self) -> Dict[str, Any]:
         """
         Convert WalkForwardResults to dictionary for serialization.
 
         Returns:
-            Dictionary representation of all results
+            Dictionary representation of all results with the following structure:
+            {
+                "config": {...},
+                "optimization": {
+                    "metric": "duration",
+                    "mode": "min",
+                    "metric_display": "duration (lower is better)"
+                },
+                "window_results": [
+                    {
+                        "window": 1,
+                        "best_metric_value": 2.5264,
+                        "best_epoch": 11,
+                        "checkpoint_path": "checkpoints/window_1/best_model.pt",
+                        ...
+                    }
+                ],
+                "best_window": {
+                    "window_id": 2,
+                    "metric_value": 2.4372,
+                    "checkpoint_path": "checkpoints/window_2/best_model.pt"
+                }
+            }
         """
+        # Build window_results in the requested format
+        window_results = []
+        for w in self.window_metrics:
+            window_results.append({
+                'window': w.window_id + 1,  # 1-indexed for display
+                'train_start': w.train_start,
+                'train_end': w.train_end,
+                'val_start': w.val_start,
+                'val_end': w.val_end,
+                'best_metric_value': w.best_val_metric,
+                'best_epoch': w.best_epoch + 1,  # 1-indexed for display
+                'checkpoint_path': w.checkpoint_path,
+                'num_train_samples': w.metadata.get('num_train_samples'),
+                'num_val_samples': w.metadata.get('num_val_samples'),
+                'epochs_trained': w.epochs_trained,
+                'training_time_seconds': w.training_time_seconds,
+            })
+
+        # Build best_window section
+        best_window_obj = self.get_best_window()
+        best_window = None
+        if best_window_obj:
+            best_window = {
+                'window_id': best_window_obj.window_id + 1,  # 1-indexed for display
+                'metric_value': best_window_obj.best_val_metric,
+                'checkpoint_path': best_window_obj.checkpoint_path,
+            }
+
         return {
-            'num_windows': self.num_windows,
-            'window_type': self.window_type,
-            'window_metrics': [w.to_dict() for w in self.window_metrics],
-            'best_metric_name': self.best_metric_name,
+            'config': self.metadata.get('config', {}),
+            'optimization': {
+                'metric': self.best_metric_name,
+                'mode': self.metric_mode,
+                'metric_display': self.get_metric_description(),
+            },
+            'window_results': window_results,
+            'best_window': best_window,
+            'aggregate': {
+                'num_windows': self.num_windows,
+                'window_type': self.window_type,
+                'aggregated_metrics': self.get_aggregated_metrics(),
+                'training_time_stats': self.get_training_time_stats(),
+            },
             'creation_timestamp': self.creation_timestamp,
-            'metadata': self.metadata,
-            'aggregated_metrics': self.get_aggregated_metrics(),
-            'training_time_stats': self.get_training_time_stats(),
         }
 
     @classmethod
@@ -226,23 +311,86 @@ class WalkForwardResults:
         """
         Create WalkForwardResults from dictionary.
 
+        Supports both the new format (with 'optimization', 'window_results', 'best_window')
+        and the legacy format (with 'window_metrics', 'best_metric_name', 'metric_mode').
+
         Args:
             data: Dictionary representation of results
 
         Returns:
             WalkForwardResults object
         """
-        # Extract window metrics and convert to objects
-        window_dicts = data.pop('window_metrics', [])
-        windows = [WindowMetrics.from_dict(w) for w in window_dicts]
+        # Make a copy to avoid modifying the input
+        data = data.copy()
 
-        # Remove computed fields that shouldn't be in constructor
-        data.pop('aggregated_metrics', None)
-        data.pop('training_time_stats', None)
+        # Check if this is the new format (has 'optimization' key)
+        if 'optimization' in data:
+            # New format: extract optimization info
+            optimization = data.pop('optimization', {})
+            best_metric_name = optimization.get('metric', 'total')
+            metric_mode = optimization.get('mode', 'min')
 
-        # Create object
-        results = cls(**data)
-        results.window_metrics = windows
+            # Extract config from top level
+            config = data.pop('config', {})
+
+            # Extract aggregate section
+            aggregate = data.pop('aggregate', {})
+            num_windows = aggregate.get('num_windows', 0)
+            window_type = aggregate.get('window_type', 'rolling')
+
+            # Extract window_results and convert to WindowMetrics
+            window_results = data.pop('window_results', [])
+            windows = []
+            for wr in window_results:
+                window = WindowMetrics(
+                    window_id=wr.get('window', 1) - 1,  # Convert 1-indexed to 0-indexed
+                    train_start=wr.get('train_start', ''),
+                    train_end=wr.get('train_end', ''),
+                    val_start=wr.get('val_start', ''),
+                    val_end=wr.get('val_end', ''),
+                    best_val_metric=wr.get('best_metric_value', 0.0),
+                    best_val_metric_name=best_metric_name,
+                    metric_mode=metric_mode,
+                    epochs_trained=wr.get('epochs_trained', 0),
+                    best_epoch=wr.get('best_epoch', 1) - 1,  # Convert 1-indexed to 0-indexed
+                    checkpoint_path=wr.get('checkpoint_path'),
+                    training_time_seconds=wr.get('training_time_seconds', 0.0),
+                    metadata={
+                        'num_train_samples': wr.get('num_train_samples'),
+                        'num_val_samples': wr.get('num_val_samples'),
+                    }
+                )
+                windows.append(window)
+
+            # Remove fields we don't need for constructor
+            data.pop('best_window', None)
+
+            # Build metadata
+            metadata = {'config': config}
+
+            # Create the object
+            results = cls(
+                num_windows=num_windows,
+                window_type=window_type,
+                best_metric_name=best_metric_name,
+                metric_mode=metric_mode,
+                creation_timestamp=data.get('creation_timestamp', datetime.now().isoformat()),
+                metadata=metadata,
+            )
+            results.window_metrics = windows
+
+        else:
+            # Legacy format: extract window metrics and convert to objects
+            window_dicts = data.pop('window_metrics', [])
+            windows = [WindowMetrics.from_dict(w) for w in window_dicts]
+
+            # Remove computed fields that shouldn't be in constructor
+            data.pop('aggregated_metrics', None)
+            data.pop('training_time_stats', None)
+
+            # Create object
+            results = cls(**data)
+            results.window_metrics = windows
 
         return results
 
@@ -284,7 +432,7 @@ class WalkForwardResults:
         print("=" * 60)
         print(f"Window Type: {self.window_type}")
         print(f"Number of Windows: {self.num_windows}")
-        print(f"Best Metric: {self.best_metric_name}")
+        print(f"Best Metric: {self.get_metric_description()}")
         print()
 
         # Per-window summary

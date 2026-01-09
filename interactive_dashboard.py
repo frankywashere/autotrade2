@@ -129,11 +129,16 @@ def extract_config_from_checkpoint(checkpoint_path: Path) -> Optional[Dict]:
                     int(hidden_dim * 1.5)  # fallback
                 )
 
+                # Check for SE-block layers to infer use_se_blocks
+                use_se_blocks = any('se_block' in key for key in state_dict.keys())
+
                 config_dict['model'] = {
                     'hidden_dim': hidden_dim,
                     'cfc_units': cfc_units,
                     'num_attention_heads': 4 if hidden_dim <= 128 else 8,
                     'dropout': 0.1,
+                    'use_se_blocks': use_se_blocks,
+                    'se_reduction_ratio': 8,  # Default value when inferring
                     '_inferred': True
                 }
 
@@ -237,6 +242,8 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
             cfc_units = model_config.get("cfc_units", 96)
             num_attention_heads = model_config.get("num_attention_heads", 4)
             dropout = model_config.get("dropout", 0.1)
+            use_se_blocks = model_config.get("use_se_blocks", False)
+            se_reduction_ratio = model_config.get("se_reduction_ratio", 8)
         else:
             # Try to infer from weight shapes
             state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
@@ -266,12 +273,18 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
             num_attention_heads = 4 if hidden_dim <= 128 else 8
             dropout = 0.1
 
+            # Check for SE-block layers to infer use_se_blocks
+            use_se_blocks = any('se_block' in key for key in state_dict.keys())
+            se_reduction_ratio = 8  # Default value when inferring
+
         model = HierarchicalCfCModel(
             feature_config=FeatureConfig(),
             hidden_dim=hidden_dim,
             cfc_units=cfc_units,
             num_attention_heads=num_attention_heads,
-            dropout=dropout
+            dropout=dropout,
+            use_se_blocks=use_se_blocks,
+            se_reduction_ratio=se_reduction_ratio
         )
 
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -285,7 +298,9 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
         checkpoint_info["discovered_config"] = {
             "hidden_dim": hidden_dim,
             "cfc_units": cfc_units,
-            "num_attention_heads": num_attention_heads
+            "num_attention_heads": num_attention_heads,
+            "use_se_blocks": use_se_blocks,
+            "se_reduction_ratio": se_reduction_ratio
         }
 
         return model

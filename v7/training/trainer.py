@@ -72,6 +72,12 @@ class TrainingConfig:
     uncertainty_penalty: float = 0.1  # Penalizes "I don't know" predictions (0 = disabled)
     min_duration_precision: float = 0.25  # Floor for duration task weight (prevents abandonment)
 
+    # SE-blocks (Squeeze-and-Excitation) for feature reweighting
+    # SE-blocks learn which features in the hidden representation are important per sample
+    # This is lighter than full attention (~4K params/branch vs ~4M for attention)
+    use_se_blocks: bool = False  # Enable SE-block feature reweighting in TF branches
+    se_reduction_ratio: int = 8  # Bottleneck ratio (hidden_dim/ratio = bottleneck size)
+
     # Optimization
     optimizer: str = 'adam'  # 'adam', 'adamw', 'sgd'
     scheduler: str = 'cosine_restarts'  # 'cosine', 'cosine_restarts', 'step', 'plateau', 'none'
@@ -83,8 +89,8 @@ class TrainingConfig:
 
     # Early stopping
     early_stopping_patience: int = 10
-    early_stopping_metric: str = 'val_loss'  # 'val_loss', 'val_accuracy', etc.
-    early_stopping_mode: str = 'min'  # 'min' or 'max'
+    early_stopping_metric: str = 'total'  # 'total', 'duration', 'direction_acc', 'next_channel_acc', etc.
+    early_stopping_mode: str = 'min'  # 'min' for losses, 'max' for accuracies
 
     # Checkpointing
     save_dir: Path = Path('./checkpoints')
@@ -582,6 +588,18 @@ class Trainer:
 
     def save_checkpoint(self, filename: str, is_best: bool = False):
         """Save model checkpoint."""
+        # Ensure model_kwargs includes SE-blocks parameters from TrainingConfig
+        # This is critical for dashboards to reconstruct models properly
+        model_kwargs = dict(self.config.model_kwargs) if self.config.model_kwargs else {}
+        if 'use_se_blocks' not in model_kwargs:
+            model_kwargs['use_se_blocks'] = self.config.use_se_blocks
+        if 'se_reduction_ratio' not in model_kwargs:
+            model_kwargs['se_reduction_ratio'] = self.config.se_reduction_ratio
+
+        # Create a copy of config with updated model_kwargs
+        # We modify the dataclass directly since it will be serialized
+        self.config.model_kwargs = model_kwargs
+
         checkpoint = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,

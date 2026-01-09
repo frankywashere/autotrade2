@@ -40,6 +40,8 @@ def create_model_with_window_selection(
             - cfc_units: CfC units per branch (default: 192, v9.2)
             - num_attention_heads: Number of attention heads (default: 4)
             - dropout: Dropout probability (default: 0.1)
+            - use_se_blocks: Enable SE-block feature reweighting (default: False)
+            - se_reduction_ratio: SE-block bottleneck ratio (default: 8)
 
             For EndToEndWindowModel only:
             - window_embed_dim: Window embedding dimension (default: 128)
@@ -97,6 +99,8 @@ def create_model_with_window_selection(
             cfc_units=config['cfc_units'],
             num_attention_heads=config['num_attention_heads'],
             dropout=config['dropout'],
+            use_se_blocks=config.get('use_se_blocks', False),
+            se_reduction_ratio=config.get('se_reduction_ratio', 8),
         )
 
     return model

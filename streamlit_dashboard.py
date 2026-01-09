@@ -234,15 +234,36 @@ def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[D
                     int(hidden_dim * 1.5)
                 )
 
+                # Heuristic: detect SE-blocks from state_dict keys
+                use_se_blocks = any('tf_branches.0.se_block' in k for k in state_dict.keys())
+
                 config_dict['model'] = {
                     'hidden_dim': hidden_dim,
                     'cfc_units': cfc_units,
                     'num_attention_heads': 4 if hidden_dim <= 128 else 8,
                     'dropout': 0.1,
+                    'use_se_blocks': use_se_blocks,
+                    'se_reduction_ratio': 4,  # Default value when inferred
                     '_source': 'heuristic_inference',
                     '_inferred': True,
                     '_inference_note': f"Config inferred from tensor shapes (may not match training)"
                 }
+
+            # === Post-processing: Extract SE-block params if not already present ===
+            # Also add heuristic detection for SE-blocks from state_dict
+            if 'model' in config_dict and config_dict['model']:
+                model_cfg = config_dict['model']
+                state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+                # Extract use_se_blocks and se_reduction_ratio from config if present
+                # (they may already be there from SOURCE 1 or 2)
+                if 'use_se_blocks' not in model_cfg:
+                    # Heuristic fallback: check if SE-block exists in state_dict
+                    has_se_block = any('tf_branches.0.se_block' in k for k in state_dict.keys())
+                    model_cfg['use_se_blocks'] = has_se_block
+
+                if 'se_reduction_ratio' not in model_cfg:
+                    model_cfg['se_reduction_ratio'] = 4  # Default value
 
         return config_dict if config_dict else None
     except Exception as e:
@@ -277,6 +298,8 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
             num_heads = model_config.get('num_attention_heads', 4)
             dropout = model_config.get('dropout', 0.1)
             shared_heads = model_config.get('shared_heads', True)  # Default to shared for backward compat
+            use_se_blocks = model_config.get('use_se_blocks', False)
+            se_reduction_ratio = model_config.get('se_reduction_ratio', 4)
 
             # Show config source status
             source = model_config.get('_source', 'unknown')
@@ -286,8 +309,11 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 st.info(f"✓ Config from training_config.json: hidden_dim={hidden_dim}, cfc_units={cfc_units}")
             elif source == 'heuristic_inference':
                 st.warning(f"⚠️ Config inferred from tensor shapes: hidden_dim={hidden_dim}, cfc_units={cfc_units}")
+            if use_se_blocks:
+                st.info(f"SE-blocks enabled (reduction_ratio={se_reduction_ratio})")
         else:
             hidden_dim, cfc_units, num_heads, dropout, shared_heads = 64, 96, 4, 0.1, True
+            use_se_blocks, se_reduction_ratio = False, 4
             st.warning("⚠️ No config found, using defaults: hidden_dim=64, cfc_units=96")
 
         # Infer shared_heads from state_dict keys (overrides config if separate heads detected)
@@ -319,6 +345,8 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 num_attention_heads=num_heads,
                 dropout=dropout,
                 shared_heads=shared_heads,
+                use_se_blocks=use_se_blocks,
+                se_reduction_ratio=se_reduction_ratio,
                 device='cpu'
             )
 

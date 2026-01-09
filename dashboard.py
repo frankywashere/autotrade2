@@ -48,6 +48,7 @@ from v7.features.full_features import extract_full_features, features_to_tensor_
 from v7.features.events import EventsHandler, extract_event_features
 from v7.features.feature_ordering import FEATURE_ORDER
 from v7.models.hierarchical_cfc import HierarchicalCfCModel, FeatureConfig
+from v7.models import create_model
 
 
 # Constants
@@ -128,6 +129,91 @@ def get_data_date_range(df: pd.DataFrame) -> str:
         return f"{start} to {end}"
     except (IndexError, AttributeError):
         return "Invalid data"
+
+
+def _load_training_config_json(checkpoint_path: Path) -> Optional[Dict]:
+    """Try to load training_config.json from checkpoint directory or parent."""
+    config_paths = [
+        checkpoint_path.parent / "training_config.json",
+        checkpoint_path.parent.parent / "training_config.json",  # For window_X/best_model.pt
+    ]
+    for config_path in config_paths:
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    config_data = json.load(f)
+                if 'model' in config_data:
+                    return config_data['model']
+            except Exception:
+                pass
+    return None
+
+
+def extract_model_config(checkpoint_path: Path, checkpoint: Dict) -> Dict:
+    """Extract model config from checkpoint for proper model instantiation.
+
+    Config sources (in priority order):
+    1. TrainingConfig.model_kwargs embedded in checkpoint
+    2. training_config.json file in checkpoint directory
+    3. Default values as fallback
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+        checkpoint: Pre-loaded checkpoint dict
+
+    Returns:
+        Dict with model configuration parameters
+    """
+    model_config = {}
+    source = 'defaults'
+
+    # === SOURCE 1: Embedded config in checkpoint ===
+    if isinstance(checkpoint, dict) and 'config' in checkpoint:
+        config = checkpoint['config']
+
+        # Try TrainingConfig.model_kwargs (the actual attribute name)
+        if hasattr(config, 'model_kwargs') and config.model_kwargs:
+            model_config = dict(config.model_kwargs)
+            source = 'checkpoint_model_kwargs'
+        # Try config.model for compatibility
+        elif hasattr(config, 'model') and config.model:
+            model_cfg = config.model
+            if hasattr(model_cfg, '__dict__'):
+                model_config = dict(model_cfg.__dict__)
+            elif isinstance(model_cfg, dict):
+                model_config = dict(model_cfg)
+            source = 'checkpoint_config_model'
+        # Try dict-style access
+        elif isinstance(config, dict) and 'model' in config:
+            model_config = dict(config['model'])
+            source = 'checkpoint_dict'
+
+    # === SOURCE 2: training_config.json file ===
+    if not model_config:
+        json_config = _load_training_config_json(checkpoint_path)
+        if json_config:
+            model_config = dict(json_config)
+            source = 'training_config_json'
+
+    # Extract values with defaults
+    result = {
+        'hidden_dim': model_config.get('hidden_dim', 64),
+        'cfc_units': model_config.get('cfc_units', 96),
+        'num_attention_heads': model_config.get('num_attention_heads', 4),
+        'dropout': model_config.get('dropout', 0.1),
+        'shared_heads': model_config.get('shared_heads', True),
+        'use_se_blocks': model_config.get('use_se_blocks', False),
+        'se_reduction_ratio': model_config.get('se_reduction_ratio', 8),
+        '_source': source
+    }
+
+    # Infer shared_heads from state_dict keys (overrides config if separate heads detected)
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    has_separate_heads = any('per_tf_duration_heads' in k for k in state_dict.keys())
+    if has_separate_heads:
+        result['shared_heads'] = False
+
+    return result
 
 
 class DashboardData:
@@ -725,11 +811,38 @@ def main():
     model = None
     if args.model and Path(args.model).exists():
         console.print(f"[cyan]Loading model from {args.model}...[/cyan]")
-        model = HierarchicalCfCModel(feature_config=FeatureConfig())
-        checkpoint = torch.load(args.model, map_location='cpu', weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint_path = Path(args.model)
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+        # Extract model config from checkpoint (supports SE-blocks and all architecture params)
+        model_cfg = extract_model_config(checkpoint_path, checkpoint)
+        source = model_cfg.pop('_source', 'unknown')
+
+        # Create model with proper architecture
+        model = create_model(
+            hidden_dim=model_cfg['hidden_dim'],
+            cfc_units=model_cfg['cfc_units'],
+            num_attention_heads=model_cfg['num_attention_heads'],
+            dropout=model_cfg['dropout'],
+            shared_heads=model_cfg['shared_heads'],
+            use_se_blocks=model_cfg['use_se_blocks'],
+            se_reduction_ratio=model_cfg['se_reduction_ratio'],
+            device='cpu'
+        )
+
+        # Load state dict
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        if incompatible.missing_keys:
+            console.print(f"[yellow]Warning: Checkpoint missing {len(incompatible.missing_keys)} keys[/yellow]")
+        if incompatible.unexpected_keys:
+            console.print(f"[yellow]Warning: Checkpoint has {len(incompatible.unexpected_keys)} unexpected keys[/yellow]")
         model.eval()
-        console.print("[green]Model loaded successfully[/green]")
+
+        # Report loaded config
+        se_info = f", SE-blocks (r={model_cfg['se_reduction_ratio']})" if model_cfg['use_se_blocks'] else ""
+        console.print(f"[green]Model loaded successfully[/green] (config from {source})")
+        console.print(f"[dim]  hidden_dim={model_cfg['hidden_dim']}, cfc_units={model_cfg['cfc_units']}{se_info}[/dim]")
     else:
         console.print("[yellow]No model loaded - showing features only[/yellow]")
 

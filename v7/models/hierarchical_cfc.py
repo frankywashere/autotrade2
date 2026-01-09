@@ -202,6 +202,91 @@ class FeatureConfig:
 
 
 # =============================================================================
+# Squeeze-and-Excitation Block (Feature Reweighting)
+# =============================================================================
+
+class SEBlock(nn.Module):
+    """
+    Squeeze-and-Excitation block for feature reweighting.
+
+    SE-blocks learn channel-wise (feature-wise) attention weights to emphasize
+    important features and suppress less relevant ones. Originally from SENet
+    (Hu et al., 2018) for image classification, adapted here for tabular data.
+
+    Architecture:
+    -------------
+    For input x of shape [batch, channels]:
+
+        x → Excitation(x) → scale
+              ↓
+        FC(channels, channels/r) → ReLU → FC(channels/r, channels) → Sigmoid
+              ↓
+        x * scale → output
+
+    The "squeeze" operation (global pooling) is implicit for 1D features since
+    we already have per-feature values (no spatial dimensions to pool over).
+
+    Benefits for Financial Data:
+    ---------------------------
+    1. **Adaptive feature selection**: Learns which features matter for each sample
+       (e.g., RSI might matter more when near overbought/oversold)
+    2. **Lightweight**: Only adds ~4K params per branch vs ~4M for full attention
+    3. **Non-disruptive**: Multiplicative reweighting preserves original feature space
+    4. **Sample-dependent**: Different samples can have different feature importance
+
+    Example:
+    --------
+        >>> se = SEBlock(channels=128, reduction_ratio=8)
+        >>> x = torch.randn(32, 128)  # batch=32, features=128
+        >>> out = se(x)               # [32, 128] - reweighted features
+        >>> # Each feature in out is x[i] * learned_weight[i]
+    """
+
+    def __init__(self, channels: int, reduction_ratio: int = 8):
+        """
+        Initialize SE-block.
+
+        Args:
+            channels: Number of input features (hidden_dim in our case)
+            reduction_ratio: Bottleneck reduction factor (default 8)
+                            channels/reduction_ratio = intermediate size
+                            e.g., 128/8 = 16 intermediate neurons
+        """
+        super().__init__()
+
+        # Ensure we don't reduce too much (minimum 4 neurons in bottleneck)
+        reduced_channels = max(channels // reduction_ratio, 4)
+
+        # Excitation network: learns feature importance weights
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, reduced_channels, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced_channels, channels, bias=True),
+            nn.Sigmoid()  # Output in [0, 1] for multiplicative scaling
+        )
+
+        # Store for logging/debugging
+        self.channels = channels
+        self.reduced_channels = reduced_channels
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply SE reweighting to input features.
+
+        Args:
+            x: [batch, channels] - input features
+
+        Returns:
+            [batch, channels] - reweighted features (x * scale)
+        """
+        # Compute feature importance weights
+        scale = self.excitation(x)  # [batch, channels], values in [0, 1]
+
+        # Apply multiplicative reweighting
+        return x * scale
+
+
+# =============================================================================
 # Timeframe Branch (CfC Processing)
 # =============================================================================
 
@@ -228,7 +313,9 @@ class TFBranch(nn.Module):
         shared_dim: int,
         hidden_dim: int = 64,
         cfc_units: int = 96,  # Must be > hidden_dim + 2
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_se_blocks: bool = False,
+        se_reduction_ratio: int = 8
     ):
         """
         Initialize timeframe branch.
@@ -239,14 +326,22 @@ class TFBranch(nn.Module):
             hidden_dim: Output embedding dimension
             cfc_units: Number of CfC units (neurons in liquid network, must be > hidden_dim + 2)
             dropout: Dropout probability
+            use_se_blocks: If True, add SE-block for feature reweighting (default: False)
+            se_reduction_ratio: Reduction ratio for SE-block bottleneck (default: 8)
         """
         super().__init__()
 
         input_dim = per_tf_dim + shared_dim
+        self.use_se_blocks = use_se_blocks
 
         # Input projection
         self.input_proj = nn.Linear(input_dim, hidden_dim)
         self.input_norm = nn.LayerNorm(hidden_dim)
+
+        # Optional SE-block for feature reweighting (applied before CfC)
+        # This learns which hidden features are important per sample
+        if use_se_blocks:
+            self.se_block = SEBlock(channels=hidden_dim, reduction_ratio=se_reduction_ratio)
 
         # CfC (Liquid Neural Network) layer
         # AutoNCP creates a sparsely connected recurrent architecture
@@ -285,6 +380,11 @@ class TFBranch(nn.Module):
         x = self.input_proj(x)
         x = self.input_norm(x)
         x = F.gelu(x)
+
+        # Apply SE-block for feature reweighting (if enabled)
+        # This learns which features in the hidden representation are important
+        if self.use_se_blocks:
+            x = self.se_block(x)  # [batch, hidden_dim] - reweighted
 
         # Add sequence dimension for CfC (expects 3D input)
         x = x.unsqueeze(1)  # [batch, 1, hidden_dim]
@@ -1343,7 +1443,9 @@ class HierarchicalCfCModel(nn.Module):
         cfc_units: int = 192,   # v9.2: Increased from 96 (must be > hidden_dim + 2)
         num_attention_heads: int = 4,
         dropout: float = 0.1,
-        shared_heads: bool = True
+        shared_heads: bool = True,
+        use_se_blocks: bool = False,
+        se_reduction_ratio: int = 8
     ):
         """
         Initialize hierarchical CfC model.
@@ -1356,6 +1458,10 @@ class HierarchicalCfCModel(nn.Module):
             dropout: Dropout probability
             shared_heads: If True (default), use single shared heads for all TFs.
                          If False, create separate heads per timeframe (11x more head params).
+            use_se_blocks: If True, add SE-blocks to each TF branch for feature reweighting.
+                          SE-blocks learn which features matter per sample. (default: False)
+            se_reduction_ratio: Reduction ratio for SE-block bottleneck (default: 8).
+                               hidden_dim/ratio = bottleneck size (e.g., 128/8 = 16 neurons)
         """
         super().__init__()
 
@@ -1363,6 +1469,7 @@ class HierarchicalCfCModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_timeframes = self.config.n_timeframes
         self.shared_heads = shared_heads
+        self.use_se_blocks = use_se_blocks
 
         # Validate total input dimension against canonical value from feature_ordering
         assert self.config.total_features == TOTAL_FEATURES, \
@@ -1373,13 +1480,16 @@ class HierarchicalCfCModel(nn.Module):
             f"cfc_units ({cfc_units}) must be > hidden_dim + 2 ({hidden_dim + 2})"
 
         # Create TF branches (11 parallel CfC processors)
+        # Each branch optionally includes SE-block for feature reweighting
         self.tf_branches = nn.ModuleList([
             TFBranch(
                 per_tf_dim=self.config.per_tf_features,
                 shared_dim=self.config.shared_features,
                 hidden_dim=hidden_dim,
                 cfc_units=cfc_units,
-                dropout=dropout
+                dropout=dropout,
+                use_se_blocks=use_se_blocks,
+                se_reduction_ratio=se_reduction_ratio
             )
             for _ in range(self.n_timeframes)
         ])
@@ -1951,6 +2061,8 @@ def create_model(
     num_attention_heads: int = 4,
     dropout: float = 0.1,
     shared_heads: bool = True,
+    use_se_blocks: bool = False,
+    se_reduction_ratio: int = 8,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> HierarchicalCfCModel:
     """
@@ -1963,6 +2075,8 @@ def create_model(
         dropout: Dropout probability
         shared_heads: If True, use single shared heads for all TFs (default).
                      If False, create separate prediction heads per timeframe.
+        use_se_blocks: If True, add SE-blocks for feature reweighting (default: False)
+        se_reduction_ratio: Reduction ratio for SE-block bottleneck (default: 8)
         device: Device to place model on
 
     Returns:
@@ -1974,7 +2088,9 @@ def create_model(
         cfc_units=cfc_units,
         num_attention_heads=num_attention_heads,
         dropout=dropout,
-        shared_heads=shared_heads
+        shared_heads=shared_heads,
+        use_se_blocks=use_se_blocks,
+        se_reduction_ratio=se_reduction_ratio
     )
 
     model = model.to(device)
