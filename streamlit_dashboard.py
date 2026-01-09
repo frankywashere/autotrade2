@@ -334,6 +334,8 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 num_attention_heads=num_heads,
                 dropout=dropout,
                 shared_heads=shared_heads,
+                use_se_blocks=use_se_blocks,
+                se_reduction_ratio=se_reduction_ratio,
                 device='cpu'
             )
         else:
@@ -563,7 +565,8 @@ def make_predictions(
         from v7.features.feature_ordering import FEATURE_ORDER
 
         # Check if model is end-to-end (multi-window)
-        is_end_to_end = END_TO_END_AVAILABLE and isinstance(model, EndToEndWindowModel)
+        # Use hasattr() instead of isinstance() for reliability with pickled models
+        is_end_to_end = hasattr(model, 'window_encoder') and hasattr(model, 'window_selector')
 
         if is_end_to_end:
             # Extract features for ALL 8 windows
