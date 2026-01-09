@@ -897,6 +897,56 @@ def main():
                 else:
                     st.info("ℹ️ **LOW CONFIDENCE** - No clear trading signal")
 
+                # Channel Prediction Visualization
+                st.divider()
+                st.subheader("Channel Prediction")
+
+                try:
+                    # Detect channel for the best timeframe
+                    tsla_channels, _ = detect_all_channels(data["tsla_df"], data["spy_df"])
+
+                    if best_tf_name in tsla_channels and tsla_channels[best_tf_name].valid:
+                        channel = tsla_channels[best_tf_name]
+                        predicted_direction = "UP" if best_dir_prob > 0.5 else "DOWN"
+
+                        # Create prediction chart
+                        pred_chart = create_prediction_chart(
+                            df=data["tsla_df"],
+                            channel=channel,
+                            timeframe=best_tf_name,
+                            symbol="TSLA",
+                            predicted_duration=best_dur,
+                            predicted_direction=predicted_direction,
+                            direction_prob=best_dir_prob if predicted_direction == "UP" else (1 - best_dir_prob),
+                            confidence=best_conf
+                        )
+
+                        if pred_chart:
+                            st.plotly_chart(pred_chart, use_container_width=True)
+
+                            # Show price level summary
+                            current_price = data["tsla_df"]['close'].iloc[-1]
+                            current_upper = channel.upper_line[-1]
+                            current_lower = channel.lower_line[-1]
+                            position = channel.position_at()
+
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("Current Price", f"${current_price:.2f}")
+                            with col2:
+                                st.metric("Upper Bound", f"${current_upper:.2f}", f"{((current_upper/current_price)-1)*100:+.1f}%")
+                            with col3:
+                                st.metric("Lower Bound", f"${current_lower:.2f}", f"{((current_lower/current_price)-1)*100:+.1f}%")
+                            with col4:
+                                pos_label = "Near Upper" if position > 0.7 else "Near Lower" if position < 0.3 else "Mid-Channel"
+                                st.metric("Position", pos_label, f"{position:.0%}")
+                        else:
+                            st.info("Chart visualization not available (Plotly not installed)")
+                    else:
+                        st.info(f"No valid channel detected for {best_tf_name} timeframe")
+                except Exception as e:
+                    st.warning(f"Could not generate channel visualization: {e}")
+
                 # v9.0.0: Display trigger TF prediction if available
                 agg = predictions.get('aggregate', {})
                 trigger_tf = agg.get('trigger_tf', 0)
@@ -1284,6 +1334,213 @@ def create_channel_chart(
             ticktext=ticktext,
             tickangle=-45
         )
+    )
+
+    return fig
+
+
+def create_prediction_chart(
+    df: pd.DataFrame,
+    channel: Channel,
+    timeframe: str,
+    symbol: str,
+    predicted_duration: float,
+    predicted_direction: str,  # "UP" or "DOWN"
+    direction_prob: float,
+    confidence: float
+) -> Optional['go.Figure']:
+    """
+    Create channel chart with forward projection based on model predictions.
+
+    Shows:
+    - Current channel with price data
+    - Projected channel extension (predicted duration bars forward)
+    - Current and projected price levels
+    - Break direction indicator
+    """
+    if not PLOTLY_AVAILABLE:
+        return None
+
+    # Filter to regular trading hours only
+    df = filter_market_hours(df)
+
+    # Resample data to match timeframe
+    if timeframe != '5min':
+        df_resampled = resample_ohlc(df, timeframe)
+    else:
+        df_resampled = df
+
+    # Get last window bars
+    window = channel.window
+    df_window = df_resampled.iloc[-window:].copy()
+
+    # Bar indices for current data
+    bar_indices = list(range(len(df_window)))
+
+    # Calculate projection bars (at least 5, cap at reasonable amount)
+    proj_bars = max(5, min(int(predicted_duration), 50))
+    proj_indices = list(range(len(df_window), len(df_window) + proj_bars))
+    all_indices = bar_indices + proj_indices
+
+    # Project channel forward using slope
+    x_proj = np.arange(window, window + proj_bars)
+    center_proj = channel.slope * x_proj + channel.intercept
+    upper_proj = center_proj + 2 * channel.std_dev
+    lower_proj = center_proj - 2 * channel.std_dev
+
+    # Combine current and projected lines
+    center_all = np.concatenate([channel.center_line, center_proj])
+    upper_all = np.concatenate([channel.upper_line, upper_proj])
+    lower_all = np.concatenate([channel.lower_line, lower_proj])
+
+    # Create figure
+    fig = go.Figure()
+
+    # Add candlestick for current data
+    fig.add_trace(go.Candlestick(
+        x=bar_indices,
+        open=df_window['open'],
+        high=df_window['high'],
+        low=df_window['low'],
+        close=df_window['close'],
+        name=symbol,
+        increasing_line_color='green',
+        decreasing_line_color='red'
+    ))
+
+    # Add current channel lines (solid)
+    fig.add_trace(go.Scatter(
+        x=bar_indices,
+        y=channel.center_line,
+        mode='lines',
+        name='Center',
+        line=dict(color='blue', width=2)
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=bar_indices,
+        y=channel.upper_line,
+        mode='lines',
+        name='Upper',
+        line=dict(color='red', width=1.5),
+        fill=None
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=bar_indices,
+        y=channel.lower_line,
+        mode='lines',
+        name='Lower',
+        line=dict(color='green', width=1.5),
+        fill='tonexty',
+        fillcolor='rgba(0, 100, 200, 0.1)'
+    ))
+
+    # Add projected channel lines (dashed, with different fill color)
+    proj_color = 'rgba(255, 100, 100, 0.3)' if predicted_direction == "DOWN" else 'rgba(100, 255, 100, 0.3)'
+
+    fig.add_trace(go.Scatter(
+        x=proj_indices,
+        y=center_proj,
+        mode='lines',
+        name='Projected Center',
+        line=dict(color='blue', width=2, dash='dot'),
+        showlegend=False
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=proj_indices,
+        y=upper_proj,
+        mode='lines',
+        name='Projected Upper',
+        line=dict(color='red', width=1.5, dash='dash'),
+        fill=None,
+        showlegend=False
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=proj_indices,
+        y=lower_proj,
+        mode='lines',
+        name='Projected Lower',
+        line=dict(color='green', width=1.5, dash='dash'),
+        fill='tonexty',
+        fillcolor=proj_color,
+        showlegend=False
+    ))
+
+    # Add vertical line at "now"
+    fig.add_vline(
+        x=len(bar_indices) - 0.5,
+        line_dash="dash",
+        line_color="gray",
+        annotation_text="NOW",
+        annotation_position="top"
+    )
+
+    # Current price and channel levels
+    current_price = df_window['close'].iloc[-1]
+    current_upper = channel.upper_line[-1]
+    current_lower = channel.lower_line[-1]
+
+    # Projected levels at predicted duration
+    proj_idx = min(proj_bars - 1, int(predicted_duration) - 1) if predicted_duration > 0 else 0
+    projected_upper = upper_proj[proj_idx] if proj_idx < len(upper_proj) else upper_proj[-1]
+    projected_lower = lower_proj[proj_idx] if proj_idx < len(lower_proj) else lower_proj[-1]
+
+    # Add price level annotations on the right side
+    annotations = [
+        # Current levels
+        dict(x=len(bar_indices) - 1, y=current_upper, text=f"Upper: ${current_upper:.2f}",
+             showarrow=False, xanchor='right', font=dict(size=10, color='red')),
+        dict(x=len(bar_indices) - 1, y=current_lower, text=f"Lower: ${current_lower:.2f}",
+             showarrow=False, xanchor='right', font=dict(size=10, color='green')),
+        # Projected levels
+        dict(x=len(bar_indices) + proj_bars - 1, y=projected_upper,
+             text=f"Target High: ${projected_upper:.2f}",
+             showarrow=True, arrowhead=2, ax=40, ay=0, font=dict(size=10, color='darkred')),
+        dict(x=len(bar_indices) + proj_bars - 1, y=projected_lower,
+             text=f"Target Low: ${projected_lower:.2f}",
+             showarrow=True, arrowhead=2, ax=40, ay=0, font=dict(size=10, color='darkgreen')),
+    ]
+
+    # Add break direction arrow
+    break_y = current_lower if predicted_direction == "DOWN" else current_upper
+    break_color = "red" if predicted_direction == "DOWN" else "green"
+    arrow_y_offset = -30 if predicted_direction == "DOWN" else 30
+
+    fig.add_annotation(
+        x=len(bar_indices) + proj_bars // 2,
+        y=break_y,
+        text=f"Break {predicted_direction} ({direction_prob:.0%})",
+        showarrow=True,
+        arrowhead=2,
+        arrowsize=1.5,
+        arrowwidth=2,
+        arrowcolor=break_color,
+        ax=0,
+        ay=arrow_y_offset,
+        font=dict(size=12, color=break_color, weight='bold'),
+        bgcolor='white',
+        bordercolor=break_color,
+        borderwidth=1
+    )
+
+    # Update layout
+    dir_emoji = "🔴" if predicted_direction == "DOWN" else "🟢"
+    title = f"{dir_emoji} {symbol} {timeframe} | Predicted: {predicted_direction} in ~{predicted_duration:.0f} bars | Confidence: {confidence:.0%}"
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14)),
+        yaxis_title="Price ($)",
+        xaxis_title=f"Bars ({timeframe})",
+        height=450,
+        hovermode='x unified',
+        xaxis_rangeslider_visible=False,
+        template='plotly_white',
+        legend=dict(x=0.01, y=0.99, bgcolor='rgba(255,255,255,0.8)'),
+        annotations=annotations,
+        margin=dict(r=120)  # Extra right margin for annotations
     )
 
     return fig
