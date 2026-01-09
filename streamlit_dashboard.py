@@ -53,6 +53,7 @@ except ImportError:
 # =============================================================================
 
 CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
+RUNS_DIR = PROJECT_ROOT / "runs"
 DATA_DIR = PROJECT_ROOT / "data"
 
 # Import canonical timeframes from v7.core - these must match the model's 11 timeframes
@@ -146,7 +147,55 @@ def find_checkpoints() -> List[Dict]:
                     **metrics
                 })
 
+    # Also scan runs directory for models
+    if RUNS_DIR.exists():
+        # Check for runs/*/window_*/best_model.pt
+        for run_dir in sorted(RUNS_DIR.iterdir()):
+            if run_dir.is_dir() and not run_dir.name.startswith('.'):
+                # Check window subdirectories
+                for window_dir in sorted(run_dir.glob("window_*")):
+                    if window_dir.is_dir():
+                        model_path = window_dir / "best_model.pt"
+                        if model_path.exists():
+                            config = extract_config_from_checkpoint(model_path)
+                            metrics = extract_metrics(model_path)
+                            checkpoints.append({
+                                "name": f"runs/{run_dir.name}/{window_dir.name}/best_model",
+                                "path": model_path,
+                                "config": config,
+                                "size_mb": model_path.stat().st_size / (1024 * 1024),
+                                "source": "run",
+                                **metrics
+                            })
+
+                # Check for runs/*/best_model.pt (non-walk-forward runs)
+                root_model = run_dir / "best_model.pt"
+                if root_model.exists():
+                    config = extract_config_from_checkpoint(root_model)
+                    metrics = extract_metrics(root_model)
+                    checkpoints.append({
+                        "name": f"runs/{run_dir.name}/best_model",
+                        "path": root_model,
+                        "config": config,
+                        "size_mb": root_model.stat().st_size / (1024 * 1024),
+                        "source": "run",
+                        **metrics
+                    })
+
     return checkpoints
+
+
+@st.cache_data(ttl=60)  # Cache for 60 seconds, auto-refresh
+def load_experiments_index() -> List[dict]:
+    """Load experiments from runs/experiments_index.json."""
+    index_path = RUNS_DIR / "experiments_index.json"
+    if not index_path.exists():
+        return []
+    try:
+        with open(index_path) as f:
+            return json.load(f)
+    except Exception:
+        return []
 
 
 def _load_training_config_json(checkpoint_path: Path) -> Optional[Dict]:
@@ -798,6 +847,101 @@ def main():
 
         st.divider()
 
+        # Training Runs section
+        st.subheader("Training Runs")
+        experiments = load_experiments_index()
+
+        if experiments:
+            # Create display names with timestamps
+            run_display_names = []
+            for exp in experiments:
+                name = exp.get('run_name', 'Unknown')
+                timestamp = exp.get('timestamp', '')
+                if timestamp:
+                    # Format timestamp for display (show date and time)
+                    try:
+                        ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        ts_str = ts.strftime('%m/%d %H:%M')
+                    except Exception:
+                        ts_str = timestamp[:16] if len(timestamp) > 16 else timestamp
+                    run_display_names.append(f"{name} ({ts_str})")
+                else:
+                    run_display_names.append(name)
+
+            selected_run_idx = st.selectbox(
+                "Select Run",
+                range(len(run_display_names)),
+                format_func=lambda x: run_display_names[x],
+                key="run_selector"
+            )
+
+            selected_exp = experiments[selected_run_idx]
+
+            # Show selected run info
+            st.caption(f"Timestamp: {selected_exp.get('timestamp', 'N/A')}")
+
+            # Status
+            status = selected_exp.get('status', 'unknown')
+            if status == 'completed':
+                st.caption(":green[Status: Completed]")
+            elif status == 'running':
+                st.caption(":orange[Status: Running]")
+            else:
+                st.caption(f"Status: {status}")
+
+            # Best metrics
+            best_val_loss = selected_exp.get('best_val_loss')
+            if best_val_loss is not None:
+                st.caption(f"Best Val Loss: {best_val_loss:.4f}")
+
+            dir_acc = selected_exp.get('best_direction_acc')
+            if dir_acc is not None:
+                st.caption(f"Dir Accuracy: {dir_acc*100:.1f}%")
+
+            # Key settings
+            settings = selected_exp.get('settings', {})
+            if settings:
+                se_blocks = settings.get('use_se_blocks', False)
+                hidden_dim = settings.get('hidden_dim', 'N/A')
+                lr = settings.get('lr', settings.get('learning_rate', 'N/A'))
+                batch_size = settings.get('batch_size', 'N/A')
+
+                st.caption(f"SE-blocks: {'Yes' if se_blocks else 'No'}")
+                st.caption(f"hidden_dim: {hidden_dim}")
+                if lr != 'N/A':
+                    st.caption(f"LR: {lr}")
+                st.caption(f"Batch: {batch_size}")
+
+            # Load Run's Best Model button
+            run_dir = selected_exp.get('run_dir', '')
+            if run_dir:
+                run_path = RUNS_DIR / run_dir
+                # Check for best_model.pt in run directory or window subdirectories
+                best_model_path = None
+                if (run_path / "best_model.pt").exists():
+                    best_model_path = run_path / "best_model.pt"
+                else:
+                    # Check window directories
+                    for window_dir in sorted(run_path.glob("window_*")):
+                        model_path = window_dir / "best_model.pt"
+                        if model_path.exists():
+                            best_model_path = model_path
+                            break
+
+                if best_model_path and st.button("Load Run's Best Model", key="load_run_model"):
+                    with st.spinner("Loading model from run..."):
+                        model = load_model(str(best_model_path))
+                        if model is not None:
+                            st.session_state.model = model
+                            st.session_state.model_name = f"runs/{run_dir}/best_model"
+                            st.success(f"Loaded: {st.session_state.model_name}")
+                        else:
+                            st.error("Failed to load model")
+        else:
+            st.info("No runs found. Train a model to see runs here.")
+
+        st.divider()
+
         # Data settings
         st.subheader("Data Settings")
 
@@ -1246,6 +1390,84 @@ def main():
                             st.json(cp['config'])
         else:
             st.info("No checkpoints found in checkpoints/")
+
+        # Training Runs Comparison section
+        st.subheader("Training Runs Comparison")
+        experiments = load_experiments_index()
+
+        if experiments:
+            # Build comparison DataFrame
+            runs_rows = []
+            for exp in experiments:
+                settings = exp.get('settings', {})
+                runs_rows.append({
+                    'Run Name': exp.get('run_name', 'Unknown'),
+                    'Timestamp': exp.get('timestamp', 'N/A'),
+                    'Status': exp.get('status', 'unknown'),
+                    'Val Loss': exp.get('best_val_loss'),
+                    'Dir Acc%': exp.get('best_direction_acc', 0) * 100 if exp.get('best_direction_acc') else None,
+                    'SE-blocks': 'Yes' if settings.get('use_se_blocks', False) else 'No',
+                    'hidden_dim': settings.get('hidden_dim', 'N/A'),
+                    'LR': settings.get('lr', settings.get('learning_rate', 'N/A')),
+                    'Batch': settings.get('batch_size', 'N/A'),
+                })
+
+            runs_df = pd.DataFrame(runs_rows)
+
+            # Sort by Val Loss ascending (best at top)
+            runs_df = runs_df.sort_values('Val Loss', ascending=True, na_position='last')
+
+            # Mark best run with star
+            if len(runs_df) > 0 and pd.notna(runs_df.iloc[0]['Val Loss']):
+                runs_df.iloc[0, runs_df.columns.get_loc('Run Name')] = '\u2b50 ' + str(runs_df.iloc[0]['Run Name'])
+
+            # Format display DataFrame
+            def format_run_value(val, decimals=4, is_percentage=False):
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return '\u2014'  # em-dash
+                if is_percentage:
+                    return f'{val:.1f}'
+                if isinstance(val, float):
+                    return f'{val:.{decimals}f}'
+                return str(val)
+
+            display_runs_df = pd.DataFrame({
+                'Run Name': runs_df['Run Name'],
+                'Timestamp': runs_df['Timestamp'].apply(lambda x: x[:19] if isinstance(x, str) and len(x) > 19 else x),
+                'Status': runs_df['Status'],
+                'Val Loss': runs_df['Val Loss'].apply(lambda x: format_run_value(x, 4)),
+                'Dir Acc%': runs_df['Dir Acc%'].apply(lambda x: format_run_value(x, 1, True)),
+                'SE-blocks': runs_df['SE-blocks'],
+                'hidden_dim': runs_df['hidden_dim'],
+                'LR': runs_df['LR'],
+                'Batch': runs_df['Batch'],
+            })
+
+            st.dataframe(display_runs_df, width='stretch', hide_index=True)
+
+            # Expanders for full settings
+            st.subheader("Run Details")
+            for exp in experiments:
+                run_name = exp.get('run_name', 'Unknown')
+                with st.expander(run_name):
+                    st.write(f"**Run Directory:** {exp.get('run_dir', 'N/A')}")
+                    st.write(f"**Timestamp:** {exp.get('timestamp', 'N/A')}")
+                    st.write(f"**Status:** {exp.get('status', 'N/A')}")
+
+                    best_val_loss = exp.get('best_val_loss')
+                    if best_val_loss is not None:
+                        st.write(f"**Best Val Loss:** {best_val_loss:.4f}")
+
+                    best_dir_acc = exp.get('best_direction_acc')
+                    if best_dir_acc is not None:
+                        st.write(f"**Best Direction Accuracy:** {best_dir_acc*100:.1f}%")
+
+                    settings = exp.get('settings', {})
+                    if settings:
+                        st.write("**Full Settings:**")
+                        st.json(settings)
+        else:
+            st.info("No runs found in experiments_index.json. Train a model to see runs here.")
 
 
 def create_channel_chart(

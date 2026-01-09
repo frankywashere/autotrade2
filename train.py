@@ -69,6 +69,7 @@ from v7.training.dataset import (
     is_cache_valid,
 )
 from v7.training.walk_forward_results import WalkForwardResults, WindowMetrics
+from v7.training.run_manager import RunManager, generate_run_id
 from v7.models import create_model, create_loss, create_end_to_end_model
 from v7.core.window_strategy import SelectionStrategy
 
@@ -502,6 +503,20 @@ def validate_date_in_range(date_str: str, min_date: str, max_date: str) -> bool:
         return date_min <= date <= date_max
     except ValueError:
         return False
+
+
+def configure_run_name() -> str:
+    """
+    Prompt user for an optional run name.
+
+    Returns:
+        Run name string (can be empty for timestamp-only naming)
+    """
+    name = inquirer.text(
+        message="Enter a name for this run (leave blank for timestamp only):",
+        default="",
+    ).execute()
+    return name.strip()
 
 
 def configure_walkforward() -> Optional[Dict]:
@@ -2656,14 +2671,24 @@ def main():
     # Paths
     data_dir = Path(__file__).parent / "data"
     cache_dir = data_dir / "feature_cache"
-    save_dir = Path(__file__).parent / "checkpoints"
+    # Note: save_dir is now set by RunManager below (checkpoints dir kept for resume)
+    checkpoints_dir = Path(__file__).parent / "checkpoints"
 
     # Select mode
     mode = select_mode()
 
     if mode == "Resume":
-        resume_training(save_dir, data_dir, cache_dir)
+        resume_training(checkpoints_dir, data_dir, cache_dir)
         return
+
+    # Configure run name and create run directory
+    run_name = configure_run_name()
+    run_manager = RunManager(base_dir=Path(__file__).parent / "runs")
+    run_dir = run_manager.create_run(name=run_name)
+    save_dir = run_dir / "windows"  # Checkpoints go in windows subdirectory
+    log_dir = run_dir / "logs"
+
+    console.print(f"\n[green]Run directory created:[/green] [cyan]{run_dir}[/cyan]\n")
 
     # =========================================================================
     # CACHE DETECTION - Show existing cache status before configuration
@@ -2700,6 +2725,7 @@ def main():
         "model": {},
         "training": {},
         "device": None,
+        "run_dir": str(run_dir),  # Store run directory path
         "_cache_summary": cache_summary,  # Pass cache info for reference
         "_use_cached_params": use_cached_params,
         "_force_rebuild": force_rebuild,
@@ -2809,15 +2835,38 @@ def main():
     # Display summary
     display_config_summary(config)
 
-    # Save directories
-    save_dir.mkdir(parents=True, exist_ok=True)
-    log_dir = Path(__file__).parent / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    # Save run configuration at start of training
+    run_manager.save_run_config(run_dir, config)
+    console.print(f"[dim]Configuration saved to: {run_dir / 'run_config.json'}[/dim]\n")
 
     # Route to walk-forward training if enabled
     if mode == "Walk-Forward" and config["data"].get("walk_forward"):
         try:
-            run_walk_forward_training(config, data_dir, cache_dir, save_dir, log_dir)
+            wf_results = run_walk_forward_training(config, data_dir, cache_dir, save_dir, log_dir)
+
+            # Update experiments index with walk-forward results
+            walk_forward_results = wf_results.get("walk_forward_results")
+            if walk_forward_results and walk_forward_results.window_metrics:
+                # Get aggregate metrics
+                agg_metrics = walk_forward_results.get_aggregated_metrics()
+                best_window = walk_forward_results.get_best_window()
+
+                summary = {
+                    "name": run_name,
+                    "status": "completed",
+                    "num_windows": len(walk_forward_results.window_metrics),
+                    "best_val_loss": agg_metrics.get("total", {}).get("mean") if "total" in agg_metrics else None,
+                    "best_direction_acc": agg_metrics.get("direction_acc", {}).get("mean") if "direction_acc" in agg_metrics else None,
+                    "best_epoch": best_window.best_epoch if best_window else None,
+                    "settings": {
+                        **config.get("model", {}),
+                        **config.get("training", {}),
+                        "walk_forward": config["data"].get("walk_forward", {}),
+                    },
+                }
+                run_manager.update_experiments_index(run_dir, summary)
+                console.print(f"[dim]Experiments index updated: {run_manager.index_file}[/dim]\n")
+
         except Exception as e:
             console.print(
                 f"\n\n[bold red]Error during walk-forward training:[/bold red]", style="red"
@@ -2953,6 +3002,30 @@ def main():
         if success:
             # Post-training summary
             post_training_summary(trainer, config, save_dir)
+
+            # Update experiments index with training results
+            best_epoch = int(np.argmin([m["total"] for m in trainer.val_metrics_history])) + 1
+            best_val_loss = float(min([m["total"] for m in trainer.val_metrics_history]))
+
+            # Try to get direction accuracy if available
+            best_direction_acc = None
+            if trainer.val_metrics_history and "direction_acc" in trainer.val_metrics_history[0]:
+                best_direction_acc = float(max([m.get("direction_acc", 0) for m in trainer.val_metrics_history]))
+
+            summary = {
+                "name": run_name,
+                "status": "completed",
+                "num_windows": 1,  # Standard training = 1 window
+                "best_val_loss": best_val_loss,
+                "best_direction_acc": best_direction_acc,
+                "best_epoch": best_epoch,
+                "settings": {
+                    **config.get("model", {}),
+                    **config.get("training", {}),
+                },
+            }
+            run_manager.update_experiments_index(run_dir, summary)
+            console.print(f"[dim]Experiments index updated: {run_manager.index_file}[/dim]\n")
 
     except Exception as e:
         console.print(
