@@ -11,7 +11,7 @@ Architecture Overview:
                     +------------------+
                     |   Per-Window     |
                     | Feature Tensor   |
-                    | [batch, 8, 761]  |
+                    | [batch, 8, 776]  |
                     +--------+---------+
                              |
               +--------------+--------------+
@@ -50,7 +50,7 @@ Architecture Overview:
                     [batch, D]
                     Weighted Embedding
                            |
-                           v (project to 761)
+                           v (project to 776)
                   +------------------+
                   | HierarchicalCfC  |
                   | (existing model) |
@@ -446,7 +446,7 @@ class EndToEndWindowModel(nn.Module):
 
     def __init__(
         self,
-        feature_dim: int = 761,
+        feature_dim: int = 776,
         window_embed_dim: int = 128,
         num_windows: int = 8,
         temperature: float = 1.0,
@@ -464,7 +464,7 @@ class EndToEndWindowModel(nn.Module):
         Parameters:
         ----------
         feature_dim : int, optional
-            Dimension of input features per window. Default is 761, matching
+            Dimension of input features per window. Default is 776, matching
             TOTAL_FEATURES from v7/features/feature_ordering.py.
 
         window_embed_dim : int, optional
@@ -850,7 +850,7 @@ class TemperatureScheduler:
 # =============================================================================
 
 def create_end_to_end_model(
-    feature_dim: int = 761,
+    feature_dim: int = 776,
     window_embed_dim: int = 128,
     num_windows: int = 8,
     temperature: float = 1.0,

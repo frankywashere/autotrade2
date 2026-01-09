@@ -87,7 +87,7 @@ def create_model_with_window_selection(
             temperature=config.get('temperature', 1.0),
             use_gumbel=config.get('use_gumbel', False),
             num_windows=config.get('num_windows', 8),
-            feature_dim=config.get('feature_dim', 761),
+            feature_dim=config.get('feature_dim', 776),
         )
     else:
         # Standard model (Phase 2a)

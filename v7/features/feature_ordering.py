@@ -264,7 +264,7 @@ def get_shared_index_range() -> tuple:
         Tuple of (start_idx, end_idx) for slicing
     """
     start = N_TIMEFRAMES * PER_TF_FEATURES  # 11 * 56 = 616
-    end = start + SHARED_FEATURES           # 616 + 145 = 761
+    end = start + SHARED_FEATURES           # 616 + 160 = 776
     return start, end
 
 
@@ -284,7 +284,7 @@ def concatenate_features_in_order(features_dict: Dict[str, np.ndarray]) -> np.nd
                        keys (e.g., 'tsla_5min', 'vix') to numpy arrays
 
     Returns:
-        Concatenated numpy array of shape (TOTAL_FEATURES,) = (761,)
+        Concatenated numpy array of shape (TOTAL_FEATURES,) = (776,)
 
     Raises:
         KeyError: If a required feature key is missing from features_dict
@@ -295,7 +295,7 @@ def concatenate_features_in_order(features_dict: Dict[str, np.ndarray]) -> np.nd
         # features_dict = {'tsla_5min': array([...]), 'spy_5min': array([...]), ...}
 
         features_array = concatenate_features_in_order(features_dict)
-        # features_array.shape = (761,)
+        # features_array.shape = (776,)
     """
     arrays = []
     for key in FEATURE_ORDER:

@@ -7,7 +7,7 @@ This model predicts channel break timing, direction, and post-break channel dire
 using a hierarchical architecture that processes each timeframe independently before
 combining insights across timeframes.
 
-Input Features: 761 dimensions (TIMEFRAME-GROUPED ordering)
+Input Features: 776 dimensions (TIMEFRAME-GROUPED ordering)
 ------------------------------------------------------------
 The input tensor is ordered by timeframe, NOT alphabetically!
 Each TF block contains: [tsla_{tf}, spy_{tf}, cross_{tf}] = 56 features
@@ -29,8 +29,9 @@ Followed by shared features at the end.
   * TSLA position in SPY channels (8 features)
   * RSI correlation features (2 features)
 
-- VIX regime: 6 features
-  * Level, normalized level, trends, percentile, regime
+- VIX regime: 21 features
+  * Level, normalized level, trends, percentile, regime (6 basic)
+  * VIX-channel interaction features (15 features)
 
 - History features: 25 features (TSLA) + 25 features (SPY) = 50 total
   * Last 5 directions, durations, break directions (5+5+5 = 15)
@@ -47,7 +48,7 @@ Followed by shared features at the end.
 
 Architecture Flow:
 =================
-1. Input Layer (761 dims) → Feature Decomposition
+1. Input Layer (776 dims) → Feature Decomposition
    ├─ Per-TF features extracted for each of 11 timeframes (56 features each)
    ├─ Shared features (VIX, history, alignment, events, window_scores) extracted from end
    ├─ Window scores (last 40 of shared) used for per-TF window selection
@@ -129,8 +130,8 @@ class FeatureConfig:
     Feature Layout (TIMEFRAME-GROUPED ordering):
     - Per-TF block: [tsla_{tf}(35), spy_{tf}(11), cross_{tf}(10)] = 56 features
     - 11 timeframes × 56 = 616 per-TF features
-    - Shared: [vix(6), tsla_history(25), spy_history(25), alignment(3), events(46), window_scores(40)] = 145 features
-    - Total: 616 + 145 = 761 features
+    - Shared: [vix(21), tsla_history(25), spy_history(25), alignment(3), events(46), window_scores(40)] = 160 features
+    - Total: 616 + 160 = 776 features
     """
 
     # Per-timeframe feature counts (from feature_ordering.py)
@@ -139,7 +140,7 @@ class FeatureConfig:
     cross_per_tf: int = CROSS_PER_TF  # 10 (TSLA-in-SPY containment + 2 RSI correlation)
 
     # Shared features (same across all TFs)
-    vix_features: int = VIX_FEATURES                      # 6
+    vix_features: int = VIX_FEATURES                      # 21 (6 basic + 15 channel interaction)
     tsla_history_features: int = TSLA_HISTORY_FEATURES    # 25 (5+5+5 lists + 10 scalars)
     spy_history_features: int = SPY_HISTORY_FEATURES      # 25 (same structure)
     alignment_features: int = ALIGNMENT_FEATURES          # 3
@@ -160,7 +161,7 @@ class FeatureConfig:
         shared = (self.vix_features + self.tsla_history_features +
                   self.spy_history_features + self.alignment_features +
                   self.event_features + self.window_score_features)
-        return per_tf + shared  # = (35+11+10)*11 + (6+25+25+3+46+40) = 616 + 145 = 761
+        return per_tf + shared  # = (35+11+10)*11 + (21+25+25+3+46+40) = 616 + 160 = 776
 
     @property
     def shared_features(self) -> int:
@@ -803,25 +804,25 @@ class SharedWindowEncoder(nn.Module):
     Attributes:
     ----------
     input_dim : int
-        Dimension of input features (default: 761, matching TOTAL_FEATURES)
+        Dimension of input features (default: 776, matching TOTAL_FEATURES)
     embed_dim : int
         Dimension of output embeddings (default: 128)
     encoder : nn.Sequential
         The MLP encoder network
     """
 
-    def __init__(self, input_dim: int = 761, embed_dim: int = 128):
+    def __init__(self, input_dim: int = 776, embed_dim: int = 128):
         """
         Initialize the SharedWindowEncoder.
 
         Parameters:
         ----------
         input_dim : int, optional
-            Dimension of input features per window. Default is 761, which matches
+            Dimension of input features per window. Default is 776, which matches
             the canonical TOTAL_FEATURES from v7/features/feature_ordering.py.
             This includes:
             - Per-TF features: 616 (56 features x 11 timeframes)
-            - Shared features: 145 (VIX, history, alignment, events, window_scores)
+            - Shared features: 160 (VIX, history, alignment, events, window_scores)
 
         embed_dim : int, optional
             Dimension of output embeddings. Default is 128, providing a good
@@ -834,7 +835,7 @@ class SharedWindowEncoder(nn.Module):
         Note:
         ----
         The intermediate hidden dimension of 256 is hardcoded as it provides
-        a good compression ratio (761 -> 256 -> embed_dim) while being
+        a good compression ratio (776 -> 256 -> embed_dim) while being
         computationally efficient.
         """
         super().__init__()

@@ -637,7 +637,7 @@ class ChannelDataset(Dataset):
                 - Each key maps to a tensor of that feature group's dimensions
 
             End-to-End Mode (strategy="learned_selection" or Phase 2b):
-                - per_window_features: [8, 761] stacked tensor with features for all windows
+                - per_window_features: [8, 776] stacked tensor with features for all windows
                 - window_valid: [8] bool tensor indicating which windows have valid features
                 Uses _get_per_window_features_tensor() to convert per_window_features dict.
 
@@ -700,12 +700,12 @@ class ChannelDataset(Dataset):
 
         if is_end_to_end and sample.per_window_features:
             # =========================================================================
-            # End-to-End Mode: Return ALL windows' features stacked as [8, 761]
+            # End-to-End Mode: Return ALL windows' features stacked as [8, 776]
             # =========================================================================
             # This enables the model to see all windows simultaneously and learn
             # which window to select based on downstream task performance.
             # Use _get_per_window_features_tensor for canonical feature ordering.
-            stacked_features = self._get_per_window_features_tensor(sample)  # [8, 761]
+            stacked_features = self._get_per_window_features_tensor(sample)  # [8, 776]
 
             # Build window validity mask
             window_valid_mask = [
@@ -714,7 +714,7 @@ class ChannelDataset(Dataset):
             ]
 
             features_tensors = {
-                'per_window_features': stacked_features,  # [8, 761]
+                'per_window_features': stacked_features,  # [8, 776]
                 'window_valid': torch.tensor(window_valid_mask, dtype=torch.bool),  # [8]
             }
 
@@ -977,9 +977,9 @@ class ChannelDataset(Dataset):
             sample: ChannelSample with per_window_features attribute
 
         Returns:
-            Stacked tensor of shape [8, 761] where:
+            Stacked tensor of shape [8, 776] where:
             - 8 is len(STANDARD_WINDOWS)
-            - 761 is TOTAL_FEATURES (the concatenated feature dimension)
+            - 776 is TOTAL_FEATURES (the concatenated feature dimension)
             Each row contains features for one window size.
 
         Note:
@@ -993,13 +993,13 @@ class ChannelDataset(Dataset):
                 features_dict = features_to_tensor_dict(features)
                 # Concatenate in canonical order using FEATURE_ORDER
                 tensor_array = concatenate_features_in_order(features_dict)
-                tensor = torch.from_numpy(tensor_array).float()  # [761]
+                tensor = torch.from_numpy(tensor_array).float()  # [776]
             else:
                 # Missing window - use zeros
-                tensor = torch.zeros(TOTAL_FEATURES, dtype=torch.float32)  # [761]
+                tensor = torch.zeros(TOTAL_FEATURES, dtype=torch.float32)  # [776]
             per_window_tensors.append(tensor)
 
-        return torch.stack(per_window_tensors, dim=0)  # [8, 761]
+        return torch.stack(per_window_tensors, dim=0)  # [8, 776]
 
 
 def load_market_data(

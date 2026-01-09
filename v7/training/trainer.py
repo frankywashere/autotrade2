@@ -269,13 +269,13 @@ class Trainer:
             features = {k: v.to(self.device) for k, v in features.items()}
 
             # Handle feature input based on mode:
-            # - End-to-end mode (learned_selection): features contains 'per_window_features' [batch, 8, 761]
+            # - End-to-end mode (learned_selection): features contains 'per_window_features' [batch, 8, 776]
             # - Standard mode: features contains individual keys matching FEATURE_ORDER
             is_end_to_end = 'per_window_features' in features
 
             if is_end_to_end:
                 # End-to-end mode: use per_window_features directly
-                x = features['per_window_features']  # [batch, 8, 761]
+                x = features['per_window_features']  # [batch, 8, 776]
                 window_valid = features.get('window_valid')  # [batch, 8]
                 window_scores = labels.get('window_scores')
                 if window_scores is not None:
@@ -419,13 +419,13 @@ class Trainer:
                 features = {k: v.to(self.device) for k, v in features.items()}
 
                 # Handle feature input based on mode:
-                # - End-to-end mode (learned_selection): features contains 'per_window_features' [batch, 8, 761]
+                # - End-to-end mode (learned_selection): features contains 'per_window_features' [batch, 8, 776]
                 # - Standard mode: features contains individual keys matching FEATURE_ORDER
                 is_end_to_end = 'per_window_features' in features
 
                 if is_end_to_end:
                     # End-to-end mode: use per_window_features directly
-                    x = features['per_window_features']  # [batch, 8, 761]
+                    x = features['per_window_features']  # [batch, 8, 776]
                     window_valid = features.get('window_valid')  # [batch, 8]
                     window_scores = labels.get('window_scores')
                     if window_scores is not None:
