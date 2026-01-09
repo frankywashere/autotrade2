@@ -148,37 +148,44 @@ def find_checkpoints() -> List[Dict]:
                 })
 
     # Also scan runs directory for models
+    # Structure: runs/TIMESTAMP_name/windows/window_1/best_model.pt (walk-forward)
+    #            runs/TIMESTAMP_name/windows/best_model.pt (standard)
     if RUNS_DIR.exists():
-        # Check for runs/*/window_*/best_model.pt
         for run_dir in sorted(RUNS_DIR.iterdir()):
             if run_dir.is_dir() and not run_dir.name.startswith('.'):
-                # Check window subdirectories
-                for window_dir in sorted(run_dir.glob("window_*")):
+                windows_dir = run_dir / "windows"
+                if not windows_dir.exists():
+                    continue
+
+                # Check for walk-forward window subdirectories: runs/*/windows/window_*/best_model.pt
+                for window_dir in sorted(windows_dir.glob("window_*")):
                     if window_dir.is_dir():
                         model_path = window_dir / "best_model.pt"
                         if model_path.exists():
                             config = extract_config_from_checkpoint(model_path)
                             metrics = extract_metrics(model_path)
                             checkpoints.append({
-                                "name": f"runs/{run_dir.name}/{window_dir.name}/best_model",
+                                "name": f"runs/{run_dir.name}/windows/{window_dir.name}/best_model",
                                 "path": model_path,
                                 "config": config,
                                 "size_mb": model_path.stat().st_size / (1024 * 1024),
                                 "source": "run",
+                                "run_id": run_dir.name,
                                 **metrics
                             })
 
-                # Check for runs/*/best_model.pt (non-walk-forward runs)
-                root_model = run_dir / "best_model.pt"
+                # Check for standard (non-walk-forward): runs/*/windows/best_model.pt
+                root_model = windows_dir / "best_model.pt"
                 if root_model.exists():
                     config = extract_config_from_checkpoint(root_model)
                     metrics = extract_metrics(root_model)
                     checkpoints.append({
-                        "name": f"runs/{run_dir.name}/best_model",
+                        "name": f"runs/{run_dir.name}/windows/best_model",
                         "path": root_model,
                         "config": config,
                         "size_mb": root_model.stat().st_size / (1024 * 1024),
                         "source": "run",
+                        "run_id": run_dir.name,
                         **metrics
                     })
 
@@ -913,27 +920,34 @@ def main():
                 st.caption(f"Batch: {batch_size}")
 
             # Load Run's Best Model button
-            run_dir = selected_exp.get('run_dir', '')
+            # run_id contains the directory name (e.g., "20250109_143022_test")
+            run_dir = selected_exp.get('run_id', '')
             if run_dir:
                 run_path = RUNS_DIR / run_dir
-                # Check for best_model.pt in run directory or window subdirectories
+                windows_path = run_path / "windows"
+                # Check for best_model.pt in windows/ or windows/window_*/ subdirectories
                 best_model_path = None
-                if (run_path / "best_model.pt").exists():
-                    best_model_path = run_path / "best_model.pt"
-                else:
-                    # Check window directories
-                    for window_dir in sorted(run_path.glob("window_*")):
-                        model_path = window_dir / "best_model.pt"
-                        if model_path.exists():
-                            best_model_path = model_path
-                            break
+                best_model_name = ""
+                if windows_path.exists():
+                    # First check standard training: runs/*/windows/best_model.pt
+                    if (windows_path / "best_model.pt").exists():
+                        best_model_path = windows_path / "best_model.pt"
+                        best_model_name = f"runs/{run_dir}/windows/best_model"
+                    else:
+                        # Check walk-forward window directories: runs/*/windows/window_*/best_model.pt
+                        for window_dir in sorted(windows_path.glob("window_*")):
+                            model_path = window_dir / "best_model.pt"
+                            if model_path.exists():
+                                best_model_path = model_path
+                                best_model_name = f"runs/{run_dir}/windows/{window_dir.name}/best_model"
+                                break
 
                 if best_model_path and st.button("Load Run's Best Model", key="load_run_model"):
                     with st.spinner("Loading model from run..."):
                         model = load_model(str(best_model_path))
                         if model is not None:
                             st.session_state.model = model
-                            st.session_state.model_name = f"runs/{run_dir}/best_model"
+                            st.session_state.model_name = best_model_name
                             st.success(f"Loaded: {st.session_state.model_name}")
                         else:
                             st.error("Failed to load model")
