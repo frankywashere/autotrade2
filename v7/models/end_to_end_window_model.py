@@ -457,6 +457,8 @@ class EndToEndWindowModel(nn.Module):
         num_attention_heads: int = 4,
         dropout: float = 0.1,
         shared_heads: bool = True,
+        use_se_blocks: bool = False,
+        se_reduction_ratio: int = 8,
     ):
         """
         Initialize the EndToEndWindowModel.
@@ -497,6 +499,14 @@ class EndToEndWindowModel(nn.Module):
         shared_heads : bool, optional
             If True, use shared prediction heads across timeframes.
             If False, separate heads per TF. Default is True.
+
+        use_se_blocks : bool, optional
+            If True, add SE-blocks (Squeeze-and-Excitation) to each TF branch
+            for adaptive feature reweighting. Default is False.
+
+        se_reduction_ratio : int, optional
+            Reduction ratio for SE-block bottleneck. Controls the compression
+            in the SE-block's channel attention mechanism. Default is 8.
         """
         super().__init__()
 
@@ -537,6 +547,8 @@ class EndToEndWindowModel(nn.Module):
             num_attention_heads=num_attention_heads,
             dropout=dropout,
             shared_heads=shared_heads,
+            use_se_blocks=use_se_blocks,
+            se_reduction_ratio=se_reduction_ratio,
         )
 
     def forward(
@@ -695,6 +707,9 @@ class EndToEndWindowModel(nn.Module):
         This method is for inference only. It uses hard (argmax) window
         selection for interpretable, discrete window choices.
 
+        Returns output in the SAME FORMAT as HierarchicalCfCModel.predict()
+        for dashboard compatibility, plus window selection info.
+
         Parameters:
         ----------
         per_window_features : torch.Tensor
@@ -709,13 +724,12 @@ class EndToEndWindowModel(nn.Module):
         Returns:
         -------
         Dict[str, torch.Tensor]
-            All outputs from forward() plus:
-
-            - **selected_window_idx**: [batch]
-              Index of selected window (0-7)
-
-            - **selection_confidence**: [batch]
-              Confidence in window selection (0-1), derived from entropy
+            Same format as HierarchicalCfCModel.predict():
+            - 'per_tf': Dict with per-timeframe predictions
+            - 'aggregate': Dict with aggregate predictions
+            - 'best_tf_idx': Recommended timeframe index
+            - 'attention_weights': Cross-TF attention weights
+            - 'window_selection': Dict with window selection info (EndToEnd-specific)
         """
         self.eval()
         with torch.no_grad():
@@ -727,20 +741,79 @@ class EndToEndWindowModel(nn.Module):
                 return_attention=True,
             )
 
-            # Get selected window index
+            # Get selected window index and confidence
             selected_window_idx = outputs['window_selection_probs'].argmax(dim=-1)  # [batch]
-
-            # Convert entropy to confidence
-            # Max entropy (uniform) = log(8) = 2.08 -> confidence 0
-            # Min entropy (one-hot) = 0 -> confidence 1
-            max_entropy = torch.log(torch.tensor(float(self.num_windows)))
+            max_entropy = torch.log(torch.tensor(float(self.num_windows), device=per_window_features.device))
             selection_confidence = 1.0 - (outputs['window_selection_entropy'] / max_entropy)
             selection_confidence = selection_confidence.clamp(0, 1)
 
-            outputs['selected_window_idx'] = selected_window_idx
-            outputs['selection_confidence'] = selection_confidence
+            # Convert per-timeframe logits to probabilities (match HierarchicalCfCModel.predict())
+            direction_probs = torch.sigmoid(outputs['direction_logits'])  # [batch, 11]
+            next_channel_probs = F.softmax(outputs['next_channel_logits'], dim=-1)  # [batch, 11, 3]
 
-            return outputs
+            # Convert aggregate logits to probabilities
+            agg_direction_probs = torch.sigmoid(outputs['aggregate']['direction_logits'])  # [batch, 1]
+            agg_next_channel_probs = F.softmax(outputs['aggregate']['next_channel_logits'], dim=-1)  # [batch, 3]
+            agg_trigger_tf_probs = F.softmax(outputs['aggregate']['trigger_tf_logits'], dim=-1)  # [batch, 21]
+
+            # Get class predictions for per-timeframe
+            direction = (direction_probs > 0.5).long()  # [batch, 11]
+            next_channel = next_channel_probs.argmax(dim=-1)  # [batch, 11]
+
+            # Get aggregate class predictions
+            agg_direction = (agg_direction_probs > 0.5).long()  # [batch, 1]
+            agg_next_channel = agg_next_channel_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
+            agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
+
+            # Compute std from log_std
+            duration_std = torch.exp(outputs['duration_log_std'])  # [batch, 11]
+            agg_duration_std = torch.exp(outputs['aggregate']['duration_log_std'])  # [batch, 1]
+
+            # Find recommended timeframe (highest confidence)
+            best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
+
+            # Return in same format as HierarchicalCfCModel.predict()
+            return {
+                # Per-timeframe predictions (for dashboard table)
+                'per_tf': {
+                    'duration_mean': outputs['duration_mean'],  # [batch, 11]
+                    'duration_std': duration_std,  # [batch, 11]
+                    'direction': direction,  # [batch, 11]
+                    'direction_probs': direction_probs,  # [batch, 11]
+                    'next_channel': next_channel,  # [batch, 11]
+                    'next_channel_probs': next_channel_probs,  # [batch, 11, 3]
+                    'confidence': outputs['confidence'],  # [batch, 11]
+                },
+
+                # Window selection (EndToEnd-specific, different from HierarchicalCfCModel)
+                'window_selection': {
+                    'selected_idx': selected_window_idx,  # [batch] - which window (0-7)
+                    'confidence': selection_confidence,  # [batch] - selection confidence
+                    'probs': outputs['window_selection_probs'],  # [batch, 8] - window probabilities
+                },
+
+                # Aggregate prediction (for simple signal)
+                'aggregate': {
+                    'duration_mean': outputs['aggregate']['duration_mean'],
+                    'duration_std': agg_duration_std,
+                    'direction': agg_direction,  # [batch, 1]
+                    'direction_probs': agg_direction_probs,  # [batch, 1]
+                    'next_channel': agg_next_channel,
+                    'next_channel_probs': agg_next_channel_probs,
+                    'confidence': outputs['aggregate']['confidence'],
+                    # v9.0.0: Trigger TF predictions (21-class)
+                    'trigger_tf': agg_trigger_tf,  # [batch, 1]
+                    'trigger_tf_probs': agg_trigger_tf_probs,  # [batch, 21]
+                },
+
+                # Metadata
+                'best_tf_idx': best_tf_idx,  # [batch] - which TF to use
+                'attention_weights': outputs['attention_weights'],  # [batch, 11, 11]
+
+                # Keep raw outputs for debugging/advanced use
+                'selected_window_idx': selected_window_idx,
+                'selection_confidence': selection_confidence,
+            }
 
     def set_temperature(self, temperature: float):
         """
@@ -860,6 +933,8 @@ def create_end_to_end_model(
     num_attention_heads: int = 4,
     dropout: float = 0.1,
     shared_heads: bool = True,
+    use_se_blocks: bool = False,
+    se_reduction_ratio: int = 8,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
 ) -> EndToEndWindowModel:
     """
@@ -897,6 +972,14 @@ def create_end_to_end_model(
     shared_heads : bool, optional
         Whether to share prediction heads across TFs. Default is True.
 
+    use_se_blocks : bool, optional
+        If True, add SE-blocks (Squeeze-and-Excitation) to each TF branch
+        for adaptive feature reweighting. Default is False.
+
+    se_reduction_ratio : int, optional
+        Reduction ratio for SE-block bottleneck. Controls the compression
+        in the SE-block's channel attention mechanism. Default is 8.
+
     device : str, optional
         Device to place model on. Default is 'cuda' if available, else 'cpu'.
 
@@ -916,6 +999,8 @@ def create_end_to_end_model(
         num_attention_heads=num_attention_heads,
         dropout=dropout,
         shared_heads=shared_heads,
+        use_se_blocks=use_se_blocks,
+        se_reduction_ratio=se_reduction_ratio,
     )
 
     model = model.to(device)

@@ -2327,6 +2327,8 @@ def run_walk_forward_training(
                         num_attention_heads=config["model"]["num_attention_heads"],
                         dropout=config["model"]["dropout"],
                         shared_heads=config["model"].get("shared_heads", True),
+                        use_se_blocks=config["model"].get("use_se_blocks", False),
+                        se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                         device=config["device"],
                     )
                 else:
@@ -2883,6 +2885,8 @@ def main():
                     num_attention_heads=config["model"]["num_attention_heads"],
                     dropout=config["model"]["dropout"],
                     shared_heads=config["model"].get("shared_heads", True),
+                    use_se_blocks=config["model"].get("use_se_blocks", False),
+                    se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                     device=config["device"],
                 )
                 console.print("[yellow]ℹ[/yellow] Using EndToEndWindowModel for learned_selection strategy\n")

@@ -586,15 +586,18 @@ def make_predictions(
                     feature_array = np.concatenate(feature_list)
                     per_window_features.append(feature_array)
 
-                    # Extract channel quality scores if available
-                    if features.channel is not None:
-                        ch = features.channel
+                    # Extract channel quality scores from tsla_window_scores
+                    # tsla_window_scores has shape (8, 5) with metrics for all STANDARD_WINDOWS
+                    # Metrics order: bounce_count, r_squared, quality_score, alternation_ratio, width_pct
+                    if features.tsla_window_scores is not None:
+                        window_idx = STANDARD_WINDOWS.index(window)
+                        scores = features.tsla_window_scores[window_idx]
                         window_scores_list.append([
-                            float(ch.bounce_count),
-                            float(ch.r_squared),
-                            float(ch.quality_score) if hasattr(ch, 'quality_score') else 0.0,
-                            float(ch.alternation_ratio) if hasattr(ch, 'alternation_ratio') else 0.0,
-                            float(ch.width_pct) if hasattr(ch, 'width_pct') else 0.0
+                            float(scores[0]),  # bounce_count
+                            float(scores[1]),  # r_squared
+                            float(scores[2]),  # quality_score
+                            float(scores[3]),  # alternation_ratio
+                            float(scores[4]),  # width_pct
                         ])
                         window_valid_list.append(True)
                     else:
@@ -1178,7 +1181,7 @@ def main():
                     'Size MB': df['Size MB'].apply(lambda x: format_value(x, 1))
                 })
 
-                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                st.dataframe(display_df, width='stretch', hide_index=True)
 
                 # Show expandable details for each checkpoint
                 st.subheader("Checkpoint Details")
