@@ -50,6 +50,9 @@ config.ini
 *.log
 logs/
 
+# Experiment runs
+runs/
+
 # OS
 .DS_Store
 Thumbs.db

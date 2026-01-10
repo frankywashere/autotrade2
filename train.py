@@ -88,9 +88,9 @@ PRESETS = {
     "Quick Start": {
         "desc": "Fast training for testing (smaller model, few epochs)",
         "step": 50,
-        "hidden_dim": 64,  # Smaller for speed - use Standard for production
-        "cfc_units": 96,   # Smaller for speed
-        "attention_heads": 4,  # Simple configuration
+        "hidden_dim": 64,
+        "cfc_units": 96,
+        "attention_heads": 4,
         "num_epochs": 10,
         "batch_size": 32,
         "learning_rate": 0.001,
@@ -100,7 +100,7 @@ PRESETS = {
         "step": 25,
         "hidden_dim": 128,
         "cfc_units": 192,
-        "attention_heads": 8,  # Balanced configuration
+        "attention_heads": 8,
         "num_epochs": 50,
         "batch_size": 64,
         "learning_rate": 0.0005,
@@ -110,12 +110,15 @@ PRESETS = {
         "step": 10,
         "hidden_dim": 256,
         "cfc_units": 384,
-        "attention_heads": 8,  # Same as Standard
+        "attention_heads": 8,
         "num_epochs": 100,
         "batch_size": 128,
         "learning_rate": 0.0003,
     },
 }
+
+# Import CLI parser (for non-interactive mode)
+from cli_parser import create_argument_parser, validate_args, args_to_config
 
 
 # =============================================================================
@@ -2665,14 +2668,259 @@ def resume_training(save_dir: Path, data_dir: Path, cache_dir: Path):
 
 
 def main():
-    """Main training CLI."""
-    banner()
-
-    # Paths
+    """Main training CLI with both interactive and non-interactive modes."""
+    # Paths (needed for both modes)
     data_dir = Path(__file__).parent / "data"
     cache_dir = data_dir / "feature_cache"
-    # Note: save_dir is now set by RunManager below (checkpoints dir kept for resume)
     checkpoints_dir = Path(__file__).parent / "checkpoints"
+
+    # =========================================================================
+    # CLI ARGUMENT PARSING
+    # =========================================================================
+    parser = create_argument_parser()
+    args = parser.parse_args()
+
+    # =========================================================================
+    # NON-INTERACTIVE CLI MODE
+    # =========================================================================
+    if args.no_interactive:
+        console.print("\n[bold cyan]Running in non-interactive CLI mode[/bold cyan]\n")
+
+        # Validate arguments
+        try:
+            validate_args(args)
+        except ValueError as e:
+            console.print(f"[red]Argument validation error: {e}[/red]")
+            sys.exit(1)
+
+        # Build config from CLI args
+        config = args_to_config(args)
+
+        # Determine mode for display
+        mode = config.get("mode", "Standard")
+        if args.mode == "walk-forward" or args.wf_enabled:
+            mode = "Walk-Forward"
+
+        # Create run directory
+        run_name = args.run_name
+        run_manager = RunManager(base_dir=Path(__file__).parent / "runs")
+        run_dir = run_manager.create_run(name=run_name)
+        save_dir = run_dir / "windows"
+        log_dir = run_dir / "logs"
+        config["run_dir"] = str(run_dir)
+
+        console.print(f"[green]Run directory:[/green] [cyan]{run_dir}[/cyan]")
+        console.print(f"[green]Mode:[/green] [cyan]{mode}[/cyan]")
+        console.print(f"[green]Device:[/green] [cyan]{config['device']}[/cyan]\n")
+
+        # Display config summary
+        display_config_summary(config)
+
+        # Save run configuration
+        run_manager.save_run_config(run_dir, config)
+        console.print(f"[dim]Configuration saved to: {run_dir / 'run_config.json'}[/dim]\n")
+
+        # Pre-flight checks (simplified for CLI mode)
+        console.print("[bold cyan]Pre-flight Checks[/bold cyan]")
+        required_files = ["TSLA_1min.csv", "SPY_1min.csv", "VIX_History.csv", "events.csv"]
+        all_present = True
+        for f in required_files:
+            if (data_dir / f).exists():
+                console.print(f"  [green]✓[/green] {f}")
+            else:
+                console.print(f"  [red]✗[/red] {f} [red]MISSING[/red]")
+                all_present = False
+
+        if not all_present:
+            console.print("\n[red]Error: Required data files missing[/red]")
+            sys.exit(1)
+        console.print()
+
+        # Route to walk-forward or standard training
+        if mode == "Walk-Forward" and config["data"].get("walk_forward"):
+            try:
+                wf_results = run_walk_forward_training(config, data_dir, cache_dir, save_dir, log_dir)
+
+                # Update experiments index
+                walk_forward_results = wf_results.get("walk_forward_results")
+                if walk_forward_results and walk_forward_results.window_metrics:
+                    agg_metrics = walk_forward_results.get_aggregated_metrics()
+                    best_window = walk_forward_results.get_best_window()
+
+                    summary = {
+                        "name": run_name,
+                        "status": "completed",
+                        "num_windows": len(walk_forward_results.window_metrics),
+                        "best_val_loss": agg_metrics.get("total", {}).get("mean") if "total" in agg_metrics else None,
+                        "best_direction_acc": agg_metrics.get("direction_acc", {}).get("mean") if "direction_acc" in agg_metrics else None,
+                        "best_epoch": best_window.best_epoch if best_window else None,
+                        "settings": {
+                            **config.get("model", {}),
+                            **config.get("training", {}),
+                        },
+                    }
+                    run_manager.update_experiments_index(run_dir, summary)
+
+            except Exception as e:
+                console.print(f"\n[red]Error during walk-forward training: {e}[/red]")
+                console.print(traceback.format_exc())
+                sys.exit(1)
+        else:
+            # Standard training
+            try:
+                console.print("[bold cyan]Preparing Dataset...[/bold cyan]\n")
+
+                with console.status("[bold green]Loading and preparing data...", spinner="dots"):
+                    train_samples, val_samples, test_samples = prepare_dataset_from_scratch(
+                        data_dir=data_dir,
+                        cache_dir=cache_dir,
+                        window=config["data"]["window"],
+                        step=config["data"]["step"],
+                        min_cycles=config["data"].get("min_cycles", 1),
+                        max_scan=config["data"].get("max_scan", 500),
+                        return_threshold=config["data"].get("return_threshold", 20),
+                        lookforward_bars=config["data"].get("lookforward_bars", 200),
+                        train_end=config["data"]["train_end"],
+                        val_end=config["data"]["val_end"],
+                        start_date=config["data"].get("start_date"),
+                        end_date=config["data"].get("end_date"),
+                        include_history=config["data"]["include_history"],
+                        force_rebuild=False,
+                        custom_return_thresholds=config["data"].get("custom_return_thresholds"),
+                    )
+
+                console.print(
+                    f"[green]✓[/green] Dataset prepared: {len(train_samples)} train, "
+                    f"{len(val_samples)} val, {len(test_samples)} test samples\n"
+                )
+
+                # Create dataloaders
+                strategy = config["data"].get("window_selection_strategy", "bounce_first")
+                with console.status("[bold green]Creating dataloaders...", spinner="dots"):
+                    train_loader, val_loader, test_loader = create_dataloaders(
+                        train_samples,
+                        val_samples,
+                        test_samples,
+                        batch_size=config["training"]["batch_size"],
+                        device=config["device"],
+                        augment_train=True,
+                        strategy=strategy,
+                    )
+
+                console.print(
+                    f"[green]✓[/green] Dataloaders ready: {len(train_loader)} train batches, "
+                    f"{len(val_loader)} val batches\n"
+                )
+
+                # Create model
+                console.print("[bold cyan]Creating Model...[/bold cyan]\n")
+                with console.status("[bold green]Initializing model...", spinner="dots"):
+                    if strategy == "learned_selection":
+                        model = create_end_to_end_model(
+                            hidden_dim=config["model"]["hidden_dim"],
+                            cfc_units=config["model"]["cfc_units"],
+                            num_attention_heads=config["model"]["num_attention_heads"],
+                            dropout=config["model"]["dropout"],
+                            shared_heads=config["model"].get("shared_heads", True),
+                            use_se_blocks=config["model"].get("use_se_blocks", False),
+                            se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                            device=config["device"],
+                        )
+                    else:
+                        model = create_model(
+                            hidden_dim=config["model"]["hidden_dim"],
+                            cfc_units=config["model"]["cfc_units"],
+                            num_attention_heads=config["model"]["num_attention_heads"],
+                            dropout=config["model"]["dropout"],
+                            shared_heads=config["model"].get("shared_heads", True),
+                            use_se_blocks=config["model"].get("use_se_blocks", False),
+                            se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                            device=config["device"],
+                        )
+
+                console.print(
+                    f"[green]✓[/green] Model created: {model.get_num_parameters()['total']:,} parameters\n"
+                )
+
+                # Create trainer config
+                trainer_config = TrainingConfig(
+                    model_kwargs=config["model"],
+                    num_epochs=config["training"]["num_epochs"],
+                    learning_rate=config["training"]["learning_rate"],
+                    batch_size=config["training"]["batch_size"],
+                    optimizer=config["training"]["optimizer"],
+                    scheduler=config["training"]["scheduler"],
+                    use_amp=config["training"].get("use_amp", False),
+                    weight_decay=config["training"]["weight_decay"],
+                    gradient_clip=config["training"]["gradient_clip"],
+                    use_learnable_weights=config["training"]["use_learnable_weights"],
+                    fixed_weights=config["training"]["fixed_weights"],
+                    calibration_mode=config["training"].get("calibration_mode", "brier_per_tf"),
+                    use_window_selection_loss=config["training"].get("use_window_selection_loss", False),
+                    window_selection_weight=config["training"].get("window_selection_weight", 0.1),
+                    use_end_to_end_loss=(strategy == "learned_selection"),
+                    early_stopping_patience=config["training"].get("early_stopping_patience", 15),
+                    early_stopping_metric=config["training"].get("early_stopping_metric", "total"),
+                    early_stopping_mode=config["training"].get("early_stopping_mode", "min"),
+                    uncertainty_penalty=config["training"].get("uncertainty_penalty", 0.1),
+                    min_duration_precision=config["training"].get("min_duration_precision", 0.25),
+                    use_se_blocks=config["model"].get("use_se_blocks", False),
+                    se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                    device=config["device"],
+                    save_dir=save_dir,
+                    log_dir=log_dir,
+                    save_every_n_epochs=5,
+                )
+
+                # Create trainer
+                trainer = Trainer(
+                    model=model,
+                    config=trainer_config,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    test_loader=test_loader,
+                )
+
+                # Train
+                success = train_with_progress(trainer, config, save_dir)
+
+                if success:
+                    post_training_summary(trainer, config, save_dir)
+
+                    # Update experiments index
+                    best_epoch = int(np.argmin([m["total"] for m in trainer.val_metrics_history])) + 1
+                    best_val_loss = float(min([m["total"] for m in trainer.val_metrics_history]))
+                    best_direction_acc = None
+                    if trainer.val_metrics_history and "direction_acc" in trainer.val_metrics_history[0]:
+                        best_direction_acc = float(max([m.get("direction_acc", 0) for m in trainer.val_metrics_history]))
+
+                    summary = {
+                        "name": run_name,
+                        "status": "completed",
+                        "num_windows": 1,
+                        "best_val_loss": best_val_loss,
+                        "best_direction_acc": best_direction_acc,
+                        "best_epoch": best_epoch,
+                        "settings": {
+                            **config.get("model", {}),
+                            **config.get("training", {}),
+                        },
+                    }
+                    run_manager.update_experiments_index(run_dir, summary)
+                    console.print(f"[dim]Experiments index updated[/dim]\n")
+
+            except Exception as e:
+                console.print(f"\n[red]Error during training: {e}[/red]")
+                console.print(traceback.format_exc())
+                sys.exit(1)
+
+        console.print("\n[bold green]Training complete![/bold green]\n")
+        return
+
+    # =========================================================================
+    # INTERACTIVE MODE (original behavior)
+    # =========================================================================
+    banner()
 
     # Select mode
     mode = select_mode()

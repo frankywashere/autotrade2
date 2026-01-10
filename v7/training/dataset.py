@@ -1835,6 +1835,10 @@ def prepare_dataset_from_scratch(
                         valid_tf_set.add(tf)
 
         # Cache to disk with ALL parameters (including warmup and v8 fields)
+        # Calculate actual sample date range (not raw data range)
+        sample_start = min(s.timestamp for s in samples)
+        sample_end = max(s.timestamp for s in samples)
+
         metadata = {
             'window': window,  # Legacy: single window parameter for backward compat
             'windows': list(STANDARD_WINDOWS),  # Multi-window: list of window sizes used
@@ -1847,8 +1851,12 @@ def prepare_dataset_from_scratch(
             'include_history': include_history,
             'min_warmup_bars': min_warmup_bars,
             'num_samples': len(samples),
-            'start_date': str(tsla_df.index[0]),
-            'end_date': str(tsla_df.index[-1]),
+            # Actual sample date range (accounts for warmup and lookforward)
+            'start_date': str(sample_start),
+            'end_date': str(sample_end),
+            # Raw data range for reference
+            'raw_data_start': str(tsla_df.index[0]),
+            'raw_data_end': str(tsla_df.index[-1]),
             'created_at': str(datetime.now()),
             # v8.0.0 fields for native per-TF labels
             'native_per_tf_labels': True,
