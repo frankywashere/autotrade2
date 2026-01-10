@@ -118,7 +118,7 @@ PRESETS = {
 }
 
 # Import CLI parser (for non-interactive mode)
-from cli_parser import create_argument_parser, validate_args, args_to_config
+from train_cli import create_argument_parser, validate_args, args_to_config
 
 
 # =============================================================================
