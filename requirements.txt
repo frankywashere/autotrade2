@@ -1,0 +1,22 @@
+# Core ML
+torch>=2.0.0
+numpy
+pandas
+
+# Model architecture
+ncps
+
+# Training CLI/UI
+rich
+InquirerPy
+
+# Market calendar
+pandas_market_calendars
+
+# Dashboard (optional)
+streamlit
+plotly
+
+# Utilities
+python-dateutil
+tqdm
