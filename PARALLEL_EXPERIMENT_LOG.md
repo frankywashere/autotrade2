@@ -31,7 +31,16 @@
 - [x] Setup complete: x9 branch pulled on server
 - [x] Investigated existing features (6+ agents)
 - [x] Found 90% of features already exist!
-- [ ] Implementing ATR + new features
+- [x] Implemented ATR calculation (14-period SMA-ATR)
+- [x] Added 3 ATR-normalized distance features to TSLAChannelFeatures
+- [x] **Codex Review - Fixed 4 critical bugs:**
+  - ✅ Model defaults updated 776→809 (end_to_end_window_model.py, model_factory.py)
+  - ✅ Cache version bumped v12→v13 (forces rebuild with new features)
+  - ✅ Sanitized inf to 999.0 (prevents NaN in training)
+  - ✅ Fixed streamlit_dashboard.py hardcoded 776→809
+- [x] All CLI menu options tested (18/18 passed)
+- [x] Feature dimensions: 776→809 (33 new ATR features across 11 TFs)
+- [x] Ready to deploy and test on server
 
 ---
 
@@ -40,28 +49,51 @@
 **Server Path:** /workspace/autotrade2_x10
 **Goal:** Optimize task balancing and understand walk-forward variance
 
-### Experiments to Run:
-- [x] Weight grid: duration_weight = 3.0, 4.0, 5.0, 6.0 - **RUNNING** (4 agents in background)
-- [x] 10-window walk-forward (tighten variance) - **RUNNING** (10 windows, 2-month val each)
-- [x] Analyze Window 2's 73.3% performance - **RUNNING** (regime analysis agent)
-- [x] Try GradNorm for gradient balancing - **RUNNING** (test experiment)
+### Experiments Status:
+
+| Experiment | Status | Progress |
+|------------|--------|----------|
+| Weight grid 3.0 | 🔄 RUNNING | Epoch 4/20 |
+| Weight grid 4.0 | 🔄 RUNNING | Epoch 1/20 |
+| Weight grid 5.0 | 🔄 RUNNING | Epoch 1/20 |
+| Weight grid 6.0 | 🔄 RUNNING | Epoch 2/20 |
+| 10-window WF | 🔄 RUNNING | Window 2/10 (Window 1 complete) |
+| Window 2 Analysis | ✅ COMPLETE | Found: 2x higher volatility |
+| GradNorm Test | ⚠️ BUG FOUND | Validation metrics frozen |
 
 ### Progress:
 - [x] Setup complete: x10 branch pulled on server
-- [x] Started weight grid: 3.0, 4.0, 5.0, 6.0 (4 parallel runs)
-- [x] Started 10-window WF: Windows validated (2024-01 through 2025-09)
-- [x] Started Window 2 analysis: Comparing regime characteristics
-- [x] Started GradNorm test: vs learnable weights baseline
+- [x] Started weight grid: 3.0, 4.0, 5.0, 6.0 (4 parallel runs on server)
+- [x] Started 10-window WF: Window 1 complete, Window 2 running
+- [x] **Window 2 Analysis COMPLETE** - Key findings:
+  - VIX 2x higher (24.7 vs 16.5) = clearer patterns
+  - TSLA had strong uptrend (+16% vs -16%)
+  - Higher volatility = better prediction (paradox)
+- [x] GradNorm test: **CRITICAL BUG** - validation metrics frozen at 49.5%
 
 ---
 
 ## Results Summary
 
 ### X9 Results:
-TBD
+- **ATR Implementation**: 5 commits, 226 new lines
+- **New Features**: 3 ATR-normalized distances per TF (33 total)
+- **Feature Count**: 776→809
+- **Testing**: All 18 CLI modes work ✓
+- **Status**: Ready for server deployment
 
 ### X10 Results:
-TBD
+
+**Window 2 Analysis (73.3% vs 63.5%)**:
+- Window 2 had **2x higher volatility** (VIX 24.7 vs 16.5)
+- **Stronger trend**: TSLA +16% vs -16%
+- **Wider ranges**: 6.26% vs 4.98% daily (+26%)
+- **Balanced days**: 50% up vs 36% up
+- **Conclusion**: Higher volatility = easier to predict (clearer patterns)
+
+**Weight Grid**: Running (awaiting completion)
+**10-Window WF**: Window 1 complete, Window 2 in progress
+**GradNorm**: Validation bug (metrics frozen - experiment invalid)
 
 ---
 
