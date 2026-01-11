@@ -578,3 +578,61 @@ def find_best_channel(
     )
 
     return best if best.valid else None
+
+
+def calculate_atr(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int = 14
+) -> Tuple[np.ndarray, float]:
+    """
+    Calculate Average True Range (ATR).
+
+    ATR is a volatility measure: average of True Range over period bars.
+    True Range = max(high - low, abs(high - prev_close), abs(low - prev_close))
+
+    Args:
+        high: High prices array
+        low: Low prices array
+        close: Close prices array
+        period: Lookback period for averaging (default 14)
+
+    Returns:
+        Tuple of (atr_series, current_atr)
+        - atr_series: Full ATR values for all bars
+        - current_atr: Most recent ATR value
+    """
+    import numpy as np
+
+    if len(high) == 0 or len(low) == 0 or len(close) == 0:
+        return np.array([]), 0.0
+
+    # Calculate True Range for each bar
+    tr = np.zeros(len(high), dtype=np.float64)
+
+    for i in range(len(high)):
+        if i == 0:
+            # First bar: TR = high - low
+            tr[i] = high[i] - low[i]
+        else:
+            # TR = max(H-L, |H-prevC|, |L-prevC|)
+            tr[i] = max(
+                high[i] - low[i],
+                abs(high[i] - close[i-1]),
+                abs(low[i] - close[i-1])
+            )
+
+    # Calculate ATR as moving average of TR
+    atr = np.zeros_like(tr)
+    for i in range(len(tr)):
+        if i < period - 1:
+            # Not enough bars: use expanding average
+            atr[i] = np.mean(tr[:i+1])
+        else:
+            # Full period available: use rolling average
+            atr[i] = np.mean(tr[i-period+1:i+1])
+
+    current_atr = atr[-1] if len(atr) > 0 else 0.0
+
+    return atr, current_atr
