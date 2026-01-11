@@ -151,6 +151,42 @@ class Channel:
         lower = self.lower_line[bar_index]
         return ((price - lower) / price) * 100 if price > 0 else 0.0
 
+    def distance_to_upper_atr_normalized(
+        self,
+        atr_value: float,
+        bar_index: int = -1
+    ) -> float:
+        """Distance to upper bound, normalized by ATR (volatility-adjusted)."""
+        if atr_value <= 0 or self.close is None:
+            return 0.0
+        price = self.close[bar_index]
+        upper = self.upper_line[bar_index]
+        return (upper - price) / atr_value
+
+    def distance_to_lower_atr_normalized(
+        self,
+        atr_value: float,
+        bar_index: int = -1
+    ) -> float:
+        """Distance to lower bound, normalized by ATR (volatility-adjusted)."""
+        if atr_value <= 0 or self.close is None:
+            return 0.0
+        price = self.close[bar_index]
+        lower = self.lower_line[bar_index]
+        return (price - lower) / atr_value
+
+    def distance_to_nearest_atr_normalized(
+        self,
+        atr_value: float,
+        bar_index: int = -1
+    ) -> float:
+        """Distance to nearest boundary, normalized by ATR."""
+        if atr_value <= 0:
+            return float('inf')
+        dist_upper = self.distance_to_upper_atr_normalized(atr_value, bar_index)
+        dist_lower = self.distance_to_lower_atr_normalized(atr_value, bar_index)
+        return min(dist_upper, dist_lower)
+
 
 def detect_bounces(
     high: np.ndarray,
