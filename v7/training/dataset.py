@@ -62,11 +62,13 @@ from .scanning import scan_valid_channels as _parallel_scan_valid_channels
 #            Supports both single-window (v10.0.0 compatible) and multi-window modes.
 # - v12.0.0: Added 15 VIX-channel interaction features (VIX_FEATURES 6→21, TOTAL_FEATURES 761→776).
 #            BounceRecord now captures VIX context at bounces. New VIXChannelFeatures dataclass.
-CACHE_VERSION = "v12.0.0"
+# - v13.0.0: Added 33 momentum features (TOTAL_FEATURES 776→809). Includes momentum strength,
+#            direction, duration, and reversion metrics for all 11 timeframes.
+CACHE_VERSION = "v13.0.0"
 
 # Supported cache versions for migration (read-only compatibility)
 # These older versions can be loaded but will trigger rebuild recommendation
-COMPATIBLE_CACHE_VERSIONS = ["v11.0.0", "v10.0.0", "v9.0.0", "v8.0.0", "v7.3.0", "v7.2.0", "v7.1.0"]
+COMPATIBLE_CACHE_VERSIONS = ["v12.0.0", "v11.0.0", "v10.0.0", "v9.0.0", "v8.0.0", "v7.3.0", "v7.2.0", "v7.1.0"]
 
 
 def get_cache_metadata_path(cache_path: Path) -> Path:

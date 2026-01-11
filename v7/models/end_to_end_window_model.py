@@ -446,7 +446,7 @@ class EndToEndWindowModel(nn.Module):
 
     def __init__(
         self,
-        feature_dim: int = 776,
+        feature_dim: int = 809,
         window_embed_dim: int = 128,
         num_windows: int = 8,
         temperature: float = 1.0,
@@ -475,7 +475,7 @@ class EndToEndWindowModel(nn.Module):
         Parameters:
         ----------
         feature_dim : int, optional
-            Dimension of input features per window. Default is 776, matching
+            Dimension of input features per window. Default is 809, matching
             TOTAL_FEATURES from v7/features/feature_ordering.py.
 
         window_embed_dim : int, optional
@@ -963,7 +963,7 @@ class TemperatureScheduler:
 # =============================================================================
 
 def create_end_to_end_model(
-    feature_dim: int = 776,
+    feature_dim: int = 809,
     window_embed_dim: int = 128,
     num_windows: int = 8,
     temperature: float = 1.0,

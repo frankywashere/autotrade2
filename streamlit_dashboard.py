@@ -458,7 +458,7 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
         if is_end_to_end and END_TO_END_AVAILABLE:
             st.info("🔄 Detected EndToEndWindowModel (Phase 2b)")
             model = create_end_to_end_model(
-                feature_dim=776,
+                feature_dim=809,
                 window_embed_dim=128,
                 num_windows=8,
                 hidden_dim=hidden_dim,
@@ -740,11 +740,11 @@ def make_predictions(
                         window_valid_list.append(False)
                 else:
                     # Use zeros for missing windows
-                    per_window_features.append(np.zeros(776, dtype=np.float32))
+                    per_window_features.append(np.zeros(809, dtype=np.float32))
                     window_scores_list.append([0.0, 0.0, 0.0, 0.0, 0.0])
                     window_valid_list.append(False)
 
-            # Stack into tensors: [1, 8, 776]
+            # Stack into tensors: [1, 8, 809]
             per_window_tensor = torch.from_numpy(np.stack(per_window_features)).float().unsqueeze(0)
             window_scores_tensor = torch.tensor([window_scores_list], dtype=torch.float32)
             window_valid_tensor = torch.tensor([window_valid_list], dtype=torch.bool)

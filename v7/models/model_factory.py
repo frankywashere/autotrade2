@@ -117,7 +117,7 @@ def create_model_with_window_selection(
             temperature=config.get('temperature', 1.0),
             use_gumbel=config.get('use_gumbel', False),
             num_windows=config.get('num_windows', 8),
-            feature_dim=config.get('feature_dim', 776),
+            feature_dim=config.get('feature_dim', 809),
             # SE-block parameters
             use_se_blocks=config.get('use_se_blocks', False),
             se_reduction_ratio=config.get('se_reduction_ratio', 8),

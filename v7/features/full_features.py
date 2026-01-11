@@ -134,7 +134,7 @@ class TSLAChannelFeatures:
     # ATR-normalized boundary distances
     distance_to_upper_atr: float = 0.0
     distance_to_lower_atr: float = 0.0
-    distance_to_nearest_atr: float = float('inf')
+    distance_to_nearest_atr: float = 999.0
 
     # Containment against longer TFs
     containments: Dict[str, ContainmentInfo] = field(default_factory=dict)
@@ -385,7 +385,7 @@ def extract_tsla_channel_features(
     # Calculate ATR-normalized distances
     distance_to_upper_atr = 0.0
     distance_to_lower_atr = 0.0
-    distance_to_nearest_atr = float('inf')
+    distance_to_nearest_atr = 999.0
 
     if atr > 0 and channel.close is not None:
         current_price = channel.close[-1]
@@ -1188,7 +1188,7 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 # ATR-normalized distances (3)
                 0.0,   # distance_to_upper_atr
                 0.0,   # distance_to_lower_atr
-                float('inf'),  # distance_to_nearest_atr
+                999.0,  # distance_to_nearest_atr
                 # Exit tracking defaults (15: 10 original + 5 new return tracking)
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0, 0.0, 0.0,
