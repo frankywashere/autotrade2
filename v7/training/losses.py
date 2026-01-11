@@ -1215,6 +1215,16 @@ class CombinedLoss(nn.Module):
             'trigger_tf': loss_trigger_tf.item() if isinstance(loss_trigger_tf, torch.Tensor) else loss_trigger_tf  # v9.0.0
         }
 
+        # Add raw loss tensors for gradient balancing (GradNorm, PCGrad)
+        # These retain gradients for computing per-task gradient norms
+        loss_dict['raw_losses'] = {
+            'duration': loss_duration,
+            'direction': loss_direction,
+            'next_channel': loss_next_channel,
+            'calibration': loss_calibration,
+            'trigger_tf': loss_trigger_tf if isinstance(loss_trigger_tf, torch.Tensor) else torch.tensor(0.0, device=loss_duration.device)
+        }
+
         # Add window selection loss to loss_dict if computed
         if loss_window_selection is not None:
             loss_dict['window_selection'] = loss_window_selection.item()

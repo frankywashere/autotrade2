@@ -620,16 +620,15 @@ class Trainer:
 
                 # Backward pass with gradient balancing
                 if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:
-                    # Get individual task losses from loss_dict
+                    # Get individual task losses from raw_losses (tensors with gradients)
+                    raw_losses = loss_dict.get('raw_losses', {})
                     task_losses = [
-                        loss_dict.get('duration', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('direction', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('next_channel', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('calibration', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('trigger_tf', torch.tensor(0.0, device=self.device)),
+                        raw_losses.get('duration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('direction', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('next_channel', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('calibration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('trigger_tf', torch.tensor(0.0, device=self.device, requires_grad=True)),
                     ]
-                    # Convert to tensors if they are floats
-                    task_losses = [torch.tensor(l, device=self.device) if isinstance(l, (int, float)) else l for l in task_losses]
 
                     # Get shared parameters (encoder - not head parameters)
                     shared_params = [p for n, p in self.model.named_parameters()
@@ -644,16 +643,15 @@ class Trainer:
                     self.scaler.scale(loss).backward()
 
                 elif self.gradient_balancing == 'pcgrad' and self.grad_balancer is not None:
-                    # Get individual task losses
+                    # Get individual task losses from raw_losses (tensors with gradients)
+                    raw_losses = loss_dict.get('raw_losses', {})
                     task_losses = [
-                        loss_dict.get('duration', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('direction', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('next_channel', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('calibration', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('trigger_tf', torch.tensor(0.0, device=self.device)),
+                        raw_losses.get('duration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('direction', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('next_channel', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('calibration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('trigger_tf', torch.tensor(0.0, device=self.device, requires_grad=True)),
                     ]
-                    # Convert to tensors if they are floats
-                    task_losses = [torch.tensor(l, device=self.device, requires_grad=True) if isinstance(l, (int, float)) else l for l in task_losses]
 
                     # Apply PCGrad - this sets gradients directly
                     loss = self.grad_balancer.apply(self.model, task_losses)
@@ -680,16 +678,15 @@ class Trainer:
 
                 # Backward pass with gradient balancing
                 if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:
-                    # Get individual task losses from loss_dict
+                    # Get individual task losses from raw_losses (tensors with gradients)
+                    raw_losses = loss_dict.get('raw_losses', {})
                     task_losses = [
-                        loss_dict.get('duration', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('direction', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('next_channel', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('calibration', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('trigger_tf', torch.tensor(0.0, device=self.device)),
+                        raw_losses.get('duration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('direction', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('next_channel', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('calibration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('trigger_tf', torch.tensor(0.0, device=self.device, requires_grad=True)),
                     ]
-                    # Convert to tensors if they are floats
-                    task_losses = [torch.tensor(l, device=self.device) if isinstance(l, (int, float)) else l for l in task_losses]
 
                     # Get shared parameters (encoder - not head parameters)
                     shared_params = [p for n, p in self.model.named_parameters()
@@ -704,16 +701,15 @@ class Trainer:
                     loss.backward()
 
                 elif self.gradient_balancing == 'pcgrad' and self.grad_balancer is not None:
-                    # Get individual task losses
+                    # Get individual task losses from raw_losses (tensors with gradients)
+                    raw_losses = loss_dict.get('raw_losses', {})
                     task_losses = [
-                        loss_dict.get('duration', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('direction', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('next_channel', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('calibration', torch.tensor(0.0, device=self.device)),
-                        loss_dict.get('trigger_tf', torch.tensor(0.0, device=self.device)),
+                        raw_losses.get('duration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('direction', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('next_channel', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('calibration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('trigger_tf', torch.tensor(0.0, device=self.device, requires_grad=True)),
                     ]
-                    # Convert to tensors if they are floats
-                    task_losses = [torch.tensor(l, device=self.device, requires_grad=True) if isinstance(l, (int, float)) else l for l in task_losses]
 
                     # Apply PCGrad - this sets gradients directly
                     loss = self.grad_balancer.apply(self.model, task_losses)
