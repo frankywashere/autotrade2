@@ -253,19 +253,31 @@ Experiments to improve duration prediction while maintaining direction accuracy.
 | EXP29 | Early Stopping pat=2 | `--early-stopping 2 --epochs 8` | 63.9% | 2.37 | Stopped at epoch 5, slightly worse |
 | EXP30 | Lower LR | `--lr 0.0003 --epochs 40` | CRASHED | - | Memory/segfault |
 | EXP31 | Shared + PCGrad | `--shared-heads --gradient-balancing pcgrad` | 43.4% | - | Complete failure |
-| WF_W1 | Walk-forward Window 1 | EXP27 config, 3-month val window | 61.2% | 2.31 | Lower than single split (distribution shift) |
+| WF_W1 | Walk-forward Window 1 (buggy) | EXP27 config, 3-month val window | 61.2% | 2.31 | Crashed after Window 1 |
+| **WF_FINAL** | **Walk-forward 3 windows (fixed)** | **Batch=32, expanding windows** | **67.45% ± 4.24%** | **5.82 ± 0.18 bars MAE** | **PRIMARY ESTIMATE** |
+
+### Walk-Forward Detailed Results (Fixed Survival Loss):
+
+| Window | Val Period | Direction Acc | Duration MAE | Duration Loss | Best Epoch |
+|--------|------------|---------------|--------------|---------------|------------|
+| 1      | 2024-12 → 2025-03 | 63.5% | 5.59 bars | 1.96 | 10 |
+| 2      | 2025-03 → 2025-06 | 73.3% | 6.02 bars | 1.95 | 19 |
+| 3      | 2025-06 → 2025-09 | 65.5% | 5.86 bars | 1.92 | 5 |
+| **Average** | **All windows** | **67.45% ± 4.24%** | **5.82 ± 0.18 bars** | **1.94 ± 0.02** | **11.3** |
 
 ### Key Findings (Duration Experiments):
 
-1. **Survival loss + learnable weights is BEST: 64.8% direction, 2.39 duration (EXP27)**
-2. **TCN adds temporal patterns: 64.0% direction** - but combining with learnable hurts (redundancy)
-3. **Shared heads + PCGrad completely failed** - 43.4% direction (do NOT use)
-4. **Two-stage duration pretraining hurts performance** - 59.3% vs 64.8%
-5. **Survival loss models time-to-event better than Huber/Gaussian** - best duration loss
-6. **Learnable task weights auto-balance objectives better than fixed weights**
-7. **Models peak very early (epoch 2-6) then overfit** - consistent across all experiments
-8. **Walk-forward shows distribution shift** - Window 1 only 61.2% vs 64.8% single split
-9. **Early stopping too aggressive** - patience=2 stops at epoch 5, gives 63.9% (suboptimal)
+1. **Walk-forward is PRIMARY estimate: 67.45% ± 4.24% direction, 5.82 ± 0.18 bars MAE**
+2. **Multi-seed stable performance: 60.7% ± 1.7% direction** (single split)
+3. **Critical bug fixed**: Survival NLL now uses S(t-1) for correct likelihood
+4. **Duration metrics now meaningful**: MAE computed from hazard-derived expected duration
+5. **Survival loss models time-to-event better than Huber/Gaussian**
+6. **Learnable task weights auto-balance better than fixed weights**
+7. **TCN adds temporal patterns: 64.0% direction** - but combining with learnable hurts (redundancy)
+8. **Shared heads + PCGrad completely failed** - 43.4% direction (do NOT use)
+9. **Two-stage duration pretraining hurts performance**
+10. **Models peak very early (epoch 2-11) then overfit** - use early stopping
+11. **Walk-forward variance is higher** - samples different market regimes (more realistic)
 
 ### Multi-Seed Results (EXP27 with Fixed Survival Loss):
 
