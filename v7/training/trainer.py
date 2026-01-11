@@ -57,8 +57,13 @@ class GradNormBalancer:
         for loss in losses:
             # Compute gradients
             grads = torch.autograd.grad(loss, shared_params, retain_graph=True, allow_unused=True)
-            # Compute L2 norm of gradients
-            grad_norm = torch.sqrt(sum((g ** 2).sum() for g in grads if g is not None) + 1e-8)
+            # Compute L2 norm of gradients - ensure result is a tensor even if all grads are None
+            grad_squared_sums = [g.pow(2).sum() for g in grads if g is not None]
+            if grad_squared_sums:
+                grad_norm = torch.sqrt(sum(grad_squared_sums) + 1e-8)
+            else:
+                # No gradients - return small norm to avoid division issues
+                grad_norm = torch.tensor(1e-8, device=self.device)
             grad_norms.append(grad_norm)
         return torch.stack(grad_norms)
 
