@@ -239,22 +239,29 @@ Experiments to improve duration prediction while maintaining direction accuracy.
 | Exp | Name | Config | Dir Acc | Duration Val | Notes |
 |-----|------|--------|---------|--------------|-------|
 | EXP17b | Huber dur_w=4.0 | `--duration-loss huber --weight-duration 4.0` | 60.7% | 5.65 | Huber slightly worse than Gaussian NLL |
-| EXP18b | Survival Loss | `--duration-loss survival` | FAILED | - | Tensor shape mismatch - model needs duration_hazard output |
+| EXP18b | Survival Loss | `--duration-loss survival` | FIXED | - | Now working after adding duration_hazard output |
 | EXP19c | Two-Stage (dur first) | `--two-stage-training --stage1-task duration --stage1-epochs 5` | 59.3% | 2.68 | Duration pretraining didn't help |
-| **EXP20d** | **Huber dur_w=5.0** | `--duration-loss huber --weight-duration 5.0` | **62.6%** | 5.59 | **Matches best! Duration focus doesn't hurt direction** |
+| EXP20d | Huber dur_w=5.0 | `--duration-loss huber --weight-duration 5.0` | 62.6% | 5.59 | Good but not best |
+| EXP21 | Baseline (Gaussian NLL) | `--duration-loss gaussian_nll --weight-duration 2.5` | 61.8% | 2.54 | Baseline with duration metrics |
+| EXP22 | Survival Loss | `--duration-loss survival --weight-duration 5.0` | 63.7% | 2.39 | Great baseline with survival |
+| EXP23 | Huber delta=0.5 | `--duration-loss huber --huber-delta 0.5 --weight-duration 5.0` | 62.3% | 2.85 | Smaller delta didn't help |
+| EXP24 | Huber dur_w=8.0 | `--duration-loss huber --weight-duration 8.0` | 63.3% | 5.56 | High weight decent direction but worse duration |
+| EXP26 | Survival + TCN | `--duration-loss survival --use-tcn --tcn-kernel-size 5 --tcn-layers 3` | 64.0% | 2.38 | TCN helps direction slightly |
+| **EXP27** | **Survival + Learnable** | `--duration-loss survival --weight-mode learnable --min-duration-precision 0.4` | **64.8%** | **2.39** | **NEW BEST!** |
 
 ### Key Findings (Duration Experiments):
 
-1. **Huber loss with duration_weight=5.0 matches best direction accuracy (62.6%)** while potentially improving duration
-2. **Two-stage duration pretraining hurts performance** - 59.3% vs 62.6% baseline
-3. **Survival loss needs model changes** - requires duration_hazard logits output
-4. **Duration weight up to 5.0 doesn't hurt direction** - can focus on duration without sacrificing direction accuracy
+1. **Survival loss + learnable weights is BEST: 64.8% direction, 2.39 duration**
+2. **TCN adds temporal patterns and helps: 64.0% direction**
+3. **Two-stage duration pretraining hurts performance** - 59.3% vs 64.8%
+4. **Survival loss models time-to-event better than mean-only losses**
+5. **Learnable task weights auto-balance objectives better than fixed weights**
 
-### Recommended Duration Configuration:
+### Recommended Duration Configuration (BEST - EXP27):
 
 ```bash
 python3 train.py --no-interactive \
-    --run-name duration_optimized \
+    --run-name duration_best_survival_learnable \
     --hidden-dim 64 \
     --cfc-units 96 \
     --attention-heads 4 \
@@ -264,10 +271,9 @@ python3 train.py --no-interactive \
     --epochs 20 \
     --batch-size 64 \
     --lr 0.001 \
-    --weight-direction 4.0 \
-    --weight-duration 5.0 \
-    --duration-loss huber \
-    --huber-delta 1.0 \
+    --duration-loss survival \
+    --weight-mode learnable \
+    --min-duration-precision 0.4 \
     --step 25 \
     --train-end 2024-01-01 \
     --val-end 2024-12-31
@@ -277,13 +283,15 @@ python3 train.py --no-interactive \
 
 ## Next Experiments to Try
 
-1. [x] **Huber loss for duration**: Better than Gaussian NLL? - Tested, works well
-2. [x] **Two-stage training**: Pretrain on duration - Tested, doesn't help
-3. [x] **Survival loss**: Needs model changes for hazard output
-4. [ ] **Duration weight=6.0-8.0**: Can we push duration focus further?
-5. [ ] **Lower huber delta (0.5)**: More aggressive outlier handling
-6. [ ] **Auxiliary duration targets**: Add distance-to-boundary features
-7. [ ] **Full walk-forward validation**: Test best config on proper temporal splits
+1. [x] **Huber loss for duration**: Tested - not better than survival
+2. [x] **Two-stage training**: Tested - doesn't help
+3. [x] **Survival loss**: 63.7% direction, 2.39 duration
+4. [x] **Duration weight=8.0**: Tested - helps direction but not duration
+5. [x] **Lower huber delta (0.5)**: Tested - didn't help
+6. [x] **Survival + TCN**: 64.0% direction - helps!
+7. [x] **Survival + learnable weights**: **64.8% direction - BEST!**
+8. [ ] **Survival + TCN + learnable**: Combine both improvements
+9. [ ] **Full walk-forward validation**: Test best config on proper temporal splits
 
 ---
 
