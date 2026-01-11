@@ -247,7 +247,8 @@ Experiments to improve duration prediction while maintaining direction accuracy.
 | EXP23 | Huber delta=0.5 | `--duration-loss huber --huber-delta 0.5 --weight-duration 5.0` | 62.3% | 2.85 | Smaller delta didn't help |
 | EXP24 | Huber dur_w=8.0 | `--duration-loss huber --weight-duration 8.0` | 63.3% | 5.56 | High weight decent direction but worse duration |
 | EXP26 | Survival + TCN | `--duration-loss survival --use-tcn --tcn-kernel-size 5 --tcn-layers 3` | 64.0% | 2.38 | TCN helps direction slightly |
-| **EXP27** | **Survival + Learnable** | `--duration-loss survival --weight-mode learnable --min-duration-precision 0.4` | **64.8%** | **2.39** | **BEST!** |
+| **EXP27** | **Survival + Learnable** | `--duration-loss survival --weight-mode learnable --min-duration-precision 0.4` | **64.8%** | **2.39** | **BUGGY CODE** (before survival fix) |
+| EXP27_S1-5 | Multi-seed (fixed code) | 5 seeds with fixed survival NLL | **60.7% ± 1.7%** | **6.28 ± 0.06 bars MAE** | **True stable performance** |
 | EXP28 | Survival + TCN + Learnable | Combined EXP26 + EXP27 | 64.2% | 2.40 | Worse than learnable alone - redundancy |
 | EXP29 | Early Stopping pat=2 | `--early-stopping 2 --epochs 8` | 63.9% | 2.37 | Stopped at epoch 5, slightly worse |
 | EXP30 | Lower LR | `--lr 0.0003 --epochs 40` | CRASHED | - | Memory/segfault |
@@ -266,11 +267,29 @@ Experiments to improve duration prediction while maintaining direction accuracy.
 8. **Walk-forward shows distribution shift** - Window 1 only 61.2% vs 64.8% single split
 9. **Early stopping too aggressive** - patience=2 stops at epoch 5, gives 63.9% (suboptimal)
 
+### Multi-Seed Results (EXP27 with Fixed Survival Loss):
+
+| Seed | Direction Acc | Duration MAE | Duration Loss | Best Epoch |
+|------|---------------|--------------|---------------|------------|
+| 42   | 59.6%         | 6.30 bars    | 2.0411        | 3          |
+| 123  | 63.8%         | 6.23 bars    | 2.0430        | 5          |
+| 456  | 59.7%         | 6.38 bars    | 2.0461        | 2          |
+| 789  | 59.5%         | 6.26 bars    | 2.0419        | 3          |
+| 999  | 61.1%         | 6.23 bars    | 2.0437        | 3          |
+| **Mean** | **60.7% ± 1.7%** | **6.28 ± 0.06 bars** | **2.0432 ± 0.002** | **3.2** |
+
+**Bug Fix Impact:**
+- Original EXP27 (buggy survival NLL): 64.8% direction, 2.39 duration loss (no MAE)
+- Fixed survival NLL: 60.7% direction, 2.04 duration loss, **6.28 bars MAE**
+- Trade-off: Fixing the bug made duration better but direction worse
+- Why: Fixed NLL strengthens duration gradients, trades off with direction in shared capacity
+
 ### Codex Recommendations for Next Steps:
 
-1. **Multi-seed validation** - Run EXP27 with 3-5 different seeds to verify 64.8% is stable (not lucky)
-2. **Memory optimization** - Smaller batch size or gradient checkpointing for walk-forward
-3. **Walk-forward validation** - Need to complete all 3 windows to assess temporal generalization
+1. [x] **Multi-seed validation** - DONE: 60.7% ± 1.7% stable (not 64.8%)
+2. [ ] **Walk-forward validation with batch=32** - Running to assess temporal generalization
+3. [ ] **Tune task weights** - Balance direction/duration trade-off explicitly
+4. [ ] **Gradient norm analysis** - Understand direction vs duration gradient magnitudes
 
 ### Recommended Duration Configuration (BEST - EXP27):
 
