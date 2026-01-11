@@ -2018,6 +2018,20 @@ class TrainingMonitor:
             f"{val_metrics.get('next_channel_acc', 0):.1%}",
         )
 
+        # Duration prediction metrics (MAE/RMSE in bars)
+        if 'duration_mae' in val_metrics:
+            table.add_row(
+                "Duration MAE",
+                "-",
+                f"{val_metrics.get('duration_mae', 0):.2f} bars",
+            )
+        if 'duration_rmse' in val_metrics:
+            table.add_row(
+                "Duration RMSE",
+                "-",
+                f"{val_metrics.get('duration_rmse', 0):.2f} bars",
+            )
+
         return table
 
     def create_progression_summary(self, epoch: int, val_metrics: Dict) -> str:

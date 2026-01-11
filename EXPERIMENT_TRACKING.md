@@ -274,25 +274,50 @@ Experiments to improve duration prediction while maintaining direction accuracy.
 
 ### Recommended Duration Configuration (BEST - EXP27):
 
+**Full Configuration (from run_config.json on server):**
+
 ```bash
 python3 train.py --no-interactive \
-    --run-name duration_best_survival_learnable \
+    --run-name exp27_survival_learnable \
+    --mode standard \
+    --device cuda \
     --hidden-dim 64 \
     --cfc-units 96 \
     --attention-heads 4 \
     --se-blocks \
     --se-ratio 8 \
     --dropout 0.2 \
+    --shared-heads false \
+    --use-tcn false \
+    --tcn-channels 64 \
+    --tcn-layers 2 \
+    --tcn-kernel-size 3 \
     --epochs 20 \
     --batch-size 64 \
     --lr 0.001 \
+    --optimizer adamw \
+    --weight-decay 0.0001 \
+    --gradient-clip 1.0 \
+    --scheduler cosine_restarts \
     --duration-loss survival \
+    --direction-loss bce \
     --weight-mode learnable \
     --min-duration-precision 0.4 \
+    --calibration-mode brier_per_tf \
+    --uncertainty-penalty 0.1 \
+    --focal-gamma 2.0 \
+    --huber-delta 1.0 \
+    --gradient-balancing none \
+    --early-stopping 15 \
+    --early-stopping-metric duration \
+    --two-stage-training false \
     --step 25 \
     --train-end 2024-01-01 \
-    --val-end 2024-12-31
+    --val-end 2024-12-31 \
+    --window-selection-strategy learned_selection
 ```
+
+**Results:** 64.8% direction accuracy, 2.39 duration loss (best epoch 3/20)
 
 ---
 
