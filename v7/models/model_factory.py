@@ -53,6 +53,9 @@ def create_model_with_window_selection(
             - use_multi_resolution: Enable multi-resolution prediction heads (default: False)
             - resolution_levels: Number of resolution levels (default: 3)
 
+            Survival/hazard loss parameters:
+            - num_hazard_bins: Number of bins for hazard prediction (default: 0 = disabled)
+
             For EndToEndWindowModel only:
             - window_embed_dim: Window embedding dimension (default: 128)
             - temperature: Softmax temperature for window selection (default: 1.0)
@@ -126,6 +129,8 @@ def create_model_with_window_selection(
             # Multi-resolution parameters
             use_multi_resolution=config.get('use_multi_resolution', False),
             resolution_levels=config.get('resolution_levels', 3),
+            # Survival/hazard loss parameters
+            num_hazard_bins=config.get('num_hazard_bins', 0),
         )
     else:
         # Standard model (Phase 2a)
@@ -146,6 +151,8 @@ def create_model_with_window_selection(
             # Multi-resolution parameters
             use_multi_resolution=config.get('use_multi_resolution', False),
             resolution_levels=config.get('resolution_levels', 3),
+            # Survival/hazard loss parameters
+            num_hazard_bins=config.get('num_hazard_bins', 0),
         )
 
     return model

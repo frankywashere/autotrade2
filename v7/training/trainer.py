@@ -784,6 +784,11 @@ class Trainer:
         total_next_channel_samples = 0.0  # Separate counter for next_channel
         total_trigger_tf_samples = 0.0  # v9.0.0
 
+        # Duration metrics accumulators (MAE and RMSE)
+        duration_mae_sum = 0.0
+        duration_mse_sum = 0.0
+        duration_valid_count = 0.0
+
         with torch.no_grad():
             for features, labels in tqdm(self.val_loader, desc="Validation"):
                 # Move to device
@@ -882,6 +887,17 @@ class Trainer:
                 total_valid_samples += direction_mask.sum().item()
                 total_next_channel_samples += next_channel_mask.sum().item()
 
+                # Duration metrics (MAE and RMSE)
+                duration_pred = predictions['duration_mean']
+                duration_target = targets['duration']
+                duration_mask = masks.get('duration_valid', torch.ones_like(duration_target))
+                duration_errors = torch.abs(duration_pred - duration_target)
+                duration_squared_errors = (duration_pred - duration_target) ** 2
+
+                duration_mae_sum += (duration_errors * duration_mask).sum().item()
+                duration_mse_sum += (duration_squared_errors * duration_mask).sum().item()
+                duration_valid_count += duration_mask.sum().item()
+
                 # v9.0.0: Calculate trigger_tf accuracy (aggregate-only, 21-class)
                 if ('aggregate' in predictions and
                     'trigger_tf_logits' in predictions.get('aggregate', {}) and
@@ -913,6 +929,10 @@ class Trainer:
         epoch_metrics['direction_acc'] = direction_correct / total_valid_samples if total_valid_samples > 0 else 0.0
         epoch_metrics['next_channel_acc'] = next_channel_correct / total_next_channel_samples if total_next_channel_samples > 0 else 0.0
         epoch_metrics['trigger_tf_acc'] = trigger_tf_correct / total_trigger_tf_samples if total_trigger_tf_samples > 0 else 0.0  # v9.0.0
+
+        # Duration MAE and RMSE metrics
+        epoch_metrics['duration_mae'] = duration_mae_sum / duration_valid_count if duration_valid_count > 0 else 0.0
+        epoch_metrics['duration_rmse'] = np.sqrt(duration_mse_sum / duration_valid_count) if duration_valid_count > 0 else 0.0
 
         return epoch_metrics
 
@@ -1104,8 +1124,9 @@ class Trainer:
             print(f"  Val Loss: {val_metrics['total']:.4f}")
             # v9.0.0: Include trigger_tf accuracy if present
             trigger_tf_str = f", TrigTF={val_metrics.get('trigger_tf_acc', 0):.3f}" if 'trigger_tf_acc' in val_metrics else ""
+            duration_mae_str = f", DurMAE={val_metrics.get('duration_mae', 0):.3f}" if 'duration_mae' in val_metrics else ""
             print(f"  Val Accuracies: Dir={val_metrics['direction_acc']:.3f}, "
-                  f"NextCh={val_metrics['next_channel_acc']:.3f}{trigger_tf_str}")
+                  f"NextCh={val_metrics['next_channel_acc']:.3f}{trigger_tf_str}{duration_mae_str}")
 
             # Check if this is the best model
             current_metric = val_metrics[self.config.early_stopping_metric]

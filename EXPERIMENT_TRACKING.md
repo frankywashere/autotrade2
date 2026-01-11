@@ -232,14 +232,58 @@ EndToEndWindowModel
 
 ---
 
+## Duration-Focused Experiments (2026-01-10)
+
+Experiments to improve duration prediction while maintaining direction accuracy.
+
+| Exp | Name | Config | Dir Acc | Duration Val | Notes |
+|-----|------|--------|---------|--------------|-------|
+| EXP17b | Huber dur_w=4.0 | `--duration-loss huber --weight-duration 4.0` | 60.7% | 5.65 | Huber slightly worse than Gaussian NLL |
+| EXP18b | Survival Loss | `--duration-loss survival` | FAILED | - | Tensor shape mismatch - model needs duration_hazard output |
+| EXP19c | Two-Stage (dur first) | `--two-stage-training --stage1-task duration --stage1-epochs 5` | 59.3% | 2.68 | Duration pretraining didn't help |
+| **EXP20d** | **Huber dur_w=5.0** | `--duration-loss huber --weight-duration 5.0` | **62.6%** | 5.59 | **Matches best! Duration focus doesn't hurt direction** |
+
+### Key Findings (Duration Experiments):
+
+1. **Huber loss with duration_weight=5.0 matches best direction accuracy (62.6%)** while potentially improving duration
+2. **Two-stage duration pretraining hurts performance** - 59.3% vs 62.6% baseline
+3. **Survival loss needs model changes** - requires duration_hazard logits output
+4. **Duration weight up to 5.0 doesn't hurt direction** - can focus on duration without sacrificing direction accuracy
+
+### Recommended Duration Configuration:
+
+```bash
+python3 train.py --no-interactive \
+    --run-name duration_optimized \
+    --hidden-dim 64 \
+    --cfc-units 96 \
+    --attention-heads 4 \
+    --se-blocks \
+    --se-ratio 8 \
+    --dropout 0.2 \
+    --epochs 20 \
+    --batch-size 64 \
+    --lr 0.001 \
+    --weight-direction 4.0 \
+    --weight-duration 5.0 \
+    --duration-loss huber \
+    --huber-delta 1.0 \
+    --step 25 \
+    --train-end 2024-01-01 \
+    --val-end 2024-12-31
+```
+
+---
+
 ## Next Experiments to Try
 
-1. [ ] **direction_weight=8.0**: See if even higher helps
-2. [ ] **Survival loss for duration**: Replace MSE with hazard-based loss
-3. [ ] **GradNorm**: Dynamic task weighting to balance direction/duration
-4. [ ] **Two-stage training**: Pretrain on direction, then fine-tune jointly
-5. [ ] **Auxiliary duration targets**: Add distance-to-boundary features
-6. [ ] **Full walk-forward validation**: Test best config on proper temporal splits
+1. [x] **Huber loss for duration**: Better than Gaussian NLL? - Tested, works well
+2. [x] **Two-stage training**: Pretrain on duration - Tested, doesn't help
+3. [x] **Survival loss**: Needs model changes for hazard output
+4. [ ] **Duration weight=6.0-8.0**: Can we push duration focus further?
+5. [ ] **Lower huber delta (0.5)**: More aggressive outlier handling
+6. [ ] **Auxiliary duration targets**: Add distance-to-boundary features
+7. [ ] **Full walk-forward validation**: Test best config on proper temporal splits
 
 ---
 

@@ -1447,7 +1447,7 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         # Multi-task learning options
         "gradient_balancing": gradient_balancing,
         "gradnorm_alpha": gradnorm_alpha,
-        "two_stage": two_stage,
+        "two_stage_training": two_stage,
         "stage1_epochs": stage1_epochs,
         "stage1_task": stage1_task,
         # Loss function options
@@ -1909,7 +1909,7 @@ def display_config_summary(config: Dict, skip_confirm: bool = False):
         train_tree.add("Gradient Balancing: None")
 
     # Two-stage training info
-    two_stage = config['training'].get('two_stage', False)
+    two_stage = config['training'].get('two_stage_training', False)
     if two_stage:
         stage1_epochs = config['training'].get('stage1_epochs', 5)
         stage1_task = config['training'].get('stage1_task', 'direction')
@@ -2552,6 +2552,9 @@ def run_walk_forward_training(
             # Create model for this window
             # Use EndToEndWindowModel for learned_selection, otherwise HierarchicalCfCModel
             strategy = config["data"].get("window_selection_strategy", "bounce_first")
+            # Compute num_hazard_bins for survival loss (50 bins when survival, 0 otherwise)
+            duration_loss_type = config["training"].get("duration_loss", "gaussian_nll")
+            num_hazard_bins = 50 if duration_loss_type == "survival" else 0
             with console.status("[bold green]Creating model...", spinner="dots"):
                 if strategy == "learned_selection":
                     model = create_end_to_end_model(
@@ -2564,6 +2567,7 @@ def run_walk_forward_training(
                         se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                         use_multi_resolution=config["model"].get("use_multi_resolution", False),
                         resolution_levels=config["model"].get("resolution_levels", 3),
+                        num_hazard_bins=num_hazard_bins,
                         device=config["device"],
                     )
                 else:
@@ -2581,6 +2585,7 @@ def run_walk_forward_training(
                         tcn_channels=config["model"].get("tcn_channels", 64),
                         tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
                         tcn_layers=config["model"].get("tcn_layers", 2),
+                        num_hazard_bins=num_hazard_bins,
                         device=config["device"],
                     )
 
@@ -2617,8 +2622,8 @@ def run_walk_forward_training(
                 # Gradient balancing
                 gradient_balancing=config["training"].get("gradient_balancing", "none"),
                 gradnorm_alpha=config["training"].get("gradnorm_alpha", 1.5),
-                # Two-stage training (config uses 'two_stage', TrainingConfig uses 'two_stage_training')
-                two_stage_training=config["training"].get("two_stage", False),
+                # Two-stage training
+                two_stage_training=config["training"].get("two_stage_training", False),
                 stage1_epochs=config["training"].get("stage1_epochs", 5),
                 stage1_task=config["training"].get("stage1_task", "direction"),
                 # Loss type configuration (config uses 'duration_loss'/'direction_loss', TrainingConfig uses 'duration_loss_type'/'direction_loss_type')
@@ -3056,6 +3061,9 @@ def main():
                 )
 
                 # Create model
+                # Compute num_hazard_bins for survival loss (50 bins when survival, 0 otherwise)
+                duration_loss_type = config["training"].get("duration_loss", "gaussian_nll")
+                num_hazard_bins = 50 if duration_loss_type == "survival" else 0
                 console.print("[bold cyan]Creating Model...[/bold cyan]\n")
                 with console.status("[bold green]Initializing model...", spinner="dots"):
                     if strategy == "learned_selection":
@@ -3069,6 +3077,7 @@ def main():
                             se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                             use_multi_resolution=config["model"].get("use_multi_resolution", False),
                             resolution_levels=config["model"].get("resolution_levels", 3),
+                            num_hazard_bins=num_hazard_bins,
                             device=config["device"],
                         )
                     else:
@@ -3086,6 +3095,7 @@ def main():
                             tcn_channels=config["model"].get("tcn_channels", 64),
                             tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
                             tcn_layers=config["model"].get("tcn_layers", 2),
+                            num_hazard_bins=num_hazard_bins,
                             device=config["device"],
                         )
 
@@ -3120,8 +3130,8 @@ def main():
                     # Gradient balancing
                     gradient_balancing=config["training"].get("gradient_balancing", "none"),
                     gradnorm_alpha=config["training"].get("gradnorm_alpha", 1.5),
-                    # Two-stage training (config uses 'two_stage', TrainingConfig uses 'two_stage_training')
-                    two_stage_training=config["training"].get("two_stage", False),
+                    # Two-stage training
+                    two_stage_training=config["training"].get("two_stage_training", False),
                     stage1_epochs=config["training"].get("stage1_epochs", 5),
                     stage1_task=config["training"].get("stage1_task", "direction"),
                     # Loss type configuration (config uses 'duration_loss'/'direction_loss', TrainingConfig uses 'duration_loss_type'/'direction_loss_type')
@@ -3444,6 +3454,9 @@ def main():
         # Create model
         # Use EndToEndWindowModel for learned_selection, otherwise HierarchicalCfCModel
         strategy = config["data"].get("window_selection_strategy", "bounce_first")
+        # Compute num_hazard_bins for survival loss (50 bins when survival, 0 otherwise)
+        duration_loss_type = config["training"].get("duration_loss", "gaussian_nll")
+        num_hazard_bins = 50 if duration_loss_type == "survival" else 0
         console.print("[bold cyan]Creating Model...[/bold cyan]\n")
         with console.status("[bold green]Initializing model...", spinner="dots"):
             if strategy == "learned_selection":
@@ -3457,6 +3470,7 @@ def main():
                     se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                     use_multi_resolution=config["model"].get("use_multi_resolution", False),
                     resolution_levels=config["model"].get("resolution_levels", 3),
+                    num_hazard_bins=num_hazard_bins,
                     device=config["device"],
                 )
                 console.print("[yellow]ℹ[/yellow] Using EndToEndWindowModel for learned_selection strategy\n")
@@ -3475,6 +3489,7 @@ def main():
                     tcn_channels=config["model"].get("tcn_channels", 64),
                     tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
                     tcn_layers=config["model"].get("tcn_layers", 2),
+                    num_hazard_bins=num_hazard_bins,
                     device=config["device"],
                 )
 
@@ -3511,8 +3526,8 @@ def main():
             # Gradient balancing
             gradient_balancing=config["training"].get("gradient_balancing", "none"),
             gradnorm_alpha=config["training"].get("gradnorm_alpha", 1.5),
-            # Two-stage training (config uses 'two_stage', TrainingConfig uses 'two_stage_training')
-            two_stage_training=config["training"].get("two_stage", False),
+            # Two-stage training
+            two_stage_training=config["training"].get("two_stage_training", False),
             stage1_epochs=config["training"].get("stage1_epochs", 5),
             stage1_task=config["training"].get("stage1_task", "direction"),
             # Loss type configuration (config uses 'duration_loss'/'direction_loss', TrainingConfig uses 'duration_loss_type'/'direction_loss_type')

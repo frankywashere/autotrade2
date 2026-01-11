@@ -715,13 +715,14 @@ class DurationHead(nn.Module):
     - Can sample from distribution at inference
     """
 
-    def __init__(self, input_dim: int, hidden_dim: int = 64):
+    def __init__(self, input_dim: int, hidden_dim: int = 64, num_hazard_bins: int = 0):
         """
         Initialize duration head.
 
         Args:
             input_dim: Input dimension (from attention context)
             hidden_dim: Hidden layer dimension
+            num_hazard_bins: Number of bins for hazard prediction (0 = disabled)
         """
         super().__init__()
 
@@ -738,7 +739,12 @@ class DurationHead(nn.Module):
         self.mean_head = nn.Linear(hidden_dim // 2, 1)
         self.logstd_head = nn.Linear(hidden_dim // 2, 1)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Optional hazard head for survival analysis
+        self.num_hazard_bins = num_hazard_bins
+        if num_hazard_bins > 0:
+            self.hazard_head = nn.Linear(hidden_dim // 2, num_hazard_bins)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass.
 
@@ -748,6 +754,7 @@ class DurationHead(nn.Module):
         Returns:
             mean: [batch_size, 1] - predicted mean duration
             log_std: [batch_size, 1] - predicted log(standard deviation)
+            hazard: [batch_size, num_hazard_bins] or None - hazard logits for survival analysis
         """
         h = self.net(x)
 
@@ -759,7 +766,12 @@ class DurationHead(nn.Module):
         # which is appropriate for duration data ranging from 1 to 500 bars
         log_std = log_std.clamp(-2, 4)
 
-        return mean, log_std
+        # Compute hazard if enabled
+        hazard = None
+        if self.num_hazard_bins > 0:
+            hazard = self.hazard_head(h)
+
+        return mean, log_std, hazard
 
 
 class DirectionHead(nn.Module):
@@ -1679,6 +1691,7 @@ class HierarchicalCfCModel(nn.Module):
         tcn_channels: int = 64,
         tcn_kernel_size: int = 3,
         tcn_layers: int = 2,
+        num_hazard_bins: int = 0,
     ):
         """
         Initialize hierarchical CfC model.
@@ -1702,6 +1715,7 @@ class HierarchicalCfCModel(nn.Module):
             tcn_channels: Number of channels in TCN hidden layers (default: 64)
             tcn_kernel_size: Kernel size for TCN convolutions (default: 3)
             tcn_layers: Number of temporal blocks in TCN (default: 2)
+            num_hazard_bins: Number of bins for hazard prediction in SurvivalLoss (default: 0 = disabled)
         """
         super().__init__()
 
@@ -1711,6 +1725,7 @@ class HierarchicalCfCModel(nn.Module):
         self.shared_heads = shared_heads
         self.use_se_blocks = use_se_blocks
         self.use_tcn = use_tcn
+        self.num_hazard_bins = num_hazard_bins
 
         # Validate total input dimension against canonical value from feature_ordering
         assert self.config.total_features == TOTAL_FEATURES, \
@@ -1764,14 +1779,14 @@ class HierarchicalCfCModel(nn.Module):
         # Per-timeframe prediction heads
         if self.shared_heads:
             # SHARED: Single set of heads for all TFs (default, fewer parameters)
-            self.per_tf_duration_head = DurationHead(hidden_dim, hidden_dim // 2)
+            self.per_tf_duration_head = DurationHead(hidden_dim, hidden_dim // 2, num_hazard_bins)
             self.per_tf_direction_head = DirectionHead(hidden_dim, hidden_dim // 2)
             self.per_tf_next_channel_head = NextChannelDirectionHead(hidden_dim, hidden_dim // 2)
             self.per_tf_confidence_head = ConfidenceHead(hidden_dim, hidden_dim // 2)
         else:
             # SEPARATE: 11 separate heads per prediction type (more parameters, TF-specific)
             self.per_tf_duration_heads = nn.ModuleList([
-                DurationHead(hidden_dim, hidden_dim // 2)
+                DurationHead(hidden_dim, hidden_dim // 2, num_hazard_bins)
                 for _ in range(self.n_timeframes)
             ])
             self.per_tf_direction_heads = nn.ModuleList([
@@ -1788,7 +1803,7 @@ class HierarchicalCfCModel(nn.Module):
             ])
 
         # Aggregate prediction heads (richer, use full attention context) - always shared
-        self.agg_duration_head = DurationHead(context_dim, hidden_dim)
+        self.agg_duration_head = DurationHead(context_dim, hidden_dim, num_hazard_bins)
         self.agg_direction_head = DirectionHead(context_dim, hidden_dim)
         self.agg_next_channel_head = NextChannelDirectionHead(context_dim, hidden_dim)
         self.agg_confidence_head = ConfidenceHead(context_dim, hidden_dim)
@@ -1840,6 +1855,7 @@ class HierarchicalCfCModel(nn.Module):
             Dictionary with:
                 - duration_mean: [batch_size, 11]
                 - duration_log_std: [batch_size, 11]
+                - duration_hazard: [batch_size, 11, num_hazard_bins] or None (if num_hazard_bins > 0)
                 - direction_logits: [batch_size, 11]
                 - next_channel_logits: [batch_size, 11, 3]
                 - confidence: [batch_size, 11]
@@ -1919,6 +1935,7 @@ class HierarchicalCfCModel(nn.Module):
         # Other heads use raw embeddings to minimize parameter changes
         per_tf_durations_mean = []
         per_tf_durations_log_std = []
+        per_tf_hazards = []  # Optional hazard outputs for SurvivalLoss
         per_tf_directions = []
         per_tf_next_channels = []
         per_tf_confidences = []
@@ -1933,7 +1950,7 @@ class HierarchicalCfCModel(nn.Module):
             if self.shared_heads:
                 # Single shared head for all TFs
                 # v9.2: Duration uses ENRICHED embedding (with cross-TF context)
-                dur_mean, dur_log_std = self.per_tf_duration_head(enriched_embedding)
+                dur_mean, dur_log_std, dur_hazard = self.per_tf_duration_head(enriched_embedding)
                 # Other heads use raw embedding (unchanged)
                 dir_logits = self.per_tf_direction_head(embedding)
                 next_ch = self.per_tf_next_channel_head(embedding)
@@ -1941,7 +1958,7 @@ class HierarchicalCfCModel(nn.Module):
             else:
                 # Separate head per TF (TF-specific learned parameters)
                 # v9.2: Duration uses ENRICHED embedding (with cross-TF context)
-                dur_mean, dur_log_std = self.per_tf_duration_heads[tf_idx](enriched_embedding)
+                dur_mean, dur_log_std, dur_hazard = self.per_tf_duration_heads[tf_idx](enriched_embedding)
                 # Other heads use raw embedding (unchanged)
                 dir_logits = self.per_tf_direction_heads[tf_idx](embedding)
                 next_ch = self.per_tf_next_channel_heads[tf_idx](embedding)
@@ -1949,6 +1966,8 @@ class HierarchicalCfCModel(nn.Module):
 
             per_tf_durations_mean.append(dur_mean)
             per_tf_durations_log_std.append(dur_log_std)
+            if dur_hazard is not None:
+                per_tf_hazards.append(dur_hazard)
             per_tf_directions.append(dir_logits)  # [batch, 1] - binary logit for UP
             per_tf_next_channels.append(next_ch)
             per_tf_confidences.append(conf)
@@ -1964,7 +1983,7 @@ class HierarchicalCfCModel(nn.Module):
         # AGGREGATE PREDICTION (uses full attention context)
         # =====================================================================
 
-        agg_dur_mean, agg_dur_log_std = self.agg_duration_head(context)
+        agg_dur_mean, agg_dur_log_std, agg_dur_hazard = self.agg_duration_head(context)
         agg_direction = self.agg_direction_head(context)
         agg_next_channel = self.agg_next_channel_head(context)
         agg_confidence = self.agg_confidence_head(context)
@@ -2003,6 +2022,7 @@ class HierarchicalCfCModel(nn.Module):
             # Per-timeframe predictions (primary - used for training)
             'duration_mean': duration_mean,                    # [batch, 11]
             'duration_log_std': duration_log_std,              # [batch, 11]
+            'duration_hazard': torch.stack(per_tf_hazards, dim=1) if per_tf_hazards else None,  # [batch, 11, num_hazard_bins] or None
             'direction_logits': direction_logits,              # [batch, 11]
             'next_channel_logits': next_channel_logits,        # [batch, 11, 3]
             'confidence': confidence,                          # [batch, 11]
@@ -2015,6 +2035,7 @@ class HierarchicalCfCModel(nn.Module):
             'aggregate': {
                 'duration_mean': agg_dur_mean,                 # [batch, 1]
                 'duration_log_std': agg_dur_log_std,           # [batch, 1]
+                'duration_hazard': agg_dur_hazard,             # [batch, num_hazard_bins] or None
                 'direction_logits': agg_direction,             # [batch, 1] - binary logit
                 'next_channel_logits': agg_next_channel,       # [batch, 3]
                 'confidence': agg_confidence,                  # [batch, 1]
@@ -2343,6 +2364,7 @@ def create_model(
     tcn_channels: int = 64,
     tcn_kernel_size: int = 3,
     tcn_layers: int = 2,
+    num_hazard_bins: int = 0,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> HierarchicalCfCModel:
     """
@@ -2363,6 +2385,7 @@ def create_model(
         tcn_channels: Number of channels in TCN hidden layers (default: 64)
         tcn_kernel_size: Kernel size for TCN convolutions (default: 3)
         tcn_layers: Number of temporal blocks in TCN (default: 2)
+        num_hazard_bins: Number of bins for survival/hazard duration prediction (default: 0 = disabled)
         device: Device to place model on
 
     Returns:
@@ -2383,6 +2406,7 @@ def create_model(
         tcn_channels=tcn_channels,
         tcn_kernel_size=tcn_kernel_size,
         tcn_layers=tcn_layers,
+        num_hazard_bins=num_hazard_bins,
     )
 
     model = model.to(device)

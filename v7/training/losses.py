@@ -990,13 +990,34 @@ class CombinedLoss(nn.Module):
         # Compute individual losses
         # Handle different duration loss types
         if isinstance(self.duration_loss, SurvivalLoss):
-            # For survival loss, need hazard predictions
-            # This requires model changes to output hazard logits
+            # SurvivalLoss expects [batch, 50] hazard and [batch] target
+            # But we receive [batch, 11] per-timeframe data, so aggregate to batch level
+
+            # Get hazard predictions - aggregate across timeframes if needed
+            if 'duration_hazard' in predictions and predictions['duration_hazard'] is not None:
+                duration_hazard = predictions['duration_hazard']
+                if duration_hazard.dim() == 3:  # [batch, num_tfs, num_bins]
+                    duration_hazard = duration_hazard.mean(dim=1)  # [batch, num_bins]
+            else:
+                # Fallback: use duration_mean to create dummy hazard
+                duration_agg = predictions['duration_mean'].mean(dim=1)  # [batch]
+                duration_hazard = duration_agg.unsqueeze(-1).expand(-1, 50)  # [batch, 50]
+
+            # Aggregate target and mask to batch level
+            target_duration = targets['duration'].mean(dim=1)  # [batch]
+
+            if duration_mask is not None:
+                mask_agg = duration_mask.mean(dim=1)  # [batch]
+            else:
+                mask_agg = None
+
+            censored = (1 - targets.get('duration_valid', torch.ones_like(targets['duration']))).mean(dim=1)
+
             loss_duration = self.duration_loss(
-                predictions.get('duration_hazard', predictions['duration_mean'].unsqueeze(-1).expand(-1, 50)),
-                targets['duration'],
-                censored=(1 - targets.get('duration_valid', torch.ones_like(targets['duration']))),
-                mask=masks.get('duration')
+                duration_hazard,
+                target_duration,
+                censored=censored,
+                mask=mask_agg
             )
         elif isinstance(self.duration_loss, SimpleDurationLoss):
             # Huber/MSE loss only needs mean prediction
@@ -1456,12 +1477,34 @@ class EndToEndLoss(nn.Module):
         # Duration loss - THIS IS THE KEY: gradients from this loss flow back
         # through the window selection via the differentiable soft selection
         if isinstance(self.duration_loss, SurvivalLoss):
-            # For survival loss, need hazard predictions
+            # SurvivalLoss expects [batch, 50] hazard and [batch] target
+            # But we receive [batch, 11] per-timeframe data, so aggregate to batch level
+
+            # Get hazard predictions - aggregate across timeframes if needed
+            if 'duration_hazard' in predictions and predictions['duration_hazard'] is not None:
+                duration_hazard = predictions['duration_hazard']
+                if duration_hazard.dim() == 3:  # [batch, num_tfs, num_bins]
+                    duration_hazard = duration_hazard.mean(dim=1)  # [batch, num_bins]
+            else:
+                # Fallback: use duration_mean to create dummy hazard
+                duration_agg = predictions['duration_mean'].mean(dim=1)  # [batch]
+                duration_hazard = duration_agg.unsqueeze(-1).expand(-1, 50)  # [batch, 50]
+
+            # Aggregate target and mask to batch level
+            target_duration = targets['duration'].mean(dim=1)  # [batch]
+
+            if duration_mask is not None:
+                mask_agg = duration_mask.mean(dim=1)  # [batch]
+            else:
+                mask_agg = None
+
+            censored = (1 - targets.get('duration_valid', torch.ones_like(targets['duration']))).mean(dim=1)
+
             loss_duration = self.duration_loss(
-                predictions.get('duration_hazard', predictions['duration_mean'].unsqueeze(-1).expand(-1, 50)),
-                targets['duration'],
-                censored=(1 - targets.get('duration_valid', torch.ones_like(targets['duration']))),
-                mask=duration_mask
+                duration_hazard,
+                target_duration,
+                censored=censored,
+                mask=mask_agg
             )
         elif isinstance(self.duration_loss, SimpleDurationLoss):
             # Huber/MSE loss only needs mean prediction

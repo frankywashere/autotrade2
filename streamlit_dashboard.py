@@ -115,6 +115,8 @@ def find_checkpoints() -> List[Dict]:
                     if isinstance(last_entry, dict):
                         metrics['direction_acc'] = last_entry.get('direction_acc')
                         metrics['next_channel_acc'] = last_entry.get('next_channel_acc')
+                        metrics['duration_mae'] = last_entry.get('duration_mae')
+                        metrics['duration_rmse'] = last_entry.get('duration_rmse')
         except Exception:
             pass
         return metrics
@@ -1152,6 +1154,29 @@ def main():
                     next_labels = ["DOWN", "SAME", "UP"]
                     st.metric("Next Channel", next_labels[best_next_ch], f"{best_next_probs[best_next_ch]:.0%}")
 
+                # Duration error metrics (if available from training)
+                # Get metrics from the selected checkpoint
+                checkpoints = find_checkpoints()
+                checkpoint_metrics = {}
+                for cp in checkpoints:
+                    if cp['name'] == st.session_state.model_name:
+                        checkpoint_metrics = cp
+                        break
+
+                if checkpoint_metrics.get('duration_mae') is not None:
+                    st.divider()
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Duration MAE", f"{checkpoint_metrics['duration_mae']:.2f} bars",
+                                  help="Mean absolute error from validation")
+                    with col2:
+                        st.metric("Duration RMSE", f"{checkpoint_metrics.get('duration_rmse', 0):.2f} bars",
+                                  help="Root mean squared error from validation")
+                    with col3:
+                        if best_dur_std:
+                            st.metric("Pred Uncertainty", f"{best_dur_std:.2f} bars",
+                                      help="Model's estimated prediction uncertainty")
+
                 # Signal interpretation
                 st.divider()
 
@@ -1435,6 +1460,7 @@ def main():
                     'Best Epoch': None,
                     'Dir Acc %': None,
                     'Next Ch Acc %': None,
+                    'Duration MAE': cp.get('duration_mae'),
                     'SE': 'Yes' if model_cfg.get('use_se_blocks') else 'No',
                     'TCN': 'Yes' if model_cfg.get('use_tcn') else 'No',
                     'Multi-Res': 'Yes' if model_cfg.get('use_multi_resolution') else 'No',
@@ -1509,6 +1535,7 @@ def main():
                     'Best Epoch': df['Best Epoch'].apply(lambda x: format_value(x, 0) if x is None or pd.isna(x) else str(int(x))),
                     'Dir Acc %': df['Dir Acc %'].apply(lambda x: format_value(x, 1, True)),
                     'Next Ch Acc %': df['Next Ch Acc %'].apply(lambda x: format_value(x, 1, True)),
+                    'Duration MAE': df['Duration MAE'].apply(lambda x: format_value(x, 2)),
                     'SE': df['SE'],
                     'TCN': df['TCN'],
                     'Multi-Res': df['Multi-Res'],

@@ -466,6 +466,8 @@ class EndToEndWindowModel(nn.Module):
         tcn_channels: int = 64,
         tcn_kernel_size: int = 3,
         tcn_layers: int = 2,
+        # Survival/hazard loss parameters
+        num_hazard_bins: int = 0,
     ):
         """
         Initialize the EndToEndWindowModel.
@@ -534,6 +536,10 @@ class EndToEndWindowModel(nn.Module):
 
         tcn_layers : int, optional
             Number of temporal blocks in TCN. Default is 2.
+
+        num_hazard_bins : int, optional
+            Number of bins for survival/hazard duration prediction. Default is 0 (disabled).
+            When > 0, DurationHead outputs hazard logits for survival loss.
         """
         super().__init__()
 
@@ -582,6 +588,7 @@ class EndToEndWindowModel(nn.Module):
             tcn_channels=tcn_channels,
             tcn_kernel_size=tcn_kernel_size,
             tcn_layers=tcn_layers,
+            num_hazard_bins=num_hazard_bins,
         )
 
     def forward(
@@ -970,6 +977,7 @@ def create_end_to_end_model(
     se_reduction_ratio: int = 8,
     use_multi_resolution: bool = False,
     resolution_levels: int = 3,
+    num_hazard_bins: int = 0,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
 ) -> EndToEndWindowModel:
     """
@@ -1022,6 +1030,10 @@ def create_end_to_end_model(
     resolution_levels : int, optional
         Number of resolution levels for multi-resolution heads. Default is 3.
 
+    num_hazard_bins : int, optional
+        Number of bins for survival/hazard duration prediction. Default is 0 (disabled).
+        When > 0, DurationHead outputs hazard logits for survival loss.
+
     device : str, optional
         Device to place model on. Default is 'cuda' if available, else 'cpu'.
 
@@ -1045,6 +1057,7 @@ def create_end_to_end_model(
         se_reduction_ratio=se_reduction_ratio,
         use_multi_resolution=use_multi_resolution,
         resolution_levels=resolution_levels,
+        num_hazard_bins=num_hazard_bins,
     )
 
     model = model.to(device)
