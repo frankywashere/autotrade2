@@ -1637,7 +1637,7 @@ def preflight_checks(config: Dict, data_dir: Path, cache_dir: Path):
     console.print()
 
 
-def display_config_summary(config: Dict):
+def display_config_summary(config: Dict, skip_confirm: bool = False):
     """Display final configuration summary."""
     console.print("\n[bold cyan]Configuration Summary[/bold cyan]\n")
 
@@ -1726,14 +1726,15 @@ def display_config_summary(config: Dict):
 
     console.print(layout)
 
-    # Confirm to proceed
-    proceed = inquirer.confirm(
-        message="\nProceed with training?", default=True
-    ).execute()
+    # Confirm to proceed (skip in non-interactive mode)
+    if not skip_confirm:
+        proceed = inquirer.confirm(
+            message="\nProceed with training?", default=True
+        ).execute()
 
-    if not proceed:
-        console.print("\n[yellow]Training cancelled.[/yellow]")
-        sys.exit(0)
+        if not proceed:
+            console.print("\n[yellow]Training cancelled.[/yellow]")
+            sys.exit(0)
 
 
 # =============================================================================
@@ -2713,8 +2714,8 @@ def main():
         console.print(f"[green]Mode:[/green] [cyan]{mode}[/cyan]")
         console.print(f"[green]Device:[/green] [cyan]{config['device']}[/cyan]\n")
 
-        # Display config summary
-        display_config_summary(config)
+        # Display config summary (skip confirm in non-interactive mode)
+        display_config_summary(config, skip_confirm=True)
 
         # Save run configuration
         run_manager.save_run_config(run_dir, config)

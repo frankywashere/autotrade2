@@ -862,7 +862,7 @@ def main():
             # Create display names with timestamps
             run_display_names = []
             for exp in experiments:
-                name = exp.get('run_name', 'Unknown')
+                name = exp.get('name') or exp.get('run_id', 'Unknown')
                 timestamp = exp.get('timestamp', '')
                 if timestamp:
                     # Format timestamp for display (show date and time)
@@ -1415,7 +1415,7 @@ def main():
             for exp in experiments:
                 settings = exp.get('settings', {})
                 runs_rows.append({
-                    'Run Name': exp.get('run_name', 'Unknown'),
+                    'Run Name': exp.get('name') or exp.get('run_id', 'Unknown'),
                     'Timestamp': exp.get('timestamp', 'N/A'),
                     'Status': exp.get('status', 'unknown'),
                     'Val Loss': exp.get('best_val_loss'),
@@ -1462,9 +1462,9 @@ def main():
             # Expanders for full settings
             st.subheader("Run Details")
             for exp in experiments:
-                run_name = exp.get('run_name', 'Unknown')
+                run_name = exp.get('name') or exp.get('run_id', 'Unknown')
                 with st.expander(run_name):
-                    st.write(f"**Run Directory:** {exp.get('run_dir', 'N/A')}")
+                    st.write(f"**Run Directory:** {exp.get('path', 'N/A')}")
                     st.write(f"**Timestamp:** {exp.get('timestamp', 'N/A')}")
                     st.write(f"**Status:** {exp.get('status', 'N/A')}")
 
