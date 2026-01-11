@@ -247,15 +247,30 @@ Experiments to improve duration prediction while maintaining direction accuracy.
 | EXP23 | Huber delta=0.5 | `--duration-loss huber --huber-delta 0.5 --weight-duration 5.0` | 62.3% | 2.85 | Smaller delta didn't help |
 | EXP24 | Huber dur_w=8.0 | `--duration-loss huber --weight-duration 8.0` | 63.3% | 5.56 | High weight decent direction but worse duration |
 | EXP26 | Survival + TCN | `--duration-loss survival --use-tcn --tcn-kernel-size 5 --tcn-layers 3` | 64.0% | 2.38 | TCN helps direction slightly |
-| **EXP27** | **Survival + Learnable** | `--duration-loss survival --weight-mode learnable --min-duration-precision 0.4` | **64.8%** | **2.39** | **NEW BEST!** |
+| **EXP27** | **Survival + Learnable** | `--duration-loss survival --weight-mode learnable --min-duration-precision 0.4` | **64.8%** | **2.39** | **BEST!** |
+| EXP28 | Survival + TCN + Learnable | Combined EXP26 + EXP27 | 64.2% | 2.40 | Worse than learnable alone - redundancy |
+| EXP29 | Early Stopping pat=2 | `--early-stopping 2 --epochs 8` | 63.9% | 2.37 | Stopped at epoch 5, slightly worse |
+| EXP30 | Lower LR | `--lr 0.0003 --epochs 40` | CRASHED | - | Memory/segfault |
+| EXP31 | Shared + PCGrad | `--shared-heads --gradient-balancing pcgrad` | 43.4% | - | Complete failure |
+| WF_W1 | Walk-forward Window 1 | EXP27 config, 3-month val window | 61.2% | 2.31 | Lower than single split (distribution shift) |
 
 ### Key Findings (Duration Experiments):
 
-1. **Survival loss + learnable weights is BEST: 64.8% direction, 2.39 duration**
-2. **TCN adds temporal patterns and helps: 64.0% direction**
-3. **Two-stage duration pretraining hurts performance** - 59.3% vs 64.8%
-4. **Survival loss models time-to-event better than mean-only losses**
-5. **Learnable task weights auto-balance objectives better than fixed weights**
+1. **Survival loss + learnable weights is BEST: 64.8% direction, 2.39 duration (EXP27)**
+2. **TCN adds temporal patterns: 64.0% direction** - but combining with learnable hurts (redundancy)
+3. **Shared heads + PCGrad completely failed** - 43.4% direction (do NOT use)
+4. **Two-stage duration pretraining hurts performance** - 59.3% vs 64.8%
+5. **Survival loss models time-to-event better than Huber/Gaussian** - best duration loss
+6. **Learnable task weights auto-balance objectives better than fixed weights**
+7. **Models peak very early (epoch 2-6) then overfit** - consistent across all experiments
+8. **Walk-forward shows distribution shift** - Window 1 only 61.2% vs 64.8% single split
+9. **Early stopping too aggressive** - patience=2 stops at epoch 5, gives 63.9% (suboptimal)
+
+### Codex Recommendations for Next Steps:
+
+1. **Multi-seed validation** - Run EXP27 with 3-5 different seeds to verify 64.8% is stable (not lucky)
+2. **Memory optimization** - Smaller batch size or gradient checkpointing for walk-forward
+3. **Walk-forward validation** - Need to complete all 3 windows to assess temporal generalization
 
 ### Recommended Duration Configuration (BEST - EXP27):
 
