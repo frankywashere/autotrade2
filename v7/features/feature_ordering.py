@@ -11,7 +11,16 @@ CRITICAL: The ordering is TIMEFRAME-GROUPED, not alphabetical!
 - Shared features come last: [vix, tsla_history, spy_history, alignment, events, window_scores]
 
 Feature Dimensions:
-- TSLA per TF: 35 features (18 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking)
+- TSLA per TF: 38 features (21 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking)
+    Base features (21):
+      - channel_valid, direction, position, upper_dist, lower_dist, width_pct, slope_pct, r_squared (8)
+      - bounce_count, cycles, bars_since_bounce, last_touch (4)
+      - rsi, rsi_divergence, rsi_at_last_upper, rsi_at_last_lower (4)
+      - channel_quality, rsi_confidence (2)
+      - distance_to_upper_atr, distance_to_lower_atr, distance_to_nearest_atr (3 ATR features)
+    Exit tracking features (10):
+      - exit_count, avg_bars_outside, max_bars_outside, exit_frequency, exits_accelerating
+      - exits_up_count, exits_down_count, avg_return_speed, return_speed_slowing, bounces_after_last_return
     Return tracking features (5):
       - return_rate (float)
       - channel_resilience_score (float)
@@ -38,7 +47,7 @@ Feature Dimensions:
 - Events: 46 features (optional, zeros if not provided)
 - Window Scores: 40 features (8 windows x 5 metrics per window)
 
-Total: (35+11+10) × 11 + (21+25+25+3+46+40) = 56×11 + 160 = 616 + 160 = 776
+Total: (38+11+10) × 11 + (21+25+25+3+46+40) = 59×11 + 160 = 649 + 160 = 809
 """
 
 from typing import List, Dict
@@ -53,19 +62,22 @@ from v7.core.timeframe import TIMEFRAMES
 # =============================================================================
 
 # Per-timeframe feature dimensions
-TSLA_PER_TF = 35    # 18 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking
+TSLA_PER_TF = 38    # 21 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking (added 3 ATR features)
 SPY_PER_TF = 11     # channel_valid, direction, position, upper/lower_dist, width, slope, r2, bounces, cycles, rsi
 CROSS_PER_TF = 10   # spy_valid, spy_dir, spy_pos, tsla_in_upper/lower, dist_to_upper/lower, alignment + rsi_correlation (2)
 
-# TSLA per-TF feature breakdown (35 total):
-#   Base channel features (18):
-#     channel_valid, direction, position, upper_dist, lower_dist, width_pct, slope_pct, r2,
-#     bounces, cycles, touch_density, alternation, last_touch_dist, bar_depth, rsi, ...
+# TSLA per-TF feature breakdown (38 total):
+#   Base channel features (21):
+#     - Core metrics (8): channel_valid, direction, position, upper_dist, lower_dist, width_pct, slope_pct, r2
+#     - Bounce/cycle metrics (4): bounces, cycles, bars_since_bounce, last_touch
+#     - RSI metrics (4): rsi, rsi_divergence, rsi_at_last_upper, rsi_at_last_lower
+#     - Quality metrics (2): channel_quality, rsi_confidence
+#     - ATR-normalized distances (3): distance_to_upper_atr, distance_to_lower_atr, distance_to_nearest_atr
 #   Exit tracking features (10):
 #     exit_count, avg_bars_outside, max_bars_outside, exit_frequency, exits_accelerating,
 #     exits_up_count, exits_down_count, avg_return_speed, return_speed_slowing, bounces_after_last_return
 #   Break trigger features (2):
-#     break_trigger_up, break_trigger_down
+#     nearest_boundary_dist, rsi_alignment_with_boundary
 #   Return tracking features (5):
 #     return_rate, channel_resilience_score, avg_duration_after_return,
 #     max_duration_after_return, returns_leading_to_new_channel
@@ -85,10 +97,10 @@ EVENT_FEATURES = 46
 WINDOW_SCORE_FEATURES = 40  # 8 windows x 5 metrics (bounce_count, r_squared, quality, alternation_ratio, width)
 
 # Derived constants
-PER_TF_FEATURES = TSLA_PER_TF + SPY_PER_TF + CROSS_PER_TF  # 35 + 11 + 10 = 56
+PER_TF_FEATURES = TSLA_PER_TF + SPY_PER_TF + CROSS_PER_TF  # 38 + 11 + 10 = 59
 SHARED_FEATURES = VIX_FEATURES + TSLA_HISTORY_FEATURES + SPY_HISTORY_FEATURES + ALIGNMENT_FEATURES + EVENT_FEATURES + WINDOW_SCORE_FEATURES  # 21 + 25 + 25 + 3 + 46 + 40 = 160
 N_TIMEFRAMES = len(TIMEFRAMES)  # 11
-TOTAL_FEATURES = PER_TF_FEATURES * N_TIMEFRAMES + SHARED_FEATURES  # 56*11 + 160 = 776
+TOTAL_FEATURES = PER_TF_FEATURES * N_TIMEFRAMES + SHARED_FEATURES  # 59*11 + 160 = 809
 
 
 # =============================================================================
@@ -112,8 +124,8 @@ def build_feature_order() -> List[str]:
     order = []
 
     # Per-timeframe features: grouped by timeframe (TF0, TF1, ..., TF10)
-    # Each TF block has: tsla (35) + spy (11) + cross (10) = 56 features
-    # TSLA includes: 18 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking
+    # Each TF block has: tsla (38) + spy (11) + cross (10) = 59 features
+    # TSLA includes: 21 base (incl. 3 ATR) + 10 exit_tracking + 2 break_trigger + 5 return_tracking
     # Cross includes: 8 containment + 2 RSI correlation
     for tf in TIMEFRAMES:
         order.append(f'tsla_{tf}')
@@ -263,8 +275,8 @@ def get_shared_index_range() -> tuple:
     Returns:
         Tuple of (start_idx, end_idx) for slicing
     """
-    start = N_TIMEFRAMES * PER_TF_FEATURES  # 11 * 56 = 616
-    end = start + SHARED_FEATURES           # 616 + 160 = 776
+    start = N_TIMEFRAMES * PER_TF_FEATURES  # 11 * 59 = 649
+    end = start + SHARED_FEATURES           # 649 + 160 = 809
     return start, end
 
 
@@ -284,7 +296,7 @@ def concatenate_features_in_order(features_dict: Dict[str, np.ndarray]) -> np.nd
                        keys (e.g., 'tsla_5min', 'vix') to numpy arrays
 
     Returns:
-        Concatenated numpy array of shape (TOTAL_FEATURES,) = (776,)
+        Concatenated numpy array of shape (TOTAL_FEATURES,) = (809,)
 
     Raises:
         KeyError: If a required feature key is missing from features_dict
@@ -295,7 +307,7 @@ def concatenate_features_in_order(features_dict: Dict[str, np.ndarray]) -> np.nd
         # features_dict = {'tsla_5min': array([...]), 'spy_5min': array([...]), ...}
 
         features_array = concatenate_features_in_order(features_dict)
-        # features_array.shape = (776,)
+        # features_array.shape = (809,)
     """
     arrays = []
     for key in FEATURE_ORDER:
@@ -356,7 +368,7 @@ if __name__ == '__main__':
     print(f"  Shared:         indices {shared_start:3d}-{shared_end-1:3d} ({shared_end-shared_start} features)")
 
     print(f"\n  Note: TSLA per-TF includes:")
-    print(f"    - 18 base channel features")
+    print(f"    - 21 base channel features (includes 3 ATR-normalized distance features)")
     print(f"    - 10 exit tracking features")
     print(f"    - 2 break trigger features")
     print(f"    - 5 return tracking features (return_rate, channel_resilience_score,")
