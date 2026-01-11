@@ -2,6 +2,107 @@
 > This document tracks all hyperparameter experiments and configurations for the x7 trading model.
 > Created: 2026-01-10
 
+> **Note (2026-01-11):** New multi-task learning features have been added including gradient balancing methods (GradNorm, PCGrad), two-stage training, advanced loss functions, and architecture options (TCN, multi-resolution heads). See the "New Multi-Task Learning Features" section below.
+
+## New Multi-Task Learning Features (2026-01-11)
+
+### Gradient Balancing Methods
+
+Control how gradients from multiple tasks (direction, duration, etc.) are balanced during training:
+
+| Method | Flag | Description |
+|--------|------|-------------|
+| `none` | `--gradient-balancing none` | Standard gradient descent - all task gradients summed directly |
+| `gradnorm` | `--gradient-balancing gradnorm --gradnorm-alpha 1.5` | GradNorm adaptive task weighting. Dynamically adjusts task weights based on training rates. Alpha parameter (default 1.5) controls how aggressively weights are balanced |
+| `pcgrad` | `--gradient-balancing pcgrad` | PCGrad conflicting gradient projection. Projects conflicting gradients to reduce interference between tasks |
+
+### Two-Stage Training
+
+Enables pretraining on a single task before joint multi-task training:
+
+| Parameter | Flag | Description |
+|-----------|------|-------------|
+| `stage1_epochs` | `--stage1-epochs N` | Number of epochs for stage 1 pretraining (default: 0, disabled) |
+| `stage1_task` | `--stage1-task [direction\|duration]` | Primary task for stage 1 (default: direction) |
+
+**How it works:**
+1. Stage 1: Train only on the specified task (e.g., direction) for N epochs
+2. Stage 2: Continue with full multi-task training using all loss components
+3. This can help establish a strong feature representation before balancing multiple objectives
+
+### Loss Function Options
+
+#### Duration Loss Functions
+| Loss | Flag | Description |
+|------|------|-------------|
+| `gaussian_nll` | `--duration-loss gaussian_nll` | **Default.** Gaussian negative log-likelihood - learns both mean and variance |
+| `huber` | `--duration-loss huber --huber-delta 1.0` | Huber loss - robust to outliers. Delta parameter controls transition from L2 to L1 |
+| `survival` | `--duration-loss survival` | Hazard-based survival loss - treats channel break as time-to-event prediction |
+
+#### Direction Loss Functions
+| Loss | Flag | Description |
+|------|------|-------------|
+| `bce` | `--direction-loss bce` | **Default.** Binary cross-entropy |
+| `focal` | `--direction-loss focal --focal-gamma 2.0` | Focal loss - down-weights easy examples, focuses on hard cases. Gamma controls focusing strength |
+
+### Architecture Options
+
+#### TCN (Temporal Convolutional Network) Block
+Adds dilated causal convolutions to better capture temporal patterns in channel dynamics:
+
+| Parameter | Flag | Description |
+|-----------|------|-------------|
+| `use_tcn` | `--use-tcn` | Enable TCN block in the encoder |
+| `tcn_channels` | `--tcn-channels 64` | Number of TCN hidden channels (default: 64) |
+| `tcn_kernel_size` | `--tcn-kernel-size 3` | Kernel size for TCN convolutions (default: 3) |
+| `tcn_layers` | `--tcn-layers 4` | Number of TCN layers (default: 4) |
+
+#### Multi-Resolution Heads
+Enables task heads to attend to different temporal resolutions:
+
+| Parameter | Flag | Description |
+|-----------|------|-------------|
+| `use_multi_resolution` | `--use-multi-resolution` | Enable multi-resolution attention in prediction heads |
+| `resolution_levels` | `--resolution-levels 3` | Number of resolution levels (default: 3) |
+
+**How it works:** Duration head attends more to fine-grained (short window) features for precise timing, while direction head focuses on longer context for trend identification.
+
+### Example Command with New Features
+
+```bash
+# Full-featured training with GradNorm, two-stage training, and advanced options
+python3 train.py --no-interactive \
+    --run-name mtl_experiment \
+    --hidden-dim 64 \
+    --cfc-units 96 \
+    --attention-heads 4 \
+    --se-blocks \
+    --se-ratio 8 \
+    --dropout 0.2 \
+    --epochs 30 \
+    --batch-size 64 \
+    --lr 0.001 \
+    --weight-direction 4.0 \
+    --gradient-balancing gradnorm \
+    --gradnorm-alpha 1.5 \
+    --stage1-epochs 5 \
+    --stage1-task direction \
+    --duration-loss huber \
+    --huber-delta 1.0 \
+    --direction-loss focal \
+    --focal-gamma 2.0 \
+    --use-tcn \
+    --tcn-channels 64 \
+    --tcn-layers 4 \
+    --use-multi-resolution \
+    --resolution-levels 3 \
+    --step 25 \
+    --train-end 2024-01-01 \
+    --val-end 2024-12-31
+```
+
+---
+
 ## Current Best Configuration (EXP8)
 
 ```python
@@ -170,4 +271,5 @@ python3 train.py --no-interactive \
 
 | Date | Changes |
 |------|---------|
+| 2026-01-11 | Added multi-task learning features: gradient balancing (GradNorm, PCGrad), two-stage training, loss functions (Huber, survival, focal), TCN blocks, multi-resolution heads |
 | 2026-01-10 | Initial experiments, found SE-blocks + dir_weight=4.0 optimal |

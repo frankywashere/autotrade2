@@ -169,6 +169,63 @@ class SimpleDurationLoss(nn.Module):
         return loss.mean()
 
 
+class SurvivalLoss(nn.Module):
+    """
+    Survival/Hazard loss for duration prediction.
+    Models duration as time-to-event with discrete hazard rates.
+    Uses negative log-likelihood with censoring support.
+    """
+    def __init__(self, num_bins: int = 50, max_duration: float = 100.0):
+        super().__init__()
+        self.num_bins = num_bins
+        self.max_duration = max_duration
+        # Bin edges for discretizing duration
+        self.register_buffer('bin_edges', torch.linspace(0, max_duration, num_bins + 1))
+
+    def forward(self, pred_hazard: torch.Tensor, target_duration: torch.Tensor,
+                censored: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            pred_hazard: [batch, num_bins] - predicted hazard for each time bin
+            target_duration: [batch] - actual duration (in native TF bars)
+            censored: [batch] - 1.0 if censored (event not observed), 0.0 otherwise
+            mask: [batch] - validity mask
+        """
+        if censored is None:
+            censored = torch.zeros_like(target_duration)
+
+        # Convert duration to bin index
+        target_bins = torch.bucketize(target_duration.clamp(0, self.max_duration - 1e-6), self.bin_edges[1:])
+
+        # Compute survival probability: S(t) = prod(1 - h(k)) for k < t
+        hazard = torch.sigmoid(pred_hazard)  # [batch, num_bins]
+        survival = torch.cumprod(1 - hazard, dim=1)  # [batch, num_bins]
+
+        # For uncensored: likelihood = S(t-1) * h(t) = survival up to t-1, then event at t
+        # For censored: likelihood = S(t) = survival up to observed time
+
+        batch_size = pred_hazard.shape[0]
+        batch_idx = torch.arange(batch_size, device=pred_hazard.device)
+
+        # Get survival at event time
+        survival_at_event = survival[batch_idx, target_bins.clamp(0, self.num_bins - 1)]
+        hazard_at_event = hazard[batch_idx, target_bins.clamp(0, self.num_bins - 1)]
+
+        # Negative log-likelihood
+        # Uncensored: -log(S(t-1) * h(t)) = -log(S(t-1)) - log(h(t))
+        # Censored: -log(S(t))
+        eps = 1e-7
+        nll_uncensored = -torch.log(survival_at_event + eps) - torch.log(hazard_at_event + eps)
+        nll_censored = -torch.log(survival_at_event + eps)
+
+        nll = torch.where(censored > 0.5, nll_censored, nll_uncensored)
+
+        if mask is not None:
+            nll = nll * mask
+            return nll.sum() / (mask.sum() + eps)
+        return nll.mean()
+
+
 class DirectionLoss(nn.Module):
     """
     Binary cross-entropy loss for direction prediction (up/down).
@@ -219,6 +276,60 @@ class DirectionLoss(nn.Module):
             loss = loss.mean()
 
         return loss
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for direction prediction.
+    Down-weights well-classified examples to focus on hard cases.
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    """
+    def __init__(self, gamma: float = 2.0, alpha: Optional[float] = None, reduction: str = 'mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # Class weight for positive class
+        self.reduction = reduction
+
+    def forward(self, pred_logits: torch.Tensor, targets: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            pred_logits: [batch] or [batch, 1] - raw logits
+            targets: [batch] - binary targets (0 or 1)
+            mask: [batch] - validity mask
+        """
+        pred_logits = pred_logits.view(-1)
+        targets = targets.view(-1).float()
+
+        # Compute probabilities
+        probs = torch.sigmoid(pred_logits)
+
+        # p_t = p if y=1 else (1-p)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+
+        # Focal weight: (1 - p_t)^gamma
+        focal_weight = (1 - p_t) ** self.gamma
+
+        # BCE loss
+        bce = F.binary_cross_entropy_with_logits(pred_logits, targets, reduction='none')
+
+        # Apply focal weight
+        focal_loss = focal_weight * bce
+
+        # Apply alpha weighting if specified
+        if self.alpha is not None:
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+            focal_loss = alpha_t * focal_loss
+
+        if mask is not None:
+            focal_loss = focal_loss * mask.view(-1)
+            return focal_loss.sum() / (mask.sum() + 1e-7)
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
 
 
 class NextChannelDirectionLoss(nn.Module):
@@ -748,6 +859,11 @@ class CombinedLoss(nn.Module):
         # v9.1 duration loss tuning
         uncertainty_penalty: float = 0.1,
         min_duration_precision: float = 0.25,
+        # Loss type selection
+        duration_loss_type: str = 'gaussian_nll',
+        huber_delta: float = 1.0,
+        direction_loss_type: str = 'bce',
+        focal_gamma: float = 2.0,
     ):
         """
         Args:
@@ -771,17 +887,34 @@ class CombinedLoss(nn.Module):
                                the model from "gaming" the loss by saying "I don't know"
             min_duration_precision: v9.1 - Minimum precision floor for duration task weight
                                    (prevents learnable weights from abandoning duration)
+            duration_loss_type: Type of duration loss ('gaussian_nll', 'huber', 'survival')
+            huber_delta: Delta for Huber loss (used when duration_loss_type='huber')
+            direction_loss_type: Type of direction loss ('bce', 'focal')
+            focal_gamma: Gamma for focal loss (used when direction_loss_type='focal')
         """
         super().__init__()
         self.num_timeframes = num_timeframes
         self.use_learnable_weights = use_learnable_weights
         self.calibration_mode = calibration_mode
         self.min_duration_precision = min_duration_precision  # v9.1
+        self.duration_loss_type = duration_loss_type  # Store for forward() logic
 
-        # Initialize loss components
-        # v9.1: Pass uncertainty_penalty to GaussianNLLLoss
-        self.duration_loss = GaussianNLLLoss(uncertainty_penalty=uncertainty_penalty)
-        self.direction_loss = DirectionLoss()
+        # Duration loss selection
+        if duration_loss_type == 'gaussian_nll':
+            self.duration_loss = GaussianNLLLoss(uncertainty_penalty=uncertainty_penalty)
+        elif duration_loss_type == 'huber':
+            self.duration_loss = SimpleDurationLoss(use_huber=True, huber_delta=huber_delta)
+        elif duration_loss_type == 'survival':
+            self.duration_loss = SurvivalLoss(num_bins=50, max_duration=100.0)
+        else:
+            self.duration_loss = GaussianNLLLoss(uncertainty_penalty=uncertainty_penalty)
+
+        # Direction loss selection
+        if direction_loss_type == 'focal':
+            self.direction_loss = FocalLoss(gamma=focal_gamma)
+        else:
+            self.direction_loss = DirectionLoss()
+
         self.next_channel_loss = NextChannelDirectionLoss()
         self.trigger_tf_loss = TriggerTimeframeLoss()  # v9.0.0
         self.ece = ExpectedCalibrationError()
@@ -855,12 +988,31 @@ class CombinedLoss(nn.Module):
         trigger_tf_mask = masks.get('trigger_tf_valid')
 
         # Compute individual losses
-        loss_duration = self.duration_loss(
-            predictions['duration_mean'],
-            predictions['duration_log_std'],
-            targets['duration'],
-            duration_mask
-        )
+        # Handle different duration loss types
+        if isinstance(self.duration_loss, SurvivalLoss):
+            # For survival loss, need hazard predictions
+            # This requires model changes to output hazard logits
+            loss_duration = self.duration_loss(
+                predictions.get('duration_hazard', predictions['duration_mean'].unsqueeze(-1).expand(-1, 50)),
+                targets['duration'],
+                censored=(1 - targets.get('duration_valid', torch.ones_like(targets['duration']))),
+                mask=masks.get('duration')
+            )
+        elif isinstance(self.duration_loss, SimpleDurationLoss):
+            # Huber/MSE loss only needs mean prediction
+            loss_duration = self.duration_loss(
+                predictions['duration_mean'],
+                targets['duration'],
+                duration_mask
+            )
+        else:
+            # Gaussian NLL loss (default)
+            loss_duration = self.duration_loss(
+                predictions['duration_mean'],
+                predictions['duration_log_std'],
+                targets['duration'],
+                duration_mask
+            )
 
         loss_direction = self.direction_loss(
             predictions['direction_logits'],
@@ -1072,6 +1224,32 @@ class CombinedLoss(nn.Module):
 
         return total_loss, loss_dict
 
+    def set_task_weights(self, weights: Dict[str, float]):
+        """Dynamically update task weights for two-stage training.
+
+        Args:
+            weights: Dictionary with keys 'duration', 'direction', 'next_channel',
+                    'trigger_tf', 'calibration' and float values for weights.
+        """
+        if not self.use_learnable_weights and hasattr(self, 'duration_weight'):
+            # Update fixed weights stored as buffers
+            self.duration_weight = torch.tensor(weights.get('duration', self.duration_weight.item()))
+            self.direction_weight = torch.tensor(weights.get('direction', self.direction_weight.item()))
+            self.next_channel_weight = torch.tensor(weights.get('next_channel', self.next_channel_weight.item()))
+            self.trigger_tf_weight = torch.tensor(weights.get('trigger_tf', self.trigger_tf_weight.item()))
+            self.calibration_weight = torch.tensor(weights.get('calibration', self.calibration_weight.item()))
+        else:
+            # For learnable weights, we can't directly set them, but we can reinitialize
+            # Or switch to fixed weights mode temporarily
+            self.use_learnable_weights = False
+            # Register new buffers with the provided weights
+            device = next(self.parameters()).device if list(self.parameters()) else 'cpu'
+            self.register_buffer('duration_weight', torch.tensor(weights.get('duration', 1.0), device=device))
+            self.register_buffer('direction_weight', torch.tensor(weights.get('direction', 1.0), device=device))
+            self.register_buffer('next_channel_weight', torch.tensor(weights.get('next_channel', 1.0), device=device))
+            self.register_buffer('trigger_tf_weight', torch.tensor(weights.get('trigger_tf', 1.0), device=device))
+            self.register_buffer('calibration_weight', torch.tensor(weights.get('calibration', 0.1), device=device))
+
 
 class EndToEndLoss(nn.Module):
     """
@@ -1100,6 +1278,11 @@ class EndToEndLoss(nn.Module):
         calibration_weight: float = 0.5,
         entropy_weight: float = 0.1,
         consistency_weight: float = 0.05,
+        # Loss type configuration
+        duration_loss_type: str = 'gaussian_nll',
+        huber_delta: float = 1.0,
+        direction_loss_type: str = 'bce',
+        focal_gamma: float = 2.0,
     ):
         """
         Initialize EndToEndLoss.
@@ -1115,6 +1298,10 @@ class EndToEndLoss(nn.Module):
                            (default: 0.1)
             consistency_weight: Weight for consistency loss with heuristic best_window.
                                Helps warm-start training. (default: 0.05)
+            duration_loss_type: Type of duration loss ('gaussian_nll', 'huber', 'survival')
+            huber_delta: Delta for Huber loss (used when duration_loss_type='huber')
+            direction_loss_type: Type of direction loss ('bce', 'focal')
+            focal_gamma: Gamma for focal loss (used when direction_loss_type='focal')
         """
         super().__init__()
         self.num_timeframes = num_timeframes
@@ -1127,9 +1314,24 @@ class EndToEndLoss(nn.Module):
         self.entropy_weight = entropy_weight
         self.consistency_weight = consistency_weight
 
-        # Initialize loss components
-        self.duration_loss = GaussianNLLLoss()
-        self.direction_loss = DirectionLoss()
+        # Duration loss selection
+        if duration_loss_type == 'gaussian_nll':
+            self.duration_loss = GaussianNLLLoss()
+        elif duration_loss_type == 'huber':
+            self.duration_loss = SimpleDurationLoss(use_huber=True, huber_delta=huber_delta)
+        elif duration_loss_type == 'survival':
+            self.duration_loss = SurvivalLoss(num_bins=50, max_duration=100.0)
+        else:
+            raise ValueError(f"Unknown duration_loss_type: {duration_loss_type}")
+
+        # Direction loss selection
+        if direction_loss_type == 'bce':
+            self.direction_loss = DirectionLoss()
+        elif direction_loss_type == 'focal':
+            self.direction_loss = FocalLoss(gamma=focal_gamma)
+        else:
+            raise ValueError(f"Unknown direction_loss_type: {direction_loss_type}")
+
         self.next_channel_loss = NextChannelDirectionLoss()
         self.brier = BrierScore()
 

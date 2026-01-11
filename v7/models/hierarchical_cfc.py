@@ -287,6 +287,106 @@ class SEBlock(nn.Module):
 
 
 # =============================================================================
+# Temporal Convolutional Network (TCN) Block
+# =============================================================================
+
+class Chomp1d(nn.Module):
+    """Remove trailing padding to maintain causality."""
+    def __init__(self, chomp_size: int):
+        super().__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x[:, :, :-self.chomp_size] if self.chomp_size > 0 else x
+
+
+class TemporalBlock(nn.Module):
+    """Single temporal block with dilated causal convolution."""
+    def __init__(self, n_inputs: int, n_outputs: int, kernel_size: int,
+                 dilation: int, dropout: float = 0.2):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                               padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)  # Remove future padding for causality
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                               padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(
+            self.conv1, self.chomp1, self.relu1, self.dropout1,
+            self.conv2, self.chomp2, self.relu2, self.dropout2
+        )
+
+        # Residual connection
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.conv1.weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.conv2.weight, nonlinearity='relu')
+        if self.downsample is not None:
+            nn.init.kaiming_normal_(self.downsample.weight, nonlinearity='relu')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TCNBlock(nn.Module):
+    """
+    Temporal Convolutional Network block.
+    Stacks multiple TemporalBlocks with exponentially increasing dilation.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int = 2,
+                 kernel_size: int = 3, dropout: float = 0.2):
+        super().__init__()
+
+        layers = []
+        num_levels = num_layers
+        for i in range(num_levels):
+            dilation = 2 ** i
+            in_channels = input_dim if i == 0 else hidden_dim
+            layers.append(
+                TemporalBlock(in_channels, hidden_dim, kernel_size, dilation, dropout)
+            )
+
+        self.network = nn.Sequential(*layers)
+        self.output_dim = hidden_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [batch, seq_len, input_dim] or [batch, input_dim]
+        Returns:
+            [batch, seq_len, hidden_dim] or [batch, hidden_dim]
+        """
+        # Handle both 2D and 3D inputs
+        squeeze_output = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # [batch, 1, input_dim]
+            squeeze_output = True
+
+        # Conv1d expects [batch, channels, seq_len]
+        x = x.transpose(1, 2)  # [batch, input_dim, seq_len]
+        x = self.network(x)
+        x = x.transpose(1, 2)  # [batch, seq_len, hidden_dim]
+
+        if squeeze_output:
+            x = x.squeeze(1)  # [batch, hidden_dim]
+        return x
+
+
+# =============================================================================
 # Timeframe Branch (CfC Processing)
 # =============================================================================
 
@@ -298,13 +398,19 @@ class TFBranch(nn.Module):
     1. Takes per-TF features + shared context
     2. Projects to hidden dimension
     3. Processes through CfC (captures temporal dynamics)
-    4. Outputs embedding for cross-TF attention
+    4. Optionally processes through TCN for additional temporal modeling
+    5. Outputs embedding for cross-TF attention
 
     The CfC layer is particularly well-suited here because:
     - It models continuous-time dynamics (natural for financial data)
     - Has strong extrapolation capabilities
     - Learns causal relationships between features
     - Compact parameter count vs LSTM/GRU
+
+    The optional TCN block adds:
+    - Dilated causal convolutions for multi-scale temporal patterns
+    - Residual connections for gradient flow
+    - Complementary temporal modeling to CfC
     """
 
     def __init__(
@@ -315,7 +421,11 @@ class TFBranch(nn.Module):
         cfc_units: int = 96,  # Must be > hidden_dim + 2
         dropout: float = 0.1,
         use_se_blocks: bool = False,
-        se_reduction_ratio: int = 8
+        se_reduction_ratio: int = 8,
+        use_tcn: bool = False,
+        tcn_channels: int = 64,
+        tcn_kernel_size: int = 3,
+        tcn_layers: int = 2,
     ):
         """
         Initialize timeframe branch.
@@ -328,11 +438,16 @@ class TFBranch(nn.Module):
             dropout: Dropout probability
             use_se_blocks: If True, add SE-block for feature reweighting (default: False)
             se_reduction_ratio: Reduction ratio for SE-block bottleneck (default: 8)
+            use_tcn: If True, add TCN block after CfC for additional temporal modeling (default: False)
+            tcn_channels: Number of channels in TCN hidden layers (default: 64)
+            tcn_kernel_size: Kernel size for TCN convolutions (default: 3)
+            tcn_layers: Number of temporal blocks in TCN (default: 2)
         """
         super().__init__()
 
         input_dim = per_tf_dim + shared_dim
         self.use_se_blocks = use_se_blocks
+        self.use_tcn = use_tcn
 
         # Input projection
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -348,6 +463,21 @@ class TFBranch(nn.Module):
         # Note: cfc_units must be > hidden_dim + 2 for AutoNCP
         wiring = AutoNCP(cfc_units, hidden_dim)
         self.cfc = CfC(hidden_dim, wiring, batch_first=True)
+
+        # Optional TCN block for additional temporal modeling (applied after CfC)
+        if use_tcn:
+            self.tcn_block = TCNBlock(
+                input_dim=hidden_dim,
+                hidden_dim=tcn_channels,
+                num_layers=tcn_layers,
+                kernel_size=tcn_kernel_size,
+                dropout=dropout
+            )
+            # Projection to match output dim if needed
+            if tcn_channels != hidden_dim:
+                self.tcn_proj = nn.Linear(tcn_channels, hidden_dim)
+            else:
+                self.tcn_proj = nn.Identity()
 
         # Output processing
         self.output_norm = nn.LayerNorm(hidden_dim)
@@ -390,10 +520,19 @@ class TFBranch(nn.Module):
         x = x.unsqueeze(1)  # [batch, 1, hidden_dim]
 
         # Process through CfC
-        x, hx_new = self.cfc(x, hx)
+        cfc_out, hx_new = self.cfc(x, hx)
 
         # Remove sequence dimension
-        x = x.squeeze(1)  # [batch, hidden_dim]
+        cfc_out = cfc_out.squeeze(1)  # [batch, hidden_dim]
+
+        # Apply TCN if enabled
+        if self.use_tcn:
+            tcn_out = self.tcn_block(cfc_out)
+            tcn_out = self.tcn_proj(tcn_out)
+            # Residual connection: combine CfC and TCN outputs
+            x = cfc_out + tcn_out
+        else:
+            x = cfc_out
 
         # Output processing
         x = self.output_norm(x)
@@ -832,6 +971,94 @@ class TriggerTFHead(nn.Module):
         if 0 <= class_idx < TriggerTFHead.NUM_CLASSES:
             return TriggerTFHead.CLASS_NAMES[class_idx]
         return f'UNKNOWN_{class_idx}'
+
+
+class MultiResolutionHead(nn.Module):
+    """
+    Multi-resolution prediction head that makes predictions at multiple temporal scales.
+    Combines predictions via learned weighting or attention.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, num_resolutions: int = 3,
+                 head_type: str = 'duration'):
+        super().__init__()
+        self.num_resolutions = num_resolutions
+        self.head_type = head_type
+
+        # Create separate heads for each resolution
+        self.resolution_heads = nn.ModuleList()
+        for i in range(num_resolutions):
+            if head_type == 'duration':
+                self.resolution_heads.append(DurationHead(input_dim, hidden_dim))
+            elif head_type == 'direction':
+                self.resolution_heads.append(DirectionHead(input_dim, hidden_dim))
+            elif head_type == 'next_channel':
+                self.resolution_heads.append(NextChannelDirectionHead(input_dim, hidden_dim))
+            elif head_type == 'confidence':
+                self.resolution_heads.append(ConfidenceHead(input_dim, hidden_dim))
+
+        # Resolution-specific feature transforms
+        self.resolution_transforms = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, input_dim),
+                nn.LayerNorm(input_dim),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            )
+            for _ in range(num_resolutions)
+        ])
+
+        # Learned resolution weighting
+        self.resolution_weights = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_resolutions),
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            x: [batch, input_dim] - input features
+        Returns:
+            Dictionary with per-resolution predictions and combined prediction
+        """
+        outputs = {}
+
+        # Get predictions at each resolution
+        resolution_outputs = []
+        for i, (transform, head) in enumerate(zip(self.resolution_transforms, self.resolution_heads)):
+            res_features = transform(x)
+            res_pred = head(res_features)
+            resolution_outputs.append(res_pred)
+
+            if self.head_type == 'duration':
+                outputs[f'res{i}_mean'] = res_pred[0]
+                outputs[f'res{i}_log_std'] = res_pred[1]
+            else:
+                outputs[f'res{i}_pred'] = res_pred
+
+        # Compute resolution weights
+        weights = self.resolution_weights(x)  # [batch, num_resolutions]
+        outputs['resolution_weights'] = weights
+
+        # Combine predictions (weighted average)
+        if self.head_type == 'duration':
+            # Weighted combination of means
+            means = torch.stack([outputs[f'res{i}_mean'] for i in range(self.num_resolutions)], dim=-1)
+            combined_mean = (means * weights.unsqueeze(1)).sum(dim=-1)
+            outputs['combined_mean'] = combined_mean
+
+            # Combine log_stds (use mean for simplicity)
+            log_stds = torch.stack([outputs[f'res{i}_log_std'] for i in range(self.num_resolutions)], dim=-1)
+            combined_log_std = (log_stds * weights.unsqueeze(1)).sum(dim=-1)
+            outputs['combined_log_std'] = combined_log_std
+        else:
+            # Weighted combination of predictions
+            preds = torch.stack([outputs[f'res{i}_pred'] for i in range(self.num_resolutions)], dim=-1)
+            combined = (preds * weights.unsqueeze(1)).sum(dim=-1)
+            outputs['combined_pred'] = combined
+
+        return outputs
 
 
 # =============================================================================
@@ -1445,7 +1672,13 @@ class HierarchicalCfCModel(nn.Module):
         dropout: float = 0.1,
         shared_heads: bool = True,
         use_se_blocks: bool = False,
-        se_reduction_ratio: int = 8
+        se_reduction_ratio: int = 8,
+        use_multi_resolution: bool = False,
+        resolution_levels: int = 3,
+        use_tcn: bool = False,
+        tcn_channels: int = 64,
+        tcn_kernel_size: int = 3,
+        tcn_layers: int = 2,
     ):
         """
         Initialize hierarchical CfC model.
@@ -1462,6 +1695,13 @@ class HierarchicalCfCModel(nn.Module):
                           SE-blocks learn which features matter per sample. (default: False)
             se_reduction_ratio: Reduction ratio for SE-block bottleneck (default: 8).
                                hidden_dim/ratio = bottleneck size (e.g., 128/8 = 16 neurons)
+            use_multi_resolution: If True, add multi-resolution prediction heads that make
+                                 predictions at multiple temporal scales. (default: False)
+            resolution_levels: Number of resolution levels for multi-resolution heads (default: 3)
+            use_tcn: If True, add TCN block to each TF branch for additional temporal modeling (default: False)
+            tcn_channels: Number of channels in TCN hidden layers (default: 64)
+            tcn_kernel_size: Kernel size for TCN convolutions (default: 3)
+            tcn_layers: Number of temporal blocks in TCN (default: 2)
         """
         super().__init__()
 
@@ -1470,6 +1710,7 @@ class HierarchicalCfCModel(nn.Module):
         self.n_timeframes = self.config.n_timeframes
         self.shared_heads = shared_heads
         self.use_se_blocks = use_se_blocks
+        self.use_tcn = use_tcn
 
         # Validate total input dimension against canonical value from feature_ordering
         assert self.config.total_features == TOTAL_FEATURES, \
@@ -1480,7 +1721,7 @@ class HierarchicalCfCModel(nn.Module):
             f"cfc_units ({cfc_units}) must be > hidden_dim + 2 ({hidden_dim + 2})"
 
         # Create TF branches (11 parallel CfC processors)
-        # Each branch optionally includes SE-block for feature reweighting
+        # Each branch optionally includes SE-block for feature reweighting and/or TCN
         self.tf_branches = nn.ModuleList([
             TFBranch(
                 per_tf_dim=self.config.per_tf_features,
@@ -1489,7 +1730,11 @@ class HierarchicalCfCModel(nn.Module):
                 cfc_units=cfc_units,
                 dropout=dropout,
                 use_se_blocks=use_se_blocks,
-                se_reduction_ratio=se_reduction_ratio
+                se_reduction_ratio=se_reduction_ratio,
+                use_tcn=use_tcn,
+                tcn_channels=tcn_channels,
+                tcn_kernel_size=tcn_kernel_size,
+                tcn_layers=tcn_layers,
             )
             for _ in range(self.n_timeframes)
         ])
@@ -1548,6 +1793,16 @@ class HierarchicalCfCModel(nn.Module):
         self.agg_next_channel_head = NextChannelDirectionHead(context_dim, hidden_dim)
         self.agg_confidence_head = ConfidenceHead(context_dim, hidden_dim)
         self.agg_trigger_tf_head = TriggerTFHead(context_dim, hidden_dim)  # v9.0.0: 21-class trigger TF
+
+        # Multi-resolution prediction heads (optional)
+        self.use_multi_resolution = use_multi_resolution
+        if use_multi_resolution:
+            self.multi_res_duration = MultiResolutionHead(
+                context_dim, hidden_dim // 2, resolution_levels, 'duration'
+            )
+            self.multi_res_direction = MultiResolutionHead(
+                context_dim, hidden_dim // 2, resolution_levels, 'direction'
+            )
 
         # Per-TF window selector (shared across all TFs)
         self.window_selector = PerTFWindowSelector(
@@ -1716,6 +1971,20 @@ class HierarchicalCfCModel(nn.Module):
         agg_trigger_tf = self.agg_trigger_tf_head(context)  # v9.0.0: 21-class trigger TF
 
         # =====================================================================
+        # MULTI-RESOLUTION PREDICTIONS (optional)
+        # =====================================================================
+        multi_res_dur = None
+        multi_res_dir = None
+        if self.use_multi_resolution:
+            # Use aggregate context for multi-resolution
+            multi_res_dur = self.multi_res_duration(context)
+            multi_res_dir = self.multi_res_direction(context)
+
+            # Optionally override main predictions with combined multi-res
+            # outputs['agg_duration_mean'] = multi_res_dur['combined_mean']
+            # outputs['agg_duration_log_std'] = multi_res_dur['combined_log_std']
+
+        # =====================================================================
         # WINDOW SELECTION (per-TF)
         # =====================================================================
         # After TF attention, use embeddings + window_scores to select optimal window
@@ -1752,6 +2021,11 @@ class HierarchicalCfCModel(nn.Module):
                 'trigger_tf_logits': agg_trigger_tf,           # [batch, 21] - v9.0.0
             }
         }
+
+        # Multi-resolution predictions
+        if self.use_multi_resolution:
+            output['multi_res_duration'] = multi_res_dur
+            output['multi_res_direction'] = multi_res_dir
 
         if return_attention:
             output['attention_weights'] = attn_weights
@@ -2063,6 +2337,12 @@ def create_model(
     shared_heads: bool = True,
     use_se_blocks: bool = False,
     se_reduction_ratio: int = 8,
+    use_multi_resolution: bool = False,
+    resolution_levels: int = 3,
+    use_tcn: bool = False,
+    tcn_channels: int = 64,
+    tcn_kernel_size: int = 3,
+    tcn_layers: int = 2,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> HierarchicalCfCModel:
     """
@@ -2077,6 +2357,12 @@ def create_model(
                      If False, create separate prediction heads per timeframe.
         use_se_blocks: If True, add SE-blocks for feature reweighting (default: False)
         se_reduction_ratio: Reduction ratio for SE-block bottleneck (default: 8)
+        use_multi_resolution: If True, add multi-resolution prediction heads (default: False)
+        resolution_levels: Number of resolution levels for multi-resolution heads (default: 3)
+        use_tcn: If True, add TCN block to each TF branch for additional temporal modeling (default: False)
+        tcn_channels: Number of channels in TCN hidden layers (default: 64)
+        tcn_kernel_size: Kernel size for TCN convolutions (default: 3)
+        tcn_layers: Number of temporal blocks in TCN (default: 2)
         device: Device to place model on
 
     Returns:
@@ -2090,7 +2376,13 @@ def create_model(
         dropout=dropout,
         shared_heads=shared_heads,
         use_se_blocks=use_se_blocks,
-        se_reduction_ratio=se_reduction_ratio
+        se_reduction_ratio=se_reduction_ratio,
+        use_multi_resolution=use_multi_resolution,
+        resolution_levels=resolution_levels,
+        use_tcn=use_tcn,
+        tcn_channels=tcn_channels,
+        tcn_kernel_size=tcn_kernel_size,
+        tcn_layers=tcn_layers,
     )
 
     model = model.to(device)

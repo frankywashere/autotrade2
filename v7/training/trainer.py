@@ -32,6 +32,137 @@ from v7.training.losses import CombinedLoss, EndToEndLoss
 from v7.features.feature_ordering import FEATURE_ORDER, TOTAL_FEATURES
 
 
+class GradNormBalancer:
+    """
+    GradNorm: Gradient Normalization for Adaptive Loss Balancing
+    Paper: https://arxiv.org/abs/1711.02257
+
+    Dynamically adjusts task weights based on gradient magnitudes
+    to balance training across multiple tasks.
+    """
+    def __init__(self, num_tasks: int, alpha: float = 1.5, device: str = 'cpu'):
+        self.num_tasks = num_tasks
+        self.alpha = alpha  # Restoring force strength
+        self.device = device
+
+        # Task weights (learnable)
+        self.task_weights = torch.ones(num_tasks, device=device, requires_grad=True)
+
+        # Initial loss values for relative scaling
+        self.initial_losses = None
+
+    def compute_grad_norms(self, losses: List[torch.Tensor], shared_params: List[torch.Tensor]) -> torch.Tensor:
+        """Compute gradient norms for each task w.r.t. shared parameters."""
+        grad_norms = []
+        for loss in losses:
+            # Compute gradients
+            grads = torch.autograd.grad(loss, shared_params, retain_graph=True, allow_unused=True)
+            # Compute L2 norm of gradients
+            grad_norm = torch.sqrt(sum((g ** 2).sum() for g in grads if g is not None) + 1e-8)
+            grad_norms.append(grad_norm)
+        return torch.stack(grad_norms)
+
+    def update_weights(self, losses: List[torch.Tensor], shared_params: List[torch.Tensor]) -> torch.Tensor:
+        """Update task weights based on GradNorm algorithm."""
+        # Initialize initial losses on first call
+        if self.initial_losses is None:
+            self.initial_losses = torch.tensor([l.item() for l in losses], device=self.device)
+
+        # Compute gradient norms
+        grad_norms = self.compute_grad_norms(losses, shared_params)
+
+        # Compute relative inverse training rates
+        loss_ratios = torch.tensor([l.item() / (il + 1e-8) for l, il in zip(losses, self.initial_losses)],
+                                   device=self.device)
+        mean_loss_ratio = loss_ratios.mean()
+        inverse_train_rates = loss_ratios / (mean_loss_ratio + 1e-8)
+
+        # Compute target gradient norms
+        mean_grad_norm = grad_norms.mean()
+        target_grad_norms = mean_grad_norm * (inverse_train_rates ** self.alpha)
+
+        # Update weights to match target gradient norms
+        with torch.no_grad():
+            grad_norm_ratios = target_grad_norms / (grad_norms + 1e-8)
+            self.task_weights.data = self.task_weights.data * grad_norm_ratios
+            # Normalize weights to sum to num_tasks
+            self.task_weights.data = self.task_weights.data * self.num_tasks / self.task_weights.sum()
+
+        return self.task_weights.detach()
+
+
+class PCGradBalancer:
+    """
+    PCGrad: Projecting Conflicting Gradients
+    Paper: https://arxiv.org/abs/2001.06782
+
+    Projects gradients to remove conflicting components between tasks.
+    """
+    def __init__(self, num_tasks: int):
+        self.num_tasks = num_tasks
+
+    def project_gradients(self, grads: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Project gradients to remove conflicts.
+        For each gradient, subtract components that conflict with other gradients.
+        """
+        projected_grads = [g.clone() for g in grads]
+
+        for i in range(self.num_tasks):
+            for j in range(self.num_tasks):
+                if i == j:
+                    continue
+
+                # Check if gradients conflict (negative dot product)
+                dot = (projected_grads[i] * grads[j]).sum()
+                if dot < 0:
+                    # Project out the conflicting component
+                    # g_i = g_i - (g_i . g_j / ||g_j||^2) * g_j
+                    grad_j_norm_sq = (grads[j] ** 2).sum() + 1e-8
+                    projected_grads[i] = projected_grads[i] - (dot / grad_j_norm_sq) * grads[j]
+
+        return projected_grads
+
+    def apply(self, model: nn.Module, task_losses: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Compute PCGrad-adjusted combined gradient.
+
+        Args:
+            model: The model to compute gradients for
+            task_losses: List of individual task losses
+
+        Returns:
+            Combined loss for backward pass (gradients already modified)
+        """
+        # Get all parameters
+        params = [p for p in model.parameters() if p.requires_grad]
+
+        # Compute gradients for each task
+        task_grads = []
+        for loss in task_losses:
+            grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+            # Flatten all gradients into single vector
+            flat_grad = torch.cat([g.flatten() if g is not None else torch.zeros_like(p).flatten()
+                                   for g, p in zip(grads, params)])
+            task_grads.append(flat_grad)
+
+        # Project gradients
+        projected_grads = self.project_gradients(task_grads)
+
+        # Average projected gradients
+        avg_grad = torch.stack(projected_grads).mean(dim=0)
+
+        # Apply averaged gradient to parameters
+        idx = 0
+        for p in params:
+            numel = p.numel()
+            p.grad = avg_grad[idx:idx + numel].view_as(p)
+            idx += numel
+
+        # Return sum of losses (gradients already set)
+        return sum(task_losses)
+
+
 @dataclass
 class TrainingConfig:
     """Configuration for training."""
@@ -47,6 +178,10 @@ class TrainingConfig:
     batch_size: int = 32
     gradient_clip: float = 1.0
 
+    # Gradient balancing
+    gradient_balancing: str = 'none'  # 'none', 'gradnorm', 'pcgrad'
+    gradnorm_alpha: float = 1.5  # GradNorm alpha parameter
+
     # Loss configuration
     num_timeframes: int = 11  # Number of timeframes being predicted
     use_learnable_weights: bool = True  # Use uncertainty-based learnable task weights
@@ -57,6 +192,12 @@ class TrainingConfig:
     # - 'brier_per_tf': Brier on per-TF confidence head (default, separate confidence head)
     # - 'brier_aggregate': Brier on aggregate confidence head (single cross-TF confidence)
     calibration_mode: str = 'brier_per_tf'
+
+    # Loss function options
+    duration_loss_type: str = 'gaussian_nll'  # 'gaussian_nll', 'huber', 'survival'
+    huber_delta: float = 1.0
+    direction_loss_type: str = 'bce'  # 'bce', 'focal'
+    focal_gamma: float = 2.0
 
     # Window selection loss (for learned_selection strategy)
     # When enabled, trains the model's window_selector head to pick optimal windows
@@ -78,6 +219,16 @@ class TrainingConfig:
     use_se_blocks: bool = False  # Enable SE-block feature reweighting in TF branches
     se_reduction_ratio: int = 8  # Bottleneck ratio (hidden_dim/ratio = bottleneck size)
 
+    # TCN block (Temporal Convolutional Network)
+    use_tcn: bool = False
+    tcn_channels: int = 64
+    tcn_kernel_size: int = 3
+    tcn_layers: int = 2
+
+    # Multi-resolution heads
+    use_multi_resolution: bool = False
+    resolution_levels: int = 3
+
     # Optimization
     optimizer: str = 'adam'  # 'adam', 'adamw', 'sgd'
     scheduler: str = 'cosine_restarts'  # 'cosine', 'cosine_restarts', 'step', 'plateau', 'none'
@@ -91,6 +242,11 @@ class TrainingConfig:
     early_stopping_patience: int = 10
     early_stopping_metric: str = 'total'  # 'total', 'duration', 'direction_acc', 'next_channel_acc', etc.
     early_stopping_mode: str = 'min'  # 'min' for losses, 'max' for accuracies
+
+    # Two-stage training
+    two_stage_training: bool = False
+    stage1_epochs: int = 5
+    stage1_task: str = 'direction'  # 'direction' or 'duration'
 
     # Checkpointing
     save_dir: Path = Path('./checkpoints')
@@ -151,6 +307,11 @@ class Trainer:
                 calibration_weight=0.5,
                 entropy_weight=0.1,  # Encourages decisive window selection
                 consistency_weight=0.05,  # Helps warm-start with heuristic best_window
+                # Loss type configuration
+                duration_loss_type=config.duration_loss_type,
+                huber_delta=config.huber_delta,
+                direction_loss_type=config.direction_loss_type,
+                focal_gamma=config.focal_gamma,
             )
         else:
             # Phase 2a: CombinedLoss with learnable or fixed weights
@@ -164,6 +325,11 @@ class Trainer:
                 # v9.1 duration loss tuning
                 uncertainty_penalty=config.uncertainty_penalty,
                 min_duration_precision=config.min_duration_precision,
+                # Loss type configuration
+                duration_loss_type=config.duration_loss_type,
+                huber_delta=config.huber_delta,
+                direction_loss_type=config.direction_loss_type,
+                focal_gamma=config.focal_gamma,
             )
         # Move criterion to device (critical for learnable weights)
         self.criterion.to(self.device)
@@ -173,6 +339,19 @@ class Trainer:
 
         # Setup scheduler
         self.scheduler = self._create_scheduler()
+
+        # Setup gradient balancing
+        self.gradient_balancing = config.gradient_balancing
+        if self.gradient_balancing == 'gradnorm':
+            self.grad_balancer = GradNormBalancer(
+                num_tasks=5,  # duration, direction, next_channel, calibration, trigger_tf
+                alpha=config.gradnorm_alpha,
+                device=str(config.device)
+            )
+        elif self.gradient_balancing == 'pcgrad':
+            self.grad_balancer = PCGradBalancer(num_tasks=5)
+        else:
+            self.grad_balancer = None
 
         # Mixed precision scaler
         if config.use_amp:
@@ -188,6 +367,12 @@ class Trainer:
         self.epochs_without_improvement = 0
         self.train_metrics_history = []
         self.val_metrics_history = []
+
+        # Two-stage training setup
+        self.two_stage_training = config.two_stage_training
+        self.stage1_epochs = config.stage1_epochs if config.two_stage_training else 0
+        self.stage1_task = config.stage1_task
+        self.current_stage = 1 if config.two_stage_training else 0  # 0 = no two-stage, 1 = stage1, 2 = stage2
 
         # Setup directories
         self.config.save_dir.mkdir(parents=True, exist_ok=True)
@@ -282,6 +467,66 @@ class Trainer:
         else:
             raise ValueError(f"Unknown scheduler: {self.config.scheduler}")
 
+    def _setup_stage1(self):
+        """Configure model for stage 1 pretraining (single task focus)."""
+        print(f"\n[Two-Stage Training] Setting up Stage 1: Focus on {self.stage1_task}")
+
+        # Store original loss weights
+        self._original_fixed_weights = self.config.fixed_weights.copy() if self.config.fixed_weights else None
+
+        # Modify loss weights to focus on primary task
+        if self.stage1_task == 'direction':
+            self.criterion.set_task_weights({
+                'duration': 0.1,      # Minimal
+                'direction': 5.0,     # Primary focus
+                'next_channel': 0.1,
+                'trigger_tf': 0.1,
+                'calibration': 0.1,
+            })
+        elif self.stage1_task == 'duration':
+            self.criterion.set_task_weights({
+                'duration': 5.0,      # Primary focus
+                'direction': 0.1,
+                'next_channel': 0.1,
+                'trigger_tf': 0.1,
+                'calibration': 0.1,
+            })
+
+        # Optionally freeze non-primary heads to focus learning
+        for name, param in self.model.named_parameters():
+            if self.stage1_task == 'direction':
+                if 'duration_head' in name.lower():
+                    param.requires_grad = False
+            elif self.stage1_task == 'duration':
+                if 'direction_head' in name.lower():
+                    param.requires_grad = False
+
+    def _setup_stage2(self):
+        """Configure model for stage 2 joint training."""
+        print(f"\n[Two-Stage Training] Transitioning to Stage 2: Joint training")
+
+        # Unfreeze all parameters
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+        # Restore original loss weights or use balanced weights
+        if self._original_fixed_weights:
+            self.criterion.set_task_weights(self._original_fixed_weights)
+        else:
+            # Use balanced weights for joint training
+            self.criterion.set_task_weights({
+                'duration': 2.5,
+                'direction': 1.0,
+                'next_channel': 0.8,
+                'trigger_tf': 1.5,
+                'calibration': 0.5,
+            })
+
+        # Reduce learning rate for fine-tuning
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = param_group['lr'] * 0.5
+        print(f"[Two-Stage Training] Reduced learning rate to {self.optimizer.param_groups[0]['lr']:.6f}")
+
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
         # Reset hidden states for fresh start (critical for CfC models)
@@ -373,8 +618,50 @@ class Trainer:
                         predictions = self.model(x)
                     loss, loss_dict = self.criterion(predictions, targets, masks)
 
-                # Backward pass
-                self.scaler.scale(loss).backward()
+                # Backward pass with gradient balancing
+                if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:
+                    # Get individual task losses from loss_dict
+                    task_losses = [
+                        loss_dict.get('duration', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('direction', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('next_channel', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('calibration', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('trigger_tf', torch.tensor(0.0, device=self.device)),
+                    ]
+                    # Convert to tensors if they are floats
+                    task_losses = [torch.tensor(l, device=self.device) if isinstance(l, (int, float)) else l for l in task_losses]
+
+                    # Get shared parameters (encoder - not head parameters)
+                    shared_params = [p for n, p in self.model.named_parameters()
+                                     if 'head' not in n.lower() and p.requires_grad]
+
+                    # Update weights
+                    weights = self.grad_balancer.update_weights(task_losses, shared_params)
+
+                    # Recompute weighted loss
+                    loss = sum(w * l for w, l in zip(weights, task_losses))
+
+                    self.scaler.scale(loss).backward()
+
+                elif self.gradient_balancing == 'pcgrad' and self.grad_balancer is not None:
+                    # Get individual task losses
+                    task_losses = [
+                        loss_dict.get('duration', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('direction', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('next_channel', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('calibration', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('trigger_tf', torch.tensor(0.0, device=self.device)),
+                    ]
+                    # Convert to tensors if they are floats
+                    task_losses = [torch.tensor(l, device=self.device, requires_grad=True) if isinstance(l, (int, float)) else l for l in task_losses]
+
+                    # Apply PCGrad - this sets gradients directly
+                    loss = self.grad_balancer.apply(self.model, task_losses)
+                    # Skip regular backward since PCGrad already set gradients
+
+                else:
+                    # Standard backward pass
+                    self.scaler.scale(loss).backward()
 
                 # Gradient clipping (include both model and criterion parameters)
                 if self.config.gradient_clip > 0:
@@ -391,8 +678,50 @@ class Trainer:
                     predictions = self.model(x)
                 loss, loss_dict = self.criterion(predictions, targets, masks)
 
-                # Backward pass
-                loss.backward()
+                # Backward pass with gradient balancing
+                if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:
+                    # Get individual task losses from loss_dict
+                    task_losses = [
+                        loss_dict.get('duration', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('direction', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('next_channel', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('calibration', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('trigger_tf', torch.tensor(0.0, device=self.device)),
+                    ]
+                    # Convert to tensors if they are floats
+                    task_losses = [torch.tensor(l, device=self.device) if isinstance(l, (int, float)) else l for l in task_losses]
+
+                    # Get shared parameters (encoder - not head parameters)
+                    shared_params = [p for n, p in self.model.named_parameters()
+                                     if 'head' not in n.lower() and p.requires_grad]
+
+                    # Update weights
+                    weights = self.grad_balancer.update_weights(task_losses, shared_params)
+
+                    # Recompute weighted loss
+                    loss = sum(w * l for w, l in zip(weights, task_losses))
+
+                    loss.backward()
+
+                elif self.gradient_balancing == 'pcgrad' and self.grad_balancer is not None:
+                    # Get individual task losses
+                    task_losses = [
+                        loss_dict.get('duration', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('direction', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('next_channel', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('calibration', torch.tensor(0.0, device=self.device)),
+                        loss_dict.get('trigger_tf', torch.tensor(0.0, device=self.device)),
+                    ]
+                    # Convert to tensors if they are floats
+                    task_losses = [torch.tensor(l, device=self.device, requires_grad=True) if isinstance(l, (int, float)) else l for l in task_losses]
+
+                    # Apply PCGrad - this sets gradients directly
+                    loss = self.grad_balancer.apply(self.model, task_losses)
+                    # Skip regular backward since PCGrad already set gradients
+
+                else:
+                    # Standard backward pass
+                    loss.backward()
 
                 # Gradient clipping (include both model and criterion parameters)
                 if self.config.gradient_clip > 0:
@@ -588,13 +917,31 @@ class Trainer:
 
     def save_checkpoint(self, filename: str, is_best: bool = False):
         """Save model checkpoint."""
-        # Ensure model_kwargs includes SE-blocks parameters from TrainingConfig
+        # Ensure model_kwargs includes architecture parameters from TrainingConfig
         # This is critical for dashboards to reconstruct models properly
         model_kwargs = dict(self.config.model_kwargs) if self.config.model_kwargs else {}
+
+        # SE-blocks parameters
         if 'use_se_blocks' not in model_kwargs:
             model_kwargs['use_se_blocks'] = self.config.use_se_blocks
         if 'se_reduction_ratio' not in model_kwargs:
             model_kwargs['se_reduction_ratio'] = self.config.se_reduction_ratio
+
+        # TCN block parameters
+        if 'use_tcn' not in model_kwargs:
+            model_kwargs['use_tcn'] = self.config.use_tcn
+        if 'tcn_channels' not in model_kwargs:
+            model_kwargs['tcn_channels'] = self.config.tcn_channels
+        if 'tcn_kernel_size' not in model_kwargs:
+            model_kwargs['tcn_kernel_size'] = self.config.tcn_kernel_size
+        if 'tcn_layers' not in model_kwargs:
+            model_kwargs['tcn_layers'] = self.config.tcn_layers
+
+        # Multi-resolution heads parameters
+        if 'use_multi_resolution' not in model_kwargs:
+            model_kwargs['use_multi_resolution'] = self.config.use_multi_resolution
+        if 'resolution_levels' not in model_kwargs:
+            model_kwargs['resolution_levels'] = self.config.resolution_levels
 
         # Create a copy of config with updated model_kwargs
         # We modify the dataclass directly since it will be serialized
@@ -701,16 +1048,29 @@ class Trainer:
             'epochs_trained': self.current_epoch,
         }
 
-    def train(self) -> Dict[str, List[Dict]]:
-        """Main training loop."""
+    def train(self) -> Dict[str, Any]:
+        """Main training loop with optional two-stage training."""
         print(f"Starting training on {self.device}")
         print(f"Expected feature dimensions: {TOTAL_FEATURES}")
         print(f"Training samples: {len(self.train_loader.dataset)}")
         print(f"Validation samples: {len(self.val_loader.dataset)}")
 
+        # Setup stage 1 if two-stage training enabled
+        if self.two_stage_training and self.current_stage == 1:
+            self._setup_stage1()
+
         for epoch in range(self.current_epoch, self.config.num_epochs):
             self.current_epoch = epoch
             epoch_start_time = time.time()
+
+            # Check for stage transition
+            if self.two_stage_training:
+                if self.current_stage == 1 and epoch >= self.stage1_epochs:
+                    self.current_stage = 2
+                    self._setup_stage2()
+                    print(f"\n{'='*50}")
+                    print(f"Stage 2 starting at epoch {epoch}")
+                    print(f"{'='*50}\n")
 
             # Train
             train_metrics = self.train_epoch()
@@ -736,7 +1096,9 @@ class Trainer:
 
             # Print epoch summary
             epoch_time = time.time() - epoch_start_time
-            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs} ({epoch_time:.1f}s):")
+            # Log current stage
+            stage_str = f" [Stage {self.current_stage}]" if self.two_stage_training else ""
+            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}{stage_str} ({epoch_time:.1f}s):")
             print(f"  Train Loss: {train_metrics['total']:.4f}")
             print(f"  Val Loss: {val_metrics['total']:.4f}")
             # v9.0.0: Include trigger_tf accuracy if present
@@ -779,11 +1141,15 @@ class Trainer:
         if self.writer:
             self.writer.close()
 
-        # Return training history
-        return {
+        # Return training history with two-stage info
+        results = {
             'train': self.train_metrics_history,
-            'val': self.val_metrics_history
+            'val': self.val_metrics_history,
+            'two_stage_training': self.two_stage_training,
+            'stage1_epochs': self.stage1_epochs if self.two_stage_training else 0,
+            'stage1_task': self.stage1_task if self.two_stage_training else None,
         }
+        return results
 
 
 if __name__ == '__main__':

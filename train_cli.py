@@ -350,6 +350,46 @@ Examples:
         help='SE-block reduction ratio (default: 8). Only used if --se-blocks is enabled'
     )
 
+    model_group.add_argument(
+        '--use-tcn',
+        action='store_true',
+        help='Add Temporal Convolutional Network block after CfC'
+    )
+
+    model_group.add_argument(
+        '--tcn-channels',
+        type=int,
+        default=64,
+        help='Number of TCN channels (default: 64)'
+    )
+
+    model_group.add_argument(
+        '--tcn-kernel-size',
+        type=int,
+        default=3,
+        help='TCN kernel size (default: 3)'
+    )
+
+    model_group.add_argument(
+        '--tcn-layers',
+        type=int,
+        default=2,
+        help='Number of TCN layers (default: 2)'
+    )
+
+    model_group.add_argument(
+        '--use-multi-resolution',
+        action='store_true',
+        help='Use multi-resolution prediction heads'
+    )
+
+    model_group.add_argument(
+        '--resolution-levels',
+        type=int,
+        default=3,
+        help='Number of resolution levels for multi-resolution heads (default: 3)'
+    )
+
     # =========================================================================
     # Training Group
     # =========================================================================
@@ -482,6 +522,72 @@ Examples:
         default=0.25,
         metavar='PRECISION',
         help='Minimum precision floor for duration task weight (default: 0.25 = 25%%)'
+    )
+
+    training_group.add_argument(
+        '--gradient-balancing',
+        type=str,
+        choices=['none', 'gradnorm', 'pcgrad'],
+        default='none',
+        help='Gradient balancing method for multi-task learning (default: none)'
+    )
+
+    training_group.add_argument(
+        '--gradnorm-alpha',
+        type=float,
+        default=1.5,
+        help='GradNorm alpha parameter - higher = more aggressive balancing (default: 1.5)'
+    )
+
+    training_group.add_argument(
+        '--two-stage-training',
+        action='store_true',
+        help='Enable two-stage training: pretrain on primary task, then joint fine-tune'
+    )
+
+    training_group.add_argument(
+        '--stage1-epochs',
+        type=int,
+        default=5,
+        help='Number of epochs for stage 1 pretraining (default: 5)'
+    )
+
+    training_group.add_argument(
+        '--stage1-task',
+        type=str,
+        choices=['direction', 'duration'],
+        default='direction',
+        help='Primary task for stage 1 pretraining (default: direction)'
+    )
+
+    training_group.add_argument(
+        '--duration-loss',
+        type=str,
+        choices=['gaussian_nll', 'huber', 'survival'],
+        default='gaussian_nll',
+        help='Loss function for duration prediction (default: gaussian_nll)'
+    )
+
+    training_group.add_argument(
+        '--huber-delta',
+        type=float,
+        default=1.0,
+        help='Delta parameter for Huber loss (default: 1.0)'
+    )
+
+    training_group.add_argument(
+        '--direction-loss',
+        type=str,
+        choices=['bce', 'focal'],
+        default='bce',
+        help='Loss function for direction prediction (default: bce)'
+    )
+
+    training_group.add_argument(
+        '--focal-gamma',
+        type=float,
+        default=2.0,
+        help='Gamma parameter for Focal loss (default: 2.0)'
     )
 
     # =========================================================================
@@ -760,6 +866,14 @@ def args_to_config(args: argparse.Namespace) -> dict:
             'shared_heads': args.shared_heads,
             'use_se_blocks': args.se_blocks,
             'se_reduction_ratio': args.se_ratio,
+            # TCN block settings
+            'use_tcn': args.use_tcn,
+            'tcn_channels': args.tcn_channels,
+            'tcn_kernel_size': args.tcn_kernel_size,
+            'tcn_layers': args.tcn_layers,
+            # Multi-resolution heads settings
+            'use_multi_resolution': args.use_multi_resolution,
+            'resolution_levels': args.resolution_levels,
         },
         'training': {
             'num_epochs': num_epochs,
@@ -780,6 +894,18 @@ def args_to_config(args: argparse.Namespace) -> dict:
             'uncertainty_penalty': args.uncertainty_penalty,
             'min_duration_precision': args.min_duration_precision,
             'use_window_selection_loss': args.window_strategy == 'learned_selection',
+            # Gradient balancing settings
+            'gradient_balancing': args.gradient_balancing,
+            'gradnorm_alpha': args.gradnorm_alpha,
+            # Two-stage training settings
+            'two_stage_training': args.two_stage_training,
+            'stage1_epochs': args.stage1_epochs,
+            'stage1_task': args.stage1_task,
+            # Loss function settings
+            'duration_loss': args.duration_loss,
+            'huber_delta': args.huber_delta,
+            'direction_loss': args.direction_loss,
+            'focal_gamma': args.focal_gamma,
         },
         'device': args.device,
         'run_name': args.run_name,

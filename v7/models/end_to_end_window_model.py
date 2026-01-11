@@ -459,6 +459,13 @@ class EndToEndWindowModel(nn.Module):
         shared_heads: bool = True,
         use_se_blocks: bool = False,
         se_reduction_ratio: int = 8,
+        use_multi_resolution: bool = False,
+        resolution_levels: int = 3,
+        # TCN parameters
+        use_tcn: bool = False,
+        tcn_channels: int = 64,
+        tcn_kernel_size: int = 3,
+        tcn_layers: int = 2,
     ):
         """
         Initialize the EndToEndWindowModel.
@@ -507,6 +514,26 @@ class EndToEndWindowModel(nn.Module):
         se_reduction_ratio : int, optional
             Reduction ratio for SE-block bottleneck. Controls the compression
             in the SE-block's channel attention mechanism. Default is 8.
+
+        use_multi_resolution : bool, optional
+            If True, add multi-resolution prediction heads that make predictions
+            at multiple temporal scales. Default is False.
+
+        resolution_levels : int, optional
+            Number of resolution levels for multi-resolution heads. Default is 3.
+
+        use_tcn : bool, optional
+            If True, add TCN (Temporal Convolutional Network) block to each TF
+            branch for additional temporal modeling. Default is False.
+
+        tcn_channels : int, optional
+            Number of channels in TCN hidden layers. Default is 64.
+
+        tcn_kernel_size : int, optional
+            Kernel size for TCN convolutions. Default is 3.
+
+        tcn_layers : int, optional
+            Number of temporal blocks in TCN. Default is 2.
         """
         super().__init__()
 
@@ -549,6 +576,12 @@ class EndToEndWindowModel(nn.Module):
             shared_heads=shared_heads,
             use_se_blocks=use_se_blocks,
             se_reduction_ratio=se_reduction_ratio,
+            use_multi_resolution=use_multi_resolution,
+            resolution_levels=resolution_levels,
+            use_tcn=use_tcn,
+            tcn_channels=tcn_channels,
+            tcn_kernel_size=tcn_kernel_size,
+            tcn_layers=tcn_layers,
         )
 
     def forward(
@@ -935,6 +968,8 @@ def create_end_to_end_model(
     shared_heads: bool = True,
     use_se_blocks: bool = False,
     se_reduction_ratio: int = 8,
+    use_multi_resolution: bool = False,
+    resolution_levels: int = 3,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
 ) -> EndToEndWindowModel:
     """
@@ -980,6 +1015,13 @@ def create_end_to_end_model(
         Reduction ratio for SE-block bottleneck. Controls the compression
         in the SE-block's channel attention mechanism. Default is 8.
 
+    use_multi_resolution : bool, optional
+        If True, add multi-resolution prediction heads that make predictions
+        at multiple temporal scales. Default is False.
+
+    resolution_levels : int, optional
+        Number of resolution levels for multi-resolution heads. Default is 3.
+
     device : str, optional
         Device to place model on. Default is 'cuda' if available, else 'cpu'.
 
@@ -1001,6 +1043,8 @@ def create_end_to_end_model(
         shared_heads=shared_heads,
         use_se_blocks=use_se_blocks,
         se_reduction_ratio=se_reduction_ratio,
+        use_multi_resolution=use_multi_resolution,
+        resolution_levels=resolution_levels,
     )
 
     model = model.to(device)

@@ -52,6 +52,7 @@ from rich.tree import Tree
 
 # InquirerPy for interactive prompts
 from InquirerPy import inquirer
+from InquirerPy.base.control import Choice
 from InquirerPy.validator import NumberValidator, PathValidator
 
 # v7 modules
@@ -990,6 +991,50 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
         console.print(f"[green]✓ SE-blocks enabled with reduction ratio {se_reduction_ratio} "
                       f"({hidden_dim}→{max(hidden_dim // se_reduction_ratio, 4)}→{hidden_dim})[/green]")
 
+    # Temporal Convolutional Network
+    console.print("\n[dim]TCN adds causal temporal convolutions for capturing long-range dependencies[/dim]")
+    use_tcn = inquirer.confirm(
+        message="Add TCN (Temporal Convolutional Network) block?",
+        default=False,
+    ).execute()
+
+    tcn_channels = 64
+    tcn_kernel_size = 3
+    tcn_layers = 2
+    if use_tcn:
+        tcn_channels = inquirer.select(
+            message="TCN channels:",
+            choices=[32, 64, 128],
+            default=64,
+        ).execute()
+        tcn_kernel_size = inquirer.select(
+            message="TCN kernel size:",
+            choices=[3, 5, 7],
+            default=3,
+        ).execute()
+        tcn_layers = inquirer.select(
+            message="TCN layers:",
+            choices=[1, 2, 3, 4],
+            default=2,
+        ).execute()
+        console.print(f"[green]✓ TCN enabled: {tcn_layers} layers, {tcn_channels} channels, kernel size {tcn_kernel_size}[/green]")
+
+    # Multi-resolution heads
+    console.print("\n[dim]Multi-resolution heads predict at multiple temporal granularities[/dim]")
+    use_multi_resolution = inquirer.confirm(
+        message="Use multi-resolution prediction heads?",
+        default=False,
+    ).execute()
+
+    resolution_levels = 3
+    if use_multi_resolution:
+        resolution_levels = inquirer.select(
+            message="Number of resolution levels:",
+            choices=[2, 3, 4],
+            default=3,
+        ).execute()
+        console.print(f"[green]✓ Multi-resolution heads enabled: {resolution_levels} levels[/green]")
+
     return {
         "hidden_dim": hidden_dim,
         "cfc_units": cfc_units,
@@ -998,6 +1043,12 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
         "shared_heads": shared_heads,
         "use_se_blocks": use_se_blocks,
         "se_reduction_ratio": se_reduction_ratio,
+        "use_tcn": use_tcn,
+        "tcn_channels": tcn_channels,
+        "tcn_kernel_size": tcn_kernel_size,
+        "tcn_layers": tcn_layers,
+        "use_multi_resolution": use_multi_resolution,
+        "resolution_levels": resolution_levels,
     }
 
 
@@ -1188,6 +1239,104 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         console.print("[dim]  • Single confidence value weighing all timeframes[/dim]")
         console.print("[dim]  • Requires model with aggregate_confidence output[/dim]")
 
+    # Gradient balancing for multi-task learning
+    console.print("\n[bold cyan]Multi-Task Learning Configuration[/bold cyan]")
+    console.print("[dim]Configure gradient balancing for multi-task optimization[/dim]\n")
+
+    gradient_balancing = inquirer.select(
+        message="Gradient balancing method:",
+        choices=[
+            Choice("none", "None - Standard gradient descent"),
+            Choice("gradnorm", "GradNorm - Adaptive task weighting via gradient norms"),
+            Choice("pcgrad", "PCGrad - Project conflicting gradients"),
+        ],
+        default="none",
+    ).execute()
+
+    gradnorm_alpha = 1.5
+    if gradient_balancing == "gradnorm":
+        gradnorm_alpha = inquirer.number(
+            message="GradNorm alpha (higher = more aggressive balancing):",
+            float_allowed=True,
+            default=1.5,
+            min_allowed=0.1,
+            max_allowed=5.0,
+        ).execute()
+        console.print(f"[green]  GradNorm enabled with alpha={gradnorm_alpha}[/green]")
+    elif gradient_balancing == "pcgrad":
+        console.print("[green]  PCGrad enabled - conflicting gradients will be projected[/green]")
+
+    # Two-stage training
+    console.print("\n[dim]Two-stage training: pretrain on one task, then fine-tune jointly[/dim]")
+    two_stage = inquirer.confirm(
+        message="Enable two-stage training (pretrain then joint fine-tune)?",
+        default=False,
+    ).execute()
+
+    stage1_epochs = 0
+    stage1_task = "direction"
+    if two_stage:
+        stage1_epochs = inquirer.number(
+            message="Stage 1 pretraining epochs:",
+            default=5,
+            min_allowed=1,
+            max_allowed=20,
+        ).execute()
+        stage1_task = inquirer.select(
+            message="Stage 1 primary task:",
+            choices=["direction", "duration"],
+            default="direction",
+        ).execute()
+        console.print(f"[green]  Two-stage training: {stage1_epochs} epochs on {stage1_task}, then joint training[/green]")
+
+    # Duration loss function
+    console.print("\n[bold cyan]Loss Function Configuration[/bold cyan]")
+    console.print("[dim]Select loss functions for each prediction task[/dim]\n")
+
+    duration_loss = inquirer.select(
+        message="Duration loss function:",
+        choices=[
+            Choice("gaussian_nll", "Gaussian NLL - Probabilistic with uncertainty (default)"),
+            Choice("huber", "Huber - Robust to outliers"),
+            Choice("survival", "Survival/Hazard - Time-to-event modeling"),
+        ],
+        default="gaussian_nll",
+    ).execute()
+
+    huber_delta = 1.0
+    if duration_loss == "huber":
+        huber_delta = inquirer.number(
+            message="Huber delta (transition point):",
+            float_allowed=True,
+            default=1.0,
+        ).execute()
+        console.print(f"[green]  Huber loss with delta={huber_delta}[/green]")
+    elif duration_loss == "gaussian_nll":
+        console.print("[green]  Gaussian NLL - model outputs mean and variance[/green]")
+    elif duration_loss == "survival":
+        console.print("[green]  Survival loss - time-to-event modeling with hazard rates[/green]")
+
+    # Direction loss function
+    direction_loss = inquirer.select(
+        message="Direction loss function:",
+        choices=[
+            Choice("bce", "Binary Cross-Entropy (default)"),
+            Choice("focal", "Focal Loss - Better for imbalanced classes"),
+        ],
+        default="bce",
+    ).execute()
+
+    focal_gamma = 2.0
+    if direction_loss == "focal":
+        focal_gamma = inquirer.number(
+            message="Focal loss gamma (focusing parameter):",
+            float_allowed=True,
+            default=2.0,
+        ).execute()
+        console.print(f"[green]  Focal loss with gamma={focal_gamma}[/green]")
+    else:
+        console.print("[green]  Binary cross-entropy for direction prediction[/green]")
+
     # Advanced options
     configure_advanced = inquirer.confirm(
         message="\nConfigure advanced options (precision, early stopping, weight decay, gradient clipping)?", default=False
@@ -1295,6 +1444,17 @@ def configure_training(preset: Optional[Dict] = None) -> Dict:
         # v9.1 duration loss tuning
         "uncertainty_penalty": uncertainty_penalty,
         "min_duration_precision": min_duration_precision,
+        # Multi-task learning options
+        "gradient_balancing": gradient_balancing,
+        "gradnorm_alpha": gradnorm_alpha,
+        "two_stage": two_stage,
+        "stage1_epochs": stage1_epochs,
+        "stage1_task": stage1_task,
+        # Loss function options
+        "duration_loss": duration_loss,
+        "huber_delta": huber_delta,
+        "direction_loss": direction_loss,
+        "focal_gamma": focal_gamma,
     }
 
 
@@ -1679,6 +1839,24 @@ def display_config_summary(config: Dict, skip_confirm: bool = False):
     else:
         model_tree.add("SE-blocks: Disabled")
 
+    # TCN info
+    use_tcn = config['model'].get('use_tcn', False)
+    if use_tcn:
+        tcn_channels = config['model'].get('tcn_channels', 64)
+        tcn_kernel = config['model'].get('tcn_kernel_size', 3)
+        tcn_layers = config['model'].get('tcn_layers', 2)
+        model_tree.add(f"[yellow]TCN: Enabled ({tcn_layers} layers, {tcn_channels} ch, kernel={tcn_kernel})[/yellow]")
+    else:
+        model_tree.add("TCN: Disabled")
+
+    # Multi-resolution heads info
+    use_multi_resolution = config['model'].get('use_multi_resolution', False)
+    if use_multi_resolution:
+        resolution_levels = config['model'].get('resolution_levels', 3)
+        model_tree.add(f"[yellow]Multi-resolution: Enabled ({resolution_levels} levels)[/yellow]")
+    else:
+        model_tree.add("Multi-resolution: Disabled")
+
     # Training config
     train_tree = Tree("[bold]Training Configuration[/bold]")
     train_tree.add(f"Epochs: {config['training']['num_epochs']}")
@@ -1719,6 +1897,42 @@ def display_config_summary(config: Dict, skip_confirm: bool = False):
     if config['training'].get('use_window_selection_loss', False):
         weight = config['training'].get('window_selection_weight', 0.1)
         train_tree.add(f"[yellow]Window Selection Loss: ENABLED (weight={weight})[/yellow]")
+
+    # Gradient balancing info
+    gradient_balancing = config['training'].get('gradient_balancing', 'none')
+    if gradient_balancing == 'gradnorm':
+        alpha = config['training'].get('gradnorm_alpha', 1.5)
+        train_tree.add(f"[yellow]Gradient Balancing: GradNorm (alpha={alpha})[/yellow]")
+    elif gradient_balancing == 'pcgrad':
+        train_tree.add("[yellow]Gradient Balancing: PCGrad[/yellow]")
+    else:
+        train_tree.add("Gradient Balancing: None")
+
+    # Two-stage training info
+    two_stage = config['training'].get('two_stage', False)
+    if two_stage:
+        stage1_epochs = config['training'].get('stage1_epochs', 5)
+        stage1_task = config['training'].get('stage1_task', 'direction')
+        train_tree.add(f"[yellow]Two-Stage: {stage1_epochs} epochs on {stage1_task}, then joint[/yellow]")
+    else:
+        train_tree.add("Two-Stage: Disabled")
+
+    # Loss function info
+    duration_loss = config['training'].get('duration_loss', 'gaussian_nll')
+    if duration_loss == 'huber':
+        delta = config['training'].get('huber_delta', 1.0)
+        train_tree.add(f"Duration Loss: Huber (delta={delta})")
+    elif duration_loss == 'survival':
+        train_tree.add("Duration Loss: Survival/Hazard")
+    else:
+        train_tree.add("Duration Loss: Gaussian NLL")
+
+    direction_loss = config['training'].get('direction_loss', 'bce')
+    if direction_loss == 'focal':
+        gamma = config['training'].get('focal_gamma', 2.0)
+        train_tree.add(f"Direction Loss: Focal (gamma={gamma})")
+    else:
+        train_tree.add("Direction Loss: BCE")
 
     layout["data"].update(Panel(data_tree, border_style="cyan"))
     layout["model"].update(Panel(model_tree, border_style="magenta"))
@@ -2348,6 +2562,8 @@ def run_walk_forward_training(
                         shared_heads=config["model"].get("shared_heads", True),
                         use_se_blocks=config["model"].get("use_se_blocks", False),
                         se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                        use_multi_resolution=config["model"].get("use_multi_resolution", False),
+                        resolution_levels=config["model"].get("resolution_levels", 3),
                         device=config["device"],
                     )
                 else:
@@ -2359,6 +2575,12 @@ def run_walk_forward_training(
                         shared_heads=config["model"].get("shared_heads", True),
                         use_se_blocks=config["model"].get("use_se_blocks", False),
                         se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                        use_multi_resolution=config["model"].get("use_multi_resolution", False),
+                        resolution_levels=config["model"].get("resolution_levels", 3),
+                        use_tcn=config["model"].get("use_tcn", False),
+                        tcn_channels=config["model"].get("tcn_channels", 64),
+                        tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
+                        tcn_layers=config["model"].get("tcn_layers", 2),
                         device=config["device"],
                     )
 
@@ -2392,6 +2614,26 @@ def run_walk_forward_training(
                 # SE-blocks config (stored in model config)
                 use_se_blocks=config["model"].get("use_se_blocks", False),
                 se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                # Gradient balancing
+                gradient_balancing=config["training"].get("gradient_balancing", "none"),
+                gradnorm_alpha=config["training"].get("gradnorm_alpha", 1.5),
+                # Two-stage training (config uses 'two_stage', TrainingConfig uses 'two_stage_training')
+                two_stage_training=config["training"].get("two_stage", False),
+                stage1_epochs=config["training"].get("stage1_epochs", 5),
+                stage1_task=config["training"].get("stage1_task", "direction"),
+                # Loss type configuration (config uses 'duration_loss'/'direction_loss', TrainingConfig uses 'duration_loss_type'/'direction_loss_type')
+                duration_loss_type=config["training"].get("duration_loss", "gaussian_nll"),
+                huber_delta=config["training"].get("huber_delta", 1.0),
+                direction_loss_type=config["training"].get("direction_loss", "bce"),
+                focal_gamma=config["training"].get("focal_gamma", 2.0),
+                # TCN configuration
+                use_tcn=config["model"].get("use_tcn", False),
+                tcn_channels=config["model"].get("tcn_channels", 64),
+                tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
+                tcn_layers=config["model"].get("tcn_layers", 2),
+                # Multi-resolution configuration
+                use_multi_resolution=config["model"].get("use_multi_resolution", False),
+                resolution_levels=config["model"].get("resolution_levels", 3),
                 device=config["device"],
                 save_dir=window_save_dir,
                 log_dir=log_dir / f"window_{window_idx + 1}",
@@ -2825,6 +3067,8 @@ def main():
                             shared_heads=config["model"].get("shared_heads", True),
                             use_se_blocks=config["model"].get("use_se_blocks", False),
                             se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                            use_multi_resolution=config["model"].get("use_multi_resolution", False),
+                            resolution_levels=config["model"].get("resolution_levels", 3),
                             device=config["device"],
                         )
                     else:
@@ -2836,6 +3080,12 @@ def main():
                             shared_heads=config["model"].get("shared_heads", True),
                             use_se_blocks=config["model"].get("use_se_blocks", False),
                             se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                            use_multi_resolution=config["model"].get("use_multi_resolution", False),
+                            resolution_levels=config["model"].get("resolution_levels", 3),
+                            use_tcn=config["model"].get("use_tcn", False),
+                            tcn_channels=config["model"].get("tcn_channels", 64),
+                            tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
+                            tcn_layers=config["model"].get("tcn_layers", 2),
                             device=config["device"],
                         )
 
@@ -2867,6 +3117,26 @@ def main():
                     min_duration_precision=config["training"].get("min_duration_precision", 0.25),
                     use_se_blocks=config["model"].get("use_se_blocks", False),
                     se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                    # Gradient balancing
+                    gradient_balancing=config["training"].get("gradient_balancing", "none"),
+                    gradnorm_alpha=config["training"].get("gradnorm_alpha", 1.5),
+                    # Two-stage training (config uses 'two_stage', TrainingConfig uses 'two_stage_training')
+                    two_stage_training=config["training"].get("two_stage", False),
+                    stage1_epochs=config["training"].get("stage1_epochs", 5),
+                    stage1_task=config["training"].get("stage1_task", "direction"),
+                    # Loss type configuration (config uses 'duration_loss'/'direction_loss', TrainingConfig uses 'duration_loss_type'/'direction_loss_type')
+                    duration_loss_type=config["training"].get("duration_loss", "gaussian_nll"),
+                    huber_delta=config["training"].get("huber_delta", 1.0),
+                    direction_loss_type=config["training"].get("direction_loss", "bce"),
+                    focal_gamma=config["training"].get("focal_gamma", 2.0),
+                    # TCN configuration
+                    use_tcn=config["model"].get("use_tcn", False),
+                    tcn_channels=config["model"].get("tcn_channels", 64),
+                    tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
+                    tcn_layers=config["model"].get("tcn_layers", 2),
+                    # Multi-resolution configuration
+                    use_multi_resolution=config["model"].get("use_multi_resolution", False),
+                    resolution_levels=config["model"].get("resolution_levels", 3),
                     device=config["device"],
                     save_dir=save_dir,
                     log_dir=log_dir,
@@ -3185,6 +3455,8 @@ def main():
                     shared_heads=config["model"].get("shared_heads", True),
                     use_se_blocks=config["model"].get("use_se_blocks", False),
                     se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                    use_multi_resolution=config["model"].get("use_multi_resolution", False),
+                    resolution_levels=config["model"].get("resolution_levels", 3),
                     device=config["device"],
                 )
                 console.print("[yellow]ℹ[/yellow] Using EndToEndWindowModel for learned_selection strategy\n")
@@ -3197,6 +3469,12 @@ def main():
                     shared_heads=config["model"].get("shared_heads", True),
                     use_se_blocks=config["model"].get("use_se_blocks", False),
                     se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+                    use_multi_resolution=config["model"].get("use_multi_resolution", False),
+                    resolution_levels=config["model"].get("resolution_levels", 3),
+                    use_tcn=config["model"].get("use_tcn", False),
+                    tcn_channels=config["model"].get("tcn_channels", 64),
+                    tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
+                    tcn_layers=config["model"].get("tcn_layers", 2),
                     device=config["device"],
                 )
 
@@ -3230,6 +3508,26 @@ def main():
             # SE-blocks config (stored in model config)
             use_se_blocks=config["model"].get("use_se_blocks", False),
             se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
+            # Gradient balancing
+            gradient_balancing=config["training"].get("gradient_balancing", "none"),
+            gradnorm_alpha=config["training"].get("gradnorm_alpha", 1.5),
+            # Two-stage training (config uses 'two_stage', TrainingConfig uses 'two_stage_training')
+            two_stage_training=config["training"].get("two_stage", False),
+            stage1_epochs=config["training"].get("stage1_epochs", 5),
+            stage1_task=config["training"].get("stage1_task", "direction"),
+            # Loss type configuration (config uses 'duration_loss'/'direction_loss', TrainingConfig uses 'duration_loss_type'/'direction_loss_type')
+            duration_loss_type=config["training"].get("duration_loss", "gaussian_nll"),
+            huber_delta=config["training"].get("huber_delta", 1.0),
+            direction_loss_type=config["training"].get("direction_loss", "bce"),
+            focal_gamma=config["training"].get("focal_gamma", 2.0),
+            # TCN configuration
+            use_tcn=config["model"].get("use_tcn", False),
+            tcn_channels=config["model"].get("tcn_channels", 64),
+            tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
+            tcn_layers=config["model"].get("tcn_layers", 2),
+            # Multi-resolution configuration
+            use_multi_resolution=config["model"].get("use_multi_resolution", False),
+            resolution_levels=config["model"].get("resolution_levels", 3),
             device=config["device"],
             save_dir=save_dir,
             log_dir=log_dir,

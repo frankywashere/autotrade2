@@ -321,6 +321,46 @@ def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[D
                 if 'se_reduction_ratio' not in model_cfg:
                     model_cfg['se_reduction_ratio'] = 4  # Default value
 
+                # === NEW CONFIG FIELDS ===
+                # TCN options
+                if 'use_tcn' not in model_cfg:
+                    # Heuristic: check if TCN layers exist in state_dict
+                    has_tcn = any('tcn' in k.lower() for k in state_dict.keys())
+                    model_cfg['use_tcn'] = has_tcn
+                if 'tcn_channels' not in model_cfg:
+                    model_cfg['tcn_channels'] = None  # Unknown
+                if 'tcn_kernel_size' not in model_cfg:
+                    model_cfg['tcn_kernel_size'] = None
+                if 'tcn_layers' not in model_cfg:
+                    model_cfg['tcn_layers'] = None
+
+                # Multi-resolution options
+                if 'use_multi_resolution' not in model_cfg:
+                    has_multi_res = any('multi_res' in k.lower() or 'resolution' in k.lower() for k in state_dict.keys())
+                    model_cfg['use_multi_resolution'] = has_multi_res
+                if 'resolution_levels' not in model_cfg:
+                    model_cfg['resolution_levels'] = None
+
+                # Gradient balancing options (training config, not model weights)
+                if 'gradient_balancing' not in model_cfg:
+                    model_cfg['gradient_balancing'] = None
+                if 'gradnorm_alpha' not in model_cfg:
+                    model_cfg['gradnorm_alpha'] = None
+
+                # Two-stage training options (training config)
+                if 'two_stage_training' not in model_cfg:
+                    model_cfg['two_stage_training'] = None
+                if 'stage1_epochs' not in model_cfg:
+                    model_cfg['stage1_epochs'] = None
+                if 'stage1_task' not in model_cfg:
+                    model_cfg['stage1_task'] = None
+
+                # Loss types
+                if 'duration_loss_type' not in model_cfg:
+                    model_cfg['duration_loss_type'] = None
+                if 'direction_loss_type' not in model_cfg:
+                    model_cfg['direction_loss_type'] = None
+
         return config_dict if config_dict else None
     except Exception as e:
         st.warning(f"Error extracting config: {e}")
@@ -367,6 +407,40 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 st.warning(f"⚠️ Config inferred from tensor shapes: hidden_dim={hidden_dim}, cfc_units={cfc_units}")
             if use_se_blocks:
                 st.info(f"SE-blocks enabled (reduction_ratio={se_reduction_ratio})")
+
+            # Display new config options if enabled
+            use_tcn = model_config.get('use_tcn', False)
+            if use_tcn:
+                tcn_channels = model_config.get('tcn_channels', 'N/A')
+                tcn_kernel = model_config.get('tcn_kernel_size', 'N/A')
+                tcn_layers = model_config.get('tcn_layers', 'N/A')
+                st.info(f"TCN enabled (channels={tcn_channels}, kernel={tcn_kernel}, layers={tcn_layers})")
+
+            use_multi_res = model_config.get('use_multi_resolution', False)
+            if use_multi_res:
+                res_levels = model_config.get('resolution_levels', 'N/A')
+                st.info(f"Multi-resolution enabled (levels={res_levels})")
+
+            grad_balancing = model_config.get('gradient_balancing', False)
+            if grad_balancing:
+                gradnorm_alpha = model_config.get('gradnorm_alpha', 'N/A')
+                st.info(f"Gradient balancing enabled (alpha={gradnorm_alpha})")
+
+            two_stage = model_config.get('two_stage_training', False)
+            if two_stage:
+                stage1_epochs = model_config.get('stage1_epochs', 'N/A')
+                stage1_task = model_config.get('stage1_task', 'N/A')
+                st.info(f"Two-stage training (stage1: {stage1_epochs} epochs, task={stage1_task})")
+
+            duration_loss = model_config.get('duration_loss_type')
+            direction_loss = model_config.get('direction_loss_type')
+            if duration_loss or direction_loss:
+                loss_info = []
+                if duration_loss:
+                    loss_info.append(f"duration={duration_loss}")
+                if direction_loss:
+                    loss_info.append(f"direction={direction_loss}")
+                st.info(f"Loss types: {', '.join(loss_info)}")
         else:
             hidden_dim, cfc_units, num_heads, dropout, shared_heads = 64, 96, 4, 0.1, True
             use_se_blocks, se_reduction_ratio = False, 4
@@ -805,6 +879,44 @@ def main():
                 cfg = selected_cp['config']['model']
                 st.caption(f"hidden_dim: {cfg.get('hidden_dim', '?')}")
                 st.caption(f"cfc_units: {cfg.get('cfc_units', '?')}")
+
+                # Display new config options in sidebar
+                # SE-blocks
+                if cfg.get('use_se_blocks'):
+                    st.caption(f"SE-blocks: Yes (r={cfg.get('se_reduction_ratio', 4)})")
+
+                # TCN
+                if cfg.get('use_tcn'):
+                    tcn_info = f"TCN: Yes"
+                    if cfg.get('tcn_channels'):
+                        tcn_info += f" (ch={cfg.get('tcn_channels')})"
+                    st.caption(tcn_info)
+
+                # Multi-resolution
+                if cfg.get('use_multi_resolution'):
+                    res_levels = cfg.get('resolution_levels', '?')
+                    st.caption(f"Multi-res: {res_levels} levels")
+
+                # Gradient balancing
+                if cfg.get('gradient_balancing'):
+                    alpha = cfg.get('gradnorm_alpha', '?')
+                    st.caption(f"Grad bal: alpha={alpha}")
+
+                # Two-stage training
+                if cfg.get('two_stage_training'):
+                    stage1 = cfg.get('stage1_task', '?')
+                    st.caption(f"Two-stage: {stage1}")
+
+                # Loss types (only show if non-default)
+                dur_loss = cfg.get('duration_loss_type')
+                dir_loss = cfg.get('direction_loss_type')
+                if dur_loss or dir_loss:
+                    loss_parts = []
+                    if dur_loss:
+                        loss_parts.append(f"dur={dur_loss}")
+                    if dir_loss:
+                        loss_parts.append(f"dir={dir_loss}")
+                    st.caption(f"Loss: {', '.join(loss_parts)}")
 
             # Show training metrics if available
             val_loss = selected_cp.get('val_loss')
@@ -1314,12 +1426,20 @@ def main():
         if checkpoints:
             comparison_rows = []
             for cp in checkpoints:
+                # Get model config for new fields
+                model_cfg = cp.get('config', {}).get('model', {})
+
                 row = {
                     'Model Name': cp['name'],
                     'Val Loss': None,
                     'Best Epoch': None,
                     'Dir Acc %': None,
                     'Next Ch Acc %': None,
+                    'SE': 'Yes' if model_cfg.get('use_se_blocks') else 'No',
+                    'TCN': 'Yes' if model_cfg.get('use_tcn') else 'No',
+                    'Multi-Res': 'Yes' if model_cfg.get('use_multi_resolution') else 'No',
+                    'Grad Bal': 'Yes' if model_cfg.get('gradient_balancing') else 'No',
+                    'Two-Stage': 'Yes' if model_cfg.get('two_stage_training') else 'No',
                     'Size MB': cp['size_mb']
                 }
 
@@ -1389,6 +1509,11 @@ def main():
                     'Best Epoch': df['Best Epoch'].apply(lambda x: format_value(x, 0) if x is None or pd.isna(x) else str(int(x))),
                     'Dir Acc %': df['Dir Acc %'].apply(lambda x: format_value(x, 1, True)),
                     'Next Ch Acc %': df['Next Ch Acc %'].apply(lambda x: format_value(x, 1, True)),
+                    'SE': df['SE'],
+                    'TCN': df['TCN'],
+                    'Multi-Res': df['Multi-Res'],
+                    'Grad Bal': df['Grad Bal'],
+                    'Two-Stage': df['Two-Stage'],
                     'Size MB': df['Size MB'].apply(lambda x: format_value(x, 1))
                 })
 
@@ -1420,7 +1545,11 @@ def main():
                     'Status': exp.get('status', 'unknown'),
                     'Val Loss': exp.get('best_val_loss'),
                     'Dir Acc%': exp.get('best_direction_acc', 0) * 100 if exp.get('best_direction_acc') else None,
-                    'SE-blocks': 'Yes' if settings.get('use_se_blocks', False) else 'No',
+                    'SE': 'Yes' if settings.get('use_se_blocks', False) else 'No',
+                    'TCN': 'Yes' if settings.get('use_tcn', False) else 'No',
+                    'Multi-Res': 'Yes' if settings.get('use_multi_resolution', False) else 'No',
+                    'Grad Bal': 'Yes' if settings.get('gradient_balancing', False) else 'No',
+                    'Two-Stage': 'Yes' if settings.get('two_stage_training', False) else 'No',
                     'hidden_dim': settings.get('hidden_dim', 'N/A'),
                     'LR': settings.get('lr', settings.get('learning_rate', 'N/A')),
                     'Batch': settings.get('batch_size', 'N/A'),
@@ -1451,7 +1580,11 @@ def main():
                 'Status': runs_df['Status'],
                 'Val Loss': runs_df['Val Loss'].apply(lambda x: format_run_value(x, 4)),
                 'Dir Acc%': runs_df['Dir Acc%'].apply(lambda x: format_run_value(x, 1, True)),
-                'SE-blocks': runs_df['SE-blocks'],
+                'SE': runs_df['SE'],
+                'TCN': runs_df['TCN'],
+                'Multi-Res': runs_df['Multi-Res'],
+                'Grad Bal': runs_df['Grad Bal'],
+                'Two-Stage': runs_df['Two-Stage'],
                 'hidden_dim': runs_df['hidden_dim'],
                 'LR': runs_df['LR'],
                 'Batch': runs_df['Batch'],
