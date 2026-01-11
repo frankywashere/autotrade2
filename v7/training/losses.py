@@ -1455,12 +1455,29 @@ class EndToEndLoss(nn.Module):
 
         # Duration loss - THIS IS THE KEY: gradients from this loss flow back
         # through the window selection via the differentiable soft selection
-        loss_duration = self.duration_loss(
-            predictions['duration_mean'],
-            predictions['duration_log_std'],
-            targets['duration'],
-            duration_mask
-        )
+        if isinstance(self.duration_loss, SurvivalLoss):
+            # For survival loss, need hazard predictions
+            loss_duration = self.duration_loss(
+                predictions.get('duration_hazard', predictions['duration_mean'].unsqueeze(-1).expand(-1, 50)),
+                targets['duration'],
+                censored=(1 - targets.get('duration_valid', torch.ones_like(targets['duration']))),
+                mask=duration_mask
+            )
+        elif isinstance(self.duration_loss, SimpleDurationLoss):
+            # Huber/MSE loss only needs mean prediction
+            loss_duration = self.duration_loss(
+                predictions['duration_mean'],
+                targets['duration'],
+                duration_mask
+            )
+        else:
+            # Gaussian NLL loss (default)
+            loss_duration = self.duration_loss(
+                predictions['duration_mean'],
+                predictions['duration_log_std'],
+                targets['duration'],
+                duration_mask
+            )
 
         # Direction loss
         loss_direction = self.direction_loss(
