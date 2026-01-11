@@ -131,6 +131,11 @@ class TSLAChannelFeatures:
     channel_quality: float        # Composite quality score (0-1)
     rsi_confidence: float         # RSI reliability score (0-1)
 
+    # ATR-normalized boundary distances
+    distance_to_upper_atr: float = 0.0
+    distance_to_lower_atr: float = 0.0
+    distance_to_nearest_atr: float = float('inf')
+
     # Containment against longer TFs
     containments: Dict[str, ContainmentInfo] = field(default_factory=dict)
 
@@ -174,6 +179,9 @@ class SharedFeatures:
 
     # RSI series for each TF (reusable for divergence/bounce detection)
     rsi_series_per_tf: Dict[str, np.ndarray] = field(default_factory=dict)
+
+    # ATR values for each TF (reusable for distance normalization)
+    atr_values_per_tf: Dict[str, float] = field(default_factory=dict)
 
     # Event calendar features (46 features)
     events: Optional[EventFeatures] = None
@@ -249,6 +257,7 @@ def extract_tsla_channel_features(
     window: int = 20,
     longer_tf_channels: Optional[Dict[str, Channel]] = None,
     lookforward_bars: int = 200,
+    atr: float = 0.0,
 ) -> TSLAChannelFeatures:
     """Extract TSLA channel features for one timeframe.
 
@@ -264,6 +273,7 @@ def extract_tsla_channel_features(
         window: Channel detection window size (for exit tracking context)
         longer_tf_channels: Pre-computed channels from longer timeframes
         lookforward_bars: Bars to look forward for exit tracking
+        atr: Average True Range for this timeframe (for distance normalization)
 
     Raises:
         ValueError: If channel or rsi_series is None
@@ -372,6 +382,25 @@ def extract_tsla_channel_features(
             # Good RSI behavior at bounces
             rsi_confidence = min(rsi_confidence * 1.1, 1.0)
 
+    # Calculate ATR-normalized distances
+    distance_to_upper_atr = 0.0
+    distance_to_lower_atr = 0.0
+    distance_to_nearest_atr = float('inf')
+
+    if atr > 0 and channel.close is not None:
+        current_price = channel.close[-1]
+        upper = channel.upper_line[-1]
+        lower = channel.lower_line[-1]
+
+        # Distance to upper in ATR units
+        distance_to_upper_atr = (upper - current_price) / atr
+
+        # Distance to lower in ATR units
+        distance_to_lower_atr = (current_price - lower) / atr
+
+        # Distance to nearest boundary
+        distance_to_nearest_atr = min(distance_to_upper_atr, distance_to_lower_atr)
+
     return TSLAChannelFeatures(
         timeframe=timeframe,
         channel_valid=channel.valid,
@@ -392,6 +421,9 @@ def extract_tsla_channel_features(
         rsi_at_last_lower=rsi_at_last_lower,
         channel_quality=channel_quality,
         rsi_confidence=rsi_confidence,
+        distance_to_upper_atr=distance_to_upper_atr,
+        distance_to_lower_atr=distance_to_lower_atr,
+        distance_to_nearest_atr=distance_to_nearest_atr,
         containments=containments,
         exit_tracking=exit_features,
         break_trigger=break_trigger,
@@ -437,9 +469,11 @@ def extract_full_features(
                 resample_cache[cache_key] = resample_ohlc(df, tf)
         return resample_cache[cache_key]
 
-    # First pass: detect channels and compute RSI at all timeframes for TSLA
+    # First pass: detect channels and compute RSI and ATR at all timeframes for TSLA
+    from v7.core.channel import calculate_atr
     tsla_channels_dict = {}
     rsi_series_per_tf = {}
+    atr_values_per_tf = {}
     for tf in TIMEFRAMES:
         df_tf = get_resampled(tsla_df, tf, 'tsla')
 
@@ -452,6 +486,21 @@ def extract_full_features(
             rsi_series_per_tf[tf] = calculate_rsi_series(df_tf['close'].values, period=14)
         except (ValueError, IndexError):
             pass
+
+        # Calculate ATR
+        if len(df_tf) >= 14:
+            try:
+                atr_series, current_atr = calculate_atr(
+                    df_tf['high'].values,
+                    df_tf['low'].values,
+                    df_tf['close'].values,
+                    period=14
+                )
+                atr_values_per_tf[tf] = current_atr
+            except (ValueError, IndexError):
+                atr_values_per_tf[tf] = 0.0
+        else:
+            atr_values_per_tf[tf] = 0.0
 
     # Second pass: extract features with longer TF context
     # Channel and RSI series are REQUIRED - skip TFs that don't have them
@@ -470,11 +519,15 @@ def extract_full_features(
             longer_tfs = get_longer_timeframes(tf)
             longer_channels = {ltf: tsla_channels_dict.get(ltf) for ltf in longer_tfs if ltf in tsla_channels_dict}
 
+            # Get ATR for this timeframe
+            atr = atr_values_per_tf.get(tf, 0.0)
+
             tsla_features[tf] = extract_tsla_channel_features(
                 df_tf, tf, channel, rsi_series,
                 window=window,
                 longer_tf_channels=longer_channels,
                 lookforward_bars=lookforward_bars,
+                atr=atr,
             )
         except (ValueError, IndexError):
             pass
@@ -683,6 +736,25 @@ def extract_shared_features(
         except (ValueError, IndexError):
             pass
 
+    # Step 4b: Calculate ATR for each TSLA timeframe
+    from v7.core.channel import calculate_atr
+    atr_values_per_tf = {}
+    for tf in TIMEFRAMES:
+        df_tf = tsla_resampled.get(tf)
+        if df_tf is not None and len(df_tf) >= 14:
+            try:
+                atr_series, current_atr = calculate_atr(
+                    df_tf['high'].values,
+                    df_tf['low'].values,
+                    df_tf['close'].values,
+                    period=14
+                )
+                atr_values_per_tf[tf] = current_atr
+            except (ValueError, IndexError):
+                atr_values_per_tf[tf] = 0.0
+        else:
+            atr_values_per_tf[tf] = 0.0
+
     # Step 5: Extract event features if handler provided
     event_features = None
     if events_handler is not None:
@@ -805,6 +877,7 @@ def extract_shared_features(
         both_near_upper=(tsla_pos > 0.8 and spy_pos > 0.8),
         both_near_lower=(tsla_pos < 0.2 and spy_pos < 0.2),
         rsi_series_per_tf=rsi_series_per_tf,
+        atr_values_per_tf=atr_values_per_tf,
         events=event_features,
         tsla_window_scores=tsla_window_scores,
     )
@@ -867,11 +940,15 @@ def extract_window_features(
             longer_tfs = get_longer_timeframes(tf)
             longer_channels = {ltf: tsla_channels_dict.get(ltf) for ltf in longer_tfs if ltf in tsla_channels_dict}
 
+            # Get ATR for this timeframe
+            atr = shared.atr_values_per_tf.get(tf, 0.0)
+
             tsla_features[tf] = extract_tsla_channel_features(
                 df_tf, tf, channel, rsi_series,
                 window=window,
                 longer_tf_channels=longer_channels,
                 lookforward_bars=lookforward_bars,
+                atr=atr,
             )
         except (ValueError, IndexError):
             pass
@@ -1045,6 +1122,9 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 f.rsi_at_last_lower,
                 f.channel_quality,
                 f.rsi_confidence,
+                f.distance_to_upper_atr,
+                f.distance_to_lower_atr,
+                f.distance_to_nearest_atr,
             ]
 
             # Add exit tracking features (15 total: 10 original + 5 new return tracking)
@@ -1084,7 +1164,7 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
 
             arrays[f'tsla_{tf}'] = np.array(base_features, dtype=np.float32)
         else:
-            # Provide default invalid features for this TF (35 total features)
+            # Provide default invalid features for this TF (38 total features)
             # All zeros with channel_valid=0.0, direction=1 (sideways), position=0.5, rsi=50.0
             arrays[f'tsla_{tf}'] = np.array([
                 0.0,   # channel_valid
@@ -1105,6 +1185,10 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 50.0,  # rsi_at_last_lower
                 0.0,   # channel_quality
                 0.5,   # rsi_confidence
+                # ATR-normalized distances (3)
+                0.0,   # distance_to_upper_atr
+                0.0,   # distance_to_lower_atr
+                float('inf'),  # distance_to_nearest_atr
                 # Exit tracking defaults (15: 10 original + 5 new return tracking)
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0, 0.0, 0.0,
