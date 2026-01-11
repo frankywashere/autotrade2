@@ -217,6 +217,7 @@ class TrainingConfig:
     # These settings prevent the model from "gaming" the loss by predicting high uncertainty
     uncertainty_penalty: float = 0.1  # Penalizes "I don't know" predictions (0 = disabled)
     min_duration_precision: float = 0.25  # Floor for duration task weight (prevents abandonment)
+    max_duration: float = 100.0  # Maximum duration for SurvivalLoss binning (in TF bars)
 
     # SE-blocks (Squeeze-and-Excitation) for feature reweighting
     # SE-blocks learn which features in the hidden representation are important per sample
@@ -317,6 +318,7 @@ class Trainer:
                 huber_delta=config.huber_delta,
                 direction_loss_type=config.direction_loss_type,
                 focal_gamma=config.focal_gamma,
+                max_duration=config.max_duration,
             )
         else:
             # Phase 2a: CombinedLoss with learnable or fixed weights
@@ -335,6 +337,7 @@ class Trainer:
                 huber_delta=config.huber_delta,
                 direction_loss_type=config.direction_loss_type,
                 focal_gamma=config.focal_gamma,
+                max_duration=config.max_duration,
             )
         # Move criterion to device (critical for learnable weights)
         self.criterion.to(self.device)
@@ -888,7 +891,19 @@ class Trainer:
                 total_next_channel_samples += next_channel_mask.sum().item()
 
                 # Duration metrics (MAE and RMSE)
-                duration_pred = predictions['duration_mean']
+                # Use hazard-derived expected duration if available (for survival loss)
+                if 'duration_hazard' in predictions and predictions['duration_hazard'] is not None:
+                    # Compute expected duration from hazard (E[T] = sum of survival probabilities)
+                    hazard = torch.sigmoid(predictions['duration_hazard'])  # [batch, num_tfs, num_bins] or [batch, num_bins]
+                    survival = torch.cumprod(1 - hazard, dim=-1)  # Cumulative survival
+                    # Expected duration = sum of survival probabilities across bins
+                    # (each bin contributes its survival probability)
+                    duration_pred = survival.sum(dim=-1)  # [batch, num_tfs] or [batch]
+                    if duration_pred.dim() == 1:  # If aggregate [batch], expand to [batch, num_tfs]
+                        duration_pred = duration_pred.unsqueeze(1).expand(-1, targets['duration'].shape[1])
+                else:
+                    duration_pred = predictions['duration_mean']
+
                 duration_target = targets['duration']
                 duration_mask = masks.get('duration_valid', torch.ones_like(duration_target))
                 duration_errors = torch.abs(duration_pred - duration_target)

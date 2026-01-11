@@ -197,9 +197,9 @@ class SurvivalLoss(nn.Module):
         # Convert duration to bin index
         target_bins = torch.bucketize(target_duration.clamp(0, self.max_duration - 1e-6), self.bin_edges[1:])
 
-        # Compute survival probability: S(t) = prod(1 - h(k)) for k < t
+        # Compute survival probability: S(t) = prod(1 - h(k)) for k <= t
         hazard = torch.sigmoid(pred_hazard)  # [batch, num_bins]
-        survival = torch.cumprod(1 - hazard, dim=1)  # [batch, num_bins]
+        survival = torch.cumprod(1 - hazard, dim=1)  # [batch, num_bins], S(t) includes (1-h(t))
 
         # For uncensored: likelihood = S(t-1) * h(t) = survival up to t-1, then event at t
         # For censored: likelihood = S(t) = survival up to observed time
@@ -207,7 +207,17 @@ class SurvivalLoss(nn.Module):
         batch_size = pred_hazard.shape[0]
         batch_idx = torch.arange(batch_size, device=pred_hazard.device)
 
-        # Get survival at event time
+        # Create S(t-1) by prepending 1.0 (survival at t=0) and removing last element
+        # survival_shifted[t] = S(t-1) for use in uncensored likelihood
+        survival_shifted = torch.cat([
+            torch.ones(batch_size, 1, device=pred_hazard.device),
+            survival[:, :-1]
+        ], dim=1)  # [batch, num_bins]
+
+        # Get survival and hazard at event time
+        # For uncensored: use S(t-1) from survival_shifted
+        # For censored: use S(t) from survival
+        survival_prev = survival_shifted[batch_idx, target_bins.clamp(0, self.num_bins - 1)]
         survival_at_event = survival[batch_idx, target_bins.clamp(0, self.num_bins - 1)]
         hazard_at_event = hazard[batch_idx, target_bins.clamp(0, self.num_bins - 1)]
 
@@ -215,7 +225,7 @@ class SurvivalLoss(nn.Module):
         # Uncensored: -log(S(t-1) * h(t)) = -log(S(t-1)) - log(h(t))
         # Censored: -log(S(t))
         eps = 1e-7
-        nll_uncensored = -torch.log(survival_at_event + eps) - torch.log(hazard_at_event + eps)
+        nll_uncensored = -torch.log(survival_prev + eps) - torch.log(hazard_at_event + eps)
         nll_censored = -torch.log(survival_at_event + eps)
 
         nll = torch.where(censored > 0.5, nll_censored, nll_uncensored)
@@ -864,6 +874,7 @@ class CombinedLoss(nn.Module):
         huber_delta: float = 1.0,
         direction_loss_type: str = 'bce',
         focal_gamma: float = 2.0,
+        max_duration: float = 100.0,
     ):
         """
         Args:
@@ -891,6 +902,7 @@ class CombinedLoss(nn.Module):
             huber_delta: Delta for Huber loss (used when duration_loss_type='huber')
             direction_loss_type: Type of direction loss ('bce', 'focal')
             focal_gamma: Gamma for focal loss (used when direction_loss_type='focal')
+            max_duration: Maximum duration for SurvivalLoss binning (in TF bars)
         """
         super().__init__()
         self.num_timeframes = num_timeframes
@@ -898,6 +910,7 @@ class CombinedLoss(nn.Module):
         self.calibration_mode = calibration_mode
         self.min_duration_precision = min_duration_precision  # v9.1
         self.duration_loss_type = duration_loss_type  # Store for forward() logic
+        self.max_duration = max_duration  # Store for reference
 
         # Duration loss selection
         if duration_loss_type == 'gaussian_nll':
@@ -905,7 +918,7 @@ class CombinedLoss(nn.Module):
         elif duration_loss_type == 'huber':
             self.duration_loss = SimpleDurationLoss(use_huber=True, huber_delta=huber_delta)
         elif duration_loss_type == 'survival':
-            self.duration_loss = SurvivalLoss(num_bins=50, max_duration=100.0)
+            self.duration_loss = SurvivalLoss(num_bins=50, max_duration=max_duration)
         else:
             self.duration_loss = GaussianNLLLoss(uncertainty_penalty=uncertainty_penalty)
 
@@ -1314,6 +1327,7 @@ class EndToEndLoss(nn.Module):
         huber_delta: float = 1.0,
         direction_loss_type: str = 'bce',
         focal_gamma: float = 2.0,
+        max_duration: float = 100.0,
     ):
         """
         Initialize EndToEndLoss.
@@ -1333,6 +1347,7 @@ class EndToEndLoss(nn.Module):
             huber_delta: Delta for Huber loss (used when duration_loss_type='huber')
             direction_loss_type: Type of direction loss ('bce', 'focal')
             focal_gamma: Gamma for focal loss (used when direction_loss_type='focal')
+            max_duration: Maximum duration for SurvivalLoss binning (in TF bars)
         """
         super().__init__()
         self.num_timeframes = num_timeframes
@@ -1344,6 +1359,7 @@ class EndToEndLoss(nn.Module):
         self.calibration_weight = calibration_weight
         self.entropy_weight = entropy_weight
         self.consistency_weight = consistency_weight
+        self.max_duration = max_duration  # Store for reference
 
         # Duration loss selection
         if duration_loss_type == 'gaussian_nll':
@@ -1351,7 +1367,7 @@ class EndToEndLoss(nn.Module):
         elif duration_loss_type == 'huber':
             self.duration_loss = SimpleDurationLoss(use_huber=True, huber_delta=huber_delta)
         elif duration_loss_type == 'survival':
-            self.duration_loss = SurvivalLoss(num_bins=50, max_duration=100.0)
+            self.duration_loss = SurvivalLoss(num_bins=50, max_duration=max_duration)
         else:
             raise ValueError(f"Unknown duration_loss_type: {duration_loss_type}")
 
