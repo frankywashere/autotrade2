@@ -348,7 +348,63 @@ python3 train.py --no-interactive \
     --window-selection-strategy learned_selection
 ```
 
-**Results:** 64.8% direction accuracy, 2.39 duration loss (best epoch 3/20)
+**Results:** 64.8% direction accuracy, 2.39 duration loss (best epoch 3/20) - BUGGY CODE
+
+---
+
+### Walk-Forward Validation Configuration (PRIMARY ESTIMATE):
+
+**Full Configuration (from run_config.json on server):**
+
+```bash
+python3 train.py --no-interactive \
+    --mode walk-forward \
+    --run-name exp_wf_fixed_batch32 \
+    --device cuda \
+    --wf-windows 3 \
+    --wf-val-months 3 \
+    --wf-type expanding \
+    --hidden-dim 64 \
+    --cfc-units 96 \
+    --attention-heads 4 \
+    --se-blocks \
+    --se-ratio 8 \
+    --dropout 0.2 \
+    --shared-heads false \
+    --use-tcn false \
+    --tcn-channels 64 \
+    --tcn-layers 2 \
+    --tcn-kernel-size 3 \
+    --batch-size 32 \
+    --epochs 20 \
+    --lr 0.001 \
+    --optimizer adamw \
+    --weight-decay 0.0001 \
+    --gradient-clip 1.0 \
+    --scheduler cosine_restarts \
+    --duration-loss survival \
+    --direction-loss bce \
+    --weight-mode learnable \
+    --min-duration-precision 0.4 \
+    --calibration-mode brier_per_tf \
+    --uncertainty-penalty 0.1 \
+    --focal-gamma 2.0 \
+    --huber-delta 1.0 \
+    --gradient-balancing none \
+    --early-stopping 15 \
+    --early-stopping-metric duration \
+    --two-stage-training false \
+    --step 25 \
+    --window-selection-strategy learned_selection
+```
+
+**Results:** 67.45% ± 4.24% direction, 5.82 ± 0.18 bars MAE (3 windows avg)
+
+**Key Differences from Single-Split:**
+- Mode: `walk-forward` (not `standard`)
+- Batch size: `32` (not `64`) - to avoid memory crashes
+- Validation: 3 rolling windows of 3 months each
+- Window type: `expanding` (training data grows each window)
 
 ---
 
