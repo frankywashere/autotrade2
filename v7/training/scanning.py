@@ -24,10 +24,9 @@ from .types import ChannelSample
 # =============================================================================
 
 # Worker process globals for parallel scanning
-_WORKER_TSLA_VALUES = None
-_WORKER_TSLA_INDEX = None
-_WORKER_SPY_VALUES = None
-_WORKER_VIX_VALUES = None
+_WORKER_TSLA_DF = None
+_WORKER_SPY_DF = None
+_WORKER_VIX_DF = None
 _WORKER_PROGRESS_COUNTER = None  # Shared counter for progress updates
 
 # Pre-computed resampled DataFrames to avoid redundant resampling across positions
@@ -39,17 +38,16 @@ _WORKER_PRECOMPUTED_SPY = None   # Dict[str, pd.DataFrame]
 PROGRESS_STRIDE = 10
 
 
-def _init_scan_worker(tsla_values, tsla_index, spy_values, vix_values, progress_counter=None,
+def _init_scan_worker(tsla_df, spy_df, vix_df, progress_counter=None,
                        precomputed_tsla=None, precomputed_spy=None):
-    """Initialize worker process with shared data arrays, progress counter, and pre-computed resampled data."""
-    global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES, _WORKER_PROGRESS_COUNTER
+    """Initialize worker process with shared DataFrames, progress counter, and pre-computed resampled data."""
+    global _WORKER_TSLA_DF, _WORKER_SPY_DF, _WORKER_VIX_DF, _WORKER_PROGRESS_COUNTER
     global _WORKER_PRECOMPUTED_TSLA, _WORKER_PRECOMPUTED_SPY
 
     try:
-        _WORKER_TSLA_VALUES = tsla_values
-        _WORKER_TSLA_INDEX = tsla_index
-        _WORKER_SPY_VALUES = spy_values
-        _WORKER_VIX_VALUES = vix_values
+        _WORKER_TSLA_DF = tsla_df
+        _WORKER_SPY_DF = spy_df
+        _WORKER_VIX_DF = vix_df
         _WORKER_PROGRESS_COUNTER = progress_counter
         _WORKER_PRECOMPUTED_TSLA = precomputed_tsla
         _WORKER_PRECOMPUTED_SPY = precomputed_spy
@@ -69,10 +67,9 @@ def _init_scan_worker(tsla_values, tsla_index, spy_values, vix_values, progress_
 
 def _process_single_position(
     i: int,
-    tsla_values: np.ndarray,
-    tsla_index: pd.DatetimeIndex,
-    spy_values: np.ndarray,
-    vix_values: np.ndarray,
+    tsla_df: pd.DataFrame,
+    spy_df: pd.DataFrame,
+    vix_df: pd.DataFrame,
     window: int,
     min_cycles: int,
     max_scan: int,
@@ -86,14 +83,13 @@ def _process_single_position(
     Process a single position for channel detection.
 
     This is a standalone function designed to be called by parallel workers.
-    It receives numpy arrays instead of DataFrames to avoid pickling overhead.
+    It receives pre-sliced DataFrames to avoid redundant reconstruction.
 
     Args:
         i: Position index in the data
-        tsla_values: TSLA OHLCV data as numpy array (columns: open, high, low, close, volume)
-        tsla_index: TSLA datetime index
-        spy_values: SPY OHLCV data as numpy array
-        vix_values: VIX OHLCV data as numpy array
+        tsla_df: TSLA OHLCV DataFrame (pre-sliced with all data up to max position)
+        spy_df: SPY OHLCV DataFrame (pre-sliced)
+        vix_df: VIX OHLCV DataFrame (pre-sliced)
         window: Channel detection window
         min_cycles: Minimum cycles for valid channel
         max_scan: Maximum bars to scan forward for labels
@@ -111,23 +107,11 @@ def _process_single_position(
     from ..features.full_features import extract_full_features, extract_all_window_features
     from .labels import generate_labels_multi_window, select_best_window_by_labels
 
-    # Reconstruct DataFrames from numpy arrays for this position
-    # Only use data up to position i for channel detection
-    tsla_window_df = pd.DataFrame(
-        tsla_values[:i],
-        index=tsla_index[:i],
-        columns=['open', 'high', 'low', 'close', 'volume']
-    )
-    spy_window_df = pd.DataFrame(
-        spy_values[:i],
-        index=tsla_index[:i],
-        columns=['open', 'high', 'low', 'close', 'volume']
-    )
-    vix_window_df = pd.DataFrame(
-        vix_values[:i],
-        index=tsla_index[:i],
-        columns=['open', 'high', 'low', 'close']
-    )
+    # Slice DataFrames to position i for channel detection
+    # This is much faster than DataFrame reconstruction from numpy arrays
+    tsla_window_df = tsla_df.iloc[:i]
+    spy_window_df = spy_df.iloc[:i]
+    vix_window_df = vix_df.iloc[:i]
 
     if len(tsla_window_df) < window or len(spy_window_df) < window:
         return None
@@ -175,12 +159,8 @@ def _process_single_position(
 
     # Generate native per-TF labels for all window sizes
     # Need forward data for label generation
-    forward_end = min(i + max_forward_5min_bars, len(tsla_values))
-    tsla_full_df = pd.DataFrame(
-        tsla_values[:forward_end],
-        index=tsla_index[:forward_end],
-        columns=['open', 'high', 'low', 'close', 'volume']
-    )
+    forward_end = min(i + max_forward_5min_bars, len(tsla_df))
+    tsla_full_df = tsla_df.iloc[:forward_end]
 
     try:
         labels_per_window = generate_labels_multi_window(
@@ -203,7 +183,7 @@ def _process_single_position(
 
     # Create sample with multi-window channels, labels, and features
     sample = ChannelSample(
-        timestamp=tsla_index[i - 1],
+        timestamp=tsla_df.index[i - 1],
         channel_end_idx=i - 1,
         channel=best_channel,
         features=features,
@@ -231,13 +211,13 @@ def _process_position_batch(
     """
     Process a batch of positions. Used by parallel workers.
 
-    Reads data arrays from worker process globals (_WORKER_TSLA_VALUES, etc.)
+    Reads DataFrames from worker process globals (_WORKER_TSLA_DF, etc.)
     instead of receiving them as parameters, reducing serialization overhead.
 
     Returns list of (index, sample) tuples for valid samples.
     """
     # Read from worker globals (set by _init_scan_worker)
-    global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES, _WORKER_PROGRESS_COUNTER
+    global _WORKER_TSLA_DF, _WORKER_SPY_DF, _WORKER_VIX_DF, _WORKER_PROGRESS_COUNTER
 
     results = []
     local_processed = 0  # Local counter to batch progress updates
@@ -245,10 +225,9 @@ def _process_position_batch(
     for i in indices:
         result = _process_single_position(
             i=i,
-            tsla_values=_WORKER_TSLA_VALUES,
-            tsla_index=_WORKER_TSLA_INDEX,
-            spy_values=_WORKER_SPY_VALUES,
-            vix_values=_WORKER_VIX_VALUES,
+            tsla_df=_WORKER_TSLA_DF,
+            spy_df=_WORKER_SPY_DF,
+            vix_df=_WORKER_VIX_DF,
             window=window,
             min_cycles=min_cycles,
             max_scan=max_scan,
@@ -457,8 +436,9 @@ def _scan_parallel(
     """
     Parallel scanning implementation using ProcessPoolExecutor.
 
-    Converts DataFrames to numpy arrays to efficiently pass to worker processes.
-    Workers process batches of positions to reduce overhead.
+    Passes pre-sliced DataFrames to worker processes via initializer.
+    Workers use df.iloc[:i] slicing instead of DataFrame reconstruction.
+    This avoids redundant numpy array conversions and DataFrame reconstructions.
 
     Returns:
         Tuple of (samples, valid_count)
@@ -470,16 +450,12 @@ def _scan_parallel(
         max_workers = min(cpu_count - 1, 8)
     max_workers = max(1, max_workers)  # At least 1 worker
 
-    # Convert DataFrames to numpy arrays for efficient pickling
-    # Include all data needed for label generation (up to max index + forward bars)
-    # Use .to_numpy(copy=False) to avoid unnecessary copying
+    # Pre-slice DataFrames to the maximum index needed
+    # This avoids passing unnecessary data to worker processes
     max_idx = max(indices_list) + max_forward_5min_bars
-    tsla_values = tsla_df.iloc[:max_idx].to_numpy(copy=False)
-    tsla_index = tsla_df.index[:max_idx]
-    spy_values = spy_aligned.iloc[:max_idx].to_numpy(copy=False)
-    # VIX has fewer columns - handle the column difference
-    vix_cols = ['open', 'high', 'low', 'close'] if 'open' in vix_aligned.columns else list(vix_aligned.columns[:4])
-    vix_values = vix_aligned[vix_cols].iloc[:max_idx].to_numpy(copy=False)
+    tsla_sliced = tsla_df.iloc[:max_idx]
+    spy_sliced = spy_aligned.iloc[:max_idx]
+    vix_sliced = vix_aligned.iloc[:max_idx]
 
     # Split indices into chunks for workers
     # Each chunk should have enough work to amortize process overhead
@@ -501,25 +477,14 @@ def _scan_parallel(
     if progress:
         print("Pre-computing resampled data for all timeframes...")
 
-    # Create full DataFrames for resampling (need proper index for time-based resampling)
-    tsla_full_df = pd.DataFrame(
-        tsla_values,
-        index=tsla_index,
-        columns=['open', 'high', 'low', 'close', 'volume']
-    )
-    spy_full_df = pd.DataFrame(
-        spy_values,
-        index=tsla_index,
-        columns=['open', 'high', 'low', 'close', 'volume']
-    )
-
     # Pre-compute all resampled versions (skip 5min as it's the base)
-    precomputed_tsla = {'5min': tsla_full_df}  # 5min is identity
-    precomputed_spy = {'5min': spy_full_df}
+    # Use the already sliced DataFrames - no need to reconstruct from arrays
+    precomputed_tsla = {'5min': tsla_sliced}  # 5min is identity
+    precomputed_spy = {'5min': spy_sliced}
     for tf in TIMEFRAMES:
         if tf != '5min':
-            precomputed_tsla[tf] = resample_ohlc(tsla_full_df, tf)
-            precomputed_spy[tf] = resample_ohlc(spy_full_df, tf)
+            precomputed_tsla[tf] = resample_ohlc(tsla_sliced, tf)
+            precomputed_spy[tf] = resample_ohlc(spy_sliced, tf)
 
     if progress:
         print(f"  Pre-computed {len(TIMEFRAMES)} timeframes for TSLA and SPY")
@@ -541,10 +506,10 @@ def _scan_parallel(
         max_workers=max_workers,
         mp_context=ctx,
         initializer=_init_scan_worker,
-        initargs=(tsla_values, tsla_index, spy_values, vix_values, progress_counter,
+        initargs=(tsla_sliced, spy_sliced, vix_sliced, progress_counter,
                   precomputed_tsla, precomputed_spy)
     ) as executor:
-        # Submit all chunks (arrays are now in worker globals, not passed per-task)
+        # Submit all chunks (DataFrames are now in worker globals, not passed per-task)
         futures = {
             executor.submit(
                 _process_position_batch,
