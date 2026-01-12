@@ -182,7 +182,7 @@ class Channel:
     ) -> float:
         """Distance to nearest boundary, normalized by ATR."""
         if atr_value <= 0:
-            return float('inf')
+            return 999.0  # Sentinel value for invalid/missing ATR
         dist_upper = self.distance_to_upper_atr_normalized(atr_value, bar_index)
         dist_lower = self.distance_to_lower_atr_normalized(atr_value, bar_index)
         return min(dist_upper, dist_lower)

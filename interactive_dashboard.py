@@ -277,6 +277,15 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
             use_se_blocks = any('se_block' in key for key in state_dict.keys())
             se_reduction_ratio = 8  # Default value when inferring
 
+        # Infer num_hazard_bins from state_dict if not in config
+        num_hazard_bins = 0
+        if config and 'model' in config:
+            num_hazard_bins = config['model'].get('num_hazard_bins', 0)
+        if num_hazard_bins == 0:
+            hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+            if hazard_key in state_dict:
+                num_hazard_bins = state_dict[hazard_key].shape[0]
+
         model = HierarchicalCfCModel(
             feature_config=FeatureConfig(),
             hidden_dim=hidden_dim,
@@ -284,7 +293,8 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
             num_attention_heads=num_attention_heads,
             dropout=dropout,
             use_se_blocks=use_se_blocks,
-            se_reduction_ratio=se_reduction_ratio
+            se_reduction_ratio=se_reduction_ratio,
+            num_hazard_bins=num_hazard_bins
         )
 
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -312,7 +322,7 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
 # Data Loading
 # =============================================================================
 
-def load_csv_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_csv_data(lookback_days: int = 500) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load data from CSV files (fallback)."""
     cutoff = datetime.now() - timedelta(days=lookback_days)
 
@@ -365,7 +375,7 @@ def load_csv_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, 
     return tsla_df, spy_df, vix_df
 
 
-def load_market_data(use_live: bool = True, lookback_days: int = 90) -> Dict[str, Any]:
+def load_market_data(use_live: bool = True, lookback_days: int = 500) -> Dict[str, Any]:
     """Load market data, preferring live data if available."""
     result = {
         "tsla_df": None,
@@ -727,7 +737,10 @@ class PredictionsScreen(Screen):
                 conf = predictions['confidence']
 
                 # Duration
-                dur_str = f"{dur:.0f} ± {dur_std:.0f}"
+                if dur_std and dur_std > 0.01:
+                    dur_str = f"{dur:.0f} ± {dur_std:.0f}"
+                else:
+                    dur_str = f"{dur:.0f}"
 
                 # Break direction
                 dir_str = "UP" if dir_prob > 0.5 else "DOWN"
@@ -1000,8 +1013,8 @@ class SettingsScreen(Screen):
                 Horizontal(
                     Label("Lookback Days:"),
                     Select(
-                        [(str(d), d) for d in [30, 60, 90, 120, 180]],
-                        value=90,
+                        [(str(d), d) for d in [420, 500, 600, 730]],
+                        value=500,
                         id="lookback-select"
                     ),
                     id="setting-lookback"
@@ -1144,7 +1157,7 @@ class DashboardApp(App):
 
         # Settings
         self.use_live_data: bool = True
-        self.lookback_days: int = 90
+        self.lookback_days: int = 500  # 420-day minimum required for proper channel detection
         self.refresh_interval: int = 0
 
     def on_mount(self) -> None:

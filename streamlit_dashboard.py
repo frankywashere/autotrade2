@@ -117,6 +117,11 @@ def find_checkpoints() -> List[Dict]:
                         metrics['next_channel_acc'] = last_entry.get('next_channel_acc')
                         metrics['duration_mae'] = last_entry.get('duration_mae')
                         metrics['duration_rmse'] = last_entry.get('duration_rmse')
+                        # Extract per-TF MAEs if available
+                        for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
+                            mae_key = f'duration_mae_{tf_name}'
+                            if mae_key in last_entry:
+                                metrics[mae_key] = last_entry.get(mae_key)
         except Exception:
             pass
         return metrics
@@ -363,10 +368,43 @@ def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[D
                 if 'direction_loss_type' not in model_cfg:
                     model_cfg['direction_loss_type'] = None
 
+                if 'num_hazard_bins' not in model_cfg:
+                    # Heuristic: infer from hazard_head layer if present
+                    hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+                    if hazard_key in state_dict:
+                        model_cfg['num_hazard_bins'] = state_dict[hazard_key].shape[0]
+                    else:
+                        hazard_key_shared = 'hierarchical_model.per_tf_duration_head.hazard_head.weight'
+                        if hazard_key_shared in state_dict:
+                            model_cfg['num_hazard_bins'] = state_dict[hazard_key_shared].shape[0]
+                        else:
+                            model_cfg['num_hazard_bins'] = 0
+
+                if 'max_duration' not in model_cfg:
+                    # Try from TrainingConfig
+                    if hasattr(config, 'max_duration'):
+                        model_cfg['max_duration'] = config.max_duration
+                    else:
+                        model_cfg['max_duration'] = 100.0
+
         return config_dict if config_dict else None
     except Exception as e:
         st.warning(f"Error extracting config: {e}")
         return None
+
+
+def detect_feature_dimension(state_dict: Dict[str, torch.Tensor]) -> int:
+    """
+    Detect expected feature dimension from checkpoint weights.
+
+    Returns 776 (v12 checkpoints) or 809 (v13 checkpoints).
+    """
+    # Check EndToEndWindowModel
+    if 'window_encoder.encoder.0.weight' in state_dict:
+        return state_dict['window_encoder.encoder.0.weight'].shape[1]
+
+    # For HierarchicalCfCModel, default to current
+    return 809
 
 
 @st.cache_resource
@@ -384,7 +422,7 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
         state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
 
         # Detect model type from state_dict keys
-        is_end_to_end = any('window_encoder' in k or 'window_selector' in k for k in state_dict.keys())
+        is_end_to_end = any('window_encoder' in k for k in state_dict.keys())
 
         # Extract config from the already-loaded checkpoint (pass checkpoint to avoid re-loading)
         config = extract_config_from_checkpoint(path, checkpoint=checkpoint)
@@ -423,6 +461,10 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 res_levels = model_config.get('resolution_levels', 'N/A')
                 st.info(f"Multi-resolution enabled (levels={res_levels})")
 
+            num_hazard_bins = model_config.get('num_hazard_bins', 0)
+            if num_hazard_bins > 0:
+                st.info(f"Survival loss enabled (hazard_bins={num_hazard_bins})")
+
             grad_balancing = model_config.get('gradient_balancing', False)
             if grad_balancing:
                 gradnorm_alpha = model_config.get('gradnorm_alpha', 'N/A')
@@ -457,8 +499,11 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
         # Create appropriate model type
         if is_end_to_end and END_TO_END_AVAILABLE:
             st.info("🔄 Detected EndToEndWindowModel (Phase 2b)")
+            detected_dim = detect_feature_dimension(state_dict)
+            if detected_dim != 809:
+                st.warning(f"⚠️ Backward compatibility: Detected feature_dim={detected_dim} (v12 checkpoint), current standard is 809 (v13)")
             model = create_end_to_end_model(
-                feature_dim=809,
+                feature_dim=detected_dim,
                 window_embed_dim=128,
                 num_windows=8,
                 hidden_dim=hidden_dim,
@@ -468,6 +513,14 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 shared_heads=shared_heads,
                 use_se_blocks=use_se_blocks,
                 se_reduction_ratio=se_reduction_ratio,
+                use_multi_resolution=model_config.get('use_multi_resolution', False),
+                resolution_levels=model_config.get('resolution_levels', 3),
+                use_tcn=model_config.get('use_tcn', False),
+                tcn_channels=model_config.get('tcn_channels', 64),
+                tcn_kernel_size=model_config.get('tcn_kernel_size', 3),
+                tcn_layers=model_config.get('tcn_layers', 2),
+                num_hazard_bins=model_config.get('num_hazard_bins', 0),
+                max_duration=model_config.get('max_duration', 100.0),
                 device='cpu'
             )
         else:
@@ -481,6 +534,14 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 shared_heads=shared_heads,
                 use_se_blocks=use_se_blocks,
                 se_reduction_ratio=se_reduction_ratio,
+                use_multi_resolution=model_config.get('use_multi_resolution', False),
+                resolution_levels=model_config.get('resolution_levels', 3),
+                use_tcn=model_config.get('use_tcn', False),
+                tcn_channels=model_config.get('tcn_channels', 64),
+                tcn_kernel_size=model_config.get('tcn_kernel_size', 3),
+                tcn_layers=model_config.get('tcn_layers', 2),
+                num_hazard_bins=model_config.get('num_hazard_bins', 0),
+                max_duration=model_config.get('max_duration', 100.0),
                 device='cpu'
             )
 
@@ -678,6 +739,37 @@ def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame) -> Tuple[Di
 # Predictions
 # =============================================================================
 
+def adapt_features_809_to_776(features_809: np.ndarray) -> np.ndarray:
+    """
+    Strip 809 features to 776 by removing 3 ATR features per timeframe.
+
+    v13 (809): TSLA=38, SPY=11, CROSS=10 per TF (59 total) x 11 + 160 shared
+    v12 (776): TSLA=35, SPY=11, CROSS=10 per TF (56 total) x 11 + 160 shared
+
+    Removes ATR features at indices [18:21] within each TSLA block.
+    """
+    if features_809.shape[-1] != 809:
+        return features_809
+
+    adapted_parts = []
+    for tf_idx in range(11):
+        # v13 structure per TF
+        tf_start = tf_idx * 59
+        tsla_end = tf_start + 38
+
+        # Keep TSLA [0:18] and [21:38], skip ATR [18:21]
+        adapted_parts.append(features_809[..., tf_start:tf_start+18])
+        adapted_parts.append(features_809[..., tf_start+21:tsla_end])
+
+        # Keep SPY and CROSS unchanged
+        adapted_parts.append(features_809[..., tsla_end:tsla_end+21])
+
+    # Keep shared features
+    adapted_parts.append(features_809[..., 649:])
+
+    return np.concatenate(adapted_parts, axis=-1)
+
+
 def make_predictions(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
@@ -698,9 +790,12 @@ def make_predictions(
 
         # Check if model is end-to-end (multi-window)
         # Use hasattr() instead of isinstance() for reliability with pickled models
-        is_end_to_end = hasattr(model, 'window_encoder') and hasattr(model, 'window_selector')
+        is_end_to_end = hasattr(model, 'window_encoder')
 
         if is_end_to_end:
+            # Detect feature dimension from model weights for backward compatibility
+            detected_dim = detect_feature_dimension(model.state_dict())
+
             # Extract features for ALL 8 windows
             per_window_features = []
             window_scores_list = []
@@ -719,6 +814,8 @@ def make_predictions(
                     feature_arrays = features_to_tensor_dict(features)
                     feature_list = [feature_arrays[k] for k in FEATURE_ORDER if k in feature_arrays]
                     feature_array = np.concatenate(feature_list)
+                    if detected_dim == 776 and feature_array.shape[0] == 809:
+                        feature_array = adapt_features_809_to_776(feature_array)
                     per_window_features.append(feature_array)
 
                     # Extract channel quality scores from tsla_window_scores
@@ -740,11 +837,11 @@ def make_predictions(
                         window_valid_list.append(False)
                 else:
                     # Use zeros for missing windows
-                    per_window_features.append(np.zeros(809, dtype=np.float32))
+                    per_window_features.append(np.zeros(detected_dim, dtype=np.float32))
                     window_scores_list.append([0.0, 0.0, 0.0, 0.0, 0.0])
                     window_valid_list.append(False)
 
-            # Stack into tensors: [1, 8, 809]
+            # Stack into tensors: [1, 8, feature_dim]
             per_window_tensor = torch.from_numpy(np.stack(per_window_features)).float().unsqueeze(0)
             window_scores_tensor = torch.tensor([window_scores_list], dtype=torch.float32)
             window_valid_tensor = torch.tensor([window_valid_list], dtype=torch.bool)
@@ -804,6 +901,7 @@ def make_predictions(
                 'next_channel': per_tf['next_channel'][0].numpy(),    # [11]
                 'next_channel_probs': per_tf['next_channel_probs'][0].numpy(),  # [11, 3]
                 'confidence': per_tf['confidence'][0].numpy(),        # [11]
+                'channel_valid': outputs.get('channel_valid', np.ones(11)),  # [11]
             },
             # Best (most confident) timeframe
             'best_tf_idx': best_tf_idx,
@@ -824,11 +922,12 @@ def make_predictions(
         }
 
         # Add window selection info if available (Phase 2b)
-        if is_end_to_end and 'window_selection_probs' in outputs:
+        if is_end_to_end and 'window_selection' in outputs:
+            ws = outputs['window_selection']
             result['window_selection'] = {
-                'probs': outputs['window_selection_probs'][0].numpy(),  # [8]
-                'selected_idx': int(outputs.get('selected_window_idx', [0])[0]),
-                'confidence': float(outputs.get('selection_confidence', [0.5])[0])
+                'probs': ws['probs'][0].numpy(),
+                'selected_idx': int(ws['selected_idx'][0]),
+                'confidence': float(ws['confidence'][0])
             }
 
         return result
@@ -1080,7 +1179,11 @@ def main():
             st.caption("✗ Live data module not available")
 
         use_live = st.checkbox("Use Live Data", value=LIVE_DATA_AVAILABLE, disabled=not LIVE_DATA_AVAILABLE)
-        lookback_days = st.slider("Lookback Days", 30, 180, 90)
+        lookback_days = st.slider("Lookback Days", 420, 730, 500, help="Model trained with 420-day warmup. Values below 420 produce unreliable predictions.")
+
+        # Data sufficiency warning
+        if lookback_days < 420:
+            st.warning("⚠️ Lookback below training minimum (420 days). Weekly/monthly timeframe predictions will be unreliable.")
 
         col_refresh1, col_refresh2 = st.columns(2)
         with col_refresh1:
@@ -1098,6 +1201,7 @@ def main():
 
     # Load data
     data = load_market_data(use_live=use_live, lookback_days=lookback_days)
+    st.info(f"📊 Using {lookback_days} days of historical data. Training requires 420+ days for all timeframes.")
 
     # Tab 1: Live Predictions
     with tab1:
@@ -1148,11 +1252,26 @@ def main():
                     st.metric("Direction", direction, f"{abs(best_dir_prob - 0.5)*200:.0f}%")
 
                 with col3:
-                    st.metric(f"Duration ({best_tf_name})", f"{best_dur:.1f} bars", f"±{best_dur_std:.1f}")
+                    if best_dur_std and best_dur_std > 0.01:
+                        st.metric(f"Duration ({best_tf_name})", f"{best_dur:.1f} bars", f"±{best_dur_std:.1f}")
+                    else:
+                        st.metric(f"Duration ({best_tf_name})", f"{best_dur:.1f} bars")
 
                 with col4:
                     next_labels = ["DOWN", "SAME", "UP"]
                     st.metric("Next Channel", next_labels[best_next_ch], f"{best_next_probs[best_next_ch]:.0%}")
+
+                # Check if the best TF channel is valid (x9 warning display)
+                try:
+                    tsla_channels_check, _ = detect_all_channels(data["tsla_df"], data["spy_df"])
+                    # Map display name back to TIMEFRAMES key
+                    display_to_tf = {v: k for k, v in TIMEFRAME_DISPLAY_NAMES.items()}
+                    tf_key = display_to_tf.get(best_tf_name, best_tf_name)
+                    if tf_key in tsla_channels_check:
+                        if not tsla_channels_check[tf_key].valid:
+                            st.warning(f"**Invalid Channel for {best_tf_name}** - Channel detection failed for most confident timeframe. Predictions may be less reliable.")
+                except Exception:
+                    pass  # Silently ignore channel check errors
 
                 # Duration error metrics (if available from training)
                 # Get metrics from the selected checkpoint
@@ -1173,9 +1292,38 @@ def main():
                         st.metric("Duration RMSE", f"{checkpoint_metrics.get('duration_rmse', 0):.2f} bars",
                                   help="Root mean squared error from validation")
                     with col3:
-                        if best_dur_std:
+                        if best_dur_std and best_dur_std > 0.01:
                             st.metric("Pred Uncertainty", f"{best_dur_std:.2f} bars",
                                       help="Model's estimated prediction uncertainty")
+                        else:
+                            st.metric("Pred Uncertainty", "Not available",
+                                      help="Model's estimated prediction uncertainty")
+
+                    # Per-TF MAE breakdown
+                    with st.expander("Per-Timeframe Duration MAE"):
+                        tf_maes = {
+                            '5min': checkpoint_metrics.get('duration_mae_5min'),
+                            '15min': checkpoint_metrics.get('duration_mae_15min'),
+                            '30min': checkpoint_metrics.get('duration_mae_30min'),
+                            '1h': checkpoint_metrics.get('duration_mae_1h'),
+                            '2h': checkpoint_metrics.get('duration_mae_2h'),
+                            '3h': checkpoint_metrics.get('duration_mae_3h'),
+                            '4h': checkpoint_metrics.get('duration_mae_4h'),
+                            'daily': checkpoint_metrics.get('duration_mae_daily'),
+                            'weekly': checkpoint_metrics.get('duration_mae_weekly'),
+                            'monthly': checkpoint_metrics.get('duration_mae_monthly'),
+                            '3month': checkpoint_metrics.get('duration_mae_3month'),
+                        }
+
+                        # Display as table
+                        if any(v is not None for v in tf_maes.values()):
+                            mae_df = pd.DataFrame({
+                                'Timeframe': list(tf_maes.keys()),
+                                'MAE (bars)': [f"{v:.2f}" if v is not None else 'N/A' for v in tf_maes.values()]
+                            })
+                            st.dataframe(mae_df, hide_index=True)
+                        else:
+                            st.caption("Per-TF MAEs not available in this checkpoint")
 
                 # Signal interpretation
                 st.divider()
@@ -1305,13 +1453,40 @@ def main():
                 st.subheader("All Timeframe Predictions")
 
                 TF_NAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', '1d', '1w', '1M', '3M']
+                # Map display TF names to TIMEFRAMES keys for channel lookup
+                TF_NAME_TO_KEY = {
+                    '5min': '5min', '15min': '15min', '30min': '30min',
+                    '1h': '1h', '2h': '2h', '3h': '3h', '4h': '4h',
+                    '1d': 'daily', '1w': 'weekly', '1M': 'monthly', '3M': '3month'
+                }
+
+                # Get channel validity for x9 icon display
+                try:
+                    tsla_channels_for_table, _ = detect_all_channels(data["tsla_df"], data["spy_df"])
+                except Exception:
+                    tsla_channels_for_table = {}
+
                 tf_rows = []
                 for i, tf_name in enumerate(TF_NAMES):
                     is_best = (i == best_tf_idx)
+                    dur_std = per_tf['duration_std'][i]
+                    if dur_std and dur_std > 0.01:
+                        duration_str = f"{per_tf['duration_mean'][i]:.1f}±{dur_std:.1f}"
+                    else:
+                        duration_str = f"{per_tf['duration_mean'][i]:.1f}"
+
+                    # Check channel validity for this TF (x9 icon)
+                    tf_key = TF_NAME_TO_KEY.get(tf_name, tf_name)
+                    channel_valid = True
+                    if tf_key in tsla_channels_for_table:
+                        channel_valid = tsla_channels_for_table[tf_key].valid
+                    channel_icon = "" if channel_valid else "⚠️"
+
                     tf_rows.append({
+                        "": channel_icon,  # Icon column for invalid channel warning
                         "TF": f"**{tf_name}**" if is_best else tf_name,
                         "Confidence": f"{per_tf['confidence'][i]:.1%}",
-                        "Duration": f"{per_tf['duration_mean'][i]:.1f}±{per_tf['duration_std'][i]:.1f}",
+                        "Duration": duration_str,
                         "Direction": "UP ↑" if per_tf['direction_probs'][i] > 0.5 else "DOWN ↓",
                         "Dir Prob": f"{per_tf['direction_probs'][i]:.0%}",
                         "Next Ch": ["DN", "SAME", "UP"][per_tf['next_channel'][i]],

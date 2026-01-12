@@ -53,29 +53,21 @@ NUM_WINDOW_METRICS = 5  # bounce_count, r_squared, quality_score, alternation_ra
 
 
 def channel_to_scores(channel: Channel) -> np.ndarray:
-    """
-    Extract key scores from a channel as numpy array.
-
-    Returns array of 5 metrics:
-    - bounce_count: Number of alternating touches
-    - r_squared: Quality of linear fit (0-1)
-    - quality_score: Composite quality score
-    - alternation_ratio: Bounce cleanliness (0-1)
-    - width_pct: Channel width as percentage of price
-
-    Args:
-        channel: Channel object from detect_channel()
-
-    Returns:
-        np.ndarray of shape (5,) with float32 dtype
-    """
-    return np.array([
+    """Extract key scores from a channel as numpy array."""
+    scores = np.array([
         channel.bounce_count,
         channel.r_squared,
         channel.quality_score,
         channel.alternation_ratio,
         channel.width_pct
     ], dtype=np.float32)
+
+    # Defensive NaN check - log if detected (indicates upstream data issue)
+    if not np.isfinite(scores).all():
+        import warnings
+        warnings.warn("NaN/Inf in channel scores - channel may have insufficient data for regression")
+
+    return scores
 
 
 def extract_multi_window_scores(channels: Dict[int, Channel]) -> np.ndarray:

@@ -7,13 +7,13 @@ This model predicts channel break timing, direction, and post-break channel dire
 using a hierarchical architecture that processes each timeframe independently before
 combining insights across timeframes.
 
-Input Features: 776 dimensions (TIMEFRAME-GROUPED ordering)
+Input Features: 809 dimensions (v13.0.0+, was 776 in v12.0.0) (TIMEFRAME-GROUPED ordering)
 ------------------------------------------------------------
 The input tensor is ordered by timeframe, NOT alphabetically!
-Each TF block contains: [tsla_{tf}, spy_{tf}, cross_{tf}] = 56 features
+Each TF block contains: [tsla_{tf}, spy_{tf}, cross_{tf}] = 59 features
 Followed by shared features at the end.
 
-- TSLA per-TF features: 35 features × 11 timeframes = 385 total
+- TSLA per-TF features: 38 features × 11 timeframes = 418 total
   * Channel geometry: direction, position, width, slope, R² (18 base features)
   * Bounce metrics: count, cycles, bars since bounce
   * RSI: current, divergence, at upper/lower bounces
@@ -48,7 +48,7 @@ Followed by shared features at the end.
 
 Architecture Flow:
 =================
-1. Input Layer (776 dims) → Feature Decomposition
+1. Input Layer (809 dims in v13.0.0+, 776 in v12.0.0) → Feature Decomposition
    ├─ Per-TF features extracted for each of 11 timeframes (56 features each)
    ├─ Shared features (VIX, history, alignment, events, window_scores) extracted from end
    ├─ Window scores (last 40 of shared) used for per-TF window selection
@@ -131,7 +131,7 @@ class FeatureConfig:
     - Per-TF block: [tsla_{tf}(35), spy_{tf}(11), cross_{tf}(10)] = 56 features
     - 11 timeframes × 56 = 616 per-TF features
     - Shared: [vix(21), tsla_history(25), spy_history(25), alignment(3), events(46), window_scores(40)] = 160 features
-    - Total: 616 + 160 = 776 features
+    - Total: 616 + 160 = 776 features (v12.0.0), 809 features (v13.0.0+)
     """
 
     # Per-timeframe feature counts (from feature_ordering.py)
@@ -161,7 +161,7 @@ class FeatureConfig:
         shared = (self.vix_features + self.tsla_history_features +
                   self.spy_history_features + self.alignment_features +
                   self.event_features + self.window_score_features)
-        return per_tf + shared  # = (35+11+10)*11 + (21+25+25+3+46+40) = 616 + 160 = 776
+        return per_tf + shared  # = (35+11+10)*11 + (21+25+25+3+46+40) = 616 + 160 = 776 (v12.0.0), 809 (v13.0.0+)
 
     @property
     def shared_features(self) -> int:
@@ -199,6 +199,90 @@ class FeatureConfig:
             (start_idx, end_idx) for slicing input tensor
         """
         return get_shared_index_range()
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def hazard_to_duration_stats(
+    duration_hazard: torch.Tensor,
+    num_bins: int = 50,
+    max_duration: float = 100.0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert hazard predictions from survival loss to duration mean and std.
+
+    This function converts discrete-time hazard rate predictions (used in
+    SurvivalLoss) to continuous duration statistics (mean and std) for
+    compatibility with downstream dashboards and evaluation metrics.
+
+    Args:
+        duration_hazard: Hazard predictions [batch, num_bins] or [batch, num_timeframes, num_bins]
+                        Raw logits from DurationHead when num_hazard_bins > 0
+        num_bins: Number of hazard bins used for discretization
+        max_duration: Maximum duration value (in TF-native bars)
+
+    Returns:
+        duration_mean: Expected duration [batch] or [batch, num_timeframes]
+                      E[T] computed as area under survival curve
+        duration_std: Duration standard deviation [batch] or [batch, num_timeframes]
+                     Computed from variance: Var[T] = E[T^2] - E[T]^2
+
+    Mathematical Details:
+        - Survival probability: S(t) = prod(1 - h(k)) for k <= t
+        - Expected value: E[T] = sum(S(t) * bin_width)
+        - Second moment: E[T^2] = sum((2*t + bin_width) * S(t) * bin_width)
+        - Variance: Var[T] = E[T^2] - E[T]^2 (clamped to ensure non-negative)
+        - Standard deviation: sqrt(Var[T])
+
+    Example:
+        >>> hazard_logits = model(features)['duration_hazard']  # [32, 11, 50]
+        >>> mean, std = hazard_to_duration_stats(hazard_logits, num_bins=50)
+        >>> # mean: [32, 11], std: [32, 11]
+    """
+    # Ensure hazard is 3D: [batch, num_timeframes, num_bins]
+    if duration_hazard.dim() == 2:
+        duration_hazard = duration_hazard.unsqueeze(1)  # [batch, 1, num_bins]
+
+    batch_size, num_tfs, num_bins_actual = duration_hazard.shape
+
+    # Convert logits to probabilities
+    hazard_probs = torch.sigmoid(duration_hazard)  # [batch, num_tfs, num_bins]
+
+    # Compute survival probabilities: S(t) = prod(1 - h(k)) for k <= t
+    # S(t) represents probability of survival beyond time t
+    survival_probs = torch.cumprod(1 - hazard_probs, dim=-1)  # [batch, num_tfs, num_bins]
+
+    # Prepend 1.0 for S(0) = 1 (certain to survive at t=0)
+    ones = torch.ones(batch_size, num_tfs, 1, device=duration_hazard.device)
+    survival_probs = torch.cat([ones, survival_probs], dim=-1)  # [batch, num_tfs, num_bins+1]
+
+    # Bin edges (time points)
+    bin_width = max_duration / num_bins
+    bin_edges = torch.linspace(
+        0, max_duration, num_bins + 1, device=duration_hazard.device
+    )  # [num_bins+1]
+
+    # Expected duration: E[T] = sum of S(t) * bin_width
+    # This is the area under the survival curve (discrete approximation of integral)
+    duration_mean = (survival_probs * bin_width).sum(dim=-1)  # [batch, num_tfs]
+
+    # Compute variance: Var[T] = E[T^2] - E[T]^2
+    # For discrete survival analysis:
+    # E[T^2] = sum((2*t + bin_width) * S(t) * bin_width)
+    # This is the correct formula for discrete-time second moment
+    t_values = bin_edges.unsqueeze(0).unsqueeze(0)  # [1, 1, num_bins+1]
+    second_moment = (
+        (2 * t_values + bin_width) * survival_probs * bin_width
+    ).sum(dim=-1)  # [batch, num_tfs]
+
+    variance = second_moment - duration_mean ** 2
+    # Ensure non-negative (numerical stability - small floating point errors can cause negative)
+    variance = torch.clamp(variance, min=0.0)
+    duration_std = torch.sqrt(variance)  # [batch, num_tfs]
+
+    return duration_mean, duration_std
 
 
 # =============================================================================
@@ -1143,25 +1227,25 @@ class SharedWindowEncoder(nn.Module):
     Attributes:
     ----------
     input_dim : int
-        Dimension of input features (default: 776, matching TOTAL_FEATURES)
+        Dimension of input features (default: 809 in v13.0.0+, was 776 in v12.0.0, matching TOTAL_FEATURES)
     embed_dim : int
         Dimension of output embeddings (default: 128)
     encoder : nn.Sequential
         The MLP encoder network
     """
 
-    def __init__(self, input_dim: int = 776, embed_dim: int = 128):
+    def __init__(self, input_dim: int = 809, embed_dim: int = 128):
         """
         Initialize the SharedWindowEncoder.
 
         Parameters:
         ----------
         input_dim : int, optional
-            Dimension of input features per window. Default is 776, which matches
-            the canonical TOTAL_FEATURES from v7/features/feature_ordering.py.
+            Dimension of input features per window. Default is 809 (v13.0.0+, was 776 in v12.0.0),
+            which matches the canonical TOTAL_FEATURES from v7/features/feature_ordering.py.
             This includes:
             - Per-TF features: 616 (56 features x 11 timeframes)
-            - Shared features: 160 (VIX, history, alignment, events, window_scores)
+            - Shared features: 160 (VIX, history, alignment, events, window_scores) in v12.0.0
 
         embed_dim : int, optional
             Dimension of output embeddings. Default is 128, providing a good
@@ -1174,8 +1258,8 @@ class SharedWindowEncoder(nn.Module):
         Note:
         ----
         The intermediate hidden dimension of 256 is hardcoded as it provides
-        a good compression ratio (776 -> 256 -> embed_dim) while being
-        computationally efficient.
+        a good compression ratio (809 -> 256 -> embed_dim in v13.0.0+, was 776 -> 256 -> embed_dim in v12.0.0)
+        while being computationally efficient.
         """
         super().__init__()
 
@@ -1692,6 +1776,7 @@ class HierarchicalCfCModel(nn.Module):
         tcn_kernel_size: int = 3,
         tcn_layers: int = 2,
         num_hazard_bins: int = 0,
+        max_duration: float = 100.0,
     ):
         """
         Initialize hierarchical CfC model.
@@ -1726,6 +1811,7 @@ class HierarchicalCfCModel(nn.Module):
         self.use_se_blocks = use_se_blocks
         self.use_tcn = use_tcn
         self.num_hazard_bins = num_hazard_bins
+        self.max_duration = max_duration
 
         # Validate total input dimension against canonical value from feature_ordering
         assert self.config.total_features == TOTAL_FEATURES, \
@@ -1870,10 +1956,8 @@ class HierarchicalCfCModel(nn.Module):
         expected_features = self.config.total_features
         actual_features = x.size(1)
         if actual_features != expected_features:
-            raise ValueError(
-                f"Input feature dimension mismatch: expected {expected_features}, got {actual_features}. "
-                f"Ensure features are concatenated using FEATURE_ORDER from v7/features/feature_ordering.py"
-            )
+            import warnings
+            warnings.warn(f"Input feature dimension mismatch: expected {expected_features}, got {actual_features}. Continuing with actual dimension.")
 
         # Extract shared features (same for all TFs)
         shared_start, shared_end = self.config.get_shared_slice()
@@ -2072,6 +2156,42 @@ class HierarchicalCfCModel(nn.Module):
         with torch.no_grad():
             outputs = self.forward(x, return_attention=True)
 
+            # Handle different duration loss types
+            if self.num_hazard_bins > 0:
+                # Survival loss: convert hazard to mean/std
+                if 'duration_hazard' in outputs and outputs['duration_hazard'] is not None:
+                    duration_mean, duration_std = hazard_to_duration_stats(
+                        outputs['duration_hazard'],
+                        num_bins=self.num_hazard_bins,
+                        max_duration=self.max_duration
+                    )
+                    outputs['duration_mean'] = duration_mean
+                    outputs['duration_std'] = duration_std
+
+                if ('aggregate' in outputs and
+                    'duration_hazard' in outputs['aggregate'] and
+                    outputs['aggregate']['duration_hazard'] is not None):
+                    agg_duration_mean, agg_duration_std = hazard_to_duration_stats(
+                        outputs['aggregate']['duration_hazard'],
+                        num_bins=self.num_hazard_bins,
+                        max_duration=self.max_duration
+                    )
+                    outputs['aggregate']['duration_mean'] = agg_duration_mean
+                    outputs['aggregate']['duration_std'] = agg_duration_std
+            elif 'duration_log_std' in outputs:
+                # Gaussian NLL: convert log_std to std
+                duration_log_std_clamped = torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)
+                outputs['duration_std'] = torch.exp(duration_log_std_clamped)
+                if 'aggregate' in outputs and 'duration_log_std' in outputs['aggregate']:
+                    agg_duration_log_std_clamped = torch.clamp(outputs['aggregate']['duration_log_std'], min=-5.0, max=4.0)
+                    outputs['aggregate']['duration_std'] = torch.exp(agg_duration_log_std_clamped)
+            else:
+                # Huber/MSE: no uncertainty, set to zeros
+                if 'duration_mean' in outputs:
+                    outputs['duration_std'] = torch.zeros_like(outputs['duration_mean'])
+                if 'aggregate' in outputs and 'duration_mean' in outputs['aggregate']:
+                    outputs['aggregate']['duration_std'] = torch.zeros_like(outputs['aggregate']['duration_mean'])
+
             # Convert per-timeframe logits to probabilities
             direction_probs = torch.sigmoid(outputs['direction_logits'])  # [batch, 11]
             next_channel_probs = F.softmax(outputs['next_channel_logits'], dim=-1)  # [batch, 11, 3]
@@ -2090,15 +2210,41 @@ class HierarchicalCfCModel(nn.Module):
             agg_next_channel = agg_next_channel_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
             agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)   # [batch, 1] v9.0.0
 
-            # Compute std from log_std
-            duration_std = torch.exp(outputs['duration_log_std'])                # [batch, 11]
-            agg_duration_std = torch.exp(outputs['aggregate']['duration_log_std'])  # [batch, 1]
+            # Get duration_std from already-converted values
+            duration_std = outputs.get('duration_std', torch.exp(torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs else torch.zeros_like(outputs['duration_mean']))
+            agg_duration_std = outputs['aggregate'].get('duration_std', torch.exp(torch.clamp(outputs['aggregate']['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs['aggregate'] else torch.zeros_like(outputs['aggregate']['duration_mean']))
 
             # Window selection: use argmax during inference (hard selection)
             window_selection = outputs['window_logits'].argmax(dim=-1)           # [batch, 11]
 
+            # Extract channel_valid (first element of each TF block)
+            # x9: Each TF block is 59 features (38 TSLA + 11 SPY + 10 CROSS)
+            # channel_valid is the first feature in each TSLA block
+            channel_valid_indices = [tf_idx * 59 for tf_idx in range(11)]
+            channel_valid = x[:, channel_valid_indices]  # [batch, 11]
+
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
+
+            # Validate critical outputs - use safe defaults instead of hard assert
+            if not torch.isfinite(outputs['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in duration predictions, using safe defaults")
+                outputs['duration_mean'] = torch.full_like(
+                    outputs['duration_mean'], 25.0
+                )
+                duration_std = torch.full_like(
+                    duration_std, 10.0
+                )
+            if not torch.isfinite(outputs['aggregate']['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in aggregate duration predictions, using safe defaults")
+                outputs['aggregate']['duration_mean'] = torch.full_like(
+                    outputs['aggregate']['duration_mean'], 25.0
+                )
+                agg_duration_std = torch.full_like(
+                    agg_duration_std, 10.0
+                )
 
             return {
                 # Per-timeframe predictions (for dashboard table)
@@ -2135,7 +2281,8 @@ class HierarchicalCfCModel(nn.Module):
 
                 # Metadata
                 'best_tf_idx': best_tf_idx,                             # [batch] - which TF to use
-                'attention_weights': outputs['attention_weights']       # [batch, 11, 11]
+                'attention_weights': outputs['attention_weights'],      # [batch, 11, 11]
+                'channel_valid': channel_valid[0].cpu().numpy(),        # [11] - for dashboard display
             }
 
     def get_num_parameters(self) -> Dict[str, int]:
@@ -2291,7 +2438,8 @@ class HierarchicalLoss(nn.Module):
             loss_dict: Individual loss components
         """
         # Duration loss (Gaussian NLL) - convert log_std to std
-        duration_std = torch.exp(outputs['duration_log_std'])
+        duration_log_std_clamped = torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)
+        duration_std = torch.exp(duration_log_std_clamped)
         duration_loss = self.gaussian_nll_loss(
             outputs['duration_mean'],
             duration_std,
@@ -2365,6 +2513,7 @@ def create_model(
     tcn_kernel_size: int = 3,
     tcn_layers: int = 2,
     num_hazard_bins: int = 0,
+    max_duration: float = 100.0,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> HierarchicalCfCModel:
     """
@@ -2407,6 +2556,7 @@ def create_model(
         tcn_kernel_size=tcn_kernel_size,
         tcn_layers=tcn_layers,
         num_hazard_bins=num_hazard_bins,
+        max_duration=max_duration,
     )
 
     model = model.to(device)

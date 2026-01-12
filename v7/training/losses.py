@@ -1720,7 +1720,8 @@ class MetricsCalculator:
         metrics['duration_mae'] = duration_mae.item()
 
         # Duration uncertainty (average predicted std)
-        duration_std = torch.exp(predictions['duration_log_std'])
+        duration_log_std_clamped = torch.clamp(predictions['duration_log_std'], min=-5.0, max=4.0)
+        duration_std = torch.exp(duration_log_std_clamped)
         if duration_mask is not None:
             avg_std = (duration_std * duration_mask).sum() / (duration_mask.sum() + 1e-6)
         else:

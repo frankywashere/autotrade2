@@ -25,8 +25,11 @@ from tqdm import tqdm
 import numpy as np
 from datetime import datetime
 
-# Import loss classes
-from v7.training.losses import CombinedLoss, EndToEndLoss
+# Import loss classes and metrics
+from v7.training.losses import CombinedLoss, EndToEndLoss, MetricsCalculator
+
+# Import hazard_to_duration_stats for survival mode MAE calculation
+from v7.models.hierarchical_cfc import hazard_to_duration_stats
 
 # Import canonical feature ordering - CRITICAL for correct feature concatenation!
 from v7.features.feature_ordering import FEATURE_ORDER, TOTAL_FEATURES
@@ -166,6 +169,19 @@ class PCGradBalancer:
 
         # Return sum of losses (gradients already set)
         return sum(task_losses)
+
+
+def assert_finite(name: str, tensor: torch.Tensor, raise_error: bool = True):
+    """Check tensor for NaN/Inf values."""
+    if not torch.isfinite(tensor).all():
+        msg = f"{name} contains NaN or Inf values"
+        if raise_error:
+            raise ValueError(msg)
+        else:
+            import warnings
+            warnings.warn(msg)
+            return False
+    return True
 
 
 @dataclass
@@ -394,6 +410,11 @@ class Trainer:
                 self.writer = SummaryWriter(log_dir=str(config.log_dir))
             except ImportError:
                 print("TensorBoard not available. Install with: pip install tensorboard")
+
+        # MetricsCalculator for parallel computation of validation metrics
+        # Uses timeframe names from core module for per-TF metrics
+        from v7.core.timeframe import TIMEFRAMES
+        self.metrics_calculator = MetricsCalculator(timeframe_names=list(TIMEFRAMES))
 
     def _create_optimizer(self) -> optim.Optimizer:
         """Create optimizer based on config.
@@ -624,7 +645,19 @@ class Trainer:
                         predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
                     else:
                         predictions = self.model(x)
+
+                    # Check predictions for NaN/Inf (early detection)
+                    if not assert_finite("duration_mean", predictions['duration_mean'], raise_error=False):
+                        continue  # Skip this batch
+
                     loss, loss_dict = self.criterion(predictions, targets, masks)
+
+                # Check loss for NaN/Inf
+                if not torch.isfinite(loss):
+                    import warnings
+                    warnings.warn(f"Loss is NaN/Inf at step {self.global_step}, skipping update")
+                    self.global_step += 1
+                    continue  # Skip optimization for this batch
 
                 # Backward pass with gradient balancing
                 if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:
@@ -682,7 +715,19 @@ class Trainer:
                     predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
                 else:
                     predictions = self.model(x)
+
+                # Check predictions for NaN/Inf (early detection)
+                if not assert_finite("duration_mean", predictions['duration_mean'], raise_error=False):
+                    continue  # Skip this batch
+
                 loss, loss_dict = self.criterion(predictions, targets, masks)
+
+                # Check loss for NaN/Inf
+                if not torch.isfinite(loss):
+                    import warnings
+                    warnings.warn(f"Loss is NaN/Inf at step {self.global_step}, skipping update")
+                    self.global_step += 1
+                    continue  # Skip optimization for this batch
 
                 # Backward pass with gradient balancing
                 if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:
@@ -762,7 +807,7 @@ class Trainer:
         return epoch_metrics
 
     def validate(self) -> Dict[str, float]:
-        """Validate on validation set."""
+        """Validate on validation set with MetricsCalculator parallel computation."""
         self.model.eval()
 
         epoch_losses = {
@@ -791,6 +836,11 @@ class Trainer:
         duration_mae_sum = 0.0
         duration_mse_sum = 0.0
         duration_valid_count = 0.0
+
+        # MetricsCalculator accumulation lists for parallel computation
+        all_predictions = []
+        all_targets = []
+        all_masks = []
 
         with torch.no_grad():
             for features, labels in tqdm(self.val_loader, desc="Validation"):
@@ -893,12 +943,12 @@ class Trainer:
                 # Duration metrics (MAE and RMSE)
                 # Use hazard-derived expected duration if available (for survival loss)
                 if 'duration_hazard' in predictions and predictions['duration_hazard'] is not None:
-                    # Compute expected duration from hazard (E[T] = sum of survival probabilities)
-                    hazard = torch.sigmoid(predictions['duration_hazard'])  # [batch, num_tfs, num_bins] or [batch, num_bins]
-                    survival = torch.cumprod(1 - hazard, dim=-1)  # Cumulative survival
-                    # Expected duration = sum of survival probabilities across bins
-                    # (each bin contributes its survival probability)
-                    duration_pred = survival.sum(dim=-1)  # [batch, num_tfs] or [batch]
+                    # Use hazard_to_duration_stats for proper bin-width scaling
+                    duration_pred, _ = hazard_to_duration_stats(
+                        predictions['duration_hazard'],
+                        num_bins=self.model.num_hazard_bins,
+                        max_duration=self.model.max_duration
+                    )
                     if duration_pred.dim() == 1:  # If aggregate [batch], expand to [batch, num_tfs]
                         duration_pred = duration_pred.unsqueeze(1).expand(-1, targets['duration'].shape[1])
                 else:
@@ -939,6 +989,41 @@ class Trainer:
                         trigger_tf_correct += trigger_tf_matches.sum().item()
                         total_trigger_tf_samples += trigger_tf_matches.numel()
 
+                # Accumulate for MetricsCalculator parallel computation
+                # Handle hazard-to-duration conversion for survival mode
+                if 'duration_hazard' in predictions and predictions['duration_hazard'] is not None:
+                    # Use hazard_to_duration_stats for proper bin-width scaling
+                    duration_mean_for_metrics, _ = hazard_to_duration_stats(
+                        predictions['duration_hazard'],
+                        num_bins=self.model.num_hazard_bins,
+                        max_duration=self.model.max_duration
+                    )
+                    if duration_mean_for_metrics.dim() == 1:
+                        duration_mean_for_metrics = duration_mean_for_metrics.unsqueeze(1).expand(-1, targets['duration'].shape[1])
+                else:
+                    duration_mean_for_metrics = predictions['duration_mean']
+
+                # Store predictions with converted duration for MetricsCalculator
+                batch_predictions = {
+                    'duration_mean': duration_mean_for_metrics.cpu(),
+                    'duration_log_std': predictions['duration_log_std'].cpu(),
+                    'direction_logits': predictions['direction_logits'].cpu(),
+                    'next_channel_logits': predictions['next_channel_logits'].cpu(),
+                }
+                batch_targets = {
+                    'duration': targets['duration'].cpu(),
+                    'direction': targets['direction'].cpu(),
+                    'next_channel': targets['next_channel'].cpu(),
+                }
+                batch_masks = {
+                    'duration_valid': masks['duration_valid'].cpu(),
+                    'direction_valid': masks['direction_valid'].cpu(),
+                    'next_channel_valid': masks['next_channel_valid'].cpu(),
+                }
+                all_predictions.append(batch_predictions)
+                all_targets.append(batch_targets)
+                all_masks.append(batch_masks)
+
         # Average losses and accuracies
         epoch_metrics = {k: np.mean(v) if v else 0.0 for k, v in epoch_losses.items()}
         epoch_metrics['direction_acc'] = direction_correct / total_valid_samples if total_valid_samples > 0 else 0.0
@@ -948,6 +1033,36 @@ class Trainer:
         # Duration MAE and RMSE metrics
         epoch_metrics['duration_mae'] = duration_mae_sum / duration_valid_count if duration_valid_count > 0 else 0.0
         epoch_metrics['duration_rmse'] = np.sqrt(duration_mse_sum / duration_valid_count) if duration_valid_count > 0 else 0.0
+
+        # MetricsCalculator parallel computation
+        # Concatenate all batches for comprehensive metrics
+        if all_predictions:
+            concat_predictions = {
+                k: torch.cat([p[k] for p in all_predictions], dim=0)
+                for k in all_predictions[0].keys()
+            }
+            concat_targets = {
+                k: torch.cat([t[k] for t in all_targets], dim=0)
+                for k in all_targets[0].keys()
+            }
+            concat_masks = {
+                k: torch.cat([m[k] for m in all_masks], dim=0)
+                for k in all_masks[0].keys()
+            }
+
+            # Compute comprehensive metrics using MetricsCalculator
+            calculator_metrics = self.metrics_calculator.compute_metrics(
+                concat_predictions, concat_targets, concat_masks
+            )
+
+            # Merge calculator metrics into epoch_metrics
+            for k, v in calculator_metrics.items():
+                if 'duration_mae_' in k:
+                    # Use unprefixed key for per-TF MAEs (dashboard compatibility)
+                    epoch_metrics[k] = v
+                else:
+                    # Prefix other metrics to distinguish from manual computation
+                    epoch_metrics[f'calc_{k}'] = v
 
         return epoch_metrics
 
@@ -978,6 +1093,34 @@ class Trainer:
             model_kwargs['use_multi_resolution'] = self.config.use_multi_resolution
         if 'resolution_levels' not in model_kwargs:
             model_kwargs['resolution_levels'] = self.config.resolution_levels
+
+        # Loss configuration
+        if 'duration_loss_type' not in model_kwargs:
+            model_kwargs['duration_loss_type'] = self.config.duration_loss_type
+        if 'direction_loss_type' not in model_kwargs:
+            model_kwargs['direction_loss_type'] = self.config.direction_loss_type
+        if 'num_hazard_bins' not in model_kwargs:
+            model_kwargs['num_hazard_bins'] = 50 if self.config.duration_loss_type == 'survival' else 0
+        if 'huber_delta' not in model_kwargs:
+            model_kwargs['huber_delta'] = self.config.huber_delta if hasattr(self.config, 'huber_delta') else 1.0
+        if 'focal_gamma' not in model_kwargs:
+            model_kwargs['focal_gamma'] = self.config.focal_gamma if hasattr(self.config, 'focal_gamma') else 2.0
+
+        # Training strategy
+        if 'gradient_balancing' not in model_kwargs:
+            model_kwargs['gradient_balancing'] = self.config.gradient_balancing if hasattr(self.config, 'gradient_balancing') else 'none'
+        if 'gradnorm_alpha' not in model_kwargs:
+            model_kwargs['gradnorm_alpha'] = self.config.gradnorm_alpha if hasattr(self.config, 'gradnorm_alpha') else 1.5
+        if 'two_stage_training' not in model_kwargs:
+            model_kwargs['two_stage_training'] = self.config.two_stage_training if hasattr(self.config, 'two_stage_training') else False
+        if 'stage1_epochs' not in model_kwargs:
+            model_kwargs['stage1_epochs'] = self.config.stage1_epochs if hasattr(self.config, 'stage1_epochs') else 5
+        if 'stage1_task' not in model_kwargs:
+            model_kwargs['stage1_task'] = self.config.stage1_task if hasattr(self.config, 'stage1_task') else 'direction'
+
+        # Calibration configuration
+        if 'calibration_mode' not in model_kwargs:
+            model_kwargs['calibration_mode'] = self.config.calibration_mode if hasattr(self.config, 'calibration_mode') else 'brier_per_tf'
 
         # Create a copy of config with updated model_kwargs
         # We modify the dataclass directly since it will be serialized

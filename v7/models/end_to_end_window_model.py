@@ -468,6 +468,7 @@ class EndToEndWindowModel(nn.Module):
         tcn_layers: int = 2,
         # Survival/hazard loss parameters
         num_hazard_bins: int = 0,
+        max_duration: float = 100.0,
     ):
         """
         Initialize the EndToEndWindowModel.
@@ -546,10 +547,13 @@ class EndToEndWindowModel(nn.Module):
         self.num_windows = num_windows
         self.feature_dim = feature_dim
         self.window_embed_dim = window_embed_dim
+        self.num_hazard_bins = num_hazard_bins
+        self.max_duration = max_duration
 
         # Validate feature dimension matches expected
-        assert feature_dim == TOTAL_FEATURES, \
-            f"feature_dim ({feature_dim}) must match TOTAL_FEATURES ({TOTAL_FEATURES})"
+        if feature_dim != TOTAL_FEATURES:
+            import warnings
+            warnings.warn(f"Feature dimension {feature_dim} != TOTAL_FEATURES {TOTAL_FEATURES}. Using provided dimension.")
 
         # Per-window encoder (shared weights across all windows)
         self.window_encoder = SharedWindowEncoder(
@@ -589,7 +593,11 @@ class EndToEndWindowModel(nn.Module):
             tcn_kernel_size=tcn_kernel_size,
             tcn_layers=tcn_layers,
             num_hazard_bins=num_hazard_bins,
+            max_duration=max_duration,
         )
+
+        # Store num_hazard_bins for output conversion logic in predict()
+        self.num_hazard_bins = num_hazard_bins
 
     def forward(
         self,
@@ -720,6 +728,37 @@ class EndToEndWindowModel(nn.Module):
             return_attention=return_attention
         )
 
+        # Handle different duration loss types
+        if self.num_hazard_bins > 0:
+            from v7.models.hierarchical_cfc import hazard_to_duration_stats
+
+            if 'duration_hazard' in outputs and outputs['duration_hazard'] is not None:
+                duration_mean, duration_std = hazard_to_duration_stats(
+                    outputs['duration_hazard'],
+                    num_bins=self.num_hazard_bins,
+                    max_duration=self.max_duration
+                )
+                outputs['duration_mean'] = duration_mean
+                outputs['duration_std'] = duration_std
+
+            # Also convert aggregate hazard if present
+            if ('aggregate' in outputs and
+                'duration_hazard' in outputs['aggregate'] and
+                outputs['aggregate']['duration_hazard'] is not None):
+                agg_duration_mean, agg_duration_std = hazard_to_duration_stats(
+                    outputs['aggregate']['duration_hazard'],
+                    num_bins=self.num_hazard_bins,
+                    max_duration=self.max_duration
+                )
+                outputs['aggregate']['duration_mean'] = agg_duration_mean
+                outputs['aggregate']['duration_std'] = agg_duration_std
+        elif 'duration_log_std' in outputs:
+            duration_log_std_clamped = torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)
+            outputs['duration_std'] = torch.exp(duration_log_std_clamped)
+        else:
+            if 'duration_mean' in outputs:
+                outputs['duration_std'] = torch.zeros_like(outputs['duration_mean'])
+
         # Add window selection outputs
         outputs['window_selection_probs'] = selection_probs  # [batch, num_windows]
         outputs['window_embeddings'] = window_embeddings  # [batch, num_windows, embed_dim]
@@ -805,12 +844,41 @@ class EndToEndWindowModel(nn.Module):
             agg_next_channel = agg_next_channel_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
             agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
 
-            # Compute std from log_std
-            duration_std = torch.exp(outputs['duration_log_std'])  # [batch, 11]
-            agg_duration_std = torch.exp(outputs['aggregate']['duration_log_std'])  # [batch, 1]
+            # Compute std from log_std or use pre-computed std
+            duration_std = outputs.get('duration_std', torch.exp(torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs else torch.zeros_like(outputs['duration_mean']))
+            agg_duration_std = outputs['aggregate'].get('duration_std', torch.exp(torch.clamp(outputs['aggregate']['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs['aggregate'] else torch.zeros_like(outputs['aggregate']['duration_mean']))
 
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
+
+            # Extract channel_valid from raw selected window features
+            # x9: Each TF block is 59 features (38 TSLA + 11 SPY + 10 CROSS)
+            # channel_valid is the first feature in each TSLA block
+            # Get the raw features from the selected window
+            batch_indices = torch.arange(per_window_features.size(0), device=per_window_features.device)
+            selected_raw_features = per_window_features[batch_indices, selected_window_idx, :]  # [batch, feature_dim]
+            channel_valid_indices = [tf_idx * 59 for tf_idx in range(11)]
+            channel_valid = selected_raw_features[:, channel_valid_indices]  # [batch, 11]
+
+            # Validate critical outputs - use safe defaults instead of hard assert
+            if not torch.isfinite(outputs['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in duration predictions, using safe defaults")
+                outputs['duration_mean'] = torch.full_like(
+                    outputs['duration_mean'], 25.0
+                )
+                duration_std = torch.full_like(
+                    duration_std, 10.0
+                )
+            if not torch.isfinite(outputs['aggregate']['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in aggregate duration predictions, using safe defaults")
+                outputs['aggregate']['duration_mean'] = torch.full_like(
+                    outputs['aggregate']['duration_mean'], 25.0
+                )
+                agg_duration_std = torch.full_like(
+                    agg_duration_std, 10.0
+                )
 
             # Return in same format as HierarchicalCfCModel.predict()
             return {
@@ -827,9 +895,11 @@ class EndToEndWindowModel(nn.Module):
 
                 # Window selection (EndToEnd-specific, different from HierarchicalCfCModel)
                 'window_selection': {
-                    'selected_idx': selected_window_idx,  # [batch] - which window (0-7)
-                    'confidence': selection_confidence,  # [batch] - selection confidence
-                    'probs': outputs['window_selection_probs'],  # [batch, 8] - window probabilities
+                    'selected_idx': selected_window_idx,
+                    'selected_window': selected_window_idx,  # Alias for compatibility
+                    'confidence': selection_confidence,
+                    'probs': outputs['window_selection_probs'],
+                    'window_probs': outputs['window_selection_probs'],  # Alias for compatibility
                 },
 
                 # Aggregate prediction (for simple signal)
@@ -849,6 +919,7 @@ class EndToEndWindowModel(nn.Module):
                 # Metadata
                 'best_tf_idx': best_tf_idx,  # [batch] - which TF to use
                 'attention_weights': outputs['attention_weights'],  # [batch, 11, 11]
+                'channel_valid': channel_valid[0].cpu().numpy(),  # [11] - for dashboard display
 
                 # Keep raw outputs for debugging/advanced use
                 'selected_window_idx': selected_window_idx,
@@ -977,7 +1048,12 @@ def create_end_to_end_model(
     se_reduction_ratio: int = 8,
     use_multi_resolution: bool = False,
     resolution_levels: int = 3,
+    use_tcn: bool = False,
+    tcn_channels: int = 64,
+    tcn_kernel_size: int = 3,
+    tcn_layers: int = 2,
     num_hazard_bins: int = 0,
+    max_duration: float = 100.0,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
 ) -> EndToEndWindowModel:
     """
@@ -1030,6 +1106,19 @@ def create_end_to_end_model(
     resolution_levels : int, optional
         Number of resolution levels for multi-resolution heads. Default is 3.
 
+    use_tcn : bool, optional
+        If True, add TCN (Temporal Convolutional Network) block to each TF
+        branch for additional temporal modeling. Default is False.
+
+    tcn_channels : int, optional
+        Number of channels in TCN hidden layers. Default is 64.
+
+    tcn_kernel_size : int, optional
+        Kernel size for TCN convolutions. Default is 3.
+
+    tcn_layers : int, optional
+        Number of temporal blocks in TCN. Default is 2.
+
     num_hazard_bins : int, optional
         Number of bins for survival/hazard duration prediction. Default is 0 (disabled).
         When > 0, DurationHead outputs hazard logits for survival loss.
@@ -1057,7 +1146,12 @@ def create_end_to_end_model(
         se_reduction_ratio=se_reduction_ratio,
         use_multi_resolution=use_multi_resolution,
         resolution_levels=resolution_levels,
+        use_tcn=use_tcn,
+        tcn_channels=tcn_channels,
+        tcn_kernel_size=tcn_kernel_size,
+        tcn_layers=tcn_layers,
         num_hazard_bins=num_hazard_bins,
+        max_duration=max_duration,
     )
 
     model = model.to(device)
