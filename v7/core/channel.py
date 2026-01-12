@@ -240,6 +240,12 @@ def detect_bounces(
         last_type = touch.touch_type
 
     # Count complete cycles (full round-trips)
+    # A complete cycle is L→U→L or U→L→U (three consecutive touches forming a round-trip)
+    # We count NON-OVERLAPPING cycles: after finding a cycle at positions [i, i+1, i+2],
+    # we advance by 2 so the next potential cycle starts at i+2 (sharing one touch).
+    # This means L→U→L→U→L counts as 2 cycles (not 3 overlapping ones).
+    # This is intentional: overlapping cycles would overcount the same price action.
+    # Example: L U L U L → cycle at [0,1,2], then at [2,3,4] → 2 cycles
     complete_cycles = 0
     i = 0
     while i < len(touches) - 2:
@@ -251,7 +257,7 @@ def detect_bounces(
         if (t1 == TouchType.LOWER and t2 == TouchType.UPPER and t3 == TouchType.LOWER) or \
            (t1 == TouchType.UPPER and t2 == TouchType.LOWER and t3 == TouchType.UPPER):
             complete_cycles += 1
-            i += 2  # Skip to after this cycle
+            i += 2  # Advance by 2 to allow sharing one touch with next cycle
         else:
             i += 1
 
@@ -372,22 +378,29 @@ def calculate_channel_quality_score(
     false_break_rate: Optional[float] = None
 ) -> float:
     """
-    Calculate quality score emphasizing alternating bounces.
+    Calculate quality score emphasizing alternating bounces, normalized to [0, 1].
 
-    Score = alternations × (1 + alternation_ratio) × (1 + 0.2 × false_break_rate)
+    Raw score = alternations x (1 + alternation_ratio) x (1 + 0.2 x false_break_rate)
+    Normalized score = 2 / (1 + exp(-raw_score / 5)) - 1
+
+    The sigmoid transformation maps the unbounded raw score to [0, 1]:
+    - raw_score=0 -> normalized=0.0
+    - raw_score=5 -> normalized~0.46
+    - raw_score=10 -> normalized~0.73
+    - raw_score=20 -> normalized~0.96
+    - raw_score->inf -> normalized->1.0
 
     This rewards:
     - More alternations (bounces) - primary factor
     - Cleaner alternation pattern (higher ratio) - secondary factor
     - Higher false break resilience (optional) - tertiary factor
 
-    Examples:
-    - 5 alternations with ratio 1.0, no false break data → score = 5 × 2.0 = 10.0
-    - 5 alternations with ratio 1.0, false_break_rate 0.5 → score = 5 × 2.0 × 1.1 = 11.0
-    - 5 alternations with ratio 0.5 → score = 5 × 1.5 = 7.5
-    - 2 alternations with ratio 1.0 → score = 2 × 2.0 = 4.0
+    The normalization is important because quality_score is used:
+    - As neural network input (requires bounded values for stable training)
+    - In softmax operations (unbounded values cause numerical overflow)
+    - For comparison across channels (bounded scale enables fair comparison)
 
-    R² is deliberately NOT used - a channel with many bounces is valid
+    R-squared is deliberately NOT used - a channel with many bounces is valid
     regardless of how well a linear regression fits.
 
     Args:
@@ -397,19 +410,32 @@ def calculate_channel_quality_score(
                          backwards compatibility.
 
     Returns:
-        float: Quality score (0.0+, typically 0-20)
+        float: Quality score normalized to [0.0, 1.0]
     """
+    import math
+
     # Use alternations field (same as bounce_count)
     alternations = channel.alternations
     ratio = channel.alternation_ratio
 
-    quality = alternations * (1 + ratio)
+    # Calculate raw unbounded score
+    raw_quality = alternations * (1 + ratio)
 
     # Optionally incorporate false break resilience
     if false_break_rate is not None:
-        quality = quality * (1 + 0.2 * false_break_rate)
+        raw_quality = raw_quality * (1 + 0.2 * false_break_rate)
 
-    return float(quality)
+    # Apply sigmoid normalization to bound score to [0, 1]
+    # Formula: 2 / (1 + exp(-x/5)) - 1
+    # This maps 0->0, ~5->0.46, ~10->0.73, ~20->0.96, inf->1.0
+    # The divisor of 5 is chosen so typical high-quality channels (10-20 raw)
+    # map to the upper range (0.73-0.96) while leaving room for exceptional ones
+    if raw_quality <= 0:
+        return 0.0
+
+    normalized_quality = 2.0 / (1.0 + math.exp(-raw_quality / 5.0)) - 1.0
+
+    return float(normalized_quality)
 
 
 @dataclass

@@ -26,7 +26,7 @@ def calculate_rsi(prices: Union[np.ndarray, pd.Series], period: int = 14) -> flo
     prices = np.asarray(prices)
 
     if len(prices) < 2:
-        return 50.0  # Neutral if not enough data for deltas
+        raise ValueError(f"RSI calculation requires at least 2 price points, got {len(prices)}")
 
     deltas = np.diff(prices)
 

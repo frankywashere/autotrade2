@@ -34,10 +34,40 @@ from features.containment import check_containment, get_closest_boundary
 # Per-thread cache ensures thread safety without locks
 # =============================================================================
 
-# Thread-local cache storage: (df_id, len, timeframe) -> resampled DataFrame
+# Thread-local cache storage: (df_fingerprint, timeframe) -> resampled DataFrame
+# The fingerprint combines id(), len(), and hashes of first/last values to avoid
+# cache key collisions from Python's memory allocator reusing object IDs.
 _resample_cache_local = threading.local()
 
-def _get_resample_cache() -> Dict[Tuple[int, int, str], pd.DataFrame]:
+
+def _compute_df_fingerprint(df: pd.DataFrame) -> Tuple[int, int, float, float, float, float]:
+    """
+    Compute a robust fingerprint for a DataFrame that avoids id() reuse issues.
+
+    Combines:
+    - id(df): Memory address (fast but can be reused)
+    - len(df): Row count
+    - First and last index values (as timestamps)
+    - First and last close values
+
+    This combination is extremely unlikely to collide even if Python reuses
+    the same memory address for a different DataFrame.
+    """
+    if len(df) == 0:
+        return (id(df), 0, 0.0, 0.0, 0.0, 0.0)
+
+    # Get first/last index as float timestamps for hashing
+    first_idx = float(df.index[0].value) if hasattr(df.index[0], 'value') else float(hash(df.index[0]))
+    last_idx = float(df.index[-1].value) if hasattr(df.index[-1], 'value') else float(hash(df.index[-1]))
+
+    # Get first/last close values
+    first_close = float(df['close'].iloc[0]) if 'close' in df.columns else 0.0
+    last_close = float(df['close'].iloc[-1]) if 'close' in df.columns else 0.0
+
+    return (id(df), len(df), first_idx, last_idx, first_close, last_close)
+
+
+def _get_resample_cache() -> Dict[Tuple, pd.DataFrame]:
     """Get or create the resample cache for the current thread."""
     cache = getattr(_resample_cache_local, "cache", None)
     if cache is None:
@@ -128,7 +158,8 @@ def cached_resample_ohlc(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
     Cached version of resample_ohlc (per-thread cache).
 
-    Uses id(df) + len(df) as cache key to avoid hashing large DataFrames.
+    Uses a robust fingerprint (id + len + first/last values) as cache key to avoid
+    hash collisions from Python's memory allocator reusing object IDs.
     Cache is scoped to the current thread to ensure thread safety.
 
     When ENABLE_CACHE_STATS is True, tracks hit/miss statistics per thread.
@@ -149,7 +180,9 @@ def cached_resample_ohlc(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         return precomputed_slice
 
     cache = _get_resample_cache()
-    cache_key = (id(df), len(df), timeframe)
+    # Use robust fingerprint to avoid id() reuse collisions
+    df_fingerprint = _compute_df_fingerprint(df)
+    cache_key = (df_fingerprint, timeframe)
 
     cached = cache.get(cache_key)
 
@@ -597,11 +630,9 @@ def find_permanent_break(
                 exit_direction = None
                 bars_outside = 0
 
-    # If we still have an exit that didn't get confirmed,
-    # but we ran out of data, return what we have
-    if exit_bar is not None and bars_outside > 0:
-        return exit_bar, exit_direction
-
+    # If we still have an exit that didn't get confirmed (bars_outside < return_threshold),
+    # we ran out of data before confirming the break. Return None to indicate this
+    # is not a confirmed permanent break - labels near end of dataset would be unreliable.
     return None, None
 
 
@@ -1206,10 +1237,16 @@ def generate_labels_per_tf(
             )
 
             # Scale fold_end_idx if provided
+            # Use ceiling division to be conservative (avoid lookahead by rounding up)
+            # and add bounds checking to ensure we don't exceed actual data length
             scaled_fold_end_idx = None
             if fold_end_idx is not None:
                 bars_per_tf = BARS_PER_TF.get(tf, 1)
-                scaled_fold_end_idx = fold_end_idx // bars_per_tf
+                # Use ceiling division: -(-x // y) is equivalent to ceil(x / y) for positive integers
+                scaled_fold_end_idx = -(-fold_end_idx // bars_per_tf)
+                # Ensure scaled index doesn't exceed actual resampled data length
+                if scaled_fold_end_idx > len(df_tf_full):
+                    scaled_fold_end_idx = len(df_tf_full)
 
             # Generate labels for this TF using full data (includes forward bars for scanning)
             tf_labels = generate_labels(

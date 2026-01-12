@@ -60,8 +60,13 @@ class TestChannelQualityScore:
         score = calculate_channel_quality_score(channel)
         assert score == 0.0
 
-    def test_quality_score_one_bounce(self):
-        """Quality score with 1 bounce = 1 * (R² + 0.3)."""
+    def test_quality_score_one_alternation(self):
+        """Quality score with 1 alternation and ratio 1.0.
+
+        Raw score = alternations * (1 + ratio) = 1 * (1 + 1.0) = 2.0
+        Normalized = 2 / (1 + exp(-2/5)) - 1 ~ 0.329
+        """
+        import math
         channel = Channel(
             valid=True,
             direction=Direction.BULL,
@@ -78,14 +83,26 @@ class TestChannelQualityScore:
             width_pct=4.0,
             window=20,
             close=np.array([100.0, 101.0]),
+            alternations=1,
+            alternation_ratio=1.0,
         )
 
         score = calculate_channel_quality_score(channel)
-        expected = 1 * (0.8 + 0.3)  # 1.1
+        # Raw = 1 * (1 + 1.0) = 2.0
+        # Normalized = 2 / (1 + exp(-2/5)) - 1
+        raw = 2.0
+        expected = 2.0 / (1.0 + math.exp(-raw / 5.0)) - 1.0
         assert abs(score - expected) < 0.001, f"Expected {expected}, got {score}"
+        # Score should be bounded [0, 1]
+        assert 0.0 <= score <= 1.0, f"Score {score} not in [0, 1]"
 
-    def test_quality_score_five_bounces_high_r2(self):
-        """Quality score with 5 bounces and high R²."""
+    def test_quality_score_five_alternations_high_ratio(self):
+        """Quality score with 5 alternations and ratio 1.0.
+
+        Raw score = 5 * (1 + 1.0) = 10.0
+        Normalized ~ 0.73
+        """
+        import math
         channel = Channel(
             valid=True,
             direction=Direction.BULL,
@@ -103,14 +120,25 @@ class TestChannelQualityScore:
             width_pct=4.0,
             window=20,
             close=np.array([100.0] * 10),
+            alternations=5,
+            alternation_ratio=1.0,
         )
 
         score = calculate_channel_quality_score(channel)
-        expected = 5 * (0.95 + 0.3)  # 6.25
+        # Raw = 5 * (1 + 1.0) = 10.0
+        raw = 10.0
+        expected = 2.0 / (1.0 + math.exp(-raw / 5.0)) - 1.0
         assert abs(score - expected) < 0.001, f"Expected {expected}, got {score}"
+        # Score should be bounded [0, 1]
+        assert 0.0 <= score <= 1.0, f"Score {score} not in [0, 1]"
 
-    def test_quality_score_three_bounces_low_r2(self):
-        """Quality score with 3 bounces and low R²."""
+    def test_quality_score_three_alternations_low_ratio(self):
+        """Quality score with 3 alternations and ratio 0.5.
+
+        Raw score = 3 * (1 + 0.5) = 4.5
+        Normalized ~ 0.41
+        """
+        import math
         channel = Channel(
             valid=True,
             direction=Direction.SIDEWAYS,
@@ -128,11 +156,48 @@ class TestChannelQualityScore:
             width_pct=8.0,
             window=20,
             close=np.array([100.0] * 10),
+            alternations=3,
+            alternation_ratio=0.5,
         )
 
         score = calculate_channel_quality_score(channel)
-        expected = 3 * (0.4 + 0.3)  # 2.1
+        # Raw = 3 * (1 + 0.5) = 4.5
+        raw = 4.5
+        expected = 2.0 / (1.0 + math.exp(-raw / 5.0)) - 1.0
         assert abs(score - expected) < 0.001, f"Expected {expected}, got {score}"
+        # Score should be bounded [0, 1]
+        assert 0.0 <= score <= 1.0, f"Score {score} not in [0, 1]"
+
+    def test_quality_score_bounded(self):
+        """Quality score should always be bounded in [0, 1]."""
+        import math
+        # Test with very high alternations (extreme case)
+        channel = Channel(
+            valid=True,
+            direction=Direction.BULL,
+            slope=0.1,
+            intercept=100.0,
+            r_squared=0.95,
+            std_dev=1.0,
+            upper_line=np.array([102.0] * 50),
+            lower_line=np.array([98.0] * 50),
+            center_line=np.array([100.0] * 50),
+            touches=[Touch(i, TouchType.UPPER if i % 2 else TouchType.LOWER, 100.0)
+                     for i in range(50)],
+            complete_cycles=20,
+            bounce_count=49,
+            width_pct=4.0,
+            window=50,
+            close=np.array([100.0] * 50),
+            alternations=49,
+            alternation_ratio=1.0,
+        )
+
+        score = calculate_channel_quality_score(channel)
+        # Even with 49 alternations (raw = 98), score should be < 1.0
+        assert 0.0 <= score <= 1.0, f"Score {score} not in [0, 1]"
+        # Should be close to 1.0 but not quite
+        assert score > 0.99, f"Very high alternations should give score > 0.99, got {score}"
 
 
 class TestBounceFirstSorting:

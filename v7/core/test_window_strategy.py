@@ -61,7 +61,7 @@ def mock_channels() -> Dict[int, Channel]:
         bounce_count=3,
         width_pct=4.0,
         window=50,
-        quality_score=6.0  # 3 * (1 + 1.0) = 6.0
+        quality_score=0.537  # Normalized from raw 6.0 = 3 * (1 + 1.0)
     )
 
     # Window 100: 5 bounces, r_squared=0.6
@@ -86,7 +86,7 @@ def mock_channels() -> Dict[int, Channel]:
         bounce_count=5,
         width_pct=4.0,
         window=100,
-        quality_score=10.0  # 5 * (1 + 1.0) = 10.0
+        quality_score=0.762  # Normalized from raw 10.0 = 5 * (1 + 1.0)
     )
 
     # Window 150: 5 bounces (tie), r_squared=0.8 (higher)
@@ -111,7 +111,7 @@ def mock_channels() -> Dict[int, Channel]:
         bounce_count=5,
         width_pct=4.0,
         window=150,
-        quality_score=10.0  # 5 * (1 + 1.0) = 10.0
+        quality_score=0.762  # Normalized from raw 10.0 = 5 * (1 + 1.0)
     )
 
     return channels
@@ -415,7 +415,7 @@ def test_quality_score_selects_highest_score(mock_channels):
     strategy = QualityScoreStrategy()
     best_window, confidence = strategy.select_window(mock_channels)
 
-    # Windows 100 and 150 both have quality_score=10.0
+    # Windows 100 and 150 both have quality_score=0.762 (normalized)
     # Should prefer 100 (smaller window)
     assert best_window in [100, 150]
 
@@ -424,7 +424,7 @@ def test_quality_score_tie_prefers_smaller_window(mock_channels):
     """Test that ties are broken by preferring smaller window."""
     strategy = QualityScoreStrategy()
 
-    # Windows 100 and 150 have same quality_score (10.0)
+    # Windows 100 and 150 have same quality_score (0.762 normalized)
     channels = {100: mock_channels[100], 150: mock_channels[150]}
 
     best_window, confidence = strategy.select_window(channels)
@@ -437,7 +437,7 @@ def test_quality_score_confidence_clear_winner(mock_channels):
     """Test confidence when there's a clear winner."""
     strategy = QualityScoreStrategy()
 
-    # Windows 50 (score 6.0) vs 100 (score 10.0)
+    # Windows 50 (score 0.537) vs 100 (score 0.762)
     channels = {50: mock_channels[50], 100: mock_channels[100]}
 
     best_window, confidence = strategy.select_window(channels)
@@ -707,7 +707,7 @@ def test_strategies_handle_complex_scenario(mock_channels, mock_labels):
         bounce_count=4,
         width_pct=4.0,
         window=200,
-        quality_score=8.0  # 4 * (1 + 1.0) = 8.0
+        quality_score=0.664  # Normalized from raw 8.0 = 4 * (1 + 1.0)
     )
 
     # Add labels for window 200 (2 valid TFs)

@@ -101,7 +101,7 @@ def example_strategy_comparison():
         upper_line=np.array([104.0] * 50), lower_line=np.array([96.0] * 50),
         center_line=np.array([100.0] * 50),
         touches=[Touch(i*5, TouchType.UPPER if i%2 else TouchType.LOWER, 100) for i in range(8)],
-        complete_cycles=3, bounce_count=8, width_pct=8.0, window=50, quality_score=16.0
+        complete_cycles=3, bounce_count=8, width_pct=8.0, window=50, quality_score=0.922  # Normalized
     )
 
     # Window 100: Fewer bounces, high r²
@@ -111,7 +111,7 @@ def example_strategy_comparison():
         upper_line=np.array([102.0] * 100), lower_line=np.array([98.0] * 100),
         center_line=np.array([100.0] * 100),
         touches=[Touch(i*20, TouchType.UPPER if i%2 else TouchType.LOWER, 100) for i in range(4)],
-        complete_cycles=1, bounce_count=4, width_pct=4.0, window=100, quality_score=8.0
+        complete_cycles=1, bounce_count=4, width_pct=4.0, window=100, quality_score=0.664  # Normalized
     )
 
     # Window 150: Middle ground
@@ -121,7 +121,7 @@ def example_strategy_comparison():
         upper_line=np.array([103.0] * 150), lower_line=np.array([97.0] * 150),
         center_line=np.array([100.0] * 150),
         touches=[Touch(i*25, TouchType.UPPER if i%2 else TouchType.LOWER, 100) for i in range(6)],
-        complete_cycles=2, bounce_count=6, width_pct=6.0, window=150, quality_score=12.0
+        complete_cycles=2, bounce_count=6, width_pct=6.0, window=150, quality_score=0.834  # Normalized
     )
 
     # Create mock labels with different validity patterns
@@ -312,6 +312,11 @@ def example_confidence_filtering():
         # Create channels from scenario
         channels = {}
         for window, (valid, bounces, r2) in scenario_data.items():
+            # Compute normalized quality_score using sigmoid: 2/(1+exp(-raw/5))-1
+            # raw = bounces * 2.0 (assuming alternation_ratio=1.0)
+            import math
+            raw_score = bounces * 2.0
+            normalized_score = 2.0 / (1.0 + math.exp(-raw_score / 5.0)) - 1.0 if raw_score > 0 else 0.0
             channels[window] = Channel(
                 valid=valid, direction=Direction.BULL, slope=0.01, intercept=100.0,
                 r_squared=r2, std_dev=1.0,
@@ -319,7 +324,7 @@ def example_confidence_filtering():
                 lower_line=np.array([98.0] * window),
                 center_line=np.array([100.0] * window),
                 touches=[], complete_cycles=0, bounce_count=bounces,
-                width_pct=4.0, window=window, quality_score=bounces * 2.0
+                width_pct=4.0, window=window, quality_score=normalized_score
             )
 
         best_window, confidence = strategy.select_window(channels)

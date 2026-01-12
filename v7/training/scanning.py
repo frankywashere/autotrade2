@@ -44,18 +44,27 @@ def _init_scan_worker(tsla_values, tsla_index, spy_values, vix_values, progress_
     """Initialize worker process with shared data arrays, progress counter, and pre-computed resampled data."""
     global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES, _WORKER_PROGRESS_COUNTER
     global _WORKER_PRECOMPUTED_TSLA, _WORKER_PRECOMPUTED_SPY
-    _WORKER_TSLA_VALUES = tsla_values
-    _WORKER_TSLA_INDEX = tsla_index
-    _WORKER_SPY_VALUES = spy_values
-    _WORKER_VIX_VALUES = vix_values
-    _WORKER_PROGRESS_COUNTER = progress_counter
-    _WORKER_PRECOMPUTED_TSLA = precomputed_tsla
-    _WORKER_PRECOMPUTED_SPY = precomputed_spy
 
-    # Register pre-computed data with the labels module for cache optimization
-    if precomputed_tsla is not None or precomputed_spy is not None:
-        from .labels import set_precomputed_resampled_data
-        set_precomputed_resampled_data(precomputed_tsla, precomputed_spy)
+    try:
+        _WORKER_TSLA_VALUES = tsla_values
+        _WORKER_TSLA_INDEX = tsla_index
+        _WORKER_SPY_VALUES = spy_values
+        _WORKER_VIX_VALUES = vix_values
+        _WORKER_PROGRESS_COUNTER = progress_counter
+        _WORKER_PRECOMPUTED_TSLA = precomputed_tsla
+        _WORKER_PRECOMPUTED_SPY = precomputed_spy
+
+        # Register pre-computed data with the labels module for cache optimization
+        if precomputed_tsla is not None or precomputed_spy is not None:
+            from .labels import set_precomputed_resampled_data
+            set_precomputed_resampled_data(precomputed_tsla, precomputed_spy)
+    except Exception as e:
+        # Log initialization failure - this will cause the worker to fail on first task
+        # but provides visibility into what went wrong
+        import sys
+        print(f"ERROR: Worker initialization failed: {e}", file=sys.stderr)
+        # Re-raise to ensure the executor knows this worker failed to initialize
+        raise
 
 
 def _process_single_position(
@@ -109,6 +118,11 @@ def _process_single_position(
         index=tsla_index[:i],
         columns=['open', 'high', 'low', 'close', 'volume']
     )
+    # NOTE: SPY and VIX use tsla_index intentionally, not their original indices.
+    # The data arrays (spy_values, vix_values) were pre-aligned to TSLA's timestamps
+    # via forward-fill in scan_valid_channels() before being passed to workers.
+    # This ensures all DataFrames share the same DatetimeIndex for consistent
+    # feature extraction and prevents timestamp misalignment issues.
     spy_window_df = pd.DataFrame(
         spy_values[:i],
         index=tsla_index[:i],
@@ -155,8 +169,11 @@ def _process_single_position(
     # For backward compatibility, keep the 'features' field as best_window features
     features = features_per_window.get(best_window)
     if features is None:
-        # If best_window failed, use any available window
-        features = next(iter(features_per_window.values()))
+        # If best_window failed, use the smallest available window for determinism
+        # (dict iteration order is insertion order in Python 3.7+, but we use min()
+        # to be explicit and avoid any ambiguity across different code paths)
+        fallback_window = min(features_per_window.keys())
+        features = features_per_window[fallback_window]
 
     # Generate native per-TF labels for all window sizes
     # Need forward data for label generation
@@ -356,8 +373,9 @@ def _scan_sequential(
         # For backward compatibility, keep the 'features' field as best_window features
         features = features_per_window.get(best_window)
         if features is None:
-            # If best_window failed, use any available window
-            features = next(iter(features_per_window.values()))
+            # If best_window failed, use the smallest available window for determinism
+            fallback_window = min(features_per_window.keys())
+            features = features_per_window[fallback_window]
 
         # Generate native per-TF labels for all window sizes
         try:
@@ -431,13 +449,19 @@ def _scan_parallel(
     progress: bool,
     heartbeat_timeout_sec: Optional[float],
     heartbeat_interval_sec: float,
-    fail_on_timeout: bool
+    fail_on_timeout: bool,
+    max_failed_batches: Optional[int] = None
 ) -> Tuple[List[ChannelSample], int]:
     """
     Parallel scanning implementation using ProcessPoolExecutor.
 
     Converts DataFrames to numpy arrays to efficiently pass to worker processes.
     Workers process batches of positions to reduce overhead.
+
+    Args:
+        max_failed_batches: Optional maximum number of failed batches before raising an error.
+                           If None, continue processing regardless of failures. If exceeded,
+                           raises RuntimeError with failure count.
 
     Returns:
         Tuple of (samples, valid_count)
@@ -540,18 +564,23 @@ def _scan_parallel(
         }
 
         # Set up heartbeat monitoring if timeout is specified
+        # Use a lock to synchronize access to last_progress_time between threads
+        progress_time_lock = threading.Lock()
         last_progress_time = time.monotonic()
         last_counter_value = 0
         monitor_thread = None
         stop_monitoring = threading.Event()
+        # Shared flag for timeout - daemon thread sets it, main thread checks and raises
+        timeout_flag = threading.Event()
+        timeout_message = [None]  # Use list to allow modification in nested function
 
         def heartbeat_monitor():
             """Monitor thread that checks for progress timeout."""
-            nonlocal last_progress_time
             while not stop_monitoring.is_set():
                 time.sleep(heartbeat_interval_sec)
                 if heartbeat_timeout_sec is not None:
-                    elapsed = time.monotonic() - last_progress_time
+                    with progress_time_lock:
+                        elapsed = time.monotonic() - last_progress_time
                     if elapsed > heartbeat_timeout_sec:
                         msg = f"WARNING: No progress for {elapsed:.1f}s (timeout: {heartbeat_timeout_sec}s)"
                         if progress:
@@ -560,16 +589,22 @@ def _scan_parallel(
                             print(msg)
 
                         if fail_on_timeout:
-                            stop_monitoring.set()
-                            raise TimeoutError(
+                            timeout_message[0] = (
                                 f"Worker timeout: No progress for {elapsed:.1f} seconds "
                                 f"(threshold: {heartbeat_timeout_sec}s)"
                             )
+                            timeout_flag.set()
+                            stop_monitoring.set()
+                            return  # Exit thread cleanly instead of raising
 
         # Start monitor thread if timeout monitoring is enabled
         if heartbeat_timeout_sec is not None:
             monitor_thread = threading.Thread(target=heartbeat_monitor, daemon=True)
             monitor_thread.start()
+
+        # Track failed batches for proper error reporting
+        failed_batch_count = 0
+        failed_batch_errors = []
 
         # Collect results using wait() with timeout for polling progress
         try:
@@ -577,6 +612,10 @@ def _scan_parallel(
             poll_interval = 0.1  # Poll shared counter every 100ms
 
             while pending:
+                # Check if timeout flag was set by monitor thread
+                if timeout_flag.is_set():
+                    raise TimeoutError(timeout_message[0])
+
                 # Wait for any future to complete, with timeout for progress polling
                 done, pending = wait(pending, timeout=poll_interval, return_when=FIRST_COMPLETED)
 
@@ -588,7 +627,8 @@ def _scan_parallel(
                     if delta > 0:
                         pbar.update(delta)
                         last_counter_value = current_count
-                        last_progress_time = time.monotonic()
+                        with progress_time_lock:
+                            last_progress_time = time.monotonic()
 
                 # Process completed futures
                 for future in done:
@@ -596,22 +636,49 @@ def _scan_parallel(
                         batch_results = future.result()
                         all_results.extend(batch_results)
                     except Exception as e:
+                        failed_batch_count += 1
+                        failed_batch_errors.append(str(e))
                         if progress:
-                            tqdm.write(f"Worker error: {e}")
+                            tqdm.write(f"Worker error (batch {failed_batch_count}): {e}")
 
-            # Final progress sync - catch any remaining counts
+                        # Check fail-fast threshold
+                        if max_failed_batches is not None and failed_batch_count >= max_failed_batches:
+                            raise RuntimeError(
+                                f"Too many worker failures: {failed_batch_count} batches failed "
+                                f"(threshold: {max_failed_batches}). Last error: {e}"
+                            )
+
+            # Final progress sync - sync to actual counter value, not assumed total
+            # This avoids double-counting or missing updates
             if progress_counter is not None and pbar is not None:
                 with progress_counter.get_lock():
                     final_count = progress_counter.value
-                remaining = total_positions - pbar.n
-                if remaining > 0:
-                    pbar.update(remaining)
+                # Only update by the actual remaining delta from the counter
+                final_delta = final_count - last_counter_value
+                if final_delta > 0:
+                    pbar.update(final_delta)
+                # If counter shows fewer than total (due to skipped positions), complete the bar
+                if pbar.n < total_positions:
+                    pbar.update(total_positions - pbar.n)
+
+            # Warn user about failed batches if any occurred
+            if failed_batch_count > 0:
+                warning_msg = (
+                    f"WARNING: {failed_batch_count} worker batch(es) failed during processing. "
+                    f"Results may be incomplete."
+                )
+                if progress:
+                    tqdm.write(warning_msg)
+                else:
+                    print(warning_msg)
 
         finally:
-            # Stop monitoring thread
+            # Stop monitoring thread with timeout based on heartbeat_interval_sec
+            # Use 2x interval to allow current sleep to complete plus margin
             if monitor_thread is not None:
                 stop_monitoring.set()
-                monitor_thread.join(timeout=1.0)
+                join_timeout = max(2.0, heartbeat_interval_sec * 2)
+                monitor_thread.join(timeout=join_timeout)
 
     # Close progress bar
     if pbar is not None:
@@ -644,7 +711,8 @@ def scan_valid_channels(
     max_workers: Optional[int] = None,
     heartbeat_timeout_sec: Optional[float] = None,
     heartbeat_interval_sec: float = 5.0,
-    fail_on_timeout: bool = False
+    fail_on_timeout: bool = False,
+    max_failed_batches: Optional[int] = None
 ) -> Tuple[List[ChannelSample], int]:
     """
     Scan through historical data to find all valid channels and generate samples.
@@ -686,6 +754,9 @@ def scan_valid_channels(
         heartbeat_interval_sec: Interval in seconds for checking heartbeat timeout (default: 5.0).
         fail_on_timeout: If True, raise TimeoutError when heartbeat timeout is exceeded.
                         If False (default), only print a warning and continue.
+        max_failed_batches: Optional maximum number of failed worker batches before raising an error.
+                           If None (default), continue processing and warn at the end.
+                           If exceeded, raises RuntimeError with failure count.
 
     Returns:
         List of ChannelSample objects
@@ -741,7 +812,8 @@ def scan_valid_channels(
             progress=progress,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             heartbeat_interval_sec=heartbeat_interval_sec,
-            fail_on_timeout=fail_on_timeout
+            fail_on_timeout=fail_on_timeout,
+            max_failed_batches=max_failed_batches
         )
     else:
         samples, valid_count = _scan_sequential(

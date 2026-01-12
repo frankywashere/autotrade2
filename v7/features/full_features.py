@@ -383,14 +383,19 @@ def extract_tsla_channel_features(
             rsi_confidence = min(rsi_confidence * 1.1, 1.0)
 
     # Calculate ATR-normalized distances
+    # ATR must be valid - no silent fallbacks that mask data issues
     distance_to_upper_atr = 0.0
     distance_to_lower_atr = 0.0
     distance_to_nearest_atr = 999.0
 
-    if atr > 0 and channel.close is not None:
+    if channel.close is not None:
         current_price = channel.close[-1]
         upper = channel.upper_line[-1]
         lower = channel.lower_line[-1]
+
+        # ATR is required for proper distance normalization
+        if atr <= 0:
+            raise ValueError(f"ATR is zero or negative ({atr}) for timeframe {timeframe}, which indicates insufficient data")
 
         # Distance to upper in ATR units
         distance_to_upper_atr = (upper - current_price) / atr
@@ -487,7 +492,7 @@ def extract_full_features(
         except (ValueError, IndexError):
             pass
 
-        # Calculate ATR
+        # Calculate ATR - required for proper feature extraction
         if len(df_tf) >= 14:
             try:
                 atr_series, current_atr = calculate_atr(
@@ -496,11 +501,13 @@ def extract_full_features(
                     df_tf['close'].values,
                     period=14
                 )
+                if current_atr <= 0:
+                    raise ValueError(f"ATR is zero or negative ({current_atr}) for timeframe {tf}, which indicates insufficient data")
                 atr_values_per_tf[tf] = current_atr
-            except (ValueError, IndexError):
-                atr_values_per_tf[tf] = 0.0
+            except (ValueError, IndexError) as e:
+                raise ValueError(f"ATR calculation failed for timeframe {tf}. Ensure sufficient data is available. Error: {e}")
         else:
-            atr_values_per_tf[tf] = 0.0
+            raise ValueError(f"ATR calculation requires at least 14 bars for timeframe {tf}, got {len(df_tf)}")
 
     # Second pass: extract features with longer TF context
     # Channel and RSI series are REQUIRED - skip TFs that don't have them
@@ -736,7 +743,7 @@ def extract_shared_features(
         except (ValueError, IndexError):
             pass
 
-    # Step 4b: Calculate ATR for each TSLA timeframe
+    # Step 4b: Calculate ATR for each TSLA timeframe - required for proper feature extraction
     from v7.core.channel import calculate_atr
     atr_values_per_tf = {}
     for tf in TIMEFRAMES:
@@ -749,11 +756,13 @@ def extract_shared_features(
                     df_tf['close'].values,
                     period=14
                 )
+                if current_atr <= 0:
+                    raise ValueError(f"ATR is zero or negative ({current_atr}) for timeframe {tf}, which indicates insufficient data")
                 atr_values_per_tf[tf] = current_atr
-            except (ValueError, IndexError):
-                atr_values_per_tf[tf] = 0.0
+            except (ValueError, IndexError) as e:
+                raise ValueError(f"ATR calculation failed for timeframe {tf}. Ensure sufficient data is available. Error: {e}")
         else:
-            atr_values_per_tf[tf] = 0.0
+            raise ValueError(f"ATR calculation requires at least 14 bars for timeframe {tf}, got {len(df_tf) if df_tf is not None else 0}")
 
     # Step 5: Extract event features if handler provided
     event_features = None

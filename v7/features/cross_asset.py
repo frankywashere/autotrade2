@@ -177,29 +177,17 @@ def extract_vix_channel_features(
 
     Returns:
         VIXChannelFeatures with 15 interaction features
+
+    Raises:
+        ValueError: If VIX data is not available (required for proper feature extraction)
     """
-    # Default values for when VIX data unavailable
+    # VIX data is required for proper feature extraction - no silent fallbacks
+    if vix_df is None or len(vix_df) == 0:
+        raise ValueError("VIX data is required for VIX-channel feature extraction but vix_df is None or empty")
+
+    # Default values only used for bounces without VIX context (already computed in BounceRecord)
     default_vix = 20.0
     default_regime = 1
-
-    if vix_df is None or len(vix_df) == 0:
-        return VIXChannelFeatures(
-            vix_at_channel_start=default_vix,
-            vix_at_last_bounce=default_vix,
-            vix_change_during_channel=0.0,
-            vix_regime_at_start=default_regime,
-            vix_regime_at_current=default_regime,
-            avg_vix_at_upper_bounces=default_vix,
-            avg_vix_at_lower_bounces=default_vix,
-            vix_upper_minus_lower=0.0,
-            pct_bounces_high_vix=0.0,
-            vix_trend_during_channel=0,
-            vix_volatility_during_channel=0.0,
-            vix_regime_changes_count=0,
-            bounce_hold_rate_low_vix=0.5,
-            bounce_hold_rate_high_vix=0.5,
-            vix_bounce_quality_diff=0.0,
-        )
 
     # Get current VIX
     current_vix = float(vix_df['close'].iloc[-1])

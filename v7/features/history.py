@@ -9,6 +9,7 @@ Tracks patterns of past channels:
 - Patterns like "3 bear channels then sideways"
 """
 
+import logging
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
@@ -16,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 from collections import deque
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -92,25 +95,25 @@ def _get_vix_at_timestamp(vix_df: Optional[pd.DataFrame], timestamp: pd.Timestam
         Tuple of (vix_level, vix_regime)
     """
     if vix_df is None or len(vix_df) == 0:
-        return 20.0, 1  # Default: normal regime
+        raise ValueError(f"VIX data is required but not available at timestamp {timestamp}")
 
     # Get the date from timestamp
     target_date = timestamp.date() if hasattr(timestamp, 'date') else timestamp
 
     # Find the closest VIX value at or before this timestamp
+    # IMPORTANT: Never use forward-looking data - if no historical VIX available, return default
     try:
         if hasattr(vix_df.index, 'date'):
-            # DatetimeIndex - find closest date
+            # DatetimeIndex - find closest date at or before target
             mask = vix_df.index.date <= target_date
             if mask.any():
                 vix_level = float(vix_df.loc[mask, 'close'].iloc[-1])
             else:
-                vix_level = float(vix_df['close'].iloc[0])
+                raise ValueError(f"No VIX data available at or before {target_date}. VIX data range: {vix_df.index.min()} to {vix_df.index.max()}")
         else:
-            # Use iloc for fallback
-            vix_level = float(vix_df['close'].iloc[-1])
-    except (KeyError, IndexError):
-        vix_level = 20.0
+            raise ValueError("VIX data has non-datetime index, cannot determine temporal ordering")
+    except (KeyError, IndexError) as e:
+        raise ValueError(f"Failed to lookup VIX data at {target_date}: {e}")
 
     # Determine regime
     if vix_level < 15:
@@ -147,15 +150,25 @@ def detect_bounces_with_rsi(
     """
     bounces = []
 
+    # RSI series has 14-bar padding at start (RSI period), so valid values start at index 14
+    rsi_period = 14
+
     for touch in channel.touches:
         bar_idx = touch.bar_index
 
-        # Get RSI at this bar (adjust for any offset)
+        # Get RSI at this bar (adjust for channel window offset)
+        # The channel operates on the last `window` bars of df, so bar_idx is relative to channel start
         rsi_idx = len(df) - channel.window + bar_idx
-        if 0 <= rsi_idx < len(rsi_series):
+
+        # Check bounds: rsi_idx must be valid AND past the RSI padding period
+        if rsi_idx >= rsi_period and rsi_idx < len(rsi_series):
             rsi_at_bounce = rsi_series[rsi_idx]
+        elif 0 <= rsi_idx < rsi_period:
+            # Index is in RSI padding period - RSI not yet valid
+            raise ValueError(f"RSI index {rsi_idx} in padding period (< {rsi_period}) at bounce bar_idx={bar_idx}. Need more data for valid RSI.")
         else:
-            rsi_at_bounce = 50.0
+            # Index out of bounds
+            raise ValueError(f"RSI index {rsi_idx} out of bounds for RSI series of length {len(rsi_series)} at bounce bar_idx={bar_idx}")
 
         # Channel position at this bar
         close = channel.close[bar_idx]
@@ -172,11 +185,12 @@ def detect_bounces_with_rsi(
             except (IndexError, KeyError):
                 pass
 
-        # Get VIX at bounce time
-        vix_at_bounce = 20.0
-        vix_regime = 1
-        if timestamp is not None and vix_df is not None:
-            vix_at_bounce, vix_regime = _get_vix_at_timestamp(vix_df, timestamp)
+        # Get VIX at bounce time - VIX is required for proper feature extraction
+        if timestamp is None:
+            raise ValueError(f"Cannot get VIX at bounce: timestamp is None for bounce bar_idx={bar_idx}")
+        if vix_df is None:
+            raise ValueError(f"Cannot get VIX at bounce: vix_df is None for bounce at timestamp {timestamp}")
+        vix_at_bounce, vix_regime = _get_vix_at_timestamp(vix_df, timestamp)
 
         bounces.append(BounceRecord(
             bar_index=bar_idx,
@@ -262,10 +276,32 @@ def scan_channel_history(
 
             bounces = detect_bounces_with_rsi(df_slice, channel, rsi_series, vix_df=vix_df)
 
-            # Get RSI values
-            rsi_at_start = rsi_series[rsi_start_idx] if rsi_start_idx >= 0 else 50.0
-            rsi_at_break = rsi_series[min(rsi_end_idx, len(rsi_series) - 1)]
-            avg_rsi = np.mean(rsi_series[max(0, rsi_start_idx):rsi_end_idx]) if rsi_end_idx > rsi_start_idx else 50.0
+            # Get RSI values with proper bounds validation
+            # RSI period is 14, so valid RSI values start at index 14
+            rsi_period = 14
+
+            # RSI at start - must be valid
+            if rsi_period <= rsi_start_idx < len(rsi_series):
+                rsi_at_start = rsi_series[rsi_start_idx]
+            else:
+                raise ValueError(f"RSI at channel start index {rsi_start_idx} out of valid bounds [{rsi_period}, {len(rsi_series)})")
+
+            # Validate rsi_end_idx before using
+            if rsi_end_idx >= rsi_period and rsi_end_idx < len(rsi_series):
+                rsi_at_break = rsi_series[rsi_end_idx]
+            elif rsi_end_idx >= 0 and rsi_end_idx < len(rsi_series):
+                # In padding period or at boundary - use value but it may be less reliable
+                rsi_at_break = rsi_series[rsi_end_idx]
+            else:
+                raise ValueError(f"RSI at break index {rsi_end_idx} out of bounds for RSI series of length {len(rsi_series)}")
+
+            # Calculate avg_rsi with validated bounds
+            safe_start = max(rsi_period, rsi_start_idx)
+            safe_end = min(rsi_end_idx, len(rsi_series))
+            if safe_end > safe_start:
+                avg_rsi = np.mean(rsi_series[safe_start:safe_end])
+            else:
+                raise ValueError(f"Cannot calculate avg_rsi: invalid range [{safe_start}, {safe_end})")
 
             channels.append(ChannelRecord(
                 start_idx=current_idx - window,
@@ -367,10 +403,14 @@ def extract_history_features(
     bear_channels = [c for c in channel_records if c.direction == 0]
     bull_channels = [c for c in channel_records if c.direction == 2]
 
+    # NOTE: 0.5 default is legitimate here - represents "no prior data" (50% baseline)
+    # when no bear/bull channels exist yet. This is not masking data issues.
     break_up_after_bear = 0.5
     if bear_channels:
         break_up_after_bear = sum(1 for c in bear_channels if c.break_direction == 1) / len(bear_channels)
 
+    # NOTE: 0.5 default is legitimate here - represents "no prior data" (50% baseline)
+    # when no bull channels exist yet. This is not masking data issues.
     break_down_after_bull = 0.5
     if bull_channels:
         break_down_after_bull = sum(1 for c in bull_channels if c.break_direction == 0) / len(bull_channels)

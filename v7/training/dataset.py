@@ -741,7 +741,8 @@ class ChannelDataset(Dataset):
                 # We must also use that fallback's labels to maintain alignment!
                 if sample.per_window_features:
                     # Pick any available window (prefer best_window if available)
-                    fallback_window = sample.best_window if sample.best_window in sample.per_window_features else next(iter(sample.per_window_features.keys()))
+                    # Use min() for deterministic selection instead of next(iter()) which has non-deterministic order
+                    fallback_window = sample.best_window if sample.best_window in sample.per_window_features else min(sample.per_window_features.keys())
                     selected_window_size = fallback_window
                     selected_labels = sample.labels_per_window.get(fallback_window, sample.labels)
                     features_dict = features_to_tensor_dict(sample.per_window_features[fallback_window])
