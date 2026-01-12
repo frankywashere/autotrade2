@@ -743,6 +743,18 @@ class EndToEndWindowModel(nn.Module):
                 )
                 outputs['duration_mean'] = duration_mean
                 outputs['duration_std'] = duration_std
+
+            # Also convert aggregate hazard if present
+            if ('aggregate' in outputs and
+                'duration_hazard' in outputs['aggregate'] and
+                outputs['aggregate']['duration_hazard'] is not None):
+                agg_duration_mean, agg_duration_std = hazard_to_duration_stats(
+                    outputs['aggregate']['duration_hazard'],
+                    num_bins=self.num_hazard_bins,
+                    max_duration=self.max_duration
+                )
+                outputs['aggregate']['duration_mean'] = agg_duration_mean
+                outputs['aggregate']['duration_std'] = agg_duration_std
         elif 'duration_log_std' in outputs:
             # Gaussian NLL: convert log_std to std
             outputs['duration_std'] = torch.exp(outputs['duration_log_std'])
