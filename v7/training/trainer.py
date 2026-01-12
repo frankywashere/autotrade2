@@ -28,6 +28,9 @@ from datetime import datetime
 # Import loss classes
 from v7.training.losses import CombinedLoss, EndToEndLoss, MetricsCalculator
 
+# Import TIMEFRAMES for single source of truth
+from v7.core.timeframe import TIMEFRAMES
+
 # Import canonical feature ordering - CRITICAL for correct feature concatenation!
 from v7.features.feature_ordering import FEATURE_ORDER, TOTAL_FEATURES
 
@@ -360,7 +363,7 @@ class Trainer:
 
         # MetricsCalculator for detailed per-TF metrics (parallel to inline metrics)
         self.metrics_calculator = MetricsCalculator(
-            timeframe_names=['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+            timeframe_names=list(TIMEFRAMES)
         )
 
         # Setup optimizer
