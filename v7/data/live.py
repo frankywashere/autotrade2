@@ -25,7 +25,7 @@ class LiveDataResult:
 
 
 def fetch_live_data(
-    lookback_days: int = 90,
+    lookback_days: int = 500,
     data_dir: Optional[Path] = None,
     force_historical: bool = False
 ) -> LiveDataResult:
@@ -34,8 +34,13 @@ def fetch_live_data(
 
     This is a drop-in replacement for dashboard.py's load_data() function.
 
+    Note:
+        The default lookback of 500 days ensures training compatibility.
+        A minimum of 420 days is required for proper model training
+        (365 days for training window + 55 days for walk-forward validation).
+
     Args:
-        lookback_days: Days of historical data to load
+        lookback_days: Days of historical data to load (minimum 420 for training)
         data_dir: Directory containing CSV files (default: ./data)
         force_historical: If True, skip yfinance and use only CSV data
 
@@ -43,7 +48,7 @@ def fetch_live_data(
         LiveDataResult containing tsla_df, spy_df, vix_df and metadata
 
     Example:
-        >>> result = fetch_live_data(lookback_days=90)
+        >>> result = fetch_live_data(lookback_days=500)
         >>> tsla_df = result.tsla_df
         >>> spy_df = result.spy_df
         >>> vix_df = result.vix_df
@@ -213,9 +218,12 @@ def _resample_to_5min(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # Backward compatibility: provide separate function that returns tuple
-def load_live_data_tuple(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_live_data_tuple(lookback_days: int = 500) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Backward-compatible version that returns tuple like old load_data().
+
+    Note:
+        Default of 500 days ensures training compatibility (420-day minimum required).
 
     Returns:
         (tsla_df, spy_df, vix_df) tuple

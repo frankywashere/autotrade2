@@ -69,13 +69,20 @@ def channel_to_scores(channel: Channel) -> np.ndarray:
     Returns:
         np.ndarray of shape (5,) with float32 dtype
     """
-    return np.array([
+    scores = np.array([
         channel.bounce_count,
         channel.r_squared,
         channel.quality_score,
         channel.alternation_ratio,
         channel.width_pct
     ], dtype=np.float32)
+
+    # Defensive NaN check - log if detected (indicates upstream data issue)
+    if not np.isfinite(scores).all():
+        import warnings
+        warnings.warn(f"NaN/Inf in channel scores - channel may have insufficient data for regression")
+
+    return scores
 
 
 def extract_multi_window_scores(channels: Dict[int, Channel]) -> np.ndarray:

@@ -846,6 +846,17 @@ def make_predictions(
             with torch.no_grad():
                 outputs = model.predict(feature_tensor)
 
+        # Defensive NaN check - log if detected (indicates upstream data issue)
+        import warnings
+        if outputs is not None:
+            for key in ['per_tf', 'aggregate']:
+                if key in outputs:
+                    for subkey, value in outputs[key].items():
+                        if hasattr(value, 'numpy'):
+                            arr = value.numpy() if hasattr(value, 'numpy') else value
+                            if not np.isfinite(arr).all():
+                                warnings.warn(f"NaN/Inf detected in outputs['{key}']['{subkey}'] - check data sufficiency")
+
         # Extract per-TF and aggregate predictions
         per_tf = outputs['per_tf']
         agg = outputs['aggregate']
@@ -1142,7 +1153,11 @@ def main():
             st.caption("✗ Live data module not available")
 
         use_live = st.checkbox("Use Live Data", value=LIVE_DATA_AVAILABLE, disabled=not LIVE_DATA_AVAILABLE)
-        lookback_days = st.slider("Lookback Days", 30, 180, 90)
+        lookback_days = st.slider("Lookback Days", 420, 730, 500, help="Model trained with 420-day warmup. Values below 420 produce unreliable predictions.")
+
+        # Data sufficiency warning
+        if lookback_days < 420:
+            st.warning("⚠️ Lookback below training minimum (420 days). Weekly/monthly timeframe predictions will be unreliable.")
 
         col_refresh1, col_refresh2 = st.columns(2)
         with col_refresh1:
@@ -1160,6 +1175,7 @@ def main():
 
     # Load data
     data = load_market_data(use_live=use_live, lookback_days=lookback_days)
+    st.info(f"📊 Using {lookback_days} days of historical data. Training requires 420+ days for all timeframes.")
 
     # Tab 1: Live Predictions
     with tab1:
@@ -1434,6 +1450,11 @@ def main():
 
                 tf_df = pd.DataFrame(tf_rows)
                 st.dataframe(tf_df, width='stretch', hide_index=True)
+
+                # Per-timeframe validity warning
+                invalid_tfs = [TF_NAMES[i] for i in range(len(TF_NAMES)) if per_tf.get('channel_valid', [1]*11)[i] < 0.5]
+                if invalid_tfs:
+                    st.warning(f"⚠️ Insufficient data for valid channel detection in: {', '.join(invalid_tfs)}. Predictions for these timeframes are unreliable. Consider using 420+ days of lookback data.")
 
         # Price info
         if data["tsla_df"] is not None and len(data["tsla_df"]) > 0:

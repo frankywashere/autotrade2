@@ -353,7 +353,7 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
 # Data Loading
 # =============================================================================
 
-def load_csv_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_csv_data(lookback_days: int = 500) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load data from CSV files (fallback)."""
     cutoff = datetime.now() - timedelta(days=lookback_days)
 
@@ -406,7 +406,7 @@ def load_csv_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, 
     return tsla_df, spy_df, vix_df
 
 
-def load_market_data(use_live: bool = True, lookback_days: int = 90) -> Dict[str, Any]:
+def load_market_data(use_live: bool = True, lookback_days: int = 500) -> Dict[str, Any]:
     """Load market data, preferring live data if available."""
     result = {
         "tsla_df": None,
@@ -750,6 +750,19 @@ class PredictionsScreen(Screen):
             table_widget.update("")
             return
 
+        # Check for insufficient data warning
+        app = self.app
+        data_warning = ""
+        if app.tsla_df is not None and len(app.tsla_df) > 0:
+            # Estimate days of data available (5min bars, ~78 bars per trading day)
+            bars_per_day = 78  # 6.5 hours * 12 bars/hour
+            estimated_days = len(app.tsla_df) / bars_per_day
+            if estimated_days < 420:
+                data_warning = (
+                    f"\n[bold yellow]Warning:[/] Only ~{estimated_days:.0f} days of data available. "
+                    f"Minimum 420 days recommended for reliable predictions.\n"
+                )
+
         table = Table(title="Predictions by Timeframe", expand=True)
         table.add_column("TF", style="cyan", width=8)
         table.add_column("Duration", width=12)
@@ -792,7 +805,13 @@ class PredictionsScreen(Screen):
                     f"{conf_pct:.0f}%"
                 )
 
-        table_widget.update(table)
+        # Include data warning if present
+        if data_warning:
+            from rich.console import Group
+            warning_text = Text.from_markup(data_warning)
+            table_widget.update(Group(warning_text, table))
+        else:
+            table_widget.update(table)
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
@@ -1044,8 +1063,8 @@ class SettingsScreen(Screen):
                 Horizontal(
                     Label("Lookback Days:"),
                     Select(
-                        [(str(d), d) for d in [30, 60, 90, 120, 180]],
-                        value=90,
+                        [(str(d), d) for d in [420, 500, 600, 730]],
+                        value=500,
                         id="lookback-select"
                     ),
                     id="setting-lookback"
@@ -1076,7 +1095,12 @@ class SettingsScreen(Screen):
         info.update(Panel(
             f"Live Data Available: {'Yes' if LIVE_DATA_AVAILABLE else 'No'}\n"
             f"Data Directory: {DATA_DIR.absolute()}\n"
-            f"Checkpoints Directory: {CHECKPOINTS_DIR.absolute()}",
+            f"Checkpoints Directory: {CHECKPOINTS_DIR.absolute()}\n\n"
+            "[bold yellow]Data Requirements:[/]\n"
+            "Minimum 420 days of historical data required for reliable\n"
+            "predictions. The model uses walk-forward windows that need\n"
+            "sufficient history for proper feature extraction and\n"
+            "channel pattern detection across all timeframes.",
             title="Info",
             border_style="dim"
         ))
@@ -1188,7 +1212,7 @@ class DashboardApp(App):
 
         # Settings
         self.use_live_data: bool = True
-        self.lookback_days: int = 90
+        self.lookback_days: int = 500  # Minimum 420 days required for reliable predictions
         self.refresh_interval: int = 0
 
     def on_mount(self) -> None:

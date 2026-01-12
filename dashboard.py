@@ -256,7 +256,7 @@ class DashboardData:
         self.vix: float = 0.0
 
 
-def load_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_data(lookback_days: int = 500) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Load latest data from CSV files.
 
@@ -267,6 +267,7 @@ def load_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, pd.D
         (tsla_df, spy_df, vix_df) with DatetimeIndex
     """
     console.print(f"\n[cyan]Loading data (last {lookback_days} days)...[/cyan]")
+    console.print("[dim]Note: 420+ days recommended for reliable weekly/monthly predictions[/dim]")
 
     # Load TSLA
     tsla = pd.read_csv(TSLA_CSV, parse_dates=['timestamp'])
@@ -839,8 +840,11 @@ def main():
     parser.add_argument('--model', type=str, help='Path to trained model checkpoint')
     parser.add_argument('--refresh', type=int, default=0, help='Auto-refresh interval in seconds (0=no refresh)')
     parser.add_argument('--export', type=str, help='Directory to export predictions')
-    parser.add_argument('--lookback', type=int, default=90, help='Days of data to load')
+    parser.add_argument('--lookback', type=int, default=500, help='Days of data to load (minimum 420 for reliable predictions)')
     args = parser.parse_args()
+
+    if args.lookback < 420:
+        console.print("[yellow]⚠️ Warning: Lookback below 420 days. Weekly/monthly predictions may be unreliable.[/yellow]")
 
     # Load model if provided
     model = None
