@@ -379,6 +379,10 @@ def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[D
                         else:
                             model_cfg['num_hazard_bins'] = 0  # Default (disabled)
 
+                # Extract max_duration from config or use default
+                if 'max_duration' not in model_cfg:
+                    model_cfg['max_duration'] = 100.0  # Default value
+
         return config_dict if config_dict else None
     except Exception as e:
         st.warning(f"Error extracting config: {e}")
@@ -466,6 +470,7 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
         else:
             hidden_dim, cfc_units, num_heads, dropout, shared_heads = 64, 96, 4, 0.1, True
             use_se_blocks, se_reduction_ratio = False, 4
+            model_config = {}  # Empty dict for default case
             st.warning("⚠️ No config found, using defaults: hidden_dim=64, cfc_units=96")
 
         # Infer shared_heads from state_dict keys (overrides config if separate heads detected)
@@ -488,6 +493,14 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 shared_heads=shared_heads,
                 use_se_blocks=use_se_blocks,
                 se_reduction_ratio=se_reduction_ratio,
+                use_multi_resolution=model_config.get('use_multi_resolution', False),
+                resolution_levels=model_config.get('resolution_levels', 3),
+                use_tcn=model_config.get('use_tcn', False),
+                tcn_channels=model_config.get('tcn_channels', 64),
+                tcn_kernel_size=model_config.get('tcn_kernel_size', 3),
+                tcn_layers=model_config.get('tcn_layers', 2),
+                num_hazard_bins=model_config.get('num_hazard_bins', 0),
+                max_duration=model_config.get('max_duration', 100.0),
                 device='cpu'
             )
         else:
@@ -501,6 +514,14 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 shared_heads=shared_heads,
                 use_se_blocks=use_se_blocks,
                 se_reduction_ratio=se_reduction_ratio,
+                use_multi_resolution=model_config.get('use_multi_resolution', False),
+                resolution_levels=model_config.get('resolution_levels', 3),
+                use_tcn=model_config.get('use_tcn', False),
+                tcn_channels=model_config.get('tcn_channels', 64),
+                tcn_kernel_size=model_config.get('tcn_kernel_size', 3),
+                tcn_layers=model_config.get('tcn_layers', 2),
+                num_hazard_bins=model_config.get('num_hazard_bins', 0),
+                max_duration=model_config.get('max_duration', 100.0),
                 device='cpu'
             )
 
