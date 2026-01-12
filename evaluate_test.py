@@ -135,6 +135,19 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'auto'):
         num_attention_heads = 8
         dropout = 0.1
         shared_heads = True
+        config_json = None
+
+    # Get state_dict for num_hazard_bins inference
+    state_dict = checkpoint['model_state_dict']
+
+    # Infer num_hazard_bins from state_dict if not in config
+    num_hazard_bins = model_config.get('num_hazard_bins', 0) if config_json else 0
+    if num_hazard_bins == 0:
+        # Check for hazard_head in state_dict
+        hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+        if hazard_key in state_dict:
+            num_hazard_bins = state_dict[hazard_key].shape[0]
+            console.print(f"  [cyan]Detected survival loss (hazard_bins={num_hazard_bins})[/cyan]")
 
     # Create model with inferred architecture
     model = create_model(
@@ -143,6 +156,7 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'auto'):
         num_attention_heads=num_attention_heads,
         dropout=dropout,
         shared_heads=shared_heads,
+        num_hazard_bins=num_hazard_bins,
         device=device
     )
 

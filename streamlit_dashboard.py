@@ -363,6 +363,22 @@ def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[D
                 if 'direction_loss_type' not in model_cfg:
                     model_cfg['direction_loss_type'] = None
 
+                # EndToEndWindowModel-specific parameters
+                # Infer num_hazard_bins from hazard_head layer if present
+                if 'num_hazard_bins' not in model_cfg:
+                    # Heuristic: infer from hazard_head layer if present
+                    # Check for per-TF hazard heads first (separate heads architecture)
+                    hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+                    if hazard_key in state_dict:
+                        model_cfg['num_hazard_bins'] = state_dict[hazard_key].shape[0]
+                    else:
+                        # Check for shared heads architecture
+                        hazard_key_shared = 'hierarchical_model.per_tf_duration_head.hazard_head.weight'
+                        if hazard_key_shared in state_dict:
+                            model_cfg['num_hazard_bins'] = state_dict[hazard_key_shared].shape[0]
+                        else:
+                            model_cfg['num_hazard_bins'] = 0  # Default (disabled)
+
         return config_dict if config_dict else None
     except Exception as e:
         st.warning(f"Error extracting config: {e}")
@@ -422,6 +438,10 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
             if use_multi_res:
                 res_levels = model_config.get('resolution_levels', 'N/A')
                 st.info(f"Multi-resolution enabled (levels={res_levels})")
+
+            num_hazard_bins = model_config.get('num_hazard_bins', 0)
+            if num_hazard_bins > 0:
+                st.info(f"Survival loss enabled (hazard_bins={num_hazard_bins})")
 
             grad_balancing = model_config.get('gradient_balancing', False)
             if grad_balancing:
@@ -1148,7 +1168,11 @@ def main():
                     st.metric("Direction", direction, f"{abs(best_dir_prob - 0.5)*200:.0f}%")
 
                 with col3:
-                    st.metric(f"Duration ({best_tf_name})", f"{best_dur:.1f} bars", f"±{best_dur_std:.1f}")
+                    # Show uncertainty only if available and > 0
+                    if best_dur_std and best_dur_std > 0.01:
+                        st.metric(f"Duration ({best_tf_name})", f"{best_dur:.1f} bars", f"±{best_dur_std:.1f}")
+                    else:
+                        st.metric(f"Duration ({best_tf_name})", f"{best_dur:.1f} bars")
 
                 with col4:
                     next_labels = ["DOWN", "SAME", "UP"]
@@ -1173,8 +1197,12 @@ def main():
                         st.metric("Duration RMSE", f"{checkpoint_metrics.get('duration_rmse', 0):.2f} bars",
                                   help="Root mean squared error from validation")
                     with col3:
-                        if best_dur_std:
+                        # Show uncertainty only if available and > 0
+                        if best_dur_std and best_dur_std > 0.01:
                             st.metric("Pred Uncertainty", f"{best_dur_std:.2f} bars",
+                                      help="Model's estimated prediction uncertainty")
+                        else:
+                            st.metric("Pred Uncertainty", "Not available",
                                       help="Model's estimated prediction uncertainty")
 
                 # Signal interpretation
@@ -1308,10 +1336,18 @@ def main():
                 tf_rows = []
                 for i, tf_name in enumerate(TF_NAMES):
                     is_best = (i == best_tf_idx)
+                    # Format duration with uncertainty only if > 0
+                    dur_mean = per_tf['duration_mean'][i]
+                    dur_std = per_tf['duration_std'][i]
+                    if dur_std and dur_std > 0.01:
+                        duration_str = f"{dur_mean:.1f}±{dur_std:.1f}"
+                    else:
+                        duration_str = f"{dur_mean:.1f}"
+
                     tf_rows.append({
                         "TF": f"**{tf_name}**" if is_best else tf_name,
                         "Confidence": f"{per_tf['confidence'][i]:.1%}",
-                        "Duration": f"{per_tf['duration_mean'][i]:.1f}±{per_tf['duration_std'][i]:.1f}",
+                        "Duration": duration_str,
                         "Direction": "UP ↑" if per_tf['direction_probs'][i] > 0.5 else "DOWN ↓",
                         "Dir Prob": f"{per_tf['direction_probs'][i]:.0%}",
                         "Next Ch": ["DN", "SAME", "UP"][per_tf['next_channel'][i]],

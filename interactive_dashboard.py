@@ -277,6 +277,16 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
             use_se_blocks = any('se_block' in key for key in state_dict.keys())
             se_reduction_ratio = 8  # Default value when inferring
 
+        # Infer num_hazard_bins from state_dict if not in config
+        num_hazard_bins = 0
+        if config and 'model' in config:
+            num_hazard_bins = config['model'].get('num_hazard_bins', 0)
+        if num_hazard_bins == 0:
+            # Check for hazard_head in state_dict
+            hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+            if hazard_key in state_dict:
+                num_hazard_bins = state_dict[hazard_key].shape[0]
+
         model = HierarchicalCfCModel(
             feature_config=FeatureConfig(),
             hidden_dim=hidden_dim,
@@ -284,7 +294,8 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
             num_attention_heads=num_attention_heads,
             dropout=dropout,
             use_se_blocks=use_se_blocks,
-            se_reduction_ratio=se_reduction_ratio
+            se_reduction_ratio=se_reduction_ratio,
+            num_hazard_bins=num_hazard_bins
         )
 
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -470,7 +481,7 @@ def make_predictions(
 
         return {
             'duration_mean': outputs['duration_mean'].numpy()[0],
-            'duration_std': outputs['duration_std'].numpy()[0],
+            'duration_std': outputs.get('duration_std').numpy()[0] if 'duration_std' in outputs else None,
             'direction_probs': torch.sigmoid(outputs['direction_logits']).numpy()[0],
             'next_direction_probs': torch.softmax(outputs['next_channel_logits'], dim=-1).numpy()[0],
             'confidence': outputs['confidence'].numpy()[0] if 'confidence' in outputs else 0.5
@@ -721,13 +732,16 @@ class PredictionsScreen(Screen):
         for i, tf in enumerate(key_tfs):
             if i < len(predictions['duration_mean']):
                 dur = predictions['duration_mean'][i]
-                dur_std = predictions['duration_std'][i]
+                dur_std = predictions['duration_std'][i] if predictions['duration_std'] is not None else None
                 dir_prob = predictions['direction_probs'][i]
                 next_probs = predictions['next_direction_probs'][i]
                 conf = predictions['confidence']
 
-                # Duration
-                dur_str = f"{dur:.0f} ± {dur_std:.0f}"
+                # Duration - conditional uncertainty display
+                if dur_std is not None and dur_std > 0:
+                    dur_str = f"{dur:.0f} ± {dur_std:.0f}"
+                else:
+                    dur_str = f"{dur:.0f}"
 
                 # Break direction
                 dir_str = "UP" if dir_prob > 0.5 else "DOWN"
