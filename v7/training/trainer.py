@@ -26,10 +26,13 @@ import numpy as np
 from datetime import datetime
 
 # Import loss classes
-from v7.training.losses import CombinedLoss, EndToEndLoss
+from v7.training.losses import CombinedLoss, EndToEndLoss, MetricsCalculator
 
 # Import canonical feature ordering - CRITICAL for correct feature concatenation!
 from v7.features.feature_ordering import FEATURE_ORDER, TOTAL_FEATURES
+
+# Import hazard conversion for survival loss metrics
+from v7.models.hierarchical_cfc import hazard_to_duration_stats
 
 
 class GradNormBalancer:
@@ -354,6 +357,11 @@ class Trainer:
             )
         # Move criterion to device (critical for learnable weights)
         self.criterion.to(self.device)
+
+        # MetricsCalculator for detailed per-TF metrics (parallel to inline metrics)
+        self.metrics_calculator = MetricsCalculator(
+            timeframe_names=['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+        )
 
         # Setup optimizer
         self.optimizer = self._create_optimizer()
@@ -827,6 +835,11 @@ class Trainer:
         duration_mse_sum = 0.0
         duration_valid_count = 0.0
 
+        # Accumulators for MetricsCalculator (detailed per-TF metrics)
+        all_predictions = {'duration_mean': [], 'duration_log_std': [], 'direction_logits': [], 'next_channel_logits': []}
+        all_targets = {'duration': [], 'direction': [], 'next_channel': []}
+        all_masks = {'duration_valid': [], 'direction_valid': [], 'next_channel_valid': []}
+
         with torch.no_grad():
             for features, labels in tqdm(self.val_loader, desc="Validation"):
                 # Move to device
@@ -911,6 +924,32 @@ class Trainer:
                         # Warn about unknown keys - helps catch mismatches between loss and trainer
                         print(f"⚠️ Warning: Unknown loss key '{k}' ignored in validation (value={v})")
 
+                # Accumulate for MetricsCalculator (detailed per-TF metrics)
+                # For survival loss, convert hazard to duration_mean/std (matches predict() behavior)
+                if (hasattr(self.model, 'num_hazard_bins') and self.model.num_hazard_bins > 0 and
+                    'duration_hazard' in predictions and predictions['duration_hazard'] is not None):
+                    # Convert hazard to duration stats for MetricsCalculator
+                    duration_mean_converted, duration_std_converted = hazard_to_duration_stats(
+                        predictions['duration_hazard'],
+                        num_bins=self.model.num_hazard_bins,
+                        max_duration=self.model.max_duration
+                    )
+                    all_predictions['duration_mean'].append(duration_mean_converted.cpu())
+                    # Store log_std for consistency (MetricsCalculator expects log_std)
+                    duration_log_std_converted = torch.log(duration_std_converted + 1e-6)
+                    all_predictions['duration_log_std'].append(duration_log_std_converted.cpu())
+                else:
+                    all_predictions['duration_mean'].append(predictions['duration_mean'].cpu())
+                    all_predictions['duration_log_std'].append(predictions['duration_log_std'].cpu())
+                all_predictions['direction_logits'].append(predictions['direction_logits'].cpu())
+                all_predictions['next_channel_logits'].append(predictions['next_channel_logits'].cpu())
+                all_targets['duration'].append(targets['duration'].cpu())
+                all_targets['direction'].append(targets['direction'].cpu())
+                all_targets['next_channel'].append(targets['next_channel'].cpu())
+                all_masks['duration_valid'].append(masks['duration_valid'].cpu())
+                all_masks['direction_valid'].append(masks['direction_valid'].cpu())
+                all_masks['next_channel_valid'].append(masks['next_channel_valid'].cpu())
+
                 # Calculate accuracies (direction is binary, next_channel is 3-class)
                 # Weight by mask - only count valid samples
                 direction_probs = torch.sigmoid(predictions['direction_logits'])
@@ -927,13 +966,14 @@ class Trainer:
 
                 # Duration metrics (MAE and RMSE)
                 # Use hazard-derived expected duration if available (for survival loss)
-                if 'duration_hazard' in predictions and predictions['duration_hazard'] is not None:
-                    # Compute expected duration from hazard (E[T] = sum of survival probabilities)
-                    hazard = torch.sigmoid(predictions['duration_hazard'])  # [batch, num_tfs, num_bins] or [batch, num_bins]
-                    survival = torch.cumprod(1 - hazard, dim=-1)  # Cumulative survival
-                    # Expected duration = sum of survival probabilities across bins
-                    # (each bin contributes its survival probability)
-                    duration_pred = survival.sum(dim=-1)  # [batch, num_tfs] or [batch]
+                if (hasattr(self.model, 'num_hazard_bins') and self.model.num_hazard_bins > 0 and
+                    'duration_hazard' in predictions and predictions['duration_hazard'] is not None):
+                    # Use same conversion as MetricsCalculator and predict() for consistency
+                    duration_pred, _ = hazard_to_duration_stats(
+                        predictions['duration_hazard'],
+                        num_bins=self.model.num_hazard_bins,
+                        max_duration=self.model.max_duration
+                    )
                     if duration_pred.dim() == 1:  # If aggregate [batch], expand to [batch, num_tfs]
                         duration_pred = duration_pred.unsqueeze(1).expand(-1, targets['duration'].shape[1])
                 else:
@@ -984,6 +1024,24 @@ class Trainer:
         epoch_metrics['duration_mae'] = duration_mae_sum / duration_valid_count if duration_valid_count > 0 else 0.0
         epoch_metrics['duration_rmse'] = np.sqrt(duration_mse_sum / duration_valid_count) if duration_valid_count > 0 else 0.0
 
+        # Compute detailed per-TF metrics using MetricsCalculator (parallel to inline metrics)
+        # This provides per-TF MAEs without replacing existing checkpoint metrics
+        if len(all_predictions['duration_mean']) > 0:  # Check if any batches were processed
+            concatenated_predictions = {k: torch.cat(v, dim=0) for k, v in all_predictions.items()}
+            concatenated_targets = {k: torch.cat(v, dim=0) for k, v in all_targets.items()}
+            concatenated_masks = {k: torch.cat(v, dim=0) for k, v in all_masks.items()}
+
+            detailed_metrics = self.metrics_calculator.compute_metrics(
+                concatenated_predictions,
+                concatenated_targets,
+                concatenated_masks
+            )
+
+            # Add per-TF MAEs to epoch_metrics for logging
+            for key, value in detailed_metrics.items():
+                if 'duration_mae_' in key:  # Only add per-TF duration MAEs
+                    epoch_metrics[key] = value
+
         return epoch_metrics
 
     def save_checkpoint(self, filename: str, is_best: bool = False):
@@ -1013,6 +1071,34 @@ class Trainer:
             model_kwargs['use_multi_resolution'] = self.config.use_multi_resolution
         if 'resolution_levels' not in model_kwargs:
             model_kwargs['resolution_levels'] = self.config.resolution_levels
+
+        # Loss configuration
+        if 'duration_loss_type' not in model_kwargs:
+            model_kwargs['duration_loss_type'] = self.config.duration_loss_type
+        if 'direction_loss_type' not in model_kwargs:
+            model_kwargs['direction_loss_type'] = self.config.direction_loss_type
+        if 'num_hazard_bins' not in model_kwargs:
+            model_kwargs['num_hazard_bins'] = 50 if self.config.duration_loss_type == 'survival' else 0
+        if 'huber_delta' not in model_kwargs:
+            model_kwargs['huber_delta'] = self.config.huber_delta if hasattr(self.config, 'huber_delta') else 1.0
+        if 'focal_gamma' not in model_kwargs:
+            model_kwargs['focal_gamma'] = self.config.focal_gamma if hasattr(self.config, 'focal_gamma') else 2.0
+
+        # Training strategy
+        if 'gradient_balancing' not in model_kwargs:
+            model_kwargs['gradient_balancing'] = self.config.gradient_balancing if hasattr(self.config, 'gradient_balancing') else 'none'
+        if 'gradnorm_alpha' not in model_kwargs:
+            model_kwargs['gradnorm_alpha'] = self.config.gradnorm_alpha if hasattr(self.config, 'gradnorm_alpha') else 1.5
+        if 'two_stage_training' not in model_kwargs:
+            model_kwargs['two_stage_training'] = self.config.two_stage_training if hasattr(self.config, 'two_stage_training') else False
+        if 'stage1_epochs' not in model_kwargs:
+            model_kwargs['stage1_epochs'] = self.config.stage1_epochs if hasattr(self.config, 'stage1_epochs') else 5
+        if 'stage1_task' not in model_kwargs:
+            model_kwargs['stage1_task'] = self.config.stage1_task if hasattr(self.config, 'stage1_task') else 'direction'
+
+        # Calibration configuration
+        if 'calibration_mode' not in model_kwargs:
+            model_kwargs['calibration_mode'] = self.config.calibration_mode if hasattr(self.config, 'calibration_mode') else 'brier_per_tf'
 
         # Create a copy of config with updated model_kwargs
         # We modify the dataclass directly since it will be serialized

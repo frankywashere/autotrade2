@@ -852,6 +852,16 @@ class EndToEndWindowModel(nn.Module):
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
 
+            # Extract channel_valid flags from input features (first element of each TF block)
+            # Each TF block is 56 features, channel_valid is at position 0
+            # For EndToEndWindowModel, use the raw selected window's features (not the learned projection)
+            # Get the selected window index
+            selected_idx = int(outputs['window_selection_probs'].argmax(dim=-1)[0])
+            # Extract channel_valid from the raw selected window features
+            raw_window_features = per_window_features[0, selected_idx, :]  # [feature_dim]
+            channel_valid_indices = [tf_idx * 56 for tf_idx in range(11)]
+            channel_valid = raw_window_features[channel_valid_indices].unsqueeze(0)  # [1, 11]
+
             # Validate critical outputs - use safe defaults instead of hard assert
             if not torch.isfinite(outputs['duration_mean']).all():
                 import warnings
@@ -876,6 +886,7 @@ class EndToEndWindowModel(nn.Module):
                     'next_channel': next_channel,  # [batch, 11]
                     'next_channel_probs': next_channel_probs,  # [batch, 11, 3]
                     'confidence': outputs['confidence'],  # [batch, 11]
+                    'channel_valid': channel_valid[0].cpu().numpy(),  # [11]
                 },
 
                 # Window selection (EndToEnd-specific, different from HierarchicalCfCModel)

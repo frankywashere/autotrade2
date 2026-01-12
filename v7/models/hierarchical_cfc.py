@@ -2192,6 +2192,11 @@ class HierarchicalCfCModel(nn.Module):
             # Window selection: use argmax during inference (hard selection)
             window_selection = outputs['window_logits'].argmax(dim=-1)           # [batch, 11]
 
+            # Extract channel_valid flags from input features (first element of each TF block)
+            # Each TF block is 56 features, channel_valid is at position 0
+            channel_valid_indices = [tf_idx * 56 for tf_idx in range(11)]
+            channel_valid = x[:, channel_valid_indices]  # [batch, 11]
+
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
 
@@ -2218,6 +2223,7 @@ class HierarchicalCfCModel(nn.Module):
                     'next_channel': next_channel,                       # [batch, 11]
                     'next_channel_probs': next_channel_probs,           # [batch, 11, 3]
                     'confidence': outputs['confidence'],                # [batch, 11]
+                    'channel_valid': channel_valid[0].cpu().numpy(),    # [11]
                 },
 
                 # Window selection (per-TF)
