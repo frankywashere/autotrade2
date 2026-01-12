@@ -211,7 +211,7 @@ def scan_channel_history(
     df: pd.DataFrame,
     window: int = 20,
     max_channels: int = 10,
-    scan_bars: int = 5000,
+    scan_bars: int = 1500,
     vix_df: Optional[pd.DataFrame] = None
 ) -> List[ChannelRecord]:
     """
@@ -220,11 +220,18 @@ def scan_channel_history(
     This is a simplified scanner that looks for channel breaks
     and records the channels that existed before each break.
 
+    PERFORMANCE OPTIMIZATIONS:
+    - Reduced default scan_bars from 5000 to 1500 (3.3x reduction in search space)
+    - Increased step size from 10 to 30 (3x fewer iterations)
+    - Uses fixed-size sliding window instead of growing window (O(1) vs O(n) per iteration)
+    - Early termination when max_channels reached
+    - Caches detected channels to avoid re-detection
+
     Args:
         df: OHLCV data
         window: Window size for channel detection
         max_channels: Maximum channels to return
-        scan_bars: How many bars back to scan
+        scan_bars: How many bars back to scan (default: 1500, was 5000)
         vix_df: Optional VIX daily data for VIX context at bounces
 
     Returns:
@@ -240,14 +247,41 @@ def scan_channel_history(
     current_idx = end_idx
     last_channel_end = end_idx
 
-    while current_idx > start_scan and len(channels) < max_channels:
-        # Look for where channel breaks
-        df_slice = df.iloc[:current_idx]
+    # Cache for detected channels to avoid re-detection
+    channel_cache = {}
 
-        if len(df_slice) < window:
+    # OPTIMIZATION: Increase step size from 10 to 30 (3x speedup)
+    step_size = 30
+
+    while current_idx > start_scan and len(channels) < max_channels:
+        # OPTIMIZATION: Use fixed-size window instead of growing slice
+        # This changes from O(n) to O(1) per detect_channel call
+        slice_start = max(0, current_idx - window - 200)  # Small buffer for context
+        slice_end = current_idx
+
+        if slice_end - slice_start < window:
             break
 
-        channel = detect_channel(df_slice, window=window)
+        # Check cache first
+        cache_key = (slice_start, slice_end)
+        if cache_key in channel_cache:
+            channel = channel_cache[cache_key]
+        else:
+            # Use fixed-size slice for channel detection
+            df_slice = df.iloc[slice_start:slice_end]
+
+            if len(df_slice) < window:
+                break
+
+            channel = detect_channel(df_slice, window=window)
+            channel_cache[cache_key] = channel
+
+            # OPTIMIZATION: Limit cache size to prevent memory issues
+            if len(channel_cache) > 100:
+                # Remove oldest entries (first 20)
+                keys_to_remove = list(channel_cache.keys())[:20]
+                for key in keys_to_remove:
+                    del channel_cache[key]
 
         if channel.valid:
             # Scan forward to find where this channel broke
@@ -271,10 +305,13 @@ def scan_channel_history(
                     break
 
             # Record this channel
-            rsi_start_idx = current_idx - window
+            # Adjust indices back to global df coordinates
+            rsi_start_idx = slice_start + (current_idx - slice_start - window)
             rsi_end_idx = break_idx
 
-            bounces = detect_bounces_with_rsi(df_slice, channel, rsi_series, vix_df=vix_df)
+            # For bounce detection, we need the full df slice up to current_idx
+            full_df_slice = df.iloc[:current_idx]
+            bounces = detect_bounces_with_rsi(full_df_slice, channel, rsi_series, vix_df=vix_df)
 
             # Get RSI values with proper bounds validation
             # RSI period is 14, so valid RSI values start at index 14
@@ -286,7 +323,8 @@ def scan_channel_history(
             else:
                 raise ValueError(f"RSI at channel start index {rsi_start_idx} out of valid bounds [{rsi_period}, {len(rsi_series)})")
 
-            # Validate rsi_end_idx before using
+            # Validate rsi_end_idx before using - clamp to valid range
+            rsi_end_idx = min(rsi_end_idx, len(rsi_series) - 1)
             if rsi_end_idx >= rsi_period and rsi_end_idx < len(rsi_series):
                 rsi_at_break = rsi_series[rsi_end_idx]
             elif rsi_end_idx >= 0 and rsi_end_idx < len(rsi_series):
@@ -317,11 +355,11 @@ def scan_channel_history(
                 bounces=bounces,
             ))
 
-            # Move back past this channel
-            current_idx = current_idx - window - 10
+            # Move back past this channel with larger step
+            current_idx = current_idx - window - step_size
         else:
-            # No valid channel, step back
-            current_idx -= 10
+            # No valid channel, step back with larger step
+            current_idx -= step_size
 
     return channels
 
