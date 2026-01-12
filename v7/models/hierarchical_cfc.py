@@ -202,6 +202,61 @@ class FeatureConfig:
 
 
 # =============================================================================
+# Utility Functions
+# =============================================================================
+
+def hazard_to_duration_stats(duration_hazard: torch.Tensor, num_bins: int = 50, max_duration: float = 100.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert hazard predictions from survival loss to duration mean and std.
+
+    Args:
+        duration_hazard: Hazard predictions [batch, num_bins] or [batch, num_timeframes, num_bins]
+        num_bins: Number of hazard bins
+        max_duration: Maximum duration value
+
+    Returns:
+        duration_mean: Expected duration [batch] or [batch, num_timeframes]
+        duration_std: Duration standard deviation [batch] or [batch, num_timeframes]
+    """
+    # Ensure hazard is 3D: [batch, num_timeframes, num_bins]
+    if duration_hazard.dim() == 2:
+        duration_hazard = duration_hazard.unsqueeze(1)  # [batch, 1, num_bins]
+
+    batch_size, num_tfs, num_bins = duration_hazard.shape
+
+    # Convert logits to probabilities
+    hazard_probs = torch.sigmoid(duration_hazard)  # [batch, num_tfs, num_bins]
+
+    # Compute survival probabilities: S(t) = prod(1 - h(k)) for k <= t
+    # S(t) represents probability of survival beyond time t
+    survival_probs = torch.cumprod(1 - hazard_probs, dim=-1)  # [batch, num_tfs, num_bins]
+
+    # Prepend 1.0 for S(0) = 1 (certain to survive at t=0)
+    ones = torch.ones(batch_size, num_tfs, 1, device=duration_hazard.device)
+    survival_probs = torch.cat([ones, survival_probs], dim=-1)  # [batch, num_tfs, num_bins+1]
+
+    # Bin edges (time points)
+    bin_width = max_duration / num_bins
+    bin_edges = torch.linspace(0, max_duration, num_bins + 1, device=duration_hazard.device)  # [num_bins+1]
+
+    # Expected duration: E[T] = sum of S(t) * bin_width
+    # This is the area under the survival curve
+    duration_mean = (survival_probs * bin_width).sum(dim=-1)  # [batch, num_tfs]
+
+    # Compute variance: Var[T] = E[T^2] - E[T]^2
+    # For discrete survival analysis:
+    # E[T^2] = sum((2*t + bin_width) * S(t) * bin_width)
+    # This is the correct formula for discrete-time second moment
+    t_values = bin_edges.unsqueeze(0).unsqueeze(0)  # [1, 1, num_bins+1]
+    second_moment = ((2 * t_values + bin_width) * survival_probs * bin_width).sum(dim=-1)  # [batch, num_tfs]
+    variance = second_moment - duration_mean ** 2
+    variance = torch.clamp(variance, min=0.0)  # Ensure non-negative (numerical stability)
+    duration_std = torch.sqrt(variance)  # [batch, num_tfs]
+
+    return duration_mean, duration_std
+
+
+# =============================================================================
 # Squeeze-and-Excitation Block (Feature Reweighting)
 # =============================================================================
 
@@ -2072,6 +2127,43 @@ class HierarchicalCfCModel(nn.Module):
         with torch.no_grad():
             outputs = self.forward(x, return_attention=True)
 
+            # =====================================================================
+            # SURVIVAL LOSS: Convert hazard outputs to mean/std
+            # =====================================================================
+            if self.num_hazard_bins > 0:
+                # Per-timeframe: convert hazard to mean/std
+                if 'duration_hazard' in outputs and outputs['duration_hazard'] is not None:
+                    duration_mean, duration_std = hazard_to_duration_stats(
+                        outputs['duration_hazard'],
+                        num_bins=self.num_hazard_bins,
+                        max_duration=100.0
+                    )
+                    outputs['duration_mean'] = duration_mean
+                    outputs['duration_std'] = duration_std
+                    # Keep hazard for potential loss computation
+
+                # Aggregate: convert hazard to mean/std
+                if 'aggregate' in outputs and outputs['aggregate']['duration_hazard'] is not None:
+                    agg_duration_mean, agg_duration_std = hazard_to_duration_stats(
+                        outputs['aggregate']['duration_hazard'],
+                        num_bins=self.num_hazard_bins,
+                        max_duration=100.0
+                    )
+                    outputs['aggregate']['duration_mean'] = agg_duration_mean
+                    outputs['aggregate']['duration_std'] = agg_duration_std
+                    # Keep hazard for potential loss computation
+            elif 'duration_log_std' in outputs:
+                # Gaussian NLL: convert log_std to std
+                outputs['duration_std'] = torch.exp(outputs['duration_log_std'])
+                if 'aggregate' in outputs and 'duration_log_std' in outputs['aggregate']:
+                    outputs['aggregate']['duration_std'] = torch.exp(outputs['aggregate']['duration_log_std'])
+            else:
+                # Huber/MSE: no uncertainty, set to zeros
+                if 'duration_mean' in outputs:
+                    outputs['duration_std'] = torch.zeros_like(outputs['duration_mean'])
+                if 'aggregate' in outputs and 'duration_mean' in outputs['aggregate']:
+                    outputs['aggregate']['duration_std'] = torch.zeros_like(outputs['aggregate']['duration_mean'])
+
             # Convert per-timeframe logits to probabilities
             direction_probs = torch.sigmoid(outputs['direction_logits'])  # [batch, 11]
             next_channel_probs = F.softmax(outputs['next_channel_logits'], dim=-1)  # [batch, 11, 3]
@@ -2090,9 +2182,9 @@ class HierarchicalCfCModel(nn.Module):
             agg_next_channel = agg_next_channel_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
             agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)   # [batch, 1] v9.0.0
 
-            # Compute std from log_std
-            duration_std = torch.exp(outputs['duration_log_std'])                # [batch, 11]
-            agg_duration_std = torch.exp(outputs['aggregate']['duration_log_std'])  # [batch, 1]
+            # Get duration_std (already computed above based on loss type)
+            duration_std = outputs.get('duration_std', torch.exp(outputs['duration_log_std']))  # [batch, 11]
+            agg_duration_std = outputs['aggregate'].get('duration_std', torch.exp(outputs['aggregate']['duration_log_std']))  # [batch, 1]
 
             # Window selection: use argmax during inference (hard selection)
             window_selection = outputs['window_logits'].argmax(dim=-1)           # [batch, 11]

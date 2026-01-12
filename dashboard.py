@@ -576,7 +576,11 @@ def create_prediction_table(data: DashboardData) -> Table:
         # Duration
         dur_mean = data.predictions['duration_mean']
         dur_std = data.predictions['duration_std']
-        duration_str = f"{dur_mean:.0f} ± {dur_std:.0f}"
+        # Gracefully handle missing or zero uncertainty
+        if dur_std and dur_std > 0:
+            duration_str = f"{dur_mean:.0f} ± {dur_std:.0f}"
+        else:
+            duration_str = f"{dur_mean:.0f}"
 
         # Break direction
         break_dir = data.predictions['break_direction']
@@ -629,6 +633,7 @@ def create_signal_panel(data: DashboardData) -> Panel:
     break_dir = data.predictions['break_direction']
     next_dir = data.predictions['next_direction']
     dur_mean = data.predictions['duration_mean']
+    dur_std = data.predictions.get('duration_std', 0)
 
     # Determine signal
     if conf > CONF_HIGH:
@@ -649,12 +654,18 @@ def create_signal_panel(data: DashboardData) -> Panel:
         signal_color = "white"
         action = "Stay on sidelines"
 
+    # Format duration with optional uncertainty
+    if dur_std and dur_std > 0:
+        duration_text = f"{dur_mean:.0f} ± {dur_std:.0f} bars"
+    else:
+        duration_text = f"{dur_mean:.0f} bars"
+
     # Build content
     content = f"""
 [bold {signal_color}]{signal}[/bold {signal_color}]
 
 Action: {action}
-Expected Duration: {dur_mean:.0f} bars
+Expected Duration: {duration_text}
 Break Direction: {'UP' if break_dir == 1 else 'DOWN'}
 Next Channel: {DIR_NAMES[next_dir]}
 Confidence: {conf*100:.0f}%

@@ -511,7 +511,7 @@ def make_predictions(
 
         return {
             'duration_mean': outputs['duration_mean'].numpy()[0],
-            'duration_std': outputs['duration_std'].numpy()[0],
+            'duration_std': outputs.get('duration_std').numpy()[0] if 'duration_std' in outputs else None,
             'direction_probs': torch.sigmoid(outputs['direction_logits']).numpy()[0],
             'next_direction_probs': torch.softmax(outputs['next_channel_logits'], dim=-1).numpy()[0],
             'confidence': outputs['confidence'].numpy()[0] if 'confidence' in outputs else 0.5
@@ -762,13 +762,16 @@ class PredictionsScreen(Screen):
         for i, tf in enumerate(key_tfs):
             if i < len(predictions['duration_mean']):
                 dur = predictions['duration_mean'][i]
-                dur_std = predictions['duration_std'][i]
+                dur_std = predictions['duration_std'][i] if predictions['duration_std'] is not None else None
                 dir_prob = predictions['direction_probs'][i]
                 next_probs = predictions['next_direction_probs'][i]
                 conf = predictions['confidence']
 
-                # Duration
-                dur_str = f"{dur:.0f} ± {dur_std:.0f}"
+                # Duration - conditional uncertainty display
+                if dur_std is not None and dur_std > 0:
+                    dur_str = f"{dur:.0f} ± {dur_std:.0f}"
+                else:
+                    dur_str = f"{dur:.0f}"
 
                 # Break direction
                 dir_str = "UP" if dir_prob > 0.5 else "DOWN"

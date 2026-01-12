@@ -591,6 +591,9 @@ class EndToEndWindowModel(nn.Module):
             num_hazard_bins=num_hazard_bins,
         )
 
+        # Store num_hazard_bins for output conversion logic
+        self.num_hazard_bins = num_hazard_bins
+
     def forward(
         self,
         per_window_features: torch.Tensor,
@@ -720,6 +723,28 @@ class EndToEndWindowModel(nn.Module):
             return_attention=return_attention
         )
 
+        # Convert survival/hazard outputs to mean/std (same as HierarchicalCfCModel)
+        if self.num_hazard_bins > 0:
+            # Import the conversion function
+            from v7.models.hierarchical_cfc import hazard_to_duration_stats
+
+            # Survival loss: convert hazard to mean/std
+            if 'duration_hazard' in outputs:
+                duration_mean, duration_std = hazard_to_duration_stats(
+                    outputs['duration_hazard'],
+                    num_bins=self.num_hazard_bins,
+                    max_duration=100.0
+                )
+                outputs['duration_mean'] = duration_mean
+                outputs['duration_std'] = duration_std
+        elif 'duration_log_std' in outputs:
+            # Gaussian NLL: convert log_std to std
+            outputs['duration_std'] = torch.exp(outputs['duration_log_std'])
+        else:
+            # Huber/MSE: no uncertainty, set to zeros
+            if 'duration_mean' in outputs:
+                outputs['duration_std'] = torch.zeros_like(outputs['duration_mean'])
+
         # Add window selection outputs
         outputs['window_selection_probs'] = selection_probs  # [batch, num_windows]
         outputs['window_embeddings'] = window_embeddings  # [batch, num_windows, embed_dim]
@@ -805,9 +830,18 @@ class EndToEndWindowModel(nn.Module):
             agg_next_channel = agg_next_channel_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
             agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
 
-            # Compute std from log_std
-            duration_std = torch.exp(outputs['duration_log_std'])  # [batch, 11]
-            agg_duration_std = torch.exp(outputs['aggregate']['duration_log_std'])  # [batch, 1]
+            # Get duration_std (already converted by forward() if using survival loss)
+            if 'duration_std' in outputs:
+                duration_std = outputs['duration_std']  # [batch, 11]
+            else:
+                # Fallback: compute std from log_std (Gaussian NLL)
+                duration_std = torch.exp(outputs['duration_log_std'])  # [batch, 11]
+
+            if 'duration_std' in outputs['aggregate']:
+                agg_duration_std = outputs['aggregate']['duration_std']  # [batch, 1]
+            else:
+                # Fallback: compute std from log_std (Gaussian NLL)
+                agg_duration_std = torch.exp(outputs['aggregate']['duration_log_std'])  # [batch, 1]
 
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
