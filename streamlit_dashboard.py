@@ -117,6 +117,11 @@ def find_checkpoints() -> List[Dict]:
                         metrics['next_channel_acc'] = last_entry.get('next_channel_acc')
                         metrics['duration_mae'] = last_entry.get('duration_mae')
                         metrics['duration_rmse'] = last_entry.get('duration_rmse')
+                        # Extract per-TF MAEs if available
+                        for tf_name in ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']:
+                            mae_key = f'duration_mae_{tf_name}'
+                            if mae_key in last_entry:
+                                metrics[mae_key] = last_entry.get(mae_key)
         except Exception:
             pass
         return metrics
@@ -896,6 +901,7 @@ def make_predictions(
                 'next_channel': per_tf['next_channel'][0].numpy(),    # [11]
                 'next_channel_probs': per_tf['next_channel_probs'][0].numpy(),  # [11, 3]
                 'confidence': per_tf['confidence'][0].numpy(),        # [11]
+                'channel_valid': outputs.get('channel_valid', np.ones(11)),  # [11]
             },
             # Best (most confident) timeframe
             'best_tf_idx': best_tf_idx,
@@ -1250,6 +1256,18 @@ def main():
                     next_labels = ["DOWN", "SAME", "UP"]
                     st.metric("Next Channel", next_labels[best_next_ch], f"{best_next_probs[best_next_ch]:.0%}")
 
+                # Check if the best TF channel is valid (x9 warning display)
+                try:
+                    tsla_channels_check, _ = detect_all_channels(data["tsla_df"], data["spy_df"])
+                    # Map display name back to TIMEFRAMES key
+                    display_to_tf = {v: k for k, v in TIMEFRAME_DISPLAY_NAMES.items()}
+                    tf_key = display_to_tf.get(best_tf_name, best_tf_name)
+                    if tf_key in tsla_channels_check:
+                        if not tsla_channels_check[tf_key].valid:
+                            st.warning(f"**Invalid Channel for {best_tf_name}** - Channel detection failed for most confident timeframe. Predictions may be less reliable.")
+                except Exception:
+                    pass  # Silently ignore channel check errors
+
                 # Duration error metrics (if available from training)
                 # Get metrics from the selected checkpoint
                 checkpoints = find_checkpoints()
@@ -1275,6 +1293,32 @@ def main():
                         else:
                             st.metric("Pred Uncertainty", "Not available",
                                       help="Model's estimated prediction uncertainty")
+
+                    # Per-TF MAE breakdown
+                    with st.expander("Per-Timeframe Duration MAE"):
+                        tf_maes = {
+                            '5min': checkpoint_metrics.get('duration_mae_5min'),
+                            '15min': checkpoint_metrics.get('duration_mae_15min'),
+                            '30min': checkpoint_metrics.get('duration_mae_30min'),
+                            '1h': checkpoint_metrics.get('duration_mae_1h'),
+                            '2h': checkpoint_metrics.get('duration_mae_2h'),
+                            '3h': checkpoint_metrics.get('duration_mae_3h'),
+                            '4h': checkpoint_metrics.get('duration_mae_4h'),
+                            'daily': checkpoint_metrics.get('duration_mae_daily'),
+                            'weekly': checkpoint_metrics.get('duration_mae_weekly'),
+                            'monthly': checkpoint_metrics.get('duration_mae_monthly'),
+                            '3month': checkpoint_metrics.get('duration_mae_3month'),
+                        }
+
+                        # Display as table
+                        if any(v is not None for v in tf_maes.values()):
+                            mae_df = pd.DataFrame({
+                                'Timeframe': list(tf_maes.keys()),
+                                'MAE (bars)': [f"{v:.2f}" if v is not None else 'N/A' for v in tf_maes.values()]
+                            })
+                            st.dataframe(mae_df, hide_index=True)
+                        else:
+                            st.caption("Per-TF MAEs not available in this checkpoint")
 
                 # Signal interpretation
                 st.divider()
@@ -1404,6 +1448,19 @@ def main():
                 st.subheader("All Timeframe Predictions")
 
                 TF_NAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', '1d', '1w', '1M', '3M']
+                # Map display TF names to TIMEFRAMES keys for channel lookup
+                TF_NAME_TO_KEY = {
+                    '5min': '5min', '15min': '15min', '30min': '30min',
+                    '1h': '1h', '2h': '2h', '3h': '3h', '4h': '4h',
+                    '1d': 'daily', '1w': 'weekly', '1M': 'monthly', '3M': '3month'
+                }
+
+                # Get channel validity for x9 icon display
+                try:
+                    tsla_channels_for_table, _ = detect_all_channels(data["tsla_df"], data["spy_df"])
+                except Exception:
+                    tsla_channels_for_table = {}
+
                 tf_rows = []
                 for i, tf_name in enumerate(TF_NAMES):
                     is_best = (i == best_tf_idx)
@@ -1412,7 +1469,16 @@ def main():
                         duration_str = f"{per_tf['duration_mean'][i]:.1f}±{dur_std:.1f}"
                     else:
                         duration_str = f"{per_tf['duration_mean'][i]:.1f}"
+
+                    # Check channel validity for this TF (x9 icon)
+                    tf_key = TF_NAME_TO_KEY.get(tf_name, tf_name)
+                    channel_valid = True
+                    if tf_key in tsla_channels_for_table:
+                        channel_valid = tsla_channels_for_table[tf_key].valid
+                    channel_icon = "" if channel_valid else "⚠️"
+
                     tf_rows.append({
+                        "": channel_icon,  # Icon column for invalid channel warning
                         "TF": f"**{tf_name}**" if is_best else tf_name,
                         "Confidence": f"{per_tf['confidence'][i]:.1%}",
                         "Duration": duration_str,

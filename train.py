@@ -2581,6 +2581,10 @@ def run_walk_forward_training(
                         se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                         use_multi_resolution=config["model"].get("use_multi_resolution", False),
                         resolution_levels=config["model"].get("resolution_levels", 3),
+                        use_tcn=config["model"].get("use_tcn", False),
+                        tcn_channels=config["model"].get("tcn_channels", 64),
+                        tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
+                        tcn_layers=config["model"].get("tcn_layers", 2),
                         num_hazard_bins=num_hazard_bins,
                         device=config["device"],
                     )
@@ -3091,6 +3095,10 @@ def main():
                             se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                             use_multi_resolution=config["model"].get("use_multi_resolution", False),
                             resolution_levels=config["model"].get("resolution_levels", 3),
+                            use_tcn=config["model"].get("use_tcn", False),
+                            tcn_channels=config["model"].get("tcn_channels", 64),
+                            tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
+                            tcn_layers=config["model"].get("tcn_layers", 2),
                             num_hazard_bins=num_hazard_bins,
                             device=config["device"],
                         )
@@ -3484,6 +3492,10 @@ def main():
                     se_reduction_ratio=config["model"].get("se_reduction_ratio", 8),
                     use_multi_resolution=config["model"].get("use_multi_resolution", False),
                     resolution_levels=config["model"].get("resolution_levels", 3),
+                    use_tcn=config["model"].get("use_tcn", False),
+                    tcn_channels=config["model"].get("tcn_channels", 64),
+                    tcn_kernel_size=config["model"].get("tcn_kernel_size", 3),
+                    tcn_layers=config["model"].get("tcn_layers", 2),
                     num_hazard_bins=num_hazard_bins,
                     device=config["device"],
                 )

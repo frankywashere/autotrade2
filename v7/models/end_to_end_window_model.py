@@ -851,6 +851,15 @@ class EndToEndWindowModel(nn.Module):
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
 
+            # Extract channel_valid from raw selected window features
+            # x9: Each TF block is 59 features (38 TSLA + 11 SPY + 10 CROSS)
+            # channel_valid is the first feature in each TSLA block
+            # Get the raw features from the selected window
+            batch_indices = torch.arange(per_window_features.size(0), device=per_window_features.device)
+            selected_raw_features = per_window_features[batch_indices, selected_window_idx, :]  # [batch, feature_dim]
+            channel_valid_indices = [tf_idx * 59 for tf_idx in range(11)]
+            channel_valid = selected_raw_features[:, channel_valid_indices]  # [batch, 11]
+
             # Validate critical outputs - use safe defaults instead of hard assert
             if not torch.isfinite(outputs['duration_mean']).all():
                 import warnings
@@ -910,6 +919,7 @@ class EndToEndWindowModel(nn.Module):
                 # Metadata
                 'best_tf_idx': best_tf_idx,  # [batch] - which TF to use
                 'attention_weights': outputs['attention_weights'],  # [batch, 11, 11]
+                'channel_valid': channel_valid[0].cpu().numpy(),  # [11] - for dashboard display
 
                 # Keep raw outputs for debugging/advanced use
                 'selected_window_idx': selected_window_idx,

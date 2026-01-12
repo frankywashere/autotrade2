@@ -10,10 +10,10 @@ combining insights across timeframes.
 Input Features: 809 dimensions (v13.0.0+, was 776 in v12.0.0) (TIMEFRAME-GROUPED ordering)
 ------------------------------------------------------------
 The input tensor is ordered by timeframe, NOT alphabetically!
-Each TF block contains: [tsla_{tf}, spy_{tf}, cross_{tf}] = 56 features
+Each TF block contains: [tsla_{tf}, spy_{tf}, cross_{tf}] = 59 features
 Followed by shared features at the end.
 
-- TSLA per-TF features: 35 features × 11 timeframes = 385 total
+- TSLA per-TF features: 38 features × 11 timeframes = 418 total
   * Channel geometry: direction, position, width, slope, R² (18 base features)
   * Bounce metrics: count, cycles, bars since bounce
   * RSI: current, divergence, at upper/lower bounces
@@ -2217,6 +2217,12 @@ class HierarchicalCfCModel(nn.Module):
             # Window selection: use argmax during inference (hard selection)
             window_selection = outputs['window_logits'].argmax(dim=-1)           # [batch, 11]
 
+            # Extract channel_valid (first element of each TF block)
+            # x9: Each TF block is 59 features (38 TSLA + 11 SPY + 10 CROSS)
+            # channel_valid is the first feature in each TSLA block
+            channel_valid_indices = [tf_idx * 59 for tf_idx in range(11)]
+            channel_valid = x[:, channel_valid_indices]  # [batch, 11]
+
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
 
@@ -2275,7 +2281,8 @@ class HierarchicalCfCModel(nn.Module):
 
                 # Metadata
                 'best_tf_idx': best_tf_idx,                             # [batch] - which TF to use
-                'attention_weights': outputs['attention_weights']       # [batch, 11, 11]
+                'attention_weights': outputs['attention_weights'],      # [batch, 11, 11]
+                'channel_valid': channel_valid[0].cpu().numpy(),        # [11] - for dashboard display
             }
 
     def get_num_parameters(self) -> Dict[str, int]:
