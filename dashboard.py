@@ -204,6 +204,7 @@ def extract_model_config(checkpoint_path: Path, checkpoint: Dict) -> Dict:
         'shared_heads': model_config.get('shared_heads', True),
         'use_se_blocks': model_config.get('use_se_blocks', False),
         'se_reduction_ratio': model_config.get('se_reduction_ratio', 8),
+        'num_hazard_bins': model_config.get('num_hazard_bins', 0),
         '_source': source
     }
 
@@ -212,6 +213,16 @@ def extract_model_config(checkpoint_path: Path, checkpoint: Dict) -> Dict:
     has_separate_heads = any('per_tf_duration_heads' in k for k in state_dict.keys())
     if has_separate_heads:
         result['shared_heads'] = False
+
+    # Infer num_hazard_bins from hazard_head layer if present and not in config
+    if result['num_hazard_bins'] == 0:
+        hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+        if hazard_key in state_dict:
+            result['num_hazard_bins'] = state_dict[hazard_key].shape[0]
+        else:
+            hazard_key_shared = 'hierarchical_model.per_tf_duration_head.hazard_head.weight'
+            if hazard_key_shared in state_dict:
+                result['num_hazard_bins'] = state_dict[hazard_key_shared].shape[0]
 
     return result
 
@@ -552,7 +563,10 @@ def create_prediction_table(data: DashboardData) -> Table:
         # Duration
         dur_mean = data.predictions['duration_mean']
         dur_std = data.predictions['duration_std']
-        duration_str = f"{dur_mean:.0f} ± {dur_std:.0f}"
+        if dur_std and dur_std > 0.01:
+            duration_str = f"{dur_mean:.0f} ± {dur_std:.0f}"
+        else:
+            duration_str = f"{dur_mean:.0f}"
 
         # Break direction
         break_dir = data.predictions['break_direction']
@@ -605,6 +619,7 @@ def create_signal_panel(data: DashboardData) -> Panel:
     break_dir = data.predictions['break_direction']
     next_dir = data.predictions['next_direction']
     dur_mean = data.predictions['duration_mean']
+    dur_std = data.predictions.get('duration_std', 0)
 
     # Determine signal
     if conf > CONF_HIGH:
@@ -626,11 +641,16 @@ def create_signal_panel(data: DashboardData) -> Panel:
         action = "Stay on sidelines"
 
     # Build content
+    if dur_std and dur_std > 0.01:
+        duration_line = f"Expected Duration: {dur_mean:.0f} ± {dur_std:.0f} bars"
+    else:
+        duration_line = f"Expected Duration: {dur_mean:.0f} bars"
+
     content = f"""
 [bold {signal_color}]{signal}[/bold {signal_color}]
 
 Action: {action}
-Expected Duration: {dur_mean:.0f} bars
+{duration_line}
 Break Direction: {'UP' if break_dir == 1 else 'DOWN'}
 Next Channel: {DIR_NAMES[next_dir]}
 Confidence: {conf*100:.0f}%

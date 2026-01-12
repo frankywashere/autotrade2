@@ -363,10 +363,36 @@ def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[D
                 if 'direction_loss_type' not in model_cfg:
                     model_cfg['direction_loss_type'] = None
 
+                if 'num_hazard_bins' not in model_cfg:
+                    # Heuristic: infer from hazard_head layer if present
+                    hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+                    if hazard_key in state_dict:
+                        model_cfg['num_hazard_bins'] = state_dict[hazard_key].shape[0]
+                    else:
+                        hazard_key_shared = 'hierarchical_model.per_tf_duration_head.hazard_head.weight'
+                        if hazard_key_shared in state_dict:
+                            model_cfg['num_hazard_bins'] = state_dict[hazard_key_shared].shape[0]
+                        else:
+                            model_cfg['num_hazard_bins'] = 0
+
         return config_dict if config_dict else None
     except Exception as e:
         st.warning(f"Error extracting config: {e}")
         return None
+
+
+def detect_feature_dimension(state_dict: Dict[str, torch.Tensor]) -> int:
+    """
+    Detect expected feature dimension from checkpoint weights.
+
+    Returns 776 (v12 checkpoints) or 809 (v13 checkpoints).
+    """
+    # Check EndToEndWindowModel
+    if 'window_encoder.encoder.0.weight' in state_dict:
+        return state_dict['window_encoder.encoder.0.weight'].shape[1]
+
+    # For HierarchicalCfCModel, default to current
+    return 809
 
 
 @st.cache_resource
@@ -384,7 +410,7 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
         state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
 
         # Detect model type from state_dict keys
-        is_end_to_end = any('window_encoder' in k or 'window_selector' in k for k in state_dict.keys())
+        is_end_to_end = any('window_encoder' in k for k in state_dict.keys())
 
         # Extract config from the already-loaded checkpoint (pass checkpoint to avoid re-loading)
         config = extract_config_from_checkpoint(path, checkpoint=checkpoint)
@@ -423,6 +449,10 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 res_levels = model_config.get('resolution_levels', 'N/A')
                 st.info(f"Multi-resolution enabled (levels={res_levels})")
 
+            num_hazard_bins = model_config.get('num_hazard_bins', 0)
+            if num_hazard_bins > 0:
+                st.info(f"Survival loss enabled (hazard_bins={num_hazard_bins})")
+
             grad_balancing = model_config.get('gradient_balancing', False)
             if grad_balancing:
                 gradnorm_alpha = model_config.get('gradnorm_alpha', 'N/A')
@@ -457,8 +487,11 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
         # Create appropriate model type
         if is_end_to_end and END_TO_END_AVAILABLE:
             st.info("🔄 Detected EndToEndWindowModel (Phase 2b)")
+            detected_dim = detect_feature_dimension(state_dict)
+            if detected_dim != 809:
+                st.warning(f"⚠️ Backward compatibility: Detected feature_dim={detected_dim} (v12 checkpoint), current standard is 809 (v13)")
             model = create_end_to_end_model(
-                feature_dim=809,
+                feature_dim=detected_dim,
                 window_embed_dim=128,
                 num_windows=8,
                 hidden_dim=hidden_dim,
@@ -698,9 +731,12 @@ def make_predictions(
 
         # Check if model is end-to-end (multi-window)
         # Use hasattr() instead of isinstance() for reliability with pickled models
-        is_end_to_end = hasattr(model, 'window_encoder') and hasattr(model, 'window_selector')
+        is_end_to_end = hasattr(model, 'window_encoder')
 
         if is_end_to_end:
+            # Detect feature dimension from model weights for backward compatibility
+            detected_dim = detect_feature_dimension(model.state_dict())
+
             # Extract features for ALL 8 windows
             per_window_features = []
             window_scores_list = []
@@ -740,11 +776,11 @@ def make_predictions(
                         window_valid_list.append(False)
                 else:
                     # Use zeros for missing windows
-                    per_window_features.append(np.zeros(809, dtype=np.float32))
+                    per_window_features.append(np.zeros(detected_dim, dtype=np.float32))
                     window_scores_list.append([0.0, 0.0, 0.0, 0.0, 0.0])
                     window_valid_list.append(False)
 
-            # Stack into tensors: [1, 8, 809]
+            # Stack into tensors: [1, 8, feature_dim]
             per_window_tensor = torch.from_numpy(np.stack(per_window_features)).float().unsqueeze(0)
             window_scores_tensor = torch.tensor([window_scores_list], dtype=torch.float32)
             window_valid_tensor = torch.tensor([window_valid_list], dtype=torch.bool)
@@ -1148,7 +1184,10 @@ def main():
                     st.metric("Direction", direction, f"{abs(best_dir_prob - 0.5)*200:.0f}%")
 
                 with col3:
-                    st.metric(f"Duration ({best_tf_name})", f"{best_dur:.1f} bars", f"±{best_dur_std:.1f}")
+                    if best_dur_std and best_dur_std > 0.01:
+                        st.metric(f"Duration ({best_tf_name})", f"{best_dur:.1f} bars", f"±{best_dur_std:.1f}")
+                    else:
+                        st.metric(f"Duration ({best_tf_name})", f"{best_dur:.1f} bars")
 
                 with col4:
                     next_labels = ["DOWN", "SAME", "UP"]
@@ -1173,8 +1212,11 @@ def main():
                         st.metric("Duration RMSE", f"{checkpoint_metrics.get('duration_rmse', 0):.2f} bars",
                                   help="Root mean squared error from validation")
                     with col3:
-                        if best_dur_std:
+                        if best_dur_std and best_dur_std > 0.01:
                             st.metric("Pred Uncertainty", f"{best_dur_std:.2f} bars",
+                                      help="Model's estimated prediction uncertainty")
+                        else:
+                            st.metric("Pred Uncertainty", "Not available",
                                       help="Model's estimated prediction uncertainty")
 
                 # Signal interpretation
@@ -1308,10 +1350,15 @@ def main():
                 tf_rows = []
                 for i, tf_name in enumerate(TF_NAMES):
                     is_best = (i == best_tf_idx)
+                    dur_std = per_tf['duration_std'][i]
+                    if dur_std and dur_std > 0.01:
+                        duration_str = f"{per_tf['duration_mean'][i]:.1f}±{dur_std:.1f}"
+                    else:
+                        duration_str = f"{per_tf['duration_mean'][i]:.1f}"
                     tf_rows.append({
                         "TF": f"**{tf_name}**" if is_best else tf_name,
                         "Confidence": f"{per_tf['confidence'][i]:.1%}",
-                        "Duration": f"{per_tf['duration_mean'][i]:.1f}±{per_tf['duration_std'][i]:.1f}",
+                        "Duration": duration_str,
                         "Direction": "UP ↑" if per_tf['direction_probs'][i] > 0.5 else "DOWN ↓",
                         "Dir Prob": f"{per_tf['direction_probs'][i]:.0%}",
                         "Next Ch": ["DN", "SAME", "UP"][per_tf['next_channel'][i]],
