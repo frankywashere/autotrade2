@@ -296,12 +296,26 @@ Experiments to improve duration prediction while maintaining direction accuracy.
 - Trade-off: Fixing the bug made duration better but direction worse
 - Why: Fixed NLL strengthens duration gradients, trades off with direction in shared capacity
 
+### Weight Grid Results (min_duration_precision Tuning):
+
+| min_dur_precision | Direction Acc | Duration MAE | Best Epoch | vs Baseline Dir | vs Baseline MAE |
+|-------------------|---------------|--------------|------------|-----------------|-----------------|
+| 0.3 | 61.1% | 6.36 bars | 1 | +0.4% | +0.08 bars |
+| **0.4** | **63.7%** | 6.43 bars | 4 | **+3.0%** | +0.15 bars |
+| 0.5 | 59.1% | 6.31 bars | 3 | -1.6% | +0.03 bars |
+| 0.6 | 58.3% | 6.27 bars | 4 | -2.4% | -0.01 bars |
+
+**Finding:** min_duration_precision=0.4 gives **best direction (63.7%)** with acceptable duration MAE trade-off (+0.15 bars)
+
+**Codex Insight:** Clear direction/duration trade-off curve. 0.6 minimizes MAE but hurts direction. 0.4 is optimal for direction-focused use case. Need multi-seed validation to confirm (single runs have ~1.7% noise).
+
 ### Codex Recommendations for Next Steps:
 
 1. [x] **Multi-seed validation** - DONE: 60.7% ± 1.7% stable (not 64.8%)
-2. [ ] **Walk-forward validation with batch=32** - Running to assess temporal generalization
-3. [ ] **Tune task weights** - Balance direction/duration trade-off explicitly
-4. [ ] **Gradient norm analysis** - Understand direction vs duration gradient magnitudes
+2. [x] **Walk-forward validation with batch=32** - DONE: 67.45% ± 4.24% (PRIMARY)
+3. [x] **Tune task weights** - DONE: 0.4 optimal for direction
+4. [ ] **Multi-seed for 0.4** - Verify 63.7% holds across seeds
+5. [ ] **Try intermediate values (0.35, 0.45)** - Find precise knee of curve
 
 ### Recommended Duration Configuration (BEST - EXP27):
 
