@@ -168,6 +168,19 @@ class PCGradBalancer:
         return sum(task_losses)
 
 
+def assert_finite(name: str, tensor: torch.Tensor, raise_error: bool = True):
+    """Check tensor for NaN/Inf values."""
+    if not torch.isfinite(tensor).all():
+        msg = f"{name} contains NaN or Inf values"
+        if raise_error:
+            raise ValueError(msg)
+        else:
+            import warnings
+            warnings.warn(msg)
+            return False
+    return True
+
+
 @dataclass
 class TrainingConfig:
     """Configuration for training."""
@@ -624,7 +637,19 @@ class Trainer:
                         predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
                     else:
                         predictions = self.model(x)
+
+                    # Check predictions for NaN/Inf (early detection)
+                    if not assert_finite("duration_mean", predictions['duration_mean'], raise_error=False):
+                        continue  # Skip this batch
+
                     loss, loss_dict = self.criterion(predictions, targets, masks)
+
+                # Check loss for NaN/Inf
+                if not torch.isfinite(loss):
+                    import warnings
+                    warnings.warn(f"Loss is NaN/Inf at step {self.global_step}, skipping update")
+                    self.global_step += 1
+                    continue  # Skip optimization for this batch
 
                 # Backward pass with gradient balancing
                 if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:
@@ -682,7 +707,19 @@ class Trainer:
                     predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
                 else:
                     predictions = self.model(x)
+
+                # Check predictions for NaN/Inf (early detection)
+                if not assert_finite("duration_mean", predictions['duration_mean'], raise_error=False):
+                    continue  # Skip this batch
+
                 loss, loss_dict = self.criterion(predictions, targets, masks)
+
+                # Check loss for NaN/Inf
+                if not torch.isfinite(loss):
+                    import warnings
+                    warnings.warn(f"Loss is NaN/Inf at step {self.global_step}, skipping update")
+                    self.global_step += 1
+                    continue  # Skip optimization for this batch
 
                 # Backward pass with gradient balancing
                 if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:

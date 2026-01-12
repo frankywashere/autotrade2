@@ -1776,6 +1776,7 @@ class HierarchicalCfCModel(nn.Module):
         tcn_kernel_size: int = 3,
         tcn_layers: int = 2,
         num_hazard_bins: int = 0,
+        max_duration: float = 100.0,
     ):
         """
         Initialize hierarchical CfC model.
@@ -1810,6 +1811,7 @@ class HierarchicalCfCModel(nn.Module):
         self.use_se_blocks = use_se_blocks
         self.use_tcn = use_tcn
         self.num_hazard_bins = num_hazard_bins
+        self.max_duration = max_duration
 
         # Validate total input dimension against canonical value from feature_ordering
         assert self.config.total_features == TOTAL_FEATURES, \
@@ -2161,7 +2163,7 @@ class HierarchicalCfCModel(nn.Module):
                     duration_mean, duration_std = hazard_to_duration_stats(
                         outputs['duration_hazard'],
                         num_bins=self.num_hazard_bins,
-                        max_duration=100.0
+                        max_duration=self.max_duration
                     )
                     outputs['duration_mean'] = duration_mean
                     outputs['duration_std'] = duration_std
@@ -2172,15 +2174,17 @@ class HierarchicalCfCModel(nn.Module):
                     agg_duration_mean, agg_duration_std = hazard_to_duration_stats(
                         outputs['aggregate']['duration_hazard'],
                         num_bins=self.num_hazard_bins,
-                        max_duration=100.0
+                        max_duration=self.max_duration
                     )
                     outputs['aggregate']['duration_mean'] = agg_duration_mean
                     outputs['aggregate']['duration_std'] = agg_duration_std
             elif 'duration_log_std' in outputs:
                 # Gaussian NLL: convert log_std to std
-                outputs['duration_std'] = torch.exp(outputs['duration_log_std'])
+                duration_log_std_clamped = torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)
+                outputs['duration_std'] = torch.exp(duration_log_std_clamped)
                 if 'aggregate' in outputs and 'duration_log_std' in outputs['aggregate']:
-                    outputs['aggregate']['duration_std'] = torch.exp(outputs['aggregate']['duration_log_std'])
+                    agg_duration_log_std_clamped = torch.clamp(outputs['aggregate']['duration_log_std'], min=-5.0, max=4.0)
+                    outputs['aggregate']['duration_std'] = torch.exp(agg_duration_log_std_clamped)
             else:
                 # Huber/MSE: no uncertainty, set to zeros
                 if 'duration_mean' in outputs:
@@ -2207,14 +2211,34 @@ class HierarchicalCfCModel(nn.Module):
             agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)   # [batch, 1] v9.0.0
 
             # Get duration_std from already-converted values
-            duration_std = outputs.get('duration_std', torch.exp(outputs['duration_log_std']) if 'duration_log_std' in outputs else torch.zeros_like(outputs['duration_mean']))
-            agg_duration_std = outputs['aggregate'].get('duration_std', torch.exp(outputs['aggregate']['duration_log_std']) if 'duration_log_std' in outputs['aggregate'] else torch.zeros_like(outputs['aggregate']['duration_mean']))
+            duration_std = outputs.get('duration_std', torch.exp(torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs else torch.zeros_like(outputs['duration_mean']))
+            agg_duration_std = outputs['aggregate'].get('duration_std', torch.exp(torch.clamp(outputs['aggregate']['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs['aggregate'] else torch.zeros_like(outputs['aggregate']['duration_mean']))
 
             # Window selection: use argmax during inference (hard selection)
             window_selection = outputs['window_logits'].argmax(dim=-1)           # [batch, 11]
 
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
+
+            # Validate critical outputs - use safe defaults instead of hard assert
+            if not torch.isfinite(outputs['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in duration predictions, using safe defaults")
+                outputs['duration_mean'] = torch.full_like(
+                    outputs['duration_mean'], 25.0
+                )
+                duration_std = torch.full_like(
+                    duration_std, 10.0
+                )
+            if not torch.isfinite(outputs['aggregate']['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in aggregate duration predictions, using safe defaults")
+                outputs['aggregate']['duration_mean'] = torch.full_like(
+                    outputs['aggregate']['duration_mean'], 25.0
+                )
+                agg_duration_std = torch.full_like(
+                    agg_duration_std, 10.0
+                )
 
             return {
                 # Per-timeframe predictions (for dashboard table)
@@ -2407,7 +2431,8 @@ class HierarchicalLoss(nn.Module):
             loss_dict: Individual loss components
         """
         # Duration loss (Gaussian NLL) - convert log_std to std
-        duration_std = torch.exp(outputs['duration_log_std'])
+        duration_log_std_clamped = torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)
+        duration_std = torch.exp(duration_log_std_clamped)
         duration_loss = self.gaussian_nll_loss(
             outputs['duration_mean'],
             duration_std,
@@ -2481,6 +2506,7 @@ def create_model(
     tcn_kernel_size: int = 3,
     tcn_layers: int = 2,
     num_hazard_bins: int = 0,
+    max_duration: float = 100.0,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> HierarchicalCfCModel:
     """
@@ -2523,6 +2549,7 @@ def create_model(
         tcn_kernel_size=tcn_kernel_size,
         tcn_layers=tcn_layers,
         num_hazard_bins=num_hazard_bins,
+        max_duration=max_duration,
     )
 
     model = model.to(device)

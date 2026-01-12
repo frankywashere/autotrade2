@@ -375,6 +375,13 @@ def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[D
                         else:
                             model_cfg['num_hazard_bins'] = 0
 
+                if 'max_duration' not in model_cfg:
+                    # Try from TrainingConfig
+                    if hasattr(config, 'max_duration'):
+                        model_cfg['max_duration'] = config.max_duration
+                    else:
+                        model_cfg['max_duration'] = 100.0
+
         return config_dict if config_dict else None
     except Exception as e:
         st.warning(f"Error extracting config: {e}")
@@ -501,6 +508,14 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 shared_heads=shared_heads,
                 use_se_blocks=use_se_blocks,
                 se_reduction_ratio=se_reduction_ratio,
+                use_multi_resolution=model_config.get('use_multi_resolution', False),
+                resolution_levels=model_config.get('resolution_levels', 3),
+                use_tcn=model_config.get('use_tcn', False),
+                tcn_channels=model_config.get('tcn_channels', 64),
+                tcn_kernel_size=model_config.get('tcn_kernel_size', 3),
+                tcn_layers=model_config.get('tcn_layers', 2),
+                num_hazard_bins=model_config.get('num_hazard_bins', 0),
+                max_duration=model_config.get('max_duration', 100.0),
                 device='cpu'
             )
         else:
@@ -514,6 +529,14 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 shared_heads=shared_heads,
                 use_se_blocks=use_se_blocks,
                 se_reduction_ratio=se_reduction_ratio,
+                use_multi_resolution=model_config.get('use_multi_resolution', False),
+                resolution_levels=model_config.get('resolution_levels', 3),
+                use_tcn=model_config.get('use_tcn', False),
+                tcn_channels=model_config.get('tcn_channels', 64),
+                tcn_kernel_size=model_config.get('tcn_kernel_size', 3),
+                tcn_layers=model_config.get('tcn_layers', 2),
+                num_hazard_bins=model_config.get('num_hazard_bins', 0),
+                max_duration=model_config.get('max_duration', 100.0),
                 device='cpu'
             )
 
@@ -711,6 +734,37 @@ def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame) -> Tuple[Di
 # Predictions
 # =============================================================================
 
+def adapt_features_809_to_776(features_809: np.ndarray) -> np.ndarray:
+    """
+    Strip 809 features to 776 by removing 3 ATR features per timeframe.
+
+    v13 (809): TSLA=38, SPY=11, CROSS=10 per TF (59 total) x 11 + 160 shared
+    v12 (776): TSLA=35, SPY=11, CROSS=10 per TF (56 total) x 11 + 160 shared
+
+    Removes ATR features at indices [18:21] within each TSLA block.
+    """
+    if features_809.shape[-1] != 809:
+        return features_809
+
+    adapted_parts = []
+    for tf_idx in range(11):
+        # v13 structure per TF
+        tf_start = tf_idx * 59
+        tsla_end = tf_start + 38
+
+        # Keep TSLA [0:18] and [21:38], skip ATR [18:21]
+        adapted_parts.append(features_809[..., tf_start:tf_start+18])
+        adapted_parts.append(features_809[..., tf_start+21:tsla_end])
+
+        # Keep SPY and CROSS unchanged
+        adapted_parts.append(features_809[..., tsla_end:tsla_end+21])
+
+    # Keep shared features
+    adapted_parts.append(features_809[..., 649:])
+
+    return np.concatenate(adapted_parts, axis=-1)
+
+
 def make_predictions(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
@@ -755,6 +809,8 @@ def make_predictions(
                     feature_arrays = features_to_tensor_dict(features)
                     feature_list = [feature_arrays[k] for k in FEATURE_ORDER if k in feature_arrays]
                     feature_array = np.concatenate(feature_list)
+                    if detected_dim == 776 and feature_array.shape[0] == 809:
+                        feature_array = adapt_features_809_to_776(feature_array)
                     per_window_features.append(feature_array)
 
                     # Extract channel quality scores from tsla_window_scores
@@ -860,11 +916,12 @@ def make_predictions(
         }
 
         # Add window selection info if available (Phase 2b)
-        if is_end_to_end and 'window_selection_probs' in outputs:
+        if is_end_to_end and 'window_selection' in outputs:
+            ws = outputs['window_selection']
             result['window_selection'] = {
-                'probs': outputs['window_selection_probs'][0].numpy(),  # [8]
-                'selected_idx': int(outputs.get('selected_window_idx', [0])[0]),
-                'confidence': float(outputs.get('selection_confidence', [0.5])[0])
+                'probs': ws['probs'][0].numpy(),
+                'selected_idx': int(ws['selected_idx'][0]),
+                'confidence': float(ws['confidence'][0])
             }
 
         return result

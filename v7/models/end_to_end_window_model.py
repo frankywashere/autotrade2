@@ -468,6 +468,7 @@ class EndToEndWindowModel(nn.Module):
         tcn_layers: int = 2,
         # Survival/hazard loss parameters
         num_hazard_bins: int = 0,
+        max_duration: float = 100.0,
     ):
         """
         Initialize the EndToEndWindowModel.
@@ -547,6 +548,7 @@ class EndToEndWindowModel(nn.Module):
         self.feature_dim = feature_dim
         self.window_embed_dim = window_embed_dim
         self.num_hazard_bins = num_hazard_bins
+        self.max_duration = max_duration
 
         # Validate feature dimension matches expected
         if feature_dim != TOTAL_FEATURES:
@@ -591,6 +593,7 @@ class EndToEndWindowModel(nn.Module):
             tcn_kernel_size=tcn_kernel_size,
             tcn_layers=tcn_layers,
             num_hazard_bins=num_hazard_bins,
+            max_duration=max_duration,
         )
 
         # Store num_hazard_bins for output conversion logic in predict()
@@ -733,12 +736,25 @@ class EndToEndWindowModel(nn.Module):
                 duration_mean, duration_std = hazard_to_duration_stats(
                     outputs['duration_hazard'],
                     num_bins=self.num_hazard_bins,
-                    max_duration=100.0
+                    max_duration=self.max_duration
                 )
                 outputs['duration_mean'] = duration_mean
                 outputs['duration_std'] = duration_std
+
+            # Also convert aggregate hazard if present
+            if ('aggregate' in outputs and
+                'duration_hazard' in outputs['aggregate'] and
+                outputs['aggregate']['duration_hazard'] is not None):
+                agg_duration_mean, agg_duration_std = hazard_to_duration_stats(
+                    outputs['aggregate']['duration_hazard'],
+                    num_bins=self.num_hazard_bins,
+                    max_duration=self.max_duration
+                )
+                outputs['aggregate']['duration_mean'] = agg_duration_mean
+                outputs['aggregate']['duration_std'] = agg_duration_std
         elif 'duration_log_std' in outputs:
-            outputs['duration_std'] = torch.exp(outputs['duration_log_std'])
+            duration_log_std_clamped = torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)
+            outputs['duration_std'] = torch.exp(duration_log_std_clamped)
         else:
             if 'duration_mean' in outputs:
                 outputs['duration_std'] = torch.zeros_like(outputs['duration_mean'])
@@ -829,11 +845,31 @@ class EndToEndWindowModel(nn.Module):
             agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
 
             # Compute std from log_std or use pre-computed std
-            duration_std = outputs.get('duration_std', torch.exp(outputs['duration_log_std']) if 'duration_log_std' in outputs else torch.zeros_like(outputs['duration_mean']))
-            agg_duration_std = outputs['aggregate'].get('duration_std', torch.exp(outputs['aggregate']['duration_log_std']) if 'duration_log_std' in outputs['aggregate'] else torch.zeros_like(outputs['aggregate']['duration_mean']))
+            duration_std = outputs.get('duration_std', torch.exp(torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs else torch.zeros_like(outputs['duration_mean']))
+            agg_duration_std = outputs['aggregate'].get('duration_std', torch.exp(torch.clamp(outputs['aggregate']['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs['aggregate'] else torch.zeros_like(outputs['aggregate']['duration_mean']))
 
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
+
+            # Validate critical outputs - use safe defaults instead of hard assert
+            if not torch.isfinite(outputs['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in duration predictions, using safe defaults")
+                outputs['duration_mean'] = torch.full_like(
+                    outputs['duration_mean'], 25.0
+                )
+                duration_std = torch.full_like(
+                    duration_std, 10.0
+                )
+            if not torch.isfinite(outputs['aggregate']['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in aggregate duration predictions, using safe defaults")
+                outputs['aggregate']['duration_mean'] = torch.full_like(
+                    outputs['aggregate']['duration_mean'], 25.0
+                )
+                agg_duration_std = torch.full_like(
+                    agg_duration_std, 10.0
+                )
 
             # Return in same format as HierarchicalCfCModel.predict()
             return {
@@ -1007,6 +1043,7 @@ def create_end_to_end_model(
     tcn_kernel_size: int = 3,
     tcn_layers: int = 2,
     num_hazard_bins: int = 0,
+    max_duration: float = 100.0,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
 ) -> EndToEndWindowModel:
     """
@@ -1104,6 +1141,7 @@ def create_end_to_end_model(
         tcn_kernel_size=tcn_kernel_size,
         tcn_layers=tcn_layers,
         num_hazard_bins=num_hazard_bins,
+        max_duration=max_duration,
     )
 
     model = model.to(device)
