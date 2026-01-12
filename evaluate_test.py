@@ -25,7 +25,7 @@ from rich import box
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from v7.models import create_model
+from v7.models import create_model, create_end_to_end_model
 from v7.training.dataset import (
     load_cached_samples,
     split_by_date,
@@ -110,6 +110,13 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'auto'):
     # Load checkpoint (weights_only=False for compatibility with PyTorch 2.6+)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
+    # Detect model type from state_dict keys
+    state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    is_end_to_end = any('window_encoder' in k or 'window_selector' in k for k in state_dict.keys())
+
+    if is_end_to_end:
+        console.print("  [cyan]Detected EndToEndWindowModel (Phase 2b)[/cyan]")
+
     # Load training_config.json for model architecture
     # The checkpoint's TrainingConfig.model_kwargs is empty, but training_config.json has it
     checkpoint_dir = checkpoint_path.parent
@@ -136,15 +143,47 @@ def load_model_from_checkpoint(checkpoint_path: Path, device: str = 'auto'):
         dropout = 0.1
         shared_heads = True
 
-    # Create model with inferred architecture
-    model = create_model(
-        hidden_dim=hidden_dim,
-        cfc_units=cfc_units,
-        num_attention_heads=num_attention_heads,
-        dropout=dropout,
-        shared_heads=shared_heads,
-        device=device
-    )
+    # Infer num_hazard_bins from state_dict if not in config
+    num_hazard_bins = model_config.get('num_hazard_bins', 0) if config_json else 0
+    if num_hazard_bins == 0:
+        # Check for hazard_head in state_dict
+        hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+        if hazard_key in state_dict:
+            num_hazard_bins = state_dict[hazard_key].shape[0]
+            console.print(f"  [cyan]Detected survival loss (hazard_bins={num_hazard_bins})[/cyan]")
+
+    # Create appropriate model type
+    if is_end_to_end:
+        try:
+            model = create_end_to_end_model(
+                feature_dim=776,
+                window_embed_dim=model_config.get('window_embed_dim', 128) if config_json else 128,
+                num_windows=8,
+                hidden_dim=hidden_dim,
+                cfc_units=cfc_units,
+                num_attention_heads=num_attention_heads,
+                dropout=dropout,
+                shared_heads=shared_heads,
+                use_se_blocks=model_config.get('use_se_blocks', False) if config_json else False,
+                se_reduction_ratio=model_config.get('se_reduction_ratio', 8) if config_json else 8,
+                num_hazard_bins=num_hazard_bins,
+                device=device
+            )
+        except Exception as e:
+            console.print(f"  [yellow]Warning: Failed to create EndToEndWindowModel: {e}[/yellow]")
+            console.print("  [yellow]Falling back to HierarchicalCfCModel[/yellow]")
+            is_end_to_end = False
+
+    if not is_end_to_end:
+        model = create_model(
+            hidden_dim=hidden_dim,
+            cfc_units=cfc_units,
+            num_attention_heads=num_attention_heads,
+            dropout=dropout,
+            shared_heads=shared_heads,
+            num_hazard_bins=num_hazard_bins,
+            device=device
+        )
 
     # Load weights
     incompatible = model.load_state_dict(checkpoint['model_state_dict'], strict=False)

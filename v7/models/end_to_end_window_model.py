@@ -977,6 +977,10 @@ def create_end_to_end_model(
     se_reduction_ratio: int = 8,
     use_multi_resolution: bool = False,
     resolution_levels: int = 3,
+    use_tcn: bool = False,
+    tcn_channels: int = 64,
+    tcn_kernel_size: int = 3,
+    tcn_layers: int = 2,
     num_hazard_bins: int = 0,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
 ) -> EndToEndWindowModel:
@@ -1030,6 +1034,19 @@ def create_end_to_end_model(
     resolution_levels : int, optional
         Number of resolution levels for multi-resolution heads. Default is 3.
 
+    use_tcn : bool, optional
+        If True, add TCN (Temporal Convolutional Network) block to each TF branch
+        for additional temporal pattern learning. Default is False.
+
+    tcn_channels : int, optional
+        Number of channels in TCN hidden layers. Default is 64.
+
+    tcn_kernel_size : int, optional
+        Kernel size for TCN convolutions. Default is 3.
+
+    tcn_layers : int, optional
+        Number of temporal blocks in TCN. Default is 2.
+
     num_hazard_bins : int, optional
         Number of bins for survival/hazard duration prediction. Default is 0 (disabled).
         When > 0, DurationHead outputs hazard logits for survival loss.
@@ -1057,6 +1074,10 @@ def create_end_to_end_model(
         se_reduction_ratio=se_reduction_ratio,
         use_multi_resolution=use_multi_resolution,
         resolution_levels=resolution_levels,
+        use_tcn=use_tcn,
+        tcn_channels=tcn_channels,
+        tcn_kernel_size=tcn_kernel_size,
+        tcn_layers=tcn_layers,
         num_hazard_bins=num_hazard_bins,
     )
 

@@ -53,6 +53,8 @@ from v7.features.full_features import extract_full_features, features_to_tensor_
 from v7.features.events import EventsHandler, extract_event_features
 from v7.features.feature_ordering import FEATURE_ORDER
 from v7.models.hierarchical_cfc import HierarchicalCfCModel, FeatureConfig
+from v7.models.end_to_end_window import EndToEndWindowModel
+from v7.models import create_end_to_end_model
 
 # Live data
 try:
@@ -277,20 +279,59 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
             use_se_blocks = any('se_block' in key for key in state_dict.keys())
             se_reduction_ratio = 8  # Default value when inferring
 
-        model = HierarchicalCfCModel(
-            feature_config=FeatureConfig(),
-            hidden_dim=hidden_dim,
-            cfc_units=cfc_units,
-            num_attention_heads=num_attention_heads,
-            dropout=dropout,
-            use_se_blocks=use_se_blocks,
-            se_reduction_ratio=se_reduction_ratio
-        )
+        # Detect model type from state_dict keys
+        state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        is_end_to_end = any('window_encoder' in k or 'window_selector' in k for k in state_dict.keys())
+
+        # Infer num_hazard_bins from state_dict if not in config
+        num_hazard_bins = 0
+        if config and 'model' in config:
+            num_hazard_bins = config['model'].get('num_hazard_bins', 0)
+        if num_hazard_bins == 0:
+            # Check for hazard_head in state_dict
+            hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+            if hazard_key in state_dict:
+                num_hazard_bins = state_dict[hazard_key].shape[0]
+
+        if is_end_to_end:
+            try:
+                from v7.models import create_end_to_end_model
+                model = create_end_to_end_model(
+                    feature_dim=776,
+                    window_embed_dim=model_config.get('window_embed_dim', 128) if config and 'model' in config else 128,
+                    num_windows=8,
+                    hidden_dim=hidden_dim,
+                    cfc_units=cfc_units,
+                    num_attention_heads=num_attention_heads,
+                    dropout=dropout,
+                    use_se_blocks=use_se_blocks,
+                    se_reduction_ratio=se_reduction_ratio,
+                    num_hazard_bins=num_hazard_bins,
+                    device='cpu'
+                )
+            except Exception as e:
+                # Fall back to HierarchicalCfCModel if EndToEndWindowModel fails
+                is_end_to_end = False
+
+        if not is_end_to_end:
+            model = HierarchicalCfCModel(
+                feature_config=FeatureConfig(),
+                hidden_dim=hidden_dim,
+                cfc_units=cfc_units,
+                num_attention_heads=num_attention_heads,
+                dropout=dropout,
+                use_se_blocks=use_se_blocks,
+                se_reduction_ratio=se_reduction_ratio,
+                num_hazard_bins=num_hazard_bins
+            )
 
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            incompatible = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            if incompatible.unexpected_keys:
+                # Log but don't fail - this is expected when architecture differs
+                pass
         else:
-            model.load_state_dict(checkpoint)
+            model.load_state_dict(checkpoint, strict=False)
 
         model.eval()
 

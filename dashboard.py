@@ -48,7 +48,7 @@ from v7.features.full_features import extract_full_features, features_to_tensor_
 from v7.features.events import EventsHandler, extract_event_features
 from v7.features.feature_ordering import FEATURE_ORDER
 from v7.models.hierarchical_cfc import HierarchicalCfCModel, FeatureConfig
-from v7.models import create_model
+from v7.models import create_model, create_end_to_end_model
 
 
 # Constants
@@ -204,6 +204,18 @@ def extract_model_config(checkpoint_path: Path, checkpoint: Dict) -> Dict:
         'shared_heads': model_config.get('shared_heads', True),
         'use_se_blocks': model_config.get('use_se_blocks', False),
         'se_reduction_ratio': model_config.get('se_reduction_ratio', 8),
+        # EndToEndWindowModel-specific parameters
+        'window_embed_dim': model_config.get('window_embed_dim', 128),
+        'temperature': model_config.get('temperature', 1.0),
+        'use_gumbel': model_config.get('use_gumbel', False),
+        'num_windows': model_config.get('num_windows', 8),
+        'use_tcn': model_config.get('use_tcn', False),
+        'tcn_channels': model_config.get('tcn_channels', 64),
+        'tcn_kernel_size': model_config.get('tcn_kernel_size', 3),
+        'tcn_layers': model_config.get('tcn_layers', 2),
+        'use_multi_resolution': model_config.get('use_multi_resolution', False),
+        'resolution_levels': model_config.get('resolution_levels', 3),
+        'num_hazard_bins': model_config.get('num_hazard_bins', 0),
         '_source': source
     }
 
@@ -212,6 +224,18 @@ def extract_model_config(checkpoint_path: Path, checkpoint: Dict) -> Dict:
     has_separate_heads = any('per_tf_duration_heads' in k for k in state_dict.keys())
     if has_separate_heads:
         result['shared_heads'] = False
+
+    # Infer num_hazard_bins from hazard_head layer if present and not in config
+    if result['num_hazard_bins'] == 0:
+        # Check for per-TF hazard heads (separate heads architecture)
+        hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+        if hazard_key in state_dict:
+            result['num_hazard_bins'] = state_dict[hazard_key].shape[0]
+        else:
+            # Check for shared heads architecture
+            hazard_key_shared = 'hierarchical_model.per_tf_duration_head.hazard_head.weight'
+            if hazard_key_shared in state_dict:
+                result['num_hazard_bins'] = state_dict[hazard_key_shared].shape[0]
 
     return result
 
@@ -818,17 +842,59 @@ def main():
         model_cfg = extract_model_config(checkpoint_path, checkpoint)
         source = model_cfg.pop('_source', 'unknown')
 
-        # Create model with proper architecture
-        model = create_model(
-            hidden_dim=model_cfg['hidden_dim'],
-            cfc_units=model_cfg['cfc_units'],
-            num_attention_heads=model_cfg['num_attention_heads'],
-            dropout=model_cfg['dropout'],
-            shared_heads=model_cfg['shared_heads'],
-            use_se_blocks=model_cfg['use_se_blocks'],
-            se_reduction_ratio=model_cfg['se_reduction_ratio'],
-            device='cpu'
-        )
+        # Detect model type from state_dict keys
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        is_end_to_end = any('window_encoder' in k or 'window_selector' in k for k in state_dict.keys())
+
+        # Create appropriate model type
+        if is_end_to_end:
+            console.print("[cyan]Detected EndToEndWindowModel (Phase 2b)[/cyan]")
+            try:
+                model = create_end_to_end_model(
+                    feature_dim=776,
+                    window_embed_dim=model_cfg.get('window_embed_dim', 128),
+                    num_windows=model_cfg.get('num_windows', 8),
+                    temperature=model_cfg.get('temperature', 1.0),
+                    use_gumbel=model_cfg.get('use_gumbel', False),
+                    hidden_dim=model_cfg['hidden_dim'],
+                    cfc_units=model_cfg['cfc_units'],
+                    num_attention_heads=model_cfg['num_attention_heads'],
+                    dropout=model_cfg['dropout'],
+                    shared_heads=model_cfg['shared_heads'],
+                    use_se_blocks=model_cfg['use_se_blocks'],
+                    se_reduction_ratio=model_cfg['se_reduction_ratio'],
+                    use_tcn=model_cfg.get('use_tcn', False),
+                    tcn_channels=model_cfg.get('tcn_channels', 64),
+                    tcn_kernel_size=model_cfg.get('tcn_kernel_size', 3),
+                    tcn_layers=model_cfg.get('tcn_layers', 2),
+                    use_multi_resolution=model_cfg.get('use_multi_resolution', False),
+                    resolution_levels=model_cfg.get('resolution_levels', 3),
+                    num_hazard_bins=model_cfg.get('num_hazard_bins', 0),
+                    device='cpu'
+                )
+            except Exception as e:
+                console.print(f"[yellow]Warning: Failed to create EndToEndWindowModel: {e}[/yellow]")
+                console.print("[yellow]Falling back to HierarchicalCfCModel[/yellow]")
+                is_end_to_end = False
+
+        if not is_end_to_end:
+            model = create_model(
+                hidden_dim=model_cfg['hidden_dim'],
+                cfc_units=model_cfg['cfc_units'],
+                num_attention_heads=model_cfg['num_attention_heads'],
+                dropout=model_cfg['dropout'],
+                shared_heads=model_cfg['shared_heads'],
+                use_se_blocks=model_cfg['use_se_blocks'],
+                se_reduction_ratio=model_cfg['se_reduction_ratio'],
+                use_tcn=model_cfg.get('use_tcn', False),
+                tcn_channels=model_cfg.get('tcn_channels', 64),
+                tcn_kernel_size=model_cfg.get('tcn_kernel_size', 3),
+                tcn_layers=model_cfg.get('tcn_layers', 2),
+                use_multi_resolution=model_cfg.get('use_multi_resolution', False),
+                resolution_levels=model_cfg.get('resolution_levels', 3),
+                num_hazard_bins=model_cfg.get('num_hazard_bins', 0),
+                device='cpu'
+            )
 
         # Load state dict
         state_dict = checkpoint.get('model_state_dict', checkpoint)

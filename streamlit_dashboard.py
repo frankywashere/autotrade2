@@ -363,6 +363,33 @@ def extract_config_from_checkpoint(checkpoint_path: Path, checkpoint: Optional[D
                 if 'direction_loss_type' not in model_cfg:
                     model_cfg['direction_loss_type'] = None
 
+                # EndToEndWindowModel-specific parameters
+                if 'window_embed_dim' not in model_cfg:
+                    # Heuristic: infer from embed_to_features layer shape
+                    if 'embed_to_features.weight' in state_dict:
+                        model_cfg['window_embed_dim'] = state_dict['embed_to_features.weight'].shape[1]
+                    else:
+                        model_cfg['window_embed_dim'] = 128  # Default
+                if 'temperature' not in model_cfg:
+                    model_cfg['temperature'] = 1.0  # Default
+                if 'use_gumbel' not in model_cfg:
+                    model_cfg['use_gumbel'] = False  # Default
+                if 'num_windows' not in model_cfg:
+                    model_cfg['num_windows'] = 8  # Default (STANDARD_WINDOWS)
+                if 'num_hazard_bins' not in model_cfg:
+                    # Heuristic: infer from hazard_head layer if present
+                    # Check for per-TF hazard heads first (separate heads architecture)
+                    hazard_key = 'hierarchical_model.per_tf_duration_heads.0.hazard_head.weight'
+                    if hazard_key in state_dict:
+                        model_cfg['num_hazard_bins'] = state_dict[hazard_key].shape[0]
+                    else:
+                        # Check for shared heads architecture
+                        hazard_key_shared = 'hierarchical_model.per_tf_duration_head.hazard_head.weight'
+                        if hazard_key_shared in state_dict:
+                            model_cfg['num_hazard_bins'] = state_dict[hazard_key_shared].shape[0]
+                        else:
+                            model_cfg['num_hazard_bins'] = 0  # Default (disabled)
+
         return config_dict if config_dict else None
     except Exception as e:
         st.warning(f"Error extracting config: {e}")
@@ -423,6 +450,10 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 res_levels = model_config.get('resolution_levels', 'N/A')
                 st.info(f"Multi-resolution enabled (levels={res_levels})")
 
+            num_hazard_bins = model_config.get('num_hazard_bins', 0)
+            if num_hazard_bins > 0:
+                st.info(f"Survival loss enabled (hazard_bins={num_hazard_bins})")
+
             grad_balancing = model_config.get('gradient_balancing', False)
             if grad_balancing:
                 gradnorm_alpha = model_config.get('gradnorm_alpha', 'N/A')
@@ -459,8 +490,10 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
             st.info("🔄 Detected EndToEndWindowModel (Phase 2b)")
             model = create_end_to_end_model(
                 feature_dim=776,
-                window_embed_dim=128,
-                num_windows=8,
+                window_embed_dim=model_config.get('window_embed_dim', 128),
+                num_windows=model_config.get('num_windows', 8),
+                temperature=model_config.get('temperature', 1.0),
+                use_gumbel=model_config.get('use_gumbel', False),
                 hidden_dim=hidden_dim,
                 cfc_units=cfc_units,
                 num_attention_heads=num_heads,
@@ -468,6 +501,13 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 shared_heads=shared_heads,
                 use_se_blocks=use_se_blocks,
                 se_reduction_ratio=se_reduction_ratio,
+                use_tcn=model_config.get('use_tcn', False),
+                tcn_channels=model_config.get('tcn_channels', 64),
+                tcn_kernel_size=model_config.get('tcn_kernel_size', 3),
+                tcn_layers=model_config.get('tcn_layers', 2),
+                use_multi_resolution=model_config.get('use_multi_resolution', False),
+                resolution_levels=model_config.get('resolution_levels', 3),
+                num_hazard_bins=model_config.get('num_hazard_bins', 0),
                 device='cpu'
             )
         else:
@@ -481,6 +521,13 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
                 shared_heads=shared_heads,
                 use_se_blocks=use_se_blocks,
                 se_reduction_ratio=se_reduction_ratio,
+                use_tcn=model_config.get('use_tcn', False),
+                tcn_channels=model_config.get('tcn_channels', 64),
+                tcn_kernel_size=model_config.get('tcn_kernel_size', 3),
+                tcn_layers=model_config.get('tcn_layers', 2),
+                use_multi_resolution=model_config.get('use_multi_resolution', False),
+                resolution_levels=model_config.get('resolution_levels', 3),
+                num_hazard_bins=model_config.get('num_hazard_bins', 0),
                 device='cpu'
             )
 
