@@ -44,18 +44,27 @@ def _init_scan_worker(tsla_values, tsla_index, spy_values, vix_values, progress_
     """Initialize worker process with shared data arrays, progress counter, and pre-computed resampled data."""
     global _WORKER_TSLA_VALUES, _WORKER_TSLA_INDEX, _WORKER_SPY_VALUES, _WORKER_VIX_VALUES, _WORKER_PROGRESS_COUNTER
     global _WORKER_PRECOMPUTED_TSLA, _WORKER_PRECOMPUTED_SPY
-    _WORKER_TSLA_VALUES = tsla_values
-    _WORKER_TSLA_INDEX = tsla_index
-    _WORKER_SPY_VALUES = spy_values
-    _WORKER_VIX_VALUES = vix_values
-    _WORKER_PROGRESS_COUNTER = progress_counter
-    _WORKER_PRECOMPUTED_TSLA = precomputed_tsla
-    _WORKER_PRECOMPUTED_SPY = precomputed_spy
 
-    # Register pre-computed data with the labels module for cache optimization
-    if precomputed_tsla is not None or precomputed_spy is not None:
-        from .labels import set_precomputed_resampled_data
-        set_precomputed_resampled_data(precomputed_tsla, precomputed_spy)
+    try:
+        _WORKER_TSLA_VALUES = tsla_values
+        _WORKER_TSLA_INDEX = tsla_index
+        _WORKER_SPY_VALUES = spy_values
+        _WORKER_VIX_VALUES = vix_values
+        _WORKER_PROGRESS_COUNTER = progress_counter
+        _WORKER_PRECOMPUTED_TSLA = precomputed_tsla
+        _WORKER_PRECOMPUTED_SPY = precomputed_spy
+
+        # Register pre-computed data with the labels module for cache optimization
+        if precomputed_tsla is not None or precomputed_spy is not None:
+            from .labels import set_precomputed_resampled_data
+            set_precomputed_resampled_data(precomputed_tsla, precomputed_spy)
+    except Exception as e:
+        # Log initialization failure - this will cause the worker to fail on first task
+        # but provides visibility into what went wrong
+        import sys
+        print(f"ERROR: Worker initialization failed: {e}", file=sys.stderr)
+        # Re-raise to ensure the executor knows this worker failed to initialize
+        raise
 
 
 def _process_single_position(
@@ -155,8 +164,14 @@ def _process_single_position(
     # For backward compatibility, keep the 'features' field as best_window features
     features = features_per_window.get(best_window)
     if features is None:
-        # If best_window failed, use any available window
-        features = next(iter(features_per_window.values()))
+        # If best_window failed, use the smallest available window for determinism
+
+        # (dict iteration order is insertion order in Python 3.7+, but we use min())
+
+        # to be explicit and avoid any ambiguity across different code paths)
+
+        fallback_window = min(features_per_window.keys())
+        features = features_per_window[fallback_window]
 
     # Generate native per-TF labels for all window sizes
     # Need forward data for label generation
@@ -356,8 +371,14 @@ def _scan_sequential(
         # For backward compatibility, keep the 'features' field as best_window features
         features = features_per_window.get(best_window)
         if features is None:
-            # If best_window failed, use any available window
-            features = next(iter(features_per_window.values()))
+            # If best_window failed, use the smallest available window for determinism
+
+            # (dict iteration order is insertion order in Python 3.7+, but we use min())
+
+            # to be explicit and avoid any ambiguity across different code paths)
+
+            fallback_window = min(features_per_window.keys())
+            features = features_per_window[fallback_window]
 
         # Generate native per-TF labels for all window sizes
         try:
@@ -644,7 +665,8 @@ def scan_valid_channels(
     max_workers: Optional[int] = None,
     heartbeat_timeout_sec: Optional[float] = None,
     heartbeat_interval_sec: float = 5.0,
-    fail_on_timeout: bool = False
+    fail_on_timeout: bool = False,
+    max_failed_batches: Optional[int] = None
 ) -> Tuple[List[ChannelSample], int]:
     """
     Scan through historical data to find all valid channels and generate samples.
@@ -686,6 +708,9 @@ def scan_valid_channels(
         heartbeat_interval_sec: Interval in seconds for checking heartbeat timeout (default: 5.0).
         fail_on_timeout: If True, raise TimeoutError when heartbeat timeout is exceeded.
                         If False (default), only print a warning and continue.
+        max_failed_batches: Optional maximum number of failed worker batches before raising an error.
+                           If None (default), continue processing and warn at the end.
+                           If exceeded, raises RuntimeError with failure count.
 
     Returns:
         List of ChannelSample objects
@@ -741,7 +766,8 @@ def scan_valid_channels(
             progress=progress,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             heartbeat_interval_sec=heartbeat_interval_sec,
-            fail_on_timeout=fail_on_timeout
+            fail_on_timeout=fail_on_timeout,
+            max_failed_batches=max_failed_batches
         )
     else:
         samples, valid_count = _scan_sequential(

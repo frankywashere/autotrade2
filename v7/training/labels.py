@@ -1370,8 +1370,8 @@ def select_best_window_by_labels(
             best_valid_count = valid_count
             best_window = window_size
 
-    # If no window found (shouldn't happen), return first
+    # If no window found (shouldn't happen), return smallest window for determinism
     if best_window is None:
-        best_window = next(iter(labels_per_window.keys()))
+        best_window = min(labels_per_window.keys())
 
     return best_window
