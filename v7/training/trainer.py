@@ -946,8 +946,8 @@ class Trainer:
                     # Use hazard_to_duration_stats for proper bin-width scaling
                     duration_pred, _ = hazard_to_duration_stats(
                         predictions['duration_hazard'],
-                        num_bins=50,  # Standard for survival loss
-                        max_duration=self.config.max_duration if hasattr(self.config, 'max_duration') else 100.0
+                        num_bins=self.model.num_hazard_bins,
+                        max_duration=self.model.max_duration
                     )
                     if duration_pred.dim() == 1:  # If aggregate [batch], expand to [batch, num_tfs]
                         duration_pred = duration_pred.unsqueeze(1).expand(-1, targets['duration'].shape[1])
@@ -995,8 +995,8 @@ class Trainer:
                     # Use hazard_to_duration_stats for proper bin-width scaling
                     duration_mean_for_metrics, _ = hazard_to_duration_stats(
                         predictions['duration_hazard'],
-                        num_bins=50,  # Standard for survival loss
-                        max_duration=self.config.max_duration if hasattr(self.config, 'max_duration') else 100.0
+                        num_bins=self.model.num_hazard_bins,
+                        max_duration=self.model.max_duration
                     )
                     if duration_mean_for_metrics.dim() == 1:
                         duration_mean_for_metrics = duration_mean_for_metrics.unsqueeze(1).expand(-1, targets['duration'].shape[1])

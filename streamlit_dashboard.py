@@ -1179,7 +1179,11 @@ def main():
             st.caption("✗ Live data module not available")
 
         use_live = st.checkbox("Use Live Data", value=LIVE_DATA_AVAILABLE, disabled=not LIVE_DATA_AVAILABLE)
-        lookback_days = st.slider("Lookback Days", 30, 180, 90)
+        lookback_days = st.slider("Lookback Days", 420, 730, 500, help="Model trained with 420-day warmup. Values below 420 produce unreliable predictions.")
+
+        # Data sufficiency warning
+        if lookback_days < 420:
+            st.warning("⚠️ Lookback below training minimum (420 days). Weekly/monthly timeframe predictions will be unreliable.")
 
         col_refresh1, col_refresh2 = st.columns(2)
         with col_refresh1:
@@ -1197,6 +1201,7 @@ def main():
 
     # Load data
     data = load_market_data(use_live=use_live, lookback_days=lookback_days)
+    st.info(f"📊 Using {lookback_days} days of historical data. Training requires 420+ days for all timeframes.")
 
     # Tab 1: Live Predictions
     with tab1:

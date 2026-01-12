@@ -322,7 +322,7 @@ def load_model_from_checkpoint(checkpoint_info: Dict) -> Optional[HierarchicalCf
 # Data Loading
 # =============================================================================
 
-def load_csv_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_csv_data(lookback_days: int = 500) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load data from CSV files (fallback)."""
     cutoff = datetime.now() - timedelta(days=lookback_days)
 
@@ -375,7 +375,7 @@ def load_csv_data(lookback_days: int = 90) -> Tuple[pd.DataFrame, pd.DataFrame, 
     return tsla_df, spy_df, vix_df
 
 
-def load_market_data(use_live: bool = True, lookback_days: int = 90) -> Dict[str, Any]:
+def load_market_data(use_live: bool = True, lookback_days: int = 500) -> Dict[str, Any]:
     """Load market data, preferring live data if available."""
     result = {
         "tsla_df": None,
@@ -1013,8 +1013,8 @@ class SettingsScreen(Screen):
                 Horizontal(
                     Label("Lookback Days:"),
                     Select(
-                        [(str(d), d) for d in [30, 60, 90, 120, 180]],
-                        value=90,
+                        [(str(d), d) for d in [420, 500, 600, 730]],
+                        value=500,
                         id="lookback-select"
                     ),
                     id="setting-lookback"
@@ -1157,7 +1157,7 @@ class DashboardApp(App):
 
         # Settings
         self.use_live_data: bool = True
-        self.lookback_days: int = 90
+        self.lookback_days: int = 500  # 420-day minimum required for proper channel detection
         self.refresh_interval: int = 0
 
     def on_mount(self) -> None:
