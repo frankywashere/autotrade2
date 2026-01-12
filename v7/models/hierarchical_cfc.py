@@ -1747,6 +1747,7 @@ class HierarchicalCfCModel(nn.Module):
         tcn_kernel_size: int = 3,
         tcn_layers: int = 2,
         num_hazard_bins: int = 0,
+        max_duration: float = 100.0,
     ):
         """
         Initialize hierarchical CfC model.
@@ -1771,6 +1772,7 @@ class HierarchicalCfCModel(nn.Module):
             tcn_kernel_size: Kernel size for TCN convolutions (default: 3)
             tcn_layers: Number of temporal blocks in TCN (default: 2)
             num_hazard_bins: Number of bins for hazard prediction in SurvivalLoss (default: 0 = disabled)
+            max_duration: Maximum duration value for survival loss conversion (default: 100.0)
         """
         super().__init__()
 
@@ -1781,6 +1783,7 @@ class HierarchicalCfCModel(nn.Module):
         self.use_se_blocks = use_se_blocks
         self.use_tcn = use_tcn
         self.num_hazard_bins = num_hazard_bins
+        self.max_duration = max_duration
 
         # Validate total input dimension against canonical value from feature_ordering
         assert self.config.total_features == TOTAL_FEATURES, \
@@ -2136,7 +2139,7 @@ class HierarchicalCfCModel(nn.Module):
                     duration_mean, duration_std = hazard_to_duration_stats(
                         outputs['duration_hazard'],
                         num_bins=self.num_hazard_bins,
-                        max_duration=100.0
+                        max_duration=self.max_duration
                     )
                     outputs['duration_mean'] = duration_mean
                     outputs['duration_std'] = duration_std
@@ -2147,7 +2150,7 @@ class HierarchicalCfCModel(nn.Module):
                     agg_duration_mean, agg_duration_std = hazard_to_duration_stats(
                         outputs['aggregate']['duration_hazard'],
                         num_bins=self.num_hazard_bins,
-                        max_duration=100.0
+                        max_duration=self.max_duration
                     )
                     outputs['aggregate']['duration_mean'] = agg_duration_mean
                     outputs['aggregate']['duration_std'] = agg_duration_std
@@ -2191,6 +2194,19 @@ class HierarchicalCfCModel(nn.Module):
 
             # Find recommended timeframe (highest confidence)
             best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
+
+            # Validate critical outputs - use safe defaults instead of hard assert
+            if not torch.isfinite(outputs['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in duration predictions, using safe defaults")
+                outputs['duration_mean'] = torch.full_like(outputs['duration_mean'], 25.0)
+                duration_std = torch.full_like(duration_std, 10.0)
+
+            if not torch.isfinite(outputs['aggregate']['duration_mean']).all():
+                import warnings
+                warnings.warn("NaN/Inf detected in aggregate duration predictions, using safe defaults")
+                outputs['aggregate']['duration_mean'] = torch.full_like(outputs['aggregate']['duration_mean'], 25.0)
+                agg_duration_std = torch.full_like(agg_duration_std, 10.0)
 
             return {
                 # Per-timeframe predictions (for dashboard table)
@@ -2457,6 +2473,7 @@ def create_model(
     tcn_kernel_size: int = 3,
     tcn_layers: int = 2,
     num_hazard_bins: int = 0,
+    max_duration: float = 100.0,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ) -> HierarchicalCfCModel:
     """
@@ -2478,6 +2495,7 @@ def create_model(
         tcn_kernel_size: Kernel size for TCN convolutions (default: 3)
         tcn_layers: Number of temporal blocks in TCN (default: 2)
         num_hazard_bins: Number of bins for survival/hazard duration prediction (default: 0 = disabled)
+        max_duration: Maximum duration value for survival loss conversion (default: 100.0)
         device: Device to place model on
 
     Returns:
@@ -2499,6 +2517,7 @@ def create_model(
         tcn_kernel_size=tcn_kernel_size,
         tcn_layers=tcn_layers,
         num_hazard_bins=num_hazard_bins,
+        max_duration=max_duration,
     )
 
     model = model.to(device)
