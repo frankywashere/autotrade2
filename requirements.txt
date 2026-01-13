@@ -12,6 +12,7 @@ InquirerPy
 
 # Market calendar
 pandas_market_calendars
+yfinance
 
 # Dashboard (optional)
 streamlit
