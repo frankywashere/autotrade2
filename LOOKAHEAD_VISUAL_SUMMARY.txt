@@ -1,0 +1,188 @@
+================================================================================
+PRECOMPUTED RESAMPLING LOOKAHEAD BUG - VISUAL SUMMARY
+================================================================================
+
+SCENARIO: Detecting channel at 14:30 on Jan 2, 2024
+--------------------------------------------------------------------------------
+
+Trading Day Timeline (5-min bars):
+═══════════════════════════════════════════════════════════════════════════════
+
+9:30      10:00     11:00     12:00     13:00     14:00  14:30  15:00     16:00
+├─────────┼─────────┼─────────┼─────────┼─────────┼──────┤──────┼─────────┤
+│◄─────────────── Historical Data (61 bars) ──────────────►│      FUTURE     │
+│                                                           │                 │
+└─────────────────────── 78 bars total ────────────────────────────────────────┘
+                                                            ▲
+                                                      We are here
+                                                      (bar 60, 14:30)
+
+
+COMPARISON: Direct Resample vs Precomputed Slice
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ METHOD 1: Direct Resample (CORRECT)                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  df_historical = df_5min.iloc[:61]  # Only 9:30 to 14:30                   │
+│  df_daily = resample_ohlc(df_historical, 'daily')                          │
+│                                                                             │
+│  Jan 2 Daily Bar:                                                           │
+│  ┌────────────────────────────────────────────┐                            │
+│  │ Timestamp:  2024-01-02 00:00:00            │                            │
+│  │ Open:       99.98  (first bar at 9:30)     │                            │
+│  │ High:      101.41  (max from 9:30-14:30)   │ ✓ NO LOOKAHEAD            │
+│  │ Low:        98.89  (min from 9:30-14:30)   │                            │
+│  │ Close:      99.55  (close at 14:30)        │                            │
+│  │ Volume:   371,981  (sum 9:30-14:30)        │                            │
+│  └────────────────────────────────────────────┘                            │
+│                                                                             │
+│  Data Used: ████████████████████░░░░░░  (61/78 bars = 78%)                 │
+│                                ▲                                            │
+│                           14:30 cutoff                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ METHOD 2: Precomputed Slice (LOOKAHEAD BUG)                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  df_daily_full = resample_ohlc(df_5min, 'daily')  # Full days precomputed  │
+│  end_timestamp = df_historical.index[-1]  # 14:30                          │
+│  idx = df_daily_full.index.searchsorted(end_timestamp, side='right')  # 1  │
+│  df_daily = df_daily_full.iloc[:idx]  # Includes full Jan 2 bar            │
+│                                                                             │
+│  Jan 2 Daily Bar:                                                           │
+│  ┌────────────────────────────────────────────┐                            │
+│  │ Timestamp:  2024-01-02 00:00:00            │                            │
+│  │ Open:       99.98  (first bar at 9:30)     │                            │
+│  │ High:      110.06  (max from 9:30-16:00)   │ ✗ INCLUDES FUTURE         │
+│  │ Low:        98.89  (min from 9:30-16:00)   │                            │
+│  │ Close:     109.90  (close at 16:00)        │                            │
+│  │ Volume:   469,248  (sum 9:30-16:00)        │                            │
+│  └────────────────────────────────────────────┘                            │
+│                                                                             │
+│  Data Used: ██████████████████████████████  (78/78 bars = 100%)            │
+│                                ▲                                            │
+│                           14:30 cutoff (ignored!)                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+DIFFERENCE (Precomputed - Correct):
+═══════════════════════════════════════════════════════════════════════════════
+
+Field      Historical    Precomputed    Difference       Impact
+─────────  ────────────  ─────────────  ─────────────  ────────────────────────
+Open          99.98         99.98           +0.00      Same (uses first)
+High         101.41        110.06          +8.65       ✗ LOOKAHEAD: +8.5%
+Low           98.89         98.89           +0.00      Same (morning = lowest)
+Close         99.55        109.90         +10.35       ✗ LOOKAHEAD: +10.4%
+Volume      371,981       469,248        +97,267       ✗ LOOKAHEAD: +26%
+
+
+FUTURE DATA INCLUDED IN PRECOMPUTED:
+═══════════════════════════════════════════════════════════════════════════════
+
+                         ╔════════════════════════════════╗
+                         ║   LOOKAHEAD: 17 BARS          ║
+                         ║   14:35 to 16:00              ║
+                         ║   (22% of trading day)         ║
+                         ╚════════════════════════════════╝
+                                        │
+9:30              14:30                 │                 16:00
+├─────────────────┤────────────────────┼──────────────────┤
+                  ▲                     │                  │
+             We are here          │                        │
+                              INCLUDES THIS FUTURE DATA ──┘
+
+
+SEARCHSORTED BEHAVIOR:
+═══════════════════════════════════════════════════════════════════════════════
+
+Daily bar index (pandas resamples to period START):
+
+  [0] 2024-01-02 00:00:00  ◄── Represents 9:30-16:00 on Jan 2
+  [1] 2024-01-03 00:00:00  ◄── Represents 9:30-16:00 on Jan 3
+  [2] 2024-01-04 00:00:00  ◄── Represents 9:30-16:00 on Jan 4
+
+Query: 2024-01-02 14:30:00
+
+searchsorted(..., side='right'):
+  - Find insertion point AFTER all elements ≤ query
+  - 00:00:00 < 14:30:00, so Jan 2 bar is ≤ query
+  - Returns: idx = 1 (position after Jan 2 bar)
+  - Slice [:1] includes: Jan 2 bar
+
+Problem:
+  ✗ Jan 2 bar (at index 0) contains data from 9:30 to 16:00
+  ✗ Query is 14:30, so we should only include 9:30 to 14:30
+  ✗ But precomputed bar has the FULL day (9:30 to 16:00)
+  ✗ This includes 17 bars of future data (14:35 to 16:00)
+
+
+IMPACT ON MODEL TRAINING:
+═══════════════════════════════════════════════════════════════════════════════
+
+Component              Impact
+─────────────────────  ──────────────────────────────────────────────────────
+Channel Detection      ✗ Daily high/low range is wider (includes afternoon)
+                       ✗ Channel std_dev is larger
+                       ✗ Channel bounds are different
+
+Break Detection        ✗ May see breaks that don't exist yet
+                       ✗ Break direction can be wrong
+                       ✗ Duration is incorrect
+
+Features               ✗ Daily OHLCV includes future data
+                       ✗ Volatility metrics contaminated
+                       ✗ Volume patterns include future trading
+
+Labels                 ✗ Break trigger TF uses future boundaries
+                       ✗ New channel direction sees future formation
+
+Model Performance      ✗ Training on impossible information
+                       ✗ Backtests are overly optimistic
+                       ✗ Production will underperform
+
+
+VERDICT:
+═══════════════════════════════════════════════════════════════════════════════
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                                                                           ║
+║  THIS IS A CONFIRMED LOOKAHEAD BUG                                        ║
+║  ─────────────────────────────────────                                    ║
+║                                                                           ║
+║  The precomputed slice includes 17 bars of future data (14:35-16:00)     ║
+║  that wouldn't be available at 14:30.                                     ║
+║                                                                           ║
+║  Evidence:                                                                ║
+║    • Close differs by 10.35 points (10.4%)                                ║
+║    • High differs by 8.65 points                                          ║
+║    • Volume differs by 97,267 shares (26%)                                ║
+║    • Affects channel detection, features, and labels                      ║
+║                                                                           ║
+║  This is NOT a "minor difference" - it's future data contamination.       ║
+║                                                                           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+
+ACTION REQUIRED:
+═══════════════════════════════════════════════════════════════════════════════
+
+Disable the precomputed optimization in v7/training/labels.py:209
+
+Option 1 (Safest - Recommended):
+  def _try_get_precomputed_slice(df, timeframe):
+      return None  # Always fall back to fresh resampling
+
+Option 2 (Complex):
+  - Detect partial bars
+  - Fall back to fresh resampling for partial periods
+  - Use precomputed only for complete periods
+
+Correctness > Speed. Training data quality is paramount.
+
+================================================================================

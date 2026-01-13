@@ -2320,6 +2320,95 @@ class HierarchicalCfCModel(nn.Module):
             'total': count_params(self)
         }
 
+    def get_ttt_parameters(self, subset: str = 'layernorm_only') -> List[nn.Parameter]:
+        """
+        Get parameters that should be updated during Test-Time Training (TTT).
+
+        TTT updates only a small subset of parameters (typically LayerNorms) to:
+        1. Limit the risk of catastrophic forgetting
+        2. Enable fast adaptation with minimal compute
+        3. Focus on normalization statistics which capture distribution info
+
+        Args:
+            subset: Which parameter subset to return:
+                - 'layernorm_only': All LayerNorm parameters in the model
+                - 'layernorm_and_attention': LayerNorm + attention output projection
+                - 'all_adaptable': All norms + projection layers
+
+        Returns:
+            List of nn.Parameter objects for TTT
+
+        Example:
+            >>> model = HierarchicalCfCModel()
+            >>> ttt_params = model.get_ttt_parameters('layernorm_only')
+            >>> ttt_optimizer = torch.optim.Adam(ttt_params, lr=1e-4)
+        """
+        params = []
+
+        if subset == 'layernorm_only':
+            # TF branch norms (11 branches × 2 norms each)
+            for branch in self.tf_branches:
+                params.extend(branch.input_norm.parameters())
+                params.extend(branch.output_norm.parameters())
+
+            # CrossTFAttention output_proj LayerNorm (index 1 in sequential)
+            # output_proj = nn.Sequential(Linear, LayerNorm, GELU, Dropout)
+            if hasattr(self.cross_tf_attention, 'output_proj'):
+                for i, module in enumerate(self.cross_tf_attention.output_proj):
+                    if isinstance(module, nn.LayerNorm):
+                        params.extend(module.parameters())
+
+            # context_proj LayerNorm (index 1 in sequential)
+            if hasattr(self, 'context_proj'):
+                for module in self.context_proj:
+                    if isinstance(module, nn.LayerNorm):
+                        params.extend(module.parameters())
+
+            # enriched_norm
+            if hasattr(self, 'enriched_norm'):
+                params.extend(self.enriched_norm.parameters())
+
+        elif subset == 'layernorm_and_attention':
+            # All LayerNorms first
+            params.extend(self.get_ttt_parameters('layernorm_only'))
+
+            # Add attention output projection (Linear layers)
+            if hasattr(self.cross_tf_attention, 'output_proj'):
+                for module in self.cross_tf_attention.output_proj:
+                    if isinstance(module, nn.Linear):
+                        params.extend(module.parameters())
+
+        elif subset == 'all_adaptable':
+            # All LayerNorms + attention
+            params.extend(self.get_ttt_parameters('layernorm_and_attention'))
+
+            # Add context_proj Linear
+            if hasattr(self, 'context_proj'):
+                for module in self.context_proj:
+                    if isinstance(module, nn.Linear):
+                        params.extend(module.parameters())
+
+        else:
+            raise ValueError(
+                f"Unknown TTT parameter subset: {subset}. "
+                f"Valid options: 'layernorm_only', 'layernorm_and_attention', 'all_adaptable'"
+            )
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_params = []
+        for p in params:
+            if id(p) not in seen:
+                seen.add(id(p))
+                unique_params.append(p)
+
+        return unique_params
+
+    def count_ttt_parameters(self, subset: str = 'layernorm_only') -> int:
+        """Count total parameters in a TTT subset."""
+        params = self.get_ttt_parameters(subset)
+        return sum(p.numel() for p in params)
+
 
 # =============================================================================
 # Loss Functions

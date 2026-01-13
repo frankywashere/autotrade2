@@ -270,6 +270,15 @@ class TrainingConfig:
     stage1_epochs: int = 5
     stage1_task: str = 'direction'  # 'direction' or 'duration'
 
+    # TTT (Test-Time Training) configuration
+    # TTT enables online adaptation during inference by updating LayerNorm parameters
+    # using self-supervised losses. Configuration stored here for checkpoint serialization.
+    ttt_enabled: bool = False
+    ttt_learning_rate: float = 1e-4
+    ttt_update_frequency: int = 12  # Update every N bars
+    ttt_loss_type: str = 'consistency'  # 'consistency', 'reconstruction', 'prediction_agreement'
+    ttt_parameter_subset: str = 'layernorm_only'  # 'layernorm_only', 'layernorm_and_attention', 'all_adaptable'
+
     # Checkpointing
     save_dir: Path = Path('./checkpoints')
     save_every_n_epochs: int = 5
@@ -1121,6 +1130,18 @@ class Trainer:
         # Calibration configuration
         if 'calibration_mode' not in model_kwargs:
             model_kwargs['calibration_mode'] = self.config.calibration_mode if hasattr(self.config, 'calibration_mode') else 'brier_per_tf'
+
+        # TTT (Test-Time Training) configuration
+        if 'ttt_enabled' not in model_kwargs:
+            model_kwargs['ttt_enabled'] = self.config.ttt_enabled if hasattr(self.config, 'ttt_enabled') else False
+        if 'ttt_learning_rate' not in model_kwargs:
+            model_kwargs['ttt_learning_rate'] = self.config.ttt_learning_rate if hasattr(self.config, 'ttt_learning_rate') else 1e-4
+        if 'ttt_update_frequency' not in model_kwargs:
+            model_kwargs['ttt_update_frequency'] = self.config.ttt_update_frequency if hasattr(self.config, 'ttt_update_frequency') else 12
+        if 'ttt_loss_type' not in model_kwargs:
+            model_kwargs['ttt_loss_type'] = self.config.ttt_loss_type if hasattr(self.config, 'ttt_loss_type') else 'consistency'
+        if 'ttt_parameter_subset' not in model_kwargs:
+            model_kwargs['ttt_parameter_subset'] = self.config.ttt_parameter_subset if hasattr(self.config, 'ttt_parameter_subset') else 'layernorm_only'
 
         # Create a copy of config with updated model_kwargs
         # We modify the dataclass directly since it will be serialized

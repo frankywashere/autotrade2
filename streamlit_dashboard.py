@@ -32,6 +32,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from v7.models import create_model
 from v7.models.hierarchical_cfc import HierarchicalCfCModel
 from v7.core.channel import detect_channel, Channel, Direction, detect_channels_multi_window, STANDARD_WINDOWS
+from v7.training.ttt import TTTConfig, TTTAdapter, TTTMode
 
 # Try to import end-to-end window model components
 try:
@@ -774,11 +775,13 @@ def make_predictions(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    model: torch.nn.Module
+    model: torch.nn.Module,
+    ttt_adapter: Optional[TTTAdapter] = None
 ) -> Optional[Dict]:
     """Make predictions using the model - returns per-TF predictions.
 
     Supports both HierarchicalCfCModel (single-window) and EndToEndWindowModel (multi-window).
+    When ttt_adapter is provided and active, uses TTT inference.
     """
     if model is None:
         return None
@@ -879,9 +882,16 @@ def make_predictions(
             feature_array = np.concatenate(feature_list)
             feature_tensor = torch.from_numpy(feature_array).float().unsqueeze(0)
 
-            # Run inference
-            with torch.no_grad():
+            # Run inference (with or without TTT)
+            if ttt_adapter is not None and ttt_adapter.config.mode != TTTMode.STATIC:
+                # TTT-enabled inference
+                raw_output, ttt_stats = ttt_adapter.step(feature_tensor)
+                # Get full predictions format
                 outputs = model.predict(feature_tensor)
+            else:
+                # Standard inference
+                with torch.no_grad():
+                    outputs = model.predict(feature_tensor)
 
         # Extract per-TF and aggregate predictions
         per_tf = outputs['per_tf']
@@ -955,6 +965,17 @@ def main():
         st.session_state.model = None
     if 'model_name' not in st.session_state:
         st.session_state.model_name = None
+    # TTT session state
+    if 'ttt_adapter' not in st.session_state:
+        st.session_state.ttt_adapter = None
+    if 'ttt_mode' not in st.session_state:
+        st.session_state.ttt_mode = 'static'
+    if 'ttt_lr' not in st.session_state:
+        st.session_state.ttt_lr = 1e-4
+    if 'ttt_update_freq' not in st.session_state:
+        st.session_state.ttt_update_freq = 12
+    if 'ttt_loss_type' not in st.session_state:
+        st.session_state.ttt_loss_type = 'consistency'
 
     # Sidebar - Model Selection
     with st.sidebar:
@@ -1064,6 +1085,114 @@ def main():
             st.success(f"✓ Active: {st.session_state.model_name}")
         else:
             st.warning("No model loaded")
+
+        st.divider()
+
+        # TTT Controls section
+        st.subheader("🔄 Test-Time Training (TTT)")
+
+        if st.session_state.model is not None:
+            # TTT mode selector
+            ttt_mode_options = ['static', 'adaptive', 'mixed']
+            ttt_mode_idx = ttt_mode_options.index(st.session_state.ttt_mode)
+            new_ttt_mode = st.selectbox(
+                "TTT Mode",
+                ttt_mode_options,
+                index=ttt_mode_idx,
+                format_func=lambda x: {
+                    'static': '⏸️ Static (disabled)',
+                    'adaptive': '🔄 Adaptive (always adapt)',
+                    'mixed': '⚖️ Mixed (adapt when uncertain)'
+                }.get(x, x),
+                help="Static: No adaptation. Adaptive: Full TTT. Mixed: Adapt only when confidence is low."
+            )
+
+            # Update mode if changed
+            if new_ttt_mode != st.session_state.ttt_mode:
+                st.session_state.ttt_mode = new_ttt_mode
+                # Reset TTT adapter when mode changes
+                if st.session_state.ttt_adapter is not None:
+                    if new_ttt_mode == 'static':
+                        st.session_state.ttt_adapter = None
+                    else:
+                        st.session_state.ttt_adapter.switch_mode(TTTMode[new_ttt_mode.upper()])
+
+            # Show advanced TTT settings in expander
+            if new_ttt_mode != 'static':
+                with st.expander("TTT Settings", expanded=False):
+                    # Learning rate
+                    ttt_lr = st.number_input(
+                        "Learning Rate",
+                        min_value=1e-6,
+                        max_value=1e-2,
+                        value=st.session_state.ttt_lr,
+                        format="%.1e",
+                        help="Learning rate for TTT parameter updates"
+                    )
+                    if ttt_lr != st.session_state.ttt_lr:
+                        st.session_state.ttt_lr = ttt_lr
+
+                    # Update frequency
+                    ttt_freq = st.selectbox(
+                        "Update Frequency",
+                        [6, 12, 24, 48],
+                        index=[6, 12, 24, 48].index(st.session_state.ttt_update_freq),
+                        format_func=lambda x: f"Every {x} bars",
+                        help="How often to update TTT parameters"
+                    )
+                    if ttt_freq != st.session_state.ttt_update_freq:
+                        st.session_state.ttt_update_freq = ttt_freq
+
+                    # Loss type
+                    ttt_loss = st.selectbox(
+                        "Loss Type",
+                        ['consistency', 'reconstruction', 'prediction_agreement'],
+                        index=['consistency', 'reconstruction', 'prediction_agreement'].index(st.session_state.ttt_loss_type),
+                        format_func=lambda x: {
+                            'consistency': 'Consistency (temporal smoothness)',
+                            'reconstruction': 'Reconstruction (feature recovery)',
+                            'prediction_agreement': 'Agreement (ensemble)'
+                        }.get(x, x),
+                        help="Self-supervised loss for TTT adaptation"
+                    )
+                    if ttt_loss != st.session_state.ttt_loss_type:
+                        st.session_state.ttt_loss_type = ttt_loss
+
+                    # Reset button
+                    if st.button("Reset TTT State", help="Restore base weights and reset TTT state"):
+                        if st.session_state.ttt_adapter is not None:
+                            st.session_state.ttt_adapter.reset()
+                            st.success("TTT state reset!")
+
+                # Initialize or update TTT adapter
+                if st.session_state.ttt_adapter is None and new_ttt_mode != 'static':
+                    ttt_config = TTTConfig(
+                        enabled=True,
+                        mode=TTTMode[new_ttt_mode.upper()],
+                        learning_rate=st.session_state.ttt_lr,
+                        update_frequency=st.session_state.ttt_update_freq,
+                        loss_type=st.session_state.ttt_loss_type,
+                        parameter_subset='layernorm_only'
+                    )
+                    st.session_state.ttt_adapter = TTTAdapter(st.session_state.model, ttt_config)
+                    st.session_state.ttt_adapter.initialize()
+                    st.session_state.ttt_adapter.prepare_for_inference()
+
+                # Show TTT status
+                if st.session_state.ttt_adapter is not None:
+                    status = st.session_state.ttt_adapter.get_status()
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("TTT Updates", status['update_count'])
+                    with col2:
+                        st.metric("Steps", status['step_count'])
+                    if status['avg_loss'] > 0:
+                        st.caption(f"Avg Loss: {status['avg_loss']:.4f}")
+                    if status['max_drift'] > 0:
+                        drift_pct = status['max_drift'] * 100
+                        st.caption(f"Max Drift: {drift_pct:.1f}%")
+        else:
+            st.caption("Load a model to enable TTT")
 
         st.divider()
 
@@ -1215,12 +1344,13 @@ def main():
         elif st.session_state.model is None:
             st.warning("⚠️ No model loaded. Select a model from the sidebar and click 'Load Model'.")
         else:
-            # Make predictions
+            # Make predictions (with optional TTT adapter)
             predictions = make_predictions(
                 data["tsla_df"],
                 data["spy_df"],
                 data["vix_df"],
-                st.session_state.model
+                st.session_state.model,
+                st.session_state.ttt_adapter
             )
 
             if predictions is None:

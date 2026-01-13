@@ -49,6 +49,7 @@ from v7.features.events import EventsHandler, extract_event_features
 from v7.features.feature_ordering import FEATURE_ORDER
 from v7.models.hierarchical_cfc import HierarchicalCfCModel, FeatureConfig
 from v7.models import create_model
+from v7.training.ttt import TTTConfig, TTTAdapter, TTTMode
 
 
 # Constants
@@ -241,6 +242,9 @@ class DashboardData:
         self.price_tsla: float = 0.0
         self.price_spy: float = 0.0
         self.vix: float = 0.0
+        # TTT state
+        self.ttt_status: Optional[Dict] = None
+        self.ttt_stats: Optional[Dict] = None
 
 
 def load_data(lookback_days: int = 500) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -380,19 +384,21 @@ def make_predictions(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    model: Optional[HierarchicalCfCModel] = None
-) -> Tuple[Dict, Dict]:
+    model: Optional[HierarchicalCfCModel] = None,
+    ttt_adapter: Optional[TTTAdapter] = None
+) -> Tuple[Dict, Dict, Optional[Dict]]:
     """
-    Extract features and make predictions.
+    Extract features and make predictions, optionally with TTT adaptation.
 
     Args:
         tsla_df: TSLA 5min OHLCV
         spy_df: SPY 5min OHLCV
         vix_df: VIX daily
         model: Trained model (if None, return features only)
+        ttt_adapter: Optional TTT adapter for test-time training
 
     Returns:
-        (predictions, features) dicts
+        (predictions, features, ttt_stats) dicts
     """
     console.print("\n[cyan]Extracting features...[/cyan]")
 
@@ -407,10 +413,9 @@ def make_predictions(
     feature_arrays = features_to_tensor_dict(full_features)
 
     predictions = {}
+    ttt_stats = None
 
     if model is not None:
-        console.print("[cyan]Running model inference...[/cyan]")
-
         # Concatenate all features using CANONICAL ordering from FEATURE_ORDER
         # CRITICAL: Must use FEATURE_ORDER for correct model input!
         feature_list = []
@@ -421,9 +426,24 @@ def make_predictions(
         # Combine into single tensor
         x = torch.from_numpy(np.concatenate(feature_list)).float().unsqueeze(0)
 
-        # Predict
-        with torch.no_grad():
+        # Run inference with or without TTT
+        if ttt_adapter is not None and ttt_adapter.config.mode != TTTMode.STATIC:
+            # TTT-enabled inference
+            console.print(f"[magenta]Running TTT inference (mode={ttt_adapter.config.mode.name})...[/magenta]")
+            raw_output, ttt_stats = ttt_adapter.step(x)
+
+            # Convert to predictions format
             predictions = model.predict(x)
+
+            if ttt_stats.get('updated', False):
+                loss_info = ttt_stats.get('loss', {})
+                console.print(f"[magenta]  TTT update #{ttt_stats.get('step', 0)}: "
+                            f"loss={loss_info.get('total', 0):.4f}[/magenta]")
+        else:
+            # Standard inference (no TTT or STATIC mode)
+            console.print("[cyan]Running model inference...[/cyan]")
+            with torch.no_grad():
+                predictions = model.predict(x)
 
         # Convert to dict of scalars
         predictions = {
@@ -437,7 +457,7 @@ def make_predictions(
             'attention_weights': predictions['attention_weights'][0].numpy()
         }
 
-    return predictions, full_features
+    return predictions, full_features, ttt_stats
 
 
 def get_upcoming_events(events_handler: EventsHandler, current_time: pd.Timestamp, n: int = 3) -> List[Dict]:
@@ -698,6 +718,57 @@ def create_events_panel(data: DashboardData) -> Panel:
     return Panel(content, title="Upcoming Events", border_style="cyan")
 
 
+def create_ttt_status_panel(data: DashboardData) -> Panel:
+    """Create TTT status panel showing adaptation state."""
+    if data.ttt_status is None:
+        content = "[dim]TTT: Not enabled[/dim]"
+        return Panel(content, title="TTT Status", border_style="dim")
+
+    status = data.ttt_status
+    mode = status.get('mode', 'STATIC')
+
+    # Mode with color coding
+    if mode == 'STATIC':
+        mode_str = "[dim]STATIC (disabled)[/dim]"
+        border_style = "dim"
+    elif mode == 'ADAPTIVE':
+        mode_str = "[magenta bold]ADAPTIVE[/magenta bold]"
+        border_style = "magenta"
+    elif mode == 'MIXED':
+        mode_str = "[yellow]MIXED[/yellow]"
+        border_style = "yellow"
+    else:
+        mode_str = mode
+        border_style = "white"
+
+    lines = [
+        f"Mode: {mode_str}",
+        f"Updates: {status.get('update_count', 0)}",
+        f"Steps: {status.get('step_count', 0)}",
+    ]
+
+    # Loss info
+    avg_loss = status.get('avg_loss', 0)
+    recent_loss = status.get('recent_loss', 0)
+    if avg_loss > 0 or recent_loss > 0:
+        lines.append(f"Avg Loss: {avg_loss:.4f}")
+        lines.append(f"Recent: {recent_loss:.4f}")
+
+    # Drift info
+    max_drift = status.get('max_drift', 0)
+    if max_drift > 0:
+        drift_color = "red" if max_drift > 0.10 else ("yellow" if max_drift > 0.05 else "green")
+        lines.append(f"Max Drift: [{drift_color}]{max_drift:.1%}[/{drift_color}]")
+
+    # Params info
+    num_params = status.get('total_adaptable_params', 0)
+    if num_params > 0:
+        lines.append(f"Params: {num_params:,}")
+
+    content = "\n".join(lines)
+    return Panel(content, title="TTT Status", border_style=border_style)
+
+
 def create_header(data: DashboardData) -> Panel:
     """Create header panel."""
     if data.timestamp:
@@ -741,11 +812,19 @@ def create_dashboard(data: DashboardData) -> Layout:
         Layout(name="channels")
     )
 
-    # Right column
-    layout["right"].split_column(
-        Layout(name="predictions"),
-        Layout(name="events", size=8)
-    )
+    # Right column - include TTT status if enabled
+    if data.ttt_status is not None and data.ttt_status.get('mode') != 'STATIC':
+        layout["right"].split_column(
+            Layout(name="predictions"),
+            Layout(name="ttt_status", size=10),
+            Layout(name="events", size=8)
+        )
+        layout["ttt_status"].update(create_ttt_status_panel(data))
+    else:
+        layout["right"].split_column(
+            Layout(name="predictions"),
+            Layout(name="events", size=8)
+        )
 
     # Populate
     layout["header"].update(create_header(data))
@@ -754,8 +833,12 @@ def create_dashboard(data: DashboardData) -> Layout:
     layout["predictions"].update(create_prediction_table(data))
     layout["events"].update(create_events_panel(data))
 
-    # Footer
-    footer_text = "[dim]Press Ctrl+C to exit | Model: v7 Hierarchical CfC | Data: Live CSV[/dim]"
+    # Footer - show TTT mode in footer
+    ttt_mode = data.ttt_status.get('mode', 'STATIC') if data.ttt_status else 'STATIC'
+    if ttt_mode != 'STATIC':
+        footer_text = f"[dim]Press Ctrl+C to exit | Model: v7 Hierarchical CfC | TTT: [magenta]{ttt_mode}[/magenta] | Data: Live CSV[/dim]"
+    else:
+        footer_text = "[dim]Press Ctrl+C to exit | Model: v7 Hierarchical CfC | Data: Live CSV[/dim]"
     layout["footer"].update(Panel(footer_text, box=box.SIMPLE))
 
     return layout
@@ -825,6 +908,12 @@ def main():
     parser.add_argument('--refresh', type=int, default=0, help='Auto-refresh interval in seconds (0=no refresh)')
     parser.add_argument('--export', type=str, help='Directory to export predictions')
     parser.add_argument('--lookback', type=int, default=500, help='Days of data to load (420-day minimum recommended)')
+    parser.add_argument('--ttt-mode', type=str, choices=['static', 'adaptive', 'mixed'], default='static',
+                        help='TTT mode: static (no adaptation), adaptive (full TTT), mixed (adapt when low confidence)')
+    parser.add_argument('--ttt-lr', type=float, default=1e-4, help='TTT learning rate')
+    parser.add_argument('--ttt-update-freq', type=int, default=12, help='TTT update frequency (every N bars)')
+    parser.add_argument('--ttt-loss-type', type=str, choices=['consistency', 'reconstruction', 'prediction_agreement'],
+                        default='consistency', help='TTT self-supervised loss type')
     args = parser.parse_args()
 
     if args.lookback < 420:
@@ -869,6 +958,28 @@ def main():
     else:
         console.print("[yellow]No model loaded - showing features only[/yellow]")
 
+    # Initialize TTT adapter if requested
+    ttt_adapter = None
+    if model is not None and args.ttt_mode != 'static':
+        ttt_mode = TTTMode[args.ttt_mode.upper()]
+        ttt_config = TTTConfig(
+            enabled=True,
+            mode=ttt_mode,
+            learning_rate=args.ttt_lr,
+            update_frequency=args.ttt_update_freq,
+            loss_type=args.ttt_loss_type,
+            parameter_subset='layernorm_only'
+        )
+        ttt_adapter = TTTAdapter(model, ttt_config)
+        ttt_adapter.initialize()
+        ttt_adapter.prepare_for_inference()
+
+        # Report TTT config
+        num_params = sum(p.numel() for p in ttt_adapter.adaptable_params)
+        console.print(f"[magenta]TTT initialized[/magenta]")
+        console.print(f"[dim]  mode={ttt_mode.name}, lr={args.ttt_lr}, update_freq={args.ttt_update_freq}[/dim]")
+        console.print(f"[dim]  loss={args.ttt_loss_type}, adaptable_params={num_params:,}[/dim]")
+
     # Initialize data container
     data = DashboardData()
 
@@ -897,8 +1008,14 @@ def main():
                         console.print(f"[yellow]Warning: Could not load events: {e}[/yellow]")
                         data.upcoming_events = []
 
-                # Make predictions
-                data.predictions, data.features = make_predictions(tsla_df, spy_df, vix_df, model)
+                # Make predictions (with optional TTT)
+                data.predictions, data.features, data.ttt_stats = make_predictions(
+                    tsla_df, spy_df, vix_df, model, ttt_adapter
+                )
+
+                # Update TTT status for display
+                if ttt_adapter is not None:
+                    data.ttt_status = ttt_adapter.get_status()
 
                 # Export if requested
                 if args.export:

@@ -391,6 +391,67 @@ Examples:
     )
 
     # =========================================================================
+    # TTT (Test-Time Training) Group
+    # =========================================================================
+    ttt_group = parser.add_argument_group(
+        'Test-Time Training (TTT)',
+        'Configuration for test-time adaptation during inference. '
+        'TTT enables the model to adapt LayerNorm parameters online using self-supervised losses.'
+    )
+
+    ttt_group.add_argument(
+        '--ttt-enabled',
+        action='store_true',
+        dest='ttt_enabled',
+        default=False,
+        help='Enable Test-Time Training for inference adaptation'
+    )
+
+    ttt_group.add_argument(
+        '--no-ttt',
+        action='store_false',
+        dest='ttt_enabled',
+        help='Disable Test-Time Training (default)'
+    )
+
+    ttt_group.add_argument(
+        '--ttt-learning-rate',
+        type=float,
+        default=1e-4,
+        metavar='LR',
+        help='Learning rate for TTT updates (default: 1e-4)'
+    )
+
+    ttt_group.add_argument(
+        '--ttt-update-frequency',
+        type=int,
+        default=12,
+        metavar='N',
+        help='Update TTT parameters every N bars (default: 12)'
+    )
+
+    ttt_group.add_argument(
+        '--ttt-loss-type',
+        type=str,
+        choices=['consistency', 'reconstruction', 'prediction_agreement'],
+        default='consistency',
+        help='Loss type for TTT updates (default: consistency). '
+             'consistency=temporal smoothness, reconstruction=feature recovery, '
+             'prediction_agreement=per-TF should agree with aggregate'
+    )
+
+    ttt_group.add_argument(
+        '--ttt-parameter-subset',
+        type=str,
+        choices=['layernorm_only', 'layernorm_and_attention', 'all_adaptable'],
+        default='layernorm_only',
+        help='Which parameters to adapt during TTT (default: layernorm_only). '
+             'layernorm_only=safest (~6.6K params), '
+             'layernorm_and_attention=more flexible, '
+             'all_adaptable=maximum adaptation'
+    )
+
+    # =========================================================================
     # Training Group
     # =========================================================================
     training_group = parser.add_argument_group(
@@ -874,6 +935,12 @@ def args_to_config(args: argparse.Namespace) -> dict:
             # Multi-resolution heads settings
             'use_multi_resolution': args.use_multi_resolution,
             'resolution_levels': args.resolution_levels,
+            # TTT (Test-Time Training) settings
+            'ttt_enabled': args.ttt_enabled,
+            'ttt_learning_rate': args.ttt_learning_rate,
+            'ttt_update_frequency': args.ttt_update_frequency,
+            'ttt_loss_type': args.ttt_loss_type,
+            'ttt_parameter_subset': args.ttt_parameter_subset,
         },
         'training': {
             'num_epochs': num_epochs,

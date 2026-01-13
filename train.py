@@ -1035,6 +1035,59 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
         ).execute()
         console.print(f"[green]✓ Multi-resolution heads enabled: {resolution_levels} levels[/green]")
 
+    # Test-Time Training (TTT)
+    console.print("\n[dim]TTT enables model adaptation during inference for regime changes[/dim]")
+    use_ttt = inquirer.confirm(
+        message="Enable Test-Time Training (TTT)?",
+        default=False,
+    ).execute()
+
+    ttt_learning_rate = 1e-4
+    ttt_update_frequency = 12
+    ttt_loss_type = 'consistency'
+    ttt_parameter_subset = 'layernorm_only'
+
+    if use_ttt:
+        ttt_learning_rate = float(inquirer.number(
+            message="TTT learning rate:",
+            default=0.0001,
+            float_allowed=True,
+        ).execute())
+
+        ttt_update_frequency = inquirer.select(
+            message="TTT update frequency (every N bars):",
+            choices=[
+                {"name": "6 bars (frequent adaptation)", "value": 6},
+                {"name": "12 bars (balanced, default)", "value": 12},
+                {"name": "24 bars (conservative)", "value": 24},
+                {"name": "48 bars (minimal adaptation)", "value": 48},
+            ],
+            default=12,
+        ).execute()
+
+        ttt_loss_type = inquirer.select(
+            message="TTT loss type:",
+            choices=[
+                {"name": "Consistency (temporal smoothness)", "value": "consistency"},
+                {"name": "Reconstruction (feature recovery)", "value": "reconstruction"},
+                {"name": "Prediction Agreement (ensemble)", "value": "prediction_agreement"},
+            ],
+            default="consistency",
+        ).execute()
+
+        ttt_parameter_subset = inquirer.select(
+            message="TTT parameter subset:",
+            choices=[
+                {"name": "LayerNorm only (~6.6K params, safest)", "value": "layernorm_only"},
+                {"name": "LayerNorm + Attention output (~20K params)", "value": "layernorm_and_attention"},
+                {"name": "All adaptable params (~50K params)", "value": "all_adaptable"},
+            ],
+            default="layernorm_only",
+        ).execute()
+
+        console.print(f"[green]✓ TTT enabled: lr={ttt_learning_rate}, every {ttt_update_frequency} bars, "
+                      f"{ttt_loss_type} loss, {ttt_parameter_subset}[/green]")
+
     return {
         "hidden_dim": hidden_dim,
         "cfc_units": cfc_units,
@@ -1049,6 +1102,12 @@ def configure_model(preset: Optional[Dict] = None) -> Dict:
         "tcn_layers": tcn_layers,
         "use_multi_resolution": use_multi_resolution,
         "resolution_levels": resolution_levels,
+        # TTT settings
+        "ttt_enabled": use_ttt,
+        "ttt_learning_rate": ttt_learning_rate,
+        "ttt_update_frequency": ttt_update_frequency,
+        "ttt_loss_type": ttt_loss_type,
+        "ttt_parameter_subset": ttt_parameter_subset,
     }
 
 

@@ -53,6 +53,7 @@ from v7.features.full_features import extract_full_features, features_to_tensor_
 from v7.features.events import EventsHandler, extract_event_features
 from v7.features.feature_ordering import FEATURE_ORDER
 from v7.models.hierarchical_cfc import HierarchicalCfCModel, FeatureConfig
+from v7.training.ttt import TTTConfig, TTTAdapter, TTTMode
 
 # Live data
 try:
@@ -447,11 +448,16 @@ def make_predictions(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    model: Optional[HierarchicalCfCModel]
-) -> Optional[Dict]:
-    """Make predictions using the model."""
+    model: Optional[HierarchicalCfCModel],
+    ttt_adapter: Optional[TTTAdapter] = None
+) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Make predictions using the model, optionally with TTT.
+
+    Returns:
+        (predictions, ttt_stats) tuple
+    """
     if model is None:
-        return None
+        return None, None
 
     try:
         features = extract_full_features(
@@ -471,22 +477,34 @@ def make_predictions(
                     feature_list.append(arr.flatten())
 
         if len(feature_list) == 0:
-            return None
+            return None, None
 
         x = torch.from_numpy(np.concatenate(feature_list)).float().unsqueeze(0)
 
-        with torch.no_grad():
-            outputs = model.predict(x)
+        ttt_stats = None
 
-        return {
+        # Run inference with or without TTT
+        if ttt_adapter is not None and ttt_adapter.config.mode != TTTMode.STATIC:
+            # TTT-enabled inference
+            raw_output, ttt_stats = ttt_adapter.step(x)
+            # Get full predictions
+            outputs = model.predict(x)
+        else:
+            # Standard inference
+            with torch.no_grad():
+                outputs = model.predict(x)
+
+        predictions = {
             'duration_mean': outputs['duration_mean'].numpy()[0],
             'duration_std': outputs['duration_std'].numpy()[0],
             'direction_probs': torch.sigmoid(outputs['direction_logits']).numpy()[0],
             'next_direction_probs': torch.softmax(outputs['next_channel_logits'], dim=-1).numpy()[0],
             'confidence': outputs['confidence'].numpy()[0] if 'confidence' in outputs else 0.5
         }
+
+        return predictions, ttt_stats
     except Exception as e:
-        return None
+        return None, None
 
 
 # =============================================================================
@@ -633,14 +651,23 @@ class PredictionsScreen(Screen):
             loading.update("[red]No data available. Check data sources.[/]")
             return
 
-        # Make predictions
+        # Make predictions (with optional TTT)
         predictions = None
+        ttt_stats = None
         if app.current_model is not None:
-            predictions = make_predictions(
-                app.tsla_df, app.spy_df, app.vix_df, app.current_model
+            predictions, ttt_stats = make_predictions(
+                app.tsla_df, app.spy_df, app.vix_df,
+                app.current_model, app.ttt_adapter
             )
 
         loading.update("")
+
+        # Show TTT status if active
+        if ttt_stats is not None and app.ttt_adapter is not None:
+            status = app.ttt_adapter.get_status()
+            if status['mode'] != 'STATIC':
+                ttt_info = f"TTT: {status['mode']} | Updates: {status['update_count']} | Loss: {status['avg_loss']:.4f}"
+                loading.update(f"[magenta]{ttt_info}[/]")
 
         # Update signal panel
         self.update_signal_panel(predictions)
@@ -1028,6 +1055,43 @@ class SettingsScreen(Screen):
                     ),
                     id="setting-refresh"
                 ),
+                Static("[bold]Test-Time Training (TTT)[/]", id="ttt-header"),
+                Horizontal(
+                    Label("TTT Mode:"),
+                    Select(
+                        [("Static (disabled)", "static"), ("Adaptive", "adaptive"), ("Mixed", "mixed")],
+                        value="static",
+                        id="ttt-mode-select"
+                    ),
+                    id="setting-ttt-mode"
+                ),
+                Horizontal(
+                    Label("TTT Learning Rate:"),
+                    Select(
+                        [("1e-5", 1e-5), ("1e-4", 1e-4), ("1e-3", 1e-3)],
+                        value=1e-4,
+                        id="ttt-lr-select"
+                    ),
+                    id="setting-ttt-lr"
+                ),
+                Horizontal(
+                    Label("Update Frequency:"),
+                    Select(
+                        [("6 bars", 6), ("12 bars", 12), ("24 bars", 24)],
+                        value=12,
+                        id="ttt-freq-select"
+                    ),
+                    id="setting-ttt-freq"
+                ),
+                Horizontal(
+                    Label("Loss Type:"),
+                    Select(
+                        [("Consistency", "consistency"), ("Reconstruction", "reconstruction"), ("Agreement", "prediction_agreement")],
+                        value="consistency",
+                        id="ttt-loss-select"
+                    ),
+                    id="setting-ttt-loss"
+                ),
                 id="settings-form"
             ),
             Static(id="settings-info"),
@@ -1058,6 +1122,39 @@ class SettingsScreen(Screen):
         self.app.use_live_data = self.query_one("#live-data-switch", Switch).value
         self.app.lookback_days = self.query_one("#lookback-select", Select).value
         self.app.refresh_interval = self.query_one("#refresh-select", Select).value
+
+        # TTT settings
+        new_ttt_mode = self.query_one("#ttt-mode-select", Select).value
+        self.app.ttt_lr = self.query_one("#ttt-lr-select", Select).value
+        self.app.ttt_update_freq = self.query_one("#ttt-freq-select", Select).value
+        self.app.ttt_loss_type = self.query_one("#ttt-loss-select", Select).value
+
+        # Handle TTT mode change
+        if new_ttt_mode != self.app.ttt_mode:
+            self.app.ttt_mode = new_ttt_mode
+
+            if new_ttt_mode == "static":
+                # Disable TTT
+                self.app.ttt_adapter = None
+                self.app.notify("TTT disabled")
+            elif self.app.current_model is not None:
+                # Initialize or update TTT adapter
+                ttt_config = TTTConfig(
+                    enabled=True,
+                    mode=TTTMode[new_ttt_mode.upper()],
+                    learning_rate=self.app.ttt_lr,
+                    update_frequency=self.app.ttt_update_freq,
+                    loss_type=self.app.ttt_loss_type,
+                    parameter_subset='layernorm_only'
+                )
+                self.app.ttt_adapter = TTTAdapter(self.app.current_model, ttt_config)
+                self.app.ttt_adapter.initialize()
+                self.app.ttt_adapter.prepare_for_inference()
+                self.app.notify(f"TTT enabled: {new_ttt_mode} mode")
+            else:
+                self.app.notify("Load a model first to enable TTT", severity="warning")
+                self.app.ttt_mode = "static"
+
         self.app.notify("Settings applied")
 
     def action_go_back(self) -> None:
@@ -1159,6 +1256,13 @@ class DashboardApp(App):
         self.use_live_data: bool = True
         self.lookback_days: int = 500  # 420-day minimum required for proper channel detection
         self.refresh_interval: int = 0
+
+        # TTT state
+        self.ttt_adapter: Optional[TTTAdapter] = None
+        self.ttt_mode: str = "static"
+        self.ttt_lr: float = 1e-4
+        self.ttt_update_freq: int = 12
+        self.ttt_loss_type: str = "consistency"
 
     def on_mount(self) -> None:
         # Try to auto-load best model

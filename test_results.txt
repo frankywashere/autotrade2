@@ -1,0 +1,39 @@
+Test Results - Sun Jan 11 12:32:41 CST 2026
+========================================
+
+✓ PASSED: Loss: Gaussian NLL (default)
+
+✓ PASSED: Loss: Huber
+
+✓ PASSED: Loss: Survival
+
+✓ PASSED: Mode: Standard (single split)
+
+✓ PASSED: Mode: Quick
+
+✓ PASSED: Mode: Walk-Forward (2 windows)
+
+✓ PASSED: Weight Mode: Fixed (balanced)
+
+✓ PASSED: Weight Mode: Fixed (duration focus)
+
+✓ PASSED: Weight Mode: Learnable
+
+✓ PASSED: Weight Mode: Fixed Custom
+
+✓ PASSED: Gradient Balancing: None
+
+✓ PASSED: Gradient Balancing: GradNorm
+
+✓ PASSED: Gradient Balancing: PCGrad
+
+✓ PASSED: Two-Stage: Direction first
+
+✓ PASSED: Two-Stage: Duration first
+
+✓ PASSED: Combo: Huber + Learnable Weights + GradNorm
+
+✓ PASSED: Combo: Survival + PCGrad + Two-Stage
+
+✓ PASSED: Combo: Walk-Forward + Learnable + GradNorm
+
