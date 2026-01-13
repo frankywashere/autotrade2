@@ -114,7 +114,29 @@ def fetch_live_data(
 
     if not force_historical:
         if csvs_available:
-            # CSV mode: merge with 7-day live data for freshness
+            # CSV mode: check if we need to fill a gap with native intervals
+            csv_end_date = tsla_hist.index[-1]
+            days_since_csv_end = (datetime.now() - csv_end_date).days
+
+            if days_since_csv_end > 7:
+                # Gap is larger than 7-day 1m limit - use native intervals to fill
+                print(f"CSV data ends {days_since_csv_end} days ago, fetching native intervals to fill gap...")
+                try:
+                    # Fetch native interval data to fill the gap
+                    tsla_native, spy_native, vix_native = _fetch_native_interval_data(days_since_csv_end + 7)
+
+                    if len(tsla_native) > 0 and len(spy_native) > 0:
+                        # Merge native data with CSV data
+                        tsla_hist = _merge_historical_live(tsla_hist, tsla_native)
+                        spy_hist = _merge_historical_live(spy_hist, spy_native)
+                        # Update VIX if we got newer data
+                        if len(vix_native) > 0 and (len(vix_hist) == 0 or vix_native.index[-1] > vix_hist.index[-1]):
+                            vix_hist = _merge_historical_live(vix_hist, vix_native) if len(vix_hist) > 0 else vix_native
+                        print(f"  Merged native interval data with CSVs")
+                except Exception as e:
+                    print(f"Warning: Could not fetch native interval data: {e}")
+
+            # Now fetch 7-day 1-minute data for maximum freshness
             try:
                 tsla_live, spy_live = _fetch_yfinance_data()
 
