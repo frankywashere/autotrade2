@@ -17,6 +17,9 @@ pandas_market_calendars
 streamlit
 plotly
 
+# Scientific computing
+scipy
+
 # Utilities
 python-dateutil
 tqdm
