@@ -4,10 +4,14 @@ Live Data Module for v7 Dashboard Integration
 Provides fetch_live_data() function to replace load_data() in dashboard.py.
 Integrates yfinance live data with historical CSV files.
 
-Supports two modes:
-1. CSV + yfinance: Full historical data from CSVs merged with recent live data
-2. yfinance-only: Fetches data using native intervals when CSVs are unavailable
-   (e.g., on Streamlit Cloud)
+Unified behavior (both local and Streamlit deployments):
+1. ALWAYS calls _fetch_all_native_timeframes() to get per-TF data
+2. Uses the 5min native data as the base tsla_df/spy_df (backward compatible)
+3. If CSVs exist and are fresh (<= 7 days old), merges 1-min CSV data for finer resolution
+4. Stores all native TF data in result.native_tfs for direct access
+
+The only difference between local and Streamlit is that local deployments
+can merge fresher 1-minute CSV data when available.
 """
 
 import pandas as pd
@@ -35,12 +39,13 @@ NATIVE_INTERVALS = {
 @dataclass
 class LiveDataResult:
     """Container for live data fetch results."""
-    tsla_df: pd.DataFrame
+    tsla_df: pd.DataFrame  # Base 5min DataFrame (backward compatible)
     spy_df: pd.DataFrame
     vix_df: pd.DataFrame
-    status: str  # 'LIVE', 'RECENT', 'STALE', 'HISTORICAL', 'YFINANCE_ONLY'
+    status: str  # 'LIVE', 'RECENT', 'STALE', 'NATIVE_ONLY'
     timestamp: pd.Timestamp
     data_age_minutes: float
+    native_tfs: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None  # Per-TF data from _fetch_all_native_timeframes()
 
 
 def fetch_live_data(
@@ -49,45 +54,38 @@ def fetch_live_data(
     force_historical: bool = False
 ) -> LiveDataResult:
     """
-    Fetch live market data, merging yfinance with historical CSV files.
+    Fetch live market data using native yfinance intervals for all timeframes.
 
     This is a drop-in replacement for dashboard.py's load_data() function.
 
-    Supports two modes:
-    1. CSV mode: If CSV files exist, loads historical data and merges with
-       7-day live data from yfinance for freshness.
-    2. yfinance-only mode: If CSVs are missing (e.g., Streamlit Cloud),
-       fetches data using native yfinance intervals:
-       - 5m interval: 60 days (for 5min through 4h timeframes via resampling)
-       - 1h interval: 730 days (for hourly data with more history)
-       - 1d interval: unlimited (for daily/weekly/monthly)
+    Unified behavior (both local and Streamlit):
+    1. ALWAYS call _fetch_all_native_timeframes() to get per-TF data
+    2. Use the 5min native data as the base tsla_df/spy_df (backward compatible)
+    3. If CSVs exist and are fresh, merge 1-min CSV data for finer resolution
+    4. Store all native TF data in result.native_tfs
 
     Note:
         The default lookback of 500 days ensures training compatibility.
         A minimum of 420 days is required for proper model training
         (365 days for training window + 55 days for walk-forward validation).
-        When running in yfinance-only mode, only ~60 days of intraday data
-        is available, so training features may be limited.
+        yfinance native intervals provide ~60 days of intraday data and
+        unlimited daily/weekly/monthly data.
 
     Args:
         lookback_days: Days of historical data to load (minimum 420 for training)
         data_dir: Directory containing CSV files (default: ./data)
-        force_historical: If True, skip yfinance and use only CSV data
+        force_historical: If True, skip yfinance fetch (only uses CSVs if available)
 
     Returns:
-        LiveDataResult containing tsla_df, spy_df, vix_df and metadata
-        Status will be one of:
-        - 'LIVE': CSV data + fresh yfinance data (< 15 min old)
-        - 'RECENT': CSV data + yfinance data (< 60 min old)
-        - 'STALE': CSV data + older yfinance data
-        - 'HISTORICAL': CSV data only (no yfinance fetch)
-        - 'YFINANCE_ONLY': No CSVs, using yfinance native intervals
+        LiveDataResult containing:
+        - tsla_df, spy_df, vix_df: Base 5min DataFrames (backward compatible)
+        - native_tfs: Dict with per-TF data for all 11 timeframes
+        - status: 'LIVE', 'RECENT', 'STALE', or 'NATIVE_ONLY'
 
     Example:
         >>> result = fetch_live_data(lookback_days=500)
-        >>> tsla_df = result.tsla_df
-        >>> spy_df = result.spy_df
-        >>> vix_df = result.vix_df
+        >>> tsla_df = result.tsla_df  # Base 5min DataFrame
+        >>> tsla_daily = result.native_tfs['tsla']['daily']  # Native daily data
         >>> print(f"Data status: {result.status}")
     """
     if data_dir is None:
@@ -100,119 +98,165 @@ def fetch_live_data(
 
     cutoff = datetime.now() - timedelta(days=lookback_days)
 
-    # Load historical data from CSV (gracefully handles missing files)
-    tsla_hist = _load_csv(tsla_csv, cutoff)
-    spy_hist = _load_csv(spy_csv, cutoff)
-    vix_hist = _load_vix_csv(vix_csv, cutoff)
-
-    # Check if CSVs are available
-    csvs_available = len(tsla_hist) > 0 and len(spy_hist) > 0
-
-    # Try to fetch live data unless force_historical is set
-    data_status = 'HISTORICAL'
+    # Initialize status and age
+    data_status = 'NATIVE_ONLY'
     data_age_minutes = float('inf')
+    native_tfs = None
 
-    if not force_historical:
-        if csvs_available:
-            # CSV mode: check if we need to fill a gap with native intervals
-            csv_end_date = tsla_hist.index[-1]
-            days_since_csv_end = (datetime.now() - csv_end_date).days
+    if force_historical:
+        # Force historical mode: only use CSVs, no yfinance
+        tsla_hist = _load_csv(tsla_csv, cutoff)
+        spy_hist = _load_csv(spy_csv, cutoff)
+        vix_hist = _load_vix_csv(vix_csv, cutoff)
 
-            if days_since_csv_end > 7:
-                # Gap is larger than 7-day 1m limit - use native intervals to fill
-                print(f"CSV data ends {days_since_csv_end} days ago, fetching native intervals to fill gap...")
-                try:
-                    # Fetch native interval data to fill the gap
-                    tsla_native, spy_native, vix_native = _fetch_native_interval_data(days_since_csv_end + 7)
+        if len(tsla_hist) == 0 or len(spy_hist) == 0:
+            empty_df = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+            return LiveDataResult(
+                tsla_df=empty_df,
+                spy_df=empty_df,
+                vix_df=vix_hist if len(vix_hist) > 0 else empty_df,
+                status='NO_DATA',
+                timestamp=pd.Timestamp.now(),
+                data_age_minutes=float('inf'),
+                native_tfs=None
+            )
 
-                    if len(tsla_native) > 0 and len(spy_native) > 0:
-                        # Merge native data with CSV data
-                        tsla_hist = _merge_historical_live(tsla_hist, tsla_native)
-                        spy_hist = _merge_historical_live(spy_hist, spy_native)
-                        # Update VIX if we got newer data
-                        if len(vix_native) > 0 and (len(vix_hist) == 0 or vix_native.index[-1] > vix_hist.index[-1]):
-                            vix_hist = _merge_historical_live(vix_hist, vix_native) if len(vix_hist) > 0 else vix_native
-                        print(f"  Merged native interval data with CSVs")
-                except Exception as e:
-                    print(f"Warning: Could not fetch native interval data: {e}")
+        # Resample to 5min
+        tsla_5min = _resample_to_5min(tsla_hist)
+        spy_5min = _resample_to_5min(spy_hist)
+        timestamp = tsla_5min.index[-1]
 
-            # Now fetch 7-day 1-minute data for maximum freshness
+        return LiveDataResult(
+            tsla_df=tsla_5min,
+            spy_df=spy_5min,
+            vix_df=vix_hist,
+            status='HISTORICAL',
+            timestamp=timestamp,
+            data_age_minutes=float('inf'),
+            native_tfs=None
+        )
+
+    # === UNIFIED APPROACH: Always fetch native TF data ===
+    try:
+        native_tfs = _fetch_all_native_timeframes()
+    except Exception as e:
+        print(f"Error fetching native timeframes: {e}")
+        native_tfs = None
+
+    # Get base 5min data from native TFs
+    if native_tfs and '5min' in native_tfs.get('tsla', {}) and '5min' in native_tfs.get('spy', {}):
+        tsla_5min = native_tfs['tsla']['5min'].copy()
+        spy_5min = native_tfs['spy']['5min'].copy()
+        vix_df = native_tfs.get('vix', pd.DataFrame())
+        if isinstance(vix_df, dict):
+            vix_df = pd.DataFrame()
+    else:
+        # Fallback: fetch 5min data directly
+        print("Warning: Could not get 5min data from native TFs, fetching directly...")
+        try:
+            tsla = yf.Ticker('TSLA')
+            spy = yf.Ticker('SPY')
+            tsla_5min = _format_yfinance_df(tsla.history(period='60d', interval='5m'))
+            spy_5min = _format_yfinance_df(spy.history(period='60d', interval='5m'))
+            vix = yf.Ticker('^VIX')
+            vix_df = _format_yfinance_df(vix.history(period='max', interval='1d'))
+        except Exception as e:
+            print(f"Error fetching fallback data: {e}")
+            empty_df = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+            return LiveDataResult(
+                tsla_df=empty_df,
+                spy_df=empty_df,
+                vix_df=empty_df,
+                status='NO_DATA',
+                timestamp=pd.Timestamp.now(),
+                data_age_minutes=float('inf'),
+                native_tfs=native_tfs
+            )
+
+    # Check if CSVs exist and are fresh for merging 1-min data
+    tsla_csv_data = _load_csv(tsla_csv, cutoff)
+    spy_csv_data = _load_csv(spy_csv, cutoff)
+    vix_csv_data = _load_vix_csv(vix_csv, cutoff)
+
+    csvs_available = len(tsla_csv_data) > 0 and len(spy_csv_data) > 0
+
+    if csvs_available:
+        csv_end_date = tsla_csv_data.index[-1]
+        days_since_csv_end = (datetime.now() - csv_end_date).days
+
+        # Only merge if CSV data is reasonably fresh (within 7 days for 1-min resolution benefit)
+        if days_since_csv_end <= 7:
+            print(f"CSV data is fresh ({days_since_csv_end} days old), merging 1-min data for finer resolution...")
+
+            # Fetch 7-day 1-minute data for maximum freshness
             try:
-                tsla_live, spy_live = _fetch_yfinance_data()
+                tsla_1min, spy_1min = _fetch_yfinance_data()
 
-                if tsla_live is not None and spy_live is not None:
-                    # Merge live with historical
-                    tsla_hist = _merge_historical_live(tsla_hist, tsla_live)
-                    spy_hist = _merge_historical_live(spy_hist, spy_live)
+                if tsla_1min is not None and spy_1min is not None:
+                    # Merge CSV + 1-min yfinance data
+                    tsla_merged = _merge_historical_live(tsla_csv_data, tsla_1min)
+                    spy_merged = _merge_historical_live(spy_csv_data, spy_1min)
 
-                    # Check freshness
-                    latest_timestamp = tsla_hist.index[-1]
-                    data_age_minutes = (datetime.now() - latest_timestamp).total_seconds() / 60
+                    # Resample merged data to 5min
+                    tsla_5min = _resample_to_5min(tsla_merged)
+                    spy_5min = _resample_to_5min(spy_merged)
 
-                    if data_age_minutes < 15:
-                        data_status = 'LIVE'
-                    elif data_age_minutes < 60:
-                        data_status = 'RECENT'
-                    else:
-                        data_status = 'STALE'
+                    # Update native_tfs 5min with the merged data
+                    if native_tfs:
+                        native_tfs['tsla']['5min'] = tsla_5min
+                        native_tfs['spy']['5min'] = spy_5min
+
+                    print(f"  Merged CSV + 1-min yfinance data")
             except Exception as e:
-                print(f"Warning: Could not fetch live data from yfinance: {e}")
-                print("Falling back to historical CSV data only")
+                print(f"Warning: Could not fetch 1-minute live data: {e}")
+                print("  Using native 5-min data without CSV merge")
         else:
-            # yfinance-only mode: fetch using native intervals
-            print("CSVs not found, fetching data from yfinance native intervals...")
-            try:
-                tsla_hist, spy_hist, vix_hist = _fetch_native_interval_data(lookback_days)
+            print(f"CSV data is stale ({days_since_csv_end} days old), using native TF data only")
 
-                if len(tsla_hist) > 0:
-                    # Try to get fresh 1-minute data for the last 7 days
-                    try:
-                        tsla_live, spy_live = _fetch_yfinance_data()
-                        if tsla_live is not None and spy_live is not None:
-                            tsla_hist = _merge_historical_live(tsla_hist, tsla_live)
-                            spy_hist = _merge_historical_live(spy_hist, spy_live)
-                    except Exception as e:
-                        print(f"Warning: Could not fetch 1-minute live data: {e}")
+        # Use VIX CSV if fresher than yfinance
+        if len(vix_csv_data) > 0:
+            if len(vix_df) == 0 or vix_csv_data.index[-1] > vix_df.index[-1]:
+                vix_df = vix_csv_data
+    else:
+        print("CSVs not available, using native TF data only")
 
-                    # Check freshness
-                    latest_timestamp = tsla_hist.index[-1]
-                    data_age_minutes = (datetime.now() - latest_timestamp).total_seconds() / 60
-                    data_status = 'YFINANCE_ONLY'
-                else:
-                    print("Error: Could not fetch any data from yfinance")
-                    data_status = 'NO_DATA'
-
-            except Exception as e:
-                print(f"Error fetching native interval data: {e}")
-                data_status = 'NO_DATA'
-
-    # Handle case where we have no data at all
-    if len(tsla_hist) == 0 or len(spy_hist) == 0:
-        # Return empty result
+    # Handle empty data
+    if len(tsla_5min) == 0 or len(spy_5min) == 0:
         empty_df = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
         return LiveDataResult(
             tsla_df=empty_df,
             spy_df=empty_df,
-            vix_df=vix_hist if len(vix_hist) > 0 else empty_df,
+            vix_df=vix_df if len(vix_df) > 0 else empty_df,
             status='NO_DATA',
             timestamp=pd.Timestamp.now(),
-            data_age_minutes=float('inf')
+            data_age_minutes=float('inf'),
+            native_tfs=native_tfs
         )
 
-    # Resample to 5min (dashboard expects 5min data)
-    tsla_5min = _resample_to_5min(tsla_hist)
-    spy_5min = _resample_to_5min(spy_hist)
-
-    # Get timestamp
+    # Determine data freshness and status
     timestamp = tsla_5min.index[-1]
+    data_age_minutes = (datetime.now() - timestamp).total_seconds() / 60
+
+    if csvs_available and (datetime.now() - tsla_csv_data.index[-1]).days <= 7:
+        # We merged fresh CSV data
+        if data_age_minutes < 15:
+            data_status = 'LIVE'
+        elif data_age_minutes < 60:
+            data_status = 'RECENT'
+        else:
+            data_status = 'STALE'
+    else:
+        # Native TF data only
+        data_status = 'NATIVE_ONLY'
 
     return LiveDataResult(
         tsla_df=tsla_5min,
         spy_df=spy_5min,
-        vix_df=vix_hist,
+        vix_df=vix_df,
         status=data_status,
         timestamp=timestamp,
-        data_age_minutes=data_age_minutes
+        data_age_minutes=data_age_minutes,
+        native_tfs=native_tfs
     )
 
 
@@ -550,3 +594,190 @@ def is_market_open() -> bool:
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
 
     return market_open <= now <= market_close
+
+
+def _fetch_all_native_timeframes() -> Dict[str, Dict[str, pd.DataFrame]]:
+    """
+    Fetch data for ALL 11 system timeframes using yfinance native intervals.
+
+    This function fetches data for TSLA, SPY, and VIX across all timeframes
+    defined in v7.core.timeframe.TIMEFRAMES using optimal yfinance native
+    intervals and resampling where necessary.
+
+    yfinance native intervals and their limits:
+        - 5m: 60 days
+        - 15m: 60 days
+        - 30m: 60 days
+        - 1h: 730 days (2 years)
+        - 1d: unlimited
+        - 1wk: unlimited
+        - 1mo: unlimited
+
+    Mapping strategy:
+        - 5min -> fetch 5m native (60 days)
+        - 15min -> fetch 15m native (60 days)
+        - 30min -> fetch 30m native (60 days)
+        - 1h -> fetch 1h native (730 days)
+        - 2h -> fetch 1h, then resample to 2h
+        - 3h -> fetch 1h, then resample to 3h
+        - 4h -> fetch 1h, then resample to 4h
+        - daily -> fetch 1d native (unlimited)
+        - weekly -> fetch 1wk native (unlimited)
+        - monthly -> fetch 1mo native (unlimited)
+        - 3month -> fetch 1mo, then resample to 3month
+
+    Returns:
+        Dict with structure:
+        {
+            'tsla': {'5min': DataFrame, '15min': DataFrame, ..., '3month': DataFrame},
+            'spy': {'5min': DataFrame, '15min': DataFrame, ..., '3month': DataFrame},
+            'vix': DataFrame  # VIX is daily only, single DataFrame
+        }
+
+    Example:
+        >>> data = _fetch_all_native_timeframes()
+        >>> tsla_daily = data['tsla']['daily']
+        >>> spy_1h = data['spy']['1h']
+        >>> vix = data['vix']
+    """
+    from v7.core.timeframe import TIMEFRAMES
+
+    # Initialize result structure
+    result = {
+        'tsla': {},
+        'spy': {},
+        'vix': pd.DataFrame()
+    }
+
+    # Define mapping from system timeframe to yfinance interval
+    # Format: system_tf -> (yf_interval, period_str, needs_resample, resample_rule)
+    tf_mapping = {
+        '5min': ('5m', '60d', False, None),
+        '15min': ('15m', '60d', False, None),
+        '30min': ('30m', '60d', False, None),
+        '1h': ('1h', '730d', False, None),
+        '2h': ('1h', '730d', True, '2h'),
+        '3h': ('1h', '730d', True, '3h'),
+        '4h': ('1h', '730d', True, '4h'),
+        'daily': ('1d', 'max', False, None),
+        'weekly': ('1wk', 'max', False, None),
+        'monthly': ('1mo', 'max', False, None),
+        '3month': ('1mo', 'max', True, '3ME'),
+    }
+
+    # Cache for fetched raw data to avoid duplicate API calls
+    # Key: (symbol, yf_interval), Value: DataFrame
+    raw_data_cache: Dict[tuple, pd.DataFrame] = {}
+
+    def fetch_raw_data(symbol: str, yf_interval: str, period: str) -> pd.DataFrame:
+        """Fetch raw data from yfinance with caching."""
+        cache_key = (symbol, yf_interval)
+        if cache_key in raw_data_cache:
+            return raw_data_cache[cache_key]
+
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period, interval=yf_interval)
+            if len(df) > 0:
+                df = _format_yfinance_df(df)
+            raw_data_cache[cache_key] = df
+            return df
+        except Exception as e:
+            print(f"    Error fetching {symbol} {yf_interval}: {e}")
+            raw_data_cache[cache_key] = pd.DataFrame()
+            return pd.DataFrame()
+
+    def resample_to_timeframe(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+        """Resample OHLCV data to a higher timeframe."""
+        if df.empty:
+            return df
+        resampled = df.resample(rule).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+        return resampled
+
+    print("=" * 60)
+    print("Fetching ALL native timeframes for TSLA, SPY, VIX")
+    print("=" * 60)
+
+    # Process each timeframe
+    for tf in TIMEFRAMES:
+        if tf not in tf_mapping:
+            print(f"  Warning: No mapping for timeframe {tf}, skipping")
+            continue
+
+        yf_interval, period, needs_resample, resample_rule = tf_mapping[tf]
+
+        print(f"\n[{tf}] Fetching via {yf_interval} interval (period={period})...")
+
+        # Fetch TSLA
+        print(f"  TSLA: ", end="")
+        tsla_df = fetch_raw_data('TSLA', yf_interval, period)
+        if not tsla_df.empty:
+            if needs_resample:
+                tsla_df = resample_to_timeframe(tsla_df, resample_rule)
+                print(f"{len(tsla_df)} bars (resampled to {resample_rule})")
+            else:
+                print(f"{len(tsla_df)} bars")
+            result['tsla'][tf] = tsla_df
+        else:
+            print("FAILED")
+            result['tsla'][tf] = pd.DataFrame()
+
+        # Fetch SPY
+        print(f"  SPY:  ", end="")
+        spy_df = fetch_raw_data('SPY', yf_interval, period)
+        if not spy_df.empty:
+            if needs_resample:
+                spy_df = resample_to_timeframe(spy_df, resample_rule)
+                print(f"{len(spy_df)} bars (resampled to {resample_rule})")
+            else:
+                print(f"{len(spy_df)} bars")
+            result['spy'][tf] = spy_df
+        else:
+            print("FAILED")
+            result['spy'][tf] = pd.DataFrame()
+
+    # Fetch VIX separately (daily data only)
+    print(f"\n[VIX] Fetching daily data...")
+    print(f"  VIX:  ", end="")
+    try:
+        vix = yf.Ticker('^VIX')
+        vix_df = vix.history(period='max', interval='1d')
+        if len(vix_df) > 0:
+            vix_df = _format_yfinance_df(vix_df)
+            print(f"{len(vix_df)} bars")
+            result['vix'] = vix_df
+        else:
+            print("FAILED (no data)")
+    except Exception as e:
+        print(f"FAILED ({e})")
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    for symbol in ['tsla', 'spy']:
+        print(f"\n{symbol.upper()}:")
+        for tf in TIMEFRAMES:
+            if tf in result[symbol] and not result[symbol][tf].empty:
+                df = result[symbol][tf]
+                date_range = f"{df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}"
+                print(f"  {tf:10s}: {len(df):6d} bars | {date_range}")
+            else:
+                print(f"  {tf:10s}: MISSING")
+
+    if not result['vix'].empty:
+        df = result['vix']
+        date_range = f"{df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}"
+        print(f"\nVIX: {len(df)} bars | {date_range}")
+    else:
+        print("\nVIX: MISSING")
+
+    print("=" * 60)
+
+    return result
