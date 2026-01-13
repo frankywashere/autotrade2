@@ -398,14 +398,24 @@ class TTTAdapter:
         self.adaptable_params = unique_params
 
     def _snapshot_base_weights(self):
-        """Store copy of original weights for drift limiting."""
+        """
+        Store copy of original weights for drift limiting.
+
+        Saves ALL parameters in self.adaptable_params, not just LayerNorm.
+        Uses parameter id() as unique key since adaptable_params can include
+        attention/projection layers depending on config.parameter_subset.
+        """
         self.base_weights = {}
-        param_idx = 0
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.LayerNorm):
-                for param_name, param in module.named_parameters():
-                    full_name = f"{name}.{param_name}"
-                    self.base_weights[full_name] = param.data.clone()
+        for idx, param in enumerate(self.adaptable_params):
+            # Use both index and id for a unique, stable key
+            key = f"param_{idx}_{id(param)}"
+            self.base_weights[key] = param.data.clone()
+
+        # Also store a mapping from key to parameter for easy access
+        self._param_key_map = {
+            f"param_{idx}_{id(param)}": param
+            for idx, param in enumerate(self.adaptable_params)
+        }
 
     def _create_optimizer(self):
         """Create optimizer for TTT parameters only."""
@@ -481,23 +491,28 @@ class TTTAdapter:
         return loss, loss_dict
 
     def _enforce_drift_limits(self):
-        """Clamp parameters to stay within max_drift_pct of base weights."""
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.LayerNorm):
-                for param_name, param in module.named_parameters():
-                    full_name = f"{name}.{param_name}"
-                    if full_name in self.base_weights:
-                        base = self.base_weights[full_name]
-                        max_delta = self.config.max_drift_pct * (base.abs().mean() + 1e-6)
-                        param.data = torch.clamp(
-                            param.data,
-                            base - max_delta,
-                            base + max_delta
-                        )
+        """
+        Clamp ALL parameters in self.base_weights to stay within max_drift_pct.
 
-                        # Track drift
-                        drift = (param.data - base).abs().mean() / (base.abs().mean() + 1e-6)
-                        self.param_drift[full_name] = drift.item()
+        This works with all parameter types (LayerNorm, attention, projections)
+        by iterating through the stored base_weights dictionary directly.
+        """
+        for key, base in self.base_weights.items():
+            # Get the corresponding parameter from our mapping
+            if not hasattr(self, '_param_key_map') or key not in self._param_key_map:
+                continue
+
+            param = self._param_key_map[key]
+            max_delta = self.config.max_drift_pct * (base.abs().mean() + 1e-6)
+            param.data = torch.clamp(
+                param.data,
+                base - max_delta,
+                base + max_delta
+            )
+
+            # Track drift for monitoring
+            drift = (param.data - base).abs().mean() / (base.abs().mean() + 1e-6)
+            self.param_drift[key] = drift.item()
 
     def step(
         self,
@@ -602,13 +617,12 @@ class TTTAdapter:
         self.previous_output = None
         self.consistency_loss.reset()
 
-        # Restore base weights
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.LayerNorm):
-                for param_name, param in module.named_parameters():
-                    full_name = f"{name}.{param_name}"
-                    if full_name in self.base_weights:
-                        param.data.copy_(self.base_weights[full_name])
+        # Restore ALL base weights (works with any parameter type)
+        if hasattr(self, '_param_key_map'):
+            for key, base in self.base_weights.items():
+                if key in self._param_key_map:
+                    param = self._param_key_map[key]
+                    param.data.copy_(base)
 
         # Reset optimizer state
         self._create_optimizer()

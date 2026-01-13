@@ -1123,37 +1123,52 @@ class SettingsScreen(Screen):
         self.app.lookback_days = self.query_one("#lookback-select", Select).value
         self.app.refresh_interval = self.query_one("#refresh-select", Select).value
 
-        # TTT settings
+        # TTT settings - get new values from UI
         new_ttt_mode = self.query_one("#ttt-mode-select", Select).value
-        self.app.ttt_lr = self.query_one("#ttt-lr-select", Select).value
-        self.app.ttt_update_freq = self.query_one("#ttt-freq-select", Select).value
-        self.app.ttt_loss_type = self.query_one("#ttt-loss-select", Select).value
+        new_ttt_lr = self.query_one("#ttt-lr-select", Select).value
+        new_ttt_freq = self.query_one("#ttt-freq-select", Select).value
+        new_ttt_loss = self.query_one("#ttt-loss-select", Select).value
 
-        # Handle TTT mode change
-        if new_ttt_mode != self.app.ttt_mode:
-            self.app.ttt_mode = new_ttt_mode
+        # Check if any TTT settings changed
+        settings_changed = (
+            new_ttt_lr != self.app.ttt_lr or
+            new_ttt_freq != self.app.ttt_update_freq or
+            new_ttt_loss != self.app.ttt_loss_type
+        )
+        mode_changed = new_ttt_mode != self.app.ttt_mode
 
-            if new_ttt_mode == "static":
-                # Disable TTT
+        # Update stored values
+        self.app.ttt_mode = new_ttt_mode
+        self.app.ttt_lr = new_ttt_lr
+        self.app.ttt_update_freq = new_ttt_freq
+        self.app.ttt_loss_type = new_ttt_loss
+
+        # Reinitialize adapter if mode or settings changed
+        if new_ttt_mode == "static":
+            # Disable TTT
+            if self.app.ttt_adapter is not None:
                 self.app.ttt_adapter = None
                 self.app.notify("TTT disabled")
-            elif self.app.current_model is not None:
-                # Initialize or update TTT adapter
-                ttt_config = TTTConfig(
-                    enabled=True,
-                    mode=TTTMode[new_ttt_mode.upper()],
-                    learning_rate=self.app.ttt_lr,
-                    update_frequency=self.app.ttt_update_freq,
-                    loss_type=self.app.ttt_loss_type,
-                    parameter_subset='layernorm_only'
-                )
-                self.app.ttt_adapter = TTTAdapter(self.app.current_model, ttt_config)
-                self.app.ttt_adapter.initialize()
-                self.app.ttt_adapter.prepare_for_inference()
+        elif (mode_changed or settings_changed) and self.app.current_model is not None:
+            # Initialize or update TTT adapter with new settings
+            ttt_config = TTTConfig(
+                enabled=True,
+                mode=TTTMode[new_ttt_mode.upper()],
+                learning_rate=new_ttt_lr,
+                update_frequency=new_ttt_freq,
+                loss_type=new_ttt_loss,
+                parameter_subset='layernorm_only'
+            )
+            self.app.ttt_adapter = TTTAdapter(self.app.current_model, ttt_config)
+            self.app.ttt_adapter.initialize()
+            self.app.ttt_adapter.prepare_for_inference()
+            if mode_changed:
                 self.app.notify(f"TTT enabled: {new_ttt_mode} mode")
             else:
-                self.app.notify("Load a model first to enable TTT", severity="warning")
-                self.app.ttt_mode = "static"
+                self.app.notify(f"TTT settings updated")
+        elif new_ttt_mode != "static" and self.app.current_model is None and mode_changed:
+            self.app.notify("Load a model first to enable TTT", severity="warning")
+            self.app.ttt_mode = "static"
 
         self.app.notify("Settings applied")
 

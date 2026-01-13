@@ -849,13 +849,24 @@ def make_predictions(
             window_scores_tensor = torch.tensor([window_scores_list], dtype=torch.float32)
             window_valid_tensor = torch.tensor([window_valid_list], dtype=torch.bool)
 
-            # Run inference with multi-window input
-            with torch.no_grad():
+            # Run inference with multi-window input (with or without TTT)
+            if ttt_adapter is not None and ttt_adapter.config.mode != TTTMode.STATIC:
+                # TTT-enabled inference for end-to-end model
+                raw_output, ttt_stats = ttt_adapter.step(per_window_tensor)
+                # Get full predictions format
                 outputs = model.predict(
                     per_window_tensor,
                     window_scores=window_scores_tensor,
                     window_valid=window_valid_tensor
                 )
+            else:
+                # Standard inference
+                with torch.no_grad():
+                    outputs = model.predict(
+                        per_window_tensor,
+                        window_scores=window_scores_tensor,
+                        window_valid=window_valid_tensor
+                    )
         else:
             # Standard single-window inference
             features = extract_full_features(
@@ -1129,8 +1140,6 @@ def main():
                         format="%.1e",
                         help="Learning rate for TTT parameter updates"
                     )
-                    if ttt_lr != st.session_state.ttt_lr:
-                        st.session_state.ttt_lr = ttt_lr
 
                     # Update frequency
                     ttt_freq = st.selectbox(
@@ -1140,8 +1149,6 @@ def main():
                         format_func=lambda x: f"Every {x} bars",
                         help="How often to update TTT parameters"
                     )
-                    if ttt_freq != st.session_state.ttt_update_freq:
-                        st.session_state.ttt_update_freq = ttt_freq
 
                     # Loss type
                     ttt_loss = st.selectbox(
@@ -1155,6 +1162,19 @@ def main():
                         }.get(x, x),
                         help="Self-supervised loss for TTT adaptation"
                     )
+
+                    # Check if settings changed BEFORE updating session state
+                    settings_changed = (
+                        ttt_lr != st.session_state.ttt_lr or
+                        ttt_freq != st.session_state.ttt_update_freq or
+                        ttt_loss != st.session_state.ttt_loss_type
+                    )
+
+                    # Now update session state
+                    if ttt_lr != st.session_state.ttt_lr:
+                        st.session_state.ttt_lr = ttt_lr
+                    if ttt_freq != st.session_state.ttt_update_freq:
+                        st.session_state.ttt_update_freq = ttt_freq
                     if ttt_loss != st.session_state.ttt_loss_type:
                         st.session_state.ttt_loss_type = ttt_loss
 
@@ -1164,8 +1184,9 @@ def main():
                             st.session_state.ttt_adapter.reset()
                             st.success("TTT state reset!")
 
-                # Initialize or update TTT adapter
-                if st.session_state.ttt_adapter is None and new_ttt_mode != 'static':
+                # Initialize or reinitialize TTT adapter if needed
+                # Reinitialize when: adapter doesn't exist OR settings changed
+                if (st.session_state.ttt_adapter is None or settings_changed) and new_ttt_mode != 'static':
                     ttt_config = TTTConfig(
                         enabled=True,
                         mode=TTTMode[new_ttt_mode.upper()],
