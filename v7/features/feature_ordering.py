@@ -12,6 +12,10 @@ CRITICAL: The ordering is TIMEFRAME-GROUPED, not alphabetical!
 
 Feature Dimensions:
 - TSLA per TF: 35 features (18 base + 10 exit_tracking + 2 break_trigger + 5 return_tracking)
+    Base features (18):
+      - channel_valid, direction, position, upper_dist, lower_dist, width_pct, slope_pct,
+        r_squared, bounce_count, cycles, bars_since_bounce, last_touch, rsi, rsi_divergence,
+        rsi_at_last_upper, rsi_at_last_lower, channel_quality, rsi_confidence
     Return tracking features (5):
       - return_rate (float)
       - channel_resilience_score (float)
@@ -38,6 +42,9 @@ Feature Dimensions:
 - Events: 46 features (optional, zeros if not provided)
 - Window Scores: 40 features (8 windows x 5 metrics per window)
 
+Note: data_confidence is stored as metadata in TSLAChannelFeatures for display purposes
+but is NOT included in the model input tensor.
+
 Total: (35+11+10) × 11 + (21+25+25+3+46+40) = 56×11 + 160 = 616 + 160 = 776
 """
 
@@ -60,12 +67,14 @@ CROSS_PER_TF = 10   # spy_valid, spy_dir, spy_pos, tsla_in_upper/lower, dist_to_
 # TSLA per-TF feature breakdown (35 total):
 #   Base channel features (18):
 #     channel_valid, direction, position, upper_dist, lower_dist, width_pct, slope_pct, r2,
-#     bounces, cycles, touch_density, alternation, last_touch_dist, bar_depth, rsi, ...
+#     bounce_count, cycles, bars_since_bounce, last_touch, rsi, rsi_divergence,
+#     rsi_at_last_upper, rsi_at_last_lower, channel_quality, rsi_confidence
+#   (Note: data_confidence is metadata only, NOT in tensor)
 #   Exit tracking features (10):
 #     exit_count, avg_bars_outside, max_bars_outside, exit_frequency, exits_accelerating,
 #     exits_up_count, exits_down_count, avg_return_speed, return_speed_slowing, bounces_after_last_return
 #   Break trigger features (2):
-#     break_trigger_up, break_trigger_down
+#     nearest_boundary_dist, rsi_alignment_with_boundary
 #   Return tracking features (5):
 #     return_rate, channel_resilience_score, avg_duration_after_return,
 #     max_duration_after_return, returns_leading_to_new_channel
@@ -356,7 +365,7 @@ if __name__ == '__main__':
     print(f"  Shared:         indices {shared_start:3d}-{shared_end-1:3d} ({shared_end-shared_start} features)")
 
     print(f"\n  Note: TSLA per-TF includes:")
-    print(f"    - 18 base channel features")
+    print(f"    - 18 base channel features (data_confidence is metadata only)")
     print(f"    - 10 exit tracking features")
     print(f"    - 2 break trigger features")
     print(f"    - 5 return tracking features (return_rate, channel_resilience_score,")

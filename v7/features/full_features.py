@@ -52,6 +52,39 @@ from features.feature_ordering import (
 NUM_WINDOW_METRICS = 5  # bounce_count, r_squared, quality_score, alternation_ratio, width_pct
 
 
+def calculate_data_confidence(num_bars: int) -> float:
+    """
+    Calculate data confidence score based on available native bars.
+
+    The confidence score indicates how reliable features are based on
+    the amount of data available for the timeframe.
+
+    Args:
+        num_bars: Number of native bars available for the timeframe
+
+    Returns:
+        float: Confidence score between 0.0 and 1.0
+            - 80+ bars: 1.0 (fully reliable)
+            - 50-79 bars: 0.8 (good)
+            - 30-49 bars: 0.6 (moderate)
+            - 20-29 bars: 0.4 (low)
+            - 10-19 bars: 0.2 (very low)
+            - <10 bars: 0.0 (insufficient)
+    """
+    if num_bars >= 80:
+        return 1.0
+    elif num_bars >= 50:
+        return 0.8
+    elif num_bars >= 30:
+        return 0.6
+    elif num_bars >= 20:
+        return 0.4
+    elif num_bars >= 10:
+        return 0.2
+    else:
+        return 0.0
+
+
 def channel_to_scores(channel: Channel) -> np.ndarray:
     """
     Extract key scores from a channel as numpy array.
@@ -138,6 +171,9 @@ class TSLAChannelFeatures:
     channel_quality: float        # Composite quality score (0-1)
     rsi_confidence: float         # RSI reliability score (0-1)
 
+    # Data confidence based on available native bars (0-1)
+    data_confidence: float = 1.0  # Default to fully reliable
+
     # Containment against longer TFs
     containments: Dict[str, ContainmentInfo] = field(default_factory=dict)
 
@@ -188,6 +224,10 @@ class SharedFeatures:
     # Multi-window channel scores using STANDARD_WINDOWS (8 x 5 = 40 features)
     # This is identical for ALL window iterations (uses hardcoded windows)
     tsla_window_scores: Optional[np.ndarray] = None
+
+    # Per-timeframe data confidence scores (0-1 based on native bar count)
+    # Window-independent since it only depends on resampled data length
+    data_confidence_per_tf: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -247,6 +287,9 @@ class FullFeatures:
     # Metrics per window: bounce_count, r_squared, quality_score, alternation_ratio, width_pct
     tsla_window_scores: Optional[np.ndarray] = None
 
+    # Per-timeframe data confidence scores (0-1 based on native bar count)
+    data_confidence_per_tf: Dict[str, float] = field(default_factory=dict)
+
 
 def extract_tsla_channel_features(
     tsla_df: pd.DataFrame,
@@ -256,6 +299,7 @@ def extract_tsla_channel_features(
     window: int = 20,
     longer_tf_channels: Optional[Dict[str, Channel]] = None,
     lookforward_bars: int = 200,
+    data_confidence: float = 1.0,
 ) -> TSLAChannelFeatures:
     """Extract TSLA channel features for one timeframe.
 
@@ -271,6 +315,7 @@ def extract_tsla_channel_features(
         window: Channel detection window size (for exit tracking context)
         longer_tf_channels: Pre-computed channels from longer timeframes
         lookforward_bars: Bars to look forward for exit tracking
+        data_confidence: Pre-computed data confidence score (0-1) based on native bar count
 
     Raises:
         ValueError: If channel or rsi_series is None
@@ -399,6 +444,7 @@ def extract_tsla_channel_features(
         rsi_at_last_lower=rsi_at_last_lower,
         channel_quality=channel_quality,
         rsi_confidence=rsi_confidence,
+        data_confidence=data_confidence,
         containments=containments,
         exit_tracking=exit_features,
         break_trigger=break_trigger,
@@ -412,7 +458,8 @@ def extract_full_features(
     window: int = 20,
     include_history: bool = True,
     lookforward_bars: int = 200,
-    events_handler: Optional[EventsHandler] = None
+    events_handler: Optional[EventsHandler] = None,
+    native_tfs: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None
 ) -> FullFeatures:
     """
     Extract ALL features for model input.
@@ -425,6 +472,10 @@ def extract_full_features(
         include_history: Whether to scan historical channels (slower)
         lookforward_bars: Bars to look forward for exit tracking
         events_handler: Optional EventsHandler for event features (46 features)
+        native_tfs: Optional dict of native timeframe DataFrames to use instead of resampling.
+                   Format: {'tsla': {'5min': DataFrame, '15min': DataFrame, ..., '3month': DataFrame},
+                            'spy': {'5min': DataFrame, ..., '3month': DataFrame}}
+                   Falls back to resampling if a specific TF is not in native_tfs.
 
     Returns:
         FullFeatures object with everything
@@ -435,20 +486,27 @@ def extract_full_features(
     resample_cache = {}
 
     def get_resampled(df, tf, cache_key_prefix):
-        """Get resampled data, using cache to avoid redundant resampling."""
+        """Get resampled data, preferring native TF data when available."""
         cache_key = f"{cache_key_prefix}_{tf}"
         if cache_key not in resample_cache:
-            if tf == '5min':
+            # Check if native TF data is available
+            if native_tfs is not None and cache_key_prefix in native_tfs and tf in native_tfs[cache_key_prefix]:
+                resample_cache[cache_key] = native_tfs[cache_key_prefix][tf]
+            elif tf == '5min':
                 resample_cache[cache_key] = df
             else:
                 resample_cache[cache_key] = resample_ohlc(df, tf)
         return resample_cache[cache_key]
 
-    # First pass: detect channels and compute RSI at all timeframes for TSLA
+    # First pass: detect channels, compute RSI, and calculate data confidence at all timeframes for TSLA
     tsla_channels_dict = {}
     rsi_series_per_tf = {}
+    data_confidence_per_tf = {}
     for tf in TIMEFRAMES:
         df_tf = get_resampled(tsla_df, tf, 'tsla')
+
+        # Calculate data confidence based on native bar count
+        data_confidence_per_tf[tf] = calculate_data_confidence(len(df_tf))
 
         try:
             tsla_channels_dict[tf] = detect_channel(df_tf, window=window)
@@ -482,6 +540,7 @@ def extract_full_features(
                 window=window,
                 longer_tf_channels=longer_channels,
                 lookforward_bars=lookforward_bars,
+                data_confidence=data_confidence_per_tf.get(tf, 1.0),
             )
         except (ValueError, IndexError):
             pass
@@ -620,6 +679,7 @@ def extract_full_features(
         both_near_lower=(tsla_pos < 0.2 and spy_pos < 0.2),
         events=event_features,
         tsla_window_scores=tsla_window_scores,
+        data_confidence_per_tf=data_confidence_per_tf,
     )
 
 
@@ -649,8 +709,10 @@ def extract_shared_features(
     timestamp = tsla_df.index[-1]
 
     # Step 1: Resample TSLA and SPY to all 11 TIMEFRAMES
+    # Also compute data confidence based on native bar count (window-independent)
     tsla_resampled = {}
     spy_resampled = {}
+    data_confidence_per_tf = {}
 
     for tf in TIMEFRAMES:
         if tf == '5min':
@@ -662,6 +724,12 @@ def extract_shared_features(
                 spy_resampled[tf] = resample_ohlc(spy_df, tf)
             except (ValueError, IndexError):
                 pass
+
+        # Calculate data confidence based on native bar count for TSLA
+        if tf in tsla_resampled:
+            data_confidence_per_tf[tf] = calculate_data_confidence(len(tsla_resampled[tf]))
+        else:
+            data_confidence_per_tf[tf] = 0.0
 
     # Step 2: Extract SPY features for all TFs using default window=20
     spy_features = {}
@@ -814,6 +882,7 @@ def extract_shared_features(
         rsi_series_per_tf=rsi_series_per_tf,
         events=event_features,
         tsla_window_scores=tsla_window_scores,
+        data_confidence_per_tf=data_confidence_per_tf,
     )
 
 
@@ -879,6 +948,7 @@ def extract_window_features(
                 window=window,
                 longer_tf_channels=longer_channels,
                 lookforward_bars=lookforward_bars,
+                data_confidence=shared.data_confidence_per_tf.get(tf, 1.0),
             )
         except (ValueError, IndexError):
             pass
@@ -953,6 +1023,7 @@ def extract_window_features(
         both_near_lower=(tsla_pos < 0.2 and spy_pos < 0.2),
         events=shared.events,
         tsla_window_scores=shared.tsla_window_scores,
+        data_confidence_per_tf=shared.data_confidence_per_tf,
     )
 
 
@@ -1052,6 +1123,7 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
                 f.rsi_at_last_lower,
                 f.channel_quality,
                 f.rsi_confidence,
+                # Note: data_confidence is metadata only, NOT included in tensor
             ]
 
             # Add exit tracking features (15 total: 10 original + 5 new return tracking)
@@ -1093,6 +1165,7 @@ def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
         else:
             # Provide default invalid features for this TF (35 total features)
             # All zeros with channel_valid=0.0, direction=1 (sideways), position=0.5, rsi=50.0
+            # Note: data_confidence is metadata only, NOT included in tensor
             arrays[f'tsla_{tf}'] = np.array([
                 0.0,   # channel_valid
                 1.0,   # direction (sideways)

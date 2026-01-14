@@ -563,12 +563,13 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
 # =============================================================================
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
-def load_market_data(use_live: bool = True, lookback_days: int = 90) -> Dict:
+def load_market_data(use_live: bool = True, lookback_days: int = 500) -> Dict:
     """Load market data from live source or CSV files."""
     result = {
         "tsla_df": None,
         "spy_df": None,
         "vix_df": None,
+        "native_tfs": None,  # Per-TF DataFrames from yfinance native intervals
         "status": "UNKNOWN",
         "timestamp": None,
         "error": None
@@ -582,6 +583,7 @@ def load_market_data(use_live: bool = True, lookback_days: int = 90) -> Dict:
                 result["tsla_df"] = live_result.tsla_df
                 result["spy_df"] = live_result.spy_df
                 result["vix_df"] = live_result.vix_df
+                result["native_tfs"] = live_result.native_tfs  # Include native TF data
                 # Status might be string or enum - handle both
                 status = live_result.status
                 result["status"] = status.name if hasattr(status, 'name') else str(status)
@@ -624,7 +626,7 @@ def load_market_data(use_live: bool = True, lookback_days: int = 90) -> Dict:
             vix_df = pd.DataFrame()
 
         # Resample to 5min if needed
-        if len(tsla_df) > 0 and tsla_df.index[1] - tsla_df.index[0] < timedelta(minutes=5):
+        if len(tsla_df) >= 2 and tsla_df.index[1] - tsla_df.index[0] < timedelta(minutes=5):
             tsla_df = resample_ohlc(tsla_df, '5min')
             if len(spy_df) > 0:
                 spy_df = resample_ohlc(spy_df, '5min')
@@ -687,9 +689,24 @@ def filter_market_hours(df: pd.DataFrame) -> pd.DataFrame:
 # Channel Detection
 # =============================================================================
 
-def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame) -> Tuple[Dict, Dict]:
-    """Detect channels for all timeframes with adaptive window sizes."""
-    # Filter to regular trading hours first
+def detect_all_channels(
+    tsla_df: pd.DataFrame,
+    spy_df: pd.DataFrame,
+    native_tfs: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None
+) -> Tuple[Dict, Dict]:
+    """Detect channels for all timeframes with adaptive window sizes.
+
+    Args:
+        tsla_df: Base TSLA 5min DataFrame (used as fallback for resampling)
+        spy_df: Base SPY 5min DataFrame (used as fallback for resampling)
+        native_tfs: Optional dict with per-TF DataFrames from yfinance native intervals.
+                   Structure: {'tsla': {tf: DataFrame}, 'spy': {tf: DataFrame}, 'vix': DataFrame}
+                   When provided, uses native data instead of resampling for better accuracy.
+
+    Returns:
+        Tuple of (tsla_channels, spy_channels) dicts mapping timeframe to Channel
+    """
+    # Filter base DataFrames to regular trading hours (used for resampling fallback)
     tsla_df = filter_market_hours(tsla_df)
     spy_df = filter_market_hours(spy_df)
 
@@ -716,18 +733,30 @@ def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame) -> Tuple[Di
         try:
             window = WINDOW_MAP.get(tf, 50)
 
-            if tf == '5min':
+            # Get TSLA data: prefer native_tfs, fallback to resampling
+            # Note: No market hours filtering - training data included extended hours,
+            # and yfinance native intervals typically return market hours only anyway
+            if native_tfs and 'tsla' in native_tfs and tf in native_tfs['tsla']:
+                tf_tsla = native_tfs['tsla'][tf]
+            elif tf == '5min':
                 tf_tsla = tsla_df
-                tf_spy = spy_df if len(spy_df) > 0 else None
             else:
                 tf_tsla = resample_ohlc(tsla_df, tf)
+
+            # Get SPY data: prefer native_tfs, fallback to resampling
+            if native_tfs and 'spy' in native_tfs and tf in native_tfs['spy']:
+                tf_spy = native_tfs['spy'][tf]
+            elif tf == '5min':
+                tf_spy = spy_df if len(spy_df) > 0 else None
+            else:
                 tf_spy = resample_ohlc(spy_df, tf) if len(spy_df) > 0 else None
 
-            if len(tf_tsla) >= window:
-                tsla_channels[tf] = detect_channel(tf_tsla, window=window, min_cycles=0)
+            # Use min_cycles=1 to match training and model feature extraction
+            if tf_tsla is not None and len(tf_tsla) >= window:
+                tsla_channels[tf] = detect_channel(tf_tsla, window=window, min_cycles=1)
 
             if tf_spy is not None and len(tf_spy) >= window:
-                spy_channels[tf] = detect_channel(tf_spy, window=window, min_cycles=0)
+                spy_channels[tf] = detect_channel(tf_spy, window=window, min_cycles=1)
         except Exception:
             pass
 
@@ -742,11 +771,21 @@ def make_predictions(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    model: torch.nn.Module
+    model: torch.nn.Module,
+    native_tfs: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None
 ) -> Optional[Dict]:
     """Make predictions using the model - returns per-TF predictions.
 
     Supports both HierarchicalCfCModel (single-window) and EndToEndWindowModel (multi-window).
+
+    Args:
+        tsla_df: Base TSLA 5min DataFrame
+        spy_df: Base SPY 5min DataFrame
+        vix_df: VIX daily DataFrame
+        model: The loaded prediction model
+        native_tfs: Optional dict with per-TF DataFrames from yfinance native intervals.
+                   Structure: {'tsla': {tf: DataFrame}, 'spy': {tf: DataFrame}, 'vix': DataFrame}
+                   When provided, uses native data instead of resampling for better accuracy.
     """
     if model is None:
         return None
@@ -760,6 +799,9 @@ def make_predictions(
         # Use hasattr() instead of isinstance() for reliability with pickled models
         is_end_to_end = hasattr(model, 'window_encoder') and hasattr(model, 'window_selector')
 
+        # Track data confidence per TF (based on native bar counts)
+        data_confidence_per_tf = {}
+
         if is_end_to_end:
             # Extract features for ALL 8 windows
             per_window_features = []
@@ -772,10 +814,14 @@ def make_predictions(
                     spy_df=spy_df,
                     vix_df=vix_df,
                     window=window,
-                    include_history=False
+                    include_history=False,
+                    native_tfs=native_tfs  # Use native TF data when available
                 )
 
                 if features is not None:
+                    # Capture data confidence (same for all windows, based on data length)
+                    if not data_confidence_per_tf and features.data_confidence_per_tf:
+                        data_confidence_per_tf = features.data_confidence_per_tf
                     feature_arrays = features_to_tensor_dict(features)
                     feature_list = [feature_arrays[k] for k in FEATURE_ORDER if k in feature_arrays]
                     feature_array = np.concatenate(feature_list)
@@ -823,11 +869,16 @@ def make_predictions(
                 spy_df=spy_df,
                 vix_df=vix_df,
                 window=50,
-                include_history=False  # Faster without history
+                include_history=False,  # Faster without history
+                native_tfs=native_tfs  # Use native TF data when available
             )
 
             if features is None:
                 return None
+
+            # Capture data confidence for single-window path
+            if features.data_confidence_per_tf:
+                data_confidence_per_tf = features.data_confidence_per_tf
 
             # Convert FullFeatures to dict of arrays
             feature_arrays = features_to_tensor_dict(features)
@@ -865,6 +916,12 @@ def make_predictions(
         # TF names for indexing
         TF_NAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', '1d', '1w', '1M', '3M']
 
+        # Convert data_confidence_per_tf dict to array of 11 values
+        TF_KEYS = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+        data_confidence_array = np.array([
+            data_confidence_per_tf.get(tf, 0.0) for tf in TF_KEYS
+        ], dtype=np.float32)
+
         result = {
             # Per-timeframe predictions (all 11 TFs)
             'per_tf': {
@@ -875,7 +932,8 @@ def make_predictions(
                 'next_channel': per_tf['next_channel'][0].numpy(),    # [11]
                 'next_channel_probs': per_tf['next_channel_probs'][0].numpy(),  # [11, 3]
                 'confidence': per_tf['confidence'][0].numpy(),        # [11]
-                'channel_valid': per_tf['channel_valid'],            # [11] bool
+                'channel_valid': per_tf['channel_valid'],            # [11] bool (channel structure)
+                'data_confidence': data_confidence_array,            # [11] float (data sufficiency)
             },
             # Best (most confident) timeframe
             'best_tf_idx': best_tf_idx,
@@ -994,7 +1052,7 @@ def main():
                     st.caption(f"Loss: {', '.join(loss_parts)}")
 
             # Show training metrics if available
-            val_loss = selected_cp.get('val_loss')
+            val_loss = selected_cp.get('best_val_loss')
             if val_loss is not None:
                 st.caption(f"Val Loss: {val_loss:.4f}")
 
@@ -1002,11 +1060,11 @@ def main():
             if best_epoch is not None:
                 st.caption(f"Best Epoch: {best_epoch}")
 
-            dir_acc = selected_cp.get('direction_accuracy')
+            dir_acc = selected_cp.get('direction_acc')
             if dir_acc is not None:
                 st.caption(f"Dir Acc: {dir_acc*100:.1f}%")
 
-            next_ch_acc = selected_cp.get('next_channel_accuracy')
+            next_ch_acc = selected_cp.get('next_channel_acc')
             if next_ch_acc is not None:
                 st.caption(f"Next Ch Acc: {next_ch_acc*100:.1f}%")
 
@@ -1194,7 +1252,8 @@ def main():
                 data["tsla_df"],
                 data["spy_df"],
                 data["vix_df"],
-                st.session_state.model
+                st.session_state.model,
+                native_tfs=data.get("native_tfs")  # Pass native TF data when available
             )
 
             if predictions is None:
@@ -1314,7 +1373,10 @@ def main():
 
                 try:
                     # Detect channel for the best timeframe
-                    tsla_channels, _ = detect_all_channels(data["tsla_df"], data["spy_df"])
+                    tsla_channels, _ = detect_all_channels(
+                        data["tsla_df"], data["spy_df"],
+                        native_tfs=data.get("native_tfs")  # Use native TF data when available
+                    )
 
                     if best_tf_name in tsla_channels and tsla_channels[best_tf_name].valid:
                         channel = tsla_channels[best_tf_name]
@@ -1425,11 +1487,15 @@ def main():
                 for i, tf_name in enumerate(TF_NAMES):
                     is_best = (i == best_tf_idx)
 
-                    # Check channel validity
-                    is_valid = per_tf.get('channel_valid', [1]*11)[i] >= 0.5
+                    # Check data confidence for graceful degradation
+                    # data_confidence is based on native bar count: 80+=1.0, 50-79=0.8, 30-49=0.6, 20-29=0.4, 10-19=0.2, <10=0.0
+                    data_conf = per_tf.get('data_confidence', [1.0]*11)[i]
                     tf_display = f"**{tf_name}**" if is_best else tf_name
-                    if not is_valid:
-                        tf_display += " ⚠️"  # Warning icon for invalid channels
+                    # Confidence levels: high (>=0.6), medium (0.4-0.6), low (<0.4)
+                    if data_conf < 0.4:
+                        tf_display += " [low]"  # Less than 30 bars
+                    elif data_conf < 0.6:
+                        tf_display += " [med]"  # 30-49 bars
 
                     # Format duration with uncertainty only if > 0
                     dur_mean = per_tf['duration_mean'][i]
@@ -1451,10 +1517,16 @@ def main():
                 tf_df = pd.DataFrame(tf_rows)
                 st.dataframe(tf_df, width='stretch', hide_index=True)
 
-                # Per-timeframe validity warning
-                invalid_tfs = [TF_NAMES[i] for i in range(len(TF_NAMES)) if per_tf.get('channel_valid', [1]*11)[i] < 0.5]
-                if invalid_tfs:
-                    st.warning(f"⚠️ Insufficient data for valid channel detection in: {', '.join(invalid_tfs)}. Predictions for these timeframes are unreliable. Consider using 420+ days of lookback data.")
+                # Per-timeframe data confidence warning (graceful degradation)
+                # Based on native bar count: 80+=high, 50-79=good, 30-49=med, <30=low
+                data_confidence = per_tf.get('data_confidence', [1.0]*11)
+                low_confidence_tfs = [TF_NAMES[i] for i in range(len(TF_NAMES)) if data_confidence[i] < 0.4]
+                med_confidence_tfs = [TF_NAMES[i] for i in range(len(TF_NAMES)) if 0.4 <= data_confidence[i] < 0.6]
+
+                if low_confidence_tfs:
+                    st.warning(f"Low data confidence for: {', '.join(low_confidence_tfs)} (<30 native bars). Predictions shown but should be weighted lower.")
+                if med_confidence_tfs:
+                    st.info(f"Medium confidence for: {', '.join(med_confidence_tfs)}. Adequate data available but additional lookback may improve accuracy.")
 
         # Price info
         if data["tsla_df"] is not None and len(data["tsla_df"]) > 0:
@@ -1490,7 +1562,8 @@ def main():
         else:
             tsla_channels, spy_channels = detect_all_channels(
                 data["tsla_df"],
-                data["spy_df"] if data["spy_df"] is not None else pd.DataFrame()
+                data["spy_df"] if data["spy_df"] is not None else pd.DataFrame(),
+                native_tfs=data.get("native_tfs")  # Use native TF data when available
             )
 
             # Channel tables

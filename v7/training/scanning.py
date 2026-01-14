@@ -24,6 +24,8 @@ from .types import ChannelSample
 # =============================================================================
 
 # Worker process globals for parallel scanning
+# Optimized to store DataFrames directly instead of numpy arrays
+# This eliminates redundant DataFrame reconstruction in each position
 _WORKER_TSLA_DF = None
 _WORKER_SPY_DF = None
 _WORKER_VIX_DF = None
@@ -83,13 +85,13 @@ def _process_single_position(
     Process a single position for channel detection.
 
     This is a standalone function designed to be called by parallel workers.
-    It receives pre-sliced DataFrames to avoid redundant reconstruction.
+    It receives DataFrames directly from worker globals to avoid redundant reconstruction.
 
     Args:
         i: Position index in the data
-        tsla_df: TSLA OHLCV DataFrame (pre-sliced with all data up to max position)
-        spy_df: SPY OHLCV DataFrame (pre-sliced)
-        vix_df: VIX OHLCV DataFrame (pre-sliced)
+        tsla_df: TSLA OHLCV DataFrame (pre-sliced to max needed length)
+        spy_df: SPY OHLCV DataFrame (pre-sliced to max needed length)
+        vix_df: VIX OHLCV DataFrame (pre-sliced to max needed length)
         window: Channel detection window
         min_cycles: Minimum cycles for valid channel
         max_scan: Maximum bars to scan forward for labels
@@ -107,8 +109,8 @@ def _process_single_position(
     from ..features.full_features import extract_full_features, extract_all_window_features
     from .labels import generate_labels_multi_window, select_best_window_by_labels
 
-    # Slice DataFrames to position i for channel detection
-    # This is much faster than DataFrame reconstruction from numpy arrays
+    # Slice DataFrames to position i for channel detection (simple slice, no reconstruction)
+    # Only use data up to position i for channel detection
     tsla_window_df = tsla_df.iloc[:i]
     spy_window_df = spy_df.iloc[:i]
     vix_window_df = vix_df.iloc[:i]
@@ -148,17 +150,11 @@ def _process_single_position(
     # For backward compatibility, keep the 'features' field as best_window features
     features = features_per_window.get(best_window)
     if features is None:
-        # If best_window failed, use the smallest available window for determinism
-
-        # (dict iteration order is insertion order in Python 3.7+, but we use min())
-
-        # to be explicit and avoid any ambiguity across different code paths)
-
-        fallback_window = min(features_per_window.keys())
-        features = features_per_window[fallback_window]
+        # If best_window failed, use any available window
+        features = next(iter(features_per_window.values()))
 
     # Generate native per-TF labels for all window sizes
-    # Need forward data for label generation
+    # Need forward data for label generation (simple slice, no reconstruction)
     forward_end = min(i + max_forward_5min_bars, len(tsla_df))
     tsla_full_df = tsla_df.iloc[:forward_end]
 
@@ -350,14 +346,8 @@ def _scan_sequential(
         # For backward compatibility, keep the 'features' field as best_window features
         features = features_per_window.get(best_window)
         if features is None:
-            # If best_window failed, use the smallest available window for determinism
-
-            # (dict iteration order is insertion order in Python 3.7+, but we use min())
-
-            # to be explicit and avoid any ambiguity across different code paths)
-
-            fallback_window = min(features_per_window.keys())
-            features = features_per_window[fallback_window]
+            # If best_window failed, use any available window
+            features = next(iter(features_per_window.values()))
 
         # Generate native per-TF labels for all window sizes
         try:
@@ -436,9 +426,8 @@ def _scan_parallel(
     """
     Parallel scanning implementation using ProcessPoolExecutor.
 
-    Passes pre-sliced DataFrames to worker processes via initializer.
-    Workers use df.iloc[:i] slicing instead of DataFrame reconstruction.
-    This avoids redundant numpy array conversions and DataFrame reconstructions.
+    Pre-slices DataFrames and passes them directly to worker processes.
+    Workers process batches of positions to reduce overhead.
 
     Returns:
         Tuple of (samples, valid_count)
@@ -450,12 +439,14 @@ def _scan_parallel(
         max_workers = min(cpu_count - 1, 8)
     max_workers = max(1, max_workers)  # At least 1 worker
 
-    # Pre-slice DataFrames to the maximum index needed
-    # This avoids passing unnecessary data to worker processes
+    # Pre-slice DataFrames to the maximum index needed (avoids redundant slicing in workers)
+    # Include all data needed for label generation (up to max index + forward bars)
     max_idx = max(indices_list) + max_forward_5min_bars
-    tsla_sliced = tsla_df.iloc[:max_idx]
-    spy_sliced = spy_aligned.iloc[:max_idx]
-    vix_sliced = vix_aligned.iloc[:max_idx]
+    tsla_presliced = tsla_df.iloc[:max_idx]
+    spy_presliced = spy_aligned.iloc[:max_idx]
+    # VIX has fewer columns - handle the column difference
+    vix_cols = ['open', 'high', 'low', 'close'] if 'open' in vix_aligned.columns else list(vix_aligned.columns[:4])
+    vix_presliced = vix_aligned[vix_cols].iloc[:max_idx]
 
     # Split indices into chunks for workers
     # Each chunk should have enough work to amortize process overhead
@@ -478,13 +469,13 @@ def _scan_parallel(
         print("Pre-computing resampled data for all timeframes...")
 
     # Pre-compute all resampled versions (skip 5min as it's the base)
-    # Use the already sliced DataFrames - no need to reconstruct from arrays
-    precomputed_tsla = {'5min': tsla_sliced}  # 5min is identity
-    precomputed_spy = {'5min': spy_sliced}
+    # Use pre-sliced DataFrames directly (already have proper index)
+    precomputed_tsla = {'5min': tsla_presliced}  # 5min is identity
+    precomputed_spy = {'5min': spy_presliced}
     for tf in TIMEFRAMES:
         if tf != '5min':
-            precomputed_tsla[tf] = resample_ohlc(tsla_sliced, tf)
-            precomputed_spy[tf] = resample_ohlc(spy_sliced, tf)
+            precomputed_tsla[tf] = resample_ohlc(tsla_presliced, tf)
+            precomputed_spy[tf] = resample_ohlc(spy_presliced, tf)
 
     if progress:
         print(f"  Pre-computed {len(TIMEFRAMES)} timeframes for TSLA and SPY")
@@ -506,7 +497,7 @@ def _scan_parallel(
         max_workers=max_workers,
         mp_context=ctx,
         initializer=_init_scan_worker,
-        initargs=(tsla_sliced, spy_sliced, vix_sliced, progress_counter,
+        initargs=(tsla_presliced, spy_presliced, vix_presliced, progress_counter,
                   precomputed_tsla, precomputed_spy)
     ) as executor:
         # Submit all chunks (DataFrames are now in worker globals, not passed per-task)
@@ -630,8 +621,7 @@ def scan_valid_channels(
     max_workers: Optional[int] = None,
     heartbeat_timeout_sec: Optional[float] = None,
     heartbeat_interval_sec: float = 5.0,
-    fail_on_timeout: bool = False,
-    max_failed_batches: Optional[int] = None
+    fail_on_timeout: bool = False
 ) -> Tuple[List[ChannelSample], int]:
     """
     Scan through historical data to find all valid channels and generate samples.
@@ -673,9 +663,6 @@ def scan_valid_channels(
         heartbeat_interval_sec: Interval in seconds for checking heartbeat timeout (default: 5.0).
         fail_on_timeout: If True, raise TimeoutError when heartbeat timeout is exceeded.
                         If False (default), only print a warning and continue.
-        max_failed_batches: Optional maximum number of failed worker batches before raising an error.
-                           If None (default), continue processing and warn at the end.
-                           If exceeded, raises RuntimeError with failure count.
 
     Returns:
         List of ChannelSample objects
@@ -731,8 +718,7 @@ def scan_valid_channels(
             progress=progress,
             heartbeat_timeout_sec=heartbeat_timeout_sec,
             heartbeat_interval_sec=heartbeat_interval_sec,
-            fail_on_timeout=fail_on_timeout,
-            max_failed_batches=max_failed_batches
+            fail_on_timeout=fail_on_timeout
         )
     else:
         samples, valid_count = _scan_sequential(
