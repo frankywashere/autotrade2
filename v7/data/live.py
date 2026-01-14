@@ -3,14 +3,34 @@ Live Data Module for v7 Dashboard Integration
 
 Provides fetch_live_data() function to replace load_data() in dashboard.py.
 Integrates yfinance live data with historical CSV files.
+
+Uses LiveDataFetcher for optimal interval selection to maximize API data:
+- 1m: up to 7 days
+- 5m: up to 60 days
+- 1h: up to 730 days (2 years)
+- 1d: unlimited
 """
 
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 from dataclasses import dataclass
+
+# Import LiveDataFetcher for native interval support
+from .live_data_fetcher import LiveDataFetcher, MultiSymbolFetcher
+
+
+# yfinance API limits by interval (mirrored from live_data_fetcher for reference)
+YFINANCE_API_LIMITS = {
+    '1m': 7,      # 1-minute: last 7 days
+    '5m': 60,     # 5-minute: last 60 days
+    '15m': 60,    # 15-minute: last 60 days
+    '30m': 60,    # 30-minute: last 60 days
+    '1h': 730,    # 1-hour: last 730 days (2 years)
+    '1d': None,   # Daily: all available (unlimited)
+}
 
 
 @dataclass
@@ -22,6 +42,7 @@ class LiveDataResult:
     status: str  # 'LIVE', 'RECENT', 'STALE', 'HISTORICAL'
     timestamp: pd.Timestamp
     data_age_minutes: float
+    live_data_days: int = 0  # How many days of live data were fetched
 
 
 def fetch_live_data(
@@ -72,10 +93,12 @@ def fetch_live_data(
     # Try to fetch live data unless force_historical is set
     data_status = 'HISTORICAL'
     data_age_minutes = float('inf')
+    live_data_days = 0
 
     if not force_historical:
         try:
-            tsla_live, spy_live = _fetch_yfinance_data()
+            # Pass lookback_days to fetch optimal interval (up to 730 days of 1h data)
+            tsla_live, spy_live, live_data_days = _fetch_yfinance_data(lookback_days=lookback_days)
 
             if tsla_live is not None and spy_live is not None:
                 # Merge live with historical
@@ -109,7 +132,8 @@ def fetch_live_data(
         vix_df=vix_hist,
         status=data_status,
         timestamp=timestamp,
-        data_age_minutes=data_age_minutes
+        data_age_minutes=data_age_minutes,
+        live_data_days=live_data_days
     )
 
 
@@ -131,37 +155,60 @@ def _load_vix_csv(csv_path: Path, cutoff: datetime) -> pd.DataFrame:
     return df
 
 
-def _fetch_yfinance_data() -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+def _fetch_yfinance_data(lookback_days: int = 7) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], int]:
     """
-    Fetch latest data from yfinance (1min resolution, last 7 days).
+    Fetch latest data from yfinance using optimal interval for requested lookback.
+
+    Uses LiveDataFetcher to select the best interval based on API limits:
+    - <= 7 days: 1m interval (highest resolution)
+    - <= 60 days: 5m interval
+    - <= 730 days: 1h interval
+    - > 730 days: 1d interval (no limit)
+
+    Args:
+        lookback_days: Number of days of live data to fetch
 
     Returns:
-        (tsla_df, spy_df) or (None, None) if failed
+        (tsla_df, spy_df, actual_days) or (None, None, 0) if failed
+        actual_days indicates how many days of live data were actually fetched
     """
     try:
-        # Fetch TSLA 1min data (yfinance limit: 7 days)
-        tsla = yf.Ticker('TSLA')
-        tsla_df = tsla.history(period='7d', interval='1m')
+        # Select optimal interval based on lookback_days
+        if lookback_days <= 7:
+            interval = '1m'
+            fetch_days = min(lookback_days, 7)
+        elif lookback_days <= 60:
+            interval = '5m'
+            fetch_days = min(lookback_days, 60)
+        elif lookback_days <= 730:
+            interval = '1h'
+            fetch_days = min(lookback_days, 730)
+        else:
+            interval = '1d'
+            fetch_days = lookback_days  # No limit for daily
 
-        if len(tsla_df) == 0:
-            return None, None
+        # Use LiveDataFetcher for robust fetching
+        tsla_fetcher = LiveDataFetcher('TSLA')
+        spy_fetcher = LiveDataFetcher('SPY')
 
-        # Fetch SPY 1min data
-        spy = yf.Ticker('SPY')
-        spy_df = spy.history(period='7d', interval='1m')
+        tsla_df = tsla_fetcher.fetch(interval=interval, days_back=fetch_days)
 
-        if len(spy_df) == 0:
-            return None, None
+        if tsla_df.empty:
+            return None, None, 0
 
-        # Format to match CSV structure
-        tsla_df = _format_yfinance_df(tsla_df)
-        spy_df = _format_yfinance_df(spy_df)
+        spy_df = spy_fetcher.fetch(interval=interval, days_back=fetch_days)
 
-        return tsla_df, spy_df
+        if spy_df.empty:
+            return None, None, 0
+
+        # Note: LiveDataFetcher already normalizes the DataFrame
+        # (lowercase columns, timezone removed, OHLCV only)
+
+        return tsla_df, spy_df, fetch_days
 
     except Exception as e:
         print(f"Error fetching from yfinance: {e}")
-        return None, None
+        return None, None, 0
 
 
 def _format_yfinance_df(df: pd.DataFrame) -> pd.DataFrame:

@@ -2285,6 +2285,153 @@ class HierarchicalCfCModel(nn.Module):
                 'channel_valid': channel_valid[0].cpu().numpy(),        # [11] - for dashboard display
             }
 
+    def raw_output_to_predict_format(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        x: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Convert raw forward() output to predict() format.
+
+        This is used by TTT (Test-Time Training) to convert the raw model output
+        from ttt_adapter.step() into the same format as predict() returns.
+
+        Args:
+            outputs: Raw output from forward() or from TTT adapter's step().
+            x: [batch_size, 761] - Original input features, needed to extract channel_valid.
+
+        Returns:
+            Dictionary in same format as predict() returns.
+        """
+        # Handle different duration loss types
+        if self.num_hazard_bins > 0:
+            # Survival loss: convert hazard to mean/std
+            if 'duration_hazard' in outputs and outputs['duration_hazard'] is not None:
+                duration_mean, duration_std = hazard_to_duration_stats(
+                    outputs['duration_hazard'],
+                    num_bins=self.num_hazard_bins,
+                    max_duration=self.max_duration
+                )
+                outputs['duration_mean'] = duration_mean
+                outputs['duration_std'] = duration_std
+
+            if ('aggregate' in outputs and
+                'duration_hazard' in outputs['aggregate'] and
+                outputs['aggregate']['duration_hazard'] is not None):
+                agg_duration_mean, agg_duration_std = hazard_to_duration_stats(
+                    outputs['aggregate']['duration_hazard'],
+                    num_bins=self.num_hazard_bins,
+                    max_duration=self.max_duration
+                )
+                outputs['aggregate']['duration_mean'] = agg_duration_mean
+                outputs['aggregate']['duration_std'] = agg_duration_std
+        elif 'duration_log_std' in outputs:
+            # Gaussian NLL: convert log_std to std
+            duration_log_std_clamped = torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)
+            outputs['duration_std'] = torch.exp(duration_log_std_clamped)
+            if 'aggregate' in outputs and 'duration_log_std' in outputs['aggregate']:
+                agg_duration_log_std_clamped = torch.clamp(outputs['aggregate']['duration_log_std'], min=-5.0, max=4.0)
+                outputs['aggregate']['duration_std'] = torch.exp(agg_duration_log_std_clamped)
+        else:
+            # Huber/MSE: no uncertainty, set to zeros
+            if 'duration_mean' in outputs:
+                outputs['duration_std'] = torch.zeros_like(outputs['duration_mean'])
+            if 'aggregate' in outputs and 'duration_mean' in outputs['aggregate']:
+                outputs['aggregate']['duration_std'] = torch.zeros_like(outputs['aggregate']['duration_mean'])
+
+        # Convert per-timeframe logits to probabilities
+        direction_probs = torch.sigmoid(outputs['direction_logits'])  # [batch, 11]
+        next_channel_probs = F.softmax(outputs['next_channel_logits'], dim=-1)  # [batch, 11, 3]
+
+        # Convert aggregate logits to probabilities
+        agg_direction_probs = torch.sigmoid(outputs['aggregate']['direction_logits'])  # [batch, 1]
+        agg_next_channel_probs = F.softmax(outputs['aggregate']['next_channel_logits'], dim=-1)  # [batch, 3]
+        agg_trigger_tf_probs = F.softmax(outputs['aggregate']['trigger_tf_logits'], dim=-1)  # [batch, 21] v9.0.0
+
+        # Get class predictions for per-timeframe
+        direction = (direction_probs > 0.5).long()                           # [batch, 11]
+        next_channel = next_channel_probs.argmax(dim=-1)                     # [batch, 11]
+
+        # Get aggregate class predictions
+        agg_direction = (agg_direction_probs > 0.5).long()                   # [batch, 1]
+        agg_next_channel = agg_next_channel_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
+        agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)   # [batch, 1] v9.0.0
+
+        # Get duration_std from already-converted values
+        duration_std = outputs.get('duration_std', torch.exp(torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs else torch.zeros_like(outputs['duration_mean']))
+        agg_duration_std = outputs['aggregate'].get('duration_std', torch.exp(torch.clamp(outputs['aggregate']['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs['aggregate'] else torch.zeros_like(outputs['aggregate']['duration_mean']))
+
+        # Window selection: use argmax during inference (hard selection)
+        window_selection = outputs['window_logits'].argmax(dim=-1)           # [batch, 11]
+
+        # Extract channel_valid (first element of each TF block)
+        # x9: Each TF block is 59 features (38 TSLA + 11 SPY + 10 CROSS)
+        # channel_valid is the first feature in each TSLA block
+        channel_valid_indices = [tf_idx * 59 for tf_idx in range(11)]
+        channel_valid = x[:, channel_valid_indices]  # [batch, 11]
+
+        # Find recommended timeframe (highest confidence)
+        best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
+
+        # Validate critical outputs - use safe defaults instead of hard assert
+        if not torch.isfinite(outputs['duration_mean']).all():
+            import warnings
+            warnings.warn("NaN/Inf detected in duration predictions, using safe defaults")
+            outputs['duration_mean'] = torch.full_like(
+                outputs['duration_mean'], 25.0
+            )
+            duration_std = torch.full_like(
+                duration_std, 10.0
+            )
+        if not torch.isfinite(outputs['aggregate']['duration_mean']).all():
+            import warnings
+            warnings.warn("NaN/Inf detected in aggregate duration predictions, using safe defaults")
+            outputs['aggregate']['duration_mean'] = torch.full_like(
+                outputs['aggregate']['duration_mean'], 25.0
+            )
+            agg_duration_std = torch.full_like(
+                agg_duration_std, 10.0
+            )
+
+        return {
+            # Per-timeframe predictions (for dashboard table)
+            'per_tf': {
+                'duration_mean': outputs['duration_mean'],          # [batch, 11]
+                'duration_std': duration_std,                       # [batch, 11]
+                'direction': direction,                             # [batch, 11]
+                'direction_probs': direction_probs,                 # [batch, 11]
+                'next_channel': next_channel,                       # [batch, 11]
+                'next_channel_probs': next_channel_probs,           # [batch, 11, 3]
+                'confidence': outputs['confidence'],                # [batch, 11]
+            },
+
+            # Window selection (per-TF)
+            'window_selection': {
+                'selected_window': window_selection,                # [batch, 11] - argmax indices
+                'window_probs': outputs['window_probs'],            # [batch, 11, 8] - softmax probs
+                'window_logits': outputs['window_logits'],          # [batch, 11, 8] - raw logits
+            },
+
+            # Aggregate prediction (for simple signal)
+            'aggregate': {
+                'duration_mean': outputs['aggregate']['duration_mean'],
+                'duration_std': agg_duration_std,
+                'direction': agg_direction,                         # [batch, 1] - binary
+                'direction_probs': agg_direction_probs,             # [batch, 1]
+                'next_channel': agg_next_channel,
+                'next_channel_probs': agg_next_channel_probs,
+                'confidence': outputs['aggregate']['confidence'],
+                # v9.0.0: Trigger TF predictions (21-class)
+                'trigger_tf': agg_trigger_tf,                       # [batch, 1] - class 0-20
+                'trigger_tf_probs': agg_trigger_tf_probs,           # [batch, 21] - probabilities
+            },
+
+            # Metadata
+            'best_tf_idx': best_tf_idx,                             # [batch] - which TF to use
+            'attention_weights': outputs.get('attention_weights'),  # [batch, 11, 11]
+            'channel_valid': channel_valid[0].cpu().numpy(),        # [11] - for dashboard display
+        }
+
     def get_num_parameters(self) -> Dict[str, int]:
         """
         Count parameters in each component.

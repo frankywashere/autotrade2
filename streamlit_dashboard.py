@@ -564,16 +564,102 @@ def load_model(checkpoint_path: str) -> Optional[torch.nn.Module]:
 # Data Loading Functions
 # =============================================================================
 
+def _align_market_data(tsla_df: pd.DataFrame, spy_df: pd.DataFrame, vix_df: pd.DataFrame) -> tuple:
+    """
+    Align SPY and VIX data to TSLA's index, matching training data alignment.
+
+    This ensures dashboard data alignment matches v7/training/dataset.py:load_market_data():
+    1. Find intersection of date ranges across TSLA/SPY/VIX
+    2. Trim ALL THREE datasets to the intersection date range BEFORE reindexing
+    3. Reindex SPY to TSLA's index with forward-fill
+    4. Reindex VIX to TSLA's index with forward-fill
+    5. Drop rows with any NaN values
+
+    IMPORTANT: Trimming all datasets to the intersection BEFORE reindexing prevents
+    ffill from pulling values from outside the overlapping date range.
+
+    Args:
+        tsla_df: TSLA 5min OHLCV data (already resampled)
+        spy_df: SPY 5min OHLCV data (already resampled)
+        vix_df: VIX daily data
+
+    Returns:
+        Tuple of (tsla_aligned, spy_aligned, vix_aligned) - all with aligned indices
+    """
+    if tsla_df.empty:
+        return tsla_df, spy_df, vix_df
+
+    # Find intersection of date ranges
+    tsla_dates = set(tsla_df.index.date)
+    spy_dates = set(spy_df.index.date) if not spy_df.empty else tsla_dates
+    vix_dates = set(vix_df.index.date) if not vix_df.empty else tsla_dates
+
+    common_dates = tsla_dates & spy_dates & vix_dates
+
+    if not common_dates:
+        # No overlapping dates - return original data
+        return tsla_df, spy_df, vix_df
+
+    intersection_start = min(common_dates)
+    intersection_end = max(common_dates)
+
+    # Filter ALL THREE datasets to intersection date range BEFORE reindexing
+    # This prevents ffill from pulling values from outside the overlapping range
+    tsla_df = tsla_df[(tsla_df.index.date >= intersection_start) & (tsla_df.index.date <= intersection_end)]
+
+    if not spy_df.empty:
+        spy_df = spy_df[(spy_df.index.date >= intersection_start) & (spy_df.index.date <= intersection_end)]
+
+    if not vix_df.empty:
+        vix_df = vix_df[(vix_df.index.date >= intersection_start) & (vix_df.index.date <= intersection_end)]
+
+    if tsla_df.empty:
+        return tsla_df, spy_df, vix_df
+
+    # Reindex SPY to TSLA's index with forward-fill (matches training alignment)
+    if not spy_df.empty:
+        spy_aligned = spy_df.reindex(tsla_df.index, method='ffill')
+    else:
+        spy_aligned = spy_df
+
+    # Reindex VIX to TSLA's index with forward-fill (matches training alignment)
+    if not vix_df.empty:
+        vix_aligned = vix_df.reindex(tsla_df.index, method='ffill')
+    else:
+        vix_aligned = vix_df
+
+    # Drop rows with NaN values (matches training: combined.isna().any(axis=1))
+    if not spy_aligned.empty and not vix_aligned.empty:
+        combined = pd.concat([tsla_df, spy_aligned, vix_aligned], axis=1)
+        valid_mask = ~combined.isna().any(axis=1)
+
+        tsla_aligned = tsla_df[valid_mask].copy()
+        spy_aligned = spy_aligned[valid_mask].copy()
+        vix_aligned = vix_aligned[valid_mask].copy()
+    else:
+        tsla_aligned = tsla_df
+
+    return tsla_aligned, spy_aligned, vix_aligned
+
+
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def load_market_data(use_live: bool = True, lookback_days: int = 90) -> Dict:
-    """Load market data from live source or CSV files."""
+    """Load market data from live source or CSV files with proper alignment.
+
+    Data alignment matches training (v7/training/dataset.py:load_market_data):
+    1. Inner join alignment across TSLA/SPY/VIX by date
+    2. SPY reindexed to TSLA timestamps with forward-fill
+    3. VIX reindexed to TSLA timestamps with forward-fill
+    4. Rows with NaN values are dropped
+    """
     result = {
         "tsla_df": None,
         "spy_df": None,
         "vix_df": None,
         "status": "UNKNOWN",
         "timestamp": None,
-        "error": None
+        "error": None,
+        "live_data_days": 0  # How many days of live API data were fetched
     }
 
     # Try live data first
@@ -581,13 +667,21 @@ def load_market_data(use_live: bool = True, lookback_days: int = 90) -> Dict:
         try:
             live_result = fetch_live_data(lookback_days=lookback_days)
             if live_result.tsla_df is not None and len(live_result.tsla_df) > 0:
-                result["tsla_df"] = live_result.tsla_df
-                result["spy_df"] = live_result.spy_df
-                result["vix_df"] = live_result.vix_df
+                tsla_df = live_result.tsla_df
+                spy_df = live_result.spy_df if live_result.spy_df is not None else pd.DataFrame()
+                vix_df = live_result.vix_df if live_result.vix_df is not None else pd.DataFrame()
+
+                # Apply alignment matching training data pipeline
+                tsla_aligned, spy_aligned, vix_aligned = _align_market_data(tsla_df, spy_df, vix_df)
+
+                result["tsla_df"] = tsla_aligned
+                result["spy_df"] = spy_aligned
+                result["vix_df"] = vix_aligned
                 # Status might be string or enum - handle both
                 status = live_result.status
                 result["status"] = status.name if hasattr(status, 'name') else str(status)
                 result["timestamp"] = live_result.timestamp
+                result["live_data_days"] = getattr(live_result, 'live_data_days', 0)
                 return result
             else:
                 result["error"] = "Live data returned empty TSLA dataframe"
@@ -631,12 +725,15 @@ def load_market_data(use_live: bool = True, lookback_days: int = 90) -> Dict:
             if len(spy_df) > 0:
                 spy_df = resample_ohlc(spy_df, '5min')
 
-        result["tsla_df"] = tsla_df
-        result["spy_df"] = spy_df
-        result["vix_df"] = vix_df
+        # Apply alignment matching training data pipeline
+        tsla_aligned, spy_aligned, vix_aligned = _align_market_data(tsla_df, spy_df, vix_df)
+
+        result["tsla_df"] = tsla_aligned
+        result["spy_df"] = spy_aligned
+        result["vix_df"] = vix_aligned
         result["status"] = "HISTORICAL"
-        if len(tsla_df) > 0:
-            result["timestamp"] = tsla_df.index[-1]
+        if len(tsla_aligned) > 0:
+            result["timestamp"] = tsla_aligned.index[-1]
     except Exception as e:
         result["error"] = str(e)
 
@@ -690,15 +787,31 @@ def filter_market_hours(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame) -> Tuple[Dict, Dict]:
-    """Detect channels for all timeframes with adaptive window sizes."""
+    """Detect channels for all timeframes with adaptive window sizes.
+
+    NOTE ON TRAINING VS INFERENCE WINDOW STRATEGY:
+    - Training (v7/training/scanning.py) uses multi-window detection with STANDARD_WINDOWS
+      = [10, 20, 30, 40, 50, 60, 70, 80] and selects the best window via select_best_channel().
+      This means training samples may have been generated with window=30, 60, etc.
+    - This dashboard uses single fixed windows per timeframe (WINDOW_MAP below) for simplicity.
+    - For EndToEndWindowModel (Phase 2b), make_predictions() extracts features for all 8
+      standard windows, matching training behavior.
+    - For standard HierarchicalCfCModel, we use single-window detection which may cause
+      slight prediction mismatch if training selected a different window as "best".
+
+    To match training exactly, you could use detect_channels_multi_window() and
+    select_best_channel() from v7.core.channel, but this adds complexity for marginal gain.
+    """
     # Filter to regular trading hours first
     tsla_df = filter_market_hours(tsla_df)
     spy_df = filter_market_hours(spy_df)
 
     # Adaptive window sizes - shorter windows for higher timeframes
     # Now includes all 11 model timeframes (using canonical names from v7.core.timeframe)
+    # NOTE: Training uses STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80] with best-window
+    # selection. These single-window values are simplified approximations.
     WINDOW_MAP = {
-        '5min': 50,    # 50 bars = 4.2 hours
+        '5min': 50,    # 50 bars = 4.2 hours (training may select 10-80)
         '15min': 40,   # 40 bars = 10 hours
         '30min': 30,   # 30 bars = 15 hours
         '1h': 20,      # 20 bars = 20 hours
@@ -852,13 +965,10 @@ def make_predictions(
             # Run inference with multi-window input (with or without TTT)
             if ttt_adapter is not None and ttt_adapter.config.mode != TTTMode.STATIC:
                 # TTT-enabled inference for end-to-end model
+                # CRITICAL: Use TTT-adapted output, not a fresh model.predict() call
                 raw_output, ttt_stats = ttt_adapter.step(per_window_tensor)
-                # Get full predictions format
-                outputs = model.predict(
-                    per_window_tensor,
-                    window_scores=window_scores_tensor,
-                    window_valid=window_valid_tensor
-                )
+                # Convert raw TTT output to predict() format
+                outputs = model.raw_output_to_predict_format(raw_output, per_window_tensor)
             else:
                 # Standard inference
                 with torch.no_grad():
@@ -896,9 +1006,10 @@ def make_predictions(
             # Run inference (with or without TTT)
             if ttt_adapter is not None and ttt_adapter.config.mode != TTTMode.STATIC:
                 # TTT-enabled inference
+                # CRITICAL: Use TTT-adapted output, not a fresh model.predict() call
                 raw_output, ttt_stats = ttt_adapter.step(feature_tensor)
-                # Get full predictions format
-                outputs = model.predict(feature_tensor)
+                # Convert raw TTT output to predict() format
+                outputs = model.raw_output_to_predict_format(raw_output, feature_tensor)
             else:
                 # Standard inference
                 with torch.no_grad():
@@ -1329,11 +1440,24 @@ def main():
             st.caption("✗ Live data module not available")
 
         use_live = st.checkbox("Use Live Data", value=LIVE_DATA_AVAILABLE, disabled=not LIVE_DATA_AVAILABLE)
-        lookback_days = st.slider("Lookback Days", 420, 730, 500, help="Model trained with 420-day warmup. Values below 420 produce unreliable predictions.")
+        lookback_days = st.slider(
+            "Lookback Days", 420, 1500, 500,
+            help="420+ for basic, 1260+ for 3-month ATR (14 bars). API limits: 7d@1m, 60d@5m, 730d@1h. Beyond uses CSV."
+        )
+
+        # Show API coverage info
+        if lookback_days <= 7:
+            st.caption("Live data: 1-min resolution (full coverage)")
+        elif lookback_days <= 60:
+            st.caption("Live data: 5-min resolution (full coverage)")
+        elif lookback_days <= 730:
+            st.caption("Live data: 1-hour resolution (full coverage)")
+        else:
+            st.caption("Live data: daily + CSV for older data")
 
         # Data sufficiency warning
         if lookback_days < 420:
-            st.warning("⚠️ Lookback below training minimum (420 days). Weekly/monthly timeframe predictions will be unreliable.")
+            st.warning("Lookback below training minimum (420 days). Weekly/monthly timeframe predictions will be unreliable.")
 
         col_refresh1, col_refresh2 = st.columns(2)
         with col_refresh1:
@@ -1351,7 +1475,11 @@ def main():
 
     # Load data
     data = load_market_data(use_live=use_live, lookback_days=lookback_days)
-    st.info(f"📊 Using {lookback_days} days of historical data. Training requires 420+ days for all timeframes.")
+    live_days = data.get("live_data_days", 0)
+    if live_days > 0:
+        st.info(f"Using {lookback_days} days of data ({live_days} days from live API, rest from CSV). Training requires 420+ days.")
+    else:
+        st.info(f"Using {lookback_days} days of historical data from CSV. Training requires 420+ days for all timeframes.")
 
     # Tab 1: Live Predictions
     with tab1:

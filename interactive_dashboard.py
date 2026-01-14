@@ -62,6 +62,42 @@ try:
 except ImportError:
     LIVE_DATA_AVAILABLE = False
 
+
+# =============================================================================
+# Feature Adaptation
+# =============================================================================
+
+def adapt_features_809_to_776(features_809: np.ndarray) -> np.ndarray:
+    """
+    Strip 809 features to 776 by removing 3 ATR features per timeframe.
+
+    v13 (809): TSLA=38, SPY=11, CROSS=10 per TF (59 total) x 11 + 160 shared
+    v12 (776): TSLA=35, SPY=11, CROSS=10 per TF (56 total) x 11 + 160 shared
+
+    Removes ATR features at indices [18:21] within each TSLA block.
+    """
+    if features_809.shape[-1] != 809:
+        return features_809
+
+    adapted_parts = []
+    for tf_idx in range(11):
+        # v13 structure per TF
+        tf_start = tf_idx * 59
+        tsla_end = tf_start + 38
+
+        # Keep TSLA [0:18] and [21:38], skip ATR [18:21]
+        adapted_parts.append(features_809[..., tf_start:tf_start+18])
+        adapted_parts.append(features_809[..., tf_start+21:tsla_end])
+
+        # Keep SPY and CROSS unchanged
+        adapted_parts.append(features_809[..., tsla_end:tsla_end+21])
+
+    # Keep shared features
+    adapted_parts.append(features_809[..., 649:])
+
+    return np.concatenate(adapted_parts, axis=-1)
+
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -376,6 +412,84 @@ def load_csv_data(lookback_days: int = 500) -> Tuple[pd.DataFrame, pd.DataFrame,
     return tsla_df, spy_df, vix_df
 
 
+def _align_market_data(tsla_df: pd.DataFrame, spy_df: pd.DataFrame, vix_df: pd.DataFrame) -> tuple:
+    """
+    Align SPY and VIX data to TSLA's index, matching training data alignment.
+
+    This ensures dashboard data alignment matches v7/training/dataset.py:load_market_data():
+    1. Find intersection of date ranges across TSLA/SPY/VIX
+    2. Trim ALL THREE datasets to the intersection date range BEFORE reindexing
+    3. Reindex SPY to TSLA's index with forward-fill
+    4. Reindex VIX to TSLA's index with forward-fill
+    5. Drop rows with any NaN values
+
+    IMPORTANT: Trimming all datasets to the intersection BEFORE reindexing prevents
+    ffill from pulling values from outside the overlapping date range.
+
+    Args:
+        tsla_df: TSLA 5min OHLCV data (already resampled)
+        spy_df: SPY 5min OHLCV data (already resampled)
+        vix_df: VIX daily data
+
+    Returns:
+        Tuple of (tsla_aligned, spy_aligned, vix_aligned) - all with aligned indices
+    """
+    if tsla_df.empty:
+        return tsla_df, spy_df, vix_df
+
+    # Find intersection of date ranges
+    tsla_dates = set(tsla_df.index.date)
+    spy_dates = set(spy_df.index.date) if not spy_df.empty else tsla_dates
+    vix_dates = set(vix_df.index.date) if not vix_df.empty else tsla_dates
+
+    common_dates = tsla_dates & spy_dates & vix_dates
+
+    if not common_dates:
+        # No overlapping dates - return original data
+        return tsla_df, spy_df, vix_df
+
+    intersection_start = min(common_dates)
+    intersection_end = max(common_dates)
+
+    # Filter ALL THREE datasets to intersection date range BEFORE reindexing
+    # This prevents ffill from pulling values from outside the overlapping range
+    tsla_df = tsla_df[(tsla_df.index.date >= intersection_start) & (tsla_df.index.date <= intersection_end)]
+
+    if not spy_df.empty:
+        spy_df = spy_df[(spy_df.index.date >= intersection_start) & (spy_df.index.date <= intersection_end)]
+
+    if not vix_df.empty:
+        vix_df = vix_df[(vix_df.index.date >= intersection_start) & (vix_df.index.date <= intersection_end)]
+
+    if tsla_df.empty:
+        return tsla_df, spy_df, vix_df
+
+    # Reindex SPY to TSLA's index with forward-fill (matches training alignment)
+    if not spy_df.empty:
+        spy_aligned = spy_df.reindex(tsla_df.index, method='ffill')
+    else:
+        spy_aligned = spy_df
+
+    # Reindex VIX to TSLA's index with forward-fill (matches training alignment)
+    if not vix_df.empty:
+        vix_aligned = vix_df.reindex(tsla_df.index, method='ffill')
+    else:
+        vix_aligned = vix_df
+
+    # Drop rows with NaN values (matches training: combined.isna().any(axis=1))
+    if not spy_aligned.empty and not vix_aligned.empty:
+        combined = pd.concat([tsla_df, spy_aligned, vix_aligned], axis=1)
+        valid_mask = ~combined.isna().any(axis=1)
+
+        tsla_aligned = tsla_df[valid_mask].copy()
+        spy_aligned = spy_aligned[valid_mask].copy()
+        vix_aligned = vix_aligned[valid_mask].copy()
+    else:
+        tsla_aligned = tsla_df
+
+    return tsla_aligned, spy_aligned, vix_aligned
+
+
 def load_market_data(use_live: bool = True, lookback_days: int = 500) -> Dict[str, Any]:
     """Load market data, preferring live data if available."""
     result = {
@@ -391,9 +505,13 @@ def load_market_data(use_live: bool = True, lookback_days: int = 500) -> Dict[st
     if use_live and LIVE_DATA_AVAILABLE:
         try:
             live_result = fetch_live_data(lookback_days=lookback_days)
-            result["tsla_df"] = live_result.tsla_df
-            result["spy_df"] = live_result.spy_df
-            result["vix_df"] = live_result.vix_df
+            # Align data to match training alignment
+            tsla_aligned, spy_aligned, vix_aligned = _align_market_data(
+                live_result.tsla_df, live_result.spy_df, live_result.vix_df
+            )
+            result["tsla_df"] = tsla_aligned
+            result["spy_df"] = spy_aligned
+            result["vix_df"] = vix_aligned
             result["status"] = live_result.status
             result["data_age_minutes"] = live_result.data_age_minutes
             result["timestamp"] = live_result.timestamp
@@ -403,12 +521,14 @@ def load_market_data(use_live: bool = True, lookback_days: int = 500) -> Dict[st
 
     try:
         tsla_df, spy_df, vix_df = load_csv_data(lookback_days)
-        result["tsla_df"] = tsla_df
-        result["spy_df"] = spy_df
-        result["vix_df"] = vix_df
+        # Align data to match training alignment
+        tsla_aligned, spy_aligned, vix_aligned = _align_market_data(tsla_df, spy_df, vix_df)
+        result["tsla_df"] = tsla_aligned
+        result["spy_df"] = spy_aligned
+        result["vix_df"] = vix_aligned
         result["status"] = "HISTORICAL"
-        if len(tsla_df) > 0:
-            result["timestamp"] = tsla_df.index[-1]
+        if len(tsla_aligned) > 0:
+            result["timestamp"] = tsla_aligned.index[-1]
     except Exception as e:
         result["error"] = str(e)
 
@@ -420,7 +540,17 @@ def load_market_data(use_live: bool = True, lookback_days: int = 500) -> Dict[st
 # =============================================================================
 
 def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame) -> Tuple[Dict, Dict]:
-    """Detect channels for all timeframes."""
+    """Detect channels for all timeframes.
+
+    NOTE ON TRAINING VS INFERENCE WINDOW STRATEGY:
+    - Training (v7/training/scanning.py) uses multi-window detection with STANDARD_WINDOWS
+      = [10, 20, 30, 40, 50, 60, 70, 80] and selects the best window via select_best_channel().
+      This means training samples may have been generated with window=30, 60, etc.
+    - This dashboard uses a fixed window=50 for all timeframes for simplicity.
+    - This may cause slight prediction mismatch if training selected a different window as "best".
+    - To match training exactly, use detect_channels_multi_window() and select_best_channel()
+      from v7.core.channel.
+    """
     tsla_channels = {}
     spy_channels = {}
 
@@ -433,6 +563,8 @@ def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame) -> Tuple[Di
                 tf_tsla = resample_ohlc(tsla_df, tf)
                 tf_spy = resample_ohlc(spy_df, tf) if len(spy_df) > 0 else None
 
+            # NOTE: Training uses STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80] with
+            # best-window selection. This fixed window=50 is a simplified approximation.
             if len(tf_tsla) >= 50:
                 tsla_channels[tf] = detect_channel(tf_tsla, window=50)
 
@@ -481,14 +613,25 @@ def make_predictions(
 
         x = torch.from_numpy(np.concatenate(feature_list)).float().unsqueeze(0)
 
+        # Adapt features if needed (809 -> 776 for older checkpoints)
+        # Check model's expected input dimension from first layer
+        expected_dim = None
+        for name, param in model.named_parameters():
+            if 'tf_branches.0.input_proj.weight' in name:
+                expected_dim = param.shape[1]
+                break
+        if expected_dim is not None and x.shape[-1] == 809 and expected_dim == 776:
+            x_np = adapt_features_809_to_776(x.numpy())
+            x = torch.from_numpy(x_np).float()
+
         ttt_stats = None
 
         # Run inference with or without TTT
         if ttt_adapter is not None and ttt_adapter.config.mode != TTTMode.STATIC:
             # TTT-enabled inference
             raw_output, ttt_stats = ttt_adapter.step(x)
-            # Get full predictions
-            outputs = model.predict(x)
+            # CRITICAL: Use TTT-adapted output, not a fresh model.predict() call
+            outputs = model.raw_output_to_predict_format(raw_output, x)
         else:
             # Standard inference
             with torch.no_grad():
@@ -1040,7 +1183,7 @@ class SettingsScreen(Screen):
                 Horizontal(
                     Label("Lookback Days:"),
                     Select(
-                        [(str(d), d) for d in [420, 500, 600, 730]],
+                        [(str(d), d) for d in [420, 500, 730, 1000, 1260, 1500]],
                         value=500,
                         id="lookback-select"
                     ),

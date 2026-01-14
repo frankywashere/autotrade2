@@ -926,6 +926,134 @@ class EndToEndWindowModel(nn.Module):
                 'selection_confidence': selection_confidence,
             }
 
+    def raw_output_to_predict_format(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        per_window_features: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Convert raw forward() output to predict() format.
+
+        This is used by TTT (Test-Time Training) to convert the raw model output
+        from ttt_adapter.step() into the same format as predict() returns.
+
+        Parameters:
+        ----------
+        outputs : Dict[str, torch.Tensor]
+            Raw output from forward() or from TTT adapter's step().
+
+        per_window_features : torch.Tensor
+            Shape [batch, num_windows, feature_dim]. Original input features,
+            needed to extract channel_valid flags.
+
+        Returns:
+        -------
+        Dict[str, torch.Tensor]
+            Same format as predict() returns.
+        """
+        # Get selected window index and confidence
+        selected_window_idx = outputs['window_selection_probs'].argmax(dim=-1)  # [batch]
+        max_entropy = torch.log(torch.tensor(float(self.num_windows), device=per_window_features.device))
+        selection_confidence = 1.0 - (outputs['window_selection_entropy'] / max_entropy)
+        selection_confidence = selection_confidence.clamp(0, 1)
+
+        # Convert per-timeframe logits to probabilities
+        direction_probs = torch.sigmoid(outputs['direction_logits'])  # [batch, 11]
+        next_channel_probs = F.softmax(outputs['next_channel_logits'], dim=-1)  # [batch, 11, 3]
+
+        # Convert aggregate logits to probabilities
+        agg_direction_probs = torch.sigmoid(outputs['aggregate']['direction_logits'])  # [batch, 1]
+        agg_next_channel_probs = F.softmax(outputs['aggregate']['next_channel_logits'], dim=-1)  # [batch, 3]
+        agg_trigger_tf_probs = F.softmax(outputs['aggregate']['trigger_tf_logits'], dim=-1)  # [batch, 21]
+
+        # Get class predictions for per-timeframe
+        direction = (direction_probs > 0.5).long()  # [batch, 11]
+        next_channel = next_channel_probs.argmax(dim=-1)  # [batch, 11]
+
+        # Get aggregate class predictions
+        agg_direction = (agg_direction_probs > 0.5).long()  # [batch, 1]
+        agg_next_channel = agg_next_channel_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
+        agg_trigger_tf = agg_trigger_tf_probs.argmax(dim=-1, keepdim=True)  # [batch, 1]
+
+        # Compute std from log_std or use pre-computed std
+        duration_std = outputs.get('duration_std', torch.exp(torch.clamp(outputs['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs else torch.zeros_like(outputs['duration_mean']))
+        agg_duration_std = outputs['aggregate'].get('duration_std', torch.exp(torch.clamp(outputs['aggregate']['duration_log_std'], min=-5.0, max=4.0)) if 'duration_log_std' in outputs['aggregate'] else torch.zeros_like(outputs['aggregate']['duration_mean']))
+
+        # Find recommended timeframe (highest confidence)
+        best_tf_idx = outputs['confidence'].argmax(dim=1)  # [batch]
+
+        # Extract channel_valid from raw selected window features
+        batch_indices = torch.arange(per_window_features.size(0), device=per_window_features.device)
+        selected_raw_features = per_window_features[batch_indices, selected_window_idx, :]  # [batch, feature_dim]
+        channel_valid_indices = [tf_idx * 59 for tf_idx in range(11)]
+        channel_valid = selected_raw_features[:, channel_valid_indices]  # [batch, 11]
+
+        # Validate critical outputs - use safe defaults instead of hard assert
+        if not torch.isfinite(outputs['duration_mean']).all():
+            import warnings
+            warnings.warn("NaN/Inf detected in duration predictions, using safe defaults")
+            outputs['duration_mean'] = torch.full_like(
+                outputs['duration_mean'], 25.0
+            )
+            duration_std = torch.full_like(
+                duration_std, 10.0
+            )
+        if not torch.isfinite(outputs['aggregate']['duration_mean']).all():
+            import warnings
+            warnings.warn("NaN/Inf detected in aggregate duration predictions, using safe defaults")
+            outputs['aggregate']['duration_mean'] = torch.full_like(
+                outputs['aggregate']['duration_mean'], 25.0
+            )
+            agg_duration_std = torch.full_like(
+                agg_duration_std, 10.0
+            )
+
+        # Return in same format as predict()
+        return {
+            # Per-timeframe predictions (for dashboard table)
+            'per_tf': {
+                'duration_mean': outputs['duration_mean'],  # [batch, 11]
+                'duration_std': duration_std,  # [batch, 11]
+                'direction': direction,  # [batch, 11]
+                'direction_probs': direction_probs,  # [batch, 11]
+                'next_channel': next_channel,  # [batch, 11]
+                'next_channel_probs': next_channel_probs,  # [batch, 11, 3]
+                'confidence': outputs['confidence'],  # [batch, 11]
+            },
+
+            # Window selection (EndToEnd-specific)
+            'window_selection': {
+                'selected_idx': selected_window_idx,
+                'selected_window': selected_window_idx,  # Alias for compatibility
+                'confidence': selection_confidence,
+                'probs': outputs['window_selection_probs'],
+                'window_probs': outputs['window_selection_probs'],  # Alias for compatibility
+            },
+
+            # Aggregate prediction (for simple signal)
+            'aggregate': {
+                'duration_mean': outputs['aggregate']['duration_mean'],
+                'duration_std': agg_duration_std,
+                'direction': agg_direction,  # [batch, 1]
+                'direction_probs': agg_direction_probs,  # [batch, 1]
+                'next_channel': agg_next_channel,
+                'next_channel_probs': agg_next_channel_probs,
+                'confidence': outputs['aggregate']['confidence'],
+                # v9.0.0: Trigger TF predictions (21-class)
+                'trigger_tf': agg_trigger_tf,  # [batch, 1]
+                'trigger_tf_probs': agg_trigger_tf_probs,  # [batch, 21]
+            },
+
+            # Metadata
+            'best_tf_idx': best_tf_idx,  # [batch] - which TF to use
+            'attention_weights': outputs.get('attention_weights'),  # [batch, 11, 11]
+            'channel_valid': channel_valid[0].cpu().numpy(),  # [11] - for dashboard display
+
+            # Keep raw outputs for debugging/advanced use
+            'selected_window_idx': selected_window_idx,
+            'selection_confidence': selection_confidence,
+        }
+
     def set_temperature(self, temperature: float):
         """
         Update the window selector's softmax temperature.

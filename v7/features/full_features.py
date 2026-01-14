@@ -485,6 +485,7 @@ def extract_full_features(
             pass
 
         # Calculate ATR - required for proper feature extraction
+        # For long timeframes (monthly, 3month) with insufficient data, skip gracefully
         if len(df_tf) >= 14:
             try:
                 atr_series, current_atr = calculate_atr(
@@ -498,6 +499,11 @@ def extract_full_features(
                 atr_values_per_tf[tf] = current_atr
             except (ValueError, IndexError) as e:
                 raise ValueError(f"ATR calculation failed for timeframe {tf}. Ensure sufficient data is available. Error: {e}")
+        elif tf in ['monthly', '3month']:
+            # Skip long timeframes with insufficient data - they'll be excluded from features
+            import warnings
+            warnings.warn(f"Skipping ATR for {tf}: only {len(df_tf)} bars (need 14). Increase lookback to 1260+ days.")
+            # Don't add to atr_values_per_tf - this TF will be skipped in feature extraction
         else:
             raise ValueError(f"ATR calculation requires at least 14 bars for timeframe {tf}, got {len(df_tf)}")
 
@@ -509,8 +515,12 @@ def extract_full_features(
         channel = tsla_channels_dict.get(tf)
         rsi_series = rsi_series_per_tf.get(tf)
 
-        # Skip if we don't have required data
+        # Skip if we don't have required data (channel, RSI, or ATR)
         if channel is None or rsi_series is None:
+            continue
+
+        # Skip timeframes without valid ATR (e.g., monthly/3month with insufficient data)
+        if tf not in atr_values_per_tf:
             continue
 
         try:
@@ -519,7 +529,7 @@ def extract_full_features(
             longer_channels = {ltf: tsla_channels_dict.get(ltf) for ltf in longer_tfs if ltf in tsla_channels_dict}
 
             # Get ATR for this timeframe
-            atr = atr_values_per_tf.get(tf, 0.0)
+            atr = atr_values_per_tf[tf]
 
             tsla_features[tf] = extract_tsla_channel_features(
                 df_tf, tf, channel, rsi_series,
@@ -736,6 +746,7 @@ def extract_shared_features(
             pass
 
     # Step 4b: Calculate ATR for each TSLA timeframe - required for proper feature extraction
+    # For long timeframes (monthly, 3month) with insufficient data, skip gracefully
     from v7.core.channel import calculate_atr
     atr_values_per_tf = {}
     for tf in TIMEFRAMES:
@@ -753,6 +764,12 @@ def extract_shared_features(
                 atr_values_per_tf[tf] = current_atr
             except (ValueError, IndexError) as e:
                 raise ValueError(f"ATR calculation failed for timeframe {tf}. Ensure sufficient data is available. Error: {e}")
+        elif tf in ['monthly', '3month']:
+            # Skip long timeframes with insufficient data - they'll be excluded from features
+            import warnings
+            bars_count = len(df_tf) if df_tf is not None else 0
+            warnings.warn(f"Skipping ATR for {tf}: only {bars_count} bars (need 14). Increase lookback to 1260+ days.")
+            # Don't add to atr_values_per_tf - this TF will be skipped in feature extraction
         else:
             raise ValueError(f"ATR calculation requires at least 14 bars for timeframe {tf}, got {len(df_tf) if df_tf is not None else 0}")
 

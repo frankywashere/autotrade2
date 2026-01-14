@@ -52,6 +52,41 @@ from v7.models import create_model
 from v7.training.ttt import TTTConfig, TTTAdapter, TTTMode
 
 
+# =============================================================================
+# Feature Adaptation
+# =============================================================================
+
+def adapt_features_809_to_776(features_809: np.ndarray) -> np.ndarray:
+    """
+    Strip 809 features to 776 by removing 3 ATR features per timeframe.
+
+    v13 (809): TSLA=38, SPY=11, CROSS=10 per TF (59 total) x 11 + 160 shared
+    v12 (776): TSLA=35, SPY=11, CROSS=10 per TF (56 total) x 11 + 160 shared
+
+    Removes ATR features at indices [18:21] within each TSLA block.
+    """
+    if features_809.shape[-1] != 809:
+        return features_809
+
+    adapted_parts = []
+    for tf_idx in range(11):
+        # v13 structure per TF
+        tf_start = tf_idx * 59
+        tsla_end = tf_start + 38
+
+        # Keep TSLA [0:18] and [21:38], skip ATR [18:21]
+        adapted_parts.append(features_809[..., tf_start:tf_start+18])
+        adapted_parts.append(features_809[..., tf_start+21:tsla_end])
+
+        # Keep SPY and CROSS unchanged
+        adapted_parts.append(features_809[..., tsla_end:tsla_end+21])
+
+    # Keep shared features
+    adapted_parts.append(features_809[..., 649:])
+
+    return np.concatenate(adapted_parts, axis=-1)
+
+
 # Constants
 DATA_DIR = Path(__file__).parent / 'data'
 TSLA_CSV = DATA_DIR / 'TSLA_1min.csv'
@@ -63,10 +98,20 @@ EVENTS_CSV = DATA_DIR / 'events.csv'
 CONF_HIGH = 0.75
 CONF_MED = 0.60
 
-# Direction mappings
-DIR_NAMES = {0: 'BEAR', 1: 'SIDE', 2: 'BULL'}
-DIR_COLORS = {0: 'red', 1: 'yellow', 2: 'green'}
-DIR_ARROWS = {0: '\u2193', 1: '\u2194', 2: '\u2191'}  # ↓ ↔ ↑
+# Direction mappings (BINARY: 0=DOWN, 1=UP - from model sigmoid output)
+DIRECTION_NAMES = {0: 'DOWN', 1: 'UP'}
+DIRECTION_COLORS = {0: 'red', 1: 'green'}
+DIRECTION_ARROWS = {0: '\u2193', 1: '\u2191'}  # ↓ ↑
+
+# Channel mappings (3-CLASS: 0=BEAR, 1=SIDE, 2=BULL - for next_channel)
+CHANNEL_NAMES = {0: 'BEAR', 1: 'SIDE', 2: 'BULL'}
+CHANNEL_COLORS = {0: 'red', 1: 'yellow', 2: 'green'}
+CHANNEL_ARROWS = {0: '\u2193', 1: '\u2194', 2: '\u2191'}  # ↓ ↔ ↑
+
+# Legacy aliases for channel detection display (uses 3-class for current channel direction)
+DIR_NAMES = CHANNEL_NAMES
+DIR_COLORS = CHANNEL_COLORS
+DIR_ARROWS = CHANNEL_ARROWS
 
 console = Console()
 
@@ -328,6 +373,20 @@ def detect_all_channels(tsla_df: pd.DataFrame, spy_df: pd.DataFrame, window: int
     """
     Detect channels across all timeframes.
 
+    NOTE ON TRAINING VS INFERENCE WINDOW STRATEGY:
+    - Training (v7/training/scanning.py) uses multi-window detection with STANDARD_WINDOWS
+      = [10, 20, 30, 40, 50, 60, 70, 80] and selects the best window via select_best_channel().
+      This means training samples may have been generated with window=30, 60, etc.
+    - This dashboard uses a fixed window (default=50) for all timeframes for simplicity.
+    - This may cause slight prediction mismatch if training selected a different window as "best".
+    - To match training exactly, use detect_channels_multi_window() and select_best_channel()
+      from v7.core.channel.
+
+    Args:
+        tsla_df: TSLA OHLCV data
+        spy_df: SPY OHLCV data
+        window: Fixed window size for channel detection (default=50, training uses 10-80 with best selection)
+
     Returns:
         (tsla_channels, spy_channels) dicts mapping timeframe -> Channel
     """
@@ -426,14 +485,26 @@ def make_predictions(
         # Combine into single tensor
         x = torch.from_numpy(np.concatenate(feature_list)).float().unsqueeze(0)
 
+        # Adapt features if needed (809 -> 776 for older checkpoints)
+        # Check model's expected input dimension from first layer
+        expected_dim = None
+        for name, param in model.named_parameters():
+            if 'tf_branches.0.input_proj.weight' in name:
+                expected_dim = param.shape[1]
+                break
+        if expected_dim is not None and x.shape[-1] == 809 and expected_dim == 776:
+            console.print("[yellow]Adapting features 809 -> 776 for backward compatibility...[/yellow]")
+            x_np = adapt_features_809_to_776(x.numpy())
+            x = torch.from_numpy(x_np).float()
+
         # Run inference with or without TTT
         if ttt_adapter is not None and ttt_adapter.config.mode != TTTMode.STATIC:
             # TTT-enabled inference
             console.print(f"[magenta]Running TTT inference (mode={ttt_adapter.config.mode.name})...[/magenta]")
             raw_output, ttt_stats = ttt_adapter.step(x)
 
-            # Convert to predictions format
-            predictions = model.predict(x)
+            # CRITICAL: Use TTT-adapted output, not a fresh model.predict() call
+            predictions = model.raw_output_to_predict_format(raw_output, x)
 
             if ttt_stats.get('updated', False):
                 loss_info = ttt_stats.get('loss', {})
@@ -445,16 +516,41 @@ def make_predictions(
             with torch.no_grad():
                 predictions = model.predict(x)
 
-        # Convert to dict of scalars
+        # Extract per-TF and aggregate predictions (modern contract)
+        per_tf = predictions['per_tf']
+        agg = predictions['aggregate']
+        best_tf_idx = int(predictions['best_tf_idx'][0])
+
+        # TF names for indexing
+        TF_NAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', '1d', '1w', '1M', '3M']
+
+        # Convert to dict format for dashboard
         predictions = {
-            'duration_mean': float(predictions['duration_mean'][0, 0]),
-            'duration_std': float(predictions['duration_std'][0, 0]),
-            'break_direction': int(predictions['break_direction'][0, 0]),
-            'break_direction_probs': predictions['break_direction_probs'][0].numpy(),
-            'next_direction': int(predictions['next_direction'][0, 0]),
-            'next_direction_probs': predictions['next_direction_probs'][0].numpy(),
-            'confidence': float(predictions['confidence'][0, 0]),
-            'attention_weights': predictions['attention_weights'][0].numpy()
+            # Per-timeframe predictions (all 11 TFs)
+            'per_tf': {
+                'duration_mean': per_tf['duration_mean'][0].numpy(),  # [11]
+                'duration_std': per_tf['duration_std'][0].numpy(),    # [11]
+                'direction': per_tf['direction'][0].numpy(),          # [11]
+                'direction_probs': per_tf['direction_probs'][0].numpy(),  # [11]
+                'next_channel': per_tf['next_channel'][0].numpy(),    # [11]
+                'next_channel_probs': per_tf['next_channel_probs'][0].numpy(),  # [11, 3]
+                'confidence': per_tf['confidence'][0].numpy(),        # [11]
+            },
+            # Best (most confident) timeframe
+            'best_tf_idx': best_tf_idx,
+            'best_tf_name': TF_NAMES[best_tf_idx],
+            # Aggregate (for reference)
+            'aggregate': {
+                'duration_mean': float(agg['duration_mean'][0, 0]),
+                'duration_std': float(agg['duration_std'][0, 0]),
+                'direction': int(agg['direction'][0, 0]),
+                'direction_probs': agg['direction_probs'][0].numpy(),
+                'next_channel': int(agg['next_channel'][0, 0]),
+                'next_channel_probs': agg['next_channel_probs'][0].numpy(),
+                'confidence': float(agg['confidence'][0, 0]),
+                'trigger_tf': int(agg['trigger_tf'][0, 0]),
+                'trigger_tf_probs': agg['trigger_tf_probs'][0].numpy()
+            }
         }
 
     return predictions, full_features, ttt_stats
@@ -556,7 +652,7 @@ def create_channel_table(data: DashboardData) -> Table:
 
 
 def create_prediction_table(data: DashboardData) -> Table:
-    """Create prediction summary table."""
+    """Create prediction summary table using modern per-TF output contract."""
     table = Table(
         title="Model Predictions (Per Timeframe)",
         box=box.ROUNDED,
@@ -566,8 +662,8 @@ def create_prediction_table(data: DashboardData) -> Table:
 
     table.add_column("TF", style="cyan", width=8)
     table.add_column("Duration", width=12, justify="center")
-    table.add_column("Break Dir", width=12, justify="center")
-    table.add_column("Next Dir", width=12, justify="center")
+    table.add_column("Direction", width=12, justify="center")
+    table.add_column("Next Ch", width=12, justify="center")
     table.add_column("Confidence", width=12, justify="center")
     table.add_column("Signal", width=10, justify="center")
 
@@ -575,79 +671,99 @@ def create_prediction_table(data: DashboardData) -> Table:
         table.add_row("No model loaded", "", "", "", "", "")
         return table
 
-    # For demo, show predictions for key timeframes
-    # In real implementation, you'd run predictions per TF
-    key_tfs = ['5min', '15min', '1h', '4h', 'daily']
+    # TF names matching model output indices
+    TF_NAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', '1d', '1w', '1M', '3M']
 
-    for tf in key_tfs:
-        # Duration
-        dur_mean = data.predictions['duration_mean']
-        dur_std = data.predictions['duration_std']
+    # Get per-TF predictions
+    per_tf = data.predictions.get('per_tf', {})
+    best_tf_idx = data.predictions.get('best_tf_idx', 0)
+
+    # Show all timeframes with per-TF predictions
+    for tf_idx, tf in enumerate(TF_NAMES):
+        # Check if this is the best (most confident) TF
+        is_best = (tf_idx == best_tf_idx)
+        tf_display = f"[bold]{tf}*[/bold]" if is_best else tf
+
+        # Duration from per-TF predictions
+        dur_mean = per_tf['duration_mean'][tf_idx] if 'duration_mean' in per_tf else 0
+        dur_std = per_tf['duration_std'][tf_idx] if 'duration_std' in per_tf else 0
         if dur_std and dur_std > 0.01:
-            duration_str = f"{dur_mean:.0f} ± {dur_std:.0f}"
+            duration_str = f"{dur_mean:.0f} +/- {dur_std:.0f}"
         else:
             duration_str = f"{dur_mean:.0f}"
 
-        # Break direction
-        break_dir = data.predictions['break_direction']
-        break_probs = data.predictions['break_direction_probs']
-        break_str = f"{'UP' if break_dir == 1 else 'DOWN'} ({break_probs[break_dir]*100:.0f}%)"
-        break_color = "green" if break_dir == 1 else "red"
-        break_str = f"[{break_color}]{break_str}[/{break_color}]"
+        # Direction (BINARY: 0=DOWN, 1=UP from sigmoid output)
+        direction = int(per_tf['direction'][tf_idx]) if 'direction' in per_tf else 0
+        # direction_probs is a single probability (sigmoid output), not 3 classes
+        direction_prob = per_tf['direction_probs'][tf_idx] if 'direction_probs' in per_tf else 0.5
+        # direction_prob is P(UP), so for DOWN we show 1 - prob
+        display_prob = direction_prob if direction == 1 else (1 - direction_prob)
+        dir_name = DIRECTION_NAMES[direction]
+        dir_color = DIRECTION_COLORS[direction]
+        dir_str = f"[{dir_color}]{dir_name} ({display_prob*100:.0f}%)[/{dir_color}]"
 
-        # Next direction
-        next_dir = data.predictions['next_direction']
-        next_probs = data.predictions['next_direction_probs']
-        next_name = DIR_NAMES[next_dir]
-        next_str = f"{next_name} ({next_probs[next_dir]*100:.0f}%)"
-        next_color = DIR_COLORS[next_dir]
-        next_str = f"[{next_color}]{next_str}[/{next_color}]"
+        # Next channel (3-CLASS: 0=BEAR, 1=SIDE, 2=BULL)
+        next_ch = int(per_tf['next_channel'][tf_idx]) if 'next_channel' in per_tf else 1
+        next_ch_probs = per_tf['next_channel_probs'][tf_idx] if 'next_channel_probs' in per_tf else [0.33, 0.34, 0.33]
+        next_ch_name = CHANNEL_NAMES[next_ch]
+        next_ch_color = CHANNEL_COLORS[next_ch]
+        next_ch_str = f"[{next_ch_color}]{next_ch_name} ({next_ch_probs[next_ch]*100:.0f}%)[/{next_ch_color}]"
 
-        # Confidence
-        conf = data.predictions['confidence']
+        # Confidence from per-TF predictions
+        conf = per_tf['confidence'][tf_idx] if 'confidence' in per_tf else 0.5
         if conf > CONF_HIGH:
             conf_color = "green"
-            conf_icon = "⭐"
+            conf_icon = "*"
         elif conf > CONF_MED:
             conf_color = "yellow"
-            conf_icon = "○"
+            conf_icon = "o"
         else:
             conf_color = "red"
-            conf_icon = "△"
+            conf_icon = "^"
         conf_str = f"[{conf_color}]{conf*100:.0f}% {conf_icon}[/{conf_color}]"
 
-        # Trading signal
+        # Trading signal based on BINARY direction (0=DOWN, 1=UP) and confidence
         if conf > CONF_HIGH:
-            if break_dir == 1:
+            if direction == 1:  # UP
                 signal = "[green]LONG[/green]"
-            else:
+            else:  # DOWN (direction == 0)
                 signal = "[red]SHORT[/red]"
         else:
             signal = "[yellow]WAIT[/yellow]"
 
-        table.add_row(tf, duration_str, break_str, next_str, conf_str, signal)
+        table.add_row(tf_display, duration_str, dir_str, next_ch_str, conf_str, signal)
 
     return table
 
 
 def create_signal_panel(data: DashboardData) -> Panel:
-    """Create main trading signal panel."""
+    """Create main trading signal panel using modern output contract."""
     if data.predictions is None or not data.predictions:
         return Panel("[red]No predictions available[/red]", title="Trading Signal")
 
-    conf = data.predictions['confidence']
-    break_dir = data.predictions['break_direction']
-    next_dir = data.predictions['next_direction']
-    dur_mean = data.predictions['duration_mean']
-    dur_std = data.predictions.get('duration_std', 0)
+    # Use aggregate predictions for the main signal panel
+    agg = data.predictions.get('aggregate', {})
+    best_tf_idx = data.predictions.get('best_tf_idx', 0)
+    best_tf_name = data.predictions.get('best_tf_name', 'unknown')
 
-    # Determine signal
+    # Get aggregate values (or fall back to best TF per-TF values)
+    per_tf = data.predictions.get('per_tf', {})
+
+    conf = agg.get('confidence', per_tf.get('confidence', [0.5])[best_tf_idx] if 'confidence' in per_tf else 0.5)
+    # Direction is BINARY (0=DOWN, 1=UP)
+    direction = agg.get('direction', per_tf.get('direction', [0])[best_tf_idx] if 'direction' in per_tf else 0)
+    # Next channel is 3-CLASS (0=BEAR, 1=SIDE, 2=BULL)
+    next_ch = agg.get('next_channel', per_tf.get('next_channel', [1])[best_tf_idx] if 'next_channel' in per_tf else 1)
+    dur_mean = agg.get('duration_mean', per_tf.get('duration_mean', [0])[best_tf_idx] if 'duration_mean' in per_tf else 0)
+    dur_std = agg.get('duration_std', per_tf.get('duration_std', [0])[best_tf_idx] if 'duration_std' in per_tf else 0)
+
+    # Determine signal based on BINARY direction (0=DOWN, 1=UP)
     if conf > CONF_HIGH:
-        if break_dir == 1:
+        if direction == 1:  # UP
             signal = "LONG"
             signal_color = "green"
             action = f"BUY {data.price_tsla:.2f}"
-        else:
+        else:  # DOWN (direction == 0)
             signal = "SHORT"
             signal_color = "red"
             action = f"SELL {data.price_tsla:.2f}"
@@ -662,18 +778,23 @@ def create_signal_panel(data: DashboardData) -> Panel:
 
     # Build content
     if dur_std and dur_std > 0.01:
-        duration_line = f"Expected Duration: {dur_mean:.0f} ± {dur_std:.0f} bars"
+        duration_line = f"Expected Duration: {dur_mean:.0f} +/- {dur_std:.0f} bars"
     else:
         duration_line = f"Expected Duration: {dur_mean:.0f} bars"
+
+    # Direction uses BINARY mapping, next_channel uses 3-CLASS mapping
+    dir_name = DIRECTION_NAMES[direction]
+    next_ch_name = CHANNEL_NAMES[next_ch]
 
     content = f"""
 [bold {signal_color}]{signal}[/bold {signal_color}]
 
 Action: {action}
 {duration_line}
-Break Direction: {'UP' if break_dir == 1 else 'DOWN'}
-Next Channel: {DIR_NAMES[next_dir]}
+Direction: {dir_name}
+Next Channel: {next_ch_name}
 Confidence: {conf*100:.0f}%
+Best TF: {best_tf_name}
 
 Current Price: ${data.price_tsla:.2f}
 SPY: ${data.price_spy:.2f}
@@ -855,16 +976,36 @@ def export_predictions(data: DashboardData, output_dir: Path):
     else:
         timestamp_str = data.timestamp.strftime('%Y%m%d_%H%M%S')
 
-    # Predictions summary
+    # Predictions summary using modern contract
     if data.predictions:
+        agg = data.predictions.get('aggregate', {})
+        per_tf = data.predictions.get('per_tf', {})
+        best_tf_idx = data.predictions.get('best_tf_idx', 0)
+        best_tf_name = data.predictions.get('best_tf_name', 'unknown')
+
+        # Export aggregate prediction
+        # Note: direction is BINARY (0=DOWN, 1=UP), direction_probs is single probability P(UP)
+        # next_channel is 3-CLASS (0=BEAR, 1=SIDE, 2=BULL), next_channel_probs is [3] array
+        direction_prob = agg.get('direction_probs', 0.5)
+        # Handle both scalar and array cases
+        if hasattr(direction_prob, '__len__'):
+            direction_prob = float(direction_prob[0]) if len(direction_prob) > 0 else 0.5
+        next_ch_probs = agg.get('next_channel_probs', [0.33, 0.34, 0.33])
+
         pred_df = pd.DataFrame([{
             'timestamp': data.timestamp if data.timestamp else datetime.now(),
-            'duration_mean': data.predictions['duration_mean'],
-            'duration_std': data.predictions['duration_std'],
-            'break_direction': data.predictions['break_direction'],
-            'break_up_prob': data.predictions['break_direction_probs'][1],
-            'next_direction': data.predictions['next_direction'],
-            'confidence': data.predictions['confidence'],
+            'best_tf_idx': best_tf_idx,
+            'best_tf_name': best_tf_name,
+            'duration_mean': agg.get('duration_mean', 0),
+            'duration_std': agg.get('duration_std', 0),
+            'direction': agg.get('direction', 0),  # BINARY: 0=DOWN, 1=UP
+            'direction_prob_up': direction_prob,  # P(UP) from sigmoid
+            'next_channel': agg.get('next_channel', 1),  # 3-CLASS: 0=BEAR, 1=SIDE, 2=BULL
+            'next_channel_probs_bear': next_ch_probs[0],
+            'next_channel_probs_side': next_ch_probs[1],
+            'next_channel_probs_bull': next_ch_probs[2],
+            'confidence': agg.get('confidence', 0.5),
+            'trigger_tf': agg.get('trigger_tf', 0),
             'tsla_price': data.price_tsla,
             'spy_price': data.price_spy,
             'vix': data.vix
@@ -872,7 +1013,30 @@ def export_predictions(data: DashboardData, output_dir: Path):
 
         pred_file = output_dir / f'prediction_{timestamp_str}.csv'
         pred_df.to_csv(pred_file, index=False)
-        console.print(f"[green]Saved prediction to {pred_file}[/green]")
+        console.print(f"[green]Saved aggregate prediction to {pred_file}[/green]")
+
+        # Also export per-TF predictions
+        # direction is BINARY (0=DOWN, 1=UP), direction_prob_up is P(UP)
+        # next_channel is 3-CLASS (0=BEAR, 1=SIDE, 2=BULL)
+        TF_NAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', '1d', '1w', '1M', '3M']
+        per_tf_data = []
+        for tf_idx, tf_name in enumerate(TF_NAMES):
+            per_tf_data.append({
+                'timestamp': data.timestamp if data.timestamp else datetime.now(),
+                'timeframe': tf_name,
+                'tf_idx': tf_idx,
+                'duration_mean': per_tf.get('duration_mean', [0]*11)[tf_idx],
+                'duration_std': per_tf.get('duration_std', [0]*11)[tf_idx],
+                'direction': int(per_tf.get('direction', [0]*11)[tf_idx]),  # BINARY: 0=DOWN, 1=UP
+                'direction_prob_up': per_tf.get('direction_probs', [0.5]*11)[tf_idx],  # P(UP)
+                'next_channel': int(per_tf.get('next_channel', [1]*11)[tf_idx]),  # 3-CLASS
+                'confidence': per_tf.get('confidence', [0.5]*11)[tf_idx],
+            })
+
+        per_tf_df = pd.DataFrame(per_tf_data)
+        per_tf_file = output_dir / f'prediction_per_tf_{timestamp_str}.csv'
+        per_tf_df.to_csv(per_tf_file, index=False)
+        console.print(f"[green]Saved per-TF predictions to {per_tf_file}[/green]")
     else:
         console.print("[yellow]No predictions to export[/yellow]")
 
