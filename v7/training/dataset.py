@@ -62,7 +62,10 @@ from .scanning import scan_valid_channels as _parallel_scan_valid_channels
 #            Supports both single-window (v10.0.0 compatible) and multi-window modes.
 # - v12.0.0: Added 15 VIX-channel interaction features (VIX_FEATURES 6→21, TOTAL_FEATURES 761→776).
 #            BounceRecord now captures VIX context at bounces. New VIXChannelFeatures dataclass.
-CACHE_VERSION = "v12.0.0"
+# - v13.0.0: Fixed feature-label window alignment for learning mode. Labels now use consistent
+#            window parameter for ALL TFs (not per-TF "best" windows), enabling learning mode
+#            to freely choose windows. Removed precomputed_tf_channels optimization.
+CACHE_VERSION = "v13.0.0"
 
 # Supported cache versions for migration (read-only compatibility)
 # These older versions can be loaded but will trigger rebuild recommendation

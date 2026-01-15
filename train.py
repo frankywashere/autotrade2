@@ -2314,21 +2314,21 @@ def run_walk_forward_training(
 
     console.print(f"[green]✓ Sufficient data available ({total_months} >= {total_required_months} months)[/green]")
 
-    # Validate configuration
-    if window_type == "sliding":
-        console.print("[yellow]Warning: Sliding windows not yet supported by walk_forward module.[/yellow]")
-        console.print("[yellow]Falling back to expanding window mode.[/yellow]\n")
-        window_type = "expanding"
-
     # Generate windows using the proper walk-forward module
     # This handles calendar months correctly using pd.DateOffset
     console.print("\n[bold cyan]Generating Walk-Forward Windows...[/bold cyan]")
+    console.print(f"  Mode: [yellow]{window_type}[/yellow]")
+    if window_type == "sliding":
+        console.print(f"  Training window size: [yellow]{train_window_months} months[/yellow]")
+
     try:
         windows = generate_walk_forward_windows(
             data_start=min_available_date,
             data_end=max_available_date,
             num_windows=num_windows,
-            validation_period_months=val_months
+            validation_period_months=val_months,
+            window_type=window_type,
+            train_window_months=train_window_months
         )
     except ValueError as e:
         console.print(f"\n[bold red]ERROR generating walk-forward windows: {e}[/bold red]")

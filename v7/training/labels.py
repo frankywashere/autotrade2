@@ -1061,7 +1061,6 @@ def generate_labels_per_tf(
     min_cycles: int = 1,
     channel: Optional[Channel] = None,
     custom_return_thresholds: Optional[Dict[str, int]] = None,
-    precomputed_tf_channels: Optional[Dict[str, Tuple[Optional[Channel], Optional[int]]]] = None,
     _clear_cache: bool = True
 ) -> Dict[str, Optional[ChannelLabels]]:
     """
@@ -1087,9 +1086,6 @@ def generate_labels_per_tf(
         custom_return_thresholds: Optional dict mapping TF names to custom return threshold
                                   values. If provided and a TF is in the dict, that value is
                                   used instead of the default. Example: {'5min': 10, '1h': 2}
-        precomputed_tf_channels: Optional dict mapping TF -> (Channel, best_window) to reuse
-                                 channel detection across calls. When provided, skips redundant
-                                 detect_channels_multi_window calls for non-5min timeframes.
         _clear_cache: Internal parameter to control cache clearing. Default True clears
                      cache at start to prevent memory bloat. Set to False when calling
                      from generate_labels_multi_window() to share cache across windows.
@@ -1133,12 +1129,6 @@ def generate_labels_per_tf(
                 if channel is not None and channel.valid:
                     tf_channel = channel
                     best_tf_window = window
-                elif precomputed_tf_channels is not None and tf in precomputed_tf_channels:
-                    # Use precomputed channel from generate_labels_multi_window
-                    tf_channel, best_tf_window = precomputed_tf_channels[tf]
-                    if tf_channel is None or not tf_channel.valid:
-                        labels_per_tf[tf] = None
-                        continue
                 else:
                     # No valid channel provided, detect one
                     df_tf_for_channel = df_historical
@@ -1171,34 +1161,27 @@ def generate_labels_per_tf(
                     labels_per_tf[tf] = None
                     continue
 
-                # Use precomputed channels if available (avoids redundant detection across windows)
-                if precomputed_tf_channels is not None and tf in precomputed_tf_channels:
-                    tf_channel, best_tf_window = precomputed_tf_channels[tf]
-                    if tf_channel is None or not tf_channel.valid:
-                        labels_per_tf[tf] = None
-                        continue
-                else:
-                    # Detect channels at MULTIPLE window sizes for this TF (matches inspector behavior)
-                    # Use historical-only data for channel detection to avoid future leakage
-                    # Need enough data for at least the smallest standard window
-                    min_window = min(STANDARD_WINDOWS)
-                    if channel_end_idx_tf < min_window - 1 or len(df_tf_for_channel) < min_window:
-                        labels_per_tf[tf] = None
-                        continue
+                # v13.0.0 FIX: Detect channel at the PASSED window parameter (not "best" window)
+                # This ensures feature-label alignment for learning mode, which needs to freely
+                # choose windows. The window parameter comes from the outer loop in
+                # generate_labels_multi_window(), ensuring labels_per_window[50] uses 50-bar
+                # channels for ALL TFs (not per-TF "best" windows).
 
-                    # Detect channels at all standard windows for this TF
-                    tf_channels = detect_channels_multi_window(
-                        df_tf_for_channel.iloc[:channel_end_idx_tf + 1],
-                        windows=STANDARD_WINDOWS,
-                        min_cycles=min_cycles
-                    )
+                # Check if we have enough data for the specified window
+                if channel_end_idx_tf < window - 1 or len(df_tf_for_channel) < window:
+                    labels_per_tf[tf] = None
+                    continue
 
-                    # Select the best channel by bounces (same logic as inspector)
-                    tf_channel, best_tf_window = select_best_channel(tf_channels)
+                # Detect channel at the specified window (consistent across all TFs)
+                tf_channel = detect_channel(
+                    df_tf_for_channel.iloc[:channel_end_idx_tf + 1],
+                    window=window,  # Use the PASSED window, enabling learning mode
+                    min_cycles=min_cycles
+                )
 
-                    if tf_channel is None or not tf_channel.valid:
-                        labels_per_tf[tf] = None
-                        continue
+                if tf_channel is None or not tf_channel.valid:
+                    labels_per_tf[tf] = None
+                    continue
 
             # Scale parameters for this timeframe
             scaled_max_scan, scaled_return_threshold = scale_label_params_for_tf(
@@ -1214,10 +1197,10 @@ def generate_labels_per_tf(
             # Generate labels for this TF using full data (includes forward bars for scanning)
             tf_labels = generate_labels(
                 df=df_tf_full,
-                channel=tf_channel,  # Use the best channel for this TF
+                channel=tf_channel,  # Use the channel detected at the specified window
                 channel_end_idx=channel_end_idx_tf,
                 current_tf=tf,
-                window=best_tf_window,  # Use the window that gave the best channel
+                window=window,  # v13.0.0: Use consistent window parameter
                 max_scan=scaled_max_scan,
                 return_threshold=scaled_return_threshold,
                 fold_end_idx=scaled_fold_end_idx
@@ -1275,38 +1258,10 @@ def generate_labels_multi_window(
 
     labels_per_window: Dict[int, Dict[str, Optional[ChannelLabels]]] = {}
 
-    # Precompute best channels once per TF to avoid redundant detection across windows
-    # This reduces 88 detect_channels_multi_window calls (8 windows × 11 TFs) to just 11
-    precomputed_tf_channels: Dict[str, Tuple[Optional[Channel], Optional[int]]] = {}
-    df_historical = df.iloc[:channel_end_idx_5min + 1]
-    min_window = min(STANDARD_WINDOWS)
-
-    for tf in TIMEFRAMES:
-        try:
-            if tf == '5min':
-                # 5min channels are passed in via the 'channels' dict, so skip precomputation
-                # Each window has its own 5min channel which may or may not be valid
-                continue
-            else:
-                df_tf_for_channel = cached_resample_ohlc(df_historical, tf)
-                channel_end_idx_tf = len(df_tf_for_channel) - 1
-
-                if channel_end_idx_tf < min_window - 1 or len(df_tf_for_channel) < min_window:
-                    precomputed_tf_channels[tf] = (None, None)
-                    continue
-
-                tf_channels = detect_channels_multi_window(
-                    df_tf_for_channel.iloc[:channel_end_idx_tf + 1],
-                    windows=STANDARD_WINDOWS,
-                    min_cycles=min_cycles
-                )
-                tf_channel, best_tf_window = select_best_channel(tf_channels)
-                if tf_channel is None or not tf_channel.valid:
-                    precomputed_tf_channels[tf] = (None, None)
-                else:
-                    precomputed_tf_channels[tf] = (tf_channel, best_tf_window)
-        except Exception:
-            precomputed_tf_channels[tf] = (None, None)
+    # v13.0.0: Removed precomputed_tf_channels optimization
+    # Each window iteration now detects channels at THAT window for all TFs
+    # This enables learning mode to freely select windows with proper feature-label alignment
+    # Trade-off: ~3-5x slower label generation (88 detections vs 11) but correct for all modes
 
     for window_size, channel in channels.items():
         # Always call generate_labels_per_tf even if 5min channel is invalid,
@@ -1314,19 +1269,18 @@ def generate_labels_multi_window(
         # A valid 1h channel might exist even if the 5min channel at this window is invalid.
 
         # Generate labels for this window's channel
+        # v13.0.0: Each window iteration detects channels at THAT window for all TFs
         # Pass _clear_cache=False to reuse cached resampled data across windows
-        # Pass precomputed_tf_channels to avoid redundant channel detection per window
         labels_per_window[window_size] = generate_labels_per_tf(
             df=df,
             channel_end_idx_5min=channel_end_idx_5min,
-            window=window_size,
+            window=window_size,  # All TFs will use THIS window
             max_scan=max_scan,
             return_threshold=return_threshold,
             fold_end_idx=fold_end_idx,
             min_cycles=min_cycles,
             channel=channel,
             custom_return_thresholds=custom_return_thresholds,
-            precomputed_tf_channels=precomputed_tf_channels,
             _clear_cache=False  # Cache already cleared above, reuse across windows
         )
 

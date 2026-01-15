@@ -71,26 +71,38 @@ def generate_walk_forward_windows(
     data_start: str,
     data_end: str,
     num_windows: int,
-    validation_period_months: int = 3
+    validation_period_months: int = 3,
+    window_type: str = "expanding",
+    train_window_months: int = None
 ) -> List[Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
     """
-    Generate walk-forward validation windows using an expanding window approach.
+    Generate walk-forward validation windows using expanding or sliding window approach.
 
-    The expanding window approach means:
+    Expanding window approach:
     - Training set starts at data_start and grows with each window
     - Each validation period is a fixed duration (validation_period_months)
     - Windows are contiguous - next validation starts where previous ended
-
-    Example with 3 windows and 3-month validation:
+    - Example with 3 windows and 3-month validation:
         Window 0: Train [2020-01 to 2023-01], Val [2023-02 to 2023-04]
         Window 1: Train [2020-01 to 2023-05], Val [2023-05 to 2023-07]
         Window 2: Train [2020-01 to 2023-08], Val [2023-08 to 2023-10]
+
+    Sliding window approach:
+    - Training set maintains fixed size (train_window_months) and slides forward
+    - Each validation period is a fixed duration (validation_period_months)
+    - Windows are contiguous - next validation starts where previous ended
+    - Example with 3 windows, 12-month training, 3-month validation:
+        Window 0: Train [2020-01 to 2021-01], Val [2021-02 to 2021-04]
+        Window 1: Train [2020-04 to 2021-04], Val [2021-05 to 2021-07]
+        Window 2: Train [2020-07 to 2021-07], Val [2021-08 to 2021-10]
 
     Args:
         data_start: Start date of entire dataset (YYYY-MM-DD)
         data_end: End date of entire dataset (YYYY-MM-DD)
         num_windows: Number of walk-forward windows to generate
         validation_period_months: Size of each validation period in months
+        window_type: 'expanding' or 'sliding' (default: 'expanding')
+        train_window_months: Fixed training window size for sliding mode (required if sliding)
 
     Returns:
         List of tuples (train_start, train_end, val_start, val_end)
@@ -147,48 +159,99 @@ def generate_walk_forward_windows(
             f"but only have {total_months} months available"
         )
 
-    # Calculate validation start point
-    # Leave minimum training period at start, distribute rest for validation windows
-    training_buffer_months = total_months - validation_months_needed
+    # Validate window_type
+    if window_type not in ['expanding', 'sliding']:
+        raise ValueError(f"window_type must be 'expanding' or 'sliding', got '{window_type}'")
 
-    # First validation starts after initial training buffer
-    first_val_start = start_date + pd.DateOffset(months=training_buffer_months)
+    # Validate train_window_months for sliding mode
+    if window_type == 'sliding':
+        if train_window_months is None:
+            raise ValueError("train_window_months is required for sliding window mode")
+        if train_window_months < 3 or train_window_months > 60:
+            raise ValueError(
+                f"train_window_months must be between 3 and 60 months, got {train_window_months}"
+            )
 
-    # Generate windows
+    # Generate windows based on mode
     windows = []
-    current_val_start = first_val_start
 
-    for i in range(num_windows):
-        # Calculate validation period for this window
-        val_start = current_val_start
-        val_end = val_start + pd.DateOffset(months=validation_period_months) - pd.DateOffset(days=1)
+    if window_type == 'expanding':
+        # EXPANDING MODE: Training set grows with each window
+        # Calculate validation start point
+        # Leave minimum training period at start, distribute rest for validation windows
+        training_buffer_months = total_months - validation_months_needed
 
-        # Ensure we don't exceed data_end
-        if val_end > end_date:
-            val_end = end_date
+        # First validation starts after initial training buffer
+        first_val_start = start_date + pd.DateOffset(months=training_buffer_months)
 
-        # Training period: from start to just before validation
-        train_start = start_date
-        train_end = val_start - pd.DateOffset(days=1)
+        current_val_start = first_val_start
 
-        # Ensure training end is after training start
-        if train_end <= train_start:
+        for i in range(num_windows):
+            # Calculate validation period for this window
+            val_start = current_val_start
+            val_end = val_start + pd.DateOffset(months=validation_period_months) - pd.DateOffset(days=1)
+
+            # Ensure we don't exceed data_end
+            if val_end > end_date:
+                val_end = end_date
+
+            # Training period: from start to just before validation
+            train_start = start_date  # Fixed start (expanding)
+            train_end = val_start - pd.DateOffset(days=1)
+
+            # Ensure training end is after training start
+            if train_end <= train_start:
+                raise ValueError(
+                    f"Window {i}: Invalid training period. "
+                    f"train_end ({train_end.date()}) <= train_start ({train_start.date()})"
+                )
+
+            # Add window
+            windows.append((train_start, train_end, val_start, val_end))
+
+            # Move to next validation period
+            current_val_start = val_end + pd.DateOffset(days=1)
+
+            # Check if we have room for another window
+            if i < num_windows - 1 and current_val_start > end_date:
+                raise ValueError(
+                    f"Cannot fit {num_windows} windows. Only able to create {i + 1} window(s)"
+                )
+
+    else:  # window_type == 'sliding'
+        # SLIDING MODE: Training window has fixed size and slides forward
+        # Validate we have enough data for sliding windows
+        required_months = train_window_months + (num_windows * validation_period_months)
+        if total_months < required_months:
             raise ValueError(
-                f"Window {i}: Invalid training period. "
-                f"train_end ({train_end.date()}) <= train_start ({train_start.date()})"
+                f"Insufficient data for sliding windows. Need at least {required_months} months "
+                f"({train_window_months} for training + {num_windows}×{validation_period_months} for validation), "
+                f"but only have {total_months} months available"
             )
 
-        # Add window
-        windows.append((train_start, train_end, val_start, val_end))
+        # Initialize first window with fixed training size
+        current_train_start = start_date
+        current_train_end = start_date + pd.DateOffset(months=train_window_months) - pd.DateOffset(days=1)
+        current_val_start = current_train_end + pd.DateOffset(days=1)
+        current_val_end = current_val_start + pd.DateOffset(months=validation_period_months) - pd.DateOffset(days=1)
 
-        # Move to next validation period
-        current_val_start = val_end + pd.DateOffset(days=1)
+        for i in range(num_windows):
+            # Validate window fits within data range
+            if current_val_end > end_date:
+                raise ValueError(
+                    f"Window {i}: Validation end ({current_val_end.date()}) exceeds "
+                    f"data_end ({end_date.date()}). Cannot fit {num_windows} windows."
+                )
 
-        # Check if we have room for another window
-        if i < num_windows - 1 and current_val_start > end_date:
-            raise ValueError(
-                f"Cannot fit {num_windows} windows. Only able to create {i + 1} window(s)"
-            )
+            # Add window
+            windows.append((current_train_start, current_train_end, current_val_start, current_val_end))
+
+            # Slide ALL boundaries forward by validation_period_months
+            slide_offset = pd.DateOffset(months=validation_period_months)
+            current_train_start = current_train_start + slide_offset
+            current_train_end = current_train_end + slide_offset
+            current_val_start = current_val_start + slide_offset
+            current_val_end = current_val_end + slide_offset
 
     return windows
 
@@ -268,19 +331,26 @@ def split_samples_by_window(
 
 def validate_windows(
     windows: List[Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]],
+    window_type: str = 'expanding',
     verbose: bool = True
 ) -> bool:
     """
     Validate walk-forward windows for correctness.
 
-    Checks:
+    Checks (all modes):
     1. Training period ends before validation starts (no data leakage)
     2. Windows are in chronological order
-    3. Training sets are expanding (each training period includes all previous)
-    4. No gaps or overlaps in validation periods
+    3. No gaps or overlaps in validation periods
+
+    Checks (expanding mode only):
+    4. Training sets are expanding (each training period includes all previous)
+
+    Checks (sliding mode only):
+    4. Training window size remains constant
 
     Args:
         windows: List of (train_start, train_end, val_start, val_end) tuples
+        window_type: 'expanding' or 'sliding' - determines which validations to apply
         verbose: Print validation details
 
     Returns:
@@ -318,21 +388,39 @@ def validate_windows(
         if i > 0:
             prev_train_start, prev_train_end, prev_val_start, prev_val_end = windows[i - 1]
 
-            # Training should expand (start stays the same or earlier)
-            if train_start != prev_train_start:
-                raise ValueError(
-                    f"Window {i}: Training start changed (not expanding window). "
-                    f"Expected {prev_train_start.date()}, got {train_start.date()}"
-                )
+            if window_type == 'expanding':
+                # EXPANDING MODE: Training should expand (start stays the same or earlier)
+                if train_start != prev_train_start:
+                    raise ValueError(
+                        f"Window {i}: Training start changed (not expanding window). "
+                        f"Expected {prev_train_start.date()}, got {train_start.date()}"
+                    )
 
-            # Training end should grow
-            if train_end <= prev_train_end:
-                raise ValueError(
-                    f"Window {i}: Training period not expanding. "
-                    f"train_end ({train_end.date()}) <= previous ({prev_train_end.date()})"
-                )
+                # Training end should grow
+                if train_end <= prev_train_end:
+                    raise ValueError(
+                        f"Window {i}: Training period not expanding. "
+                        f"train_end ({train_end.date()}) <= previous ({prev_train_end.date()})"
+                    )
 
-            # Validation should be contiguous (current starts after previous ends)
+            else:  # window_type == 'sliding'
+                # SLIDING MODE: Training start should advance
+                if train_start <= prev_train_start:
+                    raise ValueError(
+                        f"Window {i}: Training start not advancing (not sliding window). "
+                        f"train_start ({train_start.date()}) <= previous ({prev_train_start.date()})"
+                    )
+
+                # Training window size should stay approximately constant (within 2 days tolerance)
+                prev_train_size = (prev_train_end - prev_train_start).days
+                curr_train_size = (train_end - train_start).days
+                if abs(curr_train_size - prev_train_size) > 2:
+                    raise ValueError(
+                        f"Window {i}: Training window size changed (not constant sliding window). "
+                        f"Previous size: {prev_train_size} days, current size: {curr_train_size} days"
+                    )
+
+            # Validation should be contiguous (applies to both modes)
             expected_val_start = prev_val_end + pd.DateOffset(days=1)
             if val_start != expected_val_start:
                 raise ValueError(
