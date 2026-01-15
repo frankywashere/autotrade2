@@ -22,7 +22,8 @@ def generate_cache(
     step: int = 10,
     workers: int = 4,
     warmup_bars: int = 32760,
-    forward_bars: int = 8000
+    forward_bars: int = 8000,
+    sequential: bool = False
 ) -> None:
     """
     Generate channel cache from market data.
@@ -34,6 +35,7 @@ def generate_cache(
         workers: Number of parallel workers (default 4)
         warmup_bars: Warmup period for channel detection (default 32760)
         forward_bars: Forward bars for label generation (default 8000)
+        sequential: Use sequential processing instead of parallel (default False)
     """
     # 1. Load market data
     print(f"Loading market data from {data_dir}...")
@@ -59,17 +61,29 @@ def generate_cache(
     print(f"Estimated positions: ~{n_positions:,} (step={step})")
 
     # 4. Call scanner
-    print(f"Scanning channels (workers={workers})...")
-    results = scanner.scan_channels(
-        tsla_df=tsla_df,
-        spy_df=spy_df,
-        vix_df=vix_df,
-        step=step,
-        warmup_bars=warmup_bars,
-        forward_bars=forward_bars,
-        workers=workers,
-        progress=True
-    )
+    if sequential:
+        print(f"Scanning channels (sequential mode)...")
+        results = scanner.scan_channels_sequential(
+            tsla_df=tsla_df,
+            spy_df=spy_df,
+            vix_df=vix_df,
+            step=step,
+            warmup_bars=warmup_bars,
+            forward_bars=forward_bars,
+            progress=True
+        )
+    else:
+        print(f"Scanning channels (workers={workers})...")
+        results = scanner.scan_channels(
+            tsla_df=tsla_df,
+            spy_df=spy_df,
+            vix_df=vix_df,
+            step=step,
+            warmup_bars=warmup_bars,
+            forward_bars=forward_bars,
+            workers=workers,
+            progress=True
+        )
 
     # 5. Save results to pickle
     output_file = Path(output_path)
@@ -125,6 +139,11 @@ if __name__ == '__main__':
         default=8000,
         help='Forward bars for label generation (default: 8000)'
     )
+    parser.add_argument(
+        '--sequential',
+        action='store_true',
+        help='Use sequential processing instead of parallel (for debugging)'
+    )
 
     args = parser.parse_args()
 
@@ -134,5 +153,6 @@ if __name__ == '__main__':
         step=args.step,
         workers=args.workers,
         warmup_bars=args.warmup,
-        forward_bars=args.forward
+        forward_bars=args.forward,
+        sequential=args.sequential
     )

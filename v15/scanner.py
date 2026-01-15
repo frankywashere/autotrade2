@@ -394,9 +394,13 @@ def scan_channels_sequential(
                     channels_by_window=channels
                 )
 
+        # For label generation, include forward data for break scanning
+        forward_end = min(idx + forward_bars, len(tsla_df))
+        tsla_with_forward = tsla_df.iloc[:forward_end]
+
         # Generate labels
         labels = generate_labels_multi_window(
-            df=tsla_slice,
+            df=tsla_with_forward,
             channels=channels,
             channel_end_idx_5min=idx - 1
         )
