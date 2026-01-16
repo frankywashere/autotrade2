@@ -777,9 +777,9 @@ def get_all_channel_history_feature_names() -> List[str]:
     Get ALL channel history feature names across all TFs.
 
     Returns:
-        List of all 550 feature names (50 features * 11 timeframes)
+        List of all 500 feature names (50 features * 10 timeframes)
     """
-    from v7.core.timeframe import TIMEFRAMES
+    from v15.config import TIMEFRAMES
 
     all_names = []
     for tf in TIMEFRAMES:
@@ -789,12 +789,12 @@ def get_all_channel_history_feature_names() -> List[str]:
 
 def get_total_channel_history_features() -> int:
     """
-    Total channel history features: 50 * 11 TFs = 550
+    Total channel history features: 50 * 10 TFs = 500
 
     Returns:
-        550 (50 base features * 11 timeframes)
+        500 (50 base features * 10 timeframes)
     """
-    return 50 * 11
+    return 50 * 10
 
 
 def get_default_channel_history_features_tf(tf: str) -> Dict[str, float]:
@@ -819,7 +819,7 @@ def get_all_default_channel_history_features() -> Dict[str, float]:
     Returns:
         Dict with all 550 TF-prefixed features set to default values
     """
-    from v7.core.timeframe import TIMEFRAMES
+    from v15.config import TIMEFRAMES
 
     all_defaults = {}
     for tf in TIMEFRAMES:

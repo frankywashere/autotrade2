@@ -21,16 +21,16 @@ Feature Groups (Standard):
     - window_scores: Window optimization scores (~50)
 
 Feature Groups (TF-Aware):
-    - tsla_price: 60 * 11 TFs = 660
-    - technical: 77 * 11 TFs = 847
-    - spy: 80 * 11 TFs = 880
-    - vix: 25 * 11 TFs = 275
-    - cross_asset: 40 * 11 TFs = 440
-    - tsla_channel: 50 * 8 windows * 11 TFs = 4,400
-    - window_scores: 50 * 11 TFs = 550
-    - channel_history: 50 * 11 TFs = 550
+    - tsla_price: 60 * 10 TFs = 600
+    - technical: 77 * 10 TFs = 770
+    - spy: 80 * 10 TFs = 800
+    - vix: 25 * 10 TFs = 250
+    - cross_asset: 40 * 10 TFs = 400
+    - tsla_channel: 50 * 8 windows * 10 TFs = 4,000
+    - window_scores: 50 * 10 TFs = 500
+    - channel_history: 50 * 10 TFs = 500
     - events: 30 (TF-independent)
-    Total: 8,632 features
+    Total: 7,850 features
 """
 
 from __future__ import annotations
@@ -59,17 +59,17 @@ TOTAL_FEATURES = 462
 
 # New counts (with full TF awareness)
 TF_FEATURE_GROUPS = {
-    'tsla_price': 60 * 11,        # 660
-    'technical': 77 * 11,          # 847
-    'spy': 80 * 11,                # 880
-    'vix': 25 * 11,                # 275
-    'cross_asset': 40 * 11,        # 440
-    'tsla_channel': 50 * 8 * 11,   # 4,400 (per window per TF)
-    'window_scores': 50 * 11,      # 550
-    'channel_history': 50 * 11,    # 550
+    'tsla_price': 60 * 10,        # 600
+    'technical': 77 * 10,          # 770
+    'spy': 80 * 10,                # 800
+    'vix': 25 * 10,                # 250
+    'cross_asset': 40 * 10,        # 400
+    'tsla_channel': 50 * 8 * 10,   # 4,000 (per window per TF)
+    'window_scores': 50 * 10,      # 500
+    'channel_history': 50 * 10,    # 500
     'events': 30,                  # 30 (TF-independent)
 }
-TOTAL_TF_FEATURES = 8632
+TOTAL_TF_FEATURES = 7850
 
 # =============================================================================
 # Main Extractor Imports

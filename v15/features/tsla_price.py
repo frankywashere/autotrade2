@@ -577,7 +577,7 @@ def get_tsla_price_feature_names_tf(tf: str) -> list:
 
 def get_all_tsla_price_feature_names() -> list:
     """Get ALL price feature names across all TFs."""
-    from v7.core.timeframe import TIMEFRAMES
+    from v15.config import TIMEFRAMES
 
     all_names = []
     for tf in TIMEFRAMES:
@@ -586,5 +586,5 @@ def get_all_tsla_price_feature_names() -> list:
 
 
 def get_total_price_features() -> int:
-    """Total price features: 60 * 11 TFs = 660"""
-    return 60 * 11
+    """Total price features: 60 * 10 TFs = 600"""
+    return 60 * 10

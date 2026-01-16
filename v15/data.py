@@ -10,11 +10,8 @@ from typing import Tuple
 import pandas as pd
 
 
-# All 11 timeframes in hierarchical order
-TIMEFRAMES = [
-    '5min', '15min', '30min', '1h', '2h', '3h', '4h',
-    'daily', 'weekly', 'monthly', '3month'
-]
+# Import TIMEFRAMES from config as single source of truth (10 TFs - no 3month)
+from v15.config import TIMEFRAMES
 
 # Pandas resample rules for each timeframe
 RESAMPLE_RULES = {
@@ -28,7 +25,6 @@ RESAMPLE_RULES = {
     'daily': '1D',
     'weekly': '1W',
     'monthly': '1ME',
-    '3month': '3ME',
 }
 
 
@@ -180,9 +176,9 @@ def resample_ohlc(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     Args:
         df: DataFrame with DatetimeIndex and columns [open, high, low, close, volume]
             (volume is optional for VIX data)
-        timeframe: Target timeframe - one of:
+        timeframe: Target timeframe - one of the 10 supported TFs:
             '5min', '15min', '30min', '1h', '2h', '3h', '4h',
-            'daily', 'weekly', 'monthly', '3month'
+            'daily', 'weekly', 'monthly'
 
     Returns:
         Resampled DataFrame with same columns

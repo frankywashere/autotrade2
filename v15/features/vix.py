@@ -425,12 +425,12 @@ def get_vix_feature_names_tf(tf: str) -> List[str]:
 
 def get_all_vix_feature_names() -> List[str]:
     """
-    Get ALL VIX feature names across all 11 timeframes.
+    Get ALL VIX feature names across all 10 timeframes.
 
     Returns:
-        List of 275 feature names (25 features x 11 TFs)
+        List of 250 feature names (25 features x 10 TFs)
     """
-    from v7.core.timeframe import TIMEFRAMES
+    from v15.config import TIMEFRAMES
 
     all_names = []
     for tf in TIMEFRAMES:
@@ -453,6 +453,6 @@ def get_total_vix_features() -> int:
     Get total VIX features across all timeframes.
 
     Returns:
-        275 (25 features x 11 TFs)
+        250 (25 features x 10 TFs)
     """
-    return 25 * 11
+    return 25 * 10

@@ -4,7 +4,10 @@ v15/inspector.py - Terminal-based label inspector for cache samples.
 A simple CLI tool to visualize and validate cache samples interactively.
 
 Usage:
-    python -m v15.inspector --cache path/to/cache.pkl
+    python -m v15.inspector samples.pkl
+    python -m v15.inspector --samples path/to/cache.pkl
+    python -m v15.inspector -s cache.pkl --start 10
+    python -m v15.inspector --cache path/to/cache.pkl  # legacy alias
 """
 
 import argparse
@@ -105,28 +108,40 @@ def display_sample(
     print("-" * 40)
     print()
 
-    # Get channel for current window
-    channel = sample.channels.get(current_window)
-    if channel is not None:
-        print("CHANNEL INFO:")
-        # Try to access common channel attributes
-        direction = getattr(channel, 'direction', None)
-        bounce_count = getattr(channel, 'bounce_count', None)
-        r_squared = getattr(channel, 'r_squared', None)
-        width_pct = getattr(channel, 'width_pct', None)
+    # Display channel-related features from tf_features
+    print("CHANNEL INFO (from features):")
+    # Extract channel features for current TF from the flat tf_features dict
+    tf_prefix = f"{current_tf}_"
+    channel_features = {
+        k.replace(tf_prefix, ''): v
+        for k, v in sample.tf_features.items()
+        if k.startswith(tf_prefix)
+    }
 
-        if direction is not None:
-            print(f"  Direction:     {format_channel_direction(direction) if isinstance(direction, int) else direction}")
-        if bounce_count is not None:
-            print(f"  Bounce Count:  {bounce_count}")
-        if r_squared is not None:
-            print(f"  R-Squared:     {r_squared:.4f}" if isinstance(r_squared, float) else f"  R-Squared:     {r_squared}")
-        if width_pct is not None:
-            print(f"  Width %:       {width_pct:.4f}" if isinstance(width_pct, float) else f"  Width %:       {width_pct}")
-        print()
-    else:
-        print("CHANNEL INFO: Not available for this window")
-        print()
+    # Show key channel metrics if available
+    direction = channel_features.get('direction')
+    if direction is not None:
+        print(f"  Direction:     {format_channel_direction(int(direction)) if isinstance(direction, (int, float)) else direction}")
+
+    bounce_count = channel_features.get('bounce_count')
+    if bounce_count is not None:
+        print(f"  Bounce Count:  {int(bounce_count)}")
+
+    r_squared = channel_features.get('r_squared')
+    if r_squared is not None:
+        print(f"  R-Squared:     {r_squared:.4f}")
+
+    width_pct = channel_features.get('width_pct')
+    if width_pct is not None:
+        print(f"  Width %:       {width_pct:.4f}")
+
+    price_position = channel_features.get('price_position')
+    if price_position is not None:
+        print(f"  Price Pos:     {price_position:.4f}")
+
+    if not channel_features:
+        print("  No features available for this timeframe")
+    print()
 
     # Get labels for current window and timeframe
     labels_for_window = sample.labels_per_window.get(current_window, {})
@@ -155,33 +170,56 @@ def display_sample(
         print("  No labels available for this window/timeframe combination")
     print()
 
-    # Get features for current window
-    features = sample.features_per_window.get(current_window, {})
-    print("FEATURES:")
-    if features:
-        print(f"  Feature Count: {len(features)}")
-        # Show a few sample features
-        feature_items = list(features.items())[:5]
+    # Display features for current TF from flat tf_features dict
+    tf_prefix = f"{current_tf}_"
+    tf_specific_features = {
+        k: v for k, v in sample.tf_features.items()
+        if k.startswith(tf_prefix)
+    }
+    print(f"FEATURES (for {current_tf}):")
+    if tf_specific_features:
+        print(f"  Feature Count: {len(tf_specific_features)}")
+        # Show a few sample features (remove TF prefix for display)
+        feature_items = list(tf_specific_features.items())[:5]
         for name, value in feature_items:
+            display_name = name.replace(tf_prefix, '')
             if isinstance(value, float):
-                print(f"    {name}: {value:.6f}")
+                print(f"    {display_name}: {value:.6f}")
             else:
-                print(f"    {name}: {value}")
-        if len(features) > 5:
-            print(f"    ... and {len(features) - 5} more features")
+                print(f"    {display_name}: {value}")
+        if len(tf_specific_features) > 5:
+            print(f"    ... and {len(tf_specific_features) - 5} more features")
     else:
-        print("  No features available for this window")
+        print(f"  No features available for {current_tf}")
+
+    # Show total feature count
+    print(f"\n  Total Features (all TFs): {len(sample.tf_features)}")
     print()
 
     # ASCII visualization of price position
     print("PRICE POSITION IN CHANNEL:")
-    # Try to get price position from features
-    position_pct = features.get('price_position', features.get('position_pct', 0.5))
+    # Try to get price position from tf_features
+    position_pct = sample.tf_features.get(f'{current_tf}_price_position',
+                                          sample.tf_features.get(f'{current_tf}_position_pct', 0.5))
 
     print(f"  UPPER: {draw_price_position(1.0)}")
     print(f"  PRICE: {draw_price_position(position_pct)} ({position_pct:.2%})")
     print(f"  LOWER: {draw_price_position(0.0)}")
     print()
+
+    # Show bar metadata if available
+    if sample.bar_metadata:
+        print("BAR METADATA:")
+        tf_metadata = sample.bar_metadata.get(current_tf, {})
+        if tf_metadata:
+            for key, value in tf_metadata.items():
+                if isinstance(value, float):
+                    print(f"  {key}: {value:.4f}")
+                else:
+                    print(f"  {key}: {value}")
+        else:
+            print(f"  No metadata for {current_tf}")
+        print()
 
     # Show available windows and timeframes
     available_windows = sorted(sample.labels_per_window.keys())
@@ -201,12 +239,13 @@ def display_sample(
     print("-" * 60)
 
 
-def inspect_cache(cache_path: str) -> None:
+def inspect_cache(cache_path: str, start_idx: int = 0) -> None:
     """
     Main inspection loop for cache samples.
 
     Args:
         cache_path: Path to the pickle cache file containing List[ChannelSample]
+        start_idx: Starting sample index (default: 0)
     """
     # Load cache file
     print(f"Loading cache from: {cache_path}")
@@ -229,7 +268,7 @@ def inspect_cache(cache_path: str) -> None:
     print(f"Loaded {len(samples)} samples")
 
     # Initialize navigation state
-    sample_idx = 0
+    sample_idx = max(0, min(start_idx, len(samples) - 1))
 
     # Get available windows from first sample
     available_windows = sorted(samples[0].labels_per_window.keys()) if samples[0].labels_per_window else STANDARD_WINDOWS
@@ -307,19 +346,50 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python -m v15.inspector --cache v7/cache_v14/samples.pkl
-    python -m v15.inspector --cache /path/to/cache.pkl
+    python -m v15.inspector samples.pkl
+    python -m v15.inspector --samples v7/cache_v14/samples.pkl
+    python -m v15.inspector -s /path/to/cache.pkl --start 10
         """
     )
+    # Positional argument (optional) - samples pickle file
     parser.add_argument(
-        '--cache',
+        'samples_file',
         type=str,
-        required=True,
+        nargs='?',
+        default=None,
+        help='Path to the pickle cache file (positional argument)'
+    )
+    # Named argument (optional) - samples pickle file
+    parser.add_argument(
+        '--samples', '-s',
+        type=str,
+        default=None,
         help='Path to the pickle cache file containing List[ChannelSample]'
+    )
+    # Legacy alias for backwards compatibility
+    parser.add_argument(
+        '--cache', '-c',
+        type=str,
+        default=None,
+        help='Alias for --samples (backwards compatibility)'
+    )
+    # Starting sample index
+    parser.add_argument(
+        '--start', '-i',
+        type=int,
+        default=0,
+        help='Starting sample index (default: 0)'
     )
 
     args = parser.parse_args()
-    inspect_cache(args.cache)
+
+    # Resolve cache path: positional > --samples > --cache
+    cache_path = args.samples_file or args.samples or args.cache
+
+    if not cache_path:
+        parser.error("Please provide a samples pickle file as a positional argument or via --samples/-s")
+
+    inspect_cache(cache_path, start_idx=args.start)
 
 
 if __name__ == '__main__':

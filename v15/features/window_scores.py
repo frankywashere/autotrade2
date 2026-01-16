@@ -570,7 +570,7 @@ def get_window_score_feature_names_tf(tf: str) -> List[str]:
 
 def get_all_window_score_feature_names() -> List[str]:
     """Get ALL window score feature names across all TFs."""
-    from v7.core.timeframe import TIMEFRAMES
+    from v15.config import TIMEFRAMES
 
     all_names = []
     for tf in TIMEFRAMES:
@@ -579,5 +579,5 @@ def get_all_window_score_feature_names() -> List[str]:
 
 
 def get_total_window_score_features() -> int:
-    """Total window score features: 50 * 11 TFs = 550"""
-    return 50 * 11
+    """Total window score features: 50 * 10 TFs = 500"""
+    return 50 * 10

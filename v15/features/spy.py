@@ -1160,7 +1160,7 @@ def get_spy_feature_names_tf(tf: str) -> List[str]:
 
 def get_all_spy_feature_names() -> List[str]:
     """Get ALL SPY feature names across all TFs."""
-    from v7.core.timeframe import TIMEFRAMES
+    from v15.config import TIMEFRAMES
 
     all_names = []
     for tf in TIMEFRAMES:
@@ -1169,5 +1169,5 @@ def get_all_spy_feature_names() -> List[str]:
 
 
 def get_total_spy_features() -> int:
-    """Total SPY features: 80 * 11 TFs = 880"""
-    return 80 * 11
+    """Total SPY features: 80 * 10 TFs = 800"""
+    return 80 * 10

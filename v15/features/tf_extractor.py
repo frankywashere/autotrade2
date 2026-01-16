@@ -2,15 +2,15 @@
 TF-Aware Feature Extraction Orchestrator for x14 V15
 
 This module provides comprehensive multi-timeframe feature extraction by:
-1. Resampling base 5-min data to each of 11 timeframes
+1. Resampling base 5-min data to each of 10 timeframes
 2. Detecting channels at all 8 windows on each TF's resampled data
 3. Extracting ALL features from each TF's data with explicit TF prefixes
 
-Total Features: ~8,632
-- 282 window-independent features * 11 TFs = 3,102
-- 50 channel features * 8 windows * 11 TFs = 4,400
-- 50 window score features * 11 TFs = 550
-- 50 channel history features * 11 TFs = 550
+Total Features: ~7,850
+- 282 window-independent features * 10 TFs = 2,820
+- 50 channel features * 8 windows * 10 TFs = 4,000
+- 50 window score features * 10 TFs = 500
+- 50 channel history features * 10 TFs = 500
 - 30 event features (TF-independent) = 30
 
 All features are explicitly named with TF prefix (e.g., 'daily_rsi_14', '1h_w50_channel_slope').
@@ -19,7 +19,7 @@ All features are explicitly named with TF prefix (e.g., 'daily_rsi_14', '1h_w50_
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional, TYPE_CHECKING, Any, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,26 +34,54 @@ if TYPE_CHECKING:
     from v7.core.channel import Channel
 
 # =============================================================================
-# Core imports from v7
+# Core imports from v7 and v15
 # =============================================================================
 
 # Import timeframe utilities
+from v15.config import TIMEFRAMES, BARS_PER_TF as CONFIG_BARS_PER_TF
+
 try:
-    from v7.core.timeframe import resample_ohlc, TIMEFRAMES
+    from v7.core.timeframe import resample_ohlc
     _timeframe_available = True
 except ImportError as e:
-    logger.warning(f"Failed to import timeframe utilities: {e}")
+    logger.warning(f"Failed to import resample_ohlc from v7.core.timeframe: {e}")
     _timeframe_available = False
-    TIMEFRAMES = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly', '3month']
+
+# Import partial bar resampling from v15
+try:
+    from ..data.resampler import resample_with_partial
+    _partial_resampling_available = True
+except ImportError as e:
+    logger.warning(f"Failed to import partial resampling: {e}")
+    _partial_resampling_available = False
+
+# Use BARS_PER_TF from v15.config (imported above as CONFIG_BARS_PER_TF)
+BARS_PER_TF = CONFIG_BARS_PER_TF
+
+# Resample rule mapping
+TF_TO_RESAMPLE_RULE = {
+    '5min': '5min',
+    '15min': '15min',
+    '30min': '30min',
+    '1h': '1h',
+    '2h': '2h',
+    '3h': '3h',
+    '4h': '4h',
+    'daily': '1D',
+    'weekly': '1W',
+    'monthly': '1MS',
+}
+
+# Import STANDARD_WINDOWS from v15.config
+from v15.config import STANDARD_WINDOWS
 
 # Import channel detection
 try:
-    from v7.core.channel import detect_channels_multi_window, select_best_channel, STANDARD_WINDOWS
+    from v7.core.channel import detect_channels_multi_window, select_best_channel
     _channel_available = True
 except ImportError as e:
     logger.warning(f"Failed to import channel detection: {e}")
     _channel_available = False
-    STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80]
 
 # =============================================================================
 # Feature extractor imports
@@ -211,33 +239,112 @@ def _prefix_tf_window(features: Dict[str, float], tf: str, window: int) -> Dict[
     return _prefix_features(features, f"{tf}_w{window}_")
 
 
-def _resample_to_tf(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+def _resample_to_tf(
+    df: pd.DataFrame,
+    tf: str,
+    source_bar_count: Optional[int] = None
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Resample DataFrame to target timeframe.
+    Resample DataFrame to target timeframe with partial bar support.
+
+    CRITICAL: This keeps partial (incomplete) bars and calculates completion
+    metadata based on where we are within the TF bar period.
 
     Args:
         df: Base OHLCV DataFrame (5-min data)
         tf: Target timeframe
+        source_bar_count: Number of 5min bars from start of data to sample point.
+                         Used to calculate bar_completion_pct based on position
+                         within the TF bar. If None, uses len(df).
 
     Returns:
-        Resampled DataFrame, or original if tf is '5min' or resample fails
+        Tuple of (resampled_df, metadata_dict) where metadata contains:
+        - bar_completion_pct: 0.0-1.0, how complete the current TF bar is
+        - bars_in_partial: Number of 5min bars in the partial bar
+        - is_partial: Whether the last bar is incomplete
     """
+    if source_bar_count is None:
+        source_bar_count = len(df)
+
+    bars_per_tf_bar = BARS_PER_TF.get(tf, 1)
+
     if tf == '5min':
-        return df
+        # No resampling needed - always complete
+        return df, {
+            'bar_completion_pct': 1.0,
+            'bars_in_partial': 1,
+            'expected_bars': 1,
+            'is_partial': False,
+            'total_bars': len(df),
+            'source_bars': len(df),
+        }
 
-    if not _timeframe_available:
-        logger.warning(f"Cannot resample to {tf}: timeframe module not available")
-        return df
+    # Calculate completion based on position within TF bar
+    # At 5min index i, we're (i % bars_per_tf_bar) bars into the current TF bar
+    bars_into_current = source_bar_count % bars_per_tf_bar
+    if bars_into_current == 0:
+        # Exactly at a TF boundary - bar is complete
+        completion_pct = 1.0
+        is_partial = False
+    else:
+        # Partial bar
+        completion_pct = bars_into_current / bars_per_tf_bar
+        is_partial = True
 
-    try:
-        resampled = resample_ohlc(df, tf)
-        if len(resampled) < 2:
-            logger.debug(f"Not enough data after resampling to {tf}")
-            return df
-        return resampled
-    except Exception as e:
-        logger.warning(f"Failed to resample to {tf}: {e}")
-        return df
+    # Use partial resampling if available
+    if _partial_resampling_available:
+        try:
+            resample_rule = TF_TO_RESAMPLE_RULE.get(tf, tf)
+            resampled, raw_metadata = resample_with_partial(df, resample_rule)
+
+            # Override the completion_pct with our position-based calculation
+            # This ensures bar_completion_pct reflects actual position within the bar
+            metadata = {
+                'bar_completion_pct': round(completion_pct, 4),
+                'bars_in_partial': bars_into_current if is_partial else bars_per_tf_bar,
+                'expected_bars': bars_per_tf_bar,
+                'is_partial': is_partial,
+                'total_bars': len(resampled),
+                'source_bars': len(df),
+            }
+
+            if len(resampled) < 2:
+                logger.debug(f"Not enough data after resampling to {tf}")
+                return df, metadata
+
+            return resampled, metadata
+
+        except Exception as e:
+            logger.warning(f"Failed to resample to {tf} with partial support: {e}")
+
+    # Fallback to v7 resampling
+    if _timeframe_available:
+        try:
+            resampled = resample_ohlc(df, tf)
+            metadata = {
+                'bar_completion_pct': round(completion_pct, 4),
+                'bars_in_partial': bars_into_current if is_partial else bars_per_tf_bar,
+                'expected_bars': bars_per_tf_bar,
+                'is_partial': is_partial,
+                'total_bars': len(resampled),
+                'source_bars': len(df),
+            }
+            if len(resampled) < 2:
+                logger.debug(f"Not enough data after resampling to {tf}")
+                return df, metadata
+            return resampled, metadata
+        except Exception as e:
+            logger.warning(f"Failed to resample to {tf}: {e}")
+
+    # Return original with default metadata
+    return df, {
+        'bar_completion_pct': round(completion_pct, 4),
+        'bars_in_partial': bars_into_current if is_partial else bars_per_tf_bar,
+        'expected_bars': bars_per_tf_bar,
+        'is_partial': is_partial,
+        'total_bars': len(df),
+        'source_bars': len(df),
+    }
 
 
 def _detect_channels_for_tf(
@@ -477,20 +584,68 @@ def _extract_channel_history_for_tf(
 # Main Extraction Function
 # =============================================================================
 
+def _extract_bar_metadata_features(
+    metadata_by_tf: Dict[str, Dict[str, Any]]
+) -> Dict[str, float]:
+    """
+    Extract bar metadata features for all timeframes.
+
+    For each TF, extracts:
+    - {tf}_bar_completion_pct: 0.0-1.0, how complete the current TF bar is
+    - {tf}_bars_in_partial: Number of 5min bars in the partial bar
+    - {tf}_complete_bars: Total number of complete bars
+
+    Total: 3 features * 10 TFs = 30 features
+
+    Args:
+        metadata_by_tf: Dict mapping TF -> resampling metadata
+
+    Returns:
+        Dict of bar metadata features
+    """
+    features: Dict[str, float] = {}
+
+    for tf in TIMEFRAMES:
+        meta = metadata_by_tf.get(tf, {})
+
+        # Bar completion percentage (0.0 to 1.0)
+        completion = meta.get('bar_completion_pct', 1.0)
+        features[f"{tf}_bar_completion_pct"] = float(completion)
+
+        # Number of 5min bars in the partial bar
+        bars_in_partial = meta.get('bars_in_partial', 0)
+        features[f"{tf}_bars_in_partial"] = float(bars_in_partial)
+
+        # Number of complete bars (total - 1 if partial, else total)
+        total_bars = meta.get('total_bars', 0)
+        is_partial = meta.get('is_partial', False)
+        complete_bars = max(0, total_bars - 1) if is_partial else total_bars
+        features[f"{tf}_complete_bars"] = float(complete_bars)
+
+    return features
+
+
 def extract_all_tf_features(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
     timestamp: pd.Timestamp,
-    channel_history_by_tf: Optional[Dict[str, Dict]] = None
+    channel_history_by_tf: Optional[Dict[str, Dict]] = None,
+    source_bar_count: Optional[int] = None,
+    include_bar_metadata: bool = True
 ) -> Dict[str, float]:
     """
-    Extract ALL features for ALL timeframes.
+    Extract ALL features for ALL timeframes with partial bar support.
 
     This is the main entry point for TF-aware feature extraction. It:
-    1. Resamples data to each of 11 timeframes
+    1. Resamples data to each of 10 timeframes (keeping partial bars)
     2. Detects channels at all 8 windows on each TF
     3. Extracts all features with explicit TF prefixes
+    4. Includes bar metadata features showing completion percentages
+
+    CRITICAL: This supports partial bars to match live inference behavior.
+    During training, bar_completion_pct will vary based on position within
+    the TF bar, just like in live trading.
 
     Args:
         tsla_df: Base 5-min TSLA OHLCV DataFrame
@@ -499,14 +654,19 @@ def extract_all_tf_features(
         timestamp: Current timestamp for event features
         channel_history_by_tf: Optional dict mapping TF -> {'tsla': [...], 'spy': [...]}
             Each list contains the last 5 channel dicts for that TF
+        source_bar_count: Number of 5min bars from start of data to sample point.
+                         Used to calculate bar_completion_pct based on position
+                         within the TF bar. If None, uses len(tsla_df).
+        include_bar_metadata: If True, include 30 bar metadata features (default True)
 
     Returns:
-        Dict[str, float] with ~8,632 features:
-        - 282 window-independent features * 11 TFs = 3,102
-        - 50 channel features * 8 windows * 11 TFs = 4,400
-        - 50 window score features * 11 TFs = 550
-        - 50 channel history features * 11 TFs = 550
+        Dict[str, float] with ~7,880 features:
+        - 282 window-independent features * 10 TFs = 2,820
+        - 50 channel features * 8 windows * 10 TFs = 4,000
+        - 50 window score features * 10 TFs = 500
+        - 50 channel history features * 10 TFs = 500
         - 30 event features (TF-independent) = 30
+        - 30 bar metadata features (if include_bar_metadata=True)
 
         All features are explicitly named with TF prefix.
         All values are guaranteed to be valid floats (no NaN, no inf).
@@ -518,13 +678,19 @@ def extract_all_tf_features(
         - 'daily_w50_channel_slope'
         - '1h_w20_position_in_channel'
         - 'daily_valid_window_count'
+        - 'daily_bar_completion_pct'  # New: varies 0.0-1.0 during training
         - 'is_monday' (TF-independent)
     """
     all_features: Dict[str, float] = {}
+    metadata_by_tf: Dict[str, Dict[str, Any]] = {}
 
     # Initialize channel history if not provided
     if channel_history_by_tf is None:
         channel_history_by_tf = {}
+
+    # Use provided source_bar_count or default to len(tsla_df)
+    if source_bar_count is None:
+        source_bar_count = len(tsla_df)
 
     # Track extraction statistics
     extraction_stats = {
@@ -538,10 +704,14 @@ def extract_all_tf_features(
     # -------------------------------------------------------------------------
     for tf in TIMEFRAMES:
         try:
-            # 1. Resample data to this TF
-            tsla_tf = _resample_to_tf(tsla_df, tf)
-            spy_tf = _resample_to_tf(spy_df, tf)
-            vix_tf = _resample_to_tf(vix_df, tf)
+            # 1. Resample data to this TF with partial bar support
+            # Pass source_bar_count to calculate correct bar_completion_pct
+            tsla_tf, tsla_meta = _resample_to_tf(tsla_df, tf, source_bar_count)
+            spy_tf, _ = _resample_to_tf(spy_df, tf, source_bar_count)
+            vix_tf, _ = _resample_to_tf(vix_df, tf, source_bar_count)
+
+            # Store metadata for bar metadata features
+            metadata_by_tf[tf] = tsla_meta
 
             # Check if we have enough data
             if len(tsla_tf) < 10:
@@ -603,6 +773,13 @@ def extract_all_tf_features(
         except Exception as e:
             logger.error(f"Error extracting event features: {e}")
             extraction_stats['errors'].append(f"events: {e}")
+
+    # -------------------------------------------------------------------------
+    # Extract bar metadata features (30 features: 3 per TF * 10 TFs)
+    # -------------------------------------------------------------------------
+    if include_bar_metadata:
+        bar_meta_features = _extract_bar_metadata_features(metadata_by_tf)
+        all_features.update(bar_meta_features)
 
     # -------------------------------------------------------------------------
     # Sanitize all features

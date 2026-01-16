@@ -1,6 +1,11 @@
 """
 V15 Inference Module - Make predictions with trained models.
 
+Supports:
+- Partial bar feature extraction (critical for live trading)
+- Multi-timeframe feature extraction via extract_all_tf_features()
+- New 7,880 feature structure with TF prefixes
+
 Usage:
     from v15.inference import Predictor
 
@@ -16,8 +21,11 @@ from dataclasses import dataclass
 import logging
 
 from .models import V15Model, create_model
-from .features.extractor import extract_all_features, get_feature_names
-from .data.resampler import resample_with_partial
+from .features.tf_extractor import (
+    extract_all_tf_features,
+    get_tf_feature_names,
+    get_tf_feature_count,
+)
 from .config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES
 from .exceptions import ModelError, FeatureExtractionError
 
@@ -71,14 +79,14 @@ class Predictor:
         if not path.exists():
             raise ModelError(f"Checkpoint not found: {path}")
 
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
         # Create model
         model = create_model()
         model.load_state_dict(checkpoint['model_state_dict'])
 
-        # Get feature names
-        feature_names = checkpoint.get('feature_names', get_feature_names())
+        # Get feature names - use new TF-aware feature names by default
+        feature_names = checkpoint.get('feature_names', get_tf_feature_names())
 
         return cls(model, feature_names, device)
 
@@ -129,16 +137,28 @@ class Predictor:
         tsla_df: pd.DataFrame,
         spy_df: pd.DataFrame,
         vix_df: pd.DataFrame,
-        timestamp: Optional[pd.Timestamp] = None
+        timestamp: Optional[pd.Timestamp] = None,
+        source_bar_count: Optional[int] = None,
+        channel_history_by_tf: Optional[Dict[str, Dict]] = None,
     ) -> Prediction:
         """
-        Make prediction from raw market data.
+        Make prediction from raw market data with partial bar support.
+
+        This method uses the new TF-aware feature extraction that:
+        - Resamples to all 10 timeframes keeping partial bars
+        - Detects channels at all 8 windows per timeframe
+        - Includes bar_completion_pct features for partial bar awareness
 
         Args:
-            tsla_df: TSLA OHLCV DataFrame
-            spy_df: SPY OHLCV DataFrame
-            vix_df: VIX OHLCV DataFrame
+            tsla_df: TSLA OHLCV DataFrame (5-min base data)
+            spy_df: SPY OHLCV DataFrame (5-min base data)
+            vix_df: VIX OHLCV DataFrame (5-min base data)
             timestamp: Timestamp for prediction (default: last bar)
+            source_bar_count: Number of 5min bars for partial bar calculation.
+                             If None, uses len(tsla_df). This is critical for
+                             accurate bar_completion_pct during live trading.
+            channel_history_by_tf: Optional dict mapping TF -> {'tsla': [...], 'spy': [...]}
+                                  for channel history features.
 
         Returns:
             Prediction object with all outputs
@@ -148,24 +168,30 @@ class Predictor:
         if timestamp is None:
             timestamp = tsla_df.index[-1]
 
-        # Detect channels
+        # Use source_bar_count for accurate partial bar calculation
+        if source_bar_count is None:
+            source_bar_count = len(tsla_df)
+
+        # Detect channels on 5-min data for best_window selection
         channels = detect_channels_multi_window(tsla_df, windows=STANDARD_WINDOWS)
         best_channel, best_window = select_best_channel(channels)
 
-        # Extract features
-        features = extract_all_features(
+        # Extract all TF features with partial bar support
+        # This resamples to all 10 TFs and extracts ~7,880 features
+        features = extract_all_tf_features(
             tsla_df=tsla_df,
             spy_df=spy_df,
             vix_df=vix_df,
             timestamp=timestamp,
-            channels_by_window=channels,
-            validate=True
+            channel_history_by_tf=channel_history_by_tf,
+            source_bar_count=source_bar_count,
+            include_bar_metadata=True,  # Include bar_completion_pct features
         )
 
         # Make prediction
         prediction = self.predict_features(features)
         prediction.timestamp = timestamp
-        prediction.best_window = best_window
+        prediction.best_window = best_window if best_window is not None else 50
 
         return prediction
 
@@ -185,12 +211,27 @@ def quick_predict(
     checkpoint_path: str,
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
-    vix_df: pd.DataFrame
+    vix_df: pd.DataFrame,
+    source_bar_count: Optional[int] = None,
 ) -> Prediction:
     """
     Quick prediction without keeping predictor in memory.
 
     For one-off predictions. Use Predictor class for repeated predictions.
+
+    Args:
+        checkpoint_path: Path to model checkpoint
+        tsla_df: TSLA OHLCV DataFrame (5-min base data)
+        spy_df: SPY OHLCV DataFrame (5-min base data)
+        vix_df: VIX OHLCV DataFrame (5-min base data)
+        source_bar_count: Number of 5min bars for partial bar calculation.
+                         If None, uses len(tsla_df).
+
+    Returns:
+        Prediction object
     """
     predictor = Predictor.load(checkpoint_path)
-    return predictor.predict(tsla_df, spy_df, vix_df)
+    return predictor.predict(
+        tsla_df, spy_df, vix_df,
+        source_bar_count=source_bar_count
+    )

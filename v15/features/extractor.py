@@ -3,7 +3,7 @@ Feature Extractor - Main Orchestrator for x14 Feature System v15
 
 This module is the single entry point for ALL feature extraction.
 It orchestrates:
-1. Partial bar resampling across all 11 timeframes (keeping incomplete bars)
+1. Partial bar resampling across all 10 timeframes (keeping incomplete bars)
 2. Channel detection at all 8 windows per timeframe
 3. Feature extraction from all modules
 4. Bar metadata features (completion_pct, bars_in_partial, complete_bars)
@@ -40,6 +40,8 @@ from ..config import (
     BARS_PER_TF,
     FEATURE_COUNTS,
     TOTAL_FEATURES,
+    TF_LOOKBACK_5MIN,
+    TF_FORWARD_5MIN,
 )
 
 from ..exceptions import (
@@ -132,7 +134,6 @@ TF_TO_RESAMPLE_RULE = {
     'daily': '1D',
     'weekly': '1W',
     'monthly': '1MS',   # Month Start (pandas format)
-    '3month': '3MS',    # Quarter Start (pandas format)
 }
 
 
@@ -158,7 +159,9 @@ def _prefix_tf_window(features: Dict[str, float], tf: str, window: int) -> Dict[
 def _resample_to_tf(
     df: pd.DataFrame,
     tf: str,
-    source_tf: str = '5min'
+    source_tf: str = '5min',
+    max_source_bars: Optional[int] = None,
+    source_bar_count: Optional[int] = None
 ) -> tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Resample DataFrame to target timeframe using partial bar support.
@@ -170,6 +173,11 @@ def _resample_to_tf(
         df: Source OHLCV DataFrame (typically 5-min data)
         tf: Target timeframe
         source_tf: Source timeframe (for metadata calculation)
+        max_source_bars: If provided, only use last N source bars before resampling.
+                        This improves efficiency by avoiding resampling unused data.
+        source_bar_count: Number of 5min bars from start of data to sample point.
+                         Used to calculate bar_completion_pct based on position
+                         within the TF bar. If None, uses len(df).
 
     Returns:
         Tuple of (resampled_df, metadata_dict)
@@ -177,6 +185,16 @@ def _resample_to_tf(
     Raises:
         ResamplingError: If resampling fails
     """
+    # Apply efficient slicing BEFORE any processing
+    if max_source_bars is not None and len(df) > max_source_bars:
+        df = df.iloc[-max_source_bars:]
+
+    # Use provided source_bar_count or default to len(df)
+    if source_bar_count is None:
+        source_bar_count = len(df)
+
+    bars_per_tf_bar = BARS_PER_TF.get(tf, 1)
+
     if tf == '5min':
         # No resampling needed - return as-is with full completion
         return df, {
@@ -188,12 +206,36 @@ def _resample_to_tf(
             'source_bars': len(df),
         }
 
+    # Calculate completion based on position within TF bar
+    # At 5min index i, we're (i % bars_per_tf_bar) bars into the current TF bar
+    bars_into_current = source_bar_count % bars_per_tf_bar
+    if bars_into_current == 0:
+        # Exactly at a TF boundary - bar is complete
+        completion_pct = 1.0
+        is_partial = False
+    else:
+        # Partial bar
+        completion_pct = bars_into_current / bars_per_tf_bar
+        is_partial = True
+
     resample_rule = TF_TO_RESAMPLE_RULE.get(tf)
     if resample_rule is None:
         raise ResamplingError(f"Unknown timeframe: {tf}")
 
     try:
-        resampled, metadata = resample_with_partial(df, resample_rule, source_tf)
+        resampled, raw_metadata = resample_with_partial(df, resample_rule, source_tf)
+
+        # Override the completion_pct with our position-based calculation
+        # This ensures bar_completion_pct reflects actual position within the bar
+        metadata = {
+            'bar_completion_pct': round(completion_pct, 4),
+            'bars_in_partial': bars_into_current if is_partial else bars_per_tf_bar,
+            'expected_bars': bars_per_tf_bar,
+            'is_partial': is_partial,
+            'total_bars': len(resampled),
+            'source_bars': len(df),
+        }
+
         return resampled, metadata
     except Exception as e:
         raise ResamplingError(f"Failed to resample to {tf}: {e}")
@@ -236,7 +278,7 @@ def _extract_bar_metadata_features(
     - {tf}_bars_in_partial: Number of source bars in the partial bar
     - {tf}_complete_bars: Total number of complete bars
 
-    Total: 3 features * 11 TFs = 33 features
+    Total: 3 features * 10 TFs = 30 features
 
     Args:
         metadata_by_tf: Dict mapping TF -> resampling metadata
@@ -444,17 +486,23 @@ def extract_all_features(
     vix_df: pd.DataFrame,
     timestamp: pd.Timestamp,
     channels_by_window: Dict[int, "Channel"],
-    validate: bool = True
+    validate: bool = True,
+    native_tf_data: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None,
+    source_bar_count: Optional[int] = None
 ) -> Dict[str, float]:
     """
-    Extract all features for a single sample.
+    Extract all features for a single sample with partial bar support.
 
     This is the MAIN ENTRY POINT for feature extraction. It:
-    1. Resamples data to all 11 timeframes (keeping partial bars)
+    1. Resamples data to all 10 timeframes (keeping partial bars)
     2. Detects channels at all 8 windows per timeframe
     3. Extracts all features with explicit TF prefixes
-    4. Adds bar metadata features
+    4. Adds bar metadata features with position-based completion percentages
     5. Validates all features (no silent NaN)
+
+    CRITICAL: Supports partial bars to match live inference behavior.
+    During training, bar_completion_pct will vary based on position within
+    the TF bar, just like in live trading.
 
     Args:
         tsla_df: Base 5-min TSLA OHLCV DataFrame
@@ -463,14 +511,24 @@ def extract_all_features(
         timestamp: Current timestamp for event features
         channels_by_window: Pre-computed channels (optional, will detect if empty)
         validate: If True, validate all features and raise on invalid
+        native_tf_data: Optional dict of pre-loaded native TF data.
+                       Format: {symbol: {tf: DataFrame}} where symbol is 'TSLA', 'SPY', or 'VIX'.
+                       If provided for a TF, uses native data instead of resampling from 5-min.
+                       This is more efficient and accurate for higher timeframes.
+        source_bar_count: Number of 5min bars from start of data to sample point.
+                         Used to calculate bar_completion_pct based on position
+                         within the TF bar. If None, uses len(tsla_df).
+                         Example for daily TF (78 bars per day):
+                           At idx=100: bars_into_current = 100 % 78 = 22
+                           completion_pct = 22 / 78 = 0.28 (28% complete)
 
     Returns:
         Dict with TOTAL_FEATURES (8,665) named features:
-        - Window-independent per TF: 282 * 11 = 3,102
-        - Channel per window per TF: 50 * 8 * 11 = 4,400
-        - Aggregated per TF: 100 * 11 = 1,100
+        - Window-independent per TF: 282 * 10 = 2,820
+        - Channel per window per TF: 50 * 8 * 10 = 4,000
+        - Aggregated per TF: 100 * 10 = 1,000
         - Events (global): 30
-        - Bar metadata: 3 * 11 = 33
+        - Bar metadata: 3 * 10 = 30
 
     Raises:
         FeatureExtractionError: If extraction fails
@@ -487,15 +545,66 @@ def extract_all_features(
     all_features: Dict[str, float] = {}
     metadata_by_tf: Dict[str, Dict[str, Any]] = {}
 
+    # Use provided source_bar_count or default to len(tsla_df)
+    if source_bar_count is None:
+        source_bar_count = len(tsla_df)
+
     # =========================================================================
     # Process each timeframe
     # =========================================================================
     for tf in TIMEFRAMES:
         try:
-            # 1. Resample data to this TF (keeps partial bars)
-            tsla_tf, tsla_meta = _resample_to_tf(tsla_df, tf)
-            spy_tf, spy_meta = _resample_to_tf(spy_df, tf)
-            vix_tf, vix_meta = _resample_to_tf(vix_df, tf)
+            # Check if native TF data is available for this timeframe
+            use_native = (
+                native_tf_data is not None
+                and native_tf_data.get('TSLA', {}).get(tf) is not None
+                and native_tf_data.get('SPY', {}).get(tf) is not None
+                and native_tf_data.get('VIX', {}).get(tf) is not None
+            )
+
+            if use_native:
+                # Use pre-loaded native TF data (no resampling needed)
+                tsla_tf = native_tf_data['TSLA'][tf]
+                spy_tf = native_tf_data['SPY'][tf]
+                vix_tf = native_tf_data['VIX'][tf]
+
+                # Calculate completion based on position within TF bar
+                # even for native data, to maintain consistency
+                bars_per_tf_bar = BARS_PER_TF.get(tf, 1)
+                bars_into_current = source_bar_count % bars_per_tf_bar
+                if bars_into_current == 0:
+                    completion_pct = 1.0
+                    is_partial = False
+                else:
+                    completion_pct = bars_into_current / bars_per_tf_bar
+                    is_partial = True
+
+                tsla_meta = {
+                    'bar_completion_pct': round(completion_pct, 4),
+                    'bars_in_partial': bars_into_current if is_partial else bars_per_tf_bar,
+                    'expected_bars': bars_per_tf_bar,
+                    'is_partial': is_partial,
+                    'total_bars': len(tsla_tf),
+                    'source_bars': len(tsla_tf),
+                }
+            else:
+                # Get TF-specific lookback requirement for efficient slicing
+                lookback_bars = TF_LOOKBACK_5MIN.get(tf)  # None means use all data
+
+                # 1. Resample data to this TF with efficient slicing (keeps partial bars)
+                # Pass source_bar_count for position-based completion calculation
+                tsla_tf, tsla_meta = _resample_to_tf(
+                    tsla_df, tf, max_source_bars=lookback_bars,
+                    source_bar_count=source_bar_count
+                )
+                spy_tf, _ = _resample_to_tf(
+                    spy_df, tf, max_source_bars=lookback_bars,
+                    source_bar_count=source_bar_count
+                )
+                vix_tf, _ = _resample_to_tf(
+                    vix_df, tf, max_source_bars=lookback_bars,
+                    source_bar_count=source_bar_count
+                )
 
             # Store metadata for bar metadata features
             metadata_by_tf[tf] = tsla_meta

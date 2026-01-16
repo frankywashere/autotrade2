@@ -707,7 +707,7 @@ def get_cross_asset_feature_names_tf(tf: str) -> List[str]:
 
 def get_all_cross_asset_feature_names() -> List[str]:
     """Get ALL cross-asset feature names across all TFs."""
-    from v7.core.timeframe import TIMEFRAMES
+    from v15.config import TIMEFRAMES
 
     all_names = []
     for tf in TIMEFRAMES:
@@ -721,5 +721,5 @@ def get_cross_asset_feature_count() -> int:
 
 
 def get_total_cross_asset_features() -> int:
-    """Total cross-asset features: 40 * 11 TFs = 440"""
-    return 40 * 11
+    """Total cross-asset features: 40 * 10 TFs = 400"""
+    return 40 * 10

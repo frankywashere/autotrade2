@@ -3,12 +3,12 @@ V15 Configuration - Single source of truth for all constants.
 """
 from typing import Dict, List
 
-# Timeframes
+# Timeframes (10 TFs - no 3month due to data limitations)
 TIMEFRAMES: List[str] = [
     '5min', '15min', '30min', '1h', '2h', '3h', '4h',
-    'daily', 'weekly', 'monthly', '3month'
+    'daily', 'weekly', 'monthly'
 ]
-N_TIMEFRAMES: int = len(TIMEFRAMES)
+N_TIMEFRAMES: int = len(TIMEFRAMES)  # 10
 
 # Channel detection windows
 STANDARD_WINDOWS: List[int] = [10, 20, 30, 40, 50, 60, 70, 80]
@@ -26,8 +26,57 @@ BARS_PER_TF: Dict[str, int] = {
     'daily': 78,      # 6.5 hours * 12
     'weekly': 390,    # 5 days * 78
     'monthly': 1638,  # ~21 trading days * 78
-    '3month': 4914,   # ~63 trading days * 78
 }
+
+# Per-TF lookback requirements (in 5-min bars)
+# Based on max window (80 bars) * BARS_PER_TF + buffer for technical indicators
+TF_LOOKBACK_5MIN: Dict[str, int] = {
+    '5min': 200,        # 80 + buffer for RSI/MACD
+    '15min': 400,       # 80 * 3 + buffer
+    '30min': 700,       # 80 * 6 + buffer
+    '1h': 1200,         # 80 * 12 + buffer
+    '2h': 2200,         # 80 * 24 + buffer
+    '3h': 3200,         # 80 * 36 + buffer
+    '4h': 4200,         # 80 * 48 + buffer
+    'daily': 7000,      # 80 * 78 + buffer
+    'weekly': 32000,    # 80 * 390 + buffer
+    'monthly': 132000,  # 80 * 1638 + buffer
+}
+
+# Per-TF forward requirements for label scanning (in 5-min bars)
+# Based on TF_MAX_SCAN * BARS_PER_TF
+TF_FORWARD_5MIN: Dict[str, int] = {
+    '5min': 600,        # 500 + buffer
+    '15min': 1400,      # 400 * 3 + buffer
+    '30min': 2400,      # 350 * 6 + buffer
+    '1h': 4000,         # 300 * 12 + buffer
+    '2h': 6500,         # 250 * 24 + buffer
+    '3h': 8000,         # 200 * 36 + buffer
+    '4h': 8000,         # 150 * 48 + buffer
+    'daily': 8500,      # 100 * 78 + buffer
+    'weekly': 21000,    # 52 * 390 + buffer
+    'monthly': 40000,   # 24 * 1638 + buffer
+}
+
+# Maximum lookback/forward for SCANNER (determines what positions can be scanned)
+# NOTE: We use WEEKLY as the practical limit for scanning.
+# Monthly TF will have invalid labels for most samples due to data limits.
+# The model handles missing labels via masking.
+#
+# For a 440K bar dataset:
+#   - Weekly lookback (32K) + forward (21K) = 53K (reasonable)
+#   - Monthly (172K) exceeds our data
+#
+# Per-TF lookback values above are still used for EFFICIENT SLICING during
+# feature extraction - each TF only resamples the data it needs.
+
+# Practical limits for scanner (based on weekly TF)
+SCANNER_LOOKBACK_5MIN = TF_LOOKBACK_5MIN['weekly']   # 32,000
+SCANNER_FORWARD_5MIN = TF_FORWARD_5MIN['weekly']     # 21,000
+
+# True maximums (for reference - may exceed available data)
+MAX_LOOKBACK_5MIN = max(TF_LOOKBACK_5MIN.values())   # 132,000 (monthly)
+MAX_FORWARD_5MIN = max(TF_FORWARD_5MIN.values())     # 40,000 (monthly)
 
 # Feature counts per category
 FEATURE_COUNTS = {
@@ -59,12 +108,12 @@ AGGREGATED_PER_TF = (
     FEATURE_COUNTS['channel_history_per_tf']
 )  # 100
 
-BAR_METADATA_TOTAL = FEATURE_COUNTS['bar_metadata_per_tf'] * N_TIMEFRAMES  # 33
+BAR_METADATA_TOTAL = FEATURE_COUNTS['bar_metadata_per_tf'] * N_TIMEFRAMES  # 30 (3 * 10 TFs)
 
 FEATURES_PER_TF = WINDOW_INDEPENDENT_PER_TF + WINDOW_DEPENDENT_PER_TF + AGGREGATED_PER_TF  # 782
 
-TOTAL_TF_FEATURES = FEATURES_PER_TF * N_TIMEFRAMES  # 8,602
-TOTAL_FEATURES = TOTAL_TF_FEATURES + FEATURE_COUNTS['events_total'] + BAR_METADATA_TOTAL  # 8,665
+TOTAL_TF_FEATURES = FEATURES_PER_TF * N_TIMEFRAMES  # 7,820 (782 * 10 TFs)
+TOTAL_FEATURES = TOTAL_TF_FEATURES + FEATURE_COUNTS['events_total'] + BAR_METADATA_TOTAL  # 7,880 (7820 + 30 + 30)
 
 # Label scanning parameters per TF
 TF_MAX_SCAN: Dict[str, int] = {
@@ -78,7 +127,6 @@ TF_MAX_SCAN: Dict[str, int] = {
     'daily': 100,
     'weekly': 52,
     'monthly': 24,
-    '3month': 12,
 }
 
 TF_RETURN_THRESHOLD: Dict[str, int] = {
@@ -92,7 +140,6 @@ TF_RETURN_THRESHOLD: Dict[str, int] = {
     'daily': 5,
     'weekly': 3,
     'monthly': 2,
-    '3month': 1,
 }
 
 # Model configuration
@@ -114,10 +161,11 @@ TRAINING_CONFIG = {
 }
 
 # Scanner configuration
+# Uses practical limits (weekly-based) to ensure we can scan with available data
 SCANNER_CONFIG = {
     'step': 10,
-    'warmup_bars': 32760,
-    'forward_bars': 8000,
+    'warmup_bars': SCANNER_LOOKBACK_5MIN,   # 32,000 (weekly-based, practical)
+    'forward_bars': SCANNER_FORWARD_5MIN,    # 21,000 (weekly-based, practical)
     'workers': 4,
 }
 

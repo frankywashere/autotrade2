@@ -2,9 +2,15 @@
 """
 Visual Label Inspector for v15 Cache System
 
-A matplotlib-based visual inspection tool for channel samples.
+A matplotlib-based visual inspection tool for ChannelSample objects.
 Displays multi-timeframe visualization with channel bounds, break points,
 and direction arrows in a 2x2 grid layout.
+
+Works with the v15 ChannelSample structure:
+    - sample.tf_features: Flat dict of TF-prefixed features ({tf}_{feature_name})
+    - sample.labels_per_window[window][tf]: Labels for each window/timeframe
+    - 10 timeframes: 5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly
+    - 8 standard windows: 10, 20, 30, 40, 50, 60, 70, 80 bars
 
 Features:
     - Multi-timeframe 2x2 grid visualization (4 timeframes at once)
@@ -12,8 +18,11 @@ Features:
     - Window cycling ('w' key): best -> 10 -> 20 -> ... -> 80 -> best
     - Sample navigation: LEFT/RIGHT arrows, 'r' for random
     - Channel visualization: OHLC candlesticks with channel bounds projected forward
+    - Two-pass channel detection support
 
 Usage:
+    python -m v15.visual_inspector samples.pkl
+    python -m v15.visual_inspector --samples samples.pkl
     python -m v15.visual_inspector --cache data/feature_cache/test_v15.pkl
 
 Keyboard Controls:
@@ -51,7 +60,7 @@ from v15.data import load_market_data
 TF_VIEW_SETS = {
     'mixed': ['5min', '15min', '1h', 'daily'],
     'intraday': ['5min', '1h', '2h', '4h'],
-    'multiday': ['daily', 'weekly', 'monthly', '3month'],
+    'multiday': ['daily', 'weekly', 'monthly', '4h'],
 }
 TF_VIEW_NAMES = ['mixed', 'intraday', 'multiday']
 
@@ -73,7 +82,6 @@ FORWARD_BARS_PER_TF = {
     'daily': 50,
     'weekly': 50,
     'monthly': 10,
-    '3month': 10,
 }
 
 # Bars per timeframe (for resampling)
@@ -88,7 +96,6 @@ BARS_PER_TF = {
     'daily': 78,
     'weekly': 390,
     'monthly': 1638,
-    '3month': 4914,
 }
 
 
@@ -104,7 +111,7 @@ def resample_ohlc(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     rule_map = {
         '15min': '15min', '30min': '30min', '1h': '1h',
         '2h': '2h', '3h': '3h', '4h': '4h',
-        'daily': '1D', 'weekly': '1W', 'monthly': '1ME', '3month': '3ME'
+        'daily': '1D', 'weekly': '1W', 'monthly': '1ME'
     }
 
     rule = rule_map.get(timeframe)
@@ -558,7 +565,7 @@ class VisualInspector:
         tf_desc = {
             'mixed': 'Mixed (5min, 15min, 1h, daily)',
             'intraday': 'Intraday (5min, 1h, 2h, 4h)',
-            'multiday': 'Multi-day (daily, weekly, monthly, 3month)'
+            'multiday': 'Multi-day (daily, weekly, monthly, 4h)'
         }
         print(f"Timeframe View: {tf_desc[view_name]}")
 
@@ -673,16 +680,36 @@ class VisualInspector:
         if info_window != sample.best_window:
             print(f"Currently Viewing: Window {info_window}")
 
-        # Features - use the displayed window
-        features = sample.features_per_window.get(info_window, {})
-        window_label = f"window {info_window}" if info_window != sample.best_window else "best window"
-        print(f"\nFeatures ({len(features)} total, {window_label}):")
+        # Features - now stored as flat tf_features dict with TF-prefixed names
+        # Format: {tf}_{feature_name}, e.g., "5min_r_squared", "daily_slope"
+        features = sample.tf_features
+        print(f"\nFeatures ({len(features)} total, flat TF-prefixed format):")
+
+        # Group features by timeframe for display
+        tf_feature_counts = {}
+        for k in features.keys():
+            tf_prefix = k.split('_')[0]
+            # Handle timeframes with underscores like "5min" vs feature names
+            for tf in TIMEFRAMES:
+                if k.startswith(f"{tf}_"):
+                    tf_feature_counts[tf] = tf_feature_counts.get(tf, 0) + 1
+                    break
+
+        print("  Feature counts by timeframe:")
+        for tf in TIMEFRAMES:
+            count = tf_feature_counts.get(tf, 0)
+            if count > 0:
+                print(f"    {tf}: {count} features")
+
+        # Show sample of features for current window's timeframes
+        print(f"\n  Sample features (first 10):")
         for i, (k, v) in enumerate(list(features.items())[:10]):
-            print(f"  {k}: {v:.4f}")
+            print(f"    {k}: {v:.4f}")
         if len(features) > 10:
-            print(f"  ... and {len(features) - 10} more")
+            print(f"    ... and {len(features) - 10} more")
 
         # Labels - use the displayed window
+        window_label = f"window {info_window}" if info_window != sample.best_window else "best window"
         print(f"\n--- Labels by Timeframe ({window_label}) ---")
         labels_dict = sample.labels_per_window.get(info_window, {})
 
@@ -724,13 +751,37 @@ class VisualInspector:
 def main() -> None:
     """Command-line entry point for the visual inspector."""
     parser = argparse.ArgumentParser(
-        description='Visual Label Inspector for v15 cache samples'
+        description='Visual Label Inspector for v15 cache samples',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python -m v15.visual_inspector samples.pkl
+    python -m v15.visual_inspector --samples path/to/cache.pkl
+    python -m v15.visual_inspector -s cache.pkl --start 10
+    python -m v15.visual_inspector --cache path/to/cache.pkl  # legacy alias
+        """
     )
+    # Positional argument (optional) - samples pickle file
+    parser.add_argument(
+        'samples_file',
+        type=str,
+        nargs='?',
+        default=None,
+        help='Path to the pickle cache file (positional argument)'
+    )
+    # Named argument (optional) - samples pickle file
+    parser.add_argument(
+        '--samples', '-s',
+        type=str,
+        default=None,
+        help='Path to samples pickle file (.pkl)'
+    )
+    # Legacy alias for backwards compatibility
     parser.add_argument(
         '--cache', '-c',
         type=str,
-        required=True,
-        help='Path to v15 cache file (.pkl)'
+        default=None,
+        help='Alias for --samples (backwards compatibility)'
     )
     parser.add_argument(
         '--data-dir', '-d',
@@ -739,21 +790,27 @@ def main() -> None:
         help='Directory containing market data CSVs (default: data)'
     )
     parser.add_argument(
-        '--sample', '-s',
+        '--start', '-i',
         type=int,
         default=0,
-        help='Starting sample index'
+        help='Starting sample index (default: 0)'
     )
 
     args = parser.parse_args()
 
+    # Resolve cache path: positional > --samples > --cache
+    cache_file = args.samples_file or args.samples or args.cache
+
+    if not cache_file:
+        parser.error("Please provide a samples pickle file as a positional argument or via --samples/-s")
+
     # Load cache
-    cache_path = Path(args.cache)
+    cache_path = Path(cache_file)
     if not cache_path.exists():
         print(f"Error: Cache file not found: {cache_path}")
         sys.exit(1)
 
-    print(f"Loading cache from {cache_path}...")
+    print(f"Loading samples from {cache_path}...")
     with open(cache_path, 'rb') as f:
         samples = pickle.load(f)
     print(f"  Loaded {len(samples)} samples")
@@ -765,7 +822,7 @@ def main() -> None:
 
     # Create and run inspector
     inspector = VisualInspector(samples, tsla_df)
-    inspector.show(start_idx=args.sample)
+    inspector.show(start_idx=args.start)
 
 
 if __name__ == '__main__':

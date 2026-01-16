@@ -52,8 +52,7 @@ TIMEFRAME_MINUTES = {
     '4h': 240,
     '1d': 1440,  # 24 * 60
     '1wk': 10080,  # 7 * 24 * 60
-    '1mo': 43200,  # ~30 days
-    '3mo': 129600,  # ~90 days
+    '1mo': 43200,  # ~30 days (monthly only, no 3month)
     # Pandas-style formats
     '1min': 1,
     '2min': 2,
@@ -76,7 +75,8 @@ def _parse_timeframe(tf: str) -> int:
 
     Args:
         tf: Timeframe string like '1m', '5m', '1h', '4h', '1d'
-            Also supports pandas formats: '15min', '1D', '1W', '1MS', '3MS'
+            Also supports pandas formats: '15min', '1D', '1W', '1MS'
+            NOTE: 3month (quarterly) is not supported - only monthly
 
     Returns:
         Number of minutes in the timeframe
@@ -107,9 +107,9 @@ def _parse_timeframe(tf: str) -> int:
         elif tf_lower.endswith('wk') or tf_lower.endswith('w'):
             num = tf_lower.rstrip('wk').rstrip('w')
             return int(num) * 10080
-        # Month suffix
+        # Month suffix (only 1mo supported, not 3mo)
         elif tf_lower.endswith('mo') or tf_lower.endswith('ms'):
-            # Handle '1mo', '3mo', '1MS', '3MS'
+            # Handle '1mo', '1MS' (monthly only, no quarterly)
             num_str = tf_lower.rstrip('mos')
             return int(num_str) * 43200  # ~30 days
     except ValueError:
@@ -131,6 +131,7 @@ def _get_resample_rule(tf: str) -> str:
     tf_lower = tf.lower()
 
     # Direct mappings - include both short and pandas formats
+    # NOTE: Only monthly supported, no 3month (quarterly) timeframe
     mappings = {
         '1m': '1min',
         '2m': '2min',
@@ -145,13 +146,11 @@ def _get_resample_rule(tf: str) -> str:
         '1wk': '1W',
         '1w': '1W',
         '1mo': '1MS',  # Month start
-        '3mo': '3MS',  # Quarter start
         # Pandas-style formats (pass through)
         '5min': '5min',
         '15min': '15min',
         '30min': '30min',
         '1ms': '1MS',
-        '3ms': '3MS',
     }
 
     if tf_lower in mappings:

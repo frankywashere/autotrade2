@@ -9,7 +9,7 @@ Supports two extraction modes:
 2. TF-prefixed extraction: extract_tsla_channel_features_tf(channel, tf, window)
    -> 50 features with keys like 'daily_w50_channel_slope'
 
-Total features across all TFs and windows: 50 * 8 windows * 11 TFs = 4,400
+Total features across all TFs and windows: 50 * 8 windows * 10 TFs = 4,000
 """
 
 from __future__ import annotations
@@ -622,8 +622,7 @@ def get_tsla_channel_feature_names_tf(tf: str, window: int) -> List[str]:
 
 def get_all_tsla_channel_feature_names() -> List[str]:
     """Get ALL channel feature names across all TFs and windows."""
-    from v7.core.timeframe import TIMEFRAMES
-    STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80]
+    from v15.config import TIMEFRAMES, STANDARD_WINDOWS
 
     all_names = []
     for tf in TIMEFRAMES:
@@ -633,5 +632,5 @@ def get_all_tsla_channel_feature_names() -> List[str]:
 
 
 def get_total_channel_features() -> int:
-    """Total channel features: 50 * 8 windows * 11 TFs = 4,400"""
-    return 50 * 8 * 11
+    """Total channel features: 50 * 8 windows * 10 TFs = 4,000"""
+    return 50 * 8 * 10

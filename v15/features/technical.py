@@ -231,7 +231,11 @@ def _calculate_bollinger_bands(close: np.ndarray, current_close: float) -> Dict[
     bb_squeeze = 0.0
     if len(rolling_std) >= 50:
         current_std = rolling_std[-1] if np.isfinite(rolling_std[-1]) else 0.0
-        avg_std = np.nanmean(rolling_std[-50:])
+        recent_std = rolling_std[-50:]
+        if len(recent_std) > 0 and not np.all(np.isnan(recent_std)):
+            avg_std = np.nanmean(recent_std)
+        else:
+            avg_std = 0.0
         if avg_std > 0 and current_std < avg_std * 0.5:
             bb_squeeze = 1.0
 
@@ -1059,7 +1063,7 @@ def get_technical_feature_names_tf(tf: str) -> List[str]:
 
 def get_all_technical_feature_names() -> List[str]:
     """Get ALL technical feature names across all TFs."""
-    from v7.core.timeframe import TIMEFRAMES
+    from v15.config import TIMEFRAMES
 
     all_names = []
     for tf in TIMEFRAMES:
@@ -1068,5 +1072,5 @@ def get_all_technical_feature_names() -> List[str]:
 
 
 def get_total_technical_features() -> int:
-    """Total technical features: 77 * 11 TFs = 847"""
-    return 77 * 11
+    """Total technical features: 77 * 10 TFs = 770"""
+    return 77 * 10
