@@ -7,13 +7,15 @@ Standard Mode (per sample, no TF awareness):
     extract_all_features() - Extract ~462 features from market data
 
 TF-Aware Mode (full timeframe awareness):
-    extract_all_tf_features() - Extract ~8,632 features across all timeframes
+    extract_all_tf_features() - Extract features across all timeframes
 
 Feature Groups (Standard):
     - tsla_channel: Channel position, width, slope features (~50)
     - tsla_price: Price action, momentum, patterns (~60)
     - technical: RSI, MACD, Bollinger, etc. (~77)
     - spy: SPY market features and correlation (~80)
+    - spy_channel: SPY channel features (~58)
+    - channel_correlation: TSLA-SPY channel correlation (~50)
     - vix: Volatility index features (~25)
     - cross_asset: Cross-asset relationships (~40)
     - channel_history: Historical channel patterns (~50)
@@ -27,10 +29,12 @@ Feature Groups (TF-Aware):
     - vix: 25 * 10 TFs = 250
     - cross_asset: 40 * 10 TFs = 400
     - tsla_channel: 50 * 8 windows * 10 TFs = 4,000
+    - spy_channel: 58 * 8 windows * 10 TFs = 4,640
+    - channel_correlation: ~50 * 10 TFs = 500
     - window_scores: 50 * 10 TFs = 500
     - channel_history: 50 * 10 TFs = 500
     - events: 30 (TF-independent)
-    Total: 7,850 features
+    - bar_metadata: 3 * 10 TFs = 30
 """
 
 from __future__ import annotations
@@ -49,27 +53,32 @@ FEATURE_GROUPS = {
     'tsla_price': 60,
     'technical': 77,
     'spy': 80,
+    'spy_channel': 58,
+    'channel_correlation': 50,
     'vix': 25,
     'cross_asset': 40,
     'channel_history': 50,
     'events': 30,
     'window_scores': 50,
 }
-TOTAL_FEATURES = 462
+TOTAL_FEATURES = 570  # Updated to include spy_channel and channel_correlation
 
 # New counts (with full TF awareness)
 TF_FEATURE_GROUPS = {
-    'tsla_price': 60 * 10,        # 600
-    'technical': 77 * 10,          # 770
-    'spy': 80 * 10,                # 800
-    'vix': 25 * 10,                # 250
-    'cross_asset': 40 * 10,        # 400
-    'tsla_channel': 50 * 8 * 10,   # 4,000 (per window per TF)
-    'window_scores': 50 * 10,      # 500
-    'channel_history': 50 * 10,    # 500
-    'events': 30,                  # 30 (TF-independent)
+    'tsla_price': 60 * 10,                # 600
+    'technical': 77 * 10,                  # 770
+    'spy': 80 * 10,                        # 800
+    'vix': 25 * 10,                        # 250
+    'cross_asset': 40 * 10,                # 400
+    'tsla_channel': 50 * 8 * 10,           # 4,000 (per window per TF)
+    'spy_channel': 58 * 8 * 10,            # 4,640 (per window per TF)
+    'channel_correlation': 50 * 10,        # 500 (per TF)
+    'window_scores': 50 * 10,              # 500
+    'channel_history': 50 * 10,            # 500
+    'events': 30,                          # 30 (TF-independent)
+    'bar_metadata': 3 * 10,                # 30 (per TF)
 }
-TOTAL_TF_FEATURES = 7850
+TOTAL_TF_FEATURES = 13020  # Updated to include spy_channel, channel_correlation, bar_metadata
 
 # =============================================================================
 # Main Extractor Imports
@@ -284,6 +293,37 @@ except ImportError as e:
     logger.debug(f"window_scores module not available: {e}")
     _window_scores_available = False
 
+# SPY Channel Features
+try:
+    from .spy_channel import (
+        extract_spy_channel_features,
+        extract_spy_channel_features_tf,
+        get_spy_channel_feature_names,
+        get_all_spy_channel_feature_names,
+        get_spy_channel_feature_count,
+        get_total_spy_channel_features,
+    )
+    _spy_channel_available = True
+except ImportError as e:
+    logger.debug(f"spy_channel module not available: {e}")
+    _spy_channel_available = False
+
+# Channel Correlation Features
+try:
+    from .channel_correlation import (
+        extract_channel_correlation_features,
+        get_channel_correlation_feature_names,
+        get_channel_correlation_feature_names_tf,
+        get_channel_correlation_feature_count,
+        get_all_channel_correlation_feature_names,
+        get_total_channel_correlation_features,
+        extract_channel_correlation_features_multi_window,
+    )
+    _channel_correlation_available = True
+except ImportError as e:
+    logger.debug(f"channel_correlation module not available: {e}")
+    _channel_correlation_available = False
+
 # Validation Module
 try:
     from .validation import (
@@ -444,6 +484,27 @@ if _tsla_channel_available:
         'get_all_tsla_channel_feature_names',
     ])
 
+if _spy_channel_available:
+    __all__.extend([
+        'extract_spy_channel_features',
+        'extract_spy_channel_features_tf',
+        'get_spy_channel_feature_names',
+        'get_all_spy_channel_feature_names',
+        'get_spy_channel_feature_count',
+        'get_total_spy_channel_features',
+    ])
+
+if _channel_correlation_available:
+    __all__.extend([
+        'extract_channel_correlation_features',
+        'get_channel_correlation_feature_names',
+        'get_channel_correlation_feature_names_tf',
+        'get_channel_correlation_feature_count',
+        'get_all_channel_correlation_feature_names',
+        'get_total_channel_correlation_features',
+        'extract_channel_correlation_features_multi_window',
+    ])
+
 if _validation_available:
     __all__.extend([
         'validate_features',
@@ -474,6 +535,8 @@ def get_module_status() -> dict:
         'tsla_price': _tsla_price_available,
         'technical': _technical_available,
         'spy': _spy_available,
+        'spy_channel': _spy_channel_available,
+        'channel_correlation': _channel_correlation_available,
         'vix': _vix_available,
         'cross_asset': _cross_asset_available,
         'channel_history': _channel_history_available,

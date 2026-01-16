@@ -6,12 +6,15 @@ This module provides comprehensive multi-timeframe feature extraction by:
 2. Detecting channels at all 8 windows on each TF's resampled data
 3. Extracting ALL features from each TF's data with explicit TF prefixes
 
-Total Features: ~7,850
+Total Features: 13,660
 - 282 window-independent features * 10 TFs = 2,820
-- 50 channel features * 8 windows * 10 TFs = 4,000
+- 58 TSLA channel features * 8 windows * 10 TFs = 4,640
+- 58 SPY channel features * 8 windows * 10 TFs = 4,640
+- 50 channel correlation features * 10 TFs = 500
 - 50 window score features * 10 TFs = 500
 - 50 channel history features * 10 TFs = 500
 - 30 event features (TF-independent) = 30
+- 30 bar metadata features (3 per TF * 10 TFs) = 30
 
 All features are explicitly named with TF prefix (e.g., 'daily_rsi_14', '1h_w50_channel_slope').
 """
@@ -133,6 +136,20 @@ except ImportError as e:
     _tsla_channel_available = False
 
 try:
+    from .spy_channel import extract_spy_channel_features
+    _spy_channel_available = True
+except ImportError as e:
+    logger.warning(f"Failed to import spy_channel: {e}")
+    _spy_channel_available = False
+
+try:
+    from .channel_correlation import extract_channel_correlation_features
+    _channel_correlation_available = True
+except ImportError as e:
+    logger.warning(f"Failed to import channel_correlation: {e}")
+    _channel_correlation_available = False
+
+try:
     from .window_scores import extract_window_score_features
     _window_scores_available = True
 except ImportError as e:
@@ -160,15 +177,17 @@ except ImportError as e:
 
 # Feature counts per category
 TF_FEATURE_COUNTS = {
-    'price_per_tf': 60,           # tsla_price features
-    'technical_per_tf': 77,       # technical indicators
-    'spy_per_tf': 80,             # SPY features
-    'vix_per_tf': 25,             # VIX features
-    'cross_asset_per_tf': 40,     # correlations
-    'channel_per_window': 50,     # channel features per window
-    'window_scores_per_tf': 50,   # window score features
-    'channel_history_per_tf': 50, # channel history features
-    'events': 30,                 # TF-independent
+    'price_per_tf': 60,               # tsla_price features
+    'technical_per_tf': 77,           # technical indicators
+    'spy_per_tf': 80,                 # SPY features
+    'vix_per_tf': 25,                 # VIX features
+    'cross_asset_per_tf': 40,         # correlations
+    'channel_per_window': 58,         # TSLA channel (50 base + 8 excursion)
+    'spy_channel_per_window': 58,     # SPY channel (50 base + 8 excursion)
+    'channel_correlation_per_tf': 50, # Cross-correlation features
+    'window_scores_per_tf': 50,       # window score features
+    'channel_history_per_tf': 50,     # channel history features
+    'events': 30,                     # TF-independent
 }
 
 # Calculated totals
@@ -180,16 +199,23 @@ TOTAL_PER_TF_WINDOW_INDEPENDENT = (
     TF_FEATURE_COUNTS['cross_asset_per_tf']
 )  # 282
 
-TOTAL_PER_TF_WINDOW_DEPENDENT = TF_FEATURE_COUNTS['channel_per_window'] * len(STANDARD_WINDOWS)  # 400
+# TSLA channel features per TF: 58 * 8 windows = 464
+TOTAL_TSLA_CHANNEL_PER_TF = TF_FEATURE_COUNTS['channel_per_window'] * len(STANDARD_WINDOWS)  # 464
+
+# SPY channel features per TF: 58 * 8 windows = 464
+TOTAL_SPY_CHANNEL_PER_TF = TF_FEATURE_COUNTS['spy_channel_per_window'] * len(STANDARD_WINDOWS)  # 464
+
+TOTAL_PER_TF_WINDOW_DEPENDENT = TOTAL_TSLA_CHANNEL_PER_TF + TOTAL_SPY_CHANNEL_PER_TF  # 928
 
 TOTAL_PER_TF = (
     TOTAL_PER_TF_WINDOW_INDEPENDENT +
     TOTAL_PER_TF_WINDOW_DEPENDENT +
+    TF_FEATURE_COUNTS['channel_correlation_per_tf'] +
     TF_FEATURE_COUNTS['window_scores_per_tf'] +
     TF_FEATURE_COUNTS['channel_history_per_tf']
-)  # 782
+)  # 1,310
 
-TOTAL_FEATURES = TOTAL_PER_TF * len(TIMEFRAMES) + TF_FEATURE_COUNTS['events']  # 8,632
+TOTAL_FEATURES = TOTAL_PER_TF * len(TIMEFRAMES) + TF_FEATURE_COUNTS['events']  # 13,130 + 30 = 13,160
 
 
 # =============================================================================
@@ -482,10 +508,10 @@ def _extract_channel_features_for_tf(
     tf: str
 ) -> Dict[str, float]:
     """
-    Extract channel features for all windows at a single TF.
+    Extract TSLA channel features for all windows at a single TF.
 
     Features extracted:
-    - 50 channel features per valid window * 8 windows = 400 max
+    - 58 channel features per valid window * 8 windows = 464 max
 
     Args:
         channels_by_window: Dict mapping window size to Channel
@@ -507,6 +533,109 @@ def _extract_channel_features_for_tf(
             features.update(_prefix_tf_window(channel_feats, tf, window))
         except Exception as e:
             logger.debug(f"Failed to extract channel features for {tf} w{window}: {e}")
+
+    return features
+
+
+def _extract_spy_channel_features_for_tf(
+    spy_df: pd.DataFrame,
+    spy_channels_by_window: Dict[int, "Channel"],
+    tf: str
+) -> Dict[str, float]:
+    """
+    Extract SPY channel features for all windows at a single TF.
+
+    Features extracted:
+    - 58 SPY channel features per valid window * 8 windows = 464 max
+
+    Args:
+        spy_df: SPY OHLCV DataFrame (already resampled to TF)
+        spy_channels_by_window: Dict mapping window size to SPY Channel
+        tf: Timeframe name
+
+    Returns:
+        Dict with TF+window prefixed features (e.g., 'daily_w50_spy_channel_slope')
+    """
+    features: Dict[str, float] = {}
+
+    if not _spy_channel_available:
+        return features
+
+    for window in STANDARD_WINDOWS:
+        channel = spy_channels_by_window.get(window)
+
+        try:
+            # extract_spy_channel_features returns features with 'spy_' prefix
+            spy_feats = extract_spy_channel_features(spy_df, channel, window, tf)
+            # Add TF+window prefix: 'spy_position_in_channel' -> 'daily_w50_spy_position_in_channel'
+            features.update(_prefix_tf_window(spy_feats, tf, window))
+        except Exception as e:
+            logger.debug(f"Failed to extract SPY channel features for {tf} w{window}: {e}")
+
+    return features
+
+
+def _extract_channel_correlation_for_tf(
+    tsla_channels_by_window: Dict[int, "Channel"],
+    spy_channels_by_window: Dict[int, "Channel"],
+    tf: str
+) -> Dict[str, float]:
+    """
+    Extract channel correlation features for a single TF.
+
+    Compares TSLA and SPY channel features to create cross-correlation metrics.
+
+    Features extracted:
+    - 50 channel correlation features per TF
+
+    Args:
+        tsla_channels_by_window: Dict mapping window size to TSLA Channel
+        spy_channels_by_window: Dict mapping window size to SPY Channel
+        tf: Timeframe name
+
+    Returns:
+        Dict with TF-prefixed features (e.g., 'daily_position_in_channel_spread')
+    """
+    features: Dict[str, float] = {}
+
+    if not _channel_correlation_available:
+        return features
+
+    # Use a representative window for correlation (best window or default to 50)
+    # We'll use window 50 as the default comparison window
+    default_window = 50
+
+    tsla_channel = tsla_channels_by_window.get(default_window)
+    spy_channel = spy_channels_by_window.get(default_window)
+
+    # Extract base channel features for correlation comparison
+    # We need the raw feature names (without prefixes) for the correlation extractor
+    tsla_channel_feats = {}
+    spy_channel_feats = {}
+
+    if _tsla_channel_available and tsla_channel is not None:
+        try:
+            tsla_channel_feats = extract_tsla_channel_features(tsla_channel)
+        except Exception as e:
+            logger.debug(f"Failed to extract TSLA channel features for correlation {tf}: {e}")
+
+    if _spy_channel_available and spy_channel is not None:
+        try:
+            # SPY channel features have 'spy_' prefix, need to remove for correlation
+            raw_spy_feats = extract_spy_channel_features(None, spy_channel, default_window, tf)
+            # Remove 'spy_' prefix to get base feature names for correlation
+            spy_channel_feats = {k.replace('spy_', ''): v for k, v in raw_spy_feats.items()}
+        except Exception as e:
+            logger.debug(f"Failed to extract SPY channel features for correlation {tf}: {e}")
+
+    try:
+        # extract_channel_correlation_features adds the TF prefix itself
+        correlation_feats = extract_channel_correlation_features(
+            tsla_channel_feats, spy_channel_feats, tf
+        )
+        features.update(correlation_feats)
+    except Exception as e:
+        logger.debug(f"Failed to extract channel correlation features for {tf}: {e}")
 
     return features
 
@@ -639,7 +768,7 @@ def extract_all_tf_features(
 
     This is the main entry point for TF-aware feature extraction. It:
     1. Resamples data to each of 10 timeframes (keeping partial bars)
-    2. Detects channels at all 8 windows on each TF
+    2. Detects channels at all 8 windows on each TF for both TSLA and SPY
     3. Extracts all features with explicit TF prefixes
     4. Includes bar metadata features showing completion percentages
 
@@ -660,9 +789,11 @@ def extract_all_tf_features(
         include_bar_metadata: If True, include 30 bar metadata features (default True)
 
     Returns:
-        Dict[str, float] with ~7,880 features:
+        Dict[str, float] with ~13,660 features:
         - 282 window-independent features * 10 TFs = 2,820
-        - 50 channel features * 8 windows * 10 TFs = 4,000
+        - 58 TSLA channel features * 8 windows * 10 TFs = 4,640
+        - 58 SPY channel features * 8 windows * 10 TFs = 4,640
+        - 50 channel correlation features * 10 TFs = 500
         - 50 window score features * 10 TFs = 500
         - 50 channel history features * 10 TFs = 500
         - 30 event features (TF-independent) = 30
@@ -676,6 +807,8 @@ def extract_all_tf_features(
         - '1h_macd_signal'
         - 'weekly_spy_momentum_5'
         - 'daily_w50_channel_slope'
+        - 'daily_w50_spy_channel_slope'
+        - 'daily_position_in_channel_spread'
         - '1h_w20_position_in_channel'
         - 'daily_valid_window_count'
         - 'daily_bar_completion_pct'  # New: varies 0.0-1.0 during training
@@ -718,34 +851,49 @@ def extract_all_tf_features(
                 logger.debug(f"Not enough data for {tf} (have {len(tsla_tf)} bars)")
                 continue
 
-            # 2. Detect channels at all windows for this TF
-            channels_by_window = _detect_channels_for_tf(tsla_tf)
+            # 2. Detect channels at all windows for this TF (TSLA)
+            tsla_channels_by_window = _detect_channels_for_tf(tsla_tf)
 
-            # Select best channel
-            if _channel_available and channels_by_window:
-                best_channel, best_window = select_best_channel(channels_by_window)
+            # 3. Detect channels at all windows for SPY
+            spy_channels_by_window = _detect_channels_for_tf(spy_tf)
+
+            # Select best TSLA channel
+            if _channel_available and tsla_channels_by_window:
+                best_channel, best_window = select_best_channel(tsla_channels_by_window)
                 if best_window is None:
                     best_window = 50
             else:
                 best_window = 50
 
-            # 3. Extract window-independent features (282 per TF)
+            # 4. Extract window-independent features (282 per TF)
             wi_features = _extract_window_independent_features_for_tf(
                 tsla_tf, spy_tf, vix_tf, tf
             )
             all_features.update(wi_features)
 
-            # 4. Extract per-window channel features (50 per window * 8 windows = 400 per TF)
-            channel_features = _extract_channel_features_for_tf(channels_by_window, tf)
+            # 5. Extract per-window TSLA channel features (58 per window * 8 windows = 464 per TF)
+            channel_features = _extract_channel_features_for_tf(tsla_channels_by_window, tf)
             all_features.update(channel_features)
 
-            # 5. Extract window score features (50 per TF)
+            # 6. Extract per-window SPY channel features (58 per window * 8 windows = 464 per TF)
+            spy_channel_features = _extract_spy_channel_features_for_tf(
+                spy_tf, spy_channels_by_window, tf
+            )
+            all_features.update(spy_channel_features)
+
+            # 7. Extract channel correlation features (50 per TF)
+            correlation_features = _extract_channel_correlation_for_tf(
+                tsla_channels_by_window, spy_channels_by_window, tf
+            )
+            all_features.update(correlation_features)
+
+            # 8. Extract window score features (50 per TF)
             window_score_features = _extract_window_scores_for_tf(
-                channels_by_window, best_window, tf
+                tsla_channels_by_window, best_window, tf
             )
             all_features.update(window_score_features)
 
-            # 6. Extract channel history features (50 per TF)
+            # 9. Extract channel history features (50 per TF)
             tf_history = channel_history_by_tf.get(tf, {})
             tsla_history = tf_history.get('tsla', [])
             spy_history = tf_history.get('spy', [])
@@ -809,7 +957,7 @@ def get_tf_feature_count() -> int:
     Return total expected feature count.
 
     Returns:
-        Expected total features (~8,632)
+        Expected total features (~13,660)
     """
     return TOTAL_FEATURES
 
@@ -821,9 +969,11 @@ def get_tf_feature_names() -> List[str]:
     The order is:
     1. For each TF (in TIMEFRAMES order):
        a. Window-independent features (price, technical, spy, vix, cross_asset)
-       b. Per-window channel features (for each window in STANDARD_WINDOWS)
-       c. Window score features
-       d. Channel history features
+       b. Per-window TSLA channel features (for each window in STANDARD_WINDOWS)
+       c. Per-window SPY channel features (for each window in STANDARD_WINDOWS)
+       d. Channel correlation features
+       e. Window score features
+       f. Channel history features
     2. Event features (TF-independent)
 
     Returns:
@@ -866,7 +1016,19 @@ def get_tf_feature_names() -> List[str]:
         from .tsla_channel import get_tsla_channel_feature_names
         channel_names = get_tsla_channel_feature_names()
     except ImportError:
-        channel_names = [f"channel_feature_{i}" for i in range(50)]
+        channel_names = [f"channel_feature_{i}" for i in range(58)]
+
+    try:
+        from .spy_channel import get_spy_channel_feature_names
+        spy_channel_names = get_spy_channel_feature_names()
+    except ImportError:
+        spy_channel_names = [f"spy_channel_feature_{i}" for i in range(58)]
+
+    try:
+        from .channel_correlation import get_channel_correlation_feature_names
+        correlation_names = get_channel_correlation_feature_names()
+    except ImportError:
+        correlation_names = [f"correlation_feature_{i}" for i in range(50)]
 
     try:
         from .window_scores import get_window_score_feature_names
@@ -906,11 +1068,21 @@ def get_tf_feature_names() -> List[str]:
         for name in cross_names:
             all_names.append(f"{tf_prefix}{name}")
 
-        # Per-window channel features
+        # Per-window TSLA channel features
         for window in STANDARD_WINDOWS:
             window_prefix = f"{tf}_w{window}_"
             for name in channel_names:
                 all_names.append(f"{window_prefix}{name}")
+
+        # Per-window SPY channel features
+        for window in STANDARD_WINDOWS:
+            window_prefix = f"{tf}_w{window}_"
+            for name in spy_channel_names:
+                all_names.append(f"{window_prefix}{name}")
+
+        # Channel correlation features (TF-prefixed but not window-prefixed)
+        for name in correlation_names:
+            all_names.append(f"{tf_prefix}{name}")
 
         # Window score features
         for name in window_score_names:
@@ -939,13 +1111,17 @@ def get_tf_feature_breakdown() -> Dict[str, int]:
         'num_windows': len(STANDARD_WINDOWS),
         'per_tf_window_independent': TOTAL_PER_TF_WINDOW_INDEPENDENT,
         'per_tf_window_dependent': TOTAL_PER_TF_WINDOW_DEPENDENT,
+        'tsla_channel_per_tf': TOTAL_TSLA_CHANNEL_PER_TF,
+        'spy_channel_per_tf': TOTAL_SPY_CHANNEL_PER_TF,
         'per_tf_total': TOTAL_PER_TF,
         'price_per_tf': TF_FEATURE_COUNTS['price_per_tf'],
         'technical_per_tf': TF_FEATURE_COUNTS['technical_per_tf'],
         'spy_per_tf': TF_FEATURE_COUNTS['spy_per_tf'],
         'vix_per_tf': TF_FEATURE_COUNTS['vix_per_tf'],
         'cross_asset_per_tf': TF_FEATURE_COUNTS['cross_asset_per_tf'],
-        'channel_per_window': TF_FEATURE_COUNTS['channel_per_window'],
+        'tsla_channel_per_window': TF_FEATURE_COUNTS['channel_per_window'],
+        'spy_channel_per_window': TF_FEATURE_COUNTS['spy_channel_per_window'],
+        'channel_correlation_per_tf': TF_FEATURE_COUNTS['channel_correlation_per_tf'],
         'window_scores_per_tf': TF_FEATURE_COUNTS['window_scores_per_tf'],
         'channel_history_per_tf': TF_FEATURE_COUNTS['channel_history_per_tf'],
         'events_total': TF_FEATURE_COUNTS['events'],
@@ -1037,6 +1213,8 @@ def get_extraction_status() -> Dict[str, bool]:
         'vix': _vix_available,
         'cross_asset': _cross_asset_available,
         'tsla_channel': _tsla_channel_available,
+        'spy_channel': _spy_channel_available,
+        'channel_correlation': _channel_correlation_available,
         'window_scores': _window_scores_available,
         'channel_history': _channel_history_available,
         'events': _events_available,

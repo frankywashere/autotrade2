@@ -1,15 +1,15 @@
 """
 v15/features/tsla_channel.py - TSLA Channel Feature Extraction
 
-Extracts 50 channel-specific features from a Channel object.
+Extracts 58 channel-specific features from a Channel object.
 All features return valid floats with safe defaults (no NaN, no Inf).
 
 Supports two extraction modes:
-1. Base extraction: extract_tsla_channel_features(channel) -> 50 features
+1. Base extraction: extract_tsla_channel_features(channel) -> 58 features
 2. TF-prefixed extraction: extract_tsla_channel_features_tf(channel, tf, window)
-   -> 50 features with keys like 'daily_w50_channel_slope'
+   -> 58 features with keys like 'daily_w50_channel_slope'
 
-Total features across all TFs and windows: 50 * 8 windows * 10 TFs = 4,000
+Total features across all TFs and windows: 58 * 8 windows * 10 TFs = 4,640
 """
 
 from __future__ import annotations
@@ -25,13 +25,13 @@ if TYPE_CHECKING:
 
 def extract_tsla_channel_features(channel: "Channel") -> Dict[str, float]:
     """
-    Extract 50 TSLA channel features from a Channel object.
+    Extract 58 TSLA channel features from a Channel object.
 
     Args:
         channel: Channel object from v7.core.channel
 
     Returns:
-        Dict[str, float] with 50 features, all guaranteed to be valid floats
+        Dict[str, float] with 58 features, all guaranteed to be valid floats
     """
     features: Dict[str, float] = {}
 
@@ -518,6 +518,114 @@ def extract_tsla_channel_features(channel: "Channel") -> Dict[str, float]:
     else:
         features['volatility_adjusted_width'] = 1.0
 
+    # ==========================================================================
+    # 51-58. Excursion Features (price going OUTSIDE the channel)
+    # ==========================================================================
+    # Excursion = when close price goes outside the 2*std_dev channel bounds
+    # Uses: slope, intercept, std_dev, close array from channel object
+
+    std_dev = getattr(channel, 'std_dev', 0.0)
+    slope = features['channel_slope']
+    intercept = features['channel_intercept']
+
+    # Initialize excursion tracking variables
+    excursions_above = 0
+    excursions_below = 0
+    max_excursion_above = 0.0
+    max_excursion_below = 0.0
+    last_excursion_bar = -1  # -1 means no excursion found
+    last_excursion_dir = 0.5  # 0=below, 0.5=none, 1=above
+    excursion_durations = []  # Track how long each excursion lasts
+    in_excursion = False
+    current_excursion_start = -1
+
+    if close is not None and len(close) > 0 and std_dev > 0:
+        for i in range(len(close)):
+            # Calculate channel bounds at bar i
+            center_at_i = slope * i + intercept
+            upper_at_i = center_at_i + 2 * std_dev
+            lower_at_i = center_at_i - 2 * std_dev
+            close_i = close[i]
+
+            # Check for excursion above upper band
+            if close_i > upper_at_i:
+                excursions_above += 1
+                last_excursion_bar = i
+                last_excursion_dir = 1.0
+                # Calculate excursion percentage
+                if upper_at_i > 0:
+                    excursion_pct = safe_divide(close_i - upper_at_i, upper_at_i, 0.0) * 100
+                    max_excursion_above = max(max_excursion_above, excursion_pct)
+                # Track excursion duration
+                if not in_excursion:
+                    in_excursion = True
+                    current_excursion_start = i
+
+            # Check for excursion below lower band
+            elif close_i < lower_at_i:
+                excursions_below += 1
+                last_excursion_bar = i
+                last_excursion_dir = 0.0
+                # Calculate excursion percentage
+                if lower_at_i > 0:
+                    excursion_pct = safe_divide(lower_at_i - close_i, lower_at_i, 0.0) * 100
+                    max_excursion_below = max(max_excursion_below, excursion_pct)
+                # Track excursion duration
+                if not in_excursion:
+                    in_excursion = True
+                    current_excursion_start = i
+
+            else:
+                # Price is inside channel
+                if in_excursion:
+                    # Just returned from excursion, record duration
+                    duration = i - current_excursion_start
+                    excursion_durations.append(duration)
+                    in_excursion = False
+                    current_excursion_start = -1
+
+        # Handle case where we're still in excursion at end of window
+        if in_excursion and current_excursion_start >= 0:
+            duration = len(close) - current_excursion_start
+            excursion_durations.append(duration)
+
+    # 51. excursions_above_upper - Count of bars where close > upper_band
+    features['excursions_above_upper'] = safe_float(excursions_above, 0.0)
+
+    # 52. excursions_below_lower - Count of bars where close < lower_band
+    features['excursions_below_lower'] = safe_float(excursions_below, 0.0)
+
+    # 53. max_excursion_above_pct - Maximum % that price closed above upper band
+    features['max_excursion_above_pct'] = safe_float(max_excursion_above, 0.0)
+
+    # 54. max_excursion_below_pct - Maximum % that price closed below lower band
+    features['max_excursion_below_pct'] = safe_float(max_excursion_below, 0.0)
+
+    # 55. bars_since_last_excursion - Bars since price last closed outside channel
+    if last_excursion_bar >= 0 and close is not None and len(close) > 0:
+        bars_since_excursion = len(close) - 1 - last_excursion_bar
+        features['bars_since_last_excursion'] = safe_float(bars_since_excursion, window)
+    else:
+        features['bars_since_last_excursion'] = safe_float(window, window)
+
+    # 56. excursion_return_speed_avg - Average bars to return after excursion
+    if excursion_durations:
+        avg_return_speed = safe_float(np.mean(excursion_durations), 0.0)
+        features['excursion_return_speed_avg'] = avg_return_speed
+    else:
+        features['excursion_return_speed_avg'] = 0.0
+
+    # 57. excursion_rate - excursions / window (what % of bars were outside channel)
+    total_excursions = excursions_above + excursions_below
+    if close is not None and len(close) > 0:
+        features['excursion_rate'] = safe_divide(total_excursions, len(close), 0.0)
+    else:
+        features['excursion_rate'] = 0.0
+
+    # 58. last_excursion_direction - Direction of most recent excursion
+    # 0=below, 0.5=none, 1=above
+    features['last_excursion_direction'] = safe_float(last_excursion_dir, 0.5)
+
     # Final safety check
     for key, value in features.items():
         if not isinstance(value, (int, float)) or not np.isfinite(value):
@@ -579,6 +687,15 @@ def _get_default_features() -> Dict[str, float]:
         'channel_health_score': 0.0,
         'time_weighted_position': 0.0,
         'volatility_adjusted_width': 1.0,
+        # Excursion features (51-58)
+        'excursions_above_upper': 0.0,
+        'excursions_below_lower': 0.0,
+        'max_excursion_above_pct': 0.0,
+        'max_excursion_below_pct': 0.0,
+        'bars_since_last_excursion': 50.0,
+        'excursion_return_speed_avg': 0.0,
+        'excursion_rate': 0.0,
+        'last_excursion_direction': 0.5,
     }
 
 
@@ -632,5 +749,5 @@ def get_all_tsla_channel_feature_names() -> List[str]:
 
 
 def get_total_channel_features() -> int:
-    """Total channel features: 50 * 8 windows * 10 TFs = 4,000"""
-    return 50 * 8 * 10
+    """Total channel features: 58 * 8 windows * 10 TFs = 4,640"""
+    return 58 * 8 * 10
