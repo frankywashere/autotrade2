@@ -6,6 +6,10 @@
 /checkpoints/
 *.pth
 
+# Test and cache artifacts
+*.pkl
+**/cache_*
+
 # Python
 __pycache__/
 *.py[cod]
