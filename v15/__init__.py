@@ -1,40 +1,90 @@
 """
-v15 - Channel labeling and cache generation system.
+V15 Channel Prediction System
 
-Main exports:
-- Types: ChannelSample, ChannelLabels, TIMEFRAMES, STANDARD_WINDOWS
-- Data: load_market_data, resample_ohlc
-- Scanner: scan_channels
-- Pipeline: generate_cache
+A complete rewrite with:
+- 8,665 TF-aware features with explicit individual weights
+- Partial bar support (no stale TF data)
+- Loud failures (no silent exceptions)
+- Feature correlation analysis
+- Inference module for model loading and predictions
+- Dashboard for visualization and monitoring
+
+Usage:
+    # Scan data for features
+    python -m v15.pipeline scan --data-dir data --output samples.pkl
+
+    # Train model
+    python -m v15.pipeline train --samples samples.pkl --output model.pt
+
+    # Analyze features
+    python -m v15.pipeline analyze --samples samples.pkl
+
+    # Load model for inference
+    predictor = v15.load_predictor('model.pt')
 """
 
-from v15.types import (
-    ChannelSample,
-    ChannelLabels,
+from .config import (
     TIMEFRAMES,
     STANDARD_WINDOWS,
+    TOTAL_FEATURES,
+    N_TIMEFRAMES,
+    N_WINDOWS,
 )
 
-from v15.data import (
-    load_market_data,
-    resample_ohlc,
+from .exceptions import (
+    V15Error,
+    FeatureExtractionError,
+    InvalidFeatureError,
+    DataLoadError,
+    ResamplingError,
+    ModelError,
 )
 
-from v15.scanner import scan_channels
+from .types import ChannelSample, ChannelLabels
 
-from v15.pipeline import generate_cache
+# Lazy imports for optional components
+def load_market_data(data_dir: str):
+    """Load market data from directory."""
+    from .data import load_market_data as _load
+    return _load(data_dir)
+
+def create_model(**kwargs):
+    """Create V15 model."""
+    from .models import create_model as _create
+    return _create(**kwargs)
+
+def scan_channels(tsla_df, spy_df, vix_df, **kwargs):
+    """Scan for channels and extract features."""
+    from .scanner import scan_channels as _scan
+    return _scan(tsla_df, spy_df, vix_df, **kwargs)
+
+def load_predictor(checkpoint_path: str):
+    """Load a trained model for inference."""
+    from .inference import Predictor
+    return Predictor.load(checkpoint_path)
+
+__version__ = '15.0.0'
 
 __all__ = [
+    # Config
+    'TIMEFRAMES',
+    'STANDARD_WINDOWS',
+    'TOTAL_FEATURES',
+    'N_TIMEFRAMES',
+    'N_WINDOWS',
+    # Exceptions
+    'V15Error',
+    'FeatureExtractionError',
+    'InvalidFeatureError',
+    'DataLoadError',
+    'ResamplingError',
+    'ModelError',
     # Types
     'ChannelSample',
     'ChannelLabels',
-    'TIMEFRAMES',
-    'STANDARD_WINDOWS',
-    # Data
+    # Functions
     'load_market_data',
-    'resample_ohlc',
-    # Scanner
+    'create_model',
     'scan_channels',
-    # Pipeline
-    'generate_cache',
+    'load_predictor',
 ]

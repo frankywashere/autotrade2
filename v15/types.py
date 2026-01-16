@@ -5,7 +5,7 @@ Simple dataclasses and constants. No complex logic.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import pandas as pd
 
@@ -79,9 +79,11 @@ class ChannelLabels:
     Attributes:
         duration_bars: Number of bars until permanent channel break
         break_direction: Direction of break (0=DOWN, 1=UP)
-        break_trigger_tf: Encoded timeframe that triggered break (0-20)
+        break_trigger_tf: Encoded timeframe that triggered break (0-10)
         new_channel_direction: Direction after break (0=BEAR, 1=SIDEWAYS, 2=BULL)
         permanent_break: Whether a permanent break occurred
+        break_return: Return percentage at time of break
+        timeframe: The timeframe this label was computed for
 
     Validity flags indicate whether each label component is valid/usable:
         duration_valid: True if duration_bars is meaningful
@@ -92,9 +94,11 @@ class ChannelLabels:
     # Core label values
     duration_bars: int = 0
     break_direction: int = 0      # 0=DOWN, 1=UP
-    break_trigger_tf: int = 0     # encoded 0-20
+    break_trigger_tf: int = 0     # encoded 0-10 (index into TIMEFRAMES)
     new_channel_direction: int = 1  # 0=BEAR, 1=SIDEWAYS, 2=BULL
     permanent_break: bool = False
+    break_return: float = 0.0     # Return at break point
+    timeframe: str = ""           # Timeframe this label is for
 
     # Validity flags
     duration_valid: bool = False
@@ -106,23 +110,21 @@ class ChannelLabels:
 @dataclass
 class ChannelSample:
     """
-    A complete sample representing channel state at a point in time.
+    A complete sample for V15 channel prediction.
 
-    Contains channels, features, and labels for all window sizes.
-
-    Attributes:
-        timestamp: The timestamp for this sample
-        channel_end_idx: Index in the data where channel ends
-        channels: Dict mapping window size -> Channel object
-        features_per_window: Dict mapping window size -> feature dict
-        labels_per_window: Dict mapping window size -> timeframe -> ChannelLabels
-        best_window: The optimal window size for this sample
+    Contains:
+        - timestamp: When this sample was created
+        - channel_end_idx: Index in 5min data where channels end
+        - tf_features: Dict of all 8,665 features (flat, TF-prefixed)
+        - labels_per_window: Labels for each window across TFs
+        - bar_metadata: Partial bar completion info per TF
+        - best_window: Optimal window size
     """
     timestamp: pd.Timestamp = None
     channel_end_idx: int = 0
-    channels: Dict[int, Any] = field(default_factory=dict)
-    features_per_window: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    tf_features: Dict[str, float] = field(default_factory=dict)
     labels_per_window: Dict[int, Dict[str, Optional[ChannelLabels]]] = field(default_factory=dict)
+    bar_metadata: Dict[str, Dict[str, float]] = field(default_factory=dict)
     best_window: int = 50
 
 

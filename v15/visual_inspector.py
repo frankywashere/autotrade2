@@ -282,8 +282,15 @@ def plot_timeframe_panel(
     label_text = f"{tf_name}"
     if channel.valid:
         label_text += f" | {DIR_NAMES.get(channel.direction, '?')}"
-        if best_window is not None:
-            label_text += f" | Best: {best_window}"
+
+    # Show which window is displayed
+    if display_window is not None and best_window is not None:
+        if display_window == best_window:
+            label_text += f" | W:{display_window}*"  # * indicates best
+        else:
+            label_text += f" | W:{display_window} (best:{best_window})"
+    elif best_window is not None:
+        label_text += f" | W:{best_window}*"
 
     # Add label details
     if labels is not None:
@@ -320,20 +327,37 @@ def plot_timeframe_panel(
     else:
         label_text += f"\nNo labels"
 
-    # Add text box
-    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+    # Add text box with color coding for non-best windows
+    is_non_best = (display_window is not None and best_window is not None
+                   and display_window != best_window)
+    if is_non_best:
+        props = dict(boxstyle='round', facecolor='#ffe6cc', alpha=0.9,
+                     edgecolor='#cc6600', linewidth=1.5)  # Orange-tinted for non-best
+    else:
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
     ax.text(0.02, 0.98, label_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', bbox=props, family='monospace')
 
-    # Title with window info
+    # Title with clear window indication
     title = f"{tf_name}"
     if channel.valid:
         title += f" - R2: {channel.r_squared:.3f}, Width: {channel.width_pct:.2f}%"
-    if display_window is not None:
-        title += f" | Win: {display_window}"
+
+    # Show window info with clear best/non-best indication
+    if display_window is not None and best_window is not None:
+        if display_window == best_window:
+            title += f" | Win: {display_window} (best)"
+            title_color = 'black'
+        else:
+            title += f" | Win: {display_window}"
+            title_color = '#cc6600'  # Orange for non-best
     elif best_window is not None:
-        title += f" | Win: {best_window}*"
-    ax.set_title(title, fontsize=11, fontweight='bold')
+        title += f" | Win: {best_window} (best)"
+        title_color = 'black'
+    else:
+        title_color = 'black'
+
+    ax.set_title(title, fontsize=11, fontweight='bold', color=title_color)
 
     ax.set_xlabel('Bars')
     ax.set_ylabel('Price')
@@ -491,6 +515,9 @@ class VisualInspector:
 
     def _cycle_window(self) -> None:
         """Cycle through window sizes: best -> 10 -> 20 -> ... -> 80 -> best."""
+        sample = self.samples[self.current_idx]
+        best_window = getattr(sample, 'best_window', None)
+
         if self.display_window_idx is None:
             self.display_window_idx = 0
         else:
@@ -498,10 +525,28 @@ class VisualInspector:
             if self.display_window_idx >= len(STANDARD_WINDOWS):
                 self.display_window_idx = None
 
+        # Build informative console output
+        windows_str = " ".join(
+            f"[{w}]" if (self.display_window_idx is not None and STANDARD_WINDOWS[self.display_window_idx] == w)
+            else f"({w})" if w == best_window
+            else str(w)
+            for w in STANDARD_WINDOWS
+        )
+
         if self.display_window_idx is None:
-            print("Displaying: Best window (auto-selected)")
+            print(f"\n>>> Window: BEST ({best_window}) <<<")
+            print(f"    Available: {windows_str}")
+            print(f"    Labels shown are from the cached best window.\n")
         else:
-            print(f"Displaying: Window {STANDARD_WINDOWS[self.display_window_idx]}")
+            current_window = STANDARD_WINDOWS[self.display_window_idx]
+            is_best = current_window == best_window
+            marker = " (BEST)" if is_best else ""
+            print(f"\n>>> Window: {current_window}{marker} <<<")
+            print(f"    Available: {windows_str}")
+            if not is_best:
+                print(f"    NOTE: Viewing non-best window. Labels may differ from cache.\n")
+            else:
+                print(f"    This is the best window for this sample.\n")
 
         self._update_plot()
 
@@ -571,17 +616,14 @@ class VisualInspector:
                     actual_display_window = best_window
 
             # Get labels for this timeframe from cache
+            # IMPORTANT: Only use actual_display_window to ensure labels match the displayed channel
+            # No fallback to cache_window - if labels don't exist for this window, show "No labels"
             labels = None
-            cache_window = sample.best_window if hasattr(sample, 'best_window') else None
 
             if hasattr(sample, 'labels_per_window') and sample.labels_per_window:
-                # Try cache window first, then display window
-                for try_window in [cache_window, actual_display_window]:
-                    if try_window and try_window in sample.labels_per_window:
-                        window_labels = sample.labels_per_window[try_window]
-                        labels = window_labels.get(tf)
-                        if labels is not None:
-                            break
+                if actual_display_window and actual_display_window in sample.labels_per_window:
+                    window_labels = sample.labels_per_window[actual_display_window]
+                    labels = window_labels.get(tf)
 
             # Plot panel
             plot_timeframe_panel(
@@ -592,19 +634,34 @@ class VisualInspector:
                 display_window=actual_display_window,
             )
 
-        # Build title
+        # Build title with clear window indication
         title = f"Sample {self.current_idx + 1}/{len(self.samples)} | {sample.timestamp}"
-        if display_window is not None:
-            title += f" | Window: {display_window}"
-        else:
-            title += f" | Window: Best ({sample.best_window})"
+        best_win = getattr(sample, 'best_window', None)
 
-        self.fig.suptitle(title, fontsize=14, fontweight='bold')
+        if display_window is not None:
+            is_best = display_window == best_win
+            if is_best:
+                title += f" | Window: {display_window} (best)"
+                title_color = 'black'
+            else:
+                title += f" | Window: {display_window} [non-best, best={best_win}]"
+                title_color = '#cc6600'  # Orange to indicate non-best
+        else:
+            title += f" | Window: {best_win} (best)"
+            title_color = 'black'
+
+        self.fig.suptitle(title, fontsize=14, fontweight='bold', color=title_color)
         self.fig.canvas.draw_idle()
 
     def _print_sample_info(self) -> None:
         """Print detailed information about current sample."""
         sample = self.samples[self.current_idx]
+
+        # Determine which window to show info for
+        if self.display_window_idx is not None:
+            info_window = STANDARD_WINDOWS[self.display_window_idx]
+        else:
+            info_window = sample.best_window
 
         print("\n" + "=" * 60)
         print(f"SAMPLE {self.current_idx} DETAILED INFO")
@@ -613,18 +670,21 @@ class VisualInspector:
         print(f"\nTimestamp: {sample.timestamp}")
         print(f"Channel End Index: {sample.channel_end_idx}")
         print(f"Best Window: {sample.best_window}")
+        if info_window != sample.best_window:
+            print(f"Currently Viewing: Window {info_window}")
 
-        # Features
-        features = sample.features_per_window.get(sample.best_window, {})
-        print(f"\nFeatures ({len(features)} total):")
+        # Features - use the displayed window
+        features = sample.features_per_window.get(info_window, {})
+        window_label = f"window {info_window}" if info_window != sample.best_window else "best window"
+        print(f"\nFeatures ({len(features)} total, {window_label}):")
         for i, (k, v) in enumerate(list(features.items())[:10]):
             print(f"  {k}: {v:.4f}")
         if len(features) > 10:
             print(f"  ... and {len(features) - 10} more")
 
-        # Labels
-        print("\n--- Labels by Timeframe (best window) ---")
-        labels_dict = sample.labels_per_window.get(sample.best_window, {})
+        # Labels - use the displayed window
+        print(f"\n--- Labels by Timeframe ({window_label}) ---")
+        labels_dict = sample.labels_per_window.get(info_window, {})
 
         for tf in TIMEFRAMES:
             tf_label = labels_dict.get(tf)

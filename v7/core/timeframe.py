@@ -59,13 +59,17 @@ def resample_ohlc(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
 
     rule = RESAMPLE_RULES[timeframe]
 
-    resampled = df.resample(rule).agg({
+    # Build aggregation dict - volume is optional (VIX doesn't have it)
+    agg_dict = {
         'open': 'first',
         'high': 'max',
         'low': 'min',
         'close': 'last',
-        'volume': 'sum'
-    }).dropna()
+    }
+    if 'volume' in df.columns:
+        agg_dict['volume'] = 'sum'
+
+    resampled = df.resample(rule).agg(agg_dict).dropna()
 
     return resampled
 
