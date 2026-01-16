@@ -41,6 +41,12 @@ class V15Model(nn.Module):
         TF Aggregator (11 x 128 → 256)
             ↓
         Prediction Heads (duration, direction, new_channel, confidence)
+            ↓
+        [Optional] Window Selector (learned window selection)
+
+    When use_window_selector=True, the model also predicts which of the 8
+    lookback windows is optimal. This enables end-to-end training where
+    the duration loss backpropagates through the window selection.
     """
 
     def __init__(
@@ -54,13 +60,17 @@ class V15Model(nn.Module):
         dropout: float = 0.1,
         use_explicit_weights: bool = True,
         use_gating: bool = False,
-        share_tf_weights: bool = False
+        share_tf_weights: bool = False,
+        use_window_selector: bool = False,
+        num_windows: int = 8,
     ):
         super().__init__()
 
         self.input_dim = input_dim
         self.n_timeframes = n_timeframes
         self.features_per_tf = features_per_tf
+        self.use_window_selector = use_window_selector
+        self.num_windows = num_windows
 
         # Shared features = events + bar metadata
         self.shared_features_dim = (
@@ -114,10 +124,12 @@ class V15Model(nn.Module):
             output_dim=hidden_dim
         )
 
-        # 6. Prediction Heads
+        # 6. Prediction Heads (with optional window selector)
         self.prediction_heads = PredictionHeads(
             input_dim=hidden_dim,
-            hidden_dim=hidden_dim // 2
+            hidden_dim=hidden_dim // 2,
+            use_window_selector=use_window_selector,
+            num_windows=num_windows,
         )
 
     def validate_input(self, x: torch.Tensor) -> None:
@@ -159,7 +171,9 @@ class V15Model(nn.Module):
         self,
         x: torch.Tensor,
         return_attention: bool = False,
-        validate: bool = True
+        validate: bool = True,
+        window_selector_temperature: float = 1.0,
+        window_selector_hard: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
@@ -168,9 +182,12 @@ class V15Model(nn.Module):
             x: [batch, input_dim] raw features
             return_attention: If True, include attention weights in output
             validate: If True, check for NaN/Inf (LOUD failure)
+            window_selector_temperature: Temperature for window selection softmax (default: 1.0)
+            window_selector_hard: If True, use argmax for window selection (inference mode)
 
         Returns:
-            Dict with predictions and optional attention weights
+            Dict with predictions and optional attention weights.
+            If use_window_selector, also includes 'window_selection' dict.
         """
         # 1. Validate input
         if validate:
@@ -199,7 +216,11 @@ class V15Model(nn.Module):
         aggregated, agg_weights = self.tf_aggregator(tf_embeddings)
 
         # 8. Predictions
-        predictions = self.prediction_heads(aggregated)
+        predictions = self.prediction_heads(
+            aggregated,
+            window_selector_temperature=window_selector_temperature,
+            window_selector_hard=window_selector_hard,
+        )
 
         if return_attention:
             predictions['tf_attention_weights'] = attn_weights
@@ -213,6 +234,10 @@ class V15Model(nn.Module):
             return self.feature_weights.get_feature_importance()
         return None
 
+    def has_window_selector(self) -> bool:
+        """Check if this model has a learned window selector."""
+        return self.prediction_heads.has_window_selector()
+
 
 def create_model(config: Optional[Dict] = None) -> V15Model:
     """
@@ -220,6 +245,14 @@ def create_model(config: Optional[Dict] = None) -> V15Model:
 
     Args:
         config: Optional config dict, defaults to MODEL_CONFIG
+            Supported keys:
+            - input_dim: Total number of input features
+            - hidden_dim: Hidden layer dimension
+            - n_attention_heads: Number of attention heads
+            - dropout: Dropout probability
+            - use_explicit_weights: Whether to use explicit feature weights
+            - use_window_selector: Whether to include learned window selection
+            - num_windows: Number of windows for selector (default: 8)
 
     Returns:
         Initialized V15Model
@@ -232,4 +265,6 @@ def create_model(config: Optional[Dict] = None) -> V15Model:
         n_attention_heads=cfg['n_attention_heads'],
         dropout=cfg['dropout'],
         use_explicit_weights=cfg['use_explicit_weights'],
+        use_window_selector=cfg.get('use_window_selector', False),
+        num_windows=cfg.get('num_windows', 8),
     )

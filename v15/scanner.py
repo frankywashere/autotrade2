@@ -565,6 +565,20 @@ def scan_channels_two_pass(
         if len(errors) > 5:
             print(f"  ... and {len(errors) - 5} more")
 
+    # Note about window selection strategies for training
+    print(f"\n{'=' * 60}")
+    print("WINDOW SELECTION STRATEGIES")
+    print(f"{'=' * 60}")
+    print("When training, you can specify a window selection strategy:")
+    print("  --strategy bounce_first    : Select window with most complete cycles (default)")
+    print("  --strategy label_validity  : Prioritize windows with valid labels")
+    print("  --strategy balanced_score  : Balance between cycle count and label quality")
+    print("  --strategy quality_score   : Weight by overall channel quality metrics")
+    print("  --strategy learned         : Use learned window selection (requires --end-to-end)")
+    print("\nFor end-to-end learning:")
+    print("  --end-to-end               : Enable differentiable window selection")
+    print("  --window-selection-weight  : Loss weight for window selection (default: 0.1)")
+
     return samples
 
 

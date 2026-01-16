@@ -34,6 +34,11 @@ class LivePrediction:
     Includes partial bar information critical for live trading:
     - bar_completion_pct shows how complete each TF's current bar is
     - This helps traders understand data freshness at each timeframe
+
+    Also includes learned window selection info when model supports it:
+    - learned_window: Model's predicted optimal window
+    - learned_window_probs: Probabilities for each window
+    - used_learned_selection: Whether learned selection was used
     """
     prediction: Prediction
     data_timestamp: pd.Timestamp
@@ -42,6 +47,10 @@ class LivePrediction:
     channel_valid: bool
     source_bar_count: int = 0  # Number of 5-min bars used
     bar_completion_by_tf: Dict[str, float] = field(default_factory=dict)  # TF -> completion %
+    # Learned window selection fields
+    used_learned_selection: bool = False
+    learned_window: Optional[int] = None
+    learned_window_probs: Optional[Dict[int, float]] = None
 
 
 class LivePredictor:
@@ -54,10 +63,19 @@ class LivePredictor:
     - Computes accurate bar_completion_pct based on position within TF bars
     - Provides prediction latency metrics
     - Supports callbacks for new predictions
+    - Learned window selection (when model supports it)
 
     The key improvement is tracking source_bar_count accurately, which determines
     bar_completion_pct for each timeframe. During live trading, this ensures the
     model knows how "complete" each TF bar is.
+
+    Learned Window Selection:
+    When the model was trained with use_window_selector=True, the model predicts
+    which of the 8 windows is optimal. During live inference:
+    - The model's predicted window is used instead of heuristic selection
+    - The LivePrediction includes learned_window, learned_window_probs, and
+      used_learned_selection fields
+    - Logging shows which window was selected and the selection confidence
     """
 
     def __init__(
@@ -90,7 +108,19 @@ class LivePredictor:
         self.prediction_count = 0
         self.total_latency_ms = 0.0
 
-        logger.info(f"LivePredictor initialized with {self.min_bars} min bars")
+        # Log learned window selection status
+        if self.predictor.has_learned_window_selection:
+            logger.info(
+                f"LivePredictor initialized with {self.min_bars} min bars "
+                "(model has learned window selection)"
+            )
+        else:
+            logger.info(f"LivePredictor initialized with {self.min_bars} min bars")
+
+    @property
+    def has_learned_window_selection(self) -> bool:
+        """Whether this predictor uses learned window selection."""
+        return self.predictor.has_learned_window_selection
 
     def update_data(
         self,
@@ -184,6 +214,11 @@ class LivePredictor:
         - Includes bar_completion_pct features
         - Detects channels at all 8 windows per TF
 
+        If model has learned window selection:
+        - Uses model's predicted window instead of heuristic
+        - Includes learned_window, learned_window_probs in output
+        - Logs which window was selected
+
         Returns:
             LivePrediction or None if not enough data
         """
@@ -214,6 +249,7 @@ class LivePredictor:
             # Compute bar completion for each TF
             bar_completion = self._compute_bar_completion_by_tf()
 
+            # Create LivePrediction with learned window selection info
             live_pred = LivePrediction(
                 prediction=prediction,
                 data_timestamp=self.tsla_data.index[-1],
@@ -222,7 +258,18 @@ class LivePredictor:
                 channel_valid=True,
                 source_bar_count=self.total_bars_received,
                 bar_completion_by_tf=bar_completion,
+                # Learned window selection fields from prediction
+                used_learned_selection=prediction.used_learned_selection,
+                learned_window=prediction.learned_window,
+                learned_window_probs=prediction.learned_window_probs,
             )
+
+            # Log learned window selection if used
+            if prediction.used_learned_selection:
+                logger.debug(
+                    f"Live prediction using learned window={prediction.learned_window} "
+                    f"(best_window={prediction.best_window})"
+                )
 
             # Update metrics
             self.prediction_count += 1
@@ -250,6 +297,7 @@ class LivePredictor:
             'can_predict': self.can_predict(),
             'bar_completion_by_tf': bar_completion,
             'tracking_channel_history': self.track_channel_history,
+            'has_learned_window_selection': self.has_learned_window_selection,
         }
 
     def reset_bar_count(self, new_count: int = 0):

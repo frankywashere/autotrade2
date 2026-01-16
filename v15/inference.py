@@ -44,6 +44,10 @@ class Prediction:
     new_channel_probs: Dict[str, float]
     confidence: float
     best_window: int
+    # Learned window selection fields (optional)
+    learned_window: Optional[int] = None  # Window selected by model
+    learned_window_probs: Optional[Dict[int, float]] = None  # Probabilities for each window
+    used_learned_selection: bool = False  # Whether learned selection was used
 
 
 class Predictor:
@@ -55,6 +59,12 @@ class Predictor:
     - Feature extraction
     - Batch prediction
     - Result formatting
+    - Learned window selection (when model has window_selector head)
+
+    When the model was trained with learned window selection
+    (use_window_selector=True), the model predicts which of the 8 windows
+    is optimal. During inference, this learned selection is used instead
+    of the heuristic best_window from channel detection.
     """
 
     def __init__(
@@ -72,27 +82,102 @@ class Predictor:
         self.model.eval()
         self.feature_names = feature_names
 
+        # Check if model has learned window selection
+        self._has_learned_window_selection = self._detect_window_selector()
+        if self._has_learned_window_selection:
+            logger.info("Model has learned window selection - will use model predictions for window choice")
+        else:
+            logger.debug("Model does not have learned window selection - using heuristic best_window")
+
+    def _detect_window_selector(self) -> bool:
+        """
+        Detect if the model has a learned window selector.
+
+        Checks for window_selector head in the model's state_dict or
+        via the has_window_selector() method.
+
+        Returns:
+            True if model has learned window selection capability
+        """
+        # Method 1: Check via model method
+        if hasattr(self.model, 'has_window_selector'):
+            return self.model.has_window_selector()
+
+        # Method 2: Check state_dict for window_selector parameters
+        state_dict = self.model.state_dict()
+        for key in state_dict.keys():
+            if 'window_selector' in key:
+                return True
+
+        return False
+
+    @property
+    def has_learned_window_selection(self) -> bool:
+        """Whether this predictor uses learned window selection."""
+        return self._has_learned_window_selection
+
     @classmethod
     def load(cls, checkpoint_path: str, device: str = 'auto') -> 'Predictor':
-        """Load predictor from checkpoint."""
+        """
+        Load predictor from checkpoint.
+
+        Automatically detects if the model was trained with learned window
+        selection by checking for window_selector keys in the state_dict.
+
+        Args:
+            checkpoint_path: Path to model checkpoint
+            device: Device to use ('auto', 'cuda', 'cpu', etc.)
+
+        Returns:
+            Predictor instance with model loaded
+        """
         path = Path(checkpoint_path)
         if not path.exists():
             raise ModelError(f"Checkpoint not found: {path}")
 
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
-        # Create model
-        model = create_model()
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # Check if model was trained with window selector
+        state_dict = checkpoint['model_state_dict']
+        has_window_selector = any('window_selector' in key for key in state_dict.keys())
+
+        # Get config from checkpoint or use defaults
+        model_config = checkpoint.get('config', {})
+
+        # Create model with appropriate configuration
+        config = {
+            'use_window_selector': has_window_selector,
+            'num_windows': model_config.get('num_windows', 8),
+        }
+
+        model = create_model(config)
+
+        # Load state dict
+        model.load_state_dict(state_dict)
 
         # Get feature names - use new TF-aware feature names by default
         feature_names = checkpoint.get('feature_names', get_tf_feature_names())
+
+        logger.info(f"Loaded model from {path}")
+        if has_window_selector:
+            logger.info("Model includes learned window selection")
 
         return cls(model, feature_names, device)
 
     @torch.no_grad()
     def predict_features(self, features: Dict[str, float]) -> Prediction:
-        """Make prediction from pre-extracted features."""
+        """
+        Make prediction from pre-extracted features.
+
+        If the model has learned window selection, this will also output
+        the model's predicted optimal window.
+
+        Args:
+            features: Dict of feature name -> value
+
+        Returns:
+            Prediction object with all outputs
+        """
         # Convert to tensor
         feature_array = np.array([
             features.get(name, 0.0) for name in self.feature_names
@@ -100,8 +185,12 @@ class Predictor:
 
         x = torch.from_numpy(feature_array).unsqueeze(0).to(self.device)
 
-        # Forward pass
-        outputs = self.model(x, validate=True)
+        # Forward pass with hard window selection for inference
+        outputs = self.model(
+            x,
+            validate=True,
+            window_selector_hard=True,  # Use argmax for inference
+        )
 
         # Parse outputs
         duration_mean = outputs['duration_mean'].item()
@@ -117,6 +206,29 @@ class Predictor:
 
         confidence = outputs['confidence'].item()
 
+        # Handle learned window selection
+        learned_window = None
+        learned_window_probs = None
+        used_learned_selection = False
+
+        if self._has_learned_window_selection and 'window_selection' in outputs:
+            window_sel = outputs['window_selection']
+            selected_idx = window_sel['selected_idx'].item()
+            learned_window = STANDARD_WINDOWS[selected_idx]
+            used_learned_selection = True
+
+            # Get probabilities for all windows
+            probs = window_sel['probs'].squeeze()
+            learned_window_probs = {
+                STANDARD_WINDOWS[i]: probs[i].item()
+                for i in range(len(STANDARD_WINDOWS))
+            }
+
+            logger.info(
+                f"Learned window selection: window={learned_window} "
+                f"(idx={selected_idx}, prob={probs[selected_idx].item():.3f})"
+            )
+
         return Prediction(
             timestamp=pd.Timestamp.now(),
             duration_mean=duration_mean,
@@ -129,7 +241,10 @@ class Predictor:
                 for i, name in enumerate(new_channel_names)
             },
             confidence=confidence,
-            best_window=50,  # Will be updated
+            best_window=50,  # Will be updated by caller
+            learned_window=learned_window,
+            learned_window_probs=learned_window_probs,
+            used_learned_selection=used_learned_selection,
         )
 
     def predict(
@@ -149,6 +264,11 @@ class Predictor:
         - Detects channels at all 8 windows per timeframe
         - Includes bar_completion_pct features for partial bar awareness
 
+        Window Selection:
+        - If model has learned window selection, uses model's predicted window
+        - Otherwise, falls back to heuristic best_window from channel detection
+        - Both values are returned in the Prediction object for comparison
+
         Args:
             tsla_df: TSLA OHLCV DataFrame (5-min base data)
             spy_df: SPY OHLCV DataFrame (5-min base data)
@@ -161,7 +281,11 @@ class Predictor:
                                   for channel history features.
 
         Returns:
-            Prediction object with all outputs
+            Prediction object with all outputs including:
+            - best_window: Heuristic window (from channel detection) or learned window
+            - learned_window: Model's predicted window (if learned selection enabled)
+            - learned_window_probs: Probabilities for each window
+            - used_learned_selection: Whether learned selection was used
         """
         from v7.core.channel import detect_channels_multi_window, select_best_channel
 
@@ -172,9 +296,10 @@ class Predictor:
         if source_bar_count is None:
             source_bar_count = len(tsla_df)
 
-        # Detect channels on 5-min data for best_window selection
+        # Detect channels on 5-min data for heuristic best_window selection
         channels = detect_channels_multi_window(tsla_df, windows=STANDARD_WINDOWS)
-        best_channel, best_window = select_best_channel(channels)
+        heuristic_channel, heuristic_window = select_best_channel(channels)
+        heuristic_window = heuristic_window if heuristic_window is not None else 50
 
         # Extract all TF features with partial bar support
         # This resamples to all 10 TFs and extracts ~7,880 features
@@ -191,7 +316,26 @@ class Predictor:
         # Make prediction
         prediction = self.predict_features(features)
         prediction.timestamp = timestamp
-        prediction.best_window = best_window if best_window is not None else 50
+
+        # Determine which window to use
+        if prediction.used_learned_selection and prediction.learned_window is not None:
+            # Use learned window selection
+            prediction.best_window = prediction.learned_window
+
+            # Log comparison between heuristic and learned selection
+            if prediction.learned_window != heuristic_window:
+                logger.info(
+                    f"Window selection: learned={prediction.learned_window} vs "
+                    f"heuristic={heuristic_window} (using learned)"
+                )
+            else:
+                logger.debug(
+                    f"Window selection: learned and heuristic agree on window={prediction.learned_window}"
+                )
+        else:
+            # Fall back to heuristic
+            prediction.best_window = heuristic_window
+            logger.debug(f"Window selection: using heuristic window={heuristic_window}")
 
         return prediction
 

@@ -73,18 +73,24 @@ def cmd_train(args):
 
     logger.info(f"Train: {len(train_samples)}, Val: {len(val_samples)}")
 
-    # Create dataloaders
+    # Log window selection strategy
+    logger.info(f"Window selection strategy: {args.strategy}")
+    if args.end_to_end:
+        logger.info(f"End-to-end learning enabled (weight={args.window_selection_weight})")
+
+    # Create dataloaders with window selection strategy
     train_loader, val_loader = create_dataloaders(
         train_samples, val_samples,
         batch_size=args.batch_size,
-        target_tf=args.target_tf
+        target_tf=args.target_tf,
+        strategy=args.strategy
     )
 
     # Create model
     model = create_model()
     logger.info(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
 
-    # Train
+    # Train with window selection options
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -92,6 +98,8 @@ def cmd_train(args):
         lr=args.lr,
         max_epochs=args.epochs,
         checkpoint_dir=args.output,
+        end_to_end_window_selection=args.end_to_end,
+        window_selection_weight=args.window_selection_weight,
     )
 
     history = trainer.train()
@@ -204,6 +212,13 @@ def main():
     train_parser.add_argument('--lr', type=float, default=TRAINING_CONFIG['learning_rate'])
     train_parser.add_argument('--epochs', type=int, default=TRAINING_CONFIG['max_epochs'])
     train_parser.add_argument('--target-tf', default='daily', help='Target timeframe for labels')
+    train_parser.add_argument('--strategy', default='bounce_first',
+        choices=['bounce_first', 'label_validity', 'balanced_score', 'quality_score', 'learned'],
+        help='Window selection strategy')
+    train_parser.add_argument('--end-to-end', action='store_true',
+        help='Enable end-to-end window selection learning')
+    train_parser.add_argument('--window-selection-weight', type=float, default=0.1,
+        help='Weight for window selection loss (only with --end-to-end)')
 
     # Analyze command
     analyze_parser = subparsers.add_parser('analyze', help='Analyze feature correlations')

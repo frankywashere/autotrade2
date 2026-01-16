@@ -18,6 +18,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from ..config import TIMEFRAMES, TOTAL_FEATURES
+from ..core.window_strategy import SelectionStrategy, get_strategy
 from ..exceptions import DataLoadError, ValidationError
 from ..features.validation import (
     analyze_correlations,
@@ -50,6 +51,8 @@ class ChannelDataset(Dataset):
         validate: bool = True,
         target_tf: str = 'daily',
         target_window: Optional[int] = None,
+        strategy: str = 'bounce_first',
+        strategy_kwargs: Optional[Dict] = None,
         analyze_correlations: bool = True,
     ):
         """
@@ -58,7 +61,10 @@ class ChannelDataset(Dataset):
             feature_names: Optional list of feature names for validation
             validate: If True, validate features on load
             target_tf: Target timeframe for labels (must be in TIMEFRAMES)
-            target_window: Specific window to use for labels (None = use best_window)
+            target_window: Specific window to use for labels (None = use strategy)
+            strategy: Window selection strategy name ('bounce_first', 'label_validity',
+                     'balanced_score', 'quality_score', 'learned')
+            strategy_kwargs: Optional kwargs to pass to the strategy constructor
             analyze_correlations: If True, analyze feature correlations
         """
         if target_tf not in TIMEFRAMES:
@@ -70,6 +76,18 @@ class ChannelDataset(Dataset):
         self.target_window = target_window
         self.analyze_correlations_flag = analyze_correlations
         self.correlation_info = None
+
+        # Initialize window selection strategy
+        self.strategy_name = strategy
+        strategy_kwargs = strategy_kwargs or {}
+        try:
+            strategy_enum = SelectionStrategy(strategy)
+            self.strategy = get_strategy(strategy_enum, **strategy_kwargs)
+        except ValueError:
+            raise ValidationError(
+                f"Invalid strategy '{strategy}'. Must be one of: "
+                f"{[s.value for s in SelectionStrategy]}"
+            )
 
         # Extract and validate features
         self._prepare_data(validate)
@@ -98,7 +116,17 @@ class ChannelDataset(Dataset):
             features_list.append(feature_array)
 
             # Extract labels for target TF and window
-            window = self.target_window if self.target_window else sample.best_window
+            # Priority: target_window > strategy > best_window
+            if self.target_window is not None:
+                window = self.target_window
+            elif self.strategy_name == 'learned':
+                # For learned mode, we'll handle this differently (pass all windows)
+                # Use best_window as fallback for label extraction during prep
+                window = sample.best_window
+            else:
+                # Use strategy to select window
+                window = self.strategy.select_window(sample)
+
             labels = self._extract_labels(sample, self.target_tf, window)
             labels_list.append(labels)
 
@@ -195,8 +223,9 @@ class ChannelDataset(Dataset):
 
         Returns:
             Tuple of (features, labels) where:
-                - features: [n_features] tensor
+                - features: [n_features] tensor (or [8, features_per_window] for learned mode)
                 - labels: Dict with duration, direction, new_channel, etc.
+                        For learned mode, also includes 'per_window_features' and 'all_window_labels'
         """
         features = self.features_tensor[idx]
         labels = self.labels[idx]
@@ -214,7 +243,104 @@ class ChannelDataset(Dataset):
             'direction_valid': torch.tensor(labels['direction_valid'], dtype=torch.bool),
         }
 
+        # For learned mode, add per-window features so model can learn to select
+        if self.strategy_name == 'learned':
+            sample = self.samples[idx]
+            per_window_features = self._extract_per_window_features(sample)
+            label_tensors['per_window_features'] = per_window_features
+            label_tensors['all_window_labels'] = self._extract_all_window_labels(sample)
+            label_tensors['best_window_idx'] = torch.tensor(
+                self._get_best_window_index(sample), dtype=torch.long
+            )
+
         return features, label_tensors
+
+    def _extract_per_window_features(self, sample: ChannelSample) -> torch.Tensor:
+        """
+        Extract features specific to each window for learned window selection.
+
+        For each of the 8 windows (10, 20, 30, 40, 50, 60, 70, 80), extracts:
+            - Label validity counts across TFs
+            - Window-specific channel quality metrics (if available)
+
+        Returns:
+            Tensor of shape [8, features_per_window] where features_per_window
+            includes validity flags and quality metrics per window.
+        """
+        from ..types import STANDARD_WINDOWS
+
+        n_windows = len(STANDARD_WINDOWS)
+        n_tfs = len(TIMEFRAMES)
+
+        # Features per window: validity per TF (n_tfs) + summary stats (3)
+        # Summary stats: total_valid_ratio, has_target_tf, window_normalized
+        features_per_window = n_tfs + 3
+        per_window_features = torch.zeros(n_windows, features_per_window)
+
+        for i, window in enumerate(STANDARD_WINDOWS):
+            window_labels = sample.labels_per_window.get(window, {})
+
+            # Per-TF validity flags
+            for j, tf in enumerate(TIMEFRAMES):
+                tf_label = window_labels.get(tf)
+                if tf_label is not None:
+                    # Check if label has valid duration or direction
+                    is_valid = getattr(tf_label, 'duration_valid', False) or \
+                               getattr(tf_label, 'direction_valid', False)
+                    per_window_features[i, j] = 1.0 if is_valid else 0.0
+
+            # Summary stats
+            valid_count = per_window_features[i, :n_tfs].sum().item()
+            per_window_features[i, n_tfs] = valid_count / n_tfs  # valid_ratio
+
+            # Has target TF valid
+            target_label = window_labels.get(self.target_tf)
+            if target_label is not None:
+                has_target = getattr(target_label, 'duration_valid', False) or \
+                             getattr(target_label, 'direction_valid', False)
+                per_window_features[i, n_tfs + 1] = 1.0 if has_target else 0.0
+
+            # Window size normalized (smaller is closer to 1)
+            per_window_features[i, n_tfs + 2] = 1.0 - (window - 10) / 70.0
+
+        return per_window_features
+
+    def _extract_all_window_labels(self, sample: ChannelSample) -> torch.Tensor:
+        """
+        Extract labels for all windows to support learned window selection.
+
+        Returns:
+            Tensor of shape [8, n_label_fields] with labels per window.
+        """
+        from ..types import STANDARD_WINDOWS
+
+        n_windows = len(STANDARD_WINDOWS)
+        # Fields: duration, direction, valid
+        n_fields = 3
+        all_labels = torch.zeros(n_windows, n_fields)
+
+        for i, window in enumerate(STANDARD_WINDOWS):
+            labels = self._extract_labels(sample, self.target_tf, window)
+            all_labels[i, 0] = labels['duration']
+            all_labels[i, 1] = labels['direction']
+            all_labels[i, 2] = 1.0 if labels['valid'] else 0.0
+
+        return all_labels
+
+    def _get_best_window_index(self, sample: ChannelSample) -> int:
+        """
+        Get the index of the best window in STANDARD_WINDOWS.
+
+        Returns:
+            Index (0-7) of the best window in the standard windows list.
+        """
+        from ..types import STANDARD_WINDOWS
+
+        best_window = sample.best_window
+        if best_window in STANDARD_WINDOWS:
+            return STANDARD_WINDOWS.index(best_window)
+        # Fallback to middle window
+        return 4  # window 50
 
     def get_metadata(self, idx: int) -> Dict[str, Any]:
         """Get metadata for a sample (timestamp, window, bar_metadata)."""
@@ -241,6 +367,8 @@ def create_dataloaders(
     num_workers: int = 4,
     target_tf: str = 'daily',
     target_window: Optional[int] = None,
+    strategy: str = 'bounce_first',
+    strategy_kwargs: Optional[Dict] = None,
     validate: bool = True,
     analyze_correlations: bool = True,
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
@@ -253,7 +381,10 @@ def create_dataloaders(
         batch_size: Batch size for dataloaders
         num_workers: Number of worker processes
         target_tf: Target timeframe for labels
-        target_window: Specific window to use (None = use best_window)
+        target_window: Specific window to use (None = use strategy)
+        strategy: Window selection strategy ('bounce_first', 'label_validity',
+                 'balanced_score', 'quality_score', 'learned')
+        strategy_kwargs: Optional kwargs to pass to the strategy constructor
         validate: Whether to validate features
         analyze_correlations: Whether to analyze feature correlations
 
@@ -265,6 +396,8 @@ def create_dataloaders(
         validate=validate,
         target_tf=target_tf,
         target_window=target_window,
+        strategy=strategy,
+        strategy_kwargs=strategy_kwargs,
         analyze_correlations=analyze_correlations,
     )
     train_loader = DataLoader(
@@ -283,6 +416,8 @@ def create_dataloaders(
             validate=validate,
             target_tf=target_tf,
             target_window=target_window,
+            strategy=strategy,
+            strategy_kwargs=strategy_kwargs,
             analyze_correlations=False,  # Already analyzed on train
         )
         val_loader = DataLoader(

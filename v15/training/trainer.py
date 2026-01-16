@@ -1,21 +1,27 @@
 """
 V15 Training Loop with proper logging and validation.
+
+Supports:
+- Standard training (single best window per sample)
+- End-to-end window selection learning (Phase 2b)
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
+from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 from tqdm import tqdm
 import json
 import warnings
+import numpy as np
 
 from ..models import V15Model, create_model
-from ..config import TRAINING_CONFIG, TOTAL_FEATURES, TIMEFRAMES
+from ..config import TRAINING_CONFIG, TOTAL_FEATURES, TIMEFRAMES, N_WINDOWS
 from ..exceptions import ModelError
 from .metrics import compute_metrics, MetricsTracker
 from ..features.validation import analyze_correlations, check_for_constant_features
@@ -23,9 +29,181 @@ from ..features.validation import analyze_correlations, check_for_constant_featu
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Training Configuration
+# =============================================================================
+
+@dataclass
+class TrainingConfig:
+    """Configuration for V15 training with optional window selection learning."""
+
+    # Basic training hyperparameters
+    lr: float = 1e-4
+    weight_decay: float = 1e-5
+    max_epochs: int = 100
+    warmup_steps: int = 1000
+    grad_clip: float = 1.0
+    early_stopping_patience: int = 10
+
+    # Scheduler options
+    scheduler: str = 'onecycle'  # 'onecycle', 'cosine_restarts', 'none'
+    scheduler_kwargs: Dict = field(default_factory=lambda: {'T_0': 50, 'T_mult': 1})
+
+    # Device and checkpointing
+    device: str = 'auto'
+    checkpoint_dir: Optional[str] = None
+    analyze_features: bool = True
+
+    # Window selection (Phase 2b: End-to-end mode)
+    use_window_selection_loss: bool = False  # Enable window selection auxiliary loss
+    window_selection_weight: float = 0.1     # Weight for selection loss
+    use_end_to_end_loss: bool = False        # Phase 2b: End-to-end mode
+    strategy: str = 'bounce_first'           # Window selection strategy: 'bounce_first', 'heuristic', 'learned'
+
+    # End-to-end specific settings
+    entropy_weight: float = 0.1              # Encourages decisive window selection
+    consistency_weight: float = 0.05         # Helps warm-start with heuristic best_window
+    use_gumbel_softmax: bool = True          # Use Gumbel-Softmax for differentiable selection
+    gumbel_temperature: float = 1.0          # Temperature for Gumbel-Softmax (annealed during training)
+    gumbel_temperature_min: float = 0.1      # Minimum temperature after annealing
+
+    # Loss function settings
+    duration_loss_type: str = 'gaussian_nll'  # 'gaussian_nll', 'huber', 'mse'
+    direction_loss_type: str = 'bce'          # 'bce', 'focal'
+    focal_gamma: float = 2.0                  # Gamma for focal loss
+    huber_delta: float = 1.0                  # Delta for Huber loss
+
+
+# =============================================================================
+# Window Selection Head
+# =============================================================================
+
+class WindowSelectionHead(nn.Module):
+    """
+    Learns to select the best window from per-window features.
+
+    Takes features for all windows and outputs selection probabilities.
+    Supports differentiable selection via Gumbel-Softmax or soft attention.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 128,
+        n_windows: int = N_WINDOWS,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.n_windows = n_windows
+
+        # Per-window encoder
+        self.window_encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        # Window scorer: outputs logit per window
+        self.window_scorer = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(
+        self,
+        window_features: torch.Tensor,
+        window_valid: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        hard: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for window selection.
+
+        Args:
+            window_features: [batch, n_windows, input_dim] - Features for each window
+            window_valid: [batch, n_windows] - Mask for valid windows (1=valid, 0=invalid)
+            temperature: Gumbel-Softmax temperature (lower = more decisive)
+            hard: If True, use hard (argmax) selection instead of soft
+
+        Returns:
+            selected_features: [batch, input_dim] - Weighted combination of window features
+            selection_probs: [batch, n_windows] - Soft selection probabilities
+        """
+        batch_size, n_windows, input_dim = window_features.shape
+
+        # Encode each window
+        # Reshape for parallel processing: [batch * n_windows, input_dim]
+        flat_features = window_features.view(-1, input_dim)
+        encoded = self.window_encoder(flat_features)  # [batch * n_windows, hidden_dim // 2]
+
+        # Score each window
+        scores = self.window_scorer(encoded)  # [batch * n_windows, 1]
+        scores = scores.view(batch_size, n_windows)  # [batch, n_windows]
+
+        # Mask invalid windows (set score to -inf)
+        if window_valid is not None:
+            scores = scores.masked_fill(~window_valid.bool(), float('-inf'))
+
+        # Apply Gumbel-Softmax for differentiable selection
+        if self.training and not hard:
+            # Gumbel-Softmax during training
+            selection_probs = F.gumbel_softmax(scores, tau=temperature, hard=False)
+        else:
+            # Regular softmax for inference
+            selection_probs = F.softmax(scores, dim=-1)
+
+        # Handle edge case where all windows are invalid
+        if window_valid is not None:
+            all_invalid = ~window_valid.any(dim=-1, keepdim=True)  # [batch, 1]
+            # For samples with all invalid windows, use uniform distribution
+            uniform = torch.ones_like(selection_probs) / n_windows
+            selection_probs = torch.where(all_invalid, uniform, selection_probs)
+
+        # Soft selection: weighted combination of window features
+        # selection_probs: [batch, n_windows] -> [batch, n_windows, 1]
+        weights = selection_probs.unsqueeze(-1)  # [batch, n_windows, 1]
+        selected_features = (window_features * weights).sum(dim=1)  # [batch, input_dim]
+
+        return selected_features, selection_probs
+
+    def get_hard_selection(
+        self,
+        window_features: torch.Tensor,
+        window_valid: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get hard window selection (argmax) for inference.
+
+        Returns:
+            selected_features: [batch, input_dim] - Features from the selected window
+            selected_indices: [batch] - Index of selected window
+        """
+        batch_size, n_windows, input_dim = window_features.shape
+
+        # Encode and score
+        flat_features = window_features.view(-1, input_dim)
+        encoded = self.window_encoder(flat_features)
+        scores = self.window_scorer(encoded).view(batch_size, n_windows)
+
+        # Mask invalid windows
+        if window_valid is not None:
+            scores = scores.masked_fill(~window_valid.bool(), float('-inf'))
+
+        # Hard selection
+        selected_indices = scores.argmax(dim=-1)  # [batch]
+
+        # Gather selected window features
+        # selected_indices: [batch] -> [batch, 1, input_dim]
+        idx_expanded = selected_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, input_dim)
+        selected_features = window_features.gather(dim=1, index=idx_expanded).squeeze(1)
+
+        return selected_features, selected_indices
+
+
 class Trainer:
     """
-    Trainer for V15 model.
+    Trainer for V15 model with optional end-to-end window selection learning.
 
     Features:
         - Mixed precision training
@@ -34,6 +212,8 @@ class Trainer:
         - Validation with early stopping
         - Checkpointing
         - Detailed logging
+        - End-to-end window selection learning (Phase 2b)
+        - Window selection metrics tracking
     """
 
     def __init__(
@@ -41,6 +221,8 @@ class Trainer:
         model: V15Model,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
+        config: Optional[TrainingConfig] = None,
+        # Legacy parameters for backward compatibility
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         max_epochs: int = 100,
@@ -51,41 +233,72 @@ class Trainer:
         early_stopping_patience: int = 10,
         analyze_features: bool = True,
     ):
+        # Use config if provided, otherwise build from legacy parameters
+        if config is not None:
+            self.config = config
+        else:
+            self.config = TrainingConfig(
+                lr=lr,
+                weight_decay=weight_decay,
+                max_epochs=max_epochs,
+                warmup_steps=warmup_steps,
+                grad_clip=grad_clip,
+                device=device,
+                checkpoint_dir=checkpoint_dir,
+                early_stopping_patience=early_stopping_patience,
+                analyze_features=analyze_features,
+            )
+
         # Device setup
-        if device == 'auto':
+        if self.config.device == 'auto':
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
-            self.device = torch.device(device)
+            self.device = torch.device(self.config.device)
 
         self.model = model.to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.max_epochs = max_epochs
-        self.grad_clip = grad_clip
-        self.early_stopping_patience = early_stopping_patience
+        self.max_epochs = self.config.max_epochs
+        self.grad_clip = self.config.grad_clip
+        self.early_stopping_patience = self.config.early_stopping_patience
 
         # Checkpoint directory
-        if checkpoint_dir:
-            self.checkpoint_dir = Path(checkpoint_dir)
+        if self.config.checkpoint_dir:
+            self.checkpoint_dir = Path(self.config.checkpoint_dir)
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         else:
             self.checkpoint_dir = None
 
-        # Optimizer
+        # End-to-end window selection setup
+        self.use_end_to_end = self.config.use_end_to_end_loss
+        self.use_window_selection_loss = self.config.use_window_selection_loss
+        self.window_selection_head = None
+        self.gumbel_temperature = self.config.gumbel_temperature
+
+        if self.use_end_to_end:
+            # Create window selection head for end-to-end learning
+            # Input dim is per-window features (determined from dataset)
+            # Will be initialized lazily in train() when we see first batch
+            logger.info("End-to-end window selection mode enabled")
+            logger.info(f"  Strategy: {self.config.strategy}")
+            logger.info(f"  Window selection weight: {self.config.window_selection_weight}")
+            logger.info(f"  Entropy weight: {self.config.entropy_weight}")
+            logger.info(f"  Consistency weight: {self.config.consistency_weight}")
+
+        # Optimizer - include window selection head if present
+        params_to_optimize = list(model.parameters())
+        if self.window_selection_head is not None:
+            params_to_optimize += list(self.window_selection_head.parameters())
+
         self.optimizer = AdamW(
-            model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay
+            params_to_optimize,
+            lr=self.config.lr,
+            weight_decay=self.config.weight_decay
         )
 
         # Scheduler
-        total_steps = len(train_loader) * max_epochs
-        self.scheduler = OneCycleLR(
-            self.optimizer,
-            max_lr=lr,
-            total_steps=total_steps,
-            pct_start=warmup_steps / total_steps,
-        )
+        total_steps = len(train_loader) * self.max_epochs
+        self.scheduler = self._create_scheduler(total_steps)
 
         # Mixed precision
         self.scaler = torch.amp.GradScaler() if self.device.type == 'cuda' else None
@@ -95,21 +308,90 @@ class Trainer:
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
 
+        # Window selection metrics
+        self.window_selection_metrics = {
+            'selection_accuracy': [],      # Did model pick same as heuristic?
+            'selection_entropy': [],       # How decisive is the selection?
+            'consistency_loss': [],        # Distance from heuristic selection
+            'window_distribution': [],     # Distribution over windows
+        }
+
         # Feature analysis settings
-        self.analyze_features_flag = analyze_features
+        self.analyze_features_flag = self.config.analyze_features
         self.suggested_feature_drops: List[int] = []
 
         # Feature metadata (populated from dataset in train())
         self.feature_names: List[str] = None
         self.correlation_info: Dict = None
 
+    def _create_scheduler(self, total_steps: int):
+        """Create learning rate scheduler based on config."""
+        if self.config.scheduler == 'onecycle':
+            return OneCycleLR(
+                self.optimizer,
+                max_lr=self.config.lr,
+                total_steps=total_steps,
+                pct_start=self.config.warmup_steps / total_steps,
+            )
+        elif self.config.scheduler == 'cosine_restarts':
+            kwargs = {
+                'T_0': self.config.scheduler_kwargs.get('T_0', 50),
+                'T_mult': self.config.scheduler_kwargs.get('T_mult', 1),
+                'eta_min': self.config.scheduler_kwargs.get('eta_min', self.config.lr * 0.1)
+            }
+            return CosineAnnealingWarmRestarts(self.optimizer, **kwargs)
+        else:
+            return None
+
+    def _init_window_selection_head(self, per_window_features: torch.Tensor):
+        """Initialize window selection head from first batch (lazy init)."""
+        if self.window_selection_head is not None:
+            return  # Already initialized
+
+        # per_window_features: [batch, n_windows, feature_dim]
+        _, n_windows, feature_dim = per_window_features.shape
+
+        self.window_selection_head = WindowSelectionHead(
+            input_dim=feature_dim,
+            hidden_dim=128,
+            n_windows=n_windows,
+            dropout=0.1
+        ).to(self.device)
+
+        # Add to optimizer
+        self.optimizer.add_param_group({
+            'params': self.window_selection_head.parameters(),
+            'lr': self.config.lr,
+            'weight_decay': self.config.weight_decay
+        })
+
+        logger.info(f"Initialized WindowSelectionHead with input_dim={feature_dim}, n_windows={n_windows}")
+
+    def _anneal_temperature(self, epoch: int):
+        """Anneal Gumbel-Softmax temperature over training."""
+        # Exponential decay from initial to minimum temperature
+        decay_rate = 0.1  # Decay 90% over training
+        progress = epoch / self.max_epochs
+        self.gumbel_temperature = max(
+            self.config.gumbel_temperature_min,
+            self.config.gumbel_temperature * (1 - decay_rate * progress)
+        )
+
     def compute_loss(
         self,
         predictions: Dict[str, torch.Tensor],
-        labels: Dict[str, torch.Tensor]
+        labels: Dict[str, torch.Tensor],
+        window_selection_probs: Optional[torch.Tensor] = None,
+        heuristic_best_window: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute combined loss from all prediction heads.
+
+        Args:
+            predictions: Model predictions dict
+            labels: Ground truth labels dict
+            window_selection_probs: [batch, n_windows] selection probabilities (end-to-end mode)
+            heuristic_best_window: [batch] heuristic best window indices for consistency loss
 
         Returns:
             total_loss: Combined loss for backprop
@@ -119,30 +401,49 @@ class Trainer:
 
         losses = {}
 
-        # Duration loss (Gaussian NLL)
+        # Duration loss (Gaussian NLL or Huber based on config)
         if valid_mask.any():
             duration_mean = predictions['duration_mean'][valid_mask]
-            duration_log_std = predictions['duration_log_std'][valid_mask]
             duration_target = labels['duration'][valid_mask].float()
 
-            # Gaussian NLL loss
-            variance = torch.exp(2 * duration_log_std)
-            duration_loss = 0.5 * (
-                torch.log(variance) +
-                (duration_target - duration_mean) ** 2 / variance
-            ).mean()
+            if self.config.duration_loss_type == 'gaussian_nll':
+                duration_log_std = predictions['duration_log_std'][valid_mask]
+                # Gaussian NLL loss
+                variance = torch.exp(2 * duration_log_std)
+                duration_loss = 0.5 * (
+                    torch.log(variance) +
+                    (duration_target - duration_mean) ** 2 / variance
+                ).mean()
+            elif self.config.duration_loss_type == 'huber':
+                duration_loss = F.huber_loss(
+                    duration_mean, duration_target, delta=self.config.huber_delta
+                )
+            else:  # mse
+                duration_loss = F.mse_loss(duration_mean, duration_target)
+
             losses['duration'] = duration_loss.item()
         else:
             duration_loss = torch.tensor(0.0, device=self.device)
             losses['duration'] = 0.0
 
-        # Direction loss (BCE)
+        # Direction loss (BCE or Focal)
         if valid_mask.any():
             direction_logits = predictions['direction_logits'][valid_mask]
             direction_target = labels['direction'][valid_mask].float()
-            direction_loss = F.binary_cross_entropy_with_logits(
-                direction_logits, direction_target
-            )
+
+            if self.config.direction_loss_type == 'focal':
+                # Focal loss for hard examples
+                probs = torch.sigmoid(direction_logits)
+                p_t = probs * direction_target + (1 - probs) * (1 - direction_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(
+                    direction_logits, direction_target, reduction='none'
+                )
+                direction_loss = (focal_weight * bce).mean()
+            else:
+                direction_loss = F.binary_cross_entropy_with_logits(
+                    direction_logits, direction_target
+                )
             losses['direction'] = direction_loss.item()
         else:
             direction_loss = torch.tensor(0.0, device=self.device)
@@ -160,87 +461,366 @@ class Trainer:
             new_channel_loss = torch.tensor(0.0, device=self.device)
             losses['new_channel'] = 0.0
 
-        # Combined loss
+        # Combined primary loss
         total_loss = duration_loss + direction_loss + new_channel_loss
+
+        # =====================================================================
+        # Window Selection Loss (End-to-end mode)
+        # =====================================================================
+        if self.use_end_to_end and window_selection_probs is not None:
+            # Entropy loss: encourage decisive selection (low entropy)
+            # H = -sum(p * log(p))
+            eps = 1e-8
+            entropy = -(window_selection_probs * (window_selection_probs + eps).log()).sum(dim=-1)
+            entropy_loss = entropy.mean()
+            losses['entropy'] = entropy_loss.item()
+
+            # Consistency loss: match heuristic best_window (warm-start)
+            if heuristic_best_window is not None and self.config.consistency_weight > 0:
+                # Cross-entropy with heuristic selection as target
+                n_windows = window_selection_probs.size(-1)
+                heuristic_best_window = heuristic_best_window.long().clamp(0, n_windows - 1)
+                consistency_loss = F.cross_entropy(
+                    window_selection_probs.log() + eps,  # log probs for CE
+                    heuristic_best_window
+                )
+                losses['consistency'] = consistency_loss.item()
+            else:
+                consistency_loss = torch.tensor(0.0, device=self.device)
+                losses['consistency'] = 0.0
+
+            # Add window selection losses to total
+            total_loss = (
+                total_loss +
+                self.config.entropy_weight * entropy_loss +
+                self.config.consistency_weight * consistency_loss
+            )
+
+            # Track window selection statistics
+            max_prob = window_selection_probs.max(dim=-1)[0].mean()
+            losses['window_max_prob'] = max_prob.item()
+
+            # Most selected window (mode of argmax)
+            selected_windows = window_selection_probs.argmax(dim=-1)
+            window_counts = torch.bincount(selected_windows, minlength=n_windows)
+            losses['window_mode'] = window_counts.argmax().item()
+
+            # Selection accuracy vs heuristic
+            if heuristic_best_window is not None:
+                selection_accuracy = (selected_windows == heuristic_best_window).float().mean()
+                losses['selection_accuracy'] = selection_accuracy.item()
+
+        # Auxiliary window selection loss (Phase 2a style - without end-to-end)
+        elif self.use_window_selection_loss and 'window_logits' in predictions:
+            if 'best_window' in labels:
+                window_logits = predictions['window_logits']  # [batch, n_windows]
+                best_window_target = labels['best_window'].long()
+                window_selection_loss = F.cross_entropy(window_logits, best_window_target)
+                losses['window_selection'] = window_selection_loss.item()
+                total_loss = total_loss + self.config.window_selection_weight * window_selection_loss
+
         losses['total'] = total_loss.item()
 
         return total_loss, losses
 
+    def _compute_window_selection_metrics(
+        self,
+        selection_probs: torch.Tensor,
+        heuristic_best: torch.Tensor
+    ) -> Dict[str, float]:
+        """
+        Compute detailed window selection metrics.
+
+        Args:
+            selection_probs: [batch, n_windows] learned selection probabilities
+            heuristic_best: [batch] heuristic best window indices
+
+        Returns:
+            Dict of metrics
+        """
+        batch_size, n_windows = selection_probs.shape
+
+        # Model's hard selection
+        model_selection = selection_probs.argmax(dim=-1)
+
+        # Accuracy: did model pick same window as heuristic?
+        accuracy = (model_selection == heuristic_best).float().mean().item()
+
+        # Entropy: how decisive is the selection?
+        eps = 1e-8
+        entropy = -(selection_probs * (selection_probs + eps).log()).sum(dim=-1).mean().item()
+
+        # Top-k accuracy: is heuristic choice in model's top-k?
+        top2_indices = selection_probs.topk(2, dim=-1).indices
+        top2_accuracy = (top2_indices == heuristic_best.unsqueeze(-1)).any(dim=-1).float().mean().item()
+
+        # Window distribution: what's the mean probability mass per window?
+        window_probs = selection_probs.mean(dim=0).cpu().numpy()
+
+        return {
+            'accuracy': accuracy,
+            'entropy': entropy,
+            'top2_accuracy': top2_accuracy,
+            'window_distribution': window_probs.tolist(),
+            'max_prob': selection_probs.max(dim=-1)[0].mean().item(),
+        }
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
-        """Train for one epoch."""
+        """Train for one epoch with optional end-to-end window selection."""
         self.model.train()
+        if self.window_selection_head is not None:
+            self.window_selection_head.train()
+
+        # Anneal Gumbel-Softmax temperature
+        if self.use_end_to_end:
+            self._anneal_temperature(epoch)
+
         epoch_losses = []
+        epoch_window_metrics = []
 
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}')
-        for batch_idx, (features, labels) in enumerate(pbar):
-            features = features.to(self.device)
-            labels = {k: v.to(self.device) for k, v in labels.items()}
+        for batch_idx, batch_data in enumerate(pbar):
+            # Handle both standard and end-to-end data formats
+            if self.use_end_to_end and isinstance(batch_data, tuple) and len(batch_data) == 3:
+                # End-to-end format: (per_window_features, labels, metadata)
+                per_window_features, labels, metadata = batch_data
+                per_window_features = per_window_features.to(self.device)
+                labels = {k: v.to(self.device) for k, v in labels.items()}
 
-            self.optimizer.zero_grad()
+                # Get window validity mask and heuristic best window
+                window_valid = metadata.get('window_valid')
+                if window_valid is not None:
+                    window_valid = window_valid.to(self.device)
+                heuristic_best_window = labels.get('best_window')
+                if heuristic_best_window is not None:
+                    heuristic_best_window = heuristic_best_window.to(self.device)
 
-            # Forward pass with mixed precision
-            if self.scaler:
-                with torch.amp.autocast(device_type='cuda'):
+                # Initialize window selection head on first batch
+                self._init_window_selection_head(per_window_features)
+
+                self.optimizer.zero_grad()
+
+                # Forward pass with mixed precision
+                if self.scaler:
+                    with torch.amp.autocast(device_type='cuda'):
+                        # Window selection: select features via learned soft attention
+                        selected_features, selection_probs = self.window_selection_head(
+                            per_window_features,
+                            window_valid=window_valid,
+                            temperature=self.gumbel_temperature
+                        )
+
+                        # Model forward on selected features
+                        predictions = self.model(selected_features)
+
+                        # Compute loss including window selection terms
+                        loss, loss_components = self.compute_loss(
+                            predictions, labels,
+                            window_selection_probs=selection_probs,
+                            heuristic_best_window=heuristic_best_window
+                        )
+
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+
+                    # Clip gradients for both model and window selection head
+                    all_params = list(self.model.parameters())
+                    if self.window_selection_head is not None:
+                        all_params += list(self.window_selection_head.parameters())
+                    torch.nn.utils.clip_grad_norm_(all_params, self.grad_clip)
+
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # Window selection: select features via learned soft attention
+                    selected_features, selection_probs = self.window_selection_head(
+                        per_window_features,
+                        window_valid=window_valid,
+                        temperature=self.gumbel_temperature
+                    )
+
+                    # Model forward on selected features
+                    predictions = self.model(selected_features)
+
+                    # Compute loss including window selection terms
+                    loss, loss_components = self.compute_loss(
+                        predictions, labels,
+                        window_selection_probs=selection_probs,
+                        heuristic_best_window=heuristic_best_window
+                    )
+
+                    loss.backward()
+
+                    # Clip gradients for both model and window selection head
+                    all_params = list(self.model.parameters())
+                    if self.window_selection_head is not None:
+                        all_params += list(self.window_selection_head.parameters())
+                    torch.nn.utils.clip_grad_norm_(all_params, self.grad_clip)
+
+                    self.optimizer.step()
+
+                # Track window selection metrics
+                if heuristic_best_window is not None:
+                    with torch.no_grad():
+                        ws_metrics = self._compute_window_selection_metrics(
+                            selection_probs, heuristic_best_window
+                        )
+                        epoch_window_metrics.append(ws_metrics)
+
+            else:
+                # Standard format: (features, labels)
+                features, labels = batch_data
+                features = features.to(self.device)
+                labels = {k: v.to(self.device) for k, v in labels.items()}
+
+                self.optimizer.zero_grad()
+
+                # Forward pass with mixed precision
+                if self.scaler:
+                    with torch.amp.autocast(device_type='cuda'):
+                        predictions = self.model(features)
+                        loss, loss_components = self.compute_loss(predictions, labels)
+
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
                     predictions = self.model(features)
                     loss, loss_components = self.compute_loss(predictions, labels)
 
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                predictions = self.model(features)
-                loss, loss_components = self.compute_loss(predictions, labels)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.optimizer.step()
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.optimizer.step()
-
-            self.scheduler.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
             epoch_losses.append(loss_components)
 
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+            # Update progress bar
+            postfix = {'loss': f"{loss.item():.4f}"}
+            if self.use_end_to_end and 'selection_accuracy' in loss_components:
+                postfix['sel_acc'] = f"{loss_components['selection_accuracy']:.2f}"
+            pbar.set_postfix(postfix)
 
-        # Average losses
-        avg_losses = {
-            k: sum(d[k] for d in epoch_losses) / len(epoch_losses)
-            for k in epoch_losses[0].keys()
-        }
+        # Average losses (handle varying keys across batches)
+        all_keys = set()
+        for d in epoch_losses:
+            all_keys.update(d.keys())
+
+        avg_losses = {}
+        for k in all_keys:
+            values = [d.get(k, 0.0) for d in epoch_losses if k in d]
+            if values:
+                avg_losses[k] = sum(values) / len(values)
+
+        # Add window selection metrics summary
+        if epoch_window_metrics:
+            avg_losses['ws_accuracy'] = np.mean([m['accuracy'] for m in epoch_window_metrics])
+            avg_losses['ws_entropy'] = np.mean([m['entropy'] for m in epoch_window_metrics])
+            avg_losses['ws_top2_accuracy'] = np.mean([m['top2_accuracy'] for m in epoch_window_metrics])
+            avg_losses['ws_max_prob'] = np.mean([m['max_prob'] for m in epoch_window_metrics])
+
+            # Store for later analysis
+            self.window_selection_metrics['selection_accuracy'].append(avg_losses['ws_accuracy'])
+            self.window_selection_metrics['selection_entropy'].append(avg_losses['ws_entropy'])
 
         return avg_losses
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
-        """Run validation."""
+        """Run validation with optional end-to-end window selection."""
         if self.val_loader is None:
             return {}
 
         self.model.eval()
+        if self.window_selection_head is not None:
+            self.window_selection_head.eval()
+
         val_losses = []
         all_predictions = []
         all_labels = []
+        val_window_metrics = []
 
-        for features, labels in self.val_loader:
-            features = features.to(self.device)
-            labels = {k: v.to(self.device) for k, v in labels.items()}
+        for batch_data in self.val_loader:
+            # Handle both standard and end-to-end data formats
+            if self.use_end_to_end and isinstance(batch_data, tuple) and len(batch_data) == 3:
+                # End-to-end format: (per_window_features, labels, metadata)
+                per_window_features, labels, metadata = batch_data
+                per_window_features = per_window_features.to(self.device)
+                labels = {k: v.to(self.device) for k, v in labels.items()}
 
-            predictions = self.model(features)
-            loss, loss_components = self.compute_loss(predictions, labels)
+                # Get window validity mask and heuristic best window
+                window_valid = metadata.get('window_valid')
+                if window_valid is not None:
+                    window_valid = window_valid.to(self.device)
+                heuristic_best_window = labels.get('best_window')
+                if heuristic_best_window is not None:
+                    heuristic_best_window = heuristic_best_window.to(self.device)
+
+                # Use hard selection for validation (argmax instead of soft)
+                if self.window_selection_head is not None:
+                    selected_features, selected_indices = self.window_selection_head.get_hard_selection(
+                        per_window_features, window_valid
+                    )
+                    # Also get soft probs for metrics
+                    _, selection_probs = self.window_selection_head(
+                        per_window_features, window_valid, temperature=1.0, hard=True
+                    )
+                else:
+                    # Fallback: use first window
+                    selected_features = per_window_features[:, 0, :]
+                    selection_probs = None
+
+                predictions = self.model(selected_features)
+                loss, loss_components = self.compute_loss(
+                    predictions, labels,
+                    window_selection_probs=selection_probs,
+                    heuristic_best_window=heuristic_best_window
+                )
+
+                # Track window selection metrics
+                if selection_probs is not None and heuristic_best_window is not None:
+                    ws_metrics = self._compute_window_selection_metrics(
+                        selection_probs, heuristic_best_window
+                    )
+                    val_window_metrics.append(ws_metrics)
+
+            else:
+                # Standard format: (features, labels)
+                features, labels = batch_data
+                features = features.to(self.device)
+                labels = {k: v.to(self.device) for k, v in labels.items()}
+
+                predictions = self.model(features)
+                loss, loss_components = self.compute_loss(predictions, labels)
+
             val_losses.append(loss_components)
-
             all_predictions.append({k: v.cpu() for k, v in predictions.items()})
             all_labels.append({k: v.cpu() for k, v in labels.items()})
 
-        # Average losses
-        avg_losses = {
-            f'val_{k}': sum(d[k] for d in val_losses) / len(val_losses)
-            for k in val_losses[0].keys()
-        }
+        # Average losses (handle varying keys)
+        all_keys = set()
+        for d in val_losses:
+            all_keys.update(d.keys())
 
-        # Compute metrics
+        avg_losses = {}
+        for k in all_keys:
+            values = [d.get(k, 0.0) for d in val_losses if k in d]
+            if values:
+                avg_losses[f'val_{k}'] = sum(values) / len(values)
+
+        # Compute standard metrics
         metrics = compute_metrics(all_predictions, all_labels)
         avg_losses.update({f'val_{k}': v for k, v in metrics.items()})
+
+        # Add window selection metrics for validation
+        if val_window_metrics:
+            avg_losses['val_ws_accuracy'] = np.mean([m['accuracy'] for m in val_window_metrics])
+            avg_losses['val_ws_entropy'] = np.mean([m['entropy'] for m in val_window_metrics])
+            avg_losses['val_ws_top2_accuracy'] = np.mean([m['top2_accuracy'] for m in val_window_metrics])
+            avg_losses['val_ws_max_prob'] = np.mean([m['max_prob'] for m in val_window_metrics])
 
         return avg_losses
 
@@ -334,7 +914,7 @@ class Trainer:
             logger.warning("Continuing with training anyway...")
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save model checkpoint."""
+        """Save model checkpoint including window selection head if present."""
         if self.checkpoint_dir is None:
             return
 
@@ -342,7 +922,7 @@ class Trainer:
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'best_val_loss': self.best_val_loss,
             'metrics': self.metrics_tracker.get_history(),
             'feature_names': self.feature_names,
@@ -351,7 +931,27 @@ class Trainer:
                 'total_features': len(self.feature_names) if self.feature_names else TOTAL_FEATURES,
                 'timeframes': TIMEFRAMES,
             },
+            # Training config for reproducibility
+            'training_config': {
+                'use_end_to_end_loss': self.config.use_end_to_end_loss,
+                'use_window_selection_loss': self.config.use_window_selection_loss,
+                'window_selection_weight': self.config.window_selection_weight,
+                'strategy': self.config.strategy,
+                'entropy_weight': self.config.entropy_weight,
+                'consistency_weight': self.config.consistency_weight,
+                'gumbel_temperature': self.gumbel_temperature,
+                'duration_loss_type': self.config.duration_loss_type,
+                'direction_loss_type': self.config.direction_loss_type,
+            },
         }
+
+        # Save window selection head if present
+        if self.window_selection_head is not None:
+            checkpoint['window_selection_head_state_dict'] = self.window_selection_head.state_dict()
+
+        # Save window selection metrics history
+        if self.window_selection_metrics['selection_accuracy']:
+            checkpoint['window_selection_metrics'] = self.window_selection_metrics
 
         # Save latest
         torch.save(checkpoint, self.checkpoint_dir / 'latest.pt')
@@ -361,16 +961,66 @@ class Trainer:
             torch.save(checkpoint, self.checkpoint_dir / 'best.pt')
             logger.info(f"Saved best model at epoch {epoch}")
 
+    def load_checkpoint(self, checkpoint_path: Path) -> None:
+        """
+        Load model checkpoint including window selection head if present.
+
+        Args:
+            checkpoint_path: Path to checkpoint file
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Load window selection head if present
+        if 'window_selection_head_state_dict' in checkpoint and self.window_selection_head is not None:
+            self.window_selection_head.load_state_dict(checkpoint['window_selection_head_state_dict'])
+            logger.info("Loaded window selection head state")
+
+        # Load optimizer state
+        if 'optimizer_state_dict' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        # Load scheduler state
+        if 'scheduler_state_dict' in checkpoint and self.scheduler is not None and checkpoint['scheduler_state_dict'] is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        # Load training state
+        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        self.feature_names = checkpoint.get('feature_names')
+        self.correlation_info = checkpoint.get('correlation_info')
+
+        # Load window selection metrics
+        if 'window_selection_metrics' in checkpoint:
+            self.window_selection_metrics = checkpoint['window_selection_metrics']
+
+        logger.info(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+
     def train(self) -> Dict[str, List[float]]:
         """
-        Full training loop.
+        Full training loop with optional end-to-end window selection.
 
         Returns:
-            Training history
+            Training history including window selection metrics if enabled
         """
         logger.info(f"Starting training for {self.max_epochs} epochs")
         logger.info(f"Device: {self.device}")
         logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+
+        # Log end-to-end mode settings
+        if self.use_end_to_end:
+            logger.info("=" * 60)
+            logger.info("END-TO-END WINDOW SELECTION MODE (Phase 2b)")
+            logger.info("=" * 60)
+            logger.info(f"  Strategy: {self.config.strategy}")
+            logger.info(f"  Window selection weight: {self.config.window_selection_weight}")
+            logger.info(f"  Entropy weight: {self.config.entropy_weight}")
+            logger.info(f"  Consistency weight: {self.config.consistency_weight}")
+            logger.info(f"  Gumbel temperature: {self.config.gumbel_temperature} -> {self.config.gumbel_temperature_min}")
+            logger.info("=" * 60)
+        elif self.use_window_selection_loss:
+            logger.info("Window selection auxiliary loss enabled (Phase 2a)")
+            logger.info(f"  Weight: {self.config.window_selection_weight}")
 
         # Extract feature metadata from dataset
         if hasattr(self.train_loader.dataset, 'feature_names'):
@@ -393,11 +1043,26 @@ class Trainer:
             val_losses = self.validate()
             self.metrics_tracker.update('val', val_losses)
 
-            # Log
+            # Build log message
             log_msg = f"Epoch {epoch}: train_loss={train_losses['total']:.4f}"
             if val_losses:
                 log_msg += f", val_loss={val_losses.get('val_total', 0):.4f}"
+
+            # Add window selection metrics to log
+            if self.use_end_to_end:
+                if 'ws_accuracy' in train_losses:
+                    log_msg += f", ws_acc={train_losses['ws_accuracy']:.3f}"
+                if 'val_ws_accuracy' in val_losses:
+                    log_msg += f", val_ws_acc={val_losses['val_ws_accuracy']:.3f}"
+                log_msg += f", temp={self.gumbel_temperature:.3f}"
+
             logger.info(log_msg)
+
+            # Log detailed window selection info periodically
+            if self.use_end_to_end and epoch % 10 == 0:
+                if 'ws_entropy' in train_losses:
+                    logger.info(f"  Window selection - entropy: {train_losses['ws_entropy']:.3f}, "
+                              f"max_prob: {train_losses.get('ws_max_prob', 0):.3f}")
 
             # Check for improvement
             val_loss = val_losses.get('val_total', float('inf'))
@@ -415,5 +1080,17 @@ class Trainer:
             if self.epochs_without_improvement >= self.early_stopping_patience:
                 logger.info(f"Early stopping at epoch {epoch}")
                 break
+
+        # Log final window selection statistics
+        if self.use_end_to_end and self.window_selection_metrics['selection_accuracy']:
+            logger.info("=" * 60)
+            logger.info("WINDOW SELECTION TRAINING SUMMARY")
+            logger.info("=" * 60)
+            final_acc = self.window_selection_metrics['selection_accuracy'][-1]
+            best_acc = max(self.window_selection_metrics['selection_accuracy'])
+            logger.info(f"  Final selection accuracy: {final_acc:.3f}")
+            logger.info(f"  Best selection accuracy: {best_acc:.3f}")
+            logger.info(f"  Final entropy: {self.window_selection_metrics['selection_entropy'][-1]:.3f}")
+            logger.info("=" * 60)
 
         return self.metrics_tracker.get_history()
