@@ -140,7 +140,7 @@ def _detect_tf_window_worker(args):
               df_values, df_index, df_columns)
 
     Returns:
-        Tuple of (tf, window, detected_channels)
+        Tuple of (tf, window, detected_channels, failed_positions)
     """
     tf, window, step, min_cycles, min_gap_bars, df_values, df_index, df_columns = args
 
@@ -148,9 +148,10 @@ def _detect_tf_window_worker(args):
     df_tf = pd.DataFrame(df_values, index=pd.DatetimeIndex(df_index), columns=df_columns)
 
     detected_channels = []
+    failed_positions = []
 
     if len(df_tf) < window:
-        return (tf, window, detected_channels)
+        return (tf, window, detected_channels, failed_positions)
 
     # Scan through the dataset
     scan_positions = list(range(window - 1, len(df_tf), step))
@@ -187,11 +188,13 @@ def _detect_tf_window_worker(args):
 
                 # Update last channel end to prevent overlapping
                 last_channel_end = end_idx
-        except Exception:
-            # Channel detection failed - skip this position
-            pass
+        except Exception as e:
+            # Channel detection failed - log warning and track failed position
+            print(f"[WARNING] Channel detection failed: tf={tf}, window={window}, "
+                  f"start_idx={start_idx}, end_idx={end_idx}, error={e}")
+            failed_positions.append((start_idx, end_idx, str(e)))
 
-    return (tf, window, detected_channels)
+    return (tf, window, detected_channels, failed_positions)
 
 
 def detect_all_channels(
@@ -241,7 +244,8 @@ def detect_all_channels(
         else:
             try:
                 resampled_dfs[tf] = resample_ohlc(df, tf)
-            except Exception:
+            except Exception as e:
+                print(f"[WARNING] Failed to resample timeframe '{tf}': {e}")
                 resampled_dfs[tf] = None
 
     # Calculate total work estimate for verbose logging
@@ -261,7 +265,8 @@ def detect_all_channels(
             estimated_positions_per_tf[tf] = 0
 
     # Determine number of workers
-    num_workers = workers if workers is not None else max(1, min(cpu_count() - 1, 8))
+    cpus = cpu_count() or 8  # cpu_count() can return None on some systems
+    num_workers = workers if workers is not None else max(1, min(cpus - 1, 8))
 
     if verbose:
         print(f"[PASS 1] Starting channel detection (PARALLEL with {num_workers} workers):")
@@ -308,22 +313,28 @@ def detect_all_channels(
 
         # Collect results into channel_map
         total_channels_found = 0
-        for tf, window, detected_channels in results:
+        total_failed_positions = 0
+        for tf, window, detected_channels, failed_positions in results:
             channel_map[(tf, window)] = detected_channels
             num_channels = len(detected_channels)
             total_channels_found += num_channels
+            total_failed_positions += len(failed_positions)
             if verbose:
-                print(f"  TF={tf}, Window={window}: found {num_channels} channels")
+                fail_info = f" ({len(failed_positions)} failed)" if failed_positions else ""
+                print(f"  TF={tf}, Window={window}: found {num_channels} channels{fail_info}")
 
             # Progress callback (approximate since parallel)
             if progress_callback:
                 progress_callback(tf, window, 1.0)
     else:
         total_channels_found = 0
+        total_failed_positions = 0
 
     if verbose:
         print()
         print(f"[PASS 1] Complete: Found {total_channels_found} total channels across all TF/window combinations")
+        if total_failed_positions > 0:
+            print(f"         Total failed positions: {total_failed_positions}")
 
     return channel_map
 
