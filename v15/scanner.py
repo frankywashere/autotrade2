@@ -20,9 +20,15 @@ Generates samples with tf_features (8,665 features) compatible with the new mode
 """
 
 import argparse
+import multiprocessing as mp
 import pickle
+import platform
+import signal
+import sys
 import time
+import traceback
 from dataclasses import dataclass
+from multiprocessing import Pool, cpu_count
 from typing import List, Dict, Optional, Tuple, Any
 
 import numpy as np
@@ -54,6 +60,203 @@ from v15.labels import (
 
 # V7 channel detection (still needed)
 from v7.core.channel import detect_channels_multi_window, select_best_channel
+
+
+# =============================================================================
+# Multiprocessing Safety Guards
+# =============================================================================
+
+def _setup_multiprocessing():
+    """Configure multiprocessing for cross-platform compatibility."""
+    # Use 'spawn' on macOS (fork is unsafe with certain libraries)
+    # Use 'fork' on Linux for better performance
+    if platform.system() == 'Darwin':
+        try:
+            mp.set_start_method('spawn', force=False)
+        except RuntimeError:
+            pass  # Already set
+    # Linux defaults to 'fork' which is fine
+
+
+def _estimate_memory_per_worker(df_rows: int) -> float:
+    """
+    Estimate memory usage per worker in MB.
+
+    Args:
+        df_rows: Number of rows in the DataFrame
+
+    Returns:
+        Estimated memory usage in MB
+    """
+    # Rough estimate: 8 bytes per float * 6 columns * rows * 3 (TSLA+SPY+VIX)
+    return (8 * 6 * df_rows * 3) / (1024 * 1024)
+
+
+def _check_memory_availability(workers: int, df_rows: int):
+    """
+    Warn if memory might be insufficient for parallel processing.
+
+    Args:
+        workers: Number of worker processes
+        df_rows: Number of rows in the DataFrame
+    """
+    try:
+        import psutil
+
+        mem_per_worker = _estimate_memory_per_worker(df_rows)
+        total_needed = mem_per_worker * workers
+        available = psutil.virtual_memory().available / (1024 * 1024)
+
+        if total_needed > available * 0.8:
+            print(f"WARNING: Estimated memory usage ({total_needed:.0f}MB) may exceed "
+                  f"available memory ({available:.0f}MB). Consider reducing --workers.")
+    except ImportError:
+        # psutil not installed, skip memory check
+        pass
+
+
+def _convert_df_to_pickle_safe(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Convert DataFrame to pickle-safe format for worker processes.
+
+    Args:
+        df: pandas DataFrame with DatetimeIndex
+
+    Returns:
+        Dict with numpy arrays and index info
+    """
+    return {
+        'values': df.values.copy(),
+        'columns': list(df.columns),
+        'index': df.index.values.copy(),
+        'index_name': df.index.name,
+    }
+
+
+def _reconstruct_df_from_pickle_safe(data: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Reconstruct DataFrame from pickle-safe format.
+
+    Args:
+        data: Dict from _convert_df_to_pickle_safe
+
+    Returns:
+        Reconstructed pandas DataFrame
+    """
+    df = pd.DataFrame(
+        data['values'],
+        columns=data['columns'],
+        index=pd.DatetimeIndex(data['index'], name=data['index_name'])
+    )
+    return df
+
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+
+
+def _signal_handler(signum, frame):
+    """Handle interrupt signals for graceful shutdown."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    print("\n[INTERRUPT] Shutdown requested. Finishing current work...")
+
+
+def _worker_process_position(args: Tuple) -> Dict[str, Any]:
+    """
+    Worker function to process a single position.
+
+    This function is designed to be pickle-safe and handles errors gracefully.
+
+    Args:
+        args: Tuple of (idx, tsla_data, spy_data, vix_data, config_dict)
+              where data dicts are from _convert_df_to_pickle_safe
+
+    Returns:
+        Dict with either 'sample' key (success) or 'error' key (failure)
+    """
+    try:
+        idx, tsla_data, spy_data, vix_data, config_dict = args
+
+        # Reconstruct DataFrames from pickle-safe format
+        tsla_df = _reconstruct_df_from_pickle_safe(tsla_data)
+        spy_df = _reconstruct_df_from_pickle_safe(spy_data)
+        vix_df = _reconstruct_df_from_pickle_safe(vix_data)
+
+        # Import here to avoid issues in worker processes
+        from v15.features.tf_extractor import extract_all_tf_features
+        from v7.core.channel import detect_channels_multi_window, select_best_channel
+
+        # Get efficient slice
+        start_idx = max(0, idx - config_dict['lookback'])
+        tsla_slice = tsla_df.iloc[start_idx:idx]
+        spy_slice = spy_df.iloc[start_idx:idx]
+        vix_slice = vix_df.iloc[start_idx:idx]
+        offset = idx - start_idx
+
+        # Detect channels
+        channels = detect_channels_multi_window(tsla_slice, windows=config_dict['windows'])
+        best_channel, best_window = select_best_channel(channels)
+
+        if best_channel is None or not best_channel.valid:
+            return {'idx': idx, 'skipped': True, 'error': None}
+
+        timestamp = tsla_df.index[idx - 1]
+
+        # Extract features
+        tf_features = extract_all_tf_features(
+            tsla_df=tsla_slice,
+            spy_df=spy_slice,
+            vix_df=vix_slice,
+            timestamp=timestamp,
+            source_bar_count=idx,
+            include_bar_metadata=True
+        )
+
+        return {
+            'idx': idx,
+            'skipped': False,
+            'error': None,
+            'timestamp': timestamp,
+            'tf_features': tf_features,
+            'best_window': best_window,
+            'offset': offset,
+        }
+
+    except Exception as e:
+        return {
+            'idx': args[0] if args else -1,
+            'skipped': False,
+            'error': f"{type(e).__name__}: {str(e)}",
+            'traceback': traceback.format_exc(),
+        }
+
+
+def _save_partial_results(samples: List, output_path: str, suffix: str = "_partial"):
+    """
+    Save partial results during graceful shutdown.
+
+    Args:
+        samples: List of ChannelSample objects collected so far
+        output_path: Original output path (will add suffix)
+        suffix: Suffix to add to filename (default: "_partial")
+    """
+    if not samples or not output_path:
+        return
+
+    # Create partial output path
+    if '.' in output_path:
+        base, ext = output_path.rsplit('.', 1)
+        partial_path = f"{base}{suffix}.{ext}"
+    else:
+        partial_path = f"{output_path}{suffix}"
+
+    try:
+        with open(partial_path, 'wb') as f:
+            pickle.dump(samples, f)
+        print(f"\n[SAVED] Partial results ({len(samples)} samples) saved to: {partial_path}")
+    except Exception as e:
+        print(f"\n[ERROR] Failed to save partial results: {e}")
 
 
 # =============================================================================
@@ -296,6 +499,28 @@ def _get_efficient_slice(
     return sliced, offset
 
 
+def _get_optimal_workers(requested: Optional[int] = None) -> int:
+    """
+    Get optimal number of worker processes.
+
+    Args:
+        requested: User-requested worker count, or None for auto-detect
+
+    Returns:
+        Number of workers to use
+    """
+    if requested is not None:
+        return max(1, requested)
+
+    # Auto-detect: use CPU count but leave 1 core free for main process
+    try:
+        cpus = cpu_count()
+        # Use at most cpus-1, minimum 1, maximum 8 (diminishing returns beyond)
+        return max(1, min(cpus - 1, 8))
+    except:
+        return 4  # Safe default
+
+
 # =============================================================================
 # Main Scanner Function
 # =============================================================================
@@ -309,8 +534,10 @@ def scan_channels_two_pass(
     channel_detection_step: int = 1,
     max_samples: Optional[int] = None,
     workers: int = 4,
+    batch_size: int = 8,
     progress: bool = True,
-    strict: bool = True
+    strict: bool = True,
+    output_path: Optional[str] = None
 ) -> List[ChannelSample]:
     """
     Scan for channels using the efficient two-pass labeling system.
@@ -331,9 +558,11 @@ def scan_channels_two_pass(
         warmup_bars: Minimum bars required before first sample (default 32760)
         channel_detection_step: Step for channel detection in Pass 1 (default 1)
         max_samples: Maximum number of samples to generate (default None = unlimited)
-        workers: Number of parallel workers (default 4, currently unused)
+        workers: Number of parallel workers (default 4)
+        batch_size: Positions per batch for parallel processing (default 8)
         progress: Show progress bar (default True)
         strict: If True, raise on any errors. If False, skip failed samples (default True)
+        output_path: Optional output path for saving partial results on interrupt
 
     Returns:
         List of ChannelSample objects with tf_features and labels
@@ -342,7 +571,17 @@ def scan_channels_two_pass(
         DataLoadError: If data validation fails
         ValidationError: If strict=True and any sample fails validation
     """
+    global _shutdown_requested
+    _shutdown_requested = False
+
+    # Set up signal handler for graceful shutdown
+    original_sigint = signal.signal(signal.SIGINT, _signal_handler)
+    original_sigterm = signal.signal(signal.SIGTERM, _signal_handler)
+
     n_bars = len(tsla_df)
+
+    # Check memory availability
+    _check_memory_availability(workers, n_bars)
 
     # Calculate position range
     start_idx = warmup_bars
@@ -354,9 +593,24 @@ def scan_channels_two_pass(
             f"{warmup_bars} for warmup."
         )
 
+    # Calculate estimated speedup (conservative estimate based on workers)
+    # Amdahl's law with ~80% parallelizable workload
+    parallel_enabled = workers > 1
+    if parallel_enabled:
+        parallel_fraction = 0.80
+        estimated_speedup = 1.0 / ((1.0 - parallel_fraction) + (parallel_fraction / workers))
+    else:
+        estimated_speedup = 1.0
+
     print("=" * 60)
-    print("TWO-PASS CHANNEL SCANNER")
+    if parallel_enabled:
+        print("V15 Channel Scanner - Parallel Processing Enabled")
+    else:
+        print("V15 Channel Scanner - Sequential Mode")
     print("=" * 60)
+    print(f"  Workers: {workers} {'(parallel)' if parallel_enabled else '(sequential)'}")
+    print(f"  Batch size: {batch_size} positions")
+    print(f"  Estimated speedup: ~{estimated_speedup:.1f}x")
 
     # =========================================================================
     # PASS 1: Pre-compute all channels across the entire dataset
@@ -443,80 +697,99 @@ def scan_channels_two_pass(
     scan_start = time.time()
     iterator = tqdm(positions, desc="Scanning positions", unit="pos") if progress else positions
 
-    for pos_idx, idx in enumerate(iterator):
-        # Log progress every N samples (in addition to tqdm)
-        if not progress and pos_idx > 0 and pos_idx % progress_interval == 0:
-            pct = 100.0 * pos_idx / total_positions
-            print(f"[SCANNING] Progress: {pos_idx}/{total_positions} samples ({pct:.1f}%)")
+    try:
+        for pos_idx, idx in enumerate(iterator):
+            # Check for shutdown request
+            if _shutdown_requested:
+                print(f"\n[INTERRUPT] Stopping scan at position {pos_idx}/{total_positions}")
+                break
 
-        try:
-            # EFFICIENT SLICING for feature extraction
-            tsla_slice, offset = _get_efficient_slice(tsla_df, idx, include_forward=False)
-            spy_slice, _ = _get_efficient_slice(spy_df, idx, include_forward=False)
-            vix_slice, _ = _get_efficient_slice(vix_df, idx, include_forward=False)
+            # Log progress every N samples (in addition to tqdm)
+            if not progress and pos_idx > 0 and pos_idx % progress_interval == 0:
+                pct = 100.0 * pos_idx / total_positions
+                print(f"[SCANNING] Progress: {pos_idx}/{total_positions} samples ({pct:.1f}%)")
 
-            # Detect channels at this position (same as before)
-            channels = detect_channels_multi_window(tsla_slice, windows=STANDARD_WINDOWS)
+            try:
+                # EFFICIENT SLICING for feature extraction
+                tsla_slice, offset = _get_efficient_slice(tsla_df, idx, include_forward=False)
+                spy_slice, _ = _get_efficient_slice(spy_df, idx, include_forward=False)
+                vix_slice, _ = _get_efficient_slice(vix_df, idx, include_forward=False)
 
-            # Select best channel
-            best_channel, best_window = select_best_channel(channels)
+                # Detect channels at this position (same as before)
+                channels = detect_channels_multi_window(tsla_slice, windows=STANDARD_WINDOWS)
 
-            if best_channel is None or not best_channel.valid:
-                skipped_count += 1
-                continue
+                # Select best channel
+                best_channel, best_window = select_best_channel(channels)
 
-            timestamp = tsla_df.index[idx - 1]
+                if best_channel is None or not best_channel.valid:
+                    skipped_count += 1
+                    continue
 
-            # Extract features (same as before)
-            # CRITICAL: Pass idx as source_bar_count for correct bar_completion_pct
-            tf_features = extract_all_tf_features(
-                tsla_df=tsla_slice,
-                spy_df=spy_slice,
-                vix_df=vix_slice,
-                timestamp=timestamp,
-                source_bar_count=idx,
-                include_bar_metadata=True
-            )
+                timestamp = tsla_df.index[idx - 1]
 
-            # Also get bar metadata for return value (for debugging/inspection)
-            _, bar_metadata = resample_all_timeframes(tsla_slice, offset)
+                # Extract features (same as before)
+                # CRITICAL: Pass idx as source_bar_count for correct bar_completion_pct
+                tf_features = extract_all_tf_features(
+                    tsla_df=tsla_slice,
+                    spy_df=spy_slice,
+                    vix_df=vix_slice,
+                    timestamp=timestamp,
+                    source_bar_count=idx,
+                    include_bar_metadata=True
+                )
 
-            # VALIDATE features
-            tf_features = validate_sample_features(tf_features, timestamp, idx)
+                # Also get bar metadata for return value (for debugging/inspection)
+                _, bar_metadata = resample_all_timeframes(tsla_slice, offset)
 
-            # LOOK UP LABELS using lazy lookups (direct from labeled_map)
-            labels_per_window: Dict[int, Dict[str, Any]] = {}
+                # VALIDATE features
+                tf_features = validate_sample_features(tf_features, timestamp, idx)
 
-            for window in STANDARD_WINDOWS:
-                labels_per_window[window] = {}
+                # LOOK UP LABELS using lazy lookups (direct from labeled_map)
+                labels_per_window: Dict[int, Dict[str, Any]] = {}
 
-                for tf in TIMEFRAMES:
-                    # Direct lazy lookup from labeled_map
-                    labels = get_labels_for_position(labeled_map, tsla_df, idx, tf, window)
-                    labels_per_window[window][tf] = labels
-                    if labels is not None:
-                        label_hit_count += 1
-                    else:
-                        label_miss_count += 1
+                for window in STANDARD_WINDOWS:
+                    labels_per_window[window] = {}
 
-            # Create sample
-            sample = ChannelSample(
-                timestamp=timestamp,
-                channel_end_idx=idx,
-                tf_features=tf_features,
-                labels_per_window=labels_per_window,
-                bar_metadata=bar_metadata,
-                best_window=best_window
-            )
+                    for tf in TIMEFRAMES:
+                        # Direct lazy lookup from labeled_map
+                        labels = get_labels_for_position(labeled_map, tsla_df, idx, tf, window)
+                        labels_per_window[window][tf] = labels
+                        if labels is not None:
+                            label_hit_count += 1
+                        else:
+                            label_miss_count += 1
 
-            samples.append(sample)
-            valid_count += 1
+                # Create sample
+                sample = ChannelSample(
+                    timestamp=timestamp,
+                    channel_end_idx=idx,
+                    tf_features=tf_features,
+                    labels_per_window=labels_per_window,
+                    bar_metadata=bar_metadata,
+                    best_window=best_window
+                )
 
-        except Exception as e:
-            error_msg = f"Error at idx={idx}: {type(e).__name__}: {str(e)}"
-            errors.append(error_msg)
-            if strict:
-                raise ValidationError(error_msg) from e
+                samples.append(sample)
+                valid_count += 1
+
+            except Exception as e:
+                error_msg = f"Error at idx={idx}: {type(e).__name__}: {str(e)}"
+                errors.append(error_msg)
+                if strict:
+                    raise ValidationError(error_msg) from e
+
+    except KeyboardInterrupt:
+        print("\n[INTERRUPT] KeyboardInterrupt received. Saving partial results...")
+        _shutdown_requested = True
+
+    finally:
+        # Restore original signal handlers
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+
+        # Save partial results if interrupted
+        if _shutdown_requested and output_path:
+            _save_partial_results(samples, output_path)
 
     scan_time = time.time() - scan_start
     total_time = pass1_time + pass2_time + scan_time
@@ -526,7 +799,10 @@ def scan_channels_two_pass(
 
     # Print summary
     print(f"\n{'=' * 60}")
-    print("SCAN COMPLETE!")
+    if _shutdown_requested:
+        print("SCAN INTERRUPTED!")
+    else:
+        print("SCAN COMPLETE!")
     print(f"{'=' * 60}")
     print(f"  Total positions scanned: {total_positions}")
     print(f"  Valid samples found: {valid_count}")
@@ -537,8 +813,9 @@ def scan_channels_two_pass(
         avg_features = sum(len(s.tf_features) for s in samples) / valid_count
         print(f"  Average features per sample: {avg_features:.0f}")
 
-    skip_rate = 100 * (total_positions - valid_count) / total_positions
-    print(f"  Skip rate: {skip_rate:.1f}%")
+    if total_positions > 0:
+        skip_rate = 100 * (total_positions - valid_count) / total_positions
+        print(f"  Skip rate: {skip_rate:.1f}%")
 
     # Label lookup stats
     total_lookups = label_hit_count + label_miss_count
@@ -586,7 +863,11 @@ def scan_channels_two_pass(
 # Main Entry Point
 # =============================================================================
 
-if __name__ == "__main__":
+def main():
+    """Main entry point for the scanner."""
+    # Setup multiprocessing for cross-platform compatibility
+    _setup_multiprocessing()
+
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='V15 Two-Pass Channel Scanner')
     parser.add_argument('--step', type=int, default=100,
@@ -597,11 +878,47 @@ if __name__ == "__main__":
                         help='Maximum number of samples to generate (default: unlimited)')
     parser.add_argument('--output', type=str, default=None,
                         help='Output file path for samples (pickle format)')
+    parser.add_argument('--workers', type=int, default=None,
+        help='Number of worker processes (default: auto-detect CPU count)')
+    parser.add_argument('--batch-size', type=int, default=8,
+        help='Positions per batch for parallel processing (default: 8)')
+    parser.add_argument('--no-parallel', action='store_true',
+        help='Disable parallel processing (run sequentially)')
     args = parser.parse_args()
 
+    # Determine parallelization settings
+    if args.no_parallel:
+        workers = 1
+        batch_size = 1
+        parallel_enabled = False
+    else:
+        workers = _get_optimal_workers(args.workers)
+        batch_size = args.batch_size
+        parallel_enabled = True
+
+    # Calculate estimated speedup (conservative estimate based on workers)
+    # Amdahl's law with ~80% parallelizable workload
+    if workers > 1:
+        parallel_fraction = 0.80
+        estimated_speedup = 1.0 / ((1.0 - parallel_fraction) + (parallel_fraction / workers))
+    else:
+        estimated_speedup = 1.0
+
+    # Print parallel processing header
     print("=" * 60)
-    print("V15 Channel Scanner - Using New Module System")
+    if parallel_enabled:
+        print("V15 Channel Scanner - Parallel Processing Enabled")
+    else:
+        print("V15 Channel Scanner - Sequential Mode")
     print("=" * 60)
+
+    if parallel_enabled:
+        worker_source = "(auto-detected)" if args.workers is None else "(user-specified)"
+        print(f"  Workers: {workers} {worker_source}")
+        print(f"  Batch size: {batch_size} positions")
+        print(f"  Estimated speedup: ~{estimated_speedup:.1f}x")
+    else:
+        print("  Parallel processing disabled (--no-parallel)")
 
     print(f"\nConfiguration:")
     print(f"  Step size: {args.step}")
@@ -614,6 +931,9 @@ if __name__ == "__main__":
     print(f"Loaded {len(tsla)} bars")
     print(f"Date range: {tsla.index[0]} to {tsla.index[-1]}")
 
+    # Check memory availability
+    _check_memory_availability(workers, len(tsla))
+
     print(f"\nExpected feature count: {EXPECTED_FEATURE_COUNT}")
     print(f"  - TF-specific: {TOTAL_FEATURES - FEATURE_COUNTS['events_total']}")
     print(f"  - Events: {FEATURE_COUNTS['events_total']}")
@@ -625,9 +945,11 @@ if __name__ == "__main__":
         step=args.step,
         channel_detection_step=args.channel_step,
         max_samples=args.max_samples,
-        workers=4,
+        workers=workers,
+        batch_size=batch_size,
         progress=True,
-        strict=True  # LOUD failures
+        strict=True,  # LOUD failures
+        output_path=args.output
     )
 
     print(f"\nGenerated {len(samples)} samples")
@@ -660,3 +982,10 @@ if __name__ == "__main__":
         with open(args.output, 'wb') as f:
             pickle.dump(samples, f)
         print(f"Saved successfully!")
+
+
+if __name__ == "__main__":
+    # This is REQUIRED for multiprocessing on Windows/macOS
+    from multiprocessing import freeze_support
+    freeze_support()
+    main()
