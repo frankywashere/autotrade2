@@ -224,7 +224,7 @@ def detect_all_channels(
         min_gap_bars: Minimum bars between channel end and next channel start
         progress_callback: Optional callback(tf, window, pct) for progress updates
         verbose: If True, print detailed progress logging
-        workers: Number of parallel workers (defaults to min(cpu_count()-1, 8))
+        workers: Number of parallel workers (defaults to cpu_count()-1, no cap)
 
     Returns:
         ChannelMap: {(tf, window): [DetectedChannel, ...]} sorted by start_idx
@@ -265,8 +265,9 @@ def detect_all_channels(
             estimated_positions_per_tf[tf] = 0
 
     # Determine number of workers
+    # No cap - use workers parameter to limit if needed
     cpus = cpu_count() or 8  # cpu_count() can return None on some systems
-    num_workers = workers if workers is not None else max(1, min(cpus - 1, 8))
+    num_workers = workers if workers is not None else max(1, cpus - 1)
 
     if verbose:
         print(f"[PASS 1] Starting channel detection (PARALLEL with {num_workers} workers):")

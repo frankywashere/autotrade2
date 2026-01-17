@@ -821,8 +821,9 @@ def _get_optimal_workers(requested: Optional[int] = None) -> int:
         cpus = cpu_count()
         if cpus is None:
             cpus = 8  # Safe default when cpu_count() returns None
-        # Use at most cpus-1, minimum 1, maximum 8 (diminishing returns beyond)
-        return max(1, min(cpus - 1, 8))
+        # Use cpus-1 (leave one core for main process), minimum 1
+        # No cap - use --workers flag to limit if needed
+        return max(1, cpus - 1)
     except:
         return 4  # Safe default
 
