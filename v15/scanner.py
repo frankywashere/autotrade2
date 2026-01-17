@@ -939,7 +939,8 @@ def scan_channels_two_pass(
         step=channel_detection_step,
         min_cycles=1,
         min_gap_bars=5,
-        progress_callback=None
+        progress_callback=None,
+        workers=workers  # Pass through CLI --workers flag
     )
     pass1_time = time.time() - pass1_start
 
