@@ -232,6 +232,138 @@ def _worker_process_position(args: Tuple) -> Dict[str, Any]:
         }
 
 
+def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
+    """
+    Worker function to process a batch of positions.
+
+    This function is designed to be pickle-safe and handles errors gracefully.
+    It processes multiple positions in a single call to reduce IPC overhead.
+
+    Args:
+        batch_args: Tuple of (positions_batch, tsla_data, spy_data, vix_data,
+                             labeled_map, timeframes, windows)
+                   where data dicts are from _convert_df_to_pickle_safe
+
+    Returns:
+        List of result dicts, each with 'sample', 'error', or 'skipped' key
+    """
+    try:
+        (positions_batch, tsla_data, spy_data, vix_data,
+         labeled_map, timeframes, windows) = batch_args
+
+        # Reconstruct DataFrames ONCE for the entire batch
+        tsla_df = _reconstruct_df_from_pickle_safe(tsla_data)
+        spy_df = _reconstruct_df_from_pickle_safe(spy_data)
+        vix_df = _reconstruct_df_from_pickle_safe(vix_data)
+
+        # Import here to avoid issues in worker processes
+        from v15.features.tf_extractor import extract_all_tf_features
+        from v15.features.validation import validate_features
+        from v7.core.channel import detect_channels_multi_window, select_best_channel
+        from v15.labels import get_labels_for_position
+        from v15.types import ChannelSample
+
+        results = []
+
+        for idx in positions_batch:
+            try:
+                # Get efficient slice for this position
+                start_idx = max(0, idx - SCANNER_LOOKBACK_5MIN)
+                tsla_slice = tsla_df.iloc[start_idx:idx]
+                spy_slice = spy_df.iloc[start_idx:idx]
+                vix_slice = vix_df.iloc[start_idx:idx]
+                offset = idx - start_idx
+
+                # Detect channels at this position
+                channels = detect_channels_multi_window(tsla_slice, windows=windows)
+                best_channel, best_window = select_best_channel(channels)
+
+                if best_channel is None or not best_channel.valid:
+                    results.append({'idx': idx, 'skipped': True})
+                    continue
+
+                timestamp = tsla_df.index[idx - 1]
+
+                # Extract features
+                tf_features = extract_all_tf_features(
+                    tsla_df=tsla_slice,
+                    spy_df=spy_slice,
+                    vix_df=vix_slice,
+                    timestamp=timestamp,
+                    source_bar_count=idx,
+                    include_bar_metadata=True
+                )
+
+                # Validate features
+                invalid_features = validate_features(tf_features, raise_on_invalid=False)
+                if invalid_features:
+                    results.append({
+                        'idx': idx,
+                        'error': f"Invalid features at idx={idx}: {invalid_features[:5]}"
+                    })
+                    continue
+
+                # Get bar metadata
+                resampled_dfs = {'5min': tsla_slice}
+                bar_metadata = {
+                    '5min': {
+                        'bar_completion_pct': 1.0,
+                        'bars_in_partial': 0,
+                        'total_bars': len(tsla_slice),
+                        'is_partial': False,
+                    }
+                }
+
+                # Look up labels for all windows and timeframes
+                labels_per_window = {}
+                label_hits = 0
+                label_misses = 0
+
+                for window in windows:
+                    labels_per_window[window] = {}
+                    for tf in timeframes:
+                        labels = get_labels_for_position(labeled_map, tsla_df, idx, tf, window)
+                        labels_per_window[window][tf] = labels
+                        if labels is not None:
+                            label_hits += 1
+                        else:
+                            label_misses += 1
+
+                # Create sample
+                sample = ChannelSample(
+                    timestamp=timestamp,
+                    channel_end_idx=idx,
+                    tf_features=tf_features,
+                    labels_per_window=labels_per_window,
+                    bar_metadata=bar_metadata,
+                    best_window=best_window
+                )
+
+                results.append({
+                    'idx': idx,
+                    'sample': sample,
+                    'label_hits': label_hits,
+                    'label_misses': label_misses,
+                })
+
+            except Exception as e:
+                results.append({
+                    'idx': idx,
+                    'error': f"{type(e).__name__}: {str(e)}",
+                    'traceback': traceback.format_exc(),
+                })
+
+        return results
+
+    except Exception as e:
+        # If batch-level error, return error for all positions
+        return [{
+            'idx': -1,
+            'error': f"Batch error: {type(e).__name__}: {str(e)}",
+            'traceback': traceback.format_exc(),
+        }]
+
+
 def _save_partial_results(samples: List, output_path: str, suffix: str = "_partial"):
     """
     Save partial results during graceful shutdown.
@@ -683,6 +815,9 @@ def scan_channels_two_pass(
     print(f"  Step size: {step}")
     print(f"  Position range: {start_idx} to {end_idx}")
     print(f"  Expected features per sample: {EXPECTED_FEATURE_COUNT}")
+    print(f"  Processing mode: {'PARALLEL' if workers > 1 else 'SEQUENTIAL'}")
+    if workers > 1:
+        print(f"  Workers: {workers}, Batch size: {batch_size}")
 
     samples = []
     errors = []
@@ -691,92 +826,98 @@ def scan_channels_two_pass(
     label_hit_count = 0
     label_miss_count = 0
 
-    # Progress logging interval (every N samples)
-    progress_interval = max(100, total_positions // 50)  # At least every 100, or ~50 updates total
-
     scan_start = time.time()
-    iterator = tqdm(positions, desc="Scanning positions", unit="pos") if progress else positions
 
     try:
-        for pos_idx, idx in enumerate(iterator):
-            # Check for shutdown request
-            if _shutdown_requested:
-                print(f"\n[INTERRUPT] Stopping scan at position {pos_idx}/{total_positions}")
-                break
+        # Convert DataFrames to pickle-safe format ONCE before processing
+        tsla_data = _convert_df_to_pickle_safe(tsla_df)
+        spy_data = _convert_df_to_pickle_safe(spy_df)
+        vix_data = _convert_df_to_pickle_safe(vix_df)
 
-            # Log progress every N samples (in addition to tqdm)
-            if not progress and pos_idx > 0 and pos_idx % progress_interval == 0:
-                pct = 100.0 * pos_idx / total_positions
-                print(f"[SCANNING] Progress: {pos_idx}/{total_positions} samples ({pct:.1f}%)")
+        # Create batches of positions
+        batch_size_actual = batch_size or 8
+        batches = [positions[i:i+batch_size_actual] for i in range(0, len(positions), batch_size_actual)]
 
-            try:
-                # EFFICIENT SLICING for feature extraction
-                tsla_slice, offset = _get_efficient_slice(tsla_df, idx, include_forward=False)
-                spy_slice, _ = _get_efficient_slice(spy_df, idx, include_forward=False)
-                vix_slice, _ = _get_efficient_slice(vix_df, idx, include_forward=False)
+        # Prepare args for each batch
+        batch_args = [
+            (batch, tsla_data, spy_data, vix_data, labeled_map,
+             list(TIMEFRAMES), list(STANDARD_WINDOWS))
+            for batch in batches
+        ]
 
-                # Detect channels at this position (same as before)
-                channels = detect_channels_multi_window(tsla_slice, windows=STANDARD_WINDOWS)
+        total_batches = len(batches)
+        print(f"  Total batches: {total_batches}")
 
-                # Select best channel
-                best_channel, best_window = select_best_channel(channels)
+        if workers > 1:
+            # =========================================================================
+            # PARALLEL PROCESSING with Pool
+            # =========================================================================
+            print(f"\n  Starting parallel processing with {workers} workers...")
 
-                if best_channel is None or not best_channel.valid:
-                    skipped_count += 1
-                    continue
+            with Pool(processes=workers) as pool:
+                # Use imap_unordered for better performance (order doesn't matter, we sort later)
+                results_iter = pool.imap_unordered(_process_position_batch, batch_args)
 
-                timestamp = tsla_df.index[idx - 1]
+                # Process results as they come in
+                batch_iterator = tqdm(results_iter, total=total_batches,
+                                     desc="Processing batches", unit="batch") if progress else results_iter
 
-                # Extract features (same as before)
-                # CRITICAL: Pass idx as source_bar_count for correct bar_completion_pct
-                tf_features = extract_all_tf_features(
-                    tsla_df=tsla_slice,
-                    spy_df=spy_slice,
-                    vix_df=vix_slice,
-                    timestamp=timestamp,
-                    source_bar_count=idx,
-                    include_bar_metadata=True
-                )
+                batches_processed = 0
+                for batch_results in batch_iterator:
+                    # Check for shutdown request
+                    if _shutdown_requested:
+                        print(f"\n[INTERRUPT] Stopping at batch {batches_processed}/{total_batches}")
+                        pool.terminate()
+                        break
 
-                # Also get bar metadata for return value (for debugging/inspection)
-                _, bar_metadata = resample_all_timeframes(tsla_slice, offset)
+                    # Aggregate results from this batch
+                    for result in batch_results:
+                        if result.get('sample'):
+                            samples.append(result['sample'])
+                            valid_count += 1
+                            label_hit_count += result.get('label_hits', 0)
+                            label_miss_count += result.get('label_misses', 0)
+                        elif result.get('error'):
+                            errors.append(result['error'])
+                            if strict:
+                                pool.terminate()
+                                raise ValidationError(result['error'])
+                        elif result.get('skipped'):
+                            skipped_count += 1
 
-                # VALIDATE features
-                tf_features = validate_sample_features(tf_features, timestamp, idx)
+                    batches_processed += 1
 
-                # LOOK UP LABELS using lazy lookups (direct from labeled_map)
-                labels_per_window: Dict[int, Dict[str, Any]] = {}
+        else:
+            # =========================================================================
+            # SEQUENTIAL PROCESSING (fallback when workers=1)
+            # =========================================================================
+            print(f"\n  Running in sequential mode...")
 
-                for window in STANDARD_WINDOWS:
-                    labels_per_window[window] = {}
+            batch_iterator = tqdm(batch_args, desc="Processing batches",
+                                 unit="batch") if progress else batch_args
 
-                    for tf in TIMEFRAMES:
-                        # Direct lazy lookup from labeled_map
-                        labels = get_labels_for_position(labeled_map, tsla_df, idx, tf, window)
-                        labels_per_window[window][tf] = labels
-                        if labels is not None:
-                            label_hit_count += 1
-                        else:
-                            label_miss_count += 1
+            for batch_arg in batch_iterator:
+                # Check for shutdown request
+                if _shutdown_requested:
+                    print(f"\n[INTERRUPT] Stopping scan")
+                    break
 
-                # Create sample
-                sample = ChannelSample(
-                    timestamp=timestamp,
-                    channel_end_idx=idx,
-                    tf_features=tf_features,
-                    labels_per_window=labels_per_window,
-                    bar_metadata=bar_metadata,
-                    best_window=best_window
-                )
+                # Process batch sequentially
+                batch_results = _process_position_batch(batch_arg)
 
-                samples.append(sample)
-                valid_count += 1
-
-            except Exception as e:
-                error_msg = f"Error at idx={idx}: {type(e).__name__}: {str(e)}"
-                errors.append(error_msg)
-                if strict:
-                    raise ValidationError(error_msg) from e
+                # Aggregate results from this batch
+                for result in batch_results:
+                    if result.get('sample'):
+                        samples.append(result['sample'])
+                        valid_count += 1
+                        label_hit_count += result.get('label_hits', 0)
+                        label_miss_count += result.get('label_misses', 0)
+                    elif result.get('error'):
+                        errors.append(result['error'])
+                        if strict:
+                            raise ValidationError(result['error'])
+                    elif result.get('skipped'):
+                        skipped_count += 1
 
     except KeyboardInterrupt:
         print("\n[INTERRUPT] KeyboardInterrupt received. Saving partial results...")

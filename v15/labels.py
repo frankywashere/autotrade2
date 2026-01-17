@@ -25,6 +25,7 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from enum import IntEnum
+from multiprocessing import Pool, cpu_count
 
 # Import from existing v7 modules
 import sys
@@ -126,6 +127,73 @@ LabeledChannelMap = Dict[Tuple[str, int], List[LabeledChannel]]
 # PASS 1: Channel Detection
 # =============================================================================
 
+def _detect_tf_window_worker(args):
+    """
+    Worker function to detect channels for one (tf, window) combination.
+
+    This function is called by Pool.map() for parallel processing.
+    It reconstructs the DataFrame from serialized values since DataFrames
+    cannot be pickled directly for multiprocessing.
+
+    Args:
+        args: Tuple of (tf, window, step, min_cycles, min_gap_bars,
+              df_values, df_index, df_columns)
+
+    Returns:
+        Tuple of (tf, window, detected_channels)
+    """
+    tf, window, step, min_cycles, min_gap_bars, df_values, df_index, df_columns = args
+
+    # Reconstruct DataFrame from serialized components
+    df_tf = pd.DataFrame(df_values, index=pd.DatetimeIndex(df_index), columns=df_columns)
+
+    detected_channels = []
+
+    if len(df_tf) < window:
+        return (tf, window, detected_channels)
+
+    # Scan through the dataset
+    scan_positions = list(range(window - 1, len(df_tf), step))
+    last_channel_end = -min_gap_bars  # Allow first channel to start immediately
+
+    for end_idx in scan_positions:
+        start_idx = end_idx - window + 1
+
+        # Skip if this channel's START overlaps with previous channel's END
+        if start_idx <= last_channel_end + min_gap_bars:
+            continue
+
+        df_slice = df_tf.iloc[start_idx:end_idx + 1]
+
+        try:
+            channel = detect_channel(df_slice, window=window, min_cycles=min_cycles)
+
+            if channel.valid:
+                # Get timestamps for cross-TF alignment
+                start_ts = df_tf.index[start_idx]
+                end_ts = df_tf.index[end_idx]
+
+                detected = DetectedChannel(
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                    direction=int(channel.direction),
+                    channel=channel,
+                    tf=tf,
+                    window=window,
+                    start_timestamp=start_ts,
+                    end_timestamp=end_ts
+                )
+                detected_channels.append(detected)
+
+                # Update last channel end to prevent overlapping
+                last_channel_end = end_idx
+        except Exception:
+            # Channel detection failed - skip this position
+            pass
+
+    return (tf, window, detected_channels)
+
+
 def detect_all_channels(
     df: pd.DataFrame,
     timeframes: List[str] = None,
@@ -134,14 +202,15 @@ def detect_all_channels(
     min_cycles: int = 1,
     min_gap_bars: int = 5,
     progress_callback=None,
-    verbose: bool = True
+    verbose: bool = True,
+    workers: int = None
 ) -> ChannelMap:
     """
     PASS 1: Detect all channels across entire dataset for all TF/window combinations.
 
     Scans through the entire dataset and detects channels at regular intervals.
-    For efficiency, uses a sliding window approach where channels are detected
-    at every `step` bars, and overlapping channels are merged/deduplicated.
+    Uses parallel processing with multiprocessing.Pool to process each (TF, window)
+    combination concurrently for significant speedup on multi-core systems.
 
     Args:
         df: Base 5min OHLCV DataFrame with DatetimeIndex
@@ -152,6 +221,7 @@ def detect_all_channels(
         min_gap_bars: Minimum bars between channel end and next channel start
         progress_callback: Optional callback(tf, window, pct) for progress updates
         verbose: If True, print detailed progress logging
+        workers: Number of parallel workers (defaults to min(cpu_count()-1, 8))
 
     Returns:
         ChannelMap: {(tf, window): [DetectedChannel, ...]} sorted by start_idx
@@ -163,9 +233,7 @@ def detect_all_channels(
     if windows is None:
         windows = STANDARD_WINDOWS
 
-    channel_map: ChannelMap = {}
-
-    # Pre-resample all timeframes once
+    # Pre-resample all timeframes once (sequential - it's fast)
     resampled_dfs: Dict[str, pd.DataFrame] = {}
     for tf in timeframes:
         if tf == '5min':
@@ -192,94 +260,66 @@ def detect_all_channels(
         else:
             estimated_positions_per_tf[tf] = 0
 
+    # Determine number of workers
+    num_workers = workers if workers is not None else max(1, min(cpu_count() - 1, 8))
+
     if verbose:
-        print(f"[PASS 1] Starting channel detection:")
+        print(f"[PASS 1] Starting channel detection (PARALLEL with {num_workers} workers):")
         print(f"         TFs: {num_tfs}, Windows: {num_windows}, Step: {step}")
         print(f"         Estimated total scan positions: {total_estimated_positions:,}")
         print()
 
-    # For each TF and window combination
-    total_combos = len(timeframes) * len(windows)
-    combo_idx = 0
-    total_channels_found = 0
-
-    for tf_idx, tf in enumerate(timeframes):
+    # Create work items for parallel processing
+    # Each work item is a (tf, window) combination with serialized DataFrame
+    work_items = []
+    for tf in timeframes:
         df_tf = resampled_dfs.get(tf)
         if df_tf is None or len(df_tf) == 0:
-            if verbose:
-                print(f"[PASS 1] Processing TF {tf_idx + 1}/{num_tfs}: {tf}... (no data, skipping)")
-            for window in windows:
-                channel_map[(tf, window)] = []
             continue
-
-        if verbose:
-            print(f"[PASS 1] Processing TF {tf_idx + 1}/{num_tfs}: {tf}...")
-
         for window in windows:
-            key = (tf, window)
-            detected_channels: List[DetectedChannel] = []
-
             if len(df_tf) < window:
-                channel_map[key] = []
-                combo_idx += 1
                 continue
+            # Serialize DataFrame for multiprocessing (can't pickle DataFrames directly)
+            work_items.append((
+                tf,
+                window,
+                step,
+                min_cycles,
+                min_gap_bars,
+                df_tf.values,
+                df_tf.index.values,
+                list(df_tf.columns)
+            ))
 
-            # Scan through the dataset
-            # Start from window (need window bars for detection)
-            # End at len(df_tf) (last valid end position)
-            scan_positions = list(range(window - 1, len(df_tf), step))
+    if verbose:
+        print(f"[PASS 1] Created {len(work_items)} work items for parallel processing...")
 
-            last_channel_end = -min_gap_bars  # Allow first channel to start immediately
-            window_channels_found = 0
+    # Initialize channel_map with empty lists for all combinations
+    # (some may not have work items if df is too short)
+    channel_map: ChannelMap = {}
+    for tf in timeframes:
+        for window in windows:
+            channel_map[(tf, window)] = []
 
-            for end_idx in scan_positions:
-                # Detect channel ending at end_idx
-                start_idx = end_idx - window + 1
+    # Process work items in parallel using Pool.map()
+    if work_items:
+        with Pool(processes=num_workers) as pool:
+            results = pool.map(_detect_tf_window_worker, work_items)
 
-                # Skip if this channel's START overlaps with previous channel's END
-                # (must ensure gap between one channel ending and next channel's window starting)
-                if start_idx <= last_channel_end + min_gap_bars:
-                    continue
-                df_slice = df_tf.iloc[start_idx:end_idx + 1]
-
-                try:
-                    channel = detect_channel(df_slice, window=window, min_cycles=min_cycles)
-
-                    if channel.valid:
-                        # Get timestamps for cross-TF alignment
-                        start_ts = df_tf.index[start_idx]
-                        end_ts = df_tf.index[end_idx]
-
-                        detected = DetectedChannel(
-                            start_idx=start_idx,
-                            end_idx=end_idx,
-                            direction=int(channel.direction),
-                            channel=channel,
-                            tf=tf,
-                            window=window,
-                            start_timestamp=start_ts,
-                            end_timestamp=end_ts
-                        )
-                        detected_channels.append(detected)
-                        window_channels_found += 1
-
-                        # Update last channel end to prevent overlapping
-                        last_channel_end = end_idx
-
-                except Exception:
-                    # Channel detection failed - skip this position
-                    pass
-
-            channel_map[key] = detected_channels
-            total_channels_found += window_channels_found
-
+        # Collect results into channel_map
+        total_channels_found = 0
+        for tf, window, detected_channels in results:
+            channel_map[(tf, window)] = detected_channels
+            num_channels = len(detected_channels)
+            total_channels_found += num_channels
             if verbose:
-                print(f"  Window {window}: scanning... found {window_channels_found} channels")
+                print(f"  TF={tf}, Window={window}: found {num_channels} channels")
 
-            # Progress callback
-            combo_idx += 1
+            # Progress callback (approximate since parallel)
             if progress_callback:
-                progress_callback(tf, window, combo_idx / total_combos)
+                progress_callback(tf, window, 1.0)
+    else:
+        total_channels_found = 0
 
     if verbose:
         print()
