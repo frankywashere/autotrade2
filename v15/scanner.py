@@ -536,6 +536,26 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
         }]
 
 
+class _ProgressFileWriter:
+    """
+    File wrapper that reports write progress to tqdm.
+
+    Intercepts write() calls and updates the progress bar with byte counts,
+    giving real-time feedback during pickle.dump() operations.
+    """
+    def __init__(self, file, pbar):
+        self.file = file
+        self.pbar = pbar
+
+    def write(self, data):
+        self.pbar.update(len(data))
+        return self.file.write(data)
+
+    def __getattr__(self, attr):
+        # Delegate all other attributes to the underlying file
+        return getattr(self.file, attr)
+
+
 def _save_partial_results(samples: List, output_path: str, suffix: str = "_partial"):
     """
     Save partial results during graceful shutdown.
@@ -557,7 +577,9 @@ def _save_partial_results(samples: List, output_path: str, suffix: str = "_parti
 
     try:
         with open(partial_path, 'wb') as f:
-            pickle.dump(samples, f)
+            with tqdm(unit='B', unit_scale=True, unit_divisor=1024,
+                     desc="Saving partial") as pbar:
+                pickle.dump(samples, _ProgressFileWriter(f, pbar))
         print(f"\n[SAVED] Partial results ({len(samples)} samples) saved to: {partial_path}")
     except Exception as e:
         print(f"\n[ERROR] Failed to save partial results: {e}")
@@ -1328,7 +1350,9 @@ def main():
     if args.output and samples:
         print(f"\nSaving {len(samples)} samples to {args.output}...")
         with open(args.output, 'wb') as f:
-            pickle.dump(samples, f)
+            with tqdm(unit='B', unit_scale=True, unit_divisor=1024,
+                     desc="Saving") as pbar:
+                pickle.dump(samples, _ProgressFileWriter(f, pbar))
         print(f"Saved successfully!")
 
 
