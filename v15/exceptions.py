@@ -30,6 +30,14 @@ class ChannelDetectionError(V15Error):
     """Raised when channel detection fails unexpectedly."""
     pass
 
+class BreakScannerError(V15Error):
+    """Raised when break scanning fails unexpectedly."""
+    pass
+
+class InsufficientDataError(BreakScannerError):
+    """Raised when there is insufficient forward data to scan for breaks."""
+    pass
+
 class LabelGenerationError(V15Error):
     """Raised when label generation fails."""
     pass

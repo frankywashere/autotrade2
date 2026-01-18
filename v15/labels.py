@@ -21,6 +21,7 @@ This two-pass approach is significantly more efficient than the previous
 single-pass method which required O(N * max_scan) complexity per sample.
 """
 
+import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -34,6 +35,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from v7.core.channel import detect_channel, Channel
 from v7.core.timeframe import resample_ohlc
+
+# Import ChannelLabels and CrossCorrelationLabels from v15.types
+from .types import ChannelLabels, CrossCorrelationLabels
+
+# Import TF_MAX_SCAN for forward scanning limits
+from .config import TF_MAX_SCAN
+
+# Import break scanner for sophisticated break detection
+from .core.break_scanner import scan_for_break, BreakResult, InsufficientDataError
 
 
 # =============================================================================
@@ -51,31 +61,6 @@ class NewChannelDirection(IntEnum):
     BEAR = 0
     SIDEWAYS = 1
     BULL = 2
-
-
-# =============================================================================
-# Data Classes
-# =============================================================================
-
-@dataclass
-class ChannelLabels:
-    """
-    Labels for a channel indicating its future outcome.
-
-    Attributes:
-        duration_bars: Number of bars until permanent break
-        break_direction: Direction of break (0=DOWN, 1=UP)
-        new_channel_direction: Direction of next channel (0=BEAR, 1=SIDEWAYS, 2=BULL)
-        permanent_break: Whether a permanent break was found within scan window
-        duration_valid: True if duration was observed
-        direction_valid: True only if permanent_break=True
-    """
-    duration_bars: int
-    break_direction: int  # 0=DOWN, 1=UP
-    new_channel_direction: int  # 0=BEAR, 1=SIDEWAYS, 2=BULL
-    permanent_break: bool
-    duration_valid: bool = True
-    direction_valid: bool = False
 
 
 @dataclass
@@ -207,7 +192,7 @@ def detect_all_channels(
     progress_callback=None,
     verbose: bool = True,
     workers: int = None
-) -> ChannelMap:
+) -> Tuple[ChannelMap, Dict[str, pd.DataFrame]]:
     """
     PASS 1: Detect all channels across entire dataset for all TF/window combinations.
 
@@ -227,7 +212,9 @@ def detect_all_channels(
         workers: Number of parallel workers (defaults to cpu_count()-1, no cap)
 
     Returns:
-        ChannelMap: {(tf, window): [DetectedChannel, ...]} sorted by start_idx
+        Tuple of:
+            - ChannelMap: {(tf, window): [DetectedChannel, ...]} sorted by start_idx
+            - Dict[str, pd.DataFrame]: Resampled DataFrames keyed by timeframe
     """
     from v15.config import TIMEFRAMES as ALL_TIMEFRAMES, STANDARD_WINDOWS
 
@@ -337,7 +324,7 @@ def detect_all_channels(
         if total_failed_positions > 0:
             print(f"         Total failed positions: {total_failed_positions}")
 
-    return channel_map
+    return channel_map, resampled_dfs
 
 
 # =============================================================================
@@ -378,11 +365,16 @@ def label_channel_from_map(
         # Invalid index
         return ChannelLabels(
             duration_bars=0,
-            break_direction=BreakDirection.UP,
-            new_channel_direction=NewChannelDirection.SIDEWAYS,
+            break_direction=int(BreakDirection.UP),
+            break_trigger_tf=0,
+            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
+            break_return=0.0,
+            timeframe=tf,
             duration_valid=False,
-            direction_valid=False
+            direction_valid=False,
+            trigger_tf_valid=False,
+            new_channel_valid=False
         ), -1
 
     current = channels[channel_idx]
@@ -472,46 +464,281 @@ def label_channel_from_map(
                 else:
                     break_direction = BreakDirection.DOWN
 
+        # Calculate break_return as percentage price change
+        # from current channel end to next channel start
+        break_return = 0.0
+        if curr_channel.close is not None and len(curr_channel.close) > 0 and next_start_price is not None:
+            curr_end_price = curr_channel.close[-1]
+            if curr_end_price > 0:
+                break_return = (next_start_price - curr_end_price) / curr_end_price
+
         return ChannelLabels(
             duration_bars=duration_bars,
             break_direction=int(break_direction),
+            break_trigger_tf=0,  # Not determined in this context (would need cross-TF analysis)
             new_channel_direction=next_dir,
             permanent_break=True,
+            break_return=break_return,
+            timeframe=tf,
             duration_valid=True,
-            direction_valid=True
+            direction_valid=True,
+            trigger_tf_valid=False,  # Not determined in this context
+            new_channel_valid=True
         ), next_idx
 
     else:
         # No next channel - end of data
         return ChannelLabels(
             duration_bars=0,
-            break_direction=BreakDirection.UP,  # Default
-            new_channel_direction=NewChannelDirection.SIDEWAYS,
+            break_direction=int(BreakDirection.UP),  # Default
+            break_trigger_tf=0,
+            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
+            break_return=0.0,
+            timeframe=tf,
             duration_valid=False,
-            direction_valid=False
+            direction_valid=False,
+            trigger_tf_valid=False,
+            new_channel_valid=False
         ), -1
+
+
+def label_channel_forward_scan(
+    detected: DetectedChannel,
+    resampled_df: pd.DataFrame,
+    max_scan: int
+) -> ChannelLabels:
+    """
+    Label a channel using forward bar scanning to find the first break.
+
+    Uses the sophisticated scan_for_break() function from break_scanner.py
+    which provides:
+    - Accurate break detection using HIGH/LOW for exits (not just close)
+    - Return-to-channel tracking (false break detection)
+    - Multiple exit event tracking for durability analysis
+    - Break magnitude in standard deviations
+
+    Args:
+        detected: The DetectedChannel from Pass 1
+        resampled_df: The resampled DataFrame for this timeframe
+        max_scan: Maximum number of bars to scan forward (from TF_MAX_SCAN)
+
+    Returns:
+        ChannelLabels with all break scan fields populated:
+        - bars_to_first_break: When the first break occurred
+        - first_break_direction: Direction of break (0=DOWN, 1=UP)
+        - break_magnitude: How far outside bounds (in std devs)
+        - bars_outside: Total bars spent outside before return
+        - returned_to_channel: Whether price came back inside
+        - bounces_after_return: Number of false breaks before permanent exit
+        - channel_continued: Whether pattern resumed after return
+    """
+    channel = detected.channel
+    end_idx = detected.end_idx
+    tf = detected.tf
+
+    # Validate channel has required attributes
+    if channel.slope is None or channel.intercept is None or channel.std_dev is None:
+        return ChannelLabels(
+            duration_bars=0,
+            break_direction=int(BreakDirection.UP),
+            break_trigger_tf=0,
+            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            permanent_break=False,
+            break_return=0.0,
+            timeframe=tf,
+            duration_valid=False,
+            direction_valid=False,
+            trigger_tf_valid=False,
+            new_channel_valid=False,
+            break_scan_valid=False
+        )
+
+    # Get the price at end of channel for break_return calculation
+    if channel.close is not None and len(channel.close) > 0:
+        end_price = channel.close[-1]
+    else:
+        end_price = None
+
+    # Calculate available forward data
+    forward_start = end_idx + 1
+    forward_end = min(end_idx + max_scan + 1, len(resampled_df))
+
+    # Check if we have any forward data
+    if forward_start >= len(resampled_df) or forward_end <= forward_start:
+        return ChannelLabels(
+            duration_bars=0,
+            break_direction=int(BreakDirection.UP),
+            break_trigger_tf=0,
+            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            permanent_break=False,
+            break_return=0.0,
+            timeframe=tf,
+            duration_valid=False,
+            direction_valid=False,
+            trigger_tf_valid=False,
+            new_channel_valid=False,
+            break_scan_valid=False
+        )
+
+    # Extract forward price arrays for break scanner
+    forward_slice = resampled_df.iloc[forward_start:forward_end]
+    forward_high = forward_slice['high'].values.astype(np.float64)
+    forward_low = forward_slice['low'].values.astype(np.float64)
+    forward_close = forward_slice['close'].values.astype(np.float64)
+
+    # Use sophisticated break scanner
+    try:
+        result: BreakResult = scan_for_break(
+            channel=channel,
+            forward_high=forward_high,
+            forward_low=forward_low,
+            forward_close=forward_close,
+            max_scan_bars=max_scan,
+            return_threshold_bars=50  # Standard threshold for permanence
+        )
+    except InsufficientDataError:
+        # Not enough data to scan - return invalid labels
+        return ChannelLabels(
+            duration_bars=0,
+            break_direction=int(BreakDirection.UP),
+            break_trigger_tf=0,
+            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            permanent_break=False,
+            break_return=0.0,
+            timeframe=tf,
+            duration_valid=False,
+            direction_valid=False,
+            trigger_tf_valid=False,
+            new_channel_valid=False,
+            break_scan_valid=False
+        )
+
+    # Map BreakResult to ChannelLabels fields
+    if not result.break_detected:
+        # No break found within scan limit
+        return ChannelLabels(
+            duration_bars=max_scan,
+            break_direction=int(BreakDirection.UP),  # Default
+            break_trigger_tf=0,
+            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            permanent_break=False,
+            break_return=0.0,
+            timeframe=tf,
+            # Break scan fields - no break detected
+            bars_to_first_break=max_scan,
+            first_break_direction=0,
+            break_magnitude=0.0,
+            bars_outside=0,
+            returned_to_channel=False,
+            bounces_after_return=0,
+            channel_continued=True,  # No break means channel continued
+            # Validity flags
+            duration_valid=False,
+            direction_valid=False,
+            trigger_tf_valid=False,
+            new_channel_valid=False,
+            break_scan_valid=True  # Scan was performed, just no break found
+        )
+
+    # Break detected - map all fields from BreakResult
+    # Calculate break_return as percentage price change
+    break_return = 0.0
+    if end_price is not None and end_price > 0:
+        break_return = (result.break_price - end_price) / end_price
+
+    # Calculate bars_outside: total bars spent outside the channel
+    # For the first exit event, this is bars_until_return if returned, otherwise
+    # the remaining scan bars after break
+    if result.is_false_break and result.bars_until_return > 0:
+        bars_outside = result.bars_until_return
+    elif result.break_detected:
+        # Permanent break - count from break_bar to end of scan
+        bars_outside = result.scan_bars_used - result.break_bar
+    else:
+        bars_outside = 0
+
+    # bounces_after_return: Use false_break_count which counts all temporary exits
+    # that returned. If the first break returned, bounces = false_break_count - 1
+    # (since first break itself counts as one). If first break was permanent,
+    # all false breaks happened during the scan.
+    if result.is_false_break:
+        # First break returned, so subsequent false breaks are "bounces after return"
+        bounces_after_return = max(0, result.false_break_count - 1)
+    else:
+        # First break was permanent - any false breaks came before final exit
+        bounces_after_return = result.false_break_count
+
+    # channel_continued: True if price returned to channel (is_false_break)
+    # The "channel pattern continuing" means the channel held and price stayed
+    # or returned - essentially the inverse of is_permanent
+    channel_continued = result.is_false_break
+
+    return ChannelLabels(
+        # Core label values (duration_bars uses break_bar for consistency)
+        duration_bars=result.break_bar,
+        break_direction=result.break_direction,
+        break_trigger_tf=0,  # Not determined by forward scan
+        new_channel_direction=int(NewChannelDirection.SIDEWAYS),  # Not determined
+        permanent_break=result.is_permanent,
+        break_return=break_return,
+        timeframe=tf,
+        # Break scan fields from BreakResult
+        bars_to_first_break=result.break_bar,
+        first_break_direction=result.break_direction,
+        break_magnitude=result.break_magnitude,
+        bars_outside=bars_outside,
+        returned_to_channel=result.is_false_break,  # is_false_break means it returned
+        bounces_after_return=bounces_after_return,
+        channel_continued=channel_continued,
+        # Validity flags
+        duration_valid=True,
+        direction_valid=True,
+        trigger_tf_valid=False,
+        new_channel_valid=False,
+        break_scan_valid=True
+    )
 
 
 def generate_all_labels(
     channel_map: ChannelMap,
+    resampled_dfs: Optional[Dict[str, pd.DataFrame]] = None,
+    labeling_method: str = "next_channel",
     progress_callback=None,
     verbose: bool = True
 ) -> LabeledChannelMap:
     """
     PASS 2: Generate labels for all channels in the map.
 
-    For each channel, looks up the next channel in the sequence and
-    determines the break direction based on the next channel's properties.
+    Supports two labeling methods:
+    - "next_channel": Determines break by looking at next channel's start price
+      (original method, works without resampled_dfs)
+    - "forward_scan": Scans forward bars to find first close outside channel bounds
+      (requires resampled_dfs, uses TF_MAX_SCAN for scan limits)
 
     Args:
         channel_map: The channel map from detect_all_channels()
+        resampled_dfs: Optional dict of resampled DataFrames keyed by timeframe.
+                       Required for "forward_scan" method, ignored for "next_channel".
+        labeling_method: Either "next_channel" (default) or "forward_scan"
         progress_callback: Optional callback(tf, window, pct) for progress updates
         verbose: If True, print detailed progress logging
 
     Returns:
         LabeledChannelMap: {(tf, window): [LabeledChannel, ...]}
     """
+    # Validate labeling_method
+    valid_methods = ("next_channel", "forward_scan")
+    if labeling_method not in valid_methods:
+        raise ValueError(f"labeling_method must be one of {valid_methods}, got '{labeling_method}'")
+
+    # If forward_scan requested but no resampled_dfs, fall back to next_channel
+    if labeling_method == "forward_scan" and resampled_dfs is None:
+        if verbose:
+            print("[PASS 2] WARNING: forward_scan requested but resampled_dfs is None, "
+                  "falling back to next_channel method")
+        labeling_method = "next_channel"
+
     labeled_map: LabeledChannelMap = {}
 
     total_keys = len(channel_map)
@@ -525,7 +752,7 @@ def generate_all_labels(
     unique_windows = set(window for _, window in channel_map.keys())
 
     if verbose:
-        print(f"[PASS 2] Starting label generation:")
+        print(f"[PASS 2] Starting label generation (method={labeling_method}):")
         print(f"         TF/window combinations to process: {total_keys}")
         print(f"         Unique TFs: {len(unique_tfs)}, Unique windows: {len(unique_windows)}")
         print(f"         Total channels to label: {total_channels:,}")
@@ -542,8 +769,17 @@ def generate_all_labels(
             pct = (key_idx / total_keys) * 100 if total_keys > 0 else 0
             print(f"[PASS 2] Processing TF={tf}, window={window} ({key_idx + 1}/{total_keys}, {pct:.1f}%) - {num_channels} channels to label")
 
+        # Get resampled df and max_scan for forward_scan method
+        resampled_df = resampled_dfs.get(tf) if resampled_dfs else None
+        max_scan = TF_MAX_SCAN.get(tf, 500)
+
         for idx, detected in enumerate(channels):
-            labels, next_idx = label_channel_from_map(channel_map, tf, window, idx)
+            # Choose labeling method
+            if labeling_method == "forward_scan" and resampled_df is not None:
+                labels = label_channel_forward_scan(detected, resampled_df, max_scan)
+                next_idx = -1  # forward_scan doesn't determine next channel
+            else:
+                labels, next_idx = label_channel_from_map(channel_map, tf, window, idx)
 
             labeled = LabeledChannel(
                 detected=detected,
@@ -822,3 +1058,100 @@ def labeled_map_stats(labeled_map: LabeledChannelMap) -> Dict:
         stats['avg_duration_bars'] = sum(durations) / len(durations)
 
     return stats
+
+
+# =============================================================================
+# CROSS-CORRELATION LABEL COMPUTATION
+# =============================================================================
+
+def compute_cross_correlation_labels(
+    tsla_labels: ChannelLabels,
+    spy_labels: ChannelLabels,
+    tf: str
+) -> CrossCorrelationLabels:
+    """
+    Compute cross-correlation labels comparing TSLA and SPY break behavior.
+
+    This function analyzes the relationship between TSLA and SPY channel breaks
+    to identify alignment patterns that may be predictive of future movements.
+
+    The function handles cases where one or both assets have invalid labels
+    gracefully by returning a CrossCorrelationLabels with cross_valid=False.
+
+    Args:
+        tsla_labels: ChannelLabels for TSLA at this timeframe/window
+        spy_labels: ChannelLabels for SPY at this timeframe/window
+        tf: Timeframe string (e.g., '5min', '1h', 'daily') - used for context
+
+    Returns:
+        CrossCorrelationLabels with computed cross-asset comparison metrics.
+        If either TSLA or SPY labels are invalid, returns default labels with
+        cross_valid=False.
+
+    Example:
+        >>> tsla = ChannelLabels(break_direction=1, break_scan_valid=True, ...)
+        >>> spy = ChannelLabels(break_direction=1, break_scan_valid=True, ...)
+        >>> cross = compute_cross_correlation_labels(tsla, spy, '1h')
+        >>> print(cross.break_direction_aligned)  # True if both broke same way
+    """
+    # Check if both labels have valid break scan data
+    tsla_valid = tsla_labels.break_scan_valid if tsla_labels else False
+    spy_valid = spy_labels.break_scan_valid if spy_labels else False
+
+    # If either is invalid, return default invalid cross-correlation labels
+    if not tsla_valid or not spy_valid:
+        return CrossCorrelationLabels(cross_valid=False)
+
+    # Both have valid break scan data - compute cross-correlation metrics
+
+    # 1. Break direction alignment
+    # Compare first_break_direction (from break scan) for both assets
+    break_direction_aligned = (
+        tsla_labels.first_break_direction == spy_labels.first_break_direction
+    )
+
+    # 2. Which asset broke first?
+    # Compare bars_to_first_break - lower value means broke first
+    tsla_bars = tsla_labels.bars_to_first_break
+    spy_bars = spy_labels.bars_to_first_break
+
+    tsla_broke_first = tsla_bars < spy_bars
+    spy_broke_first = spy_bars < tsla_bars
+    # If equal, neither is marked as first
+
+    # 3. Break lag (absolute difference in bars)
+    break_lag_bars = abs(tsla_bars - spy_bars)
+
+    # 4. Magnitude spread (difference in break magnitudes)
+    # Positive means TSLA broke with more magnitude
+    magnitude_spread = tsla_labels.break_magnitude - spy_labels.break_magnitude
+
+    # 5. Return behavior comparison
+    tsla_returned = tsla_labels.returned_to_channel
+    spy_returned = spy_labels.returned_to_channel
+
+    both_returned = tsla_returned and spy_returned
+    both_permanent = (not tsla_returned) and (not spy_returned)
+
+    # Return pattern aligned if both returned or both didn't
+    return_pattern_aligned = both_returned or both_permanent
+
+    # 6. Continuation alignment
+    # Check if both assets' channels continued after return (or both didn't)
+    tsla_continued = tsla_labels.channel_continued
+    spy_continued = spy_labels.channel_continued
+
+    continuation_aligned = tsla_continued == spy_continued
+
+    return CrossCorrelationLabels(
+        break_direction_aligned=break_direction_aligned,
+        tsla_broke_first=tsla_broke_first,
+        spy_broke_first=spy_broke_first,
+        break_lag_bars=break_lag_bars,
+        magnitude_spread=magnitude_spread,
+        both_returned=both_returned,
+        both_permanent=both_permanent,
+        return_pattern_aligned=return_pattern_aligned,
+        continuation_aligned=continuation_aligned,
+        cross_valid=True
+    )

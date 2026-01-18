@@ -5,8 +5,21 @@ Handles the 7,880 features with proper validation.
 
 ChannelSample structure:
     - tf_features: Dict[str, float] - ~7,880 TF-prefixed features
-    - labels_per_window: Dict[int, Dict[str, ChannelLabels]] - labels per window/TF
+    - labels_per_window: Labels per window/asset/TF
+        New structure: {window: {'tsla': {tf: ChannelLabels}, 'spy': {tf: ChannelLabels}}}
+        Old structure: {window: {tf: ChannelLabels}} (backward compatible)
     - bar_metadata: Dict[str, Dict[str, float]] - partial bar completion info
+
+Label types extracted:
+    - Core labels: duration, direction, new_channel, break_trigger_tf, permanent_break, break_return
+    - TSLA break scan: bars_to_first_break, first_break_direction, break_magnitude, bars_outside,
+                       returned_to_channel, bounces_after_return, channel_continued
+    - SPY break scan: spy_bars_to_first_break, spy_first_break_direction, etc.
+    - Cross-correlation: break_direction_aligned, tsla_broke_first, spy_broke_first, break_lag_bars,
+                         magnitude_spread, both_returned, both_permanent, return_pattern_aligned,
+                         continuation_aligned
+    - Validity masks: valid, duration_valid, direction_valid, break_scan_valid, spy_break_scan_valid,
+                      cross_valid
 """
 import pickle
 import warnings
@@ -25,7 +38,8 @@ from ..features.validation import (
     check_for_constant_features,
     validate_feature_matrix,
 )
-from ..types import ChannelLabels, ChannelSample
+from ..types import ChannelLabels, ChannelSample, CrossCorrelationLabels
+from ..labels import compute_cross_correlation_labels
 
 
 class ChannelDataset(Dataset):
@@ -34,12 +48,25 @@ class ChannelDataset(Dataset):
 
     Each sample contains:
         - features: [TOTAL_FEATURES] tensor (~7,880 features)
-        - labels: Dict with duration, direction, new_channel, etc.
+        - labels: Dict with all label types as tensors:
+            Core: duration, direction, new_channel, break_trigger_tf, permanent_break, break_return
+            TSLA break scan: bars_to_first_break, first_break_direction, break_magnitude,
+                             bars_outside, returned_to_channel, bounces_after_return, channel_continued
+            SPY break scan: spy_bars_to_first_break, spy_first_break_direction, spy_break_magnitude,
+                            spy_bars_outside, spy_returned_to_channel, spy_bounces_after_return,
+                            spy_channel_continued
+            Cross-correlation: break_direction_aligned, tsla_broke_first, spy_broke_first,
+                              break_lag_bars, magnitude_spread, both_returned, both_permanent,
+                              return_pattern_aligned, continuation_aligned
+            Validity masks: valid, duration_valid, direction_valid, break_scan_valid,
+                           spy_break_scan_valid, cross_valid
         - metadata: timestamp, window, bar_metadata
 
     Expects ChannelSample objects with:
         - tf_features: Dict[str, float] - all features keyed by name
-        - labels_per_window: Dict[int, Dict[str, ChannelLabels]]
+        - labels_per_window: Labels per window/asset/TF
+            New structure: {window: {'tsla': {tf: ChannelLabels}, 'spy': {tf: ChannelLabels}}}
+            Old structure: {window: {tf: ChannelLabels}} (backward compatible)
         - bar_metadata: Dict[str, Dict[str, float]]
         - best_window: int
     """
@@ -177,32 +204,89 @@ class ChannelDataset(Dataset):
         """
         Extract labels for a specific timeframe and window.
 
+        Handles both old and new labels_per_window structures:
+        - Old: {window: {tf: ChannelLabels}}
+        - New: {window: {'tsla': {tf: ChannelLabels}, 'spy': {tf: ChannelLabels}}}
+
         Args:
             sample: ChannelSample with labels_per_window
             tf: Target timeframe (e.g., 'daily')
             window: Window size to extract labels for
 
         Returns:
-            Dict with label values and validity flags
+            Dict with label values and validity flags including:
+            - Core labels: duration, direction, new_channel, etc.
+            - TSLA break scan labels: bars_to_first_break, first_break_direction, etc.
+            - SPY break scan labels: spy_bars_to_first_break, etc.
+            - Cross-correlation labels: break_direction_aligned, tsla_broke_first, etc.
+            - Per-head validity masks: break_scan_valid, cross_valid
         """
         # Get labels from labels_per_window structure
         window_labels = sample.labels_per_window.get(window, {})
-        tf_labels: Optional[ChannelLabels] = window_labels.get(tf)
+
+        # Handle both old and new structure
+        # New structure has 'tsla' and 'spy' keys
+        # Old structure has TF keys directly
+        if 'tsla' in window_labels:
+            # New structure: {window: {'tsla': {tf: ChannelLabels}, 'spy': {tf: ChannelLabels}}}
+            tsla_labels_dict = window_labels.get('tsla', {})
+            spy_labels_dict = window_labels.get('spy', {})
+            tf_labels: Optional[ChannelLabels] = tsla_labels_dict.get(tf)
+            spy_tf_labels: Optional[ChannelLabels] = spy_labels_dict.get(tf)
+        else:
+            # Old structure: {window: {tf: ChannelLabels}}
+            tf_labels: Optional[ChannelLabels] = window_labels.get(tf)
+            spy_tf_labels = None
+
+        # Default labels for invalid/missing data
+        default_labels = {
+            # Core labels
+            'duration': 0,
+            'direction': 0,
+            'new_channel': 1,
+            'break_trigger_tf': 0,
+            'permanent_break': False,
+            'break_return': 0.0,
+            'valid': False,
+            'duration_valid': False,
+            'direction_valid': False,
+            # TSLA break scan labels
+            'bars_to_first_break': 0,
+            'first_break_direction': 0,
+            'break_magnitude': 0.0,
+            'bars_outside': 0,
+            'returned_to_channel': False,
+            'bounces_after_return': 0,
+            'channel_continued': False,
+            'break_scan_valid': False,
+            # SPY break scan labels
+            'spy_bars_to_first_break': 0,
+            'spy_first_break_direction': 0,
+            'spy_break_magnitude': 0.0,
+            'spy_bars_outside': 0,
+            'spy_returned_to_channel': False,
+            'spy_bounces_after_return': 0,
+            'spy_channel_continued': False,
+            'spy_break_scan_valid': False,
+            # Cross-correlation labels
+            'break_direction_aligned': False,
+            'tsla_broke_first': False,
+            'spy_broke_first': False,
+            'break_lag_bars': 0,
+            'magnitude_spread': 0.0,
+            'both_returned': False,
+            'both_permanent': False,
+            'return_pattern_aligned': False,
+            'continuation_aligned': False,
+            'cross_valid': False,
+        }
 
         if tf_labels is None:
-            return {
-                'duration': 0,
-                'direction': 0,
-                'new_channel': 1,
-                'break_trigger_tf': 0,
-                'permanent_break': False,
-                'break_return': 0.0,
-                'valid': False,
-                'duration_valid': False,
-                'direction_valid': False,
-            }
+            return default_labels
 
-        return {
+        # Build labels dict with core labels
+        labels = {
+            # Core labels
             'duration': tf_labels.duration_bars,
             'direction': tf_labels.break_direction,
             'new_channel': tf_labels.new_channel_direction,
@@ -212,6 +296,147 @@ class ChannelDataset(Dataset):
             'valid': tf_labels.duration_valid or tf_labels.direction_valid,
             'duration_valid': tf_labels.duration_valid,
             'direction_valid': tf_labels.direction_valid,
+            # TSLA break scan labels
+            'bars_to_first_break': getattr(tf_labels, 'bars_to_first_break', 0),
+            'first_break_direction': getattr(tf_labels, 'first_break_direction', 0),
+            'break_magnitude': getattr(tf_labels, 'break_magnitude', 0.0),
+            'bars_outside': getattr(tf_labels, 'bars_outside', 0),
+            'returned_to_channel': getattr(tf_labels, 'returned_to_channel', False),
+            'bounces_after_return': getattr(tf_labels, 'bounces_after_return', 0),
+            'channel_continued': getattr(tf_labels, 'channel_continued', False),
+            'break_scan_valid': getattr(tf_labels, 'break_scan_valid', False),
+        }
+
+        # SPY break scan labels (from SPY's ChannelLabels if available)
+        if spy_tf_labels is not None:
+            labels.update({
+                'spy_bars_to_first_break': getattr(spy_tf_labels, 'bars_to_first_break', 0),
+                'spy_first_break_direction': getattr(spy_tf_labels, 'first_break_direction', 0),
+                'spy_break_magnitude': getattr(spy_tf_labels, 'break_magnitude', 0.0),
+                'spy_bars_outside': getattr(spy_tf_labels, 'bars_outside', 0),
+                'spy_returned_to_channel': getattr(spy_tf_labels, 'returned_to_channel', False),
+                'spy_bounces_after_return': getattr(spy_tf_labels, 'bounces_after_return', 0),
+                'spy_channel_continued': getattr(spy_tf_labels, 'channel_continued', False),
+                'spy_break_scan_valid': getattr(spy_tf_labels, 'break_scan_valid', False),
+            })
+        else:
+            # Try to get SPY fields from TSLA labels (old structure with spy_ prefix on same object)
+            labels.update({
+                'spy_bars_to_first_break': getattr(tf_labels, 'spy_bars_to_first_break', 0),
+                'spy_first_break_direction': getattr(tf_labels, 'spy_first_break_direction', 0),
+                'spy_break_magnitude': getattr(tf_labels, 'spy_break_magnitude', 0.0),
+                'spy_bars_outside': getattr(tf_labels, 'spy_bars_outside', 0),
+                'spy_returned_to_channel': getattr(tf_labels, 'spy_returned_to_channel', False),
+                'spy_bounces_after_return': getattr(tf_labels, 'spy_bounces_after_return', 0),
+                'spy_channel_continued': getattr(tf_labels, 'spy_channel_continued', False),
+                'spy_break_scan_valid': getattr(tf_labels, 'break_scan_valid', False),  # Same validity for old structure
+            })
+
+        # Compute cross-correlation labels
+        cross_labels = self._extract_cross_correlation_labels(tf_labels, spy_tf_labels, tf)
+        labels.update(cross_labels)
+
+        return labels
+
+    def _extract_cross_correlation_labels(
+        self,
+        tsla_labels: Optional[ChannelLabels],
+        spy_labels: Optional[ChannelLabels],
+        tf: str
+    ) -> Dict[str, Any]:
+        """
+        Extract cross-correlation labels comparing TSLA and SPY break behavior.
+
+        Args:
+            tsla_labels: ChannelLabels for TSLA (may be None)
+            spy_labels: ChannelLabels for SPY (may be None, or same object as tsla_labels for old structure)
+            tf: Target timeframe
+
+        Returns:
+            Dict with cross-correlation label values
+        """
+        # Default cross-correlation labels
+        default_cross = {
+            'break_direction_aligned': False,
+            'tsla_broke_first': False,
+            'spy_broke_first': False,
+            'break_lag_bars': 0,
+            'magnitude_spread': 0.0,
+            'both_returned': False,
+            'both_permanent': False,
+            'return_pattern_aligned': False,
+            'continuation_aligned': False,
+            'cross_valid': False,
+        }
+
+        if tsla_labels is None:
+            return default_cross
+
+        # Check if we have separate SPY labels (new structure) or combined labels (old structure)
+        if spy_labels is not None and spy_labels is not tsla_labels:
+            # New structure: separate TSLA and SPY ChannelLabels
+            cross = compute_cross_correlation_labels(tsla_labels, spy_labels, tf)
+        else:
+            # Old structure: SPY fields are on the same ChannelLabels object
+            # Check if TSLA labels have valid break scan data for both assets
+            tsla_valid = getattr(tsla_labels, 'break_scan_valid', False)
+            # For old structure, SPY validity is implicit if spy_ fields are populated
+            spy_bars = getattr(tsla_labels, 'spy_bars_to_first_break', 0)
+            spy_valid = tsla_valid and spy_bars > 0
+
+            if not tsla_valid or not spy_valid:
+                return default_cross
+
+            # Compute cross-correlation from the single ChannelLabels object
+            tsla_break_dir = getattr(tsla_labels, 'first_break_direction', 0)
+            spy_break_dir = getattr(tsla_labels, 'spy_first_break_direction', 0)
+            break_direction_aligned = tsla_break_dir == spy_break_dir
+
+            tsla_bars = getattr(tsla_labels, 'bars_to_first_break', 0)
+            spy_bars = getattr(tsla_labels, 'spy_bars_to_first_break', 0)
+            tsla_broke_first = tsla_bars < spy_bars
+            spy_broke_first = spy_bars < tsla_bars
+            break_lag_bars = abs(tsla_bars - spy_bars)
+
+            tsla_mag = getattr(tsla_labels, 'break_magnitude', 0.0)
+            spy_mag = getattr(tsla_labels, 'spy_break_magnitude', 0.0)
+            magnitude_spread = tsla_mag - spy_mag
+
+            tsla_returned = getattr(tsla_labels, 'returned_to_channel', False)
+            spy_returned = getattr(tsla_labels, 'spy_returned_to_channel', False)
+            both_returned = tsla_returned and spy_returned
+            both_permanent = (not tsla_returned) and (not spy_returned)
+            return_pattern_aligned = both_returned or both_permanent
+
+            tsla_continued = getattr(tsla_labels, 'channel_continued', False)
+            spy_continued = getattr(tsla_labels, 'spy_channel_continued', False)
+            continuation_aligned = tsla_continued == spy_continued
+
+            return {
+                'break_direction_aligned': break_direction_aligned,
+                'tsla_broke_first': tsla_broke_first,
+                'spy_broke_first': spy_broke_first,
+                'break_lag_bars': break_lag_bars,
+                'magnitude_spread': magnitude_spread,
+                'both_returned': both_returned,
+                'both_permanent': both_permanent,
+                'return_pattern_aligned': return_pattern_aligned,
+                'continuation_aligned': continuation_aligned,
+                'cross_valid': True,
+            }
+
+        # New structure: use the CrossCorrelationLabels object
+        return {
+            'break_direction_aligned': cross.break_direction_aligned,
+            'tsla_broke_first': cross.tsla_broke_first,
+            'spy_broke_first': cross.spy_broke_first,
+            'break_lag_bars': cross.break_lag_bars,
+            'magnitude_spread': cross.magnitude_spread,
+            'both_returned': cross.both_returned,
+            'both_permanent': cross.both_permanent,
+            'return_pattern_aligned': cross.return_pattern_aligned,
+            'continuation_aligned': cross.continuation_aligned,
+            'cross_valid': cross.cross_valid,
         }
 
     def __len__(self) -> int:
@@ -224,7 +449,8 @@ class ChannelDataset(Dataset):
         Returns:
             Tuple of (features, labels) where:
                 - features: [n_features] tensor (or [8, features_per_window] for learned mode)
-                - labels: Dict with duration, direction, new_channel, etc.
+                - labels: Dict with duration, direction, new_channel, break scan fields,
+                        cross-correlation fields, and validity masks.
                         For learned mode, also includes 'per_window_features' and 'all_window_labels'
         """
         features = self.features_tensor[idx]
@@ -232,6 +458,7 @@ class ChannelDataset(Dataset):
 
         # Convert labels to tensors
         label_tensors = {
+            # Core labels
             'duration': torch.tensor(labels['duration'], dtype=torch.float32),
             'direction': torch.tensor(labels['direction'], dtype=torch.long),
             'new_channel': torch.tensor(labels['new_channel'], dtype=torch.long),
@@ -241,6 +468,38 @@ class ChannelDataset(Dataset):
             'valid': torch.tensor(labels['valid'], dtype=torch.bool),
             'duration_valid': torch.tensor(labels['duration_valid'], dtype=torch.bool),
             'direction_valid': torch.tensor(labels['direction_valid'], dtype=torch.bool),
+
+            # TSLA break scan labels
+            'bars_to_first_break': torch.tensor(labels['bars_to_first_break'], dtype=torch.float32),
+            'first_break_direction': torch.tensor(labels['first_break_direction'], dtype=torch.long),
+            'break_magnitude': torch.tensor(labels['break_magnitude'], dtype=torch.float32),
+            'bars_outside': torch.tensor(labels['bars_outside'], dtype=torch.float32),
+            'returned_to_channel': torch.tensor(labels['returned_to_channel'], dtype=torch.bool),
+            'bounces_after_return': torch.tensor(labels['bounces_after_return'], dtype=torch.float32),
+            'channel_continued': torch.tensor(labels['channel_continued'], dtype=torch.bool),
+            'break_scan_valid': torch.tensor(labels['break_scan_valid'], dtype=torch.bool),
+
+            # SPY break scan labels
+            'spy_bars_to_first_break': torch.tensor(labels['spy_bars_to_first_break'], dtype=torch.float32),
+            'spy_first_break_direction': torch.tensor(labels['spy_first_break_direction'], dtype=torch.long),
+            'spy_break_magnitude': torch.tensor(labels['spy_break_magnitude'], dtype=torch.float32),
+            'spy_bars_outside': torch.tensor(labels['spy_bars_outside'], dtype=torch.float32),
+            'spy_returned_to_channel': torch.tensor(labels['spy_returned_to_channel'], dtype=torch.bool),
+            'spy_bounces_after_return': torch.tensor(labels['spy_bounces_after_return'], dtype=torch.float32),
+            'spy_channel_continued': torch.tensor(labels['spy_channel_continued'], dtype=torch.bool),
+            'spy_break_scan_valid': torch.tensor(labels['spy_break_scan_valid'], dtype=torch.bool),
+
+            # Cross-correlation labels
+            'break_direction_aligned': torch.tensor(labels['break_direction_aligned'], dtype=torch.bool),
+            'tsla_broke_first': torch.tensor(labels['tsla_broke_first'], dtype=torch.bool),
+            'spy_broke_first': torch.tensor(labels['spy_broke_first'], dtype=torch.bool),
+            'break_lag_bars': torch.tensor(labels['break_lag_bars'], dtype=torch.float32),
+            'magnitude_spread': torch.tensor(labels['magnitude_spread'], dtype=torch.float32),
+            'both_returned': torch.tensor(labels['both_returned'], dtype=torch.bool),
+            'both_permanent': torch.tensor(labels['both_permanent'], dtype=torch.bool),
+            'return_pattern_aligned': torch.tensor(labels['return_pattern_aligned'], dtype=torch.bool),
+            'continuation_aligned': torch.tensor(labels['continuation_aligned'], dtype=torch.bool),
+            'cross_valid': torch.tensor(labels['cross_valid'], dtype=torch.bool),
         }
 
         # For learned mode, add per-window features so model can learn to select
@@ -263,6 +522,10 @@ class ChannelDataset(Dataset):
             - Label validity counts across TFs
             - Window-specific channel quality metrics (if available)
 
+        Handles both old and new labels_per_window structures:
+        - Old: {window: {tf: ChannelLabels}}
+        - New: {window: {'tsla': {tf: ChannelLabels}, 'spy': {tf: ChannelLabels}}}
+
         Returns:
             Tensor of shape [8, features_per_window] where features_per_window
             includes validity flags and quality metrics per window.
@@ -280,9 +543,17 @@ class ChannelDataset(Dataset):
         for i, window in enumerate(STANDARD_WINDOWS):
             window_labels = sample.labels_per_window.get(window, {})
 
+            # Handle both old and new structure
+            if 'tsla' in window_labels:
+                # New structure: get TSLA labels dict
+                tf_labels_dict = window_labels.get('tsla', {})
+            else:
+                # Old structure: labels are directly by TF
+                tf_labels_dict = window_labels
+
             # Per-TF validity flags
             for j, tf in enumerate(TIMEFRAMES):
-                tf_label = window_labels.get(tf)
+                tf_label = tf_labels_dict.get(tf)
                 if tf_label is not None:
                     # Check if label has valid duration or direction
                     is_valid = getattr(tf_label, 'duration_valid', False) or \
@@ -294,7 +565,7 @@ class ChannelDataset(Dataset):
             per_window_features[i, n_tfs] = valid_count / n_tfs  # valid_ratio
 
             # Has target TF valid
-            target_label = window_labels.get(self.target_tf)
+            target_label = tf_labels_dict.get(self.target_tf)
             if target_label is not None:
                 has_target = getattr(target_label, 'duration_valid', False) or \
                              getattr(target_label, 'direction_valid', False)

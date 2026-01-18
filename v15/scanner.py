@@ -163,13 +163,15 @@ _shutdown_requested = False
 _WORKER_TSLA_DF: Optional[pd.DataFrame] = None
 _WORKER_SPY_DF: Optional[pd.DataFrame] = None
 _WORKER_VIX_DF: Optional[pd.DataFrame] = None
-_WORKER_LABELED_MAP: Optional[Dict] = None
+_WORKER_TSLA_LABELED_MAP: Optional[Dict] = None
+_WORKER_SPY_LABELED_MAP: Optional[Dict] = None
 _WORKER_TIMEFRAMES: Optional[List[str]] = None
 _WORKER_WINDOWS: Optional[List[int]] = None
 
 
 def _init_worker(tsla_data: Dict, spy_data: Dict, vix_data: Dict,
-                 labeled_map: Dict, timeframes: List[str], windows: List[int]):
+                 tsla_labeled_map: Dict, spy_labeled_map: Dict,
+                 timeframes: List[str], windows: List[int]):
     """
     Initialize worker process with shared data.
 
@@ -181,18 +183,21 @@ def _init_worker(tsla_data: Dict, spy_data: Dict, vix_data: Dict,
         tsla_data: Pickle-safe TSLA DataFrame dict
         spy_data: Pickle-safe SPY DataFrame dict
         vix_data: Pickle-safe VIX DataFrame dict
-        labeled_map: Pre-computed label map
+        tsla_labeled_map: Pre-computed TSLA label map
+        spy_labeled_map: Pre-computed SPY label map
         timeframes: List of timeframe strings
         windows: List of window sizes
     """
     global _WORKER_TSLA_DF, _WORKER_SPY_DF, _WORKER_VIX_DF
-    global _WORKER_LABELED_MAP, _WORKER_TIMEFRAMES, _WORKER_WINDOWS
+    global _WORKER_TSLA_LABELED_MAP, _WORKER_SPY_LABELED_MAP
+    global _WORKER_TIMEFRAMES, _WORKER_WINDOWS
 
     # Reconstruct DataFrames ONCE per worker
     _WORKER_TSLA_DF = _reconstruct_df_from_pickle_safe(tsla_data)
     _WORKER_SPY_DF = _reconstruct_df_from_pickle_safe(spy_data)
     _WORKER_VIX_DF = _reconstruct_df_from_pickle_safe(vix_data)
-    _WORKER_LABELED_MAP = labeled_map
+    _WORKER_TSLA_LABELED_MAP = tsla_labeled_map
+    _WORKER_SPY_LABELED_MAP = spy_labeled_map
     _WORKER_TIMEFRAMES = timeframes
     _WORKER_WINDOWS = windows
 
@@ -283,7 +288,7 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
 
     Args:
         batch_args: Tuple of (positions_batch, tsla_data, spy_data, vix_data,
-                             labeled_map, timeframes, windows)
+                             tsla_labeled_map, spy_labeled_map, timeframes, windows)
                    where data dicts are from _convert_df_to_pickle_safe
 
     Returns:
@@ -291,7 +296,7 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
     """
     try:
         (positions_batch, tsla_data, spy_data, vix_data,
-         labeled_map, timeframes, windows) = batch_args
+         tsla_labeled_map, spy_labeled_map, timeframes, windows) = batch_args
 
         # Reconstruct DataFrames ONCE for the entire batch
         tsla_df = _reconstruct_df_from_pickle_safe(tsla_data)
@@ -346,7 +351,6 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
                     continue
 
                 # Get bar metadata
-                resampled_dfs = {'5min': tsla_slice}
                 bar_metadata = {
                     '5min': {
                         'bar_completion_pct': 1.0,
@@ -357,16 +361,26 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
                 }
 
                 # Look up labels for all windows and timeframes
+                # Structure: {window: {'tsla': {tf: labels}, 'spy': {tf: labels}}}
                 labels_per_window = {}
                 label_hits = 0
                 label_misses = 0
 
                 for window in windows:
-                    labels_per_window[window] = {}
+                    labels_per_window[window] = {'tsla': {}, 'spy': {}}
                     for tf in timeframes:
-                        labels = get_labels_for_position(labeled_map, tsla_df, idx, tf, window)
-                        labels_per_window[window][tf] = labels
-                        if labels is not None:
+                        # TSLA labels
+                        tsla_labels = get_labels_for_position(tsla_labeled_map, tsla_df, idx, tf, window)
+                        labels_per_window[window]['tsla'][tf] = tsla_labels
+                        if tsla_labels is not None:
+                            label_hits += 1
+                        else:
+                            label_misses += 1
+
+                        # SPY labels
+                        spy_labels = get_labels_for_position(spy_labeled_map, spy_df, idx, tf, window)
+                        labels_per_window[window]['spy'][tf] = spy_labels
+                        if spy_labels is not None:
                             label_hits += 1
                         else:
                             label_misses += 1
@@ -425,7 +439,8 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
         tsla_df = _WORKER_TSLA_DF
         spy_df = _WORKER_SPY_DF
         vix_df = _WORKER_VIX_DF
-        labeled_map = _WORKER_LABELED_MAP
+        tsla_labeled_map = _WORKER_TSLA_LABELED_MAP
+        spy_labeled_map = _WORKER_SPY_LABELED_MAP
         timeframes = _WORKER_TIMEFRAMES
         windows = _WORKER_WINDOWS
 
@@ -487,16 +502,26 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
                 }
 
                 # Look up labels for all windows and timeframes
+                # Structure: {window: {'tsla': {tf: labels}, 'spy': {tf: labels}}}
                 labels_per_window = {}
                 label_hits = 0
                 label_misses = 0
 
                 for window in windows:
-                    labels_per_window[window] = {}
+                    labels_per_window[window] = {'tsla': {}, 'spy': {}}
                     for tf in timeframes:
-                        labels = get_labels_for_position(labeled_map, tsla_df, idx, tf, window)
-                        labels_per_window[window][tf] = labels
-                        if labels is not None:
+                        # TSLA labels
+                        tsla_labels = get_labels_for_position(tsla_labeled_map, tsla_df, idx, tf, window)
+                        labels_per_window[window]['tsla'][tf] = tsla_labels
+                        if tsla_labels is not None:
+                            label_hits += 1
+                        else:
+                            label_misses += 1
+
+                        # SPY labels
+                        spy_labels = get_labels_for_position(spy_labeled_map, spy_df, idx, tf, window)
+                        labels_per_window[window]['spy'][tf] = spy_labels
+                        if spy_labels is not None:
                             label_hits += 1
                         else:
                             label_misses += 1
@@ -946,15 +971,19 @@ def scan_channels_two_pass(
     print(f"  Estimated speedup: ~{estimated_speedup:.1f}x")
 
     # =========================================================================
-    # PASS 1: Pre-compute all channels across the entire dataset
+    # PASS 1: Pre-compute all channels across the entire dataset (TSLA + SPY)
     # =========================================================================
     print("\n[PASS 1] Detecting all channels across dataset...")
+    print(f"  Assets: TSLA, SPY")
     print(f"  Timeframes: {list(TIMEFRAMES)}")
     print(f"  Windows: {list(STANDARD_WINDOWS)}")
     print(f"  Channel detection step: {channel_detection_step}")
 
     pass1_start = time.time()
-    channel_map: ChannelMap = detect_all_channels(
+
+    # TSLA channel detection
+    print("\n  [PASS 1] Detecting TSLA channels...")
+    tsla_channel_map, tsla_resampled_dfs = detect_all_channels(
         df=tsla_df,
         timeframes=list(TIMEFRAMES),
         windows=list(STANDARD_WINDOWS),
@@ -962,42 +991,81 @@ def scan_channels_two_pass(
         min_cycles=1,
         min_gap_bars=5,
         progress_callback=None,
-        workers=workers  # Pass through CLI --workers flag
+        workers=workers,
+        verbose=False
     )
+    tsla_channels = sum(len(chs) for chs in tsla_channel_map.values())
+    print(f"  TSLA: {tsla_channels} channels detected")
+
+    # SPY channel detection
+    print("\n  [PASS 1] Detecting SPY channels...")
+    spy_channel_map, spy_resampled_dfs = detect_all_channels(
+        df=spy_df,
+        timeframes=list(TIMEFRAMES),
+        windows=list(STANDARD_WINDOWS),
+        step=channel_detection_step,
+        min_cycles=1,
+        min_gap_bars=5,
+        progress_callback=None,
+        workers=workers,
+        verbose=False
+    )
+    spy_channels = sum(len(chs) for chs in spy_channel_map.values())
+    print(f"  SPY: {spy_channels} channels detected")
+
     pass1_time = time.time() - pass1_start
 
     # Count channels detected
-    total_channels = sum(len(chs) for chs in channel_map.values())
-    print(f"  Detected {total_channels} channels across all TF/window combinations")
+    total_channels = tsla_channels + spy_channels
+    print(f"\n  Total: {total_channels} channels across all TF/window combinations")
     print(f"  Pass 1 time: {pass1_time:.1f}s")
     print("\n[PASS 1] Complete!")
-    print("\n[PASS 2] Generating labels from channel map...")
+    print("\n[PASS 2] Generating labels from channel maps...")
 
     # =========================================================================
-    # PASS 2: Generate labels for all channels
+    # PASS 2: Generate labels for all channels (TSLA + SPY)
     # =========================================================================
-    # Progress callback for Pass 2
-    # Accepts: tf (str), window (int), progress_pct (float 0-1)
-    def pass2_progress_callback(tf: str, window: int, progress_pct: float):
-        pct = progress_pct * 100.0
-        if pct >= 100.0 or int(pct) % 10 == 0:
-            print(f"  [PASS 2] {tf} window={window}: {pct:.1f}% complete")
-
     pass2_start = time.time()
-    labeled_map: LabeledChannelMap = generate_all_labels(
-        channel_map=channel_map,
-        progress_callback=pass2_progress_callback
+
+    # TSLA label generation
+    print("\n  [PASS 2] Generating TSLA labels (forward_scan method)...")
+    tsla_labeled_map: LabeledChannelMap = generate_all_labels(
+        channel_map=tsla_channel_map,
+        resampled_dfs=tsla_resampled_dfs,
+        labeling_method="forward_scan",
+        progress_callback=None,
+        verbose=False
     )
+    tsla_labeled = sum(len(lcs) for lcs in tsla_labeled_map.values())
+    tsla_valid = sum(
+        1 for lcs in tsla_labeled_map.values()
+        for lc in lcs if lc.labels.direction_valid
+    )
+    print(f"  TSLA: {tsla_labeled} labeled, {tsla_valid} valid direction labels")
+
+    # SPY label generation
+    print("\n  [PASS 2] Generating SPY labels (forward_scan method)...")
+    spy_labeled_map: LabeledChannelMap = generate_all_labels(
+        channel_map=spy_channel_map,
+        resampled_dfs=spy_resampled_dfs,
+        labeling_method="forward_scan",
+        progress_callback=None,
+        verbose=False
+    )
+    spy_labeled = sum(len(lcs) for lcs in spy_labeled_map.values())
+    spy_valid = sum(
+        1 for lcs in spy_labeled_map.values()
+        for lc in lcs if lc.labels.direction_valid
+    )
+    print(f"  SPY: {spy_labeled} labeled, {spy_valid} valid direction labels")
+
     pass2_time = time.time() - pass2_start
 
     # Count labeled channels
-    total_labeled = sum(len(lcs) for lcs in labeled_map.values())
-    valid_labels = sum(
-        1 for lcs in labeled_map.values()
-        for lc in lcs if lc.labels.direction_valid
-    )
-    print(f"  Labeled {total_labeled} channels")
-    print(f"  Valid direction labels: {valid_labels}")
+    total_labeled = tsla_labeled + spy_labeled
+    valid_labels = tsla_valid + spy_valid
+    print(f"\n  Total: {total_labeled} channels labeled")
+    print(f"  Total valid direction labels: {valid_labels}")
     print(f"  Pass 2 time: {pass2_time:.1f}s")
 
     # =========================================================================
@@ -1047,7 +1115,7 @@ def scan_channels_two_pass(
             # =========================================================================
             # PARALLEL PROCESSING with Pool (using initializer for efficiency)
             # =========================================================================
-            # The large data (DataFrames, labeled_map) is passed via Pool initializer,
+            # The large data (DataFrames, labeled maps for TSLA/SPY) is passed via Pool initializer,
             # which serializes it ONCE per worker instead of ONCE per batch.
             # This dramatically reduces pickle overhead for 100s of batches.
             print(f"\n  Starting parallel processing with {workers} workers...")
@@ -1056,7 +1124,7 @@ def scan_channels_two_pass(
             with Pool(
                 processes=workers,
                 initializer=_init_worker,
-                initargs=(tsla_data, spy_data, vix_data, labeled_map,
+                initargs=(tsla_data, spy_data, vix_data, tsla_labeled_map, spy_labeled_map,
                           list(TIMEFRAMES), list(STANDARD_WINDOWS))
             ) as pool:
                 # Use imap_unordered for better performance (order doesn't matter, we sort later)
@@ -1108,11 +1176,13 @@ def scan_channels_two_pass(
 
             # Set globals for sequential processing (same as _init_worker does)
             global _WORKER_TSLA_DF, _WORKER_SPY_DF, _WORKER_VIX_DF
-            global _WORKER_LABELED_MAP, _WORKER_TIMEFRAMES, _WORKER_WINDOWS
+            global _WORKER_TSLA_LABELED_MAP, _WORKER_SPY_LABELED_MAP
+            global _WORKER_TIMEFRAMES, _WORKER_WINDOWS
             _WORKER_TSLA_DF = _reconstruct_df_from_pickle_safe(tsla_data)
             _WORKER_SPY_DF = _reconstruct_df_from_pickle_safe(spy_data)
             _WORKER_VIX_DF = _reconstruct_df_from_pickle_safe(vix_data)
-            _WORKER_LABELED_MAP = labeled_map
+            _WORKER_TSLA_LABELED_MAP = tsla_labeled_map
+            _WORKER_SPY_LABELED_MAP = spy_labeled_map
             _WORKER_TIMEFRAMES = list(TIMEFRAMES)
             _WORKER_WINDOWS = list(STANDARD_WINDOWS)
 

@@ -137,19 +137,6 @@ TF_MAX_SCAN: Dict[str, int] = {
     'monthly': 24,
 }
 
-TF_RETURN_THRESHOLD: Dict[str, int] = {
-    '5min': 25,
-    '15min': 20,
-    '30min': 18,
-    '1h': 15,
-    '2h': 12,
-    '3h': 10,
-    '4h': 8,
-    'daily': 5,
-    'weekly': 3,
-    'monthly': 2,
-}
-
 # Model configuration
 MODEL_CONFIG = {
     'input_dim': TOTAL_FEATURES,

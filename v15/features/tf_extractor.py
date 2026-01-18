@@ -335,8 +335,12 @@ def _resample_to_tf(
             }
 
             if len(resampled) < 2:
-                logger.debug(f"Not enough data after resampling to {tf}")
-                return df, metadata
+                logger.debug(f"Not enough data after resampling to {tf}: {len(resampled)} bars")
+                # Return empty dataframe to indicate insufficient data
+                # DO NOT return original df - that causes channel detection to fail silently
+                metadata['total_bars'] = len(resampled)
+                metadata['insufficient_data'] = True
+                return resampled, metadata
 
             return resampled, metadata
 
@@ -356,20 +360,25 @@ def _resample_to_tf(
                 'source_bars': len(df),
             }
             if len(resampled) < 2:
-                logger.debug(f"Not enough data after resampling to {tf}")
-                return df, metadata
+                logger.debug(f"Not enough data after resampling to {tf}: {len(resampled)} bars")
+                # Return the resampled data (even if small) - not original df
+                metadata['insufficient_data'] = True
+                return resampled, metadata
             return resampled, metadata
         except Exception as e:
             logger.warning(f"Failed to resample to {tf}: {e}")
 
-    # Return original with default metadata
-    return df, {
+    # Return empty dataframe with default metadata to indicate resampling failed completely
+    # DO NOT return original df - that would cause wrong data to be used for feature extraction
+    logger.warning(f"All resampling methods failed for {tf}, returning empty dataframe")
+    return pd.DataFrame(columns=df.columns), {
         'bar_completion_pct': round(completion_pct, 4),
         'bars_in_partial': bars_into_current if is_partial else bars_per_tf_bar,
         'expected_bars': bars_per_tf_bar,
         'is_partial': is_partial,
-        'total_bars': len(df),
+        'total_bars': 0,
         'source_bars': len(df),
+        'insufficient_data': True,
     }
 
 

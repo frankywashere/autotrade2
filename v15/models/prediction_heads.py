@@ -195,6 +195,338 @@ class WindowSelectorHead(nn.Module):
         }
 
 
+# =============================================================================
+# Break Scan Label Heads - TSLA
+# =============================================================================
+
+
+class TSLABarsToBreakHead(nn.Module):
+    """
+    Predicts TSLA bars until channel break with uncertainty.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted bars to break
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = F.softplus(self.mean_head(h))  # Bars must be positive
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class TSLABreakDirectionHead(nn.Module):
+    """
+    Predicts TSLA break direction (up/down).
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(break_up)."""
+        return self.net(x).squeeze(-1)
+
+
+class TSLABreakMagnitudeHead(nn.Module):
+    """
+    Predicts TSLA break magnitude with uncertainty.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted break magnitude
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = self.mean_head(h)  # Can be positive or negative
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class TSLAReturnedHead(nn.Module):
+    """
+    Predicts whether TSLA returned to channel after break.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(returned_to_channel)."""
+        return self.net(x).squeeze(-1)
+
+
+# =============================================================================
+# Break Scan Label Heads - SPY
+# =============================================================================
+
+
+class SPYBarsToBreakHead(nn.Module):
+    """
+    Predicts SPY bars until channel break with uncertainty.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted bars to break
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = F.softplus(self.mean_head(h))  # Bars must be positive
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class SPYBreakDirectionHead(nn.Module):
+    """
+    Predicts SPY break direction (up/down).
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(break_up)."""
+        return self.net(x).squeeze(-1)
+
+
+class SPYBreakMagnitudeHead(nn.Module):
+    """
+    Predicts SPY break magnitude with uncertainty.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted break magnitude
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = self.mean_head(h)  # Can be positive or negative
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class SPYReturnedHead(nn.Module):
+    """
+    Predicts whether SPY returned to channel after break.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(returned_to_channel)."""
+        return self.net(x).squeeze(-1)
+
+
+# =============================================================================
+# Break Scan Label Heads - Cross-Correlation
+# =============================================================================
+
+
+class DirectionAlignedHead(nn.Module):
+    """
+    Predicts whether TSLA and SPY break directions are aligned.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(directions_aligned)."""
+        return self.net(x).squeeze(-1)
+
+
+class WhoBreakFirstHead(nn.Module):
+    """
+    Predicts which asset breaks first (TSLA first, SPY first, simultaneous).
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),  # 3-class classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for 3 classes: [TSLA first, SPY first, simultaneous]."""
+        return self.net(x)
+
+
+class BreakLagHead(nn.Module):
+    """
+    Predicts break lag in bars between TSLA and SPY with uncertainty.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted break lag (can be negative)
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = self.mean_head(h)  # Can be positive or negative
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class BothPermanentHead(nn.Module):
+    """
+    Predicts whether both TSLA and SPY breaks are permanent.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(both_permanent)."""
+        return self.net(x).squeeze(-1)
+
+
+class ReturnAlignedHead(nn.Module):
+    """
+    Predicts whether TSLA and SPY return behaviors are aligned.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(return_aligned)."""
+        return self.net(x).squeeze(-1)
+
+
+# =============================================================================
+# Combined Prediction Heads
+# =============================================================================
+
+
 class PredictionHeads(nn.Module):
     """
     All prediction heads combined.
@@ -202,6 +534,11 @@ class PredictionHeads(nn.Module):
     Optionally includes a WindowSelectorHead for learned window selection
     when use_window_selector=True. This enables end-to-end training where
     the model learns which window is optimal for each prediction.
+
+    Break scan label heads can be enabled/disabled via flags:
+    - enable_tsla_heads: Enable TSLA-specific break prediction heads
+    - enable_spy_heads: Enable SPY-specific break prediction heads
+    - enable_cross_correlation_heads: Enable cross-correlation prediction heads
     """
 
     def __init__(
@@ -210,6 +547,10 @@ class PredictionHeads(nn.Module):
         hidden_dim: int = 128,
         use_window_selector: bool = False,
         num_windows: int = 8,
+        # Break scan label head flags
+        enable_tsla_heads: bool = False,
+        enable_spy_heads: bool = False,
+        enable_cross_correlation_heads: bool = False,
     ):
         """
         Initialize prediction heads.
@@ -219,11 +560,18 @@ class PredictionHeads(nn.Module):
             hidden_dim: Hidden layer dimension (default: 128)
             use_window_selector: If True, add WindowSelectorHead (default: False)
             num_windows: Number of windows for selector (default: 8)
+            enable_tsla_heads: If True, add TSLA break scan heads (default: False)
+            enable_spy_heads: If True, add SPY break scan heads (default: False)
+            enable_cross_correlation_heads: If True, add cross-correlation heads (default: False)
         """
         super().__init__()
 
         self.use_window_selector = use_window_selector
+        self.enable_tsla_heads = enable_tsla_heads
+        self.enable_spy_heads = enable_spy_heads
+        self.enable_cross_correlation_heads = enable_cross_correlation_heads
 
+        # Core prediction heads
         self.duration_head = DurationHead(input_dim, hidden_dim)
         self.direction_head = DirectionHead(input_dim, hidden_dim)
         self.new_channel_head = NewChannelDirectionHead(input_dim, hidden_dim)
@@ -238,6 +586,44 @@ class PredictionHeads(nn.Module):
             )
         else:
             self.window_selector = None
+
+        # TSLA break scan label heads
+        if enable_tsla_heads:
+            self.tsla_bars_to_break_head = TSLABarsToBreakHead(input_dim, hidden_dim)
+            self.tsla_break_direction_head = TSLABreakDirectionHead(input_dim, hidden_dim)
+            self.tsla_break_magnitude_head = TSLABreakMagnitudeHead(input_dim, hidden_dim)
+            self.tsla_returned_head = TSLAReturnedHead(input_dim, hidden_dim)
+        else:
+            self.tsla_bars_to_break_head = None
+            self.tsla_break_direction_head = None
+            self.tsla_break_magnitude_head = None
+            self.tsla_returned_head = None
+
+        # SPY break scan label heads
+        if enable_spy_heads:
+            self.spy_bars_to_break_head = SPYBarsToBreakHead(input_dim, hidden_dim)
+            self.spy_break_direction_head = SPYBreakDirectionHead(input_dim, hidden_dim)
+            self.spy_break_magnitude_head = SPYBreakMagnitudeHead(input_dim, hidden_dim)
+            self.spy_returned_head = SPYReturnedHead(input_dim, hidden_dim)
+        else:
+            self.spy_bars_to_break_head = None
+            self.spy_break_direction_head = None
+            self.spy_break_magnitude_head = None
+            self.spy_returned_head = None
+
+        # Cross-correlation heads
+        if enable_cross_correlation_heads:
+            self.direction_aligned_head = DirectionAlignedHead(input_dim, hidden_dim)
+            self.who_break_first_head = WhoBreakFirstHead(input_dim, hidden_dim)
+            self.break_lag_head = BreakLagHead(input_dim, hidden_dim)
+            self.both_permanent_head = BothPermanentHead(input_dim, hidden_dim)
+            self.return_aligned_head = ReturnAlignedHead(input_dim, hidden_dim)
+        else:
+            self.direction_aligned_head = None
+            self.who_break_first_head = None
+            self.break_lag_head = None
+            self.both_permanent_head = None
+            self.return_aligned_head = None
 
     def forward(
         self,
@@ -263,6 +649,30 @@ class PredictionHeads(nn.Module):
 
             If use_window_selector:
                 'window_selection': Dict with window selection outputs
+
+            If enable_tsla_heads:
+                'tsla_bars_to_break_mean': [batch]
+                'tsla_bars_to_break_log_std': [batch]
+                'tsla_break_direction_logits': [batch]
+                'tsla_break_magnitude_mean': [batch]
+                'tsla_break_magnitude_log_std': [batch]
+                'tsla_returned_logits': [batch]
+
+            If enable_spy_heads:
+                'spy_bars_to_break_mean': [batch]
+                'spy_bars_to_break_log_std': [batch]
+                'spy_break_direction_logits': [batch]
+                'spy_break_magnitude_mean': [batch]
+                'spy_break_magnitude_log_std': [batch]
+                'spy_returned_logits': [batch]
+
+            If enable_cross_correlation_heads:
+                'direction_aligned_logits': [batch]
+                'who_break_first_logits': [batch, 3]
+                'break_lag_mean': [batch]
+                'break_lag_log_std': [batch]
+                'both_permanent_logits': [batch]
+                'return_aligned_logits': [batch]
         """
         duration_mean, duration_log_std = self.duration_head(x)
 
@@ -283,8 +693,52 @@ class PredictionHeads(nn.Module):
             )
             outputs['window_selection'] = window_outputs
 
+        # Add TSLA break scan label outputs if enabled
+        if self.tsla_bars_to_break_head is not None:
+            tsla_bars_mean, tsla_bars_log_std = self.tsla_bars_to_break_head(x)
+            tsla_mag_mean, tsla_mag_log_std = self.tsla_break_magnitude_head(x)
+            outputs['tsla_bars_to_break_mean'] = tsla_bars_mean
+            outputs['tsla_bars_to_break_log_std'] = tsla_bars_log_std
+            outputs['tsla_break_direction_logits'] = self.tsla_break_direction_head(x)
+            outputs['tsla_break_magnitude_mean'] = tsla_mag_mean
+            outputs['tsla_break_magnitude_log_std'] = tsla_mag_log_std
+            outputs['tsla_returned_logits'] = self.tsla_returned_head(x)
+
+        # Add SPY break scan label outputs if enabled
+        if self.spy_bars_to_break_head is not None:
+            spy_bars_mean, spy_bars_log_std = self.spy_bars_to_break_head(x)
+            spy_mag_mean, spy_mag_log_std = self.spy_break_magnitude_head(x)
+            outputs['spy_bars_to_break_mean'] = spy_bars_mean
+            outputs['spy_bars_to_break_log_std'] = spy_bars_log_std
+            outputs['spy_break_direction_logits'] = self.spy_break_direction_head(x)
+            outputs['spy_break_magnitude_mean'] = spy_mag_mean
+            outputs['spy_break_magnitude_log_std'] = spy_mag_log_std
+            outputs['spy_returned_logits'] = self.spy_returned_head(x)
+
+        # Add cross-correlation outputs if enabled
+        if self.direction_aligned_head is not None:
+            break_lag_mean, break_lag_log_std = self.break_lag_head(x)
+            outputs['direction_aligned_logits'] = self.direction_aligned_head(x)
+            outputs['who_break_first_logits'] = self.who_break_first_head(x)
+            outputs['break_lag_mean'] = break_lag_mean
+            outputs['break_lag_log_std'] = break_lag_log_std
+            outputs['both_permanent_logits'] = self.both_permanent_head(x)
+            outputs['return_aligned_logits'] = self.return_aligned_head(x)
+
         return outputs
 
     def has_window_selector(self) -> bool:
         """Check if this model has a learned window selector."""
         return self.window_selector is not None
+
+    def has_tsla_heads(self) -> bool:
+        """Check if this model has TSLA break scan heads."""
+        return self.tsla_bars_to_break_head is not None
+
+    def has_spy_heads(self) -> bool:
+        """Check if this model has SPY break scan heads."""
+        return self.spy_bars_to_break_head is not None
+
+    def has_cross_correlation_heads(self) -> bool:
+        """Check if this model has cross-correlation heads."""
+        return self.direction_aligned_head is not None

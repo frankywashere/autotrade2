@@ -50,21 +50,6 @@ TF_MAX_SCAN: Dict[str, int] = {
     'monthly': 24,
 }
 
-# Return threshold percentage for significant moves per timeframe
-TF_RETURN_THRESHOLD: Dict[str, float] = {
-    '5min': 0.002,    # 0.2%
-    '15min': 0.003,   # 0.3%
-    '30min': 0.004,   # 0.4%
-    '1h': 0.005,      # 0.5%
-    '2h': 0.007,      # 0.7%
-    '3h': 0.008,      # 0.8%
-    '4h': 0.010,      # 1.0%
-    'daily': 0.015,   # 1.5%
-    'weekly': 0.030,  # 3.0%
-    'monthly': 0.050, # 5.0%
-}
-
-
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
@@ -83,11 +68,30 @@ class ChannelLabels:
         break_return: Return percentage at time of break
         timeframe: The timeframe this label was computed for
 
+    Break scan fields (TSLA):
+        bars_to_first_break: Bars from channel end until first bar outside bounds
+        first_break_direction: Direction of first exit (0=DOWN, 1=UP)
+        break_magnitude: How far outside bounds (in std devs)
+        bars_outside: Total bars spent outside bounds
+        returned_to_channel: Whether price came back inside
+        bounces_after_return: If returned, how many bounces before final exit
+        channel_continued: Whether original channel pattern continued after return
+
+    Break scan fields (SPY - mirrored):
+        spy_bars_to_first_break: Bars from channel end until first bar outside bounds
+        spy_first_break_direction: Direction of first exit (0=DOWN, 1=UP)
+        spy_break_magnitude: How far outside bounds (in std devs)
+        spy_bars_outside: Total bars spent outside bounds
+        spy_returned_to_channel: Whether price came back inside
+        spy_bounces_after_return: If returned, how many bounces before final exit
+        spy_channel_continued: Whether original channel pattern continued after return
+
     Validity flags indicate whether each label component is valid/usable:
         duration_valid: True if duration_bars is meaningful
         direction_valid: True if break_direction is meaningful
         trigger_tf_valid: True if break_trigger_tf is meaningful
         new_channel_valid: True if new_channel_direction is meaningful
+        break_scan_valid: True if forward scan was performed
     """
     # Core label values
     duration_bars: int = 0
@@ -98,11 +102,30 @@ class ChannelLabels:
     break_return: float = 0.0     # Return at break point
     timeframe: str = ""           # Timeframe this label is for
 
+    # Break scan fields - TSLA dynamics
+    bars_to_first_break: int = 0       # Bars from channel end until first bar outside bounds
+    first_break_direction: int = 0     # 0=DOWN, 1=UP (direction of first exit)
+    break_magnitude: float = 0.0       # How far outside bounds (in std devs)
+    bars_outside: int = 0              # Total bars spent outside bounds
+    returned_to_channel: bool = False  # Whether price came back inside
+    bounces_after_return: int = 0      # If returned, how many bounces before final exit
+    channel_continued: bool = False    # Whether original channel pattern continued after return
+
+    # Break scan fields - SPY dynamics (mirrored)
+    spy_bars_to_first_break: int = 0       # Bars from channel end until first bar outside bounds
+    spy_first_break_direction: int = 0     # 0=DOWN, 1=UP (direction of first exit)
+    spy_break_magnitude: float = 0.0       # How far outside bounds (in std devs)
+    spy_bars_outside: int = 0              # Total bars spent outside bounds
+    spy_returned_to_channel: bool = False  # Whether price came back inside
+    spy_bounces_after_return: int = 0      # If returned, how many bounces before final exit
+    spy_channel_continued: bool = False    # Whether original channel pattern continued after return
+
     # Validity flags
     duration_valid: bool = False
     direction_valid: bool = False
     trigger_tf_valid: bool = False
     new_channel_valid: bool = False
+    break_scan_valid: bool = False     # True if forward scan was performed
 
 
 @dataclass
@@ -114,7 +137,8 @@ class ChannelSample:
         - timestamp: When this sample was created
         - channel_end_idx: Index in 5min data where channels end
         - tf_features: Dict of all 8,665 features (flat, TF-prefixed)
-        - labels_per_window: Labels for each window across TFs
+        - labels_per_window: Labels for each window/asset/TF combination
+          Structure: {window: {'tsla': {tf: ChannelLabels}, 'spy': {tf: ChannelLabels}}}
         - bar_metadata: Partial bar completion info per TF
         - best_window: Optimal window size
     """
@@ -142,3 +166,39 @@ DIRECTION_BULL = 2
 # Timeframe to index mapping for encoding
 TF_TO_INDEX: Dict[str, int] = {tf: i for i, tf in enumerate(TIMEFRAMES)}
 INDEX_TO_TF: Dict[int, str] = {i: tf for i, tf in enumerate(TIMEFRAMES)}
+
+
+# =============================================================================
+# CROSS-CORRELATION LABELS
+# =============================================================================
+
+@dataclass
+class CrossCorrelationLabels:
+    """
+    Labels comparing TSLA and SPY channel break behavior for alignment patterns.
+
+    These labels capture how the two assets' breaks relate to each other,
+    useful for detecting lead/lag relationships and correlated movements.
+
+    Attributes:
+        break_direction_aligned: Did TSLA and SPY break in the same direction?
+        tsla_broke_first: Did TSLA break before SPY?
+        spy_broke_first: Did SPY break before TSLA?
+        break_lag_bars: Number of bars between TSLA and SPY breaks (absolute)
+        magnitude_spread: Difference in break magnitudes (TSLA - SPY return)
+        both_returned: Did both assets return to their channels?
+        both_permanent: Were both breaks permanent (no return)?
+        return_pattern_aligned: Did return behavior match (both returned or both permanent)?
+        continuation_aligned: Did continuation pattern match (same new channel direction)?
+        cross_valid: True if both TSLA and SPY had valid breaks for comparison
+    """
+    break_direction_aligned: bool = False
+    tsla_broke_first: bool = False
+    spy_broke_first: bool = False
+    break_lag_bars: int = 0
+    magnitude_spread: float = 0.0
+    both_returned: bool = False
+    both_permanent: bool = False
+    return_pattern_aligned: bool = False
+    continuation_aligned: bool = False
+    cross_valid: bool = False
