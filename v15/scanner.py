@@ -153,6 +153,63 @@ def _reconstruct_df_from_pickle_safe(data: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
+@dataclass
+class SlimLabeledChannel:
+    """
+    Memory-efficient version of LabeledChannel for worker processes.
+
+    Only contains the fields needed by get_labels_for_position():
+    - start_timestamp: For binary search
+    - end_timestamp: For binary search
+    - labels: The actual ChannelLabels to return
+
+    The heavy Channel objects with numpy arrays are STRIPPED.
+    This reduces memory from ~100MB per worker to ~1MB per worker.
+    """
+    start_timestamp: pd.Timestamp
+    end_timestamp: pd.Timestamp
+    labels: Any  # ChannelLabels
+
+    @property
+    def detected(self):
+        """Compatibility shim for get_labels_for_position()."""
+        return self
+
+
+def _create_slim_labeled_map(labeled_map: LabeledChannelMap) -> Dict[Tuple[str, int], List[SlimLabeledChannel]]:
+    """
+    Create a memory-efficient version of the labeled map for workers.
+
+    The full LabeledChannelMap contains:
+    - DetectedChannel.channel: Full Channel object with large numpy arrays
+      (upper_line, lower_line, center_line, raw close/high/low data)
+    - These arrays are NEVER used by get_labels_for_position()
+
+    This function strips the heavy data, keeping only:
+    - start_timestamp, end_timestamp (for binary search)
+    - labels (the actual ChannelLabels)
+
+    Memory reduction: ~100x per map (from GBs to MBs)
+
+    Args:
+        labeled_map: Full LabeledChannelMap from generate_all_labels()
+
+    Returns:
+        Slim version with only the data needed for label lookups
+    """
+    slim_map = {}
+    for key, labeled_channels in labeled_map.items():
+        slim_channels = []
+        for lc in labeled_channels:
+            slim_channels.append(SlimLabeledChannel(
+                start_timestamp=lc.detected.start_timestamp,
+                end_timestamp=lc.detected.end_timestamp,
+                labels=lc.labels
+            ))
+        slim_map[key] = slim_channels
+    return slim_map
+
+
 # Global flag for graceful shutdown
 _shutdown_requested = False
 
@@ -1267,17 +1324,30 @@ def scan_channels_two_pass(
             print(f"\n  Starting parallel processing with {workers} workers...")
             print(f"  Using Pool initializer (data serialized {workers}x instead of {total_batches}x)")
 
+            # CRITICAL MEMORY FIX: Create slim labeled maps for workers
+            # Full LabeledChannelMap contains Channel objects with large numpy arrays
+            # (upper_line, lower_line, center_line, etc.) that are NEVER used during scanning.
+            # Slim maps only contain timestamps + labels, reducing memory from GBs to MBs.
+            # This prevents the 80GB+ memory explosion when forking 80 workers.
+            print("  Creating slim labeled maps (stripping unused Channel arrays)...")
+            tsla_slim_map = _create_slim_labeled_map(tsla_labeled_map)
+            spy_slim_map = _create_slim_labeled_map(spy_labeled_map)
+
+            # Free the full labeled maps - no longer needed after slim maps created
+            # This reduces main process memory before forking workers
+            del tsla_labeled_map, spy_labeled_map
+            gc.collect()
+            print(f"  [Memory] Freed full labeled maps, slim maps ready for worker fork")
+
             with Pool(
                 processes=workers,
                 initializer=_init_worker,
-                initargs=(tsla_data, spy_data, vix_data, tsla_labeled_map, spy_labeled_map,
+                initargs=(tsla_data, spy_data, vix_data, tsla_slim_map, spy_slim_map,
                           list(TIMEFRAMES), list(STANDARD_WINDOWS)),
-                maxtasksperchild=5  # Recycle workers frequently to free accumulated memory
+                maxtasksperchild=50  # Recycle workers every 50 batches to free accumulated memory
             ) as pool:
-                # Use imap with chunksize=1 for backpressure (prevents queue buildup)
-                # This stops workers from piling up results faster than main process can consume
-                # Order doesn't matter - we sort at the end anyway
-                results_iter = pool.imap(_process_batch_with_globals, batches, chunksize=1)
+                # Process batches in parallel (unordered for speed, we sort at the end anyway)
+                results_iter = pool.imap_unordered(_process_batch_with_globals, batches)
 
                 # Process results as they come in
                 batch_iterator = tqdm(results_iter, total=total_batches,
@@ -1324,7 +1394,7 @@ def scan_channels_two_pass(
                             tqdm.write(f"  [Incremental] Flushed {flushed} samples to disk")
 
                     # Periodic garbage collection to prevent memory buildup
-                    if batches_processed % 5 == 0:
+                    if batches_processed % 20 == 0:
                         gc.collect()
 
                     # Check for shutdown request AFTER processing batch (no data loss)
