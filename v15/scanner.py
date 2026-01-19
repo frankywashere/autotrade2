@@ -1200,6 +1200,13 @@ def scan_channels_two_pass(
     print(f"  Total valid direction labels: {valid_labels}")
     print(f"  Pass 2 time: {pass2_time:.1f}s")
 
+    # Free Pass-1 artifacts - no longer needed after labels are generated
+    # This saves 100-500MB depending on dataset size
+    del tsla_resampled_dfs, spy_resampled_dfs
+    del tsla_channel_map, spy_channel_map
+    gc.collect()
+    print("  [Memory] Freed Pass-1 artifacts (resampled_dfs, channel_maps)")
+
     # =========================================================================
     # SCAN: Process each position using lazy label lookups
     # =========================================================================
@@ -1265,11 +1272,12 @@ def scan_channels_two_pass(
                 initializer=_init_worker,
                 initargs=(tsla_data, spy_data, vix_data, tsla_labeled_map, spy_labeled_map,
                           list(TIMEFRAMES), list(STANDARD_WINDOWS)),
-                maxtasksperchild=50  # Recycle workers every 50 batches to free accumulated memory
+                maxtasksperchild=5  # Recycle workers frequently to free accumulated memory
             ) as pool:
-                # Use imap_unordered for better performance (order doesn't matter, we sort later)
-                # Now we only pass the small batch of position indices, not the large data
-                results_iter = pool.imap_unordered(_process_batch_with_globals, batches)
+                # Use imap with chunksize=1 for backpressure (prevents queue buildup)
+                # This stops workers from piling up results faster than main process can consume
+                # Order doesn't matter - we sort at the end anyway
+                results_iter = pool.imap(_process_batch_with_globals, batches, chunksize=1)
 
                 # Process results as they come in
                 batch_iterator = tqdm(results_iter, total=total_batches,
@@ -1315,8 +1323,8 @@ def scan_channels_two_pass(
                         if progress:
                             tqdm.write(f"  [Incremental] Flushed {flushed} samples to disk")
 
-                    # Periodic garbage collection to prevent memory buildup from Pool queue
-                    if batches_processed % 20 == 0:
+                    # Periodic garbage collection to prevent memory buildup
+                    if batches_processed % 5 == 0:
                         gc.collect()
 
                     # Check for shutdown request AFTER processing batch (no data loss)
