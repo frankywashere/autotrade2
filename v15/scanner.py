@@ -1426,6 +1426,10 @@ def main():
         print(f"Saved successfully!")
 
 
+# Alias for backward compatibility with pipeline.py
+scan_channels = scan_channels_two_pass
+
+
 if __name__ == "__main__":
     # This is REQUIRED for multiprocessing on Windows/macOS
     from multiprocessing import freeze_support

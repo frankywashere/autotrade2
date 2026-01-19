@@ -43,9 +43,10 @@ def cmd_scan(args):
         vix_df=vix,
         step=args.step,
         warmup_bars=args.warmup,
-        forward_bars=args.forward,
         workers=args.workers,
-        progress=True
+        max_samples=args.max_samples,
+        progress=True,
+        output_path=args.output
     )
 
     logger.info(f"Generated {len(samples)} samples")
@@ -201,8 +202,9 @@ def main():
     scan_parser.add_argument('--output', required=True, help='Output pickle file')
     scan_parser.add_argument('--step', type=int, default=SCANNER_CONFIG['step'])
     scan_parser.add_argument('--warmup', type=int, default=SCANNER_CONFIG['warmup_bars'])
-    scan_parser.add_argument('--forward', type=int, default=SCANNER_CONFIG['forward_bars'])
     scan_parser.add_argument('--workers', type=int, default=SCANNER_CONFIG['workers'])
+    scan_parser.add_argument('--max-samples', type=int, default=None,
+        help='Maximum number of samples to generate (for testing)')
 
     # Train command
     train_parser = subparsers.add_parser('train', help='Train model')
