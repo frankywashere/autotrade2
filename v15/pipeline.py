@@ -33,6 +33,10 @@ def cmd_scan(args):
     from .data import load_market_data
     from .scanner import scan_channels
 
+    # Auto-enable incremental if chunk size specified (consistent with scanner CLI)
+    if args.incremental_chunk != 1000:
+        args.incremental = True
+
     logger.info(f"Loading data from {args.data_dir}")
     tsla, spy, vix = load_market_data(args.data_dir)
     logger.info(f"Loaded {len(tsla)} bars")

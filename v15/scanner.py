@@ -1533,6 +1533,14 @@ def _consolidate_temp_to_final(temp_file_path: str, final_path: str, progress: b
     Returns:
         int: Count of samples written
     """
+    # Handle case where temp file doesn't exist (zero samples generated)
+    if not os.path.exists(temp_file_path):
+        print(f"\n  [Incremental] No samples generated - temp file does not exist")
+        print(f"  [Incremental] Writing empty sample list to {final_path}...")
+        with open(final_path, 'wb') as f:
+            pickle.dump([], f)
+        return 0
+
     samples = []
 
     # Read all samples from temp file
