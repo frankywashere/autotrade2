@@ -21,6 +21,7 @@ Generates samples with tf_features (8,665 features) compatible with the new mode
 
 import argparse
 import multiprocessing as mp
+import os
 import pickle
 import platform
 import signal
@@ -1423,8 +1424,12 @@ def main():
     parser.add_argument('--incremental', action='store_true',
         help='Write results incrementally to disk to reduce memory usage (recommended for large scans)')
     parser.add_argument('--incremental-chunk', type=int, default=1000,
-        help='Number of samples to buffer before writing to disk (default: 1000)')
+        help='Number of samples to buffer before writing to disk (default: 1000). Specifying this automatically enables --incremental.')
     args = parser.parse_args()
+
+    # Auto-enable incremental if chunk size specified (either flag works)
+    if args.incremental_chunk != 1000:
+        args.incremental = True
 
     # Determine parallelization settings
     if args.no_parallel:
