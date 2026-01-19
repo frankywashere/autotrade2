@@ -1264,7 +1264,8 @@ def scan_channels_two_pass(
                 processes=workers,
                 initializer=_init_worker,
                 initargs=(tsla_data, spy_data, vix_data, tsla_labeled_map, spy_labeled_map,
-                          list(TIMEFRAMES), list(STANDARD_WINDOWS))
+                          list(TIMEFRAMES), list(STANDARD_WINDOWS)),
+                maxtasksperchild=50  # Recycle workers every 50 batches to free accumulated memory
             ) as pool:
                 # Use imap_unordered for better performance (order doesn't matter, we sort later)
                 # Now we only pass the small batch of position indices, not the large data
@@ -1304,12 +1305,19 @@ def scan_channels_two_pass(
 
                     batches_processed += 1
 
+                    # Explicit cleanup: free batch_results memory immediately
+                    del batch_results
+
                     # Incremental write: flush samples to temp file when threshold reached
                     if incremental_path and len(samples) >= incremental_chunk:
                         flushed = _flush_samples_to_temp(samples, incremental_path)
                         samples.clear()  # Free memory
                         if progress:
                             tqdm.write(f"  [Incremental] Flushed {flushed} samples to disk")
+
+                    # Periodic garbage collection to prevent memory buildup from Pool queue
+                    if batches_processed % 20 == 0:
+                        gc.collect()
 
                     # Check for shutdown request AFTER processing batch (no data loss)
                     if _shutdown_requested:
