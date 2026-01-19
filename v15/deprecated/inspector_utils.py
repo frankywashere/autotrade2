@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from v15.types import (
+from v15.dtypes import (
     ChannelLabels,
     CrossCorrelationLabels,
     TIMEFRAMES,

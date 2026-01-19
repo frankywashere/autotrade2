@@ -40,7 +40,7 @@ from .exceptions import (
     ModelError,
 )
 
-from .types import ChannelSample, ChannelLabels
+from .dtypes import ChannelSample, ChannelLabels
 
 # Lazy imports for optional components
 def load_market_data(data_dir: str):

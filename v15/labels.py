@@ -36,8 +36,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from v7.core.channel import detect_channel, Channel
 from v7.core.timeframe import resample_ohlc
 
-# Import ChannelLabels and CrossCorrelationLabels from v15.types
-from .types import ChannelLabels, CrossCorrelationLabels
+# Import ChannelLabels and CrossCorrelationLabels from v15.dtypes
+from .dtypes import ChannelLabels, CrossCorrelationLabels
 
 # Import TF_MAX_SCAN for forward scanning limits
 from .config import TF_MAX_SCAN

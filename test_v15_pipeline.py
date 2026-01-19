@@ -23,7 +23,7 @@ sys.path.insert(0, '.')
 from v15.data import load_market_data
 from v15.config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES
 from v15.features.extractor import extract_all_features, get_feature_names
-from v15.types import ChannelSample
+from v15.dtypes import ChannelSample
 
 print("=" * 60)
 print("V15 Pipeline Test")

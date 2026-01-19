@@ -30,7 +30,7 @@ import pickle
 import sys
 from typing import List, Optional
 
-from v15.types import (
+from v15.dtypes import (
     ChannelSample,
     ChannelLabels,
     TIMEFRAMES,

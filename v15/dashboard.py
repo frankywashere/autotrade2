@@ -25,7 +25,7 @@ import logging
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from v15.config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES
-from v15.types import ChannelSample
+from v15.dtypes import ChannelSample
 
 logger = logging.getLogger(__name__)
 

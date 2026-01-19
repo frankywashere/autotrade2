@@ -47,7 +47,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from v15.types import ChannelSample, ChannelLabels, CrossCorrelationLabels, TIMEFRAMES, STANDARD_WINDOWS
+from v15.dtypes import ChannelSample, ChannelLabels, CrossCorrelationLabels, TIMEFRAMES, STANDARD_WINDOWS
 from v15.labels import compute_cross_correlation_labels
 from v15.inspector_utils import (
     get_labels_from_sample,

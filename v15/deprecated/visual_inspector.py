@@ -48,7 +48,7 @@ import numpy as np
 import pandas as pd
 
 # Import v15 types and data loading
-from v15.types import ChannelSample, TIMEFRAMES, STANDARD_WINDOWS
+from v15.dtypes import ChannelSample, TIMEFRAMES, STANDARD_WINDOWS
 from v15.data import load_market_data
 
 

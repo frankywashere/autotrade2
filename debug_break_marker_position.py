@@ -5,7 +5,7 @@ Debug script to check break marker positions and x-axis limits.
 
 import pickle
 from pathlib import Path
-from v15.types import STANDARD_WINDOWS
+from v15.dtypes import STANDARD_WINDOWS
 
 # Load the samples
 cache_path = Path("small_sample.pkl")

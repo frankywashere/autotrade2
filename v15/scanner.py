@@ -36,7 +36,7 @@ import pandas as pd
 from tqdm import tqdm
 
 # V15 module imports
-from v15.types import ChannelSample, STANDARD_WINDOWS
+from v15.dtypes import ChannelSample, STANDARD_WINDOWS
 from v15.config import (
     SCANNER_CONFIG, TOTAL_FEATURES, FEATURE_COUNTS,
     TIMEFRAMES,  # 10-TF list (no 3month)
@@ -308,7 +308,7 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
         from v15.features.validation import validate_features
         from v7.core.channel import detect_channels_multi_window, select_best_channel
         from v15.labels import get_labels_for_position
-        from v15.types import ChannelSample
+        from v15.dtypes import ChannelSample
 
         results = []
 
@@ -449,7 +449,7 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
         from v15.features.validation import validate_features
         from v7.core.channel import detect_channels_multi_window, select_best_channel
         from v15.labels import get_labels_for_position
-        from v15.types import ChannelSample
+        from v15.dtypes import ChannelSample
 
         results = []
 
@@ -1324,6 +1324,8 @@ def main():
         help='Positions per batch for parallel processing (default: 8)')
     parser.add_argument('--no-parallel', action='store_true',
         help='Disable parallel processing (run sequentially)')
+    parser.add_argument('--data-dir', type=str, default='data',
+        help='Data directory path (default: data)')
     args = parser.parse_args()
 
     # Determine parallelization settings
@@ -1366,8 +1368,8 @@ def main():
     print(f"  Max samples: {args.max_samples if args.max_samples else 'unlimited'}")
     print(f"  Output file: {args.output if args.output else 'none (not saving)'}")
 
-    print("\nLoading market data using v15.data.loader...")
-    tsla, spy, vix = load_market_data("data")
+    print(f"\nLoading market data from {args.data_dir}...")
+    tsla, spy, vix = load_market_data(args.data_dir)
     print(f"Loaded {len(tsla)} bars")
     print(f"Date range: {tsla.index[0]} to {tsla.index[-1]}")
 
