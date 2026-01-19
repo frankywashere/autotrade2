@@ -891,7 +891,9 @@ def scan_channels_two_pass(
     batch_size: int = 8,
     progress: bool = True,
     strict: bool = True,
-    output_path: Optional[str] = None
+    output_path: Optional[str] = None,
+    incremental_path: Optional[str] = None,
+    incremental_chunk: int = 1000
 ) -> List[ChannelSample]:
     """
     Scan for channels using the efficient two-pass labeling system.
@@ -1166,6 +1168,13 @@ def scan_channels_two_pass(
 
                     batches_processed += 1
 
+                    # Incremental write: flush samples to temp file when threshold reached
+                    if incremental_path and len(samples) >= incremental_chunk:
+                        flushed = _flush_samples_to_temp(samples, incremental_path)
+                        samples.clear()  # Free memory
+                        if progress:
+                            tqdm.write(f"  [Incremental] Flushed {flushed} samples to disk")
+
         else:
             # =========================================================================
             # SEQUENTIAL PROCESSING (fallback when workers=1)
@@ -1217,6 +1226,13 @@ def scan_channels_two_pass(
                             raise ValidationError(error_with_trace)
                     elif result.get('skipped'):
                         skipped_count += 1
+
+                # Incremental write: flush samples to temp file when threshold reached
+                if incremental_path and len(samples) >= incremental_chunk:
+                    flushed = _flush_samples_to_temp(samples, incremental_path)
+                    samples.clear()  # Free memory
+                    if progress:
+                        tqdm.write(f"  [Incremental] Flushed {flushed} samples to disk")
 
     except KeyboardInterrupt:
         print("\n[INTERRUPT] KeyboardInterrupt received. Saving partial results...")
@@ -1296,6 +1312,84 @@ def scan_channels_two_pass(
     print("  --end-to-end               : Enable differentiable window selection")
     print("  --window-selection-weight  : Loss weight for window selection (default: 0.1)")
 
+    # Final flush for incremental mode
+    if incremental_path:
+        # Flush any remaining samples
+        if samples:
+            flushed = _flush_samples_to_temp(samples, incremental_path)
+            print(f"\n  [Incremental] Final flush: {flushed} samples")
+            samples.clear()
+
+        # Read all samples back from temp file
+        print(f"  [Incremental] Reading samples back from temp file...")
+        with open(incremental_path, 'rb') as f:
+            while True:
+                try:
+                    sample = pickle.load(f)
+                    samples.append(sample)
+                except EOFError:
+                    break
+        print(f"  [Incremental] Loaded {len(samples)} total samples from temp file")
+
+        # Clean up temp file (final output will be written by caller)
+        os.remove(incremental_path)
+        print(f"  [Incremental] Cleaned up temp file")
+
+    return samples
+
+
+# =============================================================================
+# Incremental Write Helpers
+# =============================================================================
+
+def _flush_samples_to_temp(samples: list, temp_file_path: str) -> int:
+    """
+    Write samples to temp file and return count written.
+    Uses append mode with streaming pickle.
+    """
+    if not samples or not temp_file_path:
+        return 0
+
+    count = len(samples)
+    with open(temp_file_path, 'ab') as f:
+        for sample in samples:
+            pickle.dump(sample, f)
+
+    return count
+
+
+def _consolidate_temp_to_final(temp_file_path: str, final_path: str, progress: bool = True) -> list:
+    """
+    Read all samples from temp file and write to final pickle.
+    Returns the list of all samples.
+    """
+    samples = []
+
+    # Read all samples from temp file
+    print(f"\nConsolidating temp file to final output...")
+    with open(temp_file_path, 'rb') as f:
+        while True:
+            try:
+                sample = pickle.load(f)
+                samples.append(sample)
+            except EOFError:
+                break
+
+    print(f"  Read {len(samples)} samples from temp file")
+
+    # Write to final output
+    print(f"  Writing to {final_path}...")
+    with open(final_path, 'wb') as f:
+        if progress:
+            with tqdm(unit='B', unit_scale=True, unit_divisor=1024, desc="Saving") as pbar:
+                pickle.dump(samples, _ProgressFileWriter(f, pbar))
+        else:
+            pickle.dump(samples, f)
+
+    # Clean up temp file
+    os.remove(temp_file_path)
+    print(f"  Cleaned up temp file")
+
     return samples
 
 
@@ -1326,6 +1420,10 @@ def main():
         help='Disable parallel processing (run sequentially)')
     parser.add_argument('--data-dir', type=str, default='data',
         help='Data directory path (default: data)')
+    parser.add_argument('--incremental', action='store_true',
+        help='Write results incrementally to disk to reduce memory usage (recommended for large scans)')
+    parser.add_argument('--incremental-chunk', type=int, default=1000,
+        help='Number of samples to buffer before writing to disk (default: 1000)')
     args = parser.parse_args()
 
     # Determine parallelization settings
@@ -1367,6 +1465,19 @@ def main():
     print(f"  Channel detection step: {args.channel_step}")
     print(f"  Max samples: {args.max_samples if args.max_samples else 'unlimited'}")
     print(f"  Output file: {args.output if args.output else 'none (not saving)'}")
+    if args.incremental:
+        print(f"  Incremental mode: ENABLED (chunk size: {args.incremental_chunk})")
+
+    # Setup incremental writes if enabled
+    temp_file_path = None
+    incremental_count = 0
+    if args.incremental and args.output:
+        import tempfile
+        temp_file_path = args.output + '.tmp'
+        # Clear any existing temp file
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        print(f"  Temp file: {temp_file_path}")
 
     print(f"\nLoading market data from {args.data_dir}...")
     tsla, spy, vix = load_market_data(args.data_dir)
@@ -1391,7 +1502,9 @@ def main():
         batch_size=batch_size,
         progress=True,
         strict=True,  # LOUD failures
-        output_path=args.output
+        output_path=args.output,
+        incremental_path=temp_file_path if args.incremental else None,
+        incremental_chunk=args.incremental_chunk
     )
 
     print(f"\nGenerated {len(samples)} samples")
