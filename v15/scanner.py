@@ -20,6 +20,7 @@ Generates samples with tf_features (8,665 features) compatible with the new mode
 """
 
 import argparse
+import gc
 import multiprocessing as mp
 import os
 import pickle
@@ -418,6 +419,11 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
                     best_window=best_window
                 )
 
+                # Memory cleanup for this position - data now copied into sample
+                del tsla_slice, spy_slice, vix_slice
+                del channels, best_channel
+                del tf_features, bar_metadata, labels_per_window
+
                 results.append({
                     'idx': idx,
                     'sample': sample,
@@ -432,6 +438,9 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
                     'error': f"[POSITION {idx}] {type(e).__name__}: {str(e)}",
                     'traceback': traceback.format_exc(),
                 })
+
+        # Trigger garbage collection at end of batch to free intermediate objects
+        gc.collect()
 
         return results
 
@@ -577,6 +586,11 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
                     best_window=best_window
                 )
 
+                # Memory cleanup for this position - data now copied into sample
+                del tsla_slice, spy_slice, vix_slice
+                del channels, best_channel
+                del tf_features, bar_metadata, labels_per_window
+
                 results.append({
                     'idx': idx,
                     'sample': sample,
@@ -591,6 +605,9 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
                     'error': f"[POSITION {idx}] {type(e).__name__}: {str(e)}",
                     'traceback': traceback.format_exc(),
                 })
+
+        # Trigger garbage collection at end of batch to free intermediate objects
+        gc.collect()
 
         return results
 
@@ -703,6 +720,7 @@ EXPECTED_FEATURE_COUNT = TOTAL_FEATURES
 
 # Minimum label hit rate required (0.0 to 1.0) - reject samples below this
 MIN_LABEL_HIT_RATE = 0.1  # At least 10% of labels must be valid
+MAX_ERRORS_IN_MEMORY = 100  # Limit error accumulation to prevent unbounded memory growth
 
 
 # =============================================================================
@@ -1205,6 +1223,7 @@ def scan_channels_two_pass(
 
     samples = []
     errors = []
+    error_count = 0  # Track total errors (even if list is truncated)
     valid_count = 0
     skipped_count = 0
     label_hit_count = 0
@@ -1269,7 +1288,11 @@ def scan_channels_two_pass(
                             error_msg = result['error']
                             if result.get('traceback'):
                                 error_msg += f"\nTraceback:\n{result['traceback']}"
-                            errors.append(error_msg)
+                            error_count += 1
+                            if len(errors) < MAX_ERRORS_IN_MEMORY:
+                                errors.append(error_msg)
+                            elif len(errors) == MAX_ERRORS_IN_MEMORY:
+                                errors.append(f"... (additional errors truncated, showing first {MAX_ERRORS_IN_MEMORY})")
                             if strict:
                                 pool.terminate()
                                 error_with_trace = result['error']
@@ -1338,7 +1361,11 @@ def scan_channels_two_pass(
                         error_msg = result['error']
                         if result.get('traceback'):
                             error_msg += f"\nTraceback:\n{result['traceback']}"
-                        errors.append(error_msg)
+                        error_count += 1
+                        if len(errors) < MAX_ERRORS_IN_MEMORY:
+                            errors.append(error_msg)
+                        elif len(errors) == MAX_ERRORS_IN_MEMORY:
+                            errors.append(f"... (additional errors truncated, showing first {MAX_ERRORS_IN_MEMORY})")
                         if strict:
                             error_with_trace = result['error']
                             if result.get('traceback'):
@@ -1383,7 +1410,7 @@ def scan_channels_two_pass(
     print(f"  Total positions scanned: {total_positions}")
     print(f"  Valid samples found: {valid_count}")
     print(f"  Skipped (no channel): {skipped_count}")
-    print(f"  Errors: {len(errors)}")
+    print(f"  Errors: {error_count}" + (f" ({len(errors)} shown)" if error_count > len(errors) else ""))
 
     if valid_count > 0:
         avg_features = sum(len(s.tf_features) for s in samples) / valid_count
@@ -1449,20 +1476,28 @@ def scan_channels_two_pass(
             print(f"\n  [Incremental] Final flush: {flushed} samples")
             samples.clear()
 
-        # Read all samples back from temp file
-        print(f"  [Incremental] Reading samples back from temp file...")
-        with open(incremental_path, 'rb') as f:
-            while True:
-                try:
-                    sample = pickle.load(f)
-                    samples.append(sample)
-                except EOFError:
-                    break
-        print(f"  [Incremental] Loaded {len(samples)} total samples from temp file")
-
-        # Clean up temp file (final output will be written by caller)
-        os.remove(incremental_path)
-        print(f"  [Incremental] Cleaned up temp file")
+        # If output_path is specified, stream directly to final output (memory efficient)
+        if output_path:
+            sample_count = _consolidate_temp_to_final(incremental_path, output_path, progress=progress)
+            print(f"  [Incremental] Wrote {sample_count} samples directly to {output_path}")
+            # Return empty list - samples are on disk, not in memory
+            # This is the key memory optimization: caller doesn't need samples in RAM
+            return []
+        else:
+            # No output path - user wants samples in memory (backward compatible)
+            print(f"  [Incremental] Reading samples back into memory (no output path specified)...")
+            with open(incremental_path, 'rb') as f:
+                while True:
+                    try:
+                        sample = pickle.load(f)
+                        samples.append(sample)
+                    except EOFError:
+                        break
+            print(f"  [Incremental] Loaded {len(samples)} total samples from temp file")
+            os.remove(incremental_path)
+            print(f"  [Incremental] Cleaned up temp file")
+            # Sort samples since they may be out of order
+            samples.sort(key=lambda s: s.channel_end_idx)
 
     return samples
 
@@ -1487,15 +1522,21 @@ def _flush_samples_to_temp(samples: list, temp_file_path: str) -> int:
     return count
 
 
-def _consolidate_temp_to_final(temp_file_path: str, final_path: str, progress: bool = True) -> list:
+def _consolidate_temp_to_final(temp_file_path: str, final_path: str, progress: bool = True) -> int:
     """
     Read all samples from temp file and write to final pickle.
-    Returns the list of all samples.
+
+    Note: This still requires loading all samples into memory for pickle list format,
+    but the key benefit is that samples are NOT returned to caller - memory is freed
+    immediately after writing. The samples exist only on disk after this function.
+
+    Returns:
+        int: Count of samples written
     """
     samples = []
 
     # Read all samples from temp file
-    print(f"\nConsolidating temp file to final output...")
+    print(f"\n  [Incremental] Consolidating temp file to final output...")
     with open(temp_file_path, 'rb') as f:
         while True:
             try:
@@ -1504,10 +1545,14 @@ def _consolidate_temp_to_final(temp_file_path: str, final_path: str, progress: b
             except EOFError:
                 break
 
-    print(f"  Read {len(samples)} samples from temp file")
+    # Sort samples by index before writing (they may be out of order from parallel processing)
+    samples.sort(key=lambda s: s.channel_end_idx)
+
+    print(f"  [Incremental] Read and sorted {len(samples)} samples from temp file")
 
     # Write to final output
-    print(f"  Writing to {final_path}...")
+    print(f"  [Incremental] Writing to {final_path}...")
+    count = len(samples)
     with open(final_path, 'wb') as f:
         if progress:
             with tqdm(unit='B', unit_scale=True, unit_divisor=1024, desc="Saving") as pbar:
@@ -1517,9 +1562,12 @@ def _consolidate_temp_to_final(temp_file_path: str, final_path: str, progress: b
 
     # Clean up temp file
     os.remove(temp_file_path)
-    print(f"  Cleaned up temp file")
+    print(f"  [Incremental] Cleaned up temp file")
 
-    return samples
+    # Explicitly free memory - samples now only exist on disk
+    del samples
+
+    return count
 
 
 # =============================================================================
@@ -1558,6 +1606,16 @@ def main():
     # Auto-enable incremental if chunk size specified (either flag works)
     if args.incremental_chunk != 1000:
         args.incremental = True
+
+    # Warn if --incremental is used without --output (it becomes a no-op)
+    if args.incremental and not args.output:
+        print("\n" + "=" * 60)
+        print("WARNING: --incremental has no effect without --output")
+        print("  Incremental mode writes samples to a temp file during scanning.")
+        print("  Without --output, there's no temp file to write to.")
+        print("  Add --output <path> or remove --incremental")
+        print("=" * 60 + "\n")
+        args.incremental = False  # Disable since it won't do anything
 
     # Determine parallelization settings
     if args.no_parallel:
@@ -1603,9 +1661,7 @@ def main():
 
     # Setup incremental writes if enabled
     temp_file_path = None
-    incremental_count = 0
     if args.incremental and args.output:
-        import tempfile
         temp_file_path = args.output + '.tmp'
         # Clear any existing temp file
         if os.path.exists(temp_file_path):
@@ -1640,38 +1696,57 @@ def main():
         incremental_chunk=args.incremental_chunk
     )
 
-    print(f"\nGenerated {len(samples)} samples")
+    # Handle output based on whether incremental mode wrote directly to disk
+    if not samples and args.incremental and args.output:
+        # Samples were written directly to output file by incremental mode
+        # Load first/last sample for display only
+        print(f"\nSamples written directly to {args.output} (incremental mode - memory optimized)")
+        with open(args.output, 'rb') as f:
+            all_samples = pickle.load(f)
+        print(f"  Total samples: {len(all_samples)}")
+        if all_samples:
+            sample = all_samples[0]
+            print(f"\nFirst sample details:")
+            print(f"  Timestamp: {sample.timestamp}")
+            print(f"  Best window: {sample.best_window}")
+            print(f"  Feature count: {len(sample.tf_features)}")
+            print(f"\nLast sample: {all_samples[-1].timestamp}")
+        # Free memory - samples already on disk
+        del all_samples
+    else:
+        # Normal mode - samples are in memory
+        print(f"\nGenerated {len(samples)} samples")
 
-    if samples:
-        sample = samples[0]
-        print(f"\nFirst sample details:")
-        print(f"  Timestamp: {sample.timestamp}")
-        print(f"  Best window: {sample.best_window}")
-        print(f"  Feature count: {len(sample.tf_features)}")
+        if samples:
+            sample = samples[0]
+            print(f"\nFirst sample details:")
+            print(f"  Timestamp: {sample.timestamp}")
+            print(f"  Best window: {sample.best_window}")
+            print(f"  Feature count: {len(sample.tf_features)}")
 
-        # Show some feature names
-        feature_names = list(sample.tf_features.keys())
-        print(f"\n  Sample feature names (first 10):")
-        for name in feature_names[:10]:
-            print(f"    - {name}: {sample.tf_features[name]:.4f}")
-
-        # Check for bar metadata features
-        bar_meta_features = [k for k in feature_names if 'bar_completion' in k]
-        if bar_meta_features:
-            print(f"\n  Bar metadata features:")
-            for name in bar_meta_features[:5]:
+            # Show some feature names
+            feature_names = list(sample.tf_features.keys())
+            print(f"\n  Sample feature names (first 10):")
+            for name in feature_names[:10]:
                 print(f"    - {name}: {sample.tf_features[name]:.4f}")
 
-        print(f"\nLast sample: {samples[-1].timestamp}")
+            # Check for bar metadata features
+            bar_meta_features = [k for k in feature_names if 'bar_completion' in k]
+            if bar_meta_features:
+                print(f"\n  Bar metadata features:")
+                for name in bar_meta_features[:5]:
+                    print(f"    - {name}: {sample.tf_features[name]:.4f}")
 
-    # Save samples to output file if specified
-    if args.output and samples:
-        print(f"\nSaving {len(samples)} samples to {args.output}...")
-        with open(args.output, 'wb') as f:
-            with tqdm(unit='B', unit_scale=True, unit_divisor=1024,
-                     desc="Saving") as pbar:
-                pickle.dump(samples, _ProgressFileWriter(f, pbar))
-        print(f"Saved successfully!")
+            print(f"\nLast sample: {samples[-1].timestamp}")
+
+        # Save samples to output file if specified
+        if args.output and samples:
+            print(f"\nSaving {len(samples)} samples to {args.output}...")
+            with open(args.output, 'wb') as f:
+                with tqdm(unit='B', unit_scale=True, unit_divisor=1024,
+                         desc="Saving") as pbar:
+                    pickle.dump(samples, _ProgressFileWriter(f, pbar))
+            print(f"Saved successfully!")
 
 
 # Alias for backward compatibility with pipeline.py

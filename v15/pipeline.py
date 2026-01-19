@@ -29,12 +29,21 @@ logger = logging.getLogger(__name__)
 
 def cmd_scan(args):
     """Run feature extraction pipeline."""
+    import os
     from .data import load_market_data
     from .scanner import scan_channels
 
     logger.info(f"Loading data from {args.data_dir}")
     tsla, spy, vix = load_market_data(args.data_dir)
     logger.info(f"Loaded {len(tsla)} bars")
+
+    # Setup incremental mode if enabled
+    incremental_path = None
+    if args.incremental:
+        incremental_path = args.output + '.tmp'
+        if os.path.exists(incremental_path):
+            os.remove(incremental_path)
+        logger.info(f"Incremental mode enabled, temp file: {incremental_path}")
 
     logger.info("Starting channel scan...")
     samples = scan_channels(
@@ -46,16 +55,27 @@ def cmd_scan(args):
         workers=args.workers,
         max_samples=args.max_samples,
         progress=True,
-        output_path=args.output
+        output_path=args.output,
+        incremental_path=incremental_path,
+        incremental_chunk=args.incremental_chunk
     )
 
-    logger.info(f"Generated {len(samples)} samples")
-
-    # Save
-    output_path = Path(args.output)
-    with open(output_path, 'wb') as f:
-        pickle.dump(samples, f)
-    logger.info(f"Saved to {output_path}")
+    # Handle output based on whether incremental mode wrote directly to disk
+    if not samples and args.incremental:
+        # Samples were written directly to output file by incremental mode
+        logger.info(f"Samples written directly to {args.output} (incremental mode)")
+        # Load to get count for logging
+        with open(args.output, 'rb') as f:
+            saved_samples = pickle.load(f)
+        logger.info(f"Total samples: {len(saved_samples)}")
+        del saved_samples  # Free memory
+    else:
+        logger.info(f"Generated {len(samples)} samples")
+        # Save
+        output_path = Path(args.output)
+        with open(output_path, 'wb') as f:
+            pickle.dump(samples, f)
+        logger.info(f"Saved to {output_path}")
 
 
 def cmd_train(args):
@@ -205,6 +225,10 @@ def main():
     scan_parser.add_argument('--workers', type=int, default=SCANNER_CONFIG['workers'])
     scan_parser.add_argument('--max-samples', type=int, default=None,
         help='Maximum number of samples to generate (for testing)')
+    scan_parser.add_argument('--incremental', action='store_true',
+        help='Write results incrementally to disk to reduce memory usage')
+    scan_parser.add_argument('--incremental-chunk', type=int, default=1000,
+        help='Number of samples to buffer before writing to disk (default: 1000)')
 
     # Train command
     train_parser = subparsers.add_parser('train', help='Train model')

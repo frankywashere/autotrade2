@@ -21,6 +21,7 @@ All features are explicitly named with TF prefix (e.g., 'daily_rsi_14', '1h_w50_
 
 from __future__ import annotations
 
+import gc
 import logging
 from typing import Dict, List, Optional, TYPE_CHECKING, Any, Tuple
 
@@ -914,6 +915,13 @@ def extract_all_tf_features(
 
             extraction_stats['timeframes_processed'] += 1
 
+            # Explicit memory cleanup for this TF iteration
+            # These large objects are no longer needed after feature extraction
+            del tsla_tf, spy_tf, vix_tf
+            del tsla_channels_by_window, spy_channels_by_window
+            del wi_features, channel_features, spy_channel_features
+            del correlation_features, window_score_features, history_features
+
         except Exception as e:
             logger.error(f"Error processing timeframe {tf}: {e}")
             extraction_stats['errors'].append(f"{tf}: {e}")
@@ -930,6 +938,9 @@ def extract_all_tf_features(
         except Exception as e:
             logger.error(f"Error extracting event features: {e}")
             extraction_stats['errors'].append(f"events: {e}")
+
+    # Trigger garbage collection after TF loop to clean up intermediate objects
+    gc.collect()
 
     # -------------------------------------------------------------------------
     # Extract bar metadata features (30 features: 3 per TF * 10 TFs)
