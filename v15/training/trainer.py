@@ -90,6 +90,14 @@ class TrainingConfig:
     spy_break_magnitude_weight: float = 1.0   # Regression: magnitude in std devs
     spy_returned_weight: float = 1.0          # Binary: returned to channel
 
+    # New TSLA heads
+    tsla_bounces_weight: float = 1.0              # Regression: bounces after return
+    tsla_channel_continued_weight: float = 1.0    # Binary: channel continued after return
+
+    # New SPY heads
+    spy_bounces_weight: float = 1.0               # Regression: bounces after return
+    spy_channel_continued_weight: float = 1.0     # Binary: channel continued after return
+
     # Cross-correlation head weights
     cross_direction_aligned_weight: float = 1.0   # Binary: TSLA/SPY broke same way
     cross_who_broke_first_weight: float = 1.0     # Multi-class: TSLA first / SPY first / simultaneous
@@ -505,17 +513,17 @@ class Trainer:
             losses['new_channel_n_valid'] = 0
 
         # =====================================================================
-        # TSLA Break Scan Heads (use break_scan_valid mask)
+        # TSLA Break Scan Heads (use tsla_break_scan_valid mask)
         # =====================================================================
-        break_scan_valid = labels.get('break_scan_valid', global_valid)
+        tsla_break_scan_valid = labels.get('tsla_break_scan_valid', global_valid)
 
         # TSLA bars_to_break (regression with Gaussian NLL or Huber)
-        if 'tsla_bars_to_break_mean' in predictions and break_scan_valid.any():
-            tsla_btb_mean = predictions['tsla_bars_to_break_mean'][break_scan_valid]
-            tsla_btb_target = labels['tsla_bars_to_break'][break_scan_valid].float()
+        if 'tsla_bars_to_break_mean' in predictions and tsla_break_scan_valid.any():
+            tsla_btb_mean = predictions['tsla_bars_to_break_mean'][tsla_break_scan_valid]
+            tsla_btb_target = labels['tsla_bars_to_first_break'][tsla_break_scan_valid].float()
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_bars_to_break_log_std' in predictions:
-                tsla_btb_log_std = predictions['tsla_bars_to_break_log_std'][break_scan_valid]
+                tsla_btb_log_std = predictions['tsla_bars_to_break_log_std'][tsla_break_scan_valid]
                 variance = torch.exp(2 * tsla_btb_log_std)
                 tsla_btb_loss = 0.5 * (
                     torch.log(variance) +
@@ -525,16 +533,16 @@ class Trainer:
                 tsla_btb_loss = F.huber_loss(tsla_btb_mean, tsla_btb_target, delta=self.config.huber_delta)
 
             losses['tsla_bars_to_break'] = tsla_btb_loss.item()
-            losses['tsla_bars_to_break_n_valid'] = int(break_scan_valid.sum().item())
+            losses['tsla_bars_to_break_n_valid'] = int(tsla_break_scan_valid.sum().item())
         else:
             tsla_btb_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_bars_to_break'] = 0.0
             losses['tsla_bars_to_break_n_valid'] = 0
 
         # TSLA break_direction (binary classification with BCE or Focal)
-        if 'tsla_break_direction_logits' in predictions and break_scan_valid.any():
-            tsla_dir_logits = predictions['tsla_break_direction_logits'][break_scan_valid]
-            tsla_dir_target = labels['tsla_break_direction'][break_scan_valid].float()
+        if 'tsla_break_direction_logits' in predictions and tsla_break_scan_valid.any():
+            tsla_dir_logits = predictions['tsla_break_direction_logits'][tsla_break_scan_valid]
+            tsla_dir_target = labels['tsla_break_direction'][tsla_break_scan_valid].float()
 
             if self.config.direction_loss_type == 'focal':
                 probs = torch.sigmoid(tsla_dir_logits)
@@ -551,12 +559,12 @@ class Trainer:
             losses['tsla_break_direction'] = 0.0
 
         # TSLA break_magnitude (regression with Gaussian NLL or Huber)
-        if 'tsla_break_magnitude_mean' in predictions and break_scan_valid.any():
-            tsla_mag_mean = predictions['tsla_break_magnitude_mean'][break_scan_valid]
-            tsla_mag_target = labels['tsla_break_magnitude'][break_scan_valid].float()
+        if 'tsla_break_magnitude_mean' in predictions and tsla_break_scan_valid.any():
+            tsla_mag_mean = predictions['tsla_break_magnitude_mean'][tsla_break_scan_valid]
+            tsla_mag_target = labels['tsla_break_magnitude'][tsla_break_scan_valid].float()
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_break_magnitude_log_std' in predictions:
-                tsla_mag_log_std = predictions['tsla_break_magnitude_log_std'][break_scan_valid]
+                tsla_mag_log_std = predictions['tsla_break_magnitude_log_std'][tsla_break_scan_valid]
                 variance = torch.exp(2 * tsla_mag_log_std)
                 tsla_mag_loss = 0.5 * (
                     torch.log(variance) +
@@ -570,10 +578,10 @@ class Trainer:
             tsla_mag_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_break_magnitude'] = 0.0
 
-        # TSLA returned (binary classification)
-        if 'tsla_returned_logits' in predictions and break_scan_valid.any():
-            tsla_ret_logits = predictions['tsla_returned_logits'][break_scan_valid]
-            tsla_ret_target = labels['tsla_returned'][break_scan_valid].float()
+        # TSLA returned_to_channel (binary classification)
+        if 'tsla_returned_logits' in predictions and tsla_break_scan_valid.any():
+            tsla_ret_logits = predictions['tsla_returned_logits'][tsla_break_scan_valid]
+            tsla_ret_target = labels['tsla_returned_to_channel'][tsla_break_scan_valid].float()
 
             if self.config.direction_loss_type == 'focal':
                 probs = torch.sigmoid(tsla_ret_logits)
@@ -589,17 +597,57 @@ class Trainer:
             tsla_ret_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_returned'] = 0.0
 
+        # TSLA bounces_after_return (regression with Gaussian NLL)
+        if 'tsla_bounces_mean' in predictions and tsla_break_scan_valid.any():
+            tsla_bounces_mean = predictions['tsla_bounces_mean'][tsla_break_scan_valid]
+            tsla_bounces_target = labels['tsla_bounces_after_return'][tsla_break_scan_valid].float()
+
+            if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_bounces_log_std' in predictions:
+                tsla_bounces_log_std = predictions['tsla_bounces_log_std'][tsla_break_scan_valid]
+                variance = torch.exp(2 * tsla_bounces_log_std)
+                tsla_bounces_loss = 0.5 * (
+                    torch.log(variance) +
+                    (tsla_bounces_target - tsla_bounces_mean) ** 2 / variance
+                ).mean()
+            else:
+                tsla_bounces_loss = F.huber_loss(tsla_bounces_mean, tsla_bounces_target, delta=self.config.huber_delta)
+
+            losses['tsla_bounces'] = tsla_bounces_loss.item()
+        else:
+            tsla_bounces_loss = torch.tensor(0.0, device=self.device)
+            losses['tsla_bounces'] = 0.0
+
+        # TSLA channel_continued (binary classification with BCE)
+        if 'tsla_channel_continued_logits' in predictions and tsla_break_scan_valid.any():
+            tsla_cc_logits = predictions['tsla_channel_continued_logits'][tsla_break_scan_valid]
+            tsla_cc_target = labels['tsla_channel_continued'][tsla_break_scan_valid].float()
+
+            if self.config.direction_loss_type == 'focal':
+                probs = torch.sigmoid(tsla_cc_logits)
+                p_t = probs * tsla_cc_target + (1 - probs) * (1 - tsla_cc_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(tsla_cc_logits, tsla_cc_target, reduction='none')
+                tsla_cc_loss = (focal_weight * bce).mean()
+            else:
+                tsla_cc_loss = F.binary_cross_entropy_with_logits(tsla_cc_logits, tsla_cc_target)
+
+            losses['tsla_channel_continued'] = tsla_cc_loss.item()
+        else:
+            tsla_cc_loss = torch.tensor(0.0, device=self.device)
+            losses['tsla_channel_continued'] = 0.0
+
         # =====================================================================
-        # SPY Break Scan Heads (use break_scan_valid mask)
+        # SPY Break Scan Heads (use spy_break_scan_valid mask)
         # =====================================================================
+        spy_break_scan_valid = labels.get('spy_break_scan_valid', global_valid)
 
         # SPY bars_to_break (regression)
-        if 'spy_bars_to_break_mean' in predictions and break_scan_valid.any():
-            spy_btb_mean = predictions['spy_bars_to_break_mean'][break_scan_valid]
-            spy_btb_target = labels['spy_bars_to_break'][break_scan_valid].float()
+        if 'spy_bars_to_break_mean' in predictions and spy_break_scan_valid.any():
+            spy_btb_mean = predictions['spy_bars_to_break_mean'][spy_break_scan_valid]
+            spy_btb_target = labels['spy_bars_to_first_break'][spy_break_scan_valid].float()
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'spy_bars_to_break_log_std' in predictions:
-                spy_btb_log_std = predictions['spy_bars_to_break_log_std'][break_scan_valid]
+                spy_btb_log_std = predictions['spy_bars_to_break_log_std'][spy_break_scan_valid]
                 variance = torch.exp(2 * spy_btb_log_std)
                 spy_btb_loss = 0.5 * (
                     torch.log(variance) +
@@ -609,16 +657,16 @@ class Trainer:
                 spy_btb_loss = F.huber_loss(spy_btb_mean, spy_btb_target, delta=self.config.huber_delta)
 
             losses['spy_bars_to_break'] = spy_btb_loss.item()
-            losses['spy_bars_to_break_n_valid'] = int(break_scan_valid.sum().item())
+            losses['spy_bars_to_break_n_valid'] = int(spy_break_scan_valid.sum().item())
         else:
             spy_btb_loss = torch.tensor(0.0, device=self.device)
             losses['spy_bars_to_break'] = 0.0
             losses['spy_bars_to_break_n_valid'] = 0
 
         # SPY break_direction (binary classification)
-        if 'spy_break_direction_logits' in predictions and break_scan_valid.any():
-            spy_dir_logits = predictions['spy_break_direction_logits'][break_scan_valid]
-            spy_dir_target = labels['spy_break_direction'][break_scan_valid].float()
+        if 'spy_break_direction_logits' in predictions and spy_break_scan_valid.any():
+            spy_dir_logits = predictions['spy_break_direction_logits'][spy_break_scan_valid]
+            spy_dir_target = labels['spy_break_direction'][spy_break_scan_valid].float()
 
             if self.config.direction_loss_type == 'focal':
                 probs = torch.sigmoid(spy_dir_logits)
@@ -635,12 +683,12 @@ class Trainer:
             losses['spy_break_direction'] = 0.0
 
         # SPY break_magnitude (regression)
-        if 'spy_break_magnitude_mean' in predictions and break_scan_valid.any():
-            spy_mag_mean = predictions['spy_break_magnitude_mean'][break_scan_valid]
-            spy_mag_target = labels['spy_break_magnitude'][break_scan_valid].float()
+        if 'spy_break_magnitude_mean' in predictions and spy_break_scan_valid.any():
+            spy_mag_mean = predictions['spy_break_magnitude_mean'][spy_break_scan_valid]
+            spy_mag_target = labels['spy_break_magnitude'][spy_break_scan_valid].float()
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'spy_break_magnitude_log_std' in predictions:
-                spy_mag_log_std = predictions['spy_break_magnitude_log_std'][break_scan_valid]
+                spy_mag_log_std = predictions['spy_break_magnitude_log_std'][spy_break_scan_valid]
                 variance = torch.exp(2 * spy_mag_log_std)
                 spy_mag_loss = 0.5 * (
                     torch.log(variance) +
@@ -654,10 +702,10 @@ class Trainer:
             spy_mag_loss = torch.tensor(0.0, device=self.device)
             losses['spy_break_magnitude'] = 0.0
 
-        # SPY returned (binary classification)
-        if 'spy_returned_logits' in predictions and break_scan_valid.any():
-            spy_ret_logits = predictions['spy_returned_logits'][break_scan_valid]
-            spy_ret_target = labels['spy_returned'][break_scan_valid].float()
+        # SPY returned_to_channel (binary classification)
+        if 'spy_returned_logits' in predictions and spy_break_scan_valid.any():
+            spy_ret_logits = predictions['spy_returned_logits'][spy_break_scan_valid]
+            spy_ret_target = labels['spy_returned_to_channel'][spy_break_scan_valid].float()
 
             if self.config.direction_loss_type == 'focal':
                 probs = torch.sigmoid(spy_ret_logits)
@@ -672,6 +720,45 @@ class Trainer:
         else:
             spy_ret_loss = torch.tensor(0.0, device=self.device)
             losses['spy_returned'] = 0.0
+
+        # SPY bounces_after_return (regression with Gaussian NLL)
+        if 'spy_bounces_mean' in predictions and spy_break_scan_valid.any():
+            spy_bounces_mean = predictions['spy_bounces_mean'][spy_break_scan_valid]
+            spy_bounces_target = labels['spy_bounces_after_return'][spy_break_scan_valid].float()
+
+            if self.config.duration_loss_type == 'gaussian_nll' and 'spy_bounces_log_std' in predictions:
+                spy_bounces_log_std = predictions['spy_bounces_log_std'][spy_break_scan_valid]
+                variance = torch.exp(2 * spy_bounces_log_std)
+                spy_bounces_loss = 0.5 * (
+                    torch.log(variance) +
+                    (spy_bounces_target - spy_bounces_mean) ** 2 / variance
+                ).mean()
+            else:
+                spy_bounces_loss = F.huber_loss(spy_bounces_mean, spy_bounces_target, delta=self.config.huber_delta)
+
+            losses['spy_bounces'] = spy_bounces_loss.item()
+        else:
+            spy_bounces_loss = torch.tensor(0.0, device=self.device)
+            losses['spy_bounces'] = 0.0
+
+        # SPY channel_continued (binary classification with BCE)
+        if 'spy_channel_continued_logits' in predictions and spy_break_scan_valid.any():
+            spy_cc_logits = predictions['spy_channel_continued_logits'][spy_break_scan_valid]
+            spy_cc_target = labels['spy_channel_continued'][spy_break_scan_valid].float()
+
+            if self.config.direction_loss_type == 'focal':
+                probs = torch.sigmoid(spy_cc_logits)
+                p_t = probs * spy_cc_target + (1 - probs) * (1 - spy_cc_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(spy_cc_logits, spy_cc_target, reduction='none')
+                spy_cc_loss = (focal_weight * bce).mean()
+            else:
+                spy_cc_loss = F.binary_cross_entropy_with_logits(spy_cc_logits, spy_cc_target)
+
+            losses['spy_channel_continued'] = spy_cc_loss.item()
+        else:
+            spy_cc_loss = torch.tensor(0.0, device=self.device)
+            losses['spy_channel_continued'] = 0.0
 
         # =====================================================================
         # Cross-Correlation Heads (use cross_valid mask)
@@ -710,10 +797,10 @@ class Trainer:
             cross_who_loss = torch.tensor(0.0, device=self.device)
             losses['cross_who_broke_first'] = 0.0
 
-        # break_lag (regression)
+        # break_lag_bars (regression)
         if 'cross_break_lag_mean' in predictions and cross_valid.any():
             cross_lag_mean = predictions['cross_break_lag_mean'][cross_valid]
-            cross_lag_target = labels['cross_break_lag'][cross_valid].float()
+            cross_lag_target = labels['cross_break_lag_bars'][cross_valid].float()
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'cross_break_lag_log_std' in predictions:
                 cross_lag_log_std = predictions['cross_break_lag_log_std'][cross_valid]
@@ -749,10 +836,10 @@ class Trainer:
             cross_perm_loss = torch.tensor(0.0, device=self.device)
             losses['cross_both_permanent'] = 0.0
 
-        # return_aligned (binary classification)
+        # return_pattern_aligned (binary classification)
         if 'cross_return_aligned_logits' in predictions and cross_valid.any():
             cross_ret_logits = predictions['cross_return_aligned_logits'][cross_valid]
-            cross_ret_target = labels['cross_return_aligned'][cross_valid].float()
+            cross_ret_target = labels['cross_return_pattern_aligned'][cross_valid].float()
 
             if self.config.direction_loss_type == 'focal':
                 probs = torch.sigmoid(cross_ret_logits)
@@ -780,11 +867,15 @@ class Trainer:
             self.config.tsla_break_direction_weight * tsla_dir_loss +
             self.config.tsla_break_magnitude_weight * tsla_mag_loss +
             self.config.tsla_returned_weight * tsla_ret_loss +
+            self.config.tsla_bounces_weight * tsla_bounces_loss +
+            self.config.tsla_channel_continued_weight * tsla_cc_loss +
             # SPY break scan heads
             self.config.spy_bars_to_break_weight * spy_btb_loss +
             self.config.spy_break_direction_weight * spy_dir_loss +
             self.config.spy_break_magnitude_weight * spy_mag_loss +
             self.config.spy_returned_weight * spy_ret_loss +
+            self.config.spy_bounces_weight * spy_bounces_loss +
+            self.config.spy_channel_continued_weight * spy_cc_loss +
             # Cross-correlation heads
             self.config.cross_direction_aligned_weight * cross_dir_loss +
             self.config.cross_who_broke_first_weight * cross_who_loss +
@@ -1280,11 +1371,15 @@ class Trainer:
                 'tsla_break_direction_weight': self.config.tsla_break_direction_weight,
                 'tsla_break_magnitude_weight': self.config.tsla_break_magnitude_weight,
                 'tsla_returned_weight': self.config.tsla_returned_weight,
+                'tsla_bounces_weight': self.config.tsla_bounces_weight,
+                'tsla_channel_continued_weight': self.config.tsla_channel_continued_weight,
                 # SPY break scan head weights
                 'spy_bars_to_break_weight': self.config.spy_bars_to_break_weight,
                 'spy_break_direction_weight': self.config.spy_break_direction_weight,
                 'spy_break_magnitude_weight': self.config.spy_break_magnitude_weight,
                 'spy_returned_weight': self.config.spy_returned_weight,
+                'spy_bounces_weight': self.config.spy_bounces_weight,
+                'spy_channel_continued_weight': self.config.spy_channel_continued_weight,
                 # Cross-correlation head weights
                 'cross_direction_aligned_weight': self.config.cross_direction_aligned_weight,
                 'cross_who_broke_first_weight': self.config.cross_who_broke_first_weight,

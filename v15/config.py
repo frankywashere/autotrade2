@@ -133,8 +133,8 @@ TF_MAX_SCAN: Dict[str, int] = {
     '3h': 200,
     '4h': 150,
     'daily': 100,
-    'weekly': 52,
-    'monthly': 24,
+    'weekly': 26,   # ~6 months
+    'monthly': 6,   # ~6 months
 }
 
 # Model configuration

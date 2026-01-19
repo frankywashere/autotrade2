@@ -302,6 +302,57 @@ class TSLAReturnedHead(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+class TSLABouncesAfterReturnHead(nn.Module):
+    """
+    Predicts number of TSLA bounces after returning to channel with uncertainty.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted number of bounces
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = F.softplus(self.mean_head(h))  # Bounces must be positive
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class TSLAChannelContinuedHead(nn.Module):
+    """
+    Predicts whether TSLA channel continued after return.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(channel_continued)."""
+        return self.net(x).squeeze(-1)
+
+
 # =============================================================================
 # Break Scan Label Heads - SPY
 # =============================================================================
@@ -406,6 +457,57 @@ class SPYReturnedHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns logits for P(returned_to_channel)."""
+        return self.net(x).squeeze(-1)
+
+
+class SPYBouncesAfterReturnHead(nn.Module):
+    """
+    Predicts number of SPY bounces after returning to channel with uncertainty.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted number of bounces
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = F.softplus(self.mean_head(h))  # Bounces must be positive
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class SPYChannelContinuedHead(nn.Module):
+    """
+    Predicts whether SPY channel continued after return.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(channel_continued)."""
         return self.net(x).squeeze(-1)
 
 
@@ -593,11 +695,15 @@ class PredictionHeads(nn.Module):
             self.tsla_break_direction_head = TSLABreakDirectionHead(input_dim, hidden_dim)
             self.tsla_break_magnitude_head = TSLABreakMagnitudeHead(input_dim, hidden_dim)
             self.tsla_returned_head = TSLAReturnedHead(input_dim, hidden_dim)
+            self.tsla_bounces_after_return_head = TSLABouncesAfterReturnHead(input_dim, hidden_dim)
+            self.tsla_channel_continued_head = TSLAChannelContinuedHead(input_dim, hidden_dim)
         else:
             self.tsla_bars_to_break_head = None
             self.tsla_break_direction_head = None
             self.tsla_break_magnitude_head = None
             self.tsla_returned_head = None
+            self.tsla_bounces_after_return_head = None
+            self.tsla_channel_continued_head = None
 
         # SPY break scan label heads
         if enable_spy_heads:
@@ -605,11 +711,15 @@ class PredictionHeads(nn.Module):
             self.spy_break_direction_head = SPYBreakDirectionHead(input_dim, hidden_dim)
             self.spy_break_magnitude_head = SPYBreakMagnitudeHead(input_dim, hidden_dim)
             self.spy_returned_head = SPYReturnedHead(input_dim, hidden_dim)
+            self.spy_bounces_after_return_head = SPYBouncesAfterReturnHead(input_dim, hidden_dim)
+            self.spy_channel_continued_head = SPYChannelContinuedHead(input_dim, hidden_dim)
         else:
             self.spy_bars_to_break_head = None
             self.spy_break_direction_head = None
             self.spy_break_magnitude_head = None
             self.spy_returned_head = None
+            self.spy_bounces_after_return_head = None
+            self.spy_channel_continued_head = None
 
         # Cross-correlation heads
         if enable_cross_correlation_heads:
@@ -657,6 +767,9 @@ class PredictionHeads(nn.Module):
                 'tsla_break_magnitude_mean': [batch]
                 'tsla_break_magnitude_log_std': [batch]
                 'tsla_returned_logits': [batch]
+                'tsla_bounces_mean': [batch]
+                'tsla_bounces_log_std': [batch]
+                'tsla_channel_continued_logits': [batch]
 
             If enable_spy_heads:
                 'spy_bars_to_break_mean': [batch]
@@ -665,6 +778,9 @@ class PredictionHeads(nn.Module):
                 'spy_break_magnitude_mean': [batch]
                 'spy_break_magnitude_log_std': [batch]
                 'spy_returned_logits': [batch]
+                'spy_bounces_mean': [batch]
+                'spy_bounces_log_std': [batch]
+                'spy_channel_continued_logits': [batch]
 
             If enable_cross_correlation_heads:
                 'direction_aligned_logits': [batch]
@@ -697,23 +813,31 @@ class PredictionHeads(nn.Module):
         if self.tsla_bars_to_break_head is not None:
             tsla_bars_mean, tsla_bars_log_std = self.tsla_bars_to_break_head(x)
             tsla_mag_mean, tsla_mag_log_std = self.tsla_break_magnitude_head(x)
+            tsla_bounces_mean, tsla_bounces_log_std = self.tsla_bounces_after_return_head(x)
             outputs['tsla_bars_to_break_mean'] = tsla_bars_mean
             outputs['tsla_bars_to_break_log_std'] = tsla_bars_log_std
             outputs['tsla_break_direction_logits'] = self.tsla_break_direction_head(x)
             outputs['tsla_break_magnitude_mean'] = tsla_mag_mean
             outputs['tsla_break_magnitude_log_std'] = tsla_mag_log_std
             outputs['tsla_returned_logits'] = self.tsla_returned_head(x)
+            outputs['tsla_bounces_mean'] = tsla_bounces_mean
+            outputs['tsla_bounces_log_std'] = tsla_bounces_log_std
+            outputs['tsla_channel_continued_logits'] = self.tsla_channel_continued_head(x)
 
         # Add SPY break scan label outputs if enabled
         if self.spy_bars_to_break_head is not None:
             spy_bars_mean, spy_bars_log_std = self.spy_bars_to_break_head(x)
             spy_mag_mean, spy_mag_log_std = self.spy_break_magnitude_head(x)
+            spy_bounces_mean, spy_bounces_log_std = self.spy_bounces_after_return_head(x)
             outputs['spy_bars_to_break_mean'] = spy_bars_mean
             outputs['spy_bars_to_break_log_std'] = spy_bars_log_std
             outputs['spy_break_direction_logits'] = self.spy_break_direction_head(x)
             outputs['spy_break_magnitude_mean'] = spy_mag_mean
             outputs['spy_break_magnitude_log_std'] = spy_mag_log_std
             outputs['spy_returned_logits'] = self.spy_returned_head(x)
+            outputs['spy_bounces_mean'] = spy_bounces_mean
+            outputs['spy_bounces_log_std'] = spy_bounces_log_std
+            outputs['spy_channel_continued_logits'] = self.spy_channel_continued_head(x)
 
         # Add cross-correlation outputs if enabled
         if self.direction_aligned_head is not None:

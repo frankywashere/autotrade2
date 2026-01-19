@@ -63,6 +63,10 @@ class V15Model(nn.Module):
         share_tf_weights: bool = False,
         use_window_selector: bool = False,
         num_windows: int = 8,
+        # Break scan label head flags
+        enable_tsla_heads: bool = False,
+        enable_spy_heads: bool = False,
+        enable_cross_correlation_heads: bool = False,
     ):
         super().__init__()
 
@@ -71,6 +75,9 @@ class V15Model(nn.Module):
         self.features_per_tf = features_per_tf
         self.use_window_selector = use_window_selector
         self.num_windows = num_windows
+        self.enable_tsla_heads = enable_tsla_heads
+        self.enable_spy_heads = enable_spy_heads
+        self.enable_cross_correlation_heads = enable_cross_correlation_heads
 
         # Shared features = events + bar metadata
         self.shared_features_dim = (
@@ -124,12 +131,15 @@ class V15Model(nn.Module):
             output_dim=hidden_dim
         )
 
-        # 6. Prediction Heads (with optional window selector)
+        # 6. Prediction Heads (with optional window selector and break scan heads)
         self.prediction_heads = PredictionHeads(
             input_dim=hidden_dim,
             hidden_dim=hidden_dim // 2,
             use_window_selector=use_window_selector,
             num_windows=num_windows,
+            enable_tsla_heads=enable_tsla_heads,
+            enable_spy_heads=enable_spy_heads,
+            enable_cross_correlation_heads=enable_cross_correlation_heads,
         )
 
     def validate_input(self, x: torch.Tensor) -> None:
@@ -238,6 +248,18 @@ class V15Model(nn.Module):
         """Check if this model has a learned window selector."""
         return self.prediction_heads.has_window_selector()
 
+    def has_tsla_heads(self) -> bool:
+        """Check if this model has TSLA break scan heads."""
+        return self.prediction_heads.has_tsla_heads()
+
+    def has_spy_heads(self) -> bool:
+        """Check if this model has SPY break scan heads."""
+        return self.prediction_heads.has_spy_heads()
+
+    def has_cross_correlation_heads(self) -> bool:
+        """Check if this model has cross-correlation heads."""
+        return self.prediction_heads.has_cross_correlation_heads()
+
 
 def create_model(config: Optional[Dict] = None) -> V15Model:
     """
@@ -253,6 +275,9 @@ def create_model(config: Optional[Dict] = None) -> V15Model:
             - use_explicit_weights: Whether to use explicit feature weights
             - use_window_selector: Whether to include learned window selection
             - num_windows: Number of windows for selector (default: 8)
+            - enable_tsla_heads: Whether to include TSLA break scan heads (default: False)
+            - enable_spy_heads: Whether to include SPY break scan heads (default: False)
+            - enable_cross_correlation_heads: Whether to include cross-correlation heads (default: False)
 
     Returns:
         Initialized V15Model
@@ -267,4 +292,7 @@ def create_model(config: Optional[Dict] = None) -> V15Model:
         use_explicit_weights=cfg['use_explicit_weights'],
         use_window_selector=cfg.get('use_window_selector', False),
         num_windows=cfg.get('num_windows', 8),
+        enable_tsla_heads=cfg.get('enable_tsla_heads', False),
+        enable_spy_heads=cfg.get('enable_spy_heads', False),
+        enable_cross_correlation_heads=cfg.get('enable_cross_correlation_heads', False),
     )

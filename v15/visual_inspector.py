@@ -315,7 +315,7 @@ def plot_timeframe_panel(
             label_text += f" | Break: {break_dir_str}"
 
         # Get new channel direction (handle enum)
-        new_dir = labels.new_channel_direction
+        new_dir = labels.next_channel_direction
         if hasattr(new_dir, 'name'):
             new_dir_str = new_dir.name
         elif new_dir in DIR_NAMES:
@@ -726,7 +726,7 @@ class VisualInspector:
             else:
                 break_dir_str = BREAK_NAMES.get(break_dir, '?')
 
-            new_dir = tf_label.new_channel_direction
+            new_dir = tf_label.next_channel_direction
             if hasattr(new_dir, 'name'):
                 new_dir_str = new_dir.name
             else:

@@ -59,72 +59,82 @@ class ChannelLabels:
     """
     Labels for a single channel at a specific window size.
 
-    Attributes:
-        duration_bars: Number of bars until permanent channel break
-        break_direction: Direction of break (0=DOWN, 1=UP)
-        break_trigger_tf: Encoded timeframe that triggered break (0-9)
-        new_channel_direction: Direction after break (0=BEAR, 1=SIDEWAYS, 2=BULL)
-        permanent_break: Whether a permanent break occurred
-        break_return: Return percentage at time of break
-        timeframe: The timeframe this label was computed for
+    PREDICTION TARGETS (what we want the model to predict):
+        duration_bars: PRIMARY - Number of bars until channel breaks
+        next_channel_direction: SECONDARY - Direction after break (0=BEAR, 1=SIDEWAYS, 2=BULL)
+        permanent_break: SECONDARY - Whether the break sticks (True/False)
 
-    Break scan fields (TSLA):
-        bars_to_first_break: Bars from channel end until first bar outside bounds
-        first_break_direction: Direction of first exit (0=DOWN, 1=UP)
-        break_magnitude: How far outside bounds (in std devs)
-        bars_outside: Total bars spent outside bounds
-        returned_to_channel: Whether price came back inside
-        bounces_after_return: If returned, how many bounces before final exit
-        channel_continued: Whether original channel pattern continued after return
+    BREAK SCAN FEATURES (tracked for model input, NOT prediction targets):
+        FIRST BREAK (initial break, may be false break that returns):
+            break_direction: Which bound was breached FIRST (UP=1, DOWN=0)
+            break_magnitude: How far outside bounds on FIRST break (in std devs)
+            bars_to_first_break: When FIRST break occurred (bars from channel end)
+            returned_to_channel: Did price come back inside bounds after first break
+            bounces_after_return: Count of false breaks before final exit
+            channel_continued: Did the original channel pattern resume after return
 
-    Break scan fields (SPY - mirrored):
-        spy_bars_to_first_break: Bars from channel end until first bar outside bounds
-        spy_first_break_direction: Direction of first exit (0=DOWN, 1=UP)
-        spy_break_magnitude: How far outside bounds (in std devs)
-        spy_bars_outside: Total bars spent outside bounds
-        spy_returned_to_channel: Whether price came back inside
-        spy_bounces_after_return: If returned, how many bounces before final exit
-        spy_channel_continued: Whether original channel pattern continued after return
+        PERMANENT BREAK (final/lasting break, may differ from first):
+            permanent_break_direction: Direction of FINAL break (-1=none, 0=DOWN, 1=UP)
+            permanent_break_magnitude: Magnitude of permanent break (in std devs)
+            bars_to_permanent_break: When permanent break occurred (-1 if none)
 
-    Validity flags indicate whether each label component is valid/usable:
+    VALIDITY FLAGS (indicate whether each component is valid/usable):
         duration_valid: True if duration_bars is meaningful
         direction_valid: True if break_direction is meaningful
-        trigger_tf_valid: True if break_trigger_tf is meaningful
-        new_channel_valid: True if new_channel_direction is meaningful
+        next_channel_valid: True if next_channel_direction is meaningful
         break_scan_valid: True if forward scan was performed
     """
-    # Core label values
+    # -------------------------------------------------------------------------
+    # PREDICTION TARGETS - What we want the model to predict
+    # -------------------------------------------------------------------------
+    # PRIMARY: How long until channel breaks
     duration_bars: int = 0
-    break_direction: int = 0      # 0=DOWN, 1=UP
-    break_trigger_tf: int = 0     # encoded 0-9 (index into TIMEFRAMES)
-    new_channel_direction: int = 1  # 0=BEAR, 1=SIDEWAYS, 2=BULL
+
+    # SECONDARY: Direction of next channel after break (0=BEAR, 1=SIDEWAYS, 2=BULL)
+    next_channel_direction: int = 1
+
+    # SECONDARY: Whether the break sticks (no return to channel)
     permanent_break: bool = False
-    break_return: float = 0.0     # Return at break point
-    timeframe: str = ""           # Timeframe this label is for
 
-    # Break scan fields - TSLA dynamics
-    bars_to_first_break: int = 0       # Bars from channel end until first bar outside bounds
-    first_break_direction: int = 0     # 0=DOWN, 1=UP (direction of first exit)
-    break_magnitude: float = 0.0       # How far outside bounds (in std devs)
-    bars_outside: int = 0              # Total bars spent outside bounds
-    returned_to_channel: bool = False  # Whether price came back inside
-    bounces_after_return: int = 0      # If returned, how many bounces before final exit
-    channel_continued: bool = False    # Whether original channel pattern continued after return
+    # Metadata (not a prediction target)
+    timeframe: str = ""  # Timeframe this label is for
 
-    # Break scan fields - SPY dynamics (mirrored)
-    spy_bars_to_first_break: int = 0       # Bars from channel end until first bar outside bounds
-    spy_first_break_direction: int = 0     # 0=DOWN, 1=UP (direction of first exit)
-    spy_break_magnitude: float = 0.0       # How far outside bounds (in std devs)
-    spy_bars_outside: int = 0              # Total bars spent outside bounds
-    spy_returned_to_channel: bool = False  # Whether price came back inside
-    spy_bounces_after_return: int = 0      # If returned, how many bounces before final exit
-    spy_channel_continued: bool = False    # Whether original channel pattern continued after return
+    # -------------------------------------------------------------------------
+    # BREAK SCAN FEATURES - For model input, NOT prediction targets
+    # These describe what happened during/after the break for feature engineering
+    # -------------------------------------------------------------------------
+    # TSLA FIRST break dynamics (initial break, may be false break)
+    break_direction: int = 0           # Which bound was breached FIRST (0=DOWN, 1=UP)
+    break_magnitude: float = 0.0       # How far outside bounds on FIRST break (in std devs)
+    bars_to_first_break: int = 0       # When FIRST break occurred (bars from channel end)
+    returned_to_channel: bool = False  # Did price come back inside bounds after first break
+    bounces_after_return: int = 0      # Count of false breaks before final exit
+    channel_continued: bool = False    # Did original channel pattern resume after return
 
-    # Validity flags
-    duration_valid: bool = False
-    direction_valid: bool = False
-    trigger_tf_valid: bool = False
-    new_channel_valid: bool = False
+    # TSLA PERMANENT break dynamics (final/lasting break, may differ from first)
+    permanent_break_direction: int = -1     # Direction of FINAL break (-1=none, 0=DOWN, 1=UP)
+    permanent_break_magnitude: float = 0.0  # Magnitude of permanent break (in std devs)
+    bars_to_permanent_break: int = -1       # When permanent break occurred (-1 if none)
+
+    # SPY FIRST break dynamics (mirrored features for cross-asset analysis)
+    spy_break_direction: int = 0           # Which bound was breached FIRST (0=DOWN, 1=UP)
+    spy_break_magnitude: float = 0.0       # How far outside bounds on FIRST break (in std devs)
+    spy_bars_to_first_break: int = 0       # When FIRST break occurred (bars from channel end)
+    spy_returned_to_channel: bool = False  # Did price come back inside bounds after first break
+    spy_bounces_after_return: int = 0      # Count of false breaks before final exit
+    spy_channel_continued: bool = False    # Did original channel pattern resume after return
+
+    # SPY PERMANENT break dynamics (final/lasting break, may differ from first)
+    spy_permanent_break_direction: int = -1     # Direction of FINAL break (-1=none, 0=DOWN, 1=UP)
+    spy_permanent_break_magnitude: float = 0.0  # Magnitude of permanent break (in std devs)
+    spy_bars_to_permanent_break: int = -1       # When permanent break occurred (-1 if none)
+
+    # -------------------------------------------------------------------------
+    # VALIDITY FLAGS - Indicate whether each label component is valid/usable
+    # -------------------------------------------------------------------------
+    duration_valid: bool = False       # True if duration_bars is meaningful
+    direction_valid: bool = False      # True if break_direction is meaningful
+    next_channel_valid: bool = False   # True if next_channel_direction is meaningful
     break_scan_valid: bool = False     # True if forward scan was performed
 
 
@@ -158,7 +168,7 @@ class ChannelSample:
 BREAK_DOWN = 0
 BREAK_UP = 1
 
-# New channel direction encoding
+# Next channel direction encoding (for next_channel_direction field)
 DIRECTION_BEAR = 0
 DIRECTION_SIDEWAYS = 1
 DIRECTION_BULL = 2
@@ -180,25 +190,62 @@ class CrossCorrelationLabels:
     These labels capture how the two assets' breaks relate to each other,
     useful for detecting lead/lag relationships and correlated movements.
 
-    Attributes:
-        break_direction_aligned: Did TSLA and SPY break in the same direction?
-        tsla_broke_first: Did TSLA break before SPY?
-        spy_broke_first: Did SPY break before TSLA?
-        break_lag_bars: Number of bars between TSLA and SPY breaks (absolute)
-        magnitude_spread: Difference in break magnitudes (TSLA - SPY return)
-        both_returned: Did both assets return to their channels?
-        both_permanent: Were both breaks permanent (no return)?
-        return_pattern_aligned: Did return behavior match (both returned or both permanent)?
-        continuation_aligned: Did continuation pattern match (same new channel direction)?
+    FIRST BREAK CROSS-CORRELATION (initial break, may be false break):
+        break_direction_aligned: Did TSLA and SPY FIRST break in the same direction?
+        tsla_broke_first: Did TSLA's FIRST break occur before SPY's?
+        spy_broke_first: Did SPY's FIRST break occur before TSLA's?
+        break_lag_bars: Bars between TSLA and SPY FIRST breaks (absolute)
+        magnitude_spread: Difference in FIRST break magnitudes (TSLA - SPY)
+
+    PERMANENT BREAK CROSS-CORRELATION (final/lasting break):
+        permanent_direction_aligned: Did TSLA and SPY PERMANENT break same direction?
+        tsla_permanent_first: Did TSLA achieve permanent break before SPY?
+        spy_permanent_first: Did SPY achieve permanent break before TSLA?
+        permanent_break_lag_bars: Bars between permanent breaks (absolute)
+        permanent_magnitude_spread: Difference in permanent break magnitudes
+
+    DIRECTION TRANSITION PATTERNS (first vs permanent):
+        tsla_direction_diverged: Did TSLA's permanent direction differ from first?
+        spy_direction_diverged: Did SPY's permanent direction differ from first?
+        both_direction_diverged: Did both change direction from first to permanent?
+        direction_divergence_aligned: Did divergence pattern match?
+
+    RETURN/PERMANENCE PATTERNS:
+        both_returned: Did both assets return to their channels after first break?
+        both_permanent: Were both FIRST breaks permanent (no return)?
+        return_pattern_aligned: Did return behavior match?
+        continuation_aligned: Did continuation pattern match (same next channel direction)?
+
+    VALIDITY:
         cross_valid: True if both TSLA and SPY had valid breaks for comparison
+        permanent_cross_valid: True if both had valid permanent breaks
     """
+    # FIRST break cross-correlation
     break_direction_aligned: bool = False
     tsla_broke_first: bool = False
     spy_broke_first: bool = False
     break_lag_bars: int = 0
     magnitude_spread: float = 0.0
+
+    # PERMANENT break cross-correlation
+    permanent_direction_aligned: bool = False
+    tsla_permanent_first: bool = False
+    spy_permanent_first: bool = False
+    permanent_break_lag_bars: int = 0
+    permanent_magnitude_spread: float = 0.0
+
+    # Direction transition patterns (first vs permanent)
+    tsla_direction_diverged: bool = False  # TSLA permanent != first break direction
+    spy_direction_diverged: bool = False   # SPY permanent != first break direction
+    both_direction_diverged: bool = False  # Both changed direction
+    direction_divergence_aligned: bool = False  # Divergence pattern matched
+
+    # Return/permanence patterns
     both_returned: bool = False
     both_permanent: bool = False
     return_pattern_aligned: bool = False
     continuation_aligned: bool = False
+
+    # Validity flags
     cross_valid: bool = False
+    permanent_cross_valid: bool = False  # Both had valid permanent breaks

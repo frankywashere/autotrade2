@@ -366,15 +366,12 @@ def label_channel_from_map(
         return ChannelLabels(
             duration_bars=0,
             break_direction=int(BreakDirection.UP),
-            break_trigger_tf=0,
-            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
-            break_return=0.0,
             timeframe=tf,
             duration_valid=False,
             direction_valid=False,
-            trigger_tf_valid=False,
-            new_channel_valid=False
+            next_channel_valid=False
         ), -1
 
     current = channels[channel_idx]
@@ -387,7 +384,8 @@ def label_channel_from_map(
         # Duration is the gap between channels
         duration_bars = next_channel.start_idx - current.end_idx
 
-        # Get the next channel's direction for the label
+        # Get the next channel's direction for next_channel_direction label
+        # This tells us what type of channel formed after the break (BEAR/SIDEWAYS/BULL)
         next_dir = next_channel.direction
 
         # Determine break direction by comparing price against current channel's
@@ -464,26 +462,15 @@ def label_channel_from_map(
                 else:
                     break_direction = BreakDirection.DOWN
 
-        # Calculate break_return as percentage price change
-        # from current channel end to next channel start
-        break_return = 0.0
-        if curr_channel.close is not None and len(curr_channel.close) > 0 and next_start_price is not None:
-            curr_end_price = curr_channel.close[-1]
-            if curr_end_price > 0:
-                break_return = (next_start_price - curr_end_price) / curr_end_price
-
         return ChannelLabels(
             duration_bars=duration_bars,
             break_direction=int(break_direction),
-            break_trigger_tf=0,  # Not determined in this context (would need cross-TF analysis)
-            new_channel_direction=next_dir,
+            next_channel_direction=next_dir,
             permanent_break=True,
-            break_return=break_return,
             timeframe=tf,
             duration_valid=True,
             direction_valid=True,
-            trigger_tf_valid=False,  # Not determined in this context
-            new_channel_valid=True
+            next_channel_valid=True
         ), next_idx
 
     else:
@@ -491,22 +478,20 @@ def label_channel_from_map(
         return ChannelLabels(
             duration_bars=0,
             break_direction=int(BreakDirection.UP),  # Default
-            break_trigger_tf=0,
-            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
-            break_return=0.0,
             timeframe=tf,
             duration_valid=False,
             direction_valid=False,
-            trigger_tf_valid=False,
-            new_channel_valid=False
+            next_channel_valid=False
         ), -1
 
 
 def label_channel_forward_scan(
     detected: DetectedChannel,
     resampled_df: pd.DataFrame,
-    max_scan: int
+    max_scan: int,
+    next_channel_direction: Optional[int] = None
 ) -> ChannelLabels:
     """
     Label a channel using forward bar scanning to find the first break.
@@ -522,13 +507,14 @@ def label_channel_forward_scan(
         detected: The DetectedChannel from Pass 1
         resampled_df: The resampled DataFrame for this timeframe
         max_scan: Maximum number of bars to scan forward (from TF_MAX_SCAN)
+        next_channel_direction: Optional direction of next channel (0=BEAR, 1=SIDEWAYS, 2=BULL).
+                                If provided (e.g., from hybrid method), populates next_channel_direction.
 
     Returns:
         ChannelLabels with all break scan fields populated:
         - bars_to_first_break: When the first break occurred
-        - first_break_direction: Direction of break (0=DOWN, 1=UP)
+        - break_direction: Direction of break (0=DOWN, 1=UP)
         - break_magnitude: How far outside bounds (in std devs)
-        - bars_outside: Total bars spent outside before return
         - returned_to_channel: Whether price came back inside
         - bounces_after_return: Number of false breaks before permanent exit
         - channel_continued: Whether pattern resumed after return
@@ -542,23 +528,14 @@ def label_channel_forward_scan(
         return ChannelLabels(
             duration_bars=0,
             break_direction=int(BreakDirection.UP),
-            break_trigger_tf=0,
-            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
-            break_return=0.0,
             timeframe=tf,
             duration_valid=False,
             direction_valid=False,
-            trigger_tf_valid=False,
-            new_channel_valid=False,
+            next_channel_valid=False,
             break_scan_valid=False
         )
-
-    # Get the price at end of channel for break_return calculation
-    if channel.close is not None and len(channel.close) > 0:
-        end_price = channel.close[-1]
-    else:
-        end_price = None
 
     # Calculate available forward data
     forward_start = end_idx + 1
@@ -569,15 +546,12 @@ def label_channel_forward_scan(
         return ChannelLabels(
             duration_bars=0,
             break_direction=int(BreakDirection.UP),
-            break_trigger_tf=0,
-            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
-            break_return=0.0,
             timeframe=tf,
             duration_valid=False,
             direction_valid=False,
-            trigger_tf_valid=False,
-            new_channel_valid=False,
+            next_channel_valid=False,
             break_scan_valid=False
         )
 
@@ -595,22 +569,19 @@ def label_channel_forward_scan(
             forward_low=forward_low,
             forward_close=forward_close,
             max_scan_bars=max_scan,
-            return_threshold_bars=50  # Standard threshold for permanence
+            return_threshold_bars=10  # Bars price must stay outside to be "permanent"
         )
     except InsufficientDataError:
         # Not enough data to scan - return invalid labels
         return ChannelLabels(
             duration_bars=0,
             break_direction=int(BreakDirection.UP),
-            break_trigger_tf=0,
-            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
-            break_return=0.0,
             timeframe=tf,
             duration_valid=False,
             direction_valid=False,
-            trigger_tf_valid=False,
-            new_channel_valid=False,
+            next_channel_valid=False,
             break_scan_valid=False
         )
 
@@ -620,43 +591,25 @@ def label_channel_forward_scan(
         return ChannelLabels(
             duration_bars=max_scan,
             break_direction=int(BreakDirection.UP),  # Default
-            break_trigger_tf=0,
-            new_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
-            break_return=0.0,
             timeframe=tf,
-            # Break scan fields - no break detected
+            # FIRST break scan fields - no break detected
             bars_to_first_break=max_scan,
-            first_break_direction=0,
             break_magnitude=0.0,
-            bars_outside=0,
             returned_to_channel=False,
             bounces_after_return=0,
             channel_continued=True,  # No break means channel continued
+            # PERMANENT break fields - no break detected
+            permanent_break_direction=-1,  # -1 = none
+            permanent_break_magnitude=0.0,
+            bars_to_permanent_break=-1,
             # Validity flags
             duration_valid=False,
             direction_valid=False,
-            trigger_tf_valid=False,
-            new_channel_valid=False,
+            next_channel_valid=False,
             break_scan_valid=True  # Scan was performed, just no break found
         )
-
-    # Break detected - map all fields from BreakResult
-    # Calculate break_return as percentage price change
-    break_return = 0.0
-    if end_price is not None and end_price > 0:
-        break_return = (result.break_price - end_price) / end_price
-
-    # Calculate bars_outside: total bars spent outside the channel
-    # For the first exit event, this is bars_until_return if returned, otherwise
-    # the remaining scan bars after break
-    if result.is_false_break and result.bars_until_return > 0:
-        bars_outside = result.bars_until_return
-    elif result.break_detected:
-        # Permanent break - count from break_bar to end of scan
-        bars_outside = result.scan_bars_used - result.break_bar
-    else:
-        bars_outside = 0
 
     # bounces_after_return: Use false_break_count which counts all temporary exits
     # that returned. If the first break returned, bounces = false_break_count - 1
@@ -674,28 +627,36 @@ def label_channel_forward_scan(
     # or returned - essentially the inverse of is_permanent
     channel_continued = result.is_false_break
 
+    # Use provided next_channel_direction if available (from hybrid method),
+    # otherwise default to SIDEWAYS (unknown)
+    if next_channel_direction is not None:
+        next_channel_dir = next_channel_direction
+        next_channel_valid_flag = True
+    else:
+        next_channel_dir = int(NewChannelDirection.SIDEWAYS)
+        next_channel_valid_flag = False
+
     return ChannelLabels(
         # Core label values (duration_bars uses break_bar for consistency)
         duration_bars=result.break_bar,
         break_direction=result.break_direction,
-        break_trigger_tf=0,  # Not determined by forward scan
-        new_channel_direction=int(NewChannelDirection.SIDEWAYS),  # Not determined
+        next_channel_direction=next_channel_dir,
         permanent_break=result.is_permanent,
-        break_return=break_return,
         timeframe=tf,
-        # Break scan fields from BreakResult
+        # FIRST break scan fields from BreakResult
         bars_to_first_break=result.break_bar,
-        first_break_direction=result.break_direction,
         break_magnitude=result.break_magnitude,
-        bars_outside=bars_outside,
         returned_to_channel=result.is_false_break,  # is_false_break means it returned
         bounces_after_return=bounces_after_return,
         channel_continued=channel_continued,
+        # PERMANENT break fields from BreakResult
+        permanent_break_direction=result.permanent_break_direction,
+        permanent_break_magnitude=result.permanent_break_magnitude,
+        bars_to_permanent_break=result.permanent_break_bar,
         # Validity flags
         duration_valid=True,
         direction_valid=True,
-        trigger_tf_valid=False,
-        new_channel_valid=False,
+        next_channel_valid=next_channel_valid_flag,
         break_scan_valid=True
     )
 
@@ -710,17 +671,22 @@ def generate_all_labels(
     """
     PASS 2: Generate labels for all channels in the map.
 
-    Supports two labeling methods:
+    Supports three labeling methods:
     - "next_channel": Determines break by looking at next channel's start price
-      (original method, works without resampled_dfs)
+      (original method, works without resampled_dfs). Uses next channel to infer
+      break_direction and gets next_channel_direction from next channel's direction.
     - "forward_scan": Scans forward bars to find first close outside channel bounds
-      (requires resampled_dfs, uses TF_MAX_SCAN for scan limits)
+      (requires resampled_dfs, uses TF_MAX_SCAN for scan limits). Provides accurate
+      bars_to_first_break, break_magnitude, returned_to_channel, etc.
+    - "hybrid": Best of both - uses forward_scan for break timing/features
+      (bars_to_first_break, break_magnitude, permanent_break, etc.) and uses
+      next_channel lookup for next_channel_direction. Requires resampled_dfs.
 
     Args:
         channel_map: The channel map from detect_all_channels()
         resampled_dfs: Optional dict of resampled DataFrames keyed by timeframe.
-                       Required for "forward_scan" method, ignored for "next_channel".
-        labeling_method: Either "next_channel" (default) or "forward_scan"
+                       Required for "forward_scan" and "hybrid" methods.
+        labeling_method: "next_channel" (default), "forward_scan", or "hybrid"
         progress_callback: Optional callback(tf, window, pct) for progress updates
         verbose: If True, print detailed progress logging
 
@@ -728,14 +694,14 @@ def generate_all_labels(
         LabeledChannelMap: {(tf, window): [LabeledChannel, ...]}
     """
     # Validate labeling_method
-    valid_methods = ("next_channel", "forward_scan")
+    valid_methods = ("next_channel", "forward_scan", "hybrid")
     if labeling_method not in valid_methods:
         raise ValueError(f"labeling_method must be one of {valid_methods}, got '{labeling_method}'")
 
-    # If forward_scan requested but no resampled_dfs, fall back to next_channel
-    if labeling_method == "forward_scan" and resampled_dfs is None:
+    # If forward_scan or hybrid requested but no resampled_dfs, fall back to next_channel
+    if labeling_method in ("forward_scan", "hybrid") and resampled_dfs is None:
         if verbose:
-            print("[PASS 2] WARNING: forward_scan requested but resampled_dfs is None, "
+            print(f"[PASS 2] WARNING: {labeling_method} requested but resampled_dfs is None, "
                   "falling back to next_channel method")
         labeling_method = "next_channel"
 
@@ -775,10 +741,26 @@ def generate_all_labels(
 
         for idx, detected in enumerate(channels):
             # Choose labeling method
-            if labeling_method == "forward_scan" and resampled_df is not None:
+            if labeling_method == "hybrid" and resampled_df is not None:
+                # Hybrid: Get next_channel_direction from map lookup, then use forward_scan
+                # for break timing features
+                next_channel_dir = None
+                next_idx = -1
+                if idx + 1 < len(channels):
+                    next_channel = channels[idx + 1]
+                    next_channel_dir = next_channel.direction  # 0=BEAR, 1=SIDEWAYS, 2=BULL
+                    next_idx = idx + 1
+
+                # Use forward_scan with next_channel_direction for best of both
+                labels = label_channel_forward_scan(
+                    detected, resampled_df, max_scan,
+                    next_channel_direction=next_channel_dir
+                )
+            elif labeling_method == "forward_scan" and resampled_df is not None:
                 labels = label_channel_forward_scan(detected, resampled_df, max_scan)
                 next_idx = -1  # forward_scan doesn't determine next channel
             else:
+                # next_channel method
                 labels, next_idx = label_channel_from_map(channel_map, tf, window, idx)
 
             labeled = LabeledChannel(
@@ -1043,9 +1025,9 @@ def labeled_map_stats(labeled_map: LabeledChannelMap) -> Dict:
                 else:
                     stats['break_down_count'] += 1
 
-                if labels.new_channel_direction == NewChannelDirection.BULL:
+                if labels.next_channel_direction == NewChannelDirection.BULL:
                     stats['next_bull_count'] += 1
-                elif labels.new_channel_direction == NewChannelDirection.BEAR:
+                elif labels.next_channel_direction == NewChannelDirection.BEAR:
                     stats['next_bear_count'] += 1
                 else:
                     stats['next_sideways_count'] += 1
@@ -1105,9 +1087,9 @@ def compute_cross_correlation_labels(
     # Both have valid break scan data - compute cross-correlation metrics
 
     # 1. Break direction alignment
-    # Compare first_break_direction (from break scan) for both assets
+    # Compare break_direction (from break scan) for both assets
     break_direction_aligned = (
-        tsla_labels.first_break_direction == spy_labels.first_break_direction
+        tsla_labels.break_direction == spy_labels.break_direction
     )
 
     # 2. Which asset broke first?
@@ -1143,15 +1125,93 @@ def compute_cross_correlation_labels(
 
     continuation_aligned = tsla_continued == spy_continued
 
+    # ==========================================================================
+    # PERMANENT BREAK CROSS-CORRELATION
+    # ==========================================================================
+
+    # Check if both have valid permanent breaks (-1 means no permanent break)
+    tsla_has_perm = tsla_labels.permanent_break_direction >= 0
+    spy_has_perm = spy_labels.permanent_break_direction >= 0
+    permanent_cross_valid = tsla_has_perm and spy_has_perm
+
+    # 7. Permanent break direction alignment
+    permanent_direction_aligned = False
+    if permanent_cross_valid:
+        permanent_direction_aligned = (
+            tsla_labels.permanent_break_direction == spy_labels.permanent_break_direction
+        )
+
+    # 8. Which asset achieved permanent break first?
+    tsla_perm_bars = tsla_labels.bars_to_permanent_break
+    spy_perm_bars = spy_labels.bars_to_permanent_break
+
+    tsla_permanent_first = False
+    spy_permanent_first = False
+    permanent_break_lag_bars = 0
+
+    if permanent_cross_valid:
+        tsla_permanent_first = tsla_perm_bars < spy_perm_bars
+        spy_permanent_first = spy_perm_bars < tsla_perm_bars
+        permanent_break_lag_bars = abs(tsla_perm_bars - spy_perm_bars)
+    elif tsla_has_perm and not spy_has_perm:
+        tsla_permanent_first = True
+    elif spy_has_perm and not tsla_has_perm:
+        spy_permanent_first = True
+
+    # 9. Permanent break magnitude spread
+    permanent_magnitude_spread = 0.0
+    if permanent_cross_valid:
+        permanent_magnitude_spread = (
+            tsla_labels.permanent_break_magnitude - spy_labels.permanent_break_magnitude
+        )
+
+    # ==========================================================================
+    # DIRECTION TRANSITION PATTERNS (first break vs permanent break)
+    # ==========================================================================
+
+    # 10. Direction divergence (did permanent direction differ from first direction?)
+    tsla_direction_diverged = False
+    spy_direction_diverged = False
+
+    if tsla_has_perm:
+        tsla_direction_diverged = (
+            tsla_labels.permanent_break_direction != tsla_labels.break_direction
+        )
+    if spy_has_perm:
+        spy_direction_diverged = (
+            spy_labels.permanent_break_direction != spy_labels.break_direction
+        )
+
+    # Both changed direction from first to permanent
+    both_direction_diverged = tsla_direction_diverged and spy_direction_diverged
+
+    # Divergence pattern aligned (both diverged OR both didn't)
+    direction_divergence_aligned = tsla_direction_diverged == spy_direction_diverged
+
     return CrossCorrelationLabels(
+        # FIRST break cross-correlation
         break_direction_aligned=break_direction_aligned,
         tsla_broke_first=tsla_broke_first,
         spy_broke_first=spy_broke_first,
         break_lag_bars=break_lag_bars,
         magnitude_spread=magnitude_spread,
+        # PERMANENT break cross-correlation
+        permanent_direction_aligned=permanent_direction_aligned,
+        tsla_permanent_first=tsla_permanent_first,
+        spy_permanent_first=spy_permanent_first,
+        permanent_break_lag_bars=permanent_break_lag_bars,
+        permanent_magnitude_spread=permanent_magnitude_spread,
+        # Direction transition patterns
+        tsla_direction_diverged=tsla_direction_diverged,
+        spy_direction_diverged=spy_direction_diverged,
+        both_direction_diverged=both_direction_diverged,
+        direction_divergence_aligned=direction_divergence_aligned,
+        # Return/permanence patterns
         both_returned=both_returned,
         both_permanent=both_permanent,
         return_pattern_aligned=return_pattern_aligned,
         continuation_aligned=continuation_aligned,
-        cross_valid=True
+        # Validity flags
+        cross_valid=True,
+        permanent_cross_valid=permanent_cross_valid
     )
