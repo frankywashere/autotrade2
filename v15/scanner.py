@@ -213,8 +213,9 @@ def _init_worker(tsla_data: Dict, spy_data: Dict, vix_data: Dict,
 def _signal_handler(signum, frame):
     """Handle interrupt signals for graceful shutdown."""
     global _shutdown_requested
-    _shutdown_requested = True
-    print("\n[INTERRUPT] Shutdown requested. Finishing current work...")
+    if not _shutdown_requested:  # Only print once
+        _shutdown_requested = True
+        print("\n[INTERRUPT] Shutdown requested. Will stop after current batch...")
 
 
 def _worker_process_position(args: Tuple) -> Dict[str, Any]:
@@ -594,26 +595,54 @@ def _save_partial_results(samples: List, output_path: str, suffix: str = "_parti
     Save partial results during graceful shutdown.
 
     Args:
-        samples: List of ChannelSample objects collected so far
+        samples: List of ChannelSample objects collected so far (in memory)
         output_path: Original output path (will add suffix)
         suffix: Suffix to add to filename (default: "_partial")
     """
-    if not samples or not output_path:
-        return
-
     # Create partial output path
     if '.' in output_path:
         base, ext = output_path.rsplit('.', 1)
         partial_path = f"{base}{suffix}.{ext}"
+        temp_path = f"{output_path}.tmp"
     else:
         partial_path = f"{output_path}{suffix}"
+        temp_path = f"{output_path}.tmp"
+
+    all_samples = []
+
+    # First, read any samples from temp file (incremental mode)
+    if os.path.exists(temp_path):
+        try:
+            print(f"\n[PARTIAL] Reading samples from temp file...")
+            with open(temp_path, 'rb') as f:
+                while True:
+                    try:
+                        sample = pickle.load(f)
+                        all_samples.append(sample)
+                    except EOFError:
+                        break
+            print(f"  Loaded {len(all_samples)} samples from temp file")
+        except Exception as e:
+            print(f"  [WARNING] Failed to read temp file: {e}")
+
+    # Add in-memory samples
+    all_samples.extend(samples)
+
+    if not all_samples:
+        print("\n[PARTIAL] No samples to save.")
+        return
 
     try:
         with open(partial_path, 'wb') as f:
             with tqdm(unit='B', unit_scale=True, unit_divisor=1024,
                      desc="Saving partial") as pbar:
-                pickle.dump(samples, _ProgressFileWriter(f, pbar))
-        print(f"\n[SAVED] Partial results ({len(samples)} samples) saved to: {partial_path}")
+                pickle.dump(all_samples, _ProgressFileWriter(f, pbar))
+        print(f"\n[SAVED] Partial results ({len(all_samples)} samples) saved to: {partial_path}")
+
+        # Clean up temp file after successful save
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+            print(f"  Cleaned up temp file")
     except Exception as e:
         print(f"\n[ERROR] Failed to save partial results: {e}")
 
@@ -1121,10 +1150,11 @@ def scan_channels_two_pass(
         total_batches = len(batches)
         print(f"  Total batches: {total_batches}")
 
-        # Reset shutdown flag before scan loop (may have been set during PASS 1/2 by spurious signals)
+        # Check if shutdown was requested during Pass 1/2 - honor it instead of resetting
         if _shutdown_requested:
-            print("\n  [Note] Resetting shutdown flag from earlier signals - scan will proceed")
-            _shutdown_requested = False
+            print("\n[INTERRUPT] Shutdown was requested during Pass 1/2. Skipping scan phase.")
+            print("  (Already-detected channels and labels are lost. Re-run for complete scan.)")
+            return samples  # Return empty, let finally block handle cleanup
 
         if workers > 1:
             # =========================================================================
@@ -1152,13 +1182,8 @@ def scan_channels_two_pass(
 
                 batches_processed = 0
                 for batch_results in batch_iterator:
-                    # Check for shutdown request
-                    if _shutdown_requested:
-                        print(f"\n[INTERRUPT] Stopping at batch {batches_processed}/{total_batches}")
-                        pool.terminate()
-                        break
-
-                    # Aggregate results from this batch
+                    # CRITICAL: Process completed batch results FIRST, then check shutdown
+                    # This ensures we don't lose already-completed work
                     for result in batch_results:
                         if result.get('sample'):
                             samples.append(result['sample'])
@@ -1187,6 +1212,13 @@ def scan_channels_two_pass(
                         samples.clear()  # Free memory
                         if progress:
                             tqdm.write(f"  [Incremental] Flushed {flushed} samples to disk")
+
+                    # Check for shutdown request AFTER processing batch (no data loss)
+                    if _shutdown_requested:
+                        print(f"\n[INTERRUPT] Stopping at batch {batches_processed}/{total_batches}")
+                        print(f"  Saved {valid_count} samples so far (no data lost from completed batches)")
+                        pool.terminate()
+                        break
 
         else:
             # =========================================================================
