@@ -350,14 +350,12 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
                     include_bar_metadata=True
                 )
 
-                # Validate features
-                invalid_features = validate_features(tf_features, raise_on_invalid=False)
-                if invalid_features:
-                    results.append({
-                        'idx': idx,
-                        'error': f"Invalid features at idx={idx}: {invalid_features[:5]}"
-                    })
-                    continue
+                # FIX #4: Validate features with LOUD failures (raises on invalid)
+                # Use validate_sample_features which enforces count + value checks
+                from v15.scanner import validate_sample_features, EXPECTED_FEATURE_COUNT
+                tf_features = validate_sample_features(
+                    tf_features, timestamp, idx, strict_count=True
+                )
 
                 # Get bar metadata
                 bar_metadata = {
@@ -374,6 +372,7 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
                 labels_per_window = {}
                 label_hits = 0
                 label_misses = 0
+                none_label_count = 0
 
                 for window in windows:
                     labels_per_window[window] = {'tsla': {}, 'spy': {}}
@@ -385,6 +384,7 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
                             label_hits += 1
                         else:
                             label_misses += 1
+                            none_label_count += 1
 
                         # SPY labels
                         spy_labels = get_labels_for_position(spy_labeled_map, spy_df, idx, tf, window)
@@ -393,6 +393,20 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
                             label_hits += 1
                         else:
                             label_misses += 1
+                            none_label_count += 1
+
+                # FIX #3: Validate minimum label threshold
+                # We need at least some valid labels for this sample to be useful
+                total_lookups = label_hits + label_misses
+                if total_lookups > 0:
+                    hit_rate = label_hits / total_lookups
+                    if hit_rate < 0.1:  # Less than 10% valid labels
+                        results.append({
+                            'idx': idx,
+                            'error': f"Label hit rate too low at idx={idx}: {hit_rate:.1%} ({label_hits}/{total_lookups}). "
+                                     f"Sample would have {none_label_count} None labels.",
+                        })
+                        continue
 
                 # Create sample
                 sample = ChannelSample(
@@ -412,19 +426,23 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
                 })
 
             except Exception as e:
+                # FIX #4: ALL errors are logged with full detail
                 results.append({
                     'idx': idx,
-                    'error': f"{type(e).__name__}: {str(e)}",
+                    'error': f"[POSITION {idx}] {type(e).__name__}: {str(e)}",
                     'traceback': traceback.format_exc(),
                 })
 
         return results
 
     except Exception as e:
-        # If batch-level error, return error for all positions
+        # If batch-level error, return error with ALL positions that were lost
+        # FIX #2: Track positions per batch so we know exactly what was lost
         return [{
             'idx': -1,
-            'error': f"Batch error: {type(e).__name__}: {str(e)}",
+            'positions_lost': positions_batch,  # Track which positions were in this batch
+            'error': f"BATCH ERROR (lost {len(positions_batch)} positions {positions_batch[0]}-{positions_batch[-1]}): "
+                     f"{type(e).__name__}: {str(e)}",
             'traceback': traceback.format_exc(),
         }]
 
@@ -456,6 +474,7 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
         # Import here to avoid issues in worker processes
         from v15.features.tf_extractor import extract_all_tf_features
         from v15.features.validation import validate_features
+        from v15.scanner import validate_sample_features, EXPECTED_FEATURE_COUNT
         from v7.core.channel import detect_channels_multi_window, select_best_channel
         from v15.labels import get_labels_for_position
         from v15.dtypes import ChannelSample
@@ -491,14 +510,11 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
                     include_bar_metadata=True
                 )
 
-                # Validate features
-                invalid_features = validate_features(tf_features, raise_on_invalid=False)
-                if invalid_features:
-                    results.append({
-                        'idx': idx,
-                        'error': f"Invalid features at idx={idx}: {invalid_features[:5]}"
-                    })
-                    continue
+                # FIX #4: Validate features with LOUD failures (raises on invalid)
+                # Use validate_sample_features which enforces count + value checks
+                tf_features = validate_sample_features(
+                    tf_features, timestamp, idx, strict_count=True
+                )
 
                 # Get bar metadata
                 bar_metadata = {
@@ -515,6 +531,7 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
                 labels_per_window = {}
                 label_hits = 0
                 label_misses = 0
+                none_label_count = 0
 
                 for window in windows:
                     labels_per_window[window] = {'tsla': {}, 'spy': {}}
@@ -526,6 +543,7 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
                             label_hits += 1
                         else:
                             label_misses += 1
+                            none_label_count += 1
 
                         # SPY labels
                         spy_labels = get_labels_for_position(spy_labeled_map, spy_df, idx, tf, window)
@@ -534,6 +552,20 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
                             label_hits += 1
                         else:
                             label_misses += 1
+                            none_label_count += 1
+
+                # FIX #3: Validate minimum label threshold
+                # We need at least some valid labels for this sample to be useful
+                total_lookups = label_hits + label_misses
+                if total_lookups > 0:
+                    hit_rate = label_hits / total_lookups
+                    if hit_rate < 0.1:  # Less than 10% valid labels
+                        results.append({
+                            'idx': idx,
+                            'error': f"Label hit rate too low at idx={idx}: {hit_rate:.1%} ({label_hits}/{total_lookups}). "
+                                     f"Sample would have {none_label_count} None labels.",
+                        })
+                        continue
 
                 # Create sample
                 sample = ChannelSample(
@@ -553,19 +585,23 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
                 })
 
             except Exception as e:
+                # FIX #4: ALL errors are logged with full detail
                 results.append({
                     'idx': idx,
-                    'error': f"{type(e).__name__}: {str(e)}",
+                    'error': f"[POSITION {idx}] {type(e).__name__}: {str(e)}",
                     'traceback': traceback.format_exc(),
                 })
 
         return results
 
     except Exception as e:
-        # If batch-level error, return error for all positions
+        # If batch-level error, return error with ALL positions that were lost
+        # FIX #2: Track positions per batch so we know exactly what was lost
         return [{
             'idx': -1,
-            'error': f"Batch error: {type(e).__name__}: {str(e)}",
+            'positions_lost': positions_batch,  # Track which positions were in this batch
+            'error': f"BATCH ERROR (lost {len(positions_batch)} positions {positions_batch[0]}-{positions_batch[-1]}): "
+                     f"{type(e).__name__}: {str(e)}",
             'traceback': traceback.format_exc(),
         }]
 
@@ -662,8 +698,11 @@ class ScanConfig:
     chunk_size: int = 100
 
 
-# Expected feature count (8,665 total)
+# Expected feature count (13,660 total)
 EXPECTED_FEATURE_COUNT = TOTAL_FEATURES
+
+# Minimum label hit rate required (0.0 to 1.0) - reject samples below this
+MIN_LABEL_HIT_RATE = 0.1  # At least 10% of labels must be valid
 
 
 # =============================================================================
@@ -673,7 +712,8 @@ EXPECTED_FEATURE_COUNT = TOTAL_FEATURES
 def validate_sample_features(
     tf_features: Dict[str, float],
     timestamp: pd.Timestamp,
-    idx: int
+    idx: int,
+    strict_count: bool = True
 ) -> Dict[str, float]:
     """
     Validate extracted features. Raises on any invalid value.
@@ -682,6 +722,7 @@ def validate_sample_features(
         tf_features: Dictionary of feature name -> value
         timestamp: Sample timestamp for error messages
         idx: Sample index for error messages
+        strict_count: If True, reject samples with wrong feature count
 
     Returns:
         Validated features dict
@@ -695,6 +736,13 @@ def validate_sample_features(
     if n_features == 0:
         raise FeatureExtractionError(
             f"No features extracted at idx={idx}, timestamp={timestamp}"
+        )
+
+    # FIX #1: Enforce expected feature count
+    if strict_count and n_features != EXPECTED_FEATURE_COUNT:
+        raise ValidationError(
+            f"Feature count mismatch at idx={idx}: got {n_features}, expected {EXPECTED_FEATURE_COUNT}. "
+            f"Missing {EXPECTED_FEATURE_COUNT - n_features} features."
         )
 
     # Validate each feature - LOUD failures
@@ -979,6 +1027,33 @@ def scan_channels_two_pass(
 
     # Check memory availability
     _check_memory_availability(workers, n_bars)
+
+    # FIX #5: Validate TSLA/SPY/VIX alignment
+    # All three must have identical length and aligned timestamps
+    if len(spy_df) != n_bars:
+        raise DataLoadError(
+            f"TSLA/SPY length mismatch! TSLA has {n_bars} bars, SPY has {len(spy_df)} bars. "
+            f"These must be aligned before scanning."
+        )
+    if len(vix_df) != n_bars:
+        raise DataLoadError(
+            f"TSLA/VIX length mismatch! TSLA has {n_bars} bars, VIX has {len(vix_df)} bars. "
+            f"These must be aligned before scanning."
+        )
+
+    # Check index alignment (first and last timestamps)
+    if tsla_df.index[0] != spy_df.index[0] or tsla_df.index[-1] != spy_df.index[-1]:
+        raise DataLoadError(
+            f"TSLA/SPY timestamp mismatch! TSLA: {tsla_df.index[0]} to {tsla_df.index[-1]}, "
+            f"SPY: {spy_df.index[0]} to {spy_df.index[-1]}. Timestamps must be aligned."
+        )
+    if tsla_df.index[0] != vix_df.index[0] or tsla_df.index[-1] != vix_df.index[-1]:
+        raise DataLoadError(
+            f"TSLA/VIX timestamp mismatch! TSLA: {tsla_df.index[0]} to {tsla_df.index[-1]}, "
+            f"VIX: {vix_df.index[0]} to {vix_df.index[-1]}. Timestamps must be aligned."
+        )
+
+    print(f"[VALIDATION] Input alignment OK: {n_bars} bars, timestamps aligned")
 
     # Calculate position range
     start_idx = warmup_bars
@@ -1336,12 +1411,21 @@ def scan_channels_two_pass(
 
     print(f"\n[COMPLETE] Scanned {valid_count} samples in {total_time:.1f} seconds")
 
-    if errors and not strict:
-        print(f"\nWarning: {len(errors)} errors occurred (strict=False)")
-        for i, err in enumerate(errors[:5]):
-            print(f"  [{i+1}] {err}")
-        if len(errors) > 5:
-            print(f"  ... and {len(errors) - 5} more")
+    # FIX #6: Log ALL errors visibly (not just first 5)
+    if errors:
+        print(f"\n{'=' * 60}")
+        print(f"ERRORS ENCOUNTERED: {len(errors)}")
+        print(f"{'=' * 60}")
+        for i, err in enumerate(errors):
+            print(f"\n[ERROR {i+1}/{len(errors)}]")
+            # Split multi-line errors for better readability
+            for line in str(err).split('\n'):
+                print(f"  {line}")
+        print(f"\n{'=' * 60}")
+        if strict:
+            print("NOTE: strict=True, errors will cause failure")
+        else:
+            print("NOTE: strict=False, errors were logged but samples skipped")
 
     # Note about window selection strategies for training
     print(f"\n{'=' * 60}")
