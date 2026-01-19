@@ -193,6 +193,13 @@ def _init_worker(tsla_data: Dict, spy_data: Dict, vix_data: Dict,
     global _WORKER_TSLA_LABELED_MAP, _WORKER_SPY_LABELED_MAP
     global _WORKER_TIMEFRAMES, _WORKER_WINDOWS
 
+    # CRITICAL: Ignore signals in worker processes!
+    # Without this, workers inherit the parent's signal handler and can trigger
+    # spurious shutdowns when the system sends signals to the process group.
+    # Only the main process should handle SIGINT/SIGTERM.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
     # Reconstruct DataFrames ONCE per worker
     _WORKER_TSLA_DF = _reconstruct_df_from_pickle_safe(tsla_data)
     _WORKER_SPY_DF = _reconstruct_df_from_pickle_safe(spy_data)
@@ -1113,6 +1120,11 @@ def scan_channels_two_pass(
 
         total_batches = len(batches)
         print(f"  Total batches: {total_batches}")
+
+        # Reset shutdown flag before scan loop (may have been set during PASS 1/2 by spurious signals)
+        if _shutdown_requested:
+            print("\n  [Note] Resetting shutdown flag from earlier signals - scan will proceed")
+            _shutdown_requested = False
 
         if workers > 1:
             # =========================================================================

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from enum import IntEnum
 from multiprocessing import Pool, cpu_count
+import signal
 
 # Import from existing v7 modules
 import sys
@@ -44,6 +45,21 @@ from .config import TF_MAX_SCAN
 
 # Import break scanner for sophisticated break detection
 from .core.break_scanner import scan_for_break, BreakResult, InsufficientDataError
+
+
+# =============================================================================
+# Worker Initializer for Signal Handling
+# =============================================================================
+
+def _worker_ignore_signals():
+    """
+    Initialize worker to ignore signals.
+
+    Prevents spurious shutdown triggers when signals are sent to the process group.
+    Only the main process should handle SIGINT/SIGTERM.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 
 # =============================================================================
@@ -296,7 +312,7 @@ def detect_all_channels(
 
     # Process work items in parallel using Pool.map()
     if work_items:
-        with Pool(processes=num_workers) as pool:
+        with Pool(processes=num_workers, initializer=_worker_ignore_signals) as pool:
             results = pool.map(_detect_tf_window_worker, work_items)
 
         # Collect results into channel_map
