@@ -48,7 +48,7 @@ import numpy as np
 import pandas as pd
 
 # Import v15 types and data loading
-from v15.dtypes import ChannelSample, TIMEFRAMES, STANDARD_WINDOWS
+from v15.dtypes import ChannelSample, CrossCorrelationLabels, TIMEFRAMES, STANDARD_WINDOWS
 from v15.data import load_market_data
 
 
@@ -125,6 +125,90 @@ def resample_ohlc(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         'close': 'last',
         'volume': 'sum'
     }).dropna()
+
+
+# =============================================================================
+# Cross-Correlation Label Utilities
+# =============================================================================
+
+def get_cross_labels_from_sample(
+    sample: ChannelSample,
+    window: int,
+    tf: str,
+) -> Optional[CrossCorrelationLabels]:
+    """
+    Extract cross-correlation labels from a sample.
+
+    Args:
+        sample: ChannelSample object
+        window: Window size
+        tf: Timeframe
+
+    Returns:
+        CrossCorrelationLabels or None if not found
+
+    Expected structure: labels_per_window[window]['cross'][tf]
+    """
+    if sample is None:
+        return None
+
+    if not hasattr(sample, 'labels_per_window') or not sample.labels_per_window:
+        return None
+
+    if window not in sample.labels_per_window:
+        return None
+
+    window_labels = sample.labels_per_window[window]
+
+    if 'cross' in window_labels:
+        cross_labels = window_labels['cross']
+        if isinstance(cross_labels, dict):
+            return cross_labels.get(tf)
+
+    return None
+
+
+def format_cross_correlation_summary(cross: CrossCorrelationLabels) -> str:
+    """
+    Format cross-correlation labels as a compact summary string for figure display.
+
+    Args:
+        cross: CrossCorrelationLabels object
+
+    Returns:
+        Compact multi-line string for display in figure text box
+    """
+    if cross is None:
+        return "Cross: N/A"
+
+    if not cross.cross_valid:
+        return "Cross: Invalid"
+
+    lines = ["Cross-Correlation:"]
+
+    # 1. break_direction_aligned - Are TSLA and SPY breaks in same direction
+    dir_str = "YES" if cross.break_direction_aligned else "NO"
+    lines.append(f"  Dir Aligned: {dir_str}")
+
+    # 2. tsla_broke_first / spy_broke_first - Which broke first
+    if cross.tsla_broke_first:
+        lines.append(f"  Leader: TSLA ({cross.break_lag_bars} bars)")
+    elif cross.spy_broke_first:
+        lines.append(f"  Leader: SPY ({cross.break_lag_bars} bars)")
+    else:
+        lines.append("  Leader: Simultaneous")
+
+    # 3. break_lag_bars is included above
+
+    # 4. tsla_direction_diverged - Did TSLA's perm differ from first
+    tsla_div = "YES" if cross.tsla_direction_diverged else "NO"
+    lines.append(f"  TSLA Diverged: {tsla_div}")
+
+    # 5. direction_divergence_aligned - Do divergence patterns match
+    div_aligned = "YES" if cross.direction_divergence_aligned else "NO"
+    lines.append(f"  Div Aligned: {div_aligned}")
+
+    return '\n'.join(lines)
 
 
 # =============================================================================
@@ -253,37 +337,73 @@ def plot_timeframe_panel(
     # Draw vertical line at channel end
     ax.axvline(channel_window_end_x, color='blue', linestyle='-', linewidth=2, alpha=0.7)
 
-    # Draw break point and direction arrow if labels exist
-    if labels is not None and getattr(labels, 'permanent_break', False):
-        break_bar = labels.duration_bars
-        if break_bar < forward_bars:
-            break_x = window + break_bar
+    # Draw break markers using hollow/filled triangle logic from test_1h_w20.py
+    if labels is not None:
+        # Check if break scan was performed
+        break_scan_valid = getattr(labels, 'break_scan_valid', True)
 
-            ax.axvline(break_x, color='purple', linestyle='--', linewidth=2, alpha=0.7)
+        # FIRST BREAK - hollow triangle + dashed line
+        bars_to_first = getattr(labels, 'bars_to_first_break', -1)
+        if break_scan_valid and bars_to_first >= 0:
+            break_x = window + bars_to_first
+            if break_x < len(closes) + forward_bars:
+                # Get break direction
+                break_dir = labels.break_direction
+                if hasattr(break_dir, 'value'):
+                    break_dir = break_dir.value
 
-            # Get break direction (handle both enum and int)
-            break_dir = labels.break_direction
-            if hasattr(break_dir, 'value'):
-                break_dir = break_dir.value
-            arrow_color = BREAK_COLORS.get(break_dir, 'gray')
+                break_color = 'green' if break_dir == 1 else 'red'
 
-            break_data_idx = channel_start_idx + int(break_x)
-            if break_data_idx < len(df_tf):
-                arrow_y = df_tf.iloc[break_data_idx]['close']
-            else:
-                arrow_y = closes[-1]
+                # Dashed line for first break
+                ax.axvline(break_x, color=break_color, linestyle='--', linewidth=1.5, alpha=0.6)
 
-            price_range = max(highs) - min(lows)
-            arrow_offset = price_range * 0.05
+                # Get price at break point
+                break_data_idx = channel_start_idx + int(break_x)
+                if break_data_idx < len(df_tf):
+                    if break_dir == 1:  # UP break - mark at high
+                        break_price = df_tf.iloc[break_data_idx]['high']
+                    else:  # DOWN break - mark at low
+                        break_price = df_tf.iloc[break_data_idx]['low']
+                else:
+                    break_price = closes[-1]
 
-            if break_dir == 1:  # UP
-                ax.annotate('', xy=(break_x, arrow_y + arrow_offset),
-                           xytext=(break_x, arrow_y - arrow_offset),
-                           arrowprops=dict(arrowstyle='->', color=arrow_color, lw=3))
-            else:  # DOWN
-                ax.annotate('', xy=(break_x, arrow_y - arrow_offset),
-                           xytext=(break_x, arrow_y + arrow_offset),
-                           arrowprops=dict(arrowstyle='->', color=arrow_color, lw=3))
+                # HOLLOW triangle (outline only)
+                marker = '^' if break_dir == 1 else 'v'
+                ax.scatter([break_x], [break_price], marker=marker, s=150,
+                          c='none', edgecolors=break_color, linewidths=2, zorder=5,
+                          label='First Break')
+
+        # PERMANENT BREAK - filled triangle + solid line
+        # Check if permanent_break is True (bool), then use break_direction and duration_bars
+        has_perm_break = getattr(labels, 'permanent_break', False)
+        perm_dir = getattr(labels, 'break_direction', -1)
+        perm_bar = getattr(labels, 'duration_bars', -1)
+        if hasattr(perm_dir, 'value'):
+            perm_dir = perm_dir.value
+
+        if break_scan_valid and has_perm_break and perm_dir >= 0 and perm_bar >= 0:
+            perm_x = window + perm_bar
+            if perm_x < len(closes) + forward_bars:
+                perm_color = 'green' if perm_dir == 1 else 'red'
+
+                # Solid line for permanent break
+                ax.axvline(perm_x, color=perm_color, linestyle='-', linewidth=2, alpha=0.8)
+
+                # Get price at break point
+                perm_data_idx = channel_start_idx + int(perm_x)
+                if perm_data_idx < len(df_tf):
+                    if perm_dir == 1:  # UP break - mark at high
+                        perm_price = df_tf.iloc[perm_data_idx]['high']
+                    else:  # DOWN break - mark at low
+                        perm_price = df_tf.iloc[perm_data_idx]['low']
+                else:
+                    perm_price = closes[-1]
+
+                # FILLED triangle
+                marker = '^' if perm_dir == 1 else 'v'
+                ax.scatter([perm_x], [perm_price], marker=marker, s=200,
+                          c=perm_color, edgecolors='black', linewidths=2, zorder=6,
+                          label='Permanent Break')
 
     # Build label annotation text
     label_text = f"{tf_name}"
@@ -300,6 +420,7 @@ def plot_timeframe_panel(
         label_text += f" | W:{best_window}*"
 
     # Add label details
+    diverged = False  # Track if break direction diverged from permanent
     if labels is not None:
         # Get break direction name (handle enum)
         break_dir = labels.break_direction
@@ -329,15 +450,39 @@ def plot_timeframe_panel(
             validity_parts.append('dur')
         if getattr(labels, 'direction_valid', False):
             validity_parts.append('dir')
+        if getattr(labels, 'next_channel_valid', False):
+            validity_parts.append('next')
         if validity_parts:
             label_text += f"\nValid: [{', '.join(validity_parts)}]"
+
+        # Check for divergence between first break and permanent break directions
+        perm_break = getattr(labels, 'permanent_break_direction', -1)
+        first_break = labels.break_direction
+        if hasattr(first_break, 'value'):
+            first_break = first_break.value
+        if hasattr(perm_break, 'value'):
+            perm_break = perm_break.value
+        diverged = (perm_break >= 0 and first_break >= 0 and perm_break != first_break)
+        if diverged:
+            label_text += " | DIVERGED!"
+
+        # Add break dynamics line: Return/Bounces/Magnitudes
+        returned = getattr(labels, 'returned_to_channel', False)
+        bounces = getattr(labels, 'bounces_after_return', 0)
+        break_mag = getattr(labels, 'break_magnitude', 0.0)
+        perm_mag = getattr(labels, 'permanent_break_magnitude', 0.0)
+        returned_str = "Yes" if returned else "No"
+        label_text += f"\nReturn: {returned_str} | Bounces: {bounces} | Mag: {break_mag:.2f}/{perm_mag:.2f}"
     else:
         label_text += f"\nNo labels"
 
-    # Add text box with color coding for non-best windows
+    # Add text box with color coding for non-best windows and divergence
     is_non_best = (display_window is not None and best_window is not None
                    and display_window != best_window)
-    if is_non_best:
+    if diverged:
+        props = dict(boxstyle='round', facecolor='#ffcccc', alpha=0.9,
+                     edgecolor='#cc0000', linewidth=2)  # Red-tinted for divergence
+    elif is_non_best:
         props = dict(boxstyle='round', facecolor='#ffe6cc', alpha=0.9,
                      edgecolor='#cc6600', linewidth=1.5)  # Orange-tinted for non-best
     else:
@@ -663,6 +808,23 @@ class VisualInspector:
             title_color = 'black'
 
         self.fig.suptitle(title, fontsize=14, fontweight='bold', color=title_color)
+
+        # Add cross-correlation summary text box in bottom-right corner of figure
+        # Use the first timeframe (e.g., 5min) as the reference for cross-correlation
+        info_window = display_window if display_window is not None else best_win
+        if info_window is not None:
+            # Get cross-correlation for the first displayed TF (most granular)
+            ref_tf = display_timeframes[0]
+            cross = get_cross_labels_from_sample(sample, info_window, ref_tf)
+            cross_text = format_cross_correlation_summary(cross)
+
+            # Add text box in bottom-right area of the figure
+            props = dict(boxstyle='round', facecolor='lightyellow', alpha=0.9,
+                         edgecolor='gray', linewidth=1)
+            self.fig.text(0.98, 0.02, cross_text, transform=self.fig.transFigure,
+                         fontsize=9, verticalalignment='bottom', horizontalalignment='right',
+                         bbox=props, family='monospace')
+
         self.fig.canvas.draw_idle()
 
     def _print_sample_info(self) -> None:
@@ -747,11 +909,53 @@ class VisualInspector:
             validity = (
                 f"dur={'V' if getattr(tf_label, 'duration_valid', False) else '-'}"
                 f" dir={'V' if getattr(tf_label, 'direction_valid', False) else '-'}"
+                f" next={'V' if getattr(tf_label, 'next_channel_valid', False) else '-'}"
             )
 
             perm_break = getattr(tf_label, 'permanent_break', False)
             print(f"  {tf:10s}: dur={tf_label.duration_bars:4d} break={str(perm_break):5s} "
                   f"dir={break_dir_str:4s} next={new_dir_str:8s} [{validity}]")
+
+            # Print additional break dynamics fields
+            returned = getattr(tf_label, 'returned_to_channel', False)
+            bounces = getattr(tf_label, 'bounces_after_return', 0)
+            break_mag = getattr(tf_label, 'break_magnitude', 0.0)
+            perm_mag = getattr(tf_label, 'permanent_break_magnitude', 0.0)
+            returned_str = "Yes" if returned else "No"
+            print(f"             Return: {returned_str} | Bounces: {bounces} | "
+                  f"Mag: {break_mag:.2f} | PermMag: {perm_mag:.2f}")
+
+        # Cross-Correlation Labels section
+        print(f"\n--- Cross-Correlation Labels ({window_label}) ---")
+        for tf in TIMEFRAMES:
+            cross = get_cross_labels_from_sample(sample, info_window, tf)
+            if cross is None:
+                print(f"  {tf:10s}: N/A")
+                continue
+
+            if not cross.cross_valid:
+                print(f"  {tf:10s}: Invalid (missing break data)")
+                continue
+
+            # 1. break_direction_aligned - Are TSLA and SPY breaks in same direction
+            dir_aligned = "YES" if cross.break_direction_aligned else "NO"
+
+            # 2. tsla_broke_first / spy_broke_first - Which broke first
+            if cross.tsla_broke_first:
+                leader = f"TSLA ({cross.break_lag_bars} bars)"
+            elif cross.spy_broke_first:
+                leader = f"SPY ({cross.break_lag_bars} bars)"
+            else:
+                leader = "Simultaneous"
+
+            # 4. tsla_direction_diverged - Did TSLA's perm differ from first
+            tsla_div = "YES" if cross.tsla_direction_diverged else "NO"
+
+            # 5. direction_divergence_aligned - Do divergence patterns match
+            div_aligned = "YES" if cross.direction_divergence_aligned else "NO"
+
+            print(f"  {tf:10s}: DirAligned={dir_aligned:3s} | Leader={leader:18s} | "
+                  f"TSLADiv={tsla_div:3s} | DivAligned={div_aligned:3s}")
 
         print("=" * 60 + "\n")
 

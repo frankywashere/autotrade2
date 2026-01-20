@@ -1297,11 +1297,11 @@ def scan_channels_two_pass(
     pass2_start = time.time()
 
     # TSLA label generation
-    print("\n  [PASS 2] Generating TSLA labels (forward_scan method)...")
+    print("\n  [PASS 2] Generating TSLA labels (hybrid method)...")
     tsla_labeled_map: LabeledChannelMap = generate_all_labels(
         channel_map=tsla_channel_map,
         resampled_dfs=tsla_resampled_dfs,
-        labeling_method="forward_scan",
+        labeling_method="hybrid",
         progress_callback=None,
         verbose=False
     )
@@ -1313,11 +1313,11 @@ def scan_channels_two_pass(
     print(f"  TSLA: {tsla_labeled} labeled, {tsla_valid} valid direction labels")
 
     # SPY label generation
-    print("\n  [PASS 2] Generating SPY labels (forward_scan method)...")
+    print("\n  [PASS 2] Generating SPY labels (hybrid method)...")
     spy_labeled_map: LabeledChannelMap = generate_all_labels(
         channel_map=spy_channel_map,
         resampled_dfs=spy_resampled_dfs,
-        labeling_method="forward_scan",
+        labeling_method="hybrid",
         progress_callback=None,
         verbose=False
     )
@@ -1492,6 +1492,12 @@ def scan_channels_two_pass(
             # and use the same worker function for consistency
             print(f"\n  Running in sequential mode...")
 
+            # Create slim labeled maps (same as parallel mode) for consistency
+            # The worker function expects SlimLabeledChannel objects with start_timestamp/end_timestamp
+            print("  Creating slim labeled maps...")
+            tsla_slim_map = _create_slim_labeled_map(tsla_labeled_map)
+            spy_slim_map = _create_slim_labeled_map(spy_labeled_map)
+
             # Set globals for sequential processing (same as _init_worker does)
             global _WORKER_TSLA_DF, _WORKER_SPY_DF, _WORKER_VIX_DF
             global _WORKER_TSLA_LABELED_MAP, _WORKER_SPY_LABELED_MAP
@@ -1499,8 +1505,8 @@ def scan_channels_two_pass(
             _WORKER_TSLA_DF = _reconstruct_df_from_pickle_safe(tsla_data)
             _WORKER_SPY_DF = _reconstruct_df_from_pickle_safe(spy_data)
             _WORKER_VIX_DF = _reconstruct_df_from_pickle_safe(vix_data)
-            _WORKER_TSLA_LABELED_MAP = tsla_labeled_map
-            _WORKER_SPY_LABELED_MAP = spy_labeled_map
+            _WORKER_TSLA_LABELED_MAP = tsla_slim_map
+            _WORKER_SPY_LABELED_MAP = spy_slim_map
             _WORKER_TIMEFRAMES = list(TIMEFRAMES)
             _WORKER_WINDOWS = list(STANDARD_WINDOWS)
 
