@@ -630,7 +630,12 @@ class VisualInspector:
             if hasattr(sample, 'labels_per_window') and sample.labels_per_window:
                 if actual_display_window and actual_display_window in sample.labels_per_window:
                     window_labels = sample.labels_per_window[actual_display_window]
-                    labels = window_labels.get(tf)
+                    # Handle new format: {window: {'tsla': {tf: labels}, 'spy': {tf: labels}}}
+                    if 'tsla' in window_labels:
+                        labels = window_labels['tsla'].get(tf)
+                    else:
+                        # Fallback to old format: {window: {tf: labels}}
+                        labels = window_labels.get(tf)
 
             # Plot panel
             plot_timeframe_panel(
@@ -713,8 +718,15 @@ class VisualInspector:
         print(f"\n--- Labels by Timeframe ({window_label}) ---")
         labels_dict = sample.labels_per_window.get(info_window, {})
 
+        # Handle new format: {window: {'tsla': {tf: labels}, 'spy': {tf: labels}}}
+        if 'tsla' in labels_dict:
+            tf_labels_dict = labels_dict['tsla']
+        else:
+            # Fallback to old format: {window: {tf: labels}}
+            tf_labels_dict = labels_dict
+
         for tf in TIMEFRAMES:
-            tf_label = labels_dict.get(tf)
+            tf_label = tf_labels_dict.get(tf)
             if tf_label is None:
                 print(f"  {tf:10s}: None")
                 continue

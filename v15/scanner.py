@@ -60,8 +60,8 @@ from v15.labels import (
     LabeledChannelMap,
 )
 
-# V7 channel detection (still needed)
-from v7.core.channel import detect_channels_multi_window, select_best_channel
+# V7 channel detection - no longer needed at module level since we use pre-computed maps
+# Legacy functions (_worker_process_position, _process_position_batch) still import locally
 
 
 # =============================================================================
@@ -162,6 +162,8 @@ class SlimLabeledChannel:
     - start_timestamp: For binary search
     - end_timestamp: For binary search
     - labels: The actual ChannelLabels to return
+    - channel_valid: Whether the original channel was valid
+    - channel_window: The window size used for this channel
 
     The heavy Channel objects with numpy arrays are STRIPPED.
     This reduces memory from ~100MB per worker to ~1MB per worker.
@@ -169,6 +171,8 @@ class SlimLabeledChannel:
     start_timestamp: pd.Timestamp
     end_timestamp: pd.Timestamp
     labels: Any  # ChannelLabels
+    channel_valid: bool = True     # From detected.channel.valid
+    channel_window: int = 0        # From detected.window
 
     @property
     def detected(self):
@@ -199,15 +203,90 @@ def _create_slim_labeled_map(labeled_map: LabeledChannelMap) -> Dict[Tuple[str, 
     """
     slim_map = {}
     for key, labeled_channels in labeled_map.items():
+        tf, window = key  # Key is (timeframe, window)
         slim_channels = []
         for lc in labeled_channels:
+            # Extract channel validity - check if channel exists and is valid
+            channel_valid = False
+            if lc.detected and lc.detected.channel:
+                channel_valid = getattr(lc.detected.channel, 'valid', False)
+
             slim_channels.append(SlimLabeledChannel(
                 start_timestamp=lc.detected.start_timestamp,
                 end_timestamp=lc.detected.end_timestamp,
-                labels=lc.labels
+                labels=lc.labels,
+                channel_valid=channel_valid,
+                channel_window=window
             ))
         slim_map[key] = slim_channels
     return slim_map
+
+
+def _get_best_channel_from_map(
+    labeled_map: Dict[Tuple[str, int], List[SlimLabeledChannel]],
+    df: pd.DataFrame,
+    position_idx: int,
+    windows: List[int],
+    tf: str = '5min'
+) -> Tuple[bool, Optional[int]]:
+    """
+    Look up best channel validity and window from pre-computed map.
+
+    This replaces the expensive detect_channels_multi_window() call
+    with an O(log N) binary search lookup.
+
+    Args:
+        labeled_map: Pre-computed slim labeled map
+        df: The DataFrame (TSLA) for timestamp lookup
+        position_idx: Position index in the DataFrame
+        windows: List of window sizes to check
+        tf: Timeframe to look up (default '5min' for TSLA base TF)
+
+    Returns:
+        (is_valid, best_window) - True/window if valid channel found, False/None otherwise
+    """
+    position_ts = df.index[position_idx]
+
+    valid_channels = {}  # window -> SlimLabeledChannel
+
+    for window in windows:
+        key = (tf, window)
+        labeled_channels = labeled_map.get(key, [])
+        if not labeled_channels:
+            continue
+
+        # Binary search for channel containing this position
+        left, right = 0, len(labeled_channels) - 1
+        found = None
+
+        while left <= right:
+            mid = (left + right) // 2
+            lc = labeled_channels[mid]
+            if lc.start_timestamp <= position_ts <= lc.end_timestamp:
+                found = lc
+                break
+            elif position_ts < lc.start_timestamp:
+                right = mid - 1
+            else:
+                left = mid + 1
+
+        # Fallback: most recent channel that ended before this position
+        if found is None:
+            for lc in reversed(labeled_channels):
+                if lc.end_timestamp <= position_ts:
+                    found = lc
+                    break
+
+        if found and found.channel_valid:
+            valid_channels[window] = found
+
+    if not valid_channels:
+        return False, None
+
+    # Select best window (largest window with a valid channel)
+    # This matches the original select_best_channel behavior
+    best_window = max(valid_channels.keys())
+    return True, best_window
 
 
 # Global flag for graceful shutdown
@@ -478,7 +557,7 @@ def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
 
                 # Memory cleanup for this position - data now copied into sample
                 del tsla_slice, spy_slice, vix_slice
-                del channels, best_channel
+                # Note: channels, best_channel no longer used (pre-computed map lookup)
                 del tf_features, bar_metadata, labels_per_window
 
                 results.append({
@@ -540,8 +619,7 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
         # Import here to avoid issues in worker processes
         from v15.features.tf_extractor import extract_all_tf_features
         from v15.features.validation import validate_features
-        from v15.scanner import validate_sample_features, EXPECTED_FEATURE_COUNT
-        from v7.core.channel import detect_channels_multi_window, select_best_channel
+        from v15.scanner import validate_sample_features, EXPECTED_FEATURE_COUNT, _get_best_channel_from_map
         from v15.labels import get_labels_for_position
         from v15.dtypes import ChannelSample
 
@@ -549,20 +627,22 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
 
         for idx in positions_batch:
             try:
-                # Get efficient slice for this position
+                # Look up best channel from pre-computed map (O(log N) instead of O(N))
+                # This replaces the expensive detect_channels_multi_window() call
+                is_valid, best_window = _get_best_channel_from_map(
+                    tsla_labeled_map, tsla_df, idx, windows
+                )
+
+                if not is_valid:
+                    results.append({'idx': idx, 'skipped': True})
+                    continue
+
+                # Get efficient slice for this position (only needed if channel is valid)
                 start_idx = max(0, idx - SCANNER_LOOKBACK_5MIN)
                 tsla_slice = tsla_df.iloc[start_idx:idx]
                 spy_slice = spy_df.iloc[start_idx:idx]
                 vix_slice = vix_df.iloc[start_idx:idx]
                 offset = idx - start_idx
-
-                # Detect channels at this position
-                channels = detect_channels_multi_window(tsla_slice, windows=windows)
-                best_channel, best_window = select_best_channel(channels)
-
-                if best_channel is None or not best_channel.valid:
-                    results.append({'idx': idx, 'skipped': True})
-                    continue
 
                 timestamp = tsla_df.index[idx - 1]
 
@@ -645,7 +725,7 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
 
                 # Memory cleanup for this position - data now copied into sample
                 del tsla_slice, spy_slice, vix_slice
-                del channels, best_channel
+                # Note: channels, best_channel no longer used (pre-computed map lookup)
                 del tf_features, bar_metadata, labels_per_window
 
                 results.append({
