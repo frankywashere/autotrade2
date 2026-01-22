@@ -22,6 +22,7 @@ import pandas as pd
 
 # Import v15 types
 from v15.dtypes import ChannelSample, ChannelLabels, TIMEFRAMES, STANDARD_WINDOWS
+from v15.config import TF_MAX_SCAN, BREAK_DETECTION, BREAK_MARKER_COLORS
 from v15.data import load_market_data
 
 # Import channel detection from v7
@@ -100,7 +101,7 @@ class Inspector:
         best_window = sample.best_window
         best_score = (-1, -1, 1000)  # (round_trips, r2, window) - window is negative priority
 
-        MIN_R2_THRESHOLD = 0.5  # Minimum R2 for a quality channel
+        MIN_R2_THRESHOLD = BREAK_DETECTION['min_r2_threshold']  # From config
 
         for window, assets_dict in sample.labels_per_window.items():
             if 'tsla' not in assets_dict:
@@ -264,9 +265,12 @@ class Inspector:
         if channel is not None and channel.valid and labels is None:
             from v15.core.break_scanner import scan_for_break
 
+            # Get TF-appropriate max scan
+            max_scan = TF_MAX_SCAN.get(tf, 200)
+
             # Get forward data for break scanning (from sample position forward)
             forward_start = sample_idx + 1
-            forward_end = min(len(df_tf), forward_start + 200)  # Scan up to 200 bars forward
+            forward_end = min(len(df_tf), forward_start + max_scan)
 
             if forward_end > forward_start:
                 forward_data = df_tf.iloc[forward_start:forward_end]
@@ -277,9 +281,9 @@ class Inspector:
                         forward_high=forward_data['high'].values,
                         forward_low=forward_data['low'].values,
                         forward_close=forward_data['close'].values,
-                        min_break_magnitude=0.1,  # 10% of channel width
-                        return_threshold_bars=5,
-                        max_scan_bars=200
+                        min_break_magnitude=BREAK_DETECTION['min_break_magnitude'],
+                        return_threshold_bars=BREAK_DETECTION['return_threshold_bars'],
+                        max_scan_bars=max_scan  # Use TF-specific value
                     )
                     fresh_break_info = result
                 except Exception as e:
@@ -425,10 +429,10 @@ class Inspector:
         Break info comes from labels (precomputed) - this is correct because breaks
         are events that happened AFTER the channel, and need to be tracked.
         """
-        # Colors
-        FIRST_COLOR = '#FF8C00'    # Orange
-        BIGGEST_COLOR = '#FF0000'  # Red
-        PERM_COLOR = '#8B008B'     # Purple
+        # Colors from config (single source of truth)
+        FIRST_COLOR = BREAK_MARKER_COLORS['first']
+        BIGGEST_COLOR = BREAK_MARKER_COLORS['biggest']
+        PERM_COLOR = BREAK_MARKER_COLORS['permanent']
 
         # Find sample position in df_plot (this is also the channel end)
         sample_ts = sample.timestamp
@@ -558,9 +562,10 @@ class Inspector:
         """
         from v15.core.break_scanner import BreakResult
 
-        # Colors
-        FIRST_COLOR = '#FF8C00'    # Orange
-        PERM_COLOR = '#8B008B'     # Purple
+        # Colors from config (single source of truth)
+        FIRST_COLOR = BREAK_MARKER_COLORS['first']
+        BIGGEST_COLOR = BREAK_MARKER_COLORS['biggest']
+        PERM_COLOR = BREAK_MARKER_COLORS['permanent']
 
         # Find sample position in df_plot (this is also the channel end)
         sample_ts = sample.timestamp
@@ -601,6 +606,31 @@ class Inspector:
                     ax.scatter([perm_x], [price], marker=marker, s=220,
                               c=PERM_COLOR, edgecolors='black', linewidths=2, zorder=12)
 
+        # BIGGEST BREAK - filled red triangle (max magnitude exit)
+        # Compute from all_exit_events since BreakResult doesn't store biggest directly
+        biggest_bar = -1
+        biggest_mag = 0.0
+        biggest_dir = 0
+        if break_result.all_exit_events:
+            for evt in break_result.all_exit_events:
+                if evt.magnitude > biggest_mag:
+                    biggest_mag = evt.magnitude
+                    biggest_bar = evt.bar_index
+                    biggest_dir = 1 if evt.exit_type == 'upper' else 0
+
+        first_mag = break_result.break_magnitude if break_result.break_detected else 0.0
+
+        # Only show if significantly bigger than first break
+        if biggest_bar >= 0 and biggest_mag > 0.5 and biggest_mag > first_mag * 1.1:
+            biggest_x = break_to_plot_x(biggest_bar)
+            if 0 <= biggest_x < n_bars:
+                marker = '^' if biggest_dir == 1 else 'v'
+                bar_idx = int(biggest_x)
+                if 0 <= bar_idx < len(df_plot):
+                    price = df_plot.iloc[bar_idx]['high' if biggest_dir == 1 else 'low']
+                    ax.scatter([biggest_x], [price], marker=marker, s=200,
+                              c=BIGGEST_COLOR, edgecolors='white', linewidths=1.5, zorder=11)
+
     def _draw_info_fresh(self, ax, break_result, tf: str, window: int,
                          sample: ChannelSample, channel: Optional[Channel] = None):
         """Draw info panel with fresh break result values."""
@@ -630,7 +660,11 @@ class Inspector:
         perm_mag = break_result.permanent_break_magnitude
 
         returned = 'Yes' if break_result.is_false_break else 'No'
-        round_trips = break_result.round_trip_bounces
+        # Use fresh channel's bounce stats when available (for consistency with _draw_info)
+        if channel is not None and channel.valid:
+            round_trips = channel.complete_cycles
+        else:
+            round_trips = break_result.round_trip_bounces
         exits_count = len(break_result.all_exit_events) if break_result.all_exit_events else 0
 
         # Compute durability score

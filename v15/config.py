@@ -150,6 +150,43 @@ TF_MAX_SCAN: Dict[str, int] = {
     'monthly': 6,   # ~6 months
 }
 
+# =============================================================================
+# BREAK DETECTION SETTINGS - Single Source of Truth
+# =============================================================================
+# These settings control how channel breaks are detected, labeled, and visualized.
+# All consumers (labels.py, inspector.py, break_scanner.py) should import from here.
+
+BREAK_DETECTION = {
+    # Minimum magnitude (in std devs) to count as a break
+    # Prevents flagging noise/minor touches as breaks
+    'min_break_magnitude': 0.5,
+
+    # Bars price must stay outside channel to be "permanent"
+    # If price returns within this many bars, it's a false break
+    'return_threshold_bars': 5,
+
+    # Minimum R2 threshold for channel quality (window selection)
+    'min_r2_threshold': 0.5,
+}
+
+# Break marker visualization colors
+BREAK_MARKER_COLORS = {
+    'first': '#FF8C00',     # Orange - hollow triangle, first CLOSE outside bounds
+    'biggest': '#FF0000',   # Red - filled triangle, largest magnitude break
+    'permanent': '#8B008B', # Purple - filled triangle, break that never returned
+}
+
+# Break marker legend (for documentation)
+BREAK_MARKER_LEGEND = """
+Break Marker Types:
+  - First Break (Orange hollow):    First bar where CLOSE price exceeded channel bounds
+  - Biggest Break (Red filled):     Bar with largest magnitude excursion outside bounds
+  - Permanent Break (Purple filled): Break that stayed outside for {return_threshold_bars}+ bars
+
+Detection uses CLOSE price (not HIGH/LOW touch) to avoid false signals from wicks.
+Magnitude threshold: {min_break_magnitude} std devs minimum to count as break.
+""".format(**BREAK_DETECTION)
+
 # Model configuration
 MODEL_CONFIG = {
     'input_dim': TOTAL_FEATURES,

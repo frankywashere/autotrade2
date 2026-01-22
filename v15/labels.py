@@ -57,8 +57,8 @@ from .core.resample import resample_ohlc
 # Import ChannelLabels and CrossCorrelationLabels from v15.dtypes
 from .dtypes import ChannelLabels, CrossCorrelationLabels
 
-# Import TF_MAX_SCAN for forward scanning limits
-from .config import TF_MAX_SCAN
+# Import config for forward scanning limits and break detection settings
+from .config import TF_MAX_SCAN, BREAK_DETECTION
 
 # Import break scanner for sophisticated break detection
 from .core.break_scanner import scan_for_break, BreakResult, InsufficientDataError, compute_durability_from_result
@@ -662,7 +662,7 @@ def label_channel_forward_scan(
     forward_low = forward_slice['low'].values.astype(np.float64)
     forward_close = forward_slice['close'].values.astype(np.float64)
 
-    # Use sophisticated break scanner
+    # Use sophisticated break scanner with settings from config (single source of truth)
     try:
         result: BreakResult = scan_for_break(
             channel=channel,
@@ -670,7 +670,8 @@ def label_channel_forward_scan(
             forward_low=forward_low,
             forward_close=forward_close,
             max_scan_bars=max_scan,
-            return_threshold_bars=5  # Bars price must stay outside to be "permanent"
+            min_break_magnitude=BREAK_DETECTION['min_break_magnitude'],
+            return_threshold_bars=BREAK_DETECTION['return_threshold_bars']
         )
     except InsufficientDataError:
         # Not enough data to scan - return invalid labels
