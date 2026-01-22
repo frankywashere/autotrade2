@@ -303,6 +303,7 @@ def scan_for_break(
     current_exit: Optional[ExitEvent] = None
     inside_channel = True
     first_break_found = False
+    first_permanent_found = False  # Track FIRST exit that stays outside for 5+ bars
 
     # Scan each bar
     for bar_idx in range(actual_scan):
@@ -328,12 +329,27 @@ def scan_for_break(
                 result.first_touch_direction = int(BreakDirection.DOWN)
                 result.first_touch_price = close  # Use close price
 
+        # Track current exit direction for opposite-direction break detection
+        current_exit_direction = None
+        if current_exit is not None:
+            current_exit_direction = current_exit.exit_type
+
         if close > upper:
             # Upper breach - calculate magnitude first (using close)
             magnitude = (close - upper) / channel.std_dev if channel.std_dev > 0 else 0.0
 
-            # Only count as break if magnitude exceeds threshold
-            if magnitude >= min_break_magnitude and inside_channel:
+            # Count as break if magnitude exceeds threshold AND either:
+            # 1. We're inside the channel (normal break), OR
+            # 2. We were outside in the OPPOSITE direction (direction reversal)
+            is_direction_reversal = (current_exit_direction == 'lower')
+            if magnitude >= min_break_magnitude and (inside_channel or is_direction_reversal):
+                # If direction reversal, close out the previous exit first
+                if is_direction_reversal and current_exit is not None:
+                    current_exit.returned = True  # Treat as returned (crossed back through)
+                    current_exit.bars_outside = bar_idx - current_exit.bar_index
+                    current_exit.return_bar = bar_idx
+                    exit_events.append(current_exit)
+
                 # New exit event
                 current_exit = ExitEvent(
                     bar_index=bar_idx,
@@ -358,8 +374,18 @@ def scan_for_break(
             # Lower breach - calculate magnitude first (using close)
             magnitude = (lower - close) / channel.std_dev if channel.std_dev > 0 else 0.0
 
-            # Only count as break if magnitude exceeds threshold
-            if magnitude >= min_break_magnitude and inside_channel:
+            # Count as break if magnitude exceeds threshold AND either:
+            # 1. We're inside the channel (normal break), OR
+            # 2. We were outside in the OPPOSITE direction (direction reversal)
+            is_direction_reversal = (current_exit_direction == 'upper')
+            if magnitude >= min_break_magnitude and (inside_channel or is_direction_reversal):
+                # If direction reversal, close out the previous exit first
+                if is_direction_reversal and current_exit is not None:
+                    current_exit.returned = True  # Treat as returned (crossed back through)
+                    current_exit.bars_outside = bar_idx - current_exit.bar_index
+                    current_exit.return_bar = bar_idx
+                    exit_events.append(current_exit)
+
                 # New exit event
                 current_exit = ExitEvent(
                     bar_index=bar_idx,
@@ -390,6 +416,33 @@ def scan_for_break(
                 current_exit.return_bar = bar_idx
                 exit_events.append(current_exit)
                 current_exit = None
+
+        # Check for PERMANENT break - FIRST exit that stays outside for 5+ consecutive bars
+        # This is checked DURING the scan, not at the end, so we catch it even if price
+        # eventually returns after many bars
+        if not inside_channel and current_exit is not None and not first_permanent_found:
+            bars_outside_so_far = bar_idx - current_exit.bar_index
+            if bars_outside_so_far >= return_threshold_bars:
+                # This exit has been outside for 5+ bars - mark as permanent
+                first_permanent_found = True
+                result.permanent_break_bar = current_exit.bar_index
+                result.permanent_break_direction = (
+                    int(BreakDirection.UP) if current_exit.exit_type == 'upper'
+                    else int(BreakDirection.DOWN)
+                )
+                # Calculate magnitude at the permanent break bar
+                _, perm_upper, perm_lower = project_channel_bounds(channel, current_exit.bar_index)
+                if channel.std_dev > 0:
+                    if current_exit.exit_type == 'upper':
+                        result.permanent_break_magnitude = (
+                            current_exit.exit_price - perm_upper
+                        ) / channel.std_dev
+                    else:
+                        result.permanent_break_magnitude = (
+                            perm_lower - current_exit.exit_price
+                        ) / channel.std_dev
+                else:
+                    result.permanent_break_magnitude = 0.0
 
     # Handle final exit if we're still outside at end of scan
     if not inside_channel and current_exit is not None:
@@ -432,59 +485,71 @@ def scan_for_break(
                 round_trip_bounces += 1
     result.round_trip_bounces = round_trip_bounces
 
-    # Find the permanent (final) break - the last exit that didn't return
-    # This may differ from the first break direction if there were false breaks
-    permanent_exit = None
-    for exit_event in reversed(exit_events):
-        if not exit_event.returned:
-            permanent_exit = exit_event
-            break  # Found the last non-returned exit
+    # PERMANENT BREAK LOGIC:
+    # Primary: Use the FIRST exit that stayed outside for 5+ consecutive bars
+    #          (already tracked during the scan loop via first_permanent_found)
+    # Fallback: If no exit reached 5+ bars during scan, use the last exit that
+    #           didn't return (still outside at scan end)
 
-    # Populate permanent break fields
-    if permanent_exit is not None:
-        result.permanent_break_bar = permanent_exit.bar_index
-        result.permanent_break_direction = (
-            int(BreakDirection.UP) if permanent_exit.exit_type == 'upper'
-            else int(BreakDirection.DOWN)
-        )
+    if not first_permanent_found:
+        # No exit stayed outside for 5+ bars during scan
+        # Fall back to finding the last exit that didn't return (if any)
+        permanent_exit = None
+        for exit_event in reversed(exit_events):
+            if not exit_event.returned:
+                permanent_exit = exit_event
+                break
 
-        # Calculate magnitude for permanent break
-        # Re-project bounds to the permanent break bar
-        _, perm_upper, perm_lower = project_channel_bounds(channel, permanent_exit.bar_index)
+        if permanent_exit is not None:
+            result.permanent_break_bar = permanent_exit.bar_index
+            result.permanent_break_direction = (
+                int(BreakDirection.UP) if permanent_exit.exit_type == 'upper'
+                else int(BreakDirection.DOWN)
+            )
 
-        if channel.std_dev > 0:
-            if permanent_exit.exit_type == 'upper':
-                result.permanent_break_magnitude = (
-                    permanent_exit.exit_price - perm_upper
-                ) / channel.std_dev
-            else:  # lower
-                result.permanent_break_magnitude = (
-                    perm_lower - permanent_exit.exit_price
-                ) / channel.std_dev
+            # Calculate magnitude for permanent break
+            _, perm_upper, perm_lower = project_channel_bounds(channel, permanent_exit.bar_index)
+
+            if channel.std_dev > 0:
+                if permanent_exit.exit_type == 'upper':
+                    result.permanent_break_magnitude = (
+                        permanent_exit.exit_price - perm_upper
+                    ) / channel.std_dev
+                else:
+                    result.permanent_break_magnitude = (
+                        perm_lower - permanent_exit.exit_price
+                    ) / channel.std_dev
+            else:
+                result.permanent_break_magnitude = 0.0
+
+            result.bars_verified_permanent = permanent_exit.bars_outside
         else:
+            # No permanent break found - all exits returned within 5 bars
+            result.permanent_break_direction = -1
+            result.permanent_break_bar = -1
             result.permanent_break_magnitude = 0.0
-
-        # NEW: Track bars verified permanent
-        # bars_outside tells us how many bars price stayed outside before scan ended
-        result.bars_verified_permanent = permanent_exit.bars_outside
+            result.bars_verified_permanent = 0
     else:
-        # No permanent break found - all exits returned
-        result.permanent_break_direction = -1
-        result.permanent_break_bar = -1
-        result.permanent_break_magnitude = 0.0
-        result.bars_verified_permanent = 0
+        # Permanent break was found during scan (first exit that stayed 5+ bars)
+        # Calculate bars_verified_permanent from the exit events
+        for exit_event in exit_events:
+            if exit_event.bar_index == result.permanent_break_bar:
+                result.bars_verified_permanent = exit_event.bars_outside
+                break
+        else:
+            # If the permanent exit is still current (not in exit_events yet)
+            if current_exit is not None and current_exit.bar_index == result.permanent_break_bar:
+                result.bars_verified_permanent = actual_scan - current_exit.bar_index
 
-    # NEW: Determine scan timeout
-    # Scan timed out if we hit max_scan_bars and either:
-    # 1. No permanent break found (all exits returned but we ran out of scan window)
-    # 2. Permanent break found but not enough bars to verify (bars_outside < return_threshold)
+    # Determine scan timeout
+    # Scan timed out if we hit max_scan_bars and no permanent break was confirmed
     result.scan_timed_out = False
     if result.scan_bars_used >= max_scan_bars:
-        if permanent_exit is None:
+        if result.permanent_break_bar < 0:
             # No permanent break found - might have found one if we scanned longer
             result.scan_timed_out = True
-        elif permanent_exit.bars_outside < return_threshold_bars:
-            # Found a "permanent" break but didn't verify it long enough
+        elif result.bars_verified_permanent < return_threshold_bars:
+            # Found a break but didn't verify it long enough
             result.scan_timed_out = True
 
     # Determine if first break was permanent or false break

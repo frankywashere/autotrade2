@@ -187,11 +187,19 @@ class Inspector:
         # Get channel end position in 5min data
         channel_end_idx = sample.channel_end_idx
 
+        # TF-specific forward bars for plot range (breaks can occur far forward)
+        tf_forward_bars = {
+            '5min': 120, '15min': 100, '30min': 80,
+            '1h': 250, '2h': 200, '3h': 150, '4h': 100,
+            'daily': 50, 'weekly': 30, 'monthly': 15
+        }
+
         # Resample TSLA data to this timeframe
         # Calculate how many 5min bars we need based on TF
         bars_per_tf = BARS_PER_TF.get(tf, 1)
         lookback_5min = (window + 50) * bars_per_tf  # window + extra for resampling
-        forward_5min = 100 * bars_per_tf  # Forward projection
+        max_forward_tf = tf_forward_bars.get(tf, 50)
+        forward_5min = (max_forward_tf + 20) * bars_per_tf  # Forward projection (with buffer)
 
         start_idx = max(0, channel_end_idx - lookback_5min)
         end_idx = min(len(self.tsla_df), channel_end_idx + forward_5min)
@@ -246,7 +254,8 @@ class Inspector:
 
         # Calculate plot range
         plot_start = max(0, sample_idx - window + 1)
-        forward_bars = min(50, len(df_tf) - sample_idx - 1)
+        max_forward = tf_forward_bars.get(tf, 50)
+        forward_bars = min(max_forward, len(df_tf) - sample_idx - 1)
         plot_end = sample_idx + forward_bars + 1
 
         df_plot = df_tf.iloc[plot_start:plot_end]
@@ -256,13 +265,20 @@ class Inspector:
         # Draw candlesticks
         self._draw_candles(ax, df_plot, x)
 
+        # Ensure x-axis shows full range for markers (disable autoscale)
+        ax.set_xlim(-1, n_bars)
+        ax.autoscale(enable=False, axis='x')
+
         # Draw channel if detected
         if channel is not None and channel.valid:
             self._draw_channel_fresh(ax, channel, window, forward_bars, n_bars, df_plot, sample)
 
         # If we have a fresh channel but no labels, detect breaks fresh
         fresh_break_info = None
-        if channel is not None and channel.valid and labels is None:
+        # ALWAYS compute fresh break detection when we have a valid channel
+        # This ensures breaks are relative to the DISPLAYED channel, not stored labels
+        # which may come from a different time period
+        if channel is not None and channel.valid:
             from v15.core.break_scanner import scan_for_break
 
             # Get TF-appropriate max scan
@@ -289,14 +305,15 @@ class Inspector:
                 except Exception as e:
                     fresh_break_info = None
 
-        # Draw breaks if we have labels (break info still comes from labels)
-        if labels is not None:
-            self._draw_breaks(ax, labels, window, n_bars, df_plot, plot_start, sample)
-            self._draw_info(ax, labels, tf, window, sample, channel)
-        elif fresh_break_info is not None:
-            # Draw fresh break info when labels are not available
+        # ALWAYS use fresh break detection for accurate visualization
+        # Stored labels may come from a different channel period than what's displayed
+        if fresh_break_info is not None:
             self._draw_breaks_fresh(ax, fresh_break_info, window, n_bars, df_plot, sample)
             self._draw_info_fresh(ax, fresh_break_info, tf, window, sample, channel)
+        elif labels is not None:
+            # Fallback to stored labels if fresh detection failed
+            self._draw_breaks(ax, labels, window, n_bars, df_plot, plot_start, sample)
+            self._draw_info(ax, labels, tf, window, sample, channel)
 
         # Draw vertical line at SAMPLE position (the prediction point)
         sample_ts = sample.timestamp
@@ -468,21 +485,19 @@ class Inspector:
         if exit_mags and len(exit_mags) > 0 and any(m > 0 for m in exit_mags):
             max_idx = np.argmax(exit_mags)
             max_mag = exit_mags[max_idx]
-            first_mag = getattr(labels, 'break_magnitude', 0.0)
+            biggest_bar = exit_bars[max_idx] if max_idx < len(exit_bars) else -1
 
-            # Only show if significantly bigger than first break
-            if max_mag > 0.5 and max_mag > first_mag * 1.1:
-                biggest_bar = exit_bars[max_idx] if max_idx < len(exit_bars) else -1
-                if biggest_bar >= 0:
-                    biggest_x = break_to_plot_x(biggest_bar)
-                    if 0 <= biggest_x < n_bars:
-                        biggest_dir = exit_types[max_idx] if max_idx < len(exit_types) else 0
-                        marker = '^' if biggest_dir == 1 else 'v'
-                        bar_idx = int(biggest_x)
-                        if 0 <= bar_idx < len(df_plot):
-                            price = df_plot.iloc[bar_idx]['high' if biggest_dir == 1 else 'low']
-                            ax.scatter([biggest_x], [price], marker=marker, s=200,
-                                      c=BIGGEST_COLOR, edgecolors='white', linewidths=1.5, zorder=11)
+            # Only show if at a different bar than first break (avoid overlapping markers)
+            if max_mag > 0.5 and biggest_bar >= 0 and biggest_bar != bars_to_first:
+                biggest_x = break_to_plot_x(biggest_bar)
+                if 0 <= biggest_x < n_bars:
+                    biggest_dir = exit_types[max_idx] if max_idx < len(exit_types) else 0
+                    marker = '^' if biggest_dir == 1 else 'v'
+                    bar_idx = int(biggest_x)
+                    if 0 <= bar_idx < len(df_plot):
+                        price = df_plot.iloc[bar_idx]['high' if biggest_dir == 1 else 'low']
+                        ax.scatter([biggest_x], [price], marker=marker, s=200,
+                                  c=BIGGEST_COLOR, edgecolors='white', linewidths=1.5, zorder=11)
 
         # PERMANENT BREAK - filled purple triangle
         perm_dir = getattr(labels, 'permanent_break_direction', -1)
@@ -618,10 +633,10 @@ class Inspector:
                     biggest_bar = evt.bar_index
                     biggest_dir = 1 if evt.exit_type == 'upper' else 0
 
-        first_mag = break_result.break_magnitude if break_result.break_detected else 0.0
+        first_bar = break_result.break_bar if break_result.break_detected else -1
 
-        # Only show if significantly bigger than first break
-        if biggest_bar >= 0 and biggest_mag > 0.5 and biggest_mag > first_mag * 1.1:
+        # Only show if at a different bar than first break (avoid overlapping markers)
+        if biggest_bar >= 0 and biggest_mag > 0.5 and biggest_bar != first_bar:
             biggest_x = break_to_plot_x(biggest_bar)
             if 0 <= biggest_x < n_bars:
                 marker = '^' if biggest_dir == 1 else 'v'
