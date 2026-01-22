@@ -75,7 +75,8 @@ def extract_technical_features(df: pd.DataFrame) -> Dict[str, float]:
     volume_arr = df['volume'].values.astype(float) if has_volume else np.zeros(len(close_arr))
 
     n = len(close_arr)
-    current_close = safe_float(close_arr[-1]) if n > 0 else 0.0
+    # Use previous bar's close to avoid data leakage (features should not see current bar)
+    current_close = safe_float(close_arr[-2]) if n > 1 else 0.0
 
     # MACD (5 features)
     macd_features = _calculate_macd(close_arr)
@@ -151,17 +152,19 @@ def _calculate_macd(close: np.ndarray) -> Dict[str, float]:
     macd_signal = ema(macd_line, 9)
     macd_histogram = macd_line - macd_signal
 
-    features['macd_line'] = get_last_valid(macd_line, 0.0)
-    features['macd_signal'] = get_last_valid(macd_signal, 0.0)
-    features['macd_histogram'] = get_last_valid(macd_histogram, 0.0)
+    # Use [:-1] slices to avoid data leakage (features should not see current bar)
+    features['macd_line'] = get_last_valid(macd_line[:-1], 0.0) if len(macd_line) > 1 else 0.0
+    features['macd_signal'] = get_last_valid(macd_signal[:-1], 0.0) if len(macd_signal) > 1 else 0.0
+    features['macd_histogram'] = get_last_valid(macd_histogram[:-1], 0.0) if len(macd_histogram) > 1 else 0.0
 
     # Crossover: 1 if MACD crossed above signal, -1 if below, 0 otherwise
+    # Use [-2] and [-3] to avoid data leakage (features should not see current bar)
     crossover = 0.0
-    if len(macd_line) >= 2 and len(macd_signal) >= 2:
-        prev_macd = macd_line[-2] if np.isfinite(macd_line[-2]) else 0.0
-        prev_signal = macd_signal[-2] if np.isfinite(macd_signal[-2]) else 0.0
-        curr_macd = macd_line[-1] if np.isfinite(macd_line[-1]) else 0.0
-        curr_signal = macd_signal[-1] if np.isfinite(macd_signal[-1]) else 0.0
+    if len(macd_line) >= 3 and len(macd_signal) >= 3:
+        prev_macd = macd_line[-3] if np.isfinite(macd_line[-3]) else 0.0
+        prev_signal = macd_signal[-3] if np.isfinite(macd_signal[-3]) else 0.0
+        curr_macd = macd_line[-2] if np.isfinite(macd_line[-2]) else 0.0
+        curr_signal = macd_signal[-2] if np.isfinite(macd_signal[-2]) else 0.0
 
         if prev_macd <= prev_signal and curr_macd > curr_signal:
             crossover = 1.0
@@ -171,10 +174,11 @@ def _calculate_macd(close: np.ndarray) -> Dict[str, float]:
     features['macd_crossover'] = crossover
 
     # Divergence: compare price direction vs MACD direction over last 10 bars
+    # Use [-2] to avoid data leakage (features should not see current bar)
     divergence = 0.0
-    if len(close) >= 10 and len(macd_line) >= 10:
-        price_change = close[-1] - close[-10]
-        macd_change = get_last_valid(macd_line[-1:], 0.0) - get_last_valid(macd_line[-10:-9], 0.0)
+    if len(close) >= 11 and len(macd_line) >= 11:
+        price_change = close[-2] - close[-11]
+        macd_change = get_last_valid(macd_line[-2:-1], 0.0) - get_last_valid(macd_line[-11:-10], 0.0)
 
         if price_change > 0 and macd_change < 0:
             divergence = -1.0  # Bearish divergence
@@ -212,9 +216,10 @@ def _calculate_bollinger_bands(close: np.ndarray, current_close: float) -> Dict[
     upper = middle + std_dev * rolling_std
     lower = middle - std_dev * rolling_std
 
-    bb_upper = get_last_valid(upper, 0.0)
-    bb_middle = get_last_valid(middle, 0.0)
-    bb_lower = get_last_valid(lower, 0.0)
+    # Use [:-1] slices to avoid data leakage (features should not see current bar)
+    bb_upper = get_last_valid(upper[:-1], 0.0) if len(upper) > 1 else 0.0
+    bb_middle = get_last_valid(middle[:-1], 0.0) if len(middle) > 1 else 0.0
+    bb_lower = get_last_valid(lower[:-1], 0.0) if len(lower) > 1 else 0.0
 
     bb_width = safe_divide(bb_upper - bb_lower, bb_middle, 0.0)
 
@@ -228,10 +233,11 @@ def _calculate_bollinger_bands(close: np.ndarray, current_close: float) -> Dict[
     price_vs_bb_lower = _scalar_pct_change(current_close, bb_lower, 0.0) if bb_lower > 0 else 0.0
 
     # Squeeze detection: compare current width to historical width
+    # Use [-2] to avoid data leakage (features should not see current bar)
     bb_squeeze = 0.0
-    if len(rolling_std) >= 50:
-        current_std = rolling_std[-1] if np.isfinite(rolling_std[-1]) else 0.0
-        recent_std = rolling_std[-50:]
+    if len(rolling_std) >= 51:
+        current_std = rolling_std[-2] if np.isfinite(rolling_std[-2]) else 0.0
+        recent_std = rolling_std[-51:-1]
         if len(recent_std) > 0 and not np.all(np.isnan(recent_std)):
             avg_std = np.nanmean(recent_std)
         else:
@@ -276,9 +282,10 @@ def _calculate_keltner(
     upper = middle + multiplier * atr_values
     lower = middle - multiplier * atr_values
 
-    keltner_upper = get_last_valid(upper, 0.0)
-    keltner_middle = get_last_valid(middle, 0.0)
-    keltner_lower = get_last_valid(lower, 0.0)
+    # Use [:-1] slices to avoid data leakage (features should not see current bar)
+    keltner_upper = get_last_valid(upper[:-1], 0.0) if len(upper) > 1 else 0.0
+    keltner_middle = get_last_valid(middle[:-1], 0.0) if len(middle) > 1 else 0.0
+    keltner_lower = get_last_valid(lower[:-1], 0.0) if len(lower) > 1 else 0.0
 
     keltner_width = safe_divide(keltner_upper - keltner_lower, keltner_middle, 0.0)
 
@@ -346,17 +353,19 @@ def _calculate_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict
 
     adx_values = ema(dx, period)
 
-    adx = get_last_valid(adx_values, 0.0)
-    plus_di_val = get_last_valid(plus_di, 0.0)
-    minus_di_val = get_last_valid(minus_di, 0.0)
+    # Use [:-1] slices to avoid data leakage (features should not see current bar)
+    adx = get_last_valid(adx_values[:-1], 0.0) if len(adx_values) > 1 else 0.0
+    plus_di_val = get_last_valid(plus_di[:-1], 0.0) if len(plus_di) > 1 else 0.0
+    minus_di_val = get_last_valid(minus_di[:-1], 0.0) if len(minus_di) > 1 else 0.0
 
     # DI crossover
+    # Use [-2] and [-3] to avoid data leakage (features should not see current bar)
     di_crossover = 0.0
-    if len(plus_di) >= 2 and len(minus_di) >= 2:
-        prev_plus = plus_di[-2] if np.isfinite(plus_di[-2]) else 0.0
-        prev_minus = minus_di[-2] if np.isfinite(minus_di[-2]) else 0.0
-        curr_plus = plus_di[-1] if np.isfinite(plus_di[-1]) else 0.0
-        curr_minus = minus_di[-1] if np.isfinite(minus_di[-1]) else 0.0
+    if len(plus_di) >= 3 and len(minus_di) >= 3:
+        prev_plus = plus_di[-3] if np.isfinite(plus_di[-3]) else 0.0
+        prev_minus = minus_di[-3] if np.isfinite(minus_di[-3]) else 0.0
+        curr_plus = plus_di[-2] if np.isfinite(plus_di[-2]) else 0.0
+        curr_minus = minus_di[-2] if np.isfinite(minus_di[-2]) else 0.0
 
         if prev_plus <= prev_minus and curr_plus > curr_minus:
             di_crossover = 1.0
@@ -388,21 +397,22 @@ def _calculate_ichimoku(
         }
 
     # Tenkan-sen (Conversion Line): (9-period high + 9-period low) / 2
-    tenkan_high = np.max(high[-9:])
-    tenkan_low = np.min(low[-9:])
+    # Use [:-1] slices to avoid data leakage (features should not see current bar)
+    tenkan_high = np.max(high[-10:-1])
+    tenkan_low = np.min(low[-10:-1])
     tenkan = (tenkan_high + tenkan_low) / 2
 
     # Kijun-sen (Base Line): (26-period high + 26-period low) / 2
-    kijun_high = np.max(high[-26:])
-    kijun_low = np.min(low[-26:])
+    kijun_high = np.max(high[-27:-1])
+    kijun_low = np.min(low[-27:-1])
     kijun = (kijun_high + kijun_low) / 2
 
     # Senkou Span A: (Tenkan + Kijun) / 2
     senkou_a = (tenkan + kijun) / 2
 
     # Senkou Span B: (52-period high + 52-period low) / 2
-    senkou_b_high = np.max(high[-52:])
-    senkou_b_low = np.min(low[-52:])
+    senkou_b_high = np.max(high[-53:-1])
+    senkou_b_low = np.min(low[-53:-1])
     senkou_b = (senkou_b_high + senkou_b_low) / 2
 
     # Price vs Cloud
@@ -463,20 +473,23 @@ def _calculate_volume_indicators(
         else:
             obv[i] = obv[i - 1]
 
-    obv_val = safe_float(obv[-1], 0.0)
+    # Use [-2] to avoid data leakage (features should not see current bar)
+    obv_val = safe_float(obv[-2], 0.0) if n >= 2 else 0.0
 
     # OBV Trend (slope over last 10 periods, normalized)
+    # Use [-2] to avoid data leakage
     obv_trend = 0.0
-    if n >= 10:
-        obv_change = obv[-1] - obv[-10]
-        avg_vol = np.mean(volume[-10:])
+    if n >= 11:
+        obv_change = obv[-2] - obv[-11]
+        avg_vol = np.mean(volume[-11:-1])
         obv_trend = safe_divide(obv_change, avg_vol * 10, 0.0)
 
     # OBV Divergence
+    # Use [-2] to avoid data leakage
     obv_divergence = 0.0
-    if n >= 10:
-        price_change = close[-1] - close[-10]
-        obv_change = obv[-1] - obv[-10]
+    if n >= 11:
+        price_change = close[-2] - close[-11]
+        obv_change = obv[-2] - obv[-11]
         if price_change > 0 and obv_change < 0:
             obv_divergence = -1.0
         elif price_change < 0 and obv_change > 0:
@@ -518,7 +531,8 @@ def _calculate_volume_indicators(
         else:
             mfi_old = 100.0 if pos_sum_old > 0 else 50.0
 
-        price_change = close[-1] - close[-10]
+        # Use [-2] to avoid data leakage (features should not see current bar)
+        price_change = close[-2] - close[-11]
         mfi_change = mfi - mfi_old
         if price_change > 0 and mfi_change < 0:
             mfi_divergence = -1.0
@@ -535,13 +549,15 @@ def _calculate_volume_indicators(
         if i > 0:
             ad[i] += ad[i - 1]
 
-    accumulation_dist = safe_float(ad[-1], 0.0)
+    # Use [-2] to avoid data leakage (features should not see current bar)
+    accumulation_dist = safe_float(ad[-2], 0.0) if n >= 2 else 0.0
 
     # Chaikin Money Flow
+    # Use range(-cmf_period-1, -1) to avoid data leakage (exclude current bar)
     cmf_period = 20
     cmf_num = 0.0
     cmf_den = 0.0
-    for i in range(-cmf_period, 0):
+    for i in range(-cmf_period - 1, -1):
         hl_range = high[i] - low[i]
         if hl_range > 0:
             clv = ((close[i] - low[i]) - (high[i] - close[i])) / hl_range
@@ -557,13 +573,15 @@ def _calculate_volume_indicators(
         force_idx[i] = (close[i] - close[i - 1]) * volume[i]
 
     force_ema = ema(force_idx, 13)
-    force_index = get_last_valid(force_ema, 0.0)
+    # Use [:-1] to avoid data leakage (features should not see current bar)
+    force_index = get_last_valid(force_ema[:-1], 0.0) if len(force_ema) > 1 else 0.0
 
     # Volume Oscillator (short EMA / long EMA - 1)
     vol_short = ema(volume, 5)
     vol_long = ema(volume, 20)
-    vol_short_val = get_last_valid(vol_short, 1.0)
-    vol_long_val = get_last_valid(vol_long, 1.0)
+    # Use [:-1] to avoid data leakage (features should not see current bar)
+    vol_short_val = get_last_valid(vol_short[:-1], 1.0) if len(vol_short) > 1 else 1.0
+    vol_long_val = get_last_valid(vol_long[:-1], 1.0) if len(vol_long) > 1 else 1.0
     volume_oscillator = safe_divide(vol_short_val - vol_long_val, vol_long_val, 0.0)
 
     # VWAP Distance
@@ -576,8 +594,9 @@ def _calculate_volume_indicators(
         if cumulative_vol[i] > 0:
             vwap[i] = cumulative_tp_vol[i] / cumulative_vol[i]
 
-    vwap_val = get_last_valid(vwap, close[-1])
-    vwap_distance = _scalar_pct_change(close[-1], vwap_val, 0.0)
+    # Use [-2] to avoid data leakage (features should not see current bar)
+    vwap_val = get_last_valid(vwap[:-1], close[-2]) if n >= 2 else 0.0
+    vwap_distance = _scalar_pct_change(close[-2], vwap_val, 0.0) if n >= 2 else 0.0
 
     return {
         'obv': obv_val,
@@ -614,9 +633,10 @@ def _calculate_oscillators(
         }
 
     # Aroon (25 period)
+    # Use [:-1] slices to avoid data leakage (features should not see current bar)
     period = 25
-    high_window = high[-period:]
-    low_window = low[-period:]
+    high_window = high[-period - 1:-1]
+    low_window = low[-period - 1:-1]
 
     days_since_high = period - 1 - np.argmax(high_window)
     days_since_low = period - 1 - np.argmin(low_window)
@@ -630,10 +650,11 @@ def _calculate_oscillators(
     ema2 = ema(ema1, 15)
     ema3 = ema(ema2, 15)
 
+    # Use [-2:-1] and [-3:-2] to avoid data leakage (features should not see current bar)
     trix_val = 0.0
-    if len(ema3) >= 2:
-        curr = get_last_valid(ema3[-1:], 0.0)
-        prev = get_last_valid(ema3[-2:-1], curr)
+    if len(ema3) >= 3:
+        curr = get_last_valid(ema3[-2:-1], 0.0)
+        prev = get_last_valid(ema3[-3:-2], curr)
         if prev > 0:
             trix_val = ((curr - prev) / prev) * 100
 
@@ -645,13 +666,14 @@ def _calculate_oscillators(
         bp[i] = close[i] - min(low[i], close[i - 1])
 
     # Three periods: 7, 14, 28
-    bp7 = np.sum(bp[-7:])
-    bp14 = np.sum(bp[-14:])
-    bp28 = np.sum(bp[-28:])
+    # Use [:-1] slices to avoid data leakage (exclude current bar)
+    bp7 = np.sum(bp[-8:-1])
+    bp14 = np.sum(bp[-15:-1])
+    bp28 = np.sum(bp[-29:-1])
 
-    tr7 = np.sum(tr_vals[-7:])
-    tr14 = np.sum(tr_vals[-14:])
-    tr28 = np.sum(tr_vals[-28:])
+    tr7 = np.sum(tr_vals[-8:-1])
+    tr14 = np.sum(tr_vals[-15:-1])
+    tr28 = np.sum(tr_vals[-29:-1])
 
     avg7 = safe_divide(bp7, tr7, 0.5)
     avg14 = safe_divide(bp14, tr14, 0.5)
@@ -669,16 +691,18 @@ def _calculate_oscillators(
         if np.isfinite(ema_26[i]) and ema_26[i] > 0:
             ppo_line[i] = ((ema_12[i] - ema_26[i]) / ema_26[i]) * 100
 
-    ppo = get_last_valid(ppo_line, 0.0)
+    # Use [:-1] to avoid data leakage (features should not see current bar)
+    ppo = get_last_valid(ppo_line[:-1], 0.0) if len(ppo_line) > 1 else 0.0
 
     # DPO (Detrended Price Oscillator)
     dpo_period = 20
     sma_vals = sma(close, dpo_period)
     shift = dpo_period // 2 + 1
 
+    # Use [-2] to avoid data leakage (features should not see current bar)
     dpo = 0.0
-    if n > shift and np.isfinite(sma_vals[-shift]):
-        dpo = close[-1] - sma_vals[-shift]
+    if n > shift + 1 and np.isfinite(sma_vals[-shift - 1]):
+        dpo = close[-2] - sma_vals[-shift - 1]
 
     # CMO (Chande Momentum Oscillator)
     cmo_period = 14
@@ -692,8 +716,10 @@ def _calculate_oscillators(
         else:
             losses[i] = -diff
 
-    sum_gains = np.sum(gains[-cmo_period:])
-    sum_losses = np.sum(losses[-cmo_period:])
+    # Use [:-1] slices to avoid data leakage (exclude current bar)
+    # gains/losses arrays are already n-1 length, so -1 more to exclude current bar's change
+    sum_gains = np.sum(gains[-cmo_period - 1:-1]) if len(gains) > cmo_period else np.sum(gains[:-1]) if len(gains) > 1 else 0.0
+    sum_losses = np.sum(losses[-cmo_period - 1:-1]) if len(losses) > cmo_period else np.sum(losses[:-1]) if len(losses) > 1 else 0.0
 
     cmo = 0.0
     total = sum_gains + sum_losses
@@ -774,9 +800,10 @@ def _calculate_fibonacci(
         }
 
     # Use last 50 bars (or available) for high/low
-    lookback = min(50, len(high))
-    swing_high = np.max(high[-lookback:])
-    swing_low = np.min(low[-lookback:])
+    # Use [:-1] slices to avoid data leakage (features should not see current bar)
+    lookback = min(50, len(high) - 1)
+    swing_high = np.max(high[-lookback - 1:-1])
+    swing_low = np.min(low[-lookback - 1:-1])
 
     range_size = swing_high - swing_low
 
@@ -837,18 +864,18 @@ def _calculate_candlestick_patterns(
         'is_spinning_top': 0.0,
     }
 
-    if n < 3:
+    if n < 4:
         return defaults
 
-    # Current candle properties
-    o, h, l, c = open_arr[-1], high[-1], low[-1], close[-1]
+    # Use previous candle properties to avoid data leakage (features should not see current bar)
+    o, h, l, c = open_arr[-2], high[-2], low[-2], close[-2]
     body = abs(c - o)
     full_range = h - l
     upper_shadow = h - max(o, c)
     lower_shadow = min(o, c) - l
 
-    # Average body size for reference
-    avg_body = np.mean([abs(close[i] - open_arr[i]) for i in range(-10, 0)])
+    # Average body size for reference (exclude current bar)
+    avg_body = np.mean([abs(close[i] - open_arr[i]) for i in range(-11, -1)])
     if avg_body == 0:
         avg_body = 1.0
 
@@ -873,9 +900,9 @@ def _calculate_candlestick_patterns(
         if upper_shadow > body and lower_shadow > body:
             features['is_spinning_top'] = 1.0
 
-    if n >= 2:
-        # Previous candle
-        o1, h1, l1, c1 = open_arr[-2], high[-2], low[-2], close[-2]
+    if n >= 3:
+        # Two bars ago (since o,h,l,c is now [-2], this is [-3])
+        o1, h1, l1, c1 = open_arr[-3], high[-3], low[-3], close[-3]
         body1 = abs(c1 - o1)
 
         # Bullish Engulfing
@@ -898,9 +925,10 @@ def _calculate_candlestick_patterns(
             if o < c1 and c > o1:  # Current inside previous
                 features['is_harami_bear'] = 1.0
 
-    if n >= 3:
-        o2, h2, l2, c2 = open_arr[-3], high[-3], low[-3], close[-3]
-        o1, h1, l1, c1 = open_arr[-2], high[-2], low[-2], close[-2]
+    if n >= 4:
+        # Shifted by 1 to avoid data leakage: [-4], [-3], [-2] instead of [-3], [-2], [-1]
+        o2, h2, l2, c2 = open_arr[-4], high[-4], low[-4], close[-4]
+        o1, h1, l1, c1 = open_arr[-3], high[-3], low[-3], close[-3]
         body2 = abs(c2 - o2)
         body1 = abs(c1 - o1)
 
@@ -912,20 +940,20 @@ def _calculate_candlestick_patterns(
         if c2 > o2 and body1 < body2 * 0.3 and c < o and c < (o2 + c2) / 2:
             features['is_evening_star'] = 1.0
 
-        # Three White Soldiers
-        if (close[-3] > open_arr[-3] and
+        # Three White Soldiers (use [-4], [-3], [-2] to avoid data leakage)
+        if (close[-4] > open_arr[-4] and
+            close[-3] > open_arr[-3] and
             close[-2] > open_arr[-2] and
-            close[-1] > open_arr[-1] and
-            close[-2] > close[-3] and
-            close[-1] > close[-2]):
+            close[-3] > close[-4] and
+            close[-2] > close[-3]):
             features['is_three_white'] = 1.0
 
-        # Three Black Crows
-        if (close[-3] < open_arr[-3] and
+        # Three Black Crows (use [-4], [-3], [-2] to avoid data leakage)
+        if (close[-4] < open_arr[-4] and
+            close[-3] < open_arr[-3] and
             close[-2] < open_arr[-2] and
-            close[-1] < open_arr[-1] and
-            close[-2] < close[-3] and
-            close[-1] < close[-2]):
+            close[-3] < close[-4] and
+            close[-2] < close[-3]):
             features['is_three_black'] = 1.0
 
     return features
@@ -964,14 +992,16 @@ def _calculate_additional(
         if mean_dev[i] > 0:
             cci[i] = (typical_price[i] - tp_sma[i]) / (0.015 * mean_dev[i])
 
-    cci_val = get_last_valid(cci, 0.0)
+    # Use [:-1] to avoid data leakage (features should not see current bar)
+    cci_val = get_last_valid(cci[:-1], 0.0) if len(cci) > 1 else 0.0
 
     # ROC (Rate of Change)
+    # Use [-2] to avoid data leakage (features should not see current bar)
     def calc_roc(periods: int) -> float:
-        if n > periods:
-            prev = close[-periods - 1]
+        if n > periods + 1:
+            prev = close[-periods - 2]
             if prev > 0:
-                return ((close[-1] - prev) / prev) * 100
+                return ((close[-2] - prev) / prev) * 100
         return 0.0
 
     roc_5 = calc_roc(5)
@@ -979,9 +1009,10 @@ def _calculate_additional(
     roc_20 = calc_roc(20)
 
     # Price Channel (Donchian)
+    # Use [:-1] slices to avoid data leakage (features should not see current bar)
     channel_period = 20
-    price_channel_upper = np.max(high[-channel_period:])
-    price_channel_lower = np.min(low[-channel_period:])
+    price_channel_upper = np.max(high[-channel_period - 1:-1])
+    price_channel_lower = np.min(low[-channel_period - 1:-1])
 
     return {
         'cci': safe_float(cci_val, 0.0),

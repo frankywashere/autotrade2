@@ -64,7 +64,7 @@ def _extract_basic_price_features(df: pd.DataFrame) -> Dict[str, float]:
     """
     features = {}
 
-    if len(df) < 2:
+    if len(df) < 3:
         return {
             "spy_close": 0.0,
             "spy_close_vs_open_pct": 0.0,
@@ -78,12 +78,12 @@ def _extract_basic_price_features(df: pd.DataFrame) -> Dict[str, float]:
             "spy_volume_vs_avg": 1.0,
         }
 
-    o = float(df["open"].iloc[-1])
-    h = float(df["high"].iloc[-1])
-    l = float(df["low"].iloc[-1])
-    c = float(df["close"].iloc[-1])
-    v = float(df["volume"].iloc[-1])
-    prev_c = float(df["close"].iloc[-2])
+    o = float(df["open"].iloc[-2])
+    h = float(df["high"].iloc[-2])
+    l = float(df["low"].iloc[-2])
+    c = float(df["close"].iloc[-2])
+    v = float(df["volume"].iloc[-2])
+    prev_c = float(df["close"].iloc[-3])
 
     hl_range = h - l
     body = abs(c - o)
@@ -781,7 +781,7 @@ def _extract_market_regime_features(df: pd.DataFrame) -> Dict[str, float]:
     volume = df["volume"].values if "volume" in df.columns else np.ones(len(close))
     n = len(close)
 
-    if n < 2:
+    if n < 3:
         return {
             "spy_intraday_range_position": 0.5,
             "spy_open_gap_filled": 0.0,
@@ -795,19 +795,19 @@ def _extract_market_regime_features(df: pd.DataFrame) -> Dict[str, float]:
             "spy_choppiness_index": 50.0,
         }
 
-    o = float(df["open"].iloc[-1])
-    h = float(high[-1])
-    l = float(low[-1])
-    c = float(close[-1])
-    v = float(volume[-1])
+    o = float(df["open"].iloc[-2])
+    h = float(high[-2])
+    l = float(low[-2])
+    c = float(close[-2])
+    v = float(volume[-2])
 
     # Intraday range position
     hl_range = h - l
     features["spy_intraday_range_position"] = safe_divide(c - l, hl_range, 0.5)
 
     # Gap filled check (did price return to previous close?)
-    if n >= 2:
-        prev_c = float(close[-2])
+    if n >= 3:
+        prev_c = float(close[-3])
         gap = o - prev_c
         if gap > 0:  # Gap up
             gap_filled = 1.0 if l <= prev_c else 0.0

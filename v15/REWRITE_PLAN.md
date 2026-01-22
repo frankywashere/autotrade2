@@ -74,7 +74,7 @@ The V15 channel prediction system is a complete rewrite addressing all architect
 - [x] `pipeline.py` - CLI entry point
 - [x] `scanner.py` - parallel channel scanning
 - [x] `inspector.py` - terminal-based sample inspection
-- [x] `visual_inspector.py` - visual inspection tools
+- [x] Visual inspection tools (deprecated)
 
 ---
 
@@ -121,8 +121,7 @@ v15/
 ├── labels.py                # Label generation
 ├── scanner.py               # Parallel data scanning pipeline
 ├── pipeline.py              # CLI entry point
-├── inspector.py             # Terminal-based sample inspector
-└── visual_inspector.py      # Visual inspection tools
+└── inspector.py             # Terminal-based sample inspector
 ```
 
 ---

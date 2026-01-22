@@ -41,7 +41,7 @@ from ..features.validation import (
     check_for_constant_features,
     validate_feature_matrix,
 )
-from ..types import ChannelLabels, ChannelSample, CrossCorrelationLabels
+from ..dtypes import ChannelLabels, ChannelSample, CrossCorrelationLabels
 from ..labels import compute_cross_correlation_labels
 
 
@@ -266,6 +266,18 @@ class ChannelDataset(Dataset):
             'tsla_bounces_after_return': 0,
             'tsla_channel_continued': False,
             'tsla_break_scan_valid': False,
+            # TSLA exit dynamics (aggregated resilience metrics)
+            'tsla_duration_to_permanent': -1,
+            'tsla_avg_bars_outside': 0.0,
+            'tsla_total_bars_outside': 0,
+            'tsla_durability_score': 0.0,
+            # TSLA exit verification tracking (NEW)
+            'tsla_first_break_returned': False,
+            'tsla_exit_return_rate': 0.0,
+            'tsla_exits_returned_count': 0,
+            'tsla_exits_stayed_out_count': 0,
+            'tsla_scan_timed_out': False,
+            'tsla_bars_verified_permanent': 0,
             # SPY break scan labels (spy_ prefix)
             'spy_bars_to_first_break': 0,
             'spy_break_direction': 0,
@@ -274,6 +286,18 @@ class ChannelDataset(Dataset):
             'spy_bounces_after_return': 0,
             'spy_channel_continued': False,
             'spy_break_scan_valid': False,
+            # SPY exit dynamics (aggregated resilience metrics)
+            'spy_duration_to_permanent': -1,
+            'spy_avg_bars_outside': 0.0,
+            'spy_total_bars_outside': 0,
+            'spy_durability_score': 0.0,
+            # SPY exit verification tracking (NEW)
+            'spy_first_break_returned': False,
+            'spy_exit_return_rate': 0.0,
+            'spy_exits_returned_count': 0,
+            'spy_exits_stayed_out_count': 0,
+            'spy_scan_timed_out': False,
+            'spy_bars_verified_permanent': 0,
             # Cross-correlation labels (cross_ prefix)
             'cross_direction_aligned': False,
             'cross_tsla_broke_first': False,
@@ -286,6 +310,34 @@ class ChannelDataset(Dataset):
             'cross_continuation_aligned': False,
             'cross_who_broke_first': 0,  # 0=simultaneous, 1=TSLA first, 2=SPY first
             'cross_valid': False,
+            # Cross-correlation exit dynamics (cross_ prefix)
+            'cross_tsla_permanent_first': False,
+            'cross_spy_permanent_first': False,
+            'cross_permanent_duration_lag_bars': 0,
+            'cross_permanent_duration_spread': 0,
+            'cross_durability_spread': 0.0,
+            'cross_avg_bars_outside_spread': 0.0,
+            'cross_total_bars_outside_spread': 0,
+            'cross_both_high_durability': False,
+            'cross_both_low_durability': False,
+            'cross_durability_aligned': False,
+            'cross_tsla_more_durable': False,
+            'cross_spy_more_durable': False,
+            'cross_permanent_dynamics_valid': False,
+            # Cross-correlation exit verification (NEW)
+            'cross_exit_return_rate_spread': 0.0,
+            'cross_exit_return_rate_aligned': False,
+            'cross_tsla_more_resilient': False,
+            'cross_spy_more_resilient': False,
+            'cross_exits_returned_spread': 0,
+            'cross_exits_stayed_out_spread': 0,
+            'cross_total_exits_spread': 0,
+            'cross_both_scan_timed_out': False,
+            'cross_scan_timeout_aligned': False,
+            'cross_bars_verified_spread': 0,
+            'cross_both_first_returned_then_permanent': False,
+            'cross_both_never_returned': False,
+            'cross_exit_verification_valid': False,
         }
 
         if tf_labels is None:
@@ -309,6 +361,18 @@ class ChannelDataset(Dataset):
             'tsla_bounces_after_return': getattr(tf_labels, 'bounces_after_return', 0),
             'tsla_channel_continued': getattr(tf_labels, 'channel_continued', False),
             'tsla_break_scan_valid': getattr(tf_labels, 'break_scan_valid', False),
+            # TSLA exit dynamics (aggregated resilience metrics)
+            'tsla_duration_to_permanent': getattr(tf_labels, 'duration_to_permanent', -1),
+            'tsla_avg_bars_outside': getattr(tf_labels, 'avg_bars_outside', 0.0),
+            'tsla_total_bars_outside': getattr(tf_labels, 'total_bars_outside', 0),
+            'tsla_durability_score': getattr(tf_labels, 'durability_score', 0.0),
+            # TSLA exit verification tracking (NEW)
+            'tsla_first_break_returned': getattr(tf_labels, 'first_break_returned', False),
+            'tsla_exit_return_rate': getattr(tf_labels, 'exit_return_rate', 0.0),
+            'tsla_exits_returned_count': getattr(tf_labels, 'exits_returned_count', 0),
+            'tsla_exits_stayed_out_count': getattr(tf_labels, 'exits_stayed_out_count', 0),
+            'tsla_scan_timed_out': getattr(tf_labels, 'scan_timed_out', False),
+            'tsla_bars_verified_permanent': getattr(tf_labels, 'bars_verified_permanent', 0),
         }
 
         # SPY break scan labels (from SPY's ChannelLabels if available)
@@ -321,6 +385,18 @@ class ChannelDataset(Dataset):
                 'spy_bounces_after_return': getattr(spy_tf_labels, 'bounces_after_return', 0),
                 'spy_channel_continued': getattr(spy_tf_labels, 'channel_continued', False),
                 'spy_break_scan_valid': getattr(spy_tf_labels, 'break_scan_valid', False),
+                # SPY exit dynamics (aggregated resilience metrics)
+                'spy_duration_to_permanent': getattr(spy_tf_labels, 'duration_to_permanent', -1),
+                'spy_avg_bars_outside': getattr(spy_tf_labels, 'avg_bars_outside', 0.0),
+                'spy_total_bars_outside': getattr(spy_tf_labels, 'total_bars_outside', 0),
+                'spy_durability_score': getattr(spy_tf_labels, 'durability_score', 0.0),
+                # SPY exit verification tracking (NEW)
+                'spy_first_break_returned': getattr(spy_tf_labels, 'first_break_returned', False),
+                'spy_exit_return_rate': getattr(spy_tf_labels, 'exit_return_rate', 0.0),
+                'spy_exits_returned_count': getattr(spy_tf_labels, 'exits_returned_count', 0),
+                'spy_exits_stayed_out_count': getattr(spy_tf_labels, 'exits_stayed_out_count', 0),
+                'spy_scan_timed_out': getattr(spy_tf_labels, 'scan_timed_out', False),
+                'spy_bars_verified_permanent': getattr(spy_tf_labels, 'bars_verified_permanent', 0),
             })
         else:
             # Try to get SPY fields from TSLA labels (old structure with spy_ prefix on same object)
@@ -332,6 +408,18 @@ class ChannelDataset(Dataset):
                 'spy_bounces_after_return': getattr(tf_labels, 'spy_bounces_after_return', 0),
                 'spy_channel_continued': getattr(tf_labels, 'spy_channel_continued', False),
                 'spy_break_scan_valid': getattr(tf_labels, 'break_scan_valid', False),  # Same validity for old structure
+                # SPY exit dynamics (old structure with spy_ prefix on same object)
+                'spy_duration_to_permanent': getattr(tf_labels, 'spy_duration_to_permanent', -1),
+                'spy_avg_bars_outside': getattr(tf_labels, 'spy_avg_bars_outside', 0.0),
+                'spy_total_bars_outside': getattr(tf_labels, 'spy_total_bars_outside', 0),
+                'spy_durability_score': getattr(tf_labels, 'spy_durability_score', 0.0),
+                # SPY exit verification tracking (NEW - old structure)
+                'spy_first_break_returned': getattr(tf_labels, 'spy_first_break_returned', False),
+                'spy_exit_return_rate': getattr(tf_labels, 'spy_exit_return_rate', 0.0),
+                'spy_exits_returned_count': getattr(tf_labels, 'spy_exits_returned_count', 0),
+                'spy_exits_stayed_out_count': getattr(tf_labels, 'spy_exits_stayed_out_count', 0),
+                'spy_scan_timed_out': getattr(tf_labels, 'spy_scan_timed_out', False),
+                'spy_bars_verified_permanent': getattr(tf_labels, 'spy_bars_verified_permanent', 0),
             })
 
         # Compute cross-correlation labels
@@ -383,6 +471,34 @@ class ChannelDataset(Dataset):
             'cross_continuation_aligned': False,
             'cross_who_broke_first': 0,  # 0=simultaneous, 1=TSLA first, 2=SPY first
             'cross_valid': False,
+            # Cross-correlation exit dynamics
+            'cross_tsla_permanent_first': False,
+            'cross_spy_permanent_first': False,
+            'cross_permanent_duration_lag_bars': 0,
+            'cross_permanent_duration_spread': 0,
+            'cross_durability_spread': 0.0,
+            'cross_avg_bars_outside_spread': 0.0,
+            'cross_total_bars_outside_spread': 0,
+            'cross_both_high_durability': False,
+            'cross_both_low_durability': False,
+            'cross_durability_aligned': False,
+            'cross_tsla_more_durable': False,
+            'cross_spy_more_durable': False,
+            'cross_permanent_dynamics_valid': False,
+            # Cross-correlation exit verification (NEW)
+            'cross_exit_return_rate_spread': 0.0,
+            'cross_exit_return_rate_aligned': False,
+            'cross_tsla_more_resilient': False,
+            'cross_spy_more_resilient': False,
+            'cross_exits_returned_spread': 0,
+            'cross_exits_stayed_out_spread': 0,
+            'cross_total_exits_spread': 0,
+            'cross_both_scan_timed_out': False,
+            'cross_scan_timeout_aligned': False,
+            'cross_bars_verified_spread': 0,
+            'cross_both_first_returned_then_permanent': False,
+            'cross_both_never_returned': False,
+            'cross_exit_verification_valid': False,
         }
 
         if tsla_labels is None:
@@ -411,6 +527,34 @@ class ChannelDataset(Dataset):
                 'cross_continuation_aligned': cross.continuation_aligned,
                 'cross_who_broke_first': who_broke_first,
                 'cross_valid': cross.cross_valid,
+                # Cross-correlation exit dynamics
+                'cross_tsla_permanent_first': cross.tsla_permanent_first,
+                'cross_spy_permanent_first': cross.spy_permanent_first,
+                'cross_permanent_duration_lag_bars': cross.permanent_duration_lag_bars,
+                'cross_permanent_duration_spread': cross.permanent_duration_spread,
+                'cross_durability_spread': cross.durability_spread,
+                'cross_avg_bars_outside_spread': cross.avg_bars_outside_spread,
+                'cross_total_bars_outside_spread': cross.total_bars_outside_spread,
+                'cross_both_high_durability': cross.both_high_durability,
+                'cross_both_low_durability': cross.both_low_durability,
+                'cross_durability_aligned': cross.durability_aligned,
+                'cross_tsla_more_durable': cross.tsla_more_durable,
+                'cross_spy_more_durable': cross.spy_more_durable,
+                'cross_permanent_dynamics_valid': cross.permanent_dynamics_valid,
+                # Cross-correlation exit verification (NEW)
+                'cross_exit_return_rate_spread': cross.exit_return_rate_spread,
+                'cross_exit_return_rate_aligned': cross.exit_return_rate_aligned,
+                'cross_tsla_more_resilient': cross.tsla_more_resilient,
+                'cross_spy_more_resilient': cross.spy_more_resilient,
+                'cross_exits_returned_spread': cross.exits_returned_spread,
+                'cross_exits_stayed_out_spread': cross.exits_stayed_out_spread,
+                'cross_total_exits_spread': cross.total_exits_spread,
+                'cross_both_scan_timed_out': cross.both_scan_timed_out,
+                'cross_scan_timeout_aligned': cross.scan_timeout_aligned,
+                'cross_bars_verified_spread': cross.bars_verified_spread,
+                'cross_both_first_returned_then_permanent': cross.both_first_returned_then_permanent,
+                'cross_both_never_returned': cross.both_never_returned,
+                'cross_exit_verification_valid': cross.exit_verification_valid,
             }
         else:
             # Old structure: SPY fields are on the same ChannelLabels object
@@ -456,6 +600,79 @@ class ChannelDataset(Dataset):
             spy_continued = getattr(tsla_labels, 'spy_channel_continued', False)
             continuation_aligned = tsla_continued == spy_continued
 
+            # Compute exit dynamics from old structure attributes
+            tsla_duration_to_permanent = getattr(tsla_labels, 'duration_to_permanent', -1)
+            spy_duration_to_permanent = getattr(tsla_labels, 'spy_duration_to_permanent', -1)
+            tsla_permanent_first = (tsla_duration_to_permanent >= 0 and spy_duration_to_permanent >= 0 and
+                                    tsla_duration_to_permanent < spy_duration_to_permanent)
+            spy_permanent_first = (tsla_duration_to_permanent >= 0 and spy_duration_to_permanent >= 0 and
+                                   spy_duration_to_permanent < tsla_duration_to_permanent)
+            permanent_duration_lag_bars = abs(tsla_duration_to_permanent - spy_duration_to_permanent) if (
+                tsla_duration_to_permanent >= 0 and spy_duration_to_permanent >= 0) else 0
+            permanent_duration_spread = (tsla_duration_to_permanent - spy_duration_to_permanent) if (
+                tsla_duration_to_permanent >= 0 and spy_duration_to_permanent >= 0) else 0
+
+            tsla_durability = getattr(tsla_labels, 'durability_score', 0.0)
+            spy_durability = getattr(tsla_labels, 'spy_durability_score', 0.0)
+            durability_spread = tsla_durability - spy_durability
+
+            tsla_avg_bars_outside = getattr(tsla_labels, 'avg_bars_outside', 0.0)
+            spy_avg_bars_outside = getattr(tsla_labels, 'spy_avg_bars_outside', 0.0)
+            avg_bars_outside_spread = tsla_avg_bars_outside - spy_avg_bars_outside
+
+            tsla_total_bars_outside = getattr(tsla_labels, 'total_bars_outside', 0)
+            spy_total_bars_outside = getattr(tsla_labels, 'spy_total_bars_outside', 0)
+            total_bars_outside_spread = tsla_total_bars_outside - spy_total_bars_outside
+
+            # Durability thresholds (same as in labels module)
+            HIGH_DURABILITY_THRESHOLD = 0.7
+            LOW_DURABILITY_THRESHOLD = 0.3
+            both_high_durability = tsla_durability >= HIGH_DURABILITY_THRESHOLD and spy_durability >= HIGH_DURABILITY_THRESHOLD
+            both_low_durability = tsla_durability <= LOW_DURABILITY_THRESHOLD and spy_durability <= LOW_DURABILITY_THRESHOLD
+            durability_aligned = both_high_durability or both_low_durability
+            tsla_more_durable = tsla_durability > spy_durability
+            spy_more_durable = spy_durability > tsla_durability
+
+            permanent_dynamics_valid = tsla_duration_to_permanent >= 0 and spy_duration_to_permanent >= 0
+
+            # Exit verification cross-correlation (NEW - old structure)
+            tsla_exit_rate = getattr(tsla_labels, 'exit_return_rate', 0.0)
+            spy_exit_rate = getattr(tsla_labels, 'spy_exit_return_rate', 0.0)
+            exit_return_rate_spread = tsla_exit_rate - spy_exit_rate
+
+            EXIT_RATE_HIGH_THRESHOLD = 0.7
+            EXIT_RATE_LOW_THRESHOLD = 0.3
+            both_high_exit_rate = tsla_exit_rate > EXIT_RATE_HIGH_THRESHOLD and spy_exit_rate > EXIT_RATE_HIGH_THRESHOLD
+            both_low_exit_rate = tsla_exit_rate < EXIT_RATE_LOW_THRESHOLD and spy_exit_rate < EXIT_RATE_LOW_THRESHOLD
+            exit_return_rate_aligned = both_high_exit_rate or both_low_exit_rate
+            tsla_more_resilient = tsla_exit_rate > spy_exit_rate
+            spy_more_resilient = spy_exit_rate > tsla_exit_rate
+
+            tsla_exits_returned = getattr(tsla_labels, 'exits_returned_count', 0)
+            spy_exits_returned = getattr(tsla_labels, 'spy_exits_returned_count', 0)
+            tsla_exits_stayed_out = getattr(tsla_labels, 'exits_stayed_out_count', 0)
+            spy_exits_stayed_out = getattr(tsla_labels, 'spy_exits_stayed_out_count', 0)
+            exits_returned_spread = tsla_exits_returned - spy_exits_returned
+            exits_stayed_out_spread = tsla_exits_stayed_out - spy_exits_stayed_out
+            total_exits_spread = (tsla_exits_returned + tsla_exits_stayed_out) - (spy_exits_returned + spy_exits_stayed_out)
+
+            tsla_scan_timed_out = getattr(tsla_labels, 'scan_timed_out', False)
+            spy_scan_timed_out = getattr(tsla_labels, 'spy_scan_timed_out', False)
+            both_scan_timed_out = tsla_scan_timed_out and spy_scan_timed_out
+            scan_timeout_aligned = tsla_scan_timed_out == spy_scan_timed_out
+
+            tsla_bars_verified = getattr(tsla_labels, 'bars_verified_permanent', 0)
+            spy_bars_verified = getattr(tsla_labels, 'spy_bars_verified_permanent', 0)
+            bars_verified_spread = tsla_bars_verified - spy_bars_verified
+
+            tsla_first_returned = getattr(tsla_labels, 'first_break_returned', False)
+            spy_first_returned = getattr(tsla_labels, 'spy_first_break_returned', False)
+            tsla_has_perm = getattr(tsla_labels, 'permanent_break_direction', -1) >= 0
+            spy_has_perm = getattr(tsla_labels, 'spy_permanent_break_direction', -1) >= 0
+            both_first_returned_then_permanent = tsla_first_returned and spy_first_returned and tsla_has_perm and spy_has_perm
+            both_never_returned = not tsla_first_returned and not spy_first_returned
+            exit_verification_valid = tsla_valid and spy_valid
+
             return {
                 'cross_direction_aligned': direction_aligned,
                 'cross_tsla_broke_first': tsla_broke_first,
@@ -468,6 +685,34 @@ class ChannelDataset(Dataset):
                 'cross_continuation_aligned': continuation_aligned,
                 'cross_who_broke_first': who_broke_first,
                 'cross_valid': True,
+                # Cross-correlation exit dynamics
+                'cross_tsla_permanent_first': tsla_permanent_first,
+                'cross_spy_permanent_first': spy_permanent_first,
+                'cross_permanent_duration_lag_bars': permanent_duration_lag_bars,
+                'cross_permanent_duration_spread': permanent_duration_spread,
+                'cross_durability_spread': durability_spread,
+                'cross_avg_bars_outside_spread': avg_bars_outside_spread,
+                'cross_total_bars_outside_spread': total_bars_outside_spread,
+                'cross_both_high_durability': both_high_durability,
+                'cross_both_low_durability': both_low_durability,
+                'cross_durability_aligned': durability_aligned,
+                'cross_tsla_more_durable': tsla_more_durable,
+                'cross_spy_more_durable': spy_more_durable,
+                'cross_permanent_dynamics_valid': permanent_dynamics_valid,
+                # Cross-correlation exit verification (NEW)
+                'cross_exit_return_rate_spread': exit_return_rate_spread,
+                'cross_exit_return_rate_aligned': exit_return_rate_aligned,
+                'cross_tsla_more_resilient': tsla_more_resilient,
+                'cross_spy_more_resilient': spy_more_resilient,
+                'cross_exits_returned_spread': exits_returned_spread,
+                'cross_exits_stayed_out_spread': exits_stayed_out_spread,
+                'cross_total_exits_spread': total_exits_spread,
+                'cross_both_scan_timed_out': both_scan_timed_out,
+                'cross_scan_timeout_aligned': scan_timeout_aligned,
+                'cross_bars_verified_spread': bars_verified_spread,
+                'cross_both_first_returned_then_permanent': both_first_returned_then_permanent,
+                'cross_both_never_returned': both_never_returned,
+                'cross_exit_verification_valid': exit_verification_valid,
             }
 
     def __len__(self) -> int:
@@ -505,6 +750,18 @@ class ChannelDataset(Dataset):
             'tsla_bounces_after_return': torch.tensor(labels['tsla_bounces_after_return'], dtype=torch.float32),
             'tsla_channel_continued': torch.tensor(labels['tsla_channel_continued'], dtype=torch.bool),
             'tsla_break_scan_valid': torch.tensor(labels['tsla_break_scan_valid'], dtype=torch.bool),
+            # TSLA exit dynamics (aggregated resilience metrics)
+            'tsla_duration_to_permanent': torch.tensor(labels['tsla_duration_to_permanent'], dtype=torch.float32),
+            'tsla_avg_bars_outside': torch.tensor(labels['tsla_avg_bars_outside'], dtype=torch.float32),
+            'tsla_total_bars_outside': torch.tensor(labels['tsla_total_bars_outside'], dtype=torch.float32),
+            'tsla_durability_score': torch.tensor(labels['tsla_durability_score'], dtype=torch.float32),
+            # TSLA exit verification tracking (NEW)
+            'tsla_first_break_returned': torch.tensor(labels['tsla_first_break_returned'], dtype=torch.bool),
+            'tsla_exit_return_rate': torch.tensor(labels['tsla_exit_return_rate'], dtype=torch.float32),
+            'tsla_exits_returned_count': torch.tensor(labels['tsla_exits_returned_count'], dtype=torch.float32),
+            'tsla_exits_stayed_out_count': torch.tensor(labels['tsla_exits_stayed_out_count'], dtype=torch.float32),
+            'tsla_scan_timed_out': torch.tensor(labels['tsla_scan_timed_out'], dtype=torch.bool),
+            'tsla_bars_verified_permanent': torch.tensor(labels['tsla_bars_verified_permanent'], dtype=torch.float32),
 
             # SPY break scan labels (spy_ prefix)
             'spy_bars_to_first_break': torch.tensor(labels['spy_bars_to_first_break'], dtype=torch.float32),
@@ -514,6 +771,18 @@ class ChannelDataset(Dataset):
             'spy_bounces_after_return': torch.tensor(labels['spy_bounces_after_return'], dtype=torch.float32),
             'spy_channel_continued': torch.tensor(labels['spy_channel_continued'], dtype=torch.bool),
             'spy_break_scan_valid': torch.tensor(labels['spy_break_scan_valid'], dtype=torch.bool),
+            # SPY exit dynamics (aggregated resilience metrics)
+            'spy_duration_to_permanent': torch.tensor(labels['spy_duration_to_permanent'], dtype=torch.float32),
+            'spy_avg_bars_outside': torch.tensor(labels['spy_avg_bars_outside'], dtype=torch.float32),
+            'spy_total_bars_outside': torch.tensor(labels['spy_total_bars_outside'], dtype=torch.float32),
+            'spy_durability_score': torch.tensor(labels['spy_durability_score'], dtype=torch.float32),
+            # SPY exit verification tracking (NEW)
+            'spy_first_break_returned': torch.tensor(labels['spy_first_break_returned'], dtype=torch.bool),
+            'spy_exit_return_rate': torch.tensor(labels['spy_exit_return_rate'], dtype=torch.float32),
+            'spy_exits_returned_count': torch.tensor(labels['spy_exits_returned_count'], dtype=torch.float32),
+            'spy_exits_stayed_out_count': torch.tensor(labels['spy_exits_stayed_out_count'], dtype=torch.float32),
+            'spy_scan_timed_out': torch.tensor(labels['spy_scan_timed_out'], dtype=torch.bool),
+            'spy_bars_verified_permanent': torch.tensor(labels['spy_bars_verified_permanent'], dtype=torch.float32),
 
             # Cross-correlation labels (cross_ prefix)
             'cross_direction_aligned': torch.tensor(labels['cross_direction_aligned'], dtype=torch.bool),
@@ -527,6 +796,34 @@ class ChannelDataset(Dataset):
             'cross_continuation_aligned': torch.tensor(labels['cross_continuation_aligned'], dtype=torch.bool),
             'cross_who_broke_first': torch.tensor(labels['cross_who_broke_first'], dtype=torch.long),
             'cross_valid': torch.tensor(labels['cross_valid'], dtype=torch.bool),
+            # Cross-correlation exit dynamics
+            'cross_tsla_permanent_first': torch.tensor(labels['cross_tsla_permanent_first'], dtype=torch.bool),
+            'cross_spy_permanent_first': torch.tensor(labels['cross_spy_permanent_first'], dtype=torch.bool),
+            'cross_permanent_duration_lag_bars': torch.tensor(labels['cross_permanent_duration_lag_bars'], dtype=torch.float32),
+            'cross_permanent_duration_spread': torch.tensor(labels['cross_permanent_duration_spread'], dtype=torch.float32),
+            'cross_durability_spread': torch.tensor(labels['cross_durability_spread'], dtype=torch.float32),
+            'cross_avg_bars_outside_spread': torch.tensor(labels['cross_avg_bars_outside_spread'], dtype=torch.float32),
+            'cross_total_bars_outside_spread': torch.tensor(labels['cross_total_bars_outside_spread'], dtype=torch.float32),
+            'cross_both_high_durability': torch.tensor(labels['cross_both_high_durability'], dtype=torch.bool),
+            'cross_both_low_durability': torch.tensor(labels['cross_both_low_durability'], dtype=torch.bool),
+            'cross_durability_aligned': torch.tensor(labels['cross_durability_aligned'], dtype=torch.bool),
+            'cross_tsla_more_durable': torch.tensor(labels['cross_tsla_more_durable'], dtype=torch.bool),
+            'cross_spy_more_durable': torch.tensor(labels['cross_spy_more_durable'], dtype=torch.bool),
+            'cross_permanent_dynamics_valid': torch.tensor(labels['cross_permanent_dynamics_valid'], dtype=torch.bool),
+            # Cross-correlation exit verification (NEW)
+            'cross_exit_return_rate_spread': torch.tensor(labels['cross_exit_return_rate_spread'], dtype=torch.float32),
+            'cross_exit_return_rate_aligned': torch.tensor(labels['cross_exit_return_rate_aligned'], dtype=torch.bool),
+            'cross_tsla_more_resilient': torch.tensor(labels['cross_tsla_more_resilient'], dtype=torch.bool),
+            'cross_spy_more_resilient': torch.tensor(labels['cross_spy_more_resilient'], dtype=torch.bool),
+            'cross_exits_returned_spread': torch.tensor(labels['cross_exits_returned_spread'], dtype=torch.float32),
+            'cross_exits_stayed_out_spread': torch.tensor(labels['cross_exits_stayed_out_spread'], dtype=torch.float32),
+            'cross_total_exits_spread': torch.tensor(labels['cross_total_exits_spread'], dtype=torch.float32),
+            'cross_both_scan_timed_out': torch.tensor(labels['cross_both_scan_timed_out'], dtype=torch.bool),
+            'cross_scan_timeout_aligned': torch.tensor(labels['cross_scan_timeout_aligned'], dtype=torch.bool),
+            'cross_bars_verified_spread': torch.tensor(labels['cross_bars_verified_spread'], dtype=torch.float32),
+            'cross_both_first_returned_then_permanent': torch.tensor(labels['cross_both_first_returned_then_permanent'], dtype=torch.bool),
+            'cross_both_never_returned': torch.tensor(labels['cross_both_never_returned'], dtype=torch.bool),
+            'cross_exit_verification_valid': torch.tensor(labels['cross_exit_verification_valid'], dtype=torch.bool),
         }
 
         # For learned mode, add per-window features so model can learn to select
@@ -557,7 +854,7 @@ class ChannelDataset(Dataset):
             Tensor of shape [8, features_per_window] where features_per_window
             includes validity flags and quality metrics per window.
         """
-        from ..types import STANDARD_WINDOWS
+        from ..dtypes import STANDARD_WINDOWS
 
         n_windows = len(STANDARD_WINDOWS)
         n_tfs = len(TIMEFRAMES)
@@ -610,7 +907,7 @@ class ChannelDataset(Dataset):
         Returns:
             Tensor of shape [8, n_label_fields] with labels per window.
         """
-        from ..types import STANDARD_WINDOWS
+        from ..dtypes import STANDARD_WINDOWS
 
         n_windows = len(STANDARD_WINDOWS)
         # Fields: duration, direction, valid
@@ -632,7 +929,7 @@ class ChannelDataset(Dataset):
         Returns:
             Index (0-7) of the best window in the standard windows list.
         """
-        from ..types import STANDARD_WINDOWS
+        from ..dtypes import STANDARD_WINDOWS
 
         best_window = sample.best_window
         if best_window in STANDARD_WINDOWS:

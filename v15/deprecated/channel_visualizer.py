@@ -3,7 +3,6 @@ Unified Channel Visualizer for V15
 
 Combines the best features from:
 - test_1h_w20.py: Hollow/filled triangle markers for first/permanent breaks
-- visual_inspector.py: Interactive keyboard navigation, multi-TF grid
 - dual_inspector.py: Side-by-side TSLA/SPY comparison, cross-correlation display
 
 Usage:

@@ -512,6 +512,180 @@ class SPYChannelContinuedHead(nn.Module):
 
 
 # =============================================================================
+# Durability and Bars-to-Permanent Heads (NEW)
+# =============================================================================
+
+
+class TSLADurabilityHead(nn.Module):
+    """
+    Predicts TSLA channel durability score with uncertainty.
+
+    Durability score measures how resilient a channel is (0.0-1.5+).
+    Higher scores mean the channel bounces back more reliably.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted durability score
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = F.softplus(self.mean_head(h))  # Durability must be positive
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class TSLABarsToPermanentHead(nn.Module):
+    """
+    Predicts TSLA bars until PERMANENT break with uncertainty.
+
+    This differs from BarsToBreakHead which predicts first break timing.
+    Permanent break may occur much later than first break if price bounces back.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted bars to permanent break
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = F.softplus(self.mean_head(h))  # Bars must be positive
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class SPYDurabilityHead(nn.Module):
+    """
+    Predicts SPY channel durability score with uncertainty.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted durability score
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = F.softplus(self.mean_head(h))  # Durability must be positive
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class SPYBarsToPermanentHead(nn.Module):
+    """
+    Predicts SPY bars until PERMANENT break with uncertainty.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted bars to permanent break
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = F.softplus(self.mean_head(h))  # Bars must be positive
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class CrossDurabilitySpreadHead(nn.Module):
+    """
+    Predicts durability spread between TSLA and SPY with uncertainty.
+
+    Spread = TSLA durability - SPY durability
+    Positive = TSLA more durable, Negative = SPY more durable
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted durability spread (can be negative)
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = self.mean_head(h)  # Spread can be positive or negative
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+# =============================================================================
 # Break Scan Label Heads - Cross-Correlation
 # =============================================================================
 
@@ -653,6 +827,8 @@ class PredictionHeads(nn.Module):
         enable_tsla_heads: bool = False,
         enable_spy_heads: bool = False,
         enable_cross_correlation_heads: bool = False,
+        # Durability and permanent break head flags (NEW)
+        enable_durability_heads: bool = False,
     ):
         """
         Initialize prediction heads.
@@ -665,6 +841,7 @@ class PredictionHeads(nn.Module):
             enable_tsla_heads: If True, add TSLA break scan heads (default: False)
             enable_spy_heads: If True, add SPY break scan heads (default: False)
             enable_cross_correlation_heads: If True, add cross-correlation heads (default: False)
+            enable_durability_heads: If True, add durability and bars-to-permanent heads (default: False)
         """
         super().__init__()
 
@@ -672,6 +849,7 @@ class PredictionHeads(nn.Module):
         self.enable_tsla_heads = enable_tsla_heads
         self.enable_spy_heads = enable_spy_heads
         self.enable_cross_correlation_heads = enable_cross_correlation_heads
+        self.enable_durability_heads = enable_durability_heads
 
         # Core prediction heads
         self.duration_head = DurationHead(input_dim, hidden_dim)
@@ -734,6 +912,20 @@ class PredictionHeads(nn.Module):
             self.break_lag_head = None
             self.both_permanent_head = None
             self.return_aligned_head = None
+
+        # Durability and bars-to-permanent heads (NEW)
+        if enable_durability_heads:
+            self.tsla_durability_head = TSLADurabilityHead(input_dim, hidden_dim)
+            self.tsla_bars_to_permanent_head = TSLABarsToPermanentHead(input_dim, hidden_dim)
+            self.spy_durability_head = SPYDurabilityHead(input_dim, hidden_dim)
+            self.spy_bars_to_permanent_head = SPYBarsToPermanentHead(input_dim, hidden_dim)
+            self.cross_durability_spread_head = CrossDurabilitySpreadHead(input_dim, hidden_dim)
+        else:
+            self.tsla_durability_head = None
+            self.tsla_bars_to_permanent_head = None
+            self.spy_durability_head = None
+            self.spy_bars_to_permanent_head = None
+            self.cross_durability_spread_head = None
 
     def forward(
         self,
@@ -849,6 +1041,25 @@ class PredictionHeads(nn.Module):
             outputs['both_permanent_logits'] = self.both_permanent_head(x)
             outputs['return_aligned_logits'] = self.return_aligned_head(x)
 
+        # Add durability and bars-to-permanent outputs if enabled (NEW)
+        if self.tsla_durability_head is not None:
+            tsla_durability_mean, tsla_durability_log_std = self.tsla_durability_head(x)
+            tsla_bars_perm_mean, tsla_bars_perm_log_std = self.tsla_bars_to_permanent_head(x)
+            spy_durability_mean, spy_durability_log_std = self.spy_durability_head(x)
+            spy_bars_perm_mean, spy_bars_perm_log_std = self.spy_bars_to_permanent_head(x)
+            cross_dur_spread_mean, cross_dur_spread_log_std = self.cross_durability_spread_head(x)
+
+            outputs['tsla_durability_mean'] = tsla_durability_mean
+            outputs['tsla_durability_log_std'] = tsla_durability_log_std
+            outputs['tsla_bars_to_permanent_mean'] = tsla_bars_perm_mean
+            outputs['tsla_bars_to_permanent_log_std'] = tsla_bars_perm_log_std
+            outputs['spy_durability_mean'] = spy_durability_mean
+            outputs['spy_durability_log_std'] = spy_durability_log_std
+            outputs['spy_bars_to_permanent_mean'] = spy_bars_perm_mean
+            outputs['spy_bars_to_permanent_log_std'] = spy_bars_perm_log_std
+            outputs['cross_durability_spread_mean'] = cross_dur_spread_mean
+            outputs['cross_durability_spread_log_std'] = cross_dur_spread_log_std
+
         return outputs
 
     def has_window_selector(self) -> bool:
@@ -866,3 +1077,7 @@ class PredictionHeads(nn.Module):
     def has_cross_correlation_heads(self) -> bool:
         """Check if this model has cross-correlation heads."""
         return self.direction_aligned_head is not None
+
+    def has_durability_heads(self) -> bool:
+        """Check if this model has durability and bars-to-permanent heads."""
+        return self.tsla_durability_head is not None

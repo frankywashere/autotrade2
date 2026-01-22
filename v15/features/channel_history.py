@@ -2,8 +2,14 @@
 v15/features/channel_history.py - Channel History Pattern Features
 
 Tracks the pattern of the LAST 5 CHANNELS for each timeframe for both TSLA and SPY.
-This module extracts 50 features from the historical channel patterns to help the model
+This module extracts 67 features from the historical channel patterns to help the model
 learn from channel sequences and regime changes.
+
+Includes historical exit features from ChannelLabels:
+- Exit counts, magnitudes, and bars outside
+- Durability scores and return rates
+- False break counts (bounces after return)
+- Trends in exit behavior over recent channels
 
 All features return valid floats with safe defaults (no NaN, no Inf).
 """
@@ -17,6 +23,7 @@ from .utils import safe_float, safe_divide, safe_mean, safe_std, safe_min, safe_
 
 if TYPE_CHECKING:
     from v7.core.channel import Channel
+    from v15.dtypes import ChannelLabels
 
 
 # =============================================================================
@@ -26,7 +33,8 @@ if TYPE_CHECKING:
 def channel_to_history_dict(
     channel: "Channel",
     duration: int,
-    break_direction: int
+    break_direction: int,
+    labels: Optional["ChannelLabels"] = None
 ) -> Dict:
     """
     Extract channel info from a Channel object for history tracking.
@@ -35,12 +43,38 @@ def channel_to_history_dict(
         channel: Channel object from v7.core.channel
         duration: Duration of the channel in bars
         break_direction: Direction of break (-1=down, 0=no break, 1=up)
+        labels: Optional ChannelLabels with exit metrics for historical exit features
 
     Returns:
-        Dict with keys: duration, slope, direction, break_direction, r_squared, bounce_count
+        Dict with keys: duration, slope, direction, break_direction, r_squared, bounce_count,
+                        exit_count, avg_exit_magnitude, avg_bars_outside, exit_return_rate,
+                        durability_score, false_break_count
     """
+    # Default exit metrics
+    exit_metrics = {
+        'exit_count': 0.0,
+        'avg_exit_magnitude': 0.0,
+        'avg_bars_outside': 0.0,
+        'exit_return_rate': 0.0,
+        'durability_score': 0.0,
+        'false_break_count': 0.0,
+    }
+
+    # Extract exit metrics from labels if provided
+    if labels is not None:
+        exit_bars = getattr(labels, 'exit_bars', []) or []
+        exit_magnitudes = getattr(labels, 'exit_magnitudes', []) or []
+        exit_count = len(exit_bars)
+
+        exit_metrics['exit_count'] = safe_float(exit_count, 0.0)
+        exit_metrics['avg_exit_magnitude'] = safe_mean(exit_magnitudes, default=0.0) if exit_magnitudes else 0.0
+        exit_metrics['avg_bars_outside'] = safe_float(getattr(labels, 'avg_bars_outside', 0.0), 0.0)
+        exit_metrics['exit_return_rate'] = safe_float(getattr(labels, 'exit_return_rate', 0.0), 0.0)
+        exit_metrics['durability_score'] = safe_float(getattr(labels, 'durability_score', 0.0), 0.0)
+        exit_metrics['false_break_count'] = safe_float(getattr(labels, 'bounces_after_return', 0), 0.0)
+
     if channel is None:
-        return {
+        base_dict = {
             'duration': safe_float(duration, 50.0),
             'slope': 0.0,
             'direction': 1,  # sideways
@@ -48,8 +82,10 @@ def channel_to_history_dict(
             'r_squared': 0.0,
             'bounce_count': 0.0,
         }
+        base_dict.update(exit_metrics)
+        return base_dict
 
-    return {
+    base_dict = {
         'duration': safe_float(duration, getattr(channel, 'window', 50)),
         'slope': safe_float(getattr(channel, 'slope', 0.0), 0.0),
         'direction': int(getattr(channel, 'direction', 1)),  # 0=bear, 1=sideways, 2=bull
@@ -57,6 +93,8 @@ def channel_to_history_dict(
         'r_squared': safe_float(getattr(channel, 'r_squared', 0.0), 0.0),
         'bounce_count': safe_float(getattr(channel, 'bounce_count', 0), 0.0),
     }
+    base_dict.update(exit_metrics)
+    return base_dict
 
 
 def _encode_direction_sequence(directions: List[int]) -> int:
@@ -424,6 +462,48 @@ def _extract_single_history_features(
     # 30. Average bounce count
     features[f'{prefix}last5_avg_bounces'] = safe_mean(bounce_counts, default=0.0)
 
+    # ==========================================================================
+    # Historical Exit Features (from ChannelLabels exit metrics)
+    # ==========================================================================
+
+    # Extract exit metric sequences from history
+    exit_counts = [h.get('exit_count', 0.0) for h in history]
+    avg_exit_magnitudes = [h.get('avg_exit_magnitude', 0.0) for h in history]
+    avg_bars_outside_list = [h.get('avg_bars_outside', 0.0) for h in history]
+    exit_return_rates = [h.get('exit_return_rate', 0.0) for h in history]
+    durability_scores = [h.get('durability_score', 0.0) for h in history]
+    false_break_counts = [h.get('false_break_count', 0.0) for h in history]
+
+    # 31. Average exits per channel in last 5
+    features[f'{prefix}last5_avg_exit_count'] = safe_mean(exit_counts, default=0.0)
+
+    # 32. Average exit magnitude across last 5 channels
+    features[f'{prefix}last5_avg_exit_magnitude'] = safe_mean(avg_exit_magnitudes, default=0.0)
+
+    # 33. Average time outside before return across last 5 channels
+    features[f'{prefix}last5_avg_bars_outside'] = safe_mean(avg_bars_outside_list, default=0.0)
+
+    # 34. Average exit return rate (how often exits return) across last 5
+    features[f'{prefix}last5_avg_exit_return_rate'] = safe_mean(exit_return_rates, default=0.0)
+
+    # 35. Average durability score across last 5 channels
+    features[f'{prefix}last5_avg_durability'] = safe_mean(durability_scores, default=0.0)
+
+    # 36. Average false breaks per channel in last 5
+    features[f'{prefix}last5_avg_false_breaks'] = safe_mean(false_break_counts, default=0.0)
+
+    # 37. Exit count trend - are channels getting more/fewer exits?
+    features[f'{prefix}exit_count_trend'] = _calculate_trend(exit_counts)
+
+    # 38. Durability trend - are channels getting more/less resilient?
+    features[f'{prefix}durability_trend'] = _calculate_trend(durability_scores)
+
+    # 39. Bars outside trend - are exits lasting longer/shorter?
+    features[f'{prefix}bars_outside_trend'] = _calculate_trend(avg_bars_outside_list)
+
+    # 40. Exit return rate trend - is return rate changing?
+    features[f'{prefix}exit_return_rate_trend'] = _calculate_trend(exit_return_rates)
+
     return features
 
 
@@ -436,20 +516,22 @@ def extract_channel_history_features(
     spy_channel_history: List[Dict]
 ) -> Dict[str, float]:
     """
-    Extract 50 channel history features from TSLA and SPY channel histories.
+    Extract 67 channel history features from TSLA and SPY channel histories.
 
     This function analyzes the pattern of the last 5 channels for each asset,
-    extracting features that capture momentum, regime shifts, and cross-asset
-    alignment patterns.
+    extracting features that capture momentum, regime shifts, cross-asset
+    alignment patterns, and historical exit behavior.
 
     Args:
         tsla_channel_history: List of last 5 channel info dicts for TSLA
-            Each dict should have: duration, slope, direction, break_direction, r_squared, bounce_count
+            Each dict should have: duration, slope, direction, break_direction, r_squared, bounce_count,
+            exit_count, avg_exit_magnitude, avg_bars_outside, exit_return_rate, durability_score, false_break_count
         spy_channel_history: List of last 5 channel info dicts for SPY
-            Each dict should have: duration, slope, direction, break_direction, r_squared, bounce_count
+            Each dict should have: duration, slope, direction, break_direction, r_squared, bounce_count,
+            exit_count, avg_exit_magnitude, avg_bars_outside, exit_return_rate, durability_score, false_break_count
 
     Returns:
-        Dict[str, float] with 50 features, all guaranteed to be valid floats
+        Dict[str, float] with 67 features, all guaranteed to be valid floats
     """
     features: Dict[str, float] = {}
 
@@ -458,19 +540,19 @@ def extract_channel_history_features(
     spy_history = spy_channel_history if spy_channel_history else []
 
     # ==========================================================================
-    # TSLA Channel History Features (1-30)
+    # TSLA Channel History Features (1-40)
     # ==========================================================================
     tsla_features = _extract_single_history_features(tsla_history, 'tsla_')
     features.update(tsla_features)
 
     # ==========================================================================
-    # SPY Channel History Features (31-60, but we'll merge and reduce)
+    # SPY Channel History Features (41-80, but we'll merge and reduce)
     # ==========================================================================
     spy_features = _extract_single_history_features(spy_history, 'spy_')
     features.update(spy_features)
 
     # ==========================================================================
-    # Cross-Asset Alignment Features (to reach exactly 50)
+    # Cross-Asset Alignment Features (to reach exactly 60)
     # ==========================================================================
 
     # Get direction patterns for alignment calculation
@@ -541,12 +623,38 @@ def extract_channel_history_features(
     features['combined_trend_strength'] = safe_float((tsla_trend + spy_trend) / 2, 0.0)
 
     # ==========================================================================
-    # Trim to exactly 50 features
+    # Cross-Asset Exit Features (historical exit pattern comparison)
     # ==========================================================================
-    # We have 30 TSLA features + 30 SPY features + 10 cross-asset = 70
-    # Need to select the most important 50
 
-    # Define the final 50 features to keep
+    # 11. Exit count spread - TSLA vs SPY exit count difference
+    tsla_exit_count = features.get('tsla_last5_avg_exit_count', 0.0)
+    spy_exit_count = features.get('spy_last5_avg_exit_count', 0.0)
+    features['exit_count_spread'] = safe_float(tsla_exit_count - spy_exit_count, 0.0)
+
+    # 12. Durability spread - TSLA vs SPY durability difference
+    tsla_durability = features.get('tsla_last5_avg_durability', 0.0)
+    spy_durability = features.get('spy_last5_avg_durability', 0.0)
+    features['durability_spread_avg'] = safe_float(tsla_durability - spy_durability, 0.0)
+
+    # 13. Exit alignment - do exit patterns correlate?
+    # Calculate correlation of exit count trends
+    tsla_exit_trend = features.get('tsla_exit_count_trend', 0.0)
+    spy_exit_trend = features.get('spy_exit_count_trend', 0.0)
+    # If both trending same direction (both positive or both negative), alignment is high
+    if (tsla_exit_trend > 0 and spy_exit_trend > 0) or (tsla_exit_trend < 0 and spy_exit_trend < 0):
+        features['exit_alignment'] = 1.0
+    elif tsla_exit_trend * spy_exit_trend < 0:  # Opposite directions
+        features['exit_alignment'] = 0.0
+    else:
+        features['exit_alignment'] = 0.5
+
+    # ==========================================================================
+    # Final Feature Selection (67 features)
+    # ==========================================================================
+    # We have 40 TSLA features + 40 SPY features + 13 cross-asset = 93
+    # Selecting the most important 67 features
+
+    # Define the final 67 features to keep
     final_feature_names = [
         # TSLA Core (5)
         'tsla_last5_avg_duration',
@@ -596,6 +704,24 @@ def extract_channel_history_features(
         'spy_up_break_ratio',
         'spy_down_break_ratio',
         'spy_channel_stability_score',
+        # TSLA Historical Exit Features (5)
+        'tsla_last5_avg_exit_count',
+        'tsla_last5_avg_exit_magnitude',
+        'tsla_last5_avg_bars_outside',
+        'tsla_last5_avg_exit_return_rate',
+        'tsla_last5_avg_durability',
+        # SPY Historical Exit Features (5)
+        'spy_last5_avg_exit_count',
+        'spy_last5_avg_exit_magnitude',
+        'spy_last5_avg_bars_outside',
+        'spy_last5_avg_exit_return_rate',
+        'spy_last5_avg_durability',
+        # TSLA Exit Trends (2)
+        'tsla_exit_count_trend',
+        'tsla_durability_trend',
+        # SPY Exit Trends (2)
+        'spy_exit_count_trend',
+        'spy_durability_trend',
         # Cross-Asset (10)
         'tsla_spy_channel_alignment',
         'channel_momentum_alignment',
@@ -607,9 +733,13 @@ def extract_channel_history_features(
         'momentum_divergence',
         'tsla_leading_indicator',
         'combined_trend_strength',
+        # Cross-Asset Exit Features (3)
+        'exit_count_spread',
+        'durability_spread_avg',
+        'exit_alignment',
     ]
 
-    # Build final feature dict with exactly 50 features
+    # Build final feature dict with exactly 67 features
     final_features: Dict[str, float] = {}
     for name in final_feature_names:
         final_features[name] = features.get(name, 0.0)
@@ -629,7 +759,7 @@ def extract_channel_history_features(
 # =============================================================================
 
 def get_channel_history_feature_names() -> List[str]:
-    """Get ordered list of all channel history feature names."""
+    """Get ordered list of all 67 channel history feature names."""
     return [
         # TSLA Core (5)
         'tsla_last5_avg_duration',
@@ -679,6 +809,24 @@ def get_channel_history_feature_names() -> List[str]:
         'spy_up_break_ratio',
         'spy_down_break_ratio',
         'spy_channel_stability_score',
+        # TSLA Historical Exit Features (5)
+        'tsla_last5_avg_exit_count',
+        'tsla_last5_avg_exit_magnitude',
+        'tsla_last5_avg_bars_outside',
+        'tsla_last5_avg_exit_return_rate',
+        'tsla_last5_avg_durability',
+        # SPY Historical Exit Features (5)
+        'spy_last5_avg_exit_count',
+        'spy_last5_avg_exit_magnitude',
+        'spy_last5_avg_bars_outside',
+        'spy_last5_avg_exit_return_rate',
+        'spy_last5_avg_durability',
+        # TSLA Exit Trends (2)
+        'tsla_exit_count_trend',
+        'tsla_durability_trend',
+        # SPY Exit Trends (2)
+        'spy_exit_count_trend',
+        'spy_durability_trend',
         # Cross-Asset (10)
         'tsla_spy_channel_alignment',
         'channel_momentum_alignment',
@@ -690,12 +838,16 @@ def get_channel_history_feature_names() -> List[str]:
         'momentum_divergence',
         'tsla_leading_indicator',
         'combined_trend_strength',
+        # Cross-Asset Exit Features (3)
+        'exit_count_spread',
+        'durability_spread_avg',
+        'exit_alignment',
     ]
 
 
 def get_channel_history_feature_count() -> int:
     """Get total number of channel history features."""
-    return 50
+    return 67
 
 
 def get_default_channel_history_features() -> Dict[str, float]:
@@ -777,7 +929,7 @@ def get_all_channel_history_feature_names() -> List[str]:
     Get ALL channel history feature names across all TFs.
 
     Returns:
-        List of all 500 feature names (50 features * 10 timeframes)
+        List of all 670 feature names (67 features * 10 timeframes)
     """
     from v15.config import TIMEFRAMES
 
@@ -789,12 +941,12 @@ def get_all_channel_history_feature_names() -> List[str]:
 
 def get_total_channel_history_features() -> int:
     """
-    Total channel history features: 50 * 10 TFs = 500
+    Total channel history features: 67 * 10 TFs = 670
 
     Returns:
-        500 (50 base features * 10 timeframes)
+        670 (67 base features * 10 timeframes)
     """
-    return 50 * 10
+    return 67 * 10
 
 
 def get_default_channel_history_features_tf(tf: str) -> Dict[str, float]:
@@ -817,7 +969,7 @@ def get_all_default_channel_history_features() -> Dict[str, float]:
     Get default feature values for ALL TFs when no history is available.
 
     Returns:
-        Dict with all 550 TF-prefixed features set to default values
+        Dict with all 670 TF-prefixed features set to default values
     """
     from v15.config import TIMEFRAMES
 

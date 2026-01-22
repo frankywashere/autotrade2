@@ -1,8 +1,7 @@
 """
 v15/inspector_utils.py - Reusable visualization functions for channel inspectors.
 
-Helper functions extracted from visual_inspector.py for use in dual inspector
-and other visualization tools.
+Helper functions for use in dual inspector and other visualization tools.
 """
 
 from __future__ import annotations

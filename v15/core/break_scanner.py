@@ -84,6 +84,7 @@ class ExitEvent:
         bar_index: Bar index (relative to scan start) when exit occurred
         exit_type: 'upper' or 'lower' indicating which boundary was breached
         exit_price: Price at exit (high for upper, low for lower breach)
+        magnitude: How far outside the channel (in std devs) at exit
         returned: Whether price returned to channel after exit
         bars_outside: Number of bars spent outside channel before return (if returned)
         return_bar: Bar index where price returned to channel (if returned)
@@ -91,6 +92,7 @@ class ExitEvent:
     bar_index: int
     exit_type: str  # 'upper' or 'lower'
     exit_price: float
+    magnitude: float = 0.0  # Breach magnitude in std devs
     returned: bool = False
     bars_outside: int = 0
     return_bar: Optional[int] = None
@@ -142,6 +144,12 @@ class BreakResult:
     break_magnitude: float = 0.0
     break_price: float = 0.0
 
+    # First touch tracking (when price first went outside bounds, even if it returned)
+    # This is the actual visual break point, before magnitude/confirmation checks
+    first_touch_bar: int = -1
+    first_touch_direction: int = 0  # 0=DOWN, 1=UP
+    first_touch_price: float = 0.0
+
     # Permanence tracking (for FIRST break)
     is_permanent: bool = False
     is_false_break: bool = False
@@ -162,6 +170,16 @@ class BreakResult:
     scan_bars_used: int = 0
     projected_upper: float = 0.0
     projected_lower: float = 0.0
+
+    # Exit verification tracking (NEW)
+    scan_timed_out: bool = False           # Did scan hit max_scan without confirming permanence?
+    bars_verified_permanent: int = 0       # How many bars was price outside before declaring permanent?
+    exits_returned_count: int = 0          # Count of exits that returned (same as false_break_count)
+    exits_stayed_out_count: int = 0        # Count of exits that didn't return
+    exit_return_rate: float = 0.0          # exits_returned / total_exits
+
+    # Round-trip bounce tracking
+    round_trip_bounces: int = 0            # Count of complete round-trip bounces (upper->lower or lower->upper)
 
     def __post_init__(self):
         """Initialize mutable defaults."""
@@ -224,7 +242,7 @@ def scan_for_break(
     forward_low: np.ndarray,
     forward_close: np.ndarray,
     max_scan_bars: int = 300,
-    return_threshold_bars: int = 10,
+    return_threshold_bars: int = 5,
     min_break_magnitude: float = 0.5
 ) -> BreakResult:
     """
@@ -298,9 +316,21 @@ def scan_for_break(
         # Check for exit (breach outside bounds)
         # Only count as break if magnitude exceeds min_break_magnitude threshold
 
-        if high > upper:
-            # Upper breach - calculate magnitude first
-            magnitude = (high - upper) / channel.std_dev if channel.std_dev > 0 else 0.0
+        # Track FIRST TOUCH - the first bar where CLOSE went outside bounds
+        # This is tracked regardless of magnitude (for visual marker placement)
+        if result.first_touch_bar < 0:
+            if close > upper:  # Require CLOSE above upper
+                result.first_touch_bar = bar_idx
+                result.first_touch_direction = int(BreakDirection.UP)
+                result.first_touch_price = close  # Use close price
+            elif close < lower:  # Require CLOSE below lower
+                result.first_touch_bar = bar_idx
+                result.first_touch_direction = int(BreakDirection.DOWN)
+                result.first_touch_price = close  # Use close price
+
+        if close > upper:
+            # Upper breach - calculate magnitude first (using close)
+            magnitude = (close - upper) / channel.std_dev if channel.std_dev > 0 else 0.0
 
             # Only count as break if magnitude exceeds threshold
             if magnitude >= min_break_magnitude and inside_channel:
@@ -308,7 +338,8 @@ def scan_for_break(
                 current_exit = ExitEvent(
                     bar_index=bar_idx,
                     exit_type='upper',
-                    exit_price=high
+                    exit_price=close,  # Use close price
+                    magnitude=magnitude
                 )
                 inside_channel = False
 
@@ -318,14 +349,14 @@ def scan_for_break(
                     result.break_detected = True
                     result.break_bar = bar_idx
                     result.break_direction = int(BreakDirection.UP)
-                    result.break_price = high
+                    result.break_price = close  # Use close price
                     result.projected_upper = upper
                     result.projected_lower = lower
                     result.break_magnitude = magnitude
 
-        elif low < lower:
-            # Lower breach - calculate magnitude first
-            magnitude = (lower - low) / channel.std_dev if channel.std_dev > 0 else 0.0
+        elif close < lower:
+            # Lower breach - calculate magnitude first (using close)
+            magnitude = (lower - close) / channel.std_dev if channel.std_dev > 0 else 0.0
 
             # Only count as break if magnitude exceeds threshold
             if magnitude >= min_break_magnitude and inside_channel:
@@ -333,7 +364,8 @@ def scan_for_break(
                 current_exit = ExitEvent(
                     bar_index=bar_idx,
                     exit_type='lower',
-                    exit_price=low
+                    exit_price=close,  # Use close price
+                    magnitude=magnitude
                 )
                 inside_channel = False
 
@@ -343,7 +375,7 @@ def scan_for_break(
                     result.break_detected = True
                     result.break_bar = bar_idx
                     result.break_direction = int(BreakDirection.DOWN)
-                    result.break_price = low
+                    result.break_price = close  # Use close price
                     result.projected_upper = upper
                     result.projected_lower = lower
                     result.break_magnitude = magnitude
@@ -368,10 +400,37 @@ def scan_for_break(
     # Store all exit events
     result.all_exit_events = exit_events
 
-    # Calculate false break statistics
+    # Calculate exit statistics (NEW: expanded from false_break_count)
     if exit_events:
-        result.false_break_count = sum(1 for e in exit_events if e.returned)
-        result.false_break_rate = result.false_break_count / len(exit_events)
+        result.exits_returned_count = sum(1 for e in exit_events if e.returned)
+        result.exits_stayed_out_count = len(exit_events) - result.exits_returned_count
+        result.exit_return_rate = result.exits_returned_count / len(exit_events)
+
+        # Backward compatibility - keep false_break fields as aliases
+        result.false_break_count = result.exits_returned_count
+        result.false_break_rate = result.exit_return_rate
+    else:
+        result.exits_returned_count = 0
+        result.exits_stayed_out_count = 0
+        result.exit_return_rate = 0.0
+        result.false_break_count = 0
+        result.false_break_rate = 0.0
+
+    # Count round-trip bounces
+    # A round-trip bounce is when price alternates between upper and lower bounds:
+    # - Exit upper -> return -> exit lower -> return = 1 bounce
+    # - Exit lower -> return -> exit upper -> return = 1 bounce
+    # We count complete round-trips where both exits returned to channel
+    round_trip_bounces = 0
+    if len(exit_events) >= 2:
+        for i in range(1, len(exit_events)):
+            prev_exit = exit_events[i - 1]
+            curr_exit = exit_events[i]
+            # Check if direction alternated and both exits returned
+            if (prev_exit.exit_type != curr_exit.exit_type and
+                    prev_exit.returned and curr_exit.returned):
+                round_trip_bounces += 1
+    result.round_trip_bounces = round_trip_bounces
 
     # Find the permanent (final) break - the last exit that didn't return
     # This may differ from the first break direction if there were false breaks
@@ -404,11 +463,29 @@ def scan_for_break(
                 ) / channel.std_dev
         else:
             result.permanent_break_magnitude = 0.0
+
+        # NEW: Track bars verified permanent
+        # bars_outside tells us how many bars price stayed outside before scan ended
+        result.bars_verified_permanent = permanent_exit.bars_outside
     else:
         # No permanent break found - all exits returned
         result.permanent_break_direction = -1
         result.permanent_break_bar = -1
         result.permanent_break_magnitude = 0.0
+        result.bars_verified_permanent = 0
+
+    # NEW: Determine scan timeout
+    # Scan timed out if we hit max_scan_bars and either:
+    # 1. No permanent break found (all exits returned but we ran out of scan window)
+    # 2. Permanent break found but not enough bars to verify (bars_outside < return_threshold)
+    result.scan_timed_out = False
+    if result.scan_bars_used >= max_scan_bars:
+        if permanent_exit is None:
+            # No permanent break found - might have found one if we scanned longer
+            result.scan_timed_out = True
+        elif permanent_exit.bars_outside < return_threshold_bars:
+            # Found a "permanent" break but didn't verify it long enough
+            result.scan_timed_out = True
 
     # Determine if first break was permanent or false break
     if result.break_detected and exit_events:

@@ -1,5 +1,5 @@
 """
-V15 Core Module - Channel detection and window selection utilities.
+V15 Core Module - Channel detection, window selection, and data utilities.
 """
 
 from .window_strategy import (
@@ -28,6 +28,23 @@ from .break_scanner import (
     compute_durability_from_result,
 )
 
+from .resample import (
+    resample_ohlc,
+    resample_multi_tf,
+    normalize_timeframe,
+    get_resample_rule,
+    get_bars_per_tf,
+    get_longer_timeframes,
+    get_shorter_timeframes,
+    validate_ohlc,
+    TIMEFRAMES,
+    RESAMPLE_RULES,
+    BARS_PER_TF,
+    TF_ALIASES,
+    BarMetadata,
+    ResamplingError,
+)
+
 __all__ = [
     # Window selection
     'SelectionStrategy',
@@ -51,4 +68,19 @@ __all__ = [
     'scan_for_break',
     'calculate_durability_score',
     'compute_durability_from_result',
+    # OHLC Resampling (canonical implementation)
+    'resample_ohlc',
+    'resample_multi_tf',
+    'normalize_timeframe',
+    'get_resample_rule',
+    'get_bars_per_tf',
+    'get_longer_timeframes',
+    'get_shorter_timeframes',
+    'validate_ohlc',
+    'TIMEFRAMES',
+    'RESAMPLE_RULES',
+    'BARS_PER_TF',
+    'TF_ALIASES',
+    'BarMetadata',
+    'ResamplingError',
 ]

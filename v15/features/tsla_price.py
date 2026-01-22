@@ -81,13 +81,13 @@ def extract_tsla_price_features(tsla_df: pd.DataFrame) -> Dict[str, float]:
 
     n = len(close_arr)
 
-    # Current bar values
-    curr_open = safe_float(open_arr[-1]) if n > 0 else 0.0
-    curr_high = safe_float(high_arr[-1]) if n > 0 else 0.0
-    curr_low = safe_float(low_arr[-1]) if n > 0 else 0.0
-    curr_close = safe_float(close_arr[-1]) if n > 0 else 0.0
-    curr_volume = safe_float(volume_arr[-1]) if n > 0 else 0.0
-    prev_close = safe_float(close_arr[-2]) if n > 1 else curr_close
+    # Previous bar values (use [-2] to avoid data leakage - features should only use data BEFORE prediction point)
+    curr_open = safe_float(open_arr[-2]) if n > 1 else 0.0
+    curr_high = safe_float(high_arr[-2]) if n > 1 else 0.0
+    curr_low = safe_float(low_arr[-2]) if n > 1 else 0.0
+    curr_close = safe_float(close_arr[-2]) if n > 1 else 0.0
+    curr_volume = safe_float(volume_arr[-2]) if n > 1 else 0.0
+    prev_close = safe_float(close_arr[-3]) if n > 2 else curr_close
 
     # =========================================================================
     # BASIC PRICE FEATURES (11)
@@ -375,9 +375,10 @@ def _calculate_williams_r(
         return -50.0
 
     try:
-        highest = np.max(high[-period:])
-        lowest = np.min(low[-period:])
-        current = close[-1]
+        # Use [-2] to avoid data leakage - features should only use data BEFORE prediction point
+        highest = np.max(high[-period-1:-1])
+        lowest = np.min(low[-period-1:-1])
+        current = close[-2]
 
         range_val = highest - lowest
         if range_val == 0:

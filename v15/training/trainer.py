@@ -105,6 +105,13 @@ class TrainingConfig:
     cross_both_permanent_weight: float = 1.0      # Binary: both breaks permanent
     cross_return_aligned_weight: float = 1.0      # Binary: return patterns aligned
 
+    # Durability and bars-to-permanent head weights (NEW)
+    tsla_durability_weight: float = 0.5           # Regression: durability score
+    tsla_bars_to_permanent_weight: float = 0.5    # Regression: bars to permanent break
+    spy_durability_weight: float = 0.5            # Regression: durability score
+    spy_bars_to_permanent_weight: float = 0.5     # Regression: bars to permanent break
+    cross_durability_spread_weight: float = 0.3   # Regression: durability spread
+
 
 # =============================================================================
 # Window Selection Head
@@ -856,6 +863,124 @@ class Trainer:
             losses['cross_return_aligned'] = 0.0
 
         # =====================================================================
+        # Durability and Bars-to-Permanent Heads (NEW)
+        # =====================================================================
+
+        # TSLA durability (regression with Gaussian NLL)
+        if 'tsla_durability_mean' in predictions and tsla_break_scan_valid.any():
+            tsla_dur_mean = predictions['tsla_durability_mean'][tsla_break_scan_valid]
+            tsla_dur_target = labels['tsla_durability_score'][tsla_break_scan_valid].float()
+
+            if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_durability_log_std' in predictions:
+                tsla_dur_log_std = predictions['tsla_durability_log_std'][tsla_break_scan_valid]
+                variance = torch.exp(2 * tsla_dur_log_std)
+                tsla_dur_loss = 0.5 * (
+                    torch.log(variance) +
+                    (tsla_dur_target - tsla_dur_mean) ** 2 / variance
+                ).mean()
+            else:
+                tsla_dur_loss = F.huber_loss(tsla_dur_mean, tsla_dur_target, delta=self.config.huber_delta)
+
+            losses['tsla_durability'] = tsla_dur_loss.item()
+        else:
+            tsla_dur_loss = torch.tensor(0.0, device=self.device)
+            losses['tsla_durability'] = 0.0
+
+        # TSLA bars_to_permanent (regression with Gaussian NLL)
+        if 'tsla_bars_to_permanent_mean' in predictions and tsla_break_scan_valid.any():
+            tsla_btp_mean = predictions['tsla_bars_to_permanent_mean'][tsla_break_scan_valid]
+            tsla_btp_target = labels['tsla_duration_to_permanent'][tsla_break_scan_valid].float()
+            # Only compute loss for samples with valid permanent break (target >= 0)
+            valid_perm_mask = tsla_btp_target >= 0
+            if valid_perm_mask.any():
+                tsla_btp_mean_valid = tsla_btp_mean[valid_perm_mask]
+                tsla_btp_target_valid = tsla_btp_target[valid_perm_mask]
+
+                if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_bars_to_permanent_log_std' in predictions:
+                    tsla_btp_log_std = predictions['tsla_bars_to_permanent_log_std'][tsla_break_scan_valid][valid_perm_mask]
+                    variance = torch.exp(2 * tsla_btp_log_std)
+                    tsla_btp_loss = 0.5 * (
+                        torch.log(variance) +
+                        (tsla_btp_target_valid - tsla_btp_mean_valid) ** 2 / variance
+                    ).mean()
+                else:
+                    tsla_btp_loss = F.huber_loss(tsla_btp_mean_valid, tsla_btp_target_valid, delta=self.config.huber_delta)
+            else:
+                tsla_btp_loss = torch.tensor(0.0, device=self.device)
+
+            losses['tsla_bars_to_permanent'] = tsla_btp_loss.item()
+        else:
+            tsla_btp_loss = torch.tensor(0.0, device=self.device)
+            losses['tsla_bars_to_permanent'] = 0.0
+
+        # SPY durability (regression with Gaussian NLL)
+        if 'spy_durability_mean' in predictions and spy_break_scan_valid.any():
+            spy_dur_mean = predictions['spy_durability_mean'][spy_break_scan_valid]
+            spy_dur_target = labels['spy_durability_score'][spy_break_scan_valid].float()
+
+            if self.config.duration_loss_type == 'gaussian_nll' and 'spy_durability_log_std' in predictions:
+                spy_dur_log_std = predictions['spy_durability_log_std'][spy_break_scan_valid]
+                variance = torch.exp(2 * spy_dur_log_std)
+                spy_dur_loss = 0.5 * (
+                    torch.log(variance) +
+                    (spy_dur_target - spy_dur_mean) ** 2 / variance
+                ).mean()
+            else:
+                spy_dur_loss = F.huber_loss(spy_dur_mean, spy_dur_target, delta=self.config.huber_delta)
+
+            losses['spy_durability'] = spy_dur_loss.item()
+        else:
+            spy_dur_loss = torch.tensor(0.0, device=self.device)
+            losses['spy_durability'] = 0.0
+
+        # SPY bars_to_permanent (regression with Gaussian NLL)
+        if 'spy_bars_to_permanent_mean' in predictions and spy_break_scan_valid.any():
+            spy_btp_mean = predictions['spy_bars_to_permanent_mean'][spy_break_scan_valid]
+            spy_btp_target = labels['spy_duration_to_permanent'][spy_break_scan_valid].float()
+            # Only compute loss for samples with valid permanent break (target >= 0)
+            valid_perm_mask = spy_btp_target >= 0
+            if valid_perm_mask.any():
+                spy_btp_mean_valid = spy_btp_mean[valid_perm_mask]
+                spy_btp_target_valid = spy_btp_target[valid_perm_mask]
+
+                if self.config.duration_loss_type == 'gaussian_nll' and 'spy_bars_to_permanent_log_std' in predictions:
+                    spy_btp_log_std = predictions['spy_bars_to_permanent_log_std'][spy_break_scan_valid][valid_perm_mask]
+                    variance = torch.exp(2 * spy_btp_log_std)
+                    spy_btp_loss = 0.5 * (
+                        torch.log(variance) +
+                        (spy_btp_target_valid - spy_btp_mean_valid) ** 2 / variance
+                    ).mean()
+                else:
+                    spy_btp_loss = F.huber_loss(spy_btp_mean_valid, spy_btp_target_valid, delta=self.config.huber_delta)
+            else:
+                spy_btp_loss = torch.tensor(0.0, device=self.device)
+
+            losses['spy_bars_to_permanent'] = spy_btp_loss.item()
+        else:
+            spy_btp_loss = torch.tensor(0.0, device=self.device)
+            losses['spy_bars_to_permanent'] = 0.0
+
+        # Cross durability spread (regression with Gaussian NLL)
+        if 'cross_durability_spread_mean' in predictions and cross_valid.any():
+            cross_dur_mean = predictions['cross_durability_spread_mean'][cross_valid]
+            cross_dur_target = labels['cross_durability_spread'][cross_valid].float()
+
+            if self.config.duration_loss_type == 'gaussian_nll' and 'cross_durability_spread_log_std' in predictions:
+                cross_dur_log_std = predictions['cross_durability_spread_log_std'][cross_valid]
+                variance = torch.exp(2 * cross_dur_log_std)
+                cross_dur_spread_loss = 0.5 * (
+                    torch.log(variance) +
+                    (cross_dur_target - cross_dur_mean) ** 2 / variance
+                ).mean()
+            else:
+                cross_dur_spread_loss = F.huber_loss(cross_dur_mean, cross_dur_target, delta=self.config.huber_delta)
+
+            losses['cross_durability_spread'] = cross_dur_spread_loss.item()
+        else:
+            cross_dur_spread_loss = torch.tensor(0.0, device=self.device)
+            losses['cross_durability_spread'] = 0.0
+
+        # =====================================================================
         # Combined primary loss with task weighting
         # =====================================================================
         total_loss = (
@@ -881,7 +1006,13 @@ class Trainer:
             self.config.cross_who_broke_first_weight * cross_who_loss +
             self.config.cross_break_lag_weight * cross_lag_loss +
             self.config.cross_both_permanent_weight * cross_perm_loss +
-            self.config.cross_return_aligned_weight * cross_ret_loss
+            self.config.cross_return_aligned_weight * cross_ret_loss +
+            # Durability and bars-to-permanent heads (NEW)
+            self.config.tsla_durability_weight * tsla_dur_loss +
+            self.config.tsla_bars_to_permanent_weight * tsla_btp_loss +
+            self.config.spy_durability_weight * spy_dur_loss +
+            self.config.spy_bars_to_permanent_weight * spy_btp_loss +
+            self.config.cross_durability_spread_weight * cross_dur_spread_loss
         )
 
         # =====================================================================

@@ -1,22 +1,25 @@
 """
-Two-Pass Channel Scanner for v15.
+Two-Pass Channel Scanner for v15 - CHANNEL-END SAMPLING ARCHITECTURE.
 
-Uses the efficient two-pass labeling system:
-1. PASS 1: Pre-compute all channels across the entire dataset
-2. PASS 2: Generate labels for all channels at once
-3. SCAN: For each position, detect channels and look up labels from map (O(1))
+SIMPLIFIED ARCHITECTURE:
+1. PASS 1: Detect all channels across the dataset (detect_all_channels)
+2. PASS 2: Compute labels at channel END positions (generate_all_labels)
+3. SCAN: Iterate over detected channels. Each channel = ONE sample at its end_idx.
 
-This is much faster than scanning forward per-sample because channels and labels
-are pre-computed once, then looked up instantly.
+KEY PRINCIPLE - ONE SAMPLE PER CHANNEL:
+- We iterate over DETECTED CHANNELS from the slim_map
+- Each channel's end_idx IS the sample position
+- Labels are PRECOMPUTED in Pass 2 and stored in SlimLabeledChannel
+- For the PRIMARY channel, use its labels directly (no lookup needed)
+- For OTHER TF/window combinations at same timestamp, do binary search lookup
+
+The --step parameter controls CHANNEL DETECTION spacing in Pass 1.
+Number of samples = number of valid detected channels.
 
 Module dependencies:
 - data.loader for data loading
-- data.resampler for partial bars (keeps incomplete bars with metadata)
 - features.tf_extractor for feature extraction
 - LOUD failures - no silent try/except
-- Validates all outputs before storing
-
-Generates samples with tf_features (8,665 features) compatible with the new model.
 """
 
 import argparse
@@ -26,42 +29,35 @@ import os
 import pickle
 import platform
 import signal
-import sys
 import time
 import traceback
 from dataclasses import dataclass
 from multiprocessing import Pool, cpu_count
 from typing import List, Dict, Optional, Tuple, Any
 
-import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 # V15 module imports
 from v15.dtypes import ChannelSample, STANDARD_WINDOWS
 from v15.config import (
-    SCANNER_CONFIG, TOTAL_FEATURES, FEATURE_COUNTS,
-    TIMEFRAMES,  # 10-TF list (no 3month)
-    SCANNER_LOOKBACK_5MIN,  # Practical limit for scanning lookback
+    TOTAL_FEATURES,
+    TIMEFRAMES,
+    SCANNER_LOOKBACK_5MIN,
 )
 from v15.exceptions import (
     DataLoadError, FeatureExtractionError, ValidationError,
-    InvalidFeatureError, ResamplingError,
 )
-from v15.data import load_market_data, resample_with_partial
+from v15.data import load_market_data
 from v15.features.tf_extractor import extract_all_tf_features
 from v15.features.validation import validate_features
 from v15.labels import (
     # Two-pass labeling system imports
     detect_all_channels,
     generate_all_labels,
-    get_labels_for_position,
     ChannelMap,
     LabeledChannelMap,
 )
-
-# V7 channel detection - no longer needed at module level since we use pre-computed maps
-# Legacy functions (_worker_process_position, _process_position_batch) still import locally
 
 
 # =============================================================================
@@ -70,63 +66,34 @@ from v15.labels import (
 
 def _setup_multiprocessing():
     """Configure multiprocessing for cross-platform compatibility."""
-    # Use 'spawn' on macOS (fork is unsafe with certain libraries)
-    # Use 'fork' on Linux for better performance
     if platform.system() == 'Darwin':
         try:
             mp.set_start_method('spawn', force=False)
         except RuntimeError:
-            pass  # Already set
-    # Linux defaults to 'fork' which is fine
+            pass
 
 
 def _estimate_memory_per_worker(df_rows: int) -> float:
-    """
-    Estimate memory usage per worker in MB.
-
-    Args:
-        df_rows: Number of rows in the DataFrame
-
-    Returns:
-        Estimated memory usage in MB
-    """
-    # Rough estimate: 8 bytes per float * 6 columns * rows * 3 (TSLA+SPY+VIX)
+    """Estimate memory usage per worker in MB."""
     return (8 * 6 * df_rows * 3) / (1024 * 1024)
 
 
 def _check_memory_availability(workers: int, df_rows: int):
-    """
-    Warn if memory might be insufficient for parallel processing.
-
-    Args:
-        workers: Number of worker processes
-        df_rows: Number of rows in the DataFrame
-    """
+    """Warn if memory might be insufficient for parallel processing."""
     try:
         import psutil
-
         mem_per_worker = _estimate_memory_per_worker(df_rows)
         total_needed = mem_per_worker * workers
         available = psutil.virtual_memory().available / (1024 * 1024)
-
         if total_needed > available * 0.8:
             print(f"WARNING: Estimated memory usage ({total_needed:.0f}MB) may exceed "
                   f"available memory ({available:.0f}MB). Consider reducing --workers.")
     except ImportError:
-        # psutil not installed, skip memory check
         pass
 
 
 def _convert_df_to_pickle_safe(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Convert DataFrame to pickle-safe format for worker processes.
-
-    Args:
-        df: pandas DataFrame with DatetimeIndex
-
-    Returns:
-        Dict with numpy arrays and index info
-    """
+    """Convert DataFrame to pickle-safe format for worker processes."""
     return {
         'values': df.values.copy(),
         'columns': list(df.columns),
@@ -136,213 +103,121 @@ def _convert_df_to_pickle_safe(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def _reconstruct_df_from_pickle_safe(data: Dict[str, Any]) -> pd.DataFrame:
-    """
-    Reconstruct DataFrame from pickle-safe format.
-
-    Args:
-        data: Dict from _convert_df_to_pickle_safe
-
-    Returns:
-        Reconstructed pandas DataFrame
-    """
-    df = pd.DataFrame(
+    """Reconstruct DataFrame from pickle-safe format."""
+    return pd.DataFrame(
         data['values'],
         columns=data['columns'],
         index=pd.DatetimeIndex(data['index'], name=data['index_name'])
     )
-    return df
 
 
 @dataclass
 class SlimLabeledChannel:
     """
-    Memory-efficient version of LabeledChannel for worker processes.
+    Memory-efficient channel with precomputed labels for worker processes.
 
-    Only contains the fields needed by get_labels_for_position():
-    - start_timestamp: For binary search
-    - end_timestamp: For binary search
-    - labels: The actual ChannelLabels to return
-    - channel_valid: Whether the original channel was valid
-    - channel_window: The window size used for this channel
-
-    The heavy Channel objects with numpy arrays are STRIPPED.
-    This reduces memory from ~100MB per worker to ~1MB per worker.
+    ARCHITECTURAL NOTE:
+    - end_idx IS the sample position (in TF-space)
+    - end_timestamp IS the sample timestamp
+    - labels are PRECOMPUTED in Pass 2 - use them directly, no lookup needed
     """
     start_timestamp: pd.Timestamp
     end_timestamp: pd.Timestamp
-    labels: Any  # ChannelLabels
-    channel_valid: bool = True     # From detected.channel.valid
-    channel_window: int = 0        # From detected.window
-
-    @property
-    def detected(self):
-        """Compatibility shim for get_labels_for_position()."""
-        return self
+    start_idx: int = 0
+    end_idx: int = 0               # THIS IS THE SAMPLE POSITION (in TF-space)
+    # Channel regression parameters
+    channel_slope: float = 0.0
+    channel_intercept: float = 0.0
+    channel_std_dev: float = 0.0
+    channel_r_squared: float = 0.0
+    channel_direction: int = -1    # 0=BEAR, 1=SIDEWAYS, 2=BULL
+    channel_valid: bool = True
+    channel_window: int = 0
+    channel_bounce_count: int = 0
+    tf: str = ""
+    # PRECOMPUTED labels from Pass 2 - USE DIRECTLY
+    labels: Any = None
 
 
 def _create_slim_labeled_map(labeled_map: LabeledChannelMap) -> Dict[Tuple[str, int], List[SlimLabeledChannel]]:
     """
     Create a memory-efficient version of the labeled map for workers.
 
-    The full LabeledChannelMap contains:
-    - DetectedChannel.channel: Full Channel object with large numpy arrays
-      (upper_line, lower_line, center_line, raw close/high/low data)
-    - These arrays are NEVER used by get_labels_for_position()
-
-    This function strips the heavy data, keeping only:
-    - start_timestamp, end_timestamp (for binary search)
-    - labels (the actual ChannelLabels)
-
-    Memory reduction: ~100x per map (from GBs to MBs)
-
-    Args:
-        labeled_map: Full LabeledChannelMap from generate_all_labels()
-
-    Returns:
-        Slim version with only the data needed for label lookups
+    Strips heavy numpy arrays (upper_line, lower_line, center_line) from channels.
+    Memory reduction: ~100x per map (from GBs to MBs).
     """
     slim_map = {}
     for key, labeled_channels in labeled_map.items():
-        tf, window = key  # Key is (timeframe, window)
+        tf, window = key
         slim_channels = []
         for lc in labeled_channels:
-            # Extract channel validity - check if channel exists and is valid
             channel_valid = False
+            channel_bounce_count = 0
+            channel_slope = 0.0
+            channel_intercept = 0.0
+            channel_std_dev = 0.0
+            channel_r_squared = 0.0
+            channel_direction = -1
+
             if lc.detected and lc.detected.channel:
-                channel_valid = getattr(lc.detected.channel, 'valid', False)
+                ch = lc.detected.channel
+                channel_valid = getattr(ch, 'valid', False)
+                channel_bounce_count = getattr(ch, 'bounce_count', 0)
+                channel_slope = ch.slope if ch.slope is not None else 0.0
+                channel_intercept = ch.intercept if ch.intercept is not None else 0.0
+                channel_std_dev = ch.std_dev if ch.std_dev is not None else 0.0
+                channel_r_squared = ch.r_squared if ch.r_squared is not None else 0.0
+                channel_direction = int(ch.direction) if ch.direction is not None else -1
 
             slim_channels.append(SlimLabeledChannel(
                 start_timestamp=lc.detected.start_timestamp,
                 end_timestamp=lc.detected.end_timestamp,
-                labels=lc.labels,
+                start_idx=lc.detected.start_idx,
+                end_idx=lc.detected.end_idx,
+                channel_slope=channel_slope,
+                channel_intercept=channel_intercept,
+                channel_std_dev=channel_std_dev,
+                channel_r_squared=channel_r_squared,
+                channel_direction=channel_direction,
                 channel_valid=channel_valid,
-                channel_window=window
+                channel_window=window,
+                channel_bounce_count=channel_bounce_count,
+                tf=tf,
+                labels=lc.labels  # Precomputed labels from Pass 2
             ))
         slim_map[key] = slim_channels
     return slim_map
 
 
-def _get_best_channel_from_map(
-    labeled_map: Dict[Tuple[str, int], List[SlimLabeledChannel]],
-    df: pd.DataFrame,
-    position_idx: int,
-    windows: List[int],
-    tf: str = '5min'
-) -> Tuple[bool, Optional[int]]:
-    """
-    Look up best channel validity and window from pre-computed map.
-
-    This replaces the expensive detect_channels_multi_window() call
-    with an O(log N) binary search lookup.
-
-    Args:
-        labeled_map: Pre-computed slim labeled map
-        df: The DataFrame (TSLA) for timestamp lookup
-        position_idx: Position index in the DataFrame
-        windows: List of window sizes to check
-        tf: Timeframe to look up (default '5min' for TSLA base TF)
-
-    Returns:
-        (is_valid, best_window) - True/window if valid channel found, False/None otherwise
-    """
-    position_ts = df.index[position_idx]
-
-    valid_channels = {}  # window -> SlimLabeledChannel
-
-    for window in windows:
-        key = (tf, window)
-        labeled_channels = labeled_map.get(key, [])
-        if not labeled_channels:
-            continue
-
-        # Binary search for channel containing this position
-        left, right = 0, len(labeled_channels) - 1
-        found = None
-
-        while left <= right:
-            mid = (left + right) // 2
-            lc = labeled_channels[mid]
-            if lc.start_timestamp <= position_ts <= lc.end_timestamp:
-                found = lc
-                break
-            elif position_ts < lc.start_timestamp:
-                right = mid - 1
-            else:
-                left = mid + 1
-
-        # Fallback: most recent channel that ended before this position
-        if found is None:
-            for lc in reversed(labeled_channels):
-                if lc.end_timestamp <= position_ts:
-                    found = lc
-                    break
-
-        if found and found.channel_valid:
-            valid_channels[window] = found
-
-    if not valid_channels:
-        return False, None
-
-    # Select best window (largest window with a valid channel)
-    # This matches the original select_best_channel behavior
-    best_window = max(valid_channels.keys())
-    return True, best_window
-
-
 # Global flag for graceful shutdown
 _shutdown_requested = False
 
-# =============================================================================
 # Worker Process Globals (set via Pool initializer)
-# =============================================================================
-# These globals are initialized once per worker process, avoiding repeated
-# serialization of large DataFrames for each batch.
-
 _WORKER_TSLA_DF: Optional[pd.DataFrame] = None
 _WORKER_SPY_DF: Optional[pd.DataFrame] = None
 _WORKER_VIX_DF: Optional[pd.DataFrame] = None
-_WORKER_TSLA_LABELED_MAP: Optional[Dict] = None
-_WORKER_SPY_LABELED_MAP: Optional[Dict] = None
+_WORKER_TSLA_SLIM_MAP: Optional[Dict] = None
+_WORKER_SPY_SLIM_MAP: Optional[Dict] = None
 _WORKER_TIMEFRAMES: Optional[List[str]] = None
 _WORKER_WINDOWS: Optional[List[int]] = None
 
 
 def _init_worker(tsla_data: Dict, spy_data: Dict, vix_data: Dict,
-                 tsla_labeled_map: Dict, spy_labeled_map: Dict,
+                 tsla_slim_map: Dict, spy_slim_map: Dict,
                  timeframes: List[str], windows: List[int]):
-    """
-    Initialize worker process with shared data.
-
-    This function runs ONCE per worker process when the Pool is created.
-    It reconstructs DataFrames from pickle-safe format and stores them
-    in global variables, avoiding repeated serialization for each batch.
-
-    Args:
-        tsla_data: Pickle-safe TSLA DataFrame dict
-        spy_data: Pickle-safe SPY DataFrame dict
-        vix_data: Pickle-safe VIX DataFrame dict
-        tsla_labeled_map: Pre-computed TSLA label map
-        spy_labeled_map: Pre-computed SPY label map
-        timeframes: List of timeframe strings
-        windows: List of window sizes
-    """
+    """Initialize worker process with shared data."""
     global _WORKER_TSLA_DF, _WORKER_SPY_DF, _WORKER_VIX_DF
-    global _WORKER_TSLA_LABELED_MAP, _WORKER_SPY_LABELED_MAP
+    global _WORKER_TSLA_SLIM_MAP, _WORKER_SPY_SLIM_MAP
     global _WORKER_TIMEFRAMES, _WORKER_WINDOWS
 
-    # CRITICAL: Ignore signals in worker processes!
-    # Without this, workers inherit the parent's signal handler and can trigger
-    # spurious shutdowns when the system sends signals to the process group.
-    # Only the main process should handle SIGINT/SIGTERM.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
-    # Reconstruct DataFrames ONCE per worker
     _WORKER_TSLA_DF = _reconstruct_df_from_pickle_safe(tsla_data)
     _WORKER_SPY_DF = _reconstruct_df_from_pickle_safe(spy_data)
     _WORKER_VIX_DF = _reconstruct_df_from_pickle_safe(vix_data)
-    _WORKER_TSLA_LABELED_MAP = tsla_labeled_map
-    _WORKER_SPY_LABELED_MAP = spy_labeled_map
+    _WORKER_TSLA_SLIM_MAP = tsla_slim_map
+    _WORKER_SPY_SLIM_MAP = spy_slim_map
     _WORKER_TIMEFRAMES = timeframes
     _WORKER_WINDOWS = windows
 
@@ -350,319 +225,179 @@ def _init_worker(tsla_data: Dict, spy_data: Dict, vix_data: Dict,
 def _signal_handler(signum, frame):
     """Handle interrupt signals for graceful shutdown."""
     global _shutdown_requested
-    if not _shutdown_requested:  # Only print once
+    if not _shutdown_requested:
         _shutdown_requested = True
         print("\n[INTERRUPT] Shutdown requested. Will stop after current batch...")
 
 
-def _worker_process_position(args: Tuple) -> Dict[str, Any]:
+def _find_channel_at_timestamp(
+    slim_map: Dict[Tuple[str, int], List[SlimLabeledChannel]],
+    tf: str,
+    window: int,
+    timestamp: pd.Timestamp
+) -> Optional[SlimLabeledChannel]:
     """
-    Worker function to process a single position.
+    Binary search to find channel ending at/before timestamp.
 
-    This function is designed to be pickle-safe and handles errors gracefully.
+    Returns the SlimLabeledChannel (not just labels) so we can access all metadata.
+    O(log N) complexity where N is number of channels for this (tf, window).
+    """
+    key = (tf, window)
+    slim_channels = slim_map.get(key, [])
+
+    if not slim_channels:
+        return None
+
+    left, right = 0, len(slim_channels) - 1
+    found = None
+
+    while left <= right:
+        mid = (left + right) // 2
+        lc = slim_channels[mid]
+
+        if lc.end_timestamp <= timestamp:
+            found = lc
+            left = mid + 1
+        else:
+            right = mid - 1
+
+    return found
+
+
+def _process_channel_batch(channel_batch: List[Tuple[str, int, int]]) -> List[Dict[str, Any]]:
+    """
+    Process a batch of channels. Each channel produces ONE sample at channel.end_idx.
+
+    SIMPLIFIED ARCHITECTURE:
+    - channel_batch: List of (tf, window, channel_index) identifying channels
+    - For each channel:
+      1. Get channel from slim_map using (tf, window, index)
+      2. Sample position = channel.end_timestamp
+      3. Extract features at that position
+      4. For PRIMARY channel (tf, window), use precomputed labels DIRECTLY
+      5. For OTHER (tf, window) combinations, do binary search lookup
 
     Args:
-        args: Tuple of (idx, tsla_data, spy_data, vix_data, config_dict)
-              where data dicts are from _convert_df_to_pickle_safe
+        channel_batch: List of (tf, window, channel_idx) tuples
 
     Returns:
-        Dict with either 'sample' key (success) or 'error' key (failure)
+        List of result dicts with 'sample', 'error', or 'skipped' keys
     """
     try:
-        idx, tsla_data, spy_data, vix_data, config_dict = args
-
-        # Reconstruct DataFrames from pickle-safe format
-        tsla_df = _reconstruct_df_from_pickle_safe(tsla_data)
-        spy_df = _reconstruct_df_from_pickle_safe(spy_data)
-        vix_df = _reconstruct_df_from_pickle_safe(vix_data)
-
-        # Import here to avoid issues in worker processes
-        from v15.features.tf_extractor import extract_all_tf_features
-        from v7.core.channel import detect_channels_multi_window, select_best_channel
-
-        # Get efficient slice
-        start_idx = max(0, idx - config_dict['lookback'])
-        tsla_slice = tsla_df.iloc[start_idx:idx]
-        spy_slice = spy_df.iloc[start_idx:idx]
-        vix_slice = vix_df.iloc[start_idx:idx]
-        offset = idx - start_idx
-
-        # Detect channels
-        channels = detect_channels_multi_window(tsla_slice, windows=config_dict['windows'])
-        best_channel, best_window = select_best_channel(channels)
-
-        if best_channel is None or not best_channel.valid:
-            return {'idx': idx, 'skipped': True, 'error': None}
-
-        timestamp = tsla_df.index[idx - 1]
-
-        # Extract features
-        tf_features = extract_all_tf_features(
-            tsla_df=tsla_slice,
-            spy_df=spy_slice,
-            vix_df=vix_slice,
-            timestamp=timestamp,
-            source_bar_count=idx,
-            include_bar_metadata=True
-        )
-
-        return {
-            'idx': idx,
-            'skipped': False,
-            'error': None,
-            'timestamp': timestamp,
-            'tf_features': tf_features,
-            'best_window': best_window,
-            'offset': offset,
-        }
-
-    except Exception as e:
-        return {
-            'idx': args[0] if args else -1,
-            'skipped': False,
-            'error': f"{type(e).__name__}: {str(e)}",
-            'traceback': traceback.format_exc(),
-        }
-
-
-def _process_position_batch(batch_args: Tuple) -> List[Dict[str, Any]]:
-    """
-    Worker function to process a batch of positions.
-
-    This function is designed to be pickle-safe and handles errors gracefully.
-    It processes multiple positions in a single call to reduce IPC overhead.
-
-    Args:
-        batch_args: Tuple of (positions_batch, tsla_data, spy_data, vix_data,
-                             tsla_labeled_map, spy_labeled_map, timeframes, windows)
-                   where data dicts are from _convert_df_to_pickle_safe
-
-    Returns:
-        List of result dicts, each with 'sample', 'error', or 'skipped' key
-    """
-    try:
-        (positions_batch, tsla_data, spy_data, vix_data,
-         tsla_labeled_map, spy_labeled_map, timeframes, windows) = batch_args
-
-        # Reconstruct DataFrames ONCE for the entire batch
-        tsla_df = _reconstruct_df_from_pickle_safe(tsla_data)
-        spy_df = _reconstruct_df_from_pickle_safe(spy_data)
-        vix_df = _reconstruct_df_from_pickle_safe(vix_data)
-
-        # Import here to avoid issues in worker processes
-        from v15.features.tf_extractor import extract_all_tf_features
-        from v15.features.validation import validate_features
-        from v7.core.channel import detect_channels_multi_window, select_best_channel
-        from v15.labels import get_labels_for_position
-        from v15.dtypes import ChannelSample
-
-        results = []
-
-        for idx in positions_batch:
-            try:
-                # Get efficient slice for this position
-                start_idx = max(0, idx - SCANNER_LOOKBACK_5MIN)
-                tsla_slice = tsla_df.iloc[start_idx:idx]
-                spy_slice = spy_df.iloc[start_idx:idx]
-                vix_slice = vix_df.iloc[start_idx:idx]
-                offset = idx - start_idx
-
-                # Detect channels at this position
-                channels = detect_channels_multi_window(tsla_slice, windows=windows)
-                best_channel, best_window = select_best_channel(channels)
-
-                if best_channel is None or not best_channel.valid:
-                    results.append({'idx': idx, 'skipped': True})
-                    continue
-
-                timestamp = tsla_df.index[idx - 1]
-
-                # Extract features
-                tf_features = extract_all_tf_features(
-                    tsla_df=tsla_slice,
-                    spy_df=spy_slice,
-                    vix_df=vix_slice,
-                    timestamp=timestamp,
-                    source_bar_count=idx,
-                    include_bar_metadata=True
-                )
-
-                # FIX #4: Validate features with LOUD failures (raises on invalid)
-                # Use validate_sample_features which enforces count + value checks
-                from v15.scanner import validate_sample_features, EXPECTED_FEATURE_COUNT
-                tf_features = validate_sample_features(
-                    tf_features, timestamp, idx, strict_count=True
-                )
-
-                # Get bar metadata
-                bar_metadata = {
-                    '5min': {
-                        'bar_completion_pct': 1.0,
-                        'bars_in_partial': 0,
-                        'total_bars': len(tsla_slice),
-                        'is_partial': False,
-                    }
-                }
-
-                # Look up labels for all windows and timeframes
-                # Structure: {window: {'tsla': {tf: labels}, 'spy': {tf: labels}}}
-                labels_per_window = {}
-                label_hits = 0
-                label_misses = 0
-                none_label_count = 0
-
-                for window in windows:
-                    labels_per_window[window] = {'tsla': {}, 'spy': {}}
-                    for tf in timeframes:
-                        # TSLA labels
-                        tsla_labels = get_labels_for_position(tsla_labeled_map, tsla_df, idx, tf, window)
-                        labels_per_window[window]['tsla'][tf] = tsla_labels
-                        if tsla_labels is not None:
-                            label_hits += 1
-                        else:
-                            label_misses += 1
-                            none_label_count += 1
-
-                        # SPY labels
-                        spy_labels = get_labels_for_position(spy_labeled_map, spy_df, idx, tf, window)
-                        labels_per_window[window]['spy'][tf] = spy_labels
-                        if spy_labels is not None:
-                            label_hits += 1
-                        else:
-                            label_misses += 1
-                            none_label_count += 1
-
-                # FIX #3: Validate minimum label threshold
-                # We need at least some valid labels for this sample to be useful
-                total_lookups = label_hits + label_misses
-                if total_lookups > 0:
-                    hit_rate = label_hits / total_lookups
-                    if hit_rate < 0.1:  # Less than 10% valid labels
-                        results.append({
-                            'idx': idx,
-                            'error': f"Label hit rate too low at idx={idx}: {hit_rate:.1%} ({label_hits}/{total_lookups}). "
-                                     f"Sample would have {none_label_count} None labels.",
-                        })
-                        continue
-
-                # Create sample
-                sample = ChannelSample(
-                    timestamp=timestamp,
-                    channel_end_idx=idx,
-                    tf_features=tf_features,
-                    labels_per_window=labels_per_window,
-                    bar_metadata=bar_metadata,
-                    best_window=best_window
-                )
-
-                # Memory cleanup for this position - data now copied into sample
-                del tsla_slice, spy_slice, vix_slice
-                # Note: channels, best_channel no longer used (pre-computed map lookup)
-                del tf_features, bar_metadata, labels_per_window
-
-                results.append({
-                    'idx': idx,
-                    'sample': sample,
-                    'label_hits': label_hits,
-                    'label_misses': label_misses,
-                })
-
-            except Exception as e:
-                # FIX #4: ALL errors are logged with full detail
-                results.append({
-                    'idx': idx,
-                    'error': f"[POSITION {idx}] {type(e).__name__}: {str(e)}",
-                    'traceback': traceback.format_exc(),
-                })
-
-        # Trigger garbage collection at end of batch to free intermediate objects
-        gc.collect()
-
-        return results
-
-    except Exception as e:
-        # If batch-level error, return error with ALL positions that were lost
-        # FIX #2: Track positions per batch so we know exactly what was lost
-        return [{
-            'idx': -1,
-            'positions_lost': positions_batch,  # Track which positions were in this batch
-            'error': f"BATCH ERROR (lost {len(positions_batch)} positions {positions_batch[0]}-{positions_batch[-1]}): "
-                     f"{type(e).__name__}: {str(e)}",
-            'traceback': traceback.format_exc(),
-        }]
-
-
-def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, Any]]:
-    """
-    Worker function that uses pre-initialized global data.
-
-    This function is called by Pool.imap_unordered after the worker has been
-    initialized with _init_worker(). It uses global variables instead of
-    receiving data in each call, dramatically reducing serialization overhead.
-
-    Args:
-        positions_batch: List of position indices to process
-
-    Returns:
-        List of result dicts, each with 'sample', 'error', or 'skipped' key
-    """
-    try:
-        # Use pre-initialized globals (set by _init_worker)
         tsla_df = _WORKER_TSLA_DF
         spy_df = _WORKER_SPY_DF
         vix_df = _WORKER_VIX_DF
-        tsla_labeled_map = _WORKER_TSLA_LABELED_MAP
-        spy_labeled_map = _WORKER_SPY_LABELED_MAP
+        tsla_slim_map = _WORKER_TSLA_SLIM_MAP
+        spy_slim_map = _WORKER_SPY_SLIM_MAP
         timeframes = _WORKER_TIMEFRAMES
         windows = _WORKER_WINDOWS
 
-        # Import here to avoid issues in worker processes
         from v15.features.tf_extractor import extract_all_tf_features
-        from v15.features.validation import validate_features
-        from v15.scanner import validate_sample_features, EXPECTED_FEATURE_COUNT, _get_best_channel_from_map
-        from v15.labels import get_labels_for_position
+        from v15.scanner import validate_sample_features, EXPECTED_FEATURE_COUNT
         from v15.dtypes import ChannelSample
 
         results = []
 
-        for idx in positions_batch:
+        for primary_tf, primary_window, channel_idx in channel_batch:
             try:
-                # Look up best channel from pre-computed map (O(log N) instead of O(N))
-                # This replaces the expensive detect_channels_multi_window() call
-                is_valid, best_window = _get_best_channel_from_map(
-                    tsla_labeled_map, tsla_df, idx, windows
-                )
+                # Get the PRIMARY channel from slim_map
+                key = (primary_tf, primary_window)
+                slim_channels = tsla_slim_map.get(key, [])
 
-                if not is_valid:
-                    results.append({'idx': idx, 'skipped': True})
+                if channel_idx < 0 or channel_idx >= len(slim_channels):
+                    results.append({'channel_key': (primary_tf, primary_window, channel_idx), 'error': "Invalid channel index"})
                     continue
 
-                # Get efficient slice for this position (only needed if channel is valid)
-                start_idx = max(0, idx - SCANNER_LOOKBACK_5MIN)
-                tsla_slice = tsla_df.iloc[start_idx:idx]
-                spy_slice = spy_df.iloc[start_idx:idx]
-                vix_slice = vix_df.iloc[start_idx:idx]
-                offset = idx - start_idx
+                primary_channel = slim_channels[channel_idx]
 
-                timestamp = tsla_df.index[idx - 1]
+                # Skip invalid channels
+                if not primary_channel.channel_valid:
+                    results.append({'channel_key': (primary_tf, primary_window, channel_idx), 'skipped': True, 'reason': 'invalid_channel'})
+                    continue
 
-                # Extract features
+                # Skip channels without valid labels
+                if primary_channel.labels is None or not primary_channel.labels.direction_valid:
+                    results.append({'channel_key': (primary_tf, primary_window, channel_idx), 'skipped': True, 'reason': 'invalid_labels'})
+                    continue
+
+                # SAMPLE POSITION = CHANNEL END
+                sample_timestamp = primary_channel.end_timestamp
+
+                # Find 5min index for this timestamp
+                try:
+                    idx_5min = tsla_df.index.searchsorted(sample_timestamp, side='right') - 1
+                    if idx_5min < 0:
+                        idx_5min = 0
+                    if idx_5min >= len(tsla_df):
+                        idx_5min = len(tsla_df) - 1
+                except Exception as e:
+                    results.append({
+                        'channel_key': (primary_tf, primary_window, channel_idx),
+                        'error': f"Failed to find 5min index: {e}"
+                    })
+                    continue
+
+                # Check warmup requirement
+                if idx_5min < SCANNER_LOOKBACK_5MIN:
+                    results.append({'channel_key': (primary_tf, primary_window, channel_idx), 'skipped': True, 'reason': 'warmup'})
+                    continue
+
+                # Get data slices for feature extraction
+                start_idx = max(0, idx_5min - SCANNER_LOOKBACK_5MIN)
+                tsla_slice = tsla_df.iloc[start_idx:idx_5min]
+                spy_slice = spy_df.iloc[start_idx:idx_5min]
+                vix_slice = vix_df.iloc[start_idx:idx_5min]
+
+                # Extract features at channel end position
                 tf_features = extract_all_tf_features(
                     tsla_df=tsla_slice,
                     spy_df=spy_slice,
                     vix_df=vix_slice,
-                    timestamp=timestamp,
-                    source_bar_count=idx,
+                    timestamp=sample_timestamp,
+                    source_bar_count=idx_5min,
                     include_bar_metadata=True
                 )
 
-                # FIX #4: Validate features with LOUD failures (raises on invalid)
-                # Use validate_sample_features which enforces count + value checks
                 tf_features = validate_sample_features(
-                    tf_features, timestamp, idx, strict_count=True
+                    tf_features, sample_timestamp, idx_5min, strict_count=True
                 )
 
-                # Get bar metadata
+                # BUILD labels_per_window
+                # For PRIMARY channel: use labels directly (no lookup)
+                # For OTHER channels: binary search lookup at same timestamp
+                labels_per_window = {}
+                label_hits = 0
+                label_misses = 0
+
+                for w in windows:
+                    labels_per_window[w] = {'tsla': {}, 'spy': {}}
+
+                    for t in timeframes:
+                        # TSLA labels
+                        if t == primary_tf and w == primary_window:
+                            # PRIMARY channel - use precomputed labels DIRECTLY
+                            tsla_labels = primary_channel.labels
+                        else:
+                            # Other (tf, window) - lookup channel at this timestamp
+                            other_channel = _find_channel_at_timestamp(tsla_slim_map, t, w, sample_timestamp)
+                            tsla_labels = other_channel.labels if other_channel else None
+
+                        labels_per_window[w]['tsla'][t] = tsla_labels
+                        if tsla_labels is not None and tsla_labels.direction_valid:
+                            label_hits += 1
+                        else:
+                            label_misses += 1
+
+                        # SPY labels - always lookup (we iterate TSLA channels)
+                        spy_channel = _find_channel_at_timestamp(spy_slim_map, t, w, sample_timestamp)
+                        spy_labels = spy_channel.labels if spy_channel else None
+                        labels_per_window[w]['spy'][t] = spy_labels
+                        if spy_labels is not None and spy_labels.direction_valid:
+                            label_hits += 1
+                        else:
+                            label_misses += 1
+
+                # Build bar metadata
                 bar_metadata = {
                     '5min': {
                         'bar_completion_pct': 1.0,
@@ -672,101 +407,43 @@ def _process_batch_with_globals(positions_batch: List[int]) -> List[Dict[str, An
                     }
                 }
 
-                # Look up labels for all windows and timeframes
-                # Structure: {window: {'tsla': {tf: labels}, 'spy': {tf: labels}}}
-                labels_per_window = {}
-                label_hits = 0
-                label_misses = 0
-                none_label_count = 0
-
-                for window in windows:
-                    labels_per_window[window] = {'tsla': {}, 'spy': {}}
-                    for tf in timeframes:
-                        # TSLA labels
-                        tsla_labels = get_labels_for_position(tsla_labeled_map, tsla_df, idx, tf, window)
-                        labels_per_window[window]['tsla'][tf] = tsla_labels
-                        if tsla_labels is not None:
-                            label_hits += 1
-                        else:
-                            label_misses += 1
-                            none_label_count += 1
-
-                        # SPY labels
-                        spy_labels = get_labels_for_position(spy_labeled_map, spy_df, idx, tf, window)
-                        labels_per_window[window]['spy'][tf] = spy_labels
-                        if spy_labels is not None:
-                            label_hits += 1
-                        else:
-                            label_misses += 1
-                            none_label_count += 1
-
-                # FIX #3: Validate minimum label threshold
-                # We need at least some valid labels for this sample to be useful
-                total_lookups = label_hits + label_misses
-                if total_lookups > 0:
-                    hit_rate = label_hits / total_lookups
-                    if hit_rate < 0.1:  # Less than 10% valid labels
-                        results.append({
-                            'idx': idx,
-                            'error': f"Label hit rate too low at idx={idx}: {hit_rate:.1%} ({label_hits}/{total_lookups}). "
-                                     f"Sample would have {none_label_count} None labels.",
-                        })
-                        continue
-
                 # Create sample
                 sample = ChannelSample(
-                    timestamp=timestamp,
-                    channel_end_idx=idx,
+                    timestamp=sample_timestamp,
+                    channel_end_idx=idx_5min,
                     tf_features=tf_features,
                     labels_per_window=labels_per_window,
                     bar_metadata=bar_metadata,
-                    best_window=best_window
+                    best_window=primary_window  # The window of the PRIMARY channel
                 )
 
-                # Memory cleanup for this position - data now copied into sample
-                del tsla_slice, spy_slice, vix_slice
-                # Note: channels, best_channel no longer used (pre-computed map lookup)
-                del tf_features, bar_metadata, labels_per_window
-
                 results.append({
-                    'idx': idx,
+                    'channel_key': (primary_tf, primary_window, channel_idx),
                     'sample': sample,
                     'label_hits': label_hits,
                     'label_misses': label_misses,
                 })
 
             except Exception as e:
-                # FIX #4: ALL errors are logged with full detail
                 results.append({
-                    'idx': idx,
-                    'error': f"[POSITION {idx}] {type(e).__name__}: {str(e)}",
+                    'channel_key': (primary_tf, primary_window, channel_idx),
+                    'error': f"{type(e).__name__}: {str(e)}",
                     'traceback': traceback.format_exc(),
                 })
 
-        # Trigger garbage collection at end of batch to free intermediate objects
         gc.collect()
-
         return results
 
     except Exception as e:
-        # If batch-level error, return error with ALL positions that were lost
-        # FIX #2: Track positions per batch so we know exactly what was lost
         return [{
-            'idx': -1,
-            'positions_lost': positions_batch,  # Track which positions were in this batch
-            'error': f"BATCH ERROR (lost {len(positions_batch)} positions {positions_batch[0]}-{positions_batch[-1]}): "
-                     f"{type(e).__name__}: {str(e)}",
+            'channel_key': ('error', -1, -1),
+            'error': f"BATCH ERROR: {type(e).__name__}: {str(e)}",
             'traceback': traceback.format_exc(),
         }]
 
 
 class _ProgressFileWriter:
-    """
-    File wrapper that reports write progress to tqdm.
-
-    Intercepts write() calls and updates the progress bar with byte counts,
-    giving real-time feedback during pickle.dump() operations.
-    """
+    """File wrapper that reports write progress to tqdm."""
     def __init__(self, file, pbar):
         self.file = file
         self.pbar = pbar
@@ -776,20 +453,11 @@ class _ProgressFileWriter:
         return self.file.write(data)
 
     def __getattr__(self, attr):
-        # Delegate all other attributes to the underlying file
         return getattr(self.file, attr)
 
 
 def _save_partial_results(samples: List, output_path: str, suffix: str = "_partial"):
-    """
-    Save partial results during graceful shutdown.
-
-    Args:
-        samples: List of ChannelSample objects collected so far (in memory)
-        output_path: Original output path (will add suffix)
-        suffix: Suffix to add to filename (default: "_partial")
-    """
-    # Create partial output path
+    """Save partial results during graceful shutdown."""
     if '.' in output_path:
         base, ext = output_path.rsplit('.', 1)
         partial_path = f"{base}{suffix}.{ext}"
@@ -800,7 +468,6 @@ def _save_partial_results(samples: List, output_path: str, suffix: str = "_parti
 
     all_samples = []
 
-    # First, read any samples from temp file (incremental mode)
     if os.path.exists(temp_path):
         try:
             print(f"\n[PARTIAL] Reading samples from temp file...")
@@ -815,7 +482,6 @@ def _save_partial_results(samples: List, output_path: str, suffix: str = "_parti
         except Exception as e:
             print(f"  [WARNING] Failed to read temp file: {e}")
 
-    # Add in-memory samples
     all_samples.extend(samples)
 
     if not all_samples:
@@ -824,45 +490,21 @@ def _save_partial_results(samples: List, output_path: str, suffix: str = "_parti
 
     try:
         with open(partial_path, 'wb') as f:
-            with tqdm(unit='B', unit_scale=True, unit_divisor=1024,
-                     desc="Saving partial") as pbar:
+            with tqdm(unit='B', unit_scale=True, unit_divisor=1024, desc="Saving partial") as pbar:
                 pickle.dump(all_samples, _ProgressFileWriter(f, pbar))
         print(f"\n[SAVED] Partial results ({len(all_samples)} samples) saved to: {partial_path}")
 
-        # Clean up temp file after successful save
         if os.path.exists(temp_path):
             os.remove(temp_path)
-            print(f"  Cleaned up temp file")
     except Exception as e:
         print(f"\n[ERROR] Failed to save partial results: {e}")
 
 
-# =============================================================================
 # Configuration
-# =============================================================================
-
-@dataclass
-class ScanConfig:
-    """Configuration for scanner workers."""
-    step: int = SCANNER_CONFIG.get('step', 10)
-    warmup_bars: int = SCANNER_CONFIG.get('warmup_bars', 32760)
-    forward_bars: int = SCANNER_CONFIG.get('forward_bars', 8000)
-    workers: int = SCANNER_CONFIG.get('workers', 4)
-    validate_features: bool = True  # Always validate - no silent failures
-    chunk_size: int = 100
-
-
-# Expected feature count (13,660 total)
 EXPECTED_FEATURE_COUNT = TOTAL_FEATURES
+MIN_LABEL_HIT_RATE = 0.1
+MAX_ERRORS_IN_MEMORY = 100
 
-# Minimum label hit rate required (0.0 to 1.0) - reject samples below this
-MIN_LABEL_HIT_RATE = 0.1  # At least 10% of labels must be valid
-MAX_ERRORS_IN_MEMORY = 100  # Limit error accumulation to prevent unbounded memory growth
-
-
-# =============================================================================
-# Feature Validation - LOUD Failures
-# =============================================================================
 
 def validate_sample_features(
     tf_features: Dict[str, float],
@@ -870,254 +512,34 @@ def validate_sample_features(
     idx: int,
     strict_count: bool = True
 ) -> Dict[str, float]:
-    """
-    Validate extracted features. Raises on any invalid value.
-
-    Args:
-        tf_features: Dictionary of feature name -> value
-        timestamp: Sample timestamp for error messages
-        idx: Sample index for error messages
-        strict_count: If True, reject samples with wrong feature count
-
-    Returns:
-        Validated features dict
-
-    Raises:
-        InvalidFeatureError: If any feature is NaN, Inf, or wrong type
-        ValidationError: If feature count is wrong
-    """
-    # Check feature count
+    """Validate extracted features. Raises on any invalid value."""
     n_features = len(tf_features)
     if n_features == 0:
         raise FeatureExtractionError(
             f"No features extracted at idx={idx}, timestamp={timestamp}"
         )
 
-    # FIX #1: Enforce expected feature count
     if strict_count and n_features != EXPECTED_FEATURE_COUNT:
         raise ValidationError(
-            f"Feature count mismatch at idx={idx}: got {n_features}, expected {EXPECTED_FEATURE_COUNT}. "
-            f"Missing {EXPECTED_FEATURE_COUNT - n_features} features."
+            f"Feature count mismatch at idx={idx}: got {n_features}, expected {EXPECTED_FEATURE_COUNT}"
         )
 
-    # Validate each feature - LOUD failures
-    invalid_features = validate_features(tf_features, raise_on_invalid=True)
-
-    # This line only reached if validation passed
+    validate_features(tf_features, raise_on_invalid=True)
     return tf_features
 
 
-def validate_bar_metadata(
-    metadata: Dict[str, Any],
-    tf: str,
-    idx: int
-) -> None:
-    """
-    Validate bar metadata from resampling.
-
-    Args:
-        metadata: Bar metadata dict from resample_with_partial
-        tf: Timeframe string
-        idx: Sample index for error messages
-
-    Raises:
-        ResamplingError: If metadata is invalid
-    """
-    required_keys = ['bar_completion_pct', 'bars_in_partial', 'total_bars']
-
-    for key in required_keys:
-        if key not in metadata:
-            raise ResamplingError(
-                f"Missing required metadata key '{key}' for {tf} at idx={idx}"
-            )
-
-    # Check completion percentage is valid
-    completion = metadata['bar_completion_pct']
-    if not isinstance(completion, (int, float)) or completion < 0 or completion > 1:
-        raise ResamplingError(
-            f"Invalid bar_completion_pct={completion} for {tf} at idx={idx}"
-        )
-
-
-# =============================================================================
-# Resampling with Partial Bar Support
-# =============================================================================
-
-def resample_all_timeframes(
-    df: pd.DataFrame,
-    idx: int,
-    include_metadata: bool = True
-) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[str, Any]]]:
-    """
-    Resample DataFrame to all timeframes, keeping partial bars.
-
-    Args:
-        df: Base 5min OHLCV DataFrame
-        idx: Sample index for error messages
-        include_metadata: Whether to include bar metadata
-
-    Returns:
-        Tuple of (resampled_dfs, bar_metadata_by_tf)
-
-    Raises:
-        ResamplingError: If resampling fails
-    """
-    resampled_dfs: Dict[str, pd.DataFrame] = {'5min': df}
-    bar_metadata: Dict[str, Dict[str, Any]] = {}
-
-    # 5min is the base - calculate its "metadata"
-    bar_metadata['5min'] = {
-        'bar_completion_pct': 1.0,
-        'bars_in_partial': 0,
-        'total_bars': len(df),
-        'is_partial': False,
-    }
-
-    for tf in TIMEFRAMES[1:]:  # Skip 5min
-        # Map TF names to pandas resample rules (10 TFs, no 3month)
-        tf_map = {
-            '15min': '15min',
-            '30min': '30min',
-            '1h': '1h',
-            '2h': '2h',
-            '3h': '3h',
-            '4h': '4h',
-            'daily': '1D',
-            'weekly': '1W',
-            'monthly': '1MS',
-        }
-
-        resample_rule = tf_map.get(tf, tf)
-
-        # Use resample_with_partial to keep incomplete bars
-        resampled, metadata = resample_with_partial(df, resample_rule)
-
-        if include_metadata:
-            validate_bar_metadata(metadata, tf, idx)
-
-        resampled_dfs[tf] = resampled
-        bar_metadata[tf] = metadata
-
-    return resampled_dfs, bar_metadata
-
-
-def extract_bar_metadata_features(
-    bar_metadata: Dict[str, Dict[str, Any]]
-) -> Dict[str, float]:
-    """
-    Convert bar metadata into features for each TF.
-
-    Creates 3 features per TF:
-    - {tf}_bar_completion_pct
-    - {tf}_bars_in_partial
-    - {tf}_complete_bars
-
-    Total: 30 features (10 TFs * 3 features)
-
-    Args:
-        bar_metadata: Dict mapping TF -> metadata dict
-
-    Returns:
-        Dict of feature name -> value
-    """
-    features: Dict[str, float] = {}
-
-    for tf in TIMEFRAMES:
-        meta = bar_metadata.get(tf, {})
-
-        # Extract metadata values with defaults
-        completion = meta.get('bar_completion_pct', 1.0)
-        bars_in_partial = meta.get('bars_in_partial', 0)
-        total_bars = meta.get('total_bars', 0)
-        is_partial = meta.get('is_partial', False)
-
-        # Complete bars = total - 1 if partial, else total
-        complete_bars = total_bars - 1 if is_partial else total_bars
-
-        features[f'{tf}_bar_completion_pct'] = float(completion)
-        features[f'{tf}_bars_in_partial'] = float(bars_in_partial)
-        features[f'{tf}_complete_bars'] = float(complete_bars)
-
-    return features
-
-
-# =============================================================================
-# Efficient Slicing Helper
-# =============================================================================
-
-def _get_efficient_slice(
-    df: pd.DataFrame,
-    idx: int,
-    include_forward: bool = False,
-    forward_bars: int = 0
-) -> Tuple[pd.DataFrame, int]:
-    """
-    Get efficient data slice for feature extraction.
-
-    Instead of passing ALL historical data from the beginning to idx,
-    this function returns only the slice needed for feature extraction.
-    This reduces memory usage and resampling costs by ~60x for intraday TFs.
-
-    Args:
-        df: Full DataFrame with DatetimeIndex
-        idx: Current position index (exclusive end for lookback)
-        include_forward: Whether to include forward data for labels
-        forward_bars: Number of forward bars to include (only used if include_forward=True)
-
-    Returns:
-        Tuple of (sliced_df, offset) where:
-        - sliced_df: The efficiently sliced DataFrame
-        - offset: The new idx position within sliced_df (use offset instead of idx)
-
-    Example:
-        If idx=50000 and SCANNER_LOOKBACK_5MIN=32760:
-        - start_idx = 50000 - 32760 = 17240
-        - sliced_df = df.iloc[17240:50000]  (32760 bars instead of 50000)
-        - offset = 32760 (position of idx within slice)
-    """
-    # Use SCANNER_LOOKBACK_5MIN as the lookback (covers all TFs)
-    # This ensures we have enough data for monthly TF feature extraction
-    start_idx = max(0, idx - SCANNER_LOOKBACK_5MIN)
-
-    if include_forward:
-        end_idx = min(len(df), idx + forward_bars)
-    else:
-        end_idx = idx
-
-    sliced = df.iloc[start_idx:end_idx]
-    offset = idx - start_idx  # New idx position in sliced data
-
-    return sliced, offset
-
-
 def _get_optimal_workers(requested: Optional[int] = None) -> int:
-    """
-    Get optimal number of worker processes.
-
-    Args:
-        requested: User-requested worker count, or None for auto-detect
-
-    Returns:
-        Number of workers to use
-    """
+    """Get optimal number of worker processes."""
     if requested is not None:
         return max(1, requested)
-
-    # Auto-detect: use CPU count but leave 1 core free for main process
     try:
         cpus = cpu_count()
         if cpus is None:
-            cpus = 8  # Safe default when cpu_count() returns None
-        # Use cpus-1 (leave one core for main process), minimum 1
-        # No cap - use --workers flag to limit if needed
+            cpus = 8
         return max(1, cpus - 1)
     except:
-        return 4  # Safe default
+        return 4
 
-
-# =============================================================================
-# Main Scanner Function
-# =============================================================================
 
 def scan_channels_two_pass(
     tsla_df: pd.DataFrame,
@@ -1125,7 +547,6 @@ def scan_channels_two_pass(
     vix_df: pd.DataFrame,
     step: int = 10,
     warmup_bars: int = 32760,
-    channel_detection_step: int = 1,
     max_samples: Optional[int] = None,
     workers: int = 4,
     batch_size: int = 8,
@@ -1136,146 +557,97 @@ def scan_channels_two_pass(
     incremental_chunk: int = 1000
 ) -> List[ChannelSample]:
     """
-    Scan for channels using the efficient two-pass labeling system.
+    Scan for channels using the two-pass labeling system.
 
-    TWO-PASS APPROACH:
-    1. **Pre-compute (Pass 1)**: Run detect_all_channels() once on entire dataset
-    2. **Label (Pass 2)**: Run generate_all_labels() to label all channels at once
-    3. **Scan**: For each position, detect channels and look up labels from map (O(1))
+    CHANNEL-END SAMPLING ARCHITECTURE:
+    1. PASS 1: detect_all_channels() - find all channels
+    2. PASS 2: generate_all_labels() - compute labels at channel END
+    3. SCAN: Iterate over detected channels - each channel = ONE sample
 
-    This approach pre-computes all channels once, then performs O(1) lookups for labels
-    instead of scanning forward thousands of bars per sample.
+    Each detected channel produces EXACTLY ONE sample at its end position.
+    The --step parameter controls channel detection spacing in Pass 1.
 
     Args:
         tsla_df: TSLA OHLCV DataFrame with DatetimeIndex
         spy_df: SPY OHLCV DataFrame aligned to TSLA
         vix_df: VIX OHLCV DataFrame aligned to TSLA
-        step: Number of bars between samples (default 10)
-        warmup_bars: Minimum bars required before first sample (default 32760)
-        channel_detection_step: Step for channel detection in Pass 1 (default 1)
-        max_samples: Maximum number of samples to generate (default None = unlimited)
+        step: Step size for channel detection in Pass 1 (default 10)
+        warmup_bars: Minimum 5min bars before first sample (default 32760)
+        max_samples: Maximum samples to generate (None = unlimited)
         workers: Number of parallel workers (default 4)
-        batch_size: Positions per batch for parallel processing (default 8)
+        batch_size: Channels per batch for parallel processing (default 8)
         progress: Show progress bar (default True)
-        strict: If True, raise on any errors. If False, skip failed samples (default True)
-        output_path: Optional output path for saving partial results on interrupt
+        strict: Raise on errors (default True)
+        output_path: Output file path for saving results
+        incremental_path: Temp file for incremental writes
+        incremental_chunk: Samples to buffer before writing (default 1000)
 
     Returns:
-        List of ChannelSample objects with tf_features and labels
-
-    Raises:
-        DataLoadError: If data validation fails
-        ValidationError: If strict=True and any sample fails validation
+        List of ChannelSample objects
     """
     global _shutdown_requested
     _shutdown_requested = False
 
-    # Ensure multiprocessing is configured (safe to call multiple times)
-    # This is critical for direct imports that bypass main()
     _setup_multiprocessing()
 
-    # Set up signal handler for graceful shutdown
     original_sigint = signal.signal(signal.SIGINT, _signal_handler)
     original_sigterm = signal.signal(signal.SIGTERM, _signal_handler)
 
     n_bars = len(tsla_df)
 
-    # Check memory availability
     _check_memory_availability(workers, n_bars)
 
-    # FIX #5: Validate TSLA/SPY/VIX alignment
-    # All three must have identical length and aligned timestamps
+    # Validate alignment
     if len(spy_df) != n_bars:
-        raise DataLoadError(
-            f"TSLA/SPY length mismatch! TSLA has {n_bars} bars, SPY has {len(spy_df)} bars. "
-            f"These must be aligned before scanning."
-        )
+        raise DataLoadError(f"TSLA/SPY length mismatch! TSLA has {n_bars} bars, SPY has {len(spy_df)} bars.")
     if len(vix_df) != n_bars:
-        raise DataLoadError(
-            f"TSLA/VIX length mismatch! TSLA has {n_bars} bars, VIX has {len(vix_df)} bars. "
-            f"These must be aligned before scanning."
-        )
-
-    # Check index alignment (first and last timestamps)
+        raise DataLoadError(f"TSLA/VIX length mismatch! TSLA has {n_bars} bars, VIX has {len(vix_df)} bars.")
     if tsla_df.index[0] != spy_df.index[0] or tsla_df.index[-1] != spy_df.index[-1]:
-        raise DataLoadError(
-            f"TSLA/SPY timestamp mismatch! TSLA: {tsla_df.index[0]} to {tsla_df.index[-1]}, "
-            f"SPY: {spy_df.index[0]} to {spy_df.index[-1]}. Timestamps must be aligned."
-        )
+        raise DataLoadError("TSLA/SPY timestamp mismatch!")
     if tsla_df.index[0] != vix_df.index[0] or tsla_df.index[-1] != vix_df.index[-1]:
-        raise DataLoadError(
-            f"TSLA/VIX timestamp mismatch! TSLA: {tsla_df.index[0]} to {tsla_df.index[-1]}, "
-            f"VIX: {vix_df.index[0]} to {vix_df.index[-1]}. Timestamps must be aligned."
-        )
+        raise DataLoadError("TSLA/VIX timestamp mismatch!")
 
     print(f"[VALIDATION] Input alignment OK: {n_bars} bars, timestamps aligned")
 
-    # Calculate position range
-    start_idx = warmup_bars
-    end_idx = n_bars  # No forward buffer needed - labels come from map
-
-    if start_idx >= end_idx:
-        raise DataLoadError(
-            f"Not enough data. Have {n_bars} bars, need at least "
-            f"{warmup_bars} for warmup."
-        )
-
-    # Calculate estimated speedup (conservative estimate based on workers)
-    # Amdahl's law with ~80% parallelizable workload
-    parallel_enabled = workers > 1
-    if parallel_enabled:
-        parallel_fraction = 0.80
-        estimated_speedup = 1.0 / ((1.0 - parallel_fraction) + (parallel_fraction / workers))
-    else:
-        estimated_speedup = 1.0
-
     print("=" * 60)
-    if parallel_enabled:
-        print("V15 Channel Scanner - Parallel Processing Enabled")
-    else:
-        print("V15 Channel Scanner - Sequential Mode")
+    print("V15 Channel Scanner - CHANNEL-END SAMPLING Architecture")
     print("=" * 60)
-    print(f"  Workers: {workers} {'(parallel)' if parallel_enabled else '(sequential)'}")
-    print(f"  Batch size: {batch_size} positions")
-    print(f"  Estimated speedup: ~{estimated_speedup:.1f}x")
+    print(f"  Workers: {workers}")
+    print(f"  Batch size: {batch_size} channels")
+    print(f"  Architecture: ONE sample per detected channel at channel END")
 
     # =========================================================================
-    # PASS 1: Pre-compute all channels across the entire dataset (TSLA + SPY)
+    # PASS 1: Pre-compute all channels
     # =========================================================================
     print("\n[PASS 1] Detecting all channels across dataset...")
-    print(f"  Assets: TSLA, SPY")
     print(f"  Timeframes: {list(TIMEFRAMES)}")
     print(f"  Windows: {list(STANDARD_WINDOWS)}")
-    print(f"  Channel detection step: {channel_detection_step}")
+    print(f"  Channel detection step: {step}")
 
     pass1_start = time.time()
 
-    # TSLA channel detection
     print("\n  [PASS 1] Detecting TSLA channels...")
     tsla_channel_map, tsla_resampled_dfs = detect_all_channels(
         df=tsla_df,
         timeframes=list(TIMEFRAMES),
         windows=list(STANDARD_WINDOWS),
-        step=channel_detection_step,
+        step=step,
         min_cycles=1,
         min_gap_bars=5,
-        progress_callback=None,
         workers=workers,
         verbose=False
     )
     tsla_channels = sum(len(chs) for chs in tsla_channel_map.values())
     print(f"  TSLA: {tsla_channels} channels detected")
 
-    # SPY channel detection
     print("\n  [PASS 1] Detecting SPY channels...")
     spy_channel_map, spy_resampled_dfs = detect_all_channels(
         df=spy_df,
         timeframes=list(TIMEFRAMES),
         windows=list(STANDARD_WINDOWS),
-        step=channel_detection_step,
+        step=step,
         min_cycles=1,
         min_gap_bars=5,
-        progress_callback=None,
         workers=workers,
         verbose=False
     )
@@ -1283,91 +655,81 @@ def scan_channels_two_pass(
     print(f"  SPY: {spy_channels} channels detected")
 
     pass1_time = time.time() - pass1_start
+    print(f"\n  Total: {tsla_channels + spy_channels} channels, Pass 1 time: {pass1_time:.1f}s")
 
-    # Count channels detected
-    total_channels = tsla_channels + spy_channels
-    print(f"\n  Total: {total_channels} channels across all TF/window combinations")
-    print(f"  Pass 1 time: {pass1_time:.1f}s")
-    print("\n[PASS 1] Complete!")
+    # =========================================================================
+    # PASS 2: Generate labels at channel END positions
+    # =========================================================================
     print("\n[PASS 2] Generating labels from channel maps...")
-
-    # =========================================================================
-    # PASS 2: Generate labels for all channels (TSLA + SPY)
-    # =========================================================================
     pass2_start = time.time()
 
-    # TSLA label generation
     print("\n  [PASS 2] Generating TSLA labels (hybrid method)...")
     tsla_labeled_map: LabeledChannelMap = generate_all_labels(
         channel_map=tsla_channel_map,
         resampled_dfs=tsla_resampled_dfs,
         labeling_method="hybrid",
-        progress_callback=None,
         verbose=False
     )
     tsla_labeled = sum(len(lcs) for lcs in tsla_labeled_map.values())
-    tsla_valid = sum(
-        1 for lcs in tsla_labeled_map.values()
-        for lc in lcs if lc.labels.direction_valid
-    )
+    tsla_valid = sum(1 for lcs in tsla_labeled_map.values() for lc in lcs if lc.labels.direction_valid)
     print(f"  TSLA: {tsla_labeled} labeled, {tsla_valid} valid direction labels")
 
-    # SPY label generation
     print("\n  [PASS 2] Generating SPY labels (hybrid method)...")
     spy_labeled_map: LabeledChannelMap = generate_all_labels(
         channel_map=spy_channel_map,
         resampled_dfs=spy_resampled_dfs,
         labeling_method="hybrid",
-        progress_callback=None,
         verbose=False
     )
     spy_labeled = sum(len(lcs) for lcs in spy_labeled_map.values())
-    spy_valid = sum(
-        1 for lcs in spy_labeled_map.values()
-        for lc in lcs if lc.labels.direction_valid
-    )
+    spy_valid = sum(1 for lcs in spy_labeled_map.values() for lc in lcs if lc.labels.direction_valid)
     print(f"  SPY: {spy_labeled} labeled, {spy_valid} valid direction labels")
 
     pass2_time = time.time() - pass2_start
+    print(f"\n  Total: {tsla_labeled + spy_labeled} channels labeled, Pass 2 time: {pass2_time:.1f}s")
 
-    # Count labeled channels
-    total_labeled = tsla_labeled + spy_labeled
-    valid_labels = tsla_valid + spy_valid
-    print(f"\n  Total: {total_labeled} channels labeled")
-    print(f"  Total valid direction labels: {valid_labels}")
-    print(f"  Pass 2 time: {pass2_time:.1f}s")
-
-    # Free Pass-1 artifacts - no longer needed after labels are generated
-    # This saves 100-500MB depending on dataset size
+    # Free Pass-1 artifacts
     del tsla_resampled_dfs, spy_resampled_dfs
     del tsla_channel_map, spy_channel_map
     gc.collect()
-    print("  [Memory] Freed Pass-1 artifacts (resampled_dfs, channel_maps)")
 
     # =========================================================================
-    # SCAN: Process each position using lazy label lookups
+    # SCAN: Create ONE sample per detected TSLA channel at channel END
     # =========================================================================
-    positions = list(range(start_idx, end_idx, step))
+    print("\n[SCAN] Creating slim labeled maps...")
+    tsla_slim_map = _create_slim_labeled_map(tsla_labeled_map)
+    spy_slim_map = _create_slim_labeled_map(spy_labeled_map)
 
-    # Limit positions if max_samples is specified
-    if max_samples is not None and len(positions) > max_samples:
-        positions = positions[:max_samples]
-        print(f"\n[SCAN] Limited to {max_samples} positions (max_samples specified)")
+    del tsla_labeled_map, spy_labeled_map
+    gc.collect()
 
-    total_positions = len(positions)
+    # Build list of (tf, window, channel_idx) for all valid TSLA channels
+    channel_work_items = []
+    for (tf, window), slim_channels in tsla_slim_map.items():
+        for idx, slim_channel in enumerate(slim_channels):
+            if slim_channel.channel_valid and slim_channel.labels is not None:
+                end_ts = slim_channel.end_timestamp
+                try:
+                    idx_5min = tsla_df.index.searchsorted(end_ts, side='right') - 1
+                    if idx_5min >= warmup_bars:
+                        channel_work_items.append((tf, window, idx))
+                except:
+                    pass
 
-    print("\n[SCANNING] Starting sample generation (lazy label lookups)...")
-    print(f"  Positions to scan: {len(positions)}")
-    print(f"  Step size: {step}")
-    print(f"  Position range: {start_idx} to {end_idx}")
-    print(f"  Expected features per sample: {EXPECTED_FEATURE_COUNT}")
+    total_channels_to_process = len(channel_work_items)
+
+    if max_samples is not None and total_channels_to_process > max_samples:
+        channel_work_items = channel_work_items[:max_samples]
+        print(f"\n[SCAN] Limited to {max_samples} channels (max_samples specified)")
+
+    print(f"\n[SCAN] Starting sample generation...")
+    print(f"  Channels to process: {len(channel_work_items)}")
+    print(f"  Each channel produces ONE sample at its end position")
     print(f"  Processing mode: {'PARALLEL' if workers > 1 else 'SEQUENTIAL'}")
-    if workers > 1:
-        print(f"  Workers: {workers}, Batch size: {batch_size}")
 
     samples = []
     errors = []
-    error_count = 0  # Track total errors (even if list is truncated)
+    error_count = 0
     valid_count = 0
     skipped_count = 0
     label_hit_count = 0
@@ -1376,67 +738,33 @@ def scan_channels_two_pass(
     scan_start = time.time()
 
     try:
-        # Convert DataFrames to pickle-safe format ONCE before processing
         tsla_data = _convert_df_to_pickle_safe(tsla_df)
         spy_data = _convert_df_to_pickle_safe(spy_df)
         vix_data = _convert_df_to_pickle_safe(vix_df)
 
-        # Create batches of positions (just the indices, not the large data)
-        batch_size_actual = batch_size or 8
-        batches = [positions[i:i+batch_size_actual] for i in range(0, len(positions), batch_size_actual)]
-
+        batches = [channel_work_items[i:i+batch_size] for i in range(0, len(channel_work_items), batch_size)]
         total_batches = len(batches)
         print(f"  Total batches: {total_batches}")
 
-        # Check if shutdown was requested during Pass 1/2 - honor it instead of resetting
         if _shutdown_requested:
             print("\n[INTERRUPT] Shutdown was requested during Pass 1/2. Skipping scan phase.")
-            print("  (Already-detected channels and labels are lost. Re-run for complete scan.)")
-            return samples  # Return empty, let finally block handle cleanup
+            return samples
 
         if workers > 1:
-            # =========================================================================
-            # PARALLEL PROCESSING with Pool (using initializer for efficiency)
-            # =========================================================================
-            # The large data (DataFrames, labeled maps for TSLA/SPY) is passed via Pool initializer,
-            # which serializes it ONCE per worker instead of ONCE per batch.
-            # This dramatically reduces pickle overhead for 100s of batches.
             print(f"\n  Starting parallel processing with {workers} workers...")
-            print(f"  Using Pool initializer (data serialized {workers}x instead of {total_batches}x)")
-
-            # CRITICAL MEMORY FIX: Create slim labeled maps for workers
-            # Full LabeledChannelMap contains Channel objects with large numpy arrays
-            # (upper_line, lower_line, center_line, etc.) that are NEVER used during scanning.
-            # Slim maps only contain timestamps + labels, reducing memory from GBs to MBs.
-            # This prevents the 80GB+ memory explosion when forking 80 workers.
-            print("  Creating slim labeled maps (stripping unused Channel arrays)...")
-            tsla_slim_map = _create_slim_labeled_map(tsla_labeled_map)
-            spy_slim_map = _create_slim_labeled_map(spy_labeled_map)
-
-            # Free the full labeled maps - no longer needed after slim maps created
-            # This reduces main process memory before forking workers
-            del tsla_labeled_map, spy_labeled_map
-            gc.collect()
-            print(f"  [Memory] Freed full labeled maps, slim maps ready for worker fork")
 
             with Pool(
                 processes=workers,
                 initializer=_init_worker,
                 initargs=(tsla_data, spy_data, vix_data, tsla_slim_map, spy_slim_map,
                           list(TIMEFRAMES), list(STANDARD_WINDOWS)),
-                maxtasksperchild=50  # Recycle workers every 50 batches to free accumulated memory
+                maxtasksperchild=50
             ) as pool:
-                # Process batches in parallel (unordered for speed, we sort at the end anyway)
-                results_iter = pool.imap_unordered(_process_batch_with_globals, batches)
-
-                # Process results as they come in
-                batch_iterator = tqdm(results_iter, total=total_batches,
-                                     desc="Processing batches", unit="batch") if progress else results_iter
+                results_iter = pool.imap_unordered(_process_channel_batch, batches)
+                batch_iterator = tqdm(results_iter, total=total_batches, desc="Processing channels", unit="batch") if progress else results_iter
 
                 batches_processed = 0
                 for batch_results in batch_iterator:
-                    # CRITICAL: Process completed batch results FIRST, then check shutdown
-                    # This ensures we don't lose already-completed work
                     for result in batch_results:
                         if result.get('sample'):
                             samples.append(result['sample'])
@@ -1450,79 +778,52 @@ def scan_channels_two_pass(
                             error_count += 1
                             if len(errors) < MAX_ERRORS_IN_MEMORY:
                                 errors.append(error_msg)
-                            elif len(errors) == MAX_ERRORS_IN_MEMORY:
-                                errors.append(f"... (additional errors truncated, showing first {MAX_ERRORS_IN_MEMORY})")
                             if strict:
                                 pool.terminate()
-                                error_with_trace = result['error']
-                                if result.get('traceback'):
-                                    error_with_trace += f"\nWorker traceback:\n{result['traceback']}"
-                                raise ValidationError(error_with_trace)
+                                raise ValidationError(error_msg)
                         elif result.get('skipped'):
                             skipped_count += 1
 
                     batches_processed += 1
-
-                    # Explicit cleanup: free batch_results memory immediately
                     del batch_results
 
-                    # Incremental write: flush samples to temp file when threshold reached
                     if incremental_path and len(samples) >= incremental_chunk:
                         flushed = _flush_samples_to_temp(samples, incremental_path)
-                        samples.clear()  # Free memory
+                        samples.clear()
                         if progress:
                             tqdm.write(f"  [Incremental] Flushed {flushed} samples to disk")
 
-                    # Periodic garbage collection to prevent memory buildup
                     if batches_processed % 20 == 0:
                         gc.collect()
 
-                    # Check for shutdown request AFTER processing batch (no data loss)
                     if _shutdown_requested:
                         print(f"\n[INTERRUPT] Stopping at batch {batches_processed}/{total_batches}")
-                        print(f"  Saved {valid_count} samples so far (no data lost from completed batches)")
                         pool.terminate()
                         break
 
         else:
-            # =========================================================================
-            # SEQUENTIAL PROCESSING (fallback when workers=1)
-            # =========================================================================
-            # In sequential mode, we set the globals directly in the main process
-            # and use the same worker function for consistency
             print(f"\n  Running in sequential mode...")
 
-            # Create slim labeled maps (same as parallel mode) for consistency
-            # The worker function expects SlimLabeledChannel objects with start_timestamp/end_timestamp
-            print("  Creating slim labeled maps...")
-            tsla_slim_map = _create_slim_labeled_map(tsla_labeled_map)
-            spy_slim_map = _create_slim_labeled_map(spy_labeled_map)
-
-            # Set globals for sequential processing (same as _init_worker does)
             global _WORKER_TSLA_DF, _WORKER_SPY_DF, _WORKER_VIX_DF
-            global _WORKER_TSLA_LABELED_MAP, _WORKER_SPY_LABELED_MAP
+            global _WORKER_TSLA_SLIM_MAP, _WORKER_SPY_SLIM_MAP
             global _WORKER_TIMEFRAMES, _WORKER_WINDOWS
             _WORKER_TSLA_DF = _reconstruct_df_from_pickle_safe(tsla_data)
             _WORKER_SPY_DF = _reconstruct_df_from_pickle_safe(spy_data)
             _WORKER_VIX_DF = _reconstruct_df_from_pickle_safe(vix_data)
-            _WORKER_TSLA_LABELED_MAP = tsla_slim_map
-            _WORKER_SPY_LABELED_MAP = spy_slim_map
+            _WORKER_TSLA_SLIM_MAP = tsla_slim_map
+            _WORKER_SPY_SLIM_MAP = spy_slim_map
             _WORKER_TIMEFRAMES = list(TIMEFRAMES)
             _WORKER_WINDOWS = list(STANDARD_WINDOWS)
 
-            batch_iterator = tqdm(batches, desc="Processing batches",
-                                 unit="batch") if progress else batches
+            batch_iterator = tqdm(batches, desc="Processing channels", unit="batch") if progress else batches
 
             for batch in batch_iterator:
-                # Check for shutdown request
                 if _shutdown_requested:
                     print(f"\n[INTERRUPT] Stopping scan")
                     break
 
-                # Process batch using the same function as parallel mode
-                batch_results = _process_batch_with_globals(batch)
+                batch_results = _process_channel_batch(batch)
 
-                # Aggregate results from this batch
                 for result in batch_results:
                     if result.get('sample'):
                         samples.append(result['sample'])
@@ -1536,20 +837,14 @@ def scan_channels_two_pass(
                         error_count += 1
                         if len(errors) < MAX_ERRORS_IN_MEMORY:
                             errors.append(error_msg)
-                        elif len(errors) == MAX_ERRORS_IN_MEMORY:
-                            errors.append(f"... (additional errors truncated, showing first {MAX_ERRORS_IN_MEMORY})")
                         if strict:
-                            error_with_trace = result['error']
-                            if result.get('traceback'):
-                                error_with_trace += f"\nWorker traceback:\n{result['traceback']}"
-                            raise ValidationError(error_with_trace)
+                            raise ValidationError(error_msg)
                     elif result.get('skipped'):
                         skipped_count += 1
 
-                # Incremental write: flush samples to temp file when threshold reached
                 if incremental_path and len(samples) >= incremental_chunk:
                     flushed = _flush_samples_to_temp(samples, incremental_path)
-                    samples.clear()  # Free memory
+                    samples.clear()
                     if progress:
                         tqdm.write(f"  [Incremental] Flushed {flushed} samples to disk")
 
@@ -1558,18 +853,15 @@ def scan_channels_two_pass(
         _shutdown_requested = True
 
     finally:
-        # Restore original signal handlers
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
 
-        # Save partial results if interrupted
         if _shutdown_requested and output_path:
             _save_partial_results(samples, output_path)
 
     scan_time = time.time() - scan_start
     total_time = pass1_time + pass2_time + scan_time
 
-    # Sort samples by index
     samples.sort(key=lambda s: s.channel_end_idx)
 
     # Print summary
@@ -1579,85 +871,54 @@ def scan_channels_two_pass(
     else:
         print("SCAN COMPLETE!")
     print(f"{'=' * 60}")
-    print(f"  Total positions scanned: {total_positions}")
-    print(f"  Valid samples found: {valid_count}")
-    print(f"  Skipped (no channel): {skipped_count}")
-    print(f"  Errors: {error_count}" + (f" ({len(errors)} shown)" if error_count > len(errors) else ""))
+    print(f"  Total channels processed: {len(channel_work_items)}")
+    print(f"  Valid samples created: {valid_count}")
+    print(f"  Skipped (invalid/no labels): {skipped_count}")
+    print(f"  Errors: {error_count}")
 
     if valid_count > 0:
         avg_features = sum(len(s.tf_features) for s in samples) / valid_count
         print(f"  Average features per sample: {avg_features:.0f}")
 
-    if total_positions > 0:
-        skip_rate = 100 * (total_positions - valid_count) / total_positions
-        print(f"  Skip rate: {skip_rate:.1f}%")
-
-    # Label lookup stats
     total_lookups = label_hit_count + label_miss_count
     if total_lookups > 0:
         hit_rate = 100 * label_hit_count / total_lookups
         print(f"\n  Label lookup stats:")
-        print(f"    Total lookups: {total_lookups}")
         print(f"    Hits: {label_hit_count} ({hit_rate:.1f}%)")
         print(f"    Misses: {label_miss_count} ({100 - hit_rate:.1f}%)")
 
-    # Timing summary
     print(f"\n  Timing breakdown:")
     print(f"    Pass 1 (channel detection): {pass1_time:.1f}s")
     print(f"    Pass 2 (label generation):  {pass2_time:.1f}s")
     print(f"    Scan loop:                  {scan_time:.1f}s")
     print(f"    Total:                      {total_time:.1f}s")
 
-    print(f"\n[COMPLETE] Scanned {valid_count} samples in {total_time:.1f} seconds")
+    print(f"\n[COMPLETE] Created {valid_count} samples in {total_time:.1f} seconds")
 
-    # FIX #6: Log ALL errors visibly (not just first 5)
     if errors:
         print(f"\n{'=' * 60}")
         print(f"ERRORS ENCOUNTERED: {len(errors)}")
         print(f"{'=' * 60}")
-        for i, err in enumerate(errors):
-            print(f"\n[ERROR {i+1}/{len(errors)}]")
-            # Split multi-line errors for better readability
-            for line in str(err).split('\n'):
+        for i, err in enumerate(errors[:10]):
+            print(f"\n[ERROR {i+1}]")
+            for line in str(err).split('\n')[:5]:
                 print(f"  {line}")
-        print(f"\n{'=' * 60}")
-        if strict:
-            print("NOTE: strict=True, errors will cause failure")
-        else:
-            print("NOTE: strict=False, errors were logged but samples skipped")
-
-    # Note about window selection strategies for training
-    print(f"\n{'=' * 60}")
-    print("WINDOW SELECTION STRATEGIES")
-    print(f"{'=' * 60}")
-    print("When training, you can specify a window selection strategy:")
-    print("  --strategy bounce_first    : Select window with most complete cycles (default)")
-    print("  --strategy label_validity  : Prioritize windows with valid labels")
-    print("  --strategy balanced_score  : Balance between cycle count and label quality")
-    print("  --strategy quality_score   : Weight by overall channel quality metrics")
-    print("  --strategy learned         : Use learned window selection (requires --end-to-end)")
-    print("\nFor end-to-end learning:")
-    print("  --end-to-end               : Enable differentiable window selection")
-    print("  --window-selection-weight  : Loss weight for window selection (default: 0.1)")
+        if len(errors) > 10:
+            print(f"\n  ... and {len(errors) - 10} more errors")
 
     # Final flush for incremental mode
     if incremental_path:
-        # Flush any remaining samples
         if samples:
             flushed = _flush_samples_to_temp(samples, incremental_path)
             print(f"\n  [Incremental] Final flush: {flushed} samples")
             samples.clear()
 
-        # If output_path is specified, stream directly to final output (memory efficient)
         if output_path:
             sample_count = _consolidate_temp_to_final(incremental_path, output_path, progress=progress)
             print(f"  [Incremental] Wrote {sample_count} samples directly to {output_path}")
-            # Return empty list - samples are on disk, not in memory
-            # This is the key memory optimization: caller doesn't need samples in RAM
             return []
         else:
-            # No output path - user wants samples in memory (backward compatible)
-            print(f"  [Incremental] Reading samples back into memory (no output path specified)...")
+            print(f"  [Incremental] Reading samples back into memory...")
             with open(incremental_path, 'rb') as f:
                 while True:
                     try:
@@ -1665,24 +926,14 @@ def scan_channels_two_pass(
                         samples.append(sample)
                     except EOFError:
                         break
-            print(f"  [Incremental] Loaded {len(samples)} total samples from temp file")
             os.remove(incremental_path)
-            print(f"  [Incremental] Cleaned up temp file")
-            # Sort samples since they may be out of order
             samples.sort(key=lambda s: s.channel_end_idx)
 
     return samples
 
 
-# =============================================================================
-# Incremental Write Helpers
-# =============================================================================
-
 def _flush_samples_to_temp(samples: list, temp_file_path: str) -> int:
-    """
-    Write samples to temp file and return count written.
-    Uses append mode with streaming pickle.
-    """
+    """Write samples to temp file and return count written."""
     if not samples or not temp_file_path:
         return 0
 
@@ -1695,27 +946,15 @@ def _flush_samples_to_temp(samples: list, temp_file_path: str) -> int:
 
 
 def _consolidate_temp_to_final(temp_file_path: str, final_path: str, progress: bool = True) -> int:
-    """
-    Read all samples from temp file and write to final pickle.
-
-    Note: This still requires loading all samples into memory for pickle list format,
-    but the key benefit is that samples are NOT returned to caller - memory is freed
-    immediately after writing. The samples exist only on disk after this function.
-
-    Returns:
-        int: Count of samples written
-    """
-    # Handle case where temp file doesn't exist (zero samples generated)
+    """Read all samples from temp file and write to final pickle."""
     if not os.path.exists(temp_file_path):
-        print(f"\n  [Incremental] No samples generated - temp file does not exist")
-        print(f"  [Incremental] Writing empty sample list to {final_path}...")
+        print(f"\n  [Incremental] No samples generated")
         with open(final_path, 'wb') as f:
             pickle.dump([], f)
         return 0
 
     samples = []
 
-    # Read all samples from temp file
     print(f"\n  [Incremental] Consolidating temp file to final output...")
     with open(temp_file_path, 'rb') as f:
         while True:
@@ -1725,12 +964,9 @@ def _consolidate_temp_to_final(temp_file_path: str, final_path: str, progress: b
             except EOFError:
                 break
 
-    # Sort samples by index before writing (they may be out of order from parallel processing)
     samples.sort(key=lambda s: s.channel_end_idx)
-
     print(f"  [Incremental] Read and sorted {len(samples)} samples from temp file")
 
-    # Write to final output
     print(f"  [Incremental] Writing to {final_path}...")
     count = len(samples)
     with open(final_path, 'wb') as f:
@@ -1740,161 +976,108 @@ def _consolidate_temp_to_final(temp_file_path: str, final_path: str, progress: b
         else:
             pickle.dump(samples, f)
 
-    # Clean up temp file
     os.remove(temp_file_path)
     print(f"  [Incremental] Cleaned up temp file")
 
-    # Explicitly free memory - samples now only exist on disk
     del samples
-
     return count
 
 
-# =============================================================================
-# Main Entry Point
-# =============================================================================
-
 def main():
     """Main entry point for the scanner."""
-    # Setup multiprocessing for cross-platform compatibility
     _setup_multiprocessing()
 
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='V15 Two-Pass Channel Scanner')
-    parser.add_argument('--step', type=int, default=100,
-                        help='Step size for sample generation (default: 100)')
-    parser.add_argument('--channel-step', type=int, default=5,
-                        help='Step size for channel detection in Pass 1 (default: 5)')
+    parser = argparse.ArgumentParser(description='V15 Two-Pass Channel Scanner (Channel-End Architecture)')
+    parser.add_argument('--step', type=int, default=10,
+                        help='Step size for CHANNEL DETECTION in Pass 1 (default: 10)')
     parser.add_argument('--max-samples', type=int, default=None,
-                        help='Maximum number of samples to generate (default: unlimited)')
+                        help='Maximum number of samples to generate')
     parser.add_argument('--output', type=str, default=None,
                         help='Output file path for samples (pickle format)')
     parser.add_argument('--workers', type=int, default=None,
-        help='Number of worker processes (default: auto-detect CPU count)')
+                        help='Number of worker processes (default: auto-detect)')
     parser.add_argument('--batch-size', type=int, default=8,
-        help='Positions per batch for parallel processing (default: 8)')
+                        help='Channels per batch for parallel processing (default: 8)')
     parser.add_argument('--no-parallel', action='store_true',
-        help='Disable parallel processing (run sequentially)')
+                        help='Disable parallel processing')
     parser.add_argument('--data-dir', type=str, default='data',
-        help='Data directory path (default: data)')
+                        help='Data directory path (default: data)')
     parser.add_argument('--incremental', action='store_true',
-        help='Write results incrementally to disk to reduce memory usage (recommended for large scans)')
+                        help='Write results incrementally to disk')
     parser.add_argument('--incremental-chunk', type=int, default=1000,
-        help='Number of samples to buffer before writing to disk (default: 1000). Specifying this automatically enables --incremental.')
+                        help='Number of samples to buffer before writing (default: 1000)')
     args = parser.parse_args()
 
-    # Auto-enable incremental if chunk size specified (either flag works)
     if args.incremental_chunk != 1000:
         args.incremental = True
 
-    # Warn if --incremental is used without --output (it becomes a no-op)
     if args.incremental and not args.output:
         print("\n" + "=" * 60)
         print("WARNING: --incremental has no effect without --output")
-        print("  Incremental mode writes samples to a temp file during scanning.")
-        print("  Without --output, there's no temp file to write to.")
-        print("  Add --output <path> or remove --incremental")
         print("=" * 60 + "\n")
-        args.incremental = False  # Disable since it won't do anything
+        args.incremental = False
 
-    # Determine parallelization settings
     if args.no_parallel:
         workers = 1
         batch_size = 1
-        parallel_enabled = False
     else:
         workers = _get_optimal_workers(args.workers)
         batch_size = args.batch_size
-        parallel_enabled = True
 
-    # Calculate estimated speedup (conservative estimate based on workers)
-    # Amdahl's law with ~80% parallelizable workload
-    if workers > 1:
-        parallel_fraction = 0.80
-        estimated_speedup = 1.0 / ((1.0 - parallel_fraction) + (parallel_fraction / workers))
-    else:
-        estimated_speedup = 1.0
-
-    # Print parallel processing header
     print("=" * 60)
-    if parallel_enabled:
-        print("V15 Channel Scanner - Parallel Processing Enabled")
-    else:
-        print("V15 Channel Scanner - Sequential Mode")
+    print("V15 Channel Scanner - CHANNEL-END SAMPLING Architecture")
     print("=" * 60)
-
-    if parallel_enabled:
-        worker_source = "(auto-detected)" if args.workers is None else "(user-specified)"
-        print(f"  Workers: {workers} {worker_source}")
-        print(f"  Batch size: {batch_size} positions")
-        print(f"  Estimated speedup: ~{estimated_speedup:.1f}x")
-    else:
-        print("  Parallel processing disabled (--no-parallel)")
+    print(f"\nArchitecture: ONE sample per detected channel at channel END")
+    print(f"  - Each channel produces exactly one sample")
+    print(f"  - Sample position = channel end position")
+    print(f"  - --step controls channel detection step, not sample step")
 
     print(f"\nConfiguration:")
-    print(f"  Step size: {args.step}")
-    print(f"  Channel detection step: {args.channel_step}")
+    print(f"  Channel detection step: {args.step}")
     print(f"  Max samples: {args.max_samples if args.max_samples else 'unlimited'}")
-    print(f"  Output file: {args.output if args.output else 'none (not saving)'}")
-    if args.incremental:
-        print(f"  Incremental mode: ENABLED (chunk size: {args.incremental_chunk})")
+    print(f"  Output file: {args.output if args.output else 'none'}")
+    print(f"  Workers: {workers}")
 
-    # Setup incremental writes if enabled
     temp_file_path = None
     if args.incremental and args.output:
         temp_file_path = args.output + '.tmp'
-        # Clear any existing temp file
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
-        print(f"  Temp file: {temp_file_path}")
 
     print(f"\nLoading market data from {args.data_dir}...")
     tsla, spy, vix = load_market_data(args.data_dir)
     print(f"Loaded {len(tsla)} bars")
     print(f"Date range: {tsla.index[0]} to {tsla.index[-1]}")
 
-    # Check memory availability
     _check_memory_availability(workers, len(tsla))
 
     print(f"\nExpected feature count: {EXPECTED_FEATURE_COUNT}")
-    print(f"  - TF-specific: {TOTAL_FEATURES - FEATURE_COUNTS['events_total']}")
-    print(f"  - Events: {FEATURE_COUNTS['events_total']}")
-    print(f"  - Bar metadata: {FEATURE_COUNTS['bar_metadata_per_tf'] * len(TIMEFRAMES)}")
 
-    print(f"\nRunning TWO-PASS scan (step={args.step})...")
+    print(f"\nRunning TWO-PASS scan (channel detection step={args.step})...")
     samples = scan_channels_two_pass(
         tsla, spy, vix,
         step=args.step,
-        channel_detection_step=args.channel_step,
         max_samples=args.max_samples,
         workers=workers,
         batch_size=batch_size,
         progress=True,
-        strict=True,  # LOUD failures
+        strict=True,
         output_path=args.output,
         incremental_path=temp_file_path if args.incremental else None,
         incremental_chunk=args.incremental_chunk
     )
 
-    # Handle output based on whether incremental mode wrote directly to disk
+    # Handle output
     if not samples and args.incremental and args.output:
-        # Samples were written directly to output file by incremental mode
-        # Load first/last sample for display only
-        print(f"\nSamples written directly to {args.output} (incremental mode - memory optimized)")
+        print(f"\nSamples written directly to {args.output} (incremental mode)")
         with open(args.output, 'rb') as f:
             all_samples = pickle.load(f)
         print(f"  Total samples: {len(all_samples)}")
         if all_samples:
-            sample = all_samples[0]
-            print(f"\nFirst sample details:")
-            print(f"  Timestamp: {sample.timestamp}")
-            print(f"  Best window: {sample.best_window}")
-            print(f"  Feature count: {len(sample.tf_features)}")
-            print(f"\nLast sample: {all_samples[-1].timestamp}")
-        # Free memory - samples already on disk
+            print(f"\nFirst sample: {all_samples[0].timestamp}")
+            print(f"Last sample: {all_samples[-1].timestamp}")
         del all_samples
     else:
-        # Normal mode - samples are in memory
         print(f"\nGenerated {len(samples)} samples")
 
         if samples:
@@ -1904,37 +1087,26 @@ def main():
             print(f"  Best window: {sample.best_window}")
             print(f"  Feature count: {len(sample.tf_features)}")
 
-            # Show some feature names
             feature_names = list(sample.tf_features.keys())
             print(f"\n  Sample feature names (first 10):")
             for name in feature_names[:10]:
                 print(f"    - {name}: {sample.tf_features[name]:.4f}")
 
-            # Check for bar metadata features
-            bar_meta_features = [k for k in feature_names if 'bar_completion' in k]
-            if bar_meta_features:
-                print(f"\n  Bar metadata features:")
-                for name in bar_meta_features[:5]:
-                    print(f"    - {name}: {sample.tf_features[name]:.4f}")
-
             print(f"\nLast sample: {samples[-1].timestamp}")
 
-        # Save samples to output file if specified
         if args.output and samples:
             print(f"\nSaving {len(samples)} samples to {args.output}...")
             with open(args.output, 'wb') as f:
-                with tqdm(unit='B', unit_scale=True, unit_divisor=1024,
-                         desc="Saving") as pbar:
+                with tqdm(unit='B', unit_scale=True, unit_divisor=1024, desc="Saving") as pbar:
                     pickle.dump(samples, _ProgressFileWriter(f, pbar))
             print(f"Saved successfully!")
 
 
-# Alias for backward compatibility with pipeline.py
+# Alias for backward compatibility
 scan_channels = scan_channels_two_pass
 
 
 if __name__ == "__main__":
-    # This is REQUIRED for multiprocessing on Windows/macOS
     from multiprocessing import freeze_support
     freeze_support()
     main()

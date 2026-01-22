@@ -49,7 +49,7 @@ Implementation
 - `v15/scanner.py` (writes pickle samples, partial save on interrupt)
 - `v15/pipeline.py` (scan command saves samples to pickle)
 - `v15/training/dataset.py` (`load_samples`)
-- `v15/visual_inspector.py`, `v15/dual_inspector.py`, `v15/deprecated_inspector.py` (load caches for inspection)
+- `v15/dual_inspector.py`, `v15/deprecated_inspector.py` (load caches for inspection)
 - `v15/data/native_tf.py` (separate cache for yfinance data)
 - `v15/dashboard.py` (Streamlit cache decorators for data/model)
 Status

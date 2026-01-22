@@ -8,8 +8,7 @@ superseded by the new unified visualizer in v15/channel_visualizer.py.
 These modules are kept for reference only and should NOT be used in new code.
 
 Deprecated modules:
-- visual_inspector.py - Original visual inspector
-- dual_inspector.py - Dual chart inspector  
+- dual_inspector.py - Dual chart inspector
 - inspector_utils.py - Shared utilities for inspectors
 - old_inspector.py - Legacy inspector implementation
 - inspector_redirect.py - Previous inspector entry point

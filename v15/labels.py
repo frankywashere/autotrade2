@@ -1,7 +1,13 @@
 """
 Two-Pass Label Generation for Channel Break Prediction (v15)
 
-This module implements an efficient two-pass labeling system for channel analysis:
+This module implements an efficient two-pass labeling system for channel analysis.
+Samples are ONLY generated at channel end positions - never mid-channel.
+
+ARCHITECTURE:
+    - Sample position = Channel end position (always)
+    - Labels are computed in Pass 2 at channel end via forward scanning
+    - No need for on-the-fly label computation from arbitrary positions
 
 PASS 1 - detect_all_channels():
     Scans the entire dataset once and detects ALL channels for each TF/window
@@ -9,13 +15,21 @@ PASS 1 - detect_all_channels():
     Complexity: O(N) where N is dataset length.
 
 PASS 2 - generate_all_labels():
-    For each detected channel, looks up the "next channel" in the map to
-    determine break direction and duration. Labels are pre-computed and stored.
+    For each detected channel, uses label_channel_forward_scan() to find breaks
+    by scanning forward from channel end. Also looks up the "next channel" in
+    the map for next_channel_direction. Labels are pre-computed and stored.
     Complexity: O(C) where C is number of channels.
 
 LOOKUP - get_labels_for_position():
-    O(log N) binary search lookup of labels for a specific position in the
-    dataset. Used by training pipeline to get labels for sample positions.
+    O(log N) binary search lookup of pre-computed labels for a specific position.
+    Since samples are only at channel ends, this returns the exact labels computed
+    in Pass 2 - no recalculation needed.
+
+KEY FUNCTIONS:
+    - label_channel_forward_scan(): Computes labels by scanning forward from
+      channel end. Used in Pass 2 for all label computation.
+    - label_channel_from_map(): Legacy function for next_channel lookup.
+    - generate_all_labels(): Orchestrates Pass 2 label generation.
 
 This two-pass approach is significantly more efficient than the previous
 single-pass method which required O(N * max_scan) complexity per sample.
@@ -35,7 +49,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from v7.core.channel import detect_channel, Channel
-from v7.core.timeframe import resample_ohlc
+
+# Use canonical resample_ohlc from v15/core/resample.py (single source of truth)
+# This ensures consistent bar boundaries across Pass 1, feature extraction, and inspector
+from .core.resample import resample_ohlc
 
 # Import ChannelLabels and CrossCorrelationLabels from v15.dtypes
 from .dtypes import ChannelLabels, CrossCorrelationLabels
@@ -44,7 +61,7 @@ from .dtypes import ChannelLabels, CrossCorrelationLabels
 from .config import TF_MAX_SCAN
 
 # Import break scanner for sophisticated break detection
-from .core.break_scanner import scan_for_break, BreakResult, InsufficientDataError
+from .core.break_scanner import scan_for_break, BreakResult, InsufficientDataError, compute_durability_from_result
 
 
 # =============================================================================
@@ -378,19 +395,37 @@ def label_channel_from_map(
     channels = channel_map.get(key, [])
 
     if channel_idx < 0 or channel_idx >= len(channels):
-        # Invalid index
+        # Invalid index - no channel to extract parameters from
         return ChannelLabels(
             duration_bars=0,
             break_direction=int(BreakDirection.UP),
             next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
             timeframe=tf,
+            # Source channel parameters - defaults since no valid channel
+            source_channel_slope=0.0,
+            source_channel_intercept=0.0,
+            source_channel_std_dev=0.0,
+            source_channel_r_squared=0.0,
+            source_channel_direction=-1,
+            # Source channel timestamps - None since no valid channel
+            source_channel_start_ts=None,
+            source_channel_end_ts=None,
+            # Validity flags
             duration_valid=False,
             direction_valid=False,
             next_channel_valid=False
         ), -1
 
     current = channels[channel_idx]
+
+    # Extract channel parameters with defaults for None values
+    curr_channel = current.channel
+    ch_slope = curr_channel.slope if curr_channel.slope is not None else 0.0
+    ch_intercept = curr_channel.intercept if curr_channel.intercept is not None else 0.0
+    ch_std_dev = curr_channel.std_dev if curr_channel.std_dev is not None else 0.0
+    ch_r_squared = curr_channel.r_squared if curr_channel.r_squared is not None else 0.0
+    ch_direction = int(curr_channel.direction) if curr_channel.direction is not None else -1
 
     # Look for next channel
     if channel_idx + 1 < len(channels):
@@ -416,7 +451,7 @@ def label_channel_from_map(
         # Upper bound = center + 2 * std_dev
         # Lower bound = center - 2 * std_dev
 
-        curr_channel = current.channel
+        # curr_channel already extracted above for parameter extraction
         next_ch_data = next_channel.channel
 
         # Get the price at the start of the next channel
@@ -484,6 +519,16 @@ def label_channel_from_map(
             next_channel_direction=next_dir,
             permanent_break=True,
             timeframe=tf,
+            # Source channel parameters
+            source_channel_slope=ch_slope,
+            source_channel_intercept=ch_intercept,
+            source_channel_std_dev=ch_std_dev,
+            source_channel_r_squared=ch_r_squared,
+            source_channel_direction=ch_direction,
+            # Source channel timestamps
+            source_channel_start_ts=current.start_timestamp,
+            source_channel_end_ts=current.end_timestamp,
+            # Validity flags
             duration_valid=True,
             direction_valid=True,
             next_channel_valid=True
@@ -497,6 +542,16 @@ def label_channel_from_map(
             next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
             timeframe=tf,
+            # Source channel parameters
+            source_channel_slope=ch_slope,
+            source_channel_intercept=ch_intercept,
+            source_channel_std_dev=ch_std_dev,
+            source_channel_r_squared=ch_r_squared,
+            source_channel_direction=ch_direction,
+            # Source channel timestamps
+            source_channel_start_ts=current.start_timestamp,
+            source_channel_end_ts=current.end_timestamp,
+            # Validity flags
             duration_valid=False,
             direction_valid=False,
             next_channel_valid=False
@@ -511,6 +566,10 @@ def label_channel_forward_scan(
 ) -> ChannelLabels:
     """
     Label a channel using forward bar scanning to find the first break.
+
+    This is the primary labeling function for Pass 2. Since samples are only
+    generated at channel end positions, this function computes labels from
+    the channel end - which IS the sample position.
 
     Uses the sophisticated scan_for_break() function from break_scanner.py
     which provides:
@@ -528,7 +587,7 @@ def label_channel_forward_scan(
 
     Returns:
         ChannelLabels with all break scan fields populated:
-        - bars_to_first_break: When the first break occurred
+        - bars_to_first_break: When the first break occurred (from channel end)
         - break_direction: Direction of break (0=DOWN, 1=UP)
         - break_magnitude: How far outside bounds (in std devs)
         - returned_to_channel: Whether price came back inside
@@ -539,6 +598,14 @@ def label_channel_forward_scan(
     end_idx = detected.end_idx
     tf = detected.tf
 
+    # Extract channel parameters with defaults for None values
+    # These will be stored in the ChannelLabels for later reconstruction
+    ch_slope = channel.slope if channel.slope is not None else 0.0
+    ch_intercept = channel.intercept if channel.intercept is not None else 0.0
+    ch_std_dev = channel.std_dev if channel.std_dev is not None else 0.0
+    ch_r_squared = channel.r_squared if channel.r_squared is not None else 0.0
+    ch_direction = int(channel.direction) if channel.direction is not None else -1
+
     # Validate channel has required attributes
     if channel.slope is None or channel.intercept is None or channel.std_dev is None:
         return ChannelLabels(
@@ -547,6 +614,15 @@ def label_channel_forward_scan(
             next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
             timeframe=tf,
+            # Source channel parameters (with extracted defaults)
+            source_channel_slope=ch_slope,
+            source_channel_intercept=ch_intercept,
+            source_channel_std_dev=ch_std_dev,
+            source_channel_r_squared=ch_r_squared,
+            source_channel_direction=ch_direction,
+            source_channel_start_ts=detected.start_timestamp,
+            source_channel_end_ts=detected.end_timestamp,
+            # Validity flags
             duration_valid=False,
             direction_valid=False,
             next_channel_valid=False,
@@ -565,6 +641,15 @@ def label_channel_forward_scan(
             next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
             timeframe=tf,
+            # Source channel parameters
+            source_channel_slope=ch_slope,
+            source_channel_intercept=ch_intercept,
+            source_channel_std_dev=ch_std_dev,
+            source_channel_r_squared=ch_r_squared,
+            source_channel_direction=ch_direction,
+            source_channel_start_ts=detected.start_timestamp,
+            source_channel_end_ts=detected.end_timestamp,
+            # Validity flags
             duration_valid=False,
             direction_valid=False,
             next_channel_valid=False,
@@ -585,7 +670,7 @@ def label_channel_forward_scan(
             forward_low=forward_low,
             forward_close=forward_close,
             max_scan_bars=max_scan,
-            return_threshold_bars=10  # Bars price must stay outside to be "permanent"
+            return_threshold_bars=5  # Bars price must stay outside to be "permanent"
         )
     except InsufficientDataError:
         # Not enough data to scan - return invalid labels
@@ -595,6 +680,15 @@ def label_channel_forward_scan(
             next_channel_direction=int(NewChannelDirection.SIDEWAYS),
             permanent_break=False,
             timeframe=tf,
+            # Source channel parameters
+            source_channel_slope=ch_slope,
+            source_channel_intercept=ch_intercept,
+            source_channel_std_dev=ch_std_dev,
+            source_channel_r_squared=ch_r_squared,
+            source_channel_direction=ch_direction,
+            source_channel_start_ts=detected.start_timestamp,
+            source_channel_end_ts=detected.end_timestamp,
+            # Validity flags
             duration_valid=False,
             direction_valid=False,
             next_channel_valid=False,
@@ -615,11 +709,25 @@ def label_channel_forward_scan(
             break_magnitude=0.0,
             returned_to_channel=False,
             bounces_after_return=0,
+            round_trip_bounces=0,
             channel_continued=True,  # No break means channel continued
             # PERMANENT break fields - no break detected
             permanent_break_direction=-1,  # -1 = none
             permanent_break_magnitude=0.0,
             bars_to_permanent_break=-1,
+            # Exit dynamics - no break detected
+            duration_to_permanent=-1,
+            avg_bars_outside=0.0,
+            total_bars_outside=0,
+            durability_score=0.0,
+            # Source channel parameters
+            source_channel_slope=ch_slope,
+            source_channel_intercept=ch_intercept,
+            source_channel_std_dev=ch_std_dev,
+            source_channel_r_squared=ch_r_squared,
+            source_channel_direction=ch_direction,
+            source_channel_start_ts=detected.start_timestamp,
+            source_channel_end_ts=detected.end_timestamp,
             # Validity flags
             duration_valid=False,
             direction_valid=False,
@@ -643,6 +751,38 @@ def label_channel_forward_scan(
     # or returned - essentially the inverse of is_permanent
     channel_continued = result.is_false_break
 
+    # Calculate exit dynamics from BreakResult
+    # avg_bars_outside: Average bars spent outside before returning (for returned exits)
+    # total_bars_outside: Sum of all bars spent outside (for returned exits)
+    # durability_score: Weighted resilience score from compute_durability_from_result
+    avg_bars_outside = 0.0
+    total_bars_outside = 0
+    durability_score = 0.0
+
+    if result.all_exit_events:
+        returned_exits = [e for e in result.all_exit_events if e.returned]
+        if returned_exits:
+            total_bars_outside = sum(e.bars_outside for e in returned_exits)
+            avg_bars_outside = total_bars_outside / len(returned_exits)
+
+        # Get durability score from break_scanner helper
+        _, _, durability_score = compute_durability_from_result(result)
+
+    # Extract individual exit events from result.all_exit_events
+    exit_bars_list = []
+    exit_magnitudes_list = []
+    exit_durations_list = []
+    exit_types_list = []
+    exit_returned_list = []
+
+    if result.all_exit_events:
+        for exit_event in result.all_exit_events:
+            exit_bars_list.append(exit_event.bar_index)
+            exit_magnitudes_list.append(getattr(exit_event, 'magnitude', 0.0))
+            exit_durations_list.append(exit_event.bars_outside if exit_event.returned else -1)
+            exit_types_list.append(1 if exit_event.exit_type == 'upper' else 0)
+            exit_returned_list.append(exit_event.returned)
+
     # Use provided next_channel_direction if available (from hybrid method),
     # otherwise default to SIDEWAYS (unknown)
     if next_channel_direction is not None:
@@ -660,15 +800,42 @@ def label_channel_forward_scan(
         permanent_break=result.is_permanent,
         timeframe=tf,
         # FIRST break scan fields from BreakResult
-        bars_to_first_break=result.break_bar,
+        bars_to_first_break=result.first_touch_bar if result.first_touch_bar >= 0 else result.break_bar,
         break_magnitude=result.break_magnitude,
         returned_to_channel=result.is_false_break,  # is_false_break means it returned
         bounces_after_return=bounces_after_return,
+        round_trip_bounces=result.round_trip_bounces,
         channel_continued=channel_continued,
         # PERMANENT break fields from BreakResult
         permanent_break_direction=result.permanent_break_direction,
         permanent_break_magnitude=result.permanent_break_magnitude,
         bars_to_permanent_break=result.permanent_break_bar,
+        # Exit dynamics (aggregated from BreakResult)
+        duration_to_permanent=result.permanent_break_bar,  # Alias for clarity
+        avg_bars_outside=avg_bars_outside,
+        total_bars_outside=total_bars_outside,
+        durability_score=durability_score,
+        # Exit verification tracking (NEW)
+        first_break_returned=result.is_false_break,  # Alias for returned_to_channel
+        exit_return_rate=result.exit_return_rate,
+        exits_returned_count=result.exits_returned_count,
+        exits_stayed_out_count=result.exits_stayed_out_count,
+        scan_timed_out=result.scan_timed_out,
+        bars_verified_permanent=result.bars_verified_permanent,
+        # Individual exit events
+        exit_bars=exit_bars_list,
+        exit_magnitudes=exit_magnitudes_list,
+        exit_durations=exit_durations_list,
+        exit_types=exit_types_list,
+        exit_returned=exit_returned_list,
+        # Source channel parameters
+        source_channel_slope=ch_slope,
+        source_channel_intercept=ch_intercept,
+        source_channel_std_dev=ch_std_dev,
+        source_channel_r_squared=ch_r_squared,
+        source_channel_direction=ch_direction,
+        source_channel_start_ts=detected.start_timestamp,
+        source_channel_end_ts=detected.end_timestamp,
         # Validity flags
         duration_valid=True,
         direction_valid=True,
@@ -680,7 +847,7 @@ def label_channel_forward_scan(
 def generate_all_labels(
     channel_map: ChannelMap,
     resampled_dfs: Optional[Dict[str, pd.DataFrame]] = None,
-    labeling_method: str = "next_channel",
+    labeling_method: str = "hybrid",
     progress_callback=None,
     verbose: bool = True
 ) -> LabeledChannelMap:
@@ -1204,6 +1371,234 @@ def compute_cross_correlation_labels(
     # Divergence pattern aligned (both diverged OR both didn't)
     direction_divergence_aligned = tsla_direction_diverged == spy_direction_diverged
 
+    # ==========================================================================
+    # EXIT DYNAMICS CROSS-CORRELATION
+    # ==========================================================================
+
+    # Check if both have valid duration_to_permanent (not -1 means permanent break found)
+    tsla_duration = tsla_labels.duration_to_permanent
+    spy_duration = spy_labels.duration_to_permanent
+    permanent_dynamics_valid = (tsla_duration >= 0) and (spy_duration >= 0)
+
+    # 11. Permanent duration lag and spread
+    # These are only meaningful when both have valid permanent breaks
+    permanent_duration_lag_bars = 0
+    permanent_duration_spread = 0
+    if permanent_dynamics_valid:
+        permanent_duration_lag_bars = abs(tsla_duration - spy_duration)
+        permanent_duration_spread = tsla_duration - spy_duration  # Signed: positive = TSLA took longer
+
+    # 12. Durability spread (TSLA durability - SPY durability)
+    # Higher durability means channel held up better (more returns before permanent break)
+    tsla_durability = tsla_labels.durability_score
+    spy_durability = spy_labels.durability_score
+    durability_spread = tsla_durability - spy_durability
+
+    # 13. Bars outside spreads
+    # avg_bars_outside: average time spent outside per exit event
+    # total_bars_outside: total cumulative time spent outside
+    avg_bars_outside_spread = tsla_labels.avg_bars_outside - spy_labels.avg_bars_outside
+    total_bars_outside_spread = tsla_labels.total_bars_outside - spy_labels.total_bars_outside
+
+    # 14. Durability alignment patterns
+    # High durability = score > 1.0 (channel is resilient, many returns)
+    # Low durability = score < 0.5 (channel breaks easily/quickly)
+    DURABILITY_HIGH_THRESHOLD = 1.0
+    DURABILITY_LOW_THRESHOLD = 0.5
+
+    tsla_high_durability = tsla_durability > DURABILITY_HIGH_THRESHOLD
+    spy_high_durability = spy_durability > DURABILITY_HIGH_THRESHOLD
+    tsla_low_durability = tsla_durability < DURABILITY_LOW_THRESHOLD
+    spy_low_durability = spy_durability < DURABILITY_LOW_THRESHOLD
+
+    both_high_durability = tsla_high_durability and spy_high_durability
+    both_low_durability = tsla_low_durability and spy_low_durability
+    durability_aligned = both_high_durability or both_low_durability
+
+    # 15. Which asset is more durable?
+    tsla_more_durable = tsla_durability > spy_durability
+    spy_more_durable = spy_durability > tsla_durability
+
+    # ==========================================================================
+    # EXIT VERIFICATION CROSS-CORRELATION (NEW)
+    # ==========================================================================
+
+    # 16. Exit return rate comparison
+    tsla_exit_rate = getattr(tsla_labels, 'exit_return_rate', 0.0)
+    spy_exit_rate = getattr(spy_labels, 'exit_return_rate', 0.0)
+    exit_return_rate_spread = tsla_exit_rate - spy_exit_rate
+
+    # Aligned if both high (>0.7) or both low (<0.3)
+    EXIT_RATE_HIGH_THRESHOLD = 0.7
+    EXIT_RATE_LOW_THRESHOLD = 0.3
+    both_high_exit_rate = tsla_exit_rate > EXIT_RATE_HIGH_THRESHOLD and spy_exit_rate > EXIT_RATE_HIGH_THRESHOLD
+    both_low_exit_rate = tsla_exit_rate < EXIT_RATE_LOW_THRESHOLD and spy_exit_rate < EXIT_RATE_LOW_THRESHOLD
+    exit_return_rate_aligned = both_high_exit_rate or both_low_exit_rate
+
+    # 17. Which asset is more resilient (higher return rate = more bounces back)
+    tsla_more_resilient = tsla_exit_rate > spy_exit_rate
+    spy_more_resilient = spy_exit_rate > tsla_exit_rate
+
+    # 18. Exit count comparisons
+    tsla_exits_returned = getattr(tsla_labels, 'exits_returned_count', 0)
+    spy_exits_returned = getattr(spy_labels, 'exits_returned_count', 0)
+    tsla_exits_stayed_out = getattr(tsla_labels, 'exits_stayed_out_count', 0)
+    spy_exits_stayed_out = getattr(spy_labels, 'exits_stayed_out_count', 0)
+
+    exits_returned_spread = tsla_exits_returned - spy_exits_returned
+    exits_stayed_out_spread = tsla_exits_stayed_out - spy_exits_stayed_out
+    total_exits_spread = (tsla_exits_returned + tsla_exits_stayed_out) - (spy_exits_returned + spy_exits_stayed_out)
+
+    # 19. Scan timeout alignment
+    tsla_scan_timed_out = getattr(tsla_labels, 'scan_timed_out', False)
+    spy_scan_timed_out = getattr(spy_labels, 'scan_timed_out', False)
+    both_scan_timed_out = tsla_scan_timed_out and spy_scan_timed_out
+    scan_timeout_aligned = tsla_scan_timed_out == spy_scan_timed_out
+
+    # 20. Bars verified comparison
+    tsla_bars_verified = getattr(tsla_labels, 'bars_verified_permanent', 0)
+    spy_bars_verified = getattr(spy_labels, 'bars_verified_permanent', 0)
+    bars_verified_spread = tsla_bars_verified - spy_bars_verified
+
+    # 21. Break progression patterns
+    tsla_first_returned = getattr(tsla_labels, 'first_break_returned', False)
+    spy_first_returned = getattr(spy_labels, 'first_break_returned', False)
+    tsla_has_perm_local = getattr(tsla_labels, 'permanent_break_direction', -1) >= 0
+    spy_has_perm_local = getattr(spy_labels, 'permanent_break_direction', -1) >= 0
+
+    # Both had first return then permanent (channel tested, then broke)
+    both_first_returned_then_permanent = (
+        tsla_first_returned and spy_first_returned and
+        tsla_has_perm_local and spy_has_perm_local
+    )
+
+    # Both never returned (first break was permanent)
+    both_never_returned = not tsla_first_returned and not spy_first_returned
+
+    # 22. Exit verification validity
+    # Valid if both have break scan data (already checked at function start)
+    exit_verification_valid = tsla_valid and spy_valid
+
+    # ==========================================================================
+    # INDIVIDUAL EXIT EVENT CROSS-CORRELATION
+    # ==========================================================================
+
+    # Extract exit lists from both labels
+    tsla_exit_bars = getattr(tsla_labels, 'exit_bars', []) or []
+    spy_exit_bars = getattr(spy_labels, 'exit_bars', []) or []
+    tsla_exit_magnitudes = getattr(tsla_labels, 'exit_magnitudes', []) or []
+    spy_exit_magnitudes = getattr(spy_labels, 'exit_magnitudes', []) or []
+    tsla_exit_durations = getattr(tsla_labels, 'exit_durations', []) or []
+    spy_exit_durations = getattr(spy_labels, 'exit_durations', []) or []
+    tsla_exit_types = getattr(tsla_labels, 'exit_types', []) or []
+    spy_exit_types = getattr(spy_labels, 'exit_types', []) or []
+
+    # Default values for exit cross-correlation metrics
+    exit_timing_correlation = 0.0
+    exit_timing_lag_mean = 0.0
+    exit_direction_agreement = 0.0
+    exit_count_spread = 0
+    lead_lag_exits = 0
+    exit_magnitude_correlation = 0.0
+    mean_magnitude_spread = 0.0
+    exit_duration_correlation = 0.0
+    mean_duration_spread = 0.0
+    simultaneous_exit_count = 0
+    exit_cross_correlation_valid = False
+
+    # Check if both have at least one exit event
+    tsla_has_exits = len(tsla_exit_bars) > 0
+    spy_has_exits = len(spy_exit_bars) > 0
+    exit_cross_correlation_valid = tsla_has_exits and spy_has_exits
+
+    # 23. Exit count spread
+    exit_count_spread = len(tsla_exit_bars) - len(spy_exit_bars)
+
+    if exit_cross_correlation_valid:
+        # 24. Timing correlation - Pearson correlation of exit bar indices
+        # Need at least 2 exits from each to compute correlation
+        if len(tsla_exit_bars) >= 2 and len(spy_exit_bars) >= 2:
+            # Pad shorter list with mean to align lengths for correlation
+            max_len = max(len(tsla_exit_bars), len(spy_exit_bars))
+            tsla_bars_padded = tsla_exit_bars + [np.mean(tsla_exit_bars)] * (max_len - len(tsla_exit_bars))
+            spy_bars_padded = spy_exit_bars + [np.mean(spy_exit_bars)] * (max_len - len(spy_exit_bars))
+            try:
+                corr_matrix = np.corrcoef(tsla_bars_padded, spy_bars_padded)
+                if not np.isnan(corr_matrix[0, 1]):
+                    exit_timing_correlation = float(corr_matrix[0, 1])
+            except Exception:
+                pass
+
+        # 25. Timing lag mean (TSLA mean exit bar - SPY mean exit bar)
+        tsla_mean_bar = np.mean(tsla_exit_bars) if tsla_exit_bars else 0.0
+        spy_mean_bar = np.mean(spy_exit_bars) if spy_exit_bars else 0.0
+        exit_timing_lag_mean = tsla_mean_bar - spy_mean_bar
+
+        # 26. Lead/lag exits (positive = TSLA exits first on average)
+        lead_lag_exits = int(np.sign(exit_timing_lag_mean) * -1) if exit_timing_lag_mean != 0 else 0
+
+        # 27. Direction agreement - % of exits with same direction
+        # Compare exit types for overlapping time windows
+        # Define "overlapping" as exits within 5 bars of each other
+        OVERLAP_THRESHOLD = 5
+        overlapping_matches = 0
+        overlapping_total = 0
+
+        for i, tsla_bar in enumerate(tsla_exit_bars):
+            for j, spy_bar in enumerate(spy_exit_bars):
+                if abs(tsla_bar - spy_bar) <= OVERLAP_THRESHOLD:
+                    overlapping_total += 1
+                    if i < len(tsla_exit_types) and j < len(spy_exit_types):
+                        if tsla_exit_types[i] == spy_exit_types[j]:
+                            overlapping_matches += 1
+
+        if overlapping_total > 0:
+            exit_direction_agreement = overlapping_matches / overlapping_total
+
+        # 28. Simultaneous exit count (exits within 3 bars of each other)
+        SIMULTANEOUS_THRESHOLD = 3
+        for tsla_bar in tsla_exit_bars:
+            for spy_bar in spy_exit_bars:
+                if abs(tsla_bar - spy_bar) <= SIMULTANEOUS_THRESHOLD:
+                    simultaneous_exit_count += 1
+
+        # 29. Magnitude correlation
+        if len(tsla_exit_magnitudes) >= 2 and len(spy_exit_magnitudes) >= 2:
+            max_len = max(len(tsla_exit_magnitudes), len(spy_exit_magnitudes))
+            tsla_mag_padded = tsla_exit_magnitudes + [np.mean(tsla_exit_magnitudes)] * (max_len - len(tsla_exit_magnitudes))
+            spy_mag_padded = spy_exit_magnitudes + [np.mean(spy_exit_magnitudes)] * (max_len - len(spy_exit_magnitudes))
+            try:
+                corr_matrix = np.corrcoef(tsla_mag_padded, spy_mag_padded)
+                if not np.isnan(corr_matrix[0, 1]):
+                    exit_magnitude_correlation = float(corr_matrix[0, 1])
+            except Exception:
+                pass
+
+        # 30. Mean magnitude spread (TSLA mean - SPY mean)
+        tsla_mean_mag = np.mean(tsla_exit_magnitudes) if tsla_exit_magnitudes else 0.0
+        spy_mean_mag = np.mean(spy_exit_magnitudes) if spy_exit_magnitudes else 0.0
+        mean_magnitude_spread = tsla_mean_mag - spy_mean_mag
+
+        # 31. Duration correlation (only for returned exits with valid duration)
+        tsla_valid_durations = [d for d in tsla_exit_durations if d >= 0]
+        spy_valid_durations = [d for d in spy_exit_durations if d >= 0]
+
+        if len(tsla_valid_durations) >= 2 and len(spy_valid_durations) >= 2:
+            max_len = max(len(tsla_valid_durations), len(spy_valid_durations))
+            tsla_dur_padded = tsla_valid_durations + [np.mean(tsla_valid_durations)] * (max_len - len(tsla_valid_durations))
+            spy_dur_padded = spy_valid_durations + [np.mean(spy_valid_durations)] * (max_len - len(spy_valid_durations))
+            try:
+                corr_matrix = np.corrcoef(tsla_dur_padded, spy_dur_padded)
+                if not np.isnan(corr_matrix[0, 1]):
+                    exit_duration_correlation = float(corr_matrix[0, 1])
+            except Exception:
+                pass
+
+        # 32. Mean duration spread (TSLA mean - SPY mean)
+        tsla_mean_dur = np.mean(tsla_valid_durations) if tsla_valid_durations else 0.0
+        spy_mean_dur = np.mean(spy_valid_durations) if spy_valid_durations else 0.0
+        mean_duration_spread = tsla_mean_dur - spy_mean_dur
+
     return CrossCorrelationLabels(
         # FIRST break cross-correlation
         break_direction_aligned=break_direction_aligned,
@@ -1227,6 +1622,44 @@ def compute_cross_correlation_labels(
         both_permanent=both_permanent,
         return_pattern_aligned=return_pattern_aligned,
         continuation_aligned=continuation_aligned,
+        # EXIT DYNAMICS cross-correlation (new fields)
+        permanent_duration_lag_bars=permanent_duration_lag_bars,
+        permanent_duration_spread=permanent_duration_spread,
+        durability_spread=durability_spread,
+        avg_bars_outside_spread=avg_bars_outside_spread,
+        total_bars_outside_spread=total_bars_outside_spread,
+        both_high_durability=both_high_durability,
+        both_low_durability=both_low_durability,
+        durability_aligned=durability_aligned,
+        tsla_more_durable=tsla_more_durable,
+        spy_more_durable=spy_more_durable,
+        permanent_dynamics_valid=permanent_dynamics_valid,
+        # EXIT VERIFICATION cross-correlation (NEW)
+        exit_return_rate_spread=exit_return_rate_spread,
+        exit_return_rate_aligned=exit_return_rate_aligned,
+        tsla_more_resilient=tsla_more_resilient,
+        spy_more_resilient=spy_more_resilient,
+        exits_returned_spread=exits_returned_spread,
+        exits_stayed_out_spread=exits_stayed_out_spread,
+        total_exits_spread=total_exits_spread,
+        both_scan_timed_out=both_scan_timed_out,
+        scan_timeout_aligned=scan_timeout_aligned,
+        bars_verified_spread=bars_verified_spread,
+        both_first_returned_then_permanent=both_first_returned_then_permanent,
+        both_never_returned=both_never_returned,
+        exit_verification_valid=exit_verification_valid,
+        # Individual Exit Event Cross-Correlation
+        exit_timing_correlation=exit_timing_correlation,
+        exit_timing_lag_mean=exit_timing_lag_mean,
+        exit_direction_agreement=exit_direction_agreement,
+        exit_count_spread=exit_count_spread,
+        lead_lag_exits=lead_lag_exits,
+        exit_magnitude_correlation=exit_magnitude_correlation,
+        mean_magnitude_spread=mean_magnitude_spread,
+        exit_duration_correlation=exit_duration_correlation,
+        mean_duration_spread=mean_duration_spread,
+        simultaneous_exit_count=simultaneous_exit_count,
+        exit_cross_correlation_valid=exit_cross_correlation_valid,
         # Validity flags
         cross_valid=True,
         permanent_cross_valid=permanent_cross_valid

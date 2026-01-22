@@ -2,12 +2,17 @@
 Cross-Asset Feature Extraction
 
 This module calculates correlations and relationships between TSLA, SPY, and VIX.
-It extracts 40 features across four main categories:
+It extracts 59 features across eight main categories:
 
 ROLLING CORRELATIONS (15): Correlation coefficients across different timeframes
 BETA METRICS (8): Market beta and regime classifications
 RELATIVE PERFORMANCE (10): Relative strength and performance comparisons
 CROSS-ASSET MOMENTUM (7): Momentum alignment and lead-lag relationships
+RSI vs CHANNEL POSITION (6): TSLA RSI and channel position correlations
+SPY RSI vs CHANNEL POSITION (2): SPY RSI and channel position correlations
+RSI vs VIX (4): RSI and VIX level correlations
+POSITION vs VIX (4): Channel position and VIX level correlations
+COMBINED SIGNALS (3): Multi-factor alignment signals (RSI + Position + VIX)
 """
 
 from __future__ import annotations
@@ -289,30 +294,74 @@ def _get_default_features() -> Dict[str, float]:
         'risk_on_off_signal': 0.0,
         'market_regime': 1.0,  # 0=risk-off, 1=neutral, 2=risk-on
         'correlation_regime': 1.0,  # 0=low, 1=normal, 2=high
+
+        # RSI vs Channel Position Correlations (6)
+        'rsi_position_spread': 0.0,
+        'rsi_above_50_in_upper_half': 0.0,
+        'rsi_below_50_in_lower_half': 0.0,
+        'rsi_position_aligned': 0.0,
+        'rsi_overbought_near_upper': 0.0,
+        'rsi_oversold_near_lower': 0.0,
+
+        # SPY RSI vs Channel Position (2)
+        'spy_rsi_position_spread': 0.0,
+        'spy_rsi_position_aligned': 0.0,
+
+        # RSI vs VIX Correlations (4)
+        'rsi_vix_spread': 0.0,
+        'rsi_high_vix_low': 0.0,
+        'rsi_low_vix_high': 0.0,
+        'rsi_vix_divergence': 0.0,
+
+        # Channel Position vs VIX Correlations (4)
+        'position_vix_spread': 0.0,
+        'near_upper_high_vix': 0.0,
+        'near_lower_low_vix': 0.0,
+        'position_vix_aligned': 0.0,
+
+        # Combined RSI + Position + VIX Signals (3)
+        'bullish_alignment': 0.0,
+        'bearish_alignment': 0.0,
+        'contrarian_signal': 0.0,
     }
 
 
 def extract_cross_asset_features(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
-    vix_df: pd.DataFrame
+    vix_df: pd.DataFrame,
+    tsla_rsi_14: Optional[float] = None,
+    spy_rsi_14: Optional[float] = None,
+    position_in_channel: Optional[float] = None,
+    spy_position_in_channel: Optional[float] = None,
+    vix_level: Optional[float] = None
 ) -> Dict[str, float]:
     """
-    Extract 40 cross-asset correlation features from TSLA, SPY, and VIX data.
+    Extract 59 cross-asset correlation features from TSLA, SPY, and VIX data.
 
     Args:
         tsla_df: TSLA OHLCV DataFrame with columns [open, high, low, close, volume]
         spy_df: SPY OHLCV DataFrame with columns [open, high, low, close, volume]
         vix_df: VIX OHLCV DataFrame with columns [open, high, low, close, volume]
+        tsla_rsi_14: Optional TSLA RSI-14 value (defaults to 50.0 if not provided)
+        spy_rsi_14: Optional SPY RSI-14 value (defaults to 50.0 if not provided)
+        position_in_channel: Optional TSLA channel position 0-1 (defaults to 0.5 if not provided)
+        spy_position_in_channel: Optional SPY channel position 0-1 (defaults to 0.5 if not provided)
+        vix_level: Optional VIX level (defaults to 20.0 if not provided)
 
     Returns:
-        Dict[str, float] with exactly 40 features, all guaranteed to be valid floats.
+        Dict[str, float] with exactly 59 features, all guaranteed to be valid floats.
 
     Feature Categories:
         - ROLLING CORRELATIONS (15): Correlation coefficients at various windows
         - BETA METRICS (8): Market beta and regime classifications
         - RELATIVE PERFORMANCE (10): Relative strength comparisons
         - CROSS-ASSET MOMENTUM (7): Momentum alignment and signals
+        - RSI vs CHANNEL POSITION (6): TSLA RSI and channel position correlations
+        - SPY RSI vs CHANNEL POSITION (2): SPY RSI and channel position correlations
+        - RSI vs VIX (4): RSI and VIX correlations
+        - POSITION vs VIX (4): Channel position and VIX correlations
+        - COMBINED SIGNALS (3): Multi-factor alignment signals
     """
     features: Dict[str, float] = {}
 
@@ -663,6 +712,46 @@ def extract_cross_asset_features(
     else:
         features['correlation_regime'] = 1.0  # Normal correlation
 
+    # =========================================================================
+    # RSI, CHANNEL POSITION, VIX CORRELATION FEATURES (21 features)
+    # =========================================================================
+
+    # Use default values if not provided
+    _tsla_rsi = safe_float(tsla_rsi_14, 50.0) if tsla_rsi_14 is not None else 50.0
+    _spy_rsi = safe_float(spy_rsi_14, 50.0) if spy_rsi_14 is not None else 50.0
+    _position = safe_float(position_in_channel, 0.5) if position_in_channel is not None else 0.5
+    _spy_position = safe_float(spy_position_in_channel, 0.5) if spy_position_in_channel is not None else 0.5
+    _vix = safe_float(vix_level, 20.0) if vix_level is not None else 20.0
+
+    # RSI vs Channel Position correlations (6 features)
+    features['rsi_position_spread'] = safe_float(_tsla_rsi - (_position * 100), 0.0)  # RSI minus position scaled to 0-100
+    features['rsi_above_50_in_upper_half'] = 1.0 if (_tsla_rsi > 50 and _position > 0.5) else 0.0
+    features['rsi_below_50_in_lower_half'] = 1.0 if (_tsla_rsi < 50 and _position < 0.5) else 0.0
+    features['rsi_position_aligned'] = 1.0 if ((_tsla_rsi > 50) == (_position > 0.5)) else 0.0
+    features['rsi_overbought_near_upper'] = 1.0 if (_tsla_rsi > 70 and _position > 0.8) else 0.0
+    features['rsi_oversold_near_lower'] = 1.0 if (_tsla_rsi < 30 and _position < 0.2) else 0.0
+
+    # SPY RSI vs Channel Position (2 features)
+    features['spy_rsi_position_spread'] = safe_float(_spy_rsi - (_spy_position * 100), 0.0)
+    features['spy_rsi_position_aligned'] = 1.0 if ((_spy_rsi > 50) == (_spy_position > 0.5)) else 0.0
+
+    # RSI vs VIX correlations (4 features)
+    features['rsi_vix_spread'] = safe_float(_tsla_rsi - _vix, 0.0)  # RSI minus VIX level
+    features['rsi_high_vix_low'] = 1.0 if (_tsla_rsi > 60 and _vix < 20) else 0.0  # Bullish: high RSI, low fear
+    features['rsi_low_vix_high'] = 1.0 if (_tsla_rsi < 40 and _vix > 25) else 0.0  # Bearish: low RSI, high fear
+    features['rsi_vix_divergence'] = 1.0 if ((_tsla_rsi > 50 and _vix > 25) or (_tsla_rsi < 50 and _vix < 15)) else 0.0
+
+    # Channel Position vs VIX correlations (4 features)
+    features['position_vix_spread'] = safe_float((_position * 100) - _vix, 0.0)
+    features['near_upper_high_vix'] = 1.0 if (_position > 0.8 and _vix > 25) else 0.0  # Risky: near top in fear
+    features['near_lower_low_vix'] = 1.0 if (_position < 0.2 and _vix < 15) else 0.0  # Complacent bottom
+    features['position_vix_aligned'] = 1.0 if ((_position > 0.5) == (_vix < 20)) else 0.0  # High position = low VIX
+
+    # Combined RSI + Position + VIX signals (3 features)
+    features['bullish_alignment'] = 1.0 if (_tsla_rsi > 50 and _position > 0.5 and _vix < 20) else 0.0
+    features['bearish_alignment'] = 1.0 if (_tsla_rsi < 50 and _position < 0.5 and _vix > 25) else 0.0
+    features['contrarian_signal'] = 1.0 if (_tsla_rsi < 30 and _position < 0.2 and _vix > 30) else 0.0  # Oversold + fear = buy?
+
     # Final safety check: ensure all features are valid floats
     for key in features:
         features[key] = safe_float(features[key], _get_default_features().get(key, 0.0))
@@ -694,7 +783,7 @@ def extract_cross_asset_features_tf(
 
 
 def get_cross_asset_feature_names() -> List[str]:
-    """Get base cross-asset feature names (40 features)."""
+    """Get base cross-asset feature names (59 features)."""
     return list(_get_default_features().keys())
 
 
@@ -716,10 +805,10 @@ def get_all_cross_asset_feature_names() -> List[str]:
 
 
 def get_cross_asset_feature_count() -> int:
-    """Base feature count (40)."""
-    return 40
+    """Base feature count (59)."""
+    return 59
 
 
 def get_total_cross_asset_features() -> int:
-    """Total cross-asset features: 40 * 10 TFs = 400"""
-    return 40 * 10
+    """Total cross-asset features: 59 * 10 TFs = 590"""
+    return 59 * 10

@@ -57,7 +57,10 @@ from ..exceptions import (
 # =============================================================================
 # Data resampling with partial bar support
 # =============================================================================
-from ..data.resampler import resample_with_partial, BarMetadata
+# Use canonical resample module for OHLC resampling
+from ..core.resample import resample_ohlc, BarMetadata, ResamplingError as CoreResamplingError
+# Also import partial bar support from data.resampler (uses canonical under the hood)
+from ..data.resampler import resample_with_partial
 
 # =============================================================================
 # Feature module imports - LOUD failures, no graceful degradation
@@ -358,7 +361,9 @@ def _extract_window_independent_features_for_tf(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
     vix_df: pd.DataFrame,
-    tf: str
+    tf: str,
+    tsla_channels: Optional[Dict[int, "Channel"]] = None,
+    spy_channels: Optional[Dict[int, "Channel"]] = None
 ) -> Dict[str, float]:
     """
     Extract all window-independent features for a single TF.
@@ -377,6 +382,8 @@ def _extract_window_independent_features_for_tf(
         spy_df: SPY OHLCV (already resampled to TF)
         vix_df: VIX OHLCV (already resampled to TF)
         tf: Timeframe name
+        tsla_channels: Optional dict of TSLA channels by window (for position_in_channel)
+        spy_channels: Optional dict of SPY channels by window (for spy_position_in_channel)
 
     Returns:
         Dict with TF-prefixed features
@@ -414,9 +421,60 @@ def _extract_window_independent_features_for_tf(
     except Exception as e:
         raise FeatureExtractionError(f"VIX extraction failed for {tf}: {e}")
 
-    # 5. Cross-Asset Features (40)
+    # 5. Cross-Asset Features (59)
+    # Pass in the already-extracted feature values for RSI/VIX correlation features
     try:
-        cross_feats = extract_cross_asset_features(tsla_df, spy_df, vix_df)
+        # Get RSI values from price features
+        tsla_rsi_14 = price_feats.get('rsi_14')
+        spy_rsi_14 = spy_feats.get('spy_rsi_14')
+        vix_level = vix_feats.get('vix_level')
+
+        # Get position_in_channel from detected channels (use window 50 as default)
+        position_in_channel = None
+        spy_position_in_channel = None
+
+        if tsla_channels:
+            # Try window 50 first, then fall back to any available window
+            tsla_channel = tsla_channels.get(50) or next(iter(tsla_channels.values()), None)
+            if tsla_channel is not None:
+                # Get position_in_channel from channel
+                # CRITICAL: Use [-2] (previous bar) to avoid data leakage
+                # Using [-1] would use current bar info which isn't available at prediction time
+                upper_line = getattr(tsla_channel, 'upper_line', None)
+                lower_line = getattr(tsla_channel, 'lower_line', None)
+                if upper_line is not None and lower_line is not None and len(upper_line) > 1:
+                    upper = upper_line[-2]  # Previous bar to avoid leakage
+                    lower = lower_line[-2]  # Previous bar to avoid leakage
+                    if upper != lower and len(tsla_df) > 1:
+                        close = float(tsla_df['close'].iloc[-2])  # Previous bar close
+                        position_in_channel = (close - lower) / (upper - lower)
+                        position_in_channel = max(0.0, min(1.0, position_in_channel))
+
+        if spy_channels:
+            # Try window 50 first, then fall back to any available window
+            spy_channel = spy_channels.get(50) or next(iter(spy_channels.values()), None)
+            if spy_channel is not None:
+                # Get position_in_channel from channel
+                # CRITICAL: Use [-2] (previous bar) to avoid data leakage
+                # Using [-1] would use current bar info which isn't available at prediction time
+                upper_line = getattr(spy_channel, 'upper_line', None)
+                lower_line = getattr(spy_channel, 'lower_line', None)
+                if upper_line is not None and lower_line is not None and len(upper_line) > 1:
+                    upper = upper_line[-2]  # Previous bar to avoid leakage
+                    lower = lower_line[-2]  # Previous bar to avoid leakage
+                    if upper != lower and len(spy_df) > 1:
+                        close = float(spy_df['close'].iloc[-2])  # Previous bar close
+                        spy_position_in_channel = (close - lower) / (upper - lower)
+                        spy_position_in_channel = max(0.0, min(1.0, spy_position_in_channel))
+
+        cross_feats = extract_cross_asset_features(
+            tsla_df, spy_df, vix_df,
+            tsla_rsi_14=tsla_rsi_14,
+            spy_rsi_14=spy_rsi_14,
+            position_in_channel=position_in_channel,
+            spy_position_in_channel=spy_position_in_channel,
+            vix_level=vix_level
+        )
         features.update(_prefix_tf(cross_feats, tf))
     except Exception as e:
         raise FeatureExtractionError(f"Cross-asset extraction failed for {tf}: {e}")
@@ -765,8 +823,11 @@ def extract_all_features(
             spy_tf_channels = _detect_spy_channels(spy_tf)
 
             # 3. Extract window-independent features (282 per TF)
+            # Pass detected channels so cross-asset features can use position_in_channel
             wi_features = _extract_window_independent_features_for_tf(
-                tsla_tf, spy_tf, vix_tf, tf
+                tsla_tf, spy_tf, vix_tf, tf,
+                tsla_channels=tf_channels,
+                spy_channels=spy_tf_channels
             )
             all_features.update(wi_features)
 

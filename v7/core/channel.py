@@ -192,7 +192,7 @@ def detect_bounces(
         if upper_dist <= threshold:
             touches.append(Touch(bar_index=i, touch_type=TouchType.UPPER, price=high[i]))
         # Touch lower if LOW is within threshold of lower (or below it)
-        elif lower_dist <= threshold:
+        if lower_dist <= threshold:
             touches.append(Touch(bar_index=i, touch_type=TouchType.LOWER, price=low[i]))
 
     # Count alternating touches (bounces)
@@ -246,11 +246,11 @@ def detect_channel(
     Returns:
         Channel object with all metrics
     """
-    # Get last 'window' bars
-    if len(df) < window:
-        window = len(df)
+    # Get last 'window' bars, excluding current bar to prevent data leakage
+    if len(df) < window + 1:
+        window = len(df) - 1
 
-    df_slice = df.iloc[-window:]
+    df_slice = df.iloc[-(window+1):-1]
     close = df_slice['close'].values.astype(np.float64)
     high = df_slice['high'].values.astype(np.float64)
     low = df_slice['low'].values.astype(np.float64)
