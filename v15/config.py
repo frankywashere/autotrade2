@@ -89,7 +89,7 @@ MAX_FORWARD_5MIN = max(TF_FORWARD_5MIN.values())     # 40,000 (monthly)
 FEATURE_COUNTS = {
     'tsla_price_per_tf': 60,
     'technical_per_tf': 77,
-    'spy_per_tf': 80,
+    'spy_per_tf': 135,  # Updated: 60 SPY-specific + 77 shared technical - 2 overlapping = 135
     'vix_per_tf': 25,
     'cross_asset_per_tf': 59,
     'channel_per_window': 58,
@@ -151,6 +151,34 @@ TF_MAX_SCAN: Dict[str, int] = {
 }
 
 # =============================================================================
+# CHANNEL RANKING - Single Source of Truth
+# =============================================================================
+# Controls how channels are ranked/sorted across the system.
+
+CHANNEL_RANKING = {
+    'primary': 'bounce_count',
+    'secondary': 'r_squared',
+    'min_r2_threshold': 0.5,
+}
+
+def channel_sort_key(channel) -> tuple:
+    """Standard sorting key for channel ranking. Single source of truth."""
+    return (channel.bounce_count, channel.r_squared)
+
+
+# =============================================================================
+# RSI THRESHOLDS
+# =============================================================================
+
+RSI_THRESHOLDS = {
+    'overbought': 70,
+    'oversold': 30,
+    'neutral_high': 60,
+    'neutral_low': 40,
+}
+
+
+# =============================================================================
 # BREAK DETECTION SETTINGS - Single Source of Truth
 # =============================================================================
 # These settings control how channel breaks are detected, labeled, and visualized.
@@ -163,10 +191,13 @@ BREAK_DETECTION = {
 
     # Bars price must stay outside channel to be "permanent"
     # If price returns within this many bars, it's a false break
-    'return_threshold_bars': 5,
+    'return_threshold_bars': 10,
 
     # Minimum R2 threshold for channel quality (window selection)
     'min_r2_threshold': 0.5,
+
+    # Max bars from permanent break for biggest marker
+    'biggest_break_max_distance': 10,
 }
 
 # Break marker visualization colors

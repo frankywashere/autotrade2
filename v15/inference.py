@@ -4,7 +4,7 @@ V15 Inference Module - Make predictions with trained models.
 Supports:
 - Partial bar feature extraction (critical for live trading)
 - Multi-timeframe feature extraction via extract_all_tf_features()
-- New 7,880 feature structure with TF prefixes
+- TF-prefixed feature structure (see config.py TOTAL_FEATURES for current count)
 
 Usage:
     from v15.inference import Predictor

@@ -22,7 +22,8 @@ import pandas as pd
 
 # Import v15 types
 from v15.dtypes import ChannelSample, ChannelLabels, TIMEFRAMES, STANDARD_WINDOWS
-from v15.config import TF_MAX_SCAN, BREAK_DETECTION, BREAK_MARKER_COLORS
+from v15.labels import DetectedChannel
+from v15.config import TF_MAX_SCAN, BREAK_DETECTION, BREAK_MARKER_COLORS, channel_sort_key
 from v15.data import load_market_data
 
 # Import channel detection from v7
@@ -32,9 +33,11 @@ from v7.core.channel import detect_channel, Channel
 class Inspector:
     """Interactive channel inspector with keyboard navigation."""
 
-    def __init__(self, samples: List[ChannelSample], tsla_df: pd.DataFrame):
+    def __init__(self, samples: List[ChannelSample], tsla_df: pd.DataFrame,
+                 channel_map: Optional[Dict[Tuple[str, int], List[DetectedChannel]]] = None):
         self.samples = samples
         self.tsla_df = tsla_df
+        self.channel_map = channel_map
         self.current_idx = 0
         self.current_window = None  # None = best window
         self.fig = None
@@ -87,21 +90,49 @@ class Inspector:
     def _get_best_window_for_tf(self, sample: ChannelSample, tf: str) -> int:
         """Get the best window for a specific timeframe.
 
-        Selection priority:
+        Selection priority (via channel_sort_key from config):
         1. Has valid labels with direction >= 0
         2. Meets minimum R-squared threshold (quality filter)
-        3. Higher round_trip_bounces (true oscillating channel activity)
+        3. Higher bounce_count (channel quality metric)
         4. Higher r_squared (better fit)
-        5. Smaller window (more stable)
+        5. Smaller window (tiebreaker - more stable)
 
-        The R2 threshold ensures we don't select a poor-quality channel just
-        because it has more bounces. A channel with R2=0.358 and 4 bounces
-        should NOT beat a channel with R2=0.843 and 2 bounces.
+        Uses channel_sort_key from config for consistent ranking across the system.
         """
+        from v15.core.resample import resample_ohlc
+
         best_window = sample.best_window
-        best_score = (-1, -1, 1000)  # (round_trips, r2, window) - window is negative priority
+        best_score = (-1, -1.0, 1000)  # (bounce_count, r2, window) - window is negative priority
 
         MIN_R2_THRESHOLD = BREAK_DETECTION['min_r2_threshold']  # From config
+
+        # Get resampled data for this TF once (for fresh channel detection)
+        BARS_PER_TF = {
+            '5min': 1, '15min': 3, '30min': 6,
+            '1h': 12, '2h': 24, '3h': 36, '4h': 48,
+            'daily': 78, 'weekly': 390, 'monthly': 1638
+        }
+        bars_per_tf = BARS_PER_TF.get(tf, 1)
+        max_window = max(STANDARD_WINDOWS)
+        lookback_5min = (max_window + 50) * bars_per_tf
+
+        channel_end_idx = sample.channel_end_idx
+        start_idx = max(0, channel_end_idx - lookback_5min)
+        end_idx = min(len(self.tsla_df), channel_end_idx + 10 * bars_per_tf)
+
+        df_slice = self.tsla_df.iloc[start_idx:end_idx].copy()
+
+        if tf != '5min':
+            df_tf = resample_ohlc(df_slice, tf, keep_partial=False)
+        else:
+            df_tf = df_slice
+
+        # Find sample position in resampled data
+        sample_ts = sample.timestamp
+        sample_idx = df_tf.index.searchsorted(sample_ts, side='right') - 1
+        if sample_idx < 0:
+            sample_idx = 0
+        sample_idx = min(sample_idx, len(df_tf) - 1)
 
         for window, assets_dict in sample.labels_per_window.items():
             if 'tsla' not in assets_dict:
@@ -116,8 +147,25 @@ class Inspector:
             if r2 < MIN_R2_THRESHOLD:
                 continue  # Skip poor quality channels
 
-            round_trips = getattr(labels, 'round_trip_bounces', 0)
-            score = (round_trips, r2, -window)  # -window so smaller is better
+            # Try to detect channel fresh to get bounce_count
+            bounce_count = 0
+            if len(df_tf) >= window:
+                detection_start = max(0, sample_idx - window)
+                detection_end = sample_idx + 1
+                channel_df = df_tf.iloc[detection_start:detection_end + 1]
+
+                if len(channel_df) >= window:
+                    if not channel_df[['open', 'high', 'low', 'close']].isna().any().any():
+                        min_cycles = 0 if tf in ['1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly'] else 1
+                        try:
+                            channel = detect_channel(channel_df, window=window, min_cycles=min_cycles)
+                            if channel is not None and channel.valid:
+                                # Use channel_sort_key for consistent ranking
+                                bounce_count, _ = channel_sort_key(channel)
+                        except Exception:
+                            pass
+
+            score = (bounce_count, r2, -window)  # -window so smaller is better
 
             if score > best_score:
                 best_score = score
@@ -537,8 +585,10 @@ class Inspector:
         # from a DIFFERENT channel were shown for FRESHLY detected channels)
         if channel is not None and channel.valid:
             round_trips = channel.complete_cycles
+            bounce_count = channel.bounce_count
         else:
             round_trips = getattr(labels, 'round_trip_bounces', 0)
+            bounce_count = getattr(labels, 'source_channel_bounce_count', 0)
 
         first_mag = getattr(labels, 'break_magnitude', 0.0)
         perm_mag = getattr(labels, 'permanent_break_magnitude', 0.0)
@@ -547,6 +597,13 @@ class Inspector:
         bars_to_perm = getattr(labels, 'bars_to_permanent_break', -1)
 
         durability = getattr(labels, 'durability_score', 0.0)
+
+        # Best next channel info
+        next_dir_val = getattr(labels, 'best_next_channel_direction', -1)
+        next_bars_away = getattr(labels, 'best_next_channel_bars_away', -1)
+        next_bounce_count = getattr(labels, 'best_next_channel_bounce_count', 0)
+        next_dir_map = {-1: 'NONE', 0: 'BEAR', 1: 'SIDE', 2: 'BULL'}
+        next_dir_str = next_dir_map.get(next_dir_val, 'NONE')
 
         # Determine best window for this TF
         best_window_for_tf = self._get_best_window_for_tf(sample, tf)
@@ -558,8 +615,9 @@ class Inspector:
             f"R2: {r_squared:.4f}",
             f"Break: {break_dir} @ bar {bars_to_first} (mag: {first_mag:.2f})",
             f"Perm: {perm_dir} @ bar {bars_to_perm} (mag: {perm_mag:.2f})",
-            f"Return: {returned} | RoundTrips: {round_trips} (exits: {bounces})",
+            f"Bounces: {bounce_count} | Return: {returned} | RoundTrips: {round_trips} (exits: {bounces})",
             f"Durability: {durability:.2f}",
+            f"Next: {next_dir_str} @ +{next_bars_away} bars (bounces: {next_bounce_count})",
         ]
 
         info_text = '\n'.join(info_lines)
@@ -634,9 +692,16 @@ class Inspector:
                     biggest_dir = 1 if evt.exit_type == 'upper' else 0
 
         first_bar = break_result.break_bar if break_result.break_detected else -1
+        perm_bar = break_result.permanent_break_bar
+
+        # Reference bar for distance check: permanent break if available, else first break
+        reference_bar = perm_bar if perm_bar >= 0 else first_bar
+        max_distance = BREAK_DETECTION['biggest_break_max_distance']
 
         # Only show if at a different bar than first break (avoid overlapping markers)
-        if biggest_bar >= 0 and biggest_mag > 0.5 and biggest_bar != first_bar:
+        # AND within max_distance bars of the reference break
+        within_distance = (reference_bar < 0 or abs(biggest_bar - reference_bar) <= max_distance)
+        if biggest_bar >= 0 and biggest_mag > 0.5 and biggest_bar != first_bar and within_distance:
             biggest_x = break_to_plot_x(biggest_bar)
             if 0 <= biggest_x < n_bars:
                 marker = '^' if biggest_dir == 1 else 'v'
@@ -645,6 +710,91 @@ class Inspector:
                     price = df_plot.iloc[bar_idx]['high' if biggest_dir == 1 else 'low']
                     ax.scatter([biggest_x], [price], marker=marker, s=200,
                               c=BIGGEST_COLOR, edgecolors='white', linewidths=1.5, zorder=11)
+
+    def _lookup_next_channel_from_map(
+        self, tf: str, window: int, sample: ChannelSample
+    ) -> Optional[Tuple[int, int, int]]:
+        """
+        Look up the best next channel from the channel map.
+
+        Searches the channel_map for the current (tf, window), finds the current
+        channel based on sample timestamp, and returns info about the best next
+        channel (ranked by bounce_count, then r_squared).
+
+        Args:
+            tf: Timeframe string
+            window: Window size
+            sample: The current ChannelSample
+
+        Returns:
+            Tuple of (direction, bars_away, bounce_count) or None if not found.
+            direction: 0=BEAR, 1=SIDE, 2=BULL
+        """
+        if self.channel_map is None:
+            return None
+
+        # Handle nested structure: channel_map may be {'tsla': {...}, 'spy': {...}}
+        # or directly a ChannelMap Dict[(tf, window), List[DetectedChannel]]
+        asset_map = self.channel_map
+        if isinstance(self.channel_map, dict) and 'tsla' in self.channel_map:
+            asset_map = self.channel_map.get('tsla', {})
+
+        key = (tf, window)
+        channels = asset_map.get(key, [])
+        if not channels:
+            return None
+
+        sample_ts = sample.timestamp
+
+        # Find the current channel index by matching end_timestamp to sample timestamp
+        # The sample is created at the channel end position
+        current_idx = -1
+        for i, detected in enumerate(channels):
+            if detected.end_timestamp is not None and detected.end_timestamp == sample_ts:
+                current_idx = i
+                break
+
+        if current_idx < 0:
+            # Fallback: find the channel whose end_timestamp is closest to (but <= ) sample_ts
+            for i, detected in enumerate(channels):
+                if detected.end_timestamp is not None and detected.end_timestamp <= sample_ts:
+                    current_idx = i
+                else:
+                    break
+
+        if current_idx < 0 or current_idx >= len(channels) - 1:
+            # No current channel found or no next channels available
+            return None
+
+        # Look at next 1-2 channels
+        next_channels_info = []
+        for offset in range(1, 3):
+            idx = current_idx + offset
+            if idx < len(channels):
+                next_ch = channels[idx]
+                current_ch = channels[current_idx]
+                bars_away = next_ch.start_idx - current_ch.end_idx
+                next_channels_info.append((next_ch, bars_away))
+
+        if not next_channels_info:
+            return None
+
+        # Find the "best" channel using channel_sort_key (bounce_count, then r_squared)
+        best_ch, best_bars_away = next_channels_info[0]
+        best_sort_key = channel_sort_key(best_ch.channel)
+
+        for next_ch, bars_away in next_channels_info[1:]:
+            sort_key = channel_sort_key(next_ch.channel)
+            if sort_key > best_sort_key:
+                best_sort_key = sort_key
+                best_ch = next_ch
+                best_bars_away = bars_away
+
+        # Extract direction and bounce_count from best channel
+        direction = best_ch.direction  # 0=BEAR, 1=SIDEWAYS, 2=BULL
+        bounce_count = best_ch.channel.bounce_count if best_ch.channel.bounce_count is not None else 0
+
+        return (direction, best_bars_away, bounce_count)
 
     def _draw_info_fresh(self, ax, break_result, tf: str, window: int,
                          sample: ChannelSample, channel: Optional[Channel] = None):
@@ -678,20 +828,35 @@ class Inspector:
         # Use fresh channel's bounce stats when available (for consistency with _draw_info)
         if channel is not None and channel.valid:
             round_trips = channel.complete_cycles
+            bounce_count = channel.bounce_count
         else:
             round_trips = break_result.round_trip_bounces
+            bounce_count = 0
         exits_count = len(break_result.all_exit_events) if break_result.all_exit_events else 0
 
         # Compute durability score
         _, _, durability = compute_durability_from_result(break_result)
+
+        # Best next channel info - look up from channel_map if available
+        next_channel_info = self._lookup_next_channel_from_map(tf, window, sample)
+        if next_channel_info is not None:
+            next_dir_val, next_bars_away, next_bounce_count = next_channel_info
+            next_dir_map = {0: 'BEAR', 1: 'SIDE', 2: 'BULL'}
+            next_dir_str = next_dir_map.get(next_dir_val, 'N/A')
+        else:
+            # Fallback to N/A display
+            next_dir_str = 'N/A'
+            next_bars_away = -1
+            next_bounce_count = 0
 
         info_lines = [
             f"{tf} | {direction} | W:{window} (fresh)",
             f"R2: {r_squared:.4f}",
             f"Break: {break_dir} @ bar {bars_to_first} (mag: {first_mag:.2f})",
             f"Perm: {perm_dir} @ bar {bars_to_perm} (mag: {perm_mag:.2f})",
-            f"Return: {returned} | RoundTrips: {round_trips} (exits: {exits_count})",
+            f"Bounces: {bounce_count} | Return: {returned} | RoundTrips: {round_trips} (exits: {exits_count})",
             f"Durability: {durability:.2f}",
+            f"Next: {next_dir_str} @ +{next_bars_away} bars (bounces: {next_bounce_count})",
         ]
 
         info_text = '\n'.join(info_lines)
@@ -708,6 +873,7 @@ def main():
     parser.add_argument('--samples', '-s', help='Path to samples pickle file')
     parser.add_argument('--data-dir', '-d', default='data', help='Market data directory')
     parser.add_argument('--start', '-i', type=int, default=0, help='Starting sample index')
+    parser.add_argument('--channel-map', '-c', help='Path to pickled channel map file (saved during scanning)')
     args = parser.parse_args()
 
     # Get samples file path
@@ -722,13 +888,27 @@ def main():
         samples = pickle.load(f)
     print(f"Loaded {len(samples)} samples")
 
+    # Load channel map if provided
+    channel_map = None
+    if args.channel_map:
+        print(f"Loading channel map from {args.channel_map}...")
+        with open(args.channel_map, 'rb') as f:
+            channel_map = pickle.load(f)
+        # Channel map structure: {'tsla': {...}, 'spy': {...}}
+        if isinstance(channel_map, dict):
+            total_channels = sum(
+                len(channels) for asset_map in channel_map.values()
+                for channels in asset_map.values()
+            ) if channel_map else 0
+            print(f"Loaded channel map with {total_channels} channels")
+
     # Load market data
     print(f"Loading market data from {args.data_dir}...")
     tsla_df, _, _ = load_market_data(args.data_dir)
     print(f"Loaded {len(tsla_df)} bars")
 
     # Launch inspector
-    inspector = Inspector(samples, tsla_df)
+    inspector = Inspector(samples, tsla_df, channel_map=channel_map)
     inspector.show(start_idx=args.start)
 
 

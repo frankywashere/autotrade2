@@ -1,10 +1,10 @@
 """
 PyTorch Dataset for V15 Channel Prediction.
 
-Handles the 7,880 features with proper validation.
+Handles features with proper validation. See config.py TOTAL_FEATURES for current count.
 
 ChannelSample structure:
-    - tf_features: Dict[str, float] - ~7,880 TF-prefixed features
+    - tf_features: Dict[str, float] - TF-prefixed features (see config.TOTAL_FEATURES)
     - labels_per_window: Labels per window/asset/TF
         New structure: {window: {'tsla': {tf: ChannelLabels}, 'spy': {tf: ChannelLabels}}}
         Old structure: {window: {tf: ChannelLabels}} (backward compatible)
@@ -338,6 +338,37 @@ class ChannelDataset(Dataset):
             'cross_both_first_returned_then_permanent': False,
             'cross_both_never_returned': False,
             'cross_exit_verification_valid': False,
+            # Cross-correlation next channel labels (Phase 6)
+            'cross_divergence_predicts_reversal': False,
+            'cross_permanent_break_matches_next': False,
+            'cross_next_channel_direction_aligned': False,
+            'cross_next_channel_quality_aligned': False,
+            'cross_best_next_channel_tsla_vs_spy': 0,
+            # Cross-correlation RSI labels (Phase 7)
+            'cross_rsi_aligned_at_break': False,
+            'cross_rsi_divergence_aligned': False,
+            'cross_tsla_rsi_higher_at_break': False,
+            'cross_rsi_spread_at_break': 0.0,
+            'cross_overbought_predicts_down_break': False,
+            'cross_oversold_predicts_up_break': False,
+            # TSLA RSI labels (tsla_ prefix)
+            'tsla_rsi_at_first_break': 50.0,
+            'tsla_rsi_at_permanent_break': 50.0,
+            'tsla_rsi_at_channel_end': 50.0,
+            'tsla_rsi_overbought_at_break': False,
+            'tsla_rsi_oversold_at_break': False,
+            'tsla_rsi_divergence_at_break': 0,
+            'tsla_rsi_trend_in_channel': 0,
+            'tsla_rsi_range_in_channel': 0.0,
+            # SPY RSI labels (spy_ prefix)
+            'spy_rsi_at_first_break': 50.0,
+            'spy_rsi_at_permanent_break': 50.0,
+            'spy_rsi_at_channel_end': 50.0,
+            'spy_rsi_overbought_at_break': False,
+            'spy_rsi_oversold_at_break': False,
+            'spy_rsi_divergence_at_break': 0,
+            'spy_rsi_trend_in_channel': 0,
+            'spy_rsi_range_in_channel': 0.0,
         }
 
         if tf_labels is None:
@@ -373,6 +404,15 @@ class ChannelDataset(Dataset):
             'tsla_exits_stayed_out_count': getattr(tf_labels, 'exits_stayed_out_count', 0),
             'tsla_scan_timed_out': getattr(tf_labels, 'scan_timed_out', False),
             'tsla_bars_verified_permanent': getattr(tf_labels, 'bars_verified_permanent', 0),
+            # TSLA RSI labels (tsla_ prefix) - extracted from non-prefixed fields in ChannelLabels
+            'tsla_rsi_at_first_break': getattr(tf_labels, 'rsi_at_first_break', 50.0),
+            'tsla_rsi_at_permanent_break': getattr(tf_labels, 'rsi_at_permanent_break', 50.0),
+            'tsla_rsi_at_channel_end': getattr(tf_labels, 'rsi_at_channel_end', 50.0),
+            'tsla_rsi_overbought_at_break': getattr(tf_labels, 'rsi_overbought_at_break', False),
+            'tsla_rsi_oversold_at_break': getattr(tf_labels, 'rsi_oversold_at_break', False),
+            'tsla_rsi_divergence_at_break': getattr(tf_labels, 'rsi_divergence_at_break', 0),
+            'tsla_rsi_trend_in_channel': getattr(tf_labels, 'rsi_trend_in_channel', 0),
+            'tsla_rsi_range_in_channel': getattr(tf_labels, 'rsi_range_in_channel', 0.0),
         }
 
         # SPY break scan labels (from SPY's ChannelLabels if available)
@@ -397,6 +437,15 @@ class ChannelDataset(Dataset):
                 'spy_exits_stayed_out_count': getattr(spy_tf_labels, 'exits_stayed_out_count', 0),
                 'spy_scan_timed_out': getattr(spy_tf_labels, 'scan_timed_out', False),
                 'spy_bars_verified_permanent': getattr(spy_tf_labels, 'bars_verified_permanent', 0),
+                # SPY RSI labels - from non-prefixed fields in SPY's ChannelLabels
+                'spy_rsi_at_first_break': getattr(spy_tf_labels, 'rsi_at_first_break', 50.0),
+                'spy_rsi_at_permanent_break': getattr(spy_tf_labels, 'rsi_at_permanent_break', 50.0),
+                'spy_rsi_at_channel_end': getattr(spy_tf_labels, 'rsi_at_channel_end', 50.0),
+                'spy_rsi_overbought_at_break': getattr(spy_tf_labels, 'rsi_overbought_at_break', False),
+                'spy_rsi_oversold_at_break': getattr(spy_tf_labels, 'rsi_oversold_at_break', False),
+                'spy_rsi_divergence_at_break': getattr(spy_tf_labels, 'rsi_divergence_at_break', 0),
+                'spy_rsi_trend_in_channel': getattr(spy_tf_labels, 'rsi_trend_in_channel', 0),
+                'spy_rsi_range_in_channel': getattr(spy_tf_labels, 'rsi_range_in_channel', 0.0),
             })
         else:
             # Try to get SPY fields from TSLA labels (old structure with spy_ prefix on same object)
@@ -420,6 +469,15 @@ class ChannelDataset(Dataset):
                 'spy_exits_stayed_out_count': getattr(tf_labels, 'spy_exits_stayed_out_count', 0),
                 'spy_scan_timed_out': getattr(tf_labels, 'spy_scan_timed_out', False),
                 'spy_bars_verified_permanent': getattr(tf_labels, 'spy_bars_verified_permanent', 0),
+                # SPY RSI labels (old structure with spy_ prefix on same object)
+                'spy_rsi_at_first_break': getattr(tf_labels, 'spy_rsi_at_first_break', 50.0),
+                'spy_rsi_at_permanent_break': getattr(tf_labels, 'spy_rsi_at_permanent_break', 50.0),
+                'spy_rsi_at_channel_end': getattr(tf_labels, 'spy_rsi_at_channel_end', 50.0),
+                'spy_rsi_overbought_at_break': getattr(tf_labels, 'spy_rsi_overbought_at_break', False),
+                'spy_rsi_oversold_at_break': getattr(tf_labels, 'spy_rsi_oversold_at_break', False),
+                'spy_rsi_divergence_at_break': getattr(tf_labels, 'spy_rsi_divergence_at_break', 0),
+                'spy_rsi_trend_in_channel': getattr(tf_labels, 'spy_rsi_trend_in_channel', 0),
+                'spy_rsi_range_in_channel': getattr(tf_labels, 'spy_rsi_range_in_channel', 0.0),
             })
 
         # Compute cross-correlation labels
@@ -499,6 +557,31 @@ class ChannelDataset(Dataset):
             'cross_both_first_returned_then_permanent': False,
             'cross_both_never_returned': False,
             'cross_exit_verification_valid': False,
+            # Individual Exit Event Cross-Correlation
+            'cross_exit_timing_correlation': 0.0,
+            'cross_exit_timing_lag_mean': 0.0,
+            'cross_exit_direction_agreement': 0.0,
+            'cross_exit_count_spread': 0,
+            'cross_lead_lag_exits': 0,
+            'cross_exit_magnitude_correlation': 0.0,
+            'cross_mean_magnitude_spread': 0.0,
+            'cross_exit_duration_correlation': 0.0,
+            'cross_mean_duration_spread': 0.0,
+            'cross_simultaneous_exit_count': 0,
+            'cross_exit_cross_correlation_valid': False,
+            # Cross-correlation next channel labels (Phase 6)
+            'cross_divergence_predicts_reversal': False,
+            'cross_permanent_break_matches_next': False,
+            'cross_next_channel_direction_aligned': False,
+            'cross_next_channel_quality_aligned': False,
+            'cross_best_next_channel_tsla_vs_spy': 0,
+            # Cross-correlation RSI labels (Phase 7)
+            'cross_rsi_aligned_at_break': False,
+            'cross_rsi_divergence_aligned': False,
+            'cross_tsla_rsi_higher_at_break': False,
+            'cross_rsi_spread_at_break': 0.0,
+            'cross_overbought_predicts_down_break': False,
+            'cross_oversold_predicts_up_break': False,
         }
 
         if tsla_labels is None:
@@ -555,6 +638,31 @@ class ChannelDataset(Dataset):
                 'cross_both_first_returned_then_permanent': cross.both_first_returned_then_permanent,
                 'cross_both_never_returned': cross.both_never_returned,
                 'cross_exit_verification_valid': cross.exit_verification_valid,
+                # Individual Exit Event Cross-Correlation
+                'cross_exit_timing_correlation': cross.exit_timing_correlation,
+                'cross_exit_timing_lag_mean': cross.exit_timing_lag_mean,
+                'cross_exit_direction_agreement': cross.exit_direction_agreement,
+                'cross_exit_count_spread': cross.exit_count_spread,
+                'cross_lead_lag_exits': cross.lead_lag_exits,
+                'cross_exit_magnitude_correlation': cross.exit_magnitude_correlation,
+                'cross_mean_magnitude_spread': cross.mean_magnitude_spread,
+                'cross_exit_duration_correlation': cross.exit_duration_correlation,
+                'cross_mean_duration_spread': cross.mean_duration_spread,
+                'cross_simultaneous_exit_count': cross.simultaneous_exit_count,
+                'cross_exit_cross_correlation_valid': cross.exit_cross_correlation_valid,
+                # Cross-correlation next channel labels (Phase 6)
+                'cross_divergence_predicts_reversal': cross.divergence_predicts_reversal,
+                'cross_permanent_break_matches_next': cross.permanent_break_matches_next,
+                'cross_next_channel_direction_aligned': cross.next_channel_direction_aligned,
+                'cross_next_channel_quality_aligned': cross.next_channel_quality_aligned,
+                'cross_best_next_channel_tsla_vs_spy': cross.best_next_channel_tsla_vs_spy,
+                # Cross-correlation RSI labels (Phase 7)
+                'cross_rsi_aligned_at_break': cross.rsi_aligned_at_break,
+                'cross_rsi_divergence_aligned': cross.rsi_divergence_aligned,
+                'cross_tsla_rsi_higher_at_break': cross.tsla_rsi_higher_at_break,
+                'cross_rsi_spread_at_break': cross.rsi_spread_at_break,
+                'cross_overbought_predicts_down_break': cross.overbought_predicts_down_break,
+                'cross_oversold_predicts_up_break': cross.oversold_predicts_up_break,
             }
         else:
             # Old structure: SPY fields are on the same ChannelLabels object
@@ -713,6 +821,31 @@ class ChannelDataset(Dataset):
                 'cross_both_first_returned_then_permanent': both_first_returned_then_permanent,
                 'cross_both_never_returned': both_never_returned,
                 'cross_exit_verification_valid': exit_verification_valid,
+                # Individual Exit Event Cross-Correlation - not computable from old structure
+                'cross_exit_timing_correlation': 0.0,
+                'cross_exit_timing_lag_mean': 0.0,
+                'cross_exit_direction_agreement': 0.0,
+                'cross_exit_count_spread': 0,
+                'cross_lead_lag_exits': 0,
+                'cross_exit_magnitude_correlation': 0.0,
+                'cross_mean_magnitude_spread': 0.0,
+                'cross_exit_duration_correlation': 0.0,
+                'cross_mean_duration_spread': 0.0,
+                'cross_simultaneous_exit_count': 0,
+                'cross_exit_cross_correlation_valid': False,
+                # Cross-correlation next channel labels (Phase 6) - not computable from old structure
+                'cross_divergence_predicts_reversal': False,
+                'cross_permanent_break_matches_next': False,
+                'cross_next_channel_direction_aligned': False,
+                'cross_next_channel_quality_aligned': False,
+                'cross_best_next_channel_tsla_vs_spy': 0,
+                # Cross-correlation RSI labels (Phase 7) - not computable from old structure
+                'cross_rsi_aligned_at_break': False,
+                'cross_rsi_divergence_aligned': False,
+                'cross_tsla_rsi_higher_at_break': False,
+                'cross_rsi_spread_at_break': 0.0,
+                'cross_overbought_predicts_down_break': False,
+                'cross_oversold_predicts_up_break': False,
             }
 
     def __len__(self) -> int:
@@ -824,6 +957,51 @@ class ChannelDataset(Dataset):
             'cross_both_first_returned_then_permanent': torch.tensor(labels['cross_both_first_returned_then_permanent'], dtype=torch.bool),
             'cross_both_never_returned': torch.tensor(labels['cross_both_never_returned'], dtype=torch.bool),
             'cross_exit_verification_valid': torch.tensor(labels['cross_exit_verification_valid'], dtype=torch.bool),
+            # Individual Exit Event Cross-Correlation
+            'cross_exit_timing_correlation': torch.tensor(labels['cross_exit_timing_correlation'], dtype=torch.float32),
+            'cross_exit_timing_lag_mean': torch.tensor(labels['cross_exit_timing_lag_mean'], dtype=torch.float32),
+            'cross_exit_direction_agreement': torch.tensor(labels['cross_exit_direction_agreement'], dtype=torch.float32),
+            'cross_exit_count_spread': torch.tensor(labels['cross_exit_count_spread'], dtype=torch.float32),
+            'cross_lead_lag_exits': torch.tensor(labels['cross_lead_lag_exits'], dtype=torch.float32),
+            'cross_exit_magnitude_correlation': torch.tensor(labels['cross_exit_magnitude_correlation'], dtype=torch.float32),
+            'cross_mean_magnitude_spread': torch.tensor(labels['cross_mean_magnitude_spread'], dtype=torch.float32),
+            'cross_exit_duration_correlation': torch.tensor(labels['cross_exit_duration_correlation'], dtype=torch.float32),
+            'cross_mean_duration_spread': torch.tensor(labels['cross_mean_duration_spread'], dtype=torch.float32),
+            'cross_simultaneous_exit_count': torch.tensor(labels['cross_simultaneous_exit_count'], dtype=torch.float32),
+            'cross_exit_cross_correlation_valid': torch.tensor(int(labels['cross_exit_cross_correlation_valid']), dtype=torch.long),
+            # Cross-correlation next channel labels (Phase 6)
+            'cross_divergence_predicts_reversal': torch.tensor(int(labels['cross_divergence_predicts_reversal']), dtype=torch.long),
+            'cross_permanent_break_matches_next': torch.tensor(int(labels['cross_permanent_break_matches_next']), dtype=torch.long),
+            'cross_next_channel_direction_aligned': torch.tensor(int(labels['cross_next_channel_direction_aligned']), dtype=torch.long),
+            'cross_next_channel_quality_aligned': torch.tensor(int(labels['cross_next_channel_quality_aligned']), dtype=torch.long),
+            'cross_best_next_channel_tsla_vs_spy': torch.tensor(labels['cross_best_next_channel_tsla_vs_spy'], dtype=torch.long),
+            # Cross-correlation RSI labels (Phase 7)
+            'cross_rsi_aligned_at_break': torch.tensor(int(labels['cross_rsi_aligned_at_break']), dtype=torch.long),
+            'cross_rsi_divergence_aligned': torch.tensor(int(labels['cross_rsi_divergence_aligned']), dtype=torch.long),
+            'cross_tsla_rsi_higher_at_break': torch.tensor(int(labels['cross_tsla_rsi_higher_at_break']), dtype=torch.long),
+            'cross_rsi_spread_at_break': torch.tensor(labels['cross_rsi_spread_at_break'], dtype=torch.float32),
+            'cross_overbought_predicts_down_break': torch.tensor(int(labels['cross_overbought_predicts_down_break']), dtype=torch.long),
+            'cross_oversold_predicts_up_break': torch.tensor(int(labels['cross_oversold_predicts_up_break']), dtype=torch.long),
+
+            # TSLA RSI labels (tsla_ prefix)
+            'tsla_rsi_at_first_break': torch.tensor(labels['tsla_rsi_at_first_break'], dtype=torch.float32),
+            'tsla_rsi_at_permanent_break': torch.tensor(labels['tsla_rsi_at_permanent_break'], dtype=torch.float32),
+            'tsla_rsi_at_channel_end': torch.tensor(labels['tsla_rsi_at_channel_end'], dtype=torch.float32),
+            'tsla_rsi_overbought_at_break': torch.tensor(int(labels['tsla_rsi_overbought_at_break']), dtype=torch.long),
+            'tsla_rsi_oversold_at_break': torch.tensor(int(labels['tsla_rsi_oversold_at_break']), dtype=torch.long),
+            'tsla_rsi_divergence_at_break': torch.tensor(labels['tsla_rsi_divergence_at_break'], dtype=torch.long),
+            'tsla_rsi_trend_in_channel': torch.tensor(labels['tsla_rsi_trend_in_channel'], dtype=torch.long),
+            'tsla_rsi_range_in_channel': torch.tensor(labels['tsla_rsi_range_in_channel'], dtype=torch.float32),
+
+            # SPY RSI labels (spy_ prefix)
+            'spy_rsi_at_first_break': torch.tensor(labels['spy_rsi_at_first_break'], dtype=torch.float32),
+            'spy_rsi_at_permanent_break': torch.tensor(labels['spy_rsi_at_permanent_break'], dtype=torch.float32),
+            'spy_rsi_at_channel_end': torch.tensor(labels['spy_rsi_at_channel_end'], dtype=torch.float32),
+            'spy_rsi_overbought_at_break': torch.tensor(int(labels['spy_rsi_overbought_at_break']), dtype=torch.long),
+            'spy_rsi_oversold_at_break': torch.tensor(int(labels['spy_rsi_oversold_at_break']), dtype=torch.long),
+            'spy_rsi_divergence_at_break': torch.tensor(labels['spy_rsi_divergence_at_break'], dtype=torch.long),
+            'spy_rsi_trend_in_channel': torch.tensor(labels['spy_rsi_trend_in_channel'], dtype=torch.long),
+            'spy_rsi_range_in_channel': torch.tensor(labels['spy_rsi_range_in_channel'], dtype=torch.float32),
         }
 
         # For learned mode, add per-window features so model can learn to select

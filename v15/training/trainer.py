@@ -112,6 +112,24 @@ class TrainingConfig:
     spy_bars_to_permanent_weight: float = 0.5     # Regression: bars to permanent break
     cross_durability_spread_weight: float = 0.3   # Regression: durability spread
 
+    # RSI prediction head weights - TSLA
+    tsla_rsi_at_break_weight: float = 1.0         # Regression: RSI value at break
+    tsla_rsi_overbought_weight: float = 1.0       # Binary: RSI > 70
+    tsla_rsi_oversold_weight: float = 1.0         # Binary: RSI < 30
+    tsla_rsi_divergence_weight: float = 1.0       # Multi-class: divergence type
+
+    # RSI prediction head weights - SPY
+    spy_rsi_at_break_weight: float = 1.0          # Regression: RSI value at break
+    spy_rsi_overbought_weight: float = 1.0        # Binary: RSI > 70
+    spy_rsi_oversold_weight: float = 1.0          # Binary: RSI < 30
+    spy_rsi_divergence_weight: float = 1.0        # Multi-class: divergence type
+
+    # RSI prediction head weights - Cross-correlation
+    cross_rsi_aligned_weight: float = 1.0         # Binary: TSLA/SPY RSI aligned
+    cross_rsi_spread_weight: float = 1.0          # Regression: RSI spread
+    cross_overbought_predicts_down_weight: float = 1.0  # Binary: overbought predicts down
+    cross_oversold_predicts_up_weight: float = 1.0      # Binary: oversold predicts up
+
 
 # =============================================================================
 # Window Selection Head
@@ -981,6 +999,233 @@ class Trainer:
             losses['cross_durability_spread'] = 0.0
 
         # =====================================================================
+        # RSI Prediction Heads - TSLA (use tsla_break_scan_valid mask)
+        # =====================================================================
+
+        # TSLA RSI at break (regression with Gaussian NLL)
+        if 'tsla_rsi_at_break_mean' in predictions and tsla_break_scan_valid.any():
+            tsla_rsi_mean = predictions['tsla_rsi_at_break_mean'][tsla_break_scan_valid]
+            tsla_rsi_target = labels['tsla_rsi_at_first_break'][tsla_break_scan_valid].float()
+
+            if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_rsi_at_break_log_std' in predictions:
+                tsla_rsi_log_std = predictions['tsla_rsi_at_break_log_std'][tsla_break_scan_valid]
+                variance = torch.exp(2 * tsla_rsi_log_std)
+                tsla_rsi_loss = 0.5 * (
+                    torch.log(variance) +
+                    (tsla_rsi_target - tsla_rsi_mean) ** 2 / variance
+                ).mean()
+            else:
+                tsla_rsi_loss = F.huber_loss(tsla_rsi_mean, tsla_rsi_target, delta=self.config.huber_delta)
+
+            losses['tsla_rsi_at_break'] = tsla_rsi_loss.item()
+        else:
+            tsla_rsi_loss = torch.tensor(0.0, device=self.device)
+            losses['tsla_rsi_at_break'] = 0.0
+
+        # TSLA RSI overbought (binary classification)
+        if 'tsla_rsi_overbought_logits' in predictions and tsla_break_scan_valid.any():
+            tsla_ob_logits = predictions['tsla_rsi_overbought_logits'][tsla_break_scan_valid]
+            tsla_ob_target = labels['tsla_rsi_overbought_at_break'][tsla_break_scan_valid].float()
+
+            if self.config.direction_loss_type == 'focal':
+                probs = torch.sigmoid(tsla_ob_logits)
+                p_t = probs * tsla_ob_target + (1 - probs) * (1 - tsla_ob_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(tsla_ob_logits, tsla_ob_target, reduction='none')
+                tsla_ob_loss = (focal_weight * bce).mean()
+            else:
+                tsla_ob_loss = F.binary_cross_entropy_with_logits(tsla_ob_logits, tsla_ob_target)
+
+            losses['tsla_rsi_overbought'] = tsla_ob_loss.item()
+        else:
+            tsla_ob_loss = torch.tensor(0.0, device=self.device)
+            losses['tsla_rsi_overbought'] = 0.0
+
+        # TSLA RSI oversold (binary classification)
+        if 'tsla_rsi_oversold_logits' in predictions and tsla_break_scan_valid.any():
+            tsla_os_logits = predictions['tsla_rsi_oversold_logits'][tsla_break_scan_valid]
+            tsla_os_target = labels['tsla_rsi_oversold_at_break'][tsla_break_scan_valid].float()
+
+            if self.config.direction_loss_type == 'focal':
+                probs = torch.sigmoid(tsla_os_logits)
+                p_t = probs * tsla_os_target + (1 - probs) * (1 - tsla_os_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(tsla_os_logits, tsla_os_target, reduction='none')
+                tsla_os_loss = (focal_weight * bce).mean()
+            else:
+                tsla_os_loss = F.binary_cross_entropy_with_logits(tsla_os_logits, tsla_os_target)
+
+            losses['tsla_rsi_oversold'] = tsla_os_loss.item()
+        else:
+            tsla_os_loss = torch.tensor(0.0, device=self.device)
+            losses['tsla_rsi_oversold'] = 0.0
+
+        # TSLA RSI divergence (3-class classification)
+        if 'tsla_rsi_divergence_logits' in predictions and tsla_break_scan_valid.any():
+            tsla_div_logits = predictions['tsla_rsi_divergence_logits'][tsla_break_scan_valid]
+            tsla_div_target = labels['tsla_rsi_divergence_at_break'][tsla_break_scan_valid].long()
+            tsla_div_loss = F.cross_entropy(tsla_div_logits, tsla_div_target)
+
+            losses['tsla_rsi_divergence'] = tsla_div_loss.item()
+        else:
+            tsla_div_loss = torch.tensor(0.0, device=self.device)
+            losses['tsla_rsi_divergence'] = 0.0
+
+        # =====================================================================
+        # RSI Prediction Heads - SPY (use spy_break_scan_valid mask)
+        # =====================================================================
+
+        # SPY RSI at break (regression with Gaussian NLL)
+        if 'spy_rsi_at_break_mean' in predictions and spy_break_scan_valid.any():
+            spy_rsi_mean = predictions['spy_rsi_at_break_mean'][spy_break_scan_valid]
+            spy_rsi_target = labels['spy_rsi_at_first_break'][spy_break_scan_valid].float()
+
+            if self.config.duration_loss_type == 'gaussian_nll' and 'spy_rsi_at_break_log_std' in predictions:
+                spy_rsi_log_std = predictions['spy_rsi_at_break_log_std'][spy_break_scan_valid]
+                variance = torch.exp(2 * spy_rsi_log_std)
+                spy_rsi_loss = 0.5 * (
+                    torch.log(variance) +
+                    (spy_rsi_target - spy_rsi_mean) ** 2 / variance
+                ).mean()
+            else:
+                spy_rsi_loss = F.huber_loss(spy_rsi_mean, spy_rsi_target, delta=self.config.huber_delta)
+
+            losses['spy_rsi_at_break'] = spy_rsi_loss.item()
+        else:
+            spy_rsi_loss = torch.tensor(0.0, device=self.device)
+            losses['spy_rsi_at_break'] = 0.0
+
+        # SPY RSI overbought (binary classification)
+        if 'spy_rsi_overbought_logits' in predictions and spy_break_scan_valid.any():
+            spy_ob_logits = predictions['spy_rsi_overbought_logits'][spy_break_scan_valid]
+            spy_ob_target = labels['spy_rsi_overbought_at_break'][spy_break_scan_valid].float()
+
+            if self.config.direction_loss_type == 'focal':
+                probs = torch.sigmoid(spy_ob_logits)
+                p_t = probs * spy_ob_target + (1 - probs) * (1 - spy_ob_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(spy_ob_logits, spy_ob_target, reduction='none')
+                spy_ob_loss = (focal_weight * bce).mean()
+            else:
+                spy_ob_loss = F.binary_cross_entropy_with_logits(spy_ob_logits, spy_ob_target)
+
+            losses['spy_rsi_overbought'] = spy_ob_loss.item()
+        else:
+            spy_ob_loss = torch.tensor(0.0, device=self.device)
+            losses['spy_rsi_overbought'] = 0.0
+
+        # SPY RSI oversold (binary classification)
+        if 'spy_rsi_oversold_logits' in predictions and spy_break_scan_valid.any():
+            spy_os_logits = predictions['spy_rsi_oversold_logits'][spy_break_scan_valid]
+            spy_os_target = labels['spy_rsi_oversold_at_break'][spy_break_scan_valid].float()
+
+            if self.config.direction_loss_type == 'focal':
+                probs = torch.sigmoid(spy_os_logits)
+                p_t = probs * spy_os_target + (1 - probs) * (1 - spy_os_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(spy_os_logits, spy_os_target, reduction='none')
+                spy_os_loss = (focal_weight * bce).mean()
+            else:
+                spy_os_loss = F.binary_cross_entropy_with_logits(spy_os_logits, spy_os_target)
+
+            losses['spy_rsi_oversold'] = spy_os_loss.item()
+        else:
+            spy_os_loss = torch.tensor(0.0, device=self.device)
+            losses['spy_rsi_oversold'] = 0.0
+
+        # SPY RSI divergence (3-class classification)
+        if 'spy_rsi_divergence_logits' in predictions and spy_break_scan_valid.any():
+            spy_div_logits = predictions['spy_rsi_divergence_logits'][spy_break_scan_valid]
+            spy_div_target = labels['spy_rsi_divergence_at_break'][spy_break_scan_valid].long()
+            spy_div_loss = F.cross_entropy(spy_div_logits, spy_div_target)
+
+            losses['spy_rsi_divergence'] = spy_div_loss.item()
+        else:
+            spy_div_loss = torch.tensor(0.0, device=self.device)
+            losses['spy_rsi_divergence'] = 0.0
+
+        # =====================================================================
+        # RSI Prediction Heads - Cross-Correlation (use cross_valid mask)
+        # =====================================================================
+
+        # Cross RSI aligned (binary classification)
+        if 'cross_rsi_aligned_logits' in predictions and cross_valid.any():
+            cross_rsi_aligned_logits = predictions['cross_rsi_aligned_logits'][cross_valid]
+            cross_rsi_aligned_target = labels['cross_rsi_aligned_at_break'][cross_valid].float()
+
+            if self.config.direction_loss_type == 'focal':
+                probs = torch.sigmoid(cross_rsi_aligned_logits)
+                p_t = probs * cross_rsi_aligned_target + (1 - probs) * (1 - cross_rsi_aligned_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(cross_rsi_aligned_logits, cross_rsi_aligned_target, reduction='none')
+                cross_rsi_aligned_loss = (focal_weight * bce).mean()
+            else:
+                cross_rsi_aligned_loss = F.binary_cross_entropy_with_logits(cross_rsi_aligned_logits, cross_rsi_aligned_target)
+
+            losses['cross_rsi_aligned'] = cross_rsi_aligned_loss.item()
+        else:
+            cross_rsi_aligned_loss = torch.tensor(0.0, device=self.device)
+            losses['cross_rsi_aligned'] = 0.0
+
+        # Cross RSI spread (regression with Gaussian NLL)
+        if 'cross_rsi_spread_mean' in predictions and cross_valid.any():
+            cross_rsi_spread_mean = predictions['cross_rsi_spread_mean'][cross_valid]
+            cross_rsi_spread_target = labels['cross_rsi_spread_at_break'][cross_valid].float()
+
+            if self.config.duration_loss_type == 'gaussian_nll' and 'cross_rsi_spread_log_std' in predictions:
+                cross_rsi_spread_log_std = predictions['cross_rsi_spread_log_std'][cross_valid]
+                variance = torch.exp(2 * cross_rsi_spread_log_std)
+                cross_rsi_spread_loss = 0.5 * (
+                    torch.log(variance) +
+                    (cross_rsi_spread_target - cross_rsi_spread_mean) ** 2 / variance
+                ).mean()
+            else:
+                cross_rsi_spread_loss = F.huber_loss(cross_rsi_spread_mean, cross_rsi_spread_target, delta=self.config.huber_delta)
+
+            losses['cross_rsi_spread'] = cross_rsi_spread_loss.item()
+        else:
+            cross_rsi_spread_loss = torch.tensor(0.0, device=self.device)
+            losses['cross_rsi_spread'] = 0.0
+
+        # Cross overbought predicts down (binary classification)
+        if 'cross_overbought_predicts_down_logits' in predictions and cross_valid.any():
+            cross_ob_down_logits = predictions['cross_overbought_predicts_down_logits'][cross_valid]
+            cross_ob_down_target = labels['cross_overbought_predicts_down_break'][cross_valid].float()
+
+            if self.config.direction_loss_type == 'focal':
+                probs = torch.sigmoid(cross_ob_down_logits)
+                p_t = probs * cross_ob_down_target + (1 - probs) * (1 - cross_ob_down_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(cross_ob_down_logits, cross_ob_down_target, reduction='none')
+                cross_ob_down_loss = (focal_weight * bce).mean()
+            else:
+                cross_ob_down_loss = F.binary_cross_entropy_with_logits(cross_ob_down_logits, cross_ob_down_target)
+
+            losses['cross_overbought_predicts_down'] = cross_ob_down_loss.item()
+        else:
+            cross_ob_down_loss = torch.tensor(0.0, device=self.device)
+            losses['cross_overbought_predicts_down'] = 0.0
+
+        # Cross oversold predicts up (binary classification)
+        if 'cross_oversold_predicts_up_logits' in predictions and cross_valid.any():
+            cross_os_up_logits = predictions['cross_oversold_predicts_up_logits'][cross_valid]
+            cross_os_up_target = labels['cross_oversold_predicts_up_break'][cross_valid].float()
+
+            if self.config.direction_loss_type == 'focal':
+                probs = torch.sigmoid(cross_os_up_logits)
+                p_t = probs * cross_os_up_target + (1 - probs) * (1 - cross_os_up_target)
+                focal_weight = (1 - p_t) ** self.config.focal_gamma
+                bce = F.binary_cross_entropy_with_logits(cross_os_up_logits, cross_os_up_target, reduction='none')
+                cross_os_up_loss = (focal_weight * bce).mean()
+            else:
+                cross_os_up_loss = F.binary_cross_entropy_with_logits(cross_os_up_logits, cross_os_up_target)
+
+            losses['cross_oversold_predicts_up'] = cross_os_up_loss.item()
+        else:
+            cross_os_up_loss = torch.tensor(0.0, device=self.device)
+            losses['cross_oversold_predicts_up'] = 0.0
+
+        # =====================================================================
         # Combined primary loss with task weighting
         # =====================================================================
         total_loss = (
@@ -1007,12 +1252,27 @@ class Trainer:
             self.config.cross_break_lag_weight * cross_lag_loss +
             self.config.cross_both_permanent_weight * cross_perm_loss +
             self.config.cross_return_aligned_weight * cross_ret_loss +
-            # Durability and bars-to-permanent heads (NEW)
+            # Durability and bars-to-permanent heads
             self.config.tsla_durability_weight * tsla_dur_loss +
             self.config.tsla_bars_to_permanent_weight * tsla_btp_loss +
             self.config.spy_durability_weight * spy_dur_loss +
             self.config.spy_bars_to_permanent_weight * spy_btp_loss +
-            self.config.cross_durability_spread_weight * cross_dur_spread_loss
+            self.config.cross_durability_spread_weight * cross_dur_spread_loss +
+            # RSI prediction heads - TSLA
+            self.config.tsla_rsi_at_break_weight * tsla_rsi_loss +
+            self.config.tsla_rsi_overbought_weight * tsla_ob_loss +
+            self.config.tsla_rsi_oversold_weight * tsla_os_loss +
+            self.config.tsla_rsi_divergence_weight * tsla_div_loss +
+            # RSI prediction heads - SPY
+            self.config.spy_rsi_at_break_weight * spy_rsi_loss +
+            self.config.spy_rsi_overbought_weight * spy_ob_loss +
+            self.config.spy_rsi_oversold_weight * spy_os_loss +
+            self.config.spy_rsi_divergence_weight * spy_div_loss +
+            # RSI prediction heads - Cross-correlation
+            self.config.cross_rsi_aligned_weight * cross_rsi_aligned_loss +
+            self.config.cross_rsi_spread_weight * cross_rsi_spread_loss +
+            self.config.cross_overbought_predicts_down_weight * cross_ob_down_loss +
+            self.config.cross_oversold_predicts_up_weight * cross_os_up_loss
         )
 
         # =====================================================================
@@ -1517,6 +1777,27 @@ class Trainer:
                 'cross_break_lag_weight': self.config.cross_break_lag_weight,
                 'cross_both_permanent_weight': self.config.cross_both_permanent_weight,
                 'cross_return_aligned_weight': self.config.cross_return_aligned_weight,
+                # Durability and bars-to-permanent head weights
+                'tsla_durability_weight': self.config.tsla_durability_weight,
+                'tsla_bars_to_permanent_weight': self.config.tsla_bars_to_permanent_weight,
+                'spy_durability_weight': self.config.spy_durability_weight,
+                'spy_bars_to_permanent_weight': self.config.spy_bars_to_permanent_weight,
+                'cross_durability_spread_weight': self.config.cross_durability_spread_weight,
+                # RSI prediction head weights - TSLA
+                'tsla_rsi_at_break_weight': self.config.tsla_rsi_at_break_weight,
+                'tsla_rsi_overbought_weight': self.config.tsla_rsi_overbought_weight,
+                'tsla_rsi_oversold_weight': self.config.tsla_rsi_oversold_weight,
+                'tsla_rsi_divergence_weight': self.config.tsla_rsi_divergence_weight,
+                # RSI prediction head weights - SPY
+                'spy_rsi_at_break_weight': self.config.spy_rsi_at_break_weight,
+                'spy_rsi_overbought_weight': self.config.spy_rsi_overbought_weight,
+                'spy_rsi_oversold_weight': self.config.spy_rsi_oversold_weight,
+                'spy_rsi_divergence_weight': self.config.spy_rsi_divergence_weight,
+                # RSI prediction head weights - Cross-correlation
+                'cross_rsi_aligned_weight': self.config.cross_rsi_aligned_weight,
+                'cross_rsi_spread_weight': self.config.cross_rsi_spread_weight,
+                'cross_overbought_predicts_down_weight': self.config.cross_overbought_predicts_down_weight,
+                'cross_oversold_predicts_up_weight': self.config.cross_oversold_predicts_up_weight,
             },
         }
 

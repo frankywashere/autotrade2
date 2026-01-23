@@ -4,37 +4,30 @@ V15 Features Package
 Unified feature extraction system for x14 trading model.
 
 Standard Mode (per sample, no TF awareness):
-    extract_all_features() - Extract ~462 features from market data
+    extract_all_features() - Extract features from market data
 
 TF-Aware Mode (full timeframe awareness):
     extract_all_tf_features() - Extract features across all timeframes
 
 Feature Groups (Standard):
-    - tsla_channel: Channel position, width, slope features (~50)
-    - tsla_price: Price action, momentum, patterns (~60)
-    - technical: RSI, MACD, Bollinger, etc. (~77)
-    - spy: SPY market features and correlation (~80)
-    - spy_channel: SPY channel features (~58)
-    - channel_correlation: TSLA-SPY channel correlation (~50)
-    - vix: Volatility index features (~25)
-    - cross_asset: Cross-asset relationships (~40)
-    - channel_history: Historical channel patterns (~50)
-    - events: Calendar, earnings, macro events (~30)
-    - window_scores: Window optimization scores (~50)
+    - tsla_channel: Channel position, width, slope features
+    - tsla_price: Price action, momentum, patterns
+    - technical: RSI, MACD, Bollinger, etc.
+    - spy: SPY market features and correlation
+    - spy_channel: SPY channel features
+    - channel_correlation: TSLA-SPY channel correlation
+    - vix: Volatility index features
+    - cross_asset: Cross-asset relationships
+    - channel_history: Historical channel patterns
+    - events: Calendar, earnings, macro events
+    - window_scores: Window optimization scores
 
 Feature Groups (TF-Aware):
-    - tsla_price: 60 * 10 TFs = 600
-    - technical: 77 * 10 TFs = 770
-    - spy: 80 * 10 TFs = 800
-    - vix: 25 * 10 TFs = 250
-    - cross_asset: 40 * 10 TFs = 400
-    - tsla_channel: 50 * 8 windows * 10 TFs = 4,000
-    - spy_channel: 58 * 8 windows * 10 TFs = 4,640
-    - channel_correlation: ~50 * 10 TFs = 500
-    - window_scores: 50 * 10 TFs = 500
-    - channel_history: 50 * 10 TFs = 500
-    - events: 30 (TF-independent)
-    - bar_metadata: 3 * 10 TFs = 30
+    See config.py for current feature counts:
+    - FEATURE_COUNTS: Per-category counts
+    - WINDOW_INDEPENDENT_PER_TF: Features not dependent on window
+    - WINDOW_DEPENDENT_PER_TF: Channel features per window
+    - TOTAL_FEATURES: Total feature count
 """
 
 from __future__ import annotations

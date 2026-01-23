@@ -217,6 +217,7 @@ class ChannelLabels:
     source_channel_std_dev: float = 0.0         # Standard deviation of residuals (channel width)
     source_channel_r_squared: float = 0.0       # R-squared goodness of fit
     source_channel_direction: int = -1          # 0=BEAR, 1=SIDEWAYS, 2=BULL, -1=unknown
+    source_channel_bounce_count: int = 0        # Bounce count (alternating touches) from original channel
     # NOTE: The following timestamp fields are NOT used by the inspector for visualization.
     # They are kept for potential future use or debugging purposes.
     source_channel_start_ts: Optional[pd.Timestamp] = None  # Start timestamp of detection window
@@ -226,6 +227,13 @@ class ChannelLabels:
     # NOTE: These timestamp fields are NOT used by the inspector for visualization.
     spy_source_channel_start_ts: Optional[pd.Timestamp] = None
     spy_source_channel_end_ts: Optional[pd.Timestamp] = None
+    # SPY source channel parameters (mirror TSLA fields)
+    spy_source_channel_slope: float = 0.0
+    spy_source_channel_intercept: float = 0.0
+    spy_source_channel_std_dev: float = 0.0
+    spy_source_channel_r_squared: float = 0.0
+    spy_source_channel_direction: int = -1
+    spy_source_channel_bounce_count: int = 0    # Bounce count (alternating touches) from original channel
 
     # -------------------------------------------------------------------------
     # VALIDITY FLAGS - Indicate whether each label component is valid/usable
@@ -234,6 +242,53 @@ class ChannelLabels:
     direction_valid: bool = False      # True if break_direction is meaningful
     next_channel_valid: bool = False   # True if next_channel_direction is meaningful
     break_scan_valid: bool = False     # True if forward scan was performed
+
+    # === NEXT CHANNEL LABELS (Phase 6) ===
+    # Best channel in next 2 channels (ranked by bounce_count)
+    best_next_channel_direction: int = -1     # BEAR(0)/SIDEWAYS(1)/BULL(2), -1=none
+    best_next_channel_bars_away: int = -1     # Bars until it starts
+    best_next_channel_duration: int = -1      # How long it lasts (bars)
+    best_next_channel_r_squared: float = 0.0  # Quality (0-1)
+    best_next_channel_bounce_count: int = 0   # Key ranking metric
+
+    # Shortest channel in next 2 channels (by duration)
+    shortest_next_channel_direction: int = -1
+    shortest_next_channel_bars_away: int = -1
+    shortest_next_channel_duration: int = -1
+
+    # Pattern info
+    small_channels_before_best: int = 0       # 0, 1, or 2
+
+    # === SPY NEXT CHANNEL LABELS (Phase 6) ===
+    spy_best_next_channel_direction: int = -1     # BEAR(0)/SIDEWAYS(1)/BULL(2), -1=none
+    spy_best_next_channel_bars_away: int = -1     # Bars until it starts
+    spy_best_next_channel_duration: int = -1      # How long it lasts (bars)
+    spy_best_next_channel_r_squared: float = 0.0  # Quality (0-1)
+    spy_best_next_channel_bounce_count: int = 0   # Key ranking metric
+    spy_shortest_next_channel_direction: int = -1
+    spy_shortest_next_channel_bars_away: int = -1
+    spy_shortest_next_channel_duration: int = -1
+    spy_small_channels_before_best: int = 0       # 0, 1, or 2
+
+    # === RSI LABELS (Phase 7) ===
+    rsi_at_first_break: float = 50.0
+    rsi_at_permanent_break: float = 50.0
+    rsi_at_channel_end: float = 50.0
+    rsi_overbought_at_break: bool = False
+    rsi_oversold_at_break: bool = False
+    rsi_divergence_at_break: int = 0          # -1=bearish, 0=none, 1=bullish
+    rsi_trend_in_channel: int = 0             # -1=falling, 0=flat, 1=rising
+    rsi_range_in_channel: float = 0.0
+
+    # === SPY RSI LABELS (Phase 7) ===
+    spy_rsi_at_first_break: float = 50.0        # RSI-14 value when first break occurred
+    spy_rsi_at_permanent_break: float = 50.0    # RSI-14 value when permanent break occurred
+    spy_rsi_at_channel_end: float = 50.0        # RSI-14 at sample position
+    spy_rsi_overbought_at_break: bool = False   # RSI > 70 at first break
+    spy_rsi_oversold_at_break: bool = False     # RSI < 30 at first break
+    spy_rsi_divergence_at_break: int = 0        # -1=bearish, 0=none, 1=bullish
+    spy_rsi_trend_in_channel: int = 0           # -1=falling, 0=flat, 1=rising
+    spy_rsi_range_in_channel: float = 0.0       # Max RSI - Min RSI during channel
 
 
 @dataclass
@@ -413,3 +468,18 @@ class CrossCorrelationLabels:
     # Validity flags
     cross_valid: bool = False
     permanent_cross_valid: bool = False  # Both had valid permanent breaks
+
+    # === NEXT CHANNEL CROSS-CORRELATION (Phase 6) ===
+    divergence_predicts_reversal: bool = False
+    permanent_break_matches_next: bool = False
+    next_channel_direction_aligned: bool = False
+    next_channel_quality_aligned: bool = False
+    best_next_channel_tsla_vs_spy: int = 0    # -1=SPY better, 0=equal, 1=TSLA better
+
+    # === RSI CROSS-CORRELATION (Phase 7) ===
+    rsi_aligned_at_break: bool = False
+    rsi_divergence_aligned: bool = False
+    tsla_rsi_higher_at_break: bool = False
+    rsi_spread_at_break: float = 0.0
+    overbought_predicts_down_break: bool = False
+    oversold_predicts_up_break: bool = False

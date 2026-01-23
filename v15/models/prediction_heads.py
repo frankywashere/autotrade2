@@ -516,6 +516,303 @@ class SPYChannelContinuedHead(nn.Module):
 # =============================================================================
 
 
+# =============================================================================
+# RSI Prediction Heads - TSLA
+# =============================================================================
+
+
+class TSLARSIAtBreakHead(nn.Module):
+    """
+    Predicts TSLA RSI-14 value at first break with uncertainty.
+
+    RSI ranges from 0-100, centered around 50.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted RSI value (0-100 range)
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = self.mean_head(h)  # RSI can be any value, sigmoid applied if needed
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class TSLARSIOverboughtHead(nn.Module):
+    """
+    Predicts whether TSLA RSI > 70 at first break (overbought condition).
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(rsi_overbought)."""
+        return self.net(x).squeeze(-1)
+
+
+class TSLARSIOversoldHead(nn.Module):
+    """
+    Predicts whether TSLA RSI < 30 at first break (oversold condition).
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(rsi_oversold)."""
+        return self.net(x).squeeze(-1)
+
+
+class TSLARSIDivergenceHead(nn.Module):
+    """
+    Predicts TSLA RSI divergence at first break.
+
+    3-class classification: -1=bearish, 0=none, 1=bullish
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),  # 3-class classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for 3 classes: [bearish, none, bullish]."""
+        return self.net(x)
+
+
+# =============================================================================
+# RSI Prediction Heads - SPY
+# =============================================================================
+
+
+class SPYRSIAtBreakHead(nn.Module):
+    """
+    Predicts SPY RSI-14 value at first break with uncertainty.
+
+    RSI ranges from 0-100, centered around 50.
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted RSI value (0-100 range)
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = self.mean_head(h)  # RSI can be any value, sigmoid applied if needed
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class SPYRSIOverboughtHead(nn.Module):
+    """
+    Predicts whether SPY RSI > 70 at first break (overbought condition).
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(rsi_overbought)."""
+        return self.net(x).squeeze(-1)
+
+
+class SPYRSIOversoldHead(nn.Module):
+    """
+    Predicts whether SPY RSI < 30 at first break (oversold condition).
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(rsi_oversold)."""
+        return self.net(x).squeeze(-1)
+
+
+class SPYRSIDivergenceHead(nn.Module):
+    """
+    Predicts SPY RSI divergence at first break.
+
+    3-class classification: -1=bearish, 0=none, 1=bullish
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),  # 3-class classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for 3 classes: [bearish, none, bullish]."""
+        return self.net(x)
+
+
+# =============================================================================
+# RSI Prediction Heads - Cross-Correlation
+# =============================================================================
+
+
+class CrossRSIAlignedHead(nn.Module):
+    """
+    Predicts whether TSLA and SPY RSI are aligned at break.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(rsi_aligned)."""
+        return self.net(x).squeeze(-1)
+
+
+class CrossRSISpreadHead(nn.Module):
+    """
+    Predicts RSI spread between TSLA and SPY at break with uncertainty.
+
+    Spread = TSLA RSI - SPY RSI (can be positive or negative)
+
+    Outputs mean and log(std) for a Gaussian distribution.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+
+        self.mean_head = nn.Linear(hidden_dim // 2, 1)
+        self.log_std_head = nn.Linear(hidden_dim // 2, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            mean: [batch] predicted RSI spread (can be negative)
+            log_std: [batch] log standard deviation
+        """
+        h = self.net(x)
+        mean = self.mean_head(h)  # Spread can be positive or negative
+        log_std = self.log_std_head(h)
+        return mean.squeeze(-1), log_std.squeeze(-1)
+
+
+class CrossOverboughtPredictsDownHead(nn.Module):
+    """
+    Predicts whether overbought RSI predicts downward break.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(overbought_predicts_down)."""
+        return self.net(x).squeeze(-1)
+
+
+class CrossOversoldPredictsUpHead(nn.Module):
+    """
+    Predicts whether oversold RSI predicts upward break.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),  # Binary classification
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns logits for P(oversold_predicts_up)."""
+        return self.net(x).squeeze(-1)
+
+
+# =============================================================================
+# Durability and Bars-to-Permanent Heads
+# =============================================================================
+
+
 class TSLADurabilityHead(nn.Module):
     """
     Predicts TSLA channel durability score with uncertainty.
@@ -815,6 +1112,8 @@ class PredictionHeads(nn.Module):
     - enable_tsla_heads: Enable TSLA-specific break prediction heads
     - enable_spy_heads: Enable SPY-specific break prediction heads
     - enable_cross_correlation_heads: Enable cross-correlation prediction heads
+    - enable_durability_heads: Enable durability and bars-to-permanent heads
+    - enable_rsi_heads: Enable RSI prediction heads for both assets and cross-correlation
     """
 
     def __init__(
@@ -827,8 +1126,10 @@ class PredictionHeads(nn.Module):
         enable_tsla_heads: bool = False,
         enable_spy_heads: bool = False,
         enable_cross_correlation_heads: bool = False,
-        # Durability and permanent break head flags (NEW)
+        # Durability and permanent break head flags
         enable_durability_heads: bool = False,
+        # RSI prediction head flags
+        enable_rsi_heads: bool = False,
     ):
         """
         Initialize prediction heads.
@@ -842,6 +1143,7 @@ class PredictionHeads(nn.Module):
             enable_spy_heads: If True, add SPY break scan heads (default: False)
             enable_cross_correlation_heads: If True, add cross-correlation heads (default: False)
             enable_durability_heads: If True, add durability and bars-to-permanent heads (default: False)
+            enable_rsi_heads: If True, add RSI prediction heads (default: False)
         """
         super().__init__()
 
@@ -850,6 +1152,7 @@ class PredictionHeads(nn.Module):
         self.enable_spy_heads = enable_spy_heads
         self.enable_cross_correlation_heads = enable_cross_correlation_heads
         self.enable_durability_heads = enable_durability_heads
+        self.enable_rsi_heads = enable_rsi_heads
 
         # Core prediction heads
         self.duration_head = DurationHead(input_dim, hidden_dim)
@@ -913,7 +1216,7 @@ class PredictionHeads(nn.Module):
             self.both_permanent_head = None
             self.return_aligned_head = None
 
-        # Durability and bars-to-permanent heads (NEW)
+        # Durability and bars-to-permanent heads
         if enable_durability_heads:
             self.tsla_durability_head = TSLADurabilityHead(input_dim, hidden_dim)
             self.tsla_bars_to_permanent_head = TSLABarsToPermanentHead(input_dim, hidden_dim)
@@ -926,6 +1229,40 @@ class PredictionHeads(nn.Module):
             self.spy_durability_head = None
             self.spy_bars_to_permanent_head = None
             self.cross_durability_spread_head = None
+
+        # RSI prediction heads
+        if enable_rsi_heads:
+            # TSLA RSI heads
+            self.tsla_rsi_at_break_head = TSLARSIAtBreakHead(input_dim, hidden_dim)
+            self.tsla_rsi_overbought_head = TSLARSIOverboughtHead(input_dim, hidden_dim)
+            self.tsla_rsi_oversold_head = TSLARSIOversoldHead(input_dim, hidden_dim)
+            self.tsla_rsi_divergence_head = TSLARSIDivergenceHead(input_dim, hidden_dim)
+            # SPY RSI heads
+            self.spy_rsi_at_break_head = SPYRSIAtBreakHead(input_dim, hidden_dim)
+            self.spy_rsi_overbought_head = SPYRSIOverboughtHead(input_dim, hidden_dim)
+            self.spy_rsi_oversold_head = SPYRSIOversoldHead(input_dim, hidden_dim)
+            self.spy_rsi_divergence_head = SPYRSIDivergenceHead(input_dim, hidden_dim)
+            # Cross-correlation RSI heads
+            self.cross_rsi_aligned_head = CrossRSIAlignedHead(input_dim, hidden_dim)
+            self.cross_rsi_spread_head = CrossRSISpreadHead(input_dim, hidden_dim)
+            self.cross_overbought_predicts_down_head = CrossOverboughtPredictsDownHead(input_dim, hidden_dim)
+            self.cross_oversold_predicts_up_head = CrossOversoldPredictsUpHead(input_dim, hidden_dim)
+        else:
+            # TSLA RSI heads
+            self.tsla_rsi_at_break_head = None
+            self.tsla_rsi_overbought_head = None
+            self.tsla_rsi_oversold_head = None
+            self.tsla_rsi_divergence_head = None
+            # SPY RSI heads
+            self.spy_rsi_at_break_head = None
+            self.spy_rsi_overbought_head = None
+            self.spy_rsi_oversold_head = None
+            self.spy_rsi_divergence_head = None
+            # Cross-correlation RSI heads
+            self.cross_rsi_aligned_head = None
+            self.cross_rsi_spread_head = None
+            self.cross_overbought_predicts_down_head = None
+            self.cross_oversold_predicts_up_head = None
 
     def forward(
         self,
@@ -981,6 +1318,23 @@ class PredictionHeads(nn.Module):
                 'break_lag_log_std': [batch]
                 'both_permanent_logits': [batch]
                 'return_aligned_logits': [batch]
+
+            If enable_rsi_heads:
+                'tsla_rsi_at_break_mean': [batch]
+                'tsla_rsi_at_break_log_std': [batch]
+                'tsla_rsi_overbought_logits': [batch]
+                'tsla_rsi_oversold_logits': [batch]
+                'tsla_rsi_divergence_logits': [batch, 3]
+                'spy_rsi_at_break_mean': [batch]
+                'spy_rsi_at_break_log_std': [batch]
+                'spy_rsi_overbought_logits': [batch]
+                'spy_rsi_oversold_logits': [batch]
+                'spy_rsi_divergence_logits': [batch, 3]
+                'cross_rsi_aligned_logits': [batch]
+                'cross_rsi_spread_mean': [batch]
+                'cross_rsi_spread_log_std': [batch]
+                'cross_overbought_predicts_down_logits': [batch]
+                'cross_oversold_predicts_up_logits': [batch]
         """
         duration_mean, duration_log_std = self.duration_head(x)
 
@@ -1041,7 +1395,7 @@ class PredictionHeads(nn.Module):
             outputs['both_permanent_logits'] = self.both_permanent_head(x)
             outputs['return_aligned_logits'] = self.return_aligned_head(x)
 
-        # Add durability and bars-to-permanent outputs if enabled (NEW)
+        # Add durability and bars-to-permanent outputs if enabled
         if self.tsla_durability_head is not None:
             tsla_durability_mean, tsla_durability_log_std = self.tsla_durability_head(x)
             tsla_bars_perm_mean, tsla_bars_perm_log_std = self.tsla_bars_to_permanent_head(x)
@@ -1059,6 +1413,32 @@ class PredictionHeads(nn.Module):
             outputs['spy_bars_to_permanent_log_std'] = spy_bars_perm_log_std
             outputs['cross_durability_spread_mean'] = cross_dur_spread_mean
             outputs['cross_durability_spread_log_std'] = cross_dur_spread_log_std
+
+        # Add RSI prediction outputs if enabled
+        if self.tsla_rsi_at_break_head is not None:
+            # TSLA RSI outputs
+            tsla_rsi_mean, tsla_rsi_log_std = self.tsla_rsi_at_break_head(x)
+            outputs['tsla_rsi_at_break_mean'] = tsla_rsi_mean
+            outputs['tsla_rsi_at_break_log_std'] = tsla_rsi_log_std
+            outputs['tsla_rsi_overbought_logits'] = self.tsla_rsi_overbought_head(x)
+            outputs['tsla_rsi_oversold_logits'] = self.tsla_rsi_oversold_head(x)
+            outputs['tsla_rsi_divergence_logits'] = self.tsla_rsi_divergence_head(x)
+
+            # SPY RSI outputs
+            spy_rsi_mean, spy_rsi_log_std = self.spy_rsi_at_break_head(x)
+            outputs['spy_rsi_at_break_mean'] = spy_rsi_mean
+            outputs['spy_rsi_at_break_log_std'] = spy_rsi_log_std
+            outputs['spy_rsi_overbought_logits'] = self.spy_rsi_overbought_head(x)
+            outputs['spy_rsi_oversold_logits'] = self.spy_rsi_oversold_head(x)
+            outputs['spy_rsi_divergence_logits'] = self.spy_rsi_divergence_head(x)
+
+            # Cross-correlation RSI outputs
+            cross_rsi_spread_mean, cross_rsi_spread_log_std = self.cross_rsi_spread_head(x)
+            outputs['cross_rsi_aligned_logits'] = self.cross_rsi_aligned_head(x)
+            outputs['cross_rsi_spread_mean'] = cross_rsi_spread_mean
+            outputs['cross_rsi_spread_log_std'] = cross_rsi_spread_log_std
+            outputs['cross_overbought_predicts_down_logits'] = self.cross_overbought_predicts_down_head(x)
+            outputs['cross_oversold_predicts_up_logits'] = self.cross_oversold_predicts_up_head(x)
 
         return outputs
 
@@ -1081,3 +1461,7 @@ class PredictionHeads(nn.Module):
     def has_durability_heads(self) -> bool:
         """Check if this model has durability and bars-to-permanent heads."""
         return self.tsla_durability_head is not None
+
+    def has_rsi_heads(self) -> bool:
+        """Check if this model has RSI prediction heads."""
+        return self.tsla_rsi_at_break_head is not None

@@ -31,7 +31,7 @@ import platform
 import signal
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing import Pool, cpu_count
 from typing import List, Dict, Optional, Tuple, Any
 
@@ -397,6 +397,39 @@ def _process_channel_batch(channel_batch: List[Tuple[str, int, int]]) -> List[Di
                         else:
                             label_misses += 1
 
+                        # Copy SPY's values into TSLA's spy_* cross-reference fields
+                        if spy_labels is not None and tsla_labels is not None:
+                            tsla_labels = replace(tsla_labels,
+                                spy_source_channel_slope=spy_labels.source_channel_slope,
+                                spy_source_channel_intercept=spy_labels.source_channel_intercept,
+                                spy_source_channel_std_dev=spy_labels.source_channel_std_dev,
+                                spy_source_channel_r_squared=spy_labels.source_channel_r_squared,
+                                spy_source_channel_direction=spy_labels.source_channel_direction,
+                                spy_source_channel_start_ts=spy_labels.source_channel_start_ts,
+                                spy_source_channel_end_ts=spy_labels.source_channel_end_ts,
+                                # Copy SPY's next channel labels
+                                spy_best_next_channel_direction=spy_labels.best_next_channel_direction,
+                                spy_best_next_channel_bars_away=spy_labels.best_next_channel_bars_away,
+                                spy_best_next_channel_duration=spy_labels.best_next_channel_duration,
+                                spy_best_next_channel_r_squared=spy_labels.best_next_channel_r_squared,
+                                spy_best_next_channel_bounce_count=spy_labels.best_next_channel_bounce_count,
+                                spy_shortest_next_channel_direction=spy_labels.shortest_next_channel_direction,
+                                spy_shortest_next_channel_bars_away=spy_labels.shortest_next_channel_bars_away,
+                                spy_shortest_next_channel_duration=spy_labels.shortest_next_channel_duration,
+                                spy_small_channels_before_best=spy_labels.small_channels_before_best,
+                                # Copy SPY's RSI labels
+                                spy_rsi_at_first_break=spy_labels.rsi_at_first_break,
+                                spy_rsi_at_permanent_break=spy_labels.rsi_at_permanent_break,
+                                spy_rsi_at_channel_end=spy_labels.rsi_at_channel_end,
+                                spy_rsi_overbought_at_break=spy_labels.rsi_overbought_at_break,
+                                spy_rsi_oversold_at_break=spy_labels.rsi_oversold_at_break,
+                                spy_rsi_divergence_at_break=spy_labels.rsi_divergence_at_break,
+                                spy_rsi_trend_in_channel=spy_labels.rsi_trend_in_channel,
+                                spy_rsi_range_in_channel=spy_labels.rsi_range_in_channel,
+                            )
+                            # Update the stored TSLA labels with the cross-referenced version
+                            labels_per_window[w]['tsla'][t] = tsla_labels
+
                 # Build bar metadata
                 bar_metadata = {
                     '5min': {
@@ -656,6 +689,24 @@ def scan_channels_two_pass(
 
     pass1_time = time.time() - pass1_start
     print(f"\n  Total: {tsla_channels + spy_channels} channels, Pass 1 time: {pass1_time:.1f}s")
+
+    # Save channel maps to disk if output path is specified
+    if output_path:
+        # Derive base path from output path (remove .pkl extension if present)
+        if output_path.endswith('.pkl'):
+            output_base = output_path[:-4]
+        else:
+            output_base = output_path
+        channel_map_path = f"{output_base}_channel_map.pkl"
+
+        print(f"\n  [PASS 1] Saving channel maps to {channel_map_path}...")
+        channel_map_data = {
+            'tsla': tsla_channel_map,
+            'spy': spy_channel_map,
+        }
+        with open(channel_map_path, 'wb') as f:
+            pickle.dump(channel_map_data, f)
+        print(f"  Saved channel maps ({tsla_channels} TSLA + {spy_channels} SPY channels)")
 
     # =========================================================================
     # PASS 2: Generate labels at channel END positions

@@ -1,17 +1,32 @@
 """
 SPY Feature Extraction Module
 
-Extracts 80 SPY-specific features that MIRROR TSLA features.
+Extracts SPY features that include both SPY-specific market features and
+shared technical indicators from technical.py for feature parity with TSLA.
 All features are prefixed with "spy_" and return a flat Dict[str, float].
 
-Features Categories (80 total):
+Features Categories (135 total = 60 SPY-specific + 77 shared technical - 2 overlapping):
+
+SPY-SPECIFIC FEATURES (60):
 - BASIC PRICE (10): Close, gap, range, shadows, volume
 - MOVING AVERAGES (10): SMA at multiple periods, price vs SMA, trend alignment
 - MOMENTUM (15): Multi-period momentum, RSI variants, stochastic, divergence
 - VOLATILITY (8): ATR, volatility at multiple periods, range, regime
-- TECHNICAL (20): MACD, Bollinger, ADX/DMI, OBV, MFI, Aroon, CCI, pivots, Ichimoku, Keltner
 - TREND (7): Higher highs/lower lows counts, up/down bars, consecutive, trend strength
 - MARKET REGIME (10): Intraday position, gap, expansion, acceleration, VPT, efficiency, choppiness
+
+SHARED TECHNICAL FEATURES (77 from technical.py):
+- MACD (5): macd_line, macd_signal, macd_histogram, macd_crossover, macd_divergence
+- Bollinger Bands (8): bb_upper, bb_middle, bb_lower, bb_width, bb_pct_b, etc.
+- Keltner (5): keltner_upper, keltner_middle, keltner_lower, keltner_width, keltner_position
+- ADX (4): adx, plus_di, minus_di, di_crossover
+- Ichimoku (6): tenkan, kijun, senkou_a, senkou_b, price_vs_cloud, cloud_thickness
+- Volume Indicators (10): obv, obv_trend, mfi, accumulation_dist, chaikin_mf, etc.
+- Other Oscillators (8): aroon_up, aroon_down, aroon_oscillator, trix, etc.
+- Pivot Points (7): pivot, r1, r2, r3, s1, s2, s3
+- Fibonacci (6): fib_236, fib_382, fib_500, fib_618, fib_786, nearest_fib_distance
+- Candlestick Patterns (12): is_doji, is_hammer, is_shooting_star, etc.
+- Additional (6): cci, roc_5, roc_10, roc_20, price_channel_upper, price_channel_lower
 """
 
 from __future__ import annotations
@@ -30,6 +45,7 @@ from .utils import (
     get_last_valid,
     true_range,
 )
+from .technical import extract_technical_features, get_technical_feature_names
 
 
 def _pct_change(current: float, previous: float, default: float = 0.0) -> float:
@@ -397,271 +413,6 @@ def _extract_volatility_features(df: pd.DataFrame) -> Dict[str, float]:
 
 
 # ============================================================================
-# TECHNICAL FEATURES (20)
-# ============================================================================
-
-def _extract_technical_features(df: pd.DataFrame) -> Dict[str, float]:
-    """
-    Extract technical indicator features.
-
-    Features:
-        spy_macd_line: MACD line (12-26 EMA)
-        spy_macd_signal: MACD signal line (9-period EMA of MACD)
-        spy_macd_histogram: MACD histogram
-        spy_macd_crossover: MACD crossover signal (-1, 0, 1)
-        spy_bb_pct_b: Bollinger Band %B
-        spy_bb_width: Bollinger Band width (%)
-        spy_bb_squeeze: Bollinger Band squeeze indicator
-        spy_adx: Average Directional Index
-        spy_plus_di: +DI line
-        spy_minus_di: -DI line
-        spy_di_crossover: DI crossover signal (-1, 0, 1)
-        spy_obv_trend: OBV trend indicator (-1, 0, 1)
-        spy_mfi: Money Flow Index
-        spy_aroon_oscillator: Aroon oscillator
-        spy_cci: Commodity Channel Index
-        spy_pivot: Daily pivot point
-        spy_r1: First resistance level
-        spy_s1: First support level
-        spy_price_vs_cloud: Price position vs Ichimoku cloud (-1 to 1)
-        spy_keltner_position: Price position in Keltner Channel (0-1)
-    """
-    features = {}
-
-    close = df["close"].values
-    high = df["high"].values
-    low = df["low"].values
-    volume = df["volume"].values if "volume" in df.columns else np.ones(len(close))
-    n = len(close)
-    c = float(close[-1]) if n > 0 else 1.0
-    h = float(high[-1]) if n > 0 else c
-    l = float(low[-1]) if n > 0 else c
-
-    # MACD (12, 26, 9)
-    ema_12 = calc_ema(close, 12)
-    ema_26 = calc_ema(close, 26)
-    macd_line_arr = ema_12 - ema_26
-    macd_signal_arr = calc_ema(macd_line_arr[~np.isnan(macd_line_arr)], 9) if np.sum(~np.isnan(macd_line_arr)) >= 9 else np.array([0.0])
-
-    macd_line = get_last_valid(macd_line_arr, 0.0)
-    macd_signal = get_last_valid(macd_signal_arr, 0.0)
-    macd_histogram = macd_line - macd_signal
-
-    features["spy_macd_line"] = macd_line
-    features["spy_macd_signal"] = macd_signal
-    features["spy_macd_histogram"] = macd_histogram
-
-    # MACD crossover
-    if n >= 2 and len(macd_line_arr) >= 2 and len(macd_signal_arr) >= 2:
-        prev_macd = macd_line_arr[-2] if np.isfinite(macd_line_arr[-2]) else macd_line
-        prev_signal = macd_signal_arr[-2] if len(macd_signal_arr) >= 2 and np.isfinite(macd_signal_arr[-2]) else macd_signal
-
-        if macd_line > macd_signal and prev_macd <= prev_signal:
-            crossover = 1  # Bullish crossover
-        elif macd_line < macd_signal and prev_macd >= prev_signal:
-            crossover = -1  # Bearish crossover
-        else:
-            crossover = 0
-    else:
-        crossover = 0
-
-    features["spy_macd_crossover"] = float(crossover)
-
-    # Bollinger Bands (20, 2)
-    bb_period = 20
-    if n >= bb_period:
-        bb_sma = np.mean(close[-bb_period:])
-        bb_std = np.std(close[-bb_period:])
-        bb_upper = bb_sma + 2 * bb_std
-        bb_lower = bb_sma - 2 * bb_std
-
-        bb_pct_b = safe_divide(c - bb_lower, bb_upper - bb_lower, 0.5)
-        bb_width = safe_divide(bb_upper - bb_lower, bb_sma, 0.0) * 100
-
-        # Squeeze: compare current width to average width
-        if n >= bb_period + 20:
-            widths = []
-            for i in range(20):
-                idx = -(1 + i)
-                sma_i = np.mean(close[max(0, n + idx - bb_period):n + idx + 1])
-                std_i = np.std(close[max(0, n + idx - bb_period):n + idx + 1])
-                w = safe_divide((sma_i + 2 * std_i) - (sma_i - 2 * std_i), sma_i, 0.0) * 100
-                widths.append(w)
-            avg_width = np.mean(widths)
-            bb_squeeze = 1.0 if bb_width < avg_width * 0.75 else 0.0
-        else:
-            bb_squeeze = 0.0
-    else:
-        bb_pct_b = 0.5
-        bb_width = 0.0
-        bb_squeeze = 0.0
-
-    features["spy_bb_pct_b"] = bb_pct_b
-    features["spy_bb_width"] = bb_width
-    features["spy_bb_squeeze"] = bb_squeeze
-
-    # ADX and DMI (14-period)
-    adx_period = 14
-    if n >= adx_period + 1:
-        # True Range
-        tr = true_range(high, low, close)
-
-        # +DM and -DM
-        plus_dm = np.zeros(n)
-        minus_dm = np.zeros(n)
-        for i in range(1, n):
-            up_move = high[i] - high[i - 1]
-            down_move = low[i - 1] - low[i]
-
-            if up_move > down_move and up_move > 0:
-                plus_dm[i] = up_move
-            if down_move > up_move and down_move > 0:
-                minus_dm[i] = down_move
-
-        # Smooth with EMA
-        tr_smooth = get_last_valid(calc_ema(tr, adx_period), 1.0)
-        plus_dm_smooth = get_last_valid(calc_ema(plus_dm, adx_period), 0.0)
-        minus_dm_smooth = get_last_valid(calc_ema(minus_dm, adx_period), 0.0)
-
-        plus_di = safe_divide(plus_dm_smooth, tr_smooth, 0.0) * 100
-        minus_di = safe_divide(minus_dm_smooth, tr_smooth, 0.0) * 100
-
-        dx = safe_divide(abs(plus_di - minus_di), plus_di + minus_di, 0.0) * 100
-
-        # ADX is smoothed DX
-        dx_arr = np.zeros(n)
-        dx_arr[-1] = dx
-        adx_val = dx  # Simplified - would need full DX series for proper ADX
-    else:
-        plus_di = 25.0
-        minus_di = 25.0
-        adx_val = 25.0
-
-    features["spy_adx"] = adx_val
-    features["spy_plus_di"] = plus_di
-    features["spy_minus_di"] = minus_di
-
-    # DI crossover
-    if plus_di > minus_di + 5:
-        di_cross = 1
-    elif minus_di > plus_di + 5:
-        di_cross = -1
-    else:
-        di_cross = 0
-
-    features["spy_di_crossover"] = float(di_cross)
-
-    # OBV trend
-    if n >= 5:
-        obv = np.cumsum(np.where(np.diff(close) > 0, volume[1:],
-                                  np.where(np.diff(close) < 0, -volume[1:], 0)))
-        if len(obv) >= 5:
-            obv_trend = np.sign(obv[-1] - obv[-5])
-        else:
-            obv_trend = 0
-    else:
-        obv_trend = 0
-
-    features["spy_obv_trend"] = float(obv_trend)
-
-    # Money Flow Index (14-period)
-    mfi_period = 14
-    if n >= mfi_period:
-        typical_price = (high + low + close) / 3
-        raw_mf = typical_price * volume
-
-        pos_mf = 0.0
-        neg_mf = 0.0
-        for i in range(n - mfi_period, n):
-            if i > 0 and typical_price[i] > typical_price[i - 1]:
-                pos_mf += raw_mf[i]
-            elif i > 0:
-                neg_mf += raw_mf[i]
-
-        mfi = safe_divide(pos_mf, pos_mf + neg_mf, 0.5) * 100
-    else:
-        mfi = 50.0
-
-    features["spy_mfi"] = mfi
-
-    # Aroon oscillator (25-period)
-    aroon_period = 25
-    if n >= aroon_period:
-        high_idx = np.argmax(high[-aroon_period:])
-        low_idx = np.argmin(low[-aroon_period:])
-
-        aroon_up = ((aroon_period - 1 - (aroon_period - 1 - high_idx)) / (aroon_period - 1)) * 100
-        aroon_down = ((aroon_period - 1 - (aroon_period - 1 - low_idx)) / (aroon_period - 1)) * 100
-        aroon_osc = aroon_up - aroon_down
-    else:
-        aroon_osc = 0.0
-
-    features["spy_aroon_oscillator"] = aroon_osc
-
-    # CCI (20-period)
-    cci_period = 20
-    if n >= cci_period:
-        typical_price = (high + low + close) / 3
-        tp_sma = np.mean(typical_price[-cci_period:])
-        tp_mad = np.mean(np.abs(typical_price[-cci_period:] - tp_sma))
-        cci = safe_divide(typical_price[-1] - tp_sma, 0.015 * tp_mad, 0.0)
-    else:
-        cci = 0.0
-
-    features["spy_cci"] = cci
-
-    # Pivot points (classic formula)
-    pivot = (h + l + c) / 3
-    r1 = 2 * pivot - l
-    s1 = 2 * pivot - h
-
-    features["spy_pivot"] = pivot
-    features["spy_r1"] = r1
-    features["spy_s1"] = s1
-
-    # Ichimoku cloud position (simplified)
-    # Conversion line (9), Base line (26), Span A, Span B (52)
-    if n >= 52:
-        conv_period = 9
-        base_period = 26
-        span_b_period = 52
-
-        conv = (np.max(high[-conv_period:]) + np.min(low[-conv_period:])) / 2
-        base = (np.max(high[-base_period:]) + np.min(low[-base_period:])) / 2
-        span_a = (conv + base) / 2
-        span_b = (np.max(high[-span_b_period:]) + np.min(low[-span_b_period:])) / 2
-
-        cloud_top = max(span_a, span_b)
-        cloud_bottom = min(span_a, span_b)
-
-        if c > cloud_top:
-            cloud_pos = 1.0  # Above cloud
-        elif c < cloud_bottom:
-            cloud_pos = -1.0  # Below cloud
-        else:
-            cloud_pos = safe_divide(c - cloud_bottom, cloud_top - cloud_bottom, 0.0) * 2 - 1  # In cloud
-    else:
-        cloud_pos = 0.0
-
-    features["spy_price_vs_cloud"] = cloud_pos
-
-    # Keltner Channel position (20-period EMA, 2x ATR)
-    kc_period = 20
-    if n >= kc_period:
-        kc_mid = get_last_valid(calc_ema(close, kc_period), c)
-        kc_atr = get_last_valid(calc_atr(high, low, close, kc_period), 0.0)
-        kc_upper = kc_mid + 2 * kc_atr
-        kc_lower = kc_mid - 2 * kc_atr
-        kc_pos = safe_divide(c - kc_lower, kc_upper - kc_lower, 0.5)
-    else:
-        kc_pos = 0.5
-
-    features["spy_keltner_position"] = kc_pos
-
-    return features
-
-
-# ============================================================================
 # TREND FEATURES (7)
 # ============================================================================
 
@@ -902,10 +653,11 @@ def _extract_market_regime_features(df: pd.DataFrame) -> Dict[str, float]:
 
 def extract_spy_features(spy_df: pd.DataFrame) -> Dict[str, float]:
     """
-    Extract all 80 SPY features from an OHLCV DataFrame.
+    Extract all 135 SPY features from an OHLCV DataFrame.
 
-    This function mirrors the TSLA feature extraction approach, providing
-    comprehensive technical analysis features for SPY market data.
+    This function provides comprehensive technical analysis features for SPY,
+    combining SPY-specific market features with shared technical indicators
+    from technical.py for feature parity with TSLA.
 
     Args:
         spy_df: pandas DataFrame with OHLCV columns:
@@ -913,7 +665,9 @@ def extract_spy_features(spy_df: pd.DataFrame) -> Dict[str, float]:
                 Index should be datetime
 
     Returns:
-        Dict[str, float] with 80 features, all prefixed with "spy_":
+        Dict[str, float] with 135 features, all prefixed with "spy_":
+
+        SPY-SPECIFIC FEATURES (60):
 
         BASIC PRICE (10):
             spy_close, spy_close_vs_open_pct, spy_high_low_range_pct,
@@ -939,13 +693,6 @@ def extract_spy_features(spy_df: pd.DataFrame) -> Dict[str, float]:
             spy_volatility_ratio, spy_range_pct_5, spy_range_pct_20,
             spy_volatility_regime
 
-        TECHNICAL (20):
-            spy_macd_line, spy_macd_signal, spy_macd_histogram,
-            spy_macd_crossover, spy_bb_pct_b, spy_bb_width, spy_bb_squeeze,
-            spy_adx, spy_plus_di, spy_minus_di, spy_di_crossover,
-            spy_obv_trend, spy_mfi, spy_aroon_oscillator, spy_cci,
-            spy_pivot, spy_r1, spy_s1, spy_price_vs_cloud, spy_keltner_position
-
         TREND (7):
             spy_higher_highs_count, spy_lower_lows_count,
             spy_up_bars_ratio_10, spy_consecutive_up, spy_consecutive_down,
@@ -956,6 +703,12 @@ def extract_spy_features(spy_df: pd.DataFrame) -> Dict[str, float]:
             spy_daily_range_expansion, spy_price_acceleration,
             spy_volume_price_trend, spy_buying_pressure,
             spy_roc_5, spy_roc_10, spy_efficiency_ratio, spy_choppiness_index
+
+        SHARED TECHNICAL FEATURES (77 from technical.py):
+            See technical.py for full list. Includes MACD (5), Bollinger (8),
+            Keltner (5), ADX (4), Ichimoku (6), Volume indicators (10),
+            Oscillators (8), Pivot Points (7), Fibonacci (6),
+            Candlestick Patterns (12), Additional (6).
 
     Example:
         >>> import pandas as pd
@@ -969,6 +722,7 @@ def extract_spy_features(spy_df: pd.DataFrame) -> Dict[str, float]:
         - All features are guaranteed to be finite (no NaN/inf)
         - Missing data is handled gracefully with sensible defaults
         - Volume column is optional (defaults to 1.0 if missing)
+        - Technical features from technical.py ensure parity with TSLA
     """
     # Validate input
     if spy_df is None or len(spy_df) == 0:
@@ -995,14 +749,16 @@ def extract_spy_features(spy_df: pd.DataFrame) -> Dict[str, float]:
     # Volatility features (8)
     features.update(_extract_volatility_features(spy_df))
 
-    # Technical features (20)
-    features.update(_extract_technical_features(spy_df))
-
     # Trend features (7)
     features.update(_extract_trend_features(spy_df))
 
     # Market regime features (10)
     features.update(_extract_market_regime_features(spy_df))
+
+    # Extract shared technical indicators (same as TSLA)
+    # This ensures feature parity between assets
+    tech_features = extract_technical_features(spy_df)
+    features.update({f'spy_{k}': v for k, v in tech_features.items()})
 
     # Final validation: ensure all values are finite
     for key, value in features.items():
@@ -1062,27 +818,6 @@ def _get_default_features() -> Dict[str, float]:
         "spy_range_pct_5": 0.0,
         "spy_range_pct_20": 0.0,
         "spy_volatility_regime": 1.0,
-        # Technical (20)
-        "spy_macd_line": 0.0,
-        "spy_macd_signal": 0.0,
-        "spy_macd_histogram": 0.0,
-        "spy_macd_crossover": 0.0,
-        "spy_bb_pct_b": 0.5,
-        "spy_bb_width": 0.0,
-        "spy_bb_squeeze": 0.0,
-        "spy_adx": 25.0,
-        "spy_plus_di": 25.0,
-        "spy_minus_di": 25.0,
-        "spy_di_crossover": 0.0,
-        "spy_obv_trend": 0.0,
-        "spy_mfi": 50.0,
-        "spy_aroon_oscillator": 0.0,
-        "spy_cci": 0.0,
-        "spy_pivot": 0.0,
-        "spy_r1": 0.0,
-        "spy_s1": 0.0,
-        "spy_price_vs_cloud": 0.0,
-        "spy_keltner_position": 0.5,
         # Trend (7)
         "spy_higher_highs_count": 0.0,
         "spy_lower_lows_count": 0.0,
@@ -1102,6 +837,95 @@ def _get_default_features() -> Dict[str, float]:
         "spy_roc_10": 0.0,
         "spy_efficiency_ratio": 0.0,
         "spy_choppiness_index": 50.0,
+        # Shared technical features (77 from technical.py)
+        # MACD (5)
+        "spy_macd_line": 0.0,
+        "spy_macd_signal": 0.0,
+        "spy_macd_histogram": 0.0,
+        "spy_macd_crossover": 0.0,
+        "spy_macd_divergence": 0.0,
+        # Bollinger Bands (8)
+        "spy_bb_upper": 0.0,
+        "spy_bb_middle": 0.0,
+        "spy_bb_lower": 0.0,
+        "spy_bb_width": 0.0,
+        "spy_bb_pct_b": 0.5,
+        "spy_price_vs_bb_upper": 0.0,
+        "spy_price_vs_bb_lower": 0.0,
+        "spy_bb_squeeze": 0.0,
+        # Keltner (5)
+        "spy_keltner_upper": 0.0,
+        "spy_keltner_middle": 0.0,
+        "spy_keltner_lower": 0.0,
+        "spy_keltner_width": 0.0,
+        "spy_keltner_position": 0.5,
+        # ADX (4)
+        "spy_adx": 0.0,
+        "spy_plus_di": 0.0,
+        "spy_minus_di": 0.0,
+        "spy_di_crossover": 0.0,
+        # Ichimoku (6)
+        "spy_tenkan": 0.0,
+        "spy_kijun": 0.0,
+        "spy_senkou_a": 0.0,
+        "spy_senkou_b": 0.0,
+        "spy_price_vs_cloud": 0.0,
+        "spy_cloud_thickness": 0.0,
+        # Volume Indicators (10)
+        "spy_obv": 0.0,
+        "spy_obv_trend": 0.0,
+        "spy_obv_divergence": 0.0,
+        "spy_mfi": 50.0,
+        "spy_mfi_divergence": 0.0,
+        "spy_accumulation_dist": 0.0,
+        "spy_chaikin_mf": 0.0,
+        "spy_force_index": 0.0,
+        "spy_volume_oscillator": 0.0,
+        "spy_vwap_distance": 0.0,
+        # Other Oscillators (8)
+        "spy_aroon_up": 0.0,
+        "spy_aroon_down": 0.0,
+        "spy_aroon_oscillator": 0.0,
+        "spy_trix": 0.0,
+        "spy_ultimate_oscillator": 50.0,
+        "spy_ppo": 0.0,
+        "spy_dpo": 0.0,
+        "spy_cmo": 0.0,
+        # Pivot Points (7)
+        "spy_pivot": 0.0,
+        "spy_r1": 0.0,
+        "spy_r2": 0.0,
+        "spy_r3": 0.0,
+        "spy_s1": 0.0,
+        "spy_s2": 0.0,
+        "spy_s3": 0.0,
+        # Fibonacci (6)
+        "spy_fib_236": 0.0,
+        "spy_fib_382": 0.0,
+        "spy_fib_500": 0.0,
+        "spy_fib_618": 0.0,
+        "spy_fib_786": 0.0,
+        "spy_nearest_fib_distance": 0.0,
+        # Candlestick Patterns (12)
+        "spy_is_doji": 0.0,
+        "spy_is_hammer": 0.0,
+        "spy_is_shooting_star": 0.0,
+        "spy_is_engulfing_bull": 0.0,
+        "spy_is_engulfing_bear": 0.0,
+        "spy_is_morning_star": 0.0,
+        "spy_is_evening_star": 0.0,
+        "spy_is_harami_bull": 0.0,
+        "spy_is_harami_bear": 0.0,
+        "spy_is_three_white": 0.0,
+        "spy_is_three_black": 0.0,
+        "spy_is_spinning_top": 0.0,
+        # Additional (6)
+        "spy_cci": 0.0,
+        "spy_roc_5": 0.0,
+        "spy_roc_10": 0.0,
+        "spy_roc_20": 0.0,
+        "spy_price_channel_upper": 0.0,
+        "spy_price_channel_lower": 0.0,
     }
 
 
@@ -1110,7 +934,8 @@ def get_spy_feature_names() -> list:
     Get ordered list of all SPY feature names.
 
     Returns:
-        List of 80 feature name strings in consistent order
+        List of 135 feature name strings in consistent order
+        (60 SPY-specific + 77 shared technical - 2 overlapping = 135)
     """
     return list(_get_default_features().keys())
 
@@ -1120,7 +945,7 @@ def get_spy_feature_count() -> int:
     Get total number of SPY features.
 
     Returns:
-        80 (the total feature count)
+        135 (60 SPY-specific + 77 shared technical - 2 overlapping)
     """
     return len(_get_default_features())
 
@@ -1169,5 +994,5 @@ def get_all_spy_feature_names() -> List[str]:
 
 
 def get_total_spy_features() -> int:
-    """Total SPY features: 80 * 10 TFs = 800"""
-    return 80 * 10
+    """Total SPY features: 135 * 10 TFs = 1350"""
+    return get_spy_feature_count() * 10

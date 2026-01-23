@@ -67,6 +67,9 @@ class V15Model(nn.Module):
         enable_tsla_heads: bool = False,
         enable_spy_heads: bool = False,
         enable_cross_correlation_heads: bool = False,
+        # Durability and RSI head flags
+        enable_durability_heads: bool = False,
+        enable_rsi_heads: bool = False,
     ):
         super().__init__()
 
@@ -78,6 +81,8 @@ class V15Model(nn.Module):
         self.enable_tsla_heads = enable_tsla_heads
         self.enable_spy_heads = enable_spy_heads
         self.enable_cross_correlation_heads = enable_cross_correlation_heads
+        self.enable_durability_heads = enable_durability_heads
+        self.enable_rsi_heads = enable_rsi_heads
 
         # Shared features = events + bar metadata
         self.shared_features_dim = (
@@ -140,6 +145,8 @@ class V15Model(nn.Module):
             enable_tsla_heads=enable_tsla_heads,
             enable_spy_heads=enable_spy_heads,
             enable_cross_correlation_heads=enable_cross_correlation_heads,
+            enable_durability_heads=enable_durability_heads,
+            enable_rsi_heads=enable_rsi_heads,
         )
 
     def validate_input(self, x: torch.Tensor) -> None:
@@ -260,6 +267,14 @@ class V15Model(nn.Module):
         """Check if this model has cross-correlation heads."""
         return self.prediction_heads.has_cross_correlation_heads()
 
+    def has_durability_heads(self) -> bool:
+        """Check if this model has durability and bars-to-permanent heads."""
+        return self.prediction_heads.has_durability_heads()
+
+    def has_rsi_heads(self) -> bool:
+        """Check if this model has RSI prediction heads."""
+        return self.prediction_heads.has_rsi_heads()
+
 
 def create_model(config: Optional[Dict] = None) -> V15Model:
     """
@@ -278,6 +293,8 @@ def create_model(config: Optional[Dict] = None) -> V15Model:
             - enable_tsla_heads: Whether to include TSLA break scan heads (default: False)
             - enable_spy_heads: Whether to include SPY break scan heads (default: False)
             - enable_cross_correlation_heads: Whether to include cross-correlation heads (default: False)
+            - enable_durability_heads: Whether to include durability heads (default: False)
+            - enable_rsi_heads: Whether to include RSI prediction heads (default: False)
 
     Returns:
         Initialized V15Model
@@ -295,4 +312,6 @@ def create_model(config: Optional[Dict] = None) -> V15Model:
         enable_tsla_heads=cfg.get('enable_tsla_heads', False),
         enable_spy_heads=cfg.get('enable_spy_heads', False),
         enable_cross_correlation_heads=cfg.get('enable_cross_correlation_heads', False),
+        enable_durability_heads=cfg.get('enable_durability_heads', False),
+        enable_rsi_heads=cfg.get('enable_rsi_heads', False),
     )

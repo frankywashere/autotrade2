@@ -37,7 +37,7 @@ single-pass method which required O(N * max_scan) complexity per sample.
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Tuple
 from enum import IntEnum
 from multiprocessing import Pool, cpu_count
@@ -58,7 +58,10 @@ from .core.resample import resample_ohlc
 from .dtypes import ChannelLabels, CrossCorrelationLabels
 
 # Import config for forward scanning limits and break detection settings
-from .config import TF_MAX_SCAN, BREAK_DETECTION
+from .config import TF_MAX_SCAN, BREAK_DETECTION, channel_sort_key, RSI_THRESHOLDS
+
+# Import RSI calculation from features utils
+from .features.utils import calc_rsi
 
 # Import break scanner for sophisticated break detection
 from .core.break_scanner import scan_for_break, BreakResult, InsufficientDataError, compute_durability_from_result
@@ -77,6 +80,163 @@ def _worker_ignore_signals():
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
+# =============================================================================
+# RSI Label Computation
+# =============================================================================
+
+def compute_rsi_labels(
+    close_prices: np.ndarray,
+    channel_end_idx: int,
+    first_break_bar: int,
+    permanent_break_bar: int,
+    channel_window: int,
+    rsi_period: int = 14
+) -> dict:
+    """
+    Compute RSI labels at key break moments.
+
+    Args:
+        close_prices: Array of close prices for the timeframe
+        channel_end_idx: Index where channel ends (sample position)
+        first_break_bar: Bars after channel end when first break occurred
+        permanent_break_bar: Bars after channel end when permanent break occurred (-1 if none)
+        channel_window: Window size of the channel
+        rsi_period: RSI period to use (default 14)
+
+    Returns:
+        Dict with RSI label fields (without asset prefix - caller adds tsla_/spy_):
+            - rsi_at_first_break: RSI-14 at channel_end_idx + first_break_bar
+            - rsi_at_permanent_break: RSI-14 at permanent break (50.0 if -1)
+            - rsi_at_channel_end: RSI-14 at channel_end_idx
+            - rsi_overbought_at_break: True if RSI > 70 at first break
+            - rsi_oversold_at_break: True if RSI < 30 at first break
+            - rsi_divergence_at_break: Price trend vs RSI trend (-1=bearish, 0=none, 1=bullish)
+            - rsi_trend_in_channel: RSI trend during channel window (-1=falling, 0=flat, 1=rising)
+            - rsi_range_in_channel: Max RSI - Min RSI during channel
+    """
+    # Default values for edge cases
+    defaults = {
+        'rsi_at_first_break': 50.0,
+        'rsi_at_permanent_break': 50.0,
+        'rsi_at_channel_end': 50.0,
+        'rsi_overbought_at_break': False,
+        'rsi_oversold_at_break': False,
+        'rsi_divergence_at_break': 0,
+        'rsi_trend_in_channel': 0,
+        'rsi_range_in_channel': 0.0,
+    }
+
+    # Validate inputs
+    if close_prices is None or len(close_prices) == 0:
+        return defaults
+
+    if channel_end_idx < 0 or channel_end_idx >= len(close_prices):
+        return defaults
+
+    if channel_window <= 0:
+        return defaults
+
+    # Need enough data for RSI calculation (at least rsi_period + 1 bars)
+    min_required = rsi_period + 1
+    if len(close_prices) < min_required:
+        return defaults
+
+    # Compute RSI for the entire price series
+    rsi_values = calc_rsi(close_prices, period=rsi_period, default=50.0)
+
+    # Extract RSI thresholds from config
+    overbought_threshold = RSI_THRESHOLDS.get('overbought', 70)
+    oversold_threshold = RSI_THRESHOLDS.get('oversold', 30)
+
+    # Initialize result dict
+    result = defaults.copy()
+
+    # 1. RSI at channel end
+    if 0 <= channel_end_idx < len(rsi_values):
+        result['rsi_at_channel_end'] = float(rsi_values[channel_end_idx])
+
+    # 2. RSI at first break
+    first_break_idx = channel_end_idx + first_break_bar
+    if 0 <= first_break_idx < len(rsi_values):
+        rsi_at_first_break = float(rsi_values[first_break_idx])
+        result['rsi_at_first_break'] = rsi_at_first_break
+
+        # 4. Overbought at break
+        result['rsi_overbought_at_break'] = rsi_at_first_break > overbought_threshold
+
+        # 5. Oversold at break
+        result['rsi_oversold_at_break'] = rsi_at_first_break < oversold_threshold
+
+    # 3. RSI at permanent break
+    if permanent_break_bar >= 0:
+        permanent_break_idx = channel_end_idx + permanent_break_bar
+        if 0 <= permanent_break_idx < len(rsi_values):
+            result['rsi_at_permanent_break'] = float(rsi_values[permanent_break_idx])
+    # If permanent_break_bar == -1, keep default 50.0
+
+    # 6. RSI divergence at break
+    # Compare price trend vs RSI trend from channel start to first break
+    # Bearish divergence: price rising, RSI falling (-1)
+    # Bullish divergence: price falling, RSI rising (1)
+    # No divergence: same direction (0)
+    channel_start_idx = channel_end_idx - channel_window + 1
+    if channel_start_idx >= 0 and first_break_idx < len(close_prices):
+        # Price trend: compare first break price to channel start price
+        if channel_start_idx < len(close_prices):
+            price_at_channel_start = close_prices[channel_start_idx]
+            price_at_first_break = close_prices[min(first_break_idx, len(close_prices) - 1)]
+
+            # RSI trend: compare RSI at first break to RSI at channel start
+            if channel_start_idx < len(rsi_values):
+                rsi_at_channel_start = rsi_values[channel_start_idx]
+                rsi_at_break = rsi_values[min(first_break_idx, len(rsi_values) - 1)]
+
+                # Determine trends
+                price_rising = price_at_first_break > price_at_channel_start
+                price_falling = price_at_first_break < price_at_channel_start
+                rsi_rising = rsi_at_break > rsi_at_channel_start
+                rsi_falling = rsi_at_break < rsi_at_channel_start
+
+                if price_rising and rsi_falling:
+                    # Bearish divergence: price up, RSI down
+                    result['rsi_divergence_at_break'] = -1
+                elif price_falling and rsi_rising:
+                    # Bullish divergence: price down, RSI up
+                    result['rsi_divergence_at_break'] = 1
+                # else: no divergence (0)
+
+    # 7. RSI trend in channel
+    # Calculate trend during the channel window
+    if channel_start_idx >= 0 and channel_end_idx < len(rsi_values):
+        channel_start_idx_valid = max(0, channel_start_idx)
+        channel_end_idx_valid = min(channel_end_idx + 1, len(rsi_values))
+
+        if channel_end_idx_valid > channel_start_idx_valid:
+            rsi_in_channel = rsi_values[channel_start_idx_valid:channel_end_idx_valid]
+
+            if len(rsi_in_channel) >= 2:
+                # Simple trend: compare end to start
+                rsi_start = rsi_in_channel[0]
+                rsi_end = rsi_in_channel[-1]
+
+                # Use a threshold to determine flat vs trending (e.g., 5 RSI points)
+                trend_threshold = 5.0
+                rsi_change = rsi_end - rsi_start
+
+                if rsi_change > trend_threshold:
+                    result['rsi_trend_in_channel'] = 1  # Rising
+                elif rsi_change < -trend_threshold:
+                    result['rsi_trend_in_channel'] = -1  # Falling
+                # else: flat (0)
+
+                # 8. RSI range in channel
+                rsi_max = float(np.max(rsi_in_channel))
+                rsi_min = float(np.min(rsi_in_channel))
+                result['rsi_range_in_channel'] = rsi_max - rsi_min
+
+    return result
 
 
 # =============================================================================
@@ -381,6 +541,12 @@ def label_channel_from_map(
     - If within bounds (rare), fall back to price movement direction
     - If no next channel (end of data) -> direction_valid = False
 
+    NEXT CHANNEL LABELING (Phase 6):
+    Looks at the next 2 channels and populates:
+    - best_next_channel_*: The channel with highest bounce_count (r_squared tiebreaker)
+    - shortest_next_channel_*: The channel with shortest duration
+    - small_channels_before_best: Count of smaller channels before the best one (0, 1, or 2)
+
     Args:
         channel_map: The channel map from detect_all_channels()
         tf: Timeframe
@@ -408,6 +574,7 @@ def label_channel_from_map(
             source_channel_std_dev=0.0,
             source_channel_r_squared=0.0,
             source_channel_direction=-1,
+            source_channel_bounce_count=0,
             # Source channel timestamps - None since no valid channel
             source_channel_start_ts=None,
             source_channel_end_ts=None,
@@ -426,8 +593,71 @@ def label_channel_from_map(
     ch_std_dev = curr_channel.std_dev if curr_channel.std_dev is not None else 0.0
     ch_r_squared = curr_channel.r_squared if curr_channel.r_squared is not None else 0.0
     ch_direction = int(curr_channel.direction) if curr_channel.direction is not None else -1
+    ch_bounce_count = curr_channel.bounce_count if curr_channel.bounce_count is not None else 0
 
-    # Look for next channel
+    # =========================================================================
+    # NEXT CHANNEL LABELING (Phase 6): Look at next 2 channels
+    # =========================================================================
+    # Collect up to 2 next channels with their metadata
+    next_channels_info = []  # List of (position_in_list, detected_channel, bars_away, duration)
+
+    for offset in range(1, 3):  # Look at next 1 and next 2
+        idx = channel_idx + offset
+        if idx < len(channels):
+            next_ch = channels[idx]
+            # bars_away = gap from current channel end to next channel start
+            bars_away = next_ch.start_idx - current.end_idx
+            # duration = how long the channel lasts (end - start)
+            duration = next_ch.end_idx - next_ch.start_idx
+            next_channels_info.append((offset - 1, next_ch, bars_away, duration))  # offset-1 gives 0 or 1
+
+    # Initialize next channel label fields with defaults
+    best_next_channel_direction = -1
+    best_next_channel_bars_away = -1
+    best_next_channel_duration = -1
+    best_next_channel_r_squared = 0.0
+    best_next_channel_bounce_count = 0
+    shortest_next_channel_direction = -1
+    shortest_next_channel_bars_away = -1
+    shortest_next_channel_duration = -1
+    small_channels_before_best = 0
+
+    if next_channels_info:
+        # Find the "best" channel: highest bounce_count, r_squared as tiebreaker
+        # Use channel_sort_key from config for consistent ranking
+        best_position = 0
+        best_ch_info = next_channels_info[0]
+        best_sort_key = channel_sort_key(best_ch_info[1].channel)
+
+        for i, ch_info in enumerate(next_channels_info[1:], start=1):
+            sort_key = channel_sort_key(ch_info[1].channel)
+            if sort_key > best_sort_key:
+                best_sort_key = sort_key
+                best_ch_info = ch_info
+                best_position = i
+
+        # Populate best channel fields
+        best_detected = best_ch_info[1]
+        best_channel_obj = best_detected.channel
+        best_next_channel_direction = best_detected.direction
+        best_next_channel_bars_away = best_ch_info[2]  # bars_away
+        best_next_channel_duration = best_ch_info[3]   # duration
+        best_next_channel_r_squared = best_channel_obj.r_squared if best_channel_obj.r_squared is not None else 0.0
+        best_next_channel_bounce_count = best_channel_obj.bounce_count if best_channel_obj.bounce_count is not None else 0
+
+        # small_channels_before_best: count of channels before the best one
+        # If best is first (position=0), then 0 small channels before it
+        # If best is second (position=1), then 1 small channel before it
+        small_channels_before_best = best_position
+
+        # Find the "shortest" channel by duration
+        shortest_ch_info = min(next_channels_info, key=lambda x: x[3])  # x[3] = duration
+        shortest_detected = shortest_ch_info[1]
+        shortest_next_channel_direction = shortest_detected.direction
+        shortest_next_channel_bars_away = shortest_ch_info[2]
+        shortest_next_channel_duration = shortest_ch_info[3]
+
+    # Look for next channel (immediate next for break direction logic)
     if channel_idx + 1 < len(channels):
         next_channel = channels[channel_idx + 1]
         next_idx = channel_idx + 1
@@ -525,9 +755,20 @@ def label_channel_from_map(
             source_channel_std_dev=ch_std_dev,
             source_channel_r_squared=ch_r_squared,
             source_channel_direction=ch_direction,
+            source_channel_bounce_count=ch_bounce_count,
             # Source channel timestamps
             source_channel_start_ts=current.start_timestamp,
             source_channel_end_ts=current.end_timestamp,
+            # Next channel labels (Phase 6)
+            best_next_channel_direction=best_next_channel_direction,
+            best_next_channel_bars_away=best_next_channel_bars_away,
+            best_next_channel_duration=best_next_channel_duration,
+            best_next_channel_r_squared=best_next_channel_r_squared,
+            best_next_channel_bounce_count=best_next_channel_bounce_count,
+            shortest_next_channel_direction=shortest_next_channel_direction,
+            shortest_next_channel_bars_away=shortest_next_channel_bars_away,
+            shortest_next_channel_duration=shortest_next_channel_duration,
+            small_channels_before_best=small_channels_before_best,
             # Validity flags
             duration_valid=True,
             direction_valid=True,
@@ -548,9 +789,20 @@ def label_channel_from_map(
             source_channel_std_dev=ch_std_dev,
             source_channel_r_squared=ch_r_squared,
             source_channel_direction=ch_direction,
+            source_channel_bounce_count=ch_bounce_count,
             # Source channel timestamps
             source_channel_start_ts=current.start_timestamp,
             source_channel_end_ts=current.end_timestamp,
+            # Next channel labels (Phase 6) - defaults since no next channels
+            best_next_channel_direction=-1,
+            best_next_channel_bars_away=-1,
+            best_next_channel_duration=-1,
+            best_next_channel_r_squared=0.0,
+            best_next_channel_bounce_count=0,
+            shortest_next_channel_direction=-1,
+            shortest_next_channel_bars_away=-1,
+            shortest_next_channel_duration=-1,
+            small_channels_before_best=0,
             # Validity flags
             duration_valid=False,
             direction_valid=False,
@@ -605,6 +857,7 @@ def label_channel_forward_scan(
     ch_std_dev = channel.std_dev if channel.std_dev is not None else 0.0
     ch_r_squared = channel.r_squared if channel.r_squared is not None else 0.0
     ch_direction = int(channel.direction) if channel.direction is not None else -1
+    ch_bounce_count = channel.bounce_count if channel.bounce_count is not None else 0
 
     # Validate channel has required attributes
     if channel.slope is None or channel.intercept is None or channel.std_dev is None:
@@ -620,6 +873,7 @@ def label_channel_forward_scan(
             source_channel_std_dev=ch_std_dev,
             source_channel_r_squared=ch_r_squared,
             source_channel_direction=ch_direction,
+            source_channel_bounce_count=ch_bounce_count,
             source_channel_start_ts=detected.start_timestamp,
             source_channel_end_ts=detected.end_timestamp,
             # Validity flags
@@ -647,6 +901,7 @@ def label_channel_forward_scan(
             source_channel_std_dev=ch_std_dev,
             source_channel_r_squared=ch_r_squared,
             source_channel_direction=ch_direction,
+            source_channel_bounce_count=ch_bounce_count,
             source_channel_start_ts=detected.start_timestamp,
             source_channel_end_ts=detected.end_timestamp,
             # Validity flags
@@ -687,6 +942,7 @@ def label_channel_forward_scan(
             source_channel_std_dev=ch_std_dev,
             source_channel_r_squared=ch_r_squared,
             source_channel_direction=ch_direction,
+            source_channel_bounce_count=ch_bounce_count,
             source_channel_start_ts=detected.start_timestamp,
             source_channel_end_ts=detected.end_timestamp,
             # Validity flags
@@ -727,6 +983,7 @@ def label_channel_forward_scan(
             source_channel_std_dev=ch_std_dev,
             source_channel_r_squared=ch_r_squared,
             source_channel_direction=ch_direction,
+            source_channel_bounce_count=ch_bounce_count,
             source_channel_start_ts=detected.start_timestamp,
             source_channel_end_ts=detected.end_timestamp,
             # Validity flags
@@ -793,6 +1050,31 @@ def label_channel_forward_scan(
         next_channel_dir = int(NewChannelDirection.SIDEWAYS)
         next_channel_valid_flag = False
 
+    # Compute RSI labels if we have close prices
+    # Need prices from channel start through forward scan region
+    rsi_labels = {}
+    channel_end_pos = resampled_df.index.get_loc(detected.end_timestamp) if detected.end_timestamp in resampled_df.index else -1
+    if channel_end_pos >= 0:
+        # Get close prices including forward region
+        close_start = max(0, channel_end_pos - detected.window - 20)  # Some lookback for RSI calculation
+        close_end = min(len(resampled_df), channel_end_pos + max_scan + 1)
+        close_prices = resampled_df['close'].iloc[close_start:close_end].values
+
+        # Adjust indices relative to close_prices array
+        channel_end_in_arr = channel_end_pos - close_start
+
+        # Determine bars to first and permanent break
+        bars_to_first = result.first_touch_bar if result.first_touch_bar >= 0 else result.break_bar
+        bars_to_perm = result.permanent_break_bar if result.permanent_break_direction >= 0 else -1
+
+        rsi_labels = compute_rsi_labels(
+            close_prices=close_prices,
+            channel_end_idx=channel_end_in_arr,
+            first_break_bar=bars_to_first,
+            permanent_break_bar=bars_to_perm,
+            channel_window=detected.window,
+        )
+
     return ChannelLabels(
         # Core label values (duration_bars uses break_bar for consistency)
         duration_bars=result.break_bar,
@@ -835,14 +1117,194 @@ def label_channel_forward_scan(
         source_channel_std_dev=ch_std_dev,
         source_channel_r_squared=ch_r_squared,
         source_channel_direction=ch_direction,
+        source_channel_bounce_count=ch_bounce_count,
         source_channel_start_ts=detected.start_timestamp,
         source_channel_end_ts=detected.end_timestamp,
+        # RSI labels
+        rsi_at_first_break=rsi_labels.get('rsi_at_first_break', 50.0),
+        rsi_at_permanent_break=rsi_labels.get('rsi_at_permanent_break', 50.0),
+        rsi_at_channel_end=rsi_labels.get('rsi_at_channel_end', 50.0),
+        rsi_overbought_at_break=rsi_labels.get('rsi_overbought_at_break', False),
+        rsi_oversold_at_break=rsi_labels.get('rsi_oversold_at_break', False),
+        rsi_divergence_at_break=rsi_labels.get('rsi_divergence_at_break', 0),
+        rsi_trend_in_channel=rsi_labels.get('rsi_trend_in_channel', 0),
+        rsi_range_in_channel=rsi_labels.get('rsi_range_in_channel', 0.0),
         # Validity flags
         duration_valid=True,
         direction_valid=True,
         next_channel_valid=next_channel_valid_flag,
         break_scan_valid=True
     )
+
+
+def _compute_next_channel_data(
+    channels: List[DetectedChannel],
+    current: DetectedChannel,
+    channel_idx: int
+) -> dict:
+    """
+    Compute next channel data for the hybrid labeling method.
+
+    Looks at the next 2 channels and returns dict with:
+    - best_next_channel_*: The channel with highest bounce_count (r_squared tiebreaker)
+    - shortest_next_channel_*: The channel with shortest duration
+    - small_channels_before_best: Count of smaller channels before the best one (0, 1, or 2)
+
+    Args:
+        channels: List of DetectedChannel for this (tf, window)
+        current: Current channel being labeled
+        channel_idx: Index of current channel in the list
+
+    Returns:
+        Dict with all next channel fields
+    """
+    # Collect up to 2 next channels with their metadata
+    next_channels_info = []  # List of (position_in_list, detected_channel, bars_away, duration)
+
+    for offset in range(1, 3):  # Look at next 1 and next 2
+        idx = channel_idx + offset
+        if idx < len(channels):
+            next_ch = channels[idx]
+            # bars_away = gap from current channel end to next channel start
+            bars_away = next_ch.start_idx - current.end_idx
+            # duration = how long the channel lasts (end - start)
+            duration = next_ch.end_idx - next_ch.start_idx
+            next_channels_info.append((offset - 1, next_ch, bars_away, duration))  # offset-1 gives 0 or 1
+
+    # Initialize with defaults
+    result = {
+        'best_next_channel_direction': -1,
+        'best_next_channel_bars_away': -1,
+        'best_next_channel_duration': -1,
+        'best_next_channel_r_squared': 0.0,
+        'best_next_channel_bounce_count': 0,
+        'shortest_next_channel_direction': -1,
+        'shortest_next_channel_bars_away': -1,
+        'shortest_next_channel_duration': -1,
+        'small_channels_before_best': 0,
+    }
+
+    if next_channels_info:
+        # Find the "best" channel: highest bounce_count, r_squared as tiebreaker
+        best_position = 0
+        best_ch_info = next_channels_info[0]
+        best_sort_key = channel_sort_key(best_ch_info[1].channel)
+
+        for i, ch_info in enumerate(next_channels_info[1:], start=1):
+            sort_key = channel_sort_key(ch_info[1].channel)
+            if sort_key > best_sort_key:
+                best_sort_key = sort_key
+                best_ch_info = ch_info
+                best_position = i
+
+        # Populate best channel fields
+        best_detected = best_ch_info[1]
+        best_channel_obj = best_detected.channel
+        result['best_next_channel_direction'] = best_detected.direction
+        result['best_next_channel_bars_away'] = best_ch_info[2]  # bars_away
+        result['best_next_channel_duration'] = best_ch_info[3]   # duration
+        result['best_next_channel_r_squared'] = best_channel_obj.r_squared if best_channel_obj.r_squared is not None else 0.0
+        result['best_next_channel_bounce_count'] = best_channel_obj.bounce_count if best_channel_obj.bounce_count is not None else 0
+
+        # small_channels_before_best: count of channels before the best one
+        result['small_channels_before_best'] = best_position
+
+        # Find the "shortest" channel by duration
+        shortest_ch_info = min(next_channels_info, key=lambda x: x[3])  # x[3] = duration
+        shortest_detected = shortest_ch_info[1]
+        result['shortest_next_channel_direction'] = shortest_detected.direction
+        result['shortest_next_channel_bars_away'] = shortest_ch_info[2]
+        result['shortest_next_channel_duration'] = shortest_ch_info[3]
+
+    return result
+
+
+def _compute_spy_next_channel_data(
+    channels: List[DetectedChannel],
+    current: DetectedChannel,
+    channel_idx: int
+) -> dict:
+    """
+    Compute SPY next channel data for cross-correlation labeling.
+
+    This function is identical in logic to _compute_next_channel_data() but returns
+    fields with 'spy_' prefix for use in cross-asset correlation analysis.
+
+    Looks at the next 2 channels and returns dict with:
+    - spy_best_next_channel_*: The channel with highest bounce_count (r_squared tiebreaker)
+    - spy_shortest_next_channel_*: The channel with shortest duration
+    - spy_small_channels_before_best: Count of smaller channels before the best one (0, 1, or 2)
+
+    Note: This function is called from the scanner (not from generate_all_labels())
+    since SPY labels are looked up separately from TSLA labels.
+
+    Args:
+        channels: List of DetectedChannel for SPY at this (tf, window)
+        current: Current SPY channel being labeled
+        channel_idx: Index of current channel in the list
+
+    Returns:
+        Dict with all SPY next channel fields (prefixed with 'spy_')
+    """
+    # Collect up to 2 next channels with their metadata
+    next_channels_info = []  # List of (position_in_list, detected_channel, bars_away, duration)
+
+    for offset in range(1, 3):  # Look at next 1 and next 2
+        idx = channel_idx + offset
+        if idx < len(channels):
+            next_ch = channels[idx]
+            # bars_away = gap from current channel end to next channel start
+            bars_away = next_ch.start_idx - current.end_idx
+            # duration = how long the channel lasts (end - start)
+            duration = next_ch.end_idx - next_ch.start_idx
+            next_channels_info.append((offset - 1, next_ch, bars_away, duration))  # offset-1 gives 0 or 1
+
+    # Initialize with defaults
+    result = {
+        'spy_best_next_channel_direction': -1,
+        'spy_best_next_channel_bars_away': -1,
+        'spy_best_next_channel_duration': -1,
+        'spy_best_next_channel_r_squared': 0.0,
+        'spy_best_next_channel_bounce_count': 0,
+        'spy_shortest_next_channel_direction': -1,
+        'spy_shortest_next_channel_bars_away': -1,
+        'spy_shortest_next_channel_duration': -1,
+        'spy_small_channels_before_best': 0,
+    }
+
+    if next_channels_info:
+        # Find the "best" channel: highest bounce_count, r_squared as tiebreaker
+        best_position = 0
+        best_ch_info = next_channels_info[0]
+        best_sort_key = channel_sort_key(best_ch_info[1].channel)
+
+        for i, ch_info in enumerate(next_channels_info[1:], start=1):
+            sort_key = channel_sort_key(ch_info[1].channel)
+            if sort_key > best_sort_key:
+                best_sort_key = sort_key
+                best_ch_info = ch_info
+                best_position = i
+
+        # Populate best channel fields
+        best_detected = best_ch_info[1]
+        best_channel_obj = best_detected.channel
+        result['spy_best_next_channel_direction'] = best_detected.direction
+        result['spy_best_next_channel_bars_away'] = best_ch_info[2]  # bars_away
+        result['spy_best_next_channel_duration'] = best_ch_info[3]   # duration
+        result['spy_best_next_channel_r_squared'] = best_channel_obj.r_squared if best_channel_obj.r_squared is not None else 0.0
+        result['spy_best_next_channel_bounce_count'] = best_channel_obj.bounce_count if best_channel_obj.bounce_count is not None else 0
+
+        # spy_small_channels_before_best: count of channels before the best one
+        result['spy_small_channels_before_best'] = best_position
+
+        # Find the "shortest" channel by duration
+        shortest_ch_info = min(next_channels_info, key=lambda x: x[3])  # x[3] = duration
+        shortest_detected = shortest_ch_info[1]
+        result['spy_shortest_next_channel_direction'] = shortest_detected.direction
+        result['spy_shortest_next_channel_bars_away'] = shortest_ch_info[2]
+        result['spy_shortest_next_channel_duration'] = shortest_ch_info[3]
+
+    return result
 
 
 def generate_all_labels(
@@ -940,6 +1402,10 @@ def generate_all_labels(
                     detected, resampled_df, max_scan,
                     next_channel_direction=next_channel_dir
                 )
+
+                # Compute next channel data (Phase 6) and merge into labels
+                next_ch_data = _compute_next_channel_data(channels, detected, idx)
+                labels = replace(labels, **next_ch_data)
             elif labeling_method == "forward_scan" and resampled_df is not None:
                 labels = label_channel_forward_scan(detected, resampled_df, max_scan)
                 next_idx = -1  # forward_scan doesn't determine next channel
@@ -1600,6 +2066,129 @@ def compute_cross_correlation_labels(
         spy_mean_dur = np.mean(spy_valid_durations) if spy_valid_durations else 0.0
         mean_duration_spread = tsla_mean_dur - spy_mean_dur
 
+    # ==========================================================================
+    # NEXT CHANNEL CROSS-CORRELATION (Phase 6)
+    # ==========================================================================
+
+    # 33. divergence_predicts_reversal:
+    # Check if either TSLA or SPY had direction divergence (permanent break different from first break)
+    # If yes, check if the next channel direction is OPPOSITE to the first break direction
+    # Example: first break UP, permanent break DOWN, next channel BEAR → True
+    divergence_predicts_reversal = False
+
+    # For TSLA: Check if divergence occurred and next channel is opposite to first break
+    if tsla_direction_diverged:
+        tsla_first_break = tsla_labels.break_direction  # 0=DOWN, 1=UP
+        tsla_next_dir = getattr(tsla_labels, 'best_next_channel_direction', -1)
+        # First break UP (1) → opposite next channel = BEAR (0)
+        # First break DOWN (0) → opposite next channel = BULL (2)
+        if tsla_next_dir >= 0:
+            if tsla_first_break == 1 and tsla_next_dir == 0:  # UP break → BEAR next
+                divergence_predicts_reversal = True
+            elif tsla_first_break == 0 and tsla_next_dir == 2:  # DOWN break → BULL next
+                divergence_predicts_reversal = True
+
+    # For SPY: Check if divergence occurred and next channel is opposite to first break
+    if not divergence_predicts_reversal and spy_direction_diverged:
+        spy_first_break = spy_labels.break_direction  # 0=DOWN, 1=UP
+        spy_next_dir = getattr(spy_labels, 'best_next_channel_direction', -1)
+        if spy_next_dir >= 0:
+            if spy_first_break == 1 and spy_next_dir == 0:  # UP break → BEAR next
+                divergence_predicts_reversal = True
+            elif spy_first_break == 0 and spy_next_dir == 2:  # DOWN break → BULL next
+                divergence_predicts_reversal = True
+
+    # 34. permanent_break_matches_next:
+    # Check if the permanent break direction matches the next channel direction
+    # permanent_break_direction=1 (UP) + next_channel_direction=2 (BULL) → True
+    # permanent_break_direction=0 (DOWN) + next_channel_direction=0 (BEAR) → True
+    permanent_break_matches_next = False
+
+    # Check TSLA
+    tsla_perm_dir = tsla_labels.permanent_break_direction  # -1=none, 0=DOWN, 1=UP
+    tsla_next_chan_dir = getattr(tsla_labels, 'best_next_channel_direction', -1)  # 0=BEAR, 1=SIDEWAYS, 2=BULL
+
+    if tsla_perm_dir >= 0 and tsla_next_chan_dir >= 0:
+        # UP break (1) matches BULL next (2)
+        # DOWN break (0) matches BEAR next (0)
+        if tsla_perm_dir == 1 and tsla_next_chan_dir == 2:
+            permanent_break_matches_next = True
+        elif tsla_perm_dir == 0 and tsla_next_chan_dir == 0:
+            permanent_break_matches_next = True
+
+    # Check SPY (if TSLA didn't match)
+    if not permanent_break_matches_next:
+        spy_perm_dir = spy_labels.permanent_break_direction
+        spy_next_chan_dir = getattr(spy_labels, 'best_next_channel_direction', -1)
+
+        if spy_perm_dir >= 0 and spy_next_chan_dir >= 0:
+            if spy_perm_dir == 1 and spy_next_chan_dir == 2:
+                permanent_break_matches_next = True
+            elif spy_perm_dir == 0 and spy_next_chan_dir == 0:
+                permanent_break_matches_next = True
+
+    # 35. next_channel_direction_aligned:
+    # Check if both TSLA and SPY have the same best_next_channel_direction
+    tsla_best_next_dir = getattr(tsla_labels, 'best_next_channel_direction', -1)
+    spy_best_next_dir = getattr(spy_labels, 'best_next_channel_direction', -1)
+
+    next_channel_direction_aligned = False
+    if tsla_best_next_dir >= 0 and spy_best_next_dir >= 0:
+        next_channel_direction_aligned = (tsla_best_next_dir == spy_best_next_dir)
+
+    # 36. next_channel_quality_aligned:
+    # "High quality" = bounce_count >= 3
+    # Both high OR both low (< 3) → True
+    tsla_bounce_count = getattr(tsla_labels, 'best_next_channel_bounce_count', 0)
+    spy_bounce_count = getattr(spy_labels, 'best_next_channel_bounce_count', 0)
+
+    QUALITY_THRESHOLD = 3
+    tsla_high_quality = tsla_bounce_count >= QUALITY_THRESHOLD
+    spy_high_quality = spy_bounce_count >= QUALITY_THRESHOLD
+
+    next_channel_quality_aligned = (tsla_high_quality == spy_high_quality)
+
+    # 37. best_next_channel_tsla_vs_spy:
+    # Compare best_next_channel_bounce_count between TSLA and SPY
+    # -1 = SPY has more bounces, 0 = equal, 1 = TSLA has more bounces
+    if tsla_bounce_count > spy_bounce_count:
+        best_next_channel_tsla_vs_spy = 1
+    elif spy_bounce_count > tsla_bounce_count:
+        best_next_channel_tsla_vs_spy = -1
+    else:
+        best_next_channel_tsla_vs_spy = 0
+
+    # ==========================================================================
+    # RSI CROSS-CORRELATION (Phase 7)
+    # ==========================================================================
+
+    # 38. rsi_aligned_at_break - Both overbought (>70) OR both oversold (<30) at break
+    tsla_ob = getattr(tsla_labels, 'rsi_overbought_at_break', False)
+    tsla_os = getattr(tsla_labels, 'rsi_oversold_at_break', False)
+    # NOTE: SPY labels use non-prefixed rsi_* fields (spy_rsi_* only exists on mirrored TSLA labels)
+    spy_ob = getattr(spy_labels, 'rsi_overbought_at_break', False)
+    spy_os = getattr(spy_labels, 'rsi_oversold_at_break', False)
+    rsi_aligned_at_break = (tsla_ob and spy_ob) or (tsla_os and spy_os)
+
+    # 39. rsi_divergence_aligned - Both have same RSI divergence signal
+    tsla_div = getattr(tsla_labels, 'rsi_divergence_at_break', 0)
+    spy_div = getattr(spy_labels, 'rsi_divergence_at_break', 0)
+    rsi_divergence_aligned = (tsla_div == spy_div)
+
+    # 40. tsla_rsi_higher_at_break - TSLA RSI > SPY RSI at break
+    tsla_rsi = getattr(tsla_labels, 'rsi_at_first_break', 50.0)
+    spy_rsi = getattr(spy_labels, 'rsi_at_first_break', 50.0)
+    tsla_rsi_higher_at_break = tsla_rsi > spy_rsi
+
+    # 41. rsi_spread_at_break - TSLA RSI - SPY RSI
+    rsi_spread_at_break = tsla_rsi - spy_rsi
+
+    # 42. overbought_predicts_down_break - RSI>70 at break AND break direction is DOWN
+    overbought_predicts_down_break = (tsla_ob or spy_ob) and (tsla_labels.break_direction == 0)
+
+    # 43. oversold_predicts_up_break - RSI<30 at break AND break direction is UP
+    oversold_predicts_up_break = (tsla_os or spy_os) and (tsla_labels.break_direction == 1)
+
     return CrossCorrelationLabels(
         # FIRST break cross-correlation
         break_direction_aligned=break_direction_aligned,
@@ -1661,6 +2250,19 @@ def compute_cross_correlation_labels(
         mean_duration_spread=mean_duration_spread,
         simultaneous_exit_count=simultaneous_exit_count,
         exit_cross_correlation_valid=exit_cross_correlation_valid,
+        # NEXT CHANNEL cross-correlation (Phase 6)
+        divergence_predicts_reversal=divergence_predicts_reversal,
+        permanent_break_matches_next=permanent_break_matches_next,
+        next_channel_direction_aligned=next_channel_direction_aligned,
+        next_channel_quality_aligned=next_channel_quality_aligned,
+        best_next_channel_tsla_vs_spy=best_next_channel_tsla_vs_spy,
+        # RSI cross-correlation (Phase 7)
+        rsi_aligned_at_break=rsi_aligned_at_break,
+        rsi_divergence_aligned=rsi_divergence_aligned,
+        tsla_rsi_higher_at_break=tsla_rsi_higher_at_break,
+        rsi_spread_at_break=rsi_spread_at_break,
+        overbought_predicts_down_break=overbought_predicts_down_break,
+        oversold_predicts_up_break=oversold_predicts_up_break,
         # Validity flags
         cross_valid=True,
         permanent_cross_valid=permanent_cross_valid
