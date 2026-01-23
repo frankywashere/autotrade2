@@ -281,7 +281,8 @@ def _process_channel_batch(channel_batch: List[Tuple[str, int, int]]) -> List[Di
         channel_batch: List of (tf, window, channel_idx) tuples
 
     Returns:
-        List of result dicts with 'sample', 'error', or 'skipped' keys
+        List of result dicts with 'sample', 'error', or 'skipped' keys.
+        Each successful result includes 'feature_extraction_time_ms' for timing stats.
     """
     try:
         tsla_df = _WORKER_TSLA_DF
@@ -299,6 +300,7 @@ def _process_channel_batch(channel_batch: List[Tuple[str, int, int]]) -> List[Di
         results = []
 
         for primary_tf, primary_window, channel_idx in channel_batch:
+            feature_extraction_time_ms = 0.0
             try:
                 # Get the PRIMARY channel from slim_map
                 key = (primary_tf, primary_window)
@@ -348,7 +350,8 @@ def _process_channel_batch(channel_batch: List[Tuple[str, int, int]]) -> List[Di
                 spy_slice = spy_df.iloc[start_idx:idx_5min]
                 vix_slice = vix_df.iloc[start_idx:idx_5min]
 
-                # Extract features at channel end position
+                # Extract features at channel end position (with timing)
+                feature_start = time.time()
                 tf_features = extract_all_tf_features(
                     tsla_df=tsla_slice,
                     spy_df=spy_slice,
@@ -361,6 +364,7 @@ def _process_channel_batch(channel_batch: List[Tuple[str, int, int]]) -> List[Di
                 tf_features = validate_sample_features(
                     tf_features, sample_timestamp, idx_5min, strict_count=True
                 )
+                feature_extraction_time_ms = (time.time() - feature_start) * 1000
 
                 # BUILD labels_per_window
                 # For PRIMARY channel: use labels directly (no lookup)
@@ -455,6 +459,7 @@ def _process_channel_batch(channel_batch: List[Tuple[str, int, int]]) -> List[Di
                     'sample': sample,
                     'label_hits': label_hits,
                     'label_misses': label_misses,
+                    'feature_extraction_time_ms': feature_extraction_time_ms,
                 })
 
             except Exception as e:
@@ -537,6 +542,80 @@ def _save_partial_results(samples: List, output_path: str, suffix: str = "_parti
 EXPECTED_FEATURE_COUNT = TOTAL_FEATURES
 MIN_LABEL_HIT_RATE = 0.1
 MAX_ERRORS_IN_MEMORY = 100
+VERBOSE_LOG_INTERVAL = 100  # Log progress every N samples
+
+
+def _format_time_remaining(seconds: float) -> str:
+    """Format seconds into human-readable time string (e.g., '1h 23m 45s')."""
+    if seconds < 0:
+        return "unknown"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    elif minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    else:
+        return f"{secs}s"
+
+
+def _log_sample_progress(
+    valid_count: int,
+    total_expected: int,
+    scan_start: float,
+    feature_times_ms: List[float],
+    skipped_count: int,
+    error_count: int,
+    use_tqdm_write: bool = True
+) -> None:
+    """
+    Log verbose progress information for sample generation.
+
+    Args:
+        valid_count: Number of valid samples created so far
+        total_expected: Total number of samples expected
+        scan_start: Start time of the scan (time.time())
+        feature_times_ms: List of recent feature extraction times in milliseconds
+        skipped_count: Number of skipped samples
+        error_count: Number of errors encountered
+        use_tqdm_write: If True, use tqdm.write() to avoid overwriting progress bar
+    """
+    elapsed = time.time() - scan_start
+    processed = valid_count + skipped_count + error_count
+
+    # Calculate samples per second and ETA
+    if elapsed > 0 and processed > 0:
+        samples_per_sec = processed / elapsed
+        remaining = total_expected - processed
+        eta_seconds = remaining / samples_per_sec if samples_per_sec > 0 else -1
+        eta_str = _format_time_remaining(eta_seconds)
+    else:
+        samples_per_sec = 0.0
+        eta_str = "calculating..."
+
+    # Calculate average feature extraction time
+    if feature_times_ms:
+        avg_feature_time = sum(feature_times_ms) / len(feature_times_ms)
+        feature_time_str = f"{avg_feature_time:.1f}ms"
+    else:
+        feature_time_str = "N/A"
+
+    # Build progress message
+    pct = 100 * processed / total_expected if total_expected > 0 else 0
+    msg = (
+        f"  [PROGRESS] {valid_count}/{total_expected} samples "
+        f"({pct:.1f}%) | "
+        f"Rate: {samples_per_sec:.1f}/s | "
+        f"ETA: {eta_str} | "
+        f"Avg feature extraction: {feature_time_str} | "
+        f"Skipped: {skipped_count}, Errors: {error_count}"
+    )
+
+    if use_tqdm_write:
+        tqdm.write(msg)
+    else:
+        print(msg)
 
 
 def validate_sample_features(
@@ -660,6 +739,10 @@ def scan_channels_two_pass(
     pass1_start = time.time()
 
     print("\n  [PASS 1] Detecting TSLA channels...")
+    print(f"           Timeframes: {list(TIMEFRAMES)}")
+    print(f"           Windows: {list(STANDARD_WINDOWS)}")
+    print(f"           Step: {step}, Workers: {workers}")
+    tsla_detect_start = time.time()
     tsla_channel_map, tsla_resampled_dfs = detect_all_channels(
         df=tsla_df,
         timeframes=list(TIMEFRAMES),
@@ -670,10 +753,15 @@ def scan_channels_two_pass(
         workers=workers,
         verbose=False
     )
+    tsla_detect_time = time.time() - tsla_detect_start
     tsla_channels = sum(len(chs) for chs in tsla_channel_map.values())
-    print(f"  TSLA: {tsla_channels} channels detected")
+    print(f"           Completed: {tsla_channels} channels detected in {tsla_detect_time:.1f}s")
 
     print("\n  [PASS 1] Detecting SPY channels...")
+    print(f"           Timeframes: {list(TIMEFRAMES)}")
+    print(f"           Windows: {list(STANDARD_WINDOWS)}")
+    print(f"           Step: {step}, Workers: {workers}")
+    spy_detect_start = time.time()
     spy_channel_map, spy_resampled_dfs = detect_all_channels(
         df=spy_df,
         timeframes=list(TIMEFRAMES),
@@ -684,11 +772,15 @@ def scan_channels_two_pass(
         workers=workers,
         verbose=False
     )
+    spy_detect_time = time.time() - spy_detect_start
     spy_channels = sum(len(chs) for chs in spy_channel_map.values())
-    print(f"  SPY: {spy_channels} channels detected")
+    print(f"           Completed: {spy_channels} channels detected in {spy_detect_time:.1f}s")
 
     pass1_time = time.time() - pass1_start
-    print(f"\n  Total: {tsla_channels + spy_channels} channels, Pass 1 time: {pass1_time:.1f}s")
+    print(f"\n  [PASS 1] Summary:")
+    print(f"           TSLA: {tsla_channels} channels in {tsla_detect_time:.1f}s")
+    print(f"           SPY:  {spy_channels} channels in {spy_detect_time:.1f}s")
+    print(f"           Total: {tsla_channels + spy_channels} channels, Pass 1 time: {pass1_time:.1f}s")
 
     # Save channel maps to disk if output path is specified
     if output_path:
@@ -714,30 +806,38 @@ def scan_channels_two_pass(
     print("\n[PASS 2] Generating labels from channel maps...")
     pass2_start = time.time()
 
-    print("\n  [PASS 2] Generating TSLA labels (hybrid method)...")
+    # Count total TSLA channels for progress logging
+    tsla_total_channels = sum(len(chs) for chs in tsla_channel_map.values())
+    print(f"\n  Generating TSLA labels... ({tsla_total_channels} channels to process)")
+    tsla_label_start = time.time()
     tsla_labeled_map: LabeledChannelMap = generate_all_labels(
         channel_map=tsla_channel_map,
         resampled_dfs=tsla_resampled_dfs,
         labeling_method="hybrid",
-        verbose=False
+        verbose=True
     )
+    tsla_label_time = time.time() - tsla_label_start
     tsla_labeled = sum(len(lcs) for lcs in tsla_labeled_map.values())
     tsla_valid = sum(1 for lcs in tsla_labeled_map.values() for lc in lcs if lc.labels.direction_valid)
-    print(f"  TSLA: {tsla_labeled} labeled, {tsla_valid} valid direction labels")
+    print(f"  TSLA complete: {tsla_labeled} labels generated in {tsla_label_time:.1f}s ({tsla_valid} valid)")
 
-    print("\n  [PASS 2] Generating SPY labels (hybrid method)...")
+    # Count total SPY channels for progress logging
+    spy_total_channels = sum(len(chs) for chs in spy_channel_map.values())
+    print(f"\n  Generating SPY labels... ({spy_total_channels} channels to process)")
+    spy_label_start = time.time()
     spy_labeled_map: LabeledChannelMap = generate_all_labels(
         channel_map=spy_channel_map,
         resampled_dfs=spy_resampled_dfs,
         labeling_method="hybrid",
-        verbose=False
+        verbose=True
     )
+    spy_label_time = time.time() - spy_label_start
     spy_labeled = sum(len(lcs) for lcs in spy_labeled_map.values())
     spy_valid = sum(1 for lcs in spy_labeled_map.values() for lc in lcs if lc.labels.direction_valid)
-    print(f"  SPY: {spy_labeled} labeled, {spy_valid} valid direction labels")
+    print(f"  SPY complete: {spy_labeled} labels generated in {spy_label_time:.1f}s ({spy_valid} valid)")
 
     pass2_time = time.time() - pass2_start
-    print(f"\n  Total: {tsla_labeled + spy_labeled} channels labeled, Pass 2 time: {pass2_time:.1f}s")
+    print(f"\n  Pass 2 summary: {tsla_labeled + spy_labeled} total labels, {pass2_time:.1f}s total time")
 
     # Free Pass-1 artifacts
     del tsla_resampled_dfs, spy_resampled_dfs
@@ -786,6 +886,11 @@ def scan_channels_two_pass(
     label_hit_count = 0
     label_miss_count = 0
 
+    # Verbose logging tracking
+    total_samples_expected = len(channel_work_items)
+    last_log_count = 0
+    feature_extraction_times_ms = []  # Track recent feature extraction times for averaging
+
     scan_start = time.time()
 
     try:
@@ -822,6 +927,12 @@ def scan_channels_two_pass(
                             valid_count += 1
                             label_hit_count += result.get('label_hits', 0)
                             label_miss_count += result.get('label_misses', 0)
+                            # Track feature extraction time for averaging
+                            if 'feature_extraction_time_ms' in result:
+                                feature_extraction_times_ms.append(result['feature_extraction_time_ms'])
+                                # Keep only last 100 times for rolling average
+                                if len(feature_extraction_times_ms) > 100:
+                                    feature_extraction_times_ms.pop(0)
                         elif result.get('error'):
                             error_msg = result['error']
                             if result.get('traceback'):
@@ -837,6 +948,20 @@ def scan_channels_two_pass(
 
                     batches_processed += 1
                     del batch_results
+
+                    # Verbose logging every VERBOSE_LOG_INTERVAL samples
+                    current_processed = valid_count + skipped_count + error_count
+                    if current_processed - last_log_count >= VERBOSE_LOG_INTERVAL:
+                        _log_sample_progress(
+                            valid_count=valid_count,
+                            total_expected=total_samples_expected,
+                            scan_start=scan_start,
+                            feature_times_ms=feature_extraction_times_ms,
+                            skipped_count=skipped_count,
+                            error_count=error_count,
+                            use_tqdm_write=progress
+                        )
+                        last_log_count = current_processed
 
                     if incremental_path and len(samples) >= incremental_chunk:
                         flushed = _flush_samples_to_temp(samples, incremental_path)
@@ -881,6 +1006,12 @@ def scan_channels_two_pass(
                         valid_count += 1
                         label_hit_count += result.get('label_hits', 0)
                         label_miss_count += result.get('label_misses', 0)
+                        # Track feature extraction time for averaging
+                        if 'feature_extraction_time_ms' in result:
+                            feature_extraction_times_ms.append(result['feature_extraction_time_ms'])
+                            # Keep only last 100 times for rolling average
+                            if len(feature_extraction_times_ms) > 100:
+                                feature_extraction_times_ms.pop(0)
                     elif result.get('error'):
                         error_msg = result['error']
                         if result.get('traceback'):
@@ -892,6 +1023,20 @@ def scan_channels_two_pass(
                             raise ValidationError(error_msg)
                     elif result.get('skipped'):
                         skipped_count += 1
+
+                # Verbose logging every VERBOSE_LOG_INTERVAL samples
+                current_processed = valid_count + skipped_count + error_count
+                if current_processed - last_log_count >= VERBOSE_LOG_INTERVAL:
+                    _log_sample_progress(
+                        valid_count=valid_count,
+                        total_expected=total_samples_expected,
+                        scan_start=scan_start,
+                        feature_times_ms=feature_extraction_times_ms,
+                        skipped_count=skipped_count,
+                        error_count=error_count,
+                        use_tqdm_write=progress
+                    )
+                    last_log_count = current_processed
 
                 if incremental_path and len(samples) >= incremental_chunk:
                     flushed = _flush_samples_to_temp(samples, incremental_path)
@@ -915,36 +1060,124 @@ def scan_channels_two_pass(
 
     samples.sort(key=lambda s: s.channel_end_idx)
 
-    # Print summary
-    print(f"\n{'=' * 60}")
-    if _shutdown_requested:
-        print("SCAN INTERRUPTED!")
-    else:
-        print("SCAN COMPLETE!")
-    print(f"{'=' * 60}")
-    print(f"  Total channels processed: {len(channel_work_items)}")
-    print(f"  Valid samples created: {valid_count}")
-    print(f"  Skipped (invalid/no labels): {skipped_count}")
-    print(f"  Errors: {error_count}")
+    # Get memory usage if psutil is available
+    memory_info = None
+    try:
+        import psutil
+        process = psutil.Process()
+        mem = process.memory_info()
+        memory_info = {
+            'rss_mb': mem.rss / (1024 * 1024),
+            'vms_mb': mem.vms / (1024 * 1024),
+            'percent': process.memory_percent(),
+        }
+    except ImportError:
+        pass
+    except Exception:
+        pass
 
-    if valid_count > 0:
-        avg_features = sum(len(s.tf_features) for s in samples) / valid_count
-        print(f"  Average features per sample: {avg_features:.0f}")
+    # ==========================================================================
+    # OVERALL SUMMARY WITH TIMING BREAKDOWN
+    # ==========================================================================
+    print("\n")
+    print("=" * 70)
+    if _shutdown_requested:
+        print("                         SCAN INTERRUPTED")
+    else:
+        print("                         SCAN COMPLETE")
+    print("=" * 70)
+
+    # --- Results Summary ---
+    print("\n" + "-" * 70)
+    print("RESULTS SUMMARY")
+    print("-" * 70)
+    print(f"  Total channels processed:     {len(channel_work_items):,}")
+    print(f"  Valid samples created:        {valid_count:,}")
+    print(f"  Skipped (invalid/no labels):  {skipped_count:,}")
+    print(f"  Errors:                       {error_count:,}")
+
+    if valid_count > 0 and samples:
+        avg_features = sum(len(s.tf_features) for s in samples) / len(samples)
+        print(f"  Average features per sample:  {avg_features:.0f}")
+
+    # Feature extraction timing stats
+    if feature_extraction_times_ms:
+        avg_feature_time = sum(feature_extraction_times_ms) / len(feature_extraction_times_ms)
+        min_feature_time = min(feature_extraction_times_ms)
+        max_feature_time = max(feature_extraction_times_ms)
+        print(f"\n  Feature Extraction Timing (last {len(feature_extraction_times_ms)} samples):")
+        print(f"    Average: {avg_feature_time:.1f}ms")
+        print(f"    Min:     {min_feature_time:.1f}ms")
+        print(f"    Max:     {max_feature_time:.1f}ms")
 
     total_lookups = label_hit_count + label_miss_count
     if total_lookups > 0:
         hit_rate = 100 * label_hit_count / total_lookups
-        print(f"\n  Label lookup stats:")
-        print(f"    Hits: {label_hit_count} ({hit_rate:.1f}%)")
-        print(f"    Misses: {label_miss_count} ({100 - hit_rate:.1f}%)")
+        print(f"\n  Label Lookup Stats:")
+        print(f"    Hits:   {label_hit_count:,} ({hit_rate:.1f}%)")
+        print(f"    Misses: {label_miss_count:,} ({100 - hit_rate:.1f}%)")
 
-    print(f"\n  Timing breakdown:")
-    print(f"    Pass 1 (channel detection): {pass1_time:.1f}s")
-    print(f"    Pass 2 (label generation):  {pass2_time:.1f}s")
-    print(f"    Scan loop:                  {scan_time:.1f}s")
-    print(f"    Total:                      {total_time:.1f}s")
+    # --- Timing Breakdown ---
+    print("\n" + "-" * 70)
+    print("TIMING BREAKDOWN")
+    print("-" * 70)
 
-    print(f"\n[COMPLETE] Created {valid_count} samples in {total_time:.1f} seconds")
+    # Calculate percentages
+    pass1_pct = (pass1_time / total_time * 100) if total_time > 0 else 0
+    pass2_pct = (pass2_time / total_time * 100) if total_time > 0 else 0
+    scan_pct = (scan_time / total_time * 100) if total_time > 0 else 0
+
+    print(f"  Pass 1 (channel detection):   {pass1_time:8.1f}s  ({pass1_pct:5.1f}%)")
+    print(f"  Pass 2 (label generation):    {pass2_time:8.1f}s  ({pass2_pct:5.1f}%)")
+    print(f"  Pass 3 (sample generation):   {scan_time:8.1f}s  ({scan_pct:5.1f}%)")
+    print(f"  " + "-" * 40)
+    print(f"  TOTAL WALL CLOCK TIME:        {total_time:8.1f}s  (100.0%)")
+
+    # Format total time in human-readable format
+    if total_time >= 3600:
+        hours = int(total_time // 3600)
+        minutes = int((total_time % 3600) // 60)
+        seconds = total_time % 60
+        print(f"                                ({hours}h {minutes}m {seconds:.1f}s)")
+    elif total_time >= 60:
+        minutes = int(total_time // 60)
+        seconds = total_time % 60
+        print(f"                                ({minutes}m {seconds:.1f}s)")
+
+    # --- Performance Metrics ---
+    print("\n" + "-" * 70)
+    print("PERFORMANCE METRICS")
+    print("-" * 70)
+
+    # Samples per second
+    if total_time > 0 and valid_count > 0:
+        samples_per_sec = valid_count / total_time
+        samples_per_sec_scan = valid_count / scan_time if scan_time > 0 else 0
+        print(f"  Overall throughput:           {samples_per_sec:.2f} samples/sec")
+        print(f"  Pass 3 throughput:            {samples_per_sec_scan:.2f} samples/sec")
+
+    # Channels per second in Pass 1
+    if pass1_time > 0:
+        channels_per_sec_p1 = (tsla_channels + spy_channels) / pass1_time
+        print(f"  Pass 1 channel detection:     {channels_per_sec_p1:.2f} channels/sec")
+
+    # Labels per second in Pass 2
+    if pass2_time > 0:
+        labels_per_sec_p2 = (tsla_labeled + spy_labeled) / pass2_time
+        print(f"  Pass 2 label generation:      {labels_per_sec_p2:.2f} labels/sec")
+
+    # --- Memory Usage ---
+    if memory_info:
+        print("\n" + "-" * 70)
+        print("MEMORY USAGE")
+        print("-" * 70)
+        print(f"  Resident Set Size (RSS):      {memory_info['rss_mb']:.1f} MB")
+        print(f"  Virtual Memory Size (VMS):    {memory_info['vms_mb']:.1f} MB")
+        print(f"  Memory Percent:               {memory_info['percent']:.1f}%")
+
+    print("\n" + "=" * 70)
+    print(f"  COMPLETE: {valid_count:,} samples generated in {total_time:.1f}s")
+    print("=" * 70)
 
     if errors:
         print(f"\n{'=' * 60}")
