@@ -533,7 +533,9 @@ def _detect_channels_for_tf(
         return {}
 
     try:
-        channels = detect_channels_multi_window(df, windows=windows)
+        # max_workers=1 disables internal threading since we're already
+        # parallelizing at the TF level in extract_all_tf_features()
+        channels = detect_channels_multi_window(df, windows=windows, max_workers=1)
         return channels
     except Exception as e:
         logger.warning(f"Channel detection failed: {e}")
