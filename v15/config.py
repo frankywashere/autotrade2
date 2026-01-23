@@ -48,35 +48,37 @@ TF_LOOKBACK_5MIN: Dict[str, int] = {
 }
 
 # Per-TF forward requirements for label scanning (in 5-min bars)
-# Based on TF_MAX_SCAN * BARS_PER_TF
+# Formula: TF_MAX_SCAN[tf] * BARS_PER_TF[tf] + buffer
+# This ensures enough forward data to scan for breaks at each TF
 TF_FORWARD_5MIN: Dict[str, int] = {
-    '5min': 600,        # 500 + buffer
-    '15min': 1400,      # 400 * 3 + buffer
-    '30min': 2400,      # 350 * 6 + buffer
-    '1h': 4000,         # 300 * 12 + buffer
-    '2h': 6500,         # 250 * 24 + buffer
-    '3h': 8000,         # 200 * 36 + buffer
-    '4h': 8000,         # 150 * 48 + buffer
-    'daily': 8500,      # 100 * 78 + buffer
-    'weekly': 21000,    # 52 * 390 + buffer
-    'monthly': 40000,   # 24 * 1638 + buffer
+    '5min': 600,       # 500 * 1 + 100 buffer
+    '15min': 1500,     # 400 * 3 + 300 buffer
+    '30min': 2500,     # 350 * 6 + 400 buffer
+    '1h': 6500,        # 500 * 12 + 500 buffer
+    '2h': 10000,       # 400 * 24 + 400 buffer
+    '3h': 11500,       # 300 * 36 + 700 buffer (highest requirement)
+    '4h': 10000,       # 200 * 48 + 400 buffer
+    'daily': 8500,     # 100 * 78 + 700 buffer
+    'weekly': 11000,   # 26 * 390 + 860 buffer
+    'monthly': 10500,  # 6 * 1638 + 672 buffer
 }
 
 # Maximum lookback/forward for SCANNER (determines what positions can be scanned)
-# NOTE: We use WEEKLY as the practical limit for scanning.
-# Monthly TF will have invalid labels for most samples due to data limits.
-# The model handles missing labels via masking.
+# NOTE: Forward limit is now based on 3h TF (highest forward requirement = 11,500).
+#
+# All TFs have correctly calculated forward requirements:
+#   TF_FORWARD_5MIN[tf] = TF_MAX_SCAN[tf] * BARS_PER_TF[tf] + buffer
 #
 # For a 440K bar dataset:
-#   - Weekly lookback (32K) + forward (21K) = 53K (reasonable)
-#   - Monthly (172K) exceeds our data
+#   - Lookback (32K) + forward (11.5K) = 43.5K bars unusable
+#   - Usable range: ~396,900 bars (90.1% of data)
 #
 # Per-TF lookback values above are still used for EFFICIENT SLICING during
 # feature extraction - each TF only resamples the data it needs.
 
-# Practical limits for scanner (based on weekly TF)
-SCANNER_LOOKBACK_5MIN = TF_LOOKBACK_5MIN['weekly']   # 32,000
-SCANNER_FORWARD_5MIN = TF_FORWARD_5MIN['weekly']     # 21,000
+# Practical limits for scanner
+SCANNER_LOOKBACK_5MIN = TF_LOOKBACK_5MIN['weekly']       # 32,000 (weekly lookback)
+SCANNER_FORWARD_5MIN = max(TF_FORWARD_5MIN.values())     # 11,500 (3h has highest need)
 
 # True maximums (for reference - may exceed available data)
 MAX_LOOKBACK_5MIN = max(TF_LOOKBACK_5MIN.values())   # 132,000 (monthly)
