@@ -353,13 +353,19 @@ def _process_channel_batch(channel_batch: List[Tuple[str, int, int]]) -> List[Di
 
                 # Extract features at channel end position (with timing)
                 feature_start = time.time()
+                # NOTE: Channel reuse from slim_maps is DISABLED because Pass 1 channels
+                # are detected on full dataset while feature extraction uses slices.
+                # The different data contexts produce different channel metadata.
+                # Keep the parameter infrastructure for future optimization.
                 tf_features = extract_all_tf_features(
                     tsla_df=tsla_slice,
                     spy_df=spy_slice,
                     vix_df=vix_slice,
                     timestamp=sample_timestamp,
                     source_bar_count=idx_5min,
-                    include_bar_metadata=True
+                    include_bar_metadata=True,
+                    tsla_slim_map=None,  # Disabled: use fresh detection
+                    spy_slim_map=None    # Disabled: use fresh detection
                 )
 
                 tf_features = validate_sample_features(

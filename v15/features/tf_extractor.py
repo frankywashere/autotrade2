@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 if TYPE_CHECKING:
     from v7.core.channel import Channel
+    from ..scanner import SlimLabeledChannel
 
 # =============================================================================
 # Core imports from v7 and v15
@@ -76,6 +77,129 @@ TF_TO_RESAMPLE_RULE = {
     'weekly': '1W',
     'monthly': '1MS',
 }
+
+
+def _lookup_channel_from_slim_map(
+    slim_map: Optional[Dict],
+    tf: str,
+    window: int,
+    timestamp: pd.Timestamp
+) -> Optional['SlimLabeledChannel']:
+    """
+    Look up a channel from slim_map that contains the given timestamp.
+
+    Uses binary search to efficiently find a channel where:
+    start_timestamp <= timestamp <= end_timestamp
+
+    Args:
+        slim_map: Dict mapping (tf, window) -> List[SlimLabeledChannel]
+        tf: Timeframe to look up
+        window: Window size to look up
+        timestamp: Timestamp to find a channel for
+
+    Returns:
+        SlimLabeledChannel if found, None otherwise
+    """
+    if slim_map is None:
+        return None
+
+    key = (tf, window)
+    channels = slim_map.get(key, [])
+
+    if not channels:
+        return None
+
+    # Binary search for channel containing timestamp
+    # Channels are sorted by end_timestamp
+    lo, hi = 0, len(channels) - 1
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        channel = channels[mid]
+
+        if channel.start_timestamp <= timestamp <= channel.end_timestamp:
+            return channel
+        elif channel.end_timestamp < timestamp:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return None
+
+
+def _reconstruct_channel_from_slim(
+    slim_channel: 'SlimLabeledChannel',
+    resampled_df: pd.DataFrame,
+    window: int
+) -> Optional['Channel']:
+    """
+    Reconstruct a Channel object from SlimLabeledChannel metadata and resampled data.
+
+    This allows reusing pre-computed channel metadata from Pass 1 instead of
+    re-detecting channels during feature extraction.
+
+    Args:
+        slim_channel: SlimLabeledChannel with precomputed metadata
+        resampled_df: OHLCV DataFrame resampled to the channel's timeframe
+        window: Window size for the channel
+
+    Returns:
+        Reconstructed Channel object, or None if reconstruction fails
+    """
+    if slim_channel is None or not slim_channel.channel_valid:
+        return None
+
+    try:
+        # Get OHLC from resampled data (last 'window' bars)
+        df_slice = resampled_df.iloc[-window:] if len(resampled_df) >= window else resampled_df
+
+        close = df_slice['close'].values
+        high = df_slice['high'].values
+        low = df_slice['low'].values
+
+        n_bars = len(close)
+
+        # Reconstruct channel lines from metadata
+        x = np.arange(n_bars)
+        slope = slim_channel.channel_slope
+        intercept = slim_channel.channel_intercept
+        std_dev = slim_channel.channel_std_dev
+
+        center_line = slope * x + intercept
+        upper_line = center_line + 2 * std_dev
+        lower_line = center_line - 2 * std_dev
+
+        # Create Channel object with reconstructed data
+        from v7.core.channel import Channel, Direction, Touch
+
+        channel = Channel(
+            valid=slim_channel.channel_valid,
+            direction=Direction(slim_channel.channel_direction) if slim_channel.channel_direction >= 0 else Direction.SIDEWAYS,
+            slope=slope,
+            intercept=intercept,
+            r_squared=slim_channel.channel_r_squared,
+            std_dev=std_dev,
+            upper_line=upper_line,
+            lower_line=lower_line,
+            center_line=center_line,
+            touches=[],  # Touch details not stored in slim channel
+            complete_cycles=0,  # Not stored
+            bounce_count=slim_channel.channel_bounce_count,
+            width_pct=0.0,  # Will be recalculated from upper/lower
+            window=window,
+        )
+
+        # Calculate width_pct
+        avg_price = np.mean(close) if len(close) > 0 else 1.0
+        channel_width = upper_line[-1] - lower_line[-1] if len(upper_line) > 0 else 0.0
+        channel.width_pct = (channel_width / avg_price * 100) if avg_price > 0 else 0.0
+
+        return channel
+
+    except Exception as e:
+        logger.warning(f"Failed to reconstruct channel: {e}")
+        return None
+
 
 # Import STANDARD_WINDOWS from v15.config
 from v15.config import STANDARD_WINDOWS
@@ -831,7 +955,10 @@ def extract_all_tf_features(
     timestamp: pd.Timestamp,
     channel_history_by_tf: Optional[Dict[str, Dict]] = None,
     source_bar_count: Optional[int] = None,
-    include_bar_metadata: bool = True
+    include_bar_metadata: bool = True,
+    # NEW PARAMETERS for channel reuse:
+    tsla_slim_map: Optional[Dict] = None,
+    spy_slim_map: Optional[Dict] = None,
 ) -> Dict[str, float]:
     """
     Extract ALL features for ALL timeframes with partial bar support.
@@ -857,6 +984,9 @@ def extract_all_tf_features(
                          Used to calculate bar_completion_pct based on position
                          within the TF bar. If None, uses len(tsla_df).
         include_bar_metadata: If True, include 30 bar metadata features (default True)
+        tsla_slim_map: Optional dict mapping (tf, window) -> List[SlimLabeledChannel].
+                       If provided, channels will be looked up instead of re-detected.
+        spy_slim_map: Optional dict for SPY channels (same format).
 
     Returns:
         Dict[str, float] with ~14,540 features:
@@ -921,11 +1051,39 @@ def extract_all_tf_features(
                 logger.debug(f"Not enough data for {tf} (have {len(tsla_tf)} bars)")
                 continue
 
-            # 2. Detect channels at all windows for this TF (TSLA)
-            tsla_channels_by_window = _detect_channels_for_tf(tsla_tf)
+            # 2. Get TSLA channels - use slim_map if available, else detect
+            if tsla_slim_map is not None:
+                # Try to reconstruct channels from precomputed slim_map
+                tsla_channels_by_window = {}
+                for window in STANDARD_WINDOWS:
+                    slim_ch = _lookup_channel_from_slim_map(tsla_slim_map, tf, window, timestamp)
+                    if slim_ch is not None:
+                        reconstructed = _reconstruct_channel_from_slim(slim_ch, tsla_tf, window)
+                        if reconstructed is not None:
+                            tsla_channels_by_window[window] = reconstructed
 
-            # 3. Detect channels at all windows for SPY
-            spy_channels_by_window = _detect_channels_for_tf(spy_tf)
+                # If we got less than half the windows, fall back to full detection
+                # (This handles edge cases where slim_map has gaps)
+                if len(tsla_channels_by_window) < len(STANDARD_WINDOWS) // 2:
+                    tsla_channels_by_window = _detect_channels_for_tf(tsla_tf)
+            else:
+                # No slim_map provided, detect channels directly
+                tsla_channels_by_window = _detect_channels_for_tf(tsla_tf)
+
+            # 3. Get SPY channels - same logic
+            if spy_slim_map is not None:
+                spy_channels_by_window = {}
+                for window in STANDARD_WINDOWS:
+                    slim_ch = _lookup_channel_from_slim_map(spy_slim_map, tf, window, timestamp)
+                    if slim_ch is not None:
+                        reconstructed = _reconstruct_channel_from_slim(slim_ch, spy_tf, window)
+                        if reconstructed is not None:
+                            spy_channels_by_window[window] = reconstructed
+
+                if len(spy_channels_by_window) < len(STANDARD_WINDOWS) // 2:
+                    spy_channels_by_window = _detect_channels_for_tf(spy_tf)
+            else:
+                spy_channels_by_window = _detect_channels_for_tf(spy_tf)
 
             # Select best TSLA channel
             if _channel_available and tsla_channels_by_window:
