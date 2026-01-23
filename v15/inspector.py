@@ -156,9 +156,8 @@ class Inspector:
 
                 if len(channel_df) >= window:
                     if not channel_df[['open', 'high', 'low', 'close']].isna().any().any():
-                        min_cycles = 0 if tf in ['1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly'] else 1
                         try:
-                            channel = detect_channel(channel_df, window=window, min_cycles=min_cycles)
+                            channel = detect_channel(channel_df, window=window, min_cycles=1)
                             if channel is not None and channel.valid:
                                 # Use channel_sort_key for consistent ranking
                                 bounce_count, _ = channel_sort_key(channel)
@@ -286,9 +285,7 @@ class Inspector:
         channel_df = df_tf.iloc[detection_start:detection_end + 1]
 
         # Detect channel fresh
-        # Use min_cycles=0 for higher timeframes (sparse data), min_cycles=1 for lower TFs
-        min_cycles = 0 if tf in ['1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly'] else 1
-
+        # Use min_cycles=1 consistently (matches scanner's detect_all_channels in labels.py)
         channel = None
         if len(channel_df) >= window:
             # Check for NaN before detection (resampled data can have NaN)
@@ -296,7 +293,7 @@ class Inspector:
                 channel = None
             else:
                 try:
-                    channel = detect_channel(channel_df, window=window, min_cycles=min_cycles)
+                    channel = detect_channel(channel_df, window=window, min_cycles=1)
                 except Exception as e:
                     channel = None
 
