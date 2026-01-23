@@ -1307,12 +1307,158 @@ def _compute_spy_next_channel_data(
     return result
 
 
+def _label_channel_worker(args):
+    """
+    Worker function to label a single channel.
+
+    This function is called by Pool.map() for parallel processing of label generation.
+    It reconstructs the DataFrame from serialized values since DataFrames cannot be
+    pickled directly for multiprocessing.
+
+    Args:
+        args: Tuple of:
+            - tf: Timeframe string
+            - window: Window size
+            - channel_idx: Index of channel in the channels list
+            - detected: DetectedChannel to label
+            - labeling_method: "hybrid", "forward_scan", or "next_channel"
+            - max_scan: Maximum bars to scan forward
+            - df_values: Numpy array of DataFrame values (for resampled_df)
+            - df_index: Numpy array of DataFrame index values
+            - df_columns: List of column names
+            - channels_data: List of tuples for reconstructing neighboring channels
+                             Each tuple: (start_idx, end_idx, direction, channel_attrs,
+                                         start_ts, end_ts)
+            - num_channels: Total number of channels for this (tf, window)
+
+    Returns:
+        Tuple of (tf, window, channel_idx, labels, next_idx, direction_valid)
+    """
+    (tf, window, channel_idx, detected, labeling_method, max_scan,
+     df_values, df_index, df_columns, channels_data, num_channels) = args
+
+    # Reconstruct resampled DataFrame if provided
+    if df_values is not None:
+        resampled_df = pd.DataFrame(
+            df_values,
+            index=pd.DatetimeIndex(df_index),
+            columns=df_columns
+        )
+    else:
+        resampled_df = None
+
+    # Choose labeling method
+    if labeling_method == "hybrid" and resampled_df is not None:
+        # Hybrid: Get next_channel_direction from map lookup, then use forward_scan
+        # for break timing features
+        next_channel_dir = None
+        next_idx = -1
+        if channel_idx + 1 < num_channels:
+            # Get next channel direction from channels_data
+            # channels_data[i] = (start_idx, end_idx, direction, ...)
+            next_channel_dir = channels_data[channel_idx + 1][2]  # direction
+            next_idx = channel_idx + 1
+
+        # Use forward_scan with next_channel_direction for best of both
+        labels = label_channel_forward_scan(
+            detected, resampled_df, max_scan,
+            next_channel_direction=next_channel_dir
+        )
+
+        # Compute next channel data (Phase 6) - need to reconstruct channels list
+        # We only need the detected channels, not full Channel objects, for _compute_next_channel_data
+        # Build a minimal list of DetectedChannel objects for the neighboring channels we need
+        # (current, current+1, current+2)
+        neighbor_channels = []
+        for i in range(max(0, channel_idx), min(num_channels, channel_idx + 3)):
+            ch_data = channels_data[i]
+            # Reconstruct a minimal DetectedChannel for next channel data computation
+            # ch_data = (start_idx, end_idx, direction, channel_attrs, start_ts, end_ts)
+            start_idx, end_idx, direction, channel_attrs, start_ts, end_ts = ch_data
+
+            # Reconstruct Channel object with necessary attributes
+            # Use a minimal Channel dataclass with required fields
+            from v7.core.channel import Channel, Direction
+
+            # Map direction int to Direction enum
+            dir_map = {0: Direction.BEAR, 1: Direction.SIDEWAYS, 2: Direction.BULL}
+            ch_direction = dir_map.get(channel_attrs.get('direction', 1), Direction.SIDEWAYS)
+
+            channel_obj = Channel(
+                valid=True,
+                direction=ch_direction,
+                slope=channel_attrs.get('slope') or 0.0,
+                intercept=channel_attrs.get('intercept') or 0.0,
+                r_squared=channel_attrs.get('r_squared') or 0.0,
+                std_dev=channel_attrs.get('std_dev') or 0.0,
+                upper_line=np.array([]),  # Not needed for next channel data
+                lower_line=np.array([]),
+                center_line=np.array([]),
+                touches=[],
+                complete_cycles=0,
+                bounce_count=channel_attrs.get('bounce_count') or 0,
+                width_pct=0.0,
+                window=window
+            )
+
+            neighbor_ch = DetectedChannel(
+                start_idx=start_idx,
+                end_idx=end_idx,
+                direction=direction,
+                channel=channel_obj,
+                tf=tf,
+                window=window,
+                start_timestamp=start_ts,
+                end_timestamp=end_ts
+            )
+            neighbor_channels.append(neighbor_ch)
+
+        # Adjust index for the local neighbor_channels list
+        local_idx = channel_idx - max(0, channel_idx)  # Will be 0 if channel_idx >= 0
+
+        next_ch_data = _compute_next_channel_data(neighbor_channels, detected, local_idx)
+        labels = replace(labels, **next_ch_data)
+
+    elif labeling_method == "forward_scan" and resampled_df is not None:
+        labels = label_channel_forward_scan(detected, resampled_df, max_scan)
+        next_idx = -1  # forward_scan doesn't determine next channel
+
+    else:
+        # next_channel method - can't use label_channel_from_map here as we don't have channel_map
+        # For workers=1 case, this path won't be used (sequential processing handles it)
+        # For parallel processing with next_channel method, we need special handling
+        # This is a fallback that returns invalid labels
+        labels = ChannelLabels(
+            duration_bars=0,
+            break_direction=int(BreakDirection.UP),
+            next_channel_direction=int(NewChannelDirection.SIDEWAYS),
+            permanent_break=False,
+            timeframe=tf,
+            source_channel_slope=0.0,
+            source_channel_intercept=0.0,
+            source_channel_std_dev=0.0,
+            source_channel_r_squared=0.0,
+            source_channel_direction=-1,
+            source_channel_bounce_count=0,
+            source_channel_start_ts=None,
+            source_channel_end_ts=None,
+            duration_valid=False,
+            direction_valid=False,
+            next_channel_valid=False,
+            break_scan_valid=False
+        )
+        next_idx = -1
+
+    return (tf, window, channel_idx, labels, next_idx, labels.direction_valid)
+
+
 def generate_all_labels(
     channel_map: ChannelMap,
     resampled_dfs: Optional[Dict[str, pd.DataFrame]] = None,
     labeling_method: str = "hybrid",
     progress_callback=None,
-    verbose: bool = True
+    verbose: bool = True,
+    workers: int = None,
 ) -> LabeledChannelMap:
     """
     PASS 2: Generate labels for all channels in the map.
@@ -1328,6 +1474,9 @@ def generate_all_labels(
       (bars_to_first_break, break_magnitude, permanent_break, etc.) and uses
       next_channel lookup for next_channel_direction. Requires resampled_dfs.
 
+    Uses parallel processing with multiprocessing.Pool to process channels
+    concurrently for significant speedup on multi-core systems.
+
     Args:
         channel_map: The channel map from detect_all_channels()
         resampled_dfs: Optional dict of resampled DataFrames keyed by timeframe.
@@ -1335,6 +1484,8 @@ def generate_all_labels(
         labeling_method: "next_channel" (default), "forward_scan", or "hybrid"
         progress_callback: Optional callback(tf, window, pct) for progress updates
         verbose: If True, print detailed progress logging
+        workers: Number of parallel workers. Defaults to cpu_count()-1.
+                 Use workers=1 for sequential processing (backward compatible).
 
     Returns:
         LabeledChannelMap: {(tf, window): [LabeledChannel, ...]}
@@ -1351,10 +1502,17 @@ def generate_all_labels(
                   "falling back to next_channel method")
         labeling_method = "next_channel"
 
+    # Determine number of workers
+    cpus = cpu_count() or 8  # cpu_count() can return None on some systems
+    num_workers = workers if workers is not None else max(1, cpus - 1)
+
+    # Force sequential processing for next_channel method (requires channel_map access)
+    # or when explicitly requested with workers=1
+    use_parallel = num_workers > 1 and labeling_method in ("hybrid", "forward_scan")
+
     labeled_map: LabeledChannelMap = {}
 
     total_keys = len(channel_map)
-    key_idx = 0
 
     # Calculate total channels to label for verbose output
     total_channels = sum(len(channels) for channels in channel_map.values())
@@ -1364,7 +1522,8 @@ def generate_all_labels(
     unique_windows = set(window for _, window in channel_map.keys())
 
     if verbose:
-        print(f"[PASS 2] Starting label generation (method={labeling_method}):")
+        mode_str = f"PARALLEL with {num_workers} workers" if use_parallel else "SEQUENTIAL"
+        print(f"[PASS 2] Starting label generation ({mode_str}, method={labeling_method}):")
         print(f"         TF/window combinations to process: {total_keys}")
         print(f"         Unique TFs: {len(unique_tfs)}, Unique windows: {len(unique_windows)}")
         print(f"         Total channels to label: {total_channels:,}")
@@ -1373,62 +1532,175 @@ def generate_all_labels(
     channels_labeled = 0
     valid_labels_count = 0
 
-    for (tf, window), channels in channel_map.items():
-        labeled_channels: List[LabeledChannel] = []
-        num_channels = len(channels)
+    if use_parallel:
+        # =======================================================================
+        # PARALLEL PROCESSING PATH
+        # =======================================================================
+        # Create work items for all channels across all (tf, window) combinations
+        work_items = []
+
+        for (tf, window), channels in channel_map.items():
+            if not channels:
+                labeled_map[(tf, window)] = []
+                continue
+
+            # Get resampled df and max_scan for this timeframe
+            resampled_df = resampled_dfs.get(tf) if resampled_dfs else None
+            max_scan = TF_MAX_SCAN.get(tf, 500)
+
+            # Serialize DataFrame for multiprocessing
+            if resampled_df is not None:
+                df_values = resampled_df.values
+                df_index = resampled_df.index.values
+                df_columns = list(resampled_df.columns)
+            else:
+                df_values = None
+                df_index = None
+                df_columns = None
+
+            # Serialize channel data for workers to reconstruct neighboring channels
+            # Each channel needs: (start_idx, end_idx, direction, channel_attrs, start_ts, end_ts)
+            channels_data = []
+            for ch in channels:
+                channel_attrs = {
+                    'slope': ch.channel.slope,
+                    'intercept': ch.channel.intercept,
+                    'std_dev': ch.channel.std_dev,
+                    'r_squared': ch.channel.r_squared,
+                    'direction': ch.channel.direction,
+                    'bounce_count': ch.channel.bounce_count,
+                }
+                channels_data.append((
+                    ch.start_idx,
+                    ch.end_idx,
+                    ch.direction,
+                    channel_attrs,
+                    ch.start_timestamp,
+                    ch.end_timestamp
+                ))
+
+            num_channels = len(channels)
+
+            # Create work item for each channel
+            for idx, detected in enumerate(channels):
+                work_items.append((
+                    tf, window, idx, detected, labeling_method, max_scan,
+                    df_values, df_index, df_columns, channels_data, num_channels
+                ))
 
         if verbose:
-            pct = (key_idx / total_keys) * 100 if total_keys > 0 else 0
-            print(f"[PASS 2] Processing TF={tf}, window={window} ({key_idx + 1}/{total_keys}, {pct:.1f}%) - {num_channels} channels to label")
+            print(f"[PASS 2] Created {len(work_items)} work items for parallel processing...")
 
-        # Get resampled df and max_scan for forward_scan method
-        resampled_df = resampled_dfs.get(tf) if resampled_dfs else None
-        max_scan = TF_MAX_SCAN.get(tf, 500)
+        # Process work items in parallel
+        if work_items:
+            with Pool(processes=num_workers, initializer=_worker_ignore_signals) as pool:
+                results = pool.map(_label_channel_worker, work_items)
 
-        for idx, detected in enumerate(channels):
-            # Choose labeling method
-            if labeling_method == "hybrid" and resampled_df is not None:
-                # Hybrid: Get next_channel_direction from map lookup, then use forward_scan
-                # for break timing features
-                next_channel_dir = None
-                next_idx = -1
-                if idx + 1 < len(channels):
-                    next_channel = channels[idx + 1]
-                    next_channel_dir = next_channel.direction  # 0=BEAR, 1=SIDEWAYS, 2=BULL
-                    next_idx = idx + 1
+            # Collect results - need to reconstruct labeled_map from scattered results
+            # First, group results by (tf, window)
+            results_by_key: Dict[Tuple[str, int], List[Tuple[int, ChannelLabels, int, bool]]] = {}
+            for tf, window, channel_idx, labels, next_idx, direction_valid in results:
+                key = (tf, window)
+                if key not in results_by_key:
+                    results_by_key[key] = []
+                results_by_key[key].append((channel_idx, labels, next_idx, direction_valid))
 
-                # Use forward_scan with next_channel_direction for best of both
-                labels = label_channel_forward_scan(
-                    detected, resampled_df, max_scan,
-                    next_channel_direction=next_channel_dir
-                )
+            # Now build labeled_map in correct order
+            for (tf, window), channels in channel_map.items():
+                if not channels:
+                    labeled_map[(tf, window)] = []
+                    continue
 
-                # Compute next channel data (Phase 6) and merge into labels
-                next_ch_data = _compute_next_channel_data(channels, detected, idx)
-                labels = replace(labels, **next_ch_data)
-            elif labeling_method == "forward_scan" and resampled_df is not None:
-                labels = label_channel_forward_scan(detected, resampled_df, max_scan)
-                next_idx = -1  # forward_scan doesn't determine next channel
-            else:
-                # next_channel method
-                labels, next_idx = label_channel_from_map(channel_map, tf, window, idx)
+                # Get results for this key and sort by channel_idx
+                key_results = results_by_key.get((tf, window), [])
+                key_results.sort(key=lambda x: x[0])  # Sort by channel_idx
 
-            labeled = LabeledChannel(
-                detected=detected,
-                labels=labels,
-                next_channel_idx=next_idx
-            )
-            labeled_channels.append(labeled)
-            channels_labeled += 1
+                labeled_channels: List[LabeledChannel] = []
+                for channel_idx, labels, next_idx, direction_valid in key_results:
+                    detected = channels[channel_idx]
+                    labeled = LabeledChannel(
+                        detected=detected,
+                        labels=labels,
+                        next_channel_idx=next_idx
+                    )
+                    labeled_channels.append(labeled)
+                    channels_labeled += 1
 
-            if labels.direction_valid:
-                valid_labels_count += 1
+                    if direction_valid:
+                        valid_labels_count += 1
 
-        labeled_map[(tf, window)] = labeled_channels
+                labeled_map[(tf, window)] = labeled_channels
 
-        key_idx += 1
+                if verbose:
+                    print(f"  TF={tf}, Window={window}: labeled {len(labeled_channels)} channels")
+
+        # Call progress callback for all keys at completion
         if progress_callback:
-            progress_callback(tf, window, key_idx / total_keys)
+            for key_idx, (tf, window) in enumerate(channel_map.keys()):
+                progress_callback(tf, window, 1.0)
+
+    else:
+        # =======================================================================
+        # SEQUENTIAL PROCESSING PATH (backward compatible)
+        # =======================================================================
+        key_idx = 0
+
+        for (tf, window), channels in channel_map.items():
+            labeled_channels: List[LabeledChannel] = []
+            num_channels = len(channels)
+
+            if verbose:
+                pct = (key_idx / total_keys) * 100 if total_keys > 0 else 0
+                print(f"[PASS 2] Processing TF={tf}, window={window} ({key_idx + 1}/{total_keys}, {pct:.1f}%) - {num_channels} channels to label")
+
+            # Get resampled df and max_scan for forward_scan method
+            resampled_df = resampled_dfs.get(tf) if resampled_dfs else None
+            max_scan = TF_MAX_SCAN.get(tf, 500)
+
+            for idx, detected in enumerate(channels):
+                # Choose labeling method
+                if labeling_method == "hybrid" and resampled_df is not None:
+                    # Hybrid: Get next_channel_direction from map lookup, then use forward_scan
+                    # for break timing features
+                    next_channel_dir = None
+                    next_idx = -1
+                    if idx + 1 < len(channels):
+                        next_channel = channels[idx + 1]
+                        next_channel_dir = next_channel.direction  # 0=BEAR, 1=SIDEWAYS, 2=BULL
+                        next_idx = idx + 1
+
+                    # Use forward_scan with next_channel_direction for best of both
+                    labels = label_channel_forward_scan(
+                        detected, resampled_df, max_scan,
+                        next_channel_direction=next_channel_dir
+                    )
+
+                    # Compute next channel data (Phase 6) and merge into labels
+                    next_ch_data = _compute_next_channel_data(channels, detected, idx)
+                    labels = replace(labels, **next_ch_data)
+                elif labeling_method == "forward_scan" and resampled_df is not None:
+                    labels = label_channel_forward_scan(detected, resampled_df, max_scan)
+                    next_idx = -1  # forward_scan doesn't determine next channel
+                else:
+                    # next_channel method
+                    labels, next_idx = label_channel_from_map(channel_map, tf, window, idx)
+
+                labeled = LabeledChannel(
+                    detected=detected,
+                    labels=labels,
+                    next_channel_idx=next_idx
+                )
+                labeled_channels.append(labeled)
+                channels_labeled += 1
+
+                if labels.direction_valid:
+                    valid_labels_count += 1
+
+            labeled_map[(tf, window)] = labeled_channels
+
+            key_idx += 1
+            if progress_callback:
+                progress_callback(tf, window, key_idx / total_keys)
 
     if verbose:
         print()

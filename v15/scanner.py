@@ -31,6 +31,7 @@ import platform
 import signal
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from multiprocessing import Pool, cpu_count
 from typing import List, Dict, Optional, Tuple, Any
@@ -738,43 +739,57 @@ def scan_channels_two_pass(
 
     pass1_start = time.time()
 
-    print("\n  [PASS 1] Detecting TSLA channels...")
+    # Run TSLA and SPY channel detection in parallel using ThreadPoolExecutor
+    # (ThreadPoolExecutor avoids nesting issues since detect_all_channels uses multiprocessing internally)
+    print("\n  [PASS 1] Detecting TSLA and SPY channels in parallel...")
     print(f"           Timeframes: {list(TIMEFRAMES)}")
     print(f"           Windows: {list(STANDARD_WINDOWS)}")
     print(f"           Step: {step}, Workers: {workers}")
-    tsla_detect_start = time.time()
-    tsla_channel_map, tsla_resampled_dfs = detect_all_channels(
-        df=tsla_df,
-        timeframes=list(TIMEFRAMES),
-        windows=list(STANDARD_WINDOWS),
-        step=step,
-        min_cycles=1,
-        min_gap_bars=5,
-        workers=workers,
-        verbose=False
-    )
-    tsla_detect_time = time.time() - tsla_detect_start
-    tsla_channels = sum(len(chs) for chs in tsla_channel_map.values())
-    print(f"           Completed: {tsla_channels} channels detected in {tsla_detect_time:.1f}s")
 
-    print("\n  [PASS 1] Detecting SPY channels...")
-    print(f"           Timeframes: {list(TIMEFRAMES)}")
-    print(f"           Windows: {list(STANDARD_WINDOWS)}")
-    print(f"           Step: {step}, Workers: {workers}")
-    spy_detect_start = time.time()
-    spy_channel_map, spy_resampled_dfs = detect_all_channels(
-        df=spy_df,
-        timeframes=list(TIMEFRAMES),
-        windows=list(STANDARD_WINDOWS),
-        step=step,
-        min_cycles=1,
-        min_gap_bars=5,
-        workers=workers,
-        verbose=False
-    )
-    spy_detect_time = time.time() - spy_detect_start
+    def detect_tsla_channels():
+        """Wrapper to detect TSLA channels with timing."""
+        start = time.time()
+        channel_map, resampled_dfs = detect_all_channels(
+            df=tsla_df,
+            timeframes=list(TIMEFRAMES),
+            windows=list(STANDARD_WINDOWS),
+            step=step,
+            min_cycles=1,
+            min_gap_bars=5,
+            workers=workers,
+            verbose=False
+        )
+        elapsed = time.time() - start
+        return channel_map, resampled_dfs, elapsed
+
+    def detect_spy_channels():
+        """Wrapper to detect SPY channels with timing."""
+        start = time.time()
+        channel_map, resampled_dfs = detect_all_channels(
+            df=spy_df,
+            timeframes=list(TIMEFRAMES),
+            windows=list(STANDARD_WINDOWS),
+            step=step,
+            min_cycles=1,
+            min_gap_bars=5,
+            workers=workers,
+            verbose=False
+        )
+        elapsed = time.time() - start
+        return channel_map, resampled_dfs, elapsed
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tsla_future = executor.submit(detect_tsla_channels)
+        spy_future = executor.submit(detect_spy_channels)
+
+        # Wait for both to complete
+        tsla_channel_map, tsla_resampled_dfs, tsla_detect_time = tsla_future.result()
+        spy_channel_map, spy_resampled_dfs, spy_detect_time = spy_future.result()
+
+    tsla_channels = sum(len(chs) for chs in tsla_channel_map.values())
     spy_channels = sum(len(chs) for chs in spy_channel_map.values())
-    print(f"           Completed: {spy_channels} channels detected in {spy_detect_time:.1f}s")
+    print(f"           TSLA: {tsla_channels} channels detected in {tsla_detect_time:.1f}s")
+    print(f"           SPY:  {spy_channels} channels detected in {spy_detect_time:.1f}s")
 
     pass1_time = time.time() - pass1_start
     print(f"\n  [PASS 1] Summary:")
@@ -801,43 +816,56 @@ def scan_channels_two_pass(
         print(f"  Saved channel maps ({tsla_channels} TSLA + {spy_channels} SPY channels)")
 
     # =========================================================================
-    # PASS 2: Generate labels at channel END positions
+    # PASS 2: Generate labels at channel END positions (PARALLEL)
     # =========================================================================
     print("\n[PASS 2] Generating labels from channel maps...")
     pass2_start = time.time()
 
-    # Count total TSLA channels for progress logging
+    # Count total channels for progress logging
     tsla_total_channels = sum(len(chs) for chs in tsla_channel_map.values())
-    print(f"\n  Generating TSLA labels... ({tsla_total_channels} channels to process)")
-    tsla_label_start = time.time()
-    tsla_labeled_map: LabeledChannelMap = generate_all_labels(
-        channel_map=tsla_channel_map,
-        resampled_dfs=tsla_resampled_dfs,
-        labeling_method="hybrid",
-        verbose=True
-    )
-    tsla_label_time = time.time() - tsla_label_start
+    spy_total_channels = sum(len(chs) for chs in spy_channel_map.values())
+    print(f"\n  Generating labels in parallel...")
+    print(f"    TSLA: {tsla_total_channels} channels")
+    print(f"    SPY:  {spy_total_channels} channels")
+
+    # Run TSLA and SPY label generation in parallel using ThreadPoolExecutor
+    # (ThreadPoolExecutor avoids nested process pool issues if generate_all_labels uses multiprocessing)
+    label_start = time.time()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tsla_future = executor.submit(
+            generate_all_labels,
+            channel_map=tsla_channel_map,
+            resampled_dfs=tsla_resampled_dfs,
+            labeling_method="hybrid",
+            verbose=True,
+            workers=workers
+        )
+        spy_future = executor.submit(
+            generate_all_labels,
+            channel_map=spy_channel_map,
+            resampled_dfs=spy_resampled_dfs,
+            labeling_method="hybrid",
+            verbose=True,
+            workers=workers
+        )
+
+        # Wait for both to complete
+        tsla_labeled_map: LabeledChannelMap = tsla_future.result()
+        spy_labeled_map: LabeledChannelMap = spy_future.result()
+
+    parallel_time = time.time() - label_start
+
+    # Compute statistics for both assets
     tsla_labeled = sum(len(lcs) for lcs in tsla_labeled_map.values())
     tsla_valid = sum(1 for lcs in tsla_labeled_map.values() for lc in lcs if lc.labels.direction_valid)
-    print(f"  TSLA complete: {tsla_labeled} labels generated in {tsla_label_time:.1f}s ({tsla_valid} valid)")
-
-    # Count total SPY channels for progress logging
-    spy_total_channels = sum(len(chs) for chs in spy_channel_map.values())
-    print(f"\n  Generating SPY labels... ({spy_total_channels} channels to process)")
-    spy_label_start = time.time()
-    spy_labeled_map: LabeledChannelMap = generate_all_labels(
-        channel_map=spy_channel_map,
-        resampled_dfs=spy_resampled_dfs,
-        labeling_method="hybrid",
-        verbose=True
-    )
-    spy_label_time = time.time() - spy_label_start
     spy_labeled = sum(len(lcs) for lcs in spy_labeled_map.values())
     spy_valid = sum(1 for lcs in spy_labeled_map.values() for lc in lcs if lc.labels.direction_valid)
-    print(f"  SPY complete: {spy_labeled} labels generated in {spy_label_time:.1f}s ({spy_valid} valid)")
+
+    print(f"  TSLA: {tsla_labeled} labels generated ({tsla_valid} valid)")
+    print(f"  SPY:  {spy_labeled} labels generated ({spy_valid} valid)")
 
     pass2_time = time.time() - pass2_start
-    print(f"\n  Pass 2 summary: {tsla_labeled + spy_labeled} total labels, {pass2_time:.1f}s total time")
+    print(f"\n  Pass 2 summary: {tsla_labeled + spy_labeled} total labels, {pass2_time:.1f}s total time (parallel: {parallel_time:.1f}s)")
 
     # Free Pass-1 artifacts
     del tsla_resampled_dfs, spy_resampled_dfs
