@@ -27,6 +27,8 @@ from typing import Dict, List, Optional, TYPE_CHECKING, Any, Tuple
 
 import numpy as np
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -948,6 +950,126 @@ def _extract_bar_metadata_features(
     return features
 
 
+def _extract_single_tf(
+    tf: str,
+    tsla_df: pd.DataFrame,
+    spy_df: pd.DataFrame,
+    vix_df: pd.DataFrame,
+    timestamp: pd.Timestamp,
+    source_bar_count: int,
+    channel_history_by_tf: Dict,
+    tsla_slim_map: Optional[Dict],
+    spy_slim_map: Optional[Dict],
+) -> Tuple[str, Dict[str, float], Dict[str, Any]]:
+    """
+    Extract all features for a single timeframe.
+
+    This is designed to be called in parallel for each TF.
+
+    Returns:
+        Tuple of (tf_name, features_dict, metadata_dict)
+    """
+    features: Dict[str, float] = {}
+    metadata: Dict[str, Any] = {}
+
+    try:
+        # 1. Resample data to this TF
+        tsla_tf, tsla_meta = _resample_to_tf(tsla_df, tf, source_bar_count)
+        spy_tf, _ = _resample_to_tf(spy_df, tf, source_bar_count)
+        vix_tf, _ = _resample_to_tf(vix_df, tf, source_bar_count)
+
+        metadata = tsla_meta
+
+        if len(tsla_tf) < 10:
+            logger.debug(f"Not enough data for {tf} (have {len(tsla_tf)} bars)")
+            return (tf, features, metadata)
+
+        # 2. Detect channels (using fresh detection since slim_maps disabled)
+        if tsla_slim_map is not None:
+            # Try to reconstruct channels from precomputed slim_map
+            tsla_channels_by_window = {}
+            for window in STANDARD_WINDOWS:
+                slim_ch = _lookup_channel_from_slim_map(tsla_slim_map, tf, window, timestamp)
+                if slim_ch is not None:
+                    reconstructed = _reconstruct_channel_from_slim(slim_ch, tsla_tf, window)
+                    if reconstructed is not None:
+                        tsla_channels_by_window[window] = reconstructed
+            # If we got less than half the windows, fall back to full detection
+            if len(tsla_channels_by_window) < len(STANDARD_WINDOWS) // 2:
+                tsla_channels_by_window = _detect_channels_for_tf(tsla_tf)
+        else:
+            tsla_channels_by_window = _detect_channels_for_tf(tsla_tf)
+
+        # Same for SPY
+        if spy_slim_map is not None:
+            spy_channels_by_window = {}
+            for window in STANDARD_WINDOWS:
+                slim_ch = _lookup_channel_from_slim_map(spy_slim_map, tf, window, timestamp)
+                if slim_ch is not None:
+                    reconstructed = _reconstruct_channel_from_slim(slim_ch, spy_tf, window)
+                    if reconstructed is not None:
+                        spy_channels_by_window[window] = reconstructed
+            if len(spy_channels_by_window) < len(STANDARD_WINDOWS) // 2:
+                spy_channels_by_window = _detect_channels_for_tf(spy_tf)
+        else:
+            spy_channels_by_window = _detect_channels_for_tf(spy_tf)
+
+        # Select best channel
+        if _channel_available and tsla_channels_by_window:
+            best_channel, best_window = select_best_channel(tsla_channels_by_window)
+            if best_window is None:
+                best_window = 50
+        else:
+            best_window = 50
+
+        # 3. Extract all feature types
+        # Window-independent features
+        wi_features = _extract_window_independent_features_for_tf(
+            tsla_tf, spy_tf, vix_tf, tf,
+            tsla_channels=tsla_channels_by_window,
+            spy_channels=spy_channels_by_window
+        )
+        features.update(wi_features)
+
+        # Channel features
+        channel_features = _extract_channel_features_for_tf(tsla_channels_by_window, tf)
+        features.update(channel_features)
+
+        # SPY channel features
+        spy_channel_features = _extract_spy_channel_features_for_tf(
+            spy_tf, spy_channels_by_window, tf
+        )
+        features.update(spy_channel_features)
+
+        # Correlation features
+        correlation_features = _extract_channel_correlation_for_tf(
+            tsla_channels_by_window, spy_channels_by_window, tf
+        )
+        features.update(correlation_features)
+
+        # Window score features
+        window_score_features = _extract_window_scores_for_tf(
+            tsla_channels_by_window, best_window, tf
+        )
+        features.update(window_score_features)
+
+        # Channel history features
+        tf_history = channel_history_by_tf.get(tf, {})
+        tsla_history = tf_history.get('tsla', [])
+        spy_history = tf_history.get('spy', [])
+        history_features = _extract_channel_history_for_tf(tsla_history, spy_history, tf)
+        features.update(history_features)
+
+        # Cleanup
+        del tsla_tf, spy_tf, vix_tf
+        del tsla_channels_by_window, spy_channels_by_window
+
+    except Exception as e:
+        logger.error(f"Error processing timeframe {tf}: {e}")
+
+    return (tf, features, metadata)
+
+
 def extract_all_tf_features(
     tsla_df: pd.DataFrame,
     spy_df: pd.DataFrame,
@@ -1033,119 +1155,51 @@ def extract_all_tf_features(
     }
 
     # -------------------------------------------------------------------------
-    # Process each timeframe
+    # Process each timeframe IN PARALLEL
     # -------------------------------------------------------------------------
-    for tf in TIMEFRAMES:
-        try:
-            # 1. Resample data to this TF with partial bar support
-            # Pass source_bar_count to calculate correct bar_completion_pct
-            tsla_tf, tsla_meta = _resample_to_tf(tsla_df, tf, source_bar_count)
-            spy_tf, _ = _resample_to_tf(spy_df, tf, source_bar_count)
-            vix_tf, _ = _resample_to_tf(vix_df, tf, source_bar_count)
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
 
-            # Store metadata for bar metadata features
-            metadata_by_tf[tf] = tsla_meta
+    feature_lock = threading.Lock()
 
-            # Check if we have enough data
-            if len(tsla_tf) < 10:
-                logger.debug(f"Not enough data for {tf} (have {len(tsla_tf)} bars)")
-                continue
+    def process_tf(tf):
+        """Wrapper to call _extract_single_tf with all parameters."""
+        return _extract_single_tf(
+            tf=tf,
+            tsla_df=tsla_df,
+            spy_df=spy_df,
+            vix_df=vix_df,
+            timestamp=timestamp,
+            source_bar_count=source_bar_count,
+            channel_history_by_tf=channel_history_by_tf,
+            tsla_slim_map=tsla_slim_map,
+            spy_slim_map=spy_slim_map,
+        )
 
-            # 2. Get TSLA channels - use slim_map if available, else detect
-            if tsla_slim_map is not None:
-                # Try to reconstruct channels from precomputed slim_map
-                tsla_channels_by_window = {}
-                for window in STANDARD_WINDOWS:
-                    slim_ch = _lookup_channel_from_slim_map(tsla_slim_map, tf, window, timestamp)
-                    if slim_ch is not None:
-                        reconstructed = _reconstruct_channel_from_slim(slim_ch, tsla_tf, window)
-                        if reconstructed is not None:
-                            tsla_channels_by_window[window] = reconstructed
+    # Use ThreadPoolExecutor for parallel TF extraction
+    # NumPy/pandas release GIL during heavy computation, so threads work well here
+    max_workers = min(4, len(TIMEFRAMES))
 
-                # If we got less than half the windows, fall back to full detection
-                # (This handles edge cases where slim_map has gaps)
-                if len(tsla_channels_by_window) < len(STANDARD_WINDOWS) // 2:
-                    tsla_channels_by_window = _detect_channels_for_tf(tsla_tf)
-            else:
-                # No slim_map provided, detect channels directly
-                tsla_channels_by_window = _detect_channels_for_tf(tsla_tf)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all TF extractions
+        futures = {executor.submit(process_tf, tf): tf for tf in TIMEFRAMES}
 
-            # 3. Get SPY channels - same logic
-            if spy_slim_map is not None:
-                spy_channels_by_window = {}
-                for window in STANDARD_WINDOWS:
-                    slim_ch = _lookup_channel_from_slim_map(spy_slim_map, tf, window, timestamp)
-                    if slim_ch is not None:
-                        reconstructed = _reconstruct_channel_from_slim(slim_ch, spy_tf, window)
-                        if reconstructed is not None:
-                            spy_channels_by_window[window] = reconstructed
+        # Collect results as they complete
+        for future in futures:
+            tf = futures[future]
+            try:
+                tf_name, tf_features, tf_metadata = future.result()
 
-                if len(spy_channels_by_window) < len(STANDARD_WINDOWS) // 2:
-                    spy_channels_by_window = _detect_channels_for_tf(spy_tf)
-            else:
-                spy_channels_by_window = _detect_channels_for_tf(spy_tf)
+                # Thread-safe update of shared dicts
+                with feature_lock:
+                    all_features.update(tf_features)
+                    if tf_metadata:
+                        metadata_by_tf[tf_name] = tf_metadata
+                    extraction_stats['timeframes_processed'] += 1
 
-            # Select best TSLA channel
-            if _channel_available and tsla_channels_by_window:
-                best_channel, best_window = select_best_channel(tsla_channels_by_window)
-                if best_window is None:
-                    best_window = 50
-            else:
-                best_window = 50
-
-            # 4. Extract window-independent features (356 per TF)
-            # Pass detected channels so cross-asset features can use position_in_channel
-            wi_features = _extract_window_independent_features_for_tf(
-                tsla_tf, spy_tf, vix_tf, tf,
-                tsla_channels=tsla_channels_by_window,
-                spy_channels=spy_channels_by_window
-            )
-            all_features.update(wi_features)
-
-            # 5. Extract per-window TSLA channel features (58 per window * 8 windows = 464 per TF)
-            channel_features = _extract_channel_features_for_tf(tsla_channels_by_window, tf)
-            all_features.update(channel_features)
-
-            # 6. Extract per-window SPY channel features (58 per window * 8 windows = 464 per TF)
-            spy_channel_features = _extract_spy_channel_features_for_tf(
-                spy_tf, spy_channels_by_window, tf
-            )
-            all_features.update(spy_channel_features)
-
-            # 7. Extract channel correlation features (50 per TF)
-            correlation_features = _extract_channel_correlation_for_tf(
-                tsla_channels_by_window, spy_channels_by_window, tf
-            )
-            all_features.update(correlation_features)
-
-            # 8. Extract window score features (50 per TF)
-            window_score_features = _extract_window_scores_for_tf(
-                tsla_channels_by_window, best_window, tf
-            )
-            all_features.update(window_score_features)
-
-            # 9. Extract channel history features (67 per TF)
-            tf_history = channel_history_by_tf.get(tf, {})
-            tsla_history = tf_history.get('tsla', [])
-            spy_history = tf_history.get('spy', [])
-
-            history_features = _extract_channel_history_for_tf(
-                tsla_history, spy_history, tf
-            )
-            all_features.update(history_features)
-
-            extraction_stats['timeframes_processed'] += 1
-
-            # Explicit memory cleanup for this TF iteration
-            # These large objects are no longer needed after feature extraction
-            del tsla_tf, spy_tf, vix_tf
-            del tsla_channels_by_window, spy_channels_by_window
-            del wi_features, channel_features, spy_channel_features
-            del correlation_features, window_score_features, history_features
-
-        except Exception as e:
-            logger.error(f"Error processing timeframe {tf}: {e}")
-            extraction_stats['errors'].append(f"{tf}: {e}")
+            except Exception as e:
+                logger.error(f"Error processing timeframe {tf}: {e}")
+                extraction_stats['errors'].append(f"{tf}: {e}")
 
     # -------------------------------------------------------------------------
     # Extract event features (TF-independent, no prefix)
