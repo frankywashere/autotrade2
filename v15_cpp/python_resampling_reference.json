@@ -1,0 +1,168 @@
+{
+  "tsla_5min_first_10": [
+    {
+      "timestamp": "2015-01-02 11:40:00",
+      "open": 223.29,
+      "high": 223.29,
+      "low": 223.29,
+      "close": 223.29,
+      "volume": 175
+    },
+    {
+      "timestamp": "2015-01-02 12:00:00",
+      "open": 223.35,
+      "high": 223.35,
+      "low": 223.35,
+      "close": 223.35,
+      "volume": 100
+    },
+    {
+      "timestamp": "2015-01-02 12:35:00",
+      "open": 223.98,
+      "high": 224.0,
+      "low": 223.56,
+      "close": 223.56,
+      "volume": 400
+    },
+    {
+      "timestamp": "2015-01-02 12:55:00",
+      "open": 223.71,
+      "high": 223.71,
+      "low": 223.61,
+      "close": 223.61,
+      "volume": 912
+    },
+    {
+      "timestamp": "2015-01-02 13:00:00",
+      "open": 223.98,
+      "high": 223.98,
+      "low": 223.62,
+      "close": 223.62,
+      "volume": 710
+    },
+    {
+      "timestamp": "2015-01-02 13:05:00",
+      "open": 223.9,
+      "high": 223.9,
+      "low": 223.9,
+      "close": 223.9,
+      "volume": 200
+    },
+    {
+      "timestamp": "2015-01-02 13:10:00",
+      "open": 223.74,
+      "high": 223.74,
+      "low": 223.35,
+      "close": 223.35,
+      "volume": 2050
+    },
+    {
+      "timestamp": "2015-01-02 13:20:00",
+      "open": 223.0,
+      "high": 223.1,
+      "low": 222.65,
+      "close": 222.65,
+      "volume": 1779
+    },
+    {
+      "timestamp": "2015-01-02 13:25:00",
+      "open": 222.88,
+      "high": 222.88,
+      "low": 222.78,
+      "close": 222.8,
+      "volume": 600
+    },
+    {
+      "timestamp": "2015-01-02 13:30:00",
+      "open": 222.87,
+      "high": 223.1,
+      "low": 222.87,
+      "close": 223.0,
+      "volume": 1563
+    }
+  ],
+  "tsla_5min_count": 440405,
+  "resampled_counts": {
+    "15min": 160772,
+    "30min": 84352,
+    "1h": 44229,
+    "2h": 23594,
+    "3h": 17359,
+    "4h": 13018,
+    "daily": 3174,
+    "weekly": 561,
+    "monthly": 129
+  },
+  "15min_first_bar": {
+    "timestamp": "2015-01-02 11:30:00",
+    "open": 223.29,
+    "high": 223.29,
+    "low": 223.29,
+    "close": 223.29,
+    "volume": 175.0
+  },
+  "30min_first_bar": {
+    "timestamp": "2015-01-02 11:30:00",
+    "open": 223.29,
+    "high": 223.29,
+    "low": 223.29,
+    "close": 223.29,
+    "volume": 175.0
+  },
+  "1h_first_bar": {
+    "timestamp": "2015-01-02 11:00:00",
+    "open": 223.29,
+    "high": 223.29,
+    "low": 223.29,
+    "close": 223.29,
+    "volume": 175.0
+  },
+  "2h_first_bar": {
+    "timestamp": "2015-01-02 10:00:00",
+    "open": 223.29,
+    "high": 223.29,
+    "low": 223.29,
+    "close": 223.29,
+    "volume": 175.0
+  },
+  "3h_first_bar": {
+    "timestamp": "2015-01-02 09:00:00",
+    "open": 223.29,
+    "high": 223.29,
+    "low": 223.29,
+    "close": 223.29,
+    "volume": 175.0
+  },
+  "4h_first_bar": {
+    "timestamp": "2015-01-02 08:00:00",
+    "open": 223.29,
+    "high": 223.29,
+    "low": 223.29,
+    "close": 223.29,
+    "volume": 175.0
+  },
+  "daily_first_bar": {
+    "timestamp": "2015-01-02 00:00:00",
+    "open": 223.29,
+    "high": 224.0,
+    "low": 213.26,
+    "close": 219.04,
+    "volume": 4136617.0
+  },
+  "weekly_first_bar": {
+    "timestamp": "2015-01-04 00:00:00",
+    "open": 223.29,
+    "high": 224.0,
+    "low": 213.26,
+    "close": 219.3,
+    "volume": 4136842.0
+  },
+  "monthly_first_bar": {
+    "timestamp": "2015-01-01 00:00:00",
+    "open": 223.29,
+    "high": 224.0,
+    "low": 183.5,
+    "close": 203.5,
+    "volume": 78830180.0
+  }
+}

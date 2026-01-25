@@ -1,0 +1,170 @@
+================================================================================
+                    v15_cpp Manual Build - Quick Start
+================================================================================
+
+NO CMAKE REQUIRED! This is a self-contained build system.
+
+--------------------------------------------------------------------------------
+STEP 1: Test Your Environment (2 seconds)
+--------------------------------------------------------------------------------
+
+    ./test_build.sh
+
+Expected output:
+    ✓ Compiler detected
+    ✓ C++17 support verified
+    ✓ Eigen3 found or will be downloaded
+    ✓ Test files compiled successfully
+
+--------------------------------------------------------------------------------
+STEP 2: Build the Project (15 seconds)
+--------------------------------------------------------------------------------
+
+    ./build_manual.sh
+
+What it does:
+    • Detects clang++ or g++
+    • Downloads Eigen3 if needed (header-only, ~40MB)
+    • Compiles all .cpp files in src/
+    • Creates libv15scanner.a static library
+    • Builds executables and tests
+
+Output directory: build_manual/
+
+--------------------------------------------------------------------------------
+STEP 3: Use the Library
+--------------------------------------------------------------------------------
+
+See how to link your programs:
+
+    ./example_link.sh
+
+Basic template:
+
+    clang++ -std=c++17 -O3 \
+        -I./include \
+        -I./build_manual/deps/eigen3 \
+        your_program.cpp \
+        -L./build_manual/lib -lv15scanner \
+        -o your_program
+
+--------------------------------------------------------------------------------
+TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+If build fails with errors about "duplicate Channel" or "no default constructor":
+
+    ./fix_build_errors.sh
+    ./build_manual.sh
+
+These are code issues in the existing codebase, not build system issues.
+
+--------------------------------------------------------------------------------
+AVAILABLE SCRIPTS
+--------------------------------------------------------------------------------
+
+    ./test_build.sh          Test compilation environment
+    ./build_manual.sh        Build entire project
+    ./build_manual.sh --clean    Remove build directory
+    ./example_link.sh        Learn how to use the library
+    ./fix_build_errors.sh    Apply quick fixes for known issues
+
+--------------------------------------------------------------------------------
+DOCUMENTATION
+--------------------------------------------------------------------------------
+
+    README_BUILD.md          Complete guide (start here)
+    BUILD_MANUAL.md          Detailed build instructions
+    MANUAL_BUILD_SUMMARY.md  Implementation summary
+
+--------------------------------------------------------------------------------
+BUILD ARTIFACTS
+--------------------------------------------------------------------------------
+
+After successful build:
+
+    build_manual/lib/libv15scanner.a    Static library (link with -lv15scanner)
+    build_manual/bin/v15_scanner        Main scanner executable
+    build_manual/bin/test_*             Test programs
+    build_manual/deps/eigen3/           Eigen3 headers (auto-downloaded)
+
+--------------------------------------------------------------------------------
+REQUIREMENTS
+--------------------------------------------------------------------------------
+
+    ✓ clang++ or g++ with C++17 support
+    ✓ curl or wget (for downloading Eigen)
+    ✓ ~50MB disk space
+
+    ✗ No CMake needed
+    ✗ No package managers needed
+    ✗ No sudo/root needed
+    ✗ No Python needed (for C++ build)
+
+--------------------------------------------------------------------------------
+QUICK COMMANDS
+--------------------------------------------------------------------------------
+
+    # Test environment
+    ./test_build.sh
+
+    # Build everything
+    ./build_manual.sh
+
+    # Build without tests
+    ./build_manual.sh --skip-tests
+
+    # Clean and rebuild
+    ./build_manual.sh --clean
+    ./build_manual.sh
+
+    # Get help
+    ./build_manual.sh --help
+
+--------------------------------------------------------------------------------
+STATUS
+--------------------------------------------------------------------------------
+
+    Build System:   ✅ Complete and tested
+    Test Build:     ✅ Passing (data_loader + indicators)
+    Full Build:     ⚠️  Requires code fixes (see fix_build_errors.sh)
+
+The build system works correctly. It reveals existing code issues:
+    1. Duplicate Channel struct definition
+    2. Missing default constructor in ChannelWorkItem
+    3. Deprecated std::result_of usage
+
+Run ./fix_build_errors.sh to automatically fix #2.
+
+--------------------------------------------------------------------------------
+COMPILER FLAGS USED
+--------------------------------------------------------------------------------
+
+    -std=c++17        C++17 standard
+    -O3               Maximum optimization
+    -march=native     CPU-specific optimizations (AVX, etc.)
+    -Wall -Wextra     Enable all warnings
+    -fPIC             Position-independent code
+
+--------------------------------------------------------------------------------
+NEXT STEPS
+--------------------------------------------------------------------------------
+
+    1. Run ./test_build.sh to verify your environment
+    2. Run ./fix_build_errors.sh to fix known issues
+    3. Run ./build_manual.sh to build the project
+    4. Run ./build_manual/bin/v15_scanner --help
+    5. Read README_BUILD.md for complete documentation
+
+--------------------------------------------------------------------------------
+GETTING HELP
+--------------------------------------------------------------------------------
+
+    Build issues:       See BUILD_MANUAL.md
+    Usage examples:     Run ./example_link.sh
+    Code issues:        See include/*.hpp for API
+    CMake alternative:  See CMakeLists.txt
+
+================================================================================
+                            Happy Building!
+================================================================================
