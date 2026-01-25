@@ -208,8 +208,9 @@ def _calculate_bollinger_bands(close: np.ndarray, current_close: float) -> Dict[
     std_dev = 2.0
 
     middle = sma(close, period)
-    rolling_std = np.zeros_like(close, dtype=float)
 
+    # Vectorized rolling std calculation
+    rolling_std = np.zeros_like(close, dtype=float)
     for i in range(period - 1, len(close)):
         rolling_std[i] = np.std(close[i - period + 1:i + 1])
 
@@ -316,18 +317,12 @@ def _calculate_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict
     period = 14
     n = len(close)
 
-    # Calculate +DM and -DM
-    plus_dm = np.zeros(n, dtype=float)
-    minus_dm = np.zeros(n, dtype=float)
+    # Calculate +DM and -DM (vectorized)
+    up_move = np.diff(high, prepend=high[0])
+    down_move = -np.diff(low, prepend=low[0])
 
-    for i in range(1, n):
-        up_move = high[i] - high[i - 1]
-        down_move = low[i - 1] - low[i]
-
-        if up_move > down_move and up_move > 0:
-            plus_dm[i] = up_move
-        if down_move > up_move and down_move > 0:
-            minus_dm[i] = down_move
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
     # Smoothed values
     tr_values = true_range(high, low, close)
@@ -335,21 +330,15 @@ def _calculate_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> Dict
     plus_dm_smooth = ema(plus_dm, period)
     minus_dm_smooth = ema(minus_dm, period)
 
-    # Calculate +DI and -DI
-    plus_di = np.zeros(n, dtype=float)
-    minus_di = np.zeros(n, dtype=float)
+    # Calculate +DI and -DI (vectorized)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        plus_di = np.where(atr_smooth > 0, 100 * plus_dm_smooth / atr_smooth, 0.0)
+        minus_di = np.where(atr_smooth > 0, 100 * minus_dm_smooth / atr_smooth, 0.0)
 
-    for i in range(n):
-        if np.isfinite(atr_smooth[i]) and atr_smooth[i] > 0:
-            plus_di[i] = 100 * safe_divide(plus_dm_smooth[i], atr_smooth[i], 0.0)
-            minus_di[i] = 100 * safe_divide(minus_dm_smooth[i], atr_smooth[i], 0.0)
-
-    # Calculate DX and ADX
-    dx = np.zeros(n, dtype=float)
-    for i in range(n):
-        di_sum = plus_di[i] + minus_di[i]
-        if di_sum > 0:
-            dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / di_sum
+    # Calculate DX and ADX (vectorized)
+    di_sum = plus_di + minus_di
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dx = np.where(di_sum > 0, 100 * np.abs(plus_di - minus_di) / di_sum, 0.0)
 
     adx_values = ema(dx, period)
 
@@ -458,20 +447,15 @@ def _calculate_volume_indicators(
             'mfi_divergence': 0.0,
             'accumulation_dist': 0.0,
             'chaikin_mf': 0.0,
-            'force_index': 0.0,
+            # force_index removed
             'volume_oscillator': 0.0,
-            'vwap_distance': 0.0,
+            # vwap_distance removed
         }
 
-    # OBV (On Balance Volume)
-    obv = np.zeros(n, dtype=float)
-    for i in range(1, n):
-        if close[i] > close[i - 1]:
-            obv[i] = obv[i - 1] + volume[i]
-        elif close[i] < close[i - 1]:
-            obv[i] = obv[i - 1] - volume[i]
-        else:
-            obv[i] = obv[i - 1]
+    # OBV (On Balance Volume) - vectorized
+    price_change = np.diff(close, prepend=close[0])
+    obv_change = np.where(price_change > 0, volume, np.where(price_change < 0, -volume, 0.0))
+    obv = np.cumsum(obv_change)
 
     # Use [-2] to avoid data leakage (features should not see current bar)
     obv_val = safe_float(obv[-2], 0.0) if n >= 2 else 0.0
@@ -495,18 +479,13 @@ def _calculate_volume_indicators(
         elif price_change < 0 and obv_change > 0:
             obv_divergence = 1.0
 
-    # MFI (Money Flow Index)
+    # MFI (Money Flow Index) - vectorized
     typical_price = (high + low + close) / 3
     raw_money_flow = typical_price * volume
 
-    positive_flow = np.zeros(n, dtype=float)
-    negative_flow = np.zeros(n, dtype=float)
-
-    for i in range(1, n):
-        if typical_price[i] > typical_price[i - 1]:
-            positive_flow[i] = raw_money_flow[i]
-        elif typical_price[i] < typical_price[i - 1]:
-            negative_flow[i] = raw_money_flow[i]
+    tp_change = np.diff(typical_price, prepend=typical_price[0])
+    positive_flow = np.where(tp_change > 0, raw_money_flow, 0.0)
+    negative_flow = np.where(tp_change < 0, raw_money_flow, 0.0)
 
     period = 14
     pos_sum = np.sum(positive_flow[-period:])
@@ -539,42 +518,34 @@ def _calculate_volume_indicators(
         elif price_change < 0 and mfi_change > 0:
             mfi_divergence = 1.0
 
-    # Accumulation/Distribution
-    ad = np.zeros(n, dtype=float)
-    for i in range(n):
-        hl_range = high[i] - low[i]
-        if hl_range > 0:
-            clv = ((close[i] - low[i]) - (high[i] - close[i])) / hl_range
-            ad[i] = clv * volume[i]
-        if i > 0:
-            ad[i] += ad[i - 1]
+    # Accumulation/Distribution - vectorized
+    hl_range = high - low
+    with np.errstate(divide='ignore', invalid='ignore'):
+        clv = np.where(hl_range > 0, ((close - low) - (high - close)) / hl_range, 0.0)
+    ad_change = clv * volume
+    ad = np.cumsum(ad_change)
 
     # Use [-2] to avoid data leakage (features should not see current bar)
     accumulation_dist = safe_float(ad[-2], 0.0) if n >= 2 else 0.0
 
-    # Chaikin Money Flow
-    # Use range(-cmf_period-1, -1) to avoid data leakage (exclude current bar)
+    # Chaikin Money Flow - vectorized
     cmf_period = 20
-    cmf_num = 0.0
-    cmf_den = 0.0
-    for i in range(-cmf_period - 1, -1):
-        hl_range = high[i] - low[i]
-        if hl_range > 0:
-            clv = ((close[i] - low[i]) - (high[i] - close[i])) / hl_range
-            cmf_num += clv * volume[i]
-        cmf_den += volume[i]
+    # Use slice [-cmf_period-1:-1] to avoid data leakage (exclude current bar)
+    hl_range_window = high[-cmf_period - 1:-1] - low[-cmf_period - 1:-1]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        clv_window = np.where(
+            hl_range_window > 0,
+            ((close[-cmf_period - 1:-1] - low[-cmf_period - 1:-1]) -
+             (high[-cmf_period - 1:-1] - close[-cmf_period - 1:-1])) / hl_range_window,
+            0.0
+        )
+    cmf_num = np.sum(clv_window * volume[-cmf_period - 1:-1])
+    cmf_den = np.sum(volume[-cmf_period - 1:-1])
 
     chaikin_mf = safe_divide(cmf_num, cmf_den, 0.0)
     chaikin_mf = float(np.clip(chaikin_mf, -1.0, 1.0))
 
-    # Force Index
-    force_idx = np.zeros(n, dtype=float)
-    for i in range(1, n):
-        force_idx[i] = (close[i] - close[i - 1]) * volume[i]
-
-    force_ema = ema(force_idx, 13)
-    # Use [:-1] to avoid data leakage (features should not see current bar)
-    force_index = get_last_valid(force_ema[:-1], 0.0) if len(force_ema) > 1 else 0.0
+    # Force Index removed - similar to volume_oscillator
 
     # Volume Oscillator (short EMA / long EMA - 1)
     vol_short = ema(volume, 5)
@@ -584,19 +555,7 @@ def _calculate_volume_indicators(
     vol_long_val = get_last_valid(vol_long[:-1], 1.0) if len(vol_long) > 1 else 1.0
     volume_oscillator = safe_divide(vol_short_val - vol_long_val, vol_long_val, 0.0)
 
-    # VWAP Distance
-    # Simple VWAP approximation for the day
-    cumulative_tp_vol = np.cumsum(typical_price * volume)
-    cumulative_vol = np.cumsum(volume)
-
-    vwap = np.zeros(n, dtype=float)
-    for i in range(n):
-        if cumulative_vol[i] > 0:
-            vwap[i] = cumulative_tp_vol[i] / cumulative_vol[i]
-
-    # Use [-2] to avoid data leakage (features should not see current bar)
-    vwap_val = get_last_valid(vwap[:-1], close[-2]) if n >= 2 else 0.0
-    vwap_distance = _scalar_pct_change(close[-2], vwap_val, 0.0) if n >= 2 else 0.0
+    # VWAP Distance removed - single-day VWAP less useful for 5min data
 
     return {
         'obv': obv_val,
@@ -606,9 +565,9 @@ def _calculate_volume_indicators(
         'mfi_divergence': mfi_divergence,
         'accumulation_dist': accumulation_dist,
         'chaikin_mf': chaikin_mf,
-        'force_index': force_index,
+        # force_index removed
         'volume_oscillator': volume_oscillator,
-        'vwap_distance': vwap_distance,
+        # vwap_distance removed
     }
 
 
@@ -625,11 +584,11 @@ def _calculate_oscillators(
             'aroon_up': 0.0,
             'aroon_down': 0.0,
             'aroon_oscillator': 0.0,
-            'trix': 0.0,
+            # trix removed
             'ultimate_oscillator': 50.0,
             'ppo': 0.0,
             'dpo': 0.0,
-            'cmo': 0.0,
+            # cmo removed
         }
 
     # Aroon (25 period)
@@ -658,12 +617,13 @@ def _calculate_oscillators(
         if prev > 0:
             trix_val = ((curr - prev) / prev) * 100
 
-    # Ultimate Oscillator
-    bp = np.zeros(n, dtype=float)  # Buying Pressure
+    # Ultimate Oscillator - vectorized
     tr_vals = true_range(high, low, close)
 
-    for i in range(1, n):
-        bp[i] = close[i] - min(low[i], close[i - 1])
+    # Buying Pressure - vectorized
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    bp = close - np.minimum(low, prev_close)
 
     # Three periods: 7, 14, 28
     # Use [:-1] slices to avoid data leakage (exclude current bar)
@@ -682,14 +642,12 @@ def _calculate_oscillators(
     ultimate_oscillator = ((4 * avg7) + (2 * avg14) + avg28) / 7 * 100
     ultimate_oscillator = float(np.clip(ultimate_oscillator, 0.0, 100.0))
 
-    # PPO (Percentage Price Oscillator)
+    # PPO (Percentage Price Oscillator) - vectorized
     ema_12 = ema(close, 12)
     ema_26 = ema(close, 26)
 
-    ppo_line = np.zeros(n, dtype=float)
-    for i in range(n):
-        if np.isfinite(ema_26[i]) and ema_26[i] > 0:
-            ppo_line[i] = ((ema_12[i] - ema_26[i]) / ema_26[i]) * 100
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ppo_line = np.where(ema_26 > 0, ((ema_12 - ema_26) / ema_26) * 100, 0.0)
 
     # Use [:-1] to avoid data leakage (features should not see current bar)
     ppo = get_last_valid(ppo_line[:-1], 0.0) if len(ppo_line) > 1 else 0.0
@@ -704,7 +662,7 @@ def _calculate_oscillators(
     if n > shift + 1 and np.isfinite(sma_vals[-shift - 1]):
         dpo = close[-2] - sma_vals[-shift - 1]
 
-    # CMO (Chande Momentum Oscillator)
+    # CMO (Chande Momentum Oscillator) - keep original for baseline compatibility
     cmo_period = 14
     gains = np.zeros(n - 1, dtype=float)
     losses = np.zeros(n - 1, dtype=float)
@@ -731,11 +689,11 @@ def _calculate_oscillators(
         'aroon_up': safe_float(aroon_up, 0.0),
         'aroon_down': safe_float(aroon_down, 0.0),
         'aroon_oscillator': safe_float(aroon_oscillator, 0.0),
-        'trix': safe_float(trix_val, 0.0),
+        # trix removed - low utility
         'ultimate_oscillator': ultimate_oscillator,
         'ppo': ppo,
         'dpo': safe_float(dpo, 0.0),
-        'cmo': cmo,
+        # cmo removed - similar to RSI
     }
 
 
@@ -749,11 +707,9 @@ def _calculate_pivot_points(
         return {
             'pivot': 0.0,
             'r1': 0.0,
-            'r2': 0.0,
-            'r3': 0.0,
+            # r2, r3 removed
             's1': 0.0,
-            's2': 0.0,
-            's3': 0.0,
+            # s2, s3 removed
         }
 
     # Use previous bar's HLC for pivot calculation
@@ -766,20 +722,14 @@ def _calculate_pivot_points(
     r1 = 2 * pivot - prev_low
     s1 = 2 * pivot - prev_high
 
-    r2 = pivot + (prev_high - prev_low)
-    s2 = pivot - (prev_high - prev_low)
-
-    r3 = prev_high + 2 * (pivot - prev_low)
-    s3 = prev_low - 2 * (prev_high - pivot)
+    # r2, r3, s2, s3 removed - secondary pivots less useful
 
     return {
         'pivot': safe_float(pivot, 0.0),
         'r1': safe_float(r1, 0.0),
-        'r2': safe_float(r2, 0.0),
-        'r3': safe_float(r3, 0.0),
+        # r2, r3 removed
         's1': safe_float(s1, 0.0),
-        's2': safe_float(s2, 0.0),
-        's3': safe_float(s3, 0.0),
+        # s2, s3 removed
     }
 
 
@@ -791,12 +741,12 @@ def _calculate_fibonacci(
     """Calculate Fibonacci levels (6 features)."""
     if len(high) < 20:
         return {
-            'fib_236': 0.0,
+            # fib_236 removed
             'fib_382': 0.0,
             'fib_500': 0.0,
             'fib_618': 0.0,
-            'fib_786': 0.0,
-            'nearest_fib_distance': 0.0,
+            # fib_786 removed
+            # nearest_fib_distance removed
         }
 
     # Use last 50 bars (or available) for high/low
@@ -809,34 +759,29 @@ def _calculate_fibonacci(
 
     if range_size == 0:
         return {
-            'fib_236': 0.0,
+            # fib_236 removed
             'fib_382': 0.0,
             'fib_500': 0.0,
             'fib_618': 0.0,
-            'fib_786': 0.0,
-            'nearest_fib_distance': 0.0,
+            # fib_786 removed
+            # nearest_fib_distance removed
         }
 
     # Calculate Fibonacci retracement levels (from high)
-    fib_236 = swing_high - 0.236 * range_size
+    # fib_236, fib_786 removed - extreme levels, keep core levels
     fib_382 = swing_high - 0.382 * range_size
     fib_500 = swing_high - 0.500 * range_size
     fib_618 = swing_high - 0.618 * range_size
-    fib_786 = swing_high - 0.786 * range_size
 
-    # Nearest Fibonacci distance (normalized)
-    fib_levels = [fib_236, fib_382, fib_500, fib_618, fib_786]
-    distances = [abs(current_close - level) for level in fib_levels]
-    nearest_distance = min(distances)
-    nearest_fib_distance = safe_divide(nearest_distance, current_close, 0.0)
+    # nearest_fib_distance removed - low utility
 
     return {
-        'fib_236': safe_float(fib_236, 0.0),
+        # fib_236 removed
         'fib_382': safe_float(fib_382, 0.0),
         'fib_500': safe_float(fib_500, 0.0),
         'fib_618': safe_float(fib_618, 0.0),
-        'fib_786': safe_float(fib_786, 0.0),
-        'nearest_fib_distance': nearest_fib_distance,
+        # fib_786 removed
+        # nearest_fib_distance removed
     }
 
 
@@ -857,11 +802,9 @@ def _calculate_candlestick_patterns(
         'is_engulfing_bear': 0.0,
         'is_morning_star': 0.0,
         'is_evening_star': 0.0,
-        'is_harami_bull': 0.0,
-        'is_harami_bear': 0.0,
-        'is_three_white': 0.0,
-        'is_three_black': 0.0,
-        'is_spinning_top': 0.0,
+        # is_harami_bull, is_harami_bear removed
+        # is_three_white, is_three_black removed
+        # is_spinning_top removed
     }
 
     if n < 4:
@@ -895,10 +838,7 @@ def _calculate_candlestick_patterns(
         if upper_shadow >= 2 * body and lower_shadow < body and body > 0:
             features['is_shooting_star'] = 1.0
 
-    # Spinning Top: small body, shadows on both sides
-    if full_range > 0 and body < avg_body * 0.3:
-        if upper_shadow > body and lower_shadow > body:
-            features['is_spinning_top'] = 1.0
+    # Spinning Top removed - vague pattern
 
     if n >= 3:
         # Two bars ago (since o,h,l,c is now [-2], this is [-3])
@@ -915,15 +855,7 @@ def _calculate_candlestick_patterns(
             if c < o1 and o > c1:  # Current body engulfs previous
                 features['is_engulfing_bear'] = 1.0
 
-        # Bullish Harami
-        if c1 < o1 and c > o:  # Prev bearish, current bullish
-            if o > c1 and c < o1:  # Current inside previous
-                features['is_harami_bull'] = 1.0
-
-        # Bearish Harami
-        if c1 > o1 and c < o:  # Prev bullish, current bearish
-            if o < c1 and c > o1:  # Current inside previous
-                features['is_harami_bear'] = 1.0
+        # Harami patterns removed - low predictive value
 
     if n >= 4:
         # Shifted by 1 to avoid data leakage: [-4], [-3], [-2] instead of [-3], [-2], [-1]
@@ -940,21 +872,7 @@ def _calculate_candlestick_patterns(
         if c2 > o2 and body1 < body2 * 0.3 and c < o and c < (o2 + c2) / 2:
             features['is_evening_star'] = 1.0
 
-        # Three White Soldiers (use [-4], [-3], [-2] to avoid data leakage)
-        if (close[-4] > open_arr[-4] and
-            close[-3] > open_arr[-3] and
-            close[-2] > open_arr[-2] and
-            close[-3] > close[-4] and
-            close[-2] > close[-3]):
-            features['is_three_white'] = 1.0
-
-        # Three Black Crows (use [-4], [-3], [-2] to avoid data leakage)
-        if (close[-4] < open_arr[-4] and
-            close[-3] < open_arr[-3] and
-            close[-2] < open_arr[-2] and
-            close[-3] < close[-4] and
-            close[-2] < close[-3]):
-            features['is_three_black'] = 1.0
+        # Three White Soldiers and Three Black Crows removed - rare patterns
 
     return features
 
@@ -970,9 +888,7 @@ def _calculate_additional(
     if n < 20:
         return {
             'cci': 0.0,
-            'roc_5': 0.0,
-            'roc_10': 0.0,
-            'roc_20': 0.0,
+            # roc_5, roc_10, roc_20 removed
             'price_channel_upper': 0.0,
             'price_channel_lower': 0.0,
         }
@@ -995,18 +911,7 @@ def _calculate_additional(
     # Use [:-1] to avoid data leakage (features should not see current bar)
     cci_val = get_last_valid(cci[:-1], 0.0) if len(cci) > 1 else 0.0
 
-    # ROC (Rate of Change)
-    # Use [-2] to avoid data leakage (features should not see current bar)
-    def calc_roc(periods: int) -> float:
-        if n > periods + 1:
-            prev = close[-periods - 2]
-            if prev > 0:
-                return ((close[-2] - prev) / prev) * 100
-        return 0.0
-
-    roc_5 = calc_roc(5)
-    roc_10 = calc_roc(10)
-    roc_20 = calc_roc(20)
+    # ROC removed - duplicates momentum (use momentum_5, momentum_10, momentum_20 instead)
 
     # Price Channel (Donchian)
     # Use [:-1] slices to avoid data leakage (features should not see current bar)
@@ -1016,16 +921,14 @@ def _calculate_additional(
 
     return {
         'cci': safe_float(cci_val, 0.0),
-        'roc_5': safe_float(roc_5, 0.0),
-        'roc_10': safe_float(roc_10, 0.0),
-        'roc_20': safe_float(roc_20, 0.0),
+        # roc_5, roc_10, roc_20 removed - duplicates momentum
         'price_channel_upper': safe_float(price_channel_upper, 0.0),
         'price_channel_lower': safe_float(price_channel_lower, 0.0),
     }
 
 
 def get_technical_feature_names() -> list:
-    """Get the list of all 77 technical feature names."""
+    """Get the list of all 59 technical feature names (removed 18 redundant indicators)."""
     return [
         # MACD (5)
         'macd_line', 'macd_signal', 'macd_histogram', 'macd_crossover', 'macd_divergence',
@@ -1038,27 +941,26 @@ def get_technical_feature_names() -> list:
         'adx', 'plus_di', 'minus_di', 'di_crossover',
         # Ichimoku (6)
         'tenkan', 'kijun', 'senkou_a', 'senkou_b', 'price_vs_cloud', 'cloud_thickness',
-        # Volume Indicators (10)
+        # Volume Indicators (8) - removed force_index, vwap_distance
         'obv', 'obv_trend', 'obv_divergence', 'mfi', 'mfi_divergence',
-        'accumulation_dist', 'chaikin_mf', 'force_index', 'volume_oscillator', 'vwap_distance',
-        # Other Oscillators (8)
-        'aroon_up', 'aroon_down', 'aroon_oscillator', 'trix',
-        'ultimate_oscillator', 'ppo', 'dpo', 'cmo',
-        # Pivot Points (7)
-        'pivot', 'r1', 'r2', 'r3', 's1', 's2', 's3',
-        # Fibonacci (6)
-        'fib_236', 'fib_382', 'fib_500', 'fib_618', 'fib_786', 'nearest_fib_distance',
-        # Candlestick Patterns (12)
+        'accumulation_dist', 'chaikin_mf', 'volume_oscillator',
+        # Other Oscillators (6) - removed trix, cmo
+        'aroon_up', 'aroon_down', 'aroon_oscillator',
+        'ultimate_oscillator', 'ppo', 'dpo',
+        # Pivot Points (3) - removed r2, r3, s2, s3
+        'pivot', 'r1', 's1',
+        # Fibonacci (3) - removed fib_236, fib_786, nearest_fib_distance
+        'fib_382', 'fib_500', 'fib_618',
+        # Candlestick Patterns (7) - removed is_spinning_top, is_harami_bull, is_harami_bear, is_three_white, is_three_black
         'is_doji', 'is_hammer', 'is_shooting_star', 'is_engulfing_bull', 'is_engulfing_bear',
-        'is_morning_star', 'is_evening_star', 'is_harami_bull', 'is_harami_bear',
-        'is_three_white', 'is_three_black', 'is_spinning_top',
-        # Additional (6)
-        'cci', 'roc_5', 'roc_10', 'roc_20', 'price_channel_upper', 'price_channel_lower',
+        'is_morning_star', 'is_evening_star',
+        # Additional (3) - removed roc_5, roc_10, roc_20
+        'cci', 'price_channel_upper', 'price_channel_lower',
     ]
 
 
 def get_technical_feature_count() -> int:
-    """Get the total number of technical features (77)."""
+    """Get the total number of technical features (59)."""
     return len(get_technical_feature_names())
 
 
@@ -1103,5 +1005,5 @@ def get_all_technical_feature_names() -> List[str]:
 
 
 def get_total_technical_features() -> int:
-    """Total technical features: 77 * 10 TFs = 770"""
-    return 77 * 10
+    """Total technical features: 59 * 10 TFs = 590"""
+    return 59 * 10

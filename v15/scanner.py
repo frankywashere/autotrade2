@@ -854,8 +854,8 @@ def scan_channels_two_pass(
     del tsla_labeled_map, spy_labeled_map
     gc.collect()
 
-    # Build list of (tf, window, channel_idx) for all valid TSLA channels
-    channel_work_items = []
+    # Build list of (tf, window, channel_idx, end_timestamp) for all valid TSLA channels
+    channel_work_items_with_ts = []
     for (tf, window), slim_channels in tsla_slim_map.items():
         for idx, slim_channel in enumerate(slim_channels):
             if slim_channel.channel_valid and slim_channel.labels is not None:
@@ -863,15 +863,20 @@ def scan_channels_two_pass(
                 try:
                     idx_5min = tsla_df.index.searchsorted(end_ts, side='right') - 1
                     if idx_5min >= warmup_bars:
-                        channel_work_items.append((tf, window, idx))
+                        channel_work_items_with_ts.append((tf, window, idx, end_ts))
                 except:
                     pass
+
+    # CRITICAL: Sort by end_timestamp to ensure consistent ordering across Python and C++
+    # (C++ uses unordered_map which has unpredictable iteration order, so we sort to match)
+    channel_work_items_with_ts.sort(key=lambda x: x[3])  # Sort by end_timestamp
+    channel_work_items = [(tf, window, idx) for tf, window, idx, _ in channel_work_items_with_ts]
 
     total_channels_to_process = len(channel_work_items)
 
     if max_samples is not None and total_channels_to_process > max_samples:
         channel_work_items = channel_work_items[:max_samples]
-        print(f"\n[SCAN] Limited to {max_samples} channels (max_samples specified)")
+        print(f"\n[SCAN] Limited to {max_samples} channels (max_samples specified, sorted by timestamp)")
 
     print(f"\n[SCAN] Starting sample generation...")
     print(f"  Channels to process: {len(channel_work_items)}")

@@ -87,9 +87,9 @@ MAX_FORWARD_5MIN = max(TF_FORWARD_5MIN.values())     # 40,000 (monthly)
 # If feature counts change in the extraction modules, update these values manually.
 
 FEATURE_COUNTS = {
-    'tsla_price_per_tf': 60,
-    'technical_per_tf': 77,
-    'spy_per_tf': 135,  # Updated: 60 SPY-specific + 77 shared technical - 2 overlapping = 135
+    'tsla_price_per_tf': 58,  # Removed 2: momentum_1, williams_r
+    'technical_per_tf': 59,   # Removed 18: roc_5/10/20, cmo, r2/r3/s2/s3, fib_236/786, nearest_fib_distance, force_index, vwap_distance, trix, 5 candlestick patterns
+    'spy_per_tf': 117,        # 60 SPY-specific + 59 shared technical - 2 overlapping = 117
     'vix_per_tf': 25,
     'cross_asset_per_tf': 59,
     'channel_per_window': 58,
@@ -114,7 +114,7 @@ WINDOW_INDEPENDENT_PER_TF = (
     FEATURE_COUNTS['spy_per_tf'] +
     FEATURE_COUNTS['vix_per_tf'] +
     FEATURE_COUNTS['cross_asset_per_tf']
-)  # Currently: 60 + 77 + 80 + 25 + 59 = 301
+)  # Currently: 58 + 59 + 117 + 25 + 59 = 318
 
 # TSLA channel + SPY channel, both per window
 WINDOW_DEPENDENT_PER_TF = (

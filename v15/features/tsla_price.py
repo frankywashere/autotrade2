@@ -216,7 +216,7 @@ def extract_tsla_price_features(tsla_df: pd.DataFrame) -> Dict[str, float]:
             return 0.0
         return _pct_change(curr_close, safe_float(close_arr[-(lookback + 1)]))
 
-    features['momentum_1'] = momentum(1)
+    # momentum_1 removed - use price change instead
     features['momentum_3'] = momentum(3)
     features['momentum_5'] = momentum(5)
     features['momentum_10'] = momentum(10)
@@ -267,8 +267,7 @@ def extract_tsla_price_features(tsla_df: pd.DataFrame) -> Dict[str, float]:
     features['stochastic_k'] = stoch_k
     features['stochastic_d'] = stoch_d
 
-    # Williams %R
-    features['williams_r'] = _calculate_williams_r(high_arr, low_arr, close_arr)
+    # Williams %R removed - inverse of stochastic_k (redundant)
 
     # =========================================================================
     # VOLATILITY FEATURES (8)
@@ -522,11 +521,11 @@ TSLA_PRICE_FEATURE_NAMES = [
     'price_vs_sma_10', 'price_vs_sma_20', 'price_vs_sma_50',
     'sma_10_vs_sma_20', 'sma_20_vs_sma_50', 'ma_spread',
     'ma_converging', 'ma_diverging', 'trend_alignment',
-    # Momentum (15)
-    'momentum_1', 'momentum_3', 'momentum_5', 'momentum_10',
+    # Momentum (13) - removed momentum_1, williams_r
+    'momentum_3', 'momentum_5', 'momentum_10',
     'momentum_20', 'momentum_50', 'acceleration',
     'rsi_5', 'rsi_9', 'rsi_14', 'rsi_21', 'rsi_divergence',
-    'stochastic_k', 'stochastic_d', 'williams_r',
+    'stochastic_k', 'stochastic_d',
     # Volatility (8)
     'atr_14', 'atr_pct', 'volatility_5', 'volatility_20',
     'volatility_ratio', 'range_pct_5', 'range_pct_20', 'volatility_regime',
@@ -542,7 +541,7 @@ def get_tsla_price_feature_names() -> list:
 
 
 def get_tsla_price_feature_count() -> int:
-    """Return the number of TSLA price features (60)."""
+    """Return the number of TSLA price features (58)."""
     return len(TSLA_PRICE_FEATURE_NAMES)
 
 
