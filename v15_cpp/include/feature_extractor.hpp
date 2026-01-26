@@ -239,9 +239,10 @@ public:
     );
 
     /**
-     * Get expected total feature count (14,190)
+     * Get expected total feature count (14,840)
+     * Updated after adding price-agnostic normalized features
      */
-    static int get_total_feature_count() { return 14190; }
+    static int get_total_feature_count() { return 14840; }
 
     /**
      * Get all feature names in consistent order

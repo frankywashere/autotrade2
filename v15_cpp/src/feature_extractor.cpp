@@ -779,7 +779,10 @@ static std::unordered_map<std::string, double> extract_channel_features_slim(
     features["channel_slope_normalized"] = safe_divide(slope, avg_price, 0.0);
 
     // 5. channel_intercept
-    features["channel_intercept"] = safe_float(slim.channel_intercept, 0.0);
+    features["channel_intercept"] = safe_float(slim.channel_intercept, 0.0);  // Raw intercept for reference
+    // Normalized intercept: express as deviation from current price
+    double current_close = close.empty() ? 1.0 : close.back();
+    features["channel_intercept_pct"] = safe_divide(slim.channel_intercept - current_close, current_close, 0.0) * 100.0;
 
     // 6. channel_r_squared
     double r_squared = safe_float(slim.channel_r_squared, 0.0);
@@ -972,6 +975,8 @@ static std::unordered_map<std::string, double> extract_channel_features_slim(
         );
     }
     features["upper_line_slope"] = upper_line_slope;
+    // Normalized slope: express as percentage of avg price per bar
+    features["upper_line_slope_pct"] = safe_divide(upper_line_slope, avg_price, 0.0) * 100.0;
 
     // 30. lower_line_slope
     double lower_line_slope = 0.0;
@@ -983,6 +988,8 @@ static std::unordered_map<std::string, double> extract_channel_features_slim(
         );
     }
     features["lower_line_slope"] = lower_line_slope;
+    // Normalized slope: express as percentage of avg price per bar
+    features["lower_line_slope_pct"] = safe_divide(lower_line_slope, avg_price, 0.0) * 100.0;
 
     // 31. channel_expanding (1 if width increasing)
     double channel_expanding = 0.0;
@@ -1370,6 +1377,9 @@ static std::unordered_map<std::string, double> extract_spy_channel_features_slim
     features["spy_channel_slope_normalized"] = safe_divide(slim.channel_slope, avg_price, 0.0);
 
     features["spy_channel_intercept"] = safe_float(slim.channel_intercept, 0.0);
+    // Normalized intercept: express as deviation from current SPY price
+    double current_close = close.empty() ? 1.0 : close.back();
+    features["spy_channel_intercept_pct"] = safe_divide(slim.channel_intercept - current_close, current_close, 0.0) * 100.0;
     double r_squared = safe_float(slim.channel_r_squared, 0.0);
     features["spy_channel_r_squared"] = r_squared;
     features["spy_channel_width_pct"] = safe_float(derived.width_pct, 0.0);
@@ -1533,6 +1543,8 @@ static std::unordered_map<std::string, double> extract_spy_channel_features_slim
         );
     }
     features["spy_upper_line_slope"] = upper_line_slope;
+    // Normalized slope: express as percentage of avg price per bar
+    features["spy_upper_line_slope_pct"] = safe_divide(upper_line_slope, avg_price, 0.0) * 100.0;
 
     // 30. lower_line_slope
     double lower_line_slope = 0.0;
@@ -1544,6 +1556,8 @@ static std::unordered_map<std::string, double> extract_spy_channel_features_slim
         );
     }
     features["spy_lower_line_slope"] = lower_line_slope;
+    // Normalized slope: express as percentage of avg price per bar
+    features["spy_lower_line_slope_pct"] = safe_divide(lower_line_slope, avg_price, 0.0) * 100.0;
 
     // 31. channel_expanding (1 if width increasing)
     double channel_expanding = 0.0;
@@ -2515,12 +2529,13 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
     double curr_volume = n > 1 ? volume[n-2] : 0.0;
     double prev_close = n > 2 ? close[n-3] : curr_close;
 
-    // Basic Price (11)
-    features["close"] = curr_close;
-    features["close_vs_open"] = curr_close - curr_open;
-    features["close_vs_open_pct"] = pct_change(curr_close, curr_open);
-    features["high_low_range"] = curr_high - curr_low;
-    features["high_low_range_pct"] = safe_divide(curr_high - curr_low, curr_close) * 100.0;
+    // Basic Price (11) - with normalized versions for price-agnostic ML
+    features["close"] = curr_close;  // Keep for reference/debugging
+    features["close_normalized"] = 1.0;  // Always 1.0 - current price is the reference point
+    features["close_vs_open"] = curr_close - curr_open;  // Raw dollar difference
+    features["close_vs_open_pct"] = pct_change(curr_close, curr_open);  // Normalized version
+    features["high_low_range"] = curr_high - curr_low;  // Raw dollar range
+    features["high_low_range_pct"] = safe_divide(curr_high - curr_low, curr_close) * 100.0;  // Normalized
 
     double bar_range = curr_high - curr_low;
     features["close_vs_high_pct"] = safe_divide(curr_high - curr_close, bar_range) * 100.0;
@@ -2536,7 +2551,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
     features["gap_pct"] = pct_change(curr_open, prev_close);
 
     // Volume (7)
-    features["volume"] = curr_volume;
+    features["volume"] = curr_volume;  // Raw volume for reference
 
     auto calc_vol_avg = [&](int period) {
         if (n < period) return curr_volume;
@@ -2554,6 +2569,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
     features["volume_vs_avg_10"] = safe_divide(curr_volume, vol_avg_10, 1.0);
     features["volume_vs_avg_20"] = safe_divide(curr_volume, vol_avg_20, 1.0);
     features["volume_vs_avg_50"] = safe_divide(curr_volume, vol_avg_50, 1.0);
+    features["volume_normalized"] = safe_divide(curr_volume, vol_avg_20, 1.0);  // Price-agnostic volume
 
     double vol_avg_5 = calc_vol_avg(5);
     features["volume_trend"] = safe_divide(vol_avg_5, vol_avg_20, 1.0);
@@ -2573,15 +2589,24 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
     double sma_20_val = get_last_valid(sma_20_arr, curr_close);
     double sma_50_val = get_last_valid(sma_50_arr, curr_close);
 
-    features["sma_10"] = sma_10_val;
+    features["sma_10"] = sma_10_val;  // Raw SMA for reference
     features["sma_20"] = sma_20_val;
     features["sma_50"] = sma_50_val;
+    // Normalized SMA features: (SMA - close) / close * 100 = percentage deviation from current price
+    features["sma_10_pct"] = safe_divide(sma_10_val - curr_close, curr_close, 0.0) * 100.0;
+    features["sma_20_pct"] = safe_divide(sma_20_val - curr_close, curr_close, 0.0) * 100.0;
+    features["sma_50_pct"] = safe_divide(sma_50_val - curr_close, curr_close, 0.0) * 100.0;
 
     auto ema_10_arr = ema(close, 10);
     auto ema_20_arr = ema(close, 20);
 
-    features["ema_10"] = get_last_valid(ema_10_arr, curr_close);
-    features["ema_20"] = get_last_valid(ema_20_arr, curr_close);
+    double ema_10_val = get_last_valid(ema_10_arr, curr_close);
+    double ema_20_val = get_last_valid(ema_20_arr, curr_close);
+    features["ema_10"] = ema_10_val;  // Raw EMA for reference
+    features["ema_20"] = ema_20_val;
+    // Normalized EMA features
+    features["ema_10_pct"] = safe_divide(ema_10_val - curr_close, curr_close, 0.0) * 100.0;
+    features["ema_20_pct"] = safe_divide(ema_20_val - curr_close, curr_close, 0.0) * 100.0;
 
     features["price_vs_sma_10"] = pct_change(curr_close, sma_10_val);
     features["price_vs_sma_20"] = pct_change(curr_close, sma_20_val);
@@ -2869,8 +2894,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_features(
     int n = static_cast<int>(close.size());
     double c = n > 0 ? close[n-1] : 0.0;
 
-    // Basic Price (10) - All properly calculated
-    features["spy_close"] = c;
+    // Basic Price (10) - All properly calculated, with normalized versions
+    features["spy_close"] = c;  // Raw price for reference
+    features["spy_close_normalized"] = 1.0;  // Current price is reference point
     features["spy_close_vs_open_pct"] = n > 0 ? pct_change(close[n-1], open[n-1]) : 0.0;
 
     // High-low range as percentage of close
@@ -2948,9 +2974,13 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_features(
     double sma_20_val = get_last_valid(sma_20_arr, c);
     double sma_50_val = get_last_valid(sma_50_arr, c);
 
-    features["spy_sma_10"] = sma_10_val;
+    features["spy_sma_10"] = sma_10_val;  // Raw SMA for reference
     features["spy_sma_20"] = sma_20_val;
     features["spy_sma_50"] = sma_50_val;
+    // Normalized SMA features: (SMA - close) / close * 100 = percentage deviation
+    features["spy_sma_10_pct"] = safe_divide(sma_10_val - c, c, 0.0) * 100.0;
+    features["spy_sma_20_pct"] = safe_divide(sma_20_val - c, c, 0.0) * 100.0;
+    features["spy_sma_50_pct"] = safe_divide(sma_50_val - c, c, 0.0) * 100.0;
     features["spy_price_vs_sma_10"] = pct_change(c, sma_10_val);
     features["spy_price_vs_sma_20"] = pct_change(c, sma_20_val);
     features["spy_price_vs_sma_50"] = pct_change(c, sma_50_val);
@@ -3415,9 +3445,15 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_vix_features(
     double sma_10_val = get_last_valid(sma_10_arr, current_vix);
     double sma_20_val = get_last_valid(sma_20_arr, current_vix);
 
-    features["vix_level"] = current_vix;
+    features["vix_level"] = current_vix;  // Raw VIX level for reference
     features["vix_sma_10"] = sma_10_val;
     features["vix_sma_20"] = sma_20_val;
+    // Normalized VIX features: divide by 20 (typical baseline VIX) for scale-invariance
+    // This makes VIX comparable across different volatility regimes
+    const double VIX_BASELINE = 20.0;
+    features["vix_level_normalized"] = current_vix / VIX_BASELINE;  // 1.0 = normal vol, >1.5 = high, <0.75 = low
+    features["vix_sma_10_normalized"] = sma_10_val / VIX_BASELINE;
+    features["vix_sma_20_normalized"] = sma_20_val / VIX_BASELINE;
     features["vix_vs_sma_10"] = pct_change(current_vix, sma_10_val);
     features["vix_vs_sma_20"] = pct_change(current_vix, sma_20_val);
 
@@ -3529,9 +3565,13 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_vix_features(
             if (close[i] < vix_5d_low) vix_5d_low = close[i];
         }
     }
-    features["vix_5d_high"] = vix_5d_high;
+    features["vix_5d_high"] = vix_5d_high;  // Raw for reference
     features["vix_5d_low"] = vix_5d_low;
-    features["vix_range_5d"] = vix_5d_high - vix_5d_low;
+    features["vix_range_5d"] = vix_5d_high - vix_5d_low;  // Raw range
+    // Normalized VIX structure features
+    features["vix_5d_high_normalized"] = vix_5d_high / VIX_BASELINE;
+    features["vix_5d_low_normalized"] = vix_5d_low / VIX_BASELINE;
+    features["vix_range_5d_pct"] = safe_divide(vix_5d_high - vix_5d_low, sma_20_val, 0.0) * 100.0;  // Range as % of SMA
 
     // VIX volatility: std dev of VIX changes
     double vix_volatility = 0.0;
@@ -3949,6 +3989,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 5. channel_intercept
     // ==========================================================================
     features["channel_intercept"] = safe_float(channel.intercept, 0.0);
+    // Normalized intercept: express as deviation from current price
+    double current_close = close.empty() ? 1.0 : close.back();
+    features["channel_intercept_pct"] = safe_divide(channel.intercept - current_close, current_close, 0.0) * 100.0;
 
     // ==========================================================================
     // 6. channel_r_squared
@@ -4192,6 +4235,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
         );
     }
     features["upper_line_slope"] = upper_line_slope;
+    // Normalized slope: express as percentage of avg price per bar
+    features["upper_line_slope_pct"] = safe_divide(upper_line_slope, avg_price, 0.0) * 100.0;
 
     // ==========================================================================
     // 30. lower_line_slope
@@ -4205,6 +4250,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
         );
     }
     features["lower_line_slope"] = lower_line_slope;
+    // Normalized slope: express as percentage of avg price per bar
+    features["lower_line_slope_pct"] = safe_divide(lower_line_slope, avg_price, 0.0) * 100.0;
 
     // ==========================================================================
     // 31. channel_expanding (1 if width increasing)
@@ -4613,6 +4660,7 @@ std::unordered_map<std::string, double> FeatureExtractor::get_default_channel_fe
         {"channel_slope", 0.0},
         {"channel_slope_normalized", 0.0},
         {"channel_intercept", 0.0},
+        {"channel_intercept_pct", 0.0},
         {"channel_r_squared", 0.0},
         {"channel_width_pct", 0.0},
         {"channel_width_atr_ratio", 0.0},
@@ -4637,7 +4685,9 @@ std::unordered_map<std::string, double> FeatureExtractor::get_default_channel_fe
         {"price_vs_channel_midpoint", 0.0},
         {"channel_momentum", 0.0},
         {"upper_line_slope", 0.0},
+        {"upper_line_slope_pct", 0.0},
         {"lower_line_slope", 0.0},
+        {"lower_line_slope_pct", 0.0},
         {"channel_expanding", 0.0},
         {"channel_contracting", 0.0},
         {"std_dev_ratio", 0.0},
@@ -4690,6 +4740,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
         features["spy_channel_slope"] = 0.0;
         features["spy_channel_slope_normalized"] = 0.0;
         features["spy_channel_intercept"] = 0.0;
+        features["spy_channel_intercept_pct"] = 0.0;
         features["spy_channel_r_squared"] = 0.0;
         features["spy_channel_width_pct"] = 0.0;
         features["spy_channel_width_atr_ratio"] = 0.0;
@@ -4714,7 +4765,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
         features["spy_price_vs_channel_midpoint"] = 0.0;
         features["spy_channel_momentum"] = 0.0;
         features["spy_upper_line_slope"] = 0.0;
+        features["spy_upper_line_slope_pct"] = 0.0;
         features["spy_lower_line_slope"] = 0.0;
+        features["spy_lower_line_slope_pct"] = 0.0;
         features["spy_channel_expanding"] = 0.0;
         features["spy_channel_contracting"] = 0.0;
         features["spy_std_dev_ratio"] = 0.0;
@@ -4791,6 +4844,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 5. spy_channel_intercept
     // ==========================================================================
     features["spy_channel_intercept"] = safe_float(channel.intercept, 0.0);
+    // Normalized intercept: express as deviation from current SPY price
+    double current_close_spy = ch_close.empty() ? 1.0 : ch_close.back();
+    features["spy_channel_intercept_pct"] = safe_divide(channel.intercept - current_close_spy, current_close_spy, 0.0) * 100.0;
 
     // ==========================================================================
     // 6. spy_channel_r_squared
@@ -5005,6 +5061,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
         upper_line_slope = (channel.last_upper_val - channel.first_upper_val) / static_cast<double>(channel.window - 1);
     }
     features["spy_upper_line_slope"] = safe_float(upper_line_slope, 0.0);
+    // Normalized slope: express as percentage of avg price per bar
+    features["spy_upper_line_slope_pct"] = safe_divide(upper_line_slope, avg_price, 0.0) * 100.0;
 
     // ==========================================================================
     // 30. spy_lower_line_slope
@@ -5014,6 +5072,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
         lower_line_slope = (channel.last_lower_val - channel.first_lower_val) / static_cast<double>(channel.window - 1);
     }
     features["spy_lower_line_slope"] = safe_float(lower_line_slope, 0.0);
+    // Normalized slope: express as percentage of avg price per bar
+    features["spy_lower_line_slope_pct"] = safe_divide(lower_line_slope, avg_price, 0.0) * 100.0;
 
     // ==========================================================================
     // 31. spy_channel_expanding (1 if width increasing)

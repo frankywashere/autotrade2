@@ -16,10 +16,11 @@ namespace v15 {
 // =============================================================================
 
 // Total number of features extracted per sample
-constexpr size_t TOTAL_FEATURE_COUNT = 14190;
+// Updated to 14840 after adding price-agnostic normalized features
+constexpr size_t TOTAL_FEATURE_COUNT = 14840;
 
-// Pre-calculated bucket count for unordered_map (prime number > 14190 / 0.7 load factor)
-constexpr size_t FEATURE_MAP_BUCKET_COUNT = 20359;
+// Pre-calculated bucket count for unordered_map (prime number > 14840 / 0.7 load factor)
+constexpr size_t FEATURE_MAP_BUCKET_COUNT = 21211;
 
 // =============================================================================
 // OPTIMIZED FEATURE MAP
@@ -27,7 +28,7 @@ constexpr size_t FEATURE_MAP_BUCKET_COUNT = 20359;
 
 /**
  * Create a pre-reserved unordered_map for feature storage.
- * This avoids rehashing during the 14,190 insertions.
+ * This avoids rehashing during the 14,840 insertions.
  *
  * Usage:
  *   auto features = create_feature_map();
@@ -300,13 +301,13 @@ private:
  * These offsets are computed based on the feature extraction order.
  */
 namespace FeatureOffsets {
-    // Per-timeframe feature counts
-    constexpr size_t TSLA_PRICE_COUNT = 58;
+    // Per-timeframe feature counts (updated for price-agnostic normalized features)
+    constexpr size_t TSLA_PRICE_COUNT = 65;      // Was 58, +7 normalized
     constexpr size_t TECHNICAL_COUNT = 59;
-    constexpr size_t SPY_COUNT = 117;
-    constexpr size_t VIX_COUNT = 25;
+    constexpr size_t SPY_COUNT = 121;            // Was 117, +4 normalized
+    constexpr size_t VIX_COUNT = 31;             // Was 25, +6 normalized
     constexpr size_t CROSS_ASSET_COUNT = 59;
-    constexpr size_t CHANNEL_PER_WINDOW_COUNT = 116;  // 58 TSLA + 58 SPY
+    constexpr size_t CHANNEL_PER_WINDOW_COUNT = 122;  // Was 116, +6 normalized (61 TSLA + 61 SPY)
     constexpr size_t WINDOW_SCORE_COUNT = 50;
     constexpr size_t CHANNEL_HISTORY_COUNT = 67;
     constexpr size_t CHANNEL_CORRELATION_COUNT = 50;
@@ -319,19 +320,19 @@ namespace FeatureOffsets {
     constexpr size_t PER_TF_BASE = TSLA_PRICE_COUNT + TECHNICAL_COUNT + SPY_COUNT +
                                     VIX_COUNT + CROSS_ASSET_COUNT + WINDOW_SCORE_COUNT +
                                     CHANNEL_HISTORY_COUNT + CHANNEL_CORRELATION_COUNT;
-    // = 58 + 59 + 117 + 25 + 59 + 50 + 67 + 50 = 485
+    // = 65 + 59 + 121 + 31 + 59 + 50 + 67 + 50 = 502
 
-    // Channel features per TF = 116 * 8 = 928
+    // Channel features per TF = 122 * 8 = 976
     constexpr size_t CHANNEL_PER_TF = CHANNEL_PER_WINDOW_COUNT * NUM_WINDOWS;
 
-    // Total per TF = 485 + 928 = 1413
+    // Total per TF = 502 + 976 = 1478
     constexpr size_t PER_TF_TOTAL = PER_TF_BASE + CHANNEL_PER_TF;
 
     // TF-independent features
     constexpr size_t EVENT_COUNT = 30;
     constexpr size_t BAR_METADATA_COUNT = 30;  // 3 per TF
 
-    // Calculated total: 1413 * 10 + 30 + 30 = 14,190
+    // Calculated total: 1478 * 10 + 30 + 30 = 14,840
     constexpr size_t CALCULATED_TOTAL = PER_TF_TOTAL * NUM_TFS + EVENT_COUNT + BAR_METADATA_COUNT;
 
     // Verify at compile time

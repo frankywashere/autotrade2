@@ -166,8 +166,8 @@ void print_validation_report(const std::vector<v15::ChannelSample>& samples,
         std::cout << "  Min features: " << min_features << "\n";
         std::cout << "  Max features: " << max_features << "\n";
 
-        // Expected feature count (should be 14,190)
-        const size_t EXPECTED_FEATURES = 14190;
+        // Expected feature count (14,840 after adding normalized features)
+        const size_t EXPECTED_FEATURES = 14840;
         if (avg_features != EXPECTED_FEATURES) {
             std::cout << "  WARNING: Expected " << EXPECTED_FEATURES
                      << " features per sample!\n";
