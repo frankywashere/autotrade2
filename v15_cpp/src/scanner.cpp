@@ -1299,15 +1299,16 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
                 continue;
             }
 
-            // Get data slices for feature extraction
-            std::vector<OHLCV> tsla_slice(tsla_df.begin() + start_idx, tsla_df.begin() + idx_5min);
-            std::vector<OHLCV> spy_slice(spy_df.begin() + start_idx, spy_df.begin() + idx_5min);
-            std::vector<OHLCV> vix_slice(vix_df.begin() + start_idx, vix_df.begin() + idx_5min);
+            // Get data views for feature extraction - ZERO COPY!
+            // DataView provides non-owning access to the underlying OHLCV data
+            DataView tsla_view(tsla_df, start_idx, slice_size);
+            DataView spy_view(spy_df, start_idx, slice_size);
+            DataView vix_view(vix_df, start_idx, slice_size);
 
-            // SAFETY: Validate slices
-            if (tsla_slice.empty() || spy_slice.empty() || vix_slice.empty()) {
+            // SAFETY: Validate views
+            if (tsla_view.empty() || spy_view.empty() || vix_view.empty()) {
                 if (config_.verbose) {
-                    std::cerr << "[WARNING] Empty data slices for channel at idx " << idx_5min << "\n";
+                    std::cerr << "[WARNING] Empty data views for channel at idx " << idx_5min << "\n";
                 }
                 continue;
             }
@@ -1316,11 +1317,11 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             auto feature_start = std::chrono::high_resolution_clock::now();
 
             auto tf_features = FeatureExtractor::extract_all_features(
-                tsla_slice,
-                spy_slice,
-                vix_slice,
+                tsla_view,
+                spy_view,
+                vix_view,
                 sample_timestamp,
-                static_cast<int>(tsla_slice.size()),  // source_bar_count - use slice size!
+                static_cast<int>(tsla_view.size()),  // source_bar_count - use view size!
                 true       // include_bar_metadata
             );
 
@@ -1503,7 +1504,7 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             std::unordered_map<std::string, std::unordered_map<std::string, double>> bar_metadata;
             bar_metadata["5min"]["bar_completion_pct"] = 1.0;
             bar_metadata["5min"]["bars_in_partial"] = 0;
-            bar_metadata["5min"]["total_bars"] = static_cast<double>(tsla_slice.size());
+            bar_metadata["5min"]["total_bars"] = static_cast<double>(tsla_view.size());
             bar_metadata["5min"]["is_partial"] = 0.0;  // false
 
             if (batch_debug_count <= 5 && config_.verbose) {

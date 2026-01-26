@@ -1,12 +1,22 @@
 #include "feature_extractor.hpp"
+#include "feature_array.hpp"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
 #include <ctime>
 #include <iostream>
 #include <set>
+#include <mutex>
+#include <array>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace v15 {
+
+// Thread-local resample cache definition
+thread_local ResampleCache FeatureExtractor::s_resample_cache;
 
 // =============================================================================
 // MAIN EXTRACTION FUNCTION
@@ -20,7 +30,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
     int source_bar_count,
     bool include_bar_metadata
 ) {
-    std::unordered_map<std::string, double> all_features;
+    // Pre-reserve the feature map to avoid rehashing during 14,190 insertions
+    // This is a significant performance optimization
+    auto all_features = create_feature_map();
 
     // SAFETY: Validate input data
     if (tsla_5min.empty()) {
@@ -59,10 +71,22 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
     // Track metadata by timeframe for bar completion features
     std::unordered_map<Timeframe, ResampleMetadata> metadata_by_tf;
 
-    // Process each timeframe
+    // Thread-local storage for parallel extraction:
+    // Each timeframe gets its own feature map, merged at the end
+    std::array<std::unordered_map<std::string, double>, NUM_TIMEFRAMES> tf_features;
+    std::array<ResampleMetadata, NUM_TIMEFRAMES> tf_metadata;
+    std::array<bool, NUM_TIMEFRAMES> tf_valid;
+    tf_valid.fill(false);
+
+    // Process each timeframe in parallel (when OpenMP is available)
+    // Each iteration is independent - writes to its own tf_features[tf_idx]
+    #pragma omp parallel for schedule(dynamic) if(NUM_TIMEFRAMES > 1)
     for (int tf_idx = 0; tf_idx < NUM_TIMEFRAMES; ++tf_idx) {
         Timeframe tf = static_cast<Timeframe>(tf_idx);
         std::string tf_prefix = std::string(timeframe_to_string(tf)) + "_";
+
+        // Thread-local feature map for this timeframe
+        std::unordered_map<std::string, double>& local_features = tf_features[tf_idx];
 
         try {
             // 1. Resample data to this timeframe
@@ -70,30 +94,42 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
             auto [spy_tf, spy_meta] = resample_to_tf(spy_5min, tf, source_bar_count);
             auto [vix_tf, vix_meta] = resample_to_tf(vix_5min, tf, source_bar_count);
 
-            // Store metadata
-            metadata_by_tf[tf] = tsla_meta;
+            // Store metadata for this timeframe
+            tf_metadata[tf_idx] = tsla_meta;
 
             // SAFETY: Check if we have enough data
             if (tsla_tf.empty()) {
-                std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty TSLA data after resampling\n";
+                #pragma omp critical
+                {
+                    std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty TSLA data after resampling\n";
+                }
                 continue;
             }
             if (spy_tf.empty()) {
-                std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty SPY data after resampling\n";
+                #pragma omp critical
+                {
+                    std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty SPY data after resampling\n";
+                }
                 continue;
             }
             if (vix_tf.empty()) {
-                std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty VIX data after resampling\n";
+                #pragma omp critical
+                {
+                    std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty VIX data after resampling\n";
+                }
                 continue;
             }
 
             // Require minimum bars for meaningful features
             if (tsla_tf.size() < 10) {
                 static int skip_count = 0;
-                if (skip_count < 3) {
-                    std::cerr << "[DEBUG] Skipping timeframe " << tf_prefix
-                              << " (only " << tsla_tf.size() << " bars, need 10+)\n";
-                    skip_count++;
+                #pragma omp critical
+                {
+                    if (skip_count < 3) {
+                        std::cerr << "[DEBUG] Skipping timeframe " << tf_prefix
+                                  << " (only " << tsla_tf.size() << " bars, need 10+)\n";
+                        skip_count++;
+                    }
                 }
                 continue;
             }
@@ -101,34 +137,40 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
             // 2. Extract TSLA price features (58)
             auto price_features = extract_tsla_price_features(tsla_tf);
             for (const auto& [name, value] : price_features) {
-                all_features[tf_prefix + name] = value;
+                local_features[tf_prefix + name] = value;
             }
 
             // 3. Extract technical indicators (59) - using existing indicators.cpp
-            std::vector<double> open, high, low, close, volume;
-            extract_ohlcv_arrays(tsla_tf, open, high, low, close, volume);
+            // Use optimized struct-of-arrays extraction (single resize vs 5 separate reserves)
+            OHLCVArrays tsla_arrays;
+            extract_ohlcv_arrays_optimized(tsla_tf, tsla_arrays);
 
             // SAFETY: Validate extracted arrays
-            if (open.empty() || high.empty() || low.empty() || close.empty()) {
-                std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty OHLCV arrays\n";
+            if (tsla_arrays.empty()) {
+                #pragma omp critical
+                {
+                    std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty OHLCV arrays\n";
+                }
                 continue;
             }
 
-            auto tech_features = TechnicalIndicators::extract_features(open, high, low, close, volume);
+            auto tech_features = TechnicalIndicators::extract_features(
+                tsla_arrays.open, tsla_arrays.high, tsla_arrays.low,
+                tsla_arrays.close, tsla_arrays.volume);
             for (const auto& [name, value] : tech_features) {
-                all_features[tf_prefix + name] = value;
+                local_features[tf_prefix + name] = value;
             }
 
             // 4. Extract SPY features (117)
             auto spy_features = extract_spy_features(spy_tf);
             for (const auto& [name, value] : spy_features) {
-                all_features[tf_prefix + name] = value;
+                local_features[tf_prefix + name] = value;
             }
 
             // 5. Extract VIX features (25)
             auto vix_features = extract_vix_features(vix_tf);
             for (const auto& [name, value] : vix_features) {
-                all_features[tf_prefix + name] = value;
+                local_features[tf_prefix + name] = value;
             }
 
             // 6. Extract cross-asset features (59)
@@ -142,7 +184,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
                 tsla_rsi_14, spy_rsi_14, 0.5, 0.5, vix_level
             );
             for (const auto& [name, value] : cross_features) {
-                all_features[tf_prefix + name] = value;
+                local_features[tf_prefix + name] = value;
             }
 
             // 7. Extract channel features for each window (58 TSLA + 58 SPY = 116 features × 8 windows = 928)
@@ -163,14 +205,14 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
                 Channel tsla_channel;
                 auto tsla_channel_feats = extract_channel_features(tsla_channel, tsla_tf);
                 for (const auto& [name, value] : tsla_channel_feats) {
-                    all_features[window_prefix + name] = value;
+                    local_features[window_prefix + name] = value;
                 }
 
                 // SPY channel features (58)
                 Channel spy_channel;
                 auto spy_channel_feats = extract_spy_channel_features(spy_channel, spy_tf, window);
                 for (const auto& [name, value] : spy_channel_feats) {
-                    all_features[window_prefix + name] = value;
+                    local_features[window_prefix + name] = value;
                 }
 
                 // Accumulate for aggregated channel correlation (computed once per TF below)
@@ -198,7 +240,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
                 tsla_channel_feats_agg, spy_channel_feats_agg
             );
             for (const auto& [name, value] : channel_corr_feats) {
-                all_features[tf_prefix + name] = value;
+                local_features[tf_prefix + name] = value;
             }
 
             // 8. Extract window score features (50)
@@ -206,7 +248,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
             std::unordered_map<int, std::shared_ptr<Channel>> channels_by_window;
             auto window_scores = extract_window_score_features(channels_by_window, 50);
             for (const auto& [name, value] : window_scores) {
-                all_features[tf_prefix + name] = value;
+                local_features[tf_prefix + name] = value;
             }
 
             // 9. Extract channel history features (67)
@@ -216,13 +258,31 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
             std::vector<ChannelHistoryEntry> spy_history;
             auto history_features = extract_channel_history_features(tsla_history, spy_history);
             for (const auto& [name, value] : history_features) {
-                all_features[tf_prefix + name] = value;
+                local_features[tf_prefix + name] = value;
             }
 
+            // Mark this timeframe as successfully processed
+            tf_valid[tf_idx] = true;
+
         } catch (const std::exception& e) {
-            std::cerr << "[ERROR] Failed to extract features for timeframe " << tf_prefix
-                      << ": " << e.what() << "\n";
+            #pragma omp critical
+            {
+                std::cerr << "[ERROR] Failed to extract features for timeframe " << tf_prefix
+                          << ": " << e.what() << "\n";
+            }
             // Continue to next timeframe on error
+        }
+    }
+
+    // Merge thread-local results into all_features (sequential, after parallel section)
+    for (int tf_idx = 0; tf_idx < NUM_TIMEFRAMES; ++tf_idx) {
+        // Copy metadata
+        Timeframe tf = static_cast<Timeframe>(tf_idx);
+        metadata_by_tf[tf] = tf_metadata[tf_idx];
+
+        // Merge features from this timeframe
+        if (tf_valid[tf_idx]) {
+            all_features.insert(tf_features[tf_idx].begin(), tf_features[tf_idx].end());
         }
     }
 
@@ -250,6 +310,246 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
 
     return all_features;
 }
+
+// =============================================================================
+// DATAVIEW OVERLOAD - ZERO-COPY FEATURE EXTRACTION
+// =============================================================================
+
+std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
+    const DataView& tsla_view,
+    const DataView& spy_view,
+    const DataView& vix_view,
+    int64_t timestamp,
+    int source_bar_count,
+    bool include_bar_metadata
+) {
+    std::unordered_map<std::string, double> all_features;
+
+    // SAFETY: Validate input data
+    if (tsla_view.empty()) {
+        std::cerr << "[ERROR] extract_all_features(DataView): TSLA data is empty\n";
+        return all_features;
+    }
+    if (spy_view.empty()) {
+        std::cerr << "[ERROR] extract_all_features(DataView): SPY data is empty\n";
+        return all_features;
+    }
+    if (vix_view.empty()) {
+        std::cerr << "[ERROR] extract_all_features(DataView): VIX data is empty\n";
+        return all_features;
+    }
+
+    // SAFETY: Validate data alignment
+    if (tsla_view.size() != spy_view.size() || tsla_view.size() != vix_view.size()) {
+        std::cerr << "[ERROR] extract_all_features(DataView): Data size mismatch - TSLA: "
+                  << tsla_view.size() << ", SPY: " << spy_view.size()
+                  << ", VIX: " << vix_view.size() << "\n";
+        return all_features;
+    }
+
+    // Default source_bar_count to data length
+    if (source_bar_count < 0) {
+        source_bar_count = static_cast<int>(tsla_view.size());
+    }
+
+    // SAFETY: Validate source_bar_count
+    if (source_bar_count > static_cast<int>(tsla_view.size())) {
+        source_bar_count = static_cast<int>(tsla_view.size());
+    }
+
+    // Track metadata by timeframe for bar completion features
+    std::unordered_map<Timeframe, ResampleMetadata> metadata_by_tf;
+
+    // Process each timeframe
+    for (int tf_idx = 0; tf_idx < NUM_TIMEFRAMES; ++tf_idx) {
+        Timeframe tf = static_cast<Timeframe>(tf_idx);
+        std::string tf_prefix = std::string(timeframe_to_string(tf)) + "_";
+
+        try {
+            // 1. Resample data to this timeframe using DataView overload
+            auto [tsla_tf, tsla_meta] = resample_to_tf(tsla_view, tf, source_bar_count);
+            auto [spy_tf, spy_meta] = resample_to_tf(spy_view, tf, source_bar_count);
+            auto [vix_tf, vix_meta] = resample_to_tf(vix_view, tf, source_bar_count);
+
+            // Store metadata
+            metadata_by_tf[tf] = tsla_meta;
+
+            // SAFETY: Check if we have enough data
+            if (tsla_tf.empty() || spy_tf.empty() || vix_tf.empty()) {
+                continue;
+            }
+
+            // Require minimum bars for meaningful features
+            if (tsla_tf.size() < 10) {
+                continue;
+            }
+
+            // 2. Extract TSLA price features (58)
+            auto price_features = extract_tsla_price_features(tsla_tf);
+            for (const auto& [name, value] : price_features) {
+                all_features[tf_prefix + name] = value;
+            }
+
+            // 3. Extract technical indicators (59)
+            // Use optimized struct-of-arrays extraction
+            OHLCVArrays tsla_arrays;
+            extract_ohlcv_arrays_optimized(tsla_tf, tsla_arrays);
+
+            if (tsla_arrays.empty()) {
+                continue;
+            }
+
+            auto tech_features = TechnicalIndicators::extract_features(
+                tsla_arrays.open, tsla_arrays.high, tsla_arrays.low,
+                tsla_arrays.close, tsla_arrays.volume);
+            for (const auto& [name, value] : tech_features) {
+                all_features[tf_prefix + name] = value;
+            }
+
+            // 4. Extract SPY features (117)
+            auto spy_features = extract_spy_features(spy_tf);
+            for (const auto& [name, value] : spy_features) {
+                all_features[tf_prefix + name] = value;
+            }
+
+            // 5. Extract VIX features (25)
+            auto vix_features = extract_vix_features(vix_tf);
+            for (const auto& [name, value] : vix_features) {
+                all_features[tf_prefix + name] = value;
+            }
+
+            // 6. Extract cross-asset features (59)
+            double tsla_rsi_14 = price_features.count("rsi_14") ? price_features.at("rsi_14") : 50.0;
+            double spy_rsi_14 = spy_features.count("spy_rsi_14") ? spy_features.at("spy_rsi_14") : 50.0;
+            double vix_level = vix_features.count("vix_level") ? vix_features.at("vix_level") : 20.0;
+
+            auto cross_features = extract_cross_asset_features(
+                tsla_tf, spy_tf, vix_tf,
+                tsla_rsi_14, spy_rsi_14, 0.5, 0.5, vix_level
+            );
+            for (const auto& [name, value] : cross_features) {
+                all_features[tf_prefix + name] = value;
+            }
+
+            // 7. Extract channel features for each window (116 features x 8 windows = 928)
+            std::unordered_map<std::string, double> tsla_channel_feats_agg;
+            std::unordered_map<std::string, double> spy_channel_feats_agg;
+            int valid_window_count = 0;
+
+            for (int window : STANDARD_WINDOWS) {
+                std::string window_prefix = tf_prefix + "w" + std::to_string(window) + "_";
+
+                Channel tsla_channel;
+                auto tsla_channel_feats = extract_channel_features(tsla_channel, tsla_tf);
+                for (const auto& [name, value] : tsla_channel_feats) {
+                    all_features[window_prefix + name] = value;
+                }
+
+                Channel spy_channel;
+                auto spy_channel_feats = extract_spy_channel_features(spy_channel, spy_tf, window);
+                for (const auto& [name, value] : spy_channel_feats) {
+                    all_features[window_prefix + name] = value;
+                }
+
+                for (const auto& [name, value] : tsla_channel_feats) {
+                    tsla_channel_feats_agg[name] += value;
+                }
+                for (const auto& [name, value] : spy_channel_feats) {
+                    spy_channel_feats_agg[name] += value;
+                }
+                valid_window_count++;
+            }
+
+            if (valid_window_count > 0) {
+                for (auto& [name, value] : tsla_channel_feats_agg) {
+                    value /= valid_window_count;
+                }
+                for (auto& [name, value] : spy_channel_feats_agg) {
+                    value /= valid_window_count;
+                }
+            }
+
+            // 7b. Channel correlation features (50 per TF)
+            auto channel_corr_feats = extract_channel_correlation_features(
+                tsla_channel_feats_agg, spy_channel_feats_agg
+            );
+            for (const auto& [name, value] : channel_corr_feats) {
+                all_features[tf_prefix + name] = value;
+            }
+
+            // 8. Extract window score features (50)
+            std::unordered_map<int, std::shared_ptr<Channel>> channels_by_window;
+            auto window_scores = extract_window_score_features(channels_by_window, 50);
+            for (const auto& [name, value] : window_scores) {
+                all_features[tf_prefix + name] = value;
+            }
+
+            // 9. Extract channel history features (67)
+            std::vector<ChannelHistoryEntry> tsla_history;
+            std::vector<ChannelHistoryEntry> spy_history;
+            auto history_features = extract_channel_history_features(tsla_history, spy_history);
+            for (const auto& [name, value] : history_features) {
+                all_features[tf_prefix + name] = value;
+            }
+
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] Failed to extract features for timeframe " << tf_prefix
+                      << ": " << e.what() << "\n";
+        }
+    }
+
+    // 10. Extract event features (30 TF-independent) using DataView overload
+    auto event_features = extract_event_features(timestamp, tsla_view);
+    all_features.insert(event_features.begin(), event_features.end());
+
+    // 11. Extract bar metadata features (30)
+    if (include_bar_metadata) {
+        auto bar_meta = extract_bar_metadata_features(metadata_by_tf);
+        all_features.insert(bar_meta.begin(), bar_meta.end());
+    }
+
+    // Sanitize all features
+    sanitize_features(all_features);
+
+    return all_features;
+}
+
+// DataView overload for resample_to_tf
+std::pair<std::vector<OHLCV>, FeatureExtractor::ResampleMetadata>
+FeatureExtractor::resample_to_tf(
+    const DataView& data_view,
+    Timeframe target_tf,
+    int source_bar_count
+) {
+    // For 5min timeframe, we can avoid copying by just wrapping the view
+    // For other timeframes, we need to copy to resample
+    if (target_tf == Timeframe::MIN_5) {
+        ResampleMetadata metadata;
+        metadata.source_bars = static_cast<int>(data_view.size());
+        metadata.bar_completion_pct = 1.0;
+        metadata.bars_in_partial = 1;
+        metadata.expected_bars = 1;
+        metadata.is_partial = false;
+        metadata.total_bars = static_cast<int>(data_view.size());
+        // Copy needed here for 5min as we return a vector
+        return {data_view.to_vector(), metadata};
+    }
+    
+    // For other timeframes, convert to vector and resample
+    // This is where the copy happens, but it's only for resampled data
+    return resample_to_tf(data_view.to_vector(), target_tf, source_bar_count);
+}
+
+// DataView overload for extract_event_features
+std::unordered_map<std::string, double> FeatureExtractor::extract_event_features(
+    int64_t timestamp,
+    const DataView& tsla_view
+) {
+    // Event features only need the last few bars, so we can work directly with the view
+    // For now, convert to vector for compatibility with existing implementation
+    return extract_event_features(timestamp, tsla_view.to_vector());
+}
+
 
 // =============================================================================
 // RESAMPLING
@@ -361,6 +661,78 @@ FeatureExtractor::resample_to_tf(
     return {resampled, metadata};
 }
 
+std::pair<std::vector<OHLCV>, FeatureExtractor::ResampleMetadata>
+FeatureExtractor::resample_to_tf_cached(
+    const std::vector<OHLCV>& data_5min,
+    Timeframe target_tf,
+    int source_bar_count,
+    ResampleCache& cache,
+    int asset_idx  // 0=TSLA, 1=SPY, 2=VIX
+) {
+    int tf_idx = static_cast<int>(target_tf);
+
+    // Check if we have a valid cached result
+    if (cache.is_valid(target_tf, data_5min.size(), source_bar_count)) {
+        // Return cached data based on asset index
+        ResampleMetadata metadata;
+        const std::vector<OHLCV>* cached_data = nullptr;
+
+        switch (asset_idx) {
+            case 0: cached_data = &cache.tsla_resampled[tf_idx]; break;
+            case 1: cached_data = &cache.spy_resampled[tf_idx]; break;
+            case 2: cached_data = &cache.vix_resampled[tf_idx]; break;
+            default: break;
+        }
+
+        if (cached_data && !cached_data->empty()) {
+            // Reconstruct metadata from cached data
+            int bars_per_tf_bar = get_bars_per_tf(target_tf);
+            metadata.source_bars = static_cast<int>(data_5min.size());
+            metadata.total_bars = static_cast<int>(cached_data->size());
+
+            if (target_tf == Timeframe::MIN_5) {
+                metadata.bar_completion_pct = 1.0;
+                metadata.bars_in_partial = 1;
+                metadata.expected_bars = 1;
+                metadata.is_partial = false;
+            } else {
+                int bars_into_current = source_bar_count % bars_per_tf_bar;
+                if (bars_into_current == 0) {
+                    metadata.bar_completion_pct = 1.0;
+                    metadata.is_partial = false;
+                } else {
+                    metadata.bar_completion_pct = static_cast<double>(bars_into_current) / bars_per_tf_bar;
+                    metadata.is_partial = true;
+                }
+                metadata.bars_in_partial = bars_into_current > 0 ? bars_into_current : bars_per_tf_bar;
+                metadata.expected_bars = bars_per_tf_bar;
+            }
+
+            return {*cached_data, metadata};
+        }
+    }
+
+    // Cache miss - perform resampling
+    auto [resampled, metadata] = resample_to_tf(data_5min, target_tf, source_bar_count);
+
+    // Store in cache if valid timeframe index
+    if (tf_idx >= 0 && tf_idx < NUM_TIMEFRAMES) {
+        switch (asset_idx) {
+            case 0: cache.tsla_resampled[tf_idx] = resampled; break;
+            case 1: cache.spy_resampled[tf_idx] = resampled; break;
+            case 2: cache.vix_resampled[tf_idx] = resampled; break;
+            default: break;
+        }
+
+        // Update cache validity
+        cache.source_size = data_5min.size();
+        cache.source_bar_count = source_bar_count;
+        cache.valid[tf_idx] = true;
+    }
+
+    return {resampled, metadata};
+}
+
 // =============================================================================
 // TSLA PRICE FEATURES (58)
 // =============================================================================
@@ -368,7 +740,8 @@ FeatureExtractor::resample_to_tf(
 std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_features(
     const std::vector<OHLCV>& tsla_data
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 58 TSLA price features
+    auto features = create_feature_map(FeatureOffsets::TSLA_PRICE_COUNT);
 
     // SAFETY: Check for insufficient data
     if (tsla_data.empty()) {
@@ -384,15 +757,22 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
         return features;
     }
 
-    // Extract arrays
-    std::vector<double> open, high, low, close, volume;
-    extract_ohlcv_arrays(tsla_data, open, high, low, close, volume);
+    // Extract arrays using optimized SoA extraction
+    OHLCVArrays arrays;
+    extract_ohlcv_arrays_optimized(tsla_data, arrays);
 
     // SAFETY: Validate extracted arrays
-    if (close.empty() || open.empty() || high.empty() || low.empty()) {
+    if (arrays.empty()) {
         std::cerr << "[WARNING] extract_tsla_price_features: Empty OHLCV arrays after extraction\n";
         return features;
     }
+
+    // Create references for readability
+    const auto& open = arrays.open;
+    const auto& high = arrays.high;
+    const auto& low = arrays.low;
+    const auto& close = arrays.close;
+    const auto& volume = arrays.volume;
 
     int n = static_cast<int>(close.size());
 
@@ -562,7 +942,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
 std::unordered_map<std::string, double> FeatureExtractor::extract_spy_features(
     const std::vector<OHLCV>& spy_data
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 117 SPY features
+    auto features = create_feature_map(FeatureOffsets::SPY_COUNT);
 
     if (spy_data.size() < 2) {
         // Return defaults
@@ -572,9 +953,16 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_features(
         return features;
     }
 
-    // Extract arrays
-    std::vector<double> open, high, low, close, volume;
-    extract_ohlcv_arrays(spy_data, open, high, low, close, volume);
+    // Extract arrays using optimized SoA extraction
+    OHLCVArrays arrays;
+    extract_ohlcv_arrays_optimized(spy_data, arrays);
+
+    // Create references for readability
+    const auto& open = arrays.open;
+    const auto& high = arrays.high;
+    const auto& low = arrays.low;
+    const auto& close = arrays.close;
+    const auto& volume = arrays.volume;
 
     int n = static_cast<int>(close.size());
     double c = n > 0 ? close[n-1] : 0.0;
@@ -678,7 +1066,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_features(
 std::unordered_map<std::string, double> FeatureExtractor::extract_vix_features(
     const std::vector<OHLCV>& vix_data
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 25 VIX features
+    auto features = create_feature_map(FeatureOffsets::VIX_COUNT);
 
     if (vix_data.empty()) {
         // Return defaults
@@ -694,8 +1083,12 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_vix_features(
         return features;
     }
 
-    std::vector<double> open, high, low, close, volume;
-    extract_ohlcv_arrays(vix_data, open, high, low, close, volume);
+    // Extract arrays using optimized SoA extraction
+    OHLCVArrays arrays;
+    extract_ohlcv_arrays_optimized(vix_data, arrays);
+
+    // Only close is needed for VIX features
+    const auto& close = arrays.close;
 
     double current_vix = close.back();
 
@@ -770,7 +1163,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_cross_asset_fe
     double spy_position_in_channel,
     double vix_level
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 59 cross-asset features
+    auto features = create_feature_map(FeatureOffsets::CROSS_ASSET_COUNT);
 
     if (tsla_data.empty() || spy_data.empty() || vix_data.empty()) {
         // Return defaults
@@ -780,15 +1174,18 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_cross_asset_fe
         return features;
     }
 
+    // Extract only close prices - more efficient than full OHLCV extraction
     std::vector<double> tsla_close, spy_close, vix_close;
-    std::vector<double> dummy;
+    tsla_close.reserve(tsla_data.size());
+    spy_close.reserve(spy_data.size());
+    vix_close.reserve(vix_data.size());
 
-    extract_ohlcv_arrays(tsla_data, dummy, dummy, dummy, tsla_close, dummy);
-    extract_ohlcv_arrays(spy_data, dummy, dummy, dummy, spy_close, dummy);
-    extract_ohlcv_arrays(vix_data, dummy, dummy, dummy, vix_close, dummy);
+    for (const auto& bar : tsla_data) tsla_close.push_back(bar.close);
+    for (const auto& bar : spy_data) spy_close.push_back(bar.close);
+    for (const auto& bar : vix_data) vix_close.push_back(bar.close);
 
     // Align to minimum length
-    int min_len = std::min({tsla_close.size(), spy_close.size(), vix_close.size()});
+    int min_len = static_cast<int>(std::min({tsla_close.size(), spy_close.size(), vix_close.size()}));
     if (min_len < 2) {
         for (int i = 0; i < 59; ++i) {
             features["cross_" + std::to_string(i)] = 0.0;
@@ -900,7 +1297,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     const Channel& channel,
     const std::vector<OHLCV>& data
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 58 channel features
+    auto features = create_feature_map(58);
 
     // Handle invalid channel - return defaults
     if (!channel.valid) {
@@ -908,13 +1306,13 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     }
 
     // Extract arrays from data for calculations
-    std::vector<double> open_arr, high_arr, low_arr, close_arr, volume_arr;
-    extract_ohlcv_arrays(data, open_arr, high_arr, low_arr, close_arr, volume_arr);
+    OHLCVArrays data_arrays;
+    extract_ohlcv_arrays_optimized(data, data_arrays);
 
     // Use channel's stored arrays if available, else use data arrays
-    const std::vector<double>& close = channel.close.empty() ? close_arr : channel.close;
-    const std::vector<double>& high = channel.high.empty() ? high_arr : channel.high;
-    const std::vector<double>& low = channel.low.empty() ? low_arr : channel.low;
+    const std::vector<double>& close = channel.close.empty() ? data_arrays.close : channel.close;
+    const std::vector<double>& high = channel.high.empty() ? data_arrays.high : channel.high;
+    const std::vector<double>& low = channel.low.empty() ? data_arrays.low : channel.low;
 
     int n = static_cast<int>(close.size());
     int window = channel.window > 0 ? channel.window : 50;
@@ -1687,7 +2085,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     const std::vector<OHLCV>& spy_data,
     int window
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 58 SPY channel features
+    auto features = create_feature_map(58);
 
     // Handle invalid channel - return all defaults
     if (!channel.valid) {
@@ -1754,14 +2153,14 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
         return features;
     }
 
-    // Extract OHLCV arrays from SPY data
-    std::vector<double> open, high, low, close, volume;
-    extract_ohlcv_arrays(spy_data, open, high, low, close, volume);
+    // Extract OHLCV arrays from SPY data using optimized extraction
+    OHLCVArrays spy_arrays;
+    extract_ohlcv_arrays_optimized(spy_data, spy_arrays);
 
     // Use channel's stored arrays if available, otherwise use extracted
-    const std::vector<double>& ch_close = channel.close.empty() ? close : channel.close;
-    const std::vector<double>& ch_high = channel.high.empty() ? high : channel.high;
-    const std::vector<double>& ch_low = channel.low.empty() ? low : channel.low;
+    const std::vector<double>& ch_close = channel.close.empty() ? spy_arrays.close : channel.close;
+    const std::vector<double>& ch_high = channel.high.empty() ? spy_arrays.high : channel.high;
+    const std::vector<double>& ch_low = channel.low.empty() ? spy_arrays.low : channel.low;
 
     // ==========================================================================
     // 1. spy_channel_valid (0/1)
@@ -2474,7 +2873,8 @@ double FeatureExtractor::calculate_regime_shift(const std::vector<ChannelHistory
 
 std::unordered_map<std::string, double> FeatureExtractor::extract_single_history_features(
     const std::vector<ChannelHistoryEntry>& history, const std::string& prefix) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for ~40 single history features
+    auto features = create_feature_map(40);
     std::vector<ChannelHistoryEntry> hist = history.size() > 5 ?
         std::vector<ChannelHistoryEntry>(history.end() - 5, history.end()) : history;
     int n_ch = static_cast<int>(hist.size());
@@ -2545,7 +2945,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_histor
     const std::vector<ChannelHistoryEntry>& tsla_history,
     const std::vector<ChannelHistoryEntry>& spy_history
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 67 channel history features (40 TSLA + 40 SPY - overlapping + cross-asset)
+    auto features = create_feature_map(FeatureOffsets::CHANNEL_HISTORY_COUNT);
     auto tsla_f = extract_single_history_features(tsla_history, "tsla_");
     auto spy_f = extract_single_history_features(spy_history, "spy_");
     features.insert(tsla_f.begin(), tsla_f.end());
@@ -2745,7 +3146,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_window_score_f
     const std::unordered_map<int, std::shared_ptr<Channel>>& channels_by_window,
     int best_window
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 50 window score features
+    auto features = create_feature_map(FeatureOffsets::WINDOW_SCORE_COUNT);
 
     // Ensure best_window is valid
     bool best_window_valid = false;
@@ -3317,7 +3719,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_correl
     const std::unordered_map<std::string, double>& tsla_channel_features,
     const std::unordered_map<std::string, double>& spy_channel_features
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 50 channel correlation features
+    auto features = create_feature_map(FeatureOffsets::CHANNEL_CORRELATION_COUNT);
 
     // Helper lambda to get feature value with default
     auto get_feature = [](const std::unordered_map<std::string, double>& feats,
@@ -3548,7 +3951,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_event_features
     int64_t timestamp,
     const std::vector<OHLCV>& tsla_data
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 30 event features
+    auto features = create_feature_map(FeatureOffsets::EVENT_COUNT);
 
     // Convert timestamp to tm struct for date features
     time_t t = static_cast<time_t>(timestamp);
@@ -3602,7 +4006,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_event_features
 std::unordered_map<std::string, double> FeatureExtractor::extract_bar_metadata_features(
     const std::unordered_map<Timeframe, ResampleMetadata>& metadata_by_tf
 ) {
-    std::unordered_map<std::string, double> features;
+    // Pre-reserve for 30 bar metadata features (3 per TF)
+    auto features = create_feature_map(FeatureOffsets::BAR_METADATA_COUNT);
 
     for (int tf_idx = 0; tf_idx < NUM_TIMEFRAMES; ++tf_idx) {
         Timeframe tf = static_cast<Timeframe>(tf_idx);
@@ -3688,6 +4093,29 @@ void FeatureExtractor::extract_ohlcv_arrays(
     }
 }
 
+void FeatureExtractor::extract_ohlcv_arrays_optimized(
+    const std::vector<OHLCV>& data,
+    OHLCVArrays& arrays
+) {
+    const size_t n = data.size();
+
+    // Resize arrays to exact size (avoids push_back overhead)
+    arrays.open.resize(n);
+    arrays.high.resize(n);
+    arrays.low.resize(n);
+    arrays.close.resize(n);
+    arrays.volume.resize(n);
+
+    // Direct assignment is faster than push_back
+    for (size_t i = 0; i < n; ++i) {
+        arrays.open[i] = data[i].open;
+        arrays.high[i] = data[i].high;
+        arrays.low[i] = data[i].low;
+        arrays.close[i] = data[i].close;
+        arrays.volume[i] = data[i].volume;
+    }
+}
+
 void FeatureExtractor::sanitize_features(std::unordered_map<std::string, double>& features) {
     for (auto& [name, value] : features) {
         if (!std::isfinite(value)) {
@@ -3700,7 +4128,8 @@ void FeatureExtractor::prefix_features(
     std::unordered_map<std::string, double>& features,
     const std::string& prefix
 ) {
-    std::unordered_map<std::string, double> prefixed;
+    // Pre-reserve for same size
+    auto prefixed = create_feature_map(features.size());
     for (const auto& [name, value] : features) {
         prefixed[prefix + name] = value;
     }
@@ -3711,7 +4140,8 @@ std::unordered_map<std::string, double> FeatureExtractor::prefix_features_copy(
     const std::unordered_map<std::string, double>& features,
     const std::string& prefix
 ) {
-    std::unordered_map<std::string, double> prefixed;
+    // Pre-reserve for same size
+    auto prefixed = create_feature_map(features.size());
     for (const auto& [name, value] : features) {
         prefixed[prefix + name] = value;
     }

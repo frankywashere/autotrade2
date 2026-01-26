@@ -126,6 +126,117 @@ std::vector<double> TechnicalIndicators::atr(
 }
 
 // =============================================================================
+// Optimized _last variants - Return only the last value
+// =============================================================================
+
+double TechnicalIndicators::sma_last(const std::vector<double>& values, int period) {
+    size_t n = values.size();
+
+    if (n == 0 || period <= 0) {
+        return 0.0;
+    }
+
+    // For the last SMA value, we only need to sum the last 'period' values
+    // If we have fewer values than period, use all available values
+    size_t start = (n >= static_cast<size_t>(period)) ? (n - period) : 0;
+    size_t count = n - start;
+
+    double sum = 0.0;
+    for (size_t i = start; i < n; ++i) {
+        sum += values[i];
+    }
+
+    return sum / count;
+}
+
+double TechnicalIndicators::ema_last(const std::vector<double>& values, int period) {
+    size_t n = values.size();
+
+    if (n == 0 || period <= 0) {
+        return 0.0;
+    }
+
+    double multiplier = 2.0 / (period + 1.0);
+    double ema_value = values[0];
+
+    // Iterate through all values to compute EMA, but only keep the last value
+    for (size_t i = 1; i < n; ++i) {
+        ema_value = (values[i] - ema_value) * multiplier + ema_value;
+    }
+
+    return ema_value;
+}
+
+double TechnicalIndicators::rsi_last(const std::vector<double>& values, int period) {
+    size_t n = values.size();
+
+    if (n <= 1 || period <= 0) {
+        return 50.0;
+    }
+
+    double multiplier = 2.0 / (period + 1.0);
+
+    // Match original behavior: gains[0] and losses[0] are 0, EMA starts with those
+    // EMA formula: result[0] = values[0], then result[i] = (values[i] - result[i-1]) * mult + result[i-1]
+    // So avg_gain and avg_loss start at 0.0 (matching gains[0] and losses[0])
+    double avg_gain = 0.0;
+    double avg_loss = 0.0;
+
+    // Process all values starting from index 1 (where gains/losses are computed)
+    for (size_t i = 1; i < n; ++i) {
+        double delta = values[i] - values[i-1];
+        double gain = (delta > 0) ? delta : 0.0;
+        double loss = (delta < 0) ? -delta : 0.0;
+
+        // EMA update: new_ema = (value - old_ema) * multiplier + old_ema
+        avg_gain = (gain - avg_gain) * multiplier + avg_gain;
+        avg_loss = (loss - avg_loss) * multiplier + avg_loss;
+    }
+
+    // Calculate final RSI
+    double rsi_value;
+    if (avg_loss == 0.0) {
+        rsi_value = (avg_gain > 0.0) ? 100.0 : 50.0;
+    } else {
+        double rs = avg_gain / avg_loss;
+        rsi_value = 100.0 - (100.0 / (1.0 + rs));
+    }
+
+    return std::clamp(rsi_value, 0.0, 100.0);
+}
+
+double TechnicalIndicators::atr_last(
+    const std::vector<double>& high,
+    const std::vector<double>& low,
+    const std::vector<double>& close,
+    int period
+) {
+    size_t n = std::min({high.size(), low.size(), close.size()});
+
+    if (n == 0 || period <= 0) {
+        return 0.0;
+    }
+
+    double multiplier = 2.0 / (period + 1.0);
+
+    // First TR value
+    double atr_value = high[0] - low[0];
+
+    // Compute true range and EMA iteratively (no array allocation)
+    for (size_t i = 1; i < n; ++i) {
+        double tr1 = high[i] - low[i];
+        double tr2 = std::abs(high[i] - close[i-1]);
+        double tr3 = std::abs(low[i] - close[i-1]);
+        double tr = std::max({tr1, tr2, tr3});
+
+        // EMA update
+        atr_value = (tr - atr_value) * multiplier + atr_value;
+    }
+
+    return atr_value;
+}
+
+// =============================================================================
 // Helper Functions - Momentum
 // =============================================================================
 
@@ -176,6 +287,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_macd(
     const std::vector<double>& close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(5);  // MACD has 5 features
 
     if (close.size() < 26) {
         features["macd_line"] = 0.0;
@@ -252,6 +364,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_bollinger
     double current_close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(8);  // Bollinger Bands has 8 features
 
     if (close.size() < 20) {
         features["bb_upper"] = 0.0;
@@ -342,6 +455,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_keltner(
     double current_close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(5);  // Keltner Channels has 5 features
 
     if (close.size() < 20) {
         features["keltner_upper"] = 0.0;
@@ -394,6 +508,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_adx(
     const std::vector<double>& close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(4);  // ADX has 4 features
 
     if (close.size() < 28) {
         features["adx"] = 0.0;
@@ -479,6 +594,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_ichimoku(
     double current_close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(6);  // Ichimoku has 6 features
 
     if (high.size() < 52) {
         features["tenkan"] = 0.0;
@@ -547,6 +663,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_volume_in
     const std::vector<double>& volume
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(8);  // Volume indicators has 8 features
     size_t n = close.size();
 
     if (n < 20) {
@@ -711,6 +828,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_oscillato
     const std::vector<double>& close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(6);  // Oscillators has 6 features
     size_t n = close.size();
 
     if (n < 28) {
@@ -794,6 +912,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_pivot_poi
     const std::vector<double>& close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(3);  // Pivot points has 3 features
 
     if (close.size() < 2) {
         features["pivot"] = 0.0;
@@ -828,6 +947,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_fibonacci
     double current_close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(3);  // Fibonacci has 3 features
 
     if (high.size() < 20) {
         features["fib_382"] = 0.0;
@@ -869,6 +989,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_candlesti
     const std::vector<double>& close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(7);  // Candlestick patterns has 7 features
     size_t n = close.size();
 
     features["is_doji"] = 0.0;
@@ -966,6 +1087,7 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_additiona
     const std::vector<double>& close
 ) {
     std::unordered_map<std::string, double> features;
+    features.reserve(3);  // Additional has 3 features
     size_t n = close.size();
 
     if (n < 20) {
@@ -1025,7 +1147,9 @@ std::unordered_map<std::string, double> TechnicalIndicators::extract_features(
     const std::vector<double>& close,
     const std::vector<double>& volume
 ) {
+    // Pre-reserve for 59 technical indicator features
     std::unordered_map<std::string, double> features;
+    features.reserve(59);
 
     size_t n = close.size();
     if (n < 2) {

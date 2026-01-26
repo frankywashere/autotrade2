@@ -7,8 +7,103 @@
 #include <unordered_map>
 #include <string>
 #include <memory>
+#include <array>
 
 namespace v15 {
+
+// =============================================================================
+// OPTIMIZED DATA STRUCTURES FOR FEATURE EXTRACTION
+// =============================================================================
+
+/**
+ * OHLCVArrays - Struct of Arrays for efficient OHLCV data access
+ *
+ * Using SoA (Struct of Arrays) instead of AoS (Array of Structs) improves
+ * cache locality when accessing individual price components sequentially.
+ */
+struct OHLCVArrays {
+    std::vector<double> open;
+    std::vector<double> high;
+    std::vector<double> low;
+    std::vector<double> close;
+    std::vector<double> volume;
+
+    OHLCVArrays() = default;
+
+    // Pre-allocate all arrays to given size
+    void reserve(size_t n) {
+        open.reserve(n);
+        high.reserve(n);
+        low.reserve(n);
+        close.reserve(n);
+        volume.reserve(n);
+    }
+
+    // Clear all arrays
+    void clear() {
+        open.clear();
+        high.clear();
+        low.clear();
+        close.clear();
+        volume.clear();
+    }
+
+    // Resize all arrays
+    void resize(size_t n) {
+        open.resize(n);
+        high.resize(n);
+        low.resize(n);
+        close.resize(n);
+        volume.resize(n);
+    }
+
+    size_t size() const { return close.size(); }
+    bool empty() const { return close.empty(); }
+};
+
+/**
+ * ResampleCache - Caches resampled OHLCV data by timeframe
+ *
+ * When extract_all_features is called, the same 5-min data may be resampled
+ * multiple times for different feature extraction passes. This cache stores
+ * the resampled data to avoid redundant computation.
+ */
+struct ResampleCache {
+    // Cached resampled data for each timeframe (TSLA, SPY, VIX)
+    std::array<std::vector<OHLCV>, NUM_TIMEFRAMES> tsla_resampled;
+    std::array<std::vector<OHLCV>, NUM_TIMEFRAMES> spy_resampled;
+    std::array<std::vector<OHLCV>, NUM_TIMEFRAMES> vix_resampled;
+
+    // Pre-extracted OHLCV arrays for each timeframe
+    std::array<OHLCVArrays, NUM_TIMEFRAMES> tsla_arrays;
+    std::array<OHLCVArrays, NUM_TIMEFRAMES> spy_arrays;
+    std::array<OHLCVArrays, NUM_TIMEFRAMES> vix_arrays;
+
+    // Validity flags
+    std::array<bool, NUM_TIMEFRAMES> valid;
+
+    // Source data fingerprint for cache invalidation
+    size_t source_size = 0;
+    int source_bar_count = -1;
+
+    ResampleCache() {
+        valid.fill(false);
+    }
+
+    void invalidate() {
+        valid.fill(false);
+        source_size = 0;
+        source_bar_count = -1;
+    }
+
+    bool is_valid(Timeframe tf, size_t data_size, int bar_count) const {
+        int idx = static_cast<int>(tf);
+        return idx >= 0 && idx < NUM_TIMEFRAMES &&
+               valid[idx] &&
+               source_size == data_size &&
+               source_bar_count == bar_count;
+    }
+};
 
 /**
  * ChannelHistoryEntry - Stores historical channel information
@@ -76,6 +171,30 @@ public:
     );
 
     /**
+     * Extract all 14,190 features using DataView (ZERO-COPY)
+     *
+     * This overload avoids copying OHLCV data by accepting DataView objects
+     * that provide non-owning views into the original data arrays.
+     * Internally converts to vectors only when resampling is needed.
+     *
+     * @param tsla_view View into 5-min TSLA OHLCV data
+     * @param spy_view View into 5-min SPY OHLCV data
+     * @param vix_view View into 5-min VIX OHLCV data
+     * @param timestamp Current timestamp for event features
+     * @param source_bar_count Number of 5min bars from start (for partial bar calculation)
+     * @param include_bar_metadata Include 30 bar metadata features
+     * @return Map of feature names to values
+     */
+    static std::unordered_map<std::string, double> extract_all_features(
+        const DataView& tsla_view,
+        const DataView& spy_view,
+        const DataView& vix_view,
+        int64_t timestamp,
+        int source_bar_count = -1,
+        bool include_bar_metadata = true
+    );
+
+    /**
      * Get expected total feature count (14,190)
      */
     static int get_total_feature_count() { return 14190; }
@@ -115,6 +234,13 @@ private:
 
     static std::pair<std::vector<OHLCV>, ResampleMetadata> resample_to_tf(
         const std::vector<OHLCV>& data_5min,
+        Timeframe target_tf,
+        int source_bar_count
+    );
+
+    // DataView overload - converts to vector internally for resampling
+    static std::pair<std::vector<OHLCV>, ResampleMetadata> resample_to_tf(
+        const DataView& data_view,
         Timeframe target_tf,
         int source_bar_count
     );
@@ -181,6 +307,12 @@ private:
         const std::vector<OHLCV>& tsla_data
     );
 
+    // DataView overload for event features
+    static std::unordered_map<std::string, double> extract_event_features(
+        int64_t timestamp,
+        const DataView& tsla_view
+    );
+
     // Bar Metadata Features (30 total: 3 per TF)
     static std::unordered_map<std::string, double> extract_bar_metadata_features(
         const std::unordered_map<Timeframe, ResampleMetadata>& metadata_by_tf
@@ -214,7 +346,7 @@ private:
         int period
     );
 
-    // Extract OHLCV components
+    // Extract OHLCV components (legacy interface - allocates new vectors)
     static void extract_ohlcv_arrays(
         const std::vector<OHLCV>& data,
         std::vector<double>& open,
@@ -222,6 +354,24 @@ private:
         std::vector<double>& low,
         std::vector<double>& close,
         std::vector<double>& volume
+    );
+
+    // Extract OHLCV components into OHLCVArrays struct (optimized - reuses memory)
+    static void extract_ohlcv_arrays_optimized(
+        const std::vector<OHLCV>& data,
+        OHLCVArrays& arrays
+    );
+
+    // Thread-local resample cache for avoiding redundant resampling
+    static thread_local ResampleCache s_resample_cache;
+
+    // Resample with caching - checks cache first, computes if needed
+    static std::pair<std::vector<OHLCV>, ResampleMetadata> resample_to_tf_cached(
+        const std::vector<OHLCV>& data_5min,
+        Timeframe target_tf,
+        int source_bar_count,
+        ResampleCache& cache,
+        int asset_idx  // 0=TSLA, 1=SPY, 2=VIX
     );
 
     // Sanitize features (ensure all are finite)

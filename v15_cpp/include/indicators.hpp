@@ -79,6 +79,49 @@ public:
         int period = 14
     );
 
+    // =============================================================================
+    // Optimized _last variants - Return only the last value without full array allocation
+    // =============================================================================
+
+    /**
+     * Compute only the last SMA value (optimized - no full array allocation)
+     * @param values Input price series
+     * @param period SMA period
+     * @return The last SMA value, or 0.0 if insufficient data
+     */
+    static double sma_last(const std::vector<double>& values, int period);
+
+    /**
+     * Compute only the last EMA value (optimized - no full array allocation)
+     * @param values Input price series
+     * @param period EMA period
+     * @return The last EMA value, or 0.0 if insufficient data
+     */
+    static double ema_last(const std::vector<double>& values, int period);
+
+    /**
+     * Compute only the last RSI value (optimized - no full array allocation)
+     * @param values Input price series
+     * @param period RSI period (default 14)
+     * @return The last RSI value (0-100), or 50.0 if insufficient data
+     */
+    static double rsi_last(const std::vector<double>& values, int period = 14);
+
+    /**
+     * Compute only the last ATR value (optimized - no full array allocation)
+     * @param high High prices
+     * @param low Low prices
+     * @param close Close prices
+     * @param period ATR period (default 14)
+     * @return The last ATR value, or 0.0 if insufficient data
+     */
+    static double atr_last(
+        const std::vector<double>& high,
+        const std::vector<double>& low,
+        const std::vector<double>& close,
+        int period = 14
+    );
+
     // Helper functions - Utilities (public for use by FeatureExtractor)
     static double safe_divide(double numerator, double denominator, double default_val = 0.0);
     static double safe_float(double value, double default_val = 0.0);

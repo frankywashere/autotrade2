@@ -4,6 +4,8 @@
 #include <string>
 #include <unordered_map>
 #include <ctime>
+#include <vector>
+#include <algorithm>
 
 namespace v15 {
 
@@ -130,6 +132,71 @@ constexpr std::array<int, NUM_TIMEFRAMES> TF_FORWARD_5MIN = {
 
 // Scanner forward requirement (based on weekly TF for practical limit)
 constexpr int SCANNER_FORWARD_5MIN = 21000;
+
+// =============================================================================
+// DATA VIEW - ZERO-COPY ACCESS TO OHLCV SLICES
+// =============================================================================
+
+/**
+ * DataView - Lightweight non-owning view into OHLCV data
+ *
+ * Provides zero-copy access to a slice of OHLCV data.
+ * Similar to std::span (C++20) but compatible with C++17.
+ *
+ * IMPORTANT: The underlying data must outlive the DataView.
+ */
+struct DataView {
+    const OHLCV* data_;
+    size_t size_;
+
+    // Default constructor - empty view
+    DataView() noexcept : data_(nullptr), size_(0) {}
+
+    // Construct from pointer and size
+    DataView(const OHLCV* data, size_t size) noexcept
+        : data_(data), size_(size) {}
+
+    // Construct from iterators (vector begin + offset, size)
+    DataView(const std::vector<OHLCV>& vec, size_t offset, size_t count) noexcept
+        : data_(vec.data() + offset), size_(count) {}
+
+    // Construct from full vector
+    explicit DataView(const std::vector<OHLCV>& vec) noexcept
+        : data_(vec.data()), size_(vec.size()) {}
+
+    // Accessors
+    const OHLCV* data() const noexcept { return data_; }
+    size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+
+    // Element access
+    const OHLCV& operator[](size_t idx) const { return data_[idx]; }
+    const OHLCV& at(size_t idx) const {
+        if (idx >= size_) throw std::out_of_range("DataView index out of range");
+        return data_[idx];
+    }
+
+    const OHLCV& front() const { return data_[0]; }
+    const OHLCV& back() const { return data_[size_ - 1]; }
+
+    // Iterators (for range-based for loops)
+    const OHLCV* begin() const noexcept { return data_; }
+    const OHLCV* end() const noexcept { return data_ + size_; }
+    const OHLCV* cbegin() const noexcept { return data_; }
+    const OHLCV* cend() const noexcept { return data_ + size_; }
+
+    // Create a subview
+    DataView subview(size_t offset, size_t count = static_cast<size_t>(-1)) const noexcept {
+        if (offset >= size_) return DataView();
+        size_t actual_count = std::min(count, size_ - offset);
+        return DataView(data_ + offset, actual_count);
+    }
+
+    // Conversion to vector (when copy is actually needed, e.g., for resampling)
+    std::vector<OHLCV> to_vector() const {
+        return std::vector<OHLCV>(data_, data_ + size_);
+    }
+};
 
 // =============================================================================
 // HELPER FUNCTIONS
