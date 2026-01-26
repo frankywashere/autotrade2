@@ -19,6 +19,65 @@ namespace v15 {
 thread_local ResampleCache FeatureExtractor::s_resample_cache;
 
 // =============================================================================
+// PRE-COMPUTED STRING PREFIXES (avoids 9,280+ allocations per extraction)
+// =============================================================================
+
+// Pre-computed window suffix strings: "w20_", "w35_", etc.
+static const std::array<std::string, 8> WINDOW_SUFFIXES = []() {
+    std::array<std::string, 8> arr;
+    for (size_t i = 0; i < STANDARD_WINDOWS.size(); ++i) {
+        arr[i] = "w" + std::to_string(STANDARD_WINDOWS[i]) + "_";
+    }
+    return arr;
+}();
+
+// Pre-computed timeframe prefixes: "5min_", "15min_", etc.
+static const std::array<std::string, NUM_TIMEFRAMES> TF_PREFIXES = []() {
+    std::array<std::string, NUM_TIMEFRAMES> arr;
+    for (int i = 0; i < NUM_TIMEFRAMES; ++i) {
+        arr[i] = std::string(timeframe_to_string(static_cast<Timeframe>(i))) + "_";
+    }
+    return arr;
+}();
+
+// Pre-computed window prefixes per timeframe: "5min_w20_", "5min_w35_", etc.
+// Layout: [tf_idx * 8 + window_idx]
+static const std::array<std::string, NUM_TIMEFRAMES * 8> TF_WINDOW_PREFIXES = []() {
+    std::array<std::string, NUM_TIMEFRAMES * 8> arr;
+    for (int tf_idx = 0; tf_idx < NUM_TIMEFRAMES; ++tf_idx) {
+        for (size_t win_idx = 0; win_idx < STANDARD_WINDOWS.size(); ++win_idx) {
+            arr[tf_idx * 8 + win_idx] = TF_PREFIXES[tf_idx] + WINDOW_SUFFIXES[win_idx];
+        }
+    }
+    return arr;
+}();
+
+// Helper to get window index in STANDARD_WINDOWS array
+static inline int get_window_index(int window) {
+    for (size_t i = 0; i < STANDARD_WINDOWS.size(); ++i) {
+        if (STANDARD_WINDOWS[i] == window) return static_cast<int>(i);
+    }
+    return 0;  // fallback
+}
+
+// Pre-computed window score feature keys: "window_20_valid", "window_20_score", etc.
+static const std::array<std::string, 8> WINDOW_VALID_KEYS = []() {
+    std::array<std::string, 8> arr;
+    for (size_t i = 0; i < STANDARD_WINDOWS.size(); ++i) {
+        arr[i] = "window_" + std::to_string(STANDARD_WINDOWS[i]) + "_valid";
+    }
+    return arr;
+}();
+
+static const std::array<std::string, 8> WINDOW_SCORE_KEYS = []() {
+    std::array<std::string, 8> arr;
+    for (size_t i = 0; i < STANDARD_WINDOWS.size(); ++i) {
+        arr[i] = "window_" + std::to_string(STANDARD_WINDOWS[i]) + "_score";
+    }
+    return arr;
+}();
+
+// =============================================================================
 // MAIN EXTRACTION FUNCTION
 // =============================================================================
 
@@ -197,8 +256,10 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
             std::unordered_map<std::string, double> spy_channel_feats_agg;
             int valid_window_count = 0;
 
-            for (int window : STANDARD_WINDOWS) {
-                std::string window_prefix = tf_prefix + "w" + std::to_string(window) + "_";
+            for (size_t win_idx = 0; win_idx < STANDARD_WINDOWS.size(); ++win_idx) {
+                int window = STANDARD_WINDOWS[win_idx];
+                // Use pre-computed prefix instead of string concatenation
+                const std::string& window_prefix = TF_WINDOW_PREFIXES[tf_idx * 8 + win_idx];
 
                 // TSLA channel features (58)
                 // For now, using default channel - in production, would use detected channel
@@ -436,8 +497,10 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
             std::unordered_map<std::string, double> spy_channel_feats_agg;
             int valid_window_count = 0;
 
-            for (int window : STANDARD_WINDOWS) {
-                std::string window_prefix = tf_prefix + "w" + std::to_string(window) + "_";
+            for (size_t win_idx = 0; win_idx < STANDARD_WINDOWS.size(); ++win_idx) {
+                int window = STANDARD_WINDOWS[win_idx];
+                // Use pre-computed prefix instead of string concatenation
+                const std::string& window_prefix = TF_WINDOW_PREFIXES[tf_idx * 8 + win_idx];
 
                 Channel tsla_channel;
                 auto tsla_channel_feats = extract_channel_features(tsla_channel, tsla_tf);
@@ -555,6 +618,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_event_features
 // =============================================================================
 
 // Helper to convert SlimLabeledChannel to Channel for feature extraction
+// NOTE: This copies the touches vector - use extract_channel_features_slim() for zero-copy
 static Channel slim_to_channel(const SlimLabeledChannel& slim) {
     Channel ch;
     ch.valid = slim.channel_valid;
@@ -584,6 +648,1234 @@ static Channel slim_to_channel(const SlimLabeledChannel& slim) {
     ch.tail_count = slim.tail_count;
 
     return ch;
+}
+
+// =============================================================================
+// SLIM CHANNEL FEATURE EXTRACTION (ZERO-COPY)
+// Computes missing fields from available data instead of copying
+// =============================================================================
+
+// Compute derived channel metrics from touches (used for features not stored in SlimLabeledChannel)
+struct SlimDerivedMetrics {
+    double width_pct = 0.0;
+    int complete_cycles = 0;
+    int upper_touches = 0;
+    int lower_touches = 0;
+    double alternation_ratio = 0.0;
+    double quality_score = 0.0;
+};
+
+static SlimDerivedMetrics compute_slim_derived_metrics(const SlimLabeledChannel& slim) {
+    SlimDerivedMetrics m;
+
+    // Compute width_pct from cached line values
+    if (slim.tail_count > 0 && slim.last_lower_val > 0) {
+        double width = slim.last_upper_val - slim.last_lower_val;
+        double mid_price = (slim.last_upper_val + slim.last_lower_val) / 2.0;
+        if (mid_price > 0) {
+            m.width_pct = (width / mid_price) * 100.0;
+        }
+    }
+
+    // Compute touch metrics from touches vector
+    const auto& touches = slim.touches;
+    if (!touches.empty()) {
+        int last_boundary = -1;  // -1=none, 0=lower, 1=upper
+        int alternations = 0;
+
+        for (const auto& touch : touches) {
+            if (touch.touch_type == TouchType::UPPER) {
+                m.upper_touches++;
+                if (last_boundary == 0) alternations++;
+                last_boundary = 1;
+            } else if (touch.touch_type == TouchType::LOWER) {
+                m.lower_touches++;
+                if (last_boundary == 1) alternations++;
+                last_boundary = 0;
+            }
+        }
+
+        int total_touches = m.upper_touches + m.lower_touches;
+        if (total_touches > 1) {
+            m.alternation_ratio = static_cast<double>(alternations) / (total_touches - 1);
+        }
+
+        // Complete cycles = min(upper_touches, lower_touches)
+        m.complete_cycles = std::min(m.upper_touches, m.lower_touches);
+    }
+
+    // Compute quality score from available metrics
+    double r_sq = slim.channel_r_squared;
+    double bounce_factor = std::min(1.0, slim.channel_bounce_count / 4.0);
+    m.quality_score = r_sq * 0.5 + bounce_factor * 0.3 + m.alternation_ratio * 0.2;
+
+    return m;
+}
+
+// =============================================================================
+// SLIM FEATURE EXTRACTION IMPLEMENTATIONS (ZERO-COPY)
+// These work directly with SlimLabeledChannel, avoiding the touches vector copy
+// =============================================================================
+
+// Helper to get default channel features (58 features with default values)
+// Forward declaration - defined later in FeatureExtractor class
+static std::unordered_map<std::string, double> get_default_channel_features();
+
+// Extract channel features directly from SlimLabeledChannel (ZERO-COPY)
+static std::unordered_map<std::string, double> extract_channel_features_slim(
+    const SlimLabeledChannel& slim,
+    const std::vector<OHLCV>& data
+) {
+    // Pre-reserve for 58 channel features
+    std::unordered_map<std::string, double> features;
+    features.reserve(64);
+
+    // Extract OHLCV arrays from data
+    std::vector<double> close, high, low;
+    close.reserve(data.size());
+    high.reserve(data.size());
+    low.reserve(data.size());
+    for (const auto& bar : data) {
+        close.push_back(bar.close);
+        high.push_back(bar.high);
+        low.push_back(bar.low);
+    }
+
+    int n = static_cast<int>(close.size());
+    int window = slim.channel_window > 0 ? slim.channel_window : 50;
+
+    // Compute derived metrics from touches (ZERO-COPY - accesses slim.touches by reference)
+    auto derived = compute_slim_derived_metrics(slim);
+
+    // Access touches by const reference (ZERO-COPY)
+    const std::vector<Touch>& touches = slim.touches;
+
+    // Helper lambdas
+    auto safe_float = [](double v, double def) { return std::isfinite(v) ? v : def; };
+    auto safe_divide = [](double num, double denom, double def) {
+        if (denom == 0.0 || !std::isfinite(num) || !std::isfinite(denom)) return def;
+        double result = num / denom;
+        return std::isfinite(result) ? result : def;
+    };
+
+    // 1. channel_valid
+    features["channel_valid"] = slim.channel_valid ? 1.0 : 0.0;
+
+    // 2. channel_direction
+    features["channel_direction"] = safe_float(static_cast<double>(slim.channel_direction), 1.0);
+
+    // 3. channel_slope
+    double slope = slim.channel_slope;
+    features["channel_slope"] = safe_float(slope, 0.0);
+
+    // 4. channel_slope_normalized
+    double avg_price = 1.0;
+    if (!close.empty()) {
+        double sum = 0.0;
+        for (double c : close) sum += c;
+        avg_price = sum / close.size();
+        if (!std::isfinite(avg_price) || avg_price == 0.0) avg_price = 1.0;
+    }
+    features["channel_slope_normalized"] = safe_divide(slope, avg_price, 0.0);
+
+    // 5. channel_intercept
+    features["channel_intercept"] = safe_float(slim.channel_intercept, 0.0);
+
+    // 6. channel_r_squared
+    double r_squared = safe_float(slim.channel_r_squared, 0.0);
+    features["channel_r_squared"] = r_squared;
+
+    // 7. channel_width_pct (from derived metrics)
+    features["channel_width_pct"] = safe_float(derived.width_pct, 0.0);
+
+    // 8. channel_width_atr_ratio
+    double channel_width_atr_ratio = 0.0;
+    if (n >= 14 && slim.tail_count > 0) {
+        // Compute ATR
+        std::vector<double> tr_values;
+        tr_values.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            double tr = high[i] - low[i];
+            if (i > 0) {
+                tr = std::max(tr, std::abs(high[i] - close[i-1]));
+                tr = std::max(tr, std::abs(low[i] - close[i-1]));
+            }
+            tr_values.push_back(tr);
+        }
+        // Simple ATR (SMA of TR)
+        double atr_sum = 0.0;
+        int atr_start = std::max(0, n - 14);
+        for (int i = atr_start; i < n; ++i) atr_sum += tr_values[i];
+        double current_atr = atr_sum / std::min(14, n - atr_start);
+        if (current_atr <= 0.0) current_atr = 1.0;
+
+        double channel_width = safe_float(slim.last_upper_val - slim.last_lower_val, 0.0);
+        channel_width_atr_ratio = safe_divide(channel_width, current_atr, 0.0);
+    }
+    features["channel_width_atr_ratio"] = channel_width_atr_ratio;
+
+    // 9. bounce_count
+    double bounce_count = safe_float(static_cast<double>(slim.channel_bounce_count), 0.0);
+    features["bounce_count"] = bounce_count;
+
+    // 10. complete_cycles (from derived)
+    features["complete_cycles"] = safe_float(static_cast<double>(derived.complete_cycles), 0.0);
+
+    // 11. upper_touches (from derived)
+    features["upper_touches"] = safe_float(static_cast<double>(derived.upper_touches), 0.0);
+
+    // 12. lower_touches (from derived)
+    features["lower_touches"] = safe_float(static_cast<double>(derived.lower_touches), 0.0);
+
+    // 13. alternation_ratio (from derived)
+    features["alternation_ratio"] = safe_float(derived.alternation_ratio, 0.0);
+
+    // 14. quality_score (from derived)
+    features["quality_score"] = safe_float(derived.quality_score, 0.0);
+
+    // 15. channel_age_bars
+    features["channel_age_bars"] = safe_float(static_cast<double>(window), 50.0);
+
+    // 16. channel_trend_strength
+    features["channel_trend_strength"] = safe_float(slope * r_squared, 0.0);
+
+    // 17-19. bars_since_* features
+    double bars_since_last = static_cast<double>(window);
+    double bars_since_upper = static_cast<double>(window);
+    double bars_since_lower = static_cast<double>(window);
+
+    if (!touches.empty()) {
+        int last_touch_bar = touches.back().bar_index;
+        bars_since_last = safe_float(static_cast<double>(window - 1 - last_touch_bar), static_cast<double>(window));
+        if (bars_since_last < 0) bars_since_last = 0;
+
+        for (auto it = touches.rbegin(); it != touches.rend(); ++it) {
+            int bar_idx = it->bar_index;
+            double bars_since = static_cast<double>(window - 1 - bar_idx);
+            if (bars_since < 0) bars_since = 0;
+
+            if (it->touch_type == TouchType::UPPER && bars_since_upper == static_cast<double>(window)) {
+                bars_since_upper = bars_since;
+            } else if (it->touch_type == TouchType::LOWER && bars_since_lower == static_cast<double>(window)) {
+                bars_since_lower = bars_since;
+            }
+            if (bars_since_upper < static_cast<double>(window) && bars_since_lower < static_cast<double>(window)) {
+                break;
+            }
+        }
+    }
+    features["bars_since_last_touch"] = bars_since_last;
+    features["bars_since_upper_touch"] = bars_since_upper;
+    features["bars_since_lower_touch"] = bars_since_lower;
+
+    // 20. touch_velocity
+    features["touch_velocity"] = safe_divide(bounce_count, static_cast<double>(window), 0.0);
+
+    // 21. last_touch_type
+    double last_touch_type = 0.0;
+    if (!touches.empty()) {
+        last_touch_type = touches.back().touch_type == TouchType::UPPER ? 1.0 : 0.0;
+    }
+    features["last_touch_type"] = last_touch_type;
+
+    // 22. consecutive_same_touches
+    int consecutive = 0;
+    if (!touches.empty()) {
+        TouchType last_type = touches.back().touch_type;
+        consecutive = 1;
+        for (int i = static_cast<int>(touches.size()) - 2; i >= 0; --i) {
+            if (touches[i].touch_type == last_type) consecutive++;
+            else break;
+        }
+    }
+    features["consecutive_same_touches"] = safe_float(static_cast<double>(consecutive), 0.0);
+
+    // 23. channel_maturity (bounces / window)
+    features["channel_maturity"] = safe_divide(bounce_count, static_cast<double>(window), 0.0);
+
+    // 24. position_in_channel (0=floor, 1=ceiling)
+    double position = 0.5;
+    if (!close.empty() && slim.tail_count > 0) {
+        double current_close = close.back();
+        double upper_val = slim.last_upper_val;
+        double lower_val = slim.last_lower_val;
+        double range = upper_val - lower_val;
+        if (range > 0.0) {
+            position = safe_divide(current_close - lower_val, range, 0.5);
+            // NOTE: Do NOT clamp - ML needs to learn from values outside [0,1]
+        }
+    }
+    features["position_in_channel"] = position;
+
+    // 25. distance_to_upper_pct
+    double distance_to_upper_pct = 0.0;
+    if (!close.empty() && slim.tail_count > 0) {
+        double current_close = close.back();
+        double upper_val = slim.last_upper_val;
+        if (current_close > 0.0) {
+            distance_to_upper_pct = safe_divide(upper_val - current_close, current_close, 0.0) * 100.0;
+        }
+    }
+    features["distance_to_upper_pct"] = distance_to_upper_pct;
+
+    // 26. distance_to_lower_pct
+    double distance_to_lower_pct = 0.0;
+    if (!close.empty() && slim.tail_count > 0) {
+        double current_close = close.back();
+        double lower_val = slim.last_lower_val;
+        if (current_close > 0.0) {
+            distance_to_lower_pct = safe_divide(current_close - lower_val, current_close, 0.0) * 100.0;
+        }
+    }
+    features["distance_to_lower_pct"] = distance_to_lower_pct;
+
+    // 27. price_vs_channel_midpoint
+    double price_vs_midpoint = 0.0;
+    if (!close.empty() && slim.tail_count > 0) {
+        double current_price = close.back();
+        double center_price = slim.last_center_val;
+        if (!std::isfinite(center_price) || center_price == 0.0) center_price = current_price;
+        price_vs_midpoint = safe_divide(current_price - center_price, center_price, 0.0) * 100.0;
+    }
+    features["price_vs_channel_midpoint"] = price_vs_midpoint;
+
+    // 28. channel_momentum (slope change - estimated from regression)
+    double channel_momentum = 0.0;
+    if (!close.empty() && n >= 10) {
+        int half_window = n / 2;
+        if (n - half_window >= 5) {
+            std::vector<double> close_half(close.begin() + half_window, close.end());
+            int m = static_cast<int>(close_half.size());
+            double sum_x = 0.0, sum_y = 0.0, sum_xy = 0.0, sum_x2 = 0.0;
+            for (int i = 0; i < m; ++i) {
+                sum_x += i;
+                sum_y += close_half[i];
+                sum_xy += i * close_half[i];
+                sum_x2 += i * i;
+            }
+            double denom = m * sum_x2 - sum_x * sum_x;
+            if (std::abs(denom) > 1e-10) {
+                double slope_half = (m * sum_xy - sum_x * sum_y) / denom;
+                channel_momentum = safe_float(slope - slope_half, 0.0);
+            }
+        }
+    }
+    features["channel_momentum"] = channel_momentum;
+
+    // 29. upper_line_slope
+    double upper_line_slope = 0.0;
+    if (slim.tail_count > 0 && slim.channel_window >= 2) {
+        upper_line_slope = safe_divide(
+            slim.last_upper_val - slim.first_upper_val,
+            static_cast<double>(slim.channel_window - 1),
+            0.0
+        );
+    }
+    features["upper_line_slope"] = upper_line_slope;
+
+    // 30. lower_line_slope
+    double lower_line_slope = 0.0;
+    if (slim.tail_count > 0 && slim.channel_window >= 2) {
+        lower_line_slope = safe_divide(
+            slim.last_lower_val - slim.first_lower_val,
+            static_cast<double>(slim.channel_window - 1),
+            0.0
+        );
+    }
+    features["lower_line_slope"] = lower_line_slope;
+
+    // 31. channel_expanding (1 if width increasing)
+    double channel_expanding = 0.0;
+    if (slim.tail_count > 0 && slim.channel_window >= 10) {
+        double width_start = slim.first_upper_val - slim.first_lower_val;
+        double width_end = slim.last_upper_val - slim.last_lower_val;
+        if (width_end > width_start * 1.05) {
+            channel_expanding = 1.0;
+        }
+    }
+    features["channel_expanding"] = channel_expanding;
+
+    // 32. channel_contracting (1 if width decreasing)
+    double channel_contracting = 0.0;
+    if (slim.tail_count > 0 && slim.channel_window >= 10) {
+        double width_start = slim.first_upper_val - slim.first_lower_val;
+        double width_end = slim.last_upper_val - slim.last_lower_val;
+        if (width_end < width_start * 0.95) {
+            channel_contracting = 1.0;
+        }
+    }
+    features["channel_contracting"] = channel_contracting;
+
+    // 33. std_dev_ratio (std_dev / avg_price)
+    double std_dev = safe_float(slim.channel_std_dev, 0.0);
+    features["std_dev_ratio"] = safe_divide(std_dev, avg_price, 0.0);
+
+    // 34. breakout_pressure_up
+    double breakout_pressure_up = 0.0;
+    if (!high.empty() && slim.tail_count > 0 && n >= 5) {
+        int start_idx = std::max(0, n - slim.tail_count);
+        int count = std::min(slim.tail_count, n - start_idx);
+        std::vector<double> distances_to_upper;
+        for (int i = 0; i < count; ++i) {
+            int h_idx = start_idx + i;
+            if (h_idx < n && i < 5) {
+                double h = high[h_idx];
+                double u = slim.upper_line_tail[i];
+                if (u > 0) {
+                    double dist = safe_divide(u - h, u, 0.0);
+                    distances_to_upper.push_back(std::max(0.0, dist));
+                }
+            }
+        }
+        if (!distances_to_upper.empty()) {
+            double avg_dist = 0.0;
+            for (double d : distances_to_upper) avg_dist += d;
+            avg_dist /= distances_to_upper.size();
+            breakout_pressure_up = safe_float(1.0 - avg_dist, 0.0);
+        }
+    }
+    features["breakout_pressure_up"] = breakout_pressure_up;
+
+    // 35. breakout_pressure_down
+    double breakout_pressure_down = 0.0;
+    if (!low.empty() && slim.tail_count > 0 && n >= 5) {
+        int start_idx = std::max(0, n - slim.tail_count);
+        int count = std::min(slim.tail_count, n - start_idx);
+        std::vector<double> distances_to_lower;
+        for (int i = 0; i < count; ++i) {
+            int l_idx = start_idx + i;
+            if (l_idx < n && i < 5) {
+                double l = low[l_idx];
+                double lb = slim.lower_line_tail[i];
+                if (l > 0) {
+                    double dist = safe_divide(l - lb, l, 0.0);
+                    distances_to_lower.push_back(std::max(0.0, dist));
+                }
+            }
+        }
+        if (!distances_to_lower.empty()) {
+            double avg_dist = 0.0;
+            for (double d : distances_to_lower) avg_dist += d;
+            avg_dist /= distances_to_lower.size();
+            breakout_pressure_down = safe_float(1.0 - avg_dist, 0.0);
+        }
+    }
+    features["breakout_pressure_down"] = breakout_pressure_down;
+
+    // 36. channel_symmetry (how balanced are upper/lower touches)
+    double upper_touches = static_cast<double>(derived.upper_touches);
+    double lower_touches = static_cast<double>(derived.lower_touches);
+    double channel_symmetry = 0.0;
+    double total_touches = upper_touches + lower_touches;
+    if (total_touches > 0) {
+        double min_touches = std::min(upper_touches, lower_touches);
+        double max_touches = std::max(upper_touches, lower_touches);
+        channel_symmetry = safe_divide(min_touches, max_touches, 0.0);
+    }
+    features["channel_symmetry"] = channel_symmetry;
+
+    // 37. touch_regularity (std dev of intervals between touches)
+    double touch_regularity = 0.0;
+    if (touches.size() >= 3) {
+        std::vector<int> intervals;
+        for (size_t i = 1; i < touches.size(); ++i) {
+            int interval = touches[i].bar_index - touches[i-1].bar_index;
+            intervals.push_back(interval);
+        }
+        if (!intervals.empty()) {
+            double sum = 0.0;
+            for (int intv : intervals) sum += intv;
+            double avg_interval = sum / intervals.size();
+            double sum_sq = 0.0;
+            for (int intv : intervals) {
+                double diff = intv - avg_interval;
+                sum_sq += diff * diff;
+            }
+            double std_interval = std::sqrt(sum_sq / intervals.size());
+            double regularity = 1.0 - safe_divide(std_interval, avg_interval + 1.0, 0.0);
+            touch_regularity = safe_float(std::max(0.0, regularity), 0.0);
+        }
+    }
+    features["touch_regularity"] = touch_regularity;
+
+    // 38. recent_touch_bias (bias toward upper or lower in recent touches)
+    double recent_touch_bias = 0.0;
+    if (touches.size() >= 3) {
+        int num_recent = std::min(5, static_cast<int>(touches.size()));
+        int recent_upper = 0;
+        int recent_lower = 0;
+        for (int i = static_cast<int>(touches.size()) - num_recent; i < static_cast<int>(touches.size()); ++i) {
+            if (touches[i].touch_type == TouchType::UPPER) recent_upper++;
+            else recent_lower++;
+        }
+        recent_touch_bias = safe_divide(
+            static_cast<double>(recent_upper - recent_lower),
+            static_cast<double>(num_recent),
+            0.0
+        );
+    }
+    features["recent_touch_bias"] = recent_touch_bias;
+
+    // 39. channel_curvature (non-linearity measure)
+    double channel_curvature = 0.0;
+    if (!close.empty() && n >= 10) {
+        if (n >= 4) {
+            int half = n / 2;
+            double sum_x1 = 0.0, sum_y1 = 0.0, sum_xy1 = 0.0, sum_x2_1 = 0.0;
+            for (int i = 0; i < half; ++i) {
+                sum_x1 += i;
+                sum_y1 += close[i];
+                sum_xy1 += i * close[i];
+                sum_x2_1 += i * i;
+            }
+            double denom1 = half * sum_x2_1 - sum_x1 * sum_x1;
+            double slope1 = 0.0;
+            if (std::abs(denom1) > 1e-10) {
+                slope1 = (half * sum_xy1 - sum_x1 * sum_y1) / denom1;
+            }
+            double sum_x2h = 0.0, sum_y2 = 0.0, sum_xy2 = 0.0, sum_x2_2 = 0.0;
+            int len2 = n - half;
+            for (int i = half; i < n; ++i) {
+                int j = i - half;
+                sum_x2h += j;
+                sum_y2 += close[i];
+                sum_xy2 += j * close[i];
+                sum_x2_2 += j * j;
+            }
+            double denom2 = len2 * sum_x2_2 - sum_x2h * sum_x2h;
+            double slope2 = 0.0;
+            if (std::abs(denom2) > 1e-10) {
+                slope2 = (len2 * sum_xy2 - sum_x2h * sum_y2) / denom2;
+            }
+            double curvature = slope2 - slope1;
+            channel_curvature = safe_divide(curvature, avg_price, 0.0) * 1000.0;
+        }
+    }
+    features["channel_curvature"] = channel_curvature;
+
+    // 40. parallel_score (how parallel are upper and lower lines)
+    double parallel_score = 0.5;
+    double avg_slope = safe_divide(upper_line_slope + lower_line_slope, 2.0, 0.0);
+    if (avg_slope != 0.0) {
+        double slope_diff = std::abs(upper_line_slope - lower_line_slope);
+        parallel_score = safe_float(
+            1.0 - safe_divide(slope_diff, std::abs(avg_slope) + 0.0001, 0.0),
+            0.5
+        );
+    } else {
+        parallel_score = (upper_line_slope == lower_line_slope) ? 1.0 : 0.5;
+    }
+    features["parallel_score"] = parallel_score;
+
+    // 41. touch_density (touches per unit channel width)
+    double width_pct = derived.width_pct;
+    features["touch_density"] = safe_divide(total_touches, width_pct + 1.0, 0.0);
+
+    // 42. bounce_efficiency (complete_cycles / total touches)
+    double complete_cycles = static_cast<double>(derived.complete_cycles);
+    features["bounce_efficiency"] = safe_divide(complete_cycles, total_touches + 1.0, 0.0);
+
+    // 43. channel_stability (r_squared * alternation_ratio)
+    double alt_ratio = derived.alternation_ratio;
+    features["channel_stability"] = safe_float(r_squared * alt_ratio, 0.0);
+
+    // 44. momentum_direction_alignment (1 if momentum matches direction)
+    double momentum_dir_align = 0.5;
+    double dir_val = static_cast<double>(slim.channel_direction);
+    if (dir_val == 2.0) {  // Bull
+        momentum_dir_align = (channel_momentum > 0) ? 1.0 : 0.0;
+    } else if (dir_val == 0.0) {  // Bear
+        momentum_dir_align = (channel_momentum < 0) ? 1.0 : 0.0;
+    } else {  // Sideways
+        momentum_dir_align = (std::abs(channel_momentum) < 0.01) ? 1.0 : 0.5;
+    }
+    features["momentum_direction_alignment"] = momentum_dir_align;
+
+    // 45. price_position_extreme (how close to boundaries)
+    features["price_position_extreme"] = safe_float(std::abs(position - 0.5) * 2.0, 0.0);
+
+    // 46. breakout_imminence (combined pressure score)
+    features["breakout_imminence"] = safe_float(std::max(breakout_pressure_up, breakout_pressure_down), 0.0);
+
+    // 47. breakout_direction_bias (positive = up, negative = down)
+    features["breakout_direction_bias"] = safe_float(breakout_pressure_up - breakout_pressure_down, 0.0);
+
+    // 48. channel_health_score (composite quality metric)
+    double health = (
+        (slim.channel_valid ? 1.0 : 0.0) * 0.2 +
+        features["channel_stability"] * 0.3 +
+        parallel_score * 0.2 +
+        touch_regularity * 0.15 +
+        channel_symmetry * 0.15
+    );
+    features["channel_health_score"] = safe_float(health, 0.0);
+
+    // 49. time_weighted_position (position weighted by time since last touch)
+    double time_factor = safe_divide(bars_since_last, static_cast<double>(window), 1.0);
+    features["time_weighted_position"] = safe_float(position * (1.0 - time_factor), 0.0);
+
+    // 50. volatility_adjusted_width (width relative to recent volatility)
+    if (channel_width_atr_ratio > 0) {
+        features["volatility_adjusted_width"] = safe_float(channel_width_atr_ratio / 4.0, 1.0);
+    } else {
+        features["volatility_adjusted_width"] = 1.0;
+    }
+
+    // 51-58. Excursion Features (price going OUTSIDE the channel)
+    double intercept = slim.channel_intercept;
+    int excursions_above = 0;
+    int excursions_below = 0;
+    double max_excursion_above = 0.0;
+    double max_excursion_below = 0.0;
+    int last_excursion_bar = -1;
+    double last_excursion_dir = 0.5;
+    std::vector<int> excursion_durations;
+    bool in_excursion = false;
+    int current_excursion_start = -1;
+
+    if (!close.empty() && std_dev > 0) {
+        for (int i = 0; i < n; ++i) {
+            double center_at_i = slope * i + intercept;
+            double upper_at_i = center_at_i + 2.0 * std_dev;
+            double lower_at_i = center_at_i - 2.0 * std_dev;
+            double close_i = close[i];
+
+            if (close_i > upper_at_i) {
+                excursions_above++;
+                last_excursion_bar = i;
+                last_excursion_dir = 1.0;
+                if (upper_at_i > 0) {
+                    double excursion_pct = safe_divide(close_i - upper_at_i, upper_at_i, 0.0) * 100.0;
+                    max_excursion_above = std::max(max_excursion_above, excursion_pct);
+                }
+                if (!in_excursion) {
+                    in_excursion = true;
+                    current_excursion_start = i;
+                }
+            } else if (close_i < lower_at_i) {
+                excursions_below++;
+                last_excursion_bar = i;
+                last_excursion_dir = 0.0;
+                if (lower_at_i > 0) {
+                    double excursion_pct = safe_divide(lower_at_i - close_i, lower_at_i, 0.0) * 100.0;
+                    max_excursion_below = std::max(max_excursion_below, excursion_pct);
+                }
+                if (!in_excursion) {
+                    in_excursion = true;
+                    current_excursion_start = i;
+                }
+            } else {
+                if (in_excursion) {
+                    int duration = i - current_excursion_start;
+                    excursion_durations.push_back(duration);
+                    in_excursion = false;
+                    current_excursion_start = -1;
+                }
+            }
+        }
+        if (in_excursion && current_excursion_start >= 0) {
+            int duration = n - current_excursion_start;
+            excursion_durations.push_back(duration);
+        }
+    }
+
+    // 51. excursions_above_upper
+    features["excursions_above_upper"] = safe_float(static_cast<double>(excursions_above), 0.0);
+
+    // 52. excursions_below_lower
+    features["excursions_below_lower"] = safe_float(static_cast<double>(excursions_below), 0.0);
+
+    // 53. max_excursion_above_pct
+    features["max_excursion_above_pct"] = safe_float(max_excursion_above, 0.0);
+
+    // 54. max_excursion_below_pct
+    features["max_excursion_below_pct"] = safe_float(max_excursion_below, 0.0);
+
+    // 55. bars_since_last_excursion
+    double bars_since_excursion = static_cast<double>(window);
+    if (last_excursion_bar >= 0 && n > 0) {
+        bars_since_excursion = static_cast<double>(n - 1 - last_excursion_bar);
+    }
+    features["bars_since_last_excursion"] = safe_float(bars_since_excursion, static_cast<double>(window));
+
+    // 56. excursion_return_speed_avg
+    double avg_return_speed = 0.0;
+    if (!excursion_durations.empty()) {
+        double sum = 0.0;
+        for (int d : excursion_durations) sum += d;
+        avg_return_speed = sum / excursion_durations.size();
+    }
+    features["excursion_return_speed_avg"] = safe_float(avg_return_speed, 0.0);
+
+    // 57. excursion_rate
+    int total_excursions = excursions_above + excursions_below;
+    features["excursion_rate"] = n > 0 ? safe_divide(static_cast<double>(total_excursions), static_cast<double>(n), 0.0) : 0.0;
+
+    // 58. last_excursion_direction
+    features["last_excursion_direction"] = safe_float(last_excursion_dir, 0.5);
+
+    return features;
+}
+
+// Extract SPY channel features directly from SlimLabeledChannel (ZERO-COPY)
+static std::unordered_map<std::string, double> extract_spy_channel_features_slim(
+    const SlimLabeledChannel& slim,
+    const std::vector<OHLCV>& spy_data,
+    int window_param
+) {
+    // Pre-reserve for 58 SPY channel features
+    std::unordered_map<std::string, double> features;
+    features.reserve(64);
+
+    // Extract OHLCV arrays
+    std::vector<double> close, high, low;
+    close.reserve(spy_data.size());
+    high.reserve(spy_data.size());
+    low.reserve(spy_data.size());
+    for (const auto& bar : spy_data) {
+        close.push_back(bar.close);
+        high.push_back(bar.high);
+        low.push_back(bar.low);
+    }
+
+    int n = static_cast<int>(close.size());
+    int window = slim.channel_window > 0 ? slim.channel_window : window_param;
+
+    // Compute derived metrics
+    auto derived = compute_slim_derived_metrics(slim);
+
+    // Access touches by const reference
+    const std::vector<Touch>& touches = slim.touches;
+
+    // Helper lambdas
+    auto safe_float = [](double v, double def) { return std::isfinite(v) ? v : def; };
+    auto safe_divide = [](double num, double denom, double def) {
+        if (denom == 0.0 || !std::isfinite(num) || !std::isfinite(denom)) return def;
+        double result = num / denom;
+        return std::isfinite(result) ? result : def;
+    };
+
+    // SPY features with "spy_" prefix
+    features["spy_channel_valid"] = slim.channel_valid ? 1.0 : 0.0;
+    features["spy_channel_direction"] = safe_float(static_cast<double>(slim.channel_direction), 1.0);
+    features["spy_channel_slope"] = safe_float(slim.channel_slope, 0.0);
+
+    double avg_price = 1.0;
+    if (!close.empty()) {
+        double sum = 0.0;
+        for (double c : close) sum += c;
+        avg_price = sum / close.size();
+        if (!std::isfinite(avg_price) || avg_price == 0.0) avg_price = 1.0;
+    }
+    features["spy_channel_slope_normalized"] = safe_divide(slim.channel_slope, avg_price, 0.0);
+
+    features["spy_channel_intercept"] = safe_float(slim.channel_intercept, 0.0);
+    double r_squared = safe_float(slim.channel_r_squared, 0.0);
+    features["spy_channel_r_squared"] = r_squared;
+    features["spy_channel_width_pct"] = safe_float(derived.width_pct, 0.0);
+
+    // ATR ratio
+    double channel_width_atr_ratio = 0.0;
+    if (n >= 14 && slim.tail_count > 0) {
+        std::vector<double> tr_values;
+        tr_values.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            double tr = high[i] - low[i];
+            if (i > 0) {
+                tr = std::max(tr, std::abs(high[i] - close[i-1]));
+                tr = std::max(tr, std::abs(low[i] - close[i-1]));
+            }
+            tr_values.push_back(tr);
+        }
+        double atr_sum = 0.0;
+        int atr_start = std::max(0, n - 14);
+        for (int i = atr_start; i < n; ++i) atr_sum += tr_values[i];
+        double current_atr = atr_sum / std::min(14, n - atr_start);
+        if (current_atr <= 0.0) current_atr = 1.0;
+        double channel_width = safe_float(slim.last_upper_val - slim.last_lower_val, 0.0);
+        channel_width_atr_ratio = safe_divide(channel_width, current_atr, 0.0);
+    }
+    features["spy_channel_width_atr_ratio"] = channel_width_atr_ratio;
+
+    features["spy_bounce_count"] = safe_float(static_cast<double>(slim.channel_bounce_count), 0.0);
+    features["spy_complete_cycles"] = safe_float(static_cast<double>(derived.complete_cycles), 0.0);
+    features["spy_upper_touches"] = safe_float(static_cast<double>(derived.upper_touches), 0.0);
+    features["spy_lower_touches"] = safe_float(static_cast<double>(derived.lower_touches), 0.0);
+    features["spy_alternation_ratio"] = safe_float(derived.alternation_ratio, 0.0);
+    features["spy_quality_score"] = safe_float(derived.quality_score, 0.0);
+    features["spy_channel_age_bars"] = safe_float(static_cast<double>(window), 50.0);
+    features["spy_channel_trend_strength"] = safe_float(slim.channel_slope * r_squared, 0.0);
+
+    // Touch timing features
+    double bars_since_last = static_cast<double>(window);
+    double bars_since_upper = static_cast<double>(window);
+    double bars_since_lower = static_cast<double>(window);
+
+    if (!touches.empty()) {
+        int last_touch_bar = touches.back().bar_index;
+        bars_since_last = safe_float(static_cast<double>(window - 1 - last_touch_bar), static_cast<double>(window));
+        if (bars_since_last < 0) bars_since_last = 0;
+
+        for (auto it = touches.rbegin(); it != touches.rend(); ++it) {
+            int bar_idx = it->bar_index;
+            double bars_since = static_cast<double>(window - 1 - bar_idx);
+            if (bars_since < 0) bars_since = 0;
+            if (it->touch_type == TouchType::UPPER && bars_since_upper == static_cast<double>(window)) {
+                bars_since_upper = bars_since;
+            } else if (it->touch_type == TouchType::LOWER && bars_since_lower == static_cast<double>(window)) {
+                bars_since_lower = bars_since;
+            }
+            if (bars_since_upper < static_cast<double>(window) && bars_since_lower < static_cast<double>(window)) {
+                break;
+            }
+        }
+    }
+    features["spy_bars_since_last_touch"] = bars_since_last;
+    features["spy_bars_since_upper_touch"] = bars_since_upper;
+    features["spy_bars_since_lower_touch"] = bars_since_lower;
+    features["spy_touch_velocity"] = safe_divide(static_cast<double>(slim.channel_bounce_count), static_cast<double>(window), 0.0);
+
+    double last_touch_type = 0.0;
+    if (!touches.empty()) {
+        last_touch_type = touches.back().touch_type == TouchType::UPPER ? 1.0 : 0.0;
+    }
+    features["spy_last_touch_type"] = last_touch_type;
+
+    int consecutive = 0;
+    if (!touches.empty()) {
+        TouchType last_type = touches.back().touch_type;
+        consecutive = 1;
+        for (int i = static_cast<int>(touches.size()) - 2; i >= 0; --i) {
+            if (touches[i].touch_type == last_type) consecutive++;
+            else break;
+        }
+    }
+    features["spy_consecutive_same_touches"] = safe_float(static_cast<double>(consecutive), 0.0);
+
+    // 23. channel_maturity (bounces / window)
+    features["spy_channel_maturity"] = safe_divide(static_cast<double>(slim.channel_bounce_count), static_cast<double>(window), 0.0);
+
+    // 24. Position in channel
+    double position = 0.5;
+    if (slim.tail_count > 0 && !close.empty()) {
+        double current_price = close.back();
+        double upper = slim.last_upper_val;
+        double lower = slim.last_lower_val;
+        double channel_height = upper - lower;
+        if (channel_height > 0) {
+            position = (current_price - lower) / channel_height;
+        }
+    }
+    features["spy_position_in_channel"] = safe_float(position, 0.5);
+
+    // 25. distance_to_upper_pct
+    double distance_to_upper_pct = 0.0;
+    if (!close.empty() && slim.tail_count > 0) {
+        double current_close = close.back();
+        double upper_val = slim.last_upper_val;
+        if (current_close > 0.0) {
+            distance_to_upper_pct = safe_divide(upper_val - current_close, current_close, 0.0) * 100.0;
+        }
+    }
+    features["spy_distance_to_upper_pct"] = distance_to_upper_pct;
+
+    // 26. distance_to_lower_pct
+    double distance_to_lower_pct = 0.0;
+    if (!close.empty() && slim.tail_count > 0) {
+        double current_close = close.back();
+        double lower_val = slim.last_lower_val;
+        if (current_close > 0.0) {
+            distance_to_lower_pct = safe_divide(current_close - lower_val, current_close, 0.0) * 100.0;
+        }
+    }
+    features["spy_distance_to_lower_pct"] = distance_to_lower_pct;
+
+    // 27. price_vs_channel_midpoint
+    double price_vs_midpoint = 0.0;
+    if (!close.empty() && slim.tail_count > 0) {
+        double current_price = close.back();
+        double center_price = slim.last_center_val;
+        if (!std::isfinite(center_price) || center_price == 0.0) center_price = current_price;
+        price_vs_midpoint = safe_divide(current_price - center_price, center_price, 0.0) * 100.0;
+    }
+    features["spy_price_vs_channel_midpoint"] = price_vs_midpoint;
+
+    // 28. channel_momentum (slope change - estimated from regression)
+    double channel_momentum = 0.0;
+    if (!close.empty() && n >= 10) {
+        int half_window = n / 2;
+        if (n - half_window >= 5) {
+            std::vector<double> close_half(close.begin() + half_window, close.end());
+            int m = static_cast<int>(close_half.size());
+            double sum_x = 0.0, sum_y = 0.0, sum_xy = 0.0, sum_x2 = 0.0;
+            for (int i = 0; i < m; ++i) {
+                sum_x += i;
+                sum_y += close_half[i];
+                sum_xy += i * close_half[i];
+                sum_x2 += i * i;
+            }
+            double denom = m * sum_x2 - sum_x * sum_x;
+            if (std::abs(denom) > 1e-10) {
+                double slope_half = (m * sum_xy - sum_x * sum_y) / denom;
+                channel_momentum = safe_float(slim.channel_slope - slope_half, 0.0);
+            }
+        }
+    }
+    features["spy_channel_momentum"] = channel_momentum;
+
+    // 29. upper_line_slope
+    double upper_line_slope = 0.0;
+    if (slim.tail_count > 0 && slim.channel_window >= 2) {
+        upper_line_slope = safe_divide(
+            slim.last_upper_val - slim.first_upper_val,
+            static_cast<double>(slim.channel_window - 1),
+            0.0
+        );
+    }
+    features["spy_upper_line_slope"] = upper_line_slope;
+
+    // 30. lower_line_slope
+    double lower_line_slope = 0.0;
+    if (slim.tail_count > 0 && slim.channel_window >= 2) {
+        lower_line_slope = safe_divide(
+            slim.last_lower_val - slim.first_lower_val,
+            static_cast<double>(slim.channel_window - 1),
+            0.0
+        );
+    }
+    features["spy_lower_line_slope"] = lower_line_slope;
+
+    // 31. channel_expanding (1 if width increasing)
+    double channel_expanding = 0.0;
+    if (slim.tail_count > 0 && slim.channel_window >= 10) {
+        double width_start = slim.first_upper_val - slim.first_lower_val;
+        double width_end = slim.last_upper_val - slim.last_lower_val;
+        if (width_end > width_start * 1.05) {
+            channel_expanding = 1.0;
+        }
+    }
+    features["spy_channel_expanding"] = channel_expanding;
+
+    // 32. channel_contracting (1 if width decreasing)
+    double channel_contracting = 0.0;
+    if (slim.tail_count > 0 && slim.channel_window >= 10) {
+        double width_start = slim.first_upper_val - slim.first_lower_val;
+        double width_end = slim.last_upper_val - slim.last_lower_val;
+        if (width_end < width_start * 0.95) {
+            channel_contracting = 1.0;
+        }
+    }
+    features["spy_channel_contracting"] = channel_contracting;
+
+    // 33. std_dev_ratio (std_dev / avg_price)
+    double std_dev = safe_float(slim.channel_std_dev, 0.0);
+    features["spy_std_dev_ratio"] = safe_divide(std_dev, avg_price, 0.0);
+
+    // 34. breakout_pressure_up
+    double breakout_pressure_up = 0.0;
+    if (!high.empty() && slim.tail_count > 0 && n >= 5) {
+        int start_idx = std::max(0, n - slim.tail_count);
+        int count = std::min(slim.tail_count, n - start_idx);
+        std::vector<double> distances_to_upper;
+        for (int i = 0; i < count; ++i) {
+            int h_idx = start_idx + i;
+            if (h_idx < n && i < 5) {
+                double h = high[h_idx];
+                double u = slim.upper_line_tail[i];
+                if (u > 0) {
+                    double dist = safe_divide(u - h, u, 0.0);
+                    distances_to_upper.push_back(std::max(0.0, dist));
+                }
+            }
+        }
+        if (!distances_to_upper.empty()) {
+            double avg_dist = 0.0;
+            for (double d : distances_to_upper) avg_dist += d;
+            avg_dist /= distances_to_upper.size();
+            breakout_pressure_up = safe_float(1.0 - avg_dist, 0.0);
+        }
+    }
+    features["spy_breakout_pressure_up"] = breakout_pressure_up;
+
+    // 35. breakout_pressure_down
+    double breakout_pressure_down = 0.0;
+    if (!low.empty() && slim.tail_count > 0 && n >= 5) {
+        int start_idx = std::max(0, n - slim.tail_count);
+        int count = std::min(slim.tail_count, n - start_idx);
+        std::vector<double> distances_to_lower;
+        for (int i = 0; i < count; ++i) {
+            int l_idx = start_idx + i;
+            if (l_idx < n && i < 5) {
+                double l = low[l_idx];
+                double lb = slim.lower_line_tail[i];
+                if (l > 0) {
+                    double dist = safe_divide(l - lb, l, 0.0);
+                    distances_to_lower.push_back(std::max(0.0, dist));
+                }
+            }
+        }
+        if (!distances_to_lower.empty()) {
+            double avg_dist = 0.0;
+            for (double d : distances_to_lower) avg_dist += d;
+            avg_dist /= distances_to_lower.size();
+            breakout_pressure_down = safe_float(1.0 - avg_dist, 0.0);
+        }
+    }
+    features["spy_breakout_pressure_down"] = breakout_pressure_down;
+
+    // 36. channel_symmetry (how balanced are upper/lower touches)
+    double upper_touches_d = static_cast<double>(derived.upper_touches);
+    double lower_touches_d = static_cast<double>(derived.lower_touches);
+    double channel_symmetry = 0.0;
+    double total_touches = upper_touches_d + lower_touches_d;
+    if (total_touches > 0) {
+        double min_touches = std::min(upper_touches_d, lower_touches_d);
+        double max_touches = std::max(upper_touches_d, lower_touches_d);
+        channel_symmetry = safe_divide(min_touches, max_touches, 0.0);
+    }
+    features["spy_channel_symmetry"] = channel_symmetry;
+
+    // 37. touch_regularity (std dev of intervals between touches)
+    double touch_regularity = 0.0;
+    if (touches.size() >= 3) {
+        std::vector<int> intervals;
+        for (size_t i = 1; i < touches.size(); ++i) {
+            int interval = touches[i].bar_index - touches[i-1].bar_index;
+            intervals.push_back(interval);
+        }
+        if (!intervals.empty()) {
+            double sum = 0.0;
+            for (int intv : intervals) sum += intv;
+            double avg_interval = sum / intervals.size();
+            double sum_sq = 0.0;
+            for (int intv : intervals) {
+                double diff = intv - avg_interval;
+                sum_sq += diff * diff;
+            }
+            double std_interval = std::sqrt(sum_sq / intervals.size());
+            double regularity = 1.0 - safe_divide(std_interval, avg_interval + 1.0, 0.0);
+            touch_regularity = safe_float(std::max(0.0, regularity), 0.0);
+        }
+    }
+    features["spy_touch_regularity"] = touch_regularity;
+
+    // 38. recent_touch_bias (bias toward upper or lower in recent touches)
+    double recent_touch_bias = 0.0;
+    if (touches.size() >= 3) {
+        int num_recent = std::min(5, static_cast<int>(touches.size()));
+        int recent_upper = 0;
+        int recent_lower = 0;
+        for (int i = static_cast<int>(touches.size()) - num_recent; i < static_cast<int>(touches.size()); ++i) {
+            if (touches[i].touch_type == TouchType::UPPER) recent_upper++;
+            else recent_lower++;
+        }
+        recent_touch_bias = safe_divide(
+            static_cast<double>(recent_upper - recent_lower),
+            static_cast<double>(num_recent),
+            0.0
+        );
+    }
+    features["spy_recent_touch_bias"] = recent_touch_bias;
+
+    // 39. channel_curvature (non-linearity measure)
+    double channel_curvature = 0.0;
+    if (!close.empty() && n >= 10) {
+        if (n >= 4) {
+            int half = n / 2;
+            double sum_x1 = 0.0, sum_y1 = 0.0, sum_xy1 = 0.0, sum_x2_1 = 0.0;
+            for (int i = 0; i < half; ++i) {
+                sum_x1 += i;
+                sum_y1 += close[i];
+                sum_xy1 += i * close[i];
+                sum_x2_1 += i * i;
+            }
+            double denom1 = half * sum_x2_1 - sum_x1 * sum_x1;
+            double slope1 = 0.0;
+            if (std::abs(denom1) > 1e-10) {
+                slope1 = (half * sum_xy1 - sum_x1 * sum_y1) / denom1;
+            }
+            double sum_x2h = 0.0, sum_y2 = 0.0, sum_xy2 = 0.0, sum_x2_2 = 0.0;
+            int len2 = n - half;
+            for (int i = half; i < n; ++i) {
+                int j = i - half;
+                sum_x2h += j;
+                sum_y2 += close[i];
+                sum_xy2 += j * close[i];
+                sum_x2_2 += j * j;
+            }
+            double denom2 = len2 * sum_x2_2 - sum_x2h * sum_x2h;
+            double slope2 = 0.0;
+            if (std::abs(denom2) > 1e-10) {
+                slope2 = (len2 * sum_xy2 - sum_x2h * sum_y2) / denom2;
+            }
+            double curvature = slope2 - slope1;
+            channel_curvature = safe_divide(curvature, avg_price, 0.0) * 1000.0;
+        }
+    }
+    features["spy_channel_curvature"] = channel_curvature;
+
+    // 40. parallel_score (how parallel are upper and lower lines)
+    double parallel_score = 0.5;
+    double avg_slope = safe_divide(upper_line_slope + lower_line_slope, 2.0, 0.0);
+    if (avg_slope != 0.0) {
+        double slope_diff = std::abs(upper_line_slope - lower_line_slope);
+        parallel_score = safe_float(
+            1.0 - safe_divide(slope_diff, std::abs(avg_slope) + 0.0001, 0.0),
+            0.5
+        );
+    } else {
+        parallel_score = (upper_line_slope == lower_line_slope) ? 1.0 : 0.5;
+    }
+    features["spy_parallel_score"] = parallel_score;
+
+    // 41. touch_density (touches per unit channel width)
+    double width_pct = derived.width_pct;
+    features["spy_touch_density"] = safe_divide(total_touches, width_pct + 1.0, 0.0);
+
+    // 42. bounce_efficiency (complete_cycles / total touches)
+    double complete_cycles = static_cast<double>(derived.complete_cycles);
+    features["spy_bounce_efficiency"] = safe_divide(complete_cycles, total_touches + 1.0, 0.0);
+
+    // 43. channel_stability (r_squared * alternation_ratio)
+    double alt_ratio = derived.alternation_ratio;
+    features["spy_channel_stability"] = safe_float(r_squared * alt_ratio, 0.0);
+
+    // 44. momentum_direction_alignment (1 if momentum matches direction)
+    double momentum_dir_align = 0.5;
+    double dir_val = static_cast<double>(slim.channel_direction);
+    if (dir_val == 2.0) {  // Bull
+        momentum_dir_align = (channel_momentum > 0) ? 1.0 : 0.0;
+    } else if (dir_val == 0.0) {  // Bear
+        momentum_dir_align = (channel_momentum < 0) ? 1.0 : 0.0;
+    } else {  // Sideways
+        momentum_dir_align = (std::abs(channel_momentum) < 0.01) ? 1.0 : 0.5;
+    }
+    features["spy_momentum_direction_alignment"] = momentum_dir_align;
+
+    // 45. price_position_extreme (how close to boundaries)
+    features["spy_price_position_extreme"] = safe_float(std::abs(position - 0.5) * 2.0, 0.0);
+
+    // 46. breakout_imminence (combined pressure score)
+    features["spy_breakout_imminence"] = safe_float(std::max(breakout_pressure_up, breakout_pressure_down), 0.0);
+
+    // 47. breakout_direction_bias (positive = up, negative = down)
+    features["spy_breakout_direction_bias"] = safe_float(breakout_pressure_up - breakout_pressure_down, 0.0);
+
+    // 48. channel_health_score (composite quality metric)
+    double health = (
+        (slim.channel_valid ? 1.0 : 0.0) * 0.2 +
+        features["spy_channel_stability"] * 0.3 +
+        parallel_score * 0.2 +
+        touch_regularity * 0.15 +
+        channel_symmetry * 0.15
+    );
+    features["spy_channel_health_score"] = safe_float(health, 0.0);
+
+    // 49. time_weighted_position (position weighted by time since last touch)
+    double time_factor = safe_divide(bars_since_last, static_cast<double>(window), 1.0);
+    features["spy_time_weighted_position"] = safe_float(position * (1.0 - time_factor), 0.0);
+
+    // 50. volatility_adjusted_width (width relative to recent volatility)
+    if (channel_width_atr_ratio > 0) {
+        features["spy_volatility_adjusted_width"] = safe_float(channel_width_atr_ratio / 4.0, 1.0);
+    } else {
+        features["spy_volatility_adjusted_width"] = 1.0;
+    }
+
+    // 51-58. Excursion Features (price going OUTSIDE the channel)
+    double intercept = slim.channel_intercept;
+    int excursions_above = 0;
+    int excursions_below = 0;
+    double max_excursion_above = 0.0;
+    double max_excursion_below = 0.0;
+    int last_excursion_bar = -1;
+    double last_excursion_dir = 0.5;
+    std::vector<int> excursion_durations;
+    bool in_excursion = false;
+    int current_excursion_start = -1;
+
+    if (!close.empty() && std_dev > 0) {
+        for (int i = 0; i < n; ++i) {
+            double center_at_i = slim.channel_slope * i + intercept;
+            double upper_at_i = center_at_i + 2.0 * std_dev;
+            double lower_at_i = center_at_i - 2.0 * std_dev;
+            double close_i = close[i];
+
+            if (close_i > upper_at_i) {
+                excursions_above++;
+                last_excursion_bar = i;
+                last_excursion_dir = 1.0;
+                if (upper_at_i > 0) {
+                    double excursion_pct = safe_divide(close_i - upper_at_i, upper_at_i, 0.0) * 100.0;
+                    max_excursion_above = std::max(max_excursion_above, excursion_pct);
+                }
+                if (!in_excursion) {
+                    in_excursion = true;
+                    current_excursion_start = i;
+                }
+            } else if (close_i < lower_at_i) {
+                excursions_below++;
+                last_excursion_bar = i;
+                last_excursion_dir = 0.0;
+                if (lower_at_i > 0) {
+                    double excursion_pct = safe_divide(lower_at_i - close_i, lower_at_i, 0.0) * 100.0;
+                    max_excursion_below = std::max(max_excursion_below, excursion_pct);
+                }
+                if (!in_excursion) {
+                    in_excursion = true;
+                    current_excursion_start = i;
+                }
+            } else {
+                if (in_excursion) {
+                    int duration = i - current_excursion_start;
+                    excursion_durations.push_back(duration);
+                    in_excursion = false;
+                    current_excursion_start = -1;
+                }
+            }
+        }
+        if (in_excursion && current_excursion_start >= 0) {
+            int duration = n - current_excursion_start;
+            excursion_durations.push_back(duration);
+        }
+    }
+
+    // 51. excursions_above_upper
+    features["spy_excursions_above_upper"] = safe_float(static_cast<double>(excursions_above), 0.0);
+
+    // 52. excursions_below_lower
+    features["spy_excursions_below_lower"] = safe_float(static_cast<double>(excursions_below), 0.0);
+
+    // 53. max_excursion_above_pct
+    features["spy_max_excursion_above_pct"] = safe_float(max_excursion_above, 0.0);
+
+    // 54. max_excursion_below_pct
+    features["spy_max_excursion_below_pct"] = safe_float(max_excursion_below, 0.0);
+
+    // 55. bars_since_last_excursion
+    double bars_since_excursion = static_cast<double>(window);
+    if (last_excursion_bar >= 0 && n > 0) {
+        bars_since_excursion = static_cast<double>(n - 1 - last_excursion_bar);
+    }
+    features["spy_bars_since_last_excursion"] = safe_float(bars_since_excursion, static_cast<double>(window));
+
+    // 56. excursion_return_speed_avg
+    double avg_return_speed = 0.0;
+    if (!excursion_durations.empty()) {
+        double sum = 0.0;
+        for (int d : excursion_durations) sum += d;
+        avg_return_speed = sum / excursion_durations.size();
+    }
+    features["spy_excursion_return_speed_avg"] = safe_float(avg_return_speed, 0.0);
+
+    // 57. excursion_rate
+    int total_excursions = excursions_above + excursions_below;
+    features["spy_excursion_rate"] = n > 0 ? safe_divide(static_cast<double>(total_excursions), static_cast<double>(n), 0.0) : 0.0;
+
+    // 58. last_excursion_direction
+    features["spy_last_excursion_direction"] = safe_float(last_excursion_dir, 0.5);
+
+    return features;
 }
 
 // Helper to find the channel that was active at a given timestamp
@@ -799,43 +2091,55 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
 
             // 7. Extract channel features for each window (58 TSLA + 58 SPY = 116 features x 8 windows = 928)
             // NOW USING REAL CHANNEL DATA FROM SLIM MAPS
+            // OPTIMIZED: Zero-copy feature extraction using SlimLabeledChannel directly
             std::unordered_map<std::string, double> tsla_channel_feats_agg;
             std::unordered_map<std::string, double> spy_channel_feats_agg;
             int valid_window_count = 0;
 
-            for (int window : STANDARD_WINDOWS) {
-                std::string window_prefix = tf_prefix + "w" + std::to_string(window) + "_";
+            // Cache for window score features (store SlimLabeledChannel pointers, not Channel copies)
+            std::unordered_map<int, const SlimLabeledChannel*> slim_channels_by_window;
 
-                // TSLA channel features (58) - using real channel from slim_map
-                Channel tsla_channel;
-                TFWindowKey tsla_key{tf_str, window};
-                auto tsla_it = tsla_slim_map.find(tsla_key);
+            for (size_t win_idx = 0; win_idx < STANDARD_WINDOWS.size(); ++win_idx) {
+                int window = STANDARD_WINDOWS[win_idx];
+                // Use pre-computed prefix instead of string concatenation
+                const std::string& window_prefix = TF_WINDOW_PREFIXES[tf_idx * 8 + win_idx];
+
+                // Build key once, reuse for both lookups
+                TFWindowKey key{tf_str, window};
+
+                // TSLA channel features (58) - ZERO-COPY using SlimLabeledChannel directly
+                std::unordered_map<std::string, double> tsla_channel_feats;
+                auto tsla_it = tsla_slim_map.find(key);
+                const SlimLabeledChannel* tsla_slim_ch = nullptr;
                 if (tsla_it != tsla_slim_map.end() && !tsla_it->second.empty()) {
                     // Find channel active at this timestamp using binary search
-                    const SlimLabeledChannel* slim_ch = find_channel_at_timestamp_slim(
-                        tsla_it->second, timestamp);
-                    if (slim_ch) {
-                        tsla_channel = slim_to_channel(*slim_ch);
-                    }
+                    tsla_slim_ch = find_channel_at_timestamp_slim(tsla_it->second, timestamp);
+                    // Cache the back() channel for window_score_features
+                    slim_channels_by_window[window] = &tsla_it->second.back();
                 }
-                auto tsla_channel_feats = extract_channel_features(tsla_channel, tsla_tf);
+                if (tsla_slim_ch && tsla_slim_ch->channel_valid) {
+                    tsla_channel_feats = extract_channel_features_slim(*tsla_slim_ch, tsla_tf);
+                } else {
+                    tsla_channel_feats = get_default_channel_features();
+                }
                 for (const auto& [name, value] : tsla_channel_feats) {
                     local_features[window_prefix + name] = value;
                 }
 
-                // SPY channel features (58) - using real channel from slim_map
-                Channel spy_channel;
-                TFWindowKey spy_key{tf_str, window};
-                auto spy_it = spy_slim_map.find(spy_key);
+                // SPY channel features (58) - ZERO-COPY using SlimLabeledChannel directly
+                std::unordered_map<std::string, double> spy_channel_feats;
+                auto spy_it = spy_slim_map.find(key);
+                const SlimLabeledChannel* spy_slim_ch = nullptr;
                 if (spy_it != spy_slim_map.end() && !spy_it->second.empty()) {
-                    // Find channel active at this timestamp using binary search
-                    const SlimLabeledChannel* slim_ch = find_channel_at_timestamp_slim(
-                        spy_it->second, timestamp);
-                    if (slim_ch) {
-                        spy_channel = slim_to_channel(*slim_ch);
-                    }
+                    spy_slim_ch = find_channel_at_timestamp_slim(spy_it->second, timestamp);
                 }
-                auto spy_channel_feats = extract_spy_channel_features(spy_channel, spy_tf, window);
+                if (spy_slim_ch && spy_slim_ch->channel_valid) {
+                    spy_channel_feats = extract_spy_channel_features_slim(*spy_slim_ch, spy_tf, window);
+                } else {
+                    // Get default SPY channel features
+                    Channel empty_channel;
+                    spy_channel_feats = extract_spy_channel_features(empty_channel, spy_tf, window);
+                }
                 for (const auto& [name, value] : spy_channel_feats) {
                     local_features[window_prefix + name] = value;
                 }
@@ -869,14 +2173,11 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
             }
 
             // 8. Extract window score features (50)
-            // Build channels_by_window from slim_map for this timeframe
+            // Convert slim channels to Channel for window_score_features (only 8 conversions per TF)
             std::unordered_map<int, std::shared_ptr<Channel>> channels_by_window;
-            for (int window : STANDARD_WINDOWS) {
-                TFWindowKey key{tf_str, window};
-                auto it = tsla_slim_map.find(key);
-                if (it != tsla_slim_map.end() && !it->second.empty()) {
-                    auto ch_ptr = std::make_shared<Channel>(slim_to_channel(it->second.back()));
-                    channels_by_window[window] = ch_ptr;
+            for (const auto& [window, slim_ptr] : slim_channels_by_window) {
+                if (slim_ptr && slim_ptr->channel_valid) {
+                    channels_by_window[window] = std::make_shared<Channel>(slim_to_channel(*slim_ptr));
                 }
             }
             auto window_scores = extract_window_score_features(channels_by_window, 50);
@@ -1289,8 +2590,27 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
     features["sma_20_vs_sma_50"] = pct_change(sma_20_val, sma_50_val);
     features["ma_spread"] = pct_change(sma_10_val, sma_50_val);
 
-    features["ma_converging"] = 0.0;
-    features["ma_diverging"] = 0.0;
+    // MA converging/diverging: check if spread between MAs is decreasing/increasing
+    double ma_spread_now = std::abs(sma_10_val - sma_50_val);
+    double ma_converging = 0.0;
+    double ma_diverging = 0.0;
+    if (n >= 10) {
+        // Get MA values from 5 bars ago to compare spread
+        auto sma_10_arr = sma(close, 10);
+        auto sma_50_arr = sma(close, 50);
+        if (sma_10_arr.size() >= 6 && sma_50_arr.size() >= 6) {
+            double sma_10_prev = sma_10_arr[sma_10_arr.size() - 6];
+            double sma_50_prev = sma_50_arr[sma_50_arr.size() - 6];
+            double ma_spread_prev = std::abs(sma_10_prev - sma_50_prev);
+            if (ma_spread_now < ma_spread_prev * 0.95) {
+                ma_converging = 1.0;
+            } else if (ma_spread_now > ma_spread_prev * 1.05) {
+                ma_diverging = 1.0;
+            }
+        }
+    }
+    features["ma_converging"] = ma_converging;
+    features["ma_diverging"] = ma_diverging;
 
     bool bullish_aligned = sma_10_val > sma_20_val && sma_20_val > sma_50_val;
     bool bearish_aligned = sma_10_val < sma_20_val && sma_20_val < sma_50_val;
@@ -1328,11 +2648,87 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
     features["rsi_14"] = get_last_valid(rsi_14_arr, 50.0);
     features["rsi_21"] = get_last_valid(rsi_21_arr, 50.0);
 
-    features["rsi_divergence"] = 0.0; // Simplified
+    // RSI divergence: detect when price makes new high/low but RSI doesn't
+    double rsi_divergence = 0.0;
+    if (n >= 20 && rsi_14_arr.size() >= 20) {
+        // Check last 20 bars for divergence
+        int lookback = std::min(20, n - 1);
+        double price_high = close[n - 1];
+        double price_low = close[n - 1];
+        double rsi_at_price_high = rsi_14_arr.back();
+        double rsi_at_price_low = rsi_14_arr.back();
+        int price_high_idx = n - 1;
+        int price_low_idx = n - 1;
 
-    // Stochastic
-    features["stochastic_k"] = 50.0; // Simplified
-    features["stochastic_d"] = 50.0; // Simplified
+        for (int i = n - lookback; i < n; ++i) {
+            if (close[i] > price_high) {
+                price_high = close[i];
+                price_high_idx = i;
+                if (i < static_cast<int>(rsi_14_arr.size())) {
+                    rsi_at_price_high = rsi_14_arr[i];
+                }
+            }
+            if (close[i] < price_low) {
+                price_low = close[i];
+                price_low_idx = i;
+                if (i < static_cast<int>(rsi_14_arr.size())) {
+                    rsi_at_price_low = rsi_14_arr[i];
+                }
+            }
+        }
+
+        double current_rsi = rsi_14_arr.back();
+        // Bearish divergence: price at/near high but RSI lower
+        if (close[n-1] >= price_high * 0.99 && current_rsi < rsi_at_price_high - 5.0) {
+            rsi_divergence = -1.0;  // Bearish
+        }
+        // Bullish divergence: price at/near low but RSI higher
+        else if (close[n-1] <= price_low * 1.01 && current_rsi > rsi_at_price_low + 5.0) {
+            rsi_divergence = 1.0;   // Bullish
+        }
+    }
+    features["rsi_divergence"] = rsi_divergence;
+
+    // Stochastic K and D: %K = (Close - LowestLow14) / (HighestHigh14 - LowestLow14) * 100
+    double stochastic_k = 50.0;
+    double stochastic_d = 50.0;
+    if (n >= 14) {
+        int stoch_period = 14;
+        int start_idx = n - stoch_period;
+        double highest_high = high[start_idx];
+        double lowest_low = low[start_idx];
+        for (int i = start_idx; i < n; ++i) {
+            if (high[i] > highest_high) highest_high = high[i];
+            if (low[i] < lowest_low) lowest_low = low[i];
+        }
+        double range = highest_high - lowest_low;
+        if (range > 0.0) {
+            stochastic_k = ((close[n-1] - lowest_low) / range) * 100.0;
+        }
+        // %D is 3-period SMA of %K - compute simple rolling
+        if (n >= 17) {  // Need 3 extra bars for %D
+            double k_sum = 0.0;
+            for (int j = 0; j < 3; ++j) {
+                int idx = n - 1 - j;
+                int s_idx = idx - stoch_period + 1;
+                if (s_idx < 0) s_idx = 0;
+                double hh = high[s_idx];
+                double ll = low[s_idx];
+                for (int i = s_idx; i <= idx; ++i) {
+                    if (high[i] > hh) hh = high[i];
+                    if (low[i] < ll) ll = low[i];
+                }
+                double r = hh - ll;
+                double k_val = (r > 0.0) ? ((close[idx] - ll) / r) * 100.0 : 50.0;
+                k_sum += k_val;
+            }
+            stochastic_d = k_sum / 3.0;
+        } else {
+            stochastic_d = stochastic_k;
+        }
+    }
+    features["stochastic_k"] = stochastic_k;
+    features["stochastic_d"] = stochastic_d;
 
     // Volatility (8)
     auto atr_arr = atr(high, low, close, 14);
@@ -1340,11 +2736,47 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
     features["atr_14"] = atr_14_val;
     features["atr_pct"] = safe_divide(atr_14_val, curr_close) * 100.0;
 
-    features["volatility_5"] = 0.0; // Would calculate std of returns
-    features["volatility_20"] = 0.0;
-    features["volatility_ratio"] = 1.0;
-    features["range_pct_5"] = 0.0;
-    features["range_pct_20"] = 0.0;
+    // Volatility: standard deviation of returns
+    auto calc_volatility = [&](int period) -> double {
+        if (n <= period) return 0.0;
+        std::vector<double> returns;
+        returns.reserve(period);
+        for (int i = n - period; i < n; ++i) {
+            if (close[i-1] > 0.0) {
+                returns.push_back((close[i] - close[i-1]) / close[i-1]);
+            }
+        }
+        if (returns.size() < 2) return 0.0;
+        double sum = 0.0;
+        for (double r : returns) sum += r;
+        double mean = sum / returns.size();
+        double sq_sum = 0.0;
+        for (double r : returns) {
+            double diff = r - mean;
+            sq_sum += diff * diff;
+        }
+        return std::sqrt(sq_sum / returns.size()) * 100.0;  // As percentage
+    };
+    double volatility_5 = calc_volatility(5);
+    double volatility_20 = calc_volatility(20);
+    features["volatility_5"] = volatility_5;
+    features["volatility_20"] = volatility_20;
+    features["volatility_ratio"] = (volatility_20 > 0.0) ? volatility_5 / volatility_20 : 1.0;
+
+    // Range: (highest high - lowest low) / close over period
+    auto calc_range_pct = [&](int period) -> double {
+        if (n < period) return 0.0;
+        int start_idx = n - period;
+        double hh = high[start_idx];
+        double ll = low[start_idx];
+        for (int i = start_idx; i < n; ++i) {
+            if (high[i] > hh) hh = high[i];
+            if (low[i] < ll) ll = low[i];
+        }
+        return (curr_close > 0.0) ? ((hh - ll) / curr_close) * 100.0 : 0.0;
+    };
+    features["range_pct_5"] = calc_range_pct(5);
+    features["range_pct_20"] = calc_range_pct(20);
 
     double atr_pct = features["atr_pct"];
     if (atr_pct < 1.5) {
@@ -1355,12 +2787,52 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_tsla_price_fea
         features["volatility_regime"] = 2.0;
     }
 
-    // Trend (5)
-    features["higher_highs_count"] = 0.0;
-    features["lower_lows_count"] = 0.0;
-    features["up_bars_ratio_10"] = 0.5;
-    features["consecutive_up"] = 0.0;
-    features["consecutive_down"] = 0.0;
+    // Trend features: count patterns in recent price action
+    int higher_highs_count = 0;
+    int lower_lows_count = 0;
+    if (n >= 10) {
+        for (int i = n - 9; i < n; ++i) {
+            if (high[i] > high[i-1]) higher_highs_count++;
+            if (low[i] < low[i-1]) lower_lows_count++;
+        }
+    }
+    features["higher_highs_count"] = static_cast<double>(higher_highs_count);
+    features["lower_lows_count"] = static_cast<double>(lower_lows_count);
+
+    // Up bars ratio: fraction of bars where close > open in last 10 bars
+    double up_bars_ratio_10 = 0.5;
+    if (n >= 10) {
+        int up_count = 0;
+        for (int i = n - 10; i < n; ++i) {
+            if (close[i] > open[i]) up_count++;
+        }
+        up_bars_ratio_10 = static_cast<double>(up_count) / 10.0;
+    }
+    features["up_bars_ratio_10"] = up_bars_ratio_10;
+
+    // Consecutive up/down: count of consecutive bars in same direction
+    int consecutive_up = 0;
+    int consecutive_down = 0;
+    if (n >= 2) {
+        // Count consecutive up bars from the end
+        for (int i = n - 1; i >= 1; --i) {
+            if (close[i] > close[i-1]) {
+                consecutive_up++;
+            } else {
+                break;
+            }
+        }
+        // Count consecutive down bars from the end
+        for (int i = n - 1; i >= 1; --i) {
+            if (close[i] < close[i-1]) {
+                consecutive_down++;
+            } else {
+                break;
+            }
+        }
+    }
+    features["consecutive_up"] = static_cast<double>(consecutive_up);
+    features["consecutive_down"] = static_cast<double>(consecutive_down);
 
     return features;
 }
@@ -1397,17 +2869,75 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_features(
     int n = static_cast<int>(close.size());
     double c = n > 0 ? close[n-1] : 0.0;
 
-    // Basic Price (10)
+    // Basic Price (10) - All properly calculated
     features["spy_close"] = c;
     features["spy_close_vs_open_pct"] = n > 0 ? pct_change(close[n-1], open[n-1]) : 0.0;
-    features["spy_high_low_range_pct"] = 0.0;
-    features["spy_close_vs_high_pct"] = 0.5;
-    features["spy_close_vs_low_pct"] = 0.5;
-    features["spy_body_pct"] = 0.0;
-    features["spy_gap_pct"] = 0.0;
-    features["spy_upper_shadow_pct"] = 0.0;
-    features["spy_lower_shadow_pct"] = 0.0;
-    features["spy_volume_vs_avg"] = 1.0;
+
+    // High-low range as percentage of close
+    double spy_high_low_range_pct = 0.0;
+    if (n > 0 && c > 0.0) {
+        spy_high_low_range_pct = ((high[n-1] - low[n-1]) / c) * 100.0;
+    }
+    features["spy_high_low_range_pct"] = spy_high_low_range_pct;
+
+    // Close position within high-low range (0 = at low, 1 = at high)
+    double spy_close_vs_high_pct = 0.5;
+    double spy_close_vs_low_pct = 0.5;
+    if (n > 0) {
+        double range = high[n-1] - low[n-1];
+        if (range > 0.0) {
+            spy_close_vs_low_pct = (close[n-1] - low[n-1]) / range;
+            spy_close_vs_high_pct = (high[n-1] - close[n-1]) / range;
+        }
+    }
+    features["spy_close_vs_high_pct"] = spy_close_vs_high_pct;
+    features["spy_close_vs_low_pct"] = spy_close_vs_low_pct;
+
+    // Body percentage: |close - open| / range
+    double spy_body_pct = 0.0;
+    if (n > 0) {
+        double range = high[n-1] - low[n-1];
+        if (range > 0.0) {
+            spy_body_pct = std::abs(close[n-1] - open[n-1]) / range;
+        }
+    }
+    features["spy_body_pct"] = spy_body_pct;
+
+    // Gap percentage: (open - previous close) / previous close
+    double spy_gap_pct = 0.0;
+    if (n >= 2 && close[n-2] > 0.0) {
+        spy_gap_pct = pct_change(open[n-1], close[n-2]);
+    }
+    features["spy_gap_pct"] = spy_gap_pct;
+
+    // Upper and lower shadow percentages
+    double spy_upper_shadow_pct = 0.0;
+    double spy_lower_shadow_pct = 0.0;
+    if (n > 0) {
+        double range = high[n-1] - low[n-1];
+        if (range > 0.0) {
+            double body_top = std::max(open[n-1], close[n-1]);
+            double body_bottom = std::min(open[n-1], close[n-1]);
+            spy_upper_shadow_pct = (high[n-1] - body_top) / range;
+            spy_lower_shadow_pct = (body_bottom - low[n-1]) / range;
+        }
+    }
+    features["spy_upper_shadow_pct"] = spy_upper_shadow_pct;
+    features["spy_lower_shadow_pct"] = spy_lower_shadow_pct;
+
+    // Volume vs average (20-period)
+    double spy_volume_vs_avg = 1.0;
+    if (n >= 20) {
+        double vol_sum = 0.0;
+        for (int i = n - 20; i < n; ++i) {
+            vol_sum += volume[i];
+        }
+        double avg_vol = vol_sum / 20.0;
+        if (avg_vol > 0.0) {
+            spy_volume_vs_avg = volume[n-1] / avg_vol;
+        }
+    }
+    features["spy_volume_vs_avg"] = spy_volume_vs_avg;
 
     // Moving Averages (10)
     auto sma_10_arr = sma(close, 10);
@@ -1427,58 +2957,414 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_features(
     features["spy_sma_10_vs_sma_20"] = pct_change(sma_10_val, sma_20_val);
     features["spy_sma_20_vs_sma_50"] = pct_change(sma_20_val, sma_50_val);
     features["spy_ma_spread"] = pct_change(sma_10_val, sma_50_val);
-    features["spy_trend_alignment"] = 0.0;
 
-    // Momentum (15)
+    // Trend alignment: 1 if bullish (sma10 > sma20 > sma50), -1 if bearish, 0 if mixed
+    double spy_trend_alignment = 0.0;
+    if (sma_10_val > sma_20_val && sma_20_val > sma_50_val) {
+        spy_trend_alignment = 1.0;  // Bullish alignment
+    } else if (sma_10_val < sma_20_val && sma_20_val < sma_50_val) {
+        spy_trend_alignment = -1.0;  // Bearish alignment
+    }
+    features["spy_trend_alignment"] = spy_trend_alignment;
+
+    // Momentum (15) - All properly calculated
+    auto rsi_5_arr = rsi(close, 5);
+    auto rsi_9_arr = rsi(close, 9);
     auto rsi_14_arr = rsi(close, 14);
-    features["spy_momentum_1"] = 0.0;
-    features["spy_momentum_3"] = 0.0;
-    features["spy_momentum_5"] = 0.0;
-    features["spy_momentum_10"] = 0.0;
-    features["spy_momentum_20"] = 0.0;
-    features["spy_acceleration"] = 0.0;
-    features["spy_rsi_5"] = 50.0;
-    features["spy_rsi_9"] = 50.0;
-    features["spy_rsi_14"] = get_last_valid(rsi_14_arr, 50.0);
-    features["spy_rsi_21"] = 50.0;
-    features["spy_stochastic_k"] = 50.0;
-    features["spy_stochastic_d"] = 50.0;
-    features["spy_williams_r"] = -50.0;
-    features["spy_rsi_divergence"] = 0.0;
-    features["spy_momentum_regime"] = 0.0;
+    auto rsi_21_arr = rsi(close, 21);
 
-    // Volatility (8)
+    // Momentum calculations: (close - close[n-period]) / close[n-period] * 100
+    auto calc_spy_momentum = [&](int period) -> double {
+        if (n <= period) return 0.0;
+        double prev_close = close[n - period - 1];
+        if (prev_close > 0.0) {
+            return pct_change(c, prev_close);
+        }
+        return 0.0;
+    };
+
+    features["spy_momentum_1"] = calc_spy_momentum(1);
+    features["spy_momentum_3"] = calc_spy_momentum(3);
+    features["spy_momentum_5"] = calc_spy_momentum(5);
+    features["spy_momentum_10"] = calc_spy_momentum(10);
+    features["spy_momentum_20"] = calc_spy_momentum(20);
+
+    // Acceleration: change in momentum (momentum now - momentum 5 bars ago)
+    double spy_acceleration = 0.0;
+    if (n > 10) {
+        double mom_5_now = calc_spy_momentum(5);
+        double close_5_ago = close[n-6];
+        double close_10_ago = close[n-11];
+        if (close_10_ago > 0.0) {
+            double mom_5_prev = pct_change(close_5_ago, close_10_ago);
+            spy_acceleration = mom_5_now - mom_5_prev;
+        }
+    }
+    features["spy_acceleration"] = spy_acceleration;
+
+    features["spy_rsi_5"] = get_last_valid(rsi_5_arr, 50.0);
+    features["spy_rsi_9"] = get_last_valid(rsi_9_arr, 50.0);
+    features["spy_rsi_14"] = get_last_valid(rsi_14_arr, 50.0);
+    features["spy_rsi_21"] = get_last_valid(rsi_21_arr, 50.0);
+
+    // Stochastic K and D
+    double spy_stochastic_k = 50.0;
+    double spy_stochastic_d = 50.0;
+    if (n >= 14) {
+        int stoch_period = 14;
+        int start_idx = n - stoch_period;
+        double highest_high = high[start_idx];
+        double lowest_low = low[start_idx];
+        for (int i = start_idx; i < n; ++i) {
+            if (high[i] > highest_high) highest_high = high[i];
+            if (low[i] < lowest_low) lowest_low = low[i];
+        }
+        double range = highest_high - lowest_low;
+        if (range > 0.0) {
+            spy_stochastic_k = ((close[n-1] - lowest_low) / range) * 100.0;
+        }
+        // %D is 3-period SMA of %K
+        if (n >= 17) {
+            double k_sum = 0.0;
+            for (int j = 0; j < 3; ++j) {
+                int idx = n - 1 - j;
+                int s_idx = idx - stoch_period + 1;
+                if (s_idx < 0) s_idx = 0;
+                double hh = high[s_idx];
+                double ll = low[s_idx];
+                for (int i = s_idx; i <= idx; ++i) {
+                    if (high[i] > hh) hh = high[i];
+                    if (low[i] < ll) ll = low[i];
+                }
+                double r = hh - ll;
+                double k_val = (r > 0.0) ? ((close[idx] - ll) / r) * 100.0 : 50.0;
+                k_sum += k_val;
+            }
+            spy_stochastic_d = k_sum / 3.0;
+        } else {
+            spy_stochastic_d = spy_stochastic_k;
+        }
+    }
+    features["spy_stochastic_k"] = spy_stochastic_k;
+    features["spy_stochastic_d"] = spy_stochastic_d;
+
+    // Williams %R: (HighestHigh - Close) / (HighestHigh - LowestLow) * -100
+    double spy_williams_r = -50.0;
+    if (n >= 14) {
+        int start_idx = n - 14;
+        double highest_high = high[start_idx];
+        double lowest_low = low[start_idx];
+        for (int i = start_idx; i < n; ++i) {
+            if (high[i] > highest_high) highest_high = high[i];
+            if (low[i] < lowest_low) lowest_low = low[i];
+        }
+        double range = highest_high - lowest_low;
+        if (range > 0.0) {
+            spy_williams_r = ((highest_high - close[n-1]) / range) * -100.0;
+        }
+    }
+    features["spy_williams_r"] = spy_williams_r;
+
+    // RSI divergence detection
+    double spy_rsi_divergence = 0.0;
+    if (n >= 20 && rsi_14_arr.size() >= 20) {
+        int lookback = std::min(20, n - 1);
+        double price_high = close[n - 1];
+        double rsi_at_price_high = rsi_14_arr.back();
+
+        for (int i = n - lookback; i < n; ++i) {
+            if (close[i] > price_high && i < static_cast<int>(rsi_14_arr.size())) {
+                price_high = close[i];
+                rsi_at_price_high = rsi_14_arr[i];
+            }
+        }
+
+        double current_rsi = rsi_14_arr.back();
+        if (close[n-1] >= price_high * 0.99 && current_rsi < rsi_at_price_high - 5.0) {
+            spy_rsi_divergence = -1.0;  // Bearish
+        } else if (close[n-1] <= price_high * 1.01 && current_rsi > rsi_at_price_high + 5.0) {
+            spy_rsi_divergence = 1.0;   // Bullish
+        }
+    }
+    features["spy_rsi_divergence"] = spy_rsi_divergence;
+
+    // Momentum regime: based on RSI and momentum
+    double spy_momentum_regime = 0.0;
+    double spy_rsi_val = features["spy_rsi_14"];
+    double spy_mom_5 = features["spy_momentum_5"];
+    if (spy_rsi_val > 70 && spy_mom_5 > 2.0) {
+        spy_momentum_regime = 2.0;  // Strong bullish
+    } else if (spy_rsi_val > 50 && spy_mom_5 > 0) {
+        spy_momentum_regime = 1.0;  // Mild bullish
+    } else if (spy_rsi_val < 30 && spy_mom_5 < -2.0) {
+        spy_momentum_regime = -2.0; // Strong bearish
+    } else if (spy_rsi_val < 50 && spy_mom_5 < 0) {
+        spy_momentum_regime = -1.0; // Mild bearish
+    }
+    features["spy_momentum_regime"] = spy_momentum_regime;
+
+    // Volatility (8) - All properly calculated
     auto atr_arr = atr(high, low, close, 14);
     double atr_14_val = get_last_valid(atr_arr, 0.0);
     features["spy_atr_14"] = atr_14_val;
-    features["spy_atr_pct"] = safe_divide(atr_14_val, c) * 100.0;
-    features["spy_volatility_5"] = 0.0;
-    features["spy_volatility_20"] = 0.0;
-    features["spy_volatility_ratio"] = 1.0;
-    features["spy_range_pct_5"] = 0.0;
-    features["spy_range_pct_20"] = 0.0;
-    features["spy_volatility_regime"] = 1.0;
+    double spy_atr_pct = safe_divide(atr_14_val, c) * 100.0;
+    features["spy_atr_pct"] = spy_atr_pct;
 
-    // Trend (7)
-    features["spy_higher_highs_count"] = 0.0;
-    features["spy_lower_lows_count"] = 0.0;
-    features["spy_up_bars_ratio_10"] = 0.5;
-    features["spy_consecutive_up"] = 0.0;
-    features["spy_consecutive_down"] = 0.0;
-    features["spy_trend_strength"] = 0.0;
-    features["spy_trend_direction"] = 0.0;
+    // Volatility: standard deviation of returns
+    auto calc_spy_volatility = [&](int period) -> double {
+        if (n <= period) return 0.0;
+        std::vector<double> returns;
+        returns.reserve(period);
+        for (int i = n - period; i < n; ++i) {
+            if (close[i-1] > 0.0) {
+                returns.push_back((close[i] - close[i-1]) / close[i-1]);
+            }
+        }
+        if (returns.size() < 2) return 0.0;
+        double sum = 0.0;
+        for (double r : returns) sum += r;
+        double mean = sum / returns.size();
+        double sq_sum = 0.0;
+        for (double r : returns) {
+            double diff = r - mean;
+            sq_sum += diff * diff;
+        }
+        return std::sqrt(sq_sum / returns.size()) * 100.0;
+    };
+    double spy_volatility_5 = calc_spy_volatility(5);
+    double spy_volatility_20 = calc_spy_volatility(20);
+    features["spy_volatility_5"] = spy_volatility_5;
+    features["spy_volatility_20"] = spy_volatility_20;
+    features["spy_volatility_ratio"] = (spy_volatility_20 > 0.0) ? spy_volatility_5 / spy_volatility_20 : 1.0;
 
-    // Market Regime (10)
-    features["spy_intraday_range_position"] = 0.5;
-    features["spy_open_gap_filled"] = 0.0;
-    features["spy_daily_range_expansion"] = 1.0;
-    features["spy_price_acceleration"] = 0.0;
-    features["spy_volume_price_trend"] = 0.0;
-    features["spy_buying_pressure"] = 0.5;
-    features["spy_roc_5"] = 0.0;
-    features["spy_roc_10"] = 0.0;
-    features["spy_efficiency_ratio"] = 0.0;
-    features["spy_choppiness_index"] = 50.0;
+    // Range percentage calculations
+    auto calc_spy_range_pct = [&](int period) -> double {
+        if (n < period) return 0.0;
+        int start_idx = n - period;
+        double hh = high[start_idx];
+        double ll = low[start_idx];
+        for (int i = start_idx; i < n; ++i) {
+            if (high[i] > hh) hh = high[i];
+            if (low[i] < ll) ll = low[i];
+        }
+        return (c > 0.0) ? ((hh - ll) / c) * 100.0 : 0.0;
+    };
+    features["spy_range_pct_5"] = calc_spy_range_pct(5);
+    features["spy_range_pct_20"] = calc_spy_range_pct(20);
+
+    // Volatility regime based on ATR%
+    double spy_volatility_regime = 1.0;
+    if (spy_atr_pct < 0.5) {
+        spy_volatility_regime = 0.0;  // Low volatility
+    } else if (spy_atr_pct < 1.0) {
+        spy_volatility_regime = 1.0;  // Normal
+    } else if (spy_atr_pct < 2.0) {
+        spy_volatility_regime = 2.0;  // Elevated
+    } else {
+        spy_volatility_regime = 3.0;  // High volatility
+    }
+    features["spy_volatility_regime"] = spy_volatility_regime;
+
+    // Trend (7) - All properly calculated
+    int spy_higher_highs_count = 0;
+    int spy_lower_lows_count = 0;
+    if (n >= 10) {
+        for (int i = n - 9; i < n; ++i) {
+            if (high[i] > high[i-1]) spy_higher_highs_count++;
+            if (low[i] < low[i-1]) spy_lower_lows_count++;
+        }
+    }
+    features["spy_higher_highs_count"] = static_cast<double>(spy_higher_highs_count);
+    features["spy_lower_lows_count"] = static_cast<double>(spy_lower_lows_count);
+
+    // Up bars ratio
+    double spy_up_bars_ratio_10 = 0.5;
+    if (n >= 10) {
+        int up_count = 0;
+        for (int i = n - 10; i < n; ++i) {
+            if (close[i] > open[i]) up_count++;
+        }
+        spy_up_bars_ratio_10 = static_cast<double>(up_count) / 10.0;
+    }
+    features["spy_up_bars_ratio_10"] = spy_up_bars_ratio_10;
+
+    // Consecutive up/down
+    int spy_consecutive_up = 0;
+    int spy_consecutive_down = 0;
+    if (n >= 2) {
+        for (int i = n - 1; i >= 1; --i) {
+            if (close[i] > close[i-1]) spy_consecutive_up++;
+            else break;
+        }
+        for (int i = n - 1; i >= 1; --i) {
+            if (close[i] < close[i-1]) spy_consecutive_down++;
+            else break;
+        }
+    }
+    features["spy_consecutive_up"] = static_cast<double>(spy_consecutive_up);
+    features["spy_consecutive_down"] = static_cast<double>(spy_consecutive_down);
+
+    // Trend strength: based on MA alignment and momentum
+    double spy_trend_strength = 0.0;
+    if (spy_trend_alignment != 0.0) {
+        // Strength is higher if momentum confirms direction
+        double mom_factor = std::abs(features["spy_momentum_10"]) / 5.0;  // Normalize
+        if (mom_factor > 1.0) mom_factor = 1.0;
+        spy_trend_strength = mom_factor * std::abs(spy_trend_alignment);
+    }
+    features["spy_trend_strength"] = spy_trend_strength;
+
+    // Trend direction: -1 bearish, 0 neutral, 1 bullish
+    double spy_trend_direction = 0.0;
+    if (sma_10_val > sma_20_val && features["spy_momentum_5"] > 0) {
+        spy_trend_direction = 1.0;
+    } else if (sma_10_val < sma_20_val && features["spy_momentum_5"] < 0) {
+        spy_trend_direction = -1.0;
+    }
+    features["spy_trend_direction"] = spy_trend_direction;
+
+    // Market Regime (10) - All properly calculated
+
+    // Intraday range position: where close sits within today's range
+    double spy_intraday_range_position = 0.5;
+    if (n > 0) {
+        double range = high[n-1] - low[n-1];
+        if (range > 0.0) {
+            spy_intraday_range_position = (close[n-1] - low[n-1]) / range;
+        }
+    }
+    features["spy_intraday_range_position"] = spy_intraday_range_position;
+
+    // Open gap filled: 1 if today's gap has been filled
+    double spy_open_gap_filled = 0.0;
+    if (n >= 2) {
+        double prev_close = close[n-2];
+        double today_open = open[n-1];
+        double today_low = low[n-1];
+        double today_high = high[n-1];
+        if (today_open > prev_close) {
+            // Gap up - filled if today's low touches prev close
+            if (today_low <= prev_close) spy_open_gap_filled = 1.0;
+        } else if (today_open < prev_close) {
+            // Gap down - filled if today's high touches prev close
+            if (today_high >= prev_close) spy_open_gap_filled = 1.0;
+        }
+    }
+    features["spy_open_gap_filled"] = spy_open_gap_filled;
+
+    // Daily range expansion: today's range vs average range
+    double spy_daily_range_expansion = 1.0;
+    if (n >= 20) {
+        double today_range = high[n-1] - low[n-1];
+        double avg_range = 0.0;
+        for (int i = n - 20; i < n - 1; ++i) {
+            avg_range += (high[i] - low[i]);
+        }
+        avg_range /= 19.0;
+        if (avg_range > 0.0) {
+            spy_daily_range_expansion = today_range / avg_range;
+        }
+    }
+    features["spy_daily_range_expansion"] = spy_daily_range_expansion;
+
+    // Price acceleration: second derivative of price
+    double spy_price_acceleration = 0.0;
+    if (n >= 10) {
+        double mom_now = features["spy_momentum_5"];
+        double close_5_ago = close[n-6];
+        double close_10_ago = close[n-11];
+        if (close_10_ago > 0.0) {
+            double mom_prev = pct_change(close_5_ago, close_10_ago);
+            spy_price_acceleration = mom_now - mom_prev;
+        }
+    }
+    features["spy_price_acceleration"] = spy_price_acceleration;
+
+    // Volume price trend: cumulative volume weighted by price direction
+    double spy_volume_price_trend = 0.0;
+    if (n >= 10) {
+        for (int i = n - 10; i < n; ++i) {
+            double price_change = close[i] - close[i-1];
+            double vol = volume[i];
+            if (close[i-1] > 0.0) {
+                double pct_chg = price_change / close[i-1];
+                spy_volume_price_trend += vol * pct_chg;
+            }
+        }
+        // Normalize by average volume
+        double avg_vol = 0.0;
+        for (int i = n - 10; i < n; ++i) avg_vol += volume[i];
+        avg_vol /= 10.0;
+        if (avg_vol > 0.0) {
+            spy_volume_price_trend /= avg_vol;
+        }
+    }
+    features["spy_volume_price_trend"] = spy_volume_price_trend;
+
+    // Buying pressure: based on close position and volume
+    double spy_buying_pressure = 0.5;
+    if (n > 0) {
+        double range = high[n-1] - low[n-1];
+        if (range > 0.0) {
+            // Close position in range (0-1)
+            double close_pos = (close[n-1] - low[n-1]) / range;
+            // Weight by volume relative to average
+            double vol_factor = (spy_volume_vs_avg > 0.0) ? std::min(2.0, spy_volume_vs_avg) / 2.0 : 0.5;
+            spy_buying_pressure = close_pos * (0.5 + vol_factor * 0.5);
+        }
+    }
+    features["spy_buying_pressure"] = spy_buying_pressure;
+
+    // Rate of Change (ROC)
+    auto calc_spy_roc = [&](int period) -> double {
+        if (n <= period) return 0.0;
+        double prev = close[n - period - 1];
+        if (prev > 0.0) {
+            return ((c - prev) / prev) * 100.0;
+        }
+        return 0.0;
+    };
+    features["spy_roc_5"] = calc_spy_roc(5);
+    features["spy_roc_10"] = calc_spy_roc(10);
+
+    // Efficiency ratio (Kaufman): direction / volatility
+    double spy_efficiency_ratio = 0.0;
+    if (n >= 10) {
+        double direction = std::abs(close[n-1] - close[n-11]);
+        double volatility = 0.0;
+        for (int i = n - 10; i < n; ++i) {
+            volatility += std::abs(close[i] - close[i-1]);
+        }
+        if (volatility > 0.0) {
+            spy_efficiency_ratio = direction / volatility;
+        }
+    }
+    features["spy_efficiency_ratio"] = spy_efficiency_ratio;
+
+    // Choppiness index: measure of market choppiness (0-100)
+    double spy_choppiness_index = 50.0;
+    if (n >= 14) {
+        double sum_tr = 0.0;
+        double highest_high = high[n-14];
+        double lowest_low = low[n-14];
+        for (int i = n - 14; i < n; ++i) {
+            double tr = high[i] - low[i];
+            if (i > n - 14) {
+                tr = std::max(tr, std::abs(high[i] - close[i-1]));
+                tr = std::max(tr, std::abs(low[i] - close[i-1]));
+            }
+            sum_tr += tr;
+            if (high[i] > highest_high) highest_high = high[i];
+            if (low[i] < lowest_low) lowest_low = low[i];
+        }
+        double range_14 = highest_high - lowest_low;
+        if (range_14 > 0.0 && sum_tr > 0.0) {
+            spy_choppiness_index = 100.0 * std::log10(sum_tr / range_14) / std::log10(14.0);
+            if (spy_choppiness_index < 0.0) spy_choppiness_index = 0.0;
+            if (spy_choppiness_index > 100.0) spy_choppiness_index = 100.0;
+        }
+    }
+    features["spy_choppiness_index"] = spy_choppiness_index;
 
     // Technical indicators (59) - reuse from TechnicalIndicators
     auto tech_features = TechnicalIndicators::extract_features(open, high, low, close, volume);
@@ -1537,15 +3423,34 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_vix_features(
 
     // Changes (4)
     int n = static_cast<int>(close.size());
-    features["vix_change_1d"] = n >= 2 ? pct_change(close[n-1], close[n-2]) : 0.0;
-    features["vix_change_5d"] = n >= 6 ? pct_change(close[n-1], close[n-6]) : 0.0;
-    features["vix_change_20d"] = n >= 21 ? pct_change(close[n-1], close[n-21]) : 0.0;
-    features["vix_acceleration"] = 0.0;
+    double vix_change_1d = n >= 2 ? pct_change(close[n-1], close[n-2]) : 0.0;
+    double vix_change_5d = n >= 6 ? pct_change(close[n-1], close[n-6]) : 0.0;
+    double vix_change_20d = n >= 21 ? pct_change(close[n-1], close[n-21]) : 0.0;
+    features["vix_change_1d"] = vix_change_1d;
+    features["vix_change_5d"] = vix_change_5d;
+    features["vix_change_20d"] = vix_change_20d;
 
-    // Percentiles (3)
-    features["vix_percentile_30d"] = 50.0;
-    features["vix_percentile_90d"] = 50.0;
-    features["vix_percentile_252d"] = 50.0;
+    // VIX acceleration: change in momentum (5d change now vs 5d change 5 bars ago)
+    double vix_acceleration = 0.0;
+    if (n >= 11) {
+        double change_5d_now = vix_change_5d;
+        double change_5d_prev = pct_change(close[n-6], close[n-11]);
+        vix_acceleration = change_5d_now - change_5d_prev;
+    }
+    features["vix_acceleration"] = vix_acceleration;
+
+    // Percentiles: rank current VIX relative to historical window
+    auto calc_percentile = [&](int period) -> double {
+        if (n < period) return 50.0;
+        int count_below = 0;
+        for (int i = n - period; i < n; ++i) {
+            if (close[i] < current_vix) count_below++;
+        }
+        return (static_cast<double>(count_below) / period) * 100.0;
+    };
+    features["vix_percentile_30d"] = calc_percentile(30);
+    features["vix_percentile_90d"] = calc_percentile(90);
+    features["vix_percentile_252d"] = calc_percentile(252);
 
     // Regime (4)
     if (current_vix < 15) {
@@ -1565,16 +3470,92 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_vix_features(
     // Technicals (5)
     auto rsi_arr = rsi(close, 14);
     features["vix_rsi"] = get_last_valid(rsi_arr, 50.0);
-    features["vix_bb_pct_b"] = 0.5;
-    features["vix_momentum_5"] = features["vix_change_5d"];
-    features["vix_momentum_10"] = 0.0;
-    features["vix_mean_reversion"] = 0.0;
+
+    // Bollinger Band %B: (price - lower) / (upper - lower)
+    double vix_bb_pct_b = 0.5;
+    if (n >= 20) {
+        // Calculate 20-period SMA and standard deviation
+        double sum = 0.0;
+        for (int i = n - 20; i < n; ++i) sum += close[i];
+        double bb_sma = sum / 20.0;
+        double sq_sum = 0.0;
+        for (int i = n - 20; i < n; ++i) {
+            double diff = close[i] - bb_sma;
+            sq_sum += diff * diff;
+        }
+        double bb_std = std::sqrt(sq_sum / 20.0);
+        double bb_upper = bb_sma + 2.0 * bb_std;
+        double bb_lower = bb_sma - 2.0 * bb_std;
+        double bb_range = bb_upper - bb_lower;
+        if (bb_range > 0.0) {
+            vix_bb_pct_b = (current_vix - bb_lower) / bb_range;
+        }
+    }
+    features["vix_bb_pct_b"] = vix_bb_pct_b;
+
+    features["vix_momentum_5"] = vix_change_5d;
+
+    // 10-period momentum
+    double vix_momentum_10 = 0.0;
+    if (n >= 11) {
+        vix_momentum_10 = pct_change(close[n-1], close[n-11]);
+    }
+    features["vix_momentum_10"] = vix_momentum_10;
+
+    // Mean reversion: distance from 20-SMA normalized by ATR-like measure
+    double vix_mean_reversion = 0.0;
+    if (n >= 20) {
+        double distance_from_sma = current_vix - sma_20_val;
+        // Calculate average true range of VIX (high-low doesn't make sense for VIX, use daily changes)
+        double avg_move = 0.0;
+        for (int i = n - 14; i < n; ++i) {
+            if (i > 0) {
+                avg_move += std::abs(close[i] - close[i-1]);
+            }
+        }
+        avg_move /= 14.0;
+        if (avg_move > 0.0) {
+            vix_mean_reversion = distance_from_sma / avg_move;
+        }
+    }
+    features["vix_mean_reversion"] = vix_mean_reversion;
 
     // Structure (4)
-    features["vix_5d_high"] = current_vix;
-    features["vix_5d_low"] = current_vix;
-    features["vix_range_5d"] = 0.0;
-    features["vix_volatility"] = 0.0;
+    double vix_5d_high = current_vix;
+    double vix_5d_low = current_vix;
+    if (n >= 5) {
+        for (int i = n - 5; i < n; ++i) {
+            if (close[i] > vix_5d_high) vix_5d_high = close[i];
+            if (close[i] < vix_5d_low) vix_5d_low = close[i];
+        }
+    }
+    features["vix_5d_high"] = vix_5d_high;
+    features["vix_5d_low"] = vix_5d_low;
+    features["vix_range_5d"] = vix_5d_high - vix_5d_low;
+
+    // VIX volatility: std dev of VIX changes
+    double vix_volatility = 0.0;
+    if (n >= 20) {
+        std::vector<double> changes;
+        changes.reserve(19);
+        for (int i = n - 19; i < n; ++i) {
+            if (close[i-1] > 0.0) {
+                changes.push_back((close[i] - close[i-1]) / close[i-1]);
+            }
+        }
+        if (changes.size() >= 2) {
+            double sum = 0.0;
+            for (double c : changes) sum += c;
+            double mean = sum / changes.size();
+            double sq_sum = 0.0;
+            for (double c : changes) {
+                double diff = c - mean;
+                sq_sum += diff * diff;
+            }
+            vix_volatility = std::sqrt(sq_sum / changes.size()) * 100.0;
+        }
+    }
+    features["vix_volatility"] = vix_volatility;
 
     return features;
 }
@@ -1636,9 +3617,41 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_cross_asset_fe
     features["spy_vix_corr_10"] = calculate_correlation(spy_close, vix_close, 10);
     features["spy_vix_corr_20"] = calculate_correlation(spy_close, vix_close, 20);
     features["spy_vix_corr_50"] = calculate_correlation(spy_close, vix_close, 50);
-    features["tsla_spy_corr_change"] = 0.0;
-    features["tsla_vix_corr_change"] = 0.0;
-    features["spy_vix_corr_change"] = 0.0;
+    // Correlation changes: compare 10-period corr now vs 10 bars ago
+    double tsla_spy_corr_change = 0.0;
+    double tsla_vix_corr_change = 0.0;
+    double spy_vix_corr_change = 0.0;
+    if (min_len >= 20) {
+        // Get correlation 10 bars ago by using data shifted by 10
+        auto calc_corr_shifted = [](const std::vector<double>& a, const std::vector<double>& b, int period, int shift) -> double {
+            int n = static_cast<int>(std::min(a.size(), b.size()));
+            if (n < period + shift) return 0.0;
+            int start = n - period - shift;
+            int end = n - shift;
+            std::vector<double> a_slice(a.begin() + start, a.begin() + end);
+            std::vector<double> b_slice(b.begin() + start, b.begin() + end);
+            // Calculate correlation
+            double sum_a = 0, sum_b = 0;
+            for (int i = 0; i < period; ++i) { sum_a += a_slice[i]; sum_b += b_slice[i]; }
+            double mean_a = sum_a / period, mean_b = sum_b / period;
+            double cov = 0, var_a = 0, var_b = 0;
+            for (int i = 0; i < period; ++i) {
+                double da = a_slice[i] - mean_a, db = b_slice[i] - mean_b;
+                cov += da * db; var_a += da * da; var_b += db * db;
+            }
+            double denom = std::sqrt(var_a * var_b);
+            return (denom > 0) ? cov / denom : 0.0;
+        };
+        double tsla_spy_corr_prev = calc_corr_shifted(tsla_close, spy_close, 10, 10);
+        double tsla_vix_corr_prev = calc_corr_shifted(tsla_close, vix_close, 10, 10);
+        double spy_vix_corr_prev = calc_corr_shifted(spy_close, vix_close, 10, 10);
+        tsla_spy_corr_change = features["tsla_spy_corr_10"] - tsla_spy_corr_prev;
+        tsla_vix_corr_change = features["tsla_vix_corr_10"] - tsla_vix_corr_prev;
+        spy_vix_corr_change = features["spy_vix_corr_10"] - spy_vix_corr_prev;
+    }
+    features["tsla_spy_corr_change"] = tsla_spy_corr_change;
+    features["tsla_vix_corr_change"] = tsla_vix_corr_change;
+    features["spy_vix_corr_change"] = spy_vix_corr_change;
 
     // Beta Metrics (8)
     // Calculate returns for beta
@@ -1648,14 +3661,28 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_cross_asset_fe
         spy_returns.push_back((spy_close[i] - spy_close[i-1]) / spy_close[i-1]);
     }
 
-    features["tsla_spy_beta_20"] = calculate_beta(tsla_returns, spy_returns, 20);
-    features["tsla_spy_beta_50"] = calculate_beta(tsla_returns, spy_returns, 50);
+    double tsla_spy_beta_20 = calculate_beta(tsla_returns, spy_returns, 20);
+    double tsla_spy_beta_50 = calculate_beta(tsla_returns, spy_returns, 50);
+    features["tsla_spy_beta_20"] = tsla_spy_beta_20;
+    features["tsla_spy_beta_50"] = tsla_spy_beta_50;
     features["tsla_spy_beta_100"] = calculate_beta(tsla_returns, spy_returns, 100);
-    features["tsla_vix_beta_20"] = 0.0;
-    features["tsla_vix_beta_50"] = 0.0;
-    features["spy_vix_beta_20"] = 0.0;
 
-    double current_beta = features["tsla_spy_beta_20"];
+    // VIX returns for beta calculation
+    std::vector<double> vix_returns;
+    for (size_t i = 1; i < min_len; ++i) {
+        if (vix_close[i-1] > 0) {
+            vix_returns.push_back((vix_close[i] - vix_close[i-1]) / vix_close[i-1]);
+        } else {
+            vix_returns.push_back(0.0);
+        }
+    }
+
+    // TSLA-VIX and SPY-VIX betas
+    features["tsla_vix_beta_20"] = calculate_beta(tsla_returns, vix_returns, 20);
+    features["tsla_vix_beta_50"] = calculate_beta(tsla_returns, vix_returns, 50);
+    features["spy_vix_beta_20"] = calculate_beta(spy_returns, vix_returns, 20);
+
+    double current_beta = tsla_spy_beta_20;
     if (current_beta < 0.8) {
         features["tsla_beta_regime"] = 0.0;
     } else if (current_beta <= 1.5) {
@@ -1663,28 +3690,170 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_cross_asset_fe
     } else {
         features["tsla_beta_regime"] = 2.0;
     }
-    features["beta_trend"] = 0.0;
 
-    // Relative Performance (10)
-    features["tsla_vs_spy_1bar"] = 0.0;
-    features["tsla_vs_spy_5bar"] = 0.0;
-    features["tsla_vs_spy_20bar"] = 0.0;
-    features["tsla_outperforming_spy"] = 0.0;
-    features["tsla_spy_divergence"] = 0.0;
-    features["spy_vs_vix_1bar"] = 0.0;
-    features["spy_vs_vix_5bar"] = 0.0;
-    features["tsla_alpha_20"] = 0.0;
-    features["relative_strength_tsla_spy"] = 0.0;
-    features["relative_strength_spy_vix"] = 0.0;
+    // Beta trend: compare current 20-bar beta to 50-bar beta
+    double beta_trend = 0.0;
+    if (tsla_spy_beta_50 != 0.0) {
+        beta_trend = (tsla_spy_beta_20 - tsla_spy_beta_50) / std::abs(tsla_spy_beta_50);
+    }
+    features["beta_trend"] = beta_trend;
 
-    // Cross-Asset Momentum (7)
-    features["cross_asset_momentum_alignment"] = 0.0;
-    features["cross_momentum_score"] = 0.0;
-    features["lead_lag_tsla_spy"] = 0.0;
-    features["lead_lag_spy_vix"] = 0.0;
-    features["risk_on_off_signal"] = 0.0;
-    features["market_regime"] = 1.0;
-    features["correlation_regime"] = 1.0;
+    // Relative Performance (10) - All properly calculated
+    // TSLA vs SPY relative returns
+    auto calc_relative_perf = [&](int period) -> double {
+        if (static_cast<int>(tsla_close.size()) <= period || static_cast<int>(spy_close.size()) <= period) return 0.0;
+        int n_tsla = static_cast<int>(tsla_close.size());
+        int n_spy = static_cast<int>(spy_close.size());
+        double tsla_ret = (tsla_close[n_tsla-1] - tsla_close[n_tsla-period-1]) / tsla_close[n_tsla-period-1];
+        double spy_ret = (spy_close[n_spy-1] - spy_close[n_spy-period-1]) / spy_close[n_spy-period-1];
+        return (tsla_ret - spy_ret) * 100.0;  // Return difference in percentage points
+    };
+    features["tsla_vs_spy_1bar"] = calc_relative_perf(1);
+    features["tsla_vs_spy_5bar"] = calc_relative_perf(5);
+    features["tsla_vs_spy_20bar"] = calc_relative_perf(20);
+
+    // Is TSLA outperforming SPY over 20 bars?
+    features["tsla_outperforming_spy"] = (features["tsla_vs_spy_20bar"] > 0) ? 1.0 : 0.0;
+
+    // TSLA-SPY divergence: TSLA and SPY moving in opposite directions
+    double tsla_spy_divergence = 0.0;
+    if (min_len >= 6) {
+        double tsla_5bar = (tsla_close.back() - tsla_close[tsla_close.size()-6]) / tsla_close[tsla_close.size()-6];
+        double spy_5bar = (spy_close.back() - spy_close[spy_close.size()-6]) / spy_close[spy_close.size()-6];
+        if ((tsla_5bar > 0.01 && spy_5bar < -0.01) || (tsla_5bar < -0.01 && spy_5bar > 0.01)) {
+            tsla_spy_divergence = 1.0;
+        }
+    }
+    features["tsla_spy_divergence"] = tsla_spy_divergence;
+
+    // SPY vs VIX relative performance
+    auto calc_spy_vix_perf = [&](int period) -> double {
+        if (static_cast<int>(spy_close.size()) <= period || static_cast<int>(vix_close.size()) <= period) return 0.0;
+        int n_spy = static_cast<int>(spy_close.size());
+        int n_vix = static_cast<int>(vix_close.size());
+        double spy_ret = (spy_close[n_spy-1] - spy_close[n_spy-period-1]) / spy_close[n_spy-period-1];
+        double vix_ret = (vix_close[n_vix-1] - vix_close[n_vix-period-1]) / vix_close[n_vix-period-1];
+        return (spy_ret + vix_ret) * 100.0;  // SPY up + VIX down = risk-on
+    };
+    features["spy_vs_vix_1bar"] = calc_spy_vix_perf(1);
+    features["spy_vs_vix_5bar"] = calc_spy_vix_perf(5);
+
+    // TSLA alpha: excess return over beta-expected return
+    double tsla_alpha_20 = 0.0;
+    if (min_len >= 21 && tsla_spy_beta_20 != 0.0) {
+        double tsla_ret = (tsla_close.back() - tsla_close[tsla_close.size()-21]) / tsla_close[tsla_close.size()-21];
+        double spy_ret = (spy_close.back() - spy_close[spy_close.size()-21]) / spy_close[spy_close.size()-21];
+        double expected_ret = tsla_spy_beta_20 * spy_ret;
+        tsla_alpha_20 = (tsla_ret - expected_ret) * 100.0;
+    }
+    features["tsla_alpha_20"] = tsla_alpha_20;
+
+    // Relative strength: TSLA/SPY price ratio trend
+    double relative_strength_tsla_spy = 0.0;
+    if (min_len >= 21) {
+        double ratio_now = tsla_close.back() / spy_close.back();
+        double ratio_20ago = tsla_close[tsla_close.size()-21] / spy_close[spy_close.size()-21];
+        if (ratio_20ago > 0) {
+            relative_strength_tsla_spy = (ratio_now / ratio_20ago - 1.0) * 100.0;
+        }
+    }
+    features["relative_strength_tsla_spy"] = relative_strength_tsla_spy;
+
+    // Relative strength: SPY/VIX
+    double relative_strength_spy_vix = 0.0;
+    if (min_len >= 21) {
+        double spy_ret = (spy_close.back() - spy_close[spy_close.size()-21]) / spy_close[spy_close.size()-21];
+        double vix_ret = (vix_close.back() - vix_close[vix_close.size()-21]) / vix_close[vix_close.size()-21];
+        relative_strength_spy_vix = (spy_ret - vix_ret) * 100.0;  // Positive = risk-on
+    }
+    features["relative_strength_spy_vix"] = relative_strength_spy_vix;
+
+    // Cross-Asset Momentum (7) - All properly calculated
+    // Momentum alignment: are all assets moving in expected risk-on/risk-off direction?
+    double cross_asset_momentum_alignment = 0.0;
+    if (min_len >= 6) {
+        double tsla_mom = (tsla_close.back() - tsla_close[tsla_close.size()-6]) / tsla_close[tsla_close.size()-6];
+        double spy_mom = (spy_close.back() - spy_close[spy_close.size()-6]) / spy_close[spy_close.size()-6];
+        double vix_mom = (vix_close.back() - vix_close[vix_close.size()-6]) / vix_close[vix_close.size()-6];
+        // Risk-on: TSLA up, SPY up, VIX down
+        if (tsla_mom > 0 && spy_mom > 0 && vix_mom < 0) {
+            cross_asset_momentum_alignment = 1.0;  // Bullish alignment
+        }
+        // Risk-off: TSLA down, SPY down, VIX up
+        else if (tsla_mom < 0 && spy_mom < 0 && vix_mom > 0) {
+            cross_asset_momentum_alignment = -1.0;  // Bearish alignment
+        }
+    }
+    features["cross_asset_momentum_alignment"] = cross_asset_momentum_alignment;
+
+    // Cross momentum score: weighted sum of momentum signals
+    double cross_momentum_score = 0.0;
+    if (min_len >= 6) {
+        double tsla_mom = (tsla_close.back() - tsla_close[tsla_close.size()-6]) / tsla_close[tsla_close.size()-6] * 100;
+        double spy_mom = (spy_close.back() - spy_close[spy_close.size()-6]) / spy_close[spy_close.size()-6] * 100;
+        double vix_mom = (vix_close.back() - vix_close[vix_close.size()-6]) / vix_close[vix_close.size()-6] * 100;
+        cross_momentum_score = tsla_mom * 0.4 + spy_mom * 0.4 - vix_mom * 0.2;  // VIX inverted
+    }
+    features["cross_momentum_score"] = cross_momentum_score;
+
+    // Lead-lag: cross-correlation at lag 1 to detect which leads
+    double lead_lag_tsla_spy = 0.0;
+    double lead_lag_spy_vix = 0.0;
+    if (min_len >= 11) {
+        // Compare correlation of tsla[t] with spy[t-1] vs tsla[t-1] with spy[t]
+        double corr_tsla_leads = 0.0, corr_spy_leads = 0.0;
+        // Simplified: just compare recent directional agreement
+        double tsla_now = tsla_close.back() - tsla_close[tsla_close.size()-2];
+        double spy_prev = spy_close[spy_close.size()-2] - spy_close[spy_close.size()-3];
+        double spy_now = spy_close.back() - spy_close[spy_close.size()-2];
+        double tsla_prev = tsla_close[tsla_close.size()-2] - tsla_close[tsla_close.size()-3];
+
+        if ((tsla_prev > 0) == (spy_now > 0)) corr_tsla_leads += 1.0;
+        if ((spy_prev > 0) == (tsla_now > 0)) corr_spy_leads += 1.0;
+        lead_lag_tsla_spy = corr_tsla_leads - corr_spy_leads;  // Positive = TSLA leads
+
+        // SPY-VIX lead-lag
+        double vix_now = vix_close.back() - vix_close[vix_close.size()-2];
+        double vix_prev = vix_close[vix_close.size()-2] - vix_close[vix_close.size()-3];
+        double corr_spy_leads_vix = 0.0, corr_vix_leads = 0.0;
+        if ((spy_prev > 0) == (vix_now < 0)) corr_spy_leads_vix += 1.0;  // SPY up predicts VIX down
+        if ((vix_prev > 0) == (spy_now < 0)) corr_vix_leads += 1.0;
+        lead_lag_spy_vix = corr_spy_leads_vix - corr_vix_leads;
+    }
+    features["lead_lag_tsla_spy"] = lead_lag_tsla_spy;
+    features["lead_lag_spy_vix"] = lead_lag_spy_vix;
+
+    // Risk-on/off signal: composite of momentum and VIX level
+    double risk_on_off_signal = 0.0;
+    if (cross_asset_momentum_alignment > 0 && vix_level < 20) {
+        risk_on_off_signal = 1.0;  // Strong risk-on
+    } else if (cross_asset_momentum_alignment < 0 && vix_level > 25) {
+        risk_on_off_signal = -1.0;  // Strong risk-off
+    } else if (vix_level < 15) {
+        risk_on_off_signal = 0.5;  // Mild risk-on
+    } else if (vix_level > 30) {
+        risk_on_off_signal = -0.5;  // Mild risk-off
+    }
+    features["risk_on_off_signal"] = risk_on_off_signal;
+
+    // Market regime: based on correlation and volatility patterns
+    double market_regime = 1.0;  // Normal
+    double tsla_spy_corr = features["tsla_spy_corr_20"];
+    if (tsla_spy_corr > 0.8 && vix_level > 25) {
+        market_regime = 2.0;  // Stress/crisis (high correlation + high VIX)
+    } else if (tsla_spy_corr < 0.3) {
+        market_regime = 0.0;  // Decoupled/idiosyncratic
+    }
+    features["market_regime"] = market_regime;
+
+    // Correlation regime: based on correlation levels
+    double correlation_regime = 1.0;  // Normal
+    if (tsla_spy_corr > 0.7) {
+        correlation_regime = 2.0;  // High correlation
+    } else if (tsla_spy_corr < 0.3) {
+        correlation_regime = 0.0;  // Low correlation
+    }
+    features["correlation_regime"] = correlation_regime;
 
     // RSI vs Channel Position (6)
     features["rsi_position_spread"] = tsla_rsi_14 - (position_in_channel * 100.0);
@@ -3606,15 +5775,15 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_window_score_f
     // ==========================================================================
     // 1. PER-WINDOW VALIDITY (8 features)
     // ==========================================================================
-    for (int window : STANDARD_WINDOWS) {
-        features["window_" + std::to_string(window) + "_valid"] = validity[window] ? 1.0 : 0.0;
+    for (size_t i = 0; i < STANDARD_WINDOWS.size(); ++i) {
+        features[WINDOW_VALID_KEYS[i]] = validity[STANDARD_WINDOWS[i]] ? 1.0 : 0.0;
     }
 
     // ==========================================================================
     // 2. PER-WINDOW SCORES (8 features)
     // ==========================================================================
-    for (int window : STANDARD_WINDOWS) {
-        features["window_" + std::to_string(window) + "_score"] = scores[window];
+    for (size_t i = 0; i < STANDARD_WINDOWS.size(); ++i) {
+        features[WINDOW_SCORE_KEYS[i]] = scores[STANDARD_WINDOWS[i]];
     }
 
     // ==========================================================================
