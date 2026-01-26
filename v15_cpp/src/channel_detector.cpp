@@ -340,7 +340,7 @@ Channel ChannelDetector::detect_channel(
 
     // Debug tracking
     static int reject_count = 0;
-    static bool debug_enabled = true;
+    static bool debug_enabled = false;  // Set to true for debugging
 
     // ========================================================================
     // SAFETY CHECK 1: Validate input arrays
@@ -569,18 +569,9 @@ Channel ChannelDetector::detect_channel(
         channel.width_pct = 0.0;
     }
 
-    // Debug: Log regression and channel parameters
-    static int detect_call_count = 0;
-    if (detect_call_count < 3) {
-        std::cout << "      [DETECT_CHANNEL] call=" << detect_call_count
-                  << " window=" << window << " n=" << n << "\n";
-        std::cout << "        slope=" << channel.slope << " intercept=" << channel.intercept
-                  << " std_dev=" << channel.std_dev << " r_squared=" << channel.r_squared << "\n";
-        std::cout << "        upper_line[0]=" << upper_line(0) << " upper_line[last]=" << upper_line(n-1) << "\n";
-        std::cout << "        lower_line[0]=" << lower_line(0) << " lower_line[last]=" << lower_line(n-1) << "\n";
-        std::cout << "        high_window[0]=" << high_window[0] << " low_window[0]=" << low_window[0] << "\n";
-        detect_call_count++;
-    }
+    // Debug output removed for cleaner output - uncomment for debugging:
+    // static std::atomic<int> detect_call_count{0};
+    // if (detect_call_count.fetch_add(1) == 0) { ... }
 
     // Detect bounces
     detect_bounces(

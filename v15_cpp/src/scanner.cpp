@@ -2,6 +2,7 @@
 #include "label_generator.hpp"
 #include "feature_extractor.hpp"
 #include "serialization.hpp"
+#include "progress_bar.hpp"
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -426,6 +427,12 @@ std::vector<ChannelSample> Scanner::scan(
     }
 
     // Process batches
+    // Create progress bar for sample generation
+    std::unique_ptr<ProgressBar> progress_bar;
+    if (config_.progress) {
+        progress_bar = std::make_unique<ProgressBar>(batches.size(), "  Pass 3");
+    }
+
     if (config_.workers == 1) {
         // Sequential processing
         if (config_.verbose) {
@@ -447,10 +454,8 @@ std::vector<ChannelSample> Scanner::scan(
             for (auto& sample : batch_samples) {
                 if (sample.is_valid()) {
                     if (use_streaming) {
-                        // Write directly to disk
                         streaming_writer->write(sample);
                     } else {
-                        // Accumulate in memory
                         samples.push_back(std::move(sample));
                     }
                     ++valid_count;
@@ -459,20 +464,13 @@ std::vector<ChannelSample> Scanner::scan(
                 }
             }
 
-            if (config_.progress && (i % 10 == 0 || i == batches.size() - 1)) {
-                double progress_pct = 100.0 * (i + 1) / batches.size();
-                std::cout << "\r  Progress: " << std::fixed << std::setprecision(1)
-                          << progress_pct << "% (" << (i + 1) << "/" << batches.size() << " batches)"
-                          << " | Samples: " << valid_count;
-                if (use_streaming) {
-                    std::cout << " (streamed to disk)";
-                }
-                std::cout.flush();
+            if (progress_bar) {
+                progress_bar->update(i + 1);
             }
         }
 
-        if (config_.progress) {
-            std::cout << "\n";
+        if (progress_bar) {
+            progress_bar->finish();
         }
     } else {
         // Parallel processing
@@ -493,11 +491,11 @@ std::vector<ChannelSample> Scanner::scan(
             ));
         }
 
-        // Collect results
+        // Collect results with progress updates
         for (size_t i = 0; i < futures.size(); ++i) {
             if (shutdown_requested_) {
                 if (config_.verbose) {
-                    std::cout << "\n[INTERRUPT] Stopping at batch " << i << "/" << futures.size() << "\n";
+                    std::cerr << "\n[INTERRUPT] Stopping at batch " << i << "/" << futures.size() << "\n";
                 }
                 break;
             }
@@ -506,11 +504,9 @@ std::vector<ChannelSample> Scanner::scan(
             for (auto& sample : batch_samples) {
                 if (sample.is_valid()) {
                     if (use_streaming) {
-                        // Write directly to disk (thread-safe)
                         std::lock_guard<std::mutex> lock(writer_mutex);
                         streaming_writer->write(sample);
                     } else {
-                        // Accumulate in memory
                         samples.push_back(std::move(sample));
                     }
                     ++valid_count;
@@ -519,20 +515,13 @@ std::vector<ChannelSample> Scanner::scan(
                 }
             }
 
-            if (config_.progress && (i % 10 == 0 || i == futures.size() - 1)) {
-                double progress_pct = 100.0 * (i + 1) / futures.size();
-                std::cout << "\r  Progress: " << std::fixed << std::setprecision(1)
-                          << progress_pct << "% (" << (i + 1) << "/" << futures.size() << " batches)"
-                          << " | Samples: " << valid_count;
-                if (use_streaming) {
-                    std::cout << " (streamed to disk)";
-                }
-                std::cout.flush();
+            if (progress_bar) {
+                progress_bar->update(i + 1);
             }
         }
 
-        if (config_.progress) {
-            std::cout << "\n";
+        if (progress_bar) {
+            progress_bar->finish();
         }
     }
 
@@ -788,27 +777,12 @@ void Scanner::detect_all_channels(
                     config_.min_cycles
                 );
 
-                // Debug: Log first few rejected channels
-                static int debug_count = 0;
-                if (!ch.valid || ch.complete_cycles < config_.min_cycles) {
-                    if (debug_count < 10 && config_.verbose) {
-                        #pragma omp critical
-                        {
-                            std::cout << "      [DEBUG] Rejected channel at pos=" << pos
-                                      << " valid=" << ch.valid
-                                      << " cycles=" << ch.complete_cycles
-                                      << " bounces=" << ch.bounce_count
-                                      << " touches=" << ch.touches.size()
-                                      << " upper_touches=" << ch.upper_touches
-                                      << " lower_touches=" << ch.lower_touches << "\n";
-                            debug_count++;
-                        }
-                    }
-                }
+                // Debug output for rejected channels - disabled for cleaner output
+                // Set to debug_count < 1 to show first rejection only
+                (void)ch;  // Suppress unused warning when debug is off
 
                 // Store valid channels
                 // Use bounce_count instead of complete_cycles since bounces are more lenient
-                static int store_debug_count = 0;
                 if (ch.valid && ch.bounce_count >= config_.min_cycles) {
                     // Set position indices - critical for label generation!
                     ch.start_idx = static_cast<int>(start_idx);
@@ -827,22 +801,8 @@ void Scanner::detect_all_channels(
                     }
 
                     detected_channels.push_back(ch);
-                    if (store_debug_count < 5 && config_.verbose) {
-                        std::cout << "      [STORED CHANNEL #" << store_debug_count << "] pos=" << pos
-                                  << " start_idx=" << ch.start_idx << " end_idx=" << ch.end_idx
-                                  << " timeframe=" << tf
-                                  << " valid=" << ch.valid << " bounces=" << ch.bounce_count
-                                  << " detected_channels.size()=" << detected_channels.size() << "\n";
-                        store_debug_count++;
-                    }
-                } else {
-                    if (store_debug_count < 5 && config_.verbose) {
-                        std::cout << "      [SKIPPED CHANNEL #" << store_debug_count << "] pos=" << pos
-                                  << " valid=" << ch.valid << " bounces=" << ch.bounce_count
-                                  << " min_cycles=" << config_.min_cycles << "\n";
-                        store_debug_count++;
-                    }
                 }
+                // Debug output removed for cleaner output
             }
 
             // Store results in channel_map (thread-safe)
@@ -902,7 +862,9 @@ void Scanner::generate_all_labels(
     std::mutex result_mutex;
     std::atomic<int> channels_processed{0};
     std::atomic<int> valid_labels_count{0};
-    std::cout << "  [DEBUG] Starting label generation for " << keys.size() << " tf/window combinations\n";
+    if (config_.verbose) {
+        std::cout << "  Processing " << keys.size() << " tf/window combinations...\n";
+    }
 
     // Process each (tf, window) combination
     auto process_tf_window = [&](const TFWindowKey& key) {
@@ -1028,16 +990,9 @@ void Scanner::generate_all_labels(
             // Adjust channel_end_idx to be relative to full_close_prices array
             int adjusted_end_idx = end_idx - start_price_idx;
 
-            // Debug: Log first few label generation calls
-            static int label_gen_count = 0;
-            if (label_gen_count < 5 && config_.verbose) {
-                std::cout << "      [LABEL_GEN #" << label_gen_count << "] tf=" << tf_str
-                          << " window=" << window << " end_idx=" << end_idx
-                          << " scan_bars=" << scan_bars << " max_scan=" << max_scan
-                          << " channel.slope=" << channel.slope
-                          << " channel.std_dev=" << channel.std_dev << "\n";
-                label_gen_count++;
-            }
+            // Debug: Log only the very first label generation call
+            static std::atomic<int> label_gen_count{0};
+            bool show_label_debug = (label_gen_count.fetch_add(1) == 0) && config_.verbose;
 
             // Generate labels using forward scan
             ChannelLabels labels = label_gen.generate_labels_forward_scan(
@@ -1053,15 +1008,8 @@ void Scanner::generate_all_labels(
                 full_close_size
             );
 
-            // Debug: Log result of first few label generations (if verbose)
-            if (label_gen_count <= 5 && config_.verbose) {
-                std::cout << "      [LABEL_RESULT #" << (label_gen_count-1) << "] "
-                          << " duration_valid=" << labels.duration_valid
-                          << " direction_valid=" << labels.direction_valid
-                          << " break_scan_valid=" << labels.break_scan_valid
-                          << " break_direction=" << labels.break_direction
-                          << " duration_bars=" << labels.duration_bars << "\n";
-            }
+            // Debug: Log result of first label generation only
+            (void)show_label_debug;  // Suppress unused warning - debug output removed for cleaner output
 
             // Create SlimLabeledChannel (strip heavy arrays)
             SlimLabeledChannel slim;
@@ -1209,13 +1157,10 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
         int primary_window = work_item.primary_window;
         int channel_idx = work_item.channel_idx;
 
-        static int batch_debug_count = 0;
-        if (batch_debug_count < 5 && config_.verbose) {
-            std::cout << "      [BATCH_PROCESS #" << batch_debug_count << "] "
-                      << "tf=" << primary_tf << " window=" << primary_window
-                      << " channel_idx=" << channel_idx << "\n";
-            batch_debug_count++;
-        }
+        // Debug output - only first item globally to avoid spam
+        static std::atomic<int> global_debug_count{0};
+        int my_debug_idx = global_debug_count.fetch_add(1);
+        bool show_debug = (my_debug_idx == 0) && config_.verbose;
 
         try {
             // Get the PRIMARY channel from slim_map
@@ -1223,7 +1168,7 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             auto it = tsla_slim_map.find(key);
             if (it == tsla_slim_map.end()) {
                 items_skipped_map_not_found++;
-                if (batch_debug_count <= 5 && config_.verbose) {
+                if (show_debug) {
                     std::cout << "      [SKIP] Channel map not found for (" << primary_tf << "," << primary_window << ")\n";
                 }
                 continue;  // Skip - channel map not found
@@ -1232,7 +1177,7 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             const std::vector<SlimLabeledChannel>& slim_channels = it->second;
             if (channel_idx < 0 || channel_idx >= static_cast<int>(slim_channels.size())) {
                 items_skipped_invalid_idx++;
-                if (batch_debug_count <= 5 && config_.verbose) {
+                if (show_debug) {
                     std::cout << "      [SKIP] Invalid channel index " << channel_idx
                               << " (size=" << slim_channels.size() << ")\n";
                 }
@@ -1244,7 +1189,7 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             // Skip invalid channels
             if (!primary_channel.channel_valid) {
                 items_skipped_channel_invalid++;
-                if (batch_debug_count <= 5 && config_.verbose) {
+                if (show_debug) {
                     std::cout << "      [SKIP] Channel not valid\n";
                 }
                 continue;
@@ -1253,13 +1198,13 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             // Skip channels without valid labels
             if (!primary_channel.labels.direction_valid) {
                 items_skipped_labels_invalid++;
-                if (batch_debug_count <= 5 && config_.verbose) {
+                if (show_debug) {
                     std::cout << "      [SKIP] Labels not valid\n";
                 }
                 continue;
             }
 
-            if (batch_debug_count <= 5 && config_.verbose) {
+            if (show_debug) {
                 std::cout << "      [PROCESSING] Channel passed validation checks\n";
             }
 
@@ -1271,7 +1216,7 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             int bars_per_tf = get_bars_per_tf(tf_enum);
             int idx_5min = primary_channel.end_idx * bars_per_tf;
 
-            if (batch_debug_count <= 5 && config_.verbose) {
+            if (show_debug) {
                 std::cout << "      [INDEX] end_idx=" << primary_channel.end_idx
                           << " bars_per_tf=" << bars_per_tf
                           << " idx_5min=" << idx_5min
@@ -1343,7 +1288,7 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             double feature_extraction_time_ms =
                 std::chrono::duration<double, std::milli>(feature_end - feature_start).count();
 
-            if (batch_debug_count <= 5 && config_.verbose) {
+            if (show_debug) {
                 std::cout << "      [FEATURES_EXTRACTED] Got " << tf_features.size() << " features\n";
             }
 
@@ -1367,18 +1312,18 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
                               << tf_features.size() << ", expected " << expected_features << "\n";
                 }
                 if (config_.strict) {
-                    if (batch_debug_count <= 5 && config_.verbose) {
+                    if (show_debug) {
                         std::cout << "      [STRICT] Skipping due to feature count mismatch\n";
                     }
                     continue;
                 } else {
-                    if (batch_debug_count <= 5 && config_.verbose) {
+                    if (show_debug) {
                         std::cout << "      [NOT_STRICT] Continuing despite mismatch (strict=" << config_.strict << ")\n";
                     }
                 }
             }
 
-            if (batch_debug_count <= 5 && config_.verbose) {
+            if (show_debug) {
                 std::cout << "      [CHECKPOINT] About to build labels_per_window...\n";
             }
 
@@ -1386,7 +1331,7 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             // For PRIMARY channel: use labels directly (no lookup)
             // For OTHER channels: binary search lookup at same timestamp
 
-            if (batch_debug_count <= 5 && config_.verbose) {
+            if (show_debug) {
                 std::cout << "      [LABELS] Building labels_per_window map...\n";
             }
 
@@ -1521,7 +1466,7 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             bar_metadata["5min"]["total_bars"] = static_cast<double>(tsla_view.size());
             bar_metadata["5min"]["is_partial"] = 0.0;  // false
 
-            if (batch_debug_count <= 5 && config_.verbose) {
+            if (show_debug) {
                 std::cout << "      [CREATE] About to create ChannelSample...\n";
                 std::cout << "        tf_features.size()=" << tf_features.size() << "\n";
                 std::cout << "        labels_per_window.size()=" << labels_per_window.size() << "\n";
