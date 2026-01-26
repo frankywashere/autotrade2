@@ -49,6 +49,30 @@ public:
     );
 
     /**
+     * Zero-copy overload - accepts raw pointers to avoid vector copies
+     *
+     * @param high Pointer to high prices array
+     * @param low Pointer to low prices array
+     * @param close Pointer to close prices array
+     * @param data_size Number of elements in the arrays
+     * @param window Number of bars for regression (default 50)
+     * @param std_multiplier Std dev multiplier for bounds (default 2.0)
+     * @param touch_threshold Touch threshold as fraction of channel width (default 0.10)
+     * @param min_cycles Minimum alternating bounces for valid channel (default 1)
+     * @return Channel object with all metrics
+     */
+    static Channel detect_channel(
+        const double* high,
+        const double* low,
+        const double* close,
+        size_t data_size,
+        int window = 50,
+        double std_multiplier = 2.0,
+        double touch_threshold = 0.10,
+        int min_cycles = 1
+    );
+
+    /**
      * Detect channels for multiple windows in parallel
      *
      * @param high High prices

@@ -3,6 +3,7 @@
 #include "types.hpp"
 #include "channel.hpp"
 #include "indicators.hpp"
+#include "scanner.hpp"  // For SlimLabeledChannelMap, SlimLabeledChannel
 #include <vector>
 #include <unordered_map>
 #include <string>
@@ -190,6 +191,49 @@ public:
         const DataView& spy_view,
         const DataView& vix_view,
         int64_t timestamp,
+        int source_bar_count = -1,
+        bool include_bar_metadata = true
+    );
+
+    /**
+     * Extract all features with slim channel maps for proper channel feature extraction
+     *
+     * This overload accepts precomputed slim channel maps from the scanner's Pass 1/2,
+     * enabling proper channel feature extraction without re-detecting channels.
+     *
+     * @param tsla_5min Base 5-min TSLA OHLCV data
+     * @param spy_5min Base 5-min SPY OHLCV data
+     * @param vix_5min Base 5-min VIX OHLCV data
+     * @param timestamp Current timestamp for event features
+     * @param tsla_slim_map Precomputed TSLA slim labeled channel map
+     * @param spy_slim_map Precomputed SPY slim labeled channel map
+     * @param source_bar_count Number of 5min bars from start (for partial bar calculation)
+     * @param include_bar_metadata Include 30 bar metadata features
+     * @return Map of feature names to values
+     */
+    static std::unordered_map<std::string, double> extract_all_features(
+        const std::vector<OHLCV>& tsla_5min,
+        const std::vector<OHLCV>& spy_5min,
+        const std::vector<OHLCV>& vix_5min,
+        int64_t timestamp,
+        const SlimLabeledChannelMap& tsla_slim_map,
+        const SlimLabeledChannelMap& spy_slim_map,
+        int source_bar_count = -1,
+        bool include_bar_metadata = true
+    );
+
+    /**
+     * Extract all features using DataView (zero-copy) with slim channel maps
+     *
+     * DataView version for optimal memory performance in scanner pipeline.
+     */
+    static std::unordered_map<std::string, double> extract_all_features(
+        const DataView& tsla_view,
+        const DataView& spy_view,
+        const DataView& vix_view,
+        int64_t timestamp,
+        const SlimLabeledChannelMap& tsla_slim_map,
+        const SlimLabeledChannelMap& spy_slim_map,
         int source_bar_count = -1,
         bool include_bar_metadata = true
     );

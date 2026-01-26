@@ -550,6 +550,436 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_event_features
     return extract_event_features(timestamp, tsla_view.to_vector());
 }
 
+// =============================================================================
+// SLIM CHANNEL MAP OVERLOAD - USES REAL CHANNEL DATA
+// =============================================================================
+
+// Helper to convert SlimLabeledChannel to Channel for feature extraction
+static Channel slim_to_channel(const SlimLabeledChannel& slim) {
+    Channel ch;
+    ch.valid = slim.channel_valid;
+    ch.slope = slim.channel_slope;
+    ch.intercept = slim.channel_intercept;
+    ch.std_dev = slim.channel_std_dev;
+    ch.r_squared = slim.channel_r_squared;
+    ch.direction = static_cast<ChannelDirection>(slim.channel_direction);
+    ch.bounce_count = slim.channel_bounce_count;
+    ch.start_idx = slim.start_idx;
+    ch.end_idx = slim.end_idx;
+    ch.start_timestamp_ms = slim.start_timestamp;
+    ch.end_timestamp_ms = slim.end_timestamp;
+    ch.touches = slim.touches;  // Copy touches for feature extraction
+    ch.window = slim.channel_window;
+    ch.window_size = slim.channel_window;
+
+    // Copy cached line values for position_in_channel calculation
+    ch.first_upper_val = slim.first_upper_val;
+    ch.last_upper_val = slim.last_upper_val;
+    ch.first_lower_val = slim.first_lower_val;
+    ch.last_lower_val = slim.last_lower_val;
+    ch.first_center_val = slim.first_center_val;
+    ch.last_center_val = slim.last_center_val;
+    ch.upper_line_tail = slim.upper_line_tail;
+    ch.lower_line_tail = slim.lower_line_tail;
+    ch.tail_count = slim.tail_count;
+
+    return ch;
+}
+
+// Helper to find the channel that was active at a given timestamp
+// Returns nullptr if no channel covers the timestamp
+static const SlimLabeledChannel* find_channel_at_timestamp_slim(
+    const std::vector<SlimLabeledChannel>& channels,
+    int64_t timestamp
+) {
+    // Channels are sorted by end_timestamp
+    // Find the last channel where start_timestamp <= timestamp <= end_timestamp
+    // Binary search for efficiency
+
+    if (channels.empty()) return nullptr;
+
+    // Binary search for the first channel with end_timestamp >= timestamp
+    int left = 0;
+    int right = static_cast<int>(channels.size()) - 1;
+    int result_idx = -1;
+
+    while (left <= right) {
+        int mid = left + (right - left) / 2;
+        if (channels[mid].end_timestamp >= timestamp) {
+            result_idx = mid;
+            right = mid - 1;
+        } else {
+            left = mid + 1;
+        }
+    }
+
+    // Check if this channel covers the timestamp
+    if (result_idx >= 0 && result_idx < static_cast<int>(channels.size())) {
+        const SlimLabeledChannel& ch = channels[result_idx];
+        // Channel is active if timestamp is within its range
+        if (ch.start_timestamp <= timestamp && timestamp <= ch.end_timestamp) {
+            return &ch;
+        }
+    }
+
+    // Also check the previous channel (in case of ties or edge cases)
+    if (result_idx > 0) {
+        const SlimLabeledChannel& prev_ch = channels[result_idx - 1];
+        if (prev_ch.start_timestamp <= timestamp && timestamp <= prev_ch.end_timestamp) {
+            return &prev_ch;
+        }
+    }
+
+    return nullptr;
+}
+
+std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
+    const std::vector<OHLCV>& tsla_5min,
+    const std::vector<OHLCV>& spy_5min,
+    const std::vector<OHLCV>& vix_5min,
+    int64_t timestamp,
+    const SlimLabeledChannelMap& tsla_slim_map,
+    const SlimLabeledChannelMap& spy_slim_map,
+    int source_bar_count,
+    bool include_bar_metadata
+) {
+    // Pre-reserve the feature map to avoid rehashing during 14,190 insertions
+    auto all_features = create_feature_map();
+
+    // SAFETY: Validate input data
+    if (tsla_5min.empty()) {
+        std::cerr << "[ERROR] extract_all_features(slim_map): TSLA data is empty\n";
+        return all_features;
+    }
+    if (spy_5min.empty()) {
+        std::cerr << "[ERROR] extract_all_features(slim_map): SPY data is empty\n";
+        return all_features;
+    }
+    if (vix_5min.empty()) {
+        std::cerr << "[ERROR] extract_all_features(slim_map): VIX data is empty\n";
+        return all_features;
+    }
+
+    // SAFETY: Validate data alignment
+    if (tsla_5min.size() != spy_5min.size() || tsla_5min.size() != vix_5min.size()) {
+        std::cerr << "[ERROR] extract_all_features(slim_map): Data size mismatch - TSLA: "
+                  << tsla_5min.size() << ", SPY: " << spy_5min.size()
+                  << ", VIX: " << vix_5min.size() << "\n";
+        return all_features;
+    }
+
+    // Default source_bar_count to data length
+    if (source_bar_count < 0) {
+        source_bar_count = static_cast<int>(tsla_5min.size());
+    }
+
+    // SAFETY: Validate source_bar_count
+    if (source_bar_count > static_cast<int>(tsla_5min.size())) {
+        std::cerr << "[WARNING] extract_all_features(slim_map): source_bar_count (" << source_bar_count
+                  << ") exceeds data size (" << tsla_5min.size() << "), clamping\n";
+        source_bar_count = static_cast<int>(tsla_5min.size());
+    }
+
+    // Track metadata by timeframe for bar completion features
+    std::unordered_map<Timeframe, ResampleMetadata> metadata_by_tf;
+
+    // Thread-local storage for parallel extraction:
+    // Each timeframe gets its own feature map, merged at the end
+    std::array<std::unordered_map<std::string, double>, NUM_TIMEFRAMES> tf_features;
+    std::array<ResampleMetadata, NUM_TIMEFRAMES> tf_metadata;
+    std::array<bool, NUM_TIMEFRAMES> tf_valid;
+    tf_valid.fill(false);
+
+    // Process each timeframe in parallel (when OpenMP is available)
+    #pragma omp parallel for schedule(dynamic) if(NUM_TIMEFRAMES > 1)
+    for (int tf_idx = 0; tf_idx < NUM_TIMEFRAMES; ++tf_idx) {
+        Timeframe tf = static_cast<Timeframe>(tf_idx);
+        std::string tf_str = std::string(timeframe_to_string(tf));
+        std::string tf_prefix = tf_str + "_";
+
+        // Thread-local feature map for this timeframe
+        std::unordered_map<std::string, double>& local_features = tf_features[tf_idx];
+
+        try {
+            // 1. Resample data to this timeframe
+            auto [tsla_tf, tsla_meta] = resample_to_tf(tsla_5min, tf, source_bar_count);
+            auto [spy_tf, spy_meta] = resample_to_tf(spy_5min, tf, source_bar_count);
+            auto [vix_tf, vix_meta] = resample_to_tf(vix_5min, tf, source_bar_count);
+
+            // Store metadata for this timeframe
+            tf_metadata[tf_idx] = tsla_meta;
+
+            // SAFETY: Check if we have enough data
+            if (tsla_tf.empty()) {
+                #pragma omp critical
+                {
+                    std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty TSLA data after resampling\n";
+                }
+                continue;
+            }
+            if (spy_tf.empty()) {
+                #pragma omp critical
+                {
+                    std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty SPY data after resampling\n";
+                }
+                continue;
+            }
+            if (vix_tf.empty()) {
+                #pragma omp critical
+                {
+                    std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty VIX data after resampling\n";
+                }
+                continue;
+            }
+
+            // Require minimum bars for meaningful features
+            if (tsla_tf.size() < 10) {
+                static int skip_count = 0;
+                #pragma omp critical
+                {
+                    if (skip_count < 3) {
+                        std::cerr << "[DEBUG] Skipping timeframe " << tf_prefix
+                                  << " (only " << tsla_tf.size() << " bars, need 10+)\n";
+                        skip_count++;
+                    }
+                }
+                continue;
+            }
+
+            // 2. Extract TSLA price features (58)
+            auto price_features = extract_tsla_price_features(tsla_tf);
+            for (const auto& [name, value] : price_features) {
+                local_features[tf_prefix + name] = value;
+            }
+
+            // 3. Extract technical indicators (59) - using existing indicators.cpp
+            OHLCVArrays tsla_arrays;
+            extract_ohlcv_arrays_optimized(tsla_tf, tsla_arrays);
+
+            // SAFETY: Validate extracted arrays
+            if (tsla_arrays.empty()) {
+                #pragma omp critical
+                {
+                    std::cerr << "[WARNING] Timeframe " << tf_prefix << " has empty OHLCV arrays\n";
+                }
+                continue;
+            }
+
+            auto tech_features = TechnicalIndicators::extract_features(
+                tsla_arrays.open, tsla_arrays.high, tsla_arrays.low,
+                tsla_arrays.close, tsla_arrays.volume);
+            for (const auto& [name, value] : tech_features) {
+                local_features[tf_prefix + name] = value;
+            }
+
+            // 4. Extract SPY features (117)
+            auto spy_features = extract_spy_features(spy_tf);
+            for (const auto& [name, value] : spy_features) {
+                local_features[tf_prefix + name] = value;
+            }
+
+            // 5. Extract VIX features (25)
+            auto vix_features = extract_vix_features(vix_tf);
+            for (const auto& [name, value] : vix_features) {
+                local_features[tf_prefix + name] = value;
+            }
+
+            // 6. Extract cross-asset features (59)
+            double tsla_rsi_14 = price_features.count("rsi_14") ? price_features.at("rsi_14") : 50.0;
+            double spy_rsi_14 = spy_features.count("spy_rsi_14") ? spy_features.at("spy_rsi_14") : 50.0;
+            double vix_level = vix_features.count("vix_level") ? vix_features.at("vix_level") : 20.0;
+
+            auto cross_features = extract_cross_asset_features(
+                tsla_tf, spy_tf, vix_tf,
+                tsla_rsi_14, spy_rsi_14, 0.5, 0.5, vix_level
+            );
+            for (const auto& [name, value] : cross_features) {
+                local_features[tf_prefix + name] = value;
+            }
+
+            // 7. Extract channel features for each window (58 TSLA + 58 SPY = 116 features x 8 windows = 928)
+            // NOW USING REAL CHANNEL DATA FROM SLIM MAPS
+            std::unordered_map<std::string, double> tsla_channel_feats_agg;
+            std::unordered_map<std::string, double> spy_channel_feats_agg;
+            int valid_window_count = 0;
+
+            for (int window : STANDARD_WINDOWS) {
+                std::string window_prefix = tf_prefix + "w" + std::to_string(window) + "_";
+
+                // TSLA channel features (58) - using real channel from slim_map
+                Channel tsla_channel;
+                TFWindowKey tsla_key{tf_str, window};
+                auto tsla_it = tsla_slim_map.find(tsla_key);
+                if (tsla_it != tsla_slim_map.end() && !tsla_it->second.empty()) {
+                    // Find channel active at this timestamp using binary search
+                    const SlimLabeledChannel* slim_ch = find_channel_at_timestamp_slim(
+                        tsla_it->second, timestamp);
+                    if (slim_ch) {
+                        tsla_channel = slim_to_channel(*slim_ch);
+                    }
+                }
+                auto tsla_channel_feats = extract_channel_features(tsla_channel, tsla_tf);
+                for (const auto& [name, value] : tsla_channel_feats) {
+                    local_features[window_prefix + name] = value;
+                }
+
+                // SPY channel features (58) - using real channel from slim_map
+                Channel spy_channel;
+                TFWindowKey spy_key{tf_str, window};
+                auto spy_it = spy_slim_map.find(spy_key);
+                if (spy_it != spy_slim_map.end() && !spy_it->second.empty()) {
+                    // Find channel active at this timestamp using binary search
+                    const SlimLabeledChannel* slim_ch = find_channel_at_timestamp_slim(
+                        spy_it->second, timestamp);
+                    if (slim_ch) {
+                        spy_channel = slim_to_channel(*slim_ch);
+                    }
+                }
+                auto spy_channel_feats = extract_spy_channel_features(spy_channel, spy_tf, window);
+                for (const auto& [name, value] : spy_channel_feats) {
+                    local_features[window_prefix + name] = value;
+                }
+
+                // Accumulate for aggregated channel correlation
+                for (const auto& [name, value] : tsla_channel_feats) {
+                    tsla_channel_feats_agg[name] += value;
+                }
+                for (const auto& [name, value] : spy_channel_feats) {
+                    spy_channel_feats_agg[name] += value;
+                }
+                valid_window_count++;
+            }
+
+            // Average the aggregated channel features across windows
+            if (valid_window_count > 0) {
+                for (auto& [name, value] : tsla_channel_feats_agg) {
+                    value /= valid_window_count;
+                }
+                for (auto& [name, value] : spy_channel_feats_agg) {
+                    value /= valid_window_count;
+                }
+            }
+
+            // 7b. Channel correlation features (50 per TF - computed once using aggregated features)
+            auto channel_corr_feats = extract_channel_correlation_features(
+                tsla_channel_feats_agg, spy_channel_feats_agg
+            );
+            for (const auto& [name, value] : channel_corr_feats) {
+                local_features[tf_prefix + name] = value;
+            }
+
+            // 8. Extract window score features (50)
+            // Build channels_by_window from slim_map for this timeframe
+            std::unordered_map<int, std::shared_ptr<Channel>> channels_by_window;
+            for (int window : STANDARD_WINDOWS) {
+                TFWindowKey key{tf_str, window};
+                auto it = tsla_slim_map.find(key);
+                if (it != tsla_slim_map.end() && !it->second.empty()) {
+                    auto ch_ptr = std::make_shared<Channel>(slim_to_channel(it->second.back()));
+                    channels_by_window[window] = ch_ptr;
+                }
+            }
+            auto window_scores = extract_window_score_features(channels_by_window, 50);
+            for (const auto& [name, value] : window_scores) {
+                local_features[tf_prefix + name] = value;
+            }
+
+            // 9. Extract channel history features (67)
+            // In production, this would use actual channel history tracking per TF
+            // For now, we use empty histories which will produce default features
+            std::vector<ChannelHistoryEntry> tsla_history;
+            std::vector<ChannelHistoryEntry> spy_history;
+            auto history_features = extract_channel_history_features(tsla_history, spy_history);
+            for (const auto& [name, value] : history_features) {
+                local_features[tf_prefix + name] = value;
+            }
+
+            // Mark this timeframe as successfully processed
+            tf_valid[tf_idx] = true;
+
+        } catch (const std::exception& e) {
+            #pragma omp critical
+            {
+                std::cerr << "[ERROR] Failed to extract features for timeframe " << tf_prefix
+                          << ": " << e.what() << "\n";
+            }
+            // Continue to next timeframe on error
+        }
+    }
+
+    // Merge thread-local results into all_features (sequential, after parallel section)
+    for (int tf_idx = 0; tf_idx < NUM_TIMEFRAMES; ++tf_idx) {
+        // Copy metadata
+        Timeframe tf = static_cast<Timeframe>(tf_idx);
+        metadata_by_tf[tf] = tf_metadata[tf_idx];
+
+        // Merge features from this timeframe
+        if (tf_valid[tf_idx]) {
+            all_features.insert(tf_features[tf_idx].begin(), tf_features[tf_idx].end());
+        }
+    }
+
+    // 10. Extract event features (30 TF-independent)
+    auto event_features = extract_event_features(timestamp, tsla_5min);
+    all_features.insert(event_features.begin(), event_features.end());
+
+    // 11. Extract bar metadata features (30)
+    if (include_bar_metadata) {
+        auto bar_meta = extract_bar_metadata_features(metadata_by_tf);
+        all_features.insert(bar_meta.begin(), bar_meta.end());
+    }
+
+    // Sanitize all features
+    sanitize_features(all_features);
+
+    // Debug: show feature count breakdown
+    static int slim_call_count = 0;
+    if (slim_call_count < 2) {
+        std::cerr << "[DEBUG] extract_all_features(slim_map) returning " << all_features.size() << " features\n";
+        std::cerr << "  source_bar_count=" << source_bar_count
+                  << " tsla_5min.size()=" << tsla_5min.size()
+                  << " tsla_slim_map.size()=" << tsla_slim_map.size()
+                  << " spy_slim_map.size()=" << spy_slim_map.size() << "\n";
+        slim_call_count++;
+    }
+
+    return all_features;
+}
+
+
+// =============================================================================
+// EXTRACT ALL FEATURES - DataView with Slim Map (zero-copy + real channels)
+// =============================================================================
+
+std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
+    const DataView& tsla_view,
+    const DataView& spy_view,
+    const DataView& vix_view,
+    int64_t timestamp,
+    const SlimLabeledChannelMap& tsla_slim_map,
+    const SlimLabeledChannelMap& spy_slim_map,
+    int source_bar_count,
+    bool include_bar_metadata
+) {
+    // Convert DataView to vectors for the vector-based implementation
+    // This is a temporary solution - eventually we should optimize the whole pipeline for DataView
+    std::vector<OHLCV> tsla_5min(tsla_view.begin(), tsla_view.end());
+    std::vector<OHLCV> spy_5min(spy_view.begin(), spy_view.end());
+    std::vector<OHLCV> vix_5min(vix_view.begin(), vix_view.end());
+
+    // Delegate to vector-based implementation with slim maps
+    return extract_all_features(
+        tsla_5min,
+        spy_5min,
+        vix_5min,
+        timestamp,
+        tsla_slim_map,
+        spy_slim_map,
+        source_bar_count,
+        include_bar_metadata
+    );
+}
+
 
 // =============================================================================
 // RESAMPLING
@@ -1372,9 +1802,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
         double current_atr = get_last_valid(atr_values, 1.0);
         if (current_atr <= 0.0) current_atr = 1.0;
 
-        if (!channel.upper_line.empty() && !channel.lower_line.empty()) {
+        if (channel.tail_count > 0) {
             double channel_width = safe_float(
-                channel.upper_line.back() - channel.lower_line.back(), 0.0
+                channel.last_upper_val - channel.last_lower_val, 0.0
             );
             channel_width_atr_ratio = safe_divide(channel_width, current_atr, 0.0);
         }
@@ -1501,15 +1931,16 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 24. position_in_channel (0=floor, 1=ceiling)
     // ==========================================================================
     double position = 0.5;
-    if (!close.empty() && !channel.upper_line.empty() && !channel.lower_line.empty()) {
+    if (!close.empty() && channel.tail_count > 0) {
         double current_close = close.back();
-        double upper_val = channel.upper_line.back();
-        double lower_val = channel.lower_line.back();
+        double upper_val = channel.last_upper_val;
+        double lower_val = channel.last_lower_val;
         double range = upper_val - lower_val;
         if (range > 0.0) {
             position = safe_divide(current_close - lower_val, range, 0.5);
-            // Clamp to [0, 1]
-            position = std::clamp(position, 0.0, 1.0);
+            // NOTE: Do NOT clamp - ML needs to learn from values outside [0,1]
+            // position < 0 means price below channel floor
+            // position > 1 means price above channel ceiling
         }
     }
     features["position_in_channel"] = position;
@@ -1518,9 +1949,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 25. distance_to_upper_pct
     // ==========================================================================
     double distance_to_upper_pct = 0.0;
-    if (!close.empty() && !channel.upper_line.empty()) {
+    if (!close.empty() && channel.tail_count > 0) {
         double current_close = close.back();
-        double upper_val = channel.upper_line.back();
+        double upper_val = channel.last_upper_val;
         if (current_close > 0.0) {
             distance_to_upper_pct = safe_divide(upper_val - current_close, current_close, 0.0) * 100.0;
         }
@@ -1531,9 +1962,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 26. distance_to_lower_pct
     // ==========================================================================
     double distance_to_lower_pct = 0.0;
-    if (!close.empty() && !channel.lower_line.empty()) {
+    if (!close.empty() && channel.tail_count > 0) {
         double current_close = close.back();
-        double lower_val = channel.lower_line.back();
+        double lower_val = channel.last_lower_val;
         if (current_close > 0.0) {
             distance_to_lower_pct = safe_divide(current_close - lower_val, current_close, 0.0) * 100.0;
         }
@@ -1544,9 +1975,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 27. price_vs_channel_midpoint
     // ==========================================================================
     double price_vs_midpoint = 0.0;
-    if (!close.empty() && !channel.center_line.empty()) {
+    if (!close.empty() && channel.tail_count > 0) {
         double current_price = close.back();
-        double center_price = channel.center_line.back();
+        double center_price = channel.last_center_val;
         if (!std::isfinite(center_price) || center_price == 0.0) center_price = current_price;
         price_vs_midpoint = safe_divide(current_price - center_price, center_price, 0.0) * 100.0;
     }
@@ -1584,11 +2015,10 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 29. upper_line_slope
     // ==========================================================================
     double upper_line_slope = 0.0;
-    if (!channel.upper_line.empty() && channel.upper_line.size() >= 2) {
-        int ul_len = static_cast<int>(channel.upper_line.size());
+    if (channel.tail_count > 0 && channel.window >= 2) {
         upper_line_slope = safe_divide(
-            channel.upper_line.back() - channel.upper_line.front(),
-            static_cast<double>(ul_len - 1),
+            channel.last_upper_val - channel.first_upper_val,
+            static_cast<double>(channel.window - 1),
             0.0
         );
     }
@@ -1598,11 +2028,10 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 30. lower_line_slope
     // ==========================================================================
     double lower_line_slope = 0.0;
-    if (!channel.lower_line.empty() && channel.lower_line.size() >= 2) {
-        int ll_len = static_cast<int>(channel.lower_line.size());
+    if (channel.tail_count > 0 && channel.window >= 2) {
         lower_line_slope = safe_divide(
-            channel.lower_line.back() - channel.lower_line.front(),
-            static_cast<double>(ll_len - 1),
+            channel.last_lower_val - channel.first_lower_val,
+            static_cast<double>(channel.window - 1),
             0.0
         );
     }
@@ -1612,10 +2041,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 31. channel_expanding (1 if width increasing)
     // ==========================================================================
     double channel_expanding = 0.0;
-    if (!channel.upper_line.empty() && !channel.lower_line.empty() &&
-        channel.upper_line.size() >= 10 && channel.lower_line.size() >= 10) {
-        double width_start = channel.upper_line.front() - channel.lower_line.front();
-        double width_end = channel.upper_line.back() - channel.lower_line.back();
+    if (channel.tail_count > 0 && channel.window >= 10) {
+        double width_start = channel.first_upper_val - channel.first_lower_val;
+        double width_end = channel.last_upper_val - channel.last_lower_val;
         if (width_end > width_start * 1.05) {
             channel_expanding = 1.0;
         }
@@ -1626,10 +2054,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 32. channel_contracting (1 if width decreasing)
     // ==========================================================================
     double channel_contracting = 0.0;
-    if (!channel.upper_line.empty() && !channel.lower_line.empty() &&
-        channel.upper_line.size() >= 10 && channel.lower_line.size() >= 10) {
-        double width_start = channel.upper_line.front() - channel.lower_line.front();
-        double width_end = channel.upper_line.back() - channel.lower_line.back();
+    if (channel.tail_count > 0 && channel.window >= 10) {
+        double width_start = channel.first_upper_val - channel.first_lower_val;
+        double width_end = channel.last_upper_val - channel.last_lower_val;
         if (width_end < width_start * 0.95) {
             channel_contracting = 1.0;
         }
@@ -1646,17 +2073,16 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 34. breakout_pressure_up
     // ==========================================================================
     double breakout_pressure_up = 0.0;
-    if (!high.empty() && !channel.upper_line.empty() && n >= 5) {
-        int start_idx = std::max(0, n - 5);
-        int upper_start = std::max(0, static_cast<int>(channel.upper_line.size()) - 5);
+    if (!high.empty() && channel.tail_count > 0 && n >= 5) {
+        int start_idx = std::max(0, n - channel.tail_count);
+        int count = std::min(channel.tail_count, n - start_idx);
 
         std::vector<double> distances_to_upper;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < count; ++i) {
             int h_idx = start_idx + i;
-            int u_idx = upper_start + i;
-            if (h_idx < n && u_idx < static_cast<int>(channel.upper_line.size())) {
+            if (h_idx < n) {
                 double h = high[h_idx];
-                double u = channel.upper_line[u_idx];
+                double u = channel.upper_line_tail[i];
                 if (u > 0) {
                     double dist = safe_divide(u - h, u, 0.0);
                     distances_to_upper.push_back(std::max(0.0, dist));
@@ -1676,17 +2102,16 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 35. breakout_pressure_down
     // ==========================================================================
     double breakout_pressure_down = 0.0;
-    if (!low.empty() && !channel.lower_line.empty() && n >= 5) {
-        int start_idx = std::max(0, n - 5);
-        int lower_start = std::max(0, static_cast<int>(channel.lower_line.size()) - 5);
+    if (!low.empty() && channel.tail_count > 0 && n >= 5) {
+        int start_idx = std::max(0, n - channel.tail_count);
+        int count = std::min(channel.tail_count, n - start_idx);
 
         std::vector<double> distances_to_lower;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < count; ++i) {
             int l_idx = start_idx + i;
-            int lb_idx = lower_start + i;
-            if (l_idx < n && lb_idx < static_cast<int>(channel.lower_line.size())) {
+            if (l_idx < n) {
                 double l = low[l_idx];
-                double lb = channel.lower_line[lb_idx];
+                double lb = channel.lower_line_tail[i];
                 if (l > 0) {
                     double dist = safe_divide(l - lb, l, 0.0);
                     distances_to_lower.push_back(std::max(0.0, dist));
@@ -2217,8 +2642,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     if (!ch_high.empty() && !ch_low.empty() && !ch_close.empty() && ch_close.size() >= 14) {
         auto atr_values = atr(ch_high, ch_low, ch_close, 14);
         double current_atr = get_last_valid(atr_values, 1.0);
-        if (!channel.upper_line.empty() && !channel.lower_line.empty()) {
-            double channel_width = channel.upper_line.back() - channel.lower_line.back();
+        if (channel.tail_count > 0) {
+            double channel_width = channel.last_upper_val - channel.last_lower_val;
             channel_width_atr_ratio = safe_divide(channel_width, current_atr, 0.0);
         }
     }
@@ -2333,14 +2758,14 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 24. spy_position_in_channel (0=floor, 1=ceiling)
     // ==========================================================================
     double position = 0.5;
-    if (!ch_close.empty() && !channel.upper_line.empty() && !channel.lower_line.empty()) {
+    if (!ch_close.empty() && channel.tail_count > 0) {
         double current_price = ch_close.back();
-        double upper = channel.upper_line.back();
-        double lower = channel.lower_line.back();
+        double upper = channel.last_upper_val;
+        double lower = channel.last_lower_val;
         double width = upper - lower;
         if (width > 0.0) {
             position = (current_price - lower) / width;
-            position = std::max(0.0, std::min(1.0, position));
+            // NOTE: Do NOT clamp - ML needs to learn from values outside [0,1]
         }
     }
     features["spy_position_in_channel"] = position;
@@ -2349,9 +2774,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 25. spy_distance_to_upper_pct
     // ==========================================================================
     double distance_to_upper_pct = 0.0;
-    if (!ch_close.empty() && !channel.upper_line.empty()) {
+    if (!ch_close.empty() && channel.tail_count > 0) {
         double current_price = ch_close.back();
-        double upper = channel.upper_line.back();
+        double upper = channel.last_upper_val;
         distance_to_upper_pct = safe_divide(upper - current_price, current_price, 0.0) * 100.0;
     }
     features["spy_distance_to_upper_pct"] = distance_to_upper_pct;
@@ -2360,9 +2785,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 26. spy_distance_to_lower_pct
     // ==========================================================================
     double distance_to_lower_pct = 0.0;
-    if (!ch_close.empty() && !channel.lower_line.empty()) {
+    if (!ch_close.empty() && channel.tail_count > 0) {
         double current_price = ch_close.back();
-        double lower = channel.lower_line.back();
+        double lower = channel.last_lower_val;
         distance_to_lower_pct = safe_divide(current_price - lower, current_price, 0.0) * 100.0;
     }
     features["spy_distance_to_lower_pct"] = distance_to_lower_pct;
@@ -2371,9 +2796,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 27. spy_price_vs_channel_midpoint
     // ==========================================================================
     double price_vs_midpoint = 0.0;
-    if (!ch_close.empty() && !channel.center_line.empty()) {
+    if (!ch_close.empty() && channel.tail_count > 0) {
         double current_price = ch_close.back();
-        double center_price = channel.center_line.back();
+        double center_price = channel.last_center_val;
         price_vs_midpoint = safe_divide(current_price - center_price, center_price, 0.0) * 100.0;
     }
     features["spy_price_vs_channel_midpoint"] = price_vs_midpoint;
@@ -2407,9 +2832,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 29. spy_upper_line_slope
     // ==========================================================================
     double upper_line_slope = 0.0;
-    const auto& upper_line = channel.upper_line;
-    if (upper_line.size() >= 2) {
-        upper_line_slope = (upper_line.back() - upper_line.front()) / static_cast<double>(upper_line.size() - 1);
+    if (channel.tail_count > 0 && channel.window >= 2) {
+        upper_line_slope = (channel.last_upper_val - channel.first_upper_val) / static_cast<double>(channel.window - 1);
     }
     features["spy_upper_line_slope"] = safe_float(upper_line_slope, 0.0);
 
@@ -2417,9 +2841,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 30. spy_lower_line_slope
     // ==========================================================================
     double lower_line_slope = 0.0;
-    const auto& lower_line = channel.lower_line;
-    if (lower_line.size() >= 2) {
-        lower_line_slope = (lower_line.back() - lower_line.front()) / static_cast<double>(lower_line.size() - 1);
+    if (channel.tail_count > 0 && channel.window >= 2) {
+        lower_line_slope = (channel.last_lower_val - channel.first_lower_val) / static_cast<double>(channel.window - 1);
     }
     features["spy_lower_line_slope"] = safe_float(lower_line_slope, 0.0);
 
@@ -2427,9 +2850,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 31. spy_channel_expanding (1 if width increasing)
     // ==========================================================================
     double channel_expanding = 0.0;
-    if (upper_line.size() >= 10 && lower_line.size() >= 10) {
-        double width_start = upper_line.front() - lower_line.front();
-        double width_end = upper_line.back() - lower_line.back();
+    if (channel.tail_count > 0 && channel.window >= 10) {
+        double width_start = channel.first_upper_val - channel.first_lower_val;
+        double width_end = channel.last_upper_val - channel.last_lower_val;
         channel_expanding = (width_end > width_start * 1.05) ? 1.0 : 0.0;
     }
     features["spy_channel_expanding"] = channel_expanding;
@@ -2438,9 +2861,9 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 32. spy_channel_contracting (1 if width decreasing)
     // ==========================================================================
     double channel_contracting = 0.0;
-    if (upper_line.size() >= 10 && lower_line.size() >= 10) {
-        double width_start = upper_line.front() - lower_line.front();
-        double width_end = upper_line.back() - lower_line.back();
+    if (channel.tail_count > 0 && channel.window >= 10) {
+        double width_start = channel.first_upper_val - channel.first_lower_val;
+        double width_end = channel.last_upper_val - channel.last_lower_val;
         channel_contracting = (width_end < width_start * 0.95) ? 1.0 : 0.0;
     }
     features["spy_channel_contracting"] = channel_contracting;
@@ -2454,14 +2877,13 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 34. spy_breakout_pressure_up
     // ==========================================================================
     double breakout_pressure_up = 0.0;
-    if (!ch_high.empty() && !upper_line.empty() && ch_high.size() >= 5) {
+    if (!ch_high.empty() && channel.tail_count > 0 && ch_high.size() >= 5) {
         double sum_dist = 0.0;
         int count = 0;
-        size_t start = ch_high.size() > 5 ? ch_high.size() - 5 : 0;
-        size_t ul_start = upper_line.size() > 5 ? upper_line.size() - 5 : 0;
-        for (size_t i = 0; i < 5 && start + i < ch_high.size() && ul_start + i < upper_line.size(); ++i) {
+        size_t start = ch_high.size() > static_cast<size_t>(channel.tail_count) ? ch_high.size() - channel.tail_count : 0;
+        for (int i = 0; i < channel.tail_count && start + i < ch_high.size(); ++i) {
             double h = ch_high[start + i];
-            double u = upper_line[ul_start + i];
+            double u = channel.upper_line_tail[i];
             if (u > 0) {
                 double dist = (u - h) / u;
                 if (dist > 0) sum_dist += dist;
@@ -2479,14 +2901,13 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     // 35. spy_breakout_pressure_down
     // ==========================================================================
     double breakout_pressure_down = 0.0;
-    if (!ch_low.empty() && !lower_line.empty() && ch_low.size() >= 5) {
+    if (!ch_low.empty() && channel.tail_count > 0 && ch_low.size() >= 5) {
         double sum_dist = 0.0;
         int count = 0;
-        size_t start = ch_low.size() > 5 ? ch_low.size() - 5 : 0;
-        size_t ll_start = lower_line.size() > 5 ? lower_line.size() - 5 : 0;
-        for (size_t i = 0; i < 5 && start + i < ch_low.size() && ll_start + i < lower_line.size(); ++i) {
+        size_t start = ch_low.size() > static_cast<size_t>(channel.tail_count) ? ch_low.size() - channel.tail_count : 0;
+        for (int i = 0; i < channel.tail_count && start + i < ch_low.size(); ++i) {
             double l = ch_low[start + i];
-            double lb = lower_line[ll_start + i];
+            double lb = channel.lower_line_tail[i];
             if (l > 0) {
                 double dist = (l - lb) / l;
                 if (dist > 0) sum_dist += dist;
@@ -2664,23 +3085,25 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     bool in_excursion = false;
     int current_excursion_start = -1;
 
-    if (!ch_high.empty() && !ch_low.empty() && !upper_line.empty() && !lower_line.empty()) {
-        size_t len = std::min({ch_high.size(), ch_low.size(), upper_line.size(), lower_line.size()});
+    // Only analyze excursions in the tail data (last N bars where N = tail_count)
+    if (!ch_high.empty() && !ch_low.empty() && channel.tail_count > 0) {
+        size_t data_start = ch_high.size() > static_cast<size_t>(channel.tail_count) ? ch_high.size() - channel.tail_count : 0;
+        int len = std::min(channel.tail_count, static_cast<int>(ch_high.size() - data_start));
 
-        for (size_t i = 0; i < len; ++i) {
-            double h = ch_high[i];
-            double l = ch_low[i];
-            double u = upper_line[i];
-            double lb = lower_line[i];
+        for (int i = 0; i < len; ++i) {
+            double h = ch_high[data_start + i];
+            double l = ch_low[data_start + i];
+            double u = channel.upper_line_tail[i];
+            double lb = channel.lower_line_tail[i];
 
             // Check for excursion above upper line
             if (h > u) {
                 if (!in_excursion) {
                     in_excursion = true;
-                    current_excursion_start = static_cast<int>(i);
+                    current_excursion_start = i;
                 }
                 excursions_above++;
-                last_excursion_bar = static_cast<int>(i);
+                last_excursion_bar = i;
                 last_excursion_dir = 1.0;
 
                 double excursion_pct = safe_divide(h - u, u, 0.0) * 100.0;
@@ -2690,10 +3113,10 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
             else if (l < lb) {
                 if (!in_excursion) {
                     in_excursion = true;
-                    current_excursion_start = static_cast<int>(i);
+                    current_excursion_start = i;
                 }
                 excursions_below++;
-                last_excursion_bar = static_cast<int>(i);
+                last_excursion_bar = i;
                 last_excursion_dir = -1.0;
 
                 double excursion_pct = safe_divide(lb - l, lb, 0.0) * 100.0;
@@ -2702,7 +3125,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
             else {
                 // Price is inside channel
                 if (in_excursion) {
-                    int duration = static_cast<int>(i) - current_excursion_start;
+                    int duration = i - current_excursion_start;
                     excursion_durations.push_back(duration);
                     in_excursion = false;
                     current_excursion_start = -1;
@@ -2712,8 +3135,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
 
         // Handle ongoing excursion at end
         if (in_excursion && current_excursion_start >= 0) {
-            size_t len = std::min({ch_high.size(), ch_low.size(), upper_line.size(), lower_line.size()});
-            int duration = static_cast<int>(len) - current_excursion_start;
+            int duration = len - current_excursion_start;
             excursion_durations.push_back(duration);
         }
     }

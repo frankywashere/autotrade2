@@ -1079,6 +1079,18 @@ void Scanner::generate_all_labels(
             slim.channel_bounce_count = channel.bounce_count;
             slim.tf = tf_str;
             slim.labels = labels;
+            slim.touches = channel.touches;  // Copy touches for feature extraction
+
+            // Copy cached line values for position_in_channel calculation
+            slim.first_upper_val = channel.first_upper_val;
+            slim.last_upper_val = channel.last_upper_val;
+            slim.first_lower_val = channel.first_lower_val;
+            slim.last_lower_val = channel.last_lower_val;
+            slim.first_center_val = channel.first_center_val;
+            slim.last_center_val = channel.last_center_val;
+            slim.upper_line_tail = channel.upper_line_tail;
+            slim.lower_line_tail = channel.lower_line_tail;
+            slim.tail_count = channel.tail_count;
 
             slim_channels.push_back(slim);
 
@@ -1321,6 +1333,8 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
                 spy_view,
                 vix_view,
                 sample_timestamp,
+                tsla_slim_map,
+                spy_slim_map,
                 static_cast<int>(tsla_view.size()),  // source_bar_count - use view size!
                 true       // include_bar_metadata
             );

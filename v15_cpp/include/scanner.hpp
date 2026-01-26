@@ -53,6 +53,20 @@ struct SlimLabeledChannel {
     // PRECOMPUTED labels from Pass 2 - USE DIRECTLY
     ChannelLabels labels;
 
+    // Touch data for feature extraction (from Channel.touches)
+    std::vector<Touch> touches;
+
+    // Cached line values for position_in_channel calculation
+    double first_upper_val = 0.0;
+    double last_upper_val = 0.0;
+    double first_lower_val = 0.0;
+    double last_lower_val = 0.0;
+    double first_center_val = 0.0;
+    double last_center_val = 0.0;
+    std::array<double, 5> upper_line_tail{};
+    std::array<double, 5> lower_line_tail{};
+    int tail_count = 0;
+
     SlimLabeledChannel()
         : start_timestamp(0)
         , end_timestamp(0)
@@ -66,6 +80,7 @@ struct SlimLabeledChannel {
         , channel_valid(false)
         , channel_window(0)
         , channel_bounce_count(0)
+        , tail_count(0)
     {}
 };
 

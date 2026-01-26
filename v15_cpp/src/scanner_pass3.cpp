@@ -106,6 +106,8 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
                 spy_slice,
                 vix_slice,
                 sample_timestamp,
+                tsla_slim_map,
+                spy_slim_map,
                 idx_5min,  // source_bar_count
                 true       // include_bar_metadata
             );

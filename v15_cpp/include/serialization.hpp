@@ -78,7 +78,7 @@ namespace v15 {
 
 // Format constants
 constexpr uint8_t MAGIC_BYTES[8] = {'V', '1', '5', 'S', 'A', 'M', 'P', '\0'};
-constexpr uint32_t FORMAT_VERSION = 1;
+constexpr uint32_t FORMAT_VERSION = 2;
 
 // =============================================================================
 // PUBLIC API

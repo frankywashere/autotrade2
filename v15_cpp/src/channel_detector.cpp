@@ -247,6 +247,10 @@ void ChannelDetector::detect_bounces(
         return;
     }
 
+    // Pre-allocate touches vector to avoid reallocations in hot loop
+    // Worst case: every bar could touch both boundaries = 2*n touches
+    touches.reserve(static_cast<size_t>(n * 2));
+
     // Detect touches
     // CRITICAL: This is the hot loop - optimize heavily
     for (int i = 0; i < n; ++i) {
@@ -664,7 +668,63 @@ Channel ChannelDetector::detect_channel(
         channel.quality_score = 0.0;
     }
 
+    // ========================================================================
+    // MEMORY OPTIMIZATION: Cache values and strip heavy vectors
+    // All vector-dependent calculations are complete at this point
+    // ========================================================================
+
+    // Cache first/last values before clearing vectors
+    if (!channel.upper_line.empty()) {
+        channel.first_upper_val = channel.upper_line.front();
+        channel.last_upper_val = channel.upper_line.back();
+        channel.tail_count = std::min(5, static_cast<int>(channel.upper_line.size()));
+        for (int i = 0; i < channel.tail_count; ++i) {
+            int idx = static_cast<int>(channel.upper_line.size()) - channel.tail_count + i;
+            channel.upper_line_tail[i] = channel.upper_line[idx];
+        }
+    }
+    if (!channel.lower_line.empty()) {
+        channel.first_lower_val = channel.lower_line.front();
+        channel.last_lower_val = channel.lower_line.back();
+        for (int i = 0; i < channel.tail_count; ++i) {
+            int idx = static_cast<int>(channel.lower_line.size()) - channel.tail_count + i;
+            channel.lower_line_tail[i] = channel.lower_line[idx];
+        }
+    }
+    if (!channel.center_line.empty()) {
+        channel.first_center_val = channel.center_line.front();
+        channel.last_center_val = channel.center_line.back();
+    }
+
+    // Free heavy vector memory using swap (clear() preserves capacity!)
+    std::vector<double>().swap(channel.upper_line);
+    std::vector<double>().swap(channel.lower_line);
+    std::vector<double>().swap(channel.center_line);
+    std::vector<double>().swap(channel.close);
+    std::vector<double>().swap(channel.high);
+    std::vector<double>().swap(channel.low);
+    // Keep touches for now - it's small
+
     return channel;
+}
+
+Channel ChannelDetector::detect_channel(
+    const double* high,
+    const double* low,
+    const double* close,
+    size_t data_size,
+    int window,
+    double std_multiplier,
+    double touch_threshold,
+    int min_cycles
+) {
+    // Create vectors from pointers - this is temporary until full refactor
+    std::vector<double> high_vec(high, high + data_size);
+    std::vector<double> low_vec(low, low + data_size);
+    std::vector<double> close_vec(close, close + data_size);
+
+    return detect_channel(high_vec, low_vec, close_vec, window,
+                         std_multiplier, touch_threshold, min_cycles);
 }
 
 std::vector<Channel> ChannelDetector::detect_multi_window(

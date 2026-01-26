@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.hpp"
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -75,6 +76,17 @@ struct Channel {
     std::vector<double> close;
     std::vector<double> high;
     std::vector<double> low;
+
+    // Cached scalar values (stored before clearing heavy vectors)
+    double first_upper_val = 0.0;
+    double last_upper_val = 0.0;
+    double first_lower_val = 0.0;
+    double last_lower_val = 0.0;
+    double first_center_val = 0.0;
+    double last_center_val = 0.0;
+    std::array<double, 5> upper_line_tail{};
+    std::array<double, 5> lower_line_tail{};
+    int tail_count = 0;  // Actual count for channels with <5 points
 
     // Metadata
     Timeframe timeframe;    // Which timeframe this channel belongs to

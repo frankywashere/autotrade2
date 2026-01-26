@@ -416,7 +416,9 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_bollinger
     // %B
     double band_range = bb_upper - bb_lower;
     double bb_pct_b = safe_divide(current_close - bb_lower, band_range, 0.5);
-    features["bb_pct_b"] = std::clamp(bb_pct_b, 0.0, 1.0);
+    // NOTE: Do NOT clamp - ML needs to learn from values outside [0,1]
+    // bb_pct_b < 0 means price below lower band, > 1 means above upper band
+    features["bb_pct_b"] = bb_pct_b;
 
     // Price vs bands
     features["price_vs_bb_upper"] = (bb_upper > 0) ? scalar_pct_change(current_close, bb_upper, 0.0) : 0.0;
@@ -493,7 +495,9 @@ std::unordered_map<std::string, double> TechnicalIndicators::calculate_keltner(
     // Position within channel
     double channel_range = keltner_upper - keltner_lower;
     double keltner_position = safe_divide(current_close - keltner_lower, channel_range, 0.5);
-    features["keltner_position"] = std::clamp(keltner_position, 0.0, 1.0);
+    // NOTE: Do NOT clamp - ML needs to learn from values outside [0,1]
+    // keltner_position < 0 means price below lower channel, > 1 means above upper
+    features["keltner_position"] = keltner_position;
 
     return features;
 }
