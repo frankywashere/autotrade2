@@ -144,8 +144,12 @@ class Predictor:
         # Get config from checkpoint or use defaults
         model_config = checkpoint.get('config', {})
 
+        # Get input_dim from checkpoint (supports models trained with different feature counts)
+        input_dim = model_config.get('total_features', TOTAL_FEATURES)
+
         # Create model with appropriate configuration
         config = {
+            'input_dim': input_dim,
             'use_window_selector': has_window_selector,
             'num_windows': model_config.get('num_windows', 8),
         }

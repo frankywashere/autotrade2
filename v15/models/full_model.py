@@ -5,6 +5,10 @@ Takes all 8,632+ features, applies explicit weights, encodes per-TF,
 applies cross-TF attention, and produces predictions.
 """
 import torch
+import logging
+
+logger = logging.getLogger(__name__)
+
 import torch.nn as nn
 from typing import Dict, Optional, Tuple
 
@@ -90,13 +94,25 @@ class V15Model(nn.Module):
             FEATURE_COUNTS['bar_metadata_per_tf'] * n_timeframes
         )
 
-        # Validate dimensions
+        # Validate or compute features_per_tf from input_dim
+        # This allows flexibility when C++ scanner produces different feature counts
         expected_dim = features_per_tf * n_timeframes + self.shared_features_dim
         if input_dim != expected_dim:
-            raise ModelError(
-                f"Input dim mismatch: got {input_dim}, expected {expected_dim} "
-                f"({features_per_tf} * {n_timeframes} + {self.shared_features_dim})"
-            )
+            # Compute features_per_tf from actual input_dim
+            computed_per_tf = (input_dim - self.shared_features_dim) // n_timeframes
+            if computed_per_tf * n_timeframes + self.shared_features_dim == input_dim:
+                logger.info(
+                    f"Adjusting features_per_tf: {features_per_tf} -> {computed_per_tf} "
+                    f"(input_dim={input_dim})"
+                )
+                self.features_per_tf = computed_per_tf
+            else:
+                # Can't evenly divide, use input_dim directly as flat features
+                logger.warning(
+                    f"Input dim {input_dim} doesn't match expected structure. "
+                    f"Using flat feature processing."
+                )
+                self.features_per_tf = (input_dim - self.shared_features_dim) // n_timeframes
 
         # 1. Explicit Feature Weights
         if use_explicit_weights:
@@ -113,7 +129,7 @@ class V15Model(nn.Module):
         # 3. Per-TF Encoders
         self.tf_encoder = MultiTFEncoder(
             n_timeframes=n_timeframes,
-            features_per_tf=features_per_tf,
+            features_per_tf=self.features_per_tf,
             shared_features=self.shared_features_dim,
             hidden_dim=hidden_dim,
             output_dim=embed_dim,

@@ -388,7 +388,7 @@ class Trainer:
                 self.optimizer,
                 max_lr=self.config.lr,
                 total_steps=total_steps,
-                pct_start=self.config.warmup_steps / total_steps,
+                pct_start=min(0.3, self.config.warmup_steps / total_steps),
             )
         elif self.config.scheduler == 'cosine_restarts':
             kwargs = {
@@ -1663,21 +1663,22 @@ class Trainer:
 
             logger.warning(f"Analyzing feature matrix with shape: {feature_matrix.shape}")
 
-            # Check for constant features
-            constant_features = check_for_constant_features(feature_matrix)
-            if constant_features:
-                logger.warning("!" * 60)
-                logger.warning("CONSTANT FEATURES DETECTED - These provide NO information!")
-                logger.warning("!" * 60)
-                for idx in constant_features:
-                    logger.warning(f"  Feature {idx} is CONSTANT (zero variance)")
-                    warnings.warn(
-                        f"Feature {idx} is constant and provides no information!",
-                        UserWarning
-                    )
-                self.suggested_feature_drops.extend(constant_features)
+            # Check for constant features (need feature_names for proper reporting)
+            if self.feature_names is not None:
+                constant_features = check_for_constant_features(feature_matrix, self.feature_names)
+                if constant_features:
+                    logger.warning("!" * 60)
+                    logger.warning(f"CONSTANT FEATURES DETECTED: {len(constant_features)} features provide NO information!")
+                    logger.warning("!" * 60)
+                    for name in constant_features[:10]:  # Show first 10
+                        logger.warning(f"  {name} is CONSTANT (zero variance)")
+                    if len(constant_features) > 10:
+                        logger.warning(f"  ... and {len(constant_features) - 10} more")
+                    self.suggested_feature_drops.extend(constant_features)
+                else:
+                    logger.warning("No constant features detected.")
             else:
-                logger.warning("No constant features detected.")
+                logger.warning("Skipping constant feature check (no feature names available)")
 
             # Analyze correlations
             correlation_results = analyze_correlations(feature_matrix)

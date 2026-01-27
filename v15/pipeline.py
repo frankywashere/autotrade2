@@ -28,58 +28,37 @@ logger = logging.getLogger(__name__)
 
 
 def cmd_scan(args):
-    """Run feature extraction pipeline."""
-    import os
-    from .data import load_market_data
-    from .scanner import scan_channels
+    """
+    DEPRECATED: Python scanner has been removed.
 
-    # Auto-enable incremental if chunk size specified (consistent with scanner CLI)
-    if args.incremental_chunk != 1000:
-        args.incremental = True
+    Use the C++ scanner instead for 10x faster performance:
+        cd v15_cpp/build && ./v15_scanner --data-dir ../../data --output samples.bin
 
-    logger.info(f"Loading data from {args.data_dir}")
-    tsla, spy, vix = load_market_data(args.data_dir)
-    logger.info(f"Loaded {len(tsla)} bars")
+    Then train with:
+        python -m v15.pipeline train --samples samples.bin --output model.pt
+    """
+    logger.error("Python scanner has been removed. Use v15_cpp/build/v15_scanner instead.")
+    logger.error("Example: cd v15_cpp/build && ./v15_scanner --data-dir ../../data --output samples.bin")
+    sys.exit(1)
 
-    # Setup incremental mode if enabled
-    incremental_path = None
-    if args.incremental:
-        incremental_path = args.output + '.tmp'
-        if os.path.exists(incremental_path):
-            os.remove(incremental_path)
-        logger.info(f"Incremental mode enabled, temp file: {incremental_path}")
 
-    logger.info("Starting channel scan...")
-    samples = scan_channels(
-        tsla_df=tsla,
-        spy_df=spy,
-        vix_df=vix,
-        step=args.step,
-        warmup_bars=args.warmup,
-        workers=args.workers,
-        max_samples=args.max_samples,
-        progress=True,
-        output_path=args.output,
-        incremental_path=incremental_path,
-        incremental_chunk=args.incremental_chunk
-    )
+def load_training_samples(path: str):
+    """Load samples from either .pkl or .bin format."""
+    from pathlib import Path
+    path = Path(path)
 
-    # Handle output based on whether incremental mode wrote directly to disk
-    if not samples and args.incremental:
-        # Samples were written directly to output file by incremental mode
-        logger.info(f"Samples written directly to {args.output} (incremental mode)")
-        # Load to get count for logging
-        with open(args.output, 'rb') as f:
-            saved_samples = pickle.load(f)
-        logger.info(f"Total samples: {len(saved_samples)}")
-        del saved_samples  # Free memory
-    else:
-        logger.info(f"Generated {len(samples)} samples")
-        # Save
-        output_path = Path(args.output)
-        with open(output_path, 'wb') as f:
-            pickle.dump(samples, f)
-        logger.info(f"Saved to {output_path}")
+    if path.suffix == '.bin' or path.suffix == '':
+        # Try binary format first
+        with open(path, 'rb') as f:
+            magic = f.read(8)
+        if magic == b'V15SAMP\x00':
+            from .binary_loader import load_samples as load_bin_samples
+            _, _, _, samples = load_bin_samples(str(path))
+            return samples
+
+    # Fall back to pickle format
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 
 
 def cmd_train(args):
@@ -88,8 +67,7 @@ def cmd_train(args):
     from .models import create_model
 
     logger.info(f"Loading samples from {args.samples}")
-    with open(args.samples, 'rb') as f:
-        samples = pickle.load(f)
+    samples = load_training_samples(args.samples)
 
     # Split train/val
     split_idx = int(len(samples) * 0.8)
@@ -111,20 +89,32 @@ def cmd_train(args):
         strategy=args.strategy
     )
 
-    # Create model
-    model = create_model()
+    # Detect actual feature count from samples (C++ scanner may produce different count than config)
+    actual_feature_count = len(samples[0].tf_features) if samples else TOTAL_FEATURES
+    if actual_feature_count != TOTAL_FEATURES:
+        logger.info(f"Note: Samples have {actual_feature_count} features (config says {TOTAL_FEATURES})")
+
+    # Create model with actual feature count
+    model = create_model({'input_dim': actual_feature_count})
     logger.info(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
 
-    # Train with window selection options
+    # Create training config with window selection options
+    from .training.trainer import TrainingConfig
+    config = TrainingConfig(
+        lr=args.lr,
+        max_epochs=args.epochs,
+        checkpoint_dir=args.output,
+        use_end_to_end_loss=args.end_to_end,
+        window_selection_weight=args.window_selection_weight,
+        strategy=args.strategy,
+    )
+
+    # Train
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        lr=args.lr,
-        max_epochs=args.epochs,
-        checkpoint_dir=args.output,
-        end_to_end_window_selection=args.end_to_end,
-        window_selection_weight=args.window_selection_weight,
+        config=config,
     )
 
     history = trainer.train()
@@ -138,8 +128,7 @@ def cmd_analyze(args):
     import numpy as np
 
     logger.info(f"Loading samples from {args.samples}")
-    with open(args.samples, 'rb') as f:
-        samples = pickle.load(f)
+    samples = load_training_samples(args.samples)
 
     # Extract feature matrix
     feature_names = sorted(samples[0].tf_features.keys())

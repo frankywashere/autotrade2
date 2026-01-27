@@ -88,12 +88,12 @@ def print_deprecation_guide():
 ║  MODELS                                                           ║
 ║  -------                                                          ║
 ║  OLD: v7.models.HierarchicalCfC (776 features)                   ║
-║  NEW: v15.models.V15Model (8,665 features)                       ║
+║  NEW: v15.models.V15Model (14,840 features via C++ scanner)      ║
 ║                                                                   ║
 ║  FEATURES                                                         ║
 ║  ---------                                                        ║
 ║  OLD: v7.features.extract_full_features() → 776 features         ║
-║  NEW: v15.features.extract_all_features() → 8,665 features       ║
+║  NEW: C++ scanner extracts 14,840 features per sample            ║
 ║                                                                   ║
 ║  TRAINING                                                         ║
 ║  ---------                                                        ║
@@ -102,15 +102,19 @@ def print_deprecation_guide():
 ║                                                                   ║
 ║  KEY IMPROVEMENTS                                                 ║
 ║  ----------------                                                 ║
-║  • Explicit feature weights (8,665 learnable weights)            ║
+║  • C++ scanner: 10x faster than Python, 14,840 features          ║
+║  • Explicit feature weights (learnable attention)                ║
 ║  • Partial bar support (no stale TF data)                        ║
 ║  • Automatic correlation analysis                                 ║
-║  • Loud failures (no silent exceptions)                          ║
+║  • Binary format (.bin) for fast sample loading                  ║
 ║                                                                   ║
 ║  COMMANDS                                                         ║
 ║  ---------                                                        ║
-║  Scan:  python -m v15.pipeline scan --data-dir data -o out.pkl  ║
-║  Train: python -m v15.pipeline train --samples out.pkl          ║
+║  Scan (C++ - 10x faster):                                        ║
+║    cd v15_cpp/build && ./v15_scanner --data-dir ../../data \    ║
+║                                       --output samples.bin       ║
+║  Train: python -m v15.pipeline train --samples samples.bin      ║
+║  Inspect: python -m v15.inspector --samples samples.bin         ║
 ║  Dashboard: streamlit run v15/dashboard.py                       ║
 ║                                                                   ║
 ╚══════════════════════════════════════════════════════════════════╝

@@ -74,25 +74,11 @@ TF_FEATURE_GROUPS = {
 TOTAL_TF_FEATURES = 13020  # Updated to include spy_channel, channel_correlation, bar_metadata
 
 # =============================================================================
-# Main Extractor Imports
+# Main Extractor Imports (DEPRECATED - use tf_extractor instead)
 # =============================================================================
-
-try:
-    from .extractor import (
-        extract_all_features,
-        extract_features,  # Legacy wrapper for scanner compatibility
-        get_feature_names,
-        get_feature_count,
-        get_feature_group_counts,
-        get_available_modules,
-        validate_features,
-        create_feature_vector,
-        features_to_dataframe,
-    )
-    _extractor_available = True
-except ImportError as e:
-    logger.warning(f"Failed to import extractor: {e}")
-    _extractor_available = False
+# The legacy extractor.py has been removed. Use tf_extractor for all feature
+# extraction. Setting _extractor_available = False to skip legacy exports.
+_extractor_available = False
 
 # =============================================================================
 # TF-Aware Extractor Imports

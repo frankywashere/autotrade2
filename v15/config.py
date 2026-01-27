@@ -3,6 +3,10 @@ V15 Configuration - Single source of truth for all constants.
 
 Feature counts are hardcoded to avoid circular import issues.
 If feature counts change, update FEATURE_COUNTS manually.
+
+NOTE: The C++ scanner (v15_cpp/build/v15_scanner) produces 14,840 features
+per sample. Python feature extraction may produce slightly different counts.
+For training, use samples from the C++ scanner for best performance.
 """
 from typing import Dict, List
 

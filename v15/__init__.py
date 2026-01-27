@@ -54,9 +54,20 @@ def create_model(**kwargs):
     return _create(**kwargs)
 
 def scan_channels(tsla_df, spy_df, vix_df, **kwargs):
-    """Scan for channels and extract features."""
-    from .scanner import scan_channels as _scan
-    return _scan(tsla_df, spy_df, vix_df, **kwargs)
+    """
+    DEPRECATED: Python scanner has been removed.
+
+    Use the C++ scanner instead for 10x faster performance:
+        cd v15_cpp/build && ./v15_scanner --data-dir ../../data --output samples.bin
+
+    Then load results with v15.binary_loader:
+        from v15.binary_loader import load_samples
+        version, num_samples, num_features, samples = load_samples('samples.bin')
+    """
+    raise NotImplementedError(
+        "Python scanner has been removed. Use v15_cpp/build/v15_scanner instead. "
+        "See v15.scan_channels.__doc__ for details."
+    )
 
 def load_predictor(checkpoint_path: str):
     """Load a trained model for inference."""

@@ -1206,10 +1206,14 @@ def create_dataloaders(
 
 def load_samples(path: str) -> List[ChannelSample]:
     """
-    Load ChannelSample objects from pickle file.
+    Load ChannelSample objects from pickle or binary file.
+
+    Supports both formats:
+    - .pkl: Python pickle format (legacy)
+    - .bin: V15 binary format from C++ scanner (preferred, 10x faster scanning)
 
     Args:
-        path: Path to pickle file containing list of ChannelSample objects
+        path: Path to samples file (.pkl or .bin)
 
     Returns:
         List of ChannelSample objects
@@ -1221,8 +1225,18 @@ def load_samples(path: str) -> List[ChannelSample]:
     if not path.exists():
         raise DataLoadError(f"Samples file not found: {path}")
 
+    # Check for binary format by reading magic bytes
     with open(path, 'rb') as f:
-        samples = pickle.load(f)
+        magic = f.read(8)
+
+    if magic == b'V15SAMP\x00':
+        # Binary format from C++ scanner
+        from ..binary_loader import load_samples as load_bin_samples
+        _, _, _, samples = load_bin_samples(str(path))
+    else:
+        # Pickle format (legacy)
+        with open(path, 'rb') as f:
+            samples = pickle.load(f)
 
     if not isinstance(samples, list):
         raise DataLoadError(f"Expected list of samples, got {type(samples)}")
