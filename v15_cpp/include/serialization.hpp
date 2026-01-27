@@ -5,6 +5,8 @@
 #include <string>
 #include <cstdint>
 #include <fstream>
+#include <unordered_map>
+#include <algorithm>
 
 namespace v15 {
 
@@ -21,13 +23,19 @@ namespace v15 {
  *   - Forward compatible with Python loading
  *   - Versioned format for future evolution
  *
- * FILE STRUCTURE:
+ * FILE STRUCTURE (v3 with feature name table optimization):
  *
  * [HEADER]
  *   magic_bytes:    8 bytes  "V15SAMP\0"
- *   version:        4 bytes  uint32_t (format version, currently 1)
+ *   version:        4 bytes  uint32_t (format version, currently 3)
  *   num_samples:    8 bytes  uint64_t (total samples in file)
  *   num_features:   4 bytes  uint32_t (features per sample, for validation)
+ *
+ * [FEATURE NAME TABLE] (v3 only - names stored once instead of per-sample)
+ *   feature_table_count: 4 bytes  uint32_t (number of feature names)
+ *   For each name:
+ *     name_length:  2 bytes  uint16_t
+ *     name_data:    N bytes  UTF-8 string (no null terminator)
  *
  * [SAMPLE RECORDS] (repeated num_samples times)
  *   For each sample:
@@ -35,11 +43,10 @@ namespace v15 {
  *     channel_end_idx:     4 bytes   int32_t
  *     best_window:         4 bytes   int32_t
  *
- *     [FEATURES]
+ *     [FEATURES] (v3: index-based)
  *       feature_count:     4 bytes   uint32_t
  *       For each feature:
- *         key_length:      2 bytes   uint16_t
- *         key_data:        N bytes   UTF-8 string (no null terminator)
+ *         feature_index:   2 bytes   uint16_t (index into feature name table)
  *         value:           8 bytes   double
  *
  *     [LABELS_PER_WINDOW]
@@ -65,7 +72,8 @@ namespace v15 {
  *
  * VERSIONING:
  *   Version 1: Initial format with full ChannelLabels support
- *   Future versions can extend ChannelLabels or add new sections
+ *   Version 2: Added SPY labels and source channel parameters
+ *   Version 3: Feature name table optimization (~70% file size reduction)
  *
  * ENDIANNESS:
  *   Little-endian for all multi-byte integers and doubles
@@ -78,7 +86,115 @@ namespace v15 {
 
 // Format constants
 constexpr uint8_t MAGIC_BYTES[8] = {'V', '1', '5', 'S', 'A', 'M', 'P', '\0'};
-constexpr uint32_t FORMAT_VERSION = 2;
+constexpr uint32_t FORMAT_VERSION = 3;
+constexpr uint32_t FORMAT_VERSION_V2 = 2;  // For backward compatibility
+
+// =============================================================================
+// FEATURE NAME TABLE
+// =============================================================================
+
+/**
+ * Feature name table for v3 format optimization.
+ *
+ * Stores feature names once in the file header, then references them by
+ * uint16_t index in each sample. This reduces file size by ~70% for
+ * datasets with many samples.
+ *
+ * DESIGN:
+ *   - Names stored alphabetically for determinism
+ *   - uint16_t indices support up to 65,535 features (current: ~14,840)
+ *   - Bidirectional lookup: name -> index and index -> name
+ */
+class FeatureNameTable {
+public:
+    /**
+     * Build the table from a sample's features.
+     * Names are sorted alphabetically for deterministic ordering.
+     */
+    void build_from_sample(const ChannelSample& sample) {
+        names_.clear();
+        name_to_index_.clear();
+
+        // Collect all feature names
+        for (const auto& pair : sample.tf_features) {
+            names_.push_back(pair.first);
+        }
+
+        // Sort alphabetically for determinism
+        std::sort(names_.begin(), names_.end());
+
+        // Build reverse lookup
+        for (size_t i = 0; i < names_.size(); ++i) {
+            name_to_index_[names_[i]] = static_cast<uint16_t>(i);
+        }
+    }
+
+    /**
+     * Get index for a feature name.
+     * @throws std::runtime_error if name not found
+     */
+    uint16_t get_index(const std::string& name) const {
+        auto it = name_to_index_.find(name);
+        if (it == name_to_index_.end()) {
+            throw std::runtime_error("Feature name not in table: " + name);
+        }
+        return it->second;
+    }
+
+    /**
+     * Get name for a feature index.
+     * @throws std::out_of_range if index invalid
+     */
+    const std::string& get_name(uint16_t index) const {
+        if (index >= names_.size()) {
+            throw std::out_of_range("Feature index out of range: " + std::to_string(index));
+        }
+        return names_[index];
+    }
+
+    /**
+     * Check if table contains a feature name.
+     */
+    bool contains(const std::string& name) const {
+        return name_to_index_.find(name) != name_to_index_.end();
+    }
+
+    /**
+     * Get total number of feature names.
+     */
+    size_t size() const { return names_.size(); }
+
+    /**
+     * Check if table is empty.
+     */
+    bool empty() const { return names_.empty(); }
+
+    /**
+     * Get all names (in sorted order).
+     */
+    const std::vector<std::string>& names() const { return names_; }
+
+    /**
+     * Add a name to the table (used during deserialization).
+     */
+    void add_name(const std::string& name) {
+        uint16_t index = static_cast<uint16_t>(names_.size());
+        names_.push_back(name);
+        name_to_index_[name] = index;
+    }
+
+    /**
+     * Clear the table.
+     */
+    void clear() {
+        names_.clear();
+        name_to_index_.clear();
+    }
+
+private:
+    std::vector<std::string> names_;                        // Ordered list of names
+    std::unordered_map<std::string, uint16_t> name_to_index_;  // Reverse lookup
+};
 
 // =============================================================================
 // PUBLIC API
@@ -227,6 +343,10 @@ private:
     size_t samples_since_flush_;
     std::streampos count_position_;  // Position of sample count in header
     std::streampos features_position_;  // Position of avg features in header
+
+    // v3 feature name table support
+    FeatureNameTable feature_table_;
+    bool feature_table_written_;
 
     void write_sample_internal(const ChannelSample& sample);
 };

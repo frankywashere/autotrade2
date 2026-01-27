@@ -879,11 +879,21 @@ def main():
         print("Error: Please provide a samples file")
         sys.exit(1)
 
-    # Load samples
+    # Load samples (supports both pickle and binary formats)
     print(f"Loading samples from {samples_path}...")
     with open(samples_path, 'rb') as f:
-        samples = pickle.load(f)
-    print(f"Loaded {len(samples)} samples")
+        magic = f.read(8)
+        f.seek(0)  # Reset to beginning
+
+        if magic == b'V15SAMP\x00':
+            # Binary format (v2 or v3)
+            from v15.binary_loader import load_samples as load_binary_samples
+            version, num_samples, num_features, samples = load_binary_samples(samples_path)
+            print(f"Loaded {len(samples)} samples (binary format v{version})")
+        else:
+            # Pickle format
+            samples = pickle.load(f)
+            print(f"Loaded {len(samples)} samples")
 
     # Load channel map if provided
     channel_map = None

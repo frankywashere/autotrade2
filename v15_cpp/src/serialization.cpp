@@ -446,16 +446,38 @@ static ChannelLabels deserialize_channel_labels(std::ifstream& ifs) {
 }
 
 // =============================================================================
+// FEATURE NAME TABLE SERIALIZATION (v3)
+// =============================================================================
+
+static void write_feature_name_table(std::ofstream& ofs, const FeatureNameTable& table) {
+    write_uint32(ofs, static_cast<uint32_t>(table.size()));
+    for (const auto& name : table.names()) {
+        write_string(ofs, name);
+    }
+}
+
+static FeatureNameTable read_feature_name_table(std::ifstream& ifs) {
+    FeatureNameTable table;
+    uint32_t count = read_uint32(ifs);
+    for (uint32_t i = 0; i < count; ++i) {
+        std::string name = read_string(ifs);
+        table.add_name(name);
+    }
+    return table;
+}
+
+// =============================================================================
 // SAMPLE SERIALIZATION
 // =============================================================================
 
-static void serialize_sample(std::ofstream& ofs, const ChannelSample& sample) {
+// v2 format: string keys for features
+static void serialize_sample_v2(std::ofstream& ofs, const ChannelSample& sample) {
     // Core sample data
     write_int64(ofs, sample.timestamp);
     write_int32(ofs, sample.channel_end_idx);
     write_int32(ofs, sample.best_window);
 
-    // Features (tf_features map)
+    // Features (tf_features map) - string keys
     write_uint32(ofs, static_cast<uint32_t>(sample.tf_features.size()));
     for (const auto& pair : sample.tf_features) {
         write_string(ofs, pair.first);
@@ -485,7 +507,52 @@ static void serialize_sample(std::ofstream& ofs, const ChannelSample& sample) {
     }
 }
 
-static ChannelSample deserialize_sample(std::ifstream& ifs) {
+// v3 format: index-based features using feature name table
+static void serialize_sample_v3(std::ofstream& ofs, const ChannelSample& sample,
+                                 const FeatureNameTable& table) {
+    // Core sample data
+    write_int64(ofs, sample.timestamp);
+    write_int32(ofs, sample.channel_end_idx);
+    write_int32(ofs, sample.best_window);
+
+    // Features (tf_features map) - index-based
+    write_uint32(ofs, static_cast<uint32_t>(sample.tf_features.size()));
+    for (const auto& pair : sample.tf_features) {
+        uint16_t index = table.get_index(pair.first);
+        write_uint16(ofs, index);
+        write_double(ofs, pair.second);
+    }
+
+    // Labels per window (unchanged from v2)
+    write_uint32(ofs, static_cast<uint32_t>(sample.labels_per_window.size()));
+    for (const auto& window_pair : sample.labels_per_window) {
+        write_int32(ofs, window_pair.first);  // window size
+        write_uint32(ofs, static_cast<uint32_t>(window_pair.second.size()));  // tf count
+        for (const auto& tf_pair : window_pair.second) {
+            write_string(ofs, tf_pair.first);  // timeframe string
+            serialize_channel_labels(ofs, tf_pair.second);
+        }
+    }
+
+    // Bar metadata (unchanged from v2)
+    write_uint32(ofs, static_cast<uint32_t>(sample.bar_metadata.size()));
+    for (const auto& tf_pair : sample.bar_metadata) {
+        write_string(ofs, tf_pair.first);  // timeframe string
+        write_uint32(ofs, static_cast<uint32_t>(tf_pair.second.size()));  // metadata count
+        for (const auto& meta_pair : tf_pair.second) {
+            write_string(ofs, meta_pair.first);  // metadata key
+            write_double(ofs, meta_pair.second);  // metadata value
+        }
+    }
+}
+
+// Legacy alias for backward compatibility
+static void serialize_sample(std::ofstream& ofs, const ChannelSample& sample) {
+    serialize_sample_v2(ofs, sample);
+}
+
+// v2 format: string keys for features
+static ChannelSample deserialize_sample_v2(std::ifstream& ifs) {
     ChannelSample sample;
 
     // Core sample data
@@ -493,7 +560,7 @@ static ChannelSample deserialize_sample(std::ifstream& ifs) {
     sample.channel_end_idx = read_int32(ifs);
     sample.best_window = read_int32(ifs);
 
-    // Features
+    // Features - string keys
     uint32_t feature_count = read_uint32(ifs);
     sample.tf_features.reserve(feature_count);
     for (uint32_t i = 0; i < feature_count; ++i) {
@@ -529,6 +596,57 @@ static ChannelSample deserialize_sample(std::ifstream& ifs) {
     return sample;
 }
 
+// v3 format: index-based features using feature name table
+static ChannelSample deserialize_sample_v3(std::ifstream& ifs, const FeatureNameTable& table) {
+    ChannelSample sample;
+
+    // Core sample data
+    sample.timestamp = read_int64(ifs);
+    sample.channel_end_idx = read_int32(ifs);
+    sample.best_window = read_int32(ifs);
+
+    // Features - index-based
+    uint32_t feature_count = read_uint32(ifs);
+    sample.tf_features.reserve(feature_count);
+    for (uint32_t i = 0; i < feature_count; ++i) {
+        uint16_t index = read_uint16(ifs);
+        double value = read_double(ifs);
+        const std::string& key = table.get_name(index);
+        sample.tf_features[key] = value;
+    }
+
+    // Labels per window (unchanged from v2)
+    uint32_t window_count = read_uint32(ifs);
+    for (uint32_t i = 0; i < window_count; ++i) {
+        int32_t window_size = read_int32(ifs);
+        uint32_t tf_count = read_uint32(ifs);
+        for (uint32_t j = 0; j < tf_count; ++j) {
+            std::string tf_key = read_string(ifs);
+            ChannelLabels labels = deserialize_channel_labels(ifs);
+            sample.labels_per_window[window_size][tf_key] = labels;
+        }
+    }
+
+    // Bar metadata (unchanged from v2)
+    uint32_t metadata_tf_count = read_uint32(ifs);
+    for (uint32_t i = 0; i < metadata_tf_count; ++i) {
+        std::string tf_key = read_string(ifs);
+        uint32_t meta_count = read_uint32(ifs);
+        for (uint32_t j = 0; j < meta_count; ++j) {
+            std::string meta_key = read_string(ifs);
+            double meta_value = read_double(ifs);
+            sample.bar_metadata[tf_key][meta_key] = meta_value;
+        }
+    }
+
+    return sample;
+}
+
+// Legacy alias for backward compatibility
+static ChannelSample deserialize_sample(std::ifstream& ifs) {
+    return deserialize_sample_v2(ifs);
+}
+
 // =============================================================================
 // PUBLIC API IMPLEMENTATION
 // =============================================================================
@@ -546,7 +664,7 @@ void save_samples(const std::vector<ChannelSample>& samples, const std::string& 
     try {
         // Write header
         ofs.write(reinterpret_cast<const char*>(MAGIC_BYTES), sizeof(MAGIC_BYTES));
-        write_uint32(ofs, FORMAT_VERSION);
+        write_uint32(ofs, FORMAT_VERSION);  // v3
         write_uint64(ofs, static_cast<uint64_t>(samples.size()));
 
         // Calculate average feature count for metadata
@@ -560,9 +678,14 @@ void save_samples(const std::vector<ChannelSample>& samples, const std::string& 
         }
         write_uint32(ofs, avg_features);
 
-        // Write samples
+        // Build and write feature name table from first sample (v3)
+        FeatureNameTable feature_table;
+        feature_table.build_from_sample(samples[0]);
+        write_feature_name_table(ofs, feature_table);
+
+        // Write samples using v3 format (index-based features)
         for (const auto& sample : samples) {
-            serialize_sample(ofs, sample);
+            serialize_sample_v3(ofs, sample, feature_table);
         }
 
         ofs.close();
@@ -591,19 +714,29 @@ std::vector<ChannelSample> load_samples(const std::string& filename) {
         }
 
         uint32_t version = read_uint32(ifs);
-        if (version != FORMAT_VERSION) {
+        if (version != FORMAT_VERSION && version != FORMAT_VERSION_V2) {
             throw std::runtime_error("Unsupported format version: " + std::to_string(version));
         }
 
         uint64_t num_samples = read_uint64(ifs);
         uint32_t num_features = read_uint32(ifs);  // Not strictly validated, just metadata
 
-        // Read samples
+        // Read samples based on version
         std::vector<ChannelSample> samples;
         samples.reserve(num_samples);
 
-        for (uint64_t i = 0; i < num_samples; ++i) {
-            samples.push_back(deserialize_sample(ifs));
+        if (version == FORMAT_VERSION) {
+            // v3: Read feature name table first
+            FeatureNameTable feature_table = read_feature_name_table(ifs);
+
+            for (uint64_t i = 0; i < num_samples; ++i) {
+                samples.push_back(deserialize_sample_v3(ifs, feature_table));
+            }
+        } else {
+            // v2: Read samples with string keys
+            for (uint64_t i = 0; i < num_samples; ++i) {
+                samples.push_back(deserialize_sample_v2(ifs));
+            }
         }
 
         ifs.close();
@@ -627,9 +760,9 @@ bool validate_sample_file(const std::string& filename) {
             return false;
         }
 
-        // Check version
+        // Check version (support both v2 and v3)
         uint32_t version = read_uint32(ifs);
-        if (version != FORMAT_VERSION) {
+        if (version != FORMAT_VERSION && version != FORMAT_VERSION_V2) {
             return false;
         }
 
@@ -678,6 +811,7 @@ StreamingSampleWriter::StreamingSampleWriter(const std::string& filename, size_t
     , samples_since_flush_(0)
     , count_position_(0)
     , features_position_(0)
+    , feature_table_written_(false)
 {
 }
 
@@ -701,10 +835,13 @@ StreamingSampleWriter::StreamingSampleWriter(StreamingSampleWriter&& other) noex
     , samples_since_flush_(other.samples_since_flush_)
     , count_position_(other.count_position_)
     , features_position_(other.features_position_)
+    , feature_table_(std::move(other.feature_table_))
+    , feature_table_written_(other.feature_table_written_)
 {
     other.is_open_ = false;
     other.samples_written_ = 0;
     other.total_features_ = 0;
+    other.feature_table_written_ = false;
 }
 
 StreamingSampleWriter& StreamingSampleWriter::operator=(StreamingSampleWriter&& other) noexcept {
@@ -721,10 +858,13 @@ StreamingSampleWriter& StreamingSampleWriter::operator=(StreamingSampleWriter&& 
         samples_since_flush_ = other.samples_since_flush_;
         count_position_ = other.count_position_;
         features_position_ = other.features_position_;
+        feature_table_ = std::move(other.feature_table_);
+        feature_table_written_ = other.feature_table_written_;
 
         other.is_open_ = false;
         other.samples_written_ = 0;
         other.total_features_ = 0;
+        other.feature_table_written_ = false;
     }
     return *this;
 }
@@ -739,7 +879,7 @@ void StreamingSampleWriter::open() {
         throw std::runtime_error("Failed to open file for writing: " + filename_);
     }
 
-    // Write header
+    // Write header (v3 format)
     ofs_.write(reinterpret_cast<const char*>(MAGIC_BYTES), sizeof(MAGIC_BYTES));
     write_uint32(ofs_, FORMAT_VERSION);
 
@@ -751,6 +891,8 @@ void StreamingSampleWriter::open() {
     features_position_ = ofs_.tellp();
     write_uint32(ofs_, 0);  // Placeholder for avg features
 
+    // Note: Feature name table will be written after first sample
+
     if (!ofs_) {
         throw std::runtime_error("Failed to write header to: " + filename_);
     }
@@ -759,42 +901,20 @@ void StreamingSampleWriter::open() {
     samples_written_ = 0;
     total_features_ = 0;
     samples_since_flush_ = 0;
+    feature_table_.clear();
+    feature_table_written_ = false;
 }
 
 void StreamingSampleWriter::write_sample_internal(const ChannelSample& sample) {
-    // Core sample data
-    write_int64(ofs_, sample.timestamp);
-    write_int32(ofs_, sample.channel_end_idx);
-    write_int32(ofs_, sample.best_window);
-
-    // Features (tf_features map)
-    write_uint32(ofs_, static_cast<uint32_t>(sample.tf_features.size()));
-    for (const auto& pair : sample.tf_features) {
-        write_string(ofs_, pair.first);
-        write_double(ofs_, pair.second);
+    // On first sample, build and write the feature name table
+    if (!feature_table_written_) {
+        feature_table_.build_from_sample(sample);
+        write_feature_name_table(ofs_, feature_table_);
+        feature_table_written_ = true;
     }
 
-    // Labels per window
-    write_uint32(ofs_, static_cast<uint32_t>(sample.labels_per_window.size()));
-    for (const auto& window_pair : sample.labels_per_window) {
-        write_int32(ofs_, window_pair.first);  // window size
-        write_uint32(ofs_, static_cast<uint32_t>(window_pair.second.size()));  // tf count
-        for (const auto& tf_pair : window_pair.second) {
-            write_string(ofs_, tf_pair.first);  // timeframe string
-            serialize_channel_labels(ofs_, tf_pair.second);
-        }
-    }
-
-    // Bar metadata
-    write_uint32(ofs_, static_cast<uint32_t>(sample.bar_metadata.size()));
-    for (const auto& tf_pair : sample.bar_metadata) {
-        write_string(ofs_, tf_pair.first);  // timeframe string
-        write_uint32(ofs_, static_cast<uint32_t>(tf_pair.second.size()));  // metadata count
-        for (const auto& meta_pair : tf_pair.second) {
-            write_string(ofs_, meta_pair.first);  // metadata key
-            write_double(ofs_, meta_pair.second);  // metadata value
-        }
-    }
+    // Use v3 format: write sample with index-based features
+    serialize_sample_v3(ofs_, sample, feature_table_);
 }
 
 void StreamingSampleWriter::write(const ChannelSample& sample) {

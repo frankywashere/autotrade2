@@ -363,8 +363,28 @@ def read_channel_labels(f) -> ChannelLabels:
     return labels
 
 
-def read_channel_sample(f) -> ChannelSample:
-    """Read ChannelSample from binary stream"""
+def read_feature_name_table(f) -> List[str]:
+    """Read feature name table from binary stream (v3 format)"""
+    count_bytes = f.read(4)
+    if len(count_bytes) != 4:
+        raise EOFError("Unexpected end of file reading feature table count")
+    count = struct.unpack('<I', count_bytes)[0]
+
+    names = []
+    for _ in range(count):
+        name = read_string(f)
+        names.append(name)
+    return names
+
+
+def read_channel_sample(f, version: int = 2, feature_table: List[str] = None) -> ChannelSample:
+    """Read ChannelSample from binary stream
+
+    Args:
+        f: File handle
+        version: Format version (2 or 3)
+        feature_table: Feature name table for v3 format (required if version=3)
+    """
     sample = ChannelSample()
 
     # Core sample data
@@ -372,12 +392,24 @@ def read_channel_sample(f) -> ChannelSample:
     sample.channel_end_idx = struct.unpack('<i', f.read(4))[0]
     sample.best_window = struct.unpack('<i', f.read(4))[0]
 
-    # Features
+    # Features - version-dependent reading
     feature_count = struct.unpack('<I', f.read(4))[0]
-    for _ in range(feature_count):
-        key = read_string(f)
-        value = struct.unpack('<d', f.read(8))[0]
-        sample.tf_features[key] = value
+    if version >= 3 and feature_table is not None:
+        # v3: index-based features
+        for _ in range(feature_count):
+            index = struct.unpack('<H', f.read(2))[0]
+            value = struct.unpack('<d', f.read(8))[0]
+            if index < len(feature_table):
+                key = feature_table[index]
+                sample.tf_features[key] = value
+            else:
+                raise ValueError(f"Feature index {index} out of range (table size: {len(feature_table)})")
+    else:
+        # v2: string keys
+        for _ in range(feature_count):
+            key = read_string(f)
+            value = struct.unpack('<d', f.read(8))[0]
+            sample.tf_features[key] = value
 
     # Labels per window
     window_count = struct.unpack('<I', f.read(4))[0]
@@ -414,6 +446,8 @@ def load_samples(filename: str) -> Tuple[int, int, int, List[ChannelSample]]:
     """
     Load samples from binary file.
 
+    Supports both v2 (string keys) and v3 (index-based) formats.
+
     Returns:
         (version, num_samples, num_features, samples)
     """
@@ -424,14 +458,22 @@ def load_samples(filename: str) -> Tuple[int, int, int, List[ChannelSample]]:
             raise ValueError(f"Invalid magic bytes: {magic}")
 
         version = struct.unpack('<I', f.read(4))[0]
+        if version not in (2, 3):
+            raise ValueError(f"Unsupported format version: {version}")
+
         num_samples = struct.unpack('<Q', f.read(8))[0]
         num_features = struct.unpack('<I', f.read(4))[0]
+
+        # v3: Read feature name table
+        feature_table = None
+        if version >= 3:
+            feature_table = read_feature_name_table(f)
 
         # Read samples
         samples = []
         for i in range(num_samples):
             try:
-                sample = read_channel_sample(f)
+                sample = read_channel_sample(f, version=version, feature_table=feature_table)
                 samples.append(sample)
             except EOFError as e:
                 raise EOFError(f"Error reading sample {i}: {e}")
