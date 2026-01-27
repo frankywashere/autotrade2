@@ -27,7 +27,7 @@ from v15.config import TF_MAX_SCAN, BREAK_DETECTION, BREAK_MARKER_COLORS, channe
 from v15.data import load_market_data
 
 # Import channel detection from v7
-from v7.core.channel import detect_channel, Channel
+from v15.core.channel import detect_channel, Channel
 
 
 class Inspector:

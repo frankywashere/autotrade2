@@ -37,12 +37,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 from enum import IntEnum
 
-# Import from v7 for compatibility
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from v7.core.channel import Channel
+from .channel import Channel
 
 from ..exceptions import V15Error
 

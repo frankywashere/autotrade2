@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 from .utils import safe_float, safe_divide, safe_mean, safe_std, safe_min, safe_max
 
 if TYPE_CHECKING:
-    from v7.core.channel import Channel
+    from v15.core.channel import Channel
 
 # Standard window sizes for multi-window channel detection
 STANDARD_WINDOWS: List[int] = [10, 20, 30, 40, 50, 60, 70, 80]

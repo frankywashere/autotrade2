@@ -48,7 +48,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from v7.core.channel import detect_channel, Channel
+from v15.core.channel import detect_channel, Channel
 
 # Use canonical resample_ohlc from v15/core/resample.py (single source of truth)
 # This ensures consistent bar boundaries across Pass 1, feature extraction, and inspector

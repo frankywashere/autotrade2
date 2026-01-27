@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, TYPE_CHECKING
 from .utils import safe_float, safe_divide, safe_mean, safe_std, safe_min, safe_max
 
 if TYPE_CHECKING:
-    from v7.core.channel import Channel
+    from v15.core.channel import Channel
     from v15.dtypes import ChannelLabels
 
 

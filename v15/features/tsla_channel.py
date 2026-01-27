@@ -20,7 +20,7 @@ from typing import Dict, List, TYPE_CHECKING
 from .utils import safe_float, safe_divide, safe_pct_change, get_last_valid, atr
 
 if TYPE_CHECKING:
-    from v7.core.channel import Channel
+    from v15.core.channel import Channel
 
 
 def extract_tsla_channel_features(channel: "Channel") -> Dict[str, float]:

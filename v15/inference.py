@@ -291,7 +291,7 @@ class Predictor:
             - learned_window_probs: Probabilities for each window
             - used_learned_selection: Whether learned selection was used
         """
-        from v7.core.channel import detect_channels_multi_window, select_best_channel
+        from v15.core.channel import detect_channels_multi_window, select_best_channel
 
         if timestamp is None:
             timestamp = tsla_df.index[-1]

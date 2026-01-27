@@ -31,16 +31,24 @@ logger = logging.getLogger(__name__)
 
 # Import window selection strategies
 try:
+    # Try to import v7 window strategies from deprecated folder
+    import sys
+    from pathlib import Path
+    _deprecated_dir = Path(__file__).parent.parent / 'deprecated'
+    if str(_deprecated_dir) not in sys.path:
+        sys.path.insert(0, str(_deprecated_dir))
     from v7.core.window_strategy import (
         SelectionStrategy, get_strategy,
         BounceFirstStrategy, LabelValidityStrategy,
         BalancedScoreStrategy, QualityScoreStrategy
     )
-    from v7.core.channel import detect_channels_multi_window, select_best_channel, STANDARD_WINDOWS as V7_WINDOWS
     WINDOW_STRATEGIES_AVAILABLE = True
 except ImportError:
     WINDOW_STRATEGIES_AVAILABLE = False
     logger.warning("Window selection strategies not available - v7.core.window_strategy not found")
+
+# Import channel detection from v15 (was v7)
+from v15.core.channel import detect_channels_multi_window, select_best_channel, STANDARD_WINDOWS as V7_WINDOWS
 
 
 # =============================================================================

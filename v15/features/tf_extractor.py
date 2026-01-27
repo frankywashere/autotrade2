@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Type checking imports
 # =============================================================================
 if TYPE_CHECKING:
-    from v7.core.channel import Channel
+    from v15.core.channel import Channel
 
 # =============================================================================
 # Core imports from v7 and v15
@@ -82,7 +82,7 @@ from v15.config import STANDARD_WINDOWS
 
 # Import channel detection
 try:
-    from v7.core.channel import detect_channels_multi_window, select_best_channel
+    from v15.core.channel import detect_channels_multi_window, select_best_channel
     _channel_available = True
 except ImportError as e:
     logger.warning(f"Failed to import channel detection: {e}")
