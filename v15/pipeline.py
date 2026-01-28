@@ -74,33 +74,57 @@ def cmd_train(args):
     from .training import ChannelDataset, create_dataloaders, Trainer
     from .models import create_model
 
+    # Check if streaming mode requested
+    streaming = getattr(args, 'streaming', False)
+    chunk_size = getattr(args, 'chunk_size', 15000)
     max_samples = getattr(args, 'max_samples', None)
-    logger.info(f"Loading samples from {args.samples}" + (f" (max {max_samples})" if max_samples else ""))
-    samples = load_training_samples(args.samples, max_samples=max_samples)
 
-    # Split train/val
-    split_idx = int(len(samples) * 0.8)
-    train_samples = samples[:split_idx]
-    val_samples = samples[split_idx:]
+    if streaming:
+        # Use streaming data loader for large datasets (low RAM usage)
+        logger.info(f"Using streaming data loader (chunk_size={chunk_size:,})")
+        logger.info(f"Loading from {args.samples}")
 
-    logger.info(f"Train: {len(train_samples)}, Val: {len(val_samples)}")
+        from .training.streaming_dataset import create_streaming_dataloaders
 
-    # Log window selection strategy
-    logger.info(f"Window selection strategy: {args.strategy}")
-    if args.end_to_end:
-        logger.info(f"End-to-end learning enabled (weight={args.window_selection_weight})")
+        train_loader, val_loader, actual_feature_count = create_streaming_dataloaders(
+            binary_path=args.samples,
+            batch_size=args.batch_size,
+            chunk_size=chunk_size,
+            target_tf=args.target_tf,
+            val_split=0.2,
+            num_workers=args.num_workers,
+            prefetch=True,
+        )
 
-    # Create dataloaders with window selection strategy
-    train_loader, val_loader = create_dataloaders(
-        train_samples, val_samples,
-        batch_size=args.batch_size,
-        target_tf=args.target_tf,
-        strategy=args.strategy,
-        num_workers=args.num_workers
-    )
+        logger.info(f"Features: {actual_feature_count:,}")
+    else:
+        # Original in-memory loading
+        logger.info(f"Loading samples from {args.samples}" + (f" (max {max_samples})" if max_samples else ""))
+        samples = load_training_samples(args.samples, max_samples=max_samples)
 
-    # Detect actual feature count from samples (C++ scanner may produce different count than config)
-    actual_feature_count = len(samples[0].tf_features) if samples else TOTAL_FEATURES
+        # Split train/val
+        split_idx = int(len(samples) * 0.8)
+        train_samples = samples[:split_idx]
+        val_samples = samples[split_idx:]
+
+        logger.info(f"Train: {len(train_samples)}, Val: {len(val_samples)}")
+
+        # Log window selection strategy
+        logger.info(f"Window selection strategy: {args.strategy}")
+        if args.end_to_end:
+            logger.info(f"End-to-end learning enabled (weight={args.window_selection_weight})")
+
+        # Create dataloaders with window selection strategy
+        train_loader, val_loader = create_dataloaders(
+            train_samples, val_samples,
+            batch_size=args.batch_size,
+            target_tf=args.target_tf,
+            strategy=args.strategy,
+            num_workers=args.num_workers
+        )
+
+        # Detect actual feature count from samples (C++ scanner may produce different count than config)
+        actual_feature_count = len(samples[0].tf_features) if samples else TOTAL_FEATURES
     if actual_feature_count != TOTAL_FEATURES:
         logger.info(f"Note: Samples have {actual_feature_count} features (config says {TOTAL_FEATURES})")
 
@@ -315,6 +339,10 @@ def main():
     train_parser.add_argument('--output', required=True, help='Output directory')
     train_parser.add_argument('--max-samples', type=int, default=None,
         help='Maximum number of samples to load (for quick experiments)')
+    train_parser.add_argument('--streaming', action='store_true',
+        help='Use streaming data loader (low RAM, supports full dataset)')
+    train_parser.add_argument('--chunk-size', type=int, default=15000,
+        help='Samples per chunk for streaming loader (default: 15000 = ~2.8GB RAM)')
     train_parser.add_argument('--batch-size', type=int, default=TRAINING_CONFIG['batch_size'])
     train_parser.add_argument('--lr', type=float, default=TRAINING_CONFIG['learning_rate'])
     train_parser.add_argument('--epochs', type=int, default=TRAINING_CONFIG['max_epochs'])
