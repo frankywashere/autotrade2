@@ -726,11 +726,15 @@ def read_channel_sample(f, version: int = 2, feature_table: Optional[List[str]] 
     return sample
 
 
-def load_samples(filename: str) -> Tuple[int, int, int, List[ChannelSample]]:
+def load_samples(filename: str, max_samples: Optional[int] = None) -> Tuple[int, int, int, List[ChannelSample]]:
     """
     Load samples from binary file.
 
     Supports both v2 (string keys) and v3 (index-based) formats.
+
+    Args:
+        filename: Path to the binary sample file
+        max_samples: Maximum number of samples to load (None for all)
 
     Returns:
         (version, num_samples, num_features, samples)
@@ -753,9 +757,14 @@ def load_samples(filename: str) -> Tuple[int, int, int, List[ChannelSample]]:
         if version >= 3:
             feature_table = read_feature_name_table(f)
 
+        # Determine how many samples to load
+        samples_to_load = num_samples
+        if max_samples is not None and max_samples < num_samples:
+            samples_to_load = max_samples
+
         # Read samples
         samples = []
-        for i in range(num_samples):
+        for i in range(samples_to_load):
             try:
                 sample = read_channel_sample(f, version=version, feature_table=feature_table)
                 samples.append(sample)
@@ -765,14 +774,18 @@ def load_samples(filename: str) -> Tuple[int, int, int, List[ChannelSample]]:
         return version, num_samples, num_features, samples
 
 
-def load_samples_simple(filename: str) -> List[ChannelSample]:
+def load_samples_simple(filename: str, max_samples: Optional[int] = None) -> List[ChannelSample]:
     """
     Load samples from binary file (simplified API).
+
+    Args:
+        filename: Path to the binary sample file
+        max_samples: Maximum number of samples to load (None for all)
 
     Returns:
         List of ChannelSample objects ready for use with inspector.
     """
-    _, _, _, samples = load_samples(filename)
+    _, _, _, samples = load_samples(filename, max_samples=max_samples)
     return samples
 
 

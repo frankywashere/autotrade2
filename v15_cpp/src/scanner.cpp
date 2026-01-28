@@ -621,8 +621,9 @@ std::vector<OHLCV> resample_ohlcv(
             ++bars_in_period;
         }
 
-        // Only add complete bars (skip partial bar at end)
-        if (bars_in_period == static_cast<size_t>(bars_per_period)) {
+        // Include partial bars if at least 50% complete (avoid data loss at edges)
+        // This is critical for higher timeframes where partial bars caused ~25% data loss
+        if (bars_in_period >= static_cast<size_t>(bars_per_period) / 2 + 1) {
             resampled.push_back(bar);
         }
 
@@ -766,14 +767,24 @@ void Scanner::detect_all_channels(
                     call_count++;
                 }
 
-                // Detect channel
+                // Detect channel - use more lenient touch_threshold for higher TFs
+                // Higher TFs have fewer bars after resampling, making bounces sparser
+                double touch_threshold = 0.10;  // Default for 5min
+                if (tf_idx == 1) {  // 15min (3x compression)
+                    touch_threshold = 0.20;
+                } else if (tf_idx == 2) {  // 30min (6x compression)
+                    touch_threshold = 0.18;
+                } else if (tf_idx >= 3) {  // 1h+ (12x+ compression)
+                    touch_threshold = 0.15;
+                }
+
                 Channel ch = ChannelDetector::detect_channel(
                     win_high,
                     win_low,
                     win_close,
                     window,
                     2.0,  // std_multiplier
-                    0.10, // touch_threshold
+                    touch_threshold,
                     config_.min_cycles
                 );
 

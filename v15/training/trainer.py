@@ -308,7 +308,12 @@ class Trainer:
 
         # Device setup
         if self.config.device == 'auto':
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+            elif torch.backends.mps.is_available():
+                self.device = torch.device('mps')
+            else:
+                self.device = torch.device('cpu')
         else:
             self.device = torch.device(self.config.device)
 
@@ -1680,9 +1685,12 @@ class Trainer:
             else:
                 logger.warning("Skipping constant feature check (no feature names available)")
 
-            # Analyze correlations
-            correlation_results = analyze_correlations(feature_matrix)
-            self.correlation_info = correlation_results
+            # Analyze correlations (SKIPPED - O(n²) too slow for 14k features)
+            # TODO: Re-enable with sampling or batch processing for large feature sets
+            # correlation_results = analyze_correlations(feature_matrix, self.feature_names)
+            # self.correlation_info = correlation_results
+            correlation_results = {}  # Skip for now
+            logger.warning("Skipping correlation analysis (too slow for 14840 features)")
 
             if correlation_results.get('highly_correlated_pairs'):
                 pairs = correlation_results['highly_correlated_pairs']
