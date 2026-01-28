@@ -9,6 +9,8 @@ Features:
 - Model performance metrics
 - Correlation analysis display
 - Window selection analysis and comparison
+- Channel visualization across all timeframes
+- Live data integration with yfinance
 """
 import streamlit as st
 import pandas as pd
@@ -26,6 +28,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from v15.config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES
 from v15.dtypes import ChannelSample
+
+# Import new visualization modules
+from v15.visualization.plotly_charts import (
+    create_tf_channel_chart,
+    create_candlestick_chart,
+    add_channel_overlay,
+    PLOTLY_AVAILABLE
+)
+
+# Import live data module
+from v15.live_data import (
+    YFinanceLiveData,
+    should_refresh,
+    fetch_live_data,
+    get_market_status,
+    YFINANCE_AVAILABLE
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +68,14 @@ except ImportError:
 
 # Import channel detection from v15 (was v7)
 from v15.core.channel import detect_channels_multi_window, select_best_channel, STANDARD_WINDOWS as V7_WINDOWS
+
+# Try to import streamlit-autorefresh
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except ImportError:
+    AUTOREFRESH_AVAILABLE = False
+    logger.info("streamlit-autorefresh not available - using manual refresh")
 
 
 # =============================================================================
@@ -346,10 +373,328 @@ def show_strategy_picks(analysis: Dict[str, Any]):
         st.success(f"All strategies agree: Window {picked_windows[0]} is best")
 
 
+# =============================================================================
+# Per-TF Predictions Display
+# =============================================================================
+
+def show_per_tf_predictions_table(prediction):
+    """Show per-timeframe prediction breakdown table."""
+    if prediction.per_tf_predictions is None:
+        st.info("Model doesn't support per-TF predictions. Train with per-TF heads enabled.")
+        return
+
+    data = []
+    for tf_name in TIMEFRAMES:
+        if tf_name in prediction.per_tf_predictions:
+            tf_pred = prediction.per_tf_predictions[tf_name]
+            data.append({
+                'Timeframe': tf_name,
+                'Duration': f"{tf_pred.duration_mean:.0f} +/- {tf_pred.duration_std:.0f}",
+                'Confidence': f"{tf_pred.confidence:.0%}",
+                'Window': tf_pred.best_window,
+            })
+        else:
+            data.append({
+                'Timeframe': tf_name,
+                'Duration': 'N/A',
+                'Confidence': 'N/A',
+                'Window': 'N/A',
+            })
+
+    df = pd.DataFrame(data)
+
+    # Style based on confidence
+    def style_confidence(row):
+        try:
+            conf_str = row['Confidence']
+            if conf_str == 'N/A':
+                return [''] * len(row)
+            conf = float(conf_str.rstrip('%')) / 100
+            if conf >= 0.8:
+                return ['background-color: #d4edda'] * len(row)  # Green
+            elif conf >= 0.6:
+                return ['background-color: #fff3cd'] * len(row)  # Yellow
+            else:
+                return ['background-color: #f8d7da'] * len(row)  # Red
+        except:
+            return [''] * len(row)
+
+    styled_df = df.style.apply(style_confidence, axis=1)
+    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# Channel Visualization Tab
+# =============================================================================
+
+def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None):
+    """
+    Display channel visualization for all 10 timeframes.
+
+    Args:
+        tsla_df: TSLA OHLCV DataFrame (5-min base)
+        prediction: Optional prediction with per_tf_predictions
+    """
+    from v15.features.tf_extractor import resample_to_timeframe
+
+    st.header("Channel Visualization")
+
+    if not PLOTLY_AVAILABLE:
+        st.error("Plotly is not available. Install with: pip install plotly")
+        return
+
+    st.markdown("""
+    This tab shows channel detection results across all 10 timeframes.
+    Each expander contains a candlestick chart with channel overlay and bounce markers.
+    """)
+
+    # Iterate through all timeframes
+    for tf_name in TIMEFRAMES:
+        # Get per-TF prediction info if available
+        duration = 0.0
+        confidence = 0.0
+        tf_window = 50
+
+        if prediction is not None and prediction.per_tf_predictions is not None:
+            if tf_name in prediction.per_tf_predictions:
+                tf_pred = prediction.per_tf_predictions[tf_name]
+                duration = tf_pred.duration_mean
+                confidence = tf_pred.confidence
+                tf_window = tf_pred.best_window
+
+        # Create expander with summary in header
+        expander_header = f"{tf_name} - Duration: {duration:.0f} bars - Conf: {confidence:.0%}"
+
+        with st.expander(expander_header, expanded=False):
+            try:
+                # Resample to this timeframe
+                tf_df = resample_to_timeframe(tsla_df, tf_name)
+
+                if len(tf_df) < 20:
+                    st.warning(f"Insufficient data for {tf_name} ({len(tf_df)} bars)")
+                    continue
+
+                # Detect channel at this timeframe
+                tf_channels = detect_channels_multi_window(tf_df, windows=STANDARD_WINDOWS)
+                best_channel, best_window = select_best_channel(tf_channels)
+
+                if best_window is None:
+                    best_window = 50
+
+                # Use the window from channel detection if prediction doesn't have it
+                if tf_window == 50 and best_window != 50:
+                    tf_window = best_window
+
+                # Get the channel for the selected window
+                channel = tf_channels.get(tf_window)
+
+                # Slice data to show just the channel window
+                window_bars = min(tf_window, len(tf_df))
+                chart_df = tf_df.iloc[-window_bars:].copy()
+
+                if channel is not None and getattr(channel, 'valid', False):
+                    # Create chart with channel
+                    fig = create_tf_channel_chart(
+                        df=chart_df,
+                        channel=channel,
+                        tf_name=tf_name,
+                        duration=duration,
+                        confidence=confidence,
+                        show_bounces=True,
+                        height=350
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # Show channel metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        bounce_count = getattr(channel, 'bounce_count', 0)
+                        st.metric("Bounces", bounce_count)
+                    with col2:
+                        r_squared = getattr(channel, 'r_squared', 0.0)
+                        st.metric("R-squared", f"{r_squared:.3f}")
+                    with col3:
+                        direction = getattr(channel, 'direction', 1)
+                        dir_names = {0: 'Bear', 1: 'Sideways', 2: 'Bull'}
+                        st.metric("Direction", dir_names.get(int(direction), 'Unknown'))
+                    with col4:
+                        st.metric("Window", f"{tf_window} bars")
+                else:
+                    # No valid channel - show placeholder
+                    st.warning("No valid channel detected for this timeframe")
+
+                    # Still show candlestick chart without channel
+                    fig = create_candlestick_chart(chart_df)
+                    fig.update_layout(
+                        title=f"{tf_name} - No Valid Channel",
+                        height=350
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            except Exception as e:
+                st.error(f"Error processing {tf_name}: {e}")
+                logger.exception(f"Channel visualization error for {tf_name}")
+
+
+# =============================================================================
+# Live Data Integration
+# =============================================================================
+
+def get_live_data_with_fallback(
+    use_live: bool,
+    loaded_data: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    lookback: int = 35000
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, bool, Optional[str]]:
+    """
+    Get market data, preferring live data if enabled and available.
+
+    Args:
+        use_live: Whether to attempt live data fetch
+        loaded_data: Tuple of (tsla, spy, vix) loaded from files
+        lookback: Number of bars to fetch for live data
+
+    Returns:
+        Tuple of (tsla, spy, vix, is_live, error_msg)
+    """
+    tsla, spy, vix = loaded_data
+    is_live = False
+    error_msg = None
+
+    if use_live:
+        if not YFINANCE_AVAILABLE:
+            error_msg = "yfinance not installed. Install with: pip install yfinance"
+            return tsla, spy, vix, False, error_msg
+
+        try:
+            data_feed = YFinanceLiveData(cache_ttl=60)
+            tsla_live, spy_live, vix_live = data_feed.get_historical(
+                period='60d',
+                interval='5m'
+            )
+
+            # Take last N bars
+            if len(tsla_live) > lookback:
+                tsla_live = tsla_live.iloc[-lookback:]
+                spy_live = spy_live.iloc[-lookback:]
+                vix_live = vix_live.iloc[-lookback:]
+
+            return tsla_live, spy_live, vix_live, True, None
+
+        except Exception as e:
+            error_msg = f"Live data fetch failed: {e}. Falling back to loaded data."
+            logger.exception("Live data error")
+            return tsla, spy, vix, False, error_msg
+
+    return tsla, spy, vix, False, None
+
+
+def show_live_data_sidebar():
+    """Show live data configuration in sidebar. Returns config dict."""
+    st.sidebar.divider()
+    st.sidebar.header("Live Data")
+
+    config = {
+        'use_live': False,
+        'auto_refresh': False,
+        'refresh_interval': 300,
+    }
+
+    if YFINANCE_AVAILABLE:
+        config['use_live'] = st.sidebar.checkbox(
+            "Use Live Data (yfinance)",
+            value=False,
+            help="Fetch real-time data from Yahoo Finance instead of loaded files"
+        )
+
+        if config['use_live']:
+            config['auto_refresh'] = st.sidebar.checkbox(
+                "Auto-refresh",
+                value=False,
+                help="Automatically refresh data at specified interval"
+            )
+
+            if config['auto_refresh']:
+                interval_options = {
+                    "1 minute": 60,
+                    "5 minutes": 300,
+                    "15 minutes": 900,
+                }
+                interval_label = st.sidebar.selectbox(
+                    "Refresh Interval",
+                    options=list(interval_options.keys()),
+                    index=1  # Default to 5 minutes
+                )
+                config['refresh_interval'] = interval_options[interval_label]
+
+                if AUTOREFRESH_AVAILABLE:
+                    # Auto-refresh using streamlit-autorefresh
+                    count = st_autorefresh(
+                        interval=config['refresh_interval'] * 1000,
+                        limit=None,
+                        key="live_data_refresh"
+                    )
+                    st.sidebar.caption(f"Auto-refresh count: {count}")
+                else:
+                    st.sidebar.info("Install streamlit-autorefresh for auto-refresh")
+                    if st.sidebar.button("Manual Refresh"):
+                        st.rerun()
+
+            # Show market status
+            try:
+                market_status = get_market_status()
+                status_text = "OPEN" if market_status['is_open'] else "CLOSED"
+                status_color = "green" if market_status['is_open'] else "red"
+                st.sidebar.markdown(f"Market: :{status_color}[{status_text}]")
+                st.sidebar.caption(market_status['current_time_et'])
+            except Exception:
+                pass
+
+    else:
+        st.sidebar.warning("yfinance not installed")
+        st.sidebar.caption("pip install yfinance")
+
+    return config
+
+
+def show_data_status_bar(is_live: bool, error_msg: Optional[str], last_update: Optional[datetime]):
+    """Show data status bar at top of page."""
+    if error_msg:
+        st.warning(error_msg)
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        source = "Live (yfinance)" if is_live else "Loaded (CSV)"
+        st.info(f"Data Source: {source}")
+
+    with col2:
+        if last_update:
+            st.info(f"Last Update: {last_update.strftime('%H:%M:%S')}")
+        else:
+            st.info("Last Update: N/A")
+
+    with col3:
+        if is_live:
+            try:
+                market_status = get_market_status()
+                if market_status['is_open']:
+                    st.success("Market: OPEN")
+                else:
+                    st.info(f"Market: CLOSED (next open: {market_status.get('next_open', 'N/A')})")
+            except Exception:
+                st.info("Market Status: Unknown")
+        else:
+            st.info("Market Status: N/A (using loaded data)")
+
+
+# =============================================================================
+# Page Configuration & Caching
+# =============================================================================
+
 # Page config
 st.set_page_config(
     page_title="V15 Channel Predictor",
-    page_icon="📈",
+    page_icon="",
     layout="wide"
 )
 
@@ -376,7 +721,7 @@ def show_prediction_card(prediction):
         st.metric(
             "Duration",
             f"{prediction.duration_mean:.0f} bars",
-            f"±{prediction.duration_std:.0f}"
+            f"+/-{prediction.duration_std:.0f}"
         )
 
     with col2:
@@ -449,7 +794,7 @@ def show_tf_attention(prediction_output: Dict[str, Any]):
 
 
 def main():
-    st.title("📈 V15 Channel Break Predictor")
+    st.title("V15 Channel Break Predictor")
 
     # Sidebar config
     st.sidebar.header("Configuration")
@@ -460,13 +805,16 @@ def main():
         value="checkpoints/best.pt"
     )
 
+    # Live data sidebar configuration
+    live_config = show_live_data_sidebar()
+
     # Check if paths exist
     if not Path(data_dir).exists():
         st.error(f"Data directory not found: {data_dir}")
         st.info("Please provide path to directory containing TSLA_1min.csv, SPY_1min.csv, VIX_History.csv")
         return
 
-    # Load data
+    # Load data from files (used as fallback)
     with st.spinner("Loading market data..."):
         try:
             tsla, spy, vix = load_market_data(data_dir)
@@ -487,9 +835,23 @@ def main():
     else:
         st.sidebar.info("No model checkpoint found. Train a model first.")
 
+    # Get data (live or loaded)
+    current_tsla, current_spy, current_vix, is_live, error_msg = get_live_data_with_fallback(
+        use_live=live_config['use_live'],
+        loaded_data=(tsla, spy, vix),
+        lookback=35000
+    )
+
+    # Track last update time
+    if 'last_update' not in st.session_state:
+        st.session_state['last_update'] = datetime.now()
+    if is_live:
+        st.session_state['last_update'] = datetime.now()
+
     # Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Live Prediction",
+        "Channel Visualization",
         "Window Selection",
         "Feature Analysis",
         "Model Info",
@@ -498,6 +860,9 @@ def main():
 
     with tab1:
         st.header("Live Prediction")
+
+        # Show data status
+        show_data_status_bar(is_live, error_msg, st.session_state.get('last_update'))
 
         if predictor is None:
             st.warning("Load a trained model to make predictions")
@@ -515,17 +880,33 @@ def main():
             if st.button("Make Prediction", type="primary"):
                 with st.spinner("Extracting features and predicting..."):
                     try:
-                        # Use recent data
-                        tsla_slice = tsla.iloc[-lookback:]
-                        spy_slice = spy.iloc[-lookback:]
-                        vix_slice = vix.iloc[-lookback:]
+                        # Use current data (live or loaded)
+                        tsla_slice = current_tsla.iloc[-lookback:]
+                        spy_slice = current_spy.iloc[-lookback:]
+                        vix_slice = current_vix.iloc[-lookback:]
 
-                        prediction = predictor.predict(
-                            tsla_slice, spy_slice, vix_slice
-                        )
+                        # Use predict_with_per_tf for per-TF breakdown
+                        try:
+                            prediction = predictor.predict_with_per_tf(
+                                tsla_slice, spy_slice, vix_slice
+                            )
+                        except AttributeError:
+                            # Fallback if predict_with_per_tf not available
+                            prediction = predictor.predict(
+                                tsla_slice, spy_slice, vix_slice
+                            )
+
+                        # Store prediction for channel visualization tab
+                        st.session_state['last_prediction'] = prediction
+                        st.session_state['prediction_data'] = (tsla_slice, spy_slice, vix_slice)
 
                         st.success("Prediction complete!")
                         show_prediction_card(prediction)
+
+                        # Show per-TF breakdown table
+                        st.divider()
+                        st.subheader("Per-Timeframe Breakdown")
+                        show_per_tf_predictions_table(prediction)
 
                         # Show details
                         with st.expander("Prediction Details"):
@@ -539,6 +920,8 @@ def main():
                                 'new_channel_probs': prediction.new_channel_probs,
                                 'confidence': prediction.confidence,
                                 'best_window': prediction.best_window,
+                                'learned_window': prediction.learned_window,
+                                'used_learned_selection': prediction.used_learned_selection,
                             })
 
                     except Exception as e:
@@ -546,6 +929,28 @@ def main():
                         logger.exception("Prediction error")
 
     with tab2:
+        # Channel Visualization tab
+        prediction = st.session_state.get('last_prediction')
+        pred_data = st.session_state.get('prediction_data')
+
+        if pred_data is not None:
+            tsla_slice, _, _ = pred_data
+            show_channel_visualization_tab(tsla_slice, prediction)
+        else:
+            st.info("Make a prediction first to see channel visualization across timeframes")
+
+            # Allow visualization without prediction
+            if st.button("Visualize Channels (without prediction)"):
+                lookback = st.slider(
+                    "Lookback for visualization",
+                    min_value=1000,
+                    max_value=20000,
+                    value=5000,
+                    key="viz_lookback"
+                )
+                show_channel_visualization_tab(current_tsla.iloc[-lookback:], None)
+
+    with tab3:
         st.header("Window Selection Analysis")
 
         st.markdown("""
@@ -574,7 +979,7 @@ def main():
             with st.spinner("Detecting channels at all window sizes..."):
                 try:
                     # Get recent data slice
-                    tsla_slice = tsla.iloc[-window_lookback:]
+                    tsla_slice = current_tsla.iloc[-window_lookback:]
 
                     # Check if v7 channel detection is available
                     if WINDOW_STRATEGIES_AVAILABLE:
@@ -671,7 +1076,7 @@ def main():
         else:
             st.info("Click 'Analyze Windows' to run the window selection analysis")
 
-    with tab3:
+    with tab4:
         st.header("Feature Analysis")
 
         if predictor is not None:
@@ -680,7 +1085,7 @@ def main():
         else:
             st.info("Load a model to see feature importance")
 
-    with tab4:
+    with tab5:
         st.header("Model Information")
 
         if predictor is not None:
@@ -696,22 +1101,40 @@ def main():
                 st.metric("Features per TF", model.features_per_tf)
                 st.metric("Has Explicit Weights", "Yes" if model.feature_weights else "No")
                 st.metric("Device", str(predictor.device))
+
+            # Additional model info
+            st.divider()
+            st.subheader("Model Capabilities")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                has_window_sel = predictor.has_learned_window_selection
+                st.metric("Learned Window Selection", "Yes" if has_window_sel else "No")
+
+            with col2:
+                # Check if model supports per-TF predictions
+                has_per_tf = hasattr(model, 'forward_with_per_tf')
+                st.metric("Per-TF Predictions", "Yes" if has_per_tf else "No")
+
         else:
             st.info("Load a model to see information")
 
-    with tab5:
+    with tab6:
         st.header("Data Explorer")
 
+        # Show data status
+        show_data_status_bar(is_live, error_msg, st.session_state.get('last_update'))
+
         st.subheader("TSLA")
-        st.line_chart(tsla['close'].tail(1000))
+        st.line_chart(current_tsla['close'].tail(1000))
 
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("Total Bars", f"{len(tsla):,}")
-            st.metric("Start", str(tsla.index[0].date()))
+            st.metric("Total Bars", f"{len(current_tsla):,}")
+            st.metric("Start", str(current_tsla.index[0].date()))
         with col2:
-            st.metric("End", str(tsla.index[-1].date()))
-            st.metric("Last Close", f"${tsla['close'].iloc[-1]:.2f}")
+            st.metric("End", str(current_tsla.index[-1].date()))
+            st.metric("Last Close", f"${current_tsla['close'].iloc[-1]:.2f}")
 
 
 if __name__ == "__main__":

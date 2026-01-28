@@ -33,6 +33,15 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class PerTFPrediction:
+    """Per-timeframe prediction breakdown."""
+    duration_mean: float
+    duration_std: float
+    confidence: float
+    best_window: int  # Heuristic window for this TF
+
+
+@dataclass
 class Prediction:
     """Single prediction result."""
     timestamp: pd.Timestamp
@@ -48,6 +57,9 @@ class Prediction:
     learned_window: Optional[int] = None  # Window selected by model
     learned_window_probs: Optional[Dict[int, float]] = None  # Probabilities for each window
     used_learned_selection: bool = False  # Whether learned selection was used
+    # Per-timeframe predictions (optional)
+    per_tf_predictions: Optional[Dict[str, PerTFPrediction]] = None
+    # Structure: {'5min': PerTFPrediction(...), '15min': PerTFPrediction(...), ...}
 
 
 class Predictor:
@@ -156,8 +168,26 @@ class Predictor:
 
         model = create_model(config)
 
-        # Load state dict
-        model.load_state_dict(state_dict)
+        # Load state dict with graceful handling of missing per_tf_heads weights
+        # Older checkpoints may not have per_tf_heads - use strict=False and warn
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+        # Check if per_tf_heads weights are missing (expected for older checkpoints)
+        per_tf_missing = [k for k in missing_keys if 'per_tf_heads' in k]
+        other_missing = [k for k in missing_keys if 'per_tf_heads' not in k]
+
+        if per_tf_missing:
+            logger.warning(
+                f"Checkpoint missing per_tf_heads weights ({len(per_tf_missing)} keys) - "
+                "per-TF predictions will be untrained"
+            )
+
+        # Warn about any other missing keys (these might be actual problems)
+        if other_missing:
+            logger.warning(f"Checkpoint missing unexpected keys: {other_missing}")
+
+        if unexpected_keys:
+            logger.warning(f"Checkpoint has unexpected keys: {unexpected_keys}")
 
         # Get feature names - use new TF-aware feature names by default
         feature_names = checkpoint.get('feature_names', get_tf_feature_names())
@@ -251,6 +281,109 @@ class Predictor:
             used_learned_selection=used_learned_selection,
         )
 
+    @torch.no_grad()
+    def predict_features_with_per_tf(
+        self,
+        features: Dict[str, float],
+        heuristic_windows_by_tf: Optional[Dict[str, int]] = None,
+    ) -> Prediction:
+        """
+        Make prediction with per-timeframe breakdown.
+
+        This method returns both the aggregated prediction and per-TF
+        predictions for duration and confidence.
+
+        Args:
+            features: Dict of feature name -> value
+            heuristic_windows_by_tf: Optional dict mapping TF name -> best window
+                                     for that TF from channel detection
+
+        Returns:
+            Prediction object with per_tf_predictions populated
+        """
+        # Convert to tensor
+        feature_array = np.array([
+            features.get(name, 0.0) for name in self.feature_names
+        ], dtype=np.float32)
+
+        x = torch.from_numpy(feature_array).unsqueeze(0).to(self.device)
+
+        # Forward pass with per-TF outputs
+        outputs, per_tf_outputs = self.model.forward_with_per_tf(
+            x,
+            validate=True,
+            window_selector_hard=True,
+        )
+
+        # Parse aggregated outputs (same as predict_features)
+        duration_mean = outputs['duration_mean'].item()
+        duration_std = torch.exp(outputs['duration_log_std']).item()
+
+        direction_prob = torch.sigmoid(outputs['direction_logits']).item()
+        direction = 'up' if direction_prob > 0.5 else 'down'
+
+        new_channel_probs = torch.softmax(outputs['new_channel_logits'], dim=-1).squeeze()
+        new_channel_idx = new_channel_probs.argmax().item()
+        new_channel_names = ['bear', 'sideways', 'bull']
+        new_channel = new_channel_names[new_channel_idx]
+
+        confidence = outputs['confidence'].item()
+
+        # Handle learned window selection
+        learned_window = None
+        learned_window_probs = None
+        used_learned_selection = False
+
+        if self._has_learned_window_selection and 'window_selection' in outputs:
+            window_sel = outputs['window_selection']
+            selected_idx = window_sel['selected_idx'].item()
+            learned_window = STANDARD_WINDOWS[selected_idx]
+            used_learned_selection = True
+
+            probs = window_sel['probs'].squeeze()
+            learned_window_probs = {
+                STANDARD_WINDOWS[i]: probs[i].item()
+                for i in range(len(STANDARD_WINDOWS))
+            }
+
+        # Parse per-TF outputs
+        per_tf_predictions = {}
+        for i, tf_name in enumerate(TIMEFRAMES):
+            tf_duration_mean = per_tf_outputs['duration_mean'][0, i].item()
+            tf_duration_std = torch.exp(per_tf_outputs['duration_log_std'][0, i]).item()
+            tf_confidence = per_tf_outputs['confidence'][0, i].item()
+
+            # Get heuristic window for this TF (default to 50 if not provided)
+            tf_best_window = 50
+            if heuristic_windows_by_tf and tf_name in heuristic_windows_by_tf:
+                tf_best_window = heuristic_windows_by_tf[tf_name]
+
+            per_tf_predictions[tf_name] = PerTFPrediction(
+                duration_mean=tf_duration_mean,
+                duration_std=tf_duration_std,
+                confidence=tf_confidence,
+                best_window=tf_best_window,
+            )
+
+        return Prediction(
+            timestamp=pd.Timestamp.now(),
+            duration_mean=duration_mean,
+            duration_std=duration_std,
+            direction=direction,
+            direction_prob=direction_prob,
+            new_channel=new_channel,
+            new_channel_probs={
+                name: new_channel_probs[i].item()
+                for i, name in enumerate(new_channel_names)
+            },
+            confidence=confidence,
+            best_window=50,  # Will be updated by caller
+            learned_window=learned_window,
+            learned_window_probs=learned_window_probs,
+            used_learned_selection=used_learned_selection,
+            per_tf_predictions=per_tf_predictions,
+        )
+
     def predict(
         self,
         tsla_df: pd.DataFrame,
@@ -340,6 +473,99 @@ class Predictor:
             # Fall back to heuristic
             prediction.best_window = heuristic_window
             logger.debug(f"Window selection: using heuristic window={heuristic_window}")
+
+        return prediction
+
+    def predict_with_per_tf(
+        self,
+        tsla_df: pd.DataFrame,
+        spy_df: pd.DataFrame,
+        vix_df: pd.DataFrame,
+        timestamp: Optional[pd.Timestamp] = None,
+        source_bar_count: Optional[int] = None,
+        channel_history_by_tf: Optional[Dict[str, Dict]] = None,
+    ) -> Prediction:
+        """
+        Make prediction with per-timeframe breakdown.
+
+        Same as predict() but also populates per_tf_predictions with
+        duration and confidence for each of the 10 timeframes.
+
+        This enables dashboard to show:
+        - Which timeframes are most confident
+        - How duration estimates vary across TFs
+        - Per-TF best windows from channel detection
+
+        Args:
+            tsla_df: TSLA OHLCV DataFrame (5-min base data)
+            spy_df: SPY OHLCV DataFrame (5-min base data)
+            vix_df: VIX OHLCV DataFrame (5-min base data)
+            timestamp: Timestamp for prediction (default: last bar)
+            source_bar_count: Number of 5min bars for partial bar calculation
+            channel_history_by_tf: Optional dict mapping TF -> {'tsla': [...], 'spy': [...]}
+
+        Returns:
+            Prediction object with per_tf_predictions populated:
+            - per_tf_predictions: Dict[str, PerTFPrediction] mapping TF name to predictions
+              Each PerTFPrediction has: duration_mean, duration_std, confidence, best_window
+        """
+        from v15.core.channel import detect_channels_multi_window, select_best_channel
+        from v15.features.tf_extractor import resample_to_timeframe
+
+        if timestamp is None:
+            timestamp = tsla_df.index[-1]
+
+        if source_bar_count is None:
+            source_bar_count = len(tsla_df)
+
+        # Detect channels on 5-min data for overall heuristic best_window
+        channels = detect_channels_multi_window(tsla_df, windows=STANDARD_WINDOWS)
+        heuristic_channel, heuristic_window = select_best_channel(channels)
+        heuristic_window = heuristic_window if heuristic_window is not None else 50
+
+        # Detect best window per timeframe for per-TF breakdown
+        heuristic_windows_by_tf = {}
+        for tf_name in TIMEFRAMES:
+            try:
+                tf_df = resample_to_timeframe(tsla_df, tf_name)
+                if len(tf_df) >= 20:  # Need enough bars for channel detection
+                    tf_channels = detect_channels_multi_window(tf_df, windows=STANDARD_WINDOWS)
+                    _, tf_window = select_best_channel(tf_channels)
+                    heuristic_windows_by_tf[tf_name] = tf_window if tf_window else 50
+                else:
+                    heuristic_windows_by_tf[tf_name] = 50
+            except Exception as e:
+                logger.debug(f"Could not detect channel for {tf_name}: {e}")
+                heuristic_windows_by_tf[tf_name] = 50
+
+        # Extract all TF features
+        features = extract_all_tf_features(
+            tsla_df=tsla_df,
+            spy_df=spy_df,
+            vix_df=vix_df,
+            timestamp=timestamp,
+            channel_history_by_tf=channel_history_by_tf,
+            source_bar_count=source_bar_count,
+            include_bar_metadata=True,
+        )
+
+        # Make prediction with per-TF breakdown
+        prediction = self.predict_features_with_per_tf(
+            features,
+            heuristic_windows_by_tf=heuristic_windows_by_tf,
+        )
+        prediction.timestamp = timestamp
+
+        # Determine which window to use for aggregated prediction
+        if prediction.used_learned_selection and prediction.learned_window is not None:
+            prediction.best_window = prediction.learned_window
+            if prediction.learned_window != heuristic_window:
+                logger.info(
+                    f"Window selection: learned={prediction.learned_window} vs "
+                    f"heuristic={heuristic_window} (using learned)"
+                )
+        else:
+            prediction.best_window = heuristic_window
 
         return prediction
 

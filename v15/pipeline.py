@@ -191,6 +191,8 @@ def cmd_train(args):
         # Cross-asset RSI head weights
         cross_rsi_aligned_weight=args.cross_rsi_aligned_weight,
         cross_rsi_spread_weight=args.cross_rsi_spread_weight,
+        # Per-timeframe loss
+        per_tf_loss_weight=args.per_tf_loss_weight,
     )
 
     # Train
@@ -458,6 +460,9 @@ def main():
         help='Weight for cross-asset RSI aligned prediction head (default: 1.0)')
     train_parser.add_argument('--cross-rsi-spread-weight', type=float, default=1.0,
         help='Weight for cross-asset RSI spread prediction head (default: 1.0)')
+    # Per-timeframe loss weight
+    train_parser.add_argument('--per-tf-loss-weight', type=float, default=0.0,
+        help='Weight for per-timeframe duration loss (0.0 = disabled, try 0.5 to enable)')
 
     # Analyze command
     analyze_parser = subparsers.add_parser('analyze', help='Analyze feature correlations')

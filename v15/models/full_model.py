@@ -15,7 +15,7 @@ from typing import Dict, Optional, Tuple
 from .feature_weights import ExplicitFeatureWeights, FeatureGating
 from .tf_encoder import MultiTFEncoder
 from .cross_tf_attention import CrossTFAttention, TFAggregator
-from .prediction_heads import PredictionHeads
+from .prediction_heads import PredictionHeads, PerTFPredictionHeads
 from ..config import (
     TOTAL_FEATURES, N_TIMEFRAMES, FEATURES_PER_TF,
     FEATURE_COUNTS, MODEL_CONFIG
@@ -165,6 +165,12 @@ class V15Model(nn.Module):
             enable_rsi_heads=enable_rsi_heads,
         )
 
+        # 7. Per-TF Prediction Heads for per-timeframe breakdown
+        self.per_tf_heads = PerTFPredictionHeads(
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim // 4,
+        )
+
     def validate_input(self, x: torch.Tensor) -> None:
         """Check for NaN/Inf in input - LOUD failure."""
         if torch.isnan(x).any():
@@ -260,6 +266,72 @@ class V15Model(nn.Module):
             predictions['aggregation_weights'] = agg_weights
 
         return predictions
+
+    def forward_with_per_tf(
+        self,
+        x: torch.Tensor,
+        validate: bool = True,
+        window_selector_temperature: float = 1.0,
+        window_selector_hard: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """
+        Forward pass that also returns per-TF predictions.
+
+        This method is useful for per-timeframe prediction breakdown.
+        Returns both the normal (aggregated) predictions and per-TF predictions
+        from lightweight heads run on embeddings after cross-TF attention.
+
+        Args:
+            x: [batch, input_dim] raw features
+            validate: If True, check for NaN/Inf (LOUD failure)
+            window_selector_temperature: Temperature for window selection softmax
+            window_selector_hard: If True, use argmax for window selection
+
+        Returns:
+            Tuple of:
+                - predictions: Dict with all aggregated prediction outputs (same as forward())
+                - per_tf_predictions: Dict with per-TF predictions:
+                    - 'duration_mean': [batch, n_timeframes]
+                    - 'duration_log_std': [batch, n_timeframes]
+                    - 'confidence': [batch, n_timeframes]
+        """
+        # 1. Validate input
+        if validate:
+            self.validate_input(x)
+
+        # 2. Apply explicit feature weights
+        if self.feature_weights is not None:
+            x = self.feature_weights(x)
+
+        # 3. Apply feature gating
+        if self.feature_gating is not None:
+            x = self.feature_gating(x)
+
+        # 4. Split into TF and shared features
+        tf_features, shared_features = self.split_features(x)
+
+        # 5. Encode per-TF
+        tf_embeddings = self.tf_encoder(tf_features, shared_features)
+
+        # 6. Cross-TF attention
+        tf_embeddings_attended, _ = self.cross_tf_attention(
+            tf_embeddings, return_attention=False
+        )
+
+        # 7. Per-TF predictions (before aggregation)
+        per_tf_predictions = self.per_tf_heads(tf_embeddings_attended)
+
+        # 8. Aggregate
+        aggregated, _ = self.tf_aggregator(tf_embeddings_attended)
+
+        # 9. Aggregated predictions
+        predictions = self.prediction_heads(
+            aggregated,
+            window_selector_temperature=window_selector_temperature,
+            window_selector_hard=window_selector_hard,
+        )
+
+        return predictions, per_tf_predictions
 
     def get_feature_importance(self) -> Optional[torch.Tensor]:
         """Get learned feature importance from explicit weights."""

@@ -1014,6 +1014,13 @@ class ChannelDataset(Dataset):
                 self._get_best_window_index(sample), dtype=torch.long
             )
 
+        # Add per-TF duration labels for per-TF loss computation
+        # Extract duration and validity for all 10 TFs from the same window
+        sample = self.samples[idx]
+        per_tf_duration, per_tf_duration_valid = self._extract_per_tf_duration_labels(sample)
+        label_tensors['per_tf_duration'] = per_tf_duration
+        label_tensors['per_tf_duration_valid'] = per_tf_duration_valid
+
         return features, label_tensors
 
     def _extract_per_window_features(self, sample: ChannelSample) -> torch.Tensor:
@@ -1114,6 +1121,52 @@ class ChannelDataset(Dataset):
             return STANDARD_WINDOWS.index(best_window)
         # Fallback to middle window
         return 4  # window 50
+
+    def _extract_per_tf_duration_labels(
+        self, sample: ChannelSample
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract duration labels for all 10 TFs from the sample's best window.
+
+        This enables per-TF loss computation where each TF's duration prediction
+        can be supervised independently. Uses the same window that was selected
+        for the main sample.
+
+        Args:
+            sample: ChannelSample with labels_per_window
+
+        Returns:
+            Tuple of:
+                - per_tf_duration: [n_tfs] tensor of duration values for each TF
+                - per_tf_duration_valid: [n_tfs] boolean tensor of validity flags
+        """
+        n_tfs = len(TIMEFRAMES)
+        per_tf_duration = torch.zeros(n_tfs, dtype=torch.float32)
+        per_tf_duration_valid = torch.zeros(n_tfs, dtype=torch.bool)
+
+        # Get labels from the sample's selected window
+        window = sample.best_window
+        window_labels = sample.labels_per_window.get(window, {})
+
+        # Handle both old and new structure
+        if 'tsla' in window_labels:
+            # New structure: {window: {'tsla': {tf: ChannelLabels}, 'spy': {tf: ChannelLabels}}}
+            tf_labels_dict = window_labels.get('tsla', {})
+        else:
+            # Old structure: {window: {tf: ChannelLabels}}
+            tf_labels_dict = window_labels
+
+        # Extract duration for each TF
+        for tf_idx, tf in enumerate(TIMEFRAMES):
+            tf_label = tf_labels_dict.get(tf)
+            if tf_label is not None:
+                # Get duration_bars and validity
+                duration = getattr(tf_label, 'duration_bars', 0)
+                is_valid = getattr(tf_label, 'duration_valid', False)
+                per_tf_duration[tf_idx] = float(duration) if duration is not None else 0.0
+                per_tf_duration_valid[tf_idx] = bool(is_valid)
+
+        return per_tf_duration, per_tf_duration_valid
 
     def get_metadata(self, idx: int) -> Dict[str, Any]:
         """Get metadata for a sample (timestamp, window, bar_metadata)."""

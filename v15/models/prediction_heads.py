@@ -96,6 +96,79 @@ class ConfidenceHead(nn.Module):
         return self.net(x).squeeze(-1)
 
 
+class PerTFPredictionHeads(nn.Module):
+    """
+    Lightweight prediction heads for per-timeframe predictions.
+
+    Runs duration and confidence heads on individual TF embeddings (after
+    cross-TF attention) to provide per-TF breakdown of predictions.
+
+    This enables dashboard to show which timeframes are most confident
+    in their predictions and how duration estimates vary across TFs.
+    """
+
+    def __init__(self, embed_dim: int = 128, hidden_dim: int = 64):
+        """
+        Initialize per-TF prediction heads.
+
+        Args:
+            embed_dim: Dimension of per-TF embeddings (default: 128)
+            hidden_dim: Hidden layer dimension (default: 64)
+        """
+        super().__init__()
+
+        # Duration head (mean + log_std)
+        self.duration_net = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+        self.duration_mean = nn.Linear(hidden_dim // 2, 1)
+        self.duration_log_std = nn.Linear(hidden_dim // 2, 1)
+
+        # Confidence head
+        self.confidence_net = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, tf_embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Run prediction heads on per-TF embeddings.
+
+        Args:
+            tf_embeddings: [batch, n_timeframes, embed_dim] embeddings after cross-TF attention
+
+        Returns:
+            Dict with:
+                'duration_mean': [batch, n_timeframes] predicted durations
+                'duration_log_std': [batch, n_timeframes] log std of durations
+                'confidence': [batch, n_timeframes] confidence scores
+        """
+        batch_size, n_tf, embed_dim = tf_embeddings.shape
+
+        # Flatten for batch processing
+        flat_embeddings = tf_embeddings.view(batch_size * n_tf, embed_dim)
+
+        # Duration predictions
+        h = self.duration_net(flat_embeddings)
+        duration_mean = F.softplus(self.duration_mean(h))  # Must be positive
+        duration_log_std = self.duration_log_std(h)
+
+        # Confidence predictions
+        confidence = self.confidence_net(flat_embeddings)
+
+        # Reshape back to [batch, n_timeframes]
+        return {
+            'duration_mean': duration_mean.view(batch_size, n_tf),
+            'duration_log_std': duration_log_std.view(batch_size, n_tf),
+            'confidence': confidence.view(batch_size, n_tf),
+        }
+
+
 class WindowSelectorHead(nn.Module):
     """
     Learned window selection head for end-to-end window selection.

@@ -130,6 +130,15 @@ class TrainingConfig:
     cross_overbought_predicts_down_weight: float = 1.0  # Binary: overbought predicts down
     cross_oversold_predicts_up_weight: float = 1.0      # Binary: oversold predicts up
 
+    # Per-TF loss weight (Phase: per-timeframe supervision)
+    # When > 0, enables auxiliary per-TF duration loss using forward_with_per_tf()
+    # This encourages the model to produce accurate per-TF duration predictions
+    # For each of the 10 TFs, computes Gaussian NLL (or configured loss type) between:
+    #   - Predicted: per_tf_preds['duration_mean'][:, tf_idx], per_tf_preds['duration_log_std'][:, tf_idx]
+    #   - Target: per-TF duration labels (from labels['per_tf_duration'][:, tf_idx])
+    # Set to 0.0 to disable (default, backward compatible)
+    per_tf_loss_weight: float = 0.0
+
 
 # =============================================================================
 # Window Selection Head
@@ -438,6 +447,83 @@ class Trainer:
             self.config.gumbel_temperature_min,
             self.config.gumbel_temperature * (1 - decay_rate * progress)
         )
+
+    def compute_per_tf_duration_loss(
+        self,
+        per_tf_preds: Dict[str, torch.Tensor],
+        labels: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute per-TF duration loss for auxiliary supervision.
+
+        This loss encourages the model's per-TF prediction heads to produce
+        accurate duration estimates for each timeframe independently.
+
+        For each of the 10 TFs, computes Gaussian NLL (or configured loss type) between:
+            - Predicted: per_tf_preds['duration_mean'][:, tf_idx], per_tf_preds['duration_log_std'][:, tf_idx]
+            - Target: labels['per_tf_duration'][:, tf_idx]
+
+        Only computes loss for TFs with valid duration labels (labels['per_tf_duration_valid'][:, tf_idx]).
+
+        Args:
+            per_tf_preds: Dict from model.forward_with_per_tf() containing:
+                - 'duration_mean': [batch, n_tfs] predicted durations per TF
+                - 'duration_log_std': [batch, n_tfs] log std of durations per TF
+                - 'confidence': [batch, n_tfs] confidence scores per TF
+            labels: Ground truth labels dict with:
+                - 'per_tf_duration': [batch, n_tfs] duration targets per TF
+                - 'per_tf_duration_valid': [batch, n_tfs] validity mask per TF
+
+        Returns:
+            per_tf_loss: Scalar tensor of averaged per-TF duration loss
+            loss_components: Dict with per-TF loss breakdown for logging
+        """
+        losses = {}
+
+        # Get per-TF duration targets and validity masks
+        per_tf_duration = labels.get('per_tf_duration')
+        per_tf_duration_valid = labels.get('per_tf_duration_valid')
+
+        if per_tf_duration is None or per_tf_duration_valid is None:
+            # No per-TF labels available - return zero loss
+            return torch.tensor(0.0, device=self.device), {'per_tf_duration': 0.0, 'per_tf_n_valid': 0}
+
+        # Get predictions
+        pred_mean = per_tf_preds['duration_mean']  # [batch, n_tfs]
+        pred_log_std = per_tf_preds['duration_log_std']  # [batch, n_tfs]
+
+        # Flatten for loss computation: [batch * n_tfs]
+        # valid_mask is True where both sample has valid label and TF has valid label
+        valid_mask = per_tf_duration_valid  # [batch, n_tfs]
+
+        if not valid_mask.any():
+            # No valid TF labels in this batch
+            return torch.tensor(0.0, device=self.device), {'per_tf_duration': 0.0, 'per_tf_n_valid': 0}
+
+        # Extract valid predictions and targets
+        pred_mean_valid = pred_mean[valid_mask]  # [n_valid]
+        pred_log_std_valid = pred_log_std[valid_mask]  # [n_valid]
+        target_valid = per_tf_duration[valid_mask].float()  # [n_valid]
+
+        # Compute loss based on configured type
+        if self.config.duration_loss_type == 'gaussian_nll':
+            # Gaussian NLL loss: -log p(y|mu, sigma) = 0.5 * [log(sigma^2) + (y-mu)^2/sigma^2]
+            variance = torch.exp(2 * pred_log_std_valid)
+            per_tf_loss = 0.5 * (
+                torch.log(variance) +
+                (target_valid - pred_mean_valid) ** 2 / variance
+            ).mean()
+        elif self.config.duration_loss_type == 'huber':
+            per_tf_loss = F.huber_loss(
+                pred_mean_valid, target_valid, delta=self.config.huber_delta
+            )
+        else:  # mse
+            per_tf_loss = F.mse_loss(pred_mean_valid, target_valid)
+
+        losses['per_tf_duration'] = per_tf_loss.item()
+        losses['per_tf_n_valid'] = int(valid_mask.sum().item())
+
+        return per_tf_loss, losses
 
     def compute_loss(
         self,
@@ -1491,11 +1577,32 @@ class Trainer:
 
                 self.optimizer.zero_grad()
 
+                # Check if per-TF loss is enabled
+                use_per_tf_loss = self.config.per_tf_loss_weight > 0
+
                 # Forward pass with mixed precision
                 if self.scaler:
                     with torch.amp.autocast(device_type='cuda'):
-                        predictions = self.model(features)
+                        # Use forward_with_per_tf when per-TF loss is enabled
+                        if use_per_tf_loss:
+                            predictions, per_tf_preds = self.model.forward_with_per_tf(features)
+                        else:
+                            predictions = self.model(features)
+                            per_tf_preds = None
+
+                        # Compute main loss
                         loss, loss_components = self.compute_loss(predictions, labels)
+
+                        # Add per-TF duration loss if enabled
+                        if use_per_tf_loss and per_tf_preds is not None:
+                            per_tf_loss, per_tf_loss_components = self.compute_per_tf_duration_loss(
+                                per_tf_preds, labels
+                            )
+                            # Add weighted per-TF loss to total
+                            loss = loss + self.config.per_tf_loss_weight * per_tf_loss
+                            # Merge loss components for logging
+                            loss_components.update(per_tf_loss_components)
+                            loss_components['total'] = loss.item()
 
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
@@ -1503,8 +1610,26 @@ class Trainer:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    predictions = self.model(features)
+                    # Use forward_with_per_tf when per-TF loss is enabled
+                    if use_per_tf_loss:
+                        predictions, per_tf_preds = self.model.forward_with_per_tf(features)
+                    else:
+                        predictions = self.model(features)
+                        per_tf_preds = None
+
+                    # Compute main loss
                     loss, loss_components = self.compute_loss(predictions, labels)
+
+                    # Add per-TF duration loss if enabled
+                    if use_per_tf_loss and per_tf_preds is not None:
+                        per_tf_loss, per_tf_loss_components = self.compute_per_tf_duration_loss(
+                            per_tf_preds, labels
+                        )
+                        # Add weighted per-TF loss to total
+                        loss = loss + self.config.per_tf_loss_weight * per_tf_loss
+                        # Merge loss components for logging
+                        loss_components.update(per_tf_loss_components)
+                        loss_components['total'] = loss.item()
 
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -1609,8 +1734,29 @@ class Trainer:
                 features = features.to(self.device)
                 labels = {k: v.to(self.device) for k, v in labels.items()}
 
-                predictions = self.model(features)
+                # Check if per-TF loss is enabled
+                use_per_tf_loss = self.config.per_tf_loss_weight > 0
+
+                # Use forward_with_per_tf when per-TF loss is enabled
+                if use_per_tf_loss:
+                    predictions, per_tf_preds = self.model.forward_with_per_tf(features)
+                else:
+                    predictions = self.model(features)
+                    per_tf_preds = None
+
+                # Compute main loss
                 loss, loss_components = self.compute_loss(predictions, labels)
+
+                # Add per-TF duration loss if enabled
+                if use_per_tf_loss and per_tf_preds is not None:
+                    per_tf_loss, per_tf_loss_components = self.compute_per_tf_duration_loss(
+                        per_tf_preds, labels
+                    )
+                    # Add weighted per-TF loss to total (for logging only in validation)
+                    loss = loss + self.config.per_tf_loss_weight * per_tf_loss
+                    # Merge loss components for logging
+                    loss_components.update(per_tf_loss_components)
+                    loss_components['total'] = loss.item()
 
             val_losses.append(loss_components)
             all_predictions.append({k: v.cpu() for k, v in predictions.items()})
@@ -1835,7 +1981,28 @@ class Trainer:
         """
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Load model state dict with graceful handling of missing per_tf_heads weights
+        # Older checkpoints may not have per_tf_heads - use strict=False and warn
+        missing_keys, unexpected_keys = self.model.load_state_dict(
+            checkpoint['model_state_dict'], strict=False
+        )
+
+        # Check if per_tf_heads weights are missing (expected for older checkpoints)
+        per_tf_missing = [k for k in missing_keys if 'per_tf_heads' in k]
+        other_missing = [k for k in missing_keys if 'per_tf_heads' not in k]
+
+        if per_tf_missing:
+            logger.warning(
+                f"Checkpoint missing per_tf_heads weights ({len(per_tf_missing)} keys) - "
+                "per-TF predictions will be untrained"
+            )
+
+        # Warn about any other missing keys (these might be actual problems)
+        if other_missing:
+            logger.warning(f"Checkpoint missing unexpected keys: {other_missing}")
+
+        if unexpected_keys:
+            logger.warning(f"Checkpoint has unexpected keys: {unexpected_keys}")
 
         # Load window selection head if present
         if 'window_selection_head_state_dict' in checkpoint and self.window_selection_head is not None:

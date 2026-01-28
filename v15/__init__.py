@@ -41,6 +41,7 @@ from .exceptions import (
 )
 
 from .dtypes import ChannelSample, ChannelLabels
+from .inference import Prediction, PerTFPrediction
 
 # Lazy imports for optional components
 def load_market_data(data_dir: str):
@@ -74,6 +75,16 @@ def load_predictor(checkpoint_path: str):
     from .inference import Predictor
     return Predictor.load(checkpoint_path)
 
+def fetch_live_data(period: str = '60d', interval: str = '5m'):
+    """Fetch live market data using yfinance."""
+    from .live_data import fetch_live_data as _fetch
+    return _fetch(period=period, interval=interval)
+
+def create_live_data_feed(**kwargs):
+    """Create a YFinanceLiveData instance for live data streaming."""
+    from .live_data import YFinanceLiveData
+    return YFinanceLiveData(**kwargs)
+
 __version__ = '15.0.0'
 
 __all__ = [
@@ -93,9 +104,13 @@ __all__ = [
     # Types
     'ChannelSample',
     'ChannelLabels',
+    'Prediction',
+    'PerTFPrediction',
     # Functions
     'load_market_data',
     'create_model',
     'scan_channels',
     'load_predictor',
+    'fetch_live_data',
+    'create_live_data_feed',
 ]
