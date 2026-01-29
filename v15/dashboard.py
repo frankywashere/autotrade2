@@ -708,9 +708,9 @@ def load_market_data(data_dir: str):
 
 @st.cache_resource
 def load_predictor(checkpoint_path: str):
-    """Load and cache predictor."""
-    from v15.inference import Predictor
-    return Predictor.load(checkpoint_path)
+    """Load and cache live predictor with channel history tracking."""
+    from v15.live import LivePredictor
+    return LivePredictor(checkpoint_path, min_bars=1000, track_channel_history=True)
 
 
 def show_prediction_card(prediction):
@@ -745,6 +745,41 @@ def show_prediction_card(prediction):
             f"{prediction.confidence:.1%}",
             f"Window: {prediction.best_window}"
         )
+
+
+def show_channel_history_status(predictor):
+    """Show channel history tracking status from LivePredictor."""
+    if not hasattr(predictor, 'channel_history_by_tf'):
+        return
+
+    history = predictor.channel_history_by_tf
+    total_entries = 0
+    populated_tfs = 0
+
+    for tf_name in TIMEFRAMES:
+        tf_hist = history.get(tf_name, {})
+        tsla_count = len(tf_hist.get('tsla', []))
+        spy_count = len(tf_hist.get('spy', []))
+        if tsla_count > 0 or spy_count > 0:
+            populated_tfs += 1
+        total_entries += tsla_count + spy_count
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            "Channel History",
+            f"{total_entries} entries",
+            help="Total channel history entries tracked across all TFs"
+        )
+    with col2:
+        st.metric(
+            "Active TFs",
+            f"{populated_tfs}/{len(TIMEFRAMES)}",
+            help="Timeframes with at least one channel history entry"
+        )
+    with col3:
+        tracking = "Active" if predictor.track_channel_history else "Disabled"
+        st.metric("History Tracking", tracking)
 
 
 def show_feature_importance(predictor, top_k: int = 50):
@@ -878,51 +913,73 @@ def main():
                 )
 
             if st.button("Make Prediction", type="primary"):
-                with st.spinner("Extracting features and predicting..."):
+                with st.spinner("Loading data and predicting..."):
                     try:
                         # Use current data (live or loaded)
                         tsla_slice = current_tsla.iloc[-lookback:]
                         spy_slice = current_spy.iloc[-lookback:]
                         vix_slice = current_vix.iloc[-lookback:]
 
-                        # Use predict_with_per_tf for per-TF breakdown
-                        try:
-                            prediction = predictor.predict_with_per_tf(
-                                tsla_slice, spy_slice, vix_slice
+                        # Load data into LivePredictor (updates rolling window + bar count)
+                        predictor.load_historical_data(tsla_slice, spy_slice, vix_slice)
+
+                        # Use predict_with_per_tf for per-TF breakdown + channel history
+                        live_pred = predictor.predict_with_per_tf()
+
+                        if live_pred is None:
+                            st.error("Prediction returned None - not enough data")
+                        else:
+                            prediction = live_pred.prediction
+
+                            # Store prediction for channel visualization tab
+                            st.session_state['last_prediction'] = prediction
+                            st.session_state['prediction_data'] = (tsla_slice, spy_slice, vix_slice)
+                            st.session_state['last_live_pred'] = live_pred
+
+                            st.success(
+                                f"Prediction complete! "
+                                f"(latency: {live_pred.latency_ms:.0f}ms, "
+                                f"bars: {live_pred.source_bar_count:,})"
                             )
-                        except AttributeError:
-                            # Fallback if predict_with_per_tf not available
-                            prediction = predictor.predict(
-                                tsla_slice, spy_slice, vix_slice
-                            )
+                            show_prediction_card(prediction)
 
-                        # Store prediction for channel visualization tab
-                        st.session_state['last_prediction'] = prediction
-                        st.session_state['prediction_data'] = (tsla_slice, spy_slice, vix_slice)
+                            # Show channel history status
+                            show_channel_history_status(predictor)
 
-                        st.success("Prediction complete!")
-                        show_prediction_card(prediction)
+                            # Show per-TF breakdown table
+                            st.divider()
+                            st.subheader("Per-Timeframe Breakdown")
+                            show_per_tf_predictions_table(prediction)
 
-                        # Show per-TF breakdown table
-                        st.divider()
-                        st.subheader("Per-Timeframe Breakdown")
-                        show_per_tf_predictions_table(prediction)
+                            # Show details
+                            with st.expander("Prediction Details"):
+                                st.json({
+                                    'timestamp': str(prediction.timestamp),
+                                    'duration_mean': prediction.duration_mean,
+                                    'duration_std': prediction.duration_std,
+                                    'direction': prediction.direction,
+                                    'direction_prob': prediction.direction_prob,
+                                    'new_channel': prediction.new_channel,
+                                    'new_channel_probs': prediction.new_channel_probs,
+                                    'confidence': prediction.confidence,
+                                    'best_window': prediction.best_window,
+                                    'learned_window': prediction.learned_window,
+                                    'used_learned_selection': prediction.used_learned_selection,
+                                })
 
-                        # Show details
-                        with st.expander("Prediction Details"):
-                            st.json({
-                                'timestamp': str(prediction.timestamp),
-                                'duration_mean': prediction.duration_mean,
-                                'duration_std': prediction.duration_std,
-                                'direction': prediction.direction,
-                                'direction_prob': prediction.direction_prob,
-                                'new_channel': prediction.new_channel,
-                                'new_channel_probs': prediction.new_channel_probs,
-                                'confidence': prediction.confidence,
-                                'best_window': prediction.best_window,
-                                'learned_window': prediction.learned_window,
-                                'used_learned_selection': prediction.used_learned_selection,
-                            })
+                            # Show bar completion by TF
+                            with st.expander("Bar Completion by Timeframe"):
+                                completion = live_pred.bar_completion_by_tf
+                                if completion:
+                                    comp_data = [
+                                        {'Timeframe': tf, 'Completion': f"{pct:.0%}"}
+                                        for tf, pct in completion.items()
+                                    ]
+                                    st.dataframe(
+                                        pd.DataFrame(comp_data),
+                                        use_container_width=True,
+                                        hide_index=True
+                                    )
 
                     except Exception as e:
                         st.error(f"Prediction failed: {e}")
@@ -1115,6 +1172,43 @@ def main():
                 # Check if model supports per-TF predictions
                 has_per_tf = hasattr(model, 'forward_with_per_tf')
                 st.metric("Per-TF Predictions", "Yes" if has_per_tf else "No")
+
+            # LivePredictor stats
+            st.divider()
+            st.subheader("Live Predictor Status")
+
+            stats = predictor.get_stats()
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Predictions Made", stats['prediction_count'])
+                st.metric("Data Bars", f"{stats['data_bars']:,}")
+            with col2:
+                st.metric("Total Bars Received", f"{stats['total_bars_received']:,}")
+                st.metric("Avg Latency", f"{stats['avg_latency_ms']:.0f}ms")
+            with col3:
+                st.metric("Channel History", "Active" if stats['tracking_channel_history'] else "Disabled")
+                st.metric("Can Predict", "Yes" if stats['can_predict'] else "No")
+
+            # Channel history detail
+            if hasattr(predictor, 'channel_history_by_tf'):
+                with st.expander("Channel History Detail"):
+                    history = predictor.channel_history_by_tf
+                    hist_data = []
+                    for tf_name in TIMEFRAMES:
+                        tf_hist = history.get(tf_name, {})
+                        tsla_count = len(tf_hist.get('tsla', []))
+                        spy_count = len(tf_hist.get('spy', []))
+                        hist_data.append({
+                            'Timeframe': tf_name,
+                            'TSLA Entries': tsla_count,
+                            'SPY Entries': spy_count,
+                            'Total': tsla_count + spy_count,
+                        })
+                    st.dataframe(
+                        pd.DataFrame(hist_data),
+                        use_container_width=True,
+                        hide_index=True
+                    )
 
         else:
             st.info("Load a model to see information")

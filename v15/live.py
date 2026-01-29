@@ -126,6 +126,21 @@ class LivePredictor:
         """Whether this predictor uses learned window selection."""
         return self.predictor.has_learned_window_selection
 
+    @property
+    def model(self):
+        """Access the underlying model (delegates to Predictor)."""
+        return self.predictor.model
+
+    @property
+    def feature_names(self) -> list:
+        """Access feature names (delegates to Predictor)."""
+        return self.predictor.feature_names
+
+    @property
+    def device(self):
+        """Access device (delegates to Predictor)."""
+        return self.predictor.device
+
     def update_data(
         self,
         tsla_bar: Dict[str, float],
@@ -291,6 +306,86 @@ class LivePredictor:
 
         except Exception as e:
             logger.error(f"Prediction failed: {e}")
+            return None
+
+    def predict_with_per_tf(self) -> Optional[LivePrediction]:
+        """
+        Make prediction with per-timeframe breakdown using channel history.
+
+        Same as predict() but uses predictor.predict_with_per_tf() for
+        per-TF duration and confidence breakdown. This is the method
+        the dashboard should use.
+
+        Returns:
+            LivePrediction with prediction.per_tf_predictions populated,
+            or None if not enough data.
+        """
+        if not self.can_predict():
+            logger.warning(
+                f"Not enough data: "
+                f"{len(self.tsla_data) if self.tsla_data is not None else 0}/{self.min_bars}"
+            )
+            return None
+
+        start_time = time.perf_counter()
+
+        try:
+            # Use VIX or create dummy
+            vix = self.vix_data if self.vix_data is not None else pd.DataFrame({
+                'open': [20.0], 'high': [20.0], 'low': [20.0], 'close': [20.0]
+            }, index=[self.tsla_data.index[-1]])
+
+            # Make prediction with per-TF breakdown + channel history
+            prediction = self.predictor.predict_with_per_tf(
+                self.tsla_data,
+                self.spy_data,
+                vix,
+                source_bar_count=self.total_bars_received,
+                channel_history_by_tf=self.channel_history_by_tf if self.track_channel_history else None,
+            )
+
+            latency_ms = (time.perf_counter() - start_time) * 1000
+
+            # Compute bar completion for each TF
+            bar_completion = self._compute_bar_completion_by_tf()
+
+            # Create LivePrediction with learned window selection info
+            live_pred = LivePrediction(
+                prediction=prediction,
+                data_timestamp=self.tsla_data.index[-1],
+                prediction_time=datetime.now(),
+                latency_ms=latency_ms,
+                channel_valid=True,
+                source_bar_count=self.total_bars_received,
+                bar_completion_by_tf=bar_completion,
+                used_learned_selection=prediction.used_learned_selection,
+                learned_window=prediction.learned_window,
+                learned_window_probs=prediction.learned_window_probs,
+            )
+
+            # Log learned window selection if used
+            if prediction.used_learned_selection:
+                logger.debug(
+                    f"Live prediction (per-TF) using learned window={prediction.learned_window} "
+                    f"(best_window={prediction.best_window})"
+                )
+
+            # Check for channel transitions and update history
+            if self.track_channel_history:
+                self._check_channel_transitions(self.tsla_data.index[-1])
+
+            # Update metrics
+            self.prediction_count += 1
+            self.total_latency_ms += latency_ms
+
+            # Callback
+            if self.on_prediction:
+                self.on_prediction(live_pred)
+
+            return live_pred
+
+        except Exception as e:
+            logger.error(f"Prediction (per-TF) failed: {e}")
             return None
 
     def _check_channel_transitions(self, current_ts: pd.Timestamp) -> None:

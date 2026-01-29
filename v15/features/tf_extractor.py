@@ -1333,6 +1333,28 @@ def create_feature_vector(
     return vector
 
 
+def resample_to_timeframe(
+    df: pd.DataFrame,
+    tf: str,
+    source_bar_count: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    Public wrapper for _resample_to_tf that returns only the resampled DataFrame.
+
+    Used by inference.py and dashboard.py for per-TF channel detection.
+
+    Args:
+        df: Base OHLCV DataFrame (5-min data)
+        tf: Target timeframe name (e.g., '5min', '1h', 'daily')
+        source_bar_count: Number of 5min bars from start of data
+
+    Returns:
+        Resampled OHLCV DataFrame
+    """
+    resampled_df, _ = _resample_to_tf(df, tf, source_bar_count)
+    return resampled_df
+
+
 def features_to_dataframe(
     features: Dict[str, float],
     timestamp: Optional[pd.Timestamp] = None
