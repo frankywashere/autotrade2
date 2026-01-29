@@ -1771,39 +1771,6 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
     return all_features;
 }
 
-
-// =============================================================================
-// EXTRACT ALL FEATURES - DataView with Slim Map (zero-copy + real channels)
-// =============================================================================
-
-std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
-    const DataView& tsla_view,
-    const DataView& spy_view,
-    const DataView& vix_view,
-    int64_t timestamp,
-    const SlimLabeledChannelMap& tsla_slim_map,
-    const SlimLabeledChannelMap& spy_slim_map,
-    int source_bar_count,
-    bool include_bar_metadata
-) {
-    // No history provided - use empty maps
-    std::unordered_map<std::string, std::vector<ChannelHistoryEntry>> empty_tsla_history;
-    std::unordered_map<std::string, std::vector<ChannelHistoryEntry>> empty_spy_history;
-
-    return extract_all_features(
-        tsla_view,
-        spy_view,
-        vix_view,
-        timestamp,
-        tsla_slim_map,
-        spy_slim_map,
-        empty_tsla_history,
-        empty_spy_history,
-        source_bar_count,
-        include_bar_metadata
-    );
-}
-
 // =============================================================================
 // EXTRACT ALL FEATURES - DataView with Slim Map AND Channel History (FULL)
 // =============================================================================

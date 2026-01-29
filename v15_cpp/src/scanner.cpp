@@ -525,16 +525,26 @@ std::vector<ChannelSample> Scanner::scan(
 
     if (config_.verbose) {
         // Count non-empty histories for debug
-        int non_empty_count = 0;
+        int tsla_non_empty_count = 0;
+        int spy_non_empty_count = 0;
+
         for (const auto& wi : channel_work_items) {
             for (const auto& [tf, hist] : wi.tsla_history_by_tf) {
-                if (!hist.empty()) non_empty_count++;
+                if (!hist.empty()) tsla_non_empty_count++;
+            }
+            for (const auto& [tf, hist] : wi.spy_history_by_tf) {
+                if (!hist.empty()) spy_non_empty_count++;
             }
         }
+
+        int total_non_empty_count = tsla_non_empty_count + spy_non_empty_count;
+
         std::cout << "  [HISTORY] Computed " << channel_work_items.size() << " snapshots in "
                   << std::fixed << std::setprecision(2) << history_time << "s ("
                   << std::setprecision(0) << (channel_work_items.size() / history_time) << " items/s)\n";
-        std::cout << "  [HISTORY] Non-empty TSLA histories: " << non_empty_count << "\n";
+        std::cout << "  [HISTORY] Non-empty TSLA histories: " << tsla_non_empty_count << "\n";
+        std::cout << "  [HISTORY] Non-empty SPY histories: " << spy_non_empty_count << "\n";
+        std::cout << "  [HISTORY] Total non-empty histories: " << total_non_empty_count << "\n";
     }
 
     int total_channels_to_process = channel_work_items.size();

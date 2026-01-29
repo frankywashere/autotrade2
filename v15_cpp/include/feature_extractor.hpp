@@ -155,22 +155,6 @@ public:
     );
 
     /**
-     * Extract all features using DataView (zero-copy) with slim channel maps
-     *
-     * DataView version for optimal memory performance in scanner pipeline.
-     */
-    static std::unordered_map<std::string, double> extract_all_features(
-        const DataView& tsla_view,
-        const DataView& spy_view,
-        const DataView& vix_view,
-        int64_t timestamp,
-        const SlimLabeledChannelMap& tsla_slim_map,
-        const SlimLabeledChannelMap& spy_slim_map,
-        int source_bar_count = -1,
-        bool include_bar_metadata = true
-    );
-
-    /**
      * Extract all features with pre-computed channel history (FULL VERSION)
      *
      * This overload accepts pre-computed channel history snapshots for each timeframe,
