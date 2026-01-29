@@ -5,6 +5,7 @@
 #include "labels.hpp"
 #include "data_loader.hpp"
 #include "channel_detector.hpp"  // Provides Channel struct for Pass 1
+#include "channel_history.hpp"   // For ChannelHistoryEntry
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -123,6 +124,11 @@ struct ChannelWorkItem {
     int primary_window;             // Primary channel window
     int channel_idx;                // Index in the slim_map for this (tf, window)
     int64_t end_timestamp;          // Channel end timestamp for sorting
+
+    // Pre-computed history snapshots for each timeframe
+    // Maps timeframe string (e.g., "5min", "1h") to vector of last 5 channels
+    std::unordered_map<std::string, std::vector<ChannelHistoryEntry>> tsla_history_by_tf;
+    std::unordered_map<std::string, std::vector<ChannelHistoryEntry>> spy_history_by_tf;
 
     ChannelWorkItem()
         : primary_tf(""), primary_window(0), channel_idx(0), end_timestamp(0) {}

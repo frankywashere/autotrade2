@@ -3,7 +3,8 @@
 #include "types.hpp"
 #include "channel.hpp"
 #include "indicators.hpp"
-#include "scanner.hpp"  // For SlimLabeledChannelMap, SlimLabeledChannel
+#include "channel_history.hpp"  // For ChannelHistoryEntry
+#include "scanner.hpp"          // For SlimLabeledChannelMap, SlimLabeledChannel
 #include <vector>
 #include <unordered_map>
 #include <string>
@@ -107,31 +108,6 @@ struct ResampleCache {
 };
 
 /**
- * ChannelHistoryEntry - Stores historical channel information
- *
- * Used to track the last 5 channels for each asset (TSLA/SPY) per timeframe.
- * Contains channel metrics and exit behavior data from ChannelLabels.
- */
-struct ChannelHistoryEntry {
-    double duration = 50.0;         // Duration of the channel in bars
-    double slope = 0.0;             // Channel slope
-    int direction = 1;              // 0=bear, 1=sideways, 2=bull
-    int break_direction = 0;        // -1=down, 0=no break, 1=up
-    double r_squared = 0.0;         // Channel quality (R-squared)
-    double bounce_count = 0.0;      // Number of bounces off channel bounds
-
-    // Exit metrics from ChannelLabels
-    double exit_count = 0.0;        // Number of exits from channel
-    double avg_exit_magnitude = 0.0; // Average magnitude of exits
-    double avg_bars_outside = 0.0;  // Average bars spent outside channel
-    double exit_return_rate = 0.0;  // Rate at which exits return to channel
-    double durability_score = 0.0;  // Channel durability (resistance to breaks)
-    double false_break_count = 0.0; // Number of false breaks (bounces after return)
-
-    ChannelHistoryEntry() = default;
-};
-
-/**
  * FeatureExtractor - Complete multi-timeframe feature extraction system
  *
  * Extracts 14,190 features from TSLA, SPY, and VIX data:
@@ -190,6 +166,37 @@ public:
         int64_t timestamp,
         const SlimLabeledChannelMap& tsla_slim_map,
         const SlimLabeledChannelMap& spy_slim_map,
+        int source_bar_count = -1,
+        bool include_bar_metadata = true
+    );
+
+    /**
+     * Extract all features with pre-computed channel history (FULL VERSION)
+     *
+     * This overload accepts pre-computed channel history snapshots for each timeframe,
+     * enabling the 670 channel history features to be populated with real data.
+     *
+     * @param tsla_view TSLA 5-min data view
+     * @param spy_view SPY 5-min data view
+     * @param vix_view VIX 5-min data view
+     * @param timestamp Current timestamp for event features
+     * @param tsla_slim_map Precomputed TSLA slim labeled channel map
+     * @param spy_slim_map Precomputed SPY slim labeled channel map
+     * @param tsla_history_by_tf Pre-computed TSLA channel history per timeframe (last 5 channels)
+     * @param spy_history_by_tf Pre-computed SPY channel history per timeframe (last 5 channels)
+     * @param source_bar_count Number of 5min bars from start (for partial bar calculation)
+     * @param include_bar_metadata Include 30 bar metadata features
+     * @return Map of feature names to values
+     */
+    static std::unordered_map<std::string, double> extract_all_features(
+        const DataView& tsla_view,
+        const DataView& spy_view,
+        const DataView& vix_view,
+        int64_t timestamp,
+        const SlimLabeledChannelMap& tsla_slim_map,
+        const SlimLabeledChannelMap& spy_slim_map,
+        const std::unordered_map<std::string, std::vector<ChannelHistoryEntry>>& tsla_history_by_tf,
+        const std::unordered_map<std::string, std::vector<ChannelHistoryEntry>>& spy_history_by_tf,
         int source_bar_count = -1,
         bool include_bar_metadata = true
     );

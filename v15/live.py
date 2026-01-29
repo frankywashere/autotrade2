@@ -20,8 +20,12 @@ import time
 from pathlib import Path
 
 from .inference import Predictor, Prediction
-from .config import TIMEFRAMES, STANDARD_WINDOWS, BARS_PER_TF
+from .config import TIMEFRAMES, STANDARD_WINDOWS, BARS_PER_TF, BREAK_DETECTION
 from .exceptions import V15Error
+from .core.channel import detect_channel, Channel
+from .core.break_scanner import scan_for_break, BreakResult, compute_durability_from_result
+from .data.resampler import resample_with_partial
+from .features.channel_history import channel_to_history_dict
 
 logger = logging.getLogger(__name__)
 
@@ -271,6 +275,10 @@ class LivePredictor:
                     f"(best_window={prediction.best_window})"
                 )
 
+            # Check for channel transitions and update history (NEW)
+            if self.track_channel_history:
+                self._check_channel_transitions(self.tsla_data.index[-1])
+
             # Update metrics
             self.prediction_count += 1
             self.total_latency_ms += latency_ms
@@ -284,6 +292,311 @@ class LivePredictor:
         except Exception as e:
             logger.error(f"Prediction failed: {e}")
             return None
+
+    def _check_channel_transitions(self, current_ts: pd.Timestamp) -> None:
+        """
+        Check all timeframes for channel breaks and update history.
+
+        Called after each prediction to maintain real-time channel tracking.
+        This enables the 670 channel history features to be populated with real data.
+        """
+        # Only check transitions periodically (not every single prediction)
+        # to reduce computational overhead
+        if self.prediction_count % 10 != 0:
+            return
+
+        for tf_name in TIMEFRAMES:
+            for asset in ['tsla', 'spy']:
+                # Check if current channel has broken permanently
+                break_info = self._detect_channel_break(tf_name, asset, current_ts)
+
+                if break_info is not None:
+                    # Channel broke - extract metrics and update history
+                    self._update_channel_history(tf_name, asset, break_info, current_ts)
+
+    def _detect_channel_break(
+        self,
+        tf_name: str,
+        asset: str,
+        current_ts: pd.Timestamp
+    ) -> Optional[Dict]:
+        """
+        Detect if current channel has broken permanently using real break_scanner.
+
+        Uses actual channel detection and break scanning from v15.core modules
+        to detect permanent breaks with full metrics.
+
+        Args:
+            tf_name: Timeframe name (e.g., '5min', '1h')
+            asset: 'tsla' or 'spy'
+            current_ts: Current timestamp
+
+        Returns:
+            Dict with channel metrics and break info if permanent break detected, None otherwise
+        """
+        try:
+            # Get current data for the asset
+            data = self.tsla_data if asset == 'tsla' else self.spy_data
+            if data is None or len(data) < 100:
+                return None
+
+            # Get bars_per_tf for this timeframe
+            bars_per_tf = BARS_PER_TF.get(tf_name, 1)
+
+            # Need enough data to resample and detect channels
+            # Minimum: window * bars_per_tf + forward scan buffer
+            min_window = STANDARD_WINDOWS[0]  # 10
+            max_window = STANDARD_WINDOWS[-1]  # 80
+            min_required_5min_bars = max_window * bars_per_tf + 100  # Buffer for forward scan
+
+            if len(data) < min_required_5min_bars:
+                return None
+
+            # Resample to target timeframe
+            # Use resample_with_partial to handle live partial bars
+            try:
+                resampled_df, _ = resample_with_partial(data, tf_name)
+            except Exception as e:
+                logger.debug(f"Resampling failed for {asset}/{tf_name}: {e}")
+                return None
+
+            if resampled_df is None or len(resampled_df) < max_window + 20:
+                return None
+
+            # Track the previous channel state for this asset/tf combo
+            state_key = f"{asset}_{tf_name}"
+            if not hasattr(self, '_channel_states'):
+                self._channel_states: Dict[str, Dict] = {}
+
+            prev_state = self._channel_states.get(state_key)
+
+            # Detect current channel using the default window (50)
+            # This gives us a channel at the current position
+            default_window = 50
+            if len(resampled_df) < default_window + 2:
+                return None
+
+            current_channel = detect_channel(
+                resampled_df,
+                window=default_window,
+                std_multiplier=2.0,
+                touch_threshold=0.10,
+                min_cycles=1
+            )
+
+            if not current_channel.valid:
+                # No valid channel - clear state and return
+                self._channel_states[state_key] = None
+                return None
+
+            # If we have a previous channel, check for permanent break
+            if prev_state is not None and prev_state.get('channel') is not None:
+                prev_channel: Channel = prev_state['channel']
+                prev_channel_end_idx = prev_state['end_idx']
+
+                # Get forward data from where previous channel ended
+                # We need high, low, close for the break scanner
+                forward_start = prev_channel_end_idx
+                if forward_start < 0 or forward_start >= len(resampled_df) - 1:
+                    # Reset state - previous position is no longer valid
+                    self._channel_states[state_key] = {
+                        'channel': current_channel,
+                        'end_idx': len(resampled_df) - 1,
+                        'end_ts': current_ts
+                    }
+                    return None
+
+                # Get forward OHLC arrays
+                forward_high = resampled_df['high'].values[forward_start:]
+                forward_low = resampled_df['low'].values[forward_start:]
+                forward_close = resampled_df['close'].values[forward_start:]
+
+                if len(forward_high) < 5:  # Need at least some forward data
+                    # Update state with current channel
+                    self._channel_states[state_key] = {
+                        'channel': current_channel,
+                        'end_idx': len(resampled_df) - 1,
+                        'end_ts': current_ts
+                    }
+                    return None
+
+                # Run break scanner on the previous channel
+                try:
+                    break_result: BreakResult = scan_for_break(
+                        channel=prev_channel,
+                        forward_high=forward_high,
+                        forward_low=forward_low,
+                        forward_close=forward_close,
+                        max_scan_bars=min(100, len(forward_high)),  # Limit scan for live
+                        return_threshold_bars=BREAK_DETECTION.get('return_threshold_bars', 10),
+                        min_break_magnitude=BREAK_DETECTION.get('min_break_magnitude', 0.5)
+                    )
+                except Exception as e:
+                    logger.debug(f"Break scan failed for {asset}/{tf_name}: {e}")
+                    # Update state with current channel
+                    self._channel_states[state_key] = {
+                        'channel': current_channel,
+                        'end_idx': len(resampled_df) - 1,
+                        'end_ts': current_ts
+                    }
+                    return None
+
+                # Check if we have a permanent break
+                if break_result.permanent_break_direction >= 0:
+                    # Permanent break detected!
+                    # Compute durability metrics
+                    false_break_count, false_break_rate, durability_score = compute_durability_from_result(break_result)
+
+                    # Calculate exit metrics from the break result
+                    exit_events = break_result.all_exit_events or []
+                    exit_count = len(exit_events)
+                    exit_magnitudes = [e.magnitude for e in exit_events]
+                    avg_exit_magnitude = np.mean(exit_magnitudes) if exit_magnitudes else 0.0
+                    avg_bars_outside = (
+                        np.mean([e.bars_outside for e in exit_events if e.returned])
+                        if any(e.returned for e in exit_events)
+                        else 0.0
+                    )
+
+                    # Build the break info dict matching ChannelHistoryEntry format
+                    break_info = {
+                        'end_timestamp': int(current_ts.value / 1e6),  # Milliseconds
+                        'duration': prev_channel.window,  # Channel duration in TF bars
+                        'slope': prev_channel.slope,
+                        'direction': int(prev_channel.direction),  # 0=BEAR, 1=SIDEWAYS, 2=BULL
+                        'break_direction': break_result.permanent_break_direction,  # 0=DOWN, 1=UP
+                        'r_squared': prev_channel.r_squared,
+                        'bounce_count': prev_channel.bounce_count,
+                        # Exit metrics
+                        'exit_count': exit_count,
+                        'avg_exit_magnitude': float(avg_exit_magnitude),
+                        'avg_bars_outside': float(avg_bars_outside),
+                        'exit_return_rate': break_result.exit_return_rate,
+                        'durability_score': durability_score,
+                        'false_break_count': false_break_count,
+                        # Store the channel object for channel_to_history_dict
+                        '_channel': prev_channel,
+                        '_break_result': break_result,
+                    }
+
+                    # Update state with current channel (the new channel after break)
+                    self._channel_states[state_key] = {
+                        'channel': current_channel,
+                        'end_idx': len(resampled_df) - 1,
+                        'end_ts': current_ts
+                    }
+
+                    return break_info
+
+            # No permanent break yet - update state with current channel
+            self._channel_states[state_key] = {
+                'channel': current_channel,
+                'end_idx': len(resampled_df) - 1,
+                'end_ts': current_ts
+            }
+            return None
+
+        except Exception as e:
+            logger.debug(f"Channel break detection failed for {asset}/{tf_name}: {e}")
+            return None
+
+    def _update_channel_history(
+        self,
+        tf_name: str,
+        asset: str,
+        break_info: Dict,
+        current_ts: pd.Timestamp
+    ) -> None:
+        """
+        Update channel history with a new broken channel using proper history dict format.
+
+        Uses channel_to_history_dict() from v15.features.channel_history to ensure
+        the history entry has all required fields for the 67 channel history features.
+
+        Maintains a rolling window of the last 5 channels per timeframe per asset.
+
+        Args:
+            tf_name: Timeframe name (e.g., '5min')
+            asset: 'tsla' or 'spy'
+            break_info: Dict from _detect_channel_break containing channel and break metrics
+            current_ts: Current timestamp
+        """
+        # Initialize if needed
+        if tf_name not in self.channel_history_by_tf:
+            self.channel_history_by_tf[tf_name] = {'tsla': [], 'spy': []}
+
+        # Extract the channel object and break result if available
+        channel = break_info.get('_channel')
+        break_result = break_info.get('_break_result')
+
+        # Build a ChannelLabels-like object for channel_to_history_dict
+        # This extracts proper exit metrics from the break result
+        class LabelsProxy:
+            """Proxy object with ChannelLabels-compatible attributes for exit metrics."""
+            def __init__(self, break_result: Optional[BreakResult]):
+                if break_result is not None and break_result.all_exit_events:
+                    exit_events = break_result.all_exit_events
+                    self.exit_bars = [e.bar_index for e in exit_events]
+                    self.exit_magnitudes = [e.magnitude for e in exit_events]
+                    self.avg_bars_outside = (
+                        np.mean([e.bars_outside for e in exit_events if e.returned])
+                        if any(e.returned for e in exit_events)
+                        else 0.0
+                    )
+                    self.exit_return_rate = break_result.exit_return_rate
+                    self.durability_score = break_info.get('durability_score', 0.0)
+                    self.bounces_after_return = break_result.false_break_count
+                else:
+                    self.exit_bars = []
+                    self.exit_magnitudes = []
+                    self.avg_bars_outside = 0.0
+                    self.exit_return_rate = 0.0
+                    self.durability_score = 0.0
+                    self.bounces_after_return = 0
+
+        labels_proxy = LabelsProxy(break_result)
+
+        # Use channel_to_history_dict if we have a channel object
+        if channel is not None:
+            history_entry = channel_to_history_dict(
+                channel=channel,
+                duration=break_info.get('duration', channel.window),
+                break_direction=break_info.get('break_direction', 0),
+                labels=labels_proxy
+            )
+        else:
+            # Fallback: build history entry directly from break_info
+            # This ensures we always have a valid history entry with all required fields
+            history_entry = {
+                'duration': break_info.get('duration', 50),
+                'slope': break_info.get('slope', 0.0),
+                'direction': break_info.get('direction', 1),  # 0=BEAR, 1=SIDEWAYS, 2=BULL
+                'break_direction': break_info.get('break_direction', 0),
+                'r_squared': break_info.get('r_squared', 0.0),
+                'bounce_count': break_info.get('bounce_count', 0),
+                # Exit metrics
+                'exit_count': break_info.get('exit_count', 0),
+                'avg_exit_magnitude': break_info.get('avg_exit_magnitude', 0.0),
+                'avg_bars_outside': break_info.get('avg_bars_outside', 0.0),
+                'exit_return_rate': break_info.get('exit_return_rate', 0.0),
+                'durability_score': break_info.get('durability_score', 0.0),
+                'false_break_count': break_info.get('false_break_count', 0),
+            }
+
+        # Append to history
+        history_list = self.channel_history_by_tf[tf_name][asset]
+        history_list.append(history_entry)
+
+        # Keep last 5
+        if len(history_list) > 5:
+            self.channel_history_by_tf[tf_name][asset] = history_list[-5:]
+
+        logger.debug(
+            f"[{current_ts}] Channel transition detected in {tf_name}/{asset}: "
+            f"direction={history_entry['direction']}, duration={history_entry['duration']}, "
+            f"break_dir={history_entry['break_direction']}, bounce_count={history_entry['bounce_count']}, "
+            f"r_squared={history_entry['r_squared']:.3f}, durability={history_entry['durability_score']:.3f}"
+        )
 
     def get_stats(self) -> Dict[str, Any]:
         """Get predictor statistics including partial bar info."""

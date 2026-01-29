@@ -16,6 +16,15 @@
 
 namespace v15 {
 
+// Forward declarations for channel history helpers (defined below)
+static ChannelHistoryEntry slim_to_history_entry(const SlimLabeledChannel& slim);
+static std::vector<ChannelHistoryEntry> build_channel_history(
+    const SlimLabeledChannelMap& slim_map,
+    const std::string& tf,
+    int64_t before_timestamp,
+    int max_count = 5
+);
+
 // =============================================================================
 // THREAD POOL IMPLEMENTATION
 // =============================================================================
@@ -368,6 +377,166 @@ std::vector<ChannelSample> Scanner::scan(
         std::cout << "  [PASS3 PREP] Work items created: " << channel_work_items.size() << "\n";
     }
 
+    // =========================================================================
+    // PRE-COMPUTE CHANNEL HISTORY SNAPSHOTS FOR ALL WORK ITEMS
+    // =========================================================================
+    // This enables the 670 channel history features to be populated with real data.
+    // Each work item gets a snapshot of the last 5 channels for each TF that ended
+    // before the work item's timestamp.
+    //
+    // OPTIMIZATION: Pre-build sorted channel indices per timeframe to avoid
+    // O(windows * channels) lookup for each work item. This reduces complexity
+    // from O(work_items * TFs * windows * channels) to O(work_items * TFs * log(channels))
+
+    if (config_.verbose) {
+        std::cout << "\n  [HISTORY] Pre-computing channel history snapshots...\n";
+        std::cout << "  [HISTORY] Work items to process: " << channel_work_items.size() << "\n";
+    }
+
+    auto history_start = std::chrono::high_resolution_clock::now();
+
+    // STEP 1: Pre-build sorted channel index per timeframe for fast lookup
+    // Key: timeframe string, Value: vector of (end_timestamp, pointer to channel) sorted by timestamp
+    using ChannelIndex = std::vector<std::pair<int64_t, const SlimLabeledChannel*>>;
+    std::unordered_map<std::string, ChannelIndex> tsla_tf_index;
+    std::unordered_map<std::string, ChannelIndex> spy_tf_index;
+
+    auto build_tf_index = [](const SlimLabeledChannelMap& slim_map) {
+        std::unordered_map<std::string, ChannelIndex> tf_index;
+
+        // Collect all channels grouped by timeframe
+        for (const auto& [key, channels] : slim_map) {
+            const std::string& tf = key.tf;
+            for (const auto& ch : channels) {
+                if (ch.channel_valid) {
+                    tf_index[tf].emplace_back(ch.end_timestamp, &ch);
+                }
+            }
+        }
+
+        // Sort each timeframe's channels by end_timestamp
+        for (auto& [tf, channel_list] : tf_index) {
+            std::sort(channel_list.begin(), channel_list.end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+
+        return tf_index;
+    };
+
+    if (config_.verbose) {
+        std::cout << "  [HISTORY] Building TSLA channel index...\n";
+    }
+    tsla_tf_index = build_tf_index(tsla_slim_map);
+
+    if (config_.verbose) {
+        std::cout << "  [HISTORY] Building SPY channel index...\n";
+    }
+    spy_tf_index = build_tf_index(spy_slim_map);
+
+    auto index_end = std::chrono::high_resolution_clock::now();
+    double index_time = std::chrono::duration<double>(index_end - history_start).count();
+
+    if (config_.verbose) {
+        size_t tsla_indexed = 0, spy_indexed = 0;
+        for (const auto& [tf, idx] : tsla_tf_index) tsla_indexed += idx.size();
+        for (const auto& [tf, idx] : spy_tf_index) spy_indexed += idx.size();
+        std::cout << "  [HISTORY] Index built in " << std::fixed << std::setprecision(2)
+                  << index_time << "s (TSLA: " << tsla_indexed << " channels, SPY: "
+                  << spy_indexed << " channels)\n";
+    }
+
+    // STEP 2: Fast history lookup using pre-built index (binary search)
+    auto fast_build_history = [](const ChannelIndex& index, int64_t before_timestamp, int max_count) {
+        std::vector<ChannelHistoryEntry> history;
+        if (index.empty()) return history;
+
+        // Binary search for last channel before timestamp
+        auto it = std::lower_bound(index.begin(), index.end(), before_timestamp,
+                                   [](const auto& pair, int64_t ts) { return pair.first < ts; });
+
+        // Move back to find channels before timestamp
+        if (it == index.begin()) return history;  // No channels before timestamp
+
+        // Collect up to max_count channels before timestamp
+        auto end_it = it;
+        auto start_it = it;
+        int count = 0;
+        while (start_it != index.begin() && count < max_count) {
+            --start_it;
+            ++count;
+        }
+
+        // Build history entries
+        history.reserve(count);
+        for (auto ptr = start_it; ptr != end_it; ++ptr) {
+            history.push_back(slim_to_history_entry(*ptr->second));
+        }
+
+        return history;
+    };
+
+    // STEP 3: Process work items with progress tracking
+    std::atomic<size_t> items_processed{0};
+    const size_t progress_interval = 1000;  // Report every 1000 items
+
+    #pragma omp parallel for schedule(dynamic, 100) if(config_.workers != 1)
+    for (size_t wi = 0; wi < channel_work_items.size(); ++wi) {
+        ChannelWorkItem& work_item = channel_work_items[wi];
+
+        // Build history snapshots for all timeframes using fast index lookup
+        for (int tf_idx = 0; tf_idx < NUM_TIMEFRAMES; ++tf_idx) {
+            std::string hist_tf = TIMEFRAME_NAMES[tf_idx];
+
+            // Fast TSLA history lookup
+            auto tsla_it = tsla_tf_index.find(hist_tf);
+            if (tsla_it != tsla_tf_index.end()) {
+                work_item.tsla_history_by_tf[hist_tf] =
+                    fast_build_history(tsla_it->second, work_item.end_timestamp, 5);
+            }
+
+            // Fast SPY history lookup
+            auto spy_it = spy_tf_index.find(hist_tf);
+            if (spy_it != spy_tf_index.end()) {
+                work_item.spy_history_by_tf[hist_tf] =
+                    fast_build_history(spy_it->second, work_item.end_timestamp, 5);
+            }
+        }
+
+        // Progress tracking (thread-safe)
+        size_t processed = items_processed.fetch_add(1) + 1;
+        if (config_.verbose && processed % progress_interval == 0) {
+            #pragma omp critical
+            {
+                auto now = std::chrono::high_resolution_clock::now();
+                double elapsed = std::chrono::duration<double>(now - history_start).count();
+                double rate = processed / elapsed;
+                double eta = (channel_work_items.size() - processed) / rate;
+                std::cout << "  [HISTORY] Progress: " << processed << "/" << channel_work_items.size()
+                          << " (" << std::fixed << std::setprecision(1)
+                          << (100.0 * processed / channel_work_items.size()) << "%) | "
+                          << std::setprecision(0) << rate << " items/s | ETA: "
+                          << std::setprecision(1) << eta << "s\n";
+            }
+        }
+    }
+
+    auto history_end = std::chrono::high_resolution_clock::now();
+    double history_time = std::chrono::duration<double>(history_end - history_start).count();
+
+    if (config_.verbose) {
+        // Count non-empty histories for debug
+        int non_empty_count = 0;
+        for (const auto& wi : channel_work_items) {
+            for (const auto& [tf, hist] : wi.tsla_history_by_tf) {
+                if (!hist.empty()) non_empty_count++;
+            }
+        }
+        std::cout << "  [HISTORY] Computed " << channel_work_items.size() << " snapshots in "
+                  << std::fixed << std::setprecision(2) << history_time << "s ("
+                  << std::setprecision(0) << (channel_work_items.size() / history_time) << " items/s)\n";
+        std::cout << "  [HISTORY] Non-empty TSLA histories: " << non_empty_count << "\n";
+    }
+
     int total_channels_to_process = channel_work_items.size();
 
     if (config_.max_samples > 0 && total_channels_to_process > config_.max_samples) {
@@ -651,6 +820,118 @@ int get_bars_per_tf(const std::string& tf) {
 }
 
 } // anonymous namespace
+
+// =============================================================================
+// CHANNEL HISTORY HELPER FUNCTIONS
+// =============================================================================
+
+/**
+ * Convert a SlimLabeledChannel to a ChannelHistoryEntry.
+ *
+ * Extracts channel metrics and exit behavior data from the slim channel
+ * and its precomputed labels.
+ */
+static ChannelHistoryEntry slim_to_history_entry(const SlimLabeledChannel& slim) {
+    ChannelHistoryEntry entry;
+    entry.end_timestamp = slim.end_timestamp;
+    entry.duration = static_cast<double>(slim.end_idx - slim.start_idx + 1);  // Channel duration in bars
+    entry.slope = slim.channel_slope;
+    entry.direction = slim.channel_direction;
+    entry.r_squared = slim.channel_r_squared;
+    entry.bounce_count = static_cast<double>(slim.channel_bounce_count);
+
+    // Extract from ChannelLabels
+    const auto& labels = slim.labels;
+    entry.break_direction = labels.break_direction;
+
+    // Calculate exit metrics
+    if (!labels.exit_magnitudes.empty()) {
+        entry.exit_count = static_cast<double>(labels.exit_magnitudes.size());
+
+        double sum_mag = 0.0;
+        for (double mag : labels.exit_magnitudes) {
+            sum_mag += std::abs(mag);
+        }
+        entry.avg_exit_magnitude = sum_mag / entry.exit_count;
+    }
+
+    entry.avg_bars_outside = labels.avg_bars_outside;
+    entry.exit_return_rate = labels.exit_return_rate;
+    entry.durability_score = labels.durability_score;
+
+    // Calculate false break count (exits that returned to channel)
+    int false_breaks = 0;
+    for (bool returned : labels.exit_returned) {
+        if (returned) false_breaks++;
+    }
+    entry.false_break_count = static_cast<double>(false_breaks);
+
+    return entry;
+}
+
+/**
+ * Build channel history for a specific timeframe.
+ *
+ * NOTE: This function has been replaced by the optimized fast_build_history()
+ * lambda in Scanner::scan() which uses a pre-built index for O(log n) lookup
+ * instead of O(windows * channels) iteration. Kept for reference.
+ *
+ * Finds all channels that ended before the given timestamp and returns
+ * the last `max_count` channels in chronological order.
+ *
+ * @param slim_map The full slim labeled channel map for an asset
+ * @param tf The timeframe to get history for
+ * @param before_timestamp Only include channels that ended before this timestamp
+ * @param max_count Maximum number of channels to return (default 5)
+ * @return Vector of ChannelHistoryEntry in chronological order (oldest first)
+ */
+[[maybe_unused]]
+static std::vector<ChannelHistoryEntry> build_channel_history(
+    const SlimLabeledChannelMap& slim_map,
+    const std::string& tf,
+    int64_t before_timestamp,
+    int max_count
+) {
+    std::vector<ChannelHistoryEntry> history;
+
+    // We need to look through all windows for this TF and find channels
+    // that ended before the given timestamp
+    std::vector<const SlimLabeledChannel*> candidate_channels;
+
+    // Iterate through all windows to find channels for this timeframe
+    for (int window : STANDARD_WINDOWS) {
+        TFWindowKey key{tf, window};
+        auto it = slim_map.find(key);
+        if (it == slim_map.end()) {
+            continue;
+        }
+
+        const auto& channels = it->second;
+        for (const auto& ch : channels) {
+            if (ch.channel_valid && ch.end_timestamp < before_timestamp) {
+                candidate_channels.push_back(&ch);
+            }
+        }
+    }
+
+    // Sort candidates by end_timestamp (chronologically)
+    std::sort(candidate_channels.begin(), candidate_channels.end(),
+              [](const SlimLabeledChannel* a, const SlimLabeledChannel* b) {
+                  return a->end_timestamp < b->end_timestamp;
+              });
+
+    // Take the last max_count channels (most recent before timestamp)
+    size_t start_idx = 0;
+    if (candidate_channels.size() > static_cast<size_t>(max_count)) {
+        start_idx = candidate_channels.size() - max_count;
+    }
+
+    for (size_t i = start_idx; i < candidate_channels.size(); ++i) {
+        history.push_back(slim_to_history_entry(*candidate_channels[i]));
+    }
+
+    return history;
+}
 
 // =============================================================================
 // PASS 1: CHANNEL DETECTION
@@ -1284,6 +1565,7 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
             // Extract features at channel end position (with timing)
             auto feature_start = std::chrono::high_resolution_clock::now();
 
+            // Use the new overload with pre-computed channel history
             auto tf_features = FeatureExtractor::extract_all_features(
                 tsla_view,
                 spy_view,
@@ -1291,6 +1573,8 @@ std::vector<ChannelSample> Scanner::process_channel_batch(
                 sample_timestamp,
                 tsla_slim_map,
                 spy_slim_map,
+                work_item.tsla_history_by_tf,  // Pre-computed TSLA history per TF
+                work_item.spy_history_by_tf,   // Pre-computed SPY history per TF
                 static_cast<int>(tsla_view.size()),  // source_bar_count - use view size!
                 true       // include_bar_metadata
             );
