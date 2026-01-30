@@ -96,6 +96,7 @@ def cmd_train(args):
             num_workers=args.num_workers,
             prefetch=True,
             sorted_reads=sorted_reads,
+            max_samples=max_samples,
         )
 
         logger.info(f"Features: {actual_feature_count:,}")

@@ -1540,6 +1540,7 @@ def create_streaming_dataloaders(
     num_workers: int = 0,
     prefetch: bool = True,
     sorted_reads: bool = False,
+    max_samples: Optional[int] = None,
 ) -> Tuple['torch.utils.data.DataLoader', 'torch.utils.data.DataLoader', int]:
     """
     Create train and validation dataloaders for streaming dataset.
@@ -1557,6 +1558,7 @@ def create_streaming_dataloaders(
         sorted_reads: Group samples by chunk for sequential disk I/O.
             Prevents chunk thrashing (loading new 15K-sample chunk per sample).
             Chunks and samples within chunks are still shuffled for training.
+        max_samples: If set, cap total samples used (train + val) to this number.
 
     Returns:
         Tuple of (train_loader, val_loader, num_features)
@@ -1581,6 +1583,8 @@ def create_streaming_dataloaders(
 
     # Split indices
     n_samples = len(dataset)
+    if max_samples is not None and max_samples < n_samples:
+        n_samples = max_samples
     indices = list(range(n_samples))
     random.shuffle(indices)
 
