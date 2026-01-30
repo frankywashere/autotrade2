@@ -97,6 +97,9 @@ class ChunkedStreamingDataset(Dataset):
 
         self.num_features = len(self.feature_names)
 
+        # Pre-build name→index map for fast feature extraction (avoids 222M dict lookups)
+        self._feature_name_to_idx = {name: i for i, name in enumerate(self.feature_names)}
+
         # Chunk cache state
         self.current_chunk_idx = -1
         self.current_chunk_features: Optional[torch.Tensor] = None
@@ -120,7 +123,8 @@ class ChunkedStreamingDataset(Dataset):
         print(f"  Num chunks: {(self.num_samples + self.chunk_size - 1) // self.chunk_size}")
         print(f"  Num features: {self.num_features:,}")
         print(f"  Target TF: {self.target_tf}")
-        print(f"  Estimated RAM per chunk: ~{self.chunk_size * 190 / 1024:.1f} MB")
+        ram_mb = self.chunk_size * self.num_features * 4 / (1024 * 1024)  # float32 = 4 bytes
+        print(f"  Estimated RAM per chunk: ~{ram_mb:.0f} MB (features only)")
 
     def __len__(self) -> int:
         return self.num_samples
@@ -150,14 +154,16 @@ class ChunkedStreamingDataset(Dataset):
         local_idx = idx - self.current_chunk_start
 
         # Bounds check
-        if local_idx < 0 or local_idx >= len(self.current_chunk_labels):
+        chunk_size = self.current_chunk_end - self.current_chunk_start
+        if local_idx < 0 or local_idx >= chunk_size:
             raise IndexError(
                 f"Index {idx} (local {local_idx}) out of range for chunk {chunk_idx} "
-                f"(size {len(self.current_chunk_labels)})"
+                f"(size {chunk_size})"
             )
 
         features = self.current_chunk_features[local_idx]
-        labels = self.current_chunk_labels[local_idx]
+        # Labels stored as Dict[str, Tensor[N, ...]] — index into each
+        labels = {k: v[local_idx] for k, v in self.current_chunk_labels.items()}
 
         return features, labels
 
@@ -189,23 +195,36 @@ class ChunkedStreamingDataset(Dataset):
 
     def _load_chunk(self, chunk_idx: int):
         """Load a chunk of samples into memory."""
+        import time as _time
         start_idx = chunk_idx * self.chunk_size
         end_idx = min(start_idx + self.chunk_size, self.num_samples)
         chunk_size = end_idx - start_idx
 
-        print(f"Loading chunk {chunk_idx}: samples [{start_idx:,}:{end_idx:,}]")
+        print(f"Loading chunk {chunk_idx}: samples [{start_idx:,}:{end_idx:,}] ({chunk_size:,} samples)")
 
         # Load samples from binary file
         samples = []
+        t0 = _time.perf_counter()
         with open(self.binary_path, 'rb') as f:
             for i in range(start_idx, end_idx):
                 offset = self.offsets[i]
                 f.seek(offset)
                 sample = read_channel_sample(f, version=self.version, feature_table=self.feature_table)
                 samples.append(sample)
+                loaded = len(samples)
+                if loaded % 5000 == 0:
+                    elapsed = _time.perf_counter() - t0
+                    rate = loaded / elapsed if elapsed > 0 else 0
+                    print(f"  Read {loaded:,}/{chunk_size:,} samples ({elapsed:.1f}s, {rate:.0f} samples/s)")
+
+        read_elapsed = _time.perf_counter() - t0
+        print(f"  Read complete: {len(samples):,} samples in {read_elapsed:.1f}s")
 
         # Convert to tensors
+        t1 = _time.perf_counter()
         features, labels = self._convert_to_tensors(samples)
+        convert_elapsed = _time.perf_counter() - t1
+        print(f"  Tensor conversion: {convert_elapsed:.1f}s")
 
         # Update cache
         self.current_chunk_features = features
@@ -214,7 +233,8 @@ class ChunkedStreamingDataset(Dataset):
         self.current_chunk_start = start_idx
         self.current_chunk_end = end_idx
 
-        print(f"  Loaded {len(samples):,} samples, features shape: {features.shape}")
+        total_elapsed = _time.perf_counter() - t0
+        print(f"  Chunk {chunk_idx} ready: {features.shape}, total {total_elapsed:.1f}s")
 
     def _start_prefetch(self, chunk_idx: int):
         """Start background thread to prefetch next chunk."""
@@ -224,27 +244,42 @@ class ChunkedStreamingDataset(Dataset):
                 return
 
         def prefetch_worker():
+            import time as _time
             try:
                 start_idx = chunk_idx * self.chunk_size
                 end_idx = min(start_idx + self.chunk_size, self.num_samples)
+                chunk_size = end_idx - start_idx
 
                 # Load samples
                 samples = []
+                t0 = _time.perf_counter()
                 with open(self.binary_path, 'rb') as f:
                     for i in range(start_idx, end_idx):
                         offset = self.offsets[i]
                         f.seek(offset)
                         sample = read_channel_sample(f, version=self.version, feature_table=self.feature_table)
                         samples.append(sample)
+                        loaded = len(samples)
+                        if loaded % 5000 == 0:
+                            elapsed = _time.perf_counter() - t0
+                            rate = loaded / elapsed if elapsed > 0 else 0
+                            print(f"  [prefetch] Read {loaded:,}/{chunk_size:,} ({elapsed:.1f}s, {rate:.0f}/s)")
+
+                read_elapsed = _time.perf_counter() - t0
 
                 # Convert to tensors
+                t1 = _time.perf_counter()
                 features, labels = self._convert_to_tensors(samples)
+                convert_elapsed = _time.perf_counter() - t1
 
                 # Store prefetched data
                 with self.prefetch_lock:
                     self.prefetch_chunk_features = features
                     self.prefetch_chunk_labels = labels
                     self.prefetch_chunk_idx = chunk_idx
+
+                total = _time.perf_counter() - t0
+                print(f"  [prefetch] Chunk {chunk_idx} ready: read {read_elapsed:.1f}s + convert {convert_elapsed:.1f}s = {total:.1f}s")
 
             except Exception as e:
                 print(f"Prefetch error for chunk {chunk_idx}: {e}")
@@ -255,31 +290,509 @@ class ChunkedStreamingDataset(Dataset):
 
     def _convert_to_tensors(
         self, samples: List[ChannelSample]
-    ) -> Tuple[torch.Tensor, List[Dict[str, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Convert samples to feature tensors and label dicts.
+        Convert samples to feature tensors and batched label tensors.
 
-        This mirrors the logic in ChannelDataset but operates on a chunk.
+        Optimized:
+        - Features: pre-allocates [N, num_features] array, fills via name→index map
+        - Labels: pre-allocates numpy arrays per label key with defaults,
+          fills raw values in one pass (no per-sample torch.tensor() calls),
+          batch-converts to tensors once at the end.
         """
-        features_list = []
-        labels_list = []
+        import time as _time
+        n = len(samples)
+        n_tfs = len(TIMEFRAMES)
 
-        for sample in samples:
-            # Extract features as ordered array
-            feature_array = np.array([
-                sample.tf_features.get(name, 0.0)
-                for name in self.feature_names
-            ], dtype=np.float32)
-            features_list.append(feature_array)
+        # --- FEATURES: pre-allocate and fill in-place ---
+        t0 = _time.perf_counter()
+        features = np.zeros((n, self.num_features), dtype=np.float32)
+        name_to_idx = self._feature_name_to_idx
 
-            # Extract labels
-            labels = self._extract_labels(sample)
-            labels_list.append(labels)
+        for i, sample in enumerate(samples):
+            for name, value in sample.tf_features.items():
+                idx = name_to_idx.get(name)
+                if idx is not None:
+                    features[i, idx] = value
 
-        # Stack features into tensor
-        features_tensor = torch.from_numpy(np.stack(features_list))
+            if (i + 1) % 5000 == 0:
+                elapsed = _time.perf_counter() - t0
+                print(f"    Features: {i+1:,}/{n:,} samples ({elapsed:.1f}s)")
 
-        return features_tensor, labels_list
+        features_tensor = torch.from_numpy(features)
+        feat_elapsed = _time.perf_counter() - t0
+
+        # --- LABELS: pre-allocate numpy arrays with defaults, fill raw values ---
+        t1 = _time.perf_counter()
+
+        # Pre-allocate all label arrays with their default values
+        # Float32 scalars
+        L_duration = np.zeros(n, dtype=np.float32)
+        L_tsla_bars_to_first_break = np.zeros(n, dtype=np.float32)
+        L_tsla_break_magnitude = np.zeros(n, dtype=np.float32)
+        L_tsla_bounces_after_return = np.zeros(n, dtype=np.float32)
+        L_tsla_duration_to_permanent = np.full(n, -1.0, dtype=np.float32)
+        L_tsla_avg_bars_outside = np.zeros(n, dtype=np.float32)
+        L_tsla_total_bars_outside = np.zeros(n, dtype=np.float32)
+        L_tsla_durability_score = np.zeros(n, dtype=np.float32)
+        L_tsla_exit_return_rate = np.zeros(n, dtype=np.float32)
+        L_tsla_exits_returned_count = np.zeros(n, dtype=np.float32)
+        L_tsla_exits_stayed_out_count = np.zeros(n, dtype=np.float32)
+        L_tsla_bars_verified_permanent = np.zeros(n, dtype=np.float32)
+        L_tsla_rsi_at_first_break = np.full(n, 50.0, dtype=np.float32)
+        L_tsla_rsi_at_permanent_break = np.full(n, 50.0, dtype=np.float32)
+        L_tsla_rsi_at_channel_end = np.full(n, 50.0, dtype=np.float32)
+        L_tsla_rsi_range_in_channel = np.zeros(n, dtype=np.float32)
+        # SPY float32 scalars
+        L_spy_bars_to_first_break = np.zeros(n, dtype=np.float32)
+        L_spy_break_magnitude = np.zeros(n, dtype=np.float32)
+        L_spy_bounces_after_return = np.zeros(n, dtype=np.float32)
+        L_spy_duration_to_permanent = np.full(n, -1.0, dtype=np.float32)
+        L_spy_avg_bars_outside = np.zeros(n, dtype=np.float32)
+        L_spy_total_bars_outside = np.zeros(n, dtype=np.float32)
+        L_spy_durability_score = np.zeros(n, dtype=np.float32)
+        L_spy_exit_return_rate = np.zeros(n, dtype=np.float32)
+        L_spy_exits_returned_count = np.zeros(n, dtype=np.float32)
+        L_spy_exits_stayed_out_count = np.zeros(n, dtype=np.float32)
+        L_spy_bars_verified_permanent = np.zeros(n, dtype=np.float32)
+        L_spy_rsi_at_first_break = np.full(n, 50.0, dtype=np.float32)
+        L_spy_rsi_at_permanent_break = np.full(n, 50.0, dtype=np.float32)
+        L_spy_rsi_at_channel_end = np.full(n, 50.0, dtype=np.float32)
+        L_spy_rsi_range_in_channel = np.zeros(n, dtype=np.float32)
+        # Cross float32 scalars
+        L_cross_break_lag_bars = np.zeros(n, dtype=np.float32)
+        L_cross_magnitude_spread = np.zeros(n, dtype=np.float32)
+        L_cross_permanent_duration_lag_bars = np.zeros(n, dtype=np.float32)
+        L_cross_permanent_duration_spread = np.zeros(n, dtype=np.float32)
+        L_cross_durability_spread = np.zeros(n, dtype=np.float32)
+        L_cross_avg_bars_outside_spread = np.zeros(n, dtype=np.float32)
+        L_cross_total_bars_outside_spread = np.zeros(n, dtype=np.float32)
+        L_cross_exit_return_rate_spread = np.zeros(n, dtype=np.float32)
+        L_cross_exits_returned_spread = np.zeros(n, dtype=np.float32)
+        L_cross_exits_stayed_out_spread = np.zeros(n, dtype=np.float32)
+        L_cross_total_exits_spread = np.zeros(n, dtype=np.float32)
+        L_cross_bars_verified_spread = np.zeros(n, dtype=np.float32)
+        L_cross_exit_timing_correlation = np.zeros(n, dtype=np.float32)
+        L_cross_exit_timing_lag_mean = np.zeros(n, dtype=np.float32)
+        L_cross_exit_direction_agreement = np.zeros(n, dtype=np.float32)
+        L_cross_exit_count_spread = np.zeros(n, dtype=np.float32)
+        L_cross_lead_lag_exits = np.zeros(n, dtype=np.float32)
+        L_cross_exit_magnitude_correlation = np.zeros(n, dtype=np.float32)
+        L_cross_mean_magnitude_spread = np.zeros(n, dtype=np.float32)
+        L_cross_exit_duration_correlation = np.zeros(n, dtype=np.float32)
+        L_cross_mean_duration_spread = np.zeros(n, dtype=np.float32)
+        L_cross_simultaneous_exit_count = np.zeros(n, dtype=np.float32)
+        L_cross_rsi_spread_at_break = np.zeros(n, dtype=np.float32)
+
+        # Long scalars
+        L_direction = np.zeros(n, dtype=np.int64)
+        L_new_channel = np.ones(n, dtype=np.int64)  # default=1 (sideways)
+        L_tsla_break_direction = np.zeros(n, dtype=np.int64)
+        L_tsla_rsi_overbought_at_break = np.zeros(n, dtype=np.int64)
+        L_tsla_rsi_oversold_at_break = np.zeros(n, dtype=np.int64)
+        L_tsla_rsi_divergence_at_break = np.zeros(n, dtype=np.int64)
+        L_tsla_rsi_trend_in_channel = np.zeros(n, dtype=np.int64)
+        L_spy_break_direction = np.zeros(n, dtype=np.int64)
+        L_spy_rsi_overbought_at_break = np.zeros(n, dtype=np.int64)
+        L_spy_rsi_oversold_at_break = np.zeros(n, dtype=np.int64)
+        L_spy_rsi_divergence_at_break = np.zeros(n, dtype=np.int64)
+        L_spy_rsi_trend_in_channel = np.zeros(n, dtype=np.int64)
+        # Cross long scalars
+        L_cross_who_broke_first = np.zeros(n, dtype=np.int64)
+        L_cross_exit_cross_correlation_valid = np.zeros(n, dtype=np.int64)
+        L_cross_divergence_predicts_reversal = np.zeros(n, dtype=np.int64)
+        L_cross_permanent_break_matches_next = np.zeros(n, dtype=np.int64)
+        L_cross_next_channel_direction_aligned = np.zeros(n, dtype=np.int64)
+        L_cross_next_channel_quality_aligned = np.zeros(n, dtype=np.int64)
+        L_cross_best_next_channel_tsla_vs_spy = np.zeros(n, dtype=np.int64)
+        L_cross_rsi_aligned_at_break = np.zeros(n, dtype=np.int64)
+        L_cross_rsi_divergence_aligned = np.zeros(n, dtype=np.int64)
+        L_cross_tsla_rsi_higher_at_break = np.zeros(n, dtype=np.int64)
+        L_cross_overbought_predicts_down_break = np.zeros(n, dtype=np.int64)
+        L_cross_oversold_predicts_up_break = np.zeros(n, dtype=np.int64)
+
+        # Bool scalars
+        L_permanent_break = np.zeros(n, dtype=np.bool_)
+        L_valid = np.zeros(n, dtype=np.bool_)
+        L_duration_valid = np.zeros(n, dtype=np.bool_)
+        L_direction_valid = np.zeros(n, dtype=np.bool_)
+        L_tsla_returned_to_channel = np.zeros(n, dtype=np.bool_)
+        L_tsla_channel_continued = np.zeros(n, dtype=np.bool_)
+        L_tsla_break_scan_valid = np.zeros(n, dtype=np.bool_)
+        L_tsla_first_break_returned = np.zeros(n, dtype=np.bool_)
+        L_tsla_scan_timed_out = np.zeros(n, dtype=np.bool_)
+        L_spy_returned_to_channel = np.zeros(n, dtype=np.bool_)
+        L_spy_channel_continued = np.zeros(n, dtype=np.bool_)
+        L_spy_break_scan_valid = np.zeros(n, dtype=np.bool_)
+        L_spy_first_break_returned = np.zeros(n, dtype=np.bool_)
+        L_spy_scan_timed_out = np.zeros(n, dtype=np.bool_)
+        # Cross bool scalars
+        L_cross_direction_aligned = np.zeros(n, dtype=np.bool_)
+        L_cross_tsla_broke_first = np.zeros(n, dtype=np.bool_)
+        L_cross_spy_broke_first = np.zeros(n, dtype=np.bool_)
+        L_cross_both_returned = np.zeros(n, dtype=np.bool_)
+        L_cross_both_permanent = np.zeros(n, dtype=np.bool_)
+        L_cross_return_pattern_aligned = np.zeros(n, dtype=np.bool_)
+        L_cross_continuation_aligned = np.zeros(n, dtype=np.bool_)
+        L_cross_valid = np.zeros(n, dtype=np.bool_)
+        L_cross_tsla_permanent_first = np.zeros(n, dtype=np.bool_)
+        L_cross_spy_permanent_first = np.zeros(n, dtype=np.bool_)
+        L_cross_both_high_durability = np.zeros(n, dtype=np.bool_)
+        L_cross_both_low_durability = np.zeros(n, dtype=np.bool_)
+        L_cross_durability_aligned = np.zeros(n, dtype=np.bool_)
+        L_cross_tsla_more_durable = np.zeros(n, dtype=np.bool_)
+        L_cross_spy_more_durable = np.zeros(n, dtype=np.bool_)
+        L_cross_permanent_dynamics_valid = np.zeros(n, dtype=np.bool_)
+        L_cross_exit_return_rate_aligned = np.zeros(n, dtype=np.bool_)
+        L_cross_tsla_more_resilient = np.zeros(n, dtype=np.bool_)
+        L_cross_spy_more_resilient = np.zeros(n, dtype=np.bool_)
+        L_cross_both_scan_timed_out = np.zeros(n, dtype=np.bool_)
+        L_cross_scan_timeout_aligned = np.zeros(n, dtype=np.bool_)
+        L_cross_both_first_returned_then_permanent = np.zeros(n, dtype=np.bool_)
+        L_cross_both_never_returned = np.zeros(n, dtype=np.bool_)
+        L_cross_exit_verification_valid = np.zeros(n, dtype=np.bool_)
+
+        # Per-TF vectors
+        L_per_tf_duration = np.zeros((n, n_tfs), dtype=np.float32)
+        L_per_tf_duration_valid = np.zeros((n, n_tfs), dtype=np.bool_)
+
+        # --- Fill raw values per sample (no torch.tensor calls) ---
+        for i, sample in enumerate(samples):
+            window = self.target_window if self.target_window is not None else sample.best_window
+            window_labels = sample.labels_per_window.get(window, {})
+
+            # Detect old vs new structure
+            if 'tsla' in window_labels:
+                tsla_labels_dict = window_labels.get('tsla', {})
+                spy_labels_dict = window_labels.get('spy', {})
+                tf_labels = tsla_labels_dict.get(self.target_tf)
+                spy_tf_labels = spy_labels_dict.get(self.target_tf)
+            else:
+                tf_labels = window_labels.get(self.target_tf)
+                spy_tf_labels = None
+
+            if tf_labels is None:
+                # defaults already set in array initialization
+                # Per-TF also defaults to zeros
+                continue
+
+            # Core labels
+            L_duration[i] = tf_labels.duration_bars
+            L_direction[i] = tf_labels.break_direction
+            L_new_channel[i] = tf_labels.next_channel_direction
+            L_permanent_break[i] = tf_labels.permanent_break
+            L_valid[i] = tf_labels.duration_valid or tf_labels.direction_valid
+            L_duration_valid[i] = tf_labels.duration_valid
+            L_direction_valid[i] = tf_labels.direction_valid
+
+            # TSLA break scan labels
+            L_tsla_bars_to_first_break[i] = getattr(tf_labels, 'bars_to_first_break', 0)
+            L_tsla_break_direction[i] = getattr(tf_labels, 'break_direction', 0)
+            L_tsla_break_magnitude[i] = getattr(tf_labels, 'break_magnitude', 0.0)
+            L_tsla_returned_to_channel[i] = getattr(tf_labels, 'returned_to_channel', False)
+            L_tsla_bounces_after_return[i] = getattr(tf_labels, 'bounces_after_return', 0)
+            L_tsla_channel_continued[i] = getattr(tf_labels, 'channel_continued', False)
+            L_tsla_break_scan_valid[i] = getattr(tf_labels, 'break_scan_valid', False)
+            L_tsla_duration_to_permanent[i] = getattr(tf_labels, 'duration_to_permanent', -1)
+            L_tsla_avg_bars_outside[i] = getattr(tf_labels, 'avg_bars_outside', 0.0)
+            L_tsla_total_bars_outside[i] = getattr(tf_labels, 'total_bars_outside', 0)
+            L_tsla_durability_score[i] = getattr(tf_labels, 'durability_score', 0.0)
+            L_tsla_first_break_returned[i] = getattr(tf_labels, 'first_break_returned', False)
+            L_tsla_exit_return_rate[i] = getattr(tf_labels, 'exit_return_rate', 0.0)
+            L_tsla_exits_returned_count[i] = getattr(tf_labels, 'exits_returned_count', 0)
+            L_tsla_exits_stayed_out_count[i] = getattr(tf_labels, 'exits_stayed_out_count', 0)
+            L_tsla_scan_timed_out[i] = getattr(tf_labels, 'scan_timed_out', False)
+            L_tsla_bars_verified_permanent[i] = getattr(tf_labels, 'bars_verified_permanent', 0)
+            # TSLA RSI
+            L_tsla_rsi_at_first_break[i] = getattr(tf_labels, 'rsi_at_first_break', 50.0)
+            L_tsla_rsi_at_permanent_break[i] = getattr(tf_labels, 'rsi_at_permanent_break', 50.0)
+            L_tsla_rsi_at_channel_end[i] = getattr(tf_labels, 'rsi_at_channel_end', 50.0)
+            L_tsla_rsi_overbought_at_break[i] = int(getattr(tf_labels, 'rsi_overbought_at_break', False))
+            L_tsla_rsi_oversold_at_break[i] = int(getattr(tf_labels, 'rsi_oversold_at_break', False))
+            L_tsla_rsi_divergence_at_break[i] = getattr(tf_labels, 'rsi_divergence_at_break', 0)
+            L_tsla_rsi_trend_in_channel[i] = getattr(tf_labels, 'rsi_trend_in_channel', 0)
+            L_tsla_rsi_range_in_channel[i] = getattr(tf_labels, 'rsi_range_in_channel', 0.0)
+
+            # SPY labels
+            spy_src = spy_tf_labels if spy_tf_labels is not None else None
+            if spy_src is not None:
+                # New structure: separate SPY object
+                L_spy_bars_to_first_break[i] = getattr(spy_src, 'bars_to_first_break', 0)
+                L_spy_break_direction[i] = getattr(spy_src, 'break_direction', 0)
+                L_spy_break_magnitude[i] = getattr(spy_src, 'break_magnitude', 0.0)
+                L_spy_returned_to_channel[i] = getattr(spy_src, 'returned_to_channel', False)
+                L_spy_bounces_after_return[i] = getattr(spy_src, 'bounces_after_return', 0)
+                L_spy_channel_continued[i] = getattr(spy_src, 'channel_continued', False)
+                L_spy_break_scan_valid[i] = getattr(spy_src, 'break_scan_valid', False)
+                L_spy_duration_to_permanent[i] = getattr(spy_src, 'duration_to_permanent', -1)
+                L_spy_avg_bars_outside[i] = getattr(spy_src, 'avg_bars_outside', 0.0)
+                L_spy_total_bars_outside[i] = getattr(spy_src, 'total_bars_outside', 0)
+                L_spy_durability_score[i] = getattr(spy_src, 'durability_score', 0.0)
+                L_spy_first_break_returned[i] = getattr(spy_src, 'first_break_returned', False)
+                L_spy_exit_return_rate[i] = getattr(spy_src, 'exit_return_rate', 0.0)
+                L_spy_exits_returned_count[i] = getattr(spy_src, 'exits_returned_count', 0)
+                L_spy_exits_stayed_out_count[i] = getattr(spy_src, 'exits_stayed_out_count', 0)
+                L_spy_scan_timed_out[i] = getattr(spy_src, 'scan_timed_out', False)
+                L_spy_bars_verified_permanent[i] = getattr(spy_src, 'bars_verified_permanent', 0)
+                L_spy_rsi_at_first_break[i] = getattr(spy_src, 'rsi_at_first_break', 50.0)
+                L_spy_rsi_at_permanent_break[i] = getattr(spy_src, 'rsi_at_permanent_break', 50.0)
+                L_spy_rsi_at_channel_end[i] = getattr(spy_src, 'rsi_at_channel_end', 50.0)
+                L_spy_rsi_overbought_at_break[i] = int(getattr(spy_src, 'rsi_overbought_at_break', False))
+                L_spy_rsi_oversold_at_break[i] = int(getattr(spy_src, 'rsi_oversold_at_break', False))
+                L_spy_rsi_divergence_at_break[i] = getattr(spy_src, 'rsi_divergence_at_break', 0)
+                L_spy_rsi_trend_in_channel[i] = getattr(spy_src, 'rsi_trend_in_channel', 0)
+                L_spy_rsi_range_in_channel[i] = getattr(spy_src, 'rsi_range_in_channel', 0.0)
+            else:
+                # Old structure: spy_ prefixed fields on tf_labels
+                L_spy_bars_to_first_break[i] = getattr(tf_labels, 'spy_bars_to_first_break', 0)
+                L_spy_break_direction[i] = getattr(tf_labels, 'spy_break_direction', 0)
+                L_spy_break_magnitude[i] = getattr(tf_labels, 'spy_break_magnitude', 0.0)
+                L_spy_returned_to_channel[i] = getattr(tf_labels, 'spy_returned_to_channel', False)
+                L_spy_bounces_after_return[i] = getattr(tf_labels, 'spy_bounces_after_return', 0)
+                L_spy_channel_continued[i] = getattr(tf_labels, 'spy_channel_continued', False)
+                L_spy_break_scan_valid[i] = getattr(tf_labels, 'break_scan_valid', False)
+                L_spy_duration_to_permanent[i] = getattr(tf_labels, 'spy_duration_to_permanent', -1)
+                L_spy_avg_bars_outside[i] = getattr(tf_labels, 'spy_avg_bars_outside', 0.0)
+                L_spy_total_bars_outside[i] = getattr(tf_labels, 'spy_total_bars_outside', 0)
+                L_spy_durability_score[i] = getattr(tf_labels, 'spy_durability_score', 0.0)
+                L_spy_first_break_returned[i] = getattr(tf_labels, 'spy_first_break_returned', False)
+                L_spy_exit_return_rate[i] = getattr(tf_labels, 'spy_exit_return_rate', 0.0)
+                L_spy_exits_returned_count[i] = getattr(tf_labels, 'spy_exits_returned_count', 0)
+                L_spy_exits_stayed_out_count[i] = getattr(tf_labels, 'spy_exits_stayed_out_count', 0)
+                L_spy_scan_timed_out[i] = getattr(tf_labels, 'spy_scan_timed_out', False)
+                L_spy_bars_verified_permanent[i] = getattr(tf_labels, 'spy_bars_verified_permanent', 0)
+                L_spy_rsi_at_first_break[i] = getattr(tf_labels, 'spy_rsi_at_first_break', 50.0)
+                L_spy_rsi_at_permanent_break[i] = getattr(tf_labels, 'spy_rsi_at_permanent_break', 50.0)
+                L_spy_rsi_at_channel_end[i] = getattr(tf_labels, 'spy_rsi_at_channel_end', 50.0)
+                L_spy_rsi_overbought_at_break[i] = int(getattr(tf_labels, 'spy_rsi_overbought_at_break', False))
+                L_spy_rsi_oversold_at_break[i] = int(getattr(tf_labels, 'spy_rsi_oversold_at_break', False))
+                L_spy_rsi_divergence_at_break[i] = getattr(tf_labels, 'spy_rsi_divergence_at_break', 0)
+                L_spy_rsi_trend_in_channel[i] = getattr(tf_labels, 'spy_rsi_trend_in_channel', 0)
+                L_spy_rsi_range_in_channel[i] = getattr(tf_labels, 'spy_rsi_range_in_channel', 0.0)
+
+            # Cross-correlation labels
+            tsla_valid = getattr(tf_labels, 'break_scan_valid', False)
+            _spy_for_cross = spy_tf_labels
+            if _spy_for_cross is not None and _spy_for_cross is not tf_labels:
+                spy_valid = getattr(_spy_for_cross, 'break_scan_valid', False)
+            else:
+                spy_bars = getattr(tf_labels, 'spy_bars_to_first_break', 0)
+                spy_valid = tsla_valid and spy_bars > 0
+                _spy_for_cross = None  # use combined path
+
+            if tsla_valid and spy_valid:
+                if _spy_for_cross is not None:
+                    # Separate objects
+                    _tsla = tf_labels
+                    _spy = _spy_for_cross
+                    tsla_dir = getattr(_tsla, 'break_direction', 0)
+                    spy_dir = getattr(_spy, 'break_direction', 0)
+                    tsla_bars = getattr(_tsla, 'bars_to_first_break', 0)
+                    spy_bars_v = getattr(_spy, 'bars_to_first_break', 0)
+                    tsla_returned = getattr(_tsla, 'returned_to_channel', False)
+                    spy_returned = getattr(_spy, 'returned_to_channel', False)
+                    tsla_mag = getattr(_tsla, 'break_magnitude', 0.0)
+                    spy_mag = getattr(_spy, 'break_magnitude', 0.0)
+                    tsla_dur_score = getattr(_tsla, 'durability_score', 0.0)
+                    spy_dur_score = getattr(_spy, 'durability_score', 0.0)
+                    tsla_avg_bars_out = getattr(_tsla, 'avg_bars_outside', 0.0)
+                    spy_avg_bars_out = getattr(_spy, 'avg_bars_outside', 0.0)
+                    tsla_total_bars_out = getattr(_tsla, 'total_bars_outside', 0)
+                    spy_total_bars_out = getattr(_spy, 'total_bars_outside', 0)
+                    tsla_cont = getattr(_tsla, 'channel_continued', False)
+                    spy_cont = getattr(_spy, 'channel_continued', False)
+                else:
+                    # Combined object
+                    tsla_dir = getattr(tf_labels, 'break_direction', 0)
+                    spy_dir = getattr(tf_labels, 'spy_break_direction', 0)
+                    tsla_bars = getattr(tf_labels, 'bars_to_first_break', 0)
+                    spy_bars_v = getattr(tf_labels, 'spy_bars_to_first_break', 0)
+                    tsla_returned = getattr(tf_labels, 'returned_to_channel', False)
+                    spy_returned = getattr(tf_labels, 'spy_returned_to_channel', False)
+                    tsla_mag = getattr(tf_labels, 'break_magnitude', 0.0)
+                    spy_mag = getattr(tf_labels, 'spy_break_magnitude', 0.0)
+                    tsla_dur_score = getattr(tf_labels, 'durability_score', 0.0)
+                    spy_dur_score = getattr(tf_labels, 'spy_durability_score', 0.0)
+                    tsla_avg_bars_out = getattr(tf_labels, 'avg_bars_outside', 0.0)
+                    spy_avg_bars_out = getattr(tf_labels, 'spy_avg_bars_outside', 0.0)
+                    tsla_total_bars_out = getattr(tf_labels, 'total_bars_outside', 0)
+                    spy_total_bars_out = getattr(tf_labels, 'spy_total_bars_outside', 0)
+                    tsla_cont = getattr(tf_labels, 'channel_continued', False)
+                    spy_cont = getattr(tf_labels, 'spy_channel_continued', False)
+
+                direction_aligned = tsla_dir == spy_dir
+                tsla_broke_first = tsla_bars < spy_bars_v
+                spy_broke_first = spy_bars_v < tsla_bars
+                who_broke_first = 1 if tsla_broke_first else (2 if spy_broke_first else 0)
+
+                L_cross_direction_aligned[i] = direction_aligned
+                L_cross_tsla_broke_first[i] = tsla_broke_first
+                L_cross_spy_broke_first[i] = spy_broke_first
+                L_cross_break_lag_bars[i] = abs(tsla_bars - spy_bars_v)
+                L_cross_magnitude_spread[i] = tsla_mag - spy_mag
+                L_cross_both_returned[i] = tsla_returned and spy_returned
+                L_cross_both_permanent[i] = not tsla_returned and not spy_returned
+                L_cross_return_pattern_aligned[i] = (
+                    (tsla_returned and spy_returned) or (not tsla_returned and not spy_returned)
+                )
+                L_cross_continuation_aligned[i] = tsla_cont == spy_cont
+                L_cross_who_broke_first[i] = who_broke_first
+                L_cross_valid[i] = True
+                L_cross_durability_spread[i] = tsla_dur_score - spy_dur_score
+                L_cross_avg_bars_outside_spread[i] = tsla_avg_bars_out - spy_avg_bars_out
+                L_cross_total_bars_outside_spread[i] = tsla_total_bars_out - spy_total_bars_out
+                L_cross_tsla_more_durable[i] = tsla_dur_score > spy_dur_score
+                L_cross_spy_more_durable[i] = spy_dur_score > tsla_dur_score
+
+            # Per-TF duration labels
+            ptf_window = sample.best_window
+            ptf_window_labels = sample.labels_per_window.get(ptf_window, {})
+            if 'tsla' in ptf_window_labels:
+                ptf_dict = ptf_window_labels.get('tsla', {})
+            else:
+                ptf_dict = ptf_window_labels
+            for tf_idx, tf in enumerate(TIMEFRAMES):
+                tf_label = ptf_dict.get(tf)
+                if tf_label is not None:
+                    dur = getattr(tf_label, 'duration_bars', 0)
+                    L_per_tf_duration[i, tf_idx] = float(dur) if dur is not None else 0.0
+                    L_per_tf_duration_valid[i, tf_idx] = bool(getattr(tf_label, 'duration_valid', False))
+
+            if (i + 1) % 5000 == 0:
+                elapsed = _time.perf_counter() - t1
+                print(f"    Labels: {i+1:,}/{n:,} samples ({elapsed:.1f}s)")
+
+        # --- Batch convert all arrays to tensors (one allocation per key) ---
+        labels_batched = {
+            # Core
+            'duration': torch.from_numpy(L_duration),
+            'direction': torch.from_numpy(L_direction),
+            'new_channel': torch.from_numpy(L_new_channel),
+            'permanent_break': torch.from_numpy(L_permanent_break),
+            'valid': torch.from_numpy(L_valid),
+            'duration_valid': torch.from_numpy(L_duration_valid),
+            'direction_valid': torch.from_numpy(L_direction_valid),
+            # TSLA
+            'tsla_bars_to_first_break': torch.from_numpy(L_tsla_bars_to_first_break),
+            'tsla_break_direction': torch.from_numpy(L_tsla_break_direction),
+            'tsla_break_magnitude': torch.from_numpy(L_tsla_break_magnitude),
+            'tsla_returned_to_channel': torch.from_numpy(L_tsla_returned_to_channel),
+            'tsla_bounces_after_return': torch.from_numpy(L_tsla_bounces_after_return),
+            'tsla_channel_continued': torch.from_numpy(L_tsla_channel_continued),
+            'tsla_break_scan_valid': torch.from_numpy(L_tsla_break_scan_valid),
+            'tsla_duration_to_permanent': torch.from_numpy(L_tsla_duration_to_permanent),
+            'tsla_avg_bars_outside': torch.from_numpy(L_tsla_avg_bars_outside),
+            'tsla_total_bars_outside': torch.from_numpy(L_tsla_total_bars_outside),
+            'tsla_durability_score': torch.from_numpy(L_tsla_durability_score),
+            'tsla_first_break_returned': torch.from_numpy(L_tsla_first_break_returned),
+            'tsla_exit_return_rate': torch.from_numpy(L_tsla_exit_return_rate),
+            'tsla_exits_returned_count': torch.from_numpy(L_tsla_exits_returned_count),
+            'tsla_exits_stayed_out_count': torch.from_numpy(L_tsla_exits_stayed_out_count),
+            'tsla_scan_timed_out': torch.from_numpy(L_tsla_scan_timed_out),
+            'tsla_bars_verified_permanent': torch.from_numpy(L_tsla_bars_verified_permanent),
+            'tsla_rsi_at_first_break': torch.from_numpy(L_tsla_rsi_at_first_break),
+            'tsla_rsi_at_permanent_break': torch.from_numpy(L_tsla_rsi_at_permanent_break),
+            'tsla_rsi_at_channel_end': torch.from_numpy(L_tsla_rsi_at_channel_end),
+            'tsla_rsi_overbought_at_break': torch.from_numpy(L_tsla_rsi_overbought_at_break),
+            'tsla_rsi_oversold_at_break': torch.from_numpy(L_tsla_rsi_oversold_at_break),
+            'tsla_rsi_divergence_at_break': torch.from_numpy(L_tsla_rsi_divergence_at_break),
+            'tsla_rsi_trend_in_channel': torch.from_numpy(L_tsla_rsi_trend_in_channel),
+            'tsla_rsi_range_in_channel': torch.from_numpy(L_tsla_rsi_range_in_channel),
+            # SPY
+            'spy_bars_to_first_break': torch.from_numpy(L_spy_bars_to_first_break),
+            'spy_break_direction': torch.from_numpy(L_spy_break_direction),
+            'spy_break_magnitude': torch.from_numpy(L_spy_break_magnitude),
+            'spy_returned_to_channel': torch.from_numpy(L_spy_returned_to_channel),
+            'spy_bounces_after_return': torch.from_numpy(L_spy_bounces_after_return),
+            'spy_channel_continued': torch.from_numpy(L_spy_channel_continued),
+            'spy_break_scan_valid': torch.from_numpy(L_spy_break_scan_valid),
+            'spy_duration_to_permanent': torch.from_numpy(L_spy_duration_to_permanent),
+            'spy_avg_bars_outside': torch.from_numpy(L_spy_avg_bars_outside),
+            'spy_total_bars_outside': torch.from_numpy(L_spy_total_bars_outside),
+            'spy_durability_score': torch.from_numpy(L_spy_durability_score),
+            'spy_first_break_returned': torch.from_numpy(L_spy_first_break_returned),
+            'spy_exit_return_rate': torch.from_numpy(L_spy_exit_return_rate),
+            'spy_exits_returned_count': torch.from_numpy(L_spy_exits_returned_count),
+            'spy_exits_stayed_out_count': torch.from_numpy(L_spy_exits_stayed_out_count),
+            'spy_scan_timed_out': torch.from_numpy(L_spy_scan_timed_out),
+            'spy_bars_verified_permanent': torch.from_numpy(L_spy_bars_verified_permanent),
+            'spy_rsi_at_first_break': torch.from_numpy(L_spy_rsi_at_first_break),
+            'spy_rsi_at_permanent_break': torch.from_numpy(L_spy_rsi_at_permanent_break),
+            'spy_rsi_at_channel_end': torch.from_numpy(L_spy_rsi_at_channel_end),
+            'spy_rsi_overbought_at_break': torch.from_numpy(L_spy_rsi_overbought_at_break),
+            'spy_rsi_oversold_at_break': torch.from_numpy(L_spy_rsi_oversold_at_break),
+            'spy_rsi_divergence_at_break': torch.from_numpy(L_spy_rsi_divergence_at_break),
+            'spy_rsi_trend_in_channel': torch.from_numpy(L_spy_rsi_trend_in_channel),
+            'spy_rsi_range_in_channel': torch.from_numpy(L_spy_rsi_range_in_channel),
+            # Cross-correlation
+            'cross_direction_aligned': torch.from_numpy(L_cross_direction_aligned),
+            'cross_tsla_broke_first': torch.from_numpy(L_cross_tsla_broke_first),
+            'cross_spy_broke_first': torch.from_numpy(L_cross_spy_broke_first),
+            'cross_break_lag_bars': torch.from_numpy(L_cross_break_lag_bars),
+            'cross_magnitude_spread': torch.from_numpy(L_cross_magnitude_spread),
+            'cross_both_returned': torch.from_numpy(L_cross_both_returned),
+            'cross_both_permanent': torch.from_numpy(L_cross_both_permanent),
+            'cross_return_pattern_aligned': torch.from_numpy(L_cross_return_pattern_aligned),
+            'cross_continuation_aligned': torch.from_numpy(L_cross_continuation_aligned),
+            'cross_who_broke_first': torch.from_numpy(L_cross_who_broke_first),
+            'cross_valid': torch.from_numpy(L_cross_valid),
+            'cross_tsla_permanent_first': torch.from_numpy(L_cross_tsla_permanent_first),
+            'cross_spy_permanent_first': torch.from_numpy(L_cross_spy_permanent_first),
+            'cross_permanent_duration_lag_bars': torch.from_numpy(L_cross_permanent_duration_lag_bars),
+            'cross_permanent_duration_spread': torch.from_numpy(L_cross_permanent_duration_spread),
+            'cross_durability_spread': torch.from_numpy(L_cross_durability_spread),
+            'cross_avg_bars_outside_spread': torch.from_numpy(L_cross_avg_bars_outside_spread),
+            'cross_total_bars_outside_spread': torch.from_numpy(L_cross_total_bars_outside_spread),
+            'cross_both_high_durability': torch.from_numpy(L_cross_both_high_durability),
+            'cross_both_low_durability': torch.from_numpy(L_cross_both_low_durability),
+            'cross_durability_aligned': torch.from_numpy(L_cross_durability_aligned),
+            'cross_tsla_more_durable': torch.from_numpy(L_cross_tsla_more_durable),
+            'cross_spy_more_durable': torch.from_numpy(L_cross_spy_more_durable),
+            'cross_permanent_dynamics_valid': torch.from_numpy(L_cross_permanent_dynamics_valid),
+            'cross_exit_return_rate_spread': torch.from_numpy(L_cross_exit_return_rate_spread),
+            'cross_exit_return_rate_aligned': torch.from_numpy(L_cross_exit_return_rate_aligned),
+            'cross_tsla_more_resilient': torch.from_numpy(L_cross_tsla_more_resilient),
+            'cross_spy_more_resilient': torch.from_numpy(L_cross_spy_more_resilient),
+            'cross_exits_returned_spread': torch.from_numpy(L_cross_exits_returned_spread),
+            'cross_exits_stayed_out_spread': torch.from_numpy(L_cross_exits_stayed_out_spread),
+            'cross_total_exits_spread': torch.from_numpy(L_cross_total_exits_spread),
+            'cross_both_scan_timed_out': torch.from_numpy(L_cross_both_scan_timed_out),
+            'cross_scan_timeout_aligned': torch.from_numpy(L_cross_scan_timeout_aligned),
+            'cross_bars_verified_spread': torch.from_numpy(L_cross_bars_verified_spread),
+            'cross_both_first_returned_then_permanent': torch.from_numpy(L_cross_both_first_returned_then_permanent),
+            'cross_both_never_returned': torch.from_numpy(L_cross_both_never_returned),
+            'cross_exit_verification_valid': torch.from_numpy(L_cross_exit_verification_valid),
+            'cross_exit_timing_correlation': torch.from_numpy(L_cross_exit_timing_correlation),
+            'cross_exit_timing_lag_mean': torch.from_numpy(L_cross_exit_timing_lag_mean),
+            'cross_exit_direction_agreement': torch.from_numpy(L_cross_exit_direction_agreement),
+            'cross_exit_count_spread': torch.from_numpy(L_cross_exit_count_spread),
+            'cross_lead_lag_exits': torch.from_numpy(L_cross_lead_lag_exits),
+            'cross_exit_magnitude_correlation': torch.from_numpy(L_cross_exit_magnitude_correlation),
+            'cross_mean_magnitude_spread': torch.from_numpy(L_cross_mean_magnitude_spread),
+            'cross_exit_duration_correlation': torch.from_numpy(L_cross_exit_duration_correlation),
+            'cross_mean_duration_spread': torch.from_numpy(L_cross_mean_duration_spread),
+            'cross_simultaneous_exit_count': torch.from_numpy(L_cross_simultaneous_exit_count),
+            'cross_exit_cross_correlation_valid': torch.from_numpy(L_cross_exit_cross_correlation_valid),
+            'cross_divergence_predicts_reversal': torch.from_numpy(L_cross_divergence_predicts_reversal),
+            'cross_permanent_break_matches_next': torch.from_numpy(L_cross_permanent_break_matches_next),
+            'cross_next_channel_direction_aligned': torch.from_numpy(L_cross_next_channel_direction_aligned),
+            'cross_next_channel_quality_aligned': torch.from_numpy(L_cross_next_channel_quality_aligned),
+            'cross_best_next_channel_tsla_vs_spy': torch.from_numpy(L_cross_best_next_channel_tsla_vs_spy),
+            'cross_rsi_aligned_at_break': torch.from_numpy(L_cross_rsi_aligned_at_break),
+            'cross_rsi_divergence_aligned': torch.from_numpy(L_cross_rsi_divergence_aligned),
+            'cross_tsla_rsi_higher_at_break': torch.from_numpy(L_cross_tsla_rsi_higher_at_break),
+            'cross_rsi_spread_at_break': torch.from_numpy(L_cross_rsi_spread_at_break),
+            'cross_overbought_predicts_down_break': torch.from_numpy(L_cross_overbought_predicts_down_break),
+            'cross_oversold_predicts_up_break': torch.from_numpy(L_cross_oversold_predicts_up_break),
+            # Per-TF
+            'per_tf_duration': torch.from_numpy(L_per_tf_duration),
+            'per_tf_duration_valid': torch.from_numpy(L_per_tf_duration_valid),
+        }
+
+        label_elapsed = _time.perf_counter() - t1
+        print(f"    Conversion breakdown: features {feat_elapsed:.1f}s + labels {label_elapsed:.1f}s")
+
+        return features_tensor, labels_batched
 
     def _extract_labels(self, sample: ChannelSample) -> Dict[str, torch.Tensor]:
         """
