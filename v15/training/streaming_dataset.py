@@ -1563,6 +1563,14 @@ def create_streaming_dataloaders(
     """
     from torch.utils.data import DataLoader, Subset
 
+    # Disable prefetch when sorted_reads is on.
+    # Prefetch assumes sequential chunk order (N → N+1), but ChunkOrderedSampler
+    # visits chunks in shuffled order, so prefetch almost never hits (<1%).
+    # Disabling it frees ~2.8GB RAM (one full chunk), allowing larger chunk sizes
+    # which is a bigger throughput win (~50%) than working prefetch could provide (~6%).
+    if sorted_reads:
+        prefetch = False
+
     # Create dataset
     dataset = ChunkedStreamingDataset(
         binary_path=binary_path,
@@ -1589,7 +1597,7 @@ def create_streaming_dataloaders(
 
     # Create dataloaders
     if sorted_reads:
-        print(f"Sorted reads: ON (chunk-ordered sampling, {len(set(i // chunk_size for i in train_indices))} train chunks)")
+        print(f"Sorted reads: ON (chunk-ordered sampling, {len(set(i // chunk_size for i in train_indices))} train chunks, prefetch OFF)")
         train_sampler = ChunkOrderedSampler(train_indices, chunk_size)
         val_sampler = ChunkOrderedSampler(val_indices, chunk_size, shuffle_chunks=False)
 
