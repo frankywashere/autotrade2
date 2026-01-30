@@ -21,8 +21,9 @@ Usage:
 """
 
 import numpy as np
+import random
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from typing import Any, Dict, List, Optional, Tuple
 import threading
 from pathlib import Path
@@ -30,6 +31,65 @@ from pathlib import Path
 from ..binary_index import get_or_build_index
 from ..binary_loader import ChannelSample, read_channel_sample
 from ..config import TIMEFRAMES
+
+
+class ChunkOrderedSampler(Sampler):
+    """
+    Sampler that groups indices by chunk for sequential disk I/O.
+
+    Instead of random access (which causes chunk thrashing — loading a new
+    15K-sample chunk for nearly every sample), this sampler ensures all
+    samples from one chunk are processed before moving to the next.
+
+    Randomness is preserved at two levels:
+    - Chunk order is shuffled each epoch
+    - Sample order within each chunk is shuffled
+
+    This eliminates chunk thrashing while maintaining training randomness.
+    """
+
+    def __init__(
+        self,
+        subset_indices: List[int],
+        chunk_size: int,
+        shuffle_chunks: bool = True,
+        shuffle_within: bool = True,
+    ):
+        """
+        Args:
+            subset_indices: Original dataset indices used by the Subset
+                (e.g., train_indices from the train/val split)
+            chunk_size: Chunk size of the streaming dataset
+            shuffle_chunks: Shuffle chunk visit order each epoch
+            shuffle_within: Shuffle sample order within each chunk
+        """
+        self.chunk_size = chunk_size
+        self.shuffle_chunks = shuffle_chunks
+        self.shuffle_within = shuffle_within
+
+        # Group logical indices (0..N-1) by which chunk their original index maps to
+        self.chunk_groups: Dict[int, List[int]] = {}
+        for logical_idx, original_idx in enumerate(subset_indices):
+            chunk_id = original_idx // chunk_size
+            if chunk_id not in self.chunk_groups:
+                self.chunk_groups[chunk_id] = []
+            self.chunk_groups[chunk_id].append(logical_idx)
+
+        self.n_samples = len(subset_indices)
+
+    def __iter__(self):
+        chunk_ids = list(self.chunk_groups.keys())
+        if self.shuffle_chunks:
+            random.shuffle(chunk_ids)
+
+        for chunk_id in chunk_ids:
+            indices = list(self.chunk_groups[chunk_id])
+            if self.shuffle_within:
+                random.shuffle(indices)
+            yield from indices
+
+    def __len__(self):
+        return self.n_samples
 
 
 class ChunkedStreamingDataset(Dataset):
@@ -1479,6 +1539,7 @@ def create_streaming_dataloaders(
     val_split: float = 0.2,
     num_workers: int = 0,
     prefetch: bool = True,
+    sorted_reads: bool = False,
 ) -> Tuple['torch.utils.data.DataLoader', 'torch.utils.data.DataLoader', int]:
     """
     Create train and validation dataloaders for streaming dataset.
@@ -1493,12 +1554,14 @@ def create_streaming_dataloaders(
         val_split: Fraction of data for validation
         num_workers: DataLoader workers (0 recommended for streaming)
         prefetch: Whether to prefetch next chunk
+        sorted_reads: Group samples by chunk for sequential disk I/O.
+            Prevents chunk thrashing (loading new 15K-sample chunk per sample).
+            Chunks and samples within chunks are still shuffled for training.
 
     Returns:
         Tuple of (train_loader, val_loader, num_features)
     """
     from torch.utils.data import DataLoader, Subset
-    import random
 
     # Create dataset
     dataset = ChunkedStreamingDataset(
@@ -1525,20 +1588,41 @@ def create_streaming_dataloaders(
     val_subset = Subset(dataset, val_indices)
 
     # Create dataloaders
-    train_loader = DataLoader(
-        train_subset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
+    if sorted_reads:
+        print(f"Sorted reads: ON (chunk-ordered sampling, {len(set(i // chunk_size for i in train_indices))} train chunks)")
+        train_sampler = ChunkOrderedSampler(train_indices, chunk_size)
+        val_sampler = ChunkOrderedSampler(val_indices, chunk_size, shuffle_chunks=False)
 
-    val_loader = DataLoader(
-        val_subset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=batch_size,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
 
     return train_loader, val_loader, dataset.get_num_features()

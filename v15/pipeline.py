@@ -86,6 +86,7 @@ def cmd_train(args):
 
         from .training.streaming_dataset import create_streaming_dataloaders
 
+        sorted_reads = getattr(args, 'sorted_reads', False)
         train_loader, val_loader, actual_feature_count = create_streaming_dataloaders(
             binary_path=args.samples,
             batch_size=args.batch_size,
@@ -94,6 +95,7 @@ def cmd_train(args):
             val_split=0.2,
             num_workers=args.num_workers,
             prefetch=True,
+            sorted_reads=sorted_reads,
         )
 
         logger.info(f"Features: {actual_feature_count:,}")
@@ -343,6 +345,8 @@ def main():
         help='Use streaming data loader (low RAM, supports full dataset)')
     train_parser.add_argument('--chunk-size', type=int, default=15000,
         help='Samples per chunk for streaming loader (default: 15000 = ~2.8GB RAM)')
+    train_parser.add_argument('--sorted-reads', action='store_true',
+        help='Group samples by chunk for sequential disk I/O (prevents chunk thrashing)')
     train_parser.add_argument('--batch-size', type=int, default=TRAINING_CONFIG['batch_size'])
     train_parser.add_argument('--lr', type=float, default=TRAINING_CONFIG['learning_rate'])
     train_parser.add_argument('--epochs', type=int, default=TRAINING_CONFIG['max_epochs'])
