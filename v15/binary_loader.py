@@ -763,6 +763,8 @@ def load_samples(filename: str, max_samples: Optional[int] = None) -> Tuple[int,
             samples_to_load = max_samples
 
         # Read samples
+        import time as _time
+        t0 = _time.perf_counter()
         samples = []
         for i in range(samples_to_load):
             try:
@@ -770,6 +772,15 @@ def load_samples(filename: str, max_samples: Optional[int] = None) -> Tuple[int,
                 samples.append(sample)
             except EOFError as e:
                 raise EOFError(f"Error reading sample {i}: {e}")
+
+            loaded = i + 1
+            if loaded % 50_000 == 0:
+                elapsed = _time.perf_counter() - t0
+                rate = loaded / elapsed if elapsed > 0 else 0
+                print(f"  Read {loaded:,}/{samples_to_load:,} samples ({elapsed:.1f}s, {rate:.0f} samples/s)")
+
+        elapsed = _time.perf_counter() - t0
+        print(f"  Read complete: {len(samples):,} samples in {elapsed:.1f}s")
 
         return version, num_samples, num_features, samples
 
