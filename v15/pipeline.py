@@ -79,7 +79,26 @@ def cmd_train(args):
     chunk_size = getattr(args, 'chunk_size', 15000)
     max_samples = getattr(args, 'max_samples', None)
 
-    if streaming:
+    # Detect .flat directory
+    import os
+    is_flat = os.path.isdir(args.samples) and os.path.exists(os.path.join(args.samples, 'meta.json'))
+
+    if is_flat:
+        # Flat format: instant loading via memory-mapped numpy arrays
+        logger.info(f"Loading flat format from {args.samples}")
+
+        from .training.flat_dataset import create_flat_dataloaders
+
+        train_loader, val_loader, actual_feature_count = create_flat_dataloaders(
+            flat_dir=args.samples,
+            batch_size=args.batch_size,
+            val_split=0.2,
+            num_workers=args.num_workers,
+            max_samples=max_samples,
+        )
+
+        logger.info(f"Features: {actual_feature_count:,}")
+    elif streaming:
         # Use streaming data loader for large datasets (low RAM usage)
         logger.info(f"Using streaming data loader (chunk_size={chunk_size:,})")
         logger.info(f"Loading from {args.samples}")
@@ -497,6 +516,15 @@ def main():
     train_parser.add_argument('--per-tf-loss-weight', type=float, default=0.0,
         help='Weight for per-timeframe duration loss (0.0 = disabled, try 0.5 to enable)')
 
+    # Convert command
+    convert_parser = subparsers.add_parser('convert', help='Convert .bin to .flat format for instant loading')
+    convert_parser.add_argument('--samples', required=True, help='Input .bin sample file')
+    convert_parser.add_argument('--output', required=True, help='Output .flat directory')
+    convert_parser.add_argument('--chunk-size', type=int, default=15000,
+        help='Samples per chunk during conversion (default: 15000)')
+    convert_parser.add_argument('--target-tf', default='daily',
+        help='Target timeframe for label extraction (default: daily)')
+
     # Analyze command
     analyze_parser = subparsers.add_parser('analyze', help='Analyze feature correlations')
     analyze_parser.add_argument('--samples', required=True, help='Samples pickle file')
@@ -525,6 +553,14 @@ def main():
             cmd_scan(args)
         elif args.command == 'train':
             cmd_train(args)
+        elif args.command == 'convert':
+            from .training.flat_dataset import convert_bin_to_flat
+            convert_bin_to_flat(
+                bin_path=args.samples,
+                output_dir=args.output,
+                chunk_size=args.chunk_size,
+                target_tf=args.target_tf,
+            )
         elif args.command == 'analyze':
             cmd_analyze(args)
         elif args.command == 'infer':
