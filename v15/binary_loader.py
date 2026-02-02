@@ -774,7 +774,7 @@ def load_samples(filename: str, max_samples: Optional[int] = None) -> Tuple[int,
                 raise EOFError(f"Error reading sample {i}: {e}")
 
             loaded = i + 1
-            if loaded % 50_000 == 0:
+            if loaded % 100 == 0:
                 elapsed = _time.perf_counter() - t0
                 rate = loaded / elapsed if elapsed > 0 else 0
                 print(f"  Read {loaded:,}/{samples_to_load:,} samples ({elapsed:.1f}s, {rate:.0f} samples/s)")
