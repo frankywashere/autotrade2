@@ -198,7 +198,21 @@ int main(int argc, char* argv[]) {
         );
 
         // Print results
-        std::cout << "\nGenerated " << samples.size() << " samples\n";
+        // When streaming mode is used, samples are written directly to disk
+        // and the in-memory vector is empty. Read the count from the file.
+        bool used_streaming = config.streaming && !config.output_path.empty();
+        if (used_streaming) {
+            uint32_t version;
+            uint64_t file_samples;
+            uint32_t num_features;
+            if (v15::get_file_metadata(config.output_path, version, file_samples, num_features)) {
+                std::cout << "\nGenerated " << file_samples << " samples (streamed to disk)\n";
+            } else {
+                std::cout << "\nGenerated samples (streamed to disk, count unavailable)\n";
+            }
+        } else {
+            std::cout << "\nGenerated " << samples.size() << " samples\n";
+        }
 
         if (!samples.empty()) {
             const v15::ChannelSample& first = samples[0];
@@ -225,7 +239,6 @@ int main(int argc, char* argv[]) {
         }
 
         // Save if output path specified (skip if streaming was used - already saved)
-        bool used_streaming = config.streaming && !config.output_path.empty();
         if (!config.output_path.empty() && !used_streaming && !samples.empty()) {
             std::cout << "\nSaving " << samples.size() << " samples to " << config.output_path << "...\n";
 
