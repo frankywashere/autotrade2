@@ -372,7 +372,12 @@ class Trainer:
         self.scheduler = self._create_scheduler(total_steps)
 
         # Mixed precision
-        self.scaler = torch.amp.GradScaler() if self.device.type == 'cuda' else None
+        # Use bfloat16 instead of float16 — bfloat16 has the same exponent range as
+        # float32 (max ~3.4e38) so features with values in the billions won't overflow.
+        # Float16 max is only 65,504 which causes immediate NaN with our feature range.
+        # GradScaler is not needed with bfloat16 (no loss scaling required).
+        self.use_amp = self.device.type == 'cuda'
+        self.scaler = None
 
         # Metrics tracking
         self.metrics_tracker = MetricsTracker()
@@ -1502,38 +1507,12 @@ class Trainer:
 
                 self.optimizer.zero_grad()
 
-                # Forward pass with mixed precision
-                if self.scaler:
-                    with torch.amp.autocast(device_type='cuda'):
-                        # Window selection: select features via learned soft attention
-                        selected_features, selection_probs = self.window_selection_head(
-                            per_window_features,
-                            window_valid=window_valid,
-                            temperature=self.gumbel_temperature
-                        )
+                # Forward pass with mixed precision (bfloat16 on CUDA, float32 elsewhere)
+                amp_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if self.use_amp else torch.no_grad.__class__()
 
-                        # Model forward on selected features
-                        predictions = self.model(selected_features)
+                self.optimizer.zero_grad()
 
-                        # Compute loss including window selection terms
-                        loss, loss_components = self.compute_loss(
-                            predictions, labels,
-                            window_selection_probs=selection_probs,
-                            heuristic_best_window=heuristic_best_window
-                        )
-
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-
-                    # Clip gradients for both model and window selection head
-                    all_params = list(self.model.parameters())
-                    if self.window_selection_head is not None:
-                        all_params += list(self.window_selection_head.parameters())
-                    torch.nn.utils.clip_grad_norm_(all_params, self.grad_clip)
-
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
+                with amp_ctx if self.use_amp else torch.enable_grad():
                     # Window selection: select features via learned soft attention
                     selected_features, selection_probs = self.window_selection_head(
                         per_window_features,
@@ -1551,15 +1530,15 @@ class Trainer:
                         heuristic_best_window=heuristic_best_window
                     )
 
-                    loss.backward()
+                loss.backward()
 
-                    # Clip gradients for both model and window selection head
-                    all_params = list(self.model.parameters())
-                    if self.window_selection_head is not None:
-                        all_params += list(self.window_selection_head.parameters())
-                    torch.nn.utils.clip_grad_norm_(all_params, self.grad_clip)
+                # Clip gradients for both model and window selection head
+                all_params = list(self.model.parameters())
+                if self.window_selection_head is not None:
+                    all_params += list(self.window_selection_head.parameters())
+                torch.nn.utils.clip_grad_norm_(all_params, self.grad_clip)
 
-                    self.optimizer.step()
+                self.optimizer.step()
 
                 # Track window selection metrics
                 if heuristic_best_window is not None:
@@ -1580,36 +1559,12 @@ class Trainer:
                 # Check if per-TF loss is enabled
                 use_per_tf_loss = self.config.per_tf_loss_weight > 0
 
-                # Forward pass with mixed precision
-                if self.scaler:
-                    with torch.amp.autocast(device_type='cuda'):
-                        # Use forward_with_per_tf when per-TF loss is enabled
-                        if use_per_tf_loss:
-                            predictions, per_tf_preds = self.model.forward_with_per_tf(features)
-                        else:
-                            predictions = self.model(features)
-                            per_tf_preds = None
+                # Forward pass with mixed precision (bfloat16 on CUDA, float32 elsewhere)
+                amp_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if self.use_amp else torch.enable_grad()
 
-                        # Compute main loss
-                        loss, loss_components = self.compute_loss(predictions, labels)
+                self.optimizer.zero_grad()
 
-                        # Add per-TF duration loss if enabled
-                        if use_per_tf_loss and per_tf_preds is not None:
-                            per_tf_loss, per_tf_loss_components = self.compute_per_tf_duration_loss(
-                                per_tf_preds, labels
-                            )
-                            # Add weighted per-TF loss to total
-                            loss = loss + self.config.per_tf_loss_weight * per_tf_loss
-                            # Merge loss components for logging
-                            loss_components.update(per_tf_loss_components)
-                            loss_components['total'] = loss.item()
-
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
+                with amp_ctx:
                     # Use forward_with_per_tf when per-TF loss is enabled
                     if use_per_tf_loss:
                         predictions, per_tf_preds = self.model.forward_with_per_tf(features)
@@ -1631,9 +1586,9 @@ class Trainer:
                         loss_components.update(per_tf_loss_components)
                         loss_components['total'] = loss.item()
 
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    self.optimizer.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                self.optimizer.step()
 
             if self.scheduler is not None:
                 self.scheduler.step()
