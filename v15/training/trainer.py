@@ -2010,11 +2010,16 @@ class Trainer:
             logger.info(f"  Weight: {self.config.window_selection_weight}")
 
         # Extract feature metadata from dataset
-        if hasattr(self.train_loader.dataset, 'feature_names'):
-            self.feature_names = self.train_loader.dataset.feature_names
+        dataset = self.train_loader.dataset
+        # Unwrap Subset to get the underlying dataset
+        if hasattr(dataset, 'dataset'):
+            dataset = dataset.dataset
+
+        if hasattr(dataset, 'feature_names'):
+            self.feature_names = dataset.feature_names
             logger.info(f"Loaded {len(self.feature_names)} feature names from dataset")
-        if hasattr(self.train_loader.dataset, 'correlation_info'):
-            self.correlation_info = self.train_loader.dataset.correlation_info
+        if hasattr(dataset, 'correlation_info'):
+            self.correlation_info = dataset.correlation_info
             logger.info("Loaded correlation info from dataset")
 
         # Run feature analysis before training
@@ -2031,9 +2036,11 @@ class Trainer:
             self.metrics_tracker.update('val', val_losses)
 
             # Build log message
+            current_lr = self.scheduler.get_last_lr()[0] if self.scheduler else self.config.lr
             log_msg = f"Epoch {epoch}: train_loss={train_losses['total']:.4f}"
             if val_losses:
                 log_msg += f", val_loss={val_losses.get('val_total', 0):.4f}"
+            log_msg += f", lr={current_lr:.6e}"
 
             # Add window selection metrics to log
             if self.use_end_to_end:

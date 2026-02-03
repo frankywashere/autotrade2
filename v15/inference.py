@@ -197,7 +197,7 @@ class Predictor:
             logger.warning(f"Checkpoint has unexpected keys: {unexpected_keys}")
 
         # Get feature names - use new TF-aware feature names by default
-        feature_names = checkpoint.get('feature_names', get_tf_feature_names())
+        feature_names = checkpoint.get('feature_names') or get_tf_feature_names()
 
         logger.info(f"Loaded model from {path}")
         if has_window_selector:
