@@ -508,7 +508,7 @@ class Trainer:
         # Compute loss based on configured type
         if self.config.duration_loss_type == 'gaussian_nll':
             # Gaussian NLL loss: -log p(y|mu, sigma) = 0.5 * [log(sigma^2) + (y-mu)^2/sigma^2]
-            variance = torch.exp(2 * pred_log_std_valid)
+            variance = torch.exp(2 * pred_log_std_valid).clamp(min=1e-6)
             per_tf_loss = 0.5 * (
                 torch.log(variance) +
                 (target_valid - pred_mean_valid) ** 2 / variance
@@ -570,7 +570,7 @@ class Trainer:
             if self.config.duration_loss_type == 'gaussian_nll':
                 duration_log_std = predictions['duration_log_std'][duration_valid]
                 # Gaussian NLL loss
-                variance = torch.exp(2 * duration_log_std)
+                variance = torch.exp(2 * duration_log_std).clamp(min=1e-6)
                 duration_loss = 0.5 * (
                     torch.log(variance) +
                     (duration_target - duration_mean) ** 2 / variance
@@ -640,7 +640,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_bars_to_break_log_std' in predictions:
                 tsla_btb_log_std = predictions['tsla_bars_to_break_log_std'][tsla_break_scan_valid]
-                variance = torch.exp(2 * tsla_btb_log_std)
+                variance = torch.exp(2 * tsla_btb_log_std).clamp(min=1e-6)
                 tsla_btb_loss = 0.5 * (
                     torch.log(variance) +
                     (tsla_btb_target - tsla_btb_mean) ** 2 / variance
@@ -681,7 +681,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_break_magnitude_log_std' in predictions:
                 tsla_mag_log_std = predictions['tsla_break_magnitude_log_std'][tsla_break_scan_valid]
-                variance = torch.exp(2 * tsla_mag_log_std)
+                variance = torch.exp(2 * tsla_mag_log_std).clamp(min=1e-6)
                 tsla_mag_loss = 0.5 * (
                     torch.log(variance) +
                     (tsla_mag_target - tsla_mag_mean) ** 2 / variance
@@ -720,7 +720,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_bounces_log_std' in predictions:
                 tsla_bounces_log_std = predictions['tsla_bounces_log_std'][tsla_break_scan_valid]
-                variance = torch.exp(2 * tsla_bounces_log_std)
+                variance = torch.exp(2 * tsla_bounces_log_std).clamp(min=1e-6)
                 tsla_bounces_loss = 0.5 * (
                     torch.log(variance) +
                     (tsla_bounces_target - tsla_bounces_mean) ** 2 / variance
@@ -764,7 +764,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'spy_bars_to_break_log_std' in predictions:
                 spy_btb_log_std = predictions['spy_bars_to_break_log_std'][spy_break_scan_valid]
-                variance = torch.exp(2 * spy_btb_log_std)
+                variance = torch.exp(2 * spy_btb_log_std).clamp(min=1e-6)
                 spy_btb_loss = 0.5 * (
                     torch.log(variance) +
                     (spy_btb_target - spy_btb_mean) ** 2 / variance
@@ -805,7 +805,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'spy_break_magnitude_log_std' in predictions:
                 spy_mag_log_std = predictions['spy_break_magnitude_log_std'][spy_break_scan_valid]
-                variance = torch.exp(2 * spy_mag_log_std)
+                variance = torch.exp(2 * spy_mag_log_std).clamp(min=1e-6)
                 spy_mag_loss = 0.5 * (
                     torch.log(variance) +
                     (spy_mag_target - spy_mag_mean) ** 2 / variance
@@ -844,7 +844,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'spy_bounces_log_std' in predictions:
                 spy_bounces_log_std = predictions['spy_bounces_log_std'][spy_break_scan_valid]
-                variance = torch.exp(2 * spy_bounces_log_std)
+                variance = torch.exp(2 * spy_bounces_log_std).clamp(min=1e-6)
                 spy_bounces_loss = 0.5 * (
                     torch.log(variance) +
                     (spy_bounces_target - spy_bounces_mean) ** 2 / variance
@@ -920,7 +920,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'cross_break_lag_log_std' in predictions:
                 cross_lag_log_std = predictions['cross_break_lag_log_std'][cross_valid]
-                variance = torch.exp(2 * cross_lag_log_std)
+                variance = torch.exp(2 * cross_lag_log_std).clamp(min=1e-6)
                 cross_lag_loss = 0.5 * (
                     torch.log(variance) +
                     (cross_lag_target - cross_lag_mean) ** 2 / variance
@@ -982,7 +982,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_durability_log_std' in predictions:
                 tsla_dur_log_std = predictions['tsla_durability_log_std'][tsla_break_scan_valid]
-                variance = torch.exp(2 * tsla_dur_log_std)
+                variance = torch.exp(2 * tsla_dur_log_std).clamp(min=1e-6)
                 tsla_dur_loss = 0.5 * (
                     torch.log(variance) +
                     (tsla_dur_target - tsla_dur_mean) ** 2 / variance
@@ -1007,7 +1007,7 @@ class Trainer:
 
                 if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_bars_to_permanent_log_std' in predictions:
                     tsla_btp_log_std = predictions['tsla_bars_to_permanent_log_std'][tsla_break_scan_valid][valid_perm_mask]
-                    variance = torch.exp(2 * tsla_btp_log_std)
+                    variance = torch.exp(2 * tsla_btp_log_std).clamp(min=1e-6)
                     tsla_btp_loss = 0.5 * (
                         torch.log(variance) +
                         (tsla_btp_target_valid - tsla_btp_mean_valid) ** 2 / variance
@@ -1029,7 +1029,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'spy_durability_log_std' in predictions:
                 spy_dur_log_std = predictions['spy_durability_log_std'][spy_break_scan_valid]
-                variance = torch.exp(2 * spy_dur_log_std)
+                variance = torch.exp(2 * spy_dur_log_std).clamp(min=1e-6)
                 spy_dur_loss = 0.5 * (
                     torch.log(variance) +
                     (spy_dur_target - spy_dur_mean) ** 2 / variance
@@ -1054,7 +1054,7 @@ class Trainer:
 
                 if self.config.duration_loss_type == 'gaussian_nll' and 'spy_bars_to_permanent_log_std' in predictions:
                     spy_btp_log_std = predictions['spy_bars_to_permanent_log_std'][spy_break_scan_valid][valid_perm_mask]
-                    variance = torch.exp(2 * spy_btp_log_std)
+                    variance = torch.exp(2 * spy_btp_log_std).clamp(min=1e-6)
                     spy_btp_loss = 0.5 * (
                         torch.log(variance) +
                         (spy_btp_target_valid - spy_btp_mean_valid) ** 2 / variance
@@ -1076,7 +1076,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'cross_durability_spread_log_std' in predictions:
                 cross_dur_log_std = predictions['cross_durability_spread_log_std'][cross_valid]
-                variance = torch.exp(2 * cross_dur_log_std)
+                variance = torch.exp(2 * cross_dur_log_std).clamp(min=1e-6)
                 cross_dur_spread_loss = 0.5 * (
                     torch.log(variance) +
                     (cross_dur_target - cross_dur_mean) ** 2 / variance
@@ -1100,7 +1100,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'tsla_rsi_at_break_log_std' in predictions:
                 tsla_rsi_log_std = predictions['tsla_rsi_at_break_log_std'][tsla_break_scan_valid]
-                variance = torch.exp(2 * tsla_rsi_log_std)
+                variance = torch.exp(2 * tsla_rsi_log_std).clamp(min=1e-6)
                 tsla_rsi_loss = 0.5 * (
                     torch.log(variance) +
                     (tsla_rsi_target - tsla_rsi_mean) ** 2 / variance
@@ -1173,7 +1173,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'spy_rsi_at_break_log_std' in predictions:
                 spy_rsi_log_std = predictions['spy_rsi_at_break_log_std'][spy_break_scan_valid]
-                variance = torch.exp(2 * spy_rsi_log_std)
+                variance = torch.exp(2 * spy_rsi_log_std).clamp(min=1e-6)
                 spy_rsi_loss = 0.5 * (
                     torch.log(variance) +
                     (spy_rsi_target - spy_rsi_mean) ** 2 / variance
@@ -1265,7 +1265,7 @@ class Trainer:
 
             if self.config.duration_loss_type == 'gaussian_nll' and 'cross_rsi_spread_log_std' in predictions:
                 cross_rsi_spread_log_std = predictions['cross_rsi_spread_log_std'][cross_valid]
-                variance = torch.exp(2 * cross_rsi_spread_log_std)
+                variance = torch.exp(2 * cross_rsi_spread_log_std).clamp(min=1e-6)
                 cross_rsi_spread_loss = 0.5 * (
                     torch.log(variance) +
                     (cross_rsi_spread_target - cross_rsi_spread_mean) ** 2 / variance
