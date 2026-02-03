@@ -156,8 +156,15 @@ class Predictor:
         # Get config from checkpoint or use defaults
         model_config = checkpoint.get('config', {})
 
-        # Get input_dim from checkpoint (supports models trained with different feature counts)
-        input_dim = model_config.get('total_features', TOTAL_FEATURES)
+        # Detect actual input_dim from state_dict (ground truth) instead of stored config
+        # The config may have stale values (e.g., 14190) while weights are 14840
+        if 'feature_weights.weights' in state_dict:
+            input_dim = state_dict['feature_weights.weights'].shape[0]
+            logger.info(f"Detected input_dim={input_dim} from checkpoint weights")
+        else:
+            # Fallback to config if no feature_weights in checkpoint
+            input_dim = model_config.get('total_features', TOTAL_FEATURES)
+            logger.info(f"Using input_dim={input_dim} from checkpoint config")
 
         # Create model with appropriate configuration
         config = {
