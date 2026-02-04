@@ -2,6 +2,7 @@
 Evaluation metrics for V15 channel prediction.
 """
 import torch
+import torch.distributed as dist
 import numpy as np
 from typing import Dict, List, Any
 from collections import defaultdict
@@ -70,6 +71,94 @@ def compute_metrics(
         metrics['new_channel_accuracy'] = (
             valid_pred_nc == valid_true_nc
         ).float().mean().item()
+
+    return metrics
+
+
+def compute_metrics_distributed(
+    all_predictions: List[Dict[str, torch.Tensor]],
+    all_labels: List[Dict[str, torch.Tensor]],
+    device: torch.device,
+) -> Dict[str, float]:
+    """
+    Compute metrics using sum/count reduction across DDP ranks.
+
+    Instead of averaging per-rank metrics (which gives wrong RMSE),
+    this reduces raw sums and counts, then computes global metrics.
+
+    Gives exact RMSE = sqrt(global_sum_sq / global_count) instead of
+    approximate mean(per_rank_RMSE).
+    """
+    # Concatenate locally
+    pred_duration = torch.cat([p['duration_mean'] for p in all_predictions])
+    pred_direction = torch.cat([p['direction_logits'] for p in all_predictions])
+    pred_new_channel = torch.cat([p['new_channel_logits'] for p in all_predictions])
+
+    true_duration = torch.cat([l['duration'] for l in all_labels])
+    true_direction = torch.cat([l['direction'] for l in all_labels])
+    true_new_channel = torch.cat([l['new_channel'] for l in all_labels])
+    valid_mask = torch.cat([l['valid'] for l in all_labels])
+
+    metrics = {}
+
+    if valid_mask.any():
+        valid_pred_dur = pred_duration[valid_mask]
+        valid_true_dur = true_duration[valid_mask].float()
+        errors = valid_pred_dur - valid_true_dur
+
+        # Local sums for reduction
+        sum_abs_error = errors.abs().sum()
+        sum_sq_error = (errors ** 2).sum()
+        count = torch.tensor(valid_mask.sum(), dtype=torch.float64)
+
+        # MAPE components
+        nonzero_mask = valid_true_dur > 0
+        if nonzero_mask.any():
+            sum_pct_error = (errors[nonzero_mask].abs() / valid_true_dur[nonzero_mask]).sum()
+            count_nonzero = torch.tensor(nonzero_mask.sum(), dtype=torch.float64)
+        else:
+            sum_pct_error = torch.tensor(0.0, dtype=torch.float64)
+            count_nonzero = torch.tensor(0.0, dtype=torch.float64)
+
+        # Direction accuracy components
+        valid_pred_dir = (torch.sigmoid(pred_direction[valid_mask]) > 0.5).long()
+        valid_true_dir = true_direction[valid_mask]
+        sum_dir_correct = (valid_pred_dir == valid_true_dir).float().sum()
+
+        # New channel accuracy components
+        valid_pred_nc = pred_new_channel[valid_mask].argmax(dim=-1)
+        valid_true_nc = true_new_channel[valid_mask]
+        sum_nc_correct = (valid_pred_nc == valid_true_nc).float().sum()
+
+        # Stack all for a single all_reduce call
+        local_stats = torch.tensor([
+            sum_abs_error.item(),
+            sum_sq_error.item(),
+            count.item(),
+            sum_pct_error.item(),
+            count_nonzero.item(),
+            sum_dir_correct.item(),
+            sum_nc_correct.item(),
+        ], dtype=torch.float64, device=device)
+
+        dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
+
+        g_sum_abs = local_stats[0].item()
+        g_sum_sq = local_stats[1].item()
+        g_count = local_stats[2].item()
+        g_sum_pct = local_stats[3].item()
+        g_count_nz = local_stats[4].item()
+        g_dir_correct = local_stats[5].item()
+        g_nc_correct = local_stats[6].item()
+
+        if g_count > 0:
+            metrics['duration_mae'] = g_sum_abs / g_count
+            metrics['duration_rmse'] = (g_sum_sq / g_count) ** 0.5
+            metrics['direction_accuracy'] = g_dir_correct / g_count
+            metrics['new_channel_accuracy'] = g_nc_correct / g_count
+
+        if g_count_nz > 0:
+            metrics['duration_mape'] = (g_sum_pct / g_count_nz) * 100
 
     return metrics
 

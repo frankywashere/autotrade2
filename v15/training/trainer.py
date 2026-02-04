@@ -19,6 +19,11 @@ from tqdm import tqdm
 import json
 import warnings
 import numpy as np
+from torch.nn.parallel import DistributedDataParallel as DDP
+from .distributed import (
+    is_distributed, is_main_process, get_rank, get_local_rank,
+    get_world_size, broadcast_tensor, all_reduce_dict, barrier,
+)
 
 from ..models import V15Model, create_model
 from ..config import TRAINING_CONFIG, TOTAL_FEATURES, TIMEFRAMES, N_WINDOWS
@@ -316,7 +321,12 @@ class Trainer:
             )
 
         # Device setup
-        if self.config.device == 'auto':
+        self.distributed = is_distributed()
+        if self.distributed:
+            local_rank = get_local_rank()
+            self.device = torch.device(f'cuda:{local_rank}')
+            torch.cuda.set_device(self.device)
+        elif self.config.device == 'auto':
             if torch.cuda.is_available():
                 self.device = torch.device('cuda')
             elif torch.backends.mps.is_available():
@@ -327,6 +337,15 @@ class Trainer:
             self.device = torch.device(self.config.device)
 
         self.model = model.to(self.device)
+        # DDP wrapping (must be after .to(device) and before optimizer creation)
+        if self.distributed:
+            self.model = DDP(
+                self.model,
+                device_ids=[get_local_rank()],
+                output_device=get_local_rank(),
+                gradient_as_bucket_view=True,
+                find_unused_parameters=True,
+            )
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.max_epochs = self.config.max_epochs
@@ -350,11 +369,12 @@ class Trainer:
             # Create window selection head for end-to-end learning
             # Input dim is per-window features (determined from dataset)
             # Will be initialized lazily in train() when we see first batch
-            logger.info("End-to-end window selection mode enabled")
-            logger.info(f"  Strategy: {self.config.strategy}")
-            logger.info(f"  Window selection weight: {self.config.window_selection_weight}")
-            logger.info(f"  Entropy weight: {self.config.entropy_weight}")
-            logger.info(f"  Consistency weight: {self.config.consistency_weight}")
+            if is_main_process():
+                logger.info("End-to-end window selection mode enabled")
+                logger.info(f"  Strategy: {self.config.strategy}")
+                logger.info(f"  Window selection weight: {self.config.window_selection_weight}")
+                logger.info(f"  Entropy weight: {self.config.entropy_weight}")
+                logger.info(f"  Consistency weight: {self.config.consistency_weight}")
 
         # Optimizer - include window selection head if present
         params_to_optimize = list(model.parameters())
@@ -400,6 +420,11 @@ class Trainer:
         self.feature_names: List[str] = None
         self.correlation_info: Dict = None
 
+    @property
+    def raw_model(self):
+        """Get the underlying model, unwrapping DDP if necessary."""
+        return self.model.module if isinstance(self.model, DDP) else self.model
+
     def _create_scheduler(self, total_steps: int):
         """Create learning rate scheduler based on config."""
         if self.config.scheduler == 'onecycle':
@@ -434,6 +459,15 @@ class Trainer:
             dropout=0.1
         ).to(self.device)
 
+        # Wrap with DDP if distributed
+        if self.distributed:
+            self.window_selection_head = DDP(
+                self.window_selection_head,
+                device_ids=[get_local_rank()],
+                output_device=get_local_rank(),
+            )
+            barrier()
+
         # Add to optimizer
         self.optimizer.add_param_group({
             'params': self.window_selection_head.parameters(),
@@ -441,7 +475,8 @@ class Trainer:
             'weight_decay': self.config.weight_decay
         })
 
-        logger.info(f"Initialized WindowSelectionHead with input_dim={feature_dim}, n_windows={n_windows}")
+        if is_main_process():
+            logger.info(f"Initialized WindowSelectionHead with input_dim={feature_dim}, n_windows={n_windows}")
 
     def _anneal_temperature(self, epoch: int):
         """Anneal Gumbel-Softmax temperature over training."""
@@ -1485,7 +1520,13 @@ class Trainer:
         epoch_losses = []
         epoch_window_metrics = []
 
-        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}')
+        # Set epoch on distributed sampler for proper shuffling
+        if self.distributed and hasattr(self.train_loader, 'sampler'):
+            sampler = self.train_loader.sampler
+            if hasattr(sampler, 'set_epoch'):
+                sampler.set_epoch(epoch)
+
+        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}') if is_main_process() else self.train_loader
         for batch_idx, batch_data in enumerate(pbar):
             # Handle both standard and end-to-end data formats
             if self.use_end_to_end and isinstance(batch_data, tuple) and len(batch_data) == 3:
@@ -1611,6 +1652,10 @@ class Trainer:
             if values:
                 avg_losses[k] = sum(values) / len(values)
 
+        # Sync losses across ranks
+        if self.distributed:
+            avg_losses = all_reduce_dict(avg_losses, self.device)
+
         # Add window selection metrics summary
         if epoch_window_metrics:
             avg_losses['ws_accuracy'] = np.mean([m['accuracy'] for m in epoch_window_metrics])
@@ -1728,8 +1773,16 @@ class Trainer:
             if values:
                 avg_losses[f'val_{k}'] = sum(values) / len(values)
 
+        # Sync losses across ranks
+        if self.distributed:
+            avg_losses = all_reduce_dict(avg_losses, self.device)
+
         # Compute standard metrics
-        metrics = compute_metrics(all_predictions, all_labels)
+        if self.distributed:
+            from .metrics import compute_metrics_distributed
+            metrics = compute_metrics_distributed(all_predictions, all_labels, self.device)
+        else:
+            metrics = compute_metrics(all_predictions, all_labels)
         avg_losses.update({f'val_{k}': v for k, v in metrics.items()})
 
         # Add window selection metrics for validation
@@ -1839,9 +1892,14 @@ class Trainer:
         if self.checkpoint_dir is None:
             return
 
+        # Only rank 0 saves checkpoints
+        if self.distributed and not is_main_process():
+            barrier()  # Wait for rank 0 to finish saving
+            return
+
         checkpoint = {
             'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': self.raw_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'best_val_loss': self.best_val_loss,
@@ -1913,7 +1971,8 @@ class Trainer:
 
         # Save window selection head if present
         if self.window_selection_head is not None:
-            checkpoint['window_selection_head_state_dict'] = self.window_selection_head.state_dict()
+            ws_head = self.window_selection_head.module if isinstance(self.window_selection_head, DDP) else self.window_selection_head
+            checkpoint['window_selection_head_state_dict'] = ws_head.state_dict()
 
         # Save window selection metrics history
         if self.window_selection_metrics['selection_accuracy']:
@@ -1927,6 +1986,9 @@ class Trainer:
             torch.save(checkpoint, self.checkpoint_dir / 'best.pt')
             logger.info(f"Saved best model at epoch {epoch}")
 
+        if self.distributed:
+            barrier()  # Signal non-rank-0 processes that save is done
+
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """
         Load model checkpoint including window selection head if present.
@@ -1938,7 +2000,7 @@ class Trainer:
 
         # Load model state dict with graceful handling of missing per_tf_heads weights
         # Older checkpoints may not have per_tf_heads - use strict=False and warn
-        missing_keys, unexpected_keys = self.model.load_state_dict(
+        missing_keys, unexpected_keys = self.raw_model.load_state_dict(
             checkpoint['model_state_dict'], strict=False
         )
 
@@ -1946,23 +2008,24 @@ class Trainer:
         per_tf_missing = [k for k in missing_keys if 'per_tf_heads' in k]
         other_missing = [k for k in missing_keys if 'per_tf_heads' not in k]
 
-        if per_tf_missing:
+        if per_tf_missing and is_main_process():
             logger.warning(
                 f"Checkpoint missing per_tf_heads weights ({len(per_tf_missing)} keys) - "
                 "per-TF predictions will be untrained"
             )
 
         # Warn about any other missing keys (these might be actual problems)
-        if other_missing:
+        if other_missing and is_main_process():
             logger.warning(f"Checkpoint missing unexpected keys: {other_missing}")
 
-        if unexpected_keys:
+        if unexpected_keys and is_main_process():
             logger.warning(f"Checkpoint has unexpected keys: {unexpected_keys}")
 
         # Load window selection head if present
         if 'window_selection_head_state_dict' in checkpoint and self.window_selection_head is not None:
             self.window_selection_head.load_state_dict(checkpoint['window_selection_head_state_dict'])
-            logger.info("Loaded window selection head state")
+            if is_main_process():
+                logger.info("Loaded window selection head state")
 
         # Load optimizer state
         if 'optimizer_state_dict' in checkpoint:
@@ -1981,7 +2044,8 @@ class Trainer:
         if 'window_selection_metrics' in checkpoint:
             self.window_selection_metrics = checkpoint['window_selection_metrics']
 
-        logger.info(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+        if is_main_process():
+            logger.info(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
 
     def train(self) -> Dict[str, List[float]]:
         """
@@ -1990,12 +2054,13 @@ class Trainer:
         Returns:
             Training history including window selection metrics if enabled
         """
-        logger.info(f"Starting training for {self.max_epochs} epochs")
-        logger.info(f"Device: {self.device}")
-        logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        if is_main_process():
+            logger.info(f"Starting training for {self.max_epochs} epochs")
+            logger.info(f"Device: {self.device}")
+            logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
 
         # Log end-to-end mode settings
-        if self.use_end_to_end:
+        if self.use_end_to_end and is_main_process():
             logger.info("=" * 60)
             logger.info("END-TO-END WINDOW SELECTION MODE (Phase 2b)")
             logger.info("=" * 60)
@@ -2005,7 +2070,7 @@ class Trainer:
             logger.info(f"  Consistency weight: {self.config.consistency_weight}")
             logger.info(f"  Gumbel temperature: {self.config.gumbel_temperature} -> {self.config.gumbel_temperature_min}")
             logger.info("=" * 60)
-        elif self.use_window_selection_loss:
+        elif self.use_window_selection_loss and is_main_process():
             logger.info("Window selection auxiliary loss enabled (Phase 2a)")
             logger.info(f"  Weight: {self.config.window_selection_weight}")
 
@@ -2017,14 +2082,18 @@ class Trainer:
 
         if hasattr(dataset, 'feature_names'):
             self.feature_names = dataset.feature_names
-            logger.info(f"Loaded {len(self.feature_names)} feature names from dataset")
+            if is_main_process():
+                logger.info(f"Loaded {len(self.feature_names)} feature names from dataset")
         if hasattr(dataset, 'correlation_info'):
             self.correlation_info = dataset.correlation_info
-            logger.info("Loaded correlation info from dataset")
+            if is_main_process():
+                logger.info("Loaded correlation info from dataset")
 
         # Run feature analysis before training
-        if self.analyze_features_flag:
+        if self.analyze_features_flag and is_main_process():
             self._analyze_features()
+        if self.distributed:
+            barrier()
 
         for epoch in range(1, self.max_epochs + 1):
             # Train
@@ -2050,10 +2119,11 @@ class Trainer:
                     log_msg += f", val_ws_acc={val_losses['val_ws_accuracy']:.3f}"
                 log_msg += f", temp={self.gumbel_temperature:.3f}"
 
-            logger.info(log_msg)
+            if is_main_process():
+                logger.info(log_msg)
 
             # Log detailed window selection info periodically
-            if self.use_end_to_end and epoch % 10 == 0:
+            if self.use_end_to_end and epoch % 10 == 0 and is_main_process():
                 if 'ws_entropy' in train_losses:
                     logger.info(f"  Window selection - entropy: {train_losses['ws_entropy']:.3f}, "
                               f"max_prob: {train_losses.get('ws_max_prob', 0):.3f}")
@@ -2070,13 +2140,21 @@ class Trainer:
             # Save checkpoint
             self.save_checkpoint(epoch, is_best)
 
-            # Early stopping
-            if self.epochs_without_improvement >= self.early_stopping_patience:
-                logger.info(f"Early stopping at epoch {epoch}")
+            # Early stopping (broadcast from rank 0 so all ranks stop together)
+            should_stop = self.epochs_without_improvement >= self.early_stopping_patience
+            if self.distributed:
+                stop_tensor = torch.tensor(
+                    [1 if should_stop else 0], device=self.device, dtype=torch.int32
+                )
+                stop_tensor = broadcast_tensor(stop_tensor, src=0)
+                should_stop = stop_tensor.item() == 1
+            if should_stop:
+                if is_main_process():
+                    logger.info(f"Early stopping at epoch {epoch}")
                 break
 
         # Log final window selection statistics
-        if self.use_end_to_end and self.window_selection_metrics['selection_accuracy']:
+        if self.use_end_to_end and self.window_selection_metrics['selection_accuracy'] and is_main_process():
             logger.info("=" * 60)
             logger.info("WINDOW SELECTION TRAINING SUMMARY")
             logger.info("=" * 60)

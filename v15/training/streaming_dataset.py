@@ -21,6 +21,7 @@ Usage:
 """
 
 import numpy as np
+import os
 import random
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -92,6 +93,93 @@ class ChunkOrderedSampler(Sampler):
         return self.n_samples
 
 
+class DistributedChunkOrderedSampler(Sampler):
+    """
+    Distributed variant of ChunkOrderedSampler for DDP training.
+
+    Assigns whole chunks to ranks via round-robin to preserve chunk locality
+    (important for streaming datasets that load chunks from disk).
+
+    Pads smaller ranks to match the largest rank's sample count to prevent
+    DDP hangs (all ranks must have the same number of batches).
+    """
+
+    def __init__(
+        self,
+        subset_indices: List[int],
+        chunk_size: int,
+        shuffle_chunks: bool = True,
+        shuffle_within: bool = True,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        seed: int = 42,
+    ):
+        import torch.distributed as dist
+
+        if num_replicas is None:
+            num_replicas = dist.get_world_size() if dist.is_initialized() else 1
+        if rank is None:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle_chunks = shuffle_chunks
+        self.shuffle_within = shuffle_within
+        self.seed = seed
+        self.epoch = 0
+
+        # Group logical indices by chunk
+        self.chunk_groups: Dict[int, List[int]] = {}
+        for logical_idx, original_idx in enumerate(subset_indices):
+            chunk_id = original_idx // chunk_size
+            if chunk_id not in self.chunk_groups:
+                self.chunk_groups[chunk_id] = []
+            self.chunk_groups[chunk_id].append(logical_idx)
+
+        # Assign chunks to this rank via round-robin
+        all_chunk_ids = sorted(self.chunk_groups.keys())
+        self.my_chunk_ids = [
+            cid for i, cid in enumerate(all_chunk_ids) if i % self.num_replicas == self.rank
+        ]
+
+        # Count samples for this rank
+        self.my_n_samples = sum(len(self.chunk_groups[cid]) for cid in self.my_chunk_ids)
+
+        # Compute padded length (all ranks must return same number of samples)
+        all_counts = []
+        for r in range(self.num_replicas):
+            r_chunks = [cid for i, cid in enumerate(all_chunk_ids) if i % self.num_replicas == r]
+            all_counts.append(sum(len(self.chunk_groups[cid]) for cid in r_chunks))
+        self.total_size = max(all_counts) if all_counts else 0
+
+    def set_epoch(self, epoch: int):
+        """Set epoch for deterministic shuffling across ranks."""
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        chunk_ids = list(self.my_chunk_ids)
+        if self.shuffle_chunks:
+            rng.shuffle(chunk_ids)
+
+        indices = []
+        for chunk_id in chunk_ids:
+            chunk_indices = list(self.chunk_groups[chunk_id])
+            if self.shuffle_within:
+                rng.shuffle(chunk_indices)
+            indices.extend(chunk_indices)
+
+        # Pad to total_size by wrapping
+        if len(indices) < self.total_size and len(indices) > 0:
+            while len(indices) < self.total_size:
+                indices.append(indices[len(indices) % self.my_n_samples])
+
+        return iter(indices[:self.total_size])
+
+    def __len__(self):
+        return self.total_size
+
+
 class ChunkedStreamingDataset(Dataset):
     """
     Memory-efficient dataset that loads samples in chunks.
@@ -139,7 +227,8 @@ class ChunkedStreamingDataset(Dataset):
         self.prefetch = prefetch
 
         # Build or load index
-        print(f"Loading offset index for {binary_path}...")
+        if int(os.environ.get('RANK', 0)) == 0:
+            print(f"Loading offset index for {binary_path}...")
         self.offsets, self.version, self.feature_table = get_or_build_index(binary_path)
         self.num_samples = len(self.offsets)
 
@@ -1541,6 +1630,8 @@ def create_streaming_dataloaders(
     prefetch: bool = True,
     sorted_reads: bool = False,
     max_samples: Optional[int] = None,
+    distributed: bool = False,
+    seed: int = 42,
 ) -> Tuple['torch.utils.data.DataLoader', 'torch.utils.data.DataLoader', int]:
     """
     Create train and validation dataloaders for streaming dataset.
@@ -1586,22 +1677,49 @@ def create_streaming_dataloaders(
     if max_samples is not None and max_samples < n_samples:
         n_samples = max_samples
     indices = list(range(n_samples))
-    random.shuffle(indices)
+    rng = random.Random(seed)
+    rng.shuffle(indices)
 
     val_size = int(n_samples * val_split)
     train_indices = indices[val_size:]
     val_indices = indices[:val_size]
 
-    print(f"Train samples: {len(train_indices):,}")
-    print(f"Val samples: {len(val_indices):,}")
+    if int(os.environ.get('RANK', 0)) == 0:
+        print(f"Train samples: {len(train_indices):,}")
+        print(f"Val samples: {len(val_indices):,}")
 
     # Create subsets
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
 
     # Create dataloaders
-    if sorted_reads:
-        print(f"Sorted reads: ON (chunk-ordered sampling, {len(set(i // chunk_size for i in train_indices))} train chunks, prefetch OFF)")
+    if distributed:
+        # DDP: chunk-ordered sampling with rank-based chunk assignment
+        train_sampler = DistributedChunkOrderedSampler(
+            train_indices, chunk_size, shuffle_chunks=True, shuffle_within=True, seed=seed,
+        )
+        val_sampler = DistributedChunkOrderedSampler(
+            val_indices, chunk_size, shuffle_chunks=False, shuffle_within=False, seed=seed,
+        )
+
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=batch_size,
+            sampler=val_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+    elif sorted_reads:
+        if int(os.environ.get('RANK', 0)) == 0:
+            print(f"Sorted reads: ON (chunk-ordered sampling, {len(set(i // chunk_size for i in train_indices))} train chunks, prefetch OFF)")
         train_sampler = ChunkOrderedSampler(train_indices, chunk_size)
         val_sampler = ChunkOrderedSampler(val_indices, chunk_size, shuffle_chunks=False)
 

@@ -1197,6 +1197,7 @@ def create_dataloaders(
     strategy_kwargs: Optional[Dict] = None,
     validate: bool = True,
     analyze_correlations: bool = True,
+    distributed: bool = False,
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
     """
     Create train and validation dataloaders.
@@ -1226,10 +1227,16 @@ def create_dataloaders(
         strategy_kwargs=strategy_kwargs,
         analyze_correlations=analyze_correlations,
     )
+    train_sampler = None
+    if distributed:
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
     )
@@ -1246,10 +1253,15 @@ def create_dataloaders(
             strategy_kwargs=strategy_kwargs,
             analyze_correlations=False,  # Already analyzed on train
         )
+        val_sampler = None
+        if distributed:
+            from torch.utils.data.distributed import DistributedSampler
+            val_sampler = DistributedSampler(val_dataset, shuffle=False)
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=num_workers,
             pin_memory=True,
         )

@@ -73,6 +73,13 @@ def cmd_train(args):
     """Train the model."""
     from .training import ChannelDataset, create_dataloaders, Trainer
     from .models import create_model
+    from .training.distributed import setup_distributed, cleanup_distributed, seed_everything, is_main_process
+
+    distributed = setup_distributed()
+    seed_everything(args.seed)
+
+    if not is_main_process():
+        logging.getLogger().setLevel(logging.WARNING)
 
     # Check if streaming mode requested
     streaming = getattr(args, 'streaming', False)
@@ -95,6 +102,8 @@ def cmd_train(args):
             val_split=0.2,
             num_workers=args.num_workers,
             max_samples=max_samples,
+            distributed=distributed,
+            seed=args.seed,
         )
 
         logger.info(f"Features: {actual_feature_count:,}")
@@ -116,6 +125,8 @@ def cmd_train(args):
             prefetch=True,
             sorted_reads=sorted_reads,
             max_samples=max_samples,
+            distributed=distributed,
+            seed=args.seed,
         )
 
         logger.info(f"Features: {actual_feature_count:,}")
@@ -142,7 +153,8 @@ def cmd_train(args):
             batch_size=args.batch_size,
             target_tf=args.target_tf,
             strategy=args.strategy,
-            num_workers=args.num_workers
+            num_workers=args.num_workers,
+            distributed=distributed,
         )
 
         # Detect actual feature count from samples (C++ scanner may produce different count than config)
@@ -252,6 +264,8 @@ def cmd_train(args):
     history = trainer.train()
 
     logger.info("Training complete!")
+
+    cleanup_distributed()
 
 
 def cmd_analyze(args):
@@ -515,6 +529,8 @@ def main():
     # Per-timeframe loss weight
     train_parser.add_argument('--per-tf-loss-weight', type=float, default=0.0,
         help='Weight for per-timeframe duration loss (0.0 = disabled, try 0.5 to enable)')
+    train_parser.add_argument('--seed', type=int, default=42,
+        help='Random seed for reproducibility (default: 42)')
 
     # Convert command
     convert_parser = subparsers.add_parser('convert', help='Convert .bin to .flat format for instant loading')

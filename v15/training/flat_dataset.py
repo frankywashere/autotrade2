@@ -219,6 +219,8 @@ def create_flat_dataloaders(
     val_split: float = 0.2,
     num_workers: int = 0,
     max_samples: Optional[int] = None,
+    distributed: bool = False,
+    seed: int = 42,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, int]:
     """
     Create train and validation dataloaders from a .flat directory.
@@ -242,7 +244,8 @@ def create_flat_dataloaders(
         n_samples = max_samples
 
     indices = list(range(n_samples))
-    random.shuffle(indices)
+    rng = random.Random(seed)
+    rng.shuffle(indices)
 
     val_size = int(n_samples * val_split)
     train_indices = indices[val_size:]
@@ -254,10 +257,19 @@ def create_flat_dataloaders(
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
 
+    train_sampler = None
+    if distributed:
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(train_subset, shuffle=True)
+        val_sampler = DistributedSampler(val_subset, shuffle=False)
+    else:
+        val_sampler = None
+
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
     )
@@ -266,6 +278,7 @@ def create_flat_dataloaders(
         val_subset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=True,
     )
