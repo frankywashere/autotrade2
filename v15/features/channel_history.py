@@ -135,7 +135,7 @@ def _encode_break_sequence(break_directions: List[int]) -> int:
     Encode a sequence of break directions to a single value.
 
     Args:
-        break_directions: List of break directions (-1=down, 0=no break, 1=up)
+        break_directions: List of break directions (0=down, 1=up)
 
     Returns:
         0 = all down breaks
@@ -148,7 +148,7 @@ def _encode_break_sequence(break_directions: List[int]) -> int:
         return 2  # mixed/unknown
 
     up_count = sum(1 for b in break_directions if b > 0)
-    down_count = sum(1 for b in break_directions if b < 0)
+    down_count = sum(1 for b in break_directions if b == 0)
     total = len(break_directions)
 
     if down_count == total:
@@ -442,7 +442,7 @@ def _extract_single_history_features(
     features[f'{prefix}up_break_ratio'] = safe_divide(up_break_count, max(n_channels, 1), 0.0)
 
     # 27. Down break ratio in last 5
-    down_break_count = sum(1 for b in break_directions if b < 0)
+    down_break_count = sum(1 for b in break_directions if b == 0)
     features[f'{prefix}down_break_ratio'] = safe_divide(down_break_count, max(n_channels, 1), 0.0)
 
     # ==========================================================================

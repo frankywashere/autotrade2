@@ -108,6 +108,10 @@ class LivePredictor:
             tf: {'tsla': [], 'spy': []} for tf in TIMEFRAMES
         }
 
+        # Native TF bars from yfinance (for higher TFs like daily/weekly/monthly)
+        # Format: {'tsla': {'daily': df, 'weekly': df, ...}, 'spy': {...}, 'vix': {...}}
+        self.native_bars_by_tf: Optional[Dict[str, Dict[str, Any]]] = None
+
         # Metrics
         self.prediction_count = 0
         self.total_latency_ms = 0.0
@@ -198,8 +202,12 @@ class LivePredictor:
     def can_predict(self) -> bool:
         """Check if we have enough data for prediction."""
         if self.tsla_data is None:
+            print(f"[PREDICT] can_predict: No data loaded yet")
             return False
-        return len(self.tsla_data) >= self.min_bars
+        has_enough = len(self.tsla_data) >= self.min_bars
+        if not has_enough:
+            print(f"[PREDICT] can_predict: {len(self.tsla_data):,} bars < {self.min_bars:,} required")
+        return has_enough
 
     def _compute_bar_completion_by_tf(self) -> Dict[str, float]:
         """
@@ -247,66 +255,62 @@ class LivePredictor:
 
         start_time = time.perf_counter()
 
-        try:
-            # Use VIX or create dummy
-            vix = self.vix_data if self.vix_data is not None else pd.DataFrame({
-                'open': [20.0], 'high': [20.0], 'low': [20.0], 'close': [20.0]
-            }, index=[self.tsla_data.index[-1]])
+        # Use VIX or create dummy
+        vix = self.vix_data if self.vix_data is not None else pd.DataFrame({
+            'open': [20.0], 'high': [20.0], 'low': [20.0], 'close': [20.0]
+        }, index=[self.tsla_data.index[-1]])
 
-            # Make prediction with partial bar support
-            # source_bar_count is critical for accurate bar_completion_pct
-            prediction = self.predictor.predict(
-                self.tsla_data,
-                self.spy_data,
-                vix,
-                source_bar_count=self.total_bars_received,
-                channel_history_by_tf=self.channel_history_by_tf if self.track_channel_history else None,
+        # Make prediction with partial bar support
+        # source_bar_count is critical for accurate bar_completion_pct
+        prediction = self.predictor.predict(
+            self.tsla_data,
+            self.spy_data,
+            vix,
+            source_bar_count=self.total_bars_received,
+            channel_history_by_tf=self.channel_history_by_tf if self.track_channel_history else None,
+            native_bars_by_tf=self.native_bars_by_tf,
+        )
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+
+        # Compute bar completion for each TF
+        bar_completion = self._compute_bar_completion_by_tf()
+
+        # Create LivePrediction with learned window selection info
+        live_pred = LivePrediction(
+            prediction=prediction,
+            data_timestamp=self.tsla_data.index[-1],
+            prediction_time=datetime.now(),
+            latency_ms=latency_ms,
+            channel_valid=True,
+            source_bar_count=self.total_bars_received,
+            bar_completion_by_tf=bar_completion,
+            # Learned window selection fields from prediction
+            used_learned_selection=prediction.used_learned_selection,
+            learned_window=prediction.learned_window,
+            learned_window_probs=prediction.learned_window_probs,
+        )
+
+        # Log learned window selection if used
+        if prediction.used_learned_selection:
+            logger.debug(
+                f"Live prediction using learned window={prediction.learned_window} "
+                f"(best_window={prediction.best_window})"
             )
 
-            latency_ms = (time.perf_counter() - start_time) * 1000
+        # Check for channel transitions and update history
+        if self.track_channel_history:
+            self._check_channel_transitions(self.tsla_data.index[-1])
 
-            # Compute bar completion for each TF
-            bar_completion = self._compute_bar_completion_by_tf()
+        # Update metrics
+        self.prediction_count += 1
+        self.total_latency_ms += latency_ms
 
-            # Create LivePrediction with learned window selection info
-            live_pred = LivePrediction(
-                prediction=prediction,
-                data_timestamp=self.tsla_data.index[-1],
-                prediction_time=datetime.now(),
-                latency_ms=latency_ms,
-                channel_valid=True,
-                source_bar_count=self.total_bars_received,
-                bar_completion_by_tf=bar_completion,
-                # Learned window selection fields from prediction
-                used_learned_selection=prediction.used_learned_selection,
-                learned_window=prediction.learned_window,
-                learned_window_probs=prediction.learned_window_probs,
-            )
+        # Callback
+        if self.on_prediction:
+            self.on_prediction(live_pred)
 
-            # Log learned window selection if used
-            if prediction.used_learned_selection:
-                logger.debug(
-                    f"Live prediction using learned window={prediction.learned_window} "
-                    f"(best_window={prediction.best_window})"
-                )
-
-            # Check for channel transitions and update history (NEW)
-            if self.track_channel_history:
-                self._check_channel_transitions(self.tsla_data.index[-1])
-
-            # Update metrics
-            self.prediction_count += 1
-            self.total_latency_ms += latency_ms
-
-            # Callback
-            if self.on_prediction:
-                self.on_prediction(live_pred)
-
-            return live_pred
-
-        except Exception as e:
-            logger.error(f"Prediction failed: {e}")
-            return None
+        return live_pred
 
     def predict_with_per_tf(self) -> Optional[LivePrediction]:
         """
@@ -327,66 +331,64 @@ class LivePredictor:
             )
             return None
 
+        print(f"[PREDICT] Running predict_with_per_tf "
+              f"({len(self.tsla_data):,} bars, {len(TIMEFRAMES)} TFs)...")
         start_time = time.perf_counter()
 
-        try:
-            # Use VIX or create dummy
-            vix = self.vix_data if self.vix_data is not None else pd.DataFrame({
-                'open': [20.0], 'high': [20.0], 'low': [20.0], 'close': [20.0]
-            }, index=[self.tsla_data.index[-1]])
+        # Use VIX or create dummy
+        vix = self.vix_data if self.vix_data is not None else pd.DataFrame({
+            'open': [20.0], 'high': [20.0], 'low': [20.0], 'close': [20.0]
+        }, index=[self.tsla_data.index[-1]])
 
-            # Make prediction with per-TF breakdown + channel history
-            prediction = self.predictor.predict_with_per_tf(
-                self.tsla_data,
-                self.spy_data,
-                vix,
-                source_bar_count=self.total_bars_received,
-                channel_history_by_tf=self.channel_history_by_tf if self.track_channel_history else None,
+        # Make prediction with per-TF breakdown + channel history
+        prediction = self.predictor.predict_with_per_tf(
+            self.tsla_data,
+            self.spy_data,
+            vix,
+            source_bar_count=self.total_bars_received,
+            channel_history_by_tf=self.channel_history_by_tf if self.track_channel_history else None,
+            native_bars_by_tf=self.native_bars_by_tf,
+        )
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+
+        # Compute bar completion for each TF
+        bar_completion = self._compute_bar_completion_by_tf()
+
+        # Create LivePrediction with learned window selection info
+        live_pred = LivePrediction(
+            prediction=prediction,
+            data_timestamp=self.tsla_data.index[-1],
+            prediction_time=datetime.now(),
+            latency_ms=latency_ms,
+            channel_valid=True,
+            source_bar_count=self.total_bars_received,
+            bar_completion_by_tf=bar_completion,
+            used_learned_selection=prediction.used_learned_selection,
+            learned_window=prediction.learned_window,
+            learned_window_probs=prediction.learned_window_probs,
+        )
+
+        # Log learned window selection if used
+        if prediction.used_learned_selection:
+            logger.debug(
+                f"Live prediction (per-TF) using learned window={prediction.learned_window} "
+                f"(best_window={prediction.best_window})"
             )
 
-            latency_ms = (time.perf_counter() - start_time) * 1000
+        # Check for channel transitions and update history
+        if self.track_channel_history:
+            self._check_channel_transitions(self.tsla_data.index[-1])
 
-            # Compute bar completion for each TF
-            bar_completion = self._compute_bar_completion_by_tf()
+        # Update metrics
+        self.prediction_count += 1
+        self.total_latency_ms += latency_ms
 
-            # Create LivePrediction with learned window selection info
-            live_pred = LivePrediction(
-                prediction=prediction,
-                data_timestamp=self.tsla_data.index[-1],
-                prediction_time=datetime.now(),
-                latency_ms=latency_ms,
-                channel_valid=True,
-                source_bar_count=self.total_bars_received,
-                bar_completion_by_tf=bar_completion,
-                used_learned_selection=prediction.used_learned_selection,
-                learned_window=prediction.learned_window,
-                learned_window_probs=prediction.learned_window_probs,
-            )
+        # Callback
+        if self.on_prediction:
+            self.on_prediction(live_pred)
 
-            # Log learned window selection if used
-            if prediction.used_learned_selection:
-                logger.debug(
-                    f"Live prediction (per-TF) using learned window={prediction.learned_window} "
-                    f"(best_window={prediction.best_window})"
-                )
-
-            # Check for channel transitions and update history
-            if self.track_channel_history:
-                self._check_channel_transitions(self.tsla_data.index[-1])
-
-            # Update metrics
-            self.prediction_count += 1
-            self.total_latency_ms += latency_ms
-
-            # Callback
-            if self.on_prediction:
-                self.on_prediction(live_pred)
-
-            return live_pred
-
-        except Exception as e:
-            logger.error(f"Prediction (per-TF) failed: {e}")
-            return None
+        return live_pred
 
     def _check_channel_transitions(self, current_ts: pd.Timestamp) -> None:
         """
@@ -759,10 +761,45 @@ class LivePredictor:
         else:
             self.total_bars_received = len(tsla_df)
 
-        logger.info(
-            f"Loaded {len(self.tsla_data)} bars of historical data. "
-            f"total_bars_received={self.total_bars_received}"
+        print(
+            f"[PREDICT] Loaded {len(self.tsla_data):,} bars "
+            f"(input had {len(tsla_df):,}, min_bars={self.min_bars:,}, "
+            f"total_bars_received={self.total_bars_received:,})"
         )
+        if self.tsla_data is not None and len(self.tsla_data) > 0:
+            print(
+                f"[PREDICT] Data range: {self.tsla_data.index[0]} to {self.tsla_data.index[-1]}"
+            )
+
+    def load_native_tf_data(
+        self,
+        native_data: Dict[str, Dict[str, 'pd.DataFrame']],
+    ) -> None:
+        """
+        Load pre-fetched native TF bars for higher timeframes.
+
+        Uses yfinance's native intervals (daily, weekly, monthly have unlimited
+        history) instead of resampling from 5-min data which is limited to ~60 days.
+
+        Args:
+            native_data: Dict from load_native_tf_data(), format:
+                {'TSLA': {'daily': df, ...}, 'SPY': {...}, '^VIX': {...}}
+                Symbol keys are yfinance-style (uppercase, ^VIX).
+        """
+        # Normalize symbol keys to lowercase for internal use
+        self.native_bars_by_tf = {
+            'tsla': native_data.get('TSLA', {}),
+            'spy': native_data.get('SPY', {}),
+            'vix': native_data.get('^VIX', {}),
+        }
+
+        # Log what we loaded
+        for asset, tfs in self.native_bars_by_tf.items():
+            if tfs:
+                tf_summary = ", ".join(
+                    f"{tf}={len(df)}" for tf, df in tfs.items() if len(df) > 0
+                )
+                print(f"[PREDICT] Native TF data for {asset}: {tf_summary}")
 
 
 def create_live_predictor(

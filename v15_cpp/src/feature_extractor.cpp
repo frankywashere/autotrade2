@@ -5229,7 +5229,7 @@ int FeatureExtractor::encode_direction_sequence(const std::vector<int>& directio
 int FeatureExtractor::encode_break_sequence(const std::vector<int>& break_directions) {
     if (break_directions.empty()) return 2;
     int up_count = 0, down_count = 0;
-    for (int b : break_directions) { if (b > 0) ++up_count; else if (b < 0) ++down_count; }
+    for (int b : break_directions) { if (b > 0) ++up_count; else if (b == 0) ++down_count; }
     int total = static_cast<int>(break_directions.size());
     if (down_count == total) return 0;
     if (up_count == total) return 4;
@@ -5328,7 +5328,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_single_history
     features[prefix + "recent_vs_avg_quality"] = r_squareds.empty() ? 0.0 : safe_float(r_squareds.back() - features[prefix + "last5_avg_quality"], 0.0);
     int bull = 0, bear = 0, up_b = 0, dn_b = 0;
     for (int d : directions) { if (d == 2) ++bull; if (d == 0) ++bear; }
-    for (int b : break_directions) { if (b > 0) ++up_b; if (b < 0) ++dn_b; }
+    for (int b : break_directions) { if (b > 0) ++up_b; if (b == 0) ++dn_b; }
     features[prefix + "bull_channel_ratio"] = safe_divide(static_cast<double>(bull), std::max(n_ch, 1), 0.0);
     features[prefix + "bear_channel_ratio"] = safe_divide(static_cast<double>(bear), std::max(n_ch, 1), 0.0);
     features[prefix + "up_break_ratio"] = safe_divide(static_cast<double>(up_b), std::max(n_ch, 1), 0.0);

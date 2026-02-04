@@ -831,7 +831,8 @@ def extract_all_tf_features(
     timestamp: pd.Timestamp,
     channel_history_by_tf: Optional[Dict[str, Dict]] = None,
     source_bar_count: Optional[int] = None,
-    include_bar_metadata: bool = True
+    include_bar_metadata: bool = True,
+    native_bars_by_tf: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None,
 ) -> Dict[str, float]:
     """
     Extract ALL features for ALL timeframes with partial bar support.
@@ -857,6 +858,11 @@ def extract_all_tf_features(
                          Used to calculate bar_completion_pct based on position
                          within the TF bar. If None, uses len(tsla_df).
         include_bar_metadata: If True, include 30 bar metadata features (default True)
+        native_bars_by_tf: Optional dict of pre-fetched native TF bars from yfinance.
+            Format: {'tsla': {'daily': df, 'weekly': df, ...}, 'spy': {...}, 'vix': {...}}
+            When provided for a TF, uses these bars instead of resampling from 5-min data.
+            This allows higher TFs (daily/weekly/monthly) to use yfinance's full data
+            history instead of being limited by 5-min data retention (~60 days).
 
     Returns:
         Dict[str, float] with ~14,540 features:
@@ -907,18 +913,42 @@ def extract_all_tf_features(
     # -------------------------------------------------------------------------
     for tf in TIMEFRAMES:
         try:
-            # 1. Resample data to this TF with partial bar support
-            # Pass source_bar_count to calculate correct bar_completion_pct
-            tsla_tf, tsla_meta = _resample_to_tf(tsla_df, tf, source_bar_count)
-            spy_tf, _ = _resample_to_tf(spy_df, tf, source_bar_count)
-            vix_tf, _ = _resample_to_tf(vix_df, tf, source_bar_count)
+            # 1. Get data for this TF — use native bars if available, else resample
+            used_native = False
+            if (native_bars_by_tf
+                    and native_bars_by_tf.get('tsla', {}).get(tf) is not None
+                    and len(native_bars_by_tf['tsla'][tf]) >= 10):
+                # Use pre-fetched native TF bars from yfinance
+                tsla_tf = native_bars_by_tf['tsla'][tf]
+                spy_tf = native_bars_by_tf.get('spy', {}).get(tf, pd.DataFrame())
+                vix_tf = native_bars_by_tf.get('vix', {}).get(tf, pd.DataFrame())
+                tsla_meta = {
+                    'bar_completion_pct': 1.0,  # Native bars are complete
+                    'bars_in_partial': 0,
+                    'expected_bars': BARS_PER_TF.get(tf, 1),
+                    'is_partial': False,
+                    'total_bars': len(tsla_tf),
+                    'source_bars': len(tsla_tf),
+                }
+                used_native = True
+                print(f"[FEATURES] {tf}: using native TF data "
+                      f"(TSLA={len(tsla_tf)}, SPY={len(spy_tf)}, VIX={len(vix_tf)} bars)")
+            else:
+                # Resample from 5-min base data
+                tsla_tf, tsla_meta = _resample_to_tf(tsla_df, tf, source_bar_count)
+                spy_tf, _ = _resample_to_tf(spy_df, tf, source_bar_count)
+                vix_tf, _ = _resample_to_tf(vix_df, tf, source_bar_count)
 
             # Store metadata for bar metadata features
             metadata_by_tf[tf] = tsla_meta
 
             # Check if we have enough data
             if len(tsla_tf) < 10:
-                logger.debug(f"Not enough data for {tf} (have {len(tsla_tf)} bars)")
+                if used_native:
+                    print(f"[FEATURES] Skipping {tf}: native TF only has "
+                          f"{len(tsla_tf)} bars (need 10)")
+                else:
+                    print(f"[FEATURES] Skipping {tf}: only {len(tsla_tf)} bars (need 10)")
                 continue
 
             # 2. Detect channels at all windows for this TF (TSLA)
@@ -1020,8 +1050,8 @@ def extract_all_tf_features(
     extraction_stats['features_extracted'] = len(all_features)
 
     # Log summary
-    logger.debug(
-        f"TF feature extraction complete: {extraction_stats['features_extracted']} features, "
+    print(
+        f"[FEATURES] Extraction complete: {extraction_stats['features_extracted']} features, "
         f"{extraction_stats['timeframes_processed']}/{len(TIMEFRAMES)} TFs processed"
     )
 

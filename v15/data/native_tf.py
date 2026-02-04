@@ -63,8 +63,8 @@ YF_INTERVAL_MAX_PERIOD = {
     '5m': 60,      # ~60 days
     '15m': 60,     # ~60 days
     '30m': 60,     # ~60 days
-    '1h': 730,     # ~2 years
-    '60m': 730,    # ~2 years
+    '1h': 729,     # ~2 years (730 rejected by Yahoo's boundary check)
+    '60m': 729,    # ~2 years
     '1d': 10000,   # Essentially unlimited
     '1wk': 10000,
     '1mo': 10000,
@@ -318,15 +318,33 @@ def fetch_native_tf(
         cache_dir = Path.home() / '.x14' / 'native_tf_cache'
     cache_dir = Path(cache_dir)
 
-    # Check cache first
+    # Get yfinance interval
+    yf_interval = TF_TO_YF_INTERVAL[tf]
+
+    # Adjust start_date for intraday retention limits BEFORE cache lookup
+    # so the cache key matches on both read and write
+    if yf_interval is not None and yf_interval in YF_INTERVAL_MAX_PERIOD:
+        max_days = YF_INTERVAL_MAX_PERIOD[yf_interval]
+        requested_days = (
+            pd.to_datetime(end_date) - pd.to_datetime(start_date)
+        ).days
+
+        if requested_days > max_days:
+            logger.warning(
+                f"Requested {requested_days} days but {yf_interval} interval "
+                f"only supports ~{max_days} days. Clamping start date."
+            )
+            adjusted_start = (
+                pd.to_datetime(end_date) - timedelta(days=max_days)
+            ).strftime('%Y-%m-%d')
+            start_date = adjusted_start
+
+    # Check cache (now using the adjusted start_date)
     if use_cache:
         cache_path = _get_cache_path(cache_dir, symbol, tf, start_date, end_date)
         cached_data = _load_from_cache(cache_path, cache_max_age_hours)
         if cached_data is not None:
             return cached_data
-
-    # Get yfinance interval
-    yf_interval = TF_TO_YF_INTERVAL[tf]
 
     # Handle timeframes that need aggregation from hourly
     if yf_interval is None:
@@ -355,24 +373,6 @@ def fetch_native_tf(
         df = _aggregate_from_hourly(hourly_df, target_hours)
 
     else:
-        # Check data retention limits for intraday
-        if yf_interval in YF_INTERVAL_MAX_PERIOD:
-            max_days = YF_INTERVAL_MAX_PERIOD[yf_interval]
-            requested_days = (
-                pd.to_datetime(end_date) - pd.to_datetime(start_date)
-            ).days
-
-            if requested_days > max_days:
-                logger.warning(
-                    f"Requested {requested_days} days but {yf_interval} interval "
-                    f"only supports ~{max_days} days. Data will be truncated."
-                )
-                # Adjust start date to respect limit
-                adjusted_start = (
-                    pd.to_datetime(end_date) - timedelta(days=max_days)
-                ).strftime('%Y-%m-%d')
-                start_date = adjusted_start
-
         # Fetch from yfinance
         df = _fetch_yfinance_data(
             symbol=symbol,

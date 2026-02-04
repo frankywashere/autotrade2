@@ -18,7 +18,7 @@ struct ChannelHistoryEntry {
     double duration = 50.0;         // Duration of the channel in bars
     double slope = 0.0;             // Channel slope
     int direction = 1;              // 0=bear, 1=sideways, 2=bull
-    int break_direction = 0;        // -1=down, 0=no break, 1=up
+    int break_direction = 0;        // 0=down, 1=up (matches BreakDirection enum)
     double r_squared = 0.0;         // Channel quality (R-squared)
     double bounce_count = 0.0;      // Number of bounces off channel bounds
 

@@ -156,7 +156,10 @@ def create_candlestick_chart(df: pd.DataFrame) -> 'go.Figure':
     )
 
     # Disable autoscale on x-axis for consistent display
-    fig.update_xaxes(fixedrange=False)
+    fig.update_xaxes(
+        fixedrange=False,
+        rangebreaks=[dict(bounds=["sat", "mon"])],
+    )
     fig.update_yaxes(fixedrange=False)
 
     return fig
@@ -172,6 +175,7 @@ def add_channel_overlay(
     start_idx: int,
     project_forward: int = 0,
     line_color: str = CHANNEL_LINE_COLOR,
+    x_index: Optional[pd.Index] = None,
     fill_color: str = CHANNEL_FILL_COLOR,
     center_color: str = CENTER_LINE_COLOR,
 ) -> 'go.Figure':
@@ -194,6 +198,9 @@ def add_channel_overlay(
         start_idx: Starting x-axis index for the channel lines
         project_forward: Number of bars to project bounds forward (default: 0)
         line_color: Color for upper/lower lines (default: orange)
+        x_index: Optional pandas Index (DatetimeIndex) from the chart DataFrame.
+                 When provided, maps integer positions to actual timestamps so
+                 channel lines align with candlestick datetime x-axis.
         fill_color: Color for fill between bounds (default: semi-transparent orange)
         center_color: Color for center line (default: blue)
 
@@ -225,7 +232,19 @@ def add_channel_overlay(
         return fig
 
     # X-axis values for the channel region
-    x_channel = list(range(start_idx, start_idx + channel_len))
+    # When x_index is provided (DatetimeIndex), map positions to timestamps
+    # so channel lines align with candlestick datetime x-axis
+    if x_index is not None and isinstance(x_index, pd.DatetimeIndex):
+        # Map channel positions to actual timestamps from the DataFrame index
+        x_channel = []
+        for i in range(channel_len):
+            idx = start_idx + i
+            if 0 <= idx < len(x_index):
+                x_channel.append(x_index[idx])
+            else:
+                x_channel.append(x_index[-1])  # Clamp to last timestamp
+    else:
+        x_channel = list(range(start_idx, start_idx + channel_len))
 
     # Add filled region between upper and lower bounds
     # Use fill='tonexty' by adding lower then upper with fill
@@ -320,6 +339,7 @@ def add_bounce_markers(
     upper_color: str = BOUNCE_UPPER_COLOR,
     lower_color: str = BOUNCE_LOWER_COLOR,
     marker_size: int = 12,
+    x_index: Optional[pd.Index] = None,
 ) -> 'go.Figure':
     """
     Add markers at bounce points where price touched channel boundaries.
@@ -338,6 +358,8 @@ def add_bounce_markers(
         upper_color: Color for upper boundary touch markers (default: red)
         lower_color: Color for lower boundary touch markers (default: green)
         marker_size: Size of touch markers (default: 12)
+        x_index: Optional pandas Index (DatetimeIndex) from the chart DataFrame.
+                 When provided, maps bar positions to actual timestamps.
 
     Returns:
         The modified Figure with bounce markers added
@@ -370,13 +392,21 @@ def add_bounce_markers(
 
     n_bars = len(df) if df is not None else float('inf')
 
+    use_datetime = x_index is not None and isinstance(x_index, pd.DatetimeIndex)
+
     for touch in touches:
         # Calculate plot x position (touch.bar_index is relative to channel window)
-        plot_x = start_idx + touch.bar_index
+        int_x = start_idx + touch.bar_index
 
         # Skip if outside valid range
-        if plot_x < 0 or plot_x >= n_bars:
+        if int_x < 0 or int_x >= n_bars:
             continue
+
+        # Map to datetime if available
+        if use_datetime and 0 <= int_x < len(x_index):
+            plot_x = x_index[int_x]
+        else:
+            plot_x = int_x
 
         # TouchType.UPPER = 1, TouchType.LOWER = 0
         touch_type = touch.touch_type
@@ -423,6 +453,115 @@ def add_bounce_markers(
             hovertemplate='Lower Touch<br>Bar: %{x}<br>Price: %{y:.2f}<extra></extra>',
             showlegend=False,
         ))
+
+    return fig
+
+
+# =============================================================================
+# DURATION PROJECTION
+# =============================================================================
+
+def add_duration_projection(
+    fig: 'go.Figure',
+    channel: 'Channel',
+    chart_df: pd.DataFrame,
+    duration_mean: float,
+    duration_std: float,
+    confidence: float,
+    direction: Optional[str] = None,
+) -> 'go.Figure':
+    """
+    Add a duration projection overlay to a timeframe chart.
+
+    Extends channel bounds forward using slope extrapolation (matching the
+    inspector's approach), colored by predicted break direction.  Adds a
+    dashed vertical marker at the mean predicted break point.
+
+    Args:
+        fig: Existing Plotly Figure to add projection to
+        channel: Channel object with slope, intercept, std_dev, center_line
+        chart_df: DataFrame used for the chart (provides x-axis index)
+        duration_mean: Mean predicted duration in bars
+        duration_std: Standard deviation of duration prediction
+        confidence: Model confidence 0-1 (controls opacity of break marker)
+        direction: Aggregate predicted direction ('up', 'down', or None)
+
+    Returns:
+        The modified Figure with projection overlay added
+    """
+    _check_plotly_available()
+
+    if not _validate_channel(channel):
+        return fig
+
+    n_forward = max(1, round(duration_mean))
+    window = len(channel.center_line)
+
+    # Generate future x-values by extrapolating the bar interval
+    x_index = chart_df.index
+    if isinstance(x_index, pd.DatetimeIndex) and len(x_index) >= 2:
+        diffs = x_index[-10:].to_series().diff().dropna()
+        bar_interval = diffs.median()
+        future_x = [x_index[-1] + bar_interval * (i + 1) for i in range(n_forward)]
+    else:
+        start = len(chart_df)
+        future_x = list(range(start, start + n_forward))
+
+    # Project channel bounds forward using slope extrapolation
+    regression_x = np.arange(window, window + n_forward)
+    proj_center = channel.slope * regression_x + channel.intercept
+    proj_upper = proj_center + 2 * channel.std_dev
+    proj_lower = proj_center - 2 * channel.std_dev
+
+    proj_upper = np.maximum(proj_upper, 0.01)
+    proj_lower = np.maximum(proj_lower, 0.01)
+
+    # Direction-based colors
+    if direction == 'up':
+        line_clr = 'rgba(0,180,0,0.5)'
+        fill_clr = 'rgba(0,180,0,0.07)'
+        vline_clr = 'green'
+    elif direction == 'down':
+        line_clr = 'rgba(200,0,0,0.5)'
+        fill_clr = 'rgba(200,0,0,0.07)'
+        vline_clr = 'red'
+    else:
+        line_clr = 'rgba(255,165,0,0.5)'
+        fill_clr = 'rgba(255,165,0,0.05)'
+        vline_clr = 'gray'
+
+    # Draw projected bounds (price-bounded, like the inspector)
+    fig.add_trace(go.Scatter(
+        x=future_x, y=proj_lower,
+        mode='lines',
+        line=dict(color=line_clr, width=1.5, dash='dot'),
+        hoverinfo='skip', showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=future_x, y=proj_upper,
+        mode='lines',
+        line=dict(color=line_clr, width=1.5, dash='dot'),
+        fill='tonexty', fillcolor=fill_clr,
+        hoverinfo='skip', showlegend=False,
+    ))
+
+    # Vertical marker at mean break point
+    mean_idx = min(round(duration_mean) - 1, n_forward - 1)
+    mean_x = future_x[max(0, mean_idx)]
+
+    fig.add_vline(
+        x=mean_x,
+        line_dash='dash', line_color=vline_clr,
+        line_width=1.5, opacity=min(confidence + 0.3, 1.0),
+    )
+
+    std_label = f" +/- {duration_std:.0f}" if duration_std > 0 else ""
+    fig.add_annotation(
+        x=mean_x, y=1.02, yref='paper',
+        text=f"Break: {duration_mean:.0f}{std_label}",
+        showarrow=False,
+        font=dict(size=11, color=vline_clr),
+    )
 
     return fig
 
@@ -514,11 +653,15 @@ def create_tf_channel_chart(
 
         # Add channel overlay
         # Channel starts at bar 0 (assuming df is already sliced to show channel period)
-        fig = add_channel_overlay(fig, channel, start_idx=0, project_forward=project_forward)
+        # Pass df.index so channel lines use datetime x-values matching the candlesticks
+        fig = add_channel_overlay(
+            fig, channel, start_idx=0, project_forward=project_forward,
+            x_index=df.index,
+        )
 
         # Add bounce markers
         if show_bounces:
-            fig = add_bounce_markers(fig, channel, df, start_idx=0)
+            fig = add_bounce_markers(fig, channel, df, start_idx=0, x_index=df.index)
     else:
         # No valid channel
         title = (

@@ -34,6 +34,7 @@ from v15.visualization.plotly_charts import (
     create_tf_channel_chart,
     create_candlestick_chart,
     add_channel_overlay,
+    add_duration_projection,
     PLOTLY_AVAILABLE
 )
 
@@ -45,6 +46,13 @@ from v15.live_data import (
     get_market_status,
     YFINANCE_AVAILABLE
 )
+
+# Import native TF data loader for per-TF yfinance fetching
+from v15.data.native_tf import load_native_tf_data as _load_native_tf_data
+
+# Higher TFs that benefit from native yfinance fetching
+# (daily/weekly/monthly have unlimited history vs 60d for 5-min)
+NATIVE_TF_LIST = ['1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
 
 logger = logging.getLogger(__name__)
 
@@ -415,7 +423,7 @@ def show_per_tf_predictions_table(prediction):
             elif conf >= 0.6:
                 return ['background-color: #fff3cd'] * len(row)  # Yellow
             else:
-                return ['background-color: #f8d7da'] * len(row)  # Red
+                return ['background-color: #3a3a3a; color: #e0e0e0'] * len(row)  # Dim
         except:
             return [''] * len(row)
 
@@ -427,13 +435,14 @@ def show_per_tf_predictions_table(prediction):
 # Channel Visualization Tab
 # =============================================================================
 
-def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None):
+def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, native_bars_by_tf=None):
     """
     Display channel visualization for all 10 timeframes.
 
     Args:
         tsla_df: TSLA OHLCV DataFrame (5-min base)
         prediction: Optional prediction with per_tf_predictions
+        native_bars_by_tf: Optional dict of native TF data keyed by symbol then timeframe
     """
     from v15.features.tf_extractor import resample_to_timeframe
 
@@ -467,8 +476,13 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None):
 
         with st.expander(expander_header, expanded=False):
             try:
-                # Resample to this timeframe
-                tf_df = resample_to_timeframe(tsla_df, tf_name)
+                # Use native TF data if available for this timeframe
+                if (native_bars_by_tf
+                        and native_bars_by_tf.get('TSLA', {}).get(tf_name) is not None
+                        and len(native_bars_by_tf['TSLA'][tf_name]) >= 20):
+                    tf_df = native_bars_by_tf['TSLA'][tf_name].copy()
+                else:
+                    tf_df = resample_to_timeframe(tsla_df, tf_name)
 
                 if len(tf_df) < 20:
                     st.warning(f"Insufficient data for {tf_name} ({len(tf_df)} bars)")
@@ -488,9 +502,11 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None):
                 # Get the channel for the selected window
                 channel = tf_channels.get(tf_window)
 
-                # Slice data to show just the channel window
-                window_bars = min(tf_window, len(tf_df))
-                chart_df = tf_df.iloc[-window_bars:].copy()
+                # Slice data to match channel detection window
+                # detect_channel uses df.iloc[-(window+1):-1] (excludes last bar)
+                # so chart_df should cover the same range for proper alignment
+                window_bars = min(tf_window, len(tf_df) - 1)
+                chart_df = tf_df.iloc[-(window_bars + 1):-1].copy()
 
                 if channel is not None and getattr(channel, 'valid', False):
                     # Create chart with channel
@@ -503,6 +519,22 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None):
                         show_bounces=True,
                         height=350
                     )
+
+                    # Add duration projection overlay
+                    if duration > 0 and confidence > 0:
+                        duration_std = 0.0
+                        if (prediction is not None
+                                and prediction.per_tf_predictions is not None
+                                and tf_name in prediction.per_tf_predictions):
+                            duration_std = prediction.per_tf_predictions[tf_name].duration_std
+
+                        agg_direction = prediction.direction if prediction else None
+
+                        fig = add_duration_projection(
+                            fig, channel, chart_df,
+                            duration, duration_std, confidence, agg_direction,
+                        )
+
                     st.plotly_chart(fig, use_container_width=True)
 
                     # Show channel metrics
@@ -546,12 +578,16 @@ def get_live_data_with_fallback(
     lookback: int = 35000
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, bool, Optional[str]]:
     """
-    Get market data, preferring live data if enabled and available.
+    Get market data, merging CSV history with fresh yfinance data.
+
+    When use_live=True, fetches recent data from yfinance and appends it
+    to the CSV historical data. This gives us years of history plus
+    current market data — both are needed for all 10 timeframes.
 
     Args:
         use_live: Whether to attempt live data fetch
-        loaded_data: Tuple of (tsla, spy, vix) loaded from files
-        lookback: Number of bars to fetch for live data
+        loaded_data: Tuple of (tsla, spy, vix) loaded from CSV files
+        lookback: Number of bars to return (from the end)
 
     Returns:
         Tuple of (tsla, spy, vix, is_live, error_msg)
@@ -560,32 +596,109 @@ def get_live_data_with_fallback(
     is_live = False
     error_msg = None
 
+    print(f"[DATA] CSV data: TSLA={len(tsla):,} bars, SPY={len(spy):,} bars, "
+          f"VIX={len(vix):,} bars")
+    if len(tsla) > 0:
+        print(f"[DATA] CSV range: {tsla.index[0]} to {tsla.index[-1]} "
+              f"(tz={tsla.index.tz})")
+
     if use_live:
         if not YFINANCE_AVAILABLE:
             error_msg = "yfinance not installed. Install with: pip install yfinance"
             return tsla, spy, vix, False, error_msg
 
         try:
+            print("[DATA] Fetching live data from yfinance...")
             data_feed = YFinanceLiveData(cache_ttl=60)
             tsla_live, spy_live, vix_live = data_feed.get_historical(
                 period='60d',
                 interval='5m'
             )
+            print(f"[DATA] yfinance returned: TSLA={len(tsla_live):,} bars "
+                  f"({tsla_live.index[0]} to {tsla_live.index[-1]}, "
+                  f"tz={tsla_live.index.tz})")
+
+            # Normalize timezones to UTC for consistent comparison
+            # CSV data is tz-naive (represents America/New_York market time)
+            # yfinance data is tz-aware (America/New_York)
+            def _normalize_to_utc(df: pd.DataFrame) -> pd.DataFrame:
+                if df.index.tz is None:
+                    # tz-naive CSV data: localize to NY then convert to UTC
+                    df = df.copy()
+                    df.index = df.index.tz_localize(
+                        "America/New_York",
+                        ambiguous="infer",
+                        nonexistent="shift_forward"
+                    ).tz_convert("UTC")
+                else:
+                    # tz-aware yfinance data: convert to UTC
+                    df = df.copy()
+                    df.index = df.index.tz_convert("UTC")
+                return df
+
+            tsla = _normalize_to_utc(tsla)
+            spy = _normalize_to_utc(spy)
+            vix = _normalize_to_utc(vix)
+            tsla_live = _normalize_to_utc(tsla_live)
+            spy_live = _normalize_to_utc(spy_live)
+            vix_live = _normalize_to_utc(vix_live)
+            print(f"[DATA] Normalized all data to UTC")
+
+            # Merge: CSV history + fresh yfinance data
+            # Find where yfinance data starts after CSV ends
+            csv_end = tsla.index[-1] if len(tsla) > 0 else pd.Timestamp.min.tz_localize("UTC")
+            fresh_tsla = tsla_live[tsla_live.index > csv_end]
+            fresh_spy = spy_live[spy_live.index > csv_end]
+            fresh_vix = vix_live[vix_live.index > csv_end]
+
+            if len(fresh_tsla) > 0:
+                tsla_merged = pd.concat([tsla, fresh_tsla])
+                spy_merged = pd.concat([spy, fresh_spy])
+                vix_merged = pd.concat([vix, fresh_vix])
+                print(f"[DATA] Merged: {len(tsla):,} CSV + {len(fresh_tsla):,} fresh "
+                      f"= {len(tsla_merged):,} total bars")
+            else:
+                # yfinance data is older than or overlaps with CSV — use CSV as-is
+                # but update the last few bars with live values for freshness
+                overlap_tsla = tsla_live[tsla_live.index >= tsla.index[0]]
+                if len(overlap_tsla) > 0:
+                    # Replace overlapping bars with live data (more current)
+                    tsla_merged = tsla.copy()
+                    spy_merged = spy.copy()
+                    vix_merged = vix.copy()
+                    tsla_merged.update(overlap_tsla)
+                    spy_merged.update(spy_live[spy_live.index >= spy.index[0]])
+                    vix_merged.update(vix_live[vix_live.index >= vix.index[0]])
+                    print(f"[DATA] Updated {len(overlap_tsla):,} overlapping bars with live data")
+                else:
+                    tsla_merged = tsla
+                    spy_merged = spy
+                    vix_merged = vix
+                    print("[DATA] No overlap — using CSV data as-is")
 
             # Take last N bars
-            if len(tsla_live) > lookback:
-                tsla_live = tsla_live.iloc[-lookback:]
-                spy_live = spy_live.iloc[-lookback:]
-                vix_live = vix_live.iloc[-lookback:]
+            if len(tsla_merged) > lookback:
+                tsla_merged = tsla_merged.iloc[-lookback:]
+                spy_merged = spy_merged.iloc[-lookback:]
+                vix_merged = vix_merged.iloc[-lookback:]
 
-            return tsla_live, spy_live, vix_live, True, None
+            print(f"[DATA] Final: {len(tsla_merged):,} bars (is_live=True)")
+            return tsla_merged, spy_merged, vix_merged, True, None
 
         except Exception as e:
-            error_msg = f"Live data fetch failed: {e}. Falling back to loaded data."
+            error_msg = f"Live data fetch failed: {e}. Using CSV data only."
             logger.exception("Live data error")
-            return tsla, spy, vix, False, error_msg
+            print(f"[DATA] yfinance failed: {e}")
+            print(f"[DATA] Falling back to CSV: {len(tsla):,} bars")
 
-    return tsla, spy, vix, False, None
+    # Take last N bars from CSV
+    if len(tsla) > lookback:
+        tsla = tsla.iloc[-lookback:]
+        spy = spy.iloc[-lookback:]
+        vix = vix.iloc[-lookback:]
+
+    print(f"[DATA] Final: {len(tsla):,} bars (is_live={is_live})")
+    return tsla, spy, vix, is_live, error_msg
 
 
 def show_live_data_sidebar():
@@ -594,64 +707,58 @@ def show_live_data_sidebar():
     st.sidebar.header("Live Data")
 
     config = {
-        'use_live': False,
+        'use_live': True,
         'auto_refresh': False,
         'refresh_interval': 300,
     }
 
-    if YFINANCE_AVAILABLE:
-        config['use_live'] = st.sidebar.checkbox(
-            "Use Live Data (yfinance)",
-            value=False,
-            help="Fetch real-time data from Yahoo Finance instead of loaded files"
-        )
-
-        if config['use_live']:
-            config['auto_refresh'] = st.sidebar.checkbox(
-                "Auto-refresh",
-                value=False,
-                help="Automatically refresh data at specified interval"
-            )
-
-            if config['auto_refresh']:
-                interval_options = {
-                    "1 minute": 60,
-                    "5 minutes": 300,
-                    "15 minutes": 900,
-                }
-                interval_label = st.sidebar.selectbox(
-                    "Refresh Interval",
-                    options=list(interval_options.keys()),
-                    index=1  # Default to 5 minutes
-                )
-                config['refresh_interval'] = interval_options[interval_label]
-
-                if AUTOREFRESH_AVAILABLE:
-                    # Auto-refresh using streamlit-autorefresh
-                    count = st_autorefresh(
-                        interval=config['refresh_interval'] * 1000,
-                        limit=None,
-                        key="live_data_refresh"
-                    )
-                    st.sidebar.caption(f"Auto-refresh count: {count}")
-                else:
-                    st.sidebar.info("Install streamlit-autorefresh for auto-refresh")
-                    if st.sidebar.button("Manual Refresh"):
-                        st.rerun()
-
-            # Show market status
-            try:
-                market_status = get_market_status()
-                status_text = "OPEN" if market_status['is_open'] else "CLOSED"
-                status_color = "green" if market_status['is_open'] else "red"
-                st.sidebar.markdown(f"Market: :{status_color}[{status_text}]")
-                st.sidebar.caption(market_status['current_time_et'])
-            except Exception:
-                pass
-
-    else:
-        st.sidebar.warning("yfinance not installed")
+    if not YFINANCE_AVAILABLE:
+        st.sidebar.error("yfinance not installed — using CSV fallback")
         st.sidebar.caption("pip install yfinance")
+        config['use_live'] = False
+        return config
+
+    # Auto-refresh options
+    config['auto_refresh'] = st.sidebar.checkbox(
+        "Auto-refresh",
+        value=False,
+        help="Automatically refresh live data at specified interval"
+    )
+
+    if config['auto_refresh']:
+        interval_options = {
+            "1 minute": 60,
+            "5 minutes": 300,
+            "15 minutes": 900,
+        }
+        interval_label = st.sidebar.selectbox(
+            "Refresh Interval",
+            options=list(interval_options.keys()),
+            index=1
+        )
+        config['refresh_interval'] = interval_options[interval_label]
+
+        if AUTOREFRESH_AVAILABLE:
+            count = st_autorefresh(
+                interval=config['refresh_interval'] * 1000,
+                limit=None,
+                key="live_data_refresh"
+            )
+            st.sidebar.caption(f"Auto-refresh count: {count}")
+        else:
+            st.sidebar.info("Install streamlit-autorefresh for auto-refresh")
+            if st.sidebar.button("Manual Refresh"):
+                st.rerun()
+
+    # Market status
+    try:
+        market_status = get_market_status()
+        status_text = "OPEN" if market_status['is_open'] else "CLOSED"
+        status_color = "green" if market_status['is_open'] else "red"
+        st.sidebar.markdown(f"Market: :{status_color}[{status_text}]")
+        st.sidebar.caption(market_status['current_time_et'])
+    except Exception:
+        pass
 
     return config
 
@@ -659,7 +766,7 @@ def show_live_data_sidebar():
 def show_data_status_bar(is_live: bool, error_msg: Optional[str], last_update: Optional[datetime]):
     """Show data status bar at top of page."""
     if error_msg:
-        st.warning(error_msg)
+        st.error(error_msg)
 
     col1, col2, col3 = st.columns(3)
 
@@ -710,7 +817,31 @@ def load_market_data(data_dir: str):
 def load_predictor(checkpoint_path: str):
     """Load and cache live predictor with channel history tracking."""
     from v15.live import LivePredictor
-    return LivePredictor(checkpoint_path, min_bars=1000, track_channel_history=True)
+    return LivePredictor(checkpoint_path, track_channel_history=True)
+
+
+@st.cache_data(ttl=300)
+def load_native_tf():
+    """Fetch and cache native TF data from yfinance for higher timeframes."""
+    print("[DATA] Fetching native TF data (daily/weekly/monthly) from yfinance...")
+    try:
+        data = _load_native_tf_data(
+            symbols=['TSLA', 'SPY', '^VIX'],
+            timeframes=NATIVE_TF_LIST,
+            start_date='2015-01-01',
+            use_cache=True,
+            cache_max_age_hours=1,
+            verbose=True,
+        )
+        for symbol in data:
+            for tf in data[symbol]:
+                df = data[symbol][tf]
+                print(f"[DATA] Native TF: {symbol} {tf} = {len(df)} bars")
+        return data
+    except Exception as e:
+        print(f"[DATA] Native TF fetch failed: {e}")
+        logger.exception("Native TF data fetch failed")
+        return None
 
 
 def show_prediction_card(prediction):
@@ -788,6 +919,11 @@ def show_feature_importance(predictor, top_k: int = 50):
         st.warning("Model doesn't have explicit feature weights")
         return
 
+    if predictor.feature_names is None:
+        st.error("Checkpoint is missing feature_names. Patch the checkpoint with "
+                 "correct names from the flat file, or retrain with updated code.")
+        return
+
     importance = predictor.model.feature_weights.get_feature_importance()
     importance = importance.cpu().numpy()
 
@@ -835,10 +971,22 @@ def main():
     st.sidebar.header("Configuration")
 
     data_dir = st.sidebar.text_input("Data Directory", value="data")
-    checkpoint_path = st.sidebar.text_input(
-        "Model Checkpoint",
-        value="checkpoints/best.pt"
-    )
+    models_dir = Path("models")
+    model_files = sorted(models_dir.glob("*.pt")) if models_dir.exists() else []
+    model_options = [str(f) for f in model_files]
+
+    if model_options:
+        checkpoint_path = st.sidebar.selectbox(
+            "Model Checkpoint",
+            options=model_options,
+            index=0,
+        )
+    else:
+        checkpoint_path = st.sidebar.text_input(
+            "Model Checkpoint",
+            value="models/best.pt"
+        )
+        st.sidebar.warning("No .pt files found in models/")
 
     # Live data sidebar configuration
     live_config = show_live_data_sidebar()
@@ -869,6 +1017,17 @@ def main():
                 st.sidebar.warning(f"Model not loaded: {e}")
     else:
         st.sidebar.info("No model checkpoint found. Train a model first.")
+
+    # Fetch native TF data for higher timeframes (daily/weekly/monthly)
+    # These have unlimited yfinance history vs 60-day limit for 5-min
+    native_tf_data = None
+    if YFINANCE_AVAILABLE:
+        with st.spinner("Fetching native TF data..."):
+            native_tf_data = load_native_tf()
+            if native_tf_data:
+                st.session_state['native_tf_data'] = native_tf_data
+                if predictor is not None:
+                    predictor.load_native_tf_data(native_tf_data)
 
     # Get data (live or loaded)
     current_tsla, current_spy, current_vix, is_live, error_msg = get_live_data_with_fallback(
@@ -902,23 +1061,20 @@ def main():
         if predictor is None:
             st.warning("Load a trained model to make predictions")
         else:
-            # Select time range
-            col1, col2 = st.columns(2)
-            with col1:
-                lookback = st.slider(
-                    "Lookback bars",
-                    min_value=1000,
-                    max_value=50000,
-                    value=35000
-                )
+            st.caption(f"Available: {len(current_tsla):,} bars")
 
             if st.button("Make Prediction", type="primary"):
                 with st.spinner("Loading data and predicting..."):
                     try:
-                        # Use current data (live or loaded)
-                        tsla_slice = current_tsla.iloc[-lookback:]
-                        spy_slice = current_spy.iloc[-lookback:]
-                        vix_slice = current_vix.iloc[-lookback:]
+                        # Use all available data (LivePredictor trims internally)
+                        tsla_slice = current_tsla
+                        spy_slice = current_spy
+                        vix_slice = current_vix
+
+                        print(f"[DASHBOARD] Prediction requested: "
+                              f"available TSLA={len(current_tsla):,} bars")
+                        if len(tsla_slice) > 0:
+                            print(f"[DASHBOARD] Slice range: {tsla_slice.index[0]} to {tsla_slice.index[-1]}")
 
                         # Load data into LivePredictor (updates rolling window + bar count)
                         predictor.load_historical_data(tsla_slice, spy_slice, vix_slice)
@@ -927,7 +1083,11 @@ def main():
                         live_pred = predictor.predict_with_per_tf()
 
                         if live_pred is None:
-                            st.error("Prediction returned None - not enough data")
+                            bar_count = len(predictor.tsla_data) if predictor.tsla_data is not None else 0
+                            st.error(
+                                f"Cannot predict: need at least {predictor.min_bars:,} bars "
+                                f"(have {bar_count:,})"
+                            )
                         else:
                             prediction = live_pred.prediction
 
@@ -942,6 +1102,13 @@ def main():
                                 f"bars: {live_pred.source_bar_count:,})"
                             )
                             show_prediction_card(prediction)
+
+                            # Show learned window selection if model uses it
+                            if prediction.used_learned_selection:
+                                st.info(
+                                    f"Model selected window {prediction.learned_window} "
+                                    f"(learned selection)"
+                                )
 
                             # Show channel history status
                             show_channel_history_status(predictor)
@@ -990,22 +1157,12 @@ def main():
         prediction = st.session_state.get('last_prediction')
         pred_data = st.session_state.get('prediction_data')
 
+        native_tf = st.session_state.get('native_tf_data')
         if pred_data is not None:
             tsla_slice, _, _ = pred_data
-            show_channel_visualization_tab(tsla_slice, prediction)
+            show_channel_visualization_tab(tsla_slice, prediction, native_bars_by_tf=native_tf)
         else:
-            st.info("Make a prediction first to see channel visualization across timeframes")
-
-            # Allow visualization without prediction
-            if st.button("Visualize Channels (without prediction)"):
-                lookback = st.slider(
-                    "Lookback for visualization",
-                    min_value=1000,
-                    max_value=20000,
-                    value=5000,
-                    key="viz_lookback"
-                )
-                show_channel_visualization_tab(current_tsla.iloc[-lookback:], None)
+            show_channel_visualization_tab(current_tsla, None, native_bars_by_tf=native_tf)
 
     with tab3:
         st.header("Window Selection Analysis")
@@ -1016,21 +1173,13 @@ def main():
         """)
 
         # Window selection controls
-        col1, col2 = st.columns(2)
-        with col1:
-            window_lookback = st.slider(
-                "Analysis Lookback (bars)",
-                min_value=500,
-                max_value=20000,
-                value=5000,
-                key="window_lookback"
-            )
-        with col2:
-            selection_mode = st.selectbox(
-                "Selection Mode",
-                ["Heuristic (Rule-based)", "Model-based (if trained)"],
-                key="selection_mode"
-            )
+        window_lookback = st.slider(
+            "Analysis Lookback (bars)",
+            min_value=500,
+            max_value=20000,
+            value=5000,
+            key="window_lookback"
+        )
 
         if st.button("Analyze Windows", type="primary", key="analyze_windows_btn"):
             with st.spinner("Detecting channels at all window sizes..."):
@@ -1075,7 +1224,7 @@ def main():
             show_window_selection_panel(
                 analysis,
                 best_window,
-                selection_mode="heuristic" if "Heuristic" in selection_mode else "learned"
+                selection_mode="heuristic"
             )
 
             st.divider()

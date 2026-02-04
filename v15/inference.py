@@ -196,8 +196,12 @@ class Predictor:
         if unexpected_keys:
             logger.warning(f"Checkpoint has unexpected keys: {unexpected_keys}")
 
-        # Get feature names - use new TF-aware feature names by default
-        feature_names = checkpoint.get('feature_names') or get_tf_feature_names()
+        # Get feature names from checkpoint (must match training data exactly)
+        feature_names = checkpoint.get('feature_names')
+        if feature_names is None:
+            logger.warning("Checkpoint has no feature_names — feature importance "
+                           "and name-based lookups will be unavailable. "
+                           "Patch the checkpoint or retrain with updated code.")
 
         logger.info(f"Loaded model from {path}")
         if has_window_selector:
@@ -399,6 +403,7 @@ class Predictor:
         timestamp: Optional[pd.Timestamp] = None,
         source_bar_count: Optional[int] = None,
         channel_history_by_tf: Optional[Dict[str, Dict]] = None,
+        native_bars_by_tf: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None,
     ) -> Prediction:
         """
         Make prediction from raw market data with partial bar support.
@@ -423,6 +428,8 @@ class Predictor:
                              accurate bar_completion_pct during live trading.
             channel_history_by_tf: Optional dict mapping TF -> {'tsla': [...], 'spy': [...]}
                                   for channel history features.
+            native_bars_by_tf: Optional pre-fetched native TF bars from yfinance.
+                              Format: {'tsla': {'daily': df, ...}, 'spy': {...}, 'vix': {...}}
 
         Returns:
             Prediction object with all outputs including:
@@ -455,6 +462,7 @@ class Predictor:
             channel_history_by_tf=channel_history_by_tf,
             source_bar_count=source_bar_count,
             include_bar_metadata=True,  # Include bar_completion_pct features
+            native_bars_by_tf=native_bars_by_tf,
         )
 
         # Make prediction
@@ -491,6 +499,7 @@ class Predictor:
         timestamp: Optional[pd.Timestamp] = None,
         source_bar_count: Optional[int] = None,
         channel_history_by_tf: Optional[Dict[str, Dict]] = None,
+        native_bars_by_tf: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None,
     ) -> Prediction:
         """
         Make prediction with per-timeframe breakdown.
@@ -510,6 +519,8 @@ class Predictor:
             timestamp: Timestamp for prediction (default: last bar)
             source_bar_count: Number of 5min bars for partial bar calculation
             channel_history_by_tf: Optional dict mapping TF -> {'tsla': [...], 'spy': [...]}
+            native_bars_by_tf: Optional pre-fetched native TF bars from yfinance.
+                              Format: {'tsla': {'daily': df, ...}, 'spy': {...}, 'vix': {...}}
 
         Returns:
             Prediction object with per_tf_predictions populated:
@@ -534,7 +545,13 @@ class Predictor:
         heuristic_windows_by_tf = {}
         for tf_name in TIMEFRAMES:
             try:
-                tf_df = resample_to_timeframe(tsla_df, tf_name)
+                # Use native bars for channel detection if available
+                if (native_bars_by_tf
+                        and native_bars_by_tf.get('tsla', {}).get(tf_name) is not None
+                        and len(native_bars_by_tf['tsla'][tf_name]) >= 20):
+                    tf_df = native_bars_by_tf['tsla'][tf_name]
+                else:
+                    tf_df = resample_to_timeframe(tsla_df, tf_name)
                 if len(tf_df) >= 20:  # Need enough bars for channel detection
                     tf_channels = detect_channels_multi_window(tf_df, windows=STANDARD_WINDOWS)
                     _, tf_window = select_best_channel(tf_channels)
@@ -554,6 +571,7 @@ class Predictor:
             channel_history_by_tf=channel_history_by_tf,
             source_bar_count=source_bar_count,
             include_bar_metadata=True,
+            native_bars_by_tf=native_bars_by_tf,
         )
 
         # Make prediction with per-TF breakdown
