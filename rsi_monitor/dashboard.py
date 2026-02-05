@@ -154,7 +154,7 @@ def main():
         st.subheader("Refresh")
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("Refresh Now", use_container_width=True):
+            if st.button("Refresh Now", width='stretch'):
                 st.session_state.last_refresh = datetime.now()
                 st.rerun()
 
@@ -172,7 +172,7 @@ def main():
         # RSIMonitor takes symbols, timeframes, and data_fetcher
         timeframes = ['5m', '15m', '1h', '4h', '1d', '1wk']
         rsi_monitor = RSIMonitor(
-            symbols=list(set(selected_symbols + ["VIX"])),
+            symbols=list(set(selected_symbols + ["^VIX"])),
             timeframes=timeframes,
             data_fetcher=data_fetcher
         )
@@ -185,7 +185,7 @@ def main():
         st.stop()
 
     # Fetch RSI for all symbols across all timeframes
-    all_symbols = list(set(selected_symbols + ["VIX"]))
+    all_symbols = list(set(selected_symbols + ["^VIX"]))
 
     with st.spinner("Fetching market data and calculating RSI..."):
         try:
@@ -209,9 +209,9 @@ def main():
 
     # Get VIX status for confirmation
     vix_rsi = None
-    if "VIX" in rsi_results and rsi_results["VIX"]:
+    if "^VIX" in rsi_results and rsi_results["^VIX"]:
         # Use daily timeframe for VIX
-        vix_rsi = rsi_results["VIX"].get("1D") or rsi_results["VIX"].get("daily") or list(rsi_results["VIX"].values())[0] if rsi_results["VIX"] else None
+        vix_rsi = rsi_results["^VIX"].get("1d") or rsi_results["^VIX"].get("1wk") or list(rsi_results["^VIX"].values())[0] if rsi_results["^VIX"] else None
     vix_status, vix_color = get_vix_status(vix_rsi, oversold_threshold, overbought_threshold)
 
     # Summary Section
@@ -338,13 +338,13 @@ def main():
                                         return "background-color: #ff444433; color: #ff4444"
                                     return ""
 
-                                styled_df = df.style.applymap(
+                                styled_df = df.style.map(
                                     color_status, subset=["Status"]
                                 )
 
                                 st.dataframe(
                                     styled_df,
-                                    use_container_width=True,
+                                    width='stretch',
                                     hide_index=True
                                 )
                             else:
