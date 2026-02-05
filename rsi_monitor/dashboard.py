@@ -38,19 +38,24 @@ RSI_LEVEL_COLORS = {
 }
 
 
-def get_rsi_status(rsi_value: float) -> str:
-    """Return 7-level status based on RSI value."""
-    if rsi_value < 20:
+def get_rsi_status(rsi_value: float, oversold: float = 30, overbought: float = 70) -> str:
+    """Return 7-level status based on RSI value with dynamic boundaries."""
+    extreme_oversold = oversold - 10
+    approaching_oversold_upper = oversold + 10
+    approaching_overbought_lower = overbought - 10
+    extreme_overbought = overbought + 10
+
+    if rsi_value < extreme_oversold:
         return "Extremely Oversold"
-    elif rsi_value < 30:
+    elif rsi_value < oversold:
         return "Oversold"
-    elif rsi_value < 40:
+    elif rsi_value < approaching_oversold_upper:
         return "Approaching Oversold"
-    elif rsi_value <= 60:
+    elif rsi_value <= approaching_overbought_lower:
         return "Neutral"
-    elif rsi_value <= 70:
+    elif rsi_value <= overbought:
         return "Approaching Overbought"
-    elif rsi_value <= 80:
+    elif rsi_value <= extreme_overbought:
         return "Overbought"
     else:
         return "Extremely Overbought"
@@ -58,7 +63,7 @@ def get_rsi_status(rsi_value: float) -> str:
 
 def get_rsi_color(rsi_value: float, oversold: float = 30, overbought: float = 70) -> str:
     """Return color based on RSI value using 7-level gradations."""
-    status = get_rsi_status(rsi_value)
+    status = get_rsi_status(rsi_value, oversold, overbought)
     return RSI_LEVEL_COLORS.get(status, "#6c757d")
 
 
@@ -79,7 +84,7 @@ def create_rsi_table(rsi_data: dict, oversold: float, overbought: float) -> pd.D
     rows = []
     for timeframe, rsi_value in rsi_data.items():
         if rsi_value is not None:
-            status = get_rsi_status(rsi_value)
+            status = get_rsi_status(rsi_value, oversold, overbought)
             rows.append({
                 "Timeframe": timeframe,
                 "RSI": round(rsi_value, 2),
@@ -123,7 +128,7 @@ def create_strength_bar(strength: int, total: int) -> str:
 
 
 def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
-    """Render comprehensive VIX confirmation card."""
+    """Render comprehensive VIX confirmation card with help tooltips."""
     vix_color = get_vix_confirmation_color(confirmation)
     strength_bar = create_strength_bar(confirmation.strength, confirmation.total_indicators)
 
@@ -135,32 +140,59 @@ def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
     </div>
     """, unsafe_allow_html=True)
 
-    # Detailed indicators
+    # Detailed indicators with help tooltips
     st.markdown("---")
 
-    # VIX Price and Change
-    change_sign = "+" if confirmation.vix_change_pct >= 0 else ""
-    change_color = "#ff4444" if confirmation.vix_change_pct > 5 else "#00C851" if confirmation.vix_change_pct < -5 else "#6c757d"
-
+    # Row 1: VIX Price and Change
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown(f"**VIX:** {confirmation.vix_price:.1f}")
-        st.markdown(f"**Percentile:** {confirmation.percentile_rank:.0f}th")
+        st.metric(
+            label="VIX",
+            value=f"{confirmation.vix_price:.1f}",
+            help="Fear gauge. <15 = complacency (bearish). 15-20 = normal. >30 = high fear (bullish for stocks)."
+        )
     with col2:
-        st.markdown(f"**Change:** <span style='color:{change_color}'>{change_sign}{confirmation.vix_change_pct:.1f}%</span>", unsafe_allow_html=True)
-        st.markdown(f"**Level:** {confirmation.level_status}")
+        change_sign = "+" if confirmation.vix_change_pct >= 0 else ""
+        st.metric(
+            label="Change",
+            value=f"{change_sign}{confirmation.vix_change_pct:.1f}%",
+            help="Daily VIX change. Spike >10% = panic/capitulation (often bullish). Drop >10% = risk-on mood."
+        )
 
-    # Term Structure
+    # Row 2: Percentile and Level
+    col3, col4 = st.columns(2)
+    with col3:
+        st.metric(
+            label="Percentile",
+            value=f"{confirmation.percentile_rank:.0f}th",
+            help="Where VIX sits vs past year. >75th = elevated fear (bullish). <25th = complacency (bearish)."
+        )
+    with col4:
+        st.metric(
+            label="Level",
+            value=confirmation.level_status,
+            help="VIX zone: Normal (15-20), Caution (20-30), Elevated (30-40), Panic (>40), Complacent (<15)."
+        )
+
+    # Row 3: Term Structure
     if confirmation.term_structure_status != "Unknown":
-        ts_color = "#00C851" if confirmation.term_structure_status == "Backwardation" else "#ff4444" if confirmation.term_structure_status == "Contango" else "#6c757d"
-        st.markdown(f"**Term Structure:** <span style='color:{ts_color}'>{confirmation.term_structure_status} ({confirmation.term_structure_pct:+.1f}%)</span>", unsafe_allow_html=True)
+        ts_display = f"{confirmation.term_structure_status} ({confirmation.term_structure_pct:+.1f}%)"
+        st.metric(
+            label="Term Structure",
+            value=ts_display,
+            help="Backwardation (VIX > VIX3M) = near-term panic, often marks bottoms (bullish). Contango = normal/complacent."
+        )
 
-    # VVIX
+    # Row 4: VVIX
     if confirmation.vvix_level is not None:
-        vvix_color = "#ff4444" if confirmation.vvix_status in ["Elevated", "Extreme"] else "#00C851" if confirmation.vvix_status == "Low" else "#6c757d"
-        st.markdown(f"**VVIX:** <span style='color:{vvix_color}'>{confirmation.vvix_level:.0f} ({confirmation.vvix_status})</span>", unsafe_allow_html=True)
+        vvix_display = f"{confirmation.vvix_level:.0f} ({confirmation.vvix_status})"
+        st.metric(
+            label="VVIX",
+            value=vvix_display,
+            help="Volatility of VIX. >120 = extreme uncertainty (bullish). <80 = complacent. Normal = 80-120."
+        )
 
-    # Overall sentiment
+    # Overall sentiment description
     sentiment_colors = {
         'extreme_fear': '#00C851',
         'fear': '#007E33',
