@@ -8,6 +8,8 @@ with confluence scoring and VIX confirmation.
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
+from .vix_analyzer import VIXAnalyzer
+
 
 @dataclass
 class SignalThresholds:
@@ -51,6 +53,7 @@ class SignalGenerator:
             extreme_oversold=extreme_oversold,
             extreme_overbought=extreme_overbought
         )
+        self.vix_analyzer = VIXAnalyzer()
 
     def _classify_rsi(self, rsi_value: float) -> str:
         """
@@ -278,75 +281,172 @@ class SignalGenerator:
             'reason': reason
         }
 
-    def check_vix_confirmation(self, vix_rsi: float, signal_type: Optional[str] = None) -> bool:
+    def vix_confirms_signal(self, vix_rsi: Optional[float] = None, signal_type: Optional[str] = None) -> bool:
         """
-        Check if VIX RSI confirms the trading signal.
+        Check if VIX indicators confirm the trading signal using VIXAnalyzer.
 
-        For contrarian trading:
-        - BUY signals are confirmed when VIX RSI > 60 (elevated fear)
-        - SELL signals are confirmed when VIX RSI < 40 (complacency)
+        Uses multiple VIX indicators for confirmation. Falls back to simple
+        RSI-based logic if VIXAnalyzer fails or no data is available.
 
         Args:
-            vix_rsi: The current VIX RSI value
+            vix_rsi: Optional VIX RSI value for backward compatibility/fallback
             signal_type: Optional signal type ('BUY', 'STRONG_BUY', 'SELL', 'STRONG_SELL')
-                        If None, returns general VIX status
+                        If None, returns general VIX confirmation status
 
         Returns:
-            True if VIX RSI confirms the signal, False otherwise
+            True if confirmation strength >= 2 (at least 2 indicators agree)
         """
+        try:
+            # Try to get confirmation from VIXAnalyzer
+            confirmation = self.vix_analyzer.get_confirmation(signal_type)
+
+            # Return True if at least 2 indicators agree
+            if confirmation.strength >= 2:
+                return True
+
+            # If VIXAnalyzer has data but strength < 2, return False
+            if confirmation.indicators:
+                return False
+
+        except Exception:
+            # VIXAnalyzer failed, fall through to fallback
+            pass
+
+        # Fallback to old simple RSI-based logic for backward compatibility
+        if vix_rsi is None:
+            return False
+
         if signal_type is None:
             # Return True if VIX is at either extreme (actionable)
             return vix_rsi > 60 or vix_rsi < 40
 
-        if 'BUY' in signal_type.upper():
+        if signal_type and 'BUY' in signal_type.upper():
             # For buy signals, we want elevated fear (high VIX RSI)
             return vix_rsi > 60
-        elif 'SELL' in signal_type.upper():
+        elif signal_type and 'SELL' in signal_type.upper():
             # For sell signals, we want complacency (low VIX RSI)
             return vix_rsi < 40
 
         return False
 
-    def get_vix_context(self, vix_rsi: float) -> Dict[str, Any]:
+    def get_vix_context(self, vix_rsi: Optional[float] = None) -> Dict[str, Any]:
         """
-        Get detailed context about VIX RSI for signal interpretation.
+        Get comprehensive VIX context using VIXAnalyzer.
+
+        Uses multiple volatility indicators to provide a complete picture
+        of market fear/greed conditions.
 
         Args:
-            vix_rsi: The current VIX RSI value
+            vix_rsi: Optional VIX RSI value for backward compatibility
 
         Returns:
-            Dictionary with VIX context information
+            Dictionary with comprehensive VIX context including:
+                - overall_sentiment: fear/greed assessment
+                - description: human-readable explanation
+                - supports_buy: whether conditions favor buying
+                - supports_sell: whether conditions favor selling
+                - confirmation_strength: number of confirming indicators
+                - indicators: detailed breakdown of each indicator
         """
-        if vix_rsi >= 80:
-            sentiment = 'extreme_fear'
-            description = 'Extreme fear in the market - strong contrarian buy opportunity'
-            supports_buy = True
-            supports_sell = False
-        elif vix_rsi >= 60:
-            sentiment = 'elevated_fear'
-            description = 'Elevated fear - favorable for contrarian buying'
-            supports_buy = True
-            supports_sell = False
-        elif vix_rsi <= 20:
-            sentiment = 'extreme_complacency'
-            description = 'Extreme complacency - strong contrarian sell opportunity'
-            supports_buy = False
-            supports_sell = True
-        elif vix_rsi <= 40:
-            sentiment = 'complacency'
-            description = 'Market complacency - favorable for contrarian selling'
-            supports_buy = False
-            supports_sell = True
-        else:
-            sentiment = 'neutral'
-            description = 'VIX RSI in neutral zone - no strong contrarian signal'
-            supports_buy = False
-            supports_sell = False
+        try:
+            # Get comprehensive confirmation from VIXAnalyzer
+            confirmation = self.vix_analyzer.get_confirmation(None)
 
-        return {
-            'vix_rsi': vix_rsi,
-            'sentiment': sentiment,
-            'description': description,
-            'supports_buy': supports_buy,
-            'supports_sell': supports_sell
-        }
+            # Build comprehensive context dict
+            context = {
+                'overall_sentiment': confirmation.overall_sentiment,
+                'description': confirmation.description,
+                'supports_buy': confirmation.confirms_buy,
+                'supports_sell': confirmation.confirms_sell,
+                'confirmation_strength': confirmation.strength,
+                'indicators': confirmation.indicators,
+            }
+
+            # Include vix_rsi if provided or available from indicators
+            if vix_rsi is not None:
+                context['vix_rsi'] = vix_rsi
+            elif 'vix_rsi' in confirmation.indicators:
+                context['vix_rsi'] = confirmation.indicators['vix_rsi'].get('value')
+
+            # Add fear/greed assessment
+            if confirmation.overall_sentiment in ('extreme_fear', 'fear'):
+                context['fear_greed'] = 'fear'
+                context['fear_greed_level'] = 'extreme' if confirmation.overall_sentiment == 'extreme_fear' else 'elevated'
+            elif confirmation.overall_sentiment in ('extreme_greed', 'greed'):
+                context['fear_greed'] = 'greed'
+                context['fear_greed_level'] = 'extreme' if confirmation.overall_sentiment == 'extreme_greed' else 'elevated'
+            else:
+                context['fear_greed'] = 'neutral'
+                context['fear_greed_level'] = 'normal'
+
+            return context
+
+        except Exception:
+            # Fallback to simple VIX RSI context if VIXAnalyzer fails
+            if vix_rsi is None:
+                return {
+                    'overall_sentiment': 'unknown',
+                    'description': 'Unable to determine VIX context - no data available',
+                    'supports_buy': False,
+                    'supports_sell': False,
+                    'confirmation_strength': 0,
+                    'indicators': {},
+                    'fear_greed': 'unknown',
+                    'fear_greed_level': 'unknown'
+                }
+
+            # Fallback logic using simple VIX RSI thresholds
+            if vix_rsi >= 80:
+                sentiment = 'extreme_fear'
+                description = 'Extreme fear in the market - strong contrarian buy opportunity'
+                supports_buy = True
+                supports_sell = False
+                fear_greed = 'fear'
+                fear_greed_level = 'extreme'
+            elif vix_rsi >= 60:
+                sentiment = 'fear'
+                description = 'Elevated fear - favorable for contrarian buying'
+                supports_buy = True
+                supports_sell = False
+                fear_greed = 'fear'
+                fear_greed_level = 'elevated'
+            elif vix_rsi <= 20:
+                sentiment = 'extreme_greed'
+                description = 'Extreme complacency - strong contrarian sell opportunity'
+                supports_buy = False
+                supports_sell = True
+                fear_greed = 'greed'
+                fear_greed_level = 'extreme'
+            elif vix_rsi <= 40:
+                sentiment = 'greed'
+                description = 'Market complacency - favorable for contrarian selling'
+                supports_buy = False
+                supports_sell = True
+                fear_greed = 'greed'
+                fear_greed_level = 'elevated'
+            else:
+                sentiment = 'neutral'
+                description = 'VIX RSI in neutral zone - no strong contrarian signal'
+                supports_buy = False
+                supports_sell = False
+                fear_greed = 'neutral'
+                fear_greed_level = 'normal'
+
+            return {
+                'vix_rsi': vix_rsi,
+                'overall_sentiment': sentiment,
+                'description': description,
+                'supports_buy': supports_buy,
+                'supports_sell': supports_sell,
+                'confirmation_strength': 1 if (supports_buy or supports_sell) else 0,
+                'indicators': {
+                    'vix_rsi': {
+                        'value': vix_rsi,
+                        'status': sentiment,
+                        'supports_buy': supports_buy,
+                        'supports_sell': supports_sell
+                    }
+                },
+                'fear_greed': fear_greed,
+                'fear_greed_level': fear_greed_level
+            }

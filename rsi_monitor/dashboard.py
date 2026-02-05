@@ -14,7 +14,7 @@ from datetime import datetime
 # Add parent directory to path for Streamlit Cloud deployment
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rsi_monitor import RSIMonitor, DataFetcher, SignalGenerator
+from rsi_monitor import RSIMonitor, DataFetcher, SignalGenerator, VIXAnalyzer
 
 
 # Signal color mapping
@@ -81,17 +81,72 @@ def calculate_confluence(rsi_data: dict, oversold: float, overbought: float) -> 
     return oversold_count, overbought_count, total
 
 
-def get_vix_status(vix_rsi: float, oversold: float, overbought: float) -> tuple:
-    """Determine VIX confirmation status."""
-    if vix_rsi is None:
-        return "Unknown", "#6c757d"
-
-    if vix_rsi >= overbought:
-        return "High Fear (Bullish for Stocks)", "#00C851"
-    elif vix_rsi <= oversold:
-        return "Low Fear (Bearish for Stocks)", "#ff4444"
+def get_vix_confirmation_color(confirmation) -> str:
+    """Get color based on VIX confirmation strength."""
+    if confirmation.strength >= 3:
+        return "#00C851"  # Green - high fear (bullish for stocks)
+    elif confirmation.strength <= 1:
+        return "#ff4444"  # Red - low fear (bearish for stocks)
     else:
-        return "Neutral", "#6c757d"
+        return "#6c757d"  # Gray - neutral
+
+
+def create_strength_bar(strength: int, total: int) -> str:
+    """Create a visual strength bar."""
+    filled = strength
+    empty = total - strength
+    return "[" + "|" * filled + "-" * empty + "]"
+
+
+def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
+    """Render comprehensive VIX confirmation card."""
+    vix_color = get_vix_confirmation_color(confirmation)
+    strength_bar = create_strength_bar(confirmation.strength, confirmation.total_indicators)
+
+    # Main card header
+    st.markdown(f"""
+    <div style="padding: 15px; border-radius: 10px; background-color: {vix_color}20; border-left: 5px solid {vix_color};">
+        <h4 style="margin: 0 0 10px 0;">VIX Confirmation</h4>
+        <p style="margin: 0; font-size: 1.1em;"><strong>Strength: {confirmation.strength}/{confirmation.total_indicators}</strong> <code>{strength_bar}</code></p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Detailed indicators
+    st.markdown("---")
+
+    # VIX Price and Change
+    change_sign = "+" if confirmation.vix_change_pct >= 0 else ""
+    change_color = "#ff4444" if confirmation.vix_change_pct > 5 else "#00C851" if confirmation.vix_change_pct < -5 else "#6c757d"
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(f"**VIX:** {confirmation.vix_price:.1f}")
+        st.markdown(f"**Percentile:** {confirmation.percentile_rank:.0f}th")
+    with col2:
+        st.markdown(f"**Change:** <span style='color:{change_color}'>{change_sign}{confirmation.vix_change_pct:.1f}%</span>", unsafe_allow_html=True)
+        st.markdown(f"**Level:** {confirmation.level_status}")
+
+    # Term Structure
+    if confirmation.term_structure_status != "Unknown":
+        ts_color = "#00C851" if confirmation.term_structure_status == "Backwardation" else "#ff4444" if confirmation.term_structure_status == "Contango" else "#6c757d"
+        st.markdown(f"**Term Structure:** <span style='color:{ts_color}'>{confirmation.term_structure_status} ({confirmation.term_structure_pct:+.1f}%)</span>", unsafe_allow_html=True)
+
+    # VVIX
+    if confirmation.vvix_level is not None:
+        vvix_color = "#ff4444" if confirmation.vvix_status in ["Elevated", "Extreme"] else "#00C851" if confirmation.vvix_status == "Low" else "#6c757d"
+        st.markdown(f"**VVIX:** <span style='color:{vvix_color}'>{confirmation.vvix_level:.0f} ({confirmation.vvix_status})</span>", unsafe_allow_html=True)
+
+    # Overall sentiment
+    sentiment_colors = {
+        'extreme_fear': '#00C851',
+        'fear': '#007E33',
+        'neutral': '#6c757d',
+        'greed': '#CC0000',
+        'extreme_greed': '#ff4444',
+        'unknown': '#6c757d',
+    }
+    sent_color = sentiment_colors.get(confirmation.overall_sentiment, '#6c757d')
+    st.markdown(f"<small style='color:{sent_color}'>{confirmation.description}</small>", unsafe_allow_html=True)
 
 
 def main():
@@ -212,12 +267,17 @@ def main():
             st.warning(f"Error generating signal for {symbol}: {e}")
             signals[symbol] = {"signal": "NEUTRAL", "strength": 0}
 
-    # Get VIX status for confirmation
-    vix_rsi = None
-    if "^VIX" in rsi_results and rsi_results["^VIX"]:
-        # Use daily timeframe for VIX
-        vix_rsi = rsi_results["^VIX"].get("1d") or rsi_results["^VIX"].get("1wk") or list(rsi_results["^VIX"].values())[0] if rsi_results["^VIX"] else None
-    vix_status, vix_color = get_vix_status(vix_rsi, oversold_threshold, overbought_threshold)
+    # Get comprehensive VIX confirmation using VIXAnalyzer
+    vix_analyzer = VIXAnalyzer()
+
+    # Fetch VIX data for comprehensive analysis
+    vix_df = data_fetcher.fetch("^VIX", interval="1d", period="1y")
+    vix3m_df = data_fetcher.fetch("^VIX3M", interval="1d", period="5d")
+    vvix_df = data_fetcher.fetch("^VVIX", interval="1d", period="5d")
+
+    # Get comprehensive VIX confirmation
+    vix_confirmation = vix_analyzer.analyze_from_dataframe(vix_df, vix3m_df, vvix_df)
+    vix_color = get_vix_confirmation_color(vix_confirmation)
 
     # Summary Section
     st.header("Market Summary")
@@ -251,14 +311,8 @@ def main():
         """, unsafe_allow_html=True)
 
     with summary_cols[1]:
-        # VIX Confirmation
-        st.markdown(f"""
-        <div style="padding: 20px; border-radius: 10px; background-color: {vix_color}20; border-left: 5px solid {vix_color};">
-            <h4 style="margin: 0;">VIX Confirmation</h4>
-            <p style="margin: 5px 0 0 0; color: {vix_color};">{vix_status}</p>
-            <p style="margin: 5px 0 0 0;">RSI: {round(vix_rsi, 2) if vix_rsi else 'N/A'}</p>
-        </div>
-        """, unsafe_allow_html=True)
+        # VIX Confirmation - Comprehensive Display
+        render_vix_confirmation_card(vix_confirmation, data_fetcher)
 
     with summary_cols[2]:
         # Active alerts
@@ -323,13 +377,17 @@ def main():
                             with metric_cols[2]:
                                 st.metric("Strength", f"{strength:.0%}" if isinstance(strength, float) else str(strength))
 
-                            # VIX confirmation for this symbol
-                            if signal in ["BUY", "STRONG_BUY"] and vix_status == "High Fear (Bullish for Stocks)":
-                                st.success("VIX Confirmed: High fear supports buy signal")
-                            elif signal in ["SELL", "STRONG_SELL"] and vix_status == "Low Fear (Bearish for Stocks)":
-                                st.success("VIX Confirmed: Low fear supports sell signal")
-                            elif signal in ["BUY", "STRONG_BUY", "SELL", "STRONG_SELL"]:
-                                st.warning("VIX Not Confirmed")
+                            # VIX confirmation for this symbol using comprehensive analysis
+                            if signal in ["BUY", "STRONG_BUY"]:
+                                if vix_confirmation.confirms_buy:
+                                    st.success(f"VIX Confirmed ({vix_confirmation.strength}/5): High fear supports buy")
+                                else:
+                                    st.warning(f"VIX Neutral ({vix_confirmation.strength}/5): Limited fear confirmation")
+                            elif signal in ["SELL", "STRONG_SELL"]:
+                                if vix_confirmation.confirms_sell:
+                                    st.success(f"VIX Confirmed ({5 - vix_confirmation.strength}/5): Complacency supports sell")
+                                else:
+                                    st.warning(f"VIX Neutral ({5 - vix_confirmation.strength}/5): Limited complacency")
 
                             # RSI Table
                             if rsi_data:
