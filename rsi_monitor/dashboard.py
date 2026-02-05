@@ -211,12 +211,43 @@ def get_vvix_color(vvix: float) -> str:
 
 
 def render_vix_indicator(label: str, value: str, color: str, help_text: str) -> None:
-    """Render a single VIX indicator with color coding."""
+    """Render a single VIX indicator with color coding and working tooltip."""
     st.markdown(f"""
-    <div style="margin-bottom: 10px;">
-        <span style="color: #888; font-size: 0.85em;">{label}</span>
-        <span style="color: #888; font-size: 0.7em;" title="{help_text}"> ⓘ</span>
-        <div style="color: {color}; font-size: 1.5em; font-weight: bold;">{value}</div>
+    <style>
+    .vix-tooltip {{
+        position: relative;
+        display: inline-block;
+        cursor: help;
+    }}
+    .vix-tooltip .vix-tooltiptext {{
+        visibility: hidden;
+        width: 180px;
+        background-color: #333;
+        color: #fff;
+        text-align: left;
+        padding: 6px 10px;
+        border-radius: 4px;
+        position: absolute;
+        z-index: 1000;
+        bottom: 125%;
+        left: 0;
+        opacity: 0;
+        transition: opacity 0.2s;
+        font-size: 0.75em;
+        line-height: 1.3;
+    }}
+    .vix-tooltip:hover .vix-tooltiptext {{
+        visibility: visible;
+        opacity: 1;
+    }}
+    </style>
+    <div style="margin-bottom: 8px;">
+        <span class="vix-tooltip">
+            <span style="color: #888; font-size: 0.85em;">{label}</span>
+            <span style="color: #888; font-size: 0.7em;"> ⓘ</span>
+            <span class="vix-tooltiptext">{help_text}</span>
+        </span>
+        <div style="color: {color}; font-size: 1.4em; font-weight: bold;">{value}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -424,29 +455,25 @@ def main():
             st.error(f"Error fetching data: {e}")
             st.stop()
 
-    # Generate signals for all symbols
+    # Get comprehensive VIX confirmation FIRST (needed for signal strength calculation)
+    vix_analyzer = VIXAnalyzer()
+    vix_df = data_fetcher.fetch("^VIX", interval="1d", period="1y")
+    vix3m_df = data_fetcher.fetch("^VIX3M", interval="1d", period="5d")
+    vvix_df = data_fetcher.fetch("^VVIX", interval="1d", period="5d")
+    vix_confirmation = vix_analyzer.analyze_from_dataframe(vix_df, vix3m_df, vvix_df)
+    vix_color = get_vix_confirmation_color(vix_confirmation)
+
+    # Generate signals for all symbols (with VIX confirmation for strength bonus)
     signals = {}
 
     for symbol in all_symbols:
         try:
             # analyze() expects dict with 'symbol' and 'timeframes' keys
             signal_input = {'symbol': symbol, 'timeframes': rsi_results.get(symbol, {})}
-            signals[symbol] = signal_generator.analyze(signal_input)
+            signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation)
         except Exception as e:
             st.warning(f"Error generating signal for {symbol}: {e}")
             signals[symbol] = {"signal": "NEUTRAL", "strength": 0}
-
-    # Get comprehensive VIX confirmation using VIXAnalyzer
-    vix_analyzer = VIXAnalyzer()
-
-    # Fetch VIX data for comprehensive analysis
-    vix_df = data_fetcher.fetch("^VIX", interval="1d", period="1y")
-    vix3m_df = data_fetcher.fetch("^VIX3M", interval="1d", period="5d")
-    vvix_df = data_fetcher.fetch("^VVIX", interval="1d", period="5d")
-
-    # Get comprehensive VIX confirmation
-    vix_confirmation = vix_analyzer.analyze_from_dataframe(vix_df, vix3m_df, vvix_df)
-    vix_color = get_vix_confirmation_color(vix_confirmation)
 
     # Summary Section
     st.header("Market Summary")

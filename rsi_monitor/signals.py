@@ -102,21 +102,24 @@ class SignalGenerator:
         rsi_data: Dict[str, Any],
         timeframe_status: Dict[str, str],
         confluence_score: int,
-        signal: str
+        signal: str,
+        vix_confirmation: Optional[Any] = None
     ) -> float:
         """
         Calculate signal strength as a float from 0 to 1.
 
         Factors:
         - Number of timeframes in agreement (confluence)
-        - Presence of extreme RSI readings
+        - RSI gradation weighting (extreme=1.5x, standard=1.0x, approaching=0.5x)
         - Significant timeframe alignment
+        - VIX confirmation bonus (if provided)
 
         Args:
             rsi_data: Original RSI data with timeframe values
             timeframe_status: Classification of each timeframe
             confluence_score: Number of timeframes in oversold/overbought
             signal: The determined signal type
+            vix_confirmation: Optional VIX confirmation object with confirms_buy/confirms_sell
 
         Returns:
             Float from 0.0 to 1.0 indicating signal strength
@@ -130,25 +133,72 @@ class SignalGenerator:
         if total_timeframes == 0:
             return 0.0
 
-        # Base strength from confluence (up to 0.5)
-        confluence_ratio = confluence_score / max(total_timeframes, 1)
-        strength += confluence_ratio * 0.5
+        # Calculate dynamic gradation boundaries from thresholds
+        extreme_oversold = self.thresholds.oversold - 10
+        approaching_oversold_upper = self.thresholds.oversold + 10
+        approaching_overbought_lower = self.thresholds.overbought - 10
+        extreme_overbought = self.thresholds.overbought + 10
 
-        # Bonus for significant timeframe alignment (up to 0.25)
+        # Base strength from confluence (up to 0.35)
+        confluence_ratio = confluence_score / max(total_timeframes, 1)
+        strength += confluence_ratio * 0.35
+
+        # Bonus for significant timeframe alignment (up to 0.2)
         condition = 'oversold' if 'BUY' in signal else 'overbought'
         if self._has_significant_timeframe(timeframe_status, condition):
-            strength += 0.25
+            strength += 0.2
 
-        # Bonus for extreme readings (up to 0.25)
+        # Weighted RSI gradation scoring (up to 0.3)
         timeframes = rsi_data.get('timeframes', rsi_data.get('rsi', {}))
         if isinstance(timeframes, dict):
-            extreme_count = sum(
-                1 for tf, rsi in timeframes.items()
-                if isinstance(rsi, (int, float)) and self._is_extreme(rsi)
-            )
-            if extreme_count > 0:
-                extreme_ratio = extreme_count / max(total_timeframes, 1)
-                strength += extreme_ratio * 0.25
+            weighted_score = 0.0
+            max_possible_weight = 0.0
+
+            for tf, rsi in timeframes.items():
+                if not isinstance(rsi, (int, float)):
+                    continue
+                # Check for NaN
+                if rsi != rsi:
+                    continue
+
+                max_possible_weight += 1.5  # Maximum weight per timeframe
+
+                # Weight based on RSI gradation level
+                if 'BUY' in signal:
+                    if rsi < extreme_oversold:
+                        weighted_score += 1.5  # Extremely Oversold
+                    elif rsi < self.thresholds.oversold:
+                        weighted_score += 1.0  # Oversold
+                    elif rsi < approaching_oversold_upper:
+                        weighted_score += 0.5  # Approaching Oversold
+                elif 'SELL' in signal:
+                    if rsi > extreme_overbought:
+                        weighted_score += 1.5  # Extremely Overbought
+                    elif rsi > self.thresholds.overbought:
+                        weighted_score += 1.0  # Overbought
+                    elif rsi > approaching_overbought_lower:
+                        weighted_score += 0.5  # Approaching Overbought
+
+            if max_possible_weight > 0:
+                gradation_ratio = weighted_score / max_possible_weight
+                strength += gradation_ratio * 0.3
+
+        # VIX confirmation bonus (up to 0.15)
+        if vix_confirmation is not None:
+            vix_confirms = False
+            vix_strength = 0
+
+            if 'BUY' in signal and hasattr(vix_confirmation, 'confirms_buy'):
+                vix_confirms = vix_confirmation.confirms_buy
+                vix_strength = getattr(vix_confirmation, 'strength', 0)
+            elif 'SELL' in signal and hasattr(vix_confirmation, 'confirms_sell'):
+                vix_confirms = vix_confirmation.confirms_sell
+                vix_strength = getattr(vix_confirmation, 'strength', 0)
+
+            if vix_confirms:
+                # Scale VIX bonus by confirmation strength (0-5 scale)
+                vix_bonus = min(vix_strength / 5.0, 1.0) * 0.15
+                strength += vix_bonus
 
         return min(strength, 1.0)
 
@@ -206,7 +256,7 @@ class SignalGenerator:
             f"Signal strength is {strength_desc} ({strength:.1%}), suggesting a potential {action}."
         )
 
-    def analyze(self, rsi_data: Dict[str, Any]) -> Dict[str, Any]:
+    def analyze(self, rsi_data: Dict[str, Any], vix_confirmation: Optional[Any] = None) -> Dict[str, Any]:
         """
         Analyze RSI data and generate a trading signal.
 
@@ -214,6 +264,7 @@ class SignalGenerator:
             rsi_data: Dictionary containing:
                 - 'symbol': The ticker symbol
                 - 'timeframes' or 'rsi': Dict of {timeframe: rsi_value}
+            vix_confirmation: Optional VIX confirmation object for strength bonus
 
         Returns:
             Dictionary with:
@@ -266,8 +317,8 @@ class SignalGenerator:
             signal = 'SELL'
             confluence_score = overbought_count
 
-        # Calculate strength
-        strength = self._calculate_strength(rsi_data, timeframe_status, confluence_score, signal)
+        # Calculate strength (with optional VIX confirmation bonus)
+        strength = self._calculate_strength(rsi_data, timeframe_status, confluence_score, signal, vix_confirmation)
 
         # Generate reason
         reason = self._generate_reason(signal, timeframe_status, confluence_score, strength)
