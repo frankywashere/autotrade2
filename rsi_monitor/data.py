@@ -53,9 +53,9 @@ class DataFetcher:
         self.cache_ttl = cache_ttl
         self._cache: dict[str, tuple[float, pd.DataFrame]] = {}
 
-    def _get_cache_key(self, symbol: str, interval: str, period: str) -> str:
+    def _get_cache_key(self, symbol: str, interval: str, period: str, prepost: bool = False) -> str:
         """Generate a cache key for the given parameters."""
-        return f"{symbol}:{interval}:{period}"
+        return f"{symbol}:{interval}:{period}:prepost={prepost}"
 
     def _is_cache_valid(self, cache_key: str) -> bool:
         """Check if cached data exists and is not expired."""
@@ -72,7 +72,8 @@ class DataFetcher:
         self,
         symbol: str,
         interval: str = '1h',
-        period: Optional[str] = None
+        period: Optional[str] = None,
+        prepost: bool = False
     ) -> Optional[pd.DataFrame]:
         """
         Fetch OHLCV data for a single symbol.
@@ -82,6 +83,7 @@ class DataFetcher:
             interval: Data interval (1m, 5m, 15m, 30m, 1h, 4h, 1d, etc.)
             period: Data period (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)
                    If None, uses sensible default based on interval.
+            prepost: Include pre-market and after-hours data (intraday only).
 
         Returns:
             DataFrame with OHLCV columns (Open, High, Low, Close, Volume),
@@ -97,7 +99,7 @@ class DataFetcher:
             period = self._get_default_period(interval)
 
         # Check cache
-        cache_key = self._get_cache_key(symbol, interval, period)
+        cache_key = self._get_cache_key(symbol, interval, period, prepost)
         if self._is_cache_valid(cache_key):
             logger.debug(f"Cache hit for {symbol} {interval} {period}")
             _, data = self._cache[cache_key]
@@ -105,9 +107,9 @@ class DataFetcher:
 
         # Fetch from yfinance
         try:
-            logger.debug(f"Fetching {symbol} with interval={interval}, period={period}")
+            logger.debug(f"Fetching {symbol} with interval={interval}, period={period}, prepost={prepost}")
             ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period, interval=interval)
+            df = ticker.history(period=period, interval=interval, prepost=prepost)
 
             if df.empty:
                 logger.warning(f"No data returned for {symbol} ({interval}, {period})")
@@ -130,7 +132,8 @@ class DataFetcher:
     def fetch_all(
         self,
         symbols: list[str],
-        intervals: list[str]
+        intervals: list[str],
+        prepost: bool = False
     ) -> dict[str, dict[str, Optional[pd.DataFrame]]]:
         """
         Fetch data for all symbol/interval combinations.
@@ -138,6 +141,7 @@ class DataFetcher:
         Args:
             symbols: List of ticker symbols
             intervals: List of intervals to fetch
+            prepost: Include pre-market and after-hours data (intraday only).
 
         Returns:
             Nested dict: {symbol: {interval: DataFrame or None}}
@@ -147,7 +151,7 @@ class DataFetcher:
         for symbol in symbols:
             results[symbol] = {}
             for interval in intervals:
-                results[symbol][interval] = self.fetch(symbol, interval)
+                results[symbol][interval] = self.fetch(symbol, interval, prepost=prepost)
 
         return results
 

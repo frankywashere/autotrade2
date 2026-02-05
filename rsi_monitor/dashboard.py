@@ -467,6 +467,16 @@ def main():
 
         st.divider()
 
+        # Market Hours
+        st.subheader("Market Hours")
+        prepost = st.checkbox(
+            "Include After-Hours Data",
+            value=False,
+            help="Include pre-market (4am-9:30am) and after-hours (4pm-8pm) data for intraday timeframes"
+        )
+
+        st.divider()
+
         # Refresh controls
         st.subheader("Refresh")
         col1, col2 = st.columns(2)
@@ -507,7 +517,7 @@ def main():
     with st.spinner("Fetching market data and calculating RSI..."):
         try:
             # get_all_rsi_with_percentile() fetches data and calculates RSI with percentiles for all symbols/timeframes
-            rsi_results = rsi_monitor.get_all_rsi_with_percentile()
+            rsi_results = rsi_monitor.get_all_rsi_with_percentile(prepost=prepost)
         except Exception as e:
             st.error(f"Error fetching data: {e}")
             st.stop()

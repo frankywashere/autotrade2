@@ -220,12 +220,15 @@ class RSIMonitor:
 
         return rsi
 
-    def get_all_rsi(self) -> Dict[str, Dict[str, float]]:
+    def get_all_rsi(self, prepost: bool = False) -> Dict[str, Dict[str, float]]:
         """
         Calculate RSI values for all symbols across all timeframes.
 
         Fetches price data using the DataFetcher and calculates RSI
         for each symbol/timeframe combination.
+
+        Args:
+            prepost: Include pre-market and after-hours data (intraday only).
 
         Returns:
             A nested dictionary with structure:
@@ -244,7 +247,7 @@ class RSIMonitor:
         for symbol in self.symbols:
             results[symbol] = {}
             for timeframe in self.timeframes:
-                data = self.data_fetcher.fetch(symbol, timeframe)
+                data = self.data_fetcher.fetch(symbol, timeframe, prepost=prepost)
                 if data is not None and len(data) > 0:
                     prices = data['Close'].values
                     rsi = self.calculate_rsi(prices)
@@ -254,7 +257,7 @@ class RSIMonitor:
 
         return results
 
-    def get_all_rsi_with_percentile(self) -> Dict[str, Dict[str, Dict[str, Optional[float]]]]:
+    def get_all_rsi_with_percentile(self, prepost: bool = False) -> Dict[str, Dict[str, Dict[str, Optional[float]]]]:
         """
         Calculate RSI values and percentiles for all symbols across all timeframes.
 
@@ -292,7 +295,7 @@ class RSIMonitor:
         for symbol in self.symbols:
             results[symbol] = {}
             for timeframe in self.timeframes:
-                data = self.data_fetcher.fetch(symbol, timeframe)
+                data = self.data_fetcher.fetch(symbol, timeframe, prepost=prepost)
 
                 if data is not None and len(data) > 0:
                     prices = data['Close'].values
@@ -315,7 +318,7 @@ class RSIMonitor:
 
         return results
 
-    def get_confluence_score(self, symbol: str) -> Dict[str, int]:
+    def get_confluence_score(self, symbol: str, prepost: bool = False) -> Dict[str, int]:
         """
         Calculate the confluence score for a symbol.
 
@@ -343,7 +346,7 @@ class RSIMonitor:
         valid_readings = 0
 
         for timeframe in self.timeframes:
-            data = self.data_fetcher.fetch(symbol, timeframe)
+            data = self.data_fetcher.fetch(symbol, timeframe, prepost=prepost)
             prices = data['Close'].values if data is not None and len(data) > 0 else None
             if prices is not None and len(prices) > 0:
                 rsi = self.calculate_rsi(prices)
