@@ -25,19 +25,19 @@ class DataFetcher:
 
     # Default periods for each interval
     DEFAULT_PERIODS = {
-        '1m': '1d',
-        '2m': '1d',
-        '5m': '1d',
-        '15m': '5d',
-        '30m': '5d',
-        '60m': '1mo',
-        '90m': '1mo',
-        '1h': '1mo',
-        '4h': '1mo',
-        '1d': '1y',
-        '5d': '5y',
-        '1wk': '5y',
-        '1mo': '5y',
+        '1m': '7d',
+        '2m': '60d',
+        '5m': '60d',
+        '15m': '60d',
+        '30m': '60d',
+        '60m': '2y',
+        '90m': '60d',
+        '1h': '2y',
+        '4h': '2y',
+        '1d': 'max',
+        '5d': 'max',
+        '1wk': 'max',
+        '1mo': 'max',
     }
 
     # Valid intervals supported by yfinance

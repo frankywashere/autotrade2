@@ -58,7 +58,7 @@ class RSIMonitor:
         self.data_fetcher = data_fetcher if data_fetcher is not None else DataFetcher()
 
     # Timeframes that support percentile calculation (daily and weekly)
-    PERCENTILE_TIMEFRAMES = {'1d', '1wk', 'daily', 'weekly', 'D', 'W'}
+    PERCENTILE_TIMEFRAMES = {'5m', '15m', '1h', '4h', '1d', '1wk', 'daily', 'weekly', 'D', 'W'}
 
     def _calculate_rsi_series(self, prices: np.ndarray, period: int = 14) -> np.ndarray:
         """

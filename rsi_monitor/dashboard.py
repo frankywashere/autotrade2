@@ -71,7 +71,8 @@ def get_rsi_status(rsi_value: float, oversold: float = 30, overbought: float = 7
 
     # Add percentile suffix if notable (<=10 or >=90)
     if percentile is not None and (percentile <= 10 or percentile >= 90):
-        pct_int = int(round(percentile))
+        display_pct = 100 - percentile if percentile <= 10 else percentile
+        pct_int = int(round(display_pct))
         status = f"{status} ({ordinal(pct_int)} %ile)"
 
     return status
