@@ -127,70 +127,183 @@ def create_strength_bar(strength: int, total: int) -> str:
     return "[" + "|" * filled + "-" * empty + "]"
 
 
-def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
-    """Render comprehensive VIX confirmation card with help tooltips."""
-    vix_color = get_vix_confirmation_color(confirmation)
-    strength_bar = create_strength_bar(confirmation.strength, confirmation.total_indicators)
+def get_vix_level_color(vix_price: float) -> str:
+    """Get color for VIX level (high fear = green/bullish, low = red/bearish)."""
+    if vix_price >= 40:
+        return "#00FF00"  # Bright green - panic (very bullish)
+    elif vix_price >= 30:
+        return "#00C851"  # Green - elevated fear (bullish)
+    elif vix_price >= 25:
+        return "#90EE90"  # Light green - caution
+    elif vix_price >= 15:
+        return "#6c757d"  # Gray - normal
+    elif vix_price >= 12:
+        return "#FF6B6B"  # Light red - complacency
+    else:
+        return "#ff4444"  # Red - extreme complacency (bearish)
 
-    # Main card header
+
+def get_vix_change_color(change_pct: float) -> str:
+    """Get color for VIX change (spike = green/bullish, drop = red/bearish)."""
+    if change_pct >= 15:
+        return "#00FF00"  # Bright green - major spike
+    elif change_pct >= 10:
+        return "#00C851"  # Green - elevated spike
+    elif change_pct >= 5:
+        return "#90EE90"  # Light green - moderate up
+    elif change_pct <= -10:
+        return "#ff4444"  # Red - fear subsiding
+    elif change_pct <= -5:
+        return "#FF6B6B"  # Light red - moderate down
+    else:
+        return "#6c757d"  # Gray - normal
+
+
+def get_vix_percentile_color(percentile: float) -> str:
+    """Get color for VIX percentile (high = green/bullish, low = red/bearish)."""
+    if percentile >= 90:
+        return "#00FF00"  # Bright green - extreme fear
+    elif percentile >= 75:
+        return "#00C851"  # Green - elevated fear
+    elif percentile >= 60:
+        return "#90EE90"  # Light green - above average
+    elif percentile <= 10:
+        return "#ff4444"  # Red - extreme complacency
+    elif percentile <= 25:
+        return "#FF6B6B"  # Light red - low volatility
+    else:
+        return "#6c757d"  # Gray - normal
+
+
+def get_term_structure_color(status: str, pct: float) -> str:
+    """Get color for term structure (backwardation = green, contango = red)."""
+    if status == "Backwardation":
+        if pct >= 10:
+            return "#00FF00"  # Bright green - severe backwardation
+        elif pct >= 5:
+            return "#00C851"  # Green - moderate backwardation
+        else:
+            return "#90EE90"  # Light green - mild backwardation
+    elif status == "Contango":
+        if pct <= -10:
+            return "#ff4444"  # Red - deep contango
+        elif pct <= -5:
+            return "#FF6B6B"  # Light red - moderate contango
+        else:
+            return "#6c757d"  # Gray - shallow contango
+    return "#6c757d"
+
+
+def get_vvix_color(vvix: float) -> str:
+    """Get color for VVIX (high = green/bullish, low = red/bearish)."""
+    if vvix >= 140:
+        return "#00FF00"  # Bright green - extreme
+    elif vvix >= 120:
+        return "#00C851"  # Green - elevated
+    elif vvix >= 100:
+        return "#90EE90"  # Light green - above average
+    elif vvix <= 70:
+        return "#ff4444"  # Red - very complacent
+    elif vvix <= 80:
+        return "#FF6B6B"  # Light red - complacent
+    else:
+        return "#6c757d"  # Gray - normal
+
+
+def render_vix_indicator(label: str, value: str, color: str, help_text: str) -> None:
+    """Render a single VIX indicator with color coding."""
     st.markdown(f"""
-    <div style="padding: 15px; border-radius: 10px; background-color: {vix_color}20; border-left: 5px solid {vix_color};">
-        <h4 style="margin: 0 0 10px 0;">VIX Confirmation</h4>
-        <p style="margin: 0; font-size: 1.1em;"><strong>Strength: {confirmation.strength}/{confirmation.total_indicators}</strong> <code>{strength_bar}</code></p>
+    <div style="margin-bottom: 10px;">
+        <span style="color: #888; font-size: 0.85em;">{label}</span>
+        <span style="color: #888; font-size: 0.7em;" title="{help_text}"> ⓘ</span>
+        <div style="color: {color}; font-size: 1.5em; font-weight: bold;">{value}</div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Detailed indicators with help tooltips
-    st.markdown("---")
 
-    # Row 1: VIX Price and Change
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(
-            label="VIX",
-            value=f"{confirmation.vix_price:.1f}",
-            help="Fear gauge. <15 = complacency (bearish). 15-20 = normal. >30 = high fear (bullish for stocks)."
-        )
-    with col2:
-        change_sign = "+" if confirmation.vix_change_pct >= 0 else ""
-        st.metric(
-            label="Change",
-            value=f"{change_sign}{confirmation.vix_change_pct:.1f}%",
-            help="Daily VIX change. Spike >10% = panic/capitulation (often bullish). Drop >10% = risk-on mood."
-        )
+def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
+    """Render comprehensive VIX confirmation card with color-coded indicators."""
+    vix_color = get_vix_confirmation_color(confirmation)
+    strength_bar = create_strength_bar(confirmation.strength, confirmation.total_indicators)
 
-    # Row 2: Percentile and Level
-    col3, col4 = st.columns(2)
-    with col3:
-        st.metric(
-            label="Percentile",
-            value=f"{confirmation.percentile_rank:.0f}th",
-            help="Where VIX sits vs past year. >75th = elevated fear (bullish). <25th = complacency (bearish)."
-        )
-    with col4:
-        st.metric(
-            label="Level",
-            value=confirmation.level_status,
-            help="VIX zone: Normal (15-20), Caution (20-30), Elevated (30-40), Panic (>40), Complacent (<15)."
-        )
+    # Compact summary header (always visible)
+    vix_val_color = get_vix_level_color(confirmation.vix_price)
+    change_color = get_vix_change_color(confirmation.vix_change_pct)
+    change_sign = "+" if confirmation.vix_change_pct >= 0 else ""
 
-    # Row 3: Term Structure
-    if confirmation.term_structure_status != "Unknown":
-        ts_display = f"{confirmation.term_structure_status} ({confirmation.term_structure_pct:+.1f}%)"
-        st.metric(
-            label="Term Structure",
-            value=ts_display,
-            help="Backwardation (VIX > VIX3M) = near-term panic, often marks bottoms (bullish). Contango = normal/complacent."
-        )
+    st.markdown(f"""
+    <div style="padding: 12px; border-radius: 8px; background-color: {vix_color}20; border-left: 4px solid {vix_color};">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-weight: bold;">VIX Confirmation</span>
+            <span><code>{strength_bar}</code> {confirmation.strength}/{confirmation.total_indicators}</span>
+        </div>
+        <div style="margin-top: 8px; display: flex; gap: 20px;">
+            <span>VIX: <strong style="color: {vix_val_color};">{confirmation.vix_price:.1f}</strong></span>
+            <span>Change: <strong style="color: {change_color};">{change_sign}{confirmation.vix_change_pct:.1f}%</strong></span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # Row 4: VVIX
-    if confirmation.vvix_level is not None:
-        vvix_display = f"{confirmation.vvix_level:.0f} ({confirmation.vvix_status})"
-        st.metric(
-            label="VVIX",
-            value=vvix_display,
-            help="Volatility of VIX. >120 = extreme uncertainty (bullish). <80 = complacent. Normal = 80-120."
-        )
+    # Collapsible details section
+    with st.expander("VIX Details", expanded=False):
+        # Row 1: VIX and Change
+        col1, col2 = st.columns(2)
+        with col1:
+            render_vix_indicator(
+                "VIX Level",
+                f"{confirmation.vix_price:.1f}",
+                vix_val_color,
+                "<15 complacent | 15-25 normal | >30 fear (bullish)"
+            )
+        with col2:
+            render_vix_indicator(
+                "Daily Change",
+                f"{change_sign}{confirmation.vix_change_pct:.1f}%",
+                change_color,
+                ">10% spike (bullish) | <-10% drop (bearish)"
+            )
+
+        # Row 2: Percentile and Level Status
+        col3, col4 = st.columns(2)
+        with col3:
+            pct_color = get_vix_percentile_color(confirmation.percentile_rank)
+            render_vix_indicator(
+                "Percentile (1Y)",
+                f"{confirmation.percentile_rank:.0f}th",
+                pct_color,
+                ">75th elevated | <25th low"
+            )
+        with col4:
+            level_color = get_vix_level_color(confirmation.vix_price)
+            render_vix_indicator(
+                "Zone",
+                confirmation.level_status,
+                level_color,
+                "Normal | Caution | Elevated | Panic"
+            )
+
+        # Row 3: Term Structure and VVIX
+        col5, col6 = st.columns(2)
+        with col5:
+            if confirmation.term_structure_status != "Unknown":
+                ts_color = get_term_structure_color(confirmation.term_structure_status, confirmation.term_structure_pct)
+                ts_display = f"{confirmation.term_structure_status} ({confirmation.term_structure_pct:+.1f}%)"
+                render_vix_indicator(
+                    "Term Structure",
+                    ts_display,
+                    ts_color,
+                    "Backwardation = fear | Contango = calm"
+                )
+        with col6:
+            if confirmation.vvix_level is not None:
+                vvix_color = get_vvix_color(confirmation.vvix_level)
+                vvix_display = f"{confirmation.vvix_level:.0f} ({confirmation.vvix_status})"
+                render_vix_indicator(
+                    "VVIX",
+                    vvix_display,
+                    vvix_color,
+                    ">120 elevated | <80 complacent"
+                )
 
     # Overall sentiment description
     sentiment_colors = {
