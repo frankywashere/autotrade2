@@ -30,7 +30,7 @@ import threading
 from pathlib import Path
 
 from ..binary_index import get_or_build_index
-from ..binary_loader import ChannelSample, read_channel_sample
+from ..binary_loader import ChannelSample, read_channel_sample, load_samples_as_array
 from ..config import TIMEFRAMES
 
 
@@ -351,29 +351,53 @@ class ChunkedStreamingDataset(Dataset):
 
         print(f"Loading chunk {chunk_idx}: samples [{start_idx:,}:{end_idx:,}] ({chunk_size:,} samples)")
 
-        # Load samples from binary file
-        samples = []
         t0 = _time.perf_counter()
-        with open(self.binary_path, 'rb') as f:
-            for i in range(start_idx, end_idx):
-                offset = self.offsets[i]
-                f.seek(offset)
-                sample = read_channel_sample(f, version=self.version, feature_table=self.feature_table)
-                samples.append(sample)
-                loaded = len(samples)
-                if loaded % 5000 == 0:
-                    elapsed = _time.perf_counter() - t0
-                    rate = loaded / elapsed if elapsed > 0 else 0
-                    print(f"  Read {loaded:,}/{chunk_size:,} samples ({elapsed:.1f}s, {rate:.0f} samples/s)")
 
-        read_elapsed = _time.perf_counter() - t0
-        print(f"  Read complete: {len(samples):,} samples in {read_elapsed:.1f}s")
+        # Use fast path for v3 format (skips Python dict building)
+        if self.version >= 3 and self.feature_table is not None:
+            features_np, samples = load_samples_as_array(
+                filename=self.binary_path,
+                offsets=self.offsets,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                feature_table=self.feature_table,
+                name_to_idx=self._feature_name_to_idx,
+                num_features=self.num_features,
+                version=self.version,
+            )
+            read_elapsed = _time.perf_counter() - t0
 
-        # Convert to tensors
-        t1 = _time.perf_counter()
-        features, labels = self._convert_to_tensors(samples)
-        convert_elapsed = _time.perf_counter() - t1
-        print(f"  Tensor conversion: {convert_elapsed:.1f}s")
+            # Convert features to tensor (already in numpy array)
+            t1 = _time.perf_counter()
+            features = torch.from_numpy(features_np)
+
+            # Extract labels only (features already done)
+            labels = self._extract_labels_only(samples)
+            convert_elapsed = _time.perf_counter() - t1
+            print(f"  Label extraction: {convert_elapsed:.1f}s")
+        else:
+            # Fallback: slow path for v2 format
+            samples = []
+            with open(self.binary_path, 'rb') as f:
+                for i in range(start_idx, end_idx):
+                    offset = self.offsets[i]
+                    f.seek(offset)
+                    sample = read_channel_sample(f, version=self.version, feature_table=self.feature_table)
+                    samples.append(sample)
+                    loaded = len(samples)
+                    if loaded % 5000 == 0:
+                        elapsed = _time.perf_counter() - t0
+                        rate = loaded / elapsed if elapsed > 0 else 0
+                        print(f"  Read {loaded:,}/{chunk_size:,} samples ({elapsed:.1f}s, {rate:.0f} samples/s)")
+
+            read_elapsed = _time.perf_counter() - t0
+            print(f"  Read complete: {len(samples):,} samples in {read_elapsed:.1f}s")
+
+            # Convert to tensors (slow path)
+            t1 = _time.perf_counter()
+            features, labels = self._convert_to_tensors(samples)
+            convert_elapsed = _time.perf_counter() - t1
+            print(f"  Tensor conversion: {convert_elapsed:.1f}s")
 
         # Update cache
         self.current_chunk_features = features
@@ -437,8 +461,19 @@ class ChunkedStreamingDataset(Dataset):
         self.prefetch_thread = threading.Thread(target=prefetch_worker, daemon=True)
         self.prefetch_thread.start()
 
-    def _convert_to_tensors(
+    def _extract_labels_only(
         self, samples: List[ChannelSample]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Extract labels only (when features are already extracted via fast path).
+
+        This is a wrapper that calls _convert_to_tensors with a dummy features flag.
+        """
+        _, labels = self._convert_to_tensors(samples, skip_features=True)
+        return labels
+
+    def _convert_to_tensors(
+        self, samples: List[ChannelSample], skip_features: bool = False
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Convert samples to feature tensors and batched label tensors.
@@ -448,6 +483,10 @@ class ChunkedStreamingDataset(Dataset):
         - Labels: pre-allocates numpy arrays per label key with defaults,
           fills raw values in one pass (no per-sample torch.tensor() calls),
           batch-converts to tensors once at the end.
+
+        Args:
+            samples: List of ChannelSample objects
+            skip_features: If True, skip feature extraction (features already in array)
         """
         import time as _time
         n = len(samples)
@@ -455,21 +494,26 @@ class ChunkedStreamingDataset(Dataset):
 
         # --- FEATURES: pre-allocate and fill in-place ---
         t0 = _time.perf_counter()
-        features = np.zeros((n, self.num_features), dtype=np.float32)
-        name_to_idx = self._feature_name_to_idx
+        if skip_features:
+            # Features already extracted via fast path, use dummy tensor
+            features_tensor = torch.zeros((n, self.num_features), dtype=torch.float32)
+            feat_elapsed = 0.0
+        else:
+            features = np.zeros((n, self.num_features), dtype=np.float32)
+            name_to_idx = self._feature_name_to_idx
 
-        for i, sample in enumerate(samples):
-            for name, value in sample.tf_features.items():
-                idx = name_to_idx.get(name)
-                if idx is not None:
-                    features[i, idx] = value
+            for i, sample in enumerate(samples):
+                for name, value in sample.tf_features.items():
+                    idx = name_to_idx.get(name)
+                    if idx is not None:
+                        features[i, idx] = value
 
-            if (i + 1) % 5000 == 0:
-                elapsed = _time.perf_counter() - t0
-                print(f"    Features: {i+1:,}/{n:,} samples ({elapsed:.1f}s)")
+                if (i + 1) % 5000 == 0:
+                    elapsed = _time.perf_counter() - t0
+                    print(f"    Features: {i+1:,}/{n:,} samples ({elapsed:.1f}s)")
 
-        features_tensor = torch.from_numpy(features)
-        feat_elapsed = _time.perf_counter() - t0
+            features_tensor = torch.from_numpy(features)
+            feat_elapsed = _time.perf_counter() - t0
 
         # --- LABELS: pre-allocate numpy arrays with defaults, fill raw values ---
         t1 = _time.perf_counter()
