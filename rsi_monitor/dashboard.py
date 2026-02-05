@@ -625,8 +625,11 @@ def main():
                     signal_color = SIGNAL_COLORS.get(signal, "#6c757d")
 
                     with col:
-                        # Get current price
-                        price_df = data_fetcher.fetch(symbol, interval="1d", period="5d")
+                        # Get current price (use intraday data for after-hours price)
+                        if prepost:
+                            price_df = data_fetcher.fetch(symbol, interval="5m", period="1d", prepost=True)
+                        else:
+                            price_df = data_fetcher.fetch(symbol, interval="1d", period="5d")
                         current_price = float(price_df["Close"].iloc[-1]) if price_df is not None and not price_df.empty else None
                         price_str = f"${current_price:.2f}" if current_price else "N/A"
 
