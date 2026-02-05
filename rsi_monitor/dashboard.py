@@ -524,8 +524,15 @@ def main():
 
     for symbol in all_symbols:
         try:
-            # analyze() expects dict with 'symbol' and 'timeframes' keys
-            signal_input = {'symbol': symbol, 'timeframes': rsi_results.get(symbol, {})}
+            # Extract plain RSI values for signal analysis (signals.py expects {tf: float})
+            symbol_data = rsi_results.get(symbol, {})
+            plain_rsi = {}
+            for tf, data in symbol_data.items():
+                if isinstance(data, dict):
+                    plain_rsi[tf] = data.get('rsi')
+                else:
+                    plain_rsi[tf] = data
+            signal_input = {'symbol': symbol, 'timeframes': plain_rsi}
             signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation)
         except Exception as e:
             st.warning(f"Error generating signal for {symbol}: {e}")
