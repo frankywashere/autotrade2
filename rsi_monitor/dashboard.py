@@ -38,7 +38,16 @@ RSI_LEVEL_COLORS = {
 }
 
 
-def get_rsi_status(rsi_value: float, oversold: float = 30, overbought: float = 70) -> str:
+def ordinal(n: int) -> str:
+    """Return ordinal string for number (1st, 2nd, 3rd, etc.)"""
+    if 11 <= n % 100 <= 13:
+        suffix = 'th'
+    else:
+        suffix = {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
+    return f"{n}{suffix}"
+
+
+def get_rsi_status(rsi_value: float, oversold: float = 30, overbought: float = 70, percentile: float = None) -> str:
     """Return 7-level status based on RSI value with dynamic boundaries."""
     extreme_oversold = oversold - 10
     approaching_oversold_upper = oversold + 10
@@ -46,19 +55,26 @@ def get_rsi_status(rsi_value: float, oversold: float = 30, overbought: float = 7
     extreme_overbought = overbought + 10
 
     if rsi_value < extreme_oversold:
-        return "Extremely Oversold"
+        status = "Extremely Oversold"
     elif rsi_value < oversold:
-        return "Oversold"
+        status = "Oversold"
     elif rsi_value < approaching_oversold_upper:
-        return "Approaching Oversold"
+        status = "Approaching Oversold"
     elif rsi_value <= approaching_overbought_lower:
-        return "Neutral"
+        status = "Neutral"
     elif rsi_value <= overbought:
-        return "Approaching Overbought"
+        status = "Approaching Overbought"
     elif rsi_value <= extreme_overbought:
-        return "Overbought"
+        status = "Overbought"
     else:
-        return "Extremely Overbought"
+        status = "Extremely Overbought"
+
+    # Add percentile suffix if notable (<=10 or >=90)
+    if percentile is not None and (percentile <= 10 or percentile >= 90):
+        pct_int = int(round(percentile))
+        status = f"{status} ({ordinal(pct_int)} %ile)"
+
+    return status
 
 
 def get_rsi_color(rsi_value: float, oversold: float = 30, overbought: float = 70) -> str:
@@ -80,11 +96,24 @@ def get_signal_emoji(signal: str) -> str:
 
 
 def create_rsi_table(rsi_data: dict, oversold: float, overbought: float) -> pd.DataFrame:
-    """Create a formatted DataFrame for RSI values across timeframes."""
+    """Create a formatted DataFrame for RSI values across timeframes.
+
+    Supports both old format (just rsi value) and new format (dict with rsi and percentile).
+    Old format: {timeframe: rsi_value}
+    New format: {timeframe: {'rsi': value, 'percentile': value_or_none}}
+    """
     rows = []
-    for timeframe, rsi_value in rsi_data.items():
+    for timeframe, data in rsi_data.items():
+        # Handle both old format (just rsi value) and new format (dict with rsi and percentile)
+        if isinstance(data, dict):
+            rsi_value = data.get('rsi')
+            percentile = data.get('percentile')
+        else:
+            rsi_value = data
+            percentile = None
+
         if rsi_value is not None:
-            status = get_rsi_status(rsi_value, oversold, overbought)
+            status = get_rsi_status(rsi_value, oversold, overbought, percentile)
             rows.append({
                 "Timeframe": timeframe,
                 "RSI": round(rsi_value, 2),
@@ -94,12 +123,21 @@ def create_rsi_table(rsi_data: dict, oversold: float, overbought: float) -> pd.D
 
 
 def calculate_confluence(rsi_data: dict, oversold: float, overbought: float) -> tuple:
-    """Calculate confluence score for oversold/overbought conditions."""
+    """Calculate confluence score for oversold/overbought conditions.
+
+    Supports both old format (just rsi value) and new format (dict with rsi and percentile).
+    """
     total = 0
     oversold_count = 0
     overbought_count = 0
 
-    for timeframe, rsi_value in rsi_data.items():
+    for timeframe, data in rsi_data.items():
+        # Handle both old format (just rsi value) and new format (dict with rsi and percentile)
+        if isinstance(data, dict):
+            rsi_value = data.get('rsi')
+        else:
+            rsi_value = data
+
         if rsi_value is not None:
             total += 1
             if rsi_value <= oversold:
@@ -467,8 +505,8 @@ def main():
 
     with st.spinner("Fetching market data and calculating RSI..."):
         try:
-            # get_all_rsi() fetches data and calculates RSI for all symbols/timeframes
-            rsi_results = rsi_monitor.get_all_rsi()
+            # get_all_rsi_with_percentile() fetches data and calculates RSI with percentiles for all symbols/timeframes
+            rsi_results = rsi_monitor.get_all_rsi_with_percentile()
         except Exception as e:
             st.error(f"Error fetching data: {e}")
             st.stop()
@@ -611,7 +649,9 @@ def main():
 
                                 # Style the dataframe with 7-level colors
                                 def color_status(val):
-                                    color = RSI_LEVEL_COLORS.get(val)
+                                    # Extract base status (before any percentile info)
+                                    base_status = val.split(" (")[0] if " (" in val else val
+                                    color = RSI_LEVEL_COLORS.get(base_status)
                                     if color:
                                         return f"background-color: {color}33; color: {color}"
                                     return ""
