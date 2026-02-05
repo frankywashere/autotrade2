@@ -52,11 +52,25 @@ def convert_bin_to_flat(
         target_tf: Target timeframe for label extraction
     """
     from .streaming_dataset import ChunkedStreamingDataset
+    from ..binary_loader import load_samples
+    import struct
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     labels_dir = output_dir / 'labels'
     labels_dir.mkdir(exist_ok=True)
+
+    # Check file version - v2 needs feature_names, v3 has them embedded
+    with open(bin_path, 'rb') as f:
+        f.read(8)  # magic
+        version = struct.unpack('<I', f.read(4))[0]
+
+    feature_names = None
+    if version < 3:
+        # v2 format: need to provide feature names from config
+        from ..features import get_tf_feature_names
+        feature_names = get_tf_feature_names()
+        print(f"  Note: v2 format detected, using {len(feature_names)} feature names from config")
 
     # Create streaming dataset for reading (no prefetch needed)
     dataset = ChunkedStreamingDataset(
@@ -64,6 +78,7 @@ def convert_bin_to_flat(
         chunk_size=chunk_size,
         target_tf=target_tf,
         prefetch=False,
+        feature_names=feature_names,  # None for v3 (uses embedded), list for v2
     )
 
     N = dataset.num_samples
