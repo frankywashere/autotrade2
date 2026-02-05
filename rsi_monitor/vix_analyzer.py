@@ -937,6 +937,7 @@ class VIXAnalyzer:
             indicator_percentages.append((level_pct, level_weight))
             greed_indicator_percentages.append((level_greed_pct, level_weight))
 
+            level_sell_weight = 0.0
             if vix_price > self.EXTREME_FEAR_LEVEL:
                 level_status = "Extreme Fear (>50)"
                 level_supports_buy = True
@@ -954,16 +955,24 @@ class VIXAnalyzer:
                 level_weight = self.WEIGHT_VIX_LEVEL_ELEVATED
             elif vix_price > self.CAUTION_LEVEL:
                 level_status = "Caution (25-30)"
-                level_supports_buy = False
+                level_supports_buy = True
                 level_supports_sell = False
+                level_weight = self.WEIGHT_VIX_LEVEL_ELEVATED * 0.5
             elif vix_price < self.EXTREME_COMPLACENCY_LEVEL:
                 level_status = "Extreme Low (<12)"
                 level_supports_buy = False
                 level_supports_sell = True
+                level_sell_weight = self.WEIGHT_VIX_LEVEL_EXTREME
             elif vix_price < self.COMPLACENCY_LEVEL:
                 level_status = "Low (12-15)"
                 level_supports_buy = False
                 level_supports_sell = True
+                level_sell_weight = self.WEIGHT_VIX_LEVEL_ELEVATED
+            elif vix_price < 18:
+                level_status = "Calm (15-18)"
+                level_supports_buy = False
+                level_supports_sell = True
+                level_sell_weight = self.WEIGHT_VIX_LEVEL_ELEVATED * 0.4
             else:
                 level_status = f"Normal ({vix_price:.0f})"
                 level_supports_buy = False
@@ -978,6 +987,7 @@ class VIXAnalyzer:
                 "supports_buy": level_supports_buy,
                 "supports_sell": level_supports_sell,
                 "weight": level_weight if level_supports_buy else 0.0,
+                "sell_weight": level_sell_weight,
                 "max_weight": self.WEIGHT_VIX_LEVEL_EXTREME,
                 "percentage": level_pct,
             }
@@ -999,15 +1009,30 @@ class VIXAnalyzer:
             indicator_percentages.append((percentile_pct, self.WEIGHT_PERCENTILE))
             greed_indicator_percentages.append((percentile_greed_pct, self.WEIGHT_PERCENTILE))
 
-            percentile_supports_buy = percentile_rank > 75
-            percentile_supports_sell = percentile_rank < 25
+            percentile_supports_buy = percentile_rank > 60
+            percentile_supports_sell = percentile_rank < 40
+            percentile_weight = 0.0
+            percentile_sell_weight = 0.0
+            if percentile_rank > 90:
+                percentile_weight = self.WEIGHT_PERCENTILE
+            elif percentile_rank > 75:
+                percentile_weight = self.WEIGHT_PERCENTILE * 0.75
+            elif percentile_rank > 60:
+                percentile_weight = self.WEIGHT_PERCENTILE * 0.4
+            elif percentile_rank < 10:
+                percentile_sell_weight = self.WEIGHT_PERCENTILE
+            elif percentile_rank < 25:
+                percentile_sell_weight = self.WEIGHT_PERCENTILE * 0.75
+            elif percentile_rank < 40:
+                percentile_sell_weight = self.WEIGHT_PERCENTILE * 0.4
             if percentile_supports_buy:
                 confirmation_count += 1
-                weighted_score += self.WEIGHT_PERCENTILE
+                weighted_score += percentile_weight
             indicators["percentile"] = {
                 "supports_buy": percentile_supports_buy,
                 "supports_sell": percentile_supports_sell,
-                "weight": self.WEIGHT_PERCENTILE if percentile_supports_buy else 0.0,
+                "weight": percentile_weight,
+                "sell_weight": percentile_sell_weight,
                 "max_weight": self.WEIGHT_PERCENTILE,
                 "percentage": percentile_pct,
             }
@@ -1028,22 +1053,35 @@ class VIXAnalyzer:
                     indicator_percentages.append((term_pct, self.WEIGHT_TERM_STRUCTURE))
                     greed_indicator_percentages.append((term_greed_pct, self.WEIGHT_TERM_STRUCTURE))
 
+                    term_weight = 0.0
+                    term_sell_weight = 0.0
                     if vix_price > vix3m_price:
                         term_structure_status = "Backwardation"
                         term_supports_buy = True
                         term_supports_sell = False
+                        if term_structure_pct > 10:
+                            term_weight = self.WEIGHT_TERM_STRUCTURE  # 2.0 severe
+                        elif term_structure_pct > 5:
+                            term_weight = self.WEIGHT_TERM_STRUCTURE * 0.75  # 1.5 moderate
+                        else:
+                            term_weight = self.WEIGHT_TERM_STRUCTURE * 0.4  # 0.8 mild
                     else:
                         term_structure_status = "Contango"
                         term_supports_buy = False
-                        term_supports_sell = term_structure_pct < -10  # Deep contango
+                        term_supports_sell = term_structure_pct < -5
+                        if term_structure_pct < -10:
+                            term_sell_weight = self.WEIGHT_TERM_STRUCTURE  # 2.0 deep
+                        elif term_structure_pct < -5:
+                            term_sell_weight = self.WEIGHT_TERM_STRUCTURE * 0.5  # 1.0 moderate
 
                     if term_supports_buy:
                         confirmation_count += 1
-                        weighted_score += self.WEIGHT_TERM_STRUCTURE
+                        weighted_score += term_weight
                     indicators["term_structure"] = {
                         "supports_buy": term_supports_buy,
                         "supports_sell": term_supports_sell,
-                        "weight": self.WEIGHT_TERM_STRUCTURE if term_supports_buy else 0.0,
+                        "weight": term_weight,
+                        "sell_weight": term_sell_weight,
                         "max_weight": self.WEIGHT_TERM_STRUCTURE,
                         "percentage": term_pct,
                     }
@@ -1062,18 +1100,38 @@ class VIXAnalyzer:
                 indicator_percentages.append((vvix_pct, self.WEIGHT_VVIX_EXTREME))
                 greed_indicator_percentages.append((vvix_greed_pct, self.WEIGHT_VVIX_EXTREME))
 
+                vvix_weight = 0.0
+                vvix_sell_weight = 0.0
                 if vvix_level > self.VVIX_EXTREME_LEVEL:
                     vvix_status = "Extreme"
                     vvix_supports_buy = True
                     vvix_supports_sell = False
+                    vvix_weight = self.WEIGHT_VVIX_EXTREME
                 elif vvix_level > self.VVIX_ELEVATED_LEVEL:
                     vvix_status = "Elevated"
                     vvix_supports_buy = True
                     vvix_supports_sell = False
+                    vvix_weight = self.WEIGHT_VVIX_EXTREME * 0.7
+                elif vvix_level > 100:
+                    vvix_status = "Approaching Elevated"
+                    vvix_supports_buy = True
+                    vvix_supports_sell = False
+                    vvix_weight = self.WEIGHT_VVIX_EXTREME * 0.35
+                elif vvix_level < 70:
+                    vvix_status = "Very Low"
+                    vvix_supports_buy = False
+                    vvix_supports_sell = True
+                    vvix_sell_weight = self.WEIGHT_VVIX_EXTREME
                 elif vvix_level < self.VVIX_COMPLACENT_LEVEL:
                     vvix_status = "Low"
                     vvix_supports_buy = False
                     vvix_supports_sell = True
+                    vvix_sell_weight = self.WEIGHT_VVIX_EXTREME * 0.7
+                elif vvix_level < 90:
+                    vvix_status = "Approaching Low"
+                    vvix_supports_buy = False
+                    vvix_supports_sell = True
+                    vvix_sell_weight = self.WEIGHT_VVIX_EXTREME * 0.35
                 else:
                     vvix_status = "Normal"
                     vvix_supports_buy = False
@@ -1081,11 +1139,12 @@ class VIXAnalyzer:
 
                 if vvix_supports_buy:
                     confirmation_count += 1
-                    weighted_score += self.WEIGHT_VVIX_EXTREME
+                    weighted_score += vvix_weight
                 indicators["vvix"] = {
                     "supports_buy": vvix_supports_buy,
                     "supports_sell": vvix_supports_sell,
-                    "weight": self.WEIGHT_VVIX_EXTREME if vvix_supports_buy else 0.0,
+                    "weight": vvix_weight,
+                    "sell_weight": vvix_sell_weight,
                     "max_weight": self.WEIGHT_VVIX_EXTREME,
                     "percentage": vvix_pct,
                 }
@@ -1100,6 +1159,8 @@ class VIXAnalyzer:
             indicator_percentages.append((roc_pct, self.WEIGHT_VIX_SPIKE))
             greed_indicator_percentages.append((roc_greed_pct, self.WEIGHT_VIX_SPIKE))
 
+            roc_weight = 0.0
+            roc_sell_weight = 0.0
             if vix_change_pct > self.ROC_SPIKE_THRESHOLD:
                 roc_supports_buy = True
                 roc_supports_sell = False
@@ -1107,15 +1168,26 @@ class VIXAnalyzer:
             elif vix_change_pct > self.ROC_ELEVATED_THRESHOLD:
                 roc_supports_buy = True
                 roc_supports_sell = False
-                roc_weight = self.WEIGHT_VIX_SPIKE * 0.7  # Reduced weight for elevated but not spike
+                roc_weight = self.WEIGHT_VIX_SPIKE * 0.7
+            elif vix_change_pct > 5:
+                roc_supports_buy = True
+                roc_supports_sell = False
+                roc_weight = self.WEIGHT_VIX_SPIKE * 0.35
+            elif vix_change_pct < -self.ROC_SPIKE_THRESHOLD:
+                roc_supports_buy = False
+                roc_supports_sell = True
+                roc_sell_weight = self.WEIGHT_VIX_SPIKE
             elif vix_change_pct < -self.ROC_ELEVATED_THRESHOLD:
                 roc_supports_buy = False
                 roc_supports_sell = True
-                roc_weight = 0.0
+                roc_sell_weight = self.WEIGHT_VIX_SPIKE * 0.7
+            elif vix_change_pct < -5:
+                roc_supports_buy = False
+                roc_supports_sell = True
+                roc_sell_weight = self.WEIGHT_VIX_SPIKE * 0.35
             else:
                 roc_supports_buy = False
                 roc_supports_sell = False
-                roc_weight = 0.0
 
             if roc_supports_buy:
                 confirmation_count += 1
@@ -1123,7 +1195,8 @@ class VIXAnalyzer:
             indicators["rate_of_change"] = {
                 "supports_buy": roc_supports_buy,
                 "supports_sell": roc_supports_sell,
-                "weight": roc_weight if roc_supports_buy else 0.0,
+                "weight": roc_weight,
+                "sell_weight": roc_sell_weight,
                 "max_weight": self.WEIGHT_VIX_SPIKE,
                 "percentage": roc_pct,
             }
@@ -1146,11 +1219,11 @@ class VIXAnalyzer:
             # Buy confirmation now requires meeting the weighted threshold (2.5)
             confirms_buy = weighted_score >= self.WEIGHTED_CONFIRMATION_THRESHOLD
 
-            # Calculate sell weighted score similarly
+            # Calculate sell weighted score using graduated sell weights
             sell_weighted_score = 0.0
             for ind_name, ind_data in indicators.items():
                 if ind_data.get("supports_sell", False):
-                    sell_weighted_score += ind_data.get("max_weight", 1.0)
+                    sell_weighted_score += ind_data.get("sell_weight", ind_data.get("max_weight", 1.0))
             confirms_sell = sell_weighted_score >= self.WEIGHTED_CONFIRMATION_THRESHOLD
 
             # Overall sentiment based on fear_percentage (0-100 scale)

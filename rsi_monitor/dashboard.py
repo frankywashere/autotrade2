@@ -174,10 +174,12 @@ def get_vix_level_color(vix_price: float) -> str:
         return "#ff4444"  # Red - elevated fear
     elif vix_price >= 25:
         return "#FF6B6B"  # Light red - caution
-    elif vix_price >= 15:
+    elif vix_price >= 18:
         return "#6c757d"  # Gray - normal
+    elif vix_price >= 15:
+        return "#B8D4B8"  # Dim green - calm
     elif vix_price >= 12:
-        return "#90EE90"  # Light green - calm
+        return "#90EE90"  # Light green - low
     else:
         return "#00C851"  # Green - very calm (greed)
 
@@ -190,10 +192,12 @@ def get_vix_change_color(change_pct: float) -> str:
         return "#ff4444"  # Red - elevated spike
     elif change_pct >= 5:
         return "#FF6B6B"  # Light red - moderate up
+    elif change_pct <= -15:
+        return "#00C851"  # Green - major drop (calm/greed)
     elif change_pct <= -10:
-        return "#00C851"  # Green - fear subsiding (calm)
+        return "#90EE90"  # Light green - fear subsiding
     elif change_pct <= -5:
-        return "#90EE90"  # Light green - moderate down
+        return "#B8D4B8"  # Dim green - moderate down
     else:
         return "#6c757d"  # Gray - normal
 
@@ -209,7 +213,9 @@ def get_vix_percentile_color(percentile: float) -> str:
     elif percentile <= 10:
         return "#00C851"  # Green - extreme calm (greed)
     elif percentile <= 25:
-        return "#90EE90"  # Light green - low volatility (calm)
+        return "#90EE90"  # Light green - low volatility
+    elif percentile <= 40:
+        return "#B8D4B8"  # Dim green - below average
     else:
         return "#6c757d"  # Gray - normal
 
@@ -228,6 +234,8 @@ def get_term_structure_color(status: str, pct: float) -> str:
             return "#00C851"  # Green - deep contango (calm/greed)
         elif pct <= -5:
             return "#90EE90"  # Light green - moderate contango
+        elif pct <= -2:
+            return "#B8D4B8"  # Dim green - light contango
         else:
             return "#6c757d"  # Gray - shallow contango
     return "#6c757d"
@@ -240,11 +248,13 @@ def get_vvix_color(vvix: float) -> str:
     elif vvix >= 120:
         return "#ff4444"  # Red - elevated fear
     elif vvix >= 100:
-        return "#FF6B6B"  # Light red - above average
+        return "#FF6B6B"  # Light red - approaching elevated
     elif vvix <= 70:
-        return "#00C851"  # Green - very calm (greed)
+        return "#00C851"  # Green - very low (greed)
     elif vvix <= 80:
-        return "#90EE90"  # Light green - calm
+        return "#90EE90"  # Light green - low
+    elif vvix <= 90:
+        return "#B8D4B8"  # Dim green - approaching low
     else:
         return "#6c757d"  # Gray - normal
 
