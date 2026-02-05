@@ -26,15 +26,40 @@ SIGNAL_COLORS = {
     "STRONG_SELL": "#ff4444",  # Bright red
 }
 
-# RSI color thresholds
-def get_rsi_color(rsi_value: float, oversold: float, overbought: float) -> str:
-    """Return color based on RSI value."""
-    if rsi_value <= oversold:
-        return "#00C851"  # Green - oversold (buy opportunity)
-    elif rsi_value >= overbought:
-        return "#ff4444"  # Red - overbought (sell opportunity)
+# RSI 7-level color mapping
+RSI_LEVEL_COLORS = {
+    "Extremely Oversold": "#00FF00",      # Bright Green
+    "Oversold": "#00C851",                # Green
+    "Approaching Oversold": "#90EE90",    # Light Green
+    "Neutral": "#6c757d",                 # Gray
+    "Approaching Overbought": "#FF6B6B",  # Light Red
+    "Overbought": "#ff4444",              # Red
+    "Extremely Overbought": "#FF0000",    # Bright Red
+}
+
+
+def get_rsi_status(rsi_value: float) -> str:
+    """Return 7-level status based on RSI value."""
+    if rsi_value < 20:
+        return "Extremely Oversold"
+    elif rsi_value < 30:
+        return "Oversold"
+    elif rsi_value < 40:
+        return "Approaching Oversold"
+    elif rsi_value <= 60:
+        return "Neutral"
+    elif rsi_value <= 70:
+        return "Approaching Overbought"
+    elif rsi_value <= 80:
+        return "Overbought"
     else:
-        return "#6c757d"  # Gray - neutral
+        return "Extremely Overbought"
+
+
+def get_rsi_color(rsi_value: float, oversold: float = 30, overbought: float = 70) -> str:
+    """Return color based on RSI value using 7-level gradations."""
+    status = get_rsi_status(rsi_value)
+    return RSI_LEVEL_COLORS.get(status, "#6c757d")
 
 
 def get_signal_emoji(signal: str) -> str:
@@ -54,8 +79,7 @@ def create_rsi_table(rsi_data: dict, oversold: float, overbought: float) -> pd.D
     rows = []
     for timeframe, rsi_value in rsi_data.items():
         if rsi_value is not None:
-            color = get_rsi_color(rsi_value, oversold, overbought)
-            status = "Oversold" if rsi_value <= oversold else "Overbought" if rsi_value >= overbought else "Neutral"
+            status = get_rsi_status(rsi_value)
             rows.append({
                 "Timeframe": timeframe,
                 "RSI": round(rsi_value, 2),
@@ -377,36 +401,21 @@ def main():
                             with metric_cols[2]:
                                 st.metric("Strength", f"{strength:.0%}" if isinstance(strength, float) else str(strength))
 
-                            # VIX confirmation for this symbol using comprehensive analysis
-                            if signal in ["BUY", "STRONG_BUY"]:
-                                if vix_confirmation.confirms_buy:
-                                    st.success(f"VIX Confirmed ({vix_confirmation.strength}/5): High fear supports buy")
-                                else:
-                                    st.warning(f"VIX Neutral ({vix_confirmation.strength}/5): Limited fear confirmation")
-                            elif signal in ["SELL", "STRONG_SELL"]:
-                                if vix_confirmation.confirms_sell:
-                                    st.success(f"VIX Confirmed ({5 - vix_confirmation.strength}/5): Complacency supports sell")
-                                else:
-                                    st.warning(f"VIX Neutral ({5 - vix_confirmation.strength}/5): Limited complacency")
-                            else:
-                                # Display VIX status for NEUTRAL signals too
-                                if vix_confirmation.confirms_buy:
-                                    st.info(f"VIX ({vix_confirmation.strength}/5): High fear - buy signals confirmed if triggered")
-                                elif vix_confirmation.confirms_sell:
-                                    st.info(f"VIX ({vix_confirmation.strength}/5): Complacency - sell signals confirmed if triggered")
-                                else:
-                                    st.info(f"VIX ({vix_confirmation.strength}/5): Neutral - no strong confirmation")
+                            # VIX confirmation - consistent display for all tickers
+                            weighted_score = vix_confirmation.weighted_score if hasattr(vix_confirmation, 'weighted_score') else vix_confirmation.strength
+                            max_score = vix_confirmation.max_weighted_score if hasattr(vix_confirmation, 'max_weighted_score') else vix_confirmation.total_indicators
+                            confirms_buy = "Yes" if vix_confirmation.confirms_buy else "No"
+                            st.info(f"VIX: {weighted_score:.1f}/{max_score:.1f} weighted | Confirms Buy: {confirms_buy}")
 
                             # RSI Table
                             if rsi_data:
                                 df = create_rsi_table(rsi_data, oversold_threshold, overbought_threshold)
 
-                                # Style the dataframe
+                                # Style the dataframe with 7-level colors
                                 def color_status(val):
-                                    if val == "Oversold":
-                                        return "background-color: #00C85133; color: #00C851"
-                                    elif val == "Overbought":
-                                        return "background-color: #ff444433; color: #ff4444"
+                                    color = RSI_LEVEL_COLORS.get(val)
+                                    if color:
+                                        return f"background-color: {color}33; color: {color}"
                                     return ""
 
                                 styled_df = df.style.map(
