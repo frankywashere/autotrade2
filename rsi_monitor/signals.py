@@ -1,0 +1,352 @@
+"""
+Signal generation module for RSI Monitor.
+
+Analyzes RSI data across multiple timeframes to generate trading signals
+with confluence scoring and VIX confirmation.
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
+
+
+@dataclass
+class SignalThresholds:
+    """Configurable RSI thresholds for signal generation."""
+    oversold: float = 30.0
+    overbought: float = 70.0
+    extreme_oversold: float = 20.0
+    extreme_overbought: float = 80.0
+
+
+class SignalGenerator:
+    """
+    Generates trading signals from RSI data across multiple timeframes.
+
+    Uses confluence of timeframes to determine signal strength and
+    supports VIX confirmation for contrarian signals.
+    """
+
+    # Higher timeframes that carry more weight
+    SIGNIFICANT_TIMEFRAMES = {'daily', 'weekly', '1d', '1w', 'D', 'W'}
+
+    def __init__(
+        self,
+        oversold_threshold: float = 30.0,
+        overbought_threshold: float = 70.0,
+        extreme_oversold: float = 20.0,
+        extreme_overbought: float = 80.0
+    ):
+        """
+        Initialize SignalGenerator with configurable thresholds.
+
+        Args:
+            oversold_threshold: RSI level below which is considered oversold (default 30)
+            overbought_threshold: RSI level above which is considered overbought (default 70)
+            extreme_oversold: RSI level for extreme oversold conditions (default 20)
+            extreme_overbought: RSI level for extreme overbought conditions (default 80)
+        """
+        self.thresholds = SignalThresholds(
+            oversold=oversold_threshold,
+            overbought=overbought_threshold,
+            extreme_oversold=extreme_oversold,
+            extreme_overbought=extreme_overbought
+        )
+
+    def _classify_rsi(self, rsi_value: float) -> str:
+        """
+        Classify an RSI value as oversold, overbought, or neutral.
+
+        Args:
+            rsi_value: The RSI value to classify
+
+        Returns:
+            'oversold', 'overbought', or 'neutral'
+        """
+        if rsi_value <= self.thresholds.oversold:
+            return 'oversold'
+        elif rsi_value >= self.thresholds.overbought:
+            return 'overbought'
+        return 'neutral'
+
+    def _is_extreme(self, rsi_value: float) -> bool:
+        """Check if RSI is at extreme levels."""
+        return (rsi_value <= self.thresholds.extreme_oversold or
+                rsi_value >= self.thresholds.extreme_overbought)
+
+    def _has_significant_timeframe(self, timeframe_status: Dict[str, str], condition: str) -> bool:
+        """
+        Check if any significant timeframe (daily/weekly) matches the condition.
+
+        Args:
+            timeframe_status: Dict mapping timeframe to status
+            condition: 'oversold' or 'overbought'
+
+        Returns:
+            True if daily or weekly timeframe matches the condition
+        """
+        for tf, status in timeframe_status.items():
+            tf_lower = tf.lower()
+            if status == condition:
+                # Check various naming conventions for daily/weekly
+                if any(sig in tf_lower for sig in ['daily', 'weekly', '1d', '1w']):
+                    return True
+                if tf in ['D', 'W']:
+                    return True
+        return False
+
+    def _calculate_strength(
+        self,
+        rsi_data: Dict[str, Any],
+        timeframe_status: Dict[str, str],
+        confluence_score: int,
+        signal: str
+    ) -> float:
+        """
+        Calculate signal strength as a float from 0 to 1.
+
+        Factors:
+        - Number of timeframes in agreement (confluence)
+        - Presence of extreme RSI readings
+        - Significant timeframe alignment
+
+        Args:
+            rsi_data: Original RSI data with timeframe values
+            timeframe_status: Classification of each timeframe
+            confluence_score: Number of timeframes in oversold/overbought
+            signal: The determined signal type
+
+        Returns:
+            Float from 0.0 to 1.0 indicating signal strength
+        """
+        if signal == 'NEUTRAL':
+            return 0.0
+
+        strength = 0.0
+        total_timeframes = len(timeframe_status)
+
+        if total_timeframes == 0:
+            return 0.0
+
+        # Base strength from confluence (up to 0.5)
+        confluence_ratio = confluence_score / max(total_timeframes, 1)
+        strength += confluence_ratio * 0.5
+
+        # Bonus for significant timeframe alignment (up to 0.25)
+        condition = 'oversold' if 'BUY' in signal else 'overbought'
+        if self._has_significant_timeframe(timeframe_status, condition):
+            strength += 0.25
+
+        # Bonus for extreme readings (up to 0.25)
+        timeframes = rsi_data.get('timeframes', rsi_data.get('rsi', {}))
+        if isinstance(timeframes, dict):
+            extreme_count = sum(
+                1 for tf, rsi in timeframes.items()
+                if isinstance(rsi, (int, float)) and self._is_extreme(rsi)
+            )
+            if extreme_count > 0:
+                extreme_ratio = extreme_count / max(total_timeframes, 1)
+                strength += extreme_ratio * 0.25
+
+        return min(strength, 1.0)
+
+    def _generate_reason(
+        self,
+        signal: str,
+        timeframe_status: Dict[str, str],
+        confluence_score: int,
+        strength: float
+    ) -> str:
+        """
+        Generate a human-readable explanation for the signal.
+
+        Args:
+            signal: The signal type
+            timeframe_status: Classification of each timeframe
+            confluence_score: Number of agreeing timeframes
+            strength: Signal strength
+
+        Returns:
+            Human-readable explanation string
+        """
+        if signal == 'NEUTRAL':
+            return "No significant RSI confluence detected across timeframes."
+
+        # Determine which condition we're looking at
+        if 'BUY' in signal:
+            condition = 'oversold'
+            action = 'buying opportunity'
+        else:
+            condition = 'overbought'
+            action = 'selling opportunity'
+
+        # Find which timeframes are in the condition
+        matching_timeframes = [
+            tf for tf, status in timeframe_status.items()
+            if status == condition
+        ]
+
+        # Build the reason
+        tf_list = ', '.join(matching_timeframes)
+
+        strength_desc = "weak"
+        if strength >= 0.75:
+            strength_desc = "strong"
+        elif strength >= 0.5:
+            strength_desc = "moderate"
+
+        has_significant = self._has_significant_timeframe(timeframe_status, condition)
+        significant_note = " including higher timeframe confirmation" if has_significant else ""
+
+        return (
+            f"{signal}: {confluence_score} timeframes showing {condition} conditions "
+            f"({tf_list}){significant_note}. "
+            f"Signal strength is {strength_desc} ({strength:.1%}), suggesting a potential {action}."
+        )
+
+    def analyze(self, rsi_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze RSI data and generate a trading signal.
+
+        Args:
+            rsi_data: Dictionary containing:
+                - 'symbol': The ticker symbol
+                - 'timeframes' or 'rsi': Dict of {timeframe: rsi_value}
+
+        Returns:
+            Dictionary with:
+                - 'symbol': the symbol
+                - 'signal': 'STRONG_BUY', 'BUY', 'NEUTRAL', 'SELL', 'STRONG_SELL'
+                - 'confluence_score': number of timeframes in oversold/overbought
+                - 'timeframe_status': dict of {timeframe: 'oversold'/'overbought'/'neutral'}
+                - 'strength': float 0-1 indicating signal strength
+                - 'reason': human-readable explanation
+        """
+        symbol = rsi_data.get('symbol', 'UNKNOWN')
+
+        # Support different data structures
+        timeframes = rsi_data.get('timeframes', rsi_data.get('rsi', {}))
+
+        if not isinstance(timeframes, dict):
+            return {
+                'symbol': symbol,
+                'signal': 'NEUTRAL',
+                'confluence_score': 0,
+                'timeframe_status': {},
+                'strength': 0.0,
+                'reason': 'No valid RSI timeframe data provided.'
+            }
+
+        # Classify each timeframe
+        timeframe_status = {}
+        for tf, rsi_value in timeframes.items():
+            if isinstance(rsi_value, (int, float)) and not (rsi_value != rsi_value):  # Check for NaN
+                timeframe_status[tf] = self._classify_rsi(rsi_value)
+
+        # Count oversold and overbought timeframes
+        oversold_count = sum(1 for status in timeframe_status.values() if status == 'oversold')
+        overbought_count = sum(1 for status in timeframe_status.values() if status == 'overbought')
+
+        # Determine signal
+        signal = 'NEUTRAL'
+        confluence_score = 0
+
+        if oversold_count >= 3 and self._has_significant_timeframe(timeframe_status, 'oversold'):
+            signal = 'STRONG_BUY'
+            confluence_score = oversold_count
+        elif oversold_count >= 2:
+            signal = 'BUY'
+            confluence_score = oversold_count
+        elif overbought_count >= 3 and self._has_significant_timeframe(timeframe_status, 'overbought'):
+            signal = 'STRONG_SELL'
+            confluence_score = overbought_count
+        elif overbought_count >= 2:
+            signal = 'SELL'
+            confluence_score = overbought_count
+
+        # Calculate strength
+        strength = self._calculate_strength(rsi_data, timeframe_status, confluence_score, signal)
+
+        # Generate reason
+        reason = self._generate_reason(signal, timeframe_status, confluence_score, strength)
+
+        return {
+            'symbol': symbol,
+            'signal': signal,
+            'confluence_score': confluence_score,
+            'timeframe_status': timeframe_status,
+            'strength': strength,
+            'reason': reason
+        }
+
+    def check_vix_confirmation(self, vix_rsi: float, signal_type: Optional[str] = None) -> bool:
+        """
+        Check if VIX RSI confirms the trading signal.
+
+        For contrarian trading:
+        - BUY signals are confirmed when VIX RSI > 60 (elevated fear)
+        - SELL signals are confirmed when VIX RSI < 40 (complacency)
+
+        Args:
+            vix_rsi: The current VIX RSI value
+            signal_type: Optional signal type ('BUY', 'STRONG_BUY', 'SELL', 'STRONG_SELL')
+                        If None, returns general VIX status
+
+        Returns:
+            True if VIX RSI confirms the signal, False otherwise
+        """
+        if signal_type is None:
+            # Return True if VIX is at either extreme (actionable)
+            return vix_rsi > 60 or vix_rsi < 40
+
+        if 'BUY' in signal_type.upper():
+            # For buy signals, we want elevated fear (high VIX RSI)
+            return vix_rsi > 60
+        elif 'SELL' in signal_type.upper():
+            # For sell signals, we want complacency (low VIX RSI)
+            return vix_rsi < 40
+
+        return False
+
+    def get_vix_context(self, vix_rsi: float) -> Dict[str, Any]:
+        """
+        Get detailed context about VIX RSI for signal interpretation.
+
+        Args:
+            vix_rsi: The current VIX RSI value
+
+        Returns:
+            Dictionary with VIX context information
+        """
+        if vix_rsi >= 80:
+            sentiment = 'extreme_fear'
+            description = 'Extreme fear in the market - strong contrarian buy opportunity'
+            supports_buy = True
+            supports_sell = False
+        elif vix_rsi >= 60:
+            sentiment = 'elevated_fear'
+            description = 'Elevated fear - favorable for contrarian buying'
+            supports_buy = True
+            supports_sell = False
+        elif vix_rsi <= 20:
+            sentiment = 'extreme_complacency'
+            description = 'Extreme complacency - strong contrarian sell opportunity'
+            supports_buy = False
+            supports_sell = True
+        elif vix_rsi <= 40:
+            sentiment = 'complacency'
+            description = 'Market complacency - favorable for contrarian selling'
+            supports_buy = False
+            supports_sell = True
+        else:
+            sentiment = 'neutral'
+            description = 'VIX RSI in neutral zone - no strong contrarian signal'
+            supports_buy = False
+            supports_sell = False
+
+        return {
+            'vix_rsi': vix_rsi,
+            'sentiment': sentiment,
+            'description': description,
+            'supports_buy': supports_buy,
+            'supports_sell': supports_sell
+        }
