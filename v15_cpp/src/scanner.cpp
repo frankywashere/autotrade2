@@ -2,6 +2,7 @@
 #include "label_generator.hpp"
 #include "feature_extractor.hpp"
 #include "serialization.hpp"
+#include "flat_writer.hpp"
 #include "progress_bar.hpp"
 #include <algorithm>
 #include <chrono>
@@ -591,18 +592,42 @@ std::vector<ChannelSample> Scanner::scan(
     // =========================================================================
     bool use_streaming = config_.streaming && !config_.output_path.empty();
     std::unique_ptr<StreamingSampleWriter> streaming_writer;
+    std::unique_ptr<FlatWriter> flat_writer;
     std::mutex writer_mutex;  // Protect streaming writer in parallel mode
 
-    if (use_streaming) {
-        if (config_.verbose) {
-            std::cout << "\n  [STREAMING MODE] Writing samples directly to disk\n";
-            std::cout << "    Output: " << config_.output_path << "\n";
-            std::cout << "    Flush interval: " << config_.flush_interval << " samples\n";
+    // Detect output format from file extension
+    bool use_flat_output = false;
+    if (!config_.output_path.empty()) {
+        size_t dot_pos = config_.output_path.rfind('.');
+        if (dot_pos != std::string::npos) {
+            std::string ext = config_.output_path.substr(dot_pos);
+            use_flat_output = (ext == ".flat");
         }
-        streaming_writer = std::make_unique<StreamingSampleWriter>(
-            config_.output_path, config_.flush_interval
-        );
-        streaming_writer->open();
+        // Also check if path ends with .flat directory
+        if (config_.output_path.size() >= 5 &&
+            config_.output_path.substr(config_.output_path.size() - 5) == ".flat") {
+            use_flat_output = true;
+        }
+    }
+
+    if (use_streaming) {
+        if (use_flat_output) {
+            if (config_.verbose) {
+                std::cout << "\n  [FLAT OUTPUT MODE] Writing samples directly to .flat format\n";
+                std::cout << "    Output: " << config_.output_path << "\n";
+            }
+            flat_writer = std::make_unique<FlatWriter>(config_.output_path, "daily");
+        } else {
+            if (config_.verbose) {
+                std::cout << "\n  [STREAMING MODE] Writing samples directly to disk\n";
+                std::cout << "    Output: " << config_.output_path << "\n";
+                std::cout << "    Flush interval: " << config_.flush_interval << " samples\n";
+            }
+            streaming_writer = std::make_unique<StreamingSampleWriter>(
+                config_.output_path, config_.flush_interval
+            );
+            streaming_writer->open();
+        }
     }
 
     // Process batches
@@ -633,7 +658,11 @@ std::vector<ChannelSample> Scanner::scan(
             for (auto& sample : batch_samples) {
                 if (sample.is_valid()) {
                     if (use_streaming) {
-                        streaming_writer->write(sample);
+                        if (use_flat_output) {
+                            flat_writer->write(sample);
+                        } else {
+                            streaming_writer->write(sample);
+                        }
                     } else {
                         samples.push_back(std::move(sample));
                     }
@@ -684,7 +713,11 @@ std::vector<ChannelSample> Scanner::scan(
                 if (sample.is_valid()) {
                     if (use_streaming) {
                         std::lock_guard<std::mutex> lock(writer_mutex);
-                        streaming_writer->write(sample);
+                        if (use_flat_output) {
+                            flat_writer->write(sample);
+                        } else {
+                            streaming_writer->write(sample);
+                        }
                     } else {
                         samples.push_back(std::move(sample));
                     }
@@ -704,12 +737,20 @@ std::vector<ChannelSample> Scanner::scan(
         }
     }
 
-    // Close streaming writer if used
-    if (use_streaming && streaming_writer) {
-        streaming_writer->close();
-        if (config_.verbose) {
-            std::cout << "\n  [STREAMING] Wrote " << streaming_writer->samples_written()
-                      << " samples to " << config_.output_path << "\n";
+    // Close streaming/flat writer if used
+    if (use_streaming) {
+        if (use_flat_output && flat_writer) {
+            flat_writer->close();
+            if (config_.verbose) {
+                std::cout << "\n  [FLAT] Wrote " << flat_writer->samples_written()
+                          << " samples to " << config_.output_path << "\n";
+            }
+        } else if (streaming_writer) {
+            streaming_writer->close();
+            if (config_.verbose) {
+                std::cout << "\n  [STREAMING] Wrote " << streaming_writer->samples_written()
+                          << " samples to " << config_.output_path << "\n";
+            }
         }
     }
 

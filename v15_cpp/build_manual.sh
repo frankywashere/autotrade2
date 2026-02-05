@@ -163,6 +163,8 @@ compile_library() {
         "src/feature_extractor.cpp"
         "src/label_generator.cpp"
         "src/serialization.cpp"
+        "src/npy_writer.cpp"
+        "src/flat_writer.cpp"
     )
 
     OBJECT_FILES=()
