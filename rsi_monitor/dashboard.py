@@ -111,11 +111,11 @@ def calculate_confluence(rsi_data: dict, oversold: float, overbought: float) -> 
 
 
 def get_vix_confirmation_color(confirmation) -> str:
-    """Get color based on VIX confirmation strength."""
+    """Get color based on VIX confirmation strength (high fear = red, low fear = green)."""
     if confirmation.strength >= 3:
-        return "#00C851"  # Green - high fear (bullish for stocks)
+        return "#ff4444"  # Red - high fear
     elif confirmation.strength <= 1:
-        return "#ff4444"  # Red - low fear (bearish for stocks)
+        return "#00C851"  # Green - low fear (calm/greed)
     else:
         return "#6c757d"  # Gray - neutral
 
@@ -128,84 +128,84 @@ def create_strength_bar(strength: int, total: int) -> str:
 
 
 def get_vix_level_color(vix_price: float) -> str:
-    """Get color for VIX level (high fear = green/bullish, low = red/bearish)."""
+    """Get color for VIX level (high fear = red, low/calm = green)."""
     if vix_price >= 40:
-        return "#00FF00"  # Bright green - panic (very bullish)
+        return "#FF0000"  # Bright red - panic (extreme fear)
     elif vix_price >= 30:
-        return "#00C851"  # Green - elevated fear (bullish)
+        return "#ff4444"  # Red - elevated fear
     elif vix_price >= 25:
-        return "#90EE90"  # Light green - caution
+        return "#FF6B6B"  # Light red - caution
     elif vix_price >= 15:
         return "#6c757d"  # Gray - normal
     elif vix_price >= 12:
-        return "#FF6B6B"  # Light red - complacency
+        return "#90EE90"  # Light green - calm
     else:
-        return "#ff4444"  # Red - extreme complacency (bearish)
+        return "#00C851"  # Green - very calm (greed)
 
 
 def get_vix_change_color(change_pct: float) -> str:
-    """Get color for VIX change (spike = green/bullish, drop = red/bearish)."""
+    """Get color for VIX change (spike = red/fear, drop = green/calm)."""
     if change_pct >= 15:
-        return "#00FF00"  # Bright green - major spike
+        return "#FF0000"  # Bright red - major spike (fear)
     elif change_pct >= 10:
-        return "#00C851"  # Green - elevated spike
+        return "#ff4444"  # Red - elevated spike
     elif change_pct >= 5:
-        return "#90EE90"  # Light green - moderate up
+        return "#FF6B6B"  # Light red - moderate up
     elif change_pct <= -10:
-        return "#ff4444"  # Red - fear subsiding
+        return "#00C851"  # Green - fear subsiding (calm)
     elif change_pct <= -5:
-        return "#FF6B6B"  # Light red - moderate down
+        return "#90EE90"  # Light green - moderate down
     else:
         return "#6c757d"  # Gray - normal
 
 
 def get_vix_percentile_color(percentile: float) -> str:
-    """Get color for VIX percentile (high = green/bullish, low = red/bearish)."""
+    """Get color for VIX percentile (high = red/fear, low = green/calm)."""
     if percentile >= 90:
-        return "#00FF00"  # Bright green - extreme fear
+        return "#FF0000"  # Bright red - extreme fear
     elif percentile >= 75:
-        return "#00C851"  # Green - elevated fear
+        return "#ff4444"  # Red - elevated fear
     elif percentile >= 60:
-        return "#90EE90"  # Light green - above average
+        return "#FF6B6B"  # Light red - above average
     elif percentile <= 10:
-        return "#ff4444"  # Red - extreme complacency
+        return "#00C851"  # Green - extreme calm (greed)
     elif percentile <= 25:
-        return "#FF6B6B"  # Light red - low volatility
+        return "#90EE90"  # Light green - low volatility (calm)
     else:
         return "#6c757d"  # Gray - normal
 
 
 def get_term_structure_color(status: str, pct: float) -> str:
-    """Get color for term structure (backwardation = green, contango = red)."""
+    """Get color for term structure (backwardation = red/fear, contango = green/calm)."""
     if status == "Backwardation":
         if pct >= 10:
-            return "#00FF00"  # Bright green - severe backwardation
+            return "#FF0000"  # Bright red - severe backwardation (fear)
         elif pct >= 5:
-            return "#00C851"  # Green - moderate backwardation
+            return "#ff4444"  # Red - moderate backwardation
         else:
-            return "#90EE90"  # Light green - mild backwardation
+            return "#FF6B6B"  # Light red - mild backwardation
     elif status == "Contango":
         if pct <= -10:
-            return "#ff4444"  # Red - deep contango
+            return "#00C851"  # Green - deep contango (calm/greed)
         elif pct <= -5:
-            return "#FF6B6B"  # Light red - moderate contango
+            return "#90EE90"  # Light green - moderate contango
         else:
             return "#6c757d"  # Gray - shallow contango
     return "#6c757d"
 
 
 def get_vvix_color(vvix: float) -> str:
-    """Get color for VVIX (high = green/bullish, low = red/bearish)."""
+    """Get color for VVIX (high = red/fear, low = green/calm)."""
     if vvix >= 140:
-        return "#00FF00"  # Bright green - extreme
+        return "#FF0000"  # Bright red - extreme fear
     elif vvix >= 120:
-        return "#00C851"  # Green - elevated
+        return "#ff4444"  # Red - elevated fear
     elif vvix >= 100:
-        return "#90EE90"  # Light green - above average
+        return "#FF6B6B"  # Light red - above average
     elif vvix <= 70:
-        return "#ff4444"  # Red - very complacent
+        return "#00C851"  # Green - very calm (greed)
     elif vvix <= 80:
-        return "#FF6B6B"  # Light red - complacent
+        return "#90EE90"  # Light green - calm
     else:
         return "#6c757d"  # Gray - normal
 
@@ -257,17 +257,17 @@ def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
     # Get fear percentage (weighted average of all indicators)
     fear_pct = getattr(confirmation, 'fear_percentage', 0.0)
 
-    # Color based on fear percentage
+    # Color based on fear percentage (high fear = red, low fear/greed = green)
     if fear_pct >= 70:
-        pct_color = "#00FF00"  # Bright green - extreme fear (bullish)
+        pct_color = "#FF0000"  # Bright red - extreme fear
     elif fear_pct >= 50:
-        pct_color = "#00C851"  # Green - elevated fear
+        pct_color = "#ff4444"  # Red - elevated fear
     elif fear_pct >= 35:
-        pct_color = "#90EE90"  # Light green - moderate
+        pct_color = "#FF6B6B"  # Light red - moderate fear
     elif fear_pct >= 20:
-        pct_color = "#6c757d"  # Gray - low
+        pct_color = "#6c757d"  # Gray - neutral
     else:
-        pct_color = "#FF6B6B"  # Light red - very low (complacent)
+        pct_color = "#90EE90"  # Light green - calm/greed
 
     # Compact summary header (always visible)
     vix_val_color = get_vix_level_color(confirmation.vix_price)
@@ -354,13 +354,13 @@ def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
                     ">120 elevated | <80 complacent"
                 )
 
-    # Overall sentiment description
+    # Overall sentiment description (fear = red, greed/calm = green)
     sentiment_colors = {
-        'extreme_fear': '#00C851',
-        'fear': '#007E33',
+        'extreme_fear': '#FF0000',
+        'fear': '#ff4444',
         'neutral': '#6c757d',
-        'greed': '#CC0000',
-        'extreme_greed': '#ff4444',
+        'greed': '#00C851',
+        'extreme_greed': '#00FF00',
         'unknown': '#6c757d',
     }
     sent_color = sentiment_colors.get(confirmation.overall_sentiment, '#6c757d')
@@ -569,13 +569,22 @@ def main():
                     signal_color = SIGNAL_COLORS.get(signal, "#6c757d")
 
                     with col:
-                        with st.expander(f"{symbol} - {signal} {get_signal_emoji(signal)}", expanded=True):
-                            # Signal header
+                        # Get current price
+                        price_df = data_fetcher.fetch(symbol, interval="1d", period="5d")
+                        current_price = float(price_df["Close"].iloc[-1]) if price_df is not None and not price_df.empty else None
+                        price_str = f"${current_price:.2f}" if current_price else "N/A"
+
+                        with st.expander(f"{symbol} {price_str} - {signal} {get_signal_emoji(signal)}", expanded=True):
+                            # Signal header with price
                             st.markdown(f"""
                             <div style="padding: 10px; border-radius: 5px; background-color: {signal_color}; color: white; text-align: center; margin-bottom: 10px;">
                                 <strong>{signal}</strong>
                             </div>
                             """, unsafe_allow_html=True)
+
+                            # Prominent price display
+                            if current_price:
+                                st.markdown(f"<h2 style='text-align: center; margin: 0 0 10px 0; color: #1f77b4;'>${current_price:.2f}</h2>", unsafe_allow_html=True)
 
                             # Confluence score
                             rsi_data = rsi_results.get(symbol, {})

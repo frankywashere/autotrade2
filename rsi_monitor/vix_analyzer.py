@@ -34,6 +34,7 @@ class VIXConfirmation:
     weighted_score: float = 0.0
     max_weighted_score: float = 7.5
     fear_percentage: float = 0.0  # Weighted average of all indicator percentages (0-100)
+    greed_percentage: float = 0.0  # Weighted average of complacency/greed indicators (0-100)
     vix_price: float = 0.0
     vix_change_pct: float = 0.0
     percentile_rank: float = 50.0
@@ -122,6 +123,86 @@ class VIXAnalyzer:
 
         percentage = ((value - threshold_low) / (threshold_high - threshold_low)) * 100
         return max(0.0, min(100.0, percentage))
+
+    def _calculate_greed_indicator_percentage(
+        self, indicator_type: str, value: float
+    ) -> float:
+        """
+        Calculate how "greedy/complacent" a value is as a percentage (0-100 scale).
+
+        This is the INVERSE of fear - measures complacency/bearish-for-stocks conditions.
+        Each indicator has different thresholds for greed:
+
+        - VIX Level: 100% greed at <=12, 0% greed at 25+ (low VIX = greed)
+        - Percentile: 100% greed at 10th percentile, 0% at 50th
+        - Term Structure: 100% greed at -15% contango, 0% at flat/backwardation
+        - VVIX: 100% greed at <=70, 0% at 100+
+        - Rate of Change: 100% greed at -15% (fear subsiding), 0% at 0%
+
+        Args:
+            indicator_type: One of 'level', 'percentile', 'term_structure', 'vvix', 'rate_of_change'
+            value: The current value to evaluate
+
+        Returns:
+            Percentage from 0.0 to 100.0 indicating greed/complacency level
+        """
+        if indicator_type == "level":
+            # VIX Level: 100% greed at <=12, 0% greed at >=25
+            # Lower VIX = more greed (inverse relationship)
+            if value <= 12:
+                return 100.0
+            elif value >= 25:
+                return 0.0
+            else:
+                # Linear interpolation from 25 (0%) to 12 (100%)
+                return ((25.0 - value) / (25.0 - 12.0)) * 100.0
+
+        elif indicator_type == "percentile":
+            # Percentile: 100% greed at 10th percentile, 0% at 50th
+            # Lower percentile = more greed
+            if value <= 10:
+                return 100.0
+            elif value >= 50:
+                return 0.0
+            else:
+                # Linear interpolation from 50 (0%) to 10 (100%)
+                return ((50.0 - value) / (50.0 - 10.0)) * 100.0
+
+        elif indicator_type == "term_structure":
+            # Term Structure: 100% greed at -15% (deep contango), 0% at 0% (flat) or above
+            # Negative values (contango) = greed, positive (backwardation) = fear
+            if value >= 0:
+                return 0.0
+            elif value <= -15:
+                return 100.0
+            else:
+                # Linear interpolation from 0 (0%) to -15 (100%)
+                return (abs(value) / 15.0) * 100.0
+
+        elif indicator_type == "vvix":
+            # VVIX: 100% greed at <=70, 0% at 100+
+            # Lower VVIX = more complacency/greed
+            if value <= 70:
+                return 100.0
+            elif value >= 100:
+                return 0.0
+            else:
+                # Linear interpolation from 100 (0%) to 70 (100%)
+                return ((100.0 - value) / (100.0 - 70.0)) * 100.0
+
+        elif indicator_type == "rate_of_change":
+            # Rate of Change: 100% greed at -15% (fear subsiding fast), 0% at 0%
+            # Negative change (VIX dropping) = greed, positive change = fear
+            if value >= 0:
+                return 0.0
+            elif value <= -15:
+                return 100.0
+            else:
+                # Linear interpolation from 0 (0%) to -15 (100%)
+                return (abs(value) / 15.0) * 100.0
+
+        else:
+            return 0.0
 
     def _fetch_data(self, symbol: str, period: str = "1y") -> Optional[pd.DataFrame]:
         """
@@ -838,7 +919,8 @@ class VIXAnalyzer:
             indicators = {}
 
             # Track indicator percentages for weighted average calculation
-            indicator_percentages = []  # List of (percentage, weight) tuples
+            indicator_percentages = []  # List of (percentage, weight) tuples for fear
+            greed_indicator_percentages = []  # List of (percentage, weight) tuples for greed
 
             # Get current and previous VIX
             vix_price = float(vix_df["Close"].iloc[-1])
@@ -850,8 +932,10 @@ class VIXAnalyzer:
             # Percentage: 0% at 15 (normal), 100% at 40+ (panic)
             total_indicators += 1
             level_pct = self._calculate_indicator_percentage(vix_price, 15.0, 40.0)
+            level_greed_pct = self._calculate_greed_indicator_percentage("level", vix_price)
             level_weight = self.WEIGHT_VIX_LEVEL_EXTREME
             indicator_percentages.append((level_pct, level_weight))
+            greed_indicator_percentages.append((level_greed_pct, level_weight))
 
             if vix_price > self.EXTREME_FEAR_LEVEL:
                 level_status = "Extreme Fear (>50)"
@@ -911,7 +995,9 @@ class VIXAnalyzer:
 
             # Calculate percentile percentage: 0% at 50th, 100% at 90th
             percentile_pct = self._calculate_indicator_percentage(percentile_rank, 50.0, 90.0)
+            percentile_greed_pct = self._calculate_greed_indicator_percentage("percentile", percentile_rank)
             indicator_percentages.append((percentile_pct, self.WEIGHT_PERCENTILE))
+            greed_indicator_percentages.append((percentile_greed_pct, self.WEIGHT_PERCENTILE))
 
             percentile_supports_buy = percentile_rank > 75
             percentile_supports_sell = percentile_rank < 25
@@ -938,7 +1024,9 @@ class VIXAnalyzer:
 
                     # Term structure percentage: 0% at 0% (flat), 100% at +15% backwardation
                     term_pct = self._calculate_indicator_percentage(term_structure_pct, 0.0, 15.0)
+                    term_greed_pct = self._calculate_greed_indicator_percentage("term_structure", term_structure_pct)
                     indicator_percentages.append((term_pct, self.WEIGHT_TERM_STRUCTURE))
+                    greed_indicator_percentages.append((term_greed_pct, self.WEIGHT_TERM_STRUCTURE))
 
                     if vix_price > vix3m_price:
                         term_structure_status = "Backwardation"
@@ -970,7 +1058,9 @@ class VIXAnalyzer:
                 vvix_level = float(vvix_df["Close"].iloc[-1])
 
                 vvix_pct = self._calculate_indicator_percentage(vvix_level, 80.0, 140.0)
+                vvix_greed_pct = self._calculate_greed_indicator_percentage("vvix", vvix_level)
                 indicator_percentages.append((vvix_pct, self.WEIGHT_VVIX_EXTREME))
+                greed_indicator_percentages.append((vvix_greed_pct, self.WEIGHT_VVIX_EXTREME))
 
                 if vvix_level > self.VVIX_EXTREME_LEVEL:
                     vvix_status = "Extreme"
@@ -1006,7 +1096,9 @@ class VIXAnalyzer:
             max_weighted_score += self.WEIGHT_VIX_SPIKE
 
             roc_pct = self._calculate_indicator_percentage(vix_change_pct, 0.0, 15.0)
+            roc_greed_pct = self._calculate_greed_indicator_percentage("rate_of_change", vix_change_pct)
             indicator_percentages.append((roc_pct, self.WEIGHT_VIX_SPIKE))
+            greed_indicator_percentages.append((roc_greed_pct, self.WEIGHT_VIX_SPIKE))
 
             if vix_change_pct > self.ROC_SPIKE_THRESHOLD:
                 roc_supports_buy = True
@@ -1042,6 +1134,13 @@ class VIXAnalyzer:
                 fear_percentage = sum(pct * weight for pct, weight in indicator_percentages) / total_weight
             else:
                 fear_percentage = 0.0
+
+            # Calculate weighted average greed percentage (0-100 scale)
+            greed_total_weight = sum(weight for _, weight in greed_indicator_percentages)
+            if greed_total_weight > 0:
+                greed_percentage = sum(pct * weight for pct, weight in greed_indicator_percentages) / greed_total_weight
+            else:
+                greed_percentage = 0.0
 
             # Determine overall sentiment and confirmation using weighted scores
             # Buy confirmation now requires meeting the weighted threshold (2.5)
@@ -1081,6 +1180,7 @@ class VIXAnalyzer:
                 weighted_score=weighted_score,
                 max_weighted_score=max_weighted_score,
                 fear_percentage=fear_percentage,
+                greed_percentage=greed_percentage,
                 vix_price=vix_price,
                 vix_change_pct=vix_change_pct,
                 percentile_rank=percentile_rank,
