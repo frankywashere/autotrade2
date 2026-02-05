@@ -13,6 +13,7 @@
 #include <thread>
 #include <future>
 #include <atomic>
+#include <queue>
 #include <functional>
 #include <cstdint>
 

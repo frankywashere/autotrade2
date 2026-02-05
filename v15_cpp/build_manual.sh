@@ -39,7 +39,7 @@ else
 fi
 
 # Compiler flags
-CXXFLAGS="-std=c++17 -O3 -march=native -Wall -Wextra -fPIC"
+CXXFLAGS="-std=c++17 -O3 -march=native -Wall -Wextra -fPIC -fopenmp"
 INCLUDE_FLAGS="-I${PROJECT_ROOT}/include"
 EIGEN_INCLUDE=""
 
