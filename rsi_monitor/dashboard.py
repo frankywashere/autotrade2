@@ -169,39 +169,43 @@ def main():
     # Initialize components
     try:
         data_fetcher = DataFetcher()
-        rsi_monitor = RSIMonitor(period=rsi_period)
+        # RSIMonitor takes symbols, timeframes, and data_fetcher
+        timeframes = ['5m', '15m', '1h', '4h', '1d', '1wk']
+        rsi_monitor = RSIMonitor(
+            symbols=list(set(selected_symbols + ["VIX"])),
+            timeframes=timeframes,
+            data_fetcher=data_fetcher
+        )
         signal_generator = SignalGenerator(
-            oversold=oversold_threshold,
-            overbought=overbought_threshold
+            oversold_threshold=oversold_threshold,
+            overbought_threshold=overbought_threshold
         )
     except Exception as e:
         st.error(f"Error initializing components: {e}")
         st.stop()
 
-    # Fetch data for all symbols including VIX
+    # Fetch RSI for all symbols across all timeframes
     all_symbols = list(set(selected_symbols + ["VIX"]))
 
-    with st.spinner("Fetching market data..."):
+    with st.spinner("Fetching market data and calculating RSI..."):
         try:
-            market_data = {}
-            for symbol in all_symbols:
-                market_data[symbol] = data_fetcher.fetch(symbol)
+            # get_all_rsi() fetches data and calculates RSI for all symbols/timeframes
+            rsi_results = rsi_monitor.get_all_rsi()
         except Exception as e:
             st.error(f"Error fetching data: {e}")
             st.stop()
 
-    # Calculate RSI for all symbols
-    rsi_results = {}
+    # Generate signals for all symbols
     signals = {}
 
     for symbol in all_symbols:
         try:
-            rsi_results[symbol] = rsi_monitor.calculate(market_data[symbol])
-            signals[symbol] = signal_generator.generate(rsi_results[symbol])
+            # analyze() expects dict with 'symbol' and 'timeframes' keys
+            signal_input = {'symbol': symbol, 'timeframes': rsi_results.get(symbol, {})}
+            signals[symbol] = signal_generator.analyze(signal_input)
         except Exception as e:
-            st.warning(f"Error calculating RSI for {symbol}: {e}")
-            rsi_results[symbol] = {}
-            signals[symbol] = {"signal": "NEUTRAL", "confidence": 0}
+            st.warning(f"Error generating signal for {symbol}: {e}")
+            signals[symbol] = {"signal": "NEUTRAL", "strength": 0}
 
     # Get VIX status for confirmation
     vix_rsi = None
@@ -286,9 +290,9 @@ def main():
             for j, col in enumerate(cols):
                 if i + j < len(selected_symbols):
                     symbol = selected_symbols[i + j]
-                    signal_data = signals.get(symbol, {"signal": "NEUTRAL", "confidence": 0})
+                    signal_data = signals.get(symbol, {"signal": "NEUTRAL", "strength": 0})
                     signal = signal_data.get("signal", "NEUTRAL")
-                    confidence = signal_data.get("confidence", 0)
+                    strength = signal_data.get("strength", 0)
                     signal_color = SIGNAL_COLORS.get(signal, "#6c757d")
 
                     with col:
@@ -312,7 +316,7 @@ def main():
                             with metric_cols[1]:
                                 st.metric("Overbought TFs", f"{overbought_count}/{total}")
                             with metric_cols[2]:
-                                st.metric("Confidence", f"{confidence:.0%}" if isinstance(confidence, float) else str(confidence))
+                                st.metric("Strength", f"{strength:.0%}" if isinstance(strength, float) else str(strength))
 
                             # VIX confirmation for this symbol
                             if signal in ["BUY", "STRONG_BUY"] and vix_status == "High Fear (Bullish for Stocks)":

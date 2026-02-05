@@ -178,7 +178,8 @@ class RSIMonitor:
         valid_readings = 0
 
         for timeframe in self.timeframes:
-            prices = self.data_fetcher.get_prices(symbol, timeframe)
+            data = self.data_fetcher.fetch(symbol, timeframe)
+            prices = data['Close'].values if data is not None and len(data) > 0 else None
             if prices is not None and len(prices) > 0:
                 rsi = self.calculate_rsi(prices)
                 if not np.isnan(rsi):
