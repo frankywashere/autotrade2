@@ -919,8 +919,8 @@ class VIXAnalyzer:
             indicators = {}
 
             # Track indicator percentages for weighted average calculation
-            indicator_percentages = []  # List of (percentage, weight) tuples for fear
-            greed_indicator_percentages = []  # List of (percentage, weight) tuples for greed
+            # Graduated weights from each indicator's severity will be used
+            # for the numerator, with fixed max_weights for the denominator
 
             # Get current and previous VIX
             vix_price = float(vix_df["Close"].iloc[-1])
@@ -934,8 +934,6 @@ class VIXAnalyzer:
             level_pct = self._calculate_indicator_percentage(vix_price, 15.0, 40.0)
             level_greed_pct = self._calculate_greed_indicator_percentage("level", vix_price)
             level_weight = self.WEIGHT_VIX_LEVEL_EXTREME
-            indicator_percentages.append((level_pct, level_weight))
-            greed_indicator_percentages.append((level_greed_pct, level_weight))
 
             level_sell_weight = 0.0
             if vix_price > self.EXTREME_FEAR_LEVEL:
@@ -990,6 +988,7 @@ class VIXAnalyzer:
                 "sell_weight": level_sell_weight,
                 "max_weight": self.WEIGHT_VIX_LEVEL_EXTREME,
                 "percentage": level_pct,
+                "greed_percentage": level_greed_pct,
             }
 
             # 2. Percentile Rank (Weight: 1.0)
@@ -1006,8 +1005,6 @@ class VIXAnalyzer:
             # Calculate percentile percentage: 0% at 50th, 100% at 90th
             percentile_pct = self._calculate_indicator_percentage(percentile_rank, 50.0, 90.0)
             percentile_greed_pct = self._calculate_greed_indicator_percentage("percentile", percentile_rank)
-            indicator_percentages.append((percentile_pct, self.WEIGHT_PERCENTILE))
-            greed_indicator_percentages.append((percentile_greed_pct, self.WEIGHT_PERCENTILE))
 
             percentile_supports_buy = percentile_rank > 60
             percentile_supports_sell = percentile_rank < 40
@@ -1035,6 +1032,7 @@ class VIXAnalyzer:
                 "sell_weight": percentile_sell_weight,
                 "max_weight": self.WEIGHT_PERCENTILE,
                 "percentage": percentile_pct,
+                "greed_percentage": percentile_greed_pct,
             }
 
             # 3. Term Structure (VIX vs VIX3M) - Weight: 2.0 (highest - rare and strong signal)
@@ -1050,8 +1048,6 @@ class VIXAnalyzer:
                     # Term structure percentage: 0% at 0% (flat), 100% at +15% backwardation
                     term_pct = self._calculate_indicator_percentage(term_structure_pct, 0.0, 15.0)
                     term_greed_pct = self._calculate_greed_indicator_percentage("term_structure", term_structure_pct)
-                    indicator_percentages.append((term_pct, self.WEIGHT_TERM_STRUCTURE))
-                    greed_indicator_percentages.append((term_greed_pct, self.WEIGHT_TERM_STRUCTURE))
 
                     term_weight = 0.0
                     term_sell_weight = 0.0
@@ -1084,6 +1080,7 @@ class VIXAnalyzer:
                         "sell_weight": term_sell_weight,
                         "max_weight": self.WEIGHT_TERM_STRUCTURE,
                         "percentage": term_pct,
+                        "greed_percentage": term_greed_pct,
                     }
 
             # 4. VVIX Analysis - Weight: 1.5 for extreme levels
@@ -1097,8 +1094,6 @@ class VIXAnalyzer:
 
                 vvix_pct = self._calculate_indicator_percentage(vvix_level, 80.0, 140.0)
                 vvix_greed_pct = self._calculate_greed_indicator_percentage("vvix", vvix_level)
-                indicator_percentages.append((vvix_pct, self.WEIGHT_VVIX_EXTREME))
-                greed_indicator_percentages.append((vvix_greed_pct, self.WEIGHT_VVIX_EXTREME))
 
                 vvix_weight = 0.0
                 vvix_sell_weight = 0.0
@@ -1147,6 +1142,7 @@ class VIXAnalyzer:
                     "sell_weight": vvix_sell_weight,
                     "max_weight": self.WEIGHT_VVIX_EXTREME,
                     "percentage": vvix_pct,
+                    "greed_percentage": vvix_greed_pct,
                 }
 
             # 5. Rate of Change - Weight: 1.5 for spikes (>15%)
@@ -1156,8 +1152,6 @@ class VIXAnalyzer:
 
             roc_pct = self._calculate_indicator_percentage(vix_change_pct, 0.0, 15.0)
             roc_greed_pct = self._calculate_greed_indicator_percentage("rate_of_change", vix_change_pct)
-            indicator_percentages.append((roc_pct, self.WEIGHT_VIX_SPIKE))
-            greed_indicator_percentages.append((roc_greed_pct, self.WEIGHT_VIX_SPIKE))
 
             roc_weight = 0.0
             roc_sell_weight = 0.0
@@ -1199,19 +1193,28 @@ class VIXAnalyzer:
                 "sell_weight": roc_sell_weight,
                 "max_weight": self.WEIGHT_VIX_SPIKE,
                 "percentage": roc_pct,
+                "greed_percentage": roc_greed_pct,
             }
 
-            # Calculate weighted average fear percentage (0-100 scale)
-            total_weight = sum(weight for _, weight in indicator_percentages)
-            if total_weight > 0:
-                fear_percentage = sum(pct * weight for pct, weight in indicator_percentages) / total_weight
+            # Calculate weighted average fear percentage using graduated weights
+            # Numerator: each indicator's fear_pct scaled by its graduated buy weight
+            # Denominator: sum of all fixed max_weights (so neutral indicators dilute fear down)
+            fear_denominator = sum(d["max_weight"] for d in indicators.values())
+            if fear_denominator > 0:
+                fear_percentage = sum(
+                    d["percentage"] * d.get("weight", 0.0)
+                    for d in indicators.values()
+                ) / fear_denominator
             else:
                 fear_percentage = 0.0
 
-            # Calculate weighted average greed percentage (0-100 scale)
-            greed_total_weight = sum(weight for _, weight in greed_indicator_percentages)
-            if greed_total_weight > 0:
-                greed_percentage = sum(pct * weight for pct, weight in greed_indicator_percentages) / greed_total_weight
+            # Calculate weighted average greed percentage using graduated sell weights
+            greed_denominator = fear_denominator  # same total max weight
+            if greed_denominator > 0:
+                greed_percentage = sum(
+                    d.get("greed_percentage", 0.0) * d.get("sell_weight", 0.0)
+                    for d in indicators.values()
+                ) / greed_denominator
             else:
                 greed_percentage = 0.0
 
