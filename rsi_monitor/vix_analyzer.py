@@ -31,6 +31,8 @@ class VIXConfirmation:
     """Container for comprehensive VIX confirmation results."""
     strength: int = 0
     total_indicators: int = 5
+    weighted_score: float = 0.0
+    max_weighted_score: float = 7.5
     vix_price: float = 0.0
     vix_change_pct: float = 0.0
     percentile_rank: float = 50.0
@@ -758,6 +760,21 @@ class VIXAnalyzer:
             "rate_of_change": self.get_rate_of_change(),
         }
 
+    # Indicator weights based on historical significance
+    # Term Structure (Backwardation): Rare and historically very strong reversal signal
+    WEIGHT_TERM_STRUCTURE = 2.0
+    # VIX Spike (Rate of Change >15%): Big spikes often mark capitulation
+    WEIGHT_VIX_SPIKE = 1.5
+    # VVIX Extreme (>140): Volatility of volatility extremes are significant
+    WEIGHT_VVIX_EXTREME = 1.5
+    # VIX Absolute Level: 1.5 for extreme (>40), 1.0 for elevated (>30)
+    WEIGHT_VIX_LEVEL_EXTREME = 1.5
+    WEIGHT_VIX_LEVEL_ELEVATED = 1.0
+    # Percentile Rank (>90th or <10th): Good context but less actionable alone
+    WEIGHT_PERCENTILE = 1.0
+    # Weighted confirmation threshold for buy signals
+    WEIGHTED_CONFIRMATION_THRESHOLD = 2.5
+
     def analyze_from_dataframe(
         self,
         vix_df: Optional[pd.DataFrame],
@@ -770,13 +787,20 @@ class VIXAnalyzer:
         This method is useful when data has already been fetched (e.g., by DataFetcher)
         and we want to avoid duplicate API calls.
 
+        Uses weighted scoring based on historical significance:
+        - Term Structure (Backwardation): Weight 2.0 - Rare and strong reversal signal
+        - VIX Spike (Rate of Change >15%): Weight 1.5 - Big spikes mark capitulation
+        - VVIX Extreme (>140): Weight 1.5 - Volatility of volatility extremes
+        - VIX Absolute Level: Weight 1.5 for extreme (>40), 1.0 for elevated (>30)
+        - Percentile Rank (>90th): Weight 1.0 - Good context but less actionable alone
+
         Args:
             vix_df: DataFrame with VIX OHLCV data (needs at least 252 rows for percentile)
             vix3m_df: DataFrame with VIX3M OHLCV data (optional, for term structure)
             vvix_df: DataFrame with VVIX OHLCV data (optional)
 
         Returns:
-            VIXConfirmation dataclass with all analysis results
+            VIXConfirmation dataclass with all analysis results including weighted scores
         """
         # Default result if no data
         if vix_df is None or vix_df.empty:
@@ -785,6 +809,8 @@ class VIXAnalyzer:
         try:
             confirmation_count = 0
             total_indicators = 0
+            weighted_score = 0.0
+            max_weighted_score = 0.0
             indicators = {}
 
             # Get current and previous VIX
@@ -793,19 +819,24 @@ class VIXAnalyzer:
             vix_change_pct = ((vix_price - previous_vix) / previous_vix) * 100 if previous_vix else 0
 
             # 1. Absolute Level Analysis
+            # Weight depends on severity: 1.5 for extreme (>40), 1.0 for elevated (>30)
             total_indicators += 1
+            level_weight = self.WEIGHT_VIX_LEVEL_ELEVATED  # Default weight for this indicator
             if vix_price > self.EXTREME_FEAR_LEVEL:
                 level_status = "Extreme Fear (>50)"
                 level_supports_buy = True
                 level_supports_sell = False
+                level_weight = self.WEIGHT_VIX_LEVEL_EXTREME
             elif vix_price > self.PANIC_LEVEL:
                 level_status = "Panic (40-50)"
                 level_supports_buy = True
                 level_supports_sell = False
+                level_weight = self.WEIGHT_VIX_LEVEL_EXTREME
             elif vix_price > self.ELEVATED_FEAR_LEVEL:
                 level_status = "Elevated (30-40)"
                 level_supports_buy = True
                 level_supports_sell = False
+                level_weight = self.WEIGHT_VIX_LEVEL_ELEVATED
             elif vix_price > self.CAUTION_LEVEL:
                 level_status = "Caution (25-30)"
                 level_supports_buy = False
@@ -823,12 +854,21 @@ class VIXAnalyzer:
                 level_supports_buy = False
                 level_supports_sell = False
 
+            # Use extreme weight as max possible for this indicator
+            max_weighted_score += self.WEIGHT_VIX_LEVEL_EXTREME
             if level_supports_buy:
                 confirmation_count += 1
-            indicators["level"] = {"supports_buy": level_supports_buy, "supports_sell": level_supports_sell}
+                weighted_score += level_weight
+            indicators["level"] = {
+                "supports_buy": level_supports_buy,
+                "supports_sell": level_supports_sell,
+                "weight": level_weight if level_supports_buy else 0.0,
+                "max_weight": self.WEIGHT_VIX_LEVEL_EXTREME,
+            }
 
-            # 2. Percentile Rank
+            # 2. Percentile Rank (Weight: 1.0)
             total_indicators += 1
+            max_weighted_score += self.WEIGHT_PERCENTILE
             if len(vix_df) >= self.PERCENTILE_LOOKBACK_DAYS:
                 close_prices = vix_df["Close"].tail(self.PERCENTILE_LOOKBACK_DAYS)
                 values_below = (close_prices < vix_price).sum()
@@ -836,17 +876,25 @@ class VIXAnalyzer:
             else:
                 percentile_rank = 50.0  # Default to middle if insufficient data
 
+            # More extreme percentiles (>90th) get full weight
             percentile_supports_buy = percentile_rank > 75
             percentile_supports_sell = percentile_rank < 25
             if percentile_supports_buy:
                 confirmation_count += 1
-            indicators["percentile"] = {"supports_buy": percentile_supports_buy, "supports_sell": percentile_supports_sell}
+                weighted_score += self.WEIGHT_PERCENTILE
+            indicators["percentile"] = {
+                "supports_buy": percentile_supports_buy,
+                "supports_sell": percentile_supports_sell,
+                "weight": self.WEIGHT_PERCENTILE if percentile_supports_buy else 0.0,
+                "max_weight": self.WEIGHT_PERCENTILE,
+            }
 
-            # 3. Term Structure (VIX vs VIX3M)
+            # 3. Term Structure (VIX vs VIX3M) - Weight: 2.0 (highest - rare and strong signal)
             term_structure_status = "Unknown"
             term_structure_pct = 0.0
             if vix3m_df is not None and not vix3m_df.empty:
                 total_indicators += 1
+                max_weighted_score += self.WEIGHT_TERM_STRUCTURE
                 vix3m_price = float(vix3m_df["Close"].iloc[-1])
                 if vix3m_price > 0:
                     term_structure_pct = ((vix_price - vix3m_price) / vix3m_price) * 100
@@ -861,13 +909,20 @@ class VIXAnalyzer:
 
                     if term_supports_buy:
                         confirmation_count += 1
-                    indicators["term_structure"] = {"supports_buy": term_supports_buy, "supports_sell": term_supports_sell}
+                        weighted_score += self.WEIGHT_TERM_STRUCTURE
+                    indicators["term_structure"] = {
+                        "supports_buy": term_supports_buy,
+                        "supports_sell": term_supports_sell,
+                        "weight": self.WEIGHT_TERM_STRUCTURE if term_supports_buy else 0.0,
+                        "max_weight": self.WEIGHT_TERM_STRUCTURE,
+                    }
 
-            # 4. VVIX Analysis
+            # 4. VVIX Analysis - Weight: 1.5 for extreme levels
             vvix_level = None
             vvix_status = "Unknown"
             if vvix_df is not None and not vvix_df.empty:
                 total_indicators += 1
+                max_weighted_score += self.WEIGHT_VVIX_EXTREME
                 vvix_level = float(vvix_df["Close"].iloc[-1])
                 if vvix_level > self.VVIX_EXTREME_LEVEL:
                     vvix_status = "Extreme"
@@ -888,53 +943,82 @@ class VIXAnalyzer:
 
                 if vvix_supports_buy:
                     confirmation_count += 1
-                indicators["vvix"] = {"supports_buy": vvix_supports_buy, "supports_sell": vvix_supports_sell}
+                    weighted_score += self.WEIGHT_VVIX_EXTREME
+                indicators["vvix"] = {
+                    "supports_buy": vvix_supports_buy,
+                    "supports_sell": vvix_supports_sell,
+                    "weight": self.WEIGHT_VVIX_EXTREME if vvix_supports_buy else 0.0,
+                    "max_weight": self.WEIGHT_VVIX_EXTREME,
+                }
 
-            # 5. Rate of Change
+            # 5. Rate of Change - Weight: 1.5 for spikes (>15%)
             total_indicators += 1
+            max_weighted_score += self.WEIGHT_VIX_SPIKE
             if vix_change_pct > self.ROC_SPIKE_THRESHOLD:
                 roc_supports_buy = True
                 roc_supports_sell = False
+                roc_weight = self.WEIGHT_VIX_SPIKE
             elif vix_change_pct > self.ROC_ELEVATED_THRESHOLD:
                 roc_supports_buy = True
                 roc_supports_sell = False
+                roc_weight = self.WEIGHT_VIX_SPIKE * 0.7  # Reduced weight for elevated but not spike
             elif vix_change_pct < -self.ROC_ELEVATED_THRESHOLD:
                 roc_supports_buy = False
                 roc_supports_sell = True
+                roc_weight = 0.0
             else:
                 roc_supports_buy = False
                 roc_supports_sell = False
+                roc_weight = 0.0
 
             if roc_supports_buy:
                 confirmation_count += 1
-            indicators["rate_of_change"] = {"supports_buy": roc_supports_buy, "supports_sell": roc_supports_sell}
+                weighted_score += roc_weight
+            indicators["rate_of_change"] = {
+                "supports_buy": roc_supports_buy,
+                "supports_sell": roc_supports_sell,
+                "weight": roc_weight if roc_supports_buy else 0.0,
+                "max_weight": self.WEIGHT_VIX_SPIKE,
+            }
 
-            # Determine overall sentiment and confirmation
-            confirms_buy = confirmation_count >= 2
-            confirms_sell = sum(1 for ind in indicators.values() if ind.get("supports_sell", False)) >= 2
+            # Determine overall sentiment and confirmation using weighted scores
+            # Buy confirmation now requires meeting the weighted threshold (2.5)
+            confirms_buy = weighted_score >= self.WEIGHTED_CONFIRMATION_THRESHOLD
 
-            # Overall sentiment
-            if confirmation_count >= 4:
+            # Calculate sell weighted score similarly
+            sell_weighted_score = 0.0
+            for ind_name, ind_data in indicators.items():
+                if ind_data.get("supports_sell", False):
+                    sell_weighted_score += ind_data.get("max_weight", 1.0)
+            confirms_sell = sell_weighted_score >= self.WEIGHTED_CONFIRMATION_THRESHOLD
+
+            # Overall sentiment based on weighted score
+            weighted_pct = (weighted_score / max_weighted_score * 100) if max_weighted_score > 0 else 0
+            if weighted_score >= 5.0:
                 overall_sentiment = "extreme_fear"
-                description = "Extreme fear across indicators - strong buy confirmation"
-            elif confirmation_count >= 3:
+                description = f"Extreme fear (weighted: {weighted_score:.1f}/{max_weighted_score:.1f}) - strong buy confirmation"
+            elif weighted_score >= 3.5:
                 overall_sentiment = "fear"
-                description = "Elevated fear across indicators - favorable for buying"
+                description = f"Elevated fear (weighted: {weighted_score:.1f}/{max_weighted_score:.1f}) - favorable for buying"
             elif confirms_sell:
-                sell_count = sum(1 for ind in indicators.values() if ind.get("supports_sell", False))
-                if sell_count >= 3:
+                if sell_weighted_score >= 4.0:
                     overall_sentiment = "extreme_greed"
-                    description = "Extreme complacency across indicators - strong sell confirmation"
+                    description = f"Extreme complacency (weighted: {sell_weighted_score:.1f}) - strong sell confirmation"
                 else:
                     overall_sentiment = "greed"
-                    description = "Complacency across indicators - favorable for selling"
+                    description = f"Complacency (weighted: {sell_weighted_score:.1f}) - favorable for selling"
+            elif weighted_score >= self.WEIGHTED_CONFIRMATION_THRESHOLD:
+                overall_sentiment = "fear"
+                description = f"Fear indicators active (weighted: {weighted_score:.1f}/{max_weighted_score:.1f}) - buy confirmation"
             else:
                 overall_sentiment = "neutral"
-                description = "Mixed signals - no strong VIX confirmation"
+                description = f"Mixed signals (weighted: {weighted_score:.1f}/{max_weighted_score:.1f}) - no strong VIX confirmation"
 
             return VIXConfirmation(
                 strength=confirmation_count,
                 total_indicators=total_indicators,
+                weighted_score=weighted_score,
+                max_weighted_score=max_weighted_score,
                 vix_price=vix_price,
                 vix_change_pct=vix_change_pct,
                 percentile_rank=percentile_rank,

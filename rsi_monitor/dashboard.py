@@ -388,6 +388,14 @@ def main():
                                     st.success(f"VIX Confirmed ({5 - vix_confirmation.strength}/5): Complacency supports sell")
                                 else:
                                     st.warning(f"VIX Neutral ({5 - vix_confirmation.strength}/5): Limited complacency")
+                            else:
+                                # Display VIX status for NEUTRAL signals too
+                                if vix_confirmation.confirms_buy:
+                                    st.info(f"VIX ({vix_confirmation.strength}/5): High fear - buy signals confirmed if triggered")
+                                elif vix_confirmation.confirms_sell:
+                                    st.info(f"VIX ({vix_confirmation.strength}/5): Complacency - sell signals confirmed if triggered")
+                                else:
+                                    st.info(f"VIX ({vix_confirmation.strength}/5): Neutral - no strong confirmation")
 
                             # RSI Table
                             if rsi_data:
