@@ -7,6 +7,7 @@ and rate of change indicators.
 """
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -1089,6 +1090,7 @@ class VIXAnalyzer:
             # 4. VVIX Analysis - Weight: 1.5 for extreme levels
             # Percentage: 0% at 80, 100% at 140+ (extreme level)
             vvix_level = None
+            vvix_pct = 0.0  # Default for shock overlay if VVIX data unavailable
             vvix_status = "Unknown"
             if vvix_df is not None and not vvix_df.empty:
                 total_indicators += 1
@@ -1201,17 +1203,38 @@ class VIXAnalyzer:
                 "percentage": roc_pct,
             }
 
-            # Calculate weighted average fear percentage (0-100 scale)
+            # Calculate fear percentage using power mean (p=3) + shock overlay
+            # Power mean emphasizes elevated indicators instead of diluting with neutrals
+            p = 3
             total_weight = sum(weight for _, weight in indicator_percentages)
             if total_weight > 0:
-                fear_percentage = sum(pct * weight for pct, weight in indicator_percentages) / total_weight
+                power_sum = sum(w * (pct / 100.0) ** p for pct, w in indicator_percentages)
+                core_fear = (power_sum / total_weight) ** (1.0 / p) * 100.0
             else:
-                fear_percentage = 0.0
+                core_fear = 0.0
 
-            # Calculate weighted average greed percentage (0-100 scale)
+            # Shock overlay: captures regime-jump days (big VIX spikes, VVIX extremes)
+            # so they can't be buried by neutral indicators
+            roc_norm = roc_pct / 100.0
+            vvix_norm = vvix_pct / 100.0
+            tau_roc = 0.6    # ~10% daily change fires the shock
+            tau_vvix = 0.5   # ~VVIX 110 fires the shock
+            a_coeff = 3.0    # daily spike has stronger immediate effect
+            b_coeff = 1.5    # VVIX is secondary
+            shock_input = (a_coeff * max(roc_norm - tau_roc, 0.0)
+                         + b_coeff * max(vvix_norm - tau_vvix, 0.0))
+            shock = (1.0 - math.exp(-shock_input)) * 100.0
+
+            # Blend: fear is at least 40% of shock value
+            shock_floor = 0.4
+            fear_percentage = max(core_fear,
+                                  shock_floor * shock + (1.0 - shock_floor) * core_fear)
+
+            # Calculate greed percentage using power mean (p=3)
             greed_total_weight = sum(weight for _, weight in greed_indicator_percentages)
             if greed_total_weight > 0:
-                greed_percentage = sum(pct * weight for pct, weight in greed_indicator_percentages) / greed_total_weight
+                greed_power_sum = sum(w * (pct / 100.0) ** p for pct, w in greed_indicator_percentages)
+                greed_percentage = (greed_power_sum / greed_total_weight) ** (1.0 / p) * 100.0
             else:
                 greed_percentage = 0.0
 
