@@ -254,19 +254,37 @@ def render_vix_indicator(label: str, value: str, color: str, help_text: str) -> 
 
 def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
     """Render comprehensive VIX confirmation card with color-coded indicators."""
-    vix_color = get_vix_confirmation_color(confirmation)
-    strength_bar = create_strength_bar(confirmation.strength, confirmation.total_indicators)
+    # Get fear percentage (weighted average of all indicators)
+    fear_pct = getattr(confirmation, 'fear_percentage', 0.0)
+
+    # Color based on fear percentage
+    if fear_pct >= 70:
+        pct_color = "#00FF00"  # Bright green - extreme fear (bullish)
+    elif fear_pct >= 50:
+        pct_color = "#00C851"  # Green - elevated fear
+    elif fear_pct >= 35:
+        pct_color = "#90EE90"  # Light green - moderate
+    elif fear_pct >= 20:
+        pct_color = "#6c757d"  # Gray - low
+    else:
+        pct_color = "#FF6B6B"  # Light red - very low (complacent)
 
     # Compact summary header (always visible)
     vix_val_color = get_vix_level_color(confirmation.vix_price)
     change_color = get_vix_change_color(confirmation.vix_change_pct)
     change_sign = "+" if confirmation.vix_change_pct >= 0 else ""
 
+    # Progress bar for fear percentage
+    bar_width = int(fear_pct)
+
     st.markdown(f"""
-    <div style="padding: 12px; border-radius: 8px; background-color: {vix_color}20; border-left: 4px solid {vix_color};">
+    <div style="padding: 12px; border-radius: 8px; background-color: {pct_color}20; border-left: 4px solid {pct_color};">
         <div style="display: flex; justify-content: space-between; align-items: center;">
-            <span style="font-weight: bold;">VIX Confirmation</span>
-            <span><code>{strength_bar}</code> {confirmation.strength}/{confirmation.total_indicators}</span>
+            <span style="font-weight: bold;">VIX Fear Level</span>
+            <span style="color: {pct_color}; font-weight: bold; font-size: 1.2em;">{fear_pct:.0f}%</span>
+        </div>
+        <div style="margin-top: 6px; background-color: #333; border-radius: 4px; height: 8px; width: 100%;">
+            <div style="background-color: {pct_color}; border-radius: 4px; height: 8px; width: {bar_width}%;"></div>
         </div>
         <div style="margin-top: 8px; display: flex; gap: 20px;">
             <span>VIX: <strong style="color: {vix_val_color};">{confirmation.vix_price:.1f}</strong></span>
@@ -574,10 +592,9 @@ def main():
                                 st.metric("Strength", f"{strength:.0%}" if isinstance(strength, float) else str(strength))
 
                             # VIX confirmation - consistent display for all tickers
-                            weighted_score = vix_confirmation.weighted_score if hasattr(vix_confirmation, 'weighted_score') else vix_confirmation.strength
-                            max_score = vix_confirmation.max_weighted_score if hasattr(vix_confirmation, 'max_weighted_score') else vix_confirmation.total_indicators
+                            fear_pct = getattr(vix_confirmation, 'fear_percentage', 0.0)
                             confirms_buy = "Yes" if vix_confirmation.confirms_buy else "No"
-                            st.info(f"VIX: {weighted_score:.1f}/{max_score:.1f} weighted | Confirms Buy: {confirms_buy}")
+                            st.info(f"VIX Fear: {fear_pct:.0f}% | Confirms Buy: {confirms_buy}")
 
                             # RSI Table
                             if rsi_data:

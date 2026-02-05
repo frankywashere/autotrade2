@@ -186,18 +186,16 @@ class SignalGenerator:
         # VIX confirmation bonus (up to 0.15)
         if vix_confirmation is not None:
             vix_confirms = False
-            vix_strength = 0
+            fear_pct = getattr(vix_confirmation, 'fear_percentage', 0.0)
 
             if 'BUY' in signal and hasattr(vix_confirmation, 'confirms_buy'):
                 vix_confirms = vix_confirmation.confirms_buy
-                vix_strength = getattr(vix_confirmation, 'strength', 0)
             elif 'SELL' in signal and hasattr(vix_confirmation, 'confirms_sell'):
                 vix_confirms = vix_confirmation.confirms_sell
-                vix_strength = getattr(vix_confirmation, 'strength', 0)
 
             if vix_confirms:
-                # Scale VIX bonus by confirmation strength (0-5 scale)
-                vix_bonus = min(vix_strength / 5.0, 1.0) * 0.15
+                # Scale VIX bonus by fear percentage (0-100 scale)
+                vix_bonus = min(fear_pct / 100.0, 1.0) * 0.15
                 strength += vix_bonus
 
         return min(strength, 1.0)
