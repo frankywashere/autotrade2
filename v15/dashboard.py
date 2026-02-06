@@ -386,7 +386,9 @@ def show_strategy_picks(analysis: Dict[str, Any]):
 # =============================================================================
 
 def show_per_tf_predictions_table(prediction):
-    """Show per-timeframe prediction breakdown table."""
+    """Show per-timeframe prediction breakdown table with direction and horizon grouping."""
+    from v15.config import TF_TO_HORIZON
+
     if prediction.per_tf_predictions is None:
         st.info("Model doesn't support per-TF predictions. Train with per-TF heads enabled.")
         return
@@ -395,39 +397,51 @@ def show_per_tf_predictions_table(prediction):
     for tf_name in TIMEFRAMES:
         if tf_name in prediction.per_tf_predictions:
             tf_pred = prediction.per_tf_predictions[tf_name]
+            horizon = TF_TO_HORIZON.get(tf_name, '?')
             data.append({
+                'Horizon': horizon.title(),
                 'Timeframe': tf_name,
-                'Duration': f"{tf_pred.duration_mean:.0f} +/- {tf_pred.duration_std:.0f}",
+                'Direction': tf_pred.direction.upper(),
+                'Dir Prob': f"{tf_pred.direction_prob:.0%}",
                 'Confidence': f"{tf_pred.confidence:.0%}",
+                'Duration': f"{tf_pred.duration_mean:.0f} +/- {tf_pred.duration_std:.0f}",
                 'Window': tf_pred.best_window,
+                '_direction': tf_pred.direction,  # hidden, for styling
+                '_confidence': tf_pred.confidence,  # hidden, for styling
             })
         else:
             data.append({
+                'Horizon': TF_TO_HORIZON.get(tf_name, '?').title(),
                 'Timeframe': tf_name,
-                'Duration': 'N/A',
+                'Direction': 'N/A',
+                'Dir Prob': 'N/A',
                 'Confidence': 'N/A',
+                'Duration': 'N/A',
                 'Window': 'N/A',
+                '_direction': None,
+                '_confidence': 0.0,
             })
 
     df = pd.DataFrame(data)
 
-    # Style based on confidence
-    def style_confidence(row):
-        try:
-            conf_str = row['Confidence']
-            if conf_str == 'N/A':
-                return [''] * len(row)
-            conf = float(conf_str.rstrip('%')) / 100
-            if conf >= 0.8:
-                return ['background-color: #d4edda'] * len(row)  # Green
-            elif conf >= 0.6:
-                return ['background-color: #fff3cd'] * len(row)  # Yellow
-            else:
-                return ['background-color: #3a3a3a; color: #e0e0e0'] * len(row)  # Dim
-        except:
+    # Style rows: green for up, red for down, dim for low confidence
+    def style_row(row):
+        direction = row.get('_direction')
+        confidence = row.get('_confidence', 0.0)
+        if direction is None:
             return [''] * len(row)
+        if confidence < 0.55:
+            return ['background-color: #3a3a3a; color: #e0e0e0'] * len(row)
+        if direction == 'up':
+            return ['background-color: #d4edda'] * len(row)  # Green
+        else:
+            return ['background-color: #f8d7da'] * len(row)  # Red
 
-    styled_df = df.style.apply(style_confidence, axis=1)
+    # Drop hidden columns for display
+    display_df = df.drop(columns=['_direction', '_confidence'])
+    styled_df = df.style.apply(style_row, axis=1)
+    # Hide the internal columns in the styled output
+    styled_df = styled_df.hide(subset=['_direction', '_confidence'], axis='columns')
     st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
 
@@ -463,6 +477,8 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
         duration = 0.0
         confidence = 0.0
         tf_window = 50
+        tf_direction = None
+        tf_pred = None
 
         if prediction is not None and prediction.per_tf_predictions is not None:
             if tf_name in prediction.per_tf_predictions:
@@ -470,9 +486,11 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                 duration = tf_pred.duration_mean
                 confidence = tf_pred.confidence
                 tf_window = tf_pred.best_window
+                tf_direction = tf_pred.direction
 
         # Create expander with summary in header
-        expander_header = f"{tf_name} - Duration: {duration:.0f} bars - Conf: {confidence:.0%}"
+        dir_str = tf_direction.upper() if tf_direction else '?'
+        expander_header = f"{tf_name} - {dir_str} - Duration: {duration:.0f} bars - Conf: {confidence:.0%}"
 
         with st.expander(expander_header, expanded=False):
             try:
@@ -530,7 +548,7 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                                 and tf_name in prediction.per_tf_predictions):
                             duration_std = prediction.per_tf_predictions[tf_name].duration_std
 
-                        agg_direction = prediction.direction if prediction else None
+                        agg_direction = tf_pred.direction if tf_pred else (prediction.direction if prediction else None)
 
                         fig = add_duration_projection(
                             fig, channel, chart_df,
@@ -885,32 +903,53 @@ def load_native_tf():
 
 
 def show_prediction_card(prediction):
-    """Display prediction in a card format."""
-    col1, col2, col3, col4 = st.columns(4)
+    """Display prediction card with trade recommendations, conflicts, and aggregated summary."""
+    # Trade Recommendations by horizon
+    if prediction.trade_recommendations:
+        st.subheader("Trade Recommendations")
+        cols = st.columns(3)
+        horizon_labels = {'short': 'Short Term', 'medium': 'Medium Term', 'long': 'Long Term'}
+        for i, horizon in enumerate(['short', 'medium', 'long']):
+            with cols[i]:
+                rec = prediction.trade_recommendations.get(horizon)
+                if rec:
+                    dir_icon = "UP" if rec.direction == 'up' else "DOWN"
+                    st.metric(
+                        horizon_labels[horizon],
+                        f"{dir_icon} ({rec.timeframe})",
+                        f"Score: {rec.score:.2f} | Conf: {rec.confidence:.0%}"
+                    )
+                    st.caption(f"Duration: {rec.duration_mean:.0f} +/- {rec.duration_std:.0f} bars")
+                else:
+                    st.metric(horizon_labels[horizon], "N/A", "No data")
+
+    # Conflict warnings
+    if prediction.conflicts:
+        for conflict in prediction.conflicts:
+            st.warning(
+                f"Conflict: {conflict.horizon_a} ({conflict.direction_a.upper()}) vs "
+                f"{conflict.horizon_b} ({conflict.direction_b.upper()})"
+            )
+
+    # Aggregated summary
+    st.subheader("Aggregated")
+    col1, col2, col3 = st.columns(3)
 
     with col1:
-        st.metric(
-            "Duration",
-            f"{prediction.duration_mean:.0f} bars",
-            f"+/-{prediction.duration_std:.0f}"
-        )
-
-    with col2:
-        direction_color = "green" if prediction.direction == 'up' else "red"
         st.metric(
             "Direction",
             prediction.direction.upper(),
             f"{prediction.direction_prob:.1%}"
         )
 
-    with col3:
+    with col2:
         st.metric(
-            "New Channel",
-            prediction.new_channel.title(),
-            f"{prediction.new_channel_probs[prediction.new_channel]:.1%}"
+            "Duration",
+            f"{prediction.duration_mean:.0f} bars",
+            f"+/-{prediction.duration_std:.0f}"
         )
 
-    with col4:
+    with col3:
         st.metric(
             "Confidence",
             f"{prediction.confidence:.1%}",

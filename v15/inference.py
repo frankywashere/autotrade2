@@ -26,7 +26,7 @@ from .features.tf_extractor import (
     get_tf_feature_names,
     get_tf_feature_count,
 )
-from .config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES
+from .config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES, HORIZON_GROUPS, TF_TO_HORIZON
 from .exceptions import ModelError, FeatureExtractionError
 
 logger = logging.getLogger(__name__)
@@ -37,8 +37,41 @@ class PerTFPrediction:
     """Per-timeframe prediction breakdown."""
     duration_mean: float
     duration_std: float
+    direction: str          # 'up' or 'down'
+    direction_prob: float   # P(break_up), calibrated if temp scaler available
+    confidence: float       # max(direction_prob, 1-direction_prob)
+    best_window: int        # Heuristic window for this TF
+
+
+@dataclass
+class HorizonSummary:
+    """Summary of predictions for a horizon group (short/medium/long)."""
+    horizon: str           # 'short', 'medium', 'long'
+    direction: str         # majority direction (weighted by confidence)
+    avg_confidence: float
+    best_tf: str           # highest confidence TF in this horizon
+    best_tf_confidence: float
+
+
+@dataclass
+class TradeRecommendation:
+    """Trade recommendation for a horizon."""
+    horizon: str
+    timeframe: str
+    direction: str
     confidence: float
-    best_window: int  # Heuristic window for this TF
+    duration_mean: float
+    duration_std: float
+    score: float           # confidence - uncertainty_penalty
+
+
+@dataclass
+class HorizonConflict:
+    """Conflict between two horizon groups."""
+    horizon_a: str
+    horizon_b: str
+    direction_a: str
+    direction_b: str
 
 
 @dataclass
@@ -60,6 +93,30 @@ class Prediction:
     # Per-timeframe predictions (optional)
     per_tf_predictions: Optional[Dict[str, PerTFPrediction]] = None
     # Structure: {'5min': PerTFPrediction(...), '15min': PerTFPrediction(...), ...}
+    # Horizon-based analysis
+    horizon_summaries: Optional[Dict[str, HorizonSummary]] = None
+    trade_recommendations: Optional[Dict[str, TradeRecommendation]] = None
+    conflicts: Optional[List[HorizonConflict]] = None
+
+
+class TemperatureScaler:
+    """Post-training temperature scaler for calibrating direction probabilities."""
+
+    def __init__(self, temperature: float = 1.0):
+        self.temperature = temperature
+
+    def calibrate(self, logit: float) -> float:
+        """Apply temperature scaling to a raw logit and return calibrated probability."""
+        import math
+        return 1.0 / (1.0 + math.exp(-logit / self.temperature))
+
+    @classmethod
+    def load(cls, path: str) -> 'TemperatureScaler':
+        """Load temperature scaler from JSON file."""
+        import json
+        with open(path) as f:
+            data = json.load(f)
+        return cls(temperature=data['temperature'])
 
 
 class Predictor:
@@ -83,7 +140,8 @@ class Predictor:
         self,
         model: V15Model,
         feature_names: List[str],
-        device: str = 'auto'
+        device: str = 'auto',
+        temperature_scaler: Optional[TemperatureScaler] = None,
     ):
         if device == 'auto':
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -93,6 +151,7 @@ class Predictor:
         self.model = model.to(self.device)
         self.model.eval()
         self.feature_names = feature_names
+        self._temperature_scaler = temperature_scaler
 
         # Check if model has learned window selection
         self._has_learned_window_selection = self._detect_window_selector()
@@ -203,11 +262,21 @@ class Predictor:
                            "and name-based lookups will be unavailable. "
                            "Patch the checkpoint or retrain with updated code.")
 
+        # Load temperature scaler if available
+        temperature_scaler = None
+        temp_path = path.parent / 'temperature_calibration.json'
+        if temp_path.exists():
+            try:
+                temperature_scaler = TemperatureScaler.load(str(temp_path))
+                logger.info(f"Loaded temperature scaler (T={temperature_scaler.temperature:.4f})")
+            except Exception as e:
+                logger.warning(f"Failed to load temperature scaler: {e}")
+
         logger.info(f"Loaded model from {path}")
         if has_window_selector:
             logger.info("Model includes learned window selection")
 
-        return cls(model, feature_names, device)
+        return cls(model, feature_names, device, temperature_scaler=temperature_scaler)
 
     @torch.no_grad()
     def predict_features(self, features: Dict[str, float]) -> Prediction:
@@ -249,7 +318,7 @@ class Predictor:
         new_channel_names = ['bear', 'sideways', 'bull']
         new_channel = new_channel_names[new_channel_idx]
 
-        confidence = outputs['confidence'].item()
+        confidence = max(direction_prob, 1.0 - direction_prob)
 
         # Handle learned window selection
         learned_window = None
@@ -338,8 +407,6 @@ class Predictor:
         new_channel_names = ['bear', 'sideways', 'bull']
         new_channel = new_channel_names[new_channel_idx]
 
-        confidence = outputs['confidence'].item()
-
         # Handle learned window selection
         learned_window = None
         learned_window_probs = None
@@ -357,12 +424,20 @@ class Predictor:
                 for i in range(len(STANDARD_WINDOWS))
             }
 
-        # Parse per-TF outputs
+        # Parse per-TF outputs with direction
         per_tf_predictions = {}
         for i, tf_name in enumerate(TIMEFRAMES):
-            tf_duration_mean = per_tf_outputs['duration_mean'][0, i].item()
-            tf_duration_std = torch.exp(per_tf_outputs['duration_log_std'][0, i]).item()
-            tf_confidence = per_tf_outputs['confidence'][0, i].item()
+            tf_dur_mean = per_tf_outputs['duration_mean'][0, i].item()
+            tf_dur_std = torch.exp(per_tf_outputs['duration_log_std'][0, i]).item()
+            tf_dir_logit = per_tf_outputs['direction_logits'][0, i].item()
+
+            if self._temperature_scaler:
+                tf_dir_prob = self._temperature_scaler.calibrate(tf_dir_logit)
+            else:
+                tf_dir_prob = torch.sigmoid(per_tf_outputs['direction_logits'][0, i]).item()
+
+            tf_direction = 'up' if tf_dir_prob > 0.5 else 'down'
+            tf_confidence = max(tf_dir_prob, 1.0 - tf_dir_prob)
 
             # Get heuristic window for this TF (default to 50 if not provided)
             tf_best_window = 50
@@ -370,11 +445,21 @@ class Predictor:
                 tf_best_window = heuristic_windows_by_tf[tf_name]
 
             per_tf_predictions[tf_name] = PerTFPrediction(
-                duration_mean=tf_duration_mean,
-                duration_std=tf_duration_std,
+                duration_mean=tf_dur_mean,
+                duration_std=tf_dur_std,
+                direction=tf_direction,
+                direction_prob=tf_dir_prob,
                 confidence=tf_confidence,
                 best_window=tf_best_window,
             )
+
+        # Aggregated confidence from per-TF
+        confidence = max(p.confidence for p in per_tf_predictions.values()) if per_tf_predictions else max(direction_prob, 1 - direction_prob)
+
+        # Compute horizon analysis
+        horizon_summaries = self._compute_horizon_summaries(per_tf_predictions)
+        trade_recommendations = self._compute_trade_recommendations(per_tf_predictions)
+        conflicts = self._detect_conflicts(horizon_summaries)
 
         return Prediction(
             timestamp=pd.Timestamp.now(),
@@ -393,7 +478,89 @@ class Predictor:
             learned_window_probs=learned_window_probs,
             used_learned_selection=used_learned_selection,
             per_tf_predictions=per_tf_predictions,
+            horizon_summaries=horizon_summaries,
+            trade_recommendations=trade_recommendations,
+            conflicts=conflicts,
         )
+
+    @staticmethod
+    def _compute_horizon_summaries(
+        per_tf_predictions: Dict[str, PerTFPrediction],
+    ) -> Dict[str, HorizonSummary]:
+        """Compute horizon summaries from per-TF predictions."""
+        summaries = {}
+        for horizon, tf_list in HORIZON_GROUPS.items():
+            preds = [(tf, per_tf_predictions[tf]) for tf in tf_list if tf in per_tf_predictions]
+            if not preds:
+                continue
+
+            # Weighted direction vote: sum confidence-weighted votes
+            up_weight = sum(p.confidence for _, p in preds if p.direction == 'up')
+            down_weight = sum(p.confidence for _, p in preds if p.direction == 'down')
+            majority_dir = 'up' if up_weight >= down_weight else 'down'
+
+            avg_conf = sum(p.confidence for _, p in preds) / len(preds)
+
+            # Best TF = highest confidence
+            best_tf, best_pred = max(preds, key=lambda x: x[1].confidence)
+
+            summaries[horizon] = HorizonSummary(
+                horizon=horizon,
+                direction=majority_dir,
+                avg_confidence=avg_conf,
+                best_tf=best_tf,
+                best_tf_confidence=best_pred.confidence,
+            )
+        return summaries
+
+    @staticmethod
+    def _compute_trade_recommendations(
+        per_tf_predictions: Dict[str, PerTFPrediction],
+    ) -> Dict[str, TradeRecommendation]:
+        """Compute best trade recommendation per horizon."""
+        recommendations = {}
+        for horizon, tf_list in HORIZON_GROUPS.items():
+            preds = [(tf, per_tf_predictions[tf]) for tf in tf_list if tf in per_tf_predictions]
+            if not preds:
+                continue
+
+            # Score = confidence - uncertainty_penalty
+            def score(p: PerTFPrediction) -> float:
+                uncertainty_penalty = 0.3 * min(p.duration_std / max(p.duration_mean, 1.0), 0.5)
+                return p.confidence - uncertainty_penalty
+
+            best_tf, best_pred = max(preds, key=lambda x: score(x[1]))
+
+            recommendations[horizon] = TradeRecommendation(
+                horizon=horizon,
+                timeframe=best_tf,
+                direction=best_pred.direction,
+                confidence=best_pred.confidence,
+                duration_mean=best_pred.duration_mean,
+                duration_std=best_pred.duration_std,
+                score=score(best_pred),
+            )
+        return recommendations
+
+    @staticmethod
+    def _detect_conflicts(
+        horizon_summaries: Dict[str, HorizonSummary],
+    ) -> List[HorizonConflict]:
+        """Detect direction conflicts between horizon groups."""
+        conflicts = []
+        horizons = list(horizon_summaries.keys())
+        for i in range(len(horizons)):
+            for j in range(i + 1, len(horizons)):
+                h_a = horizon_summaries[horizons[i]]
+                h_b = horizon_summaries[horizons[j]]
+                if h_a.direction != h_b.direction:
+                    conflicts.append(HorizonConflict(
+                        horizon_a=horizons[i],
+                        horizon_b=horizons[j],
+                        direction_a=h_a.direction,
+                        direction_b=h_b.direction,
+                    ))
+        return conflicts
 
     def predict(
         self,
@@ -525,7 +692,8 @@ class Predictor:
         Returns:
             Prediction object with per_tf_predictions populated:
             - per_tf_predictions: Dict[str, PerTFPrediction] mapping TF name to predictions
-              Each PerTFPrediction has: duration_mean, duration_std, confidence, best_window
+              Each PerTFPrediction has: duration_mean, duration_std, direction, direction_prob, confidence, best_window
+            - horizon_summaries, trade_recommendations, conflicts
         """
         from v15.core.channel import detect_channels_multi_window, select_best_channel
         from v15.features.tf_extractor import resample_to_timeframe

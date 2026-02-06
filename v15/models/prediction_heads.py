@@ -76,45 +76,17 @@ class NewChannelDirectionHead(nn.Module):
         return self.net(x)
 
 
-class ConfidenceHead(nn.Module):
-    """
-    Predicts calibrated confidence for each prediction.
-    """
-
-    def __init__(self, input_dim: int, hidden_dim: int = 64):
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),  # Output 0-1
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Returns confidence score 0-1."""
-        return self.net(x).squeeze(-1)
-
-
 class PerTFPredictionHeads(nn.Module):
     """
     Lightweight prediction heads for per-timeframe predictions.
 
-    Runs duration and confidence heads on individual TF embeddings (after
+    Runs duration and direction heads on individual TF embeddings (after
     cross-TF attention) to provide per-TF breakdown of predictions.
 
-    This enables dashboard to show which timeframes are most confident
-    in their predictions and how duration estimates vary across TFs.
+    This enables dashboard to show per-TF direction and duration estimates.
     """
 
     def __init__(self, embed_dim: int = 128, hidden_dim: int = 64):
-        """
-        Initialize per-TF prediction heads.
-
-        Args:
-            embed_dim: Dimension of per-TF embeddings (default: 128)
-            hidden_dim: Hidden layer dimension (default: 64)
-        """
         super().__init__()
 
         # Duration head (mean + log_std)
@@ -127,12 +99,11 @@ class PerTFPredictionHeads(nn.Module):
         self.duration_mean = nn.Linear(hidden_dim // 2, 1)
         self.duration_log_std = nn.Linear(hidden_dim // 2, 1)
 
-        # Confidence head
-        self.confidence_net = nn.Sequential(
+        # Direction head (replaces confidence_net)
+        self.direction_net = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid(),
+            nn.Linear(hidden_dim // 2, 1),  # raw logit, no sigmoid
         )
 
     def forward(self, tf_embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -146,7 +117,7 @@ class PerTFPredictionHeads(nn.Module):
             Dict with:
                 'duration_mean': [batch, n_timeframes] predicted durations
                 'duration_log_std': [batch, n_timeframes] log std of durations
-                'confidence': [batch, n_timeframes] confidence scores
+                'direction_logits': [batch, n_timeframes] raw direction logits
         """
         batch_size, n_tf, embed_dim = tf_embeddings.shape
 
@@ -158,14 +129,14 @@ class PerTFPredictionHeads(nn.Module):
         duration_mean = F.softplus(self.duration_mean(h))  # Must be positive
         duration_log_std = self.duration_log_std(h).clamp(-5, 5)
 
-        # Confidence predictions
-        confidence = self.confidence_net(flat_embeddings)
+        # Direction predictions
+        direction_logits = self.direction_net(flat_embeddings)
 
         # Reshape back to [batch, n_timeframes]
         return {
             'duration_mean': duration_mean.view(batch_size, n_tf),
             'duration_log_std': duration_log_std.view(batch_size, n_tf),
-            'confidence': confidence.view(batch_size, n_tf),
+            'direction_logits': direction_logits.view(batch_size, n_tf),
         }
 
 
@@ -1231,7 +1202,6 @@ class PredictionHeads(nn.Module):
         self.duration_head = DurationHead(input_dim, hidden_dim)
         self.direction_head = DirectionHead(input_dim, hidden_dim)
         self.new_channel_head = NewChannelDirectionHead(input_dim, hidden_dim)
-        self.confidence_head = ConfidenceHead(input_dim, hidden_dim // 2)
 
         # Optional window selector for learned window selection
         if use_window_selector:
@@ -1357,7 +1327,6 @@ class PredictionHeads(nn.Module):
                 'duration_log_std': [batch]
                 'direction_logits': [batch]
                 'new_channel_logits': [batch, 3]
-                'confidence': [batch]
 
             If use_window_selector:
                 'window_selection': Dict with window selection outputs
@@ -1416,7 +1385,6 @@ class PredictionHeads(nn.Module):
             'duration_log_std': duration_log_std,
             'direction_logits': self.direction_head(x),
             'new_channel_logits': self.new_channel_head(x),
-            'confidence': self.confidence_head(x),
         }
 
         # Add window selection if enabled

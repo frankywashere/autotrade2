@@ -6,7 +6,7 @@ from .tf_encoder import TFEncoder, MultiTFEncoder
 from .cross_tf_attention import CrossTFAttention, TFAggregator
 from .prediction_heads import (
     DurationHead, DirectionHead, NewChannelDirectionHead,
-    ConfidenceHead, PredictionHeads
+    PredictionHeads
 )
 from .full_model import V15Model, create_model
 
@@ -24,7 +24,6 @@ __all__ = [
     'DurationHead',
     'DirectionHead',
     'NewChannelDirectionHead',
-    'ConfidenceHead',
     'PredictionHeads',
     # Full model
     'V15Model',

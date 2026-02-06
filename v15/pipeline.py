@@ -251,6 +251,8 @@ def cmd_train(args):
         cross_rsi_spread_weight=args.cross_rsi_spread_weight,
         # Per-timeframe loss
         per_tf_loss_weight=args.per_tf_loss_weight,
+        per_tf_direction_loss_weight=args.per_tf_direction_loss_weight,
+        per_tf_loss_ramp_epochs=args.per_tf_loss_ramp_epochs,
     )
 
     # Train
@@ -337,6 +339,29 @@ def cmd_dashboard(args):
     import subprocess
     dashboard_path = Path(__file__).parent / 'dashboard.py'
     subprocess.run(['streamlit', 'run', str(dashboard_path)])
+
+
+def cmd_calibrate(args):
+    """Run temperature calibration on per-TF direction logits."""
+    from .calibration import calibrate_temperature
+
+    result = calibrate_temperature(
+        checkpoint_path=args.checkpoint,
+        data_path=args.data,
+        val_split=args.val_split,
+        batch_size=args.batch_size,
+        seed=args.seed,
+    )
+
+    if 'error' in result:
+        logger.error(f"Calibration failed: {result['error']}")
+        sys.exit(1)
+
+    print(f"\nCalibration Results:")
+    print(f"  Temperature: {result['temperature']:.4f}")
+    print(f"  NLL:  {result['nll_before']:.4f} -> {result['nll_after']:.4f}")
+    print(f"  ECE:  {result['ece_before']:.4f} -> {result['ece_after']:.4f}")
+    print(f"  Samples: {result['n_samples']:,}")
 
 
 def cmd_info(args):
@@ -529,6 +554,10 @@ def main():
     # Per-timeframe loss weight
     train_parser.add_argument('--per-tf-loss-weight', type=float, default=0.0,
         help='Weight for per-timeframe duration loss (0.0 = disabled, try 0.5 to enable)')
+    train_parser.add_argument('--per-tf-direction-loss-weight', type=float, default=0.0,
+        help='Weight for per-timeframe direction loss (0.0 = disabled, try 0.3 to enable)')
+    train_parser.add_argument('--per-tf-loss-ramp-epochs', type=int, default=20,
+        help='Epochs to ramp per-TF loss from 0 to full weight (default: 20)')
     train_parser.add_argument('--seed', type=int, default=42,
         help='Random seed for reproducibility (default: 42)')
 
@@ -540,6 +569,17 @@ def main():
         help='Samples per chunk during conversion (default: 15000)')
     convert_parser.add_argument('--target-tf', default='daily',
         help='Target timeframe for label extraction (default: daily)')
+
+    # Calibrate command
+    calibrate_parser = subparsers.add_parser('calibrate', help='Run temperature calibration on per-TF direction')
+    calibrate_parser.add_argument('--checkpoint', required=True, help='Path to model checkpoint (best.pt)')
+    calibrate_parser.add_argument('--data', required=True, help='Path to .flat data directory')
+    calibrate_parser.add_argument('--val-split', type=float, default=0.2,
+        help='Fraction of data for validation (default: 0.2)')
+    calibrate_parser.add_argument('--batch-size', type=int, default=128,
+        help='Batch size for inference (default: 128)')
+    calibrate_parser.add_argument('--seed', type=int, default=42,
+        help='Random seed (default: 42)')
 
     # Analyze command
     analyze_parser = subparsers.add_parser('analyze', help='Analyze feature correlations')
@@ -569,6 +609,8 @@ def main():
             cmd_scan(args)
         elif args.command == 'train':
             cmd_train(args)
+        elif args.command == 'calibrate':
+            cmd_calibrate(args)
         elif args.command == 'convert':
             from .training.flat_dataset import convert_bin_to_flat
             convert_bin_to_flat(

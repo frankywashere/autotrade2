@@ -18,6 +18,18 @@ TIMEFRAMES: List[str] = [
 ]
 N_TIMEFRAMES: int = len(TIMEFRAMES)  # 10
 
+# Horizon groups for trade recommendations
+HORIZON_GROUPS = {
+    'short': ['5min', '15min', '30min'],
+    'medium': ['1h', '2h', '3h', '4h'],
+    'long': ['daily', 'weekly', 'monthly'],
+}
+
+TF_TO_HORIZON = {}
+for _horizon, _tfs in HORIZON_GROUPS.items():
+    for _tf in _tfs:
+        TF_TO_HORIZON[_tf] = _horizon
+
 # Channel detection windows
 STANDARD_WINDOWS: List[int] = [10, 20, 30, 40, 50, 60, 70, 80]
 N_WINDOWS: int = len(STANDARD_WINDOWS)

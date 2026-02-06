@@ -143,6 +143,8 @@ class TrainingConfig:
     #   - Target: per-TF duration labels (from labels['per_tf_duration'][:, tf_idx])
     # Set to 0.0 to disable (default, backward compatible)
     per_tf_loss_weight: float = 0.0
+    per_tf_direction_loss_weight: float = 0.0
+    per_tf_loss_ramp_epochs: int = 20  # Epochs to ramp from 0 to full weight
 
 
 # =============================================================================
@@ -520,7 +522,7 @@ class Trainer:
             per_tf_preds: Dict from model.forward_with_per_tf() containing:
                 - 'duration_mean': [batch, n_tfs] predicted durations per TF
                 - 'duration_log_std': [batch, n_tfs] log std of durations per TF
-                - 'confidence': [batch, n_tfs] confidence scores per TF
+                - 'direction_logits': [batch, n_tfs] raw direction logits per TF
             labels: Ground truth labels dict with:
                 - 'per_tf_duration': [batch, n_tfs] duration targets per TF
                 - 'per_tf_duration_valid': [batch, n_tfs] validity mask per TF
@@ -575,6 +577,54 @@ class Trainer:
         losses['per_tf_n_valid'] = int(valid_mask.sum().item())
 
         return per_tf_loss, losses
+
+    def compute_per_tf_direction_loss(
+        self,
+        per_tf_preds: Dict[str, torch.Tensor],
+        labels: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute per-TF direction loss using focal BCE.
+
+        Args:
+            per_tf_preds: Dict from model.forward_with_per_tf() containing:
+                - 'direction_logits': [batch, n_tfs] raw direction logits per TF
+            labels: Ground truth labels dict with:
+                - 'per_tf_direction': [batch, n_tfs] direction targets (0=down, 1=up)
+                - 'per_tf_direction_valid': [batch, n_tfs] validity mask per TF
+
+        Returns:
+            loss: Scalar tensor
+            loss_components: Dict with breakdown for logging
+        """
+        per_tf_dir = labels.get('per_tf_direction')
+        per_tf_dir_valid = labels.get('per_tf_direction_valid')
+
+        if per_tf_dir is None or per_tf_dir_valid is None:
+            return torch.tensor(0.0, device=self.device), {'per_tf_direction': 0.0, 'per_tf_dir_n_valid': 0}
+
+        valid_mask = per_tf_dir_valid.bool()
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=self.device), {'per_tf_direction': 0.0, 'per_tf_dir_n_valid': 0}
+
+        pred_logits = per_tf_preds['direction_logits'][valid_mask]
+        targets = per_tf_dir[valid_mask].float()
+
+        # Focal loss (same as aggregate direction)
+        probs = torch.sigmoid(pred_logits)
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        focal_weight = (1 - p_t) ** self.config.focal_gamma
+        bce = F.binary_cross_entropy_with_logits(pred_logits, targets, reduction='none')
+        loss = (focal_weight * bce).mean()
+
+        return loss, {'per_tf_direction': loss.item(), 'per_tf_dir_n_valid': int(valid_mask.sum().item())}
+
+    def _get_per_tf_ramp(self, epoch: int) -> float:
+        """Get per-TF loss ramp factor (0.0 to 1.0) based on epoch."""
+        ramp_epochs = self.config.per_tf_loss_ramp_epochs
+        if ramp_epochs <= 0 or epoch >= ramp_epochs:
+            return 1.0
+        return epoch / ramp_epochs
 
     def compute_loss(
         self,
@@ -1609,7 +1659,8 @@ class Trainer:
                 self.optimizer.zero_grad()
 
                 # Check if per-TF loss is enabled
-                use_per_tf_loss = self.config.per_tf_loss_weight > 0
+                use_per_tf_loss = (self.config.per_tf_loss_weight > 0 or
+                                   self.config.per_tf_direction_loss_weight > 0)
 
                 # Forward pass with mixed precision (bfloat16 on CUDA, float32 elsewhere)
                 amp_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if self.use_amp else torch.enable_grad()
@@ -1627,15 +1678,24 @@ class Trainer:
                     # Compute main loss
                     loss, loss_components = self.compute_loss(predictions, labels)
 
-                    # Add per-TF duration loss if enabled
+                    # Add per-TF losses if enabled
                     if use_per_tf_loss and per_tf_preds is not None:
-                        per_tf_loss, per_tf_loss_components = self.compute_per_tf_duration_loss(
+                        ramp = self._get_per_tf_ramp(epoch)
+
+                        per_tf_dur_loss, dur_comp = self.compute_per_tf_duration_loss(
                             per_tf_preds, labels
                         )
-                        # Add weighted per-TF loss to total
-                        loss = loss + self.config.per_tf_loss_weight * per_tf_loss
-                        # Merge loss components for logging
-                        loss_components.update(per_tf_loss_components)
+                        per_tf_dir_loss, dir_comp = self.compute_per_tf_direction_loss(
+                            per_tf_preds, labels
+                        )
+
+                        per_tf_total = (self.config.per_tf_loss_weight * per_tf_dur_loss +
+                                        self.config.per_tf_direction_loss_weight * per_tf_dir_loss)
+                        loss = loss + ramp * per_tf_total
+
+                        loss_components.update(dur_comp)
+                        loss_components.update(dir_comp)
+                        loss_components['per_tf_ramp'] = ramp
                         loss_components['total'] = loss.item()
 
                 loss.backward()
@@ -1746,7 +1806,8 @@ class Trainer:
                 labels = {k: v.to(self.device) for k, v in labels.items()}
 
                 # Check if per-TF loss is enabled
-                use_per_tf_loss = self.config.per_tf_loss_weight > 0
+                use_per_tf_loss = (self.config.per_tf_loss_weight > 0 or
+                                   self.config.per_tf_direction_loss_weight > 0)
 
                 # Use forward_with_per_tf when per-TF loss is enabled
                 if use_per_tf_loss:
@@ -1758,15 +1819,21 @@ class Trainer:
                 # Compute main loss
                 loss, loss_components = self.compute_loss(predictions, labels)
 
-                # Add per-TF duration loss if enabled
+                # Add per-TF losses if enabled (for logging in validation)
                 if use_per_tf_loss and per_tf_preds is not None:
-                    per_tf_loss, per_tf_loss_components = self.compute_per_tf_duration_loss(
+                    per_tf_dur_loss, dur_comp = self.compute_per_tf_duration_loss(
                         per_tf_preds, labels
                     )
-                    # Add weighted per-TF loss to total (for logging only in validation)
-                    loss = loss + self.config.per_tf_loss_weight * per_tf_loss
-                    # Merge loss components for logging
-                    loss_components.update(per_tf_loss_components)
+                    per_tf_dir_loss, dir_comp = self.compute_per_tf_direction_loss(
+                        per_tf_preds, labels
+                    )
+
+                    per_tf_total = (self.config.per_tf_loss_weight * per_tf_dur_loss +
+                                    self.config.per_tf_direction_loss_weight * per_tf_dir_loss)
+                    loss = loss + per_tf_total
+
+                    loss_components.update(dur_comp)
+                    loss_components.update(dir_comp)
                     loss_components['total'] = loss.item()
 
             val_losses.append(loss_components)

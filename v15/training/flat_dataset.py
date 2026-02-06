@@ -211,6 +211,16 @@ class FlatDataset(Dataset):
         for npy_file in sorted(labels_dir.glob('*.npy')):
             self.labels[npy_file.stem] = np.load(str(npy_file))
 
+        # Fix 1D validity arrays that should be [N, n_cols] to match their companion data arrays
+        for key in list(self.labels.keys()):
+            if key.endswith('_valid') and self.labels[key].ndim == 1:
+                data_key = key.replace('_valid', '')
+                if data_key in self.labels and self.labels[data_key].ndim == 2:
+                    n_cols = self.labels[data_key].shape[1]
+                    if self.labels[key].shape[0] == self.num_samples * n_cols:
+                        self.labels[key] = self.labels[key].reshape(self.num_samples, n_cols)
+                        print(f"  Reshaped {key}: [{self.num_samples * n_cols}] -> [{self.num_samples}, {n_cols}]")
+
         print(f"FlatDataset loaded: {self.num_samples:,} samples, "
               f"{self.num_features:,} features, {len(self.labels)} label arrays")
 

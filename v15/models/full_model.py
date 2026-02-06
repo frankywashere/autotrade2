@@ -44,7 +44,7 @@ class V15Model(nn.Module):
             ↓
         TF Aggregator (11 x 128 → 256)
             ↓
-        Prediction Heads (duration, direction, new_channel, confidence)
+        Prediction Heads (duration, direction, new_channel)
             ↓
         [Optional] Window Selector (learned window selection)
 
@@ -293,7 +293,7 @@ class V15Model(nn.Module):
                 - per_tf_predictions: Dict with per-TF predictions:
                     - 'duration_mean': [batch, n_timeframes]
                     - 'duration_log_std': [batch, n_timeframes]
-                    - 'confidence': [batch, n_timeframes]
+                    - 'direction_logits': [batch, n_timeframes]
         """
         # 1. Validate input
         if validate:
