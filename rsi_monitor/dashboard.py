@@ -433,7 +433,7 @@ def main():
     .stDeployButton {display: none;}
 
     /* Reduce top padding */
-    div.block-container {padding-top: 1.5rem;}
+    div.block-container {padding-top: 3.5rem;}
 
     /* Style sidebar header area */
     [data-testid="stSidebar"] [data-testid="stHeader"] {
