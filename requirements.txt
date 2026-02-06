@@ -18,6 +18,8 @@ yfinance
 streamlit>=1.45.0
 plotly
 matplotlib
+pytz
+streamlit-autorefresh
 
 # Scientific computing
 scipy
