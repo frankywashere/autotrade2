@@ -40,6 +40,55 @@ BOUNCE_LOWER_COLOR = 'rgba(0, 128, 0, 0.8)'  # Green for lower touches
 # Direction labels
 DIR_NAMES = {0: 'BEAR', 1: 'SIDEWAYS', 2: 'BULL'}
 
+# Price label font size
+PRICE_LABEL_SIZE = 9
+
+
+def _add_price_labels(
+    fig: 'go.Figure',
+    x_vals: list,
+    y_upper: np.ndarray,
+    y_lower: np.ndarray,
+    color: str = 'rgba(120,120,120,0.8)',
+    max_labels: int = 6,
+) -> None:
+    """Add price annotations along upper/lower channel lines at regular intervals."""
+    n = len(x_vals)
+    if n == 0:
+        return
+
+    # Pick evenly spaced indices, always including last
+    if n <= max_labels:
+        indices = list(range(n))
+    else:
+        step = max(1, (n - 1) // (max_labels - 1))
+        indices = list(range(0, n, step))
+        if indices[-1] != n - 1:
+            indices.append(n - 1)
+
+    lbl_x = [x_vals[i] for i in indices]
+    lbl_upper = [float(y_upper[i]) for i in indices]
+    lbl_lower = [float(y_lower[i]) for i in indices]
+
+    fmt = lambda p: f"${p:,.2f}"
+
+    fig.add_trace(go.Scatter(
+        x=lbl_x, y=lbl_upper,
+        mode='text',
+        text=[fmt(p) for p in lbl_upper],
+        textposition='top center',
+        textfont=dict(size=PRICE_LABEL_SIZE, color=color),
+        showlegend=False, hoverinfo='skip',
+    ))
+    fig.add_trace(go.Scatter(
+        x=lbl_x, y=lbl_lower,
+        mode='text',
+        text=[fmt(p) for p in lbl_lower],
+        textposition='bottom center',
+        textfont=dict(size=PRICE_LABEL_SIZE, color=color),
+        showlegend=False, hoverinfo='skip',
+    ))
+
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -241,6 +290,10 @@ def add_channel_overlay(
         hoverinfo='skip', showlegend=False,
     ))
 
+    # Price labels on main channel
+    _add_price_labels(fig, x_channel, upper_line, lower_line,
+                      color=line_color, max_labels=5)
+
     # Project forward if requested
     if project_forward > 0:
         proj_start = start_idx + channel_len
@@ -274,6 +327,10 @@ def add_channel_overlay(
             fill='tonexty', fillcolor=proj_fill_color,
             hoverinfo='skip', showlegend=False,
         ))
+
+        # Price labels on projection
+        _add_price_labels(fig, proj_x, proj_upper, proj_lower,
+                          color=proj_line_color, max_labels=4)
 
     return fig
 
@@ -422,6 +479,10 @@ def add_duration_projection(
         fill='tonexty', fillcolor=fill_clr,
         hoverinfo='skip', showlegend=False,
     ))
+
+    # Price labels along projection
+    _add_price_labels(fig, future_x, proj_upper, proj_lower,
+                      color=line_clr, max_labels=5)
 
     # Vertical marker at mean break point
     mean_idx = min(round(duration_mean) - 1, n_forward - 1)
