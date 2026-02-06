@@ -520,7 +520,7 @@ def main():
         st.subheader("Market Hours")
         prepost = st.checkbox(
             "Include After-Hours Data",
-            value=False,
+            value=True,
             help="Include pre-market (4am-9:30am) and after-hours (4pm-8pm) data for intraday timeframes"
         )
 
