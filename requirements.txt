@@ -17,6 +17,7 @@ yfinance
 # Dashboard (optional)
 streamlit>=1.45.0
 plotly
+matplotlib
 
 # Scientific computing
 scipy
