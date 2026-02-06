@@ -625,28 +625,23 @@ def main():
         elif fear_pct >= 50:
             overall_status = "BUY THE DIP"
             overall_color = "#4CAF50"
-        elif confirms_sell and greed_pct >= 50:
-            overall_status = "SELL THE RIP"
-            overall_color = "#ff4444"
-        elif confirms_sell:
-            overall_status = "SELL THE RIP"
-            overall_color = "#ff9800"
         elif fear_pct >= 35:
             overall_status = "CAUTIOUS"
             overall_color = "#ffeb3b"
+        elif confirms_sell:
+            overall_status = "SELL THE RIP"
+            overall_color = "#ff4444" if greed_pct >= 50 else "#ff9800"
         else:
             overall_status = "NEUTRAL"
             overall_color = "#6c757d"
 
-        # Sub-label with fear/greed context
+        # Sub-label always shows fear level
+        sub_label = f"Fear {fear_pct:.0f}%"
         if fear_pct >= 50:
-            sub_label = f"Fear {fear_pct:.0f}%"
             sub_color = "#ff4444"
-        elif confirms_sell:
-            sub_label = f"Greed {greed_pct:.0f}%"
-            sub_color = "#00C851"
+        elif fear_pct >= 35:
+            sub_color = "#ffeb3b"
         else:
-            sub_label = f"Fear {fear_pct:.0f}%"
             sub_color = "#888"
 
         st.markdown(f"""
