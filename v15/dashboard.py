@@ -625,6 +625,8 @@ def get_live_data_with_fallback(
             # CSV data is tz-naive (represents America/New_York market time)
             # yfinance data is tz-aware (America/New_York)
             def _normalize_to_utc(df: pd.DataFrame) -> pd.DataFrame:
+                if len(df) == 0 or not isinstance(df.index, pd.DatetimeIndex):
+                    return df
                 if df.index.tz is None:
                     # tz-naive CSV data: localize to NY then convert to UTC
                     df = df.copy()
@@ -1482,15 +1484,18 @@ def main():
         show_data_status_bar(is_live, error_msg, st.session_state.get('last_update'))
 
         st.subheader("TSLA")
-        st.line_chart(current_tsla['close'].tail(1000))
+        if len(current_tsla) > 0 and 'close' in current_tsla.columns:
+            st.line_chart(current_tsla['close'].tail(1000))
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Total Bars", f"{len(current_tsla):,}")
-            st.metric("Start", str(current_tsla.index[0].date()))
-        with col2:
-            st.metric("End", str(current_tsla.index[-1].date()))
-            st.metric("Last Close", f"${current_tsla['close'].iloc[-1]:.2f}")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Bars", f"{len(current_tsla):,}")
+                st.metric("Start", str(current_tsla.index[0].date()))
+            with col2:
+                st.metric("End", str(current_tsla.index[-1].date()))
+                st.metric("Last Close", f"${current_tsla['close'].iloc[-1]:.2f}")
+        else:
+            st.info("No TSLA data available")
 
 
 if __name__ == "__main__":
