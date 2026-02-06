@@ -15,7 +15,7 @@ pandas_market_calendars
 yfinance
 
 # Dashboard (optional)
-streamlit
+streamlit>=1.45.0
 plotly
 
 # Scientific computing
