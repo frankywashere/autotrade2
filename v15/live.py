@@ -204,9 +204,15 @@ class LivePredictor:
         if self.tsla_data is None:
             print(f"[PREDICT] can_predict: No data loaded yet")
             return False
-        has_enough = len(self.tsla_data) >= self.min_bars
+        # When native TF data covers higher timeframes (1h+), we only need
+        # 5min bars for lower TFs (5min/15min/30min → max lookback 700).
+        # Without native TF data, we need 35K bars to resample everything.
+        required = self.min_bars
+        if self.native_bars_by_tf is not None:
+            required = min(required, 1000)
+        has_enough = len(self.tsla_data) >= required
         if not has_enough:
-            print(f"[PREDICT] can_predict: {len(self.tsla_data):,} bars < {self.min_bars:,} required")
+            print(f"[PREDICT] can_predict: {len(self.tsla_data):,} bars < {required:,} required")
         return has_enough
 
     def _compute_bar_completion_by_tf(self) -> Dict[str, float]:
