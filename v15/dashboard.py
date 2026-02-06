@@ -816,6 +816,36 @@ def load_market_data(data_dir: str):
     return _load(data_dir)
 
 
+CHECKPOINT_RELEASE_URL = "https://github.com/frankywashere/autotrade2/releases/download/v0.1-model/best.pt"
+DEFAULT_MODEL_PATH = "models/best.pt"
+
+
+def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> str:
+    """Download checkpoint from GitHub Releases if not present locally."""
+    p = Path(path)
+    if p.exists():
+        return str(p)
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    # For private repos, use token from Streamlit secrets or env
+    import os
+    token = os.environ.get("GITHUB_TOKEN") or st.secrets.get("GITHUB_TOKEN", "")
+
+    import urllib.request
+    req = urllib.request.Request(CHECKPOINT_RELEASE_URL)
+    if token:
+        req.add_header("Authorization", f"token {token}")
+    req.add_header("Accept", "application/octet-stream")
+
+    print(f"[MODEL] Downloading checkpoint to {p} ...")
+    with urllib.request.urlopen(req) as resp, open(p, "wb") as f:
+        import shutil
+        shutil.copyfileobj(resp, f)
+    print(f"[MODEL] Downloaded {p.stat().st_size / 1e6:.1f} MB")
+    return str(p)
+
+
 @st.cache_resource
 def load_predictor(checkpoint_path: str):
     """Load and cache live predictor with channel history tracking."""
@@ -1009,17 +1039,16 @@ def main():
             st.error(f"Failed to load data: {e}")
             return
 
-    # Load model if available
+    # Load model (auto-download from GitHub Releases if not present)
     predictor = None
-    if Path(checkpoint_path).exists():
-        with st.spinner("Loading model..."):
-            try:
-                predictor = load_predictor(checkpoint_path)
-                st.sidebar.success("Model loaded")
-            except Exception as e:
-                st.sidebar.warning(f"Model not loaded: {e}")
-    else:
-        st.sidebar.info("No model checkpoint found. Train a model first.")
+    with st.spinner("Loading model..."):
+        try:
+            checkpoint_path = _ensure_checkpoint(checkpoint_path)
+            predictor = load_predictor(checkpoint_path)
+            st.sidebar.success("Model loaded")
+        except Exception as e:
+            st.sidebar.warning(f"Model not loaded: {e}")
+            logger.exception("Model loading error")
 
     # Fetch native TF data for higher timeframes (daily/weekly/monthly)
     # These have unlimited yfinance history vs 60-day limit for 5-min
@@ -1105,6 +1134,85 @@ def main():
                                 f"bars: {live_pred.source_bar_count:,})"
                             )
                             show_prediction_card(prediction)
+
+                            # Daily channel chart with aggregate projection
+                            st.divider()
+                            st.subheader("Daily Channel")
+                            try:
+                                from v15.features.tf_extractor import resample_to_timeframe
+
+                                # Get daily data (prefer native TF)
+                                daily_df = None
+                                if (native_tf_data
+                                        and native_tf_data.get('TSLA', {}).get('daily') is not None
+                                        and len(native_tf_data['TSLA']['daily']) >= 20):
+                                    daily_df = native_tf_data['TSLA']['daily'].copy()
+                                elif len(tsla_slice) >= 20:
+                                    daily_df = resample_to_timeframe(tsla_slice, 'daily')
+
+                                if daily_df is not None and len(daily_df) >= 20:
+                                    # Detect channel
+                                    daily_channels = detect_channels_multi_window(
+                                        daily_df, windows=STANDARD_WINDOWS
+                                    )
+                                    daily_best, daily_best_window = select_best_channel(daily_channels)
+
+                                    # Use prediction's window if available
+                                    daily_window = 50
+                                    if (prediction.per_tf_predictions is not None
+                                            and 'daily' in prediction.per_tf_predictions):
+                                        daily_window = prediction.per_tf_predictions['daily'].best_window
+                                    elif daily_best_window is not None:
+                                        daily_window = daily_best_window
+
+                                    daily_channel = daily_channels.get(daily_window)
+                                    window_bars = min(daily_window, len(daily_df) - 1)
+                                    daily_chart_df = daily_df.iloc[-(window_bars + 1):].copy()
+
+                                    if daily_channel is not None and getattr(daily_channel, 'valid', False):
+                                        fig = create_tf_channel_chart(
+                                            df=daily_chart_df,
+                                            channel=daily_channel,
+                                            tf_name='daily',
+                                            duration=prediction.duration_mean,
+                                            confidence=prediction.confidence,
+                                            show_bounces=True,
+                                            height=400
+                                        )
+
+                                        if prediction.duration_mean > 0 and prediction.confidence > 0:
+                                            fig = add_duration_projection(
+                                                fig, daily_channel, daily_chart_df,
+                                                prediction.duration_mean,
+                                                prediction.duration_std,
+                                                prediction.confidence,
+                                                prediction.direction,
+                                                tf_name='daily',
+                                            )
+
+                                        st.plotly_chart(fig, use_container_width=True)
+
+                                        # Metrics row
+                                        c1, c2, c3, c4 = st.columns(4)
+                                        with c1:
+                                            st.metric("Bounces", getattr(daily_channel, 'bounce_count', 0))
+                                        with c2:
+                                            st.metric("R-squared", f"{getattr(daily_channel, 'r_squared', 0.0):.3f}")
+                                        with c3:
+                                            dir_names = {0: 'Bear', 1: 'Sideways', 2: 'Bull'}
+                                            ch_dir = getattr(daily_channel, 'direction', 1)
+                                            st.metric("Channel Dir", dir_names.get(int(ch_dir), 'Unknown'))
+                                        with c4:
+                                            st.metric("Window", f"{daily_window} bars")
+                                    else:
+                                        fig = create_candlestick_chart(daily_chart_df, tf_name='daily')
+                                        fig.update_layout(title="Daily - No Valid Channel", height=400)
+                                        st.plotly_chart(fig, use_container_width=True)
+                                else:
+                                    st.info("Insufficient daily data for channel detection")
+                            except Exception as e:
+                                st.warning(f"Could not render daily channel: {e}")
+                                logger.exception("Daily channel chart error")
 
                             # Show learned window selection if model uses it
                             if prediction.used_learned_selection:
