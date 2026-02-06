@@ -616,7 +616,7 @@ def main():
             overall_status = "BUY THE DIP"
             overall_color = "#4CAF50"
         elif fear_pct >= 35:
-            overall_status = "CAUTIOUS"
+            overall_status = "CAUTIOUS - BUY"
             overall_color = "#ffeb3b"
         elif fear_pct < 10 and confirms_sell:
             overall_status = "SELL THE RIP"
@@ -776,7 +776,7 @@ def main():
                                 base_status = val.split(" (")[0] if " (" in val else val
                                 color = RSI_LEVEL_COLORS.get(base_status)
                                 if color:
-                                    return f"background-color: {color}33; color: {color}"
+                                    return f"background-color: {color}15; color: {color}; font-weight: 600"
                                 return ""
 
                             styled_df = df.style.map(
