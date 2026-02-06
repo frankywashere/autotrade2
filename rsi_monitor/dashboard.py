@@ -775,10 +775,7 @@ def main():
                                         <span style="font-size: 1.3em; font-weight: 700; color: #e1e3ea;">{symbol}</span>
                                         <span style="font-size: 1.15em; font-weight: 600; color: #8b8fa3;">{price_str}</span>
                                     </div>
-                                    <div style="display: flex; align-items: center;">
-                                        <span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{SIGNAL_DISPLAY.get(signal, signal)}</span>
-                                        {recovery_html}
-                                    </div>
+                                    <div style="display: flex; align-items: center;"><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{SIGNAL_DISPLAY.get(signal, signal)}</span>{recovery_html}</div>
                                 </div>
                                 <div style="display: flex; gap: 10px; margin-bottom: 6px;">
                                     <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">
