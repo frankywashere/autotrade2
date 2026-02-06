@@ -1,8 +1,9 @@
 """
 v15/visualization/plotly_charts.py - Plotly-based visualizations for Streamlit dashboard.
 
-Provides interactive chart components for channel analysis visualization.
-Converted from matplotlib implementation in inspector.py and utils.py.
+Uses integer bar indices for the x-axis (like the inspector) to avoid all
+datetime gap / rangebreak / timezone complexity.  Date labels are shown as
+x-axis tick text at a few positions including the last bar.
 """
 
 from __future__ import annotations
@@ -44,6 +45,41 @@ DIR_NAMES = {0: 'BEAR', 1: 'SIDEWAYS', 2: 'BULL'}
 # HELPER FUNCTIONS
 # =============================================================================
 
+def _format_ts(ts: pd.Timestamp) -> str:
+    """Format a timestamp for tick label display."""
+    if hasattr(ts, 'hour') and (ts.hour != 0 or ts.minute != 0):
+        return ts.strftime('%b %d %H:%M')
+    return ts.strftime('%b %d')
+
+
+def _make_date_ticks(df: pd.DataFrame, n_ticks: int = 5):
+    """Build tick positions and labels from a DataFrame with DatetimeIndex.
+
+    Returns (tickvals, ticktext) for use with fig.update_xaxes().
+    If the index is not a DatetimeIndex, returns (None, None).
+    """
+    if not isinstance(df.index, pd.DatetimeIndex) or len(df) == 0:
+        return None, None
+
+    n = len(df)
+    if n <= n_ticks:
+        positions = list(range(n))
+    else:
+        step = (n - 1) / (n_ticks - 1)
+        positions = [round(i * step) for i in range(n_ticks)]
+        # Always include the last bar
+        if positions[-1] != n - 1:
+            positions[-1] = n - 1
+
+    # Convert tz-aware to ET for display
+    idx = df.index
+    if idx.tz is not None:
+        idx = idx.tz_convert('America/New_York')
+
+    labels = [_format_ts(idx[p]) for p in positions]
+    return positions, labels
+
+
 def _check_plotly_available() -> None:
     """Raise ImportError if Plotly is not available."""
     if not PLOTLY_AVAILABLE:
@@ -54,15 +90,7 @@ def _check_plotly_available() -> None:
 
 
 def _validate_ohlcv_dataframe(df: pd.DataFrame) -> bool:
-    """
-    Validate that DataFrame has required OHLCV columns.
-
-    Args:
-        df: DataFrame to validate
-
-    Returns:
-        True if valid, False otherwise
-    """
+    """Validate that DataFrame has required OHLCV columns."""
     if df is None or df.empty:
         return False
     required_cols = {'open', 'high', 'low', 'close'}
@@ -70,20 +98,11 @@ def _validate_ohlcv_dataframe(df: pd.DataFrame) -> bool:
 
 
 def _validate_channel(channel: Optional['Channel']) -> bool:
-    """
-    Validate that channel object is usable.
-
-    Args:
-        channel: Channel object to validate
-
-    Returns:
-        True if valid and usable, False otherwise
-    """
+    """Validate that channel object is usable."""
     if channel is None:
         return False
     if not getattr(channel, 'valid', False):
         return False
-    # Check required attributes
     required_attrs = ['slope', 'intercept', 'std_dev', 'upper_line', 'lower_line', 'center_line']
     for attr in required_attrs:
         if not hasattr(channel, attr) or getattr(channel, attr) is None:
@@ -95,30 +114,19 @@ def _validate_channel(channel: Optional['Channel']) -> bool:
 # CANDLESTICK CHART
 # =============================================================================
 
-def create_candlestick_chart(df: pd.DataFrame) -> 'go.Figure':
+def create_candlestick_chart(df: pd.DataFrame, tf_name: Optional[str] = None) -> 'go.Figure':
     """
     Create a Plotly candlestick chart from OHLCV DataFrame.
 
+    Uses integer bar indices for the x-axis so bars are always evenly spaced
+    with no gaps.  A few date labels are shown as tick text.
+
     Args:
         df: DataFrame with 'open', 'high', 'low', 'close' columns.
-            Optionally includes 'volume'. Index can be datetime or integer.
+        tf_name: Timeframe name (unused, kept for API compat).
 
     Returns:
         Plotly Figure with candlestick chart
-
-    Raises:
-        ImportError: If Plotly is not installed
-        ValueError: If DataFrame is empty or missing required columns
-
-    Example:
-        >>> df = pd.DataFrame({
-        ...     'open': [100, 102, 101],
-        ...     'high': [103, 104, 103],
-        ...     'low': [99, 101, 100],
-        ...     'close': [102, 101, 102]
-        ... })
-        >>> fig = create_candlestick_chart(df)
-        >>> fig.show()  # In Streamlit: st.plotly_chart(fig)
     """
     _check_plotly_available()
 
@@ -127,12 +135,10 @@ def create_candlestick_chart(df: pd.DataFrame) -> 'go.Figure':
             "DataFrame must have 'open', 'high', 'low', 'close' columns and be non-empty"
         )
 
-    # Use index as x-axis (handles both datetime and integer indices)
-    x_values = df.index if isinstance(df.index, pd.DatetimeIndex) else list(range(len(df)))
+    x_values = list(range(len(df)))
 
     fig = go.Figure()
 
-    # Add candlestick trace
     fig.add_trace(go.Candlestick(
         x=x_values,
         open=df['open'],
@@ -144,10 +150,8 @@ def create_candlestick_chart(df: pd.DataFrame) -> 'go.Figure':
         name='Price'
     ))
 
-    # Update layout for better appearance
     fig.update_layout(
-        xaxis_rangeslider_visible=False,  # Hide range slider for cleaner look
-        xaxis_title='Bar Index' if not isinstance(df.index, pd.DatetimeIndex) else 'Time',
+        xaxis_rangeslider_visible=False,
         yaxis_title='Price',
         hovermode='x unified',
         showlegend=False,
@@ -155,11 +159,12 @@ def create_candlestick_chart(df: pd.DataFrame) -> 'go.Figure':
         margin=dict(l=50, r=50, t=50, b=50),
     )
 
-    # Disable autoscale on x-axis for consistent display
-    fig.update_xaxes(
-        fixedrange=False,
-        rangebreaks=[dict(bounds=["sat", "mon"])],
-    )
+    # Date tick labels
+    tickvals, ticktext = _make_date_ticks(df)
+    if tickvals is not None:
+        fig.update_xaxes(tickvals=tickvals, ticktext=ticktext)
+
+    fig.update_xaxes(fixedrange=False)
     fig.update_yaxes(fixedrange=False)
 
     return fig
@@ -175,54 +180,29 @@ def add_channel_overlay(
     start_idx: int,
     project_forward: int = 0,
     line_color: str = CHANNEL_LINE_COLOR,
-    x_index: Optional[pd.Index] = None,
     fill_color: str = CHANNEL_FILL_COLOR,
     center_color: str = CENTER_LINE_COLOR,
+    **_kwargs,
 ) -> 'go.Figure':
     """
     Add channel boundary lines (upper/lower/center) to an existing Plotly figure.
 
-    The channel's pre-computed line arrays (upper_line, lower_line, center_line)
-    are plotted starting at start_idx. Optionally projects bounds forward using
-    slope and intercept.
+    Uses integer bar indices for x-axis alignment (no datetime mapping needed).
 
     Args:
         fig: Existing Plotly Figure to add channel overlay to
-        channel: Channel object with:
-            - slope: Regression slope
-            - intercept: Regression intercept
-            - std_dev: Standard deviation for bounds
-            - upper_line: Upper boundary values (numpy array)
-            - lower_line: Lower boundary values (numpy array)
-            - center_line: Center regression line (numpy array)
+        channel: Channel object with pre-computed line arrays
         start_idx: Starting x-axis index for the channel lines
         project_forward: Number of bars to project bounds forward (default: 0)
-        line_color: Color for upper/lower lines (default: orange)
-        x_index: Optional pandas Index (DatetimeIndex) from the chart DataFrame.
-                 When provided, maps integer positions to actual timestamps so
-                 channel lines align with candlestick datetime x-axis.
-        fill_color: Color for fill between bounds (default: semi-transparent orange)
-        center_color: Color for center line (default: blue)
-
-    Returns:
-        The modified Figure with channel overlay added
-
-    Raises:
-        ImportError: If Plotly is not installed
-
-    Note:
-        Returns the figure unchanged if channel is None or invalid.
-
-    Example:
-        >>> fig = create_candlestick_chart(df)
-        >>> fig = add_channel_overlay(fig, channel, start_idx=0)
+        line_color: Color for upper/lower lines
+        fill_color: Color for fill between bounds
+        center_color: Color for center line
     """
     _check_plotly_available()
 
     if not _validate_channel(channel):
         return fig
 
-    # Get channel line arrays
     upper_line = np.asarray(channel.upper_line)
     lower_line = np.asarray(channel.lower_line)
     center_line = np.asarray(channel.center_line)
@@ -231,54 +211,34 @@ def add_channel_overlay(
     if channel_len == 0:
         return fig
 
-    # X-axis values for the channel region
-    # When x_index is provided (DatetimeIndex), map positions to timestamps
-    # so channel lines align with candlestick datetime x-axis
-    if x_index is not None and isinstance(x_index, pd.DatetimeIndex):
-        # Map channel positions to actual timestamps from the DataFrame index
-        x_channel = []
-        for i in range(channel_len):
-            idx = start_idx + i
-            if 0 <= idx < len(x_index):
-                x_channel.append(x_index[idx])
-            else:
-                x_channel.append(x_index[-1])  # Clamp to last timestamp
-    else:
-        x_channel = list(range(start_idx, start_idx + channel_len))
+    x_channel = list(range(start_idx, start_idx + channel_len))
 
-    # Add filled region between upper and lower bounds
-    # Use fill='tonexty' by adding lower then upper with fill
+    # Lower bound
     fig.add_trace(go.Scatter(
-        x=x_channel,
-        y=lower_line,
+        x=x_channel, y=lower_line,
         mode='lines',
         line=dict(color=line_color, width=2, dash='dash'),
         name='Lower Bound',
-        hoverinfo='skip',
-        showlegend=False,
+        hoverinfo='skip', showlegend=False,
     ))
 
+    # Upper bound with fill
     fig.add_trace(go.Scatter(
-        x=x_channel,
-        y=upper_line,
+        x=x_channel, y=upper_line,
         mode='lines',
         line=dict(color=line_color, width=2, dash='dash'),
         name='Upper Bound',
-        fill='tonexty',
-        fillcolor=fill_color,
-        hoverinfo='skip',
-        showlegend=False,
+        fill='tonexty', fillcolor=fill_color,
+        hoverinfo='skip', showlegend=False,
     ))
 
-    # Add center line (dashed)
+    # Center line
     fig.add_trace(go.Scatter(
-        x=x_channel,
-        y=center_line,
+        x=x_channel, y=center_line,
         mode='lines',
         line=dict(color=center_color, width=1.5, dash='dot'),
         name='Center Line',
-        hoverinfo='skip',
-        showlegend=False,
+        hoverinfo='skip', showlegend=False,
     ))
 
     # Project forward if requested
@@ -286,42 +246,33 @@ def add_channel_overlay(
         proj_start = start_idx + channel_len
         proj_x = list(range(proj_start, proj_start + project_forward))
 
-        # Calculate projection using slope and intercept
-        # x values for regression continue from where channel ended
         regression_x = np.arange(channel_len, channel_len + project_forward)
         proj_center = channel.slope * regression_x + channel.intercept
         proj_upper = proj_center + 2 * channel.std_dev
         proj_lower = proj_center - 2 * channel.std_dev
 
-        # Ensure prices don't go negative
         proj_center = np.maximum(proj_center, 0.01)
         proj_upper = np.maximum(proj_upper, 0.01)
         proj_lower = np.maximum(proj_lower, 0.01)
 
-        # Add projected bounds with lighter styling
         proj_line_color = 'rgba(255, 165, 0, 0.5)'
         proj_fill_color = 'rgba(255, 165, 0, 0.05)'
 
         fig.add_trace(go.Scatter(
-            x=proj_x,
-            y=proj_lower,
+            x=proj_x, y=proj_lower,
             mode='lines',
             line=dict(color=proj_line_color, width=1.5, dash='dot'),
             name='Projected Lower',
-            hoverinfo='skip',
-            showlegend=False,
+            hoverinfo='skip', showlegend=False,
         ))
 
         fig.add_trace(go.Scatter(
-            x=proj_x,
-            y=proj_upper,
+            x=proj_x, y=proj_upper,
             mode='lines',
             line=dict(color=proj_line_color, width=1.5, dash='dot'),
             name='Projected Upper',
-            fill='tonexty',
-            fillcolor=proj_fill_color,
-            hoverinfo='skip',
-            showlegend=False,
+            fill='tonexty', fillcolor=proj_fill_color,
+            hoverinfo='skip', showlegend=False,
         ))
 
     return fig
@@ -339,41 +290,12 @@ def add_bounce_markers(
     upper_color: str = BOUNCE_UPPER_COLOR,
     lower_color: str = BOUNCE_LOWER_COLOR,
     marker_size: int = 12,
-    x_index: Optional[pd.Index] = None,
+    **_kwargs,
 ) -> 'go.Figure':
     """
     Add markers at bounce points where price touched channel boundaries.
 
-    Markers are placed at the actual touch prices (HIGH for upper touches,
-    LOW for lower touches) from the channel's touches list.
-
-    Args:
-        fig: Existing Plotly Figure to add markers to
-        channel: Channel object with touches: List[Touch], where each Touch has:
-            - bar_index: int - Index within the channel window
-            - touch_type: TouchType - UPPER (1) or LOWER (0)
-            - price: float - The touch price
-        df: DataFrame with price data (used to verify indices)
-        start_idx: Starting index offset for the channel in the plot (default: 0)
-        upper_color: Color for upper boundary touch markers (default: red)
-        lower_color: Color for lower boundary touch markers (default: green)
-        marker_size: Size of touch markers (default: 12)
-        x_index: Optional pandas Index (DatetimeIndex) from the chart DataFrame.
-                 When provided, maps bar positions to actual timestamps.
-
-    Returns:
-        The modified Figure with bounce markers added
-
-    Raises:
-        ImportError: If Plotly is not installed
-
-    Note:
-        Returns the figure unchanged if channel is None/invalid or has no touches.
-
-    Example:
-        >>> fig = create_candlestick_chart(df)
-        >>> fig = add_channel_overlay(fig, channel, start_idx=0)
-        >>> fig = add_bounce_markers(fig, channel, df)
+    Uses integer bar indices for x-axis alignment.
     """
     _check_plotly_available()
 
@@ -384,71 +306,45 @@ def add_bounce_markers(
     if not touches or len(touches) == 0:
         return fig
 
-    # Separate upper and lower touches
-    upper_x = []
-    upper_y = []
-    lower_x = []
-    lower_y = []
+    upper_x, upper_y = [], []
+    lower_x, lower_y = [], []
 
     n_bars = len(df) if df is not None else float('inf')
 
-    use_datetime = x_index is not None and isinstance(x_index, pd.DatetimeIndex)
-
     for touch in touches:
-        # Calculate plot x position (touch.bar_index is relative to channel window)
-        int_x = start_idx + touch.bar_index
+        plot_x = start_idx + touch.bar_index
 
-        # Skip if outside valid range
-        if int_x < 0 or int_x >= n_bars:
+        if plot_x < 0 or plot_x >= n_bars:
             continue
 
-        # Map to datetime if available
-        if use_datetime and 0 <= int_x < len(x_index):
-            plot_x = x_index[int_x]
-        else:
-            plot_x = int_x
-
-        # TouchType.UPPER = 1, TouchType.LOWER = 0
         touch_type = touch.touch_type
         if hasattr(touch_type, 'value'):
             touch_type = touch_type.value
 
-        if touch_type == 1:  # Upper touch
+        if touch_type == 1:  # Upper
             upper_x.append(plot_x)
             upper_y.append(touch.price)
-        else:  # Lower touch
+        else:  # Lower
             lower_x.append(plot_x)
             lower_y.append(touch.price)
 
-    # Add upper touch markers (triangles pointing down - price hit ceiling)
     if upper_x:
         fig.add_trace(go.Scatter(
-            x=upper_x,
-            y=upper_y,
+            x=upper_x, y=upper_y,
             mode='markers',
-            marker=dict(
-                symbol='triangle-down',
-                size=marker_size,
-                color=upper_color,
-                line=dict(color='white', width=1)
-            ),
+            marker=dict(symbol='triangle-down', size=marker_size,
+                        color=upper_color, line=dict(color='white', width=1)),
             name='Upper Touches',
             hovertemplate='Upper Touch<br>Bar: %{x}<br>Price: %{y:.2f}<extra></extra>',
             showlegend=False,
         ))
 
-    # Add lower touch markers (triangles pointing up - price hit floor)
     if lower_x:
         fig.add_trace(go.Scatter(
-            x=lower_x,
-            y=lower_y,
+            x=lower_x, y=lower_y,
             mode='markers',
-            marker=dict(
-                symbol='triangle-up',
-                size=marker_size,
-                color=lower_color,
-                line=dict(color='white', width=1)
-            ),
+            marker=dict(symbol='triangle-up', size=marker_size,
+                        color=lower_color, line=dict(color='white', width=1)),
             name='Lower Touches',
             hovertemplate='Lower Touch<br>Bar: %{x}<br>Price: %{y:.2f}<extra></extra>',
             showlegend=False,
@@ -469,25 +365,14 @@ def add_duration_projection(
     duration_std: float,
     confidence: float,
     direction: Optional[str] = None,
+    **_kwargs,
 ) -> 'go.Figure':
     """
     Add a duration projection overlay to a timeframe chart.
 
-    Extends channel bounds forward using slope extrapolation (matching the
-    inspector's approach), colored by predicted break direction.  Adds a
-    dashed vertical marker at the mean predicted break point.
-
-    Args:
-        fig: Existing Plotly Figure to add projection to
-        channel: Channel object with slope, intercept, std_dev, center_line
-        chart_df: DataFrame used for the chart (provides x-axis index)
-        duration_mean: Mean predicted duration in bars
-        duration_std: Standard deviation of duration prediction
-        confidence: Model confidence 0-1 (controls opacity of break marker)
-        direction: Aggregate predicted direction ('up', 'down', or None)
-
-    Returns:
-        The modified Figure with projection overlay added
+    Extends channel bounds forward using slope extrapolation, colored by
+    predicted break direction.  Uses integer x-axis indices starting after
+    the last candle bar.
     """
     _check_plotly_available()
 
@@ -497,17 +382,11 @@ def add_duration_projection(
     n_forward = max(1, round(duration_mean))
     window = len(channel.center_line)
 
-    # Generate future x-values by extrapolating the bar interval
-    x_index = chart_df.index
-    if isinstance(x_index, pd.DatetimeIndex) and len(x_index) >= 2:
-        diffs = x_index[-10:].to_series().diff().dropna()
-        bar_interval = diffs.median()
-        future_x = [x_index[-1] + bar_interval * (i + 1) for i in range(n_forward)]
-    else:
-        start = len(chart_df)
-        future_x = list(range(start, start + n_forward))
+    # Future x: integers starting after the last bar
+    start = len(chart_df)
+    future_x = list(range(start, start + n_forward))
 
-    # Project channel bounds forward using slope extrapolation
+    # Project channel bounds forward
     regression_x = np.arange(window, window + n_forward)
     proj_center = channel.slope * regression_x + channel.intercept
     proj_upper = proj_center + 2 * channel.std_dev
@@ -530,7 +409,6 @@ def add_duration_projection(
         fill_clr = 'rgba(255,165,0,0.05)'
         vline_clr = 'gray'
 
-    # Draw projected bounds (price-bounded, like the inspector)
     fig.add_trace(go.Scatter(
         x=future_x, y=proj_lower,
         mode='lines',
@@ -583,40 +461,7 @@ def create_tf_channel_chart(
     """
     Create a complete chart for one timeframe showing candlesticks + channel + bounces.
 
-    This is a convenience function that combines create_candlestick_chart,
-    add_channel_overlay, and add_bounce_markers into a single call with
-    appropriate title and formatting.
-
-    Args:
-        df: DataFrame with OHLCV data for the timeframe
-        channel: Channel object with all required attributes
-        tf_name: Timeframe name for title (e.g., '5min', '1h', 'daily')
-        duration: Predicted channel duration in bars (for title display)
-        confidence: Model confidence score 0-1 (for title display)
-        show_bounces: Whether to show bounce markers (default: True)
-        project_forward: Number of bars to project channel forward (default: 0)
-        height: Chart height in pixels (default: 400)
-
-    Returns:
-        Complete Plotly Figure with candlesticks, channel, and optionally bounces
-
-    Raises:
-        ImportError: If Plotly is not installed
-        ValueError: If DataFrame is empty or invalid
-
-    Note:
-        If channel is None or invalid, returns just the candlestick chart
-        with an indication in the title.
-
-    Example:
-        >>> fig = create_tf_channel_chart(
-        ...     df=df_hourly,
-        ...     channel=detected_channel,
-        ...     tf_name='1h',
-        ...     duration=45.5,
-        ...     confidence=0.82
-        ... )
-        >>> st.plotly_chart(fig, use_container_width=True)
+    Uses integer bar indices for the x-axis with date tick labels.
     """
     _check_plotly_available()
 
@@ -625,25 +470,21 @@ def create_tf_channel_chart(
             "DataFrame must have 'open', 'high', 'low', 'close' columns and be non-empty"
         )
 
-    # Create base candlestick chart
-    fig = create_candlestick_chart(df)
+    # Create base candlestick chart (uses integer x internally)
+    fig = create_candlestick_chart(df, tf_name=tf_name)
 
-    # Determine channel validity and direction for title
     channel_valid = _validate_channel(channel)
 
     if channel_valid:
-        # Get direction name
         direction_val = channel.direction
         if hasattr(direction_val, 'value'):
             direction_val = direction_val.value
         direction_str = DIR_NAMES.get(direction_val, 'UNKNOWN')
 
-        # Get quality metrics
         r_squared = getattr(channel, 'r_squared', 0.0)
         bounce_count = getattr(channel, 'bounce_count', 0)
         window = getattr(channel, 'window', len(df))
 
-        # Build title
         title = (
             f"<b>{tf_name}</b> | {direction_str} | "
             f"Duration: {duration:.1f} bars | Confidence: {confidence:.1%}<br>"
@@ -651,26 +492,19 @@ def create_tf_channel_chart(
             f"Bounces: {bounce_count} | Window: {window}</span>"
         )
 
-        # Add channel overlay
-        # Channel starts at bar 0 (assuming df is already sliced to show channel period)
-        # Pass df.index so channel lines use datetime x-values matching the candlesticks
         fig = add_channel_overlay(
             fig, channel, start_idx=0, project_forward=project_forward,
-            x_index=df.index,
         )
 
-        # Add bounce markers
         if show_bounces:
-            fig = add_bounce_markers(fig, channel, df, start_idx=0, x_index=df.index)
+            fig = add_bounce_markers(fig, channel, df, start_idx=0)
     else:
-        # No valid channel
         title = (
             f"<b>{tf_name}</b> | NO VALID CHANNEL<br>"
             f"<span style='font-size:12px'>Duration: {duration:.1f} bars | "
             f"Confidence: {confidence:.1%}</span>"
         )
 
-    # Update layout with title and sizing
     fig.update_layout(
         title=dict(
             text=title,
@@ -706,22 +540,6 @@ def create_multi_tf_chart(
             - confidence: Confidence score
         cols: Number of columns in grid (default: 2)
         height_per_row: Height per row in pixels (default: 350)
-
-    Returns:
-        Plotly Figure with subplots grid
-
-    Raises:
-        ImportError: If Plotly is not installed
-        ValueError: If tf_data is empty
-
-    Example:
-        >>> tf_data = [
-        ...     {'df': df_5min, 'channel': ch_5min, 'tf_name': '5min',
-        ...      'duration': 20, 'confidence': 0.8},
-        ...     {'df': df_1h, 'channel': ch_1h, 'tf_name': '1h',
-        ...      'duration': 45, 'confidence': 0.75},
-        ... ]
-        >>> fig = create_multi_tf_chart(tf_data)
     """
     _check_plotly_available()
 
@@ -729,9 +547,8 @@ def create_multi_tf_chart(
         raise ValueError("tf_data cannot be empty")
 
     n_charts = len(tf_data)
-    rows = (n_charts + cols - 1) // cols  # Ceiling division
+    rows = (n_charts + cols - 1) // cols
 
-    # Create subplot grid
     subplot_titles = [d.get('tf_name', f'TF {i+1}') for i, d in enumerate(tf_data)]
     fig = make_subplots(
         rows=rows,
@@ -751,10 +568,8 @@ def create_multi_tf_chart(
         if df is None or not _validate_ohlcv_dataframe(df):
             continue
 
-        # Use index as x-axis
         x_values = list(range(len(df)))
 
-        # Add candlestick
         fig.add_trace(
             go.Candlestick(
                 x=x_values,
@@ -770,7 +585,6 @@ def create_multi_tf_chart(
             col=col
         )
 
-        # Add channel if valid
         if _validate_channel(channel):
             upper_line = np.asarray(channel.upper_line)
             lower_line = np.asarray(channel.lower_line)
@@ -778,37 +592,27 @@ def create_multi_tf_chart(
             channel_len = len(center_line)
             x_channel = list(range(channel_len))
 
-            # Lower bound
             fig.add_trace(
                 go.Scatter(
-                    x=x_channel,
-                    y=lower_line,
+                    x=x_channel, y=lower_line,
                     mode='lines',
                     line=dict(color=CHANNEL_LINE_COLOR, width=1.5, dash='dash'),
-                    showlegend=False,
-                    hoverinfo='skip',
+                    showlegend=False, hoverinfo='skip',
                 ),
-                row=row,
-                col=col
+                row=row, col=col
             )
 
-            # Upper bound with fill
             fig.add_trace(
                 go.Scatter(
-                    x=x_channel,
-                    y=upper_line,
+                    x=x_channel, y=upper_line,
                     mode='lines',
                     line=dict(color=CHANNEL_LINE_COLOR, width=1.5, dash='dash'),
-                    fill='tonexty',
-                    fillcolor=CHANNEL_FILL_COLOR,
-                    showlegend=False,
-                    hoverinfo='skip',
+                    fill='tonexty', fillcolor=CHANNEL_FILL_COLOR,
+                    showlegend=False, hoverinfo='skip',
                 ),
-                row=row,
-                col=col
+                row=row, col=col
             )
 
-    # Update layout
     total_height = rows * height_per_row
     fig.update_layout(
         height=total_height,
@@ -816,7 +620,6 @@ def create_multi_tf_chart(
         template='plotly_white',
     )
 
-    # Hide range sliders for all x-axes
     for i in range(1, n_charts + 1):
         fig.update_xaxes(rangeslider_visible=False, row=(i-1)//cols + 1, col=(i-1)%cols + 1)
 

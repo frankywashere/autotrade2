@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts, LambdaLR, SequentialLR
 from torch.utils.data import DataLoader
 from typing import Dict, Optional, Tuple, List, Any
 from dataclasses import dataclass, field
@@ -440,7 +440,18 @@ class Trainer:
                 'T_mult': self.config.scheduler_kwargs.get('T_mult', 1),
                 'eta_min': self.config.scheduler_kwargs.get('eta_min', self.config.lr * 0.1)
             }
-            return CosineAnnealingWarmRestarts(self.optimizer, **kwargs)
+            cosine = CosineAnnealingWarmRestarts(self.optimizer, **kwargs)
+            if self.config.warmup_steps > 0:
+                warmup = LambdaLR(
+                    self.optimizer,
+                    lr_lambda=lambda step: min(1.0, step / max(1, self.config.warmup_steps))
+                )
+                return SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup, cosine],
+                    milestones=[self.config.warmup_steps]
+                )
+            return cosine
         else:
             return None
 

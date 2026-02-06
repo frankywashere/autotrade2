@@ -502,11 +502,13 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                 # Get the channel for the selected window
                 channel = tf_channels.get(tf_window)
 
-                # Slice data to match channel detection window
-                # detect_channel uses df.iloc[-(window+1):-1] (excludes last bar)
-                # so chart_df should cover the same range for proper alignment
+                # Slice data: channel window + current bar for display.
+                # detect_channel uses df.iloc[-(window+1):-1] internally,
+                # so the first window_bars of chart_df align with the channel.
+                # The extra bar at the end is the current bar (shown as a
+                # candle but outside the channel overlay).
                 window_bars = min(tf_window, len(tf_df) - 1)
-                chart_df = tf_df.iloc[-(window_bars + 1):-1].copy()
+                chart_df = tf_df.iloc[-(window_bars + 1):].copy()
 
                 if channel is not None and getattr(channel, 'valid', False):
                     # Create chart with channel
@@ -533,6 +535,7 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                         fig = add_duration_projection(
                             fig, channel, chart_df,
                             duration, duration_std, confidence, agg_direction,
+                            tf_name=tf_name,
                         )
 
                     st.plotly_chart(fig, use_container_width=True)
@@ -556,7 +559,7 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                     st.warning("No valid channel detected for this timeframe")
 
                     # Still show candlestick chart without channel
-                    fig = create_candlestick_chart(chart_df)
+                    fig = create_candlestick_chart(chart_df, tf_name=tf_name)
                     fig.update_layout(
                         title=f"{tf_name} - No Valid Channel",
                         height=350
@@ -830,7 +833,7 @@ def load_native_tf():
             timeframes=NATIVE_TF_LIST,
             start_date='2015-01-01',
             use_cache=True,
-            cache_max_age_hours=1,
+            cache_max_age_hours=5 / 60,  # ~5 min, matches Streamlit TTL
             verbose=True,
         )
         for symbol in data:
