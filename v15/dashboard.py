@@ -830,7 +830,12 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> str:
 
     # For private repos, use token from Streamlit secrets or env
     import os
-    token = os.environ.get("GITHUB_TOKEN") or st.secrets.get("GITHUB_TOKEN", "")
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        try:
+            token = st.secrets["GITHUB_TOKEN"]
+        except (KeyError, AttributeError):
+            token = ""
 
     import urllib.request
     req = urllib.request.Request(CHECKPOINT_RELEASE_URL)
@@ -1024,20 +1029,17 @@ def main():
     # Live data sidebar configuration
     live_config = show_live_data_sidebar()
 
-    # Check if paths exist
-    if not Path(data_dir).exists():
-        st.error(f"Data directory not found: {data_dir}")
-        st.info("Please provide path to directory containing TSLA_1min.csv, SPY_1min.csv, VIX_History.csv")
-        return
-
-    # Load data from files (used as fallback)
-    with st.spinner("Loading market data..."):
-        try:
-            tsla, spy, vix = load_market_data(data_dir)
-            st.sidebar.success(f"Loaded {len(tsla):,} bars")
-        except Exception as e:
-            st.error(f"Failed to load data: {e}")
-            return
+    # Load data from files (used as fallback; empty DFs if no local data)
+    tsla = spy = vix = pd.DataFrame()
+    if Path(data_dir).exists():
+        with st.spinner("Loading market data..."):
+            try:
+                tsla, spy, vix = load_market_data(data_dir)
+                st.sidebar.success(f"Loaded {len(tsla):,} bars")
+            except Exception as e:
+                st.sidebar.warning(f"CSV data not loaded: {e}")
+    else:
+        st.sidebar.info("No local data — using live yfinance data")
 
     # Load model (auto-download from GitHub Releases if not present)
     predictor = None
