@@ -1,5 +1,5 @@
 """
-RSI Multi-Timeframe Monitor Dashboard
+Market Pulse Dashboard
 
 A Streamlit dashboard for monitoring RSI signals across multiple timeframes and symbols.
 """
@@ -418,12 +418,12 @@ def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
 
 def main():
     st.set_page_config(
-        page_title="RSI Multi-Timeframe Monitor",
+        page_title="Market Pulse",
         page_icon="📊",
         layout="wide",
     )
 
-    st.title("RSI Multi-Timeframe Monitor")
+    st.title("Market Pulse")
 
     # Initialize session state
     if "last_refresh" not in st.session_state:
