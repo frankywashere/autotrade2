@@ -8,6 +8,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 
@@ -148,9 +149,11 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
     float cross_mag_spread = 0.0f;
     float cross_dur_spread = 0.0f;
 
-    // Per-TF duration (10 timeframes)
+    // Per-TF duration and direction (10 timeframes)
     std::vector<float> per_tf_dur(10, 0.0f);
     std::vector<uint8_t> per_tf_valid(10, 0);
+    std::vector<int64_t> per_tf_dir(10, 0);
+    std::vector<uint8_t> per_tf_dir_valid(10, 0);
 
     // Try to get labels from the sample
     // Structure: labels_per_window[window][tf] = ChannelLabels (no asset level)
@@ -169,7 +172,7 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
             duration_valid = labels.duration_valid;
             direction_valid = labels.direction_valid;
 
-            // Break scan labels (stored as TSLA since we only have one asset per sample)
+            // TSLA break scan labels
             tsla_bars_to_break = static_cast<float>(labels.bars_to_first_break);
             tsla_break_dir = labels.break_direction;
             tsla_break_mag = static_cast<float>(labels.break_magnitude);
@@ -184,7 +187,7 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
             tsla_exits_stayed = static_cast<float>(labels.exits_stayed_out_count);
             tsla_bars_verified = static_cast<float>(labels.bars_verified_permanent);
 
-            // RSI labels
+            // TSLA RSI labels
             tsla_rsi_break = static_cast<float>(labels.rsi_at_first_break);
             tsla_rsi_perm = static_cast<float>(labels.rsi_at_permanent_break);
             tsla_rsi_end = static_cast<float>(labels.rsi_at_channel_end);
@@ -193,6 +196,45 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
             tsla_rsi_div = labels.rsi_divergence_at_break;
             tsla_rsi_trend = labels.rsi_trend_in_channel;
             tsla_rsi_range = static_cast<float>(labels.rsi_range_in_channel);
+
+            // SPY break scan labels (cross-referenced from SPY channel)
+            spy_bars_to_break = static_cast<float>(labels.spy_bars_to_first_break);
+            spy_break_dir = labels.spy_break_direction;
+            spy_break_mag = static_cast<float>(labels.spy_break_magnitude);
+            spy_bounces = static_cast<float>(labels.spy_bounces_after_return);
+            spy_dur_to_perm = labels.spy_duration_to_permanent >= 0 ?
+                static_cast<float>(labels.spy_duration_to_permanent) : -1.0f;
+            spy_avg_outside = static_cast<float>(labels.spy_avg_bars_outside);
+            spy_total_outside = static_cast<float>(labels.spy_total_bars_outside);
+            spy_durability = static_cast<float>(labels.spy_durability_score);
+            spy_exit_rate = static_cast<float>(labels.spy_exit_return_rate);
+            spy_exits_returned = static_cast<float>(labels.spy_exits_returned_count);
+            spy_exits_stayed = static_cast<float>(labels.spy_exits_stayed_out_count);
+            spy_bars_verified = static_cast<float>(labels.spy_bars_verified_permanent);
+
+            // SPY RSI labels
+            spy_rsi_break = static_cast<float>(labels.spy_rsi_at_first_break);
+            spy_rsi_perm = static_cast<float>(labels.spy_rsi_at_permanent_break);
+            spy_rsi_end = static_cast<float>(labels.spy_rsi_at_channel_end);
+            spy_rsi_ob = labels.spy_rsi_overbought_at_break ? 1 : 0;
+            spy_rsi_os = labels.spy_rsi_oversold_at_break ? 1 : 0;
+            spy_rsi_div = labels.spy_rsi_divergence_at_break;
+            spy_rsi_trend = labels.spy_rsi_trend_in_channel;
+            spy_rsi_range = static_cast<float>(labels.spy_rsi_range_in_channel);
+
+            // Cross-correlation (computed from TSLA/SPY fields)
+            int tsla_btb = labels.bars_to_first_break;
+            int spy_btb = labels.spy_bars_to_first_break;
+            if (tsla_btb < spy_btb) {
+                cross_who_first = 1;   // TSLA broke first
+            } else if (spy_btb < tsla_btb) {
+                cross_who_first = -1;  // SPY broke first
+            } else {
+                cross_who_first = 0;   // Simultaneous
+            }
+            cross_lag = static_cast<float>(std::abs(tsla_btb - spy_btb));
+            cross_mag_spread = static_cast<float>(labels.break_magnitude - labels.spy_break_magnitude);
+            cross_dur_spread = static_cast<float>(labels.durability_score - labels.spy_durability_score);
         }
     }
 
@@ -207,6 +249,8 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
             if (tf_it != window_it->second.end()) {
                 per_tf_dur[i] = static_cast<float>(tf_it->second.duration_bars);
                 per_tf_valid[i] = tf_it->second.duration_valid ? 1 : 0;
+                per_tf_dir[i] = tf_it->second.break_direction;
+                per_tf_dir_valid[i] = tf_it->second.direction_valid ? 1 : 0;
             }
         }
     }
@@ -273,6 +317,8 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
     // Per-TF
     L_per_tf_duration.insert(L_per_tf_duration.end(), per_tf_dur.begin(), per_tf_dur.end());
     L_per_tf_duration_valid.insert(L_per_tf_duration_valid.end(), per_tf_valid.begin(), per_tf_valid.end());
+    L_per_tf_direction.insert(L_per_tf_direction.end(), per_tf_dir.begin(), per_tf_dir.end());
+    L_per_tf_direction_valid.insert(L_per_tf_direction_valid.end(), per_tf_dir_valid.begin(), per_tf_dir_valid.end());
 }
 
 void FlatWriter::write_features_npy() {
@@ -349,7 +395,11 @@ void FlatWriter::write_labels_npy() {
     // For now write as 1D and reshape in Python
     NpyWriter::write_bool_1d(labels_dir + "per_tf_duration_valid.npy", L_per_tf_duration_valid);
 
-    std::cout << "  Wrote " << 51 << " label arrays to " << labels_dir << std::endl;
+    // Per-TF direction (2D arrays)
+    NpyWriter::write_int64_2d(labels_dir + "per_tf_direction.npy", L_per_tf_direction, num_samples_, 10);
+    NpyWriter::write_bool_1d(labels_dir + "per_tf_direction_valid.npy", L_per_tf_direction_valid);
+
+    std::cout << "  Wrote " << 53 << " label arrays to " << labels_dir << std::endl;
 }
 
 void FlatWriter::write_metadata() {

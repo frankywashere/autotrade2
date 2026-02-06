@@ -28,6 +28,10 @@ public:
     static void write_int64_1d(const std::string& path, const int64_t* data, size_t size);
     static void write_int64_1d(const std::string& path, const std::vector<int64_t>& data);
 
+    // Write a 2D int64 array
+    static void write_int64_2d(const std::string& path, const int64_t* data, size_t rows, size_t cols);
+    static void write_int64_2d(const std::string& path, const std::vector<int64_t>& data, size_t rows, size_t cols);
+
     // Write a 1D uint8 array (for bool - numpy uses uint8 for bool)
     static void write_bool_1d(const std::string& path, const uint8_t* data, size_t size);
     static void write_bool_1d(const std::string& path, const std::vector<uint8_t>& data);

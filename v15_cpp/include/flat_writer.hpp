@@ -128,6 +128,10 @@ private:
     std::vector<float> L_per_tf_duration;  // [N * 10] flattened
     std::vector<uint8_t> L_per_tf_duration_valid;  // [N * 10] flattened
 
+    // Per-TF direction (10 timeframes)
+    std::vector<int64_t> L_per_tf_direction;  // [N * 10] flattened
+    std::vector<uint8_t> L_per_tf_direction_valid;  // [N * 10] flattened
+
     void initialize_feature_names(const ChannelSample& sample);
     void extract_labels(const ChannelSample& sample);
     void write_features_npy();

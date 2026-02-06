@@ -92,6 +92,14 @@ void NpyWriter::write_int64_1d(const std::string& path, const std::vector<int64_
     write_int64_1d(path, data.data(), data.size());
 }
 
+void NpyWriter::write_int64_2d(const std::string& path, const int64_t* data, size_t rows, size_t cols) {
+    write_array(path, data, rows * cols * sizeof(int64_t), "<i8", {rows, cols});
+}
+
+void NpyWriter::write_int64_2d(const std::string& path, const std::vector<int64_t>& data, size_t rows, size_t cols) {
+    write_int64_2d(path, data.data(), rows, cols);
+}
+
 void NpyWriter::write_bool_1d(const std::string& path, const uint8_t* data, size_t size) {
     write_array(path, data, size * sizeof(uint8_t), "|b1", {size});
 }
