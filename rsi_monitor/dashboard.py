@@ -403,17 +403,7 @@ def render_vix_confirmation_card(confirmation, data_fetcher) -> None:
                     ">120 elevated | <80 complacent"
                 )
 
-    # Overall sentiment description (fear = red, greed/calm = green)
-    sentiment_colors = {
-        'extreme_fear': '#FF0000',
-        'fear': '#ff4444',
-        'neutral': '#6c757d',
-        'greed': '#00C851',
-        'extreme_greed': '#00FF00',
-        'unknown': '#6c757d',
-    }
-    sent_color = sentiment_colors.get(confirmation.overall_sentiment, '#6c757d')
-    st.markdown(f"<small style='color:{sent_color}'>{confirmation.description}</small>", unsafe_allow_html=True)
+    # Sentiment description removed - already shown in Overall Market card
 
 
 def main():
