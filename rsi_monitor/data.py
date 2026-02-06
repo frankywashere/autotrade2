@@ -129,6 +129,106 @@ class DataFetcher:
             logger.warning(f"Failed to fetch data for {symbol}: {e}")
             return None
 
+    def fetch_batch(
+        self,
+        symbols: list[str],
+        interval: str = '1h',
+        period: Optional[str] = None,
+        prepost: bool = False
+    ) -> dict[str, Optional[pd.DataFrame]]:
+        """
+        Fetch data for multiple symbols in a single batched download.
+
+        Uses yf.download() to fetch all uncached symbols at once per interval,
+        reducing HTTP requests via yfinance's built-in threading.
+
+        Args:
+            symbols: List of ticker symbols
+            interval: Data interval
+            period: Data period (None = use default for interval)
+            prepost: Include pre/post market data
+
+        Returns:
+            Dict: {symbol: DataFrame or None}
+        """
+        if interval not in self.VALID_INTERVALS:
+            return {s: None for s in symbols}
+
+        if period is None:
+            period = self._get_default_period(interval)
+
+        results: dict[str, Optional[pd.DataFrame]] = {}
+        uncached = []
+
+        # Check cache first
+        for symbol in symbols:
+            cache_key = self._get_cache_key(symbol, interval, period, prepost)
+            if self._is_cache_valid(cache_key):
+                _, data = self._cache[cache_key]
+                results[symbol] = data.copy()
+            else:
+                uncached.append(symbol)
+
+        if not uncached:
+            return results
+
+        # Batch download uncached symbols
+        try:
+            logger.debug(f"Batch downloading {uncached} with interval={interval}, period={period}")
+            df = yf.download(
+                uncached,
+                interval=interval,
+                period=period,
+                prepost=prepost,
+                group_by='ticker',
+                threads=True,
+                progress=False,
+            )
+
+            if df.empty:
+                for symbol in uncached:
+                    results[symbol] = None
+                return results
+
+            ohlcv_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+
+            if len(uncached) == 1:
+                # Single ticker: flat columns
+                symbol = uncached[0]
+                symbol_df = df[[col for col in ohlcv_columns if col in df.columns]]
+                if not symbol_df.empty:
+                    cache_key = self._get_cache_key(symbol, interval, period, prepost)
+                    self._cache[cache_key] = (time.time(), symbol_df)
+                    results[symbol] = symbol_df.copy()
+                else:
+                    results[symbol] = None
+            else:
+                # Multiple tickers: multi-level columns grouped by ticker
+                for symbol in uncached:
+                    try:
+                        if symbol in df.columns.get_level_values(0):
+                            symbol_df = df[symbol]
+                            symbol_df = symbol_df[[col for col in ohlcv_columns if col in symbol_df.columns]]
+                            symbol_df = symbol_df.dropna(how='all')
+                            if not symbol_df.empty:
+                                cache_key = self._get_cache_key(symbol, interval, period, prepost)
+                                self._cache[cache_key] = (time.time(), symbol_df)
+                                results[symbol] = symbol_df.copy()
+                            else:
+                                results[symbol] = None
+                        else:
+                            results[symbol] = None
+                    except Exception:
+                        results[symbol] = None
+
+        except Exception as e:
+            logger.warning(f"Batch download failed for {uncached}: {e}")
+            # Fall back to individual fetches
+            for symbol in uncached:
+                results[symbol] = self.fetch(symbol, interval, period, prepost)
+
+        return results
+
     def fetch_all(
         self,
         symbols: list[str],
@@ -136,7 +236,10 @@ class DataFetcher:
         prepost: bool = False
     ) -> dict[str, dict[str, Optional[pd.DataFrame]]]:
         """
-        Fetch data for all symbol/interval combinations.
+        Fetch data for all symbol/interval combinations using batched downloads.
+
+        Groups by interval and uses fetch_batch() to download all symbols at once
+        per interval, reducing HTTP requests.
 
         Args:
             symbols: List of ticker symbols
@@ -147,11 +250,13 @@ class DataFetcher:
             Nested dict: {symbol: {interval: DataFrame or None}}
         """
         results: dict[str, dict[str, Optional[pd.DataFrame]]] = {}
-
         for symbol in symbols:
             results[symbol] = {}
-            for interval in intervals:
-                results[symbol][interval] = self.fetch(symbol, interval, prepost=prepost)
+
+        for interval in intervals:
+            batch_results = self.fetch_batch(symbols, interval, prepost=prepost)
+            for symbol in symbols:
+                results[symbol][interval] = batch_results.get(symbol)
 
         return results
 

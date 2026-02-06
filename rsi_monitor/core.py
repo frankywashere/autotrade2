@@ -290,12 +290,15 @@ class RSIMonitor:
             >>> print(data['TSLA']['5m'])
             {'rsi': 45.2, 'percentile': None}
         """
+        # Batch fetch all data at once (reduces HTTP requests via yf.download)
+        all_data = self.data_fetcher.fetch_all(self.symbols, self.timeframes, prepost=prepost)
+
         results: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {}
 
         for symbol in self.symbols:
             results[symbol] = {}
             for timeframe in self.timeframes:
-                data = self.data_fetcher.fetch(symbol, timeframe, prepost=prepost)
+                data = all_data.get(symbol, {}).get(timeframe)
 
                 if data is not None and len(data) > 0:
                     prices = data['Close'].values
@@ -305,15 +308,21 @@ class RSIMonitor:
                     if timeframe in self.PERCENTILE_TIMEFRAMES:
                         rsi_series = self._calculate_rsi_series(prices)
                         percentile = self._calculate_percentile(rsi_series, rsi)
+                        # Keep last 12 valid RSI values for recovery lookback
+                        valid_rsi = rsi_series[~np.isnan(rsi_series)]
+                        rsi_history = valid_rsi[-12:].tolist() if len(valid_rsi) > 0 else []
                     else:
                         percentile = None
+                        rsi_history = []
                 else:
                     rsi = np.nan
                     percentile = None
+                    rsi_history = []
 
                 results[symbol][timeframe] = {
                     'rsi': rsi,
-                    'percentile': percentile
+                    'percentile': percentile,
+                    'rsi_history': rsi_history,
                 }
 
         return results

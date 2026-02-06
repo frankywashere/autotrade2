@@ -6,7 +6,6 @@ with confluence scoring and VIX confirmation.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 
 from .vix_analyzer import VIXAnalyzer
@@ -36,8 +35,14 @@ class SignalGenerator:
     SHORT_TERM_TIMEFRAMES = {'5m', '15m', '1h'}
     LONG_TERM_TIMEFRAMES = {'4h', '1d', '1wk', '1w', 'daily', 'weekly', 'D', 'W'}
 
-    # Recovery window: suppress short-term signals for this many hours after long-term extreme
+    # Recovery window: how many hours of historical RSI to check for recent extremes
     RECOVERY_WINDOW_HOURS = 48
+
+    # Hours per bar for each long-term timeframe (for recovery window bar count)
+    TIMEFRAME_HOURS = {
+        '4h': 4, '1d': 24, '1wk': 168,
+        '1w': 168, 'daily': 24, 'weekly': 168, 'D': 24, 'W': 168,
+    }
 
     def __init__(
         self,
@@ -62,7 +67,6 @@ class SignalGenerator:
             extreme_overbought=extreme_overbought
         )
         self.vix_analyzer = VIXAnalyzer()
-        self._recovery_state = {}  # {symbol: {'oversold_at': datetime, 'overbought_at': datetime}}
 
     def _classify_rsi(self, rsi_value: float) -> str:
         """
@@ -261,7 +265,7 @@ class SignalGenerator:
             f"Signal strength is {strength_desc} ({strength:.1%}), suggesting a potential {action}."
         )
 
-    def analyze(self, rsi_data: Dict[str, Any], vix_confirmation: Optional[Any] = None) -> Dict[str, Any]:
+    def analyze(self, rsi_data: Dict[str, Any], vix_confirmation: Optional[Any] = None, rsi_history: Optional[Dict[str, list]] = None) -> Dict[str, Any]:
         """
         Analyze RSI data and generate a trading signal.
 
@@ -360,14 +364,6 @@ class SignalGenerator:
         # Track recovery suppression
         suppressed = False
 
-        # Update recovery state: track when long-term was last oversold/overbought
-        if symbol not in self._recovery_state:
-            self._recovery_state[symbol] = {}
-        if long_oversold > 0:
-            self._recovery_state[symbol]['oversold_at'] = datetime.now()
-        if long_overbought > 0:
-            self._recovery_state[symbol]['overbought_at'] = datetime.now()
-
         # Option 1: Suppress short-term signals when long-term RSI disagrees
         if signal == 'SHORT_TERM_SELL':
             long_rsi_values = [timeframes[tf] for tf in timeframes
@@ -388,20 +384,30 @@ class SignalGenerator:
                 confluence_score = 0
                 suppressed = True
 
-        # Option 3: Recovery window suppression (48 hours)
-        now = datetime.now()
-        recovery = self._recovery_state.get(symbol, {})
-        window = timedelta(hours=self.RECOVERY_WINDOW_HOURS)
+        # Option 3: Recovery window suppression (look back 48h in historical RSI)
+        if rsi_history and signal in ('SHORT_TERM_SELL', 'SHORT_TERM_BUY'):
+            recently_oversold = False
+            recently_overbought = False
+            for tf, history in rsi_history.items():
+                if tf not in self.LONG_TERM_TIMEFRAMES or not history:
+                    continue
+                hours_per_bar = self.TIMEFRAME_HOURS.get(tf)
+                if not hours_per_bar:
+                    continue
+                bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)  # ceil division
+                recent = history[-bars_in_window:]
+                for rsi_val in recent:
+                    if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
+                        if rsi_val <= self.thresholds.oversold:
+                            recently_oversold = True
+                        if rsi_val >= self.thresholds.overbought:
+                            recently_overbought = True
 
-        if signal == 'SHORT_TERM_SELL':
-            oversold_at = recovery.get('oversold_at')
-            if oversold_at and (now - oversold_at) < window:
+            if signal == 'SHORT_TERM_SELL' and recently_oversold:
                 signal = 'NEUTRAL'
                 confluence_score = 0
                 suppressed = True
-        elif signal == 'SHORT_TERM_BUY':
-            overbought_at = recovery.get('overbought_at')
-            if overbought_at and (now - overbought_at) < window:
+            elif signal == 'SHORT_TERM_BUY' and recently_overbought:
                 signal = 'NEUTRAL'
                 confluence_score = 0
                 suppressed = True

@@ -605,16 +605,20 @@ def main():
 
     for symbol in all_symbols:
         try:
-            # Extract plain RSI values for signal analysis (signals.py expects {tf: float})
+            # Extract plain RSI values and history for signal analysis
             symbol_data = rsi_results.get(symbol, {})
             plain_rsi = {}
+            rsi_history = {}
             for tf, data in symbol_data.items():
                 if isinstance(data, dict):
                     plain_rsi[tf] = data.get('rsi')
+                    hist = data.get('rsi_history')
+                    if hist:
+                        rsi_history[tf] = hist
                 else:
                     plain_rsi[tf] = data
             signal_input = {'symbol': symbol, 'timeframes': plain_rsi}
-            signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation)
+            signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation, rsi_history=rsi_history)
         except Exception as e:
             st.warning(f"Error generating signal for {symbol}: {e}")
             signals[symbol] = {"signal": "NEUTRAL", "strength": 0}
