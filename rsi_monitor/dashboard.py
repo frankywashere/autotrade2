@@ -759,6 +759,12 @@ def main():
 
                         strength_display = f"{strength:.0%}" if isinstance(strength, float) else str(strength)
 
+                        # Recovery suppression indicator
+                        recovery_suppressed = signal_data.get("recovery_suppressed", False)
+                        recovery_html = ""
+                        if recovery_suppressed:
+                            recovery_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #ff980022; color: #ff9800; font-size: 0.7em; font-weight: 500; margin-left: 6px;">(recovery mode)</span>'
+
                         # Styled card with top accent bar
                         st.markdown(f"""
                         <div style="background-color: #1a1c23; border: 1px solid #2d3039; border-radius: 12px; padding: 0; margin-bottom: 16px; overflow: hidden;">
@@ -769,7 +775,10 @@ def main():
                                         <span style="font-size: 1.3em; font-weight: 700; color: #e1e3ea;">{symbol}</span>
                                         <span style="font-size: 1.15em; font-weight: 600; color: #8b8fa3;">{price_str}</span>
                                     </div>
-                                    <span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{SIGNAL_DISPLAY.get(signal, signal)}</span>
+                                    <div style="display: flex; align-items: center;">
+                                        <span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{SIGNAL_DISPLAY.get(signal, signal)}</span>
+                                        {recovery_html}
+                                    </div>
                                 </div>
                                 <div style="display: flex; gap: 10px; margin-bottom: 6px;">
                                     <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">

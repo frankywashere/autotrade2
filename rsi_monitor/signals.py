@@ -6,6 +6,7 @@ with confluence scoring and VIX confirmation.
 """
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 
 from .vix_analyzer import VIXAnalyzer
@@ -35,6 +36,9 @@ class SignalGenerator:
     SHORT_TERM_TIMEFRAMES = {'5m', '15m', '1h'}
     LONG_TERM_TIMEFRAMES = {'4h', '1d', '1wk', '1w', 'daily', 'weekly', 'D', 'W'}
 
+    # Recovery window: suppress short-term signals for this many hours after long-term extreme
+    RECOVERY_WINDOW_HOURS = 48
+
     def __init__(
         self,
         oversold_threshold: float = 30.0,
@@ -58,6 +62,7 @@ class SignalGenerator:
             extreme_overbought=extreme_overbought
         )
         self.vix_analyzer = VIXAnalyzer()
+        self._recovery_state = {}  # {symbol: {'oversold_at': datetime, 'overbought_at': datetime}}
 
     def _classify_rsi(self, rsi_value: float) -> str:
         """
@@ -352,6 +357,55 @@ class SignalGenerator:
                 signal = 'SHORT_TERM_SELL'
             confluence_score = overbought_count
 
+        # Track recovery suppression
+        suppressed = False
+
+        # Update recovery state: track when long-term was last oversold/overbought
+        if symbol not in self._recovery_state:
+            self._recovery_state[symbol] = {}
+        if long_oversold > 0:
+            self._recovery_state[symbol]['oversold_at'] = datetime.now()
+        if long_overbought > 0:
+            self._recovery_state[symbol]['overbought_at'] = datetime.now()
+
+        # Option 1: Suppress short-term signals when long-term RSI disagrees
+        if signal == 'SHORT_TERM_SELL':
+            long_rsi_values = [timeframes[tf] for tf in timeframes
+                               if tf in self.LONG_TERM_TIMEFRAMES
+                               and isinstance(timeframes[tf], (int, float))
+                               and timeframes[tf] == timeframes[tf]]  # NaN check
+            if long_rsi_values and (sum(long_rsi_values) / len(long_rsi_values)) < 50:
+                signal = 'NEUTRAL'
+                confluence_score = 0
+                suppressed = True
+        elif signal == 'SHORT_TERM_BUY':
+            long_rsi_values = [timeframes[tf] for tf in timeframes
+                               if tf in self.LONG_TERM_TIMEFRAMES
+                               and isinstance(timeframes[tf], (int, float))
+                               and timeframes[tf] == timeframes[tf]]
+            if long_rsi_values and (sum(long_rsi_values) / len(long_rsi_values)) > 50:
+                signal = 'NEUTRAL'
+                confluence_score = 0
+                suppressed = True
+
+        # Option 3: Recovery window suppression (48 hours)
+        now = datetime.now()
+        recovery = self._recovery_state.get(symbol, {})
+        window = timedelta(hours=self.RECOVERY_WINDOW_HOURS)
+
+        if signal == 'SHORT_TERM_SELL':
+            oversold_at = recovery.get('oversold_at')
+            if oversold_at and (now - oversold_at) < window:
+                signal = 'NEUTRAL'
+                confluence_score = 0
+                suppressed = True
+        elif signal == 'SHORT_TERM_BUY':
+            overbought_at = recovery.get('overbought_at')
+            if overbought_at and (now - overbought_at) < window:
+                signal = 'NEUTRAL'
+                confluence_score = 0
+                suppressed = True
+
         # Calculate strength (with optional VIX confirmation bonus)
         strength = self._calculate_strength(rsi_data, timeframe_status, confluence_score, signal, vix_confirmation)
 
@@ -364,7 +418,8 @@ class SignalGenerator:
             'confluence_score': confluence_score,
             'timeframe_status': timeframe_status,
             'strength': strength,
-            'reason': reason
+            'reason': reason,
+            'recovery_suppressed': suppressed,
         }
 
     def vix_confirms_signal(self, vix_rsi: Optional[float] = None, signal_type: Optional[str] = None) -> bool:
