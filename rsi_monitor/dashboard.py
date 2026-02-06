@@ -634,11 +634,33 @@ def main():
         else:
             sub_color = "#888"
 
+        # Signal count pills
+        strong_buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_BUY")
+        buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "BUY")
+        sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "SELL")
+        strong_sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_SELL")
+
+        def _pill(label, count, color):
+            return (
+                f'<span style="display:inline-block;padding:2px 10px;margin:0 4px;'
+                f'border-radius:20px;font-size:0.75rem;font-weight:600;'
+                f'background:{color}22;color:{color};border:1px solid {color}44;">'
+                f'{label} {count}</span>'
+            )
+
+        pills_html = (
+            _pill("Strong Buy", strong_buy_count, "#00C851")
+            + _pill("Buy", buy_count, "#4CAF50")
+            + _pill("Sell", sell_count, "#ff9800")
+            + _pill("Strong Sell", strong_sell_count, "#ff4444")
+        )
+
         st.markdown(f"""
         <div style="padding: 20px 24px; border-radius: 12px; background-color: #1a1c23; border: 1px solid #2d3039;">
             <div style="margin: 0 0 10px 0; font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Overall Market</div>
             <div style="font-size: 1.6rem; font-weight: 700; color: {overall_color}; margin: 0 0 8px 0;">{overall_status}</div>
-            <div style="font-size: 0.85rem; color: {sub_color}; font-weight: 600;">{sub_label}</div>
+            <div style="font-size: 0.85rem; color: {sub_color}; font-weight: 600; margin: 0 0 12px 0;">{sub_label}</div>
+            <div>{pills_html}</div>
         </div>
         """, unsafe_allow_html=True)
 
