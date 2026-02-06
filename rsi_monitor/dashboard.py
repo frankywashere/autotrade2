@@ -19,11 +19,11 @@ from rsi_monitor import RSIMonitor, DataFetcher, SignalGenerator, VIXAnalyzer
 
 # Signal color mapping
 SIGNAL_COLORS = {
-    "STRONG_BUY": "#00C851",   # Bright green
-    "BUY": "#007E33",          # Dark green
+    "STRONG_BUY": "#00FF00",   # Bright green
+    "BUY": "#00C851",          # Green
     "NEUTRAL": "#6c757d",      # Gray
-    "SELL": "#CC0000",         # Dark red
-    "STRONG_SELL": "#ff4444",  # Bright red
+    "SELL": "#ff4444",         # Red
+    "STRONG_SELL": "#FF0000",  # Bright red
 }
 
 # RSI 7-level color mapping
@@ -673,7 +673,7 @@ def main():
         alerts = []
         for symbol in selected_symbols:
             signal = signals.get(symbol, {}).get("signal", "NEUTRAL")
-            if signal in ["STRONG_BUY", "STRONG_SELL"]:
+            if signal in ["STRONG_BUY", "BUY", "SELL", "STRONG_SELL"]:
                 alerts.append(f"{symbol}: {signal}")
 
         alert_color = "#ff4444" if alerts else "#00C851"
