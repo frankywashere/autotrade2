@@ -616,7 +616,7 @@ def main():
             overall_status = "BUY THE DIP"
             overall_color = "#4CAF50"
         elif fear_pct >= 35:
-            overall_status = "BUY THE DIP"
+            overall_status = "CAUTIOUS"
             overall_color = "#ffeb3b"
         elif fear_pct < 10 and confirms_sell:
             overall_status = "SELL THE RIP"
