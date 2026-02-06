@@ -49,7 +49,7 @@ RSI_LEVEL_COLORS = {
     "Oversold": "#00C851",                # Green
     "Approaching Oversold": "#90EE90",    # Light Green
     "Neutral": "#6c757d",                 # Gray
-    "Approaching Overbought": "#FF6B6B",  # Light Red
+    "Approaching Overbought": "#ffeb3b",  # Yellow
     "Overbought": "#ff4444",              # Red
     "Extremely Overbought": "#FF0000",    # Bright Red
 }

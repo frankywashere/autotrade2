@@ -311,12 +311,30 @@ class SignalGenerator:
                              if status == 'overbought' and tf in self.LONG_TERM_TIMEFRAMES)
 
         # Determine signal
+        # When both sides fire, long-term takes priority over short-term
         signal = 'NEUTRAL'
         confluence_score = 0
 
         if oversold_count >= 3 and self._has_significant_timeframe(timeframe_status, 'oversold'):
             signal = 'STRONG_BUY'
             confluence_score = oversold_count
+        elif overbought_count >= 3 and self._has_significant_timeframe(timeframe_status, 'overbought'):
+            signal = 'STRONG_SELL'
+            confluence_score = overbought_count
+        elif oversold_count >= 2 and overbought_count >= 2:
+            # Both sides firing — long-term wins
+            if long_oversold >= long_overbought:
+                if short_oversold > 0 and long_oversold > 0:
+                    signal = 'BUY'
+                else:
+                    signal = 'LONG_TERM_BUY'
+                confluence_score = oversold_count
+            else:
+                if short_overbought > 0 and long_overbought > 0:
+                    signal = 'SELL'
+                else:
+                    signal = 'LONG_TERM_SELL'
+                confluence_score = overbought_count
         elif oversold_count >= 2:
             if short_oversold > 0 and long_oversold > 0:
                 signal = 'BUY'
@@ -325,9 +343,6 @@ class SignalGenerator:
             else:
                 signal = 'SHORT_TERM_BUY'
             confluence_score = oversold_count
-        elif overbought_count >= 3 and self._has_significant_timeframe(timeframe_status, 'overbought'):
-            signal = 'STRONG_SELL'
-            confluence_score = overbought_count
         elif overbought_count >= 2:
             if short_overbought > 0 and long_overbought > 0:
                 signal = 'SELL'
