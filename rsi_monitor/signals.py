@@ -31,6 +31,10 @@ class SignalGenerator:
     # Higher timeframes that carry more weight
     SIGNIFICANT_TIMEFRAMES = {'daily', 'weekly', '1d', '1w', 'D', 'W'}
 
+    # Timeframe groups for short-term vs long-term signal classification
+    SHORT_TERM_TIMEFRAMES = {'5m', '15m', '1h'}
+    LONG_TERM_TIMEFRAMES = {'4h', '1d', '1wk', '1w', 'daily', 'weekly', 'D', 'W'}
+
     def __init__(
         self,
         oversold_threshold: float = 30.0,
@@ -296,6 +300,16 @@ class SignalGenerator:
         oversold_count = sum(1 for status in timeframe_status.values() if status == 'oversold')
         overbought_count = sum(1 for status in timeframe_status.values() if status == 'overbought')
 
+        # Count per timeframe group
+        short_oversold = sum(1 for tf, status in timeframe_status.items()
+                            if status == 'oversold' and tf in self.SHORT_TERM_TIMEFRAMES)
+        long_oversold = sum(1 for tf, status in timeframe_status.items()
+                           if status == 'oversold' and tf in self.LONG_TERM_TIMEFRAMES)
+        short_overbought = sum(1 for tf, status in timeframe_status.items()
+                              if status == 'overbought' and tf in self.SHORT_TERM_TIMEFRAMES)
+        long_overbought = sum(1 for tf, status in timeframe_status.items()
+                             if status == 'overbought' and tf in self.LONG_TERM_TIMEFRAMES)
+
         # Determine signal
         signal = 'NEUTRAL'
         confluence_score = 0
@@ -304,13 +318,23 @@ class SignalGenerator:
             signal = 'STRONG_BUY'
             confluence_score = oversold_count
         elif oversold_count >= 2:
-            signal = 'BUY'
+            if short_oversold > 0 and long_oversold > 0:
+                signal = 'BUY'
+            elif long_oversold >= 2:
+                signal = 'LONG_TERM_BUY'
+            else:
+                signal = 'SHORT_TERM_BUY'
             confluence_score = oversold_count
         elif overbought_count >= 3 and self._has_significant_timeframe(timeframe_status, 'overbought'):
             signal = 'STRONG_SELL'
             confluence_score = overbought_count
         elif overbought_count >= 2:
-            signal = 'SELL'
+            if short_overbought > 0 and long_overbought > 0:
+                signal = 'SELL'
+            elif long_overbought >= 2:
+                signal = 'LONG_TERM_SELL'
+            else:
+                signal = 'SHORT_TERM_SELL'
             confluence_score = overbought_count
 
         # Calculate strength (with optional VIX confirmation bonus)

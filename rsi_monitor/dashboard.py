@@ -19,11 +19,28 @@ from rsi_monitor import RSIMonitor, DataFetcher, SignalGenerator, VIXAnalyzer
 
 # Signal color mapping
 SIGNAL_COLORS = {
-    "STRONG_BUY": "#00FF00",   # Bright green
-    "BUY": "#00C851",          # Green
-    "NEUTRAL": "#6c757d",      # Gray
-    "SELL": "#ff4444",         # Red
-    "STRONG_SELL": "#FF0000",  # Bright red
+    "STRONG_BUY": "#00FF00",       # Bright green
+    "LONG_TERM_BUY": "#00C851",    # Green
+    "BUY": "#00C851",              # Green
+    "SHORT_TERM_BUY": "#4CAF50",   # Muted green
+    "NEUTRAL": "#6c757d",          # Gray
+    "SHORT_TERM_SELL": "#ff9800",  # Orange
+    "SELL": "#ff4444",             # Red
+    "LONG_TERM_SELL": "#ff4444",   # Red
+    "STRONG_SELL": "#FF0000",      # Bright red
+}
+
+# Human-readable signal display names
+SIGNAL_DISPLAY = {
+    "STRONG_BUY": "STRONG BUY",
+    "LONG_TERM_BUY": "LONG-TERM BUY",
+    "BUY": "BUY",
+    "SHORT_TERM_BUY": "SHORT-TERM BUY",
+    "NEUTRAL": "NEUTRAL",
+    "SHORT_TERM_SELL": "SHORT-TERM SELL",
+    "SELL": "SELL",
+    "LONG_TERM_SELL": "LONG-TERM SELL",
+    "STRONG_SELL": "STRONG SELL",
 }
 
 # RSI 7-level color mapping
@@ -88,9 +105,13 @@ def get_signal_emoji(signal: str) -> str:
     """Return emoji indicator for signal."""
     emoji_map = {
         "STRONG_BUY": "+++",
+        "LONG_TERM_BUY": "++",
         "BUY": "++",
+        "SHORT_TERM_BUY": "+",
         "NEUTRAL": "~",
+        "SHORT_TERM_SELL": "-",
         "SELL": "--",
+        "LONG_TERM_SELL": "--",
         "STRONG_SELL": "---",
     }
     return emoji_map.get(signal, "~")
@@ -634,10 +655,10 @@ def main():
         else:
             sub_color = "#888"
 
-        # Signal count pills
+        # Signal count pills (group BUY-family and SELL-family)
         strong_buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_BUY")
-        buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "BUY")
-        sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "SELL")
+        buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") in ("BUY", "SHORT_TERM_BUY", "LONG_TERM_BUY"))
+        sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") in ("SELL", "SHORT_TERM_SELL", "LONG_TERM_SELL"))
         strong_sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_SELL")
 
         def _pill(label, count, color):
@@ -673,8 +694,10 @@ def main():
         alerts = []
         for symbol in selected_symbols:
             signal = signals.get(symbol, {}).get("signal", "NEUTRAL")
-            if signal in ["STRONG_BUY", "BUY", "SELL", "STRONG_SELL"]:
-                alerts.append(f"{symbol}: {signal}")
+            if signal in ["STRONG_BUY", "LONG_TERM_BUY", "BUY", "SHORT_TERM_BUY",
+                         "SHORT_TERM_SELL", "SELL", "LONG_TERM_SELL", "STRONG_SELL"]:
+                display_signal = SIGNAL_DISPLAY.get(signal, signal)
+                alerts.append(f"{symbol}: {display_signal}")
 
         alert_color = "#ff4444" if alerts else "#00C851"
         alert_count_text = f"{len(alerts)} alert{'s' if len(alerts) != 1 else ''}"
@@ -746,7 +769,7 @@ def main():
                                         <span style="font-size: 1.3em; font-weight: 700; color: #e1e3ea;">{symbol}</span>
                                         <span style="font-size: 1.15em; font-weight: 600; color: #8b8fa3;">{price_str}</span>
                                     </div>
-                                    <span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{signal}</span>
+                                    <span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{SIGNAL_DISPLAY.get(signal, signal)}</span>
                                 </div>
                                 <div style="display: flex; gap: 10px; margin-bottom: 6px;">
                                     <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">
