@@ -614,42 +614,46 @@ def main():
     summary_cols = st.columns([2, 1, 1])
 
     with summary_cols[0]:
-        # Overall market status
-        strong_buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_BUY")
-        buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "BUY")
-        sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "SELL")
-        strong_sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_SELL")
+        # Overall market status based on VIX fear level
+        fear_pct = getattr(vix_confirmation, 'fear_percentage', 0.0)
+        greed_pct = getattr(vix_confirmation, 'greed_percentage', 0.0)
+        confirms_sell = getattr(vix_confirmation, 'confirms_sell', False)
 
-        if strong_buy_count > 0 or buy_count >= len(selected_symbols) // 2:
-            overall_status = "BULLISH"
+        if fear_pct >= 70:
+            overall_status = "BUY THE DIP"
             overall_color = "#00C851"
-        elif strong_sell_count > 0 or sell_count >= len(selected_symbols) // 2:
-            overall_status = "BEARISH"
+        elif fear_pct >= 50:
+            overall_status = "BUY THE DIP"
+            overall_color = "#4CAF50"
+        elif confirms_sell and greed_pct >= 50:
+            overall_status = "SELL THE RIP"
             overall_color = "#ff4444"
+        elif confirms_sell:
+            overall_status = "SELL THE RIP"
+            overall_color = "#ff9800"
+        elif fear_pct >= 35:
+            overall_status = "CAUTIOUS"
+            overall_color = "#ffeb3b"
         else:
-            overall_status = "MIXED"
+            overall_status = "NEUTRAL"
             overall_color = "#6c757d"
 
-        def _pill(label, count, color):
-            return (
-                f'<span style="display:inline-block;padding:2px 10px;margin:0 4px;'
-                f'border-radius:20px;font-size:0.75rem;font-weight:600;'
-                f'background:{color}22;color:{color};border:1px solid {color}44;">'
-                f'{label} {count}</span>'
-            )
-
-        pills_html = (
-            _pill("Strong Buy", strong_buy_count, "#00C851")
-            + _pill("Buy", buy_count, "#4CAF50")
-            + _pill("Sell", sell_count, "#ff9800")
-            + _pill("Strong Sell", strong_sell_count, "#ff4444")
-        )
+        # Sub-label with fear/greed context
+        if fear_pct >= 50:
+            sub_label = f"Fear {fear_pct:.0f}%"
+            sub_color = "#ff4444"
+        elif confirms_sell:
+            sub_label = f"Greed {greed_pct:.0f}%"
+            sub_color = "#00C851"
+        else:
+            sub_label = f"Fear {fear_pct:.0f}%"
+            sub_color = "#888"
 
         st.markdown(f"""
         <div style="padding: 20px 24px; border-radius: 12px; background-color: #1a1c23; border: 1px solid #2d3039;">
             <div style="margin: 0 0 10px 0; font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Overall Market</div>
-            <div style="font-size: 1.6rem; font-weight: 700; color: {overall_color}; margin: 0 0 12px 0;">{overall_status}</div>
-            <div>{pills_html}</div>
+            <div style="font-size: 1.6rem; font-weight: 700; color: {overall_color}; margin: 0 0 8px 0;">{overall_status}</div>
+            <div style="font-size: 0.85rem; color: {sub_color}; font-weight: 600;">{sub_label}</div>
         </div>
         """, unsafe_allow_html=True)
 

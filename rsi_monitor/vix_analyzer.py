@@ -1252,23 +1252,23 @@ class VIXAnalyzer:
             # Overall sentiment based on fear_percentage (0-100 scale)
             if fear_percentage >= 70:
                 overall_sentiment = "extreme_fear"
-                description = f"Extreme fear ({fear_percentage:.0f}%) - strong buy confirmation"
+                description = f"Panic! ({fear_percentage:.0f}%)"
             elif fear_percentage >= 50:
                 overall_sentiment = "fear"
-                description = f"Elevated fear ({fear_percentage:.0f}%) - favorable for buying"
+                description = f"Fear ({fear_percentage:.0f}%)"
             elif confirms_sell:
                 if sell_weighted_score >= 4.0:
                     overall_sentiment = "extreme_greed"
-                    description = f"Extreme complacency - strong sell confirmation"
+                    description = f"Extreme Greed"
                 else:
                     overall_sentiment = "greed"
-                    description = f"Complacency - favorable for selling"
+                    description = f"Greed"
             elif fear_percentage >= 35:
                 overall_sentiment = "cautious"
-                description = f"Moderate elevation ({fear_percentage:.0f}%) - some caution warranted"
+                description = f"Cautious ({fear_percentage:.0f}%)"
             else:
                 overall_sentiment = "neutral"
-                description = f"Low fear ({fear_percentage:.0f}%) - no strong VIX confirmation"
+                description = f"Neutral ({fear_percentage:.0f}%)"
 
             return VIXConfirmation(
                 strength=confirmation_count,
