@@ -423,7 +423,56 @@ def main():
         layout="wide",
     )
 
-    st.title("Market Pulse")
+    # Global CSS injection
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+    /* Apply Inter font globally */
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+
+    /* Hide Streamlit hamburger menu */
+    #MainMenu {visibility: hidden;}
+
+    /* Hide Streamlit footer */
+    footer {visibility: hidden;}
+
+    /* Hide deploy button */
+    .stDeployButton {display: none;}
+
+    /* Reduce top padding */
+    div.block-container {padding-top: 1.5rem;}
+
+    /* Style sidebar header area */
+    [data-testid="stSidebar"] [data-testid="stHeader"] {
+        background-color: transparent;
+    }
+    [data-testid="stSidebar"] .stMarkdown h1,
+    [data-testid="stSidebar"] .stMarkdown h2,
+    [data-testid="stSidebar"] .stMarkdown h3 {
+        font-family: 'Inter', sans-serif;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+    }
+
+    /* Subtle border-bottom on section headers */
+    .main .stMarkdown h2, .main .stMarkdown h3 {
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        padding-bottom: 0.4rem;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Styled header
+    st.markdown("""
+    <div style="margin-bottom: 1.2rem;">
+        <h1 style="margin: 0; padding: 0; font-family: 'Inter', sans-serif; font-weight: 700; color: #FFFFFF; font-size: 2.2rem; letter-spacing: -0.02em;">Market Pulse</h1>
+        <p style="margin: 0.25rem 0 0.6rem 0; padding: 0; font-family: 'Inter', sans-serif; font-size: 0.95rem; color: #888888; font-weight: 400;">Real-time RSI signals across timeframes</p>
+        <div style="width: 60px; height: 3px; background-color: #3A82FF; border-radius: 2px;"></div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # Initialize session state
     if "last_refresh" not in st.session_state:
@@ -560,7 +609,7 @@ def main():
             signals[symbol] = {"signal": "NEUTRAL", "strength": 0}
 
     # Summary Section
-    st.header("Market Summary")
+    st.markdown('<h3 style="margin: 0 0 0.5rem 0; font-weight: 600; color: #e0e0e0; letter-spacing: 0.02em;">Market Summary</h3>', unsafe_allow_html=True)
 
     summary_cols = st.columns([2, 1, 1])
 
@@ -581,12 +630,26 @@ def main():
             overall_status = "MIXED"
             overall_color = "#6c757d"
 
+        def _pill(label, count, color):
+            return (
+                f'<span style="display:inline-block;padding:2px 10px;margin:0 4px;'
+                f'border-radius:20px;font-size:0.75rem;font-weight:600;'
+                f'background:{color}22;color:{color};border:1px solid {color}44;">'
+                f'{label} {count}</span>'
+            )
+
+        pills_html = (
+            _pill("Strong Buy", strong_buy_count, "#00C851")
+            + _pill("Buy", buy_count, "#4CAF50")
+            + _pill("Sell", sell_count, "#ff9800")
+            + _pill("Strong Sell", strong_sell_count, "#ff4444")
+        )
+
         st.markdown(f"""
-        <div style="padding: 20px; border-radius: 10px; background-color: {overall_color}20; border-left: 5px solid {overall_color};">
-            <h3 style="margin: 0; color: {overall_color};">Overall Market: {overall_status}</h3>
-            <p style="margin: 5px 0 0 0;">
-                Strong Buy: {strong_buy_count} | Buy: {buy_count} | Sell: {sell_count} | Strong Sell: {strong_sell_count}
-            </p>
+        <div style="padding: 20px 24px; border-radius: 12px; background-color: #1a1c23; border: 1px solid #2d3039;">
+            <div style="margin: 0 0 10px 0; font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Overall Market</div>
+            <div style="font-size: 1.6rem; font-weight: 700; color: {overall_color}; margin: 0 0 12px 0;">{overall_status}</div>
+            <div>{pills_html}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -603,21 +666,32 @@ def main():
                 alerts.append(f"{symbol}: {signal}")
 
         alert_color = "#ff4444" if alerts else "#00C851"
+        alert_count_text = f"{len(alerts)} alert{'s' if len(alerts) != 1 else ''}"
+        alerts_list_html = ""
+        if alerts:
+            for alert in alerts:
+                parts = alert.split(": ")
+                sym = parts[0]
+                sig = parts[1] if len(parts) > 1 else ""
+                sig_color = "#ff4444" if "SELL" in sig else "#00C851"
+                alerts_list_html += (
+                    f'<div style="padding:4px 0;font-size:0.82rem;color:#ccc;">'
+                    f'<span style="font-weight:600;">{sym}</span> '
+                    f'<span style="color:{sig_color};font-weight:600;">{sig}</span></div>'
+                )
+
         st.markdown(f"""
-        <div style="padding: 20px; border-radius: 10px; background-color: {alert_color}20; border-left: 5px solid {alert_color};">
-            <h4 style="margin: 0;">Active Alerts</h4>
-            <p style="margin: 5px 0 0 0;">{len(alerts)} alert(s)</p>
+        <div style="padding: 20px 24px; border-radius: 12px; background-color: #1a1c23; border: 1px solid #2d3039;">
+            <div style="margin: 0 0 10px 0; font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Active Alerts</div>
+            <div style="font-size: 1.6rem; font-weight: 700; color: {alert_color}; margin: 0 0 8px 0;">{alert_count_text}</div>
+            {alerts_list_html}
         </div>
         """, unsafe_allow_html=True)
 
-        if alerts:
-            for alert in alerts:
-                st.warning(alert)
-
-    st.divider()
+    st.markdown('<div style="margin: 1.5rem 0;"></div>', unsafe_allow_html=True)
 
     # Individual Symbol Cards
-    st.header("Symbol Details")
+    st.markdown('<h3 style="color: #a0a3b0; font-weight: 500; margin-bottom: 16px;">Symbol Details</h3>', unsafe_allow_html=True)
 
     if not selected_symbols:
         st.info("Select at least one symbol from the sidebar to view RSI data.")
@@ -643,61 +717,68 @@ def main():
                         current_price = float(price_df["Close"].iloc[-1]) if price_df is not None and not price_df.empty else None
                         price_str = f"${current_price:.2f}" if current_price else "N/A"
 
-                        with st.expander(f"{symbol} {price_str} - {signal} {get_signal_emoji(signal)}", expanded=True):
-                            # Signal header with price
-                            st.markdown(f"""
-                            <div style="padding: 10px; border-radius: 5px; background-color: {signal_color}; color: white; text-align: center; margin-bottom: 10px;">
-                                <strong>{signal}</strong>
+                        # Confluence score
+                        rsi_data = rsi_results.get(symbol, {})
+                        oversold_count, overbought_count, total = calculate_confluence(
+                            rsi_data, oversold_threshold, overbought_threshold
+                        )
+
+                        strength_display = f"{strength:.0%}" if isinstance(strength, float) else str(strength)
+
+                        # Styled card with top accent bar
+                        st.markdown(f"""
+                        <div style="background-color: #1a1c23; border: 1px solid #2d3039; border-radius: 12px; padding: 0; margin-bottom: 16px; overflow: hidden;">
+                            <div style="height: 3px; background-color: {signal_color};"></div>
+                            <div style="padding: 20px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+                                    <div style="display: flex; align-items: baseline; gap: 12px;">
+                                        <span style="font-size: 1.3em; font-weight: 700; color: #e1e3ea;">{symbol}</span>
+                                        <span style="font-size: 1.15em; font-weight: 600; color: #8b8fa3;">{price_str}</span>
+                                    </div>
+                                    <span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{signal}</span>
+                                </div>
+                                <div style="display: flex; gap: 10px; margin-bottom: 6px;">
+                                    <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">
+                                        <div style="font-size: 0.7em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Oversold TFs</div>
+                                        <div style="font-size: 1.1em; font-weight: 600; color: #e1e3ea;">{oversold_count}/{total}</div>
+                                    </div>
+                                    <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">
+                                        <div style="font-size: 0.7em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Overbought TFs</div>
+                                        <div style="font-size: 1.1em; font-weight: 600; color: #e1e3ea;">{overbought_count}/{total}</div>
+                                    </div>
+                                    <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">
+                                        <div style="font-size: 0.7em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Strength</div>
+                                        <div style="font-size: 1.1em; font-weight: 600; color: #e1e3ea;">{strength_display}</div>
+                                    </div>
+                                </div>
                             </div>
-                            """, unsafe_allow_html=True)
+                        </div>
+                        """, unsafe_allow_html=True)
 
-                            # Prominent price display
-                            if current_price:
-                                st.markdown(f"<h2 style='text-align: center; margin: 0 0 10px 0; color: #1f77b4;'>${current_price:.2f}</h2>", unsafe_allow_html=True)
+                        # RSI Table
+                        if rsi_data:
+                            df = create_rsi_table(rsi_data, oversold_threshold, overbought_threshold)
 
-                            # Confluence score
-                            rsi_data = rsi_results.get(symbol, {})
-                            oversold_count, overbought_count, total = calculate_confluence(
-                                rsi_data, oversold_threshold, overbought_threshold
+                            # Style the dataframe with 7-level colors
+                            def color_status(val):
+                                # Extract base status (before any percentile info)
+                                base_status = val.split(" (")[0] if " (" in val else val
+                                color = RSI_LEVEL_COLORS.get(base_status)
+                                if color:
+                                    return f"background-color: {color}33; color: {color}"
+                                return ""
+
+                            styled_df = df.style.map(
+                                color_status, subset=["Status"]
                             )
 
-                            metric_cols = st.columns(3)
-                            with metric_cols[0]:
-                                st.metric("Oversold TFs", f"{oversold_count}/{total}")
-                            with metric_cols[1]:
-                                st.metric("Overbought TFs", f"{overbought_count}/{total}")
-                            with metric_cols[2]:
-                                st.metric("Strength", f"{strength:.0%}" if isinstance(strength, float) else str(strength))
-
-                            # VIX confirmation - consistent display for all tickers
-                            fear_pct = getattr(vix_confirmation, 'fear_percentage', 0.0)
-                            confirms_buy = "Yes" if vix_confirmation.confirms_buy else "No"
-                            st.info(f"VIX Fear: {fear_pct:.0f}% | Confirms Buy: {confirms_buy}")
-
-                            # RSI Table
-                            if rsi_data:
-                                df = create_rsi_table(rsi_data, oversold_threshold, overbought_threshold)
-
-                                # Style the dataframe with 7-level colors
-                                def color_status(val):
-                                    # Extract base status (before any percentile info)
-                                    base_status = val.split(" (")[0] if " (" in val else val
-                                    color = RSI_LEVEL_COLORS.get(base_status)
-                                    if color:
-                                        return f"background-color: {color}33; color: {color}"
-                                    return ""
-
-                                styled_df = df.style.map(
-                                    color_status, subset=["Status"]
-                                )
-
-                                st.dataframe(
-                                    styled_df,
-                                    width='stretch',
-                                    hide_index=True
-                                )
-                            else:
-                                st.warning("No RSI data available")
+                            st.dataframe(
+                                styled_df,
+                                width='stretch',
+                                hide_index=True
+                            )
+                        else:
+                            st.warning("No RSI data available")
 
     # Footer
     st.divider()
