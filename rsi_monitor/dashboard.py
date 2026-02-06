@@ -490,6 +490,8 @@ def main():
         st.session_state.last_refresh = datetime.now()
     if "auto_refresh" not in st.session_state:
         st.session_state.auto_refresh = True
+    if "recovery_mode_active" not in st.session_state:
+        st.session_state.recovery_mode_active = False
 
     # Sidebar configuration
     with st.sidebar:
@@ -519,12 +521,18 @@ def main():
             help="Number of periods for RSI calculation"
         )
 
+        is_recovery = st.session_state.recovery_mode_active
+
+        if is_recovery:
+            st.info("Thresholds locked (recovery mode active)")
+
         oversold_threshold = st.slider(
             "Oversold Threshold",
             min_value=10,
             max_value=40,
             value=30,
-            help="RSI below this = oversold (buy opportunity)"
+            help="RSI below this = oversold (buy opportunity)",
+            disabled=is_recovery
         )
 
         overbought_threshold = st.slider(
@@ -532,7 +540,8 @@ def main():
             min_value=60,
             max_value=90,
             value=70,
-            help="RSI above this = overbought (sell opportunity)"
+            help="RSI above this = overbought (sell opportunity)",
+            disabled=is_recovery
         )
 
         st.divider()
@@ -600,6 +609,15 @@ def main():
     vix_confirmation = vix_analyzer.analyze_from_dataframe(vix_df, vix3m_df, vvix_df)
     vix_color = get_vix_confirmation_color(vix_confirmation)
 
+    # Extract VIX RSI history for recovery window detection
+    vix_rsi_history = {}
+    vix_symbol_data = rsi_results.get("^VIX", {})
+    for tf, data in vix_symbol_data.items():
+        if isinstance(data, dict):
+            hist = data.get('rsi_history')
+            if hist:
+                vix_rsi_history[tf] = hist
+
     # Generate signals for all symbols (with VIX confirmation for strength bonus)
     signals = {}
 
@@ -618,10 +636,17 @@ def main():
                 else:
                     plain_rsi[tf] = data
             signal_input = {'symbol': symbol, 'timeframes': plain_rsi}
-            signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation, rsi_history=rsi_history)
+            signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation, rsi_history=rsi_history, vix_rsi_history=vix_rsi_history)
         except Exception as e:
             st.warning(f"Error generating signal for {symbol}: {e}")
             signals[symbol] = {"signal": "NEUTRAL", "strength": 0}
+
+    # Persist recovery mode for next render cycle (controls slider locking)
+    any_recovery = any(
+        s.get("recovery_suppressed", False)
+        for s in signals.values()
+    )
+    st.session_state.recovery_mode_active = any_recovery
 
     # Summary Section
     st.markdown('<h3 style="margin: 0 0 0.5rem 0; font-weight: 600; color: #e0e0e0; letter-spacing: 0.02em;">Market Summary</h3>', unsafe_allow_html=True)

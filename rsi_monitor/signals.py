@@ -265,7 +265,7 @@ class SignalGenerator:
             f"Signal strength is {strength_desc} ({strength:.1%}), suggesting a potential {action}."
         )
 
-    def analyze(self, rsi_data: Dict[str, Any], vix_confirmation: Optional[Any] = None, rsi_history: Optional[Dict[str, list]] = None) -> Dict[str, Any]:
+    def analyze(self, rsi_data: Dict[str, Any], vix_confirmation: Optional[Any] = None, rsi_history: Optional[Dict[str, list]] = None, vix_rsi_history: Optional[Dict[str, list]] = None) -> Dict[str, Any]:
         """
         Analyze RSI data and generate a trading signal.
 
@@ -384,33 +384,51 @@ class SignalGenerator:
                 confluence_score = 0
                 suppressed = True
 
-        # Option 3: Recovery window suppression (look back 48h in historical RSI)
-        if rsi_history and signal in ('SHORT_TERM_SELL', 'SHORT_TERM_BUY'):
-            recently_oversold = False
-            recently_overbought = False
-            for tf, history in rsi_history.items():
+        # Option 3: VIX-conditional recovery suppression (data-driven, 48h lookback)
+        # Only suppress short-term signals when VIX recently spiked (fear event)
+        vix_recently_spiked = False
+        if vix_rsi_history and signal in ('SHORT_TERM_SELL', 'SHORT_TERM_BUY'):
+            for tf, history in vix_rsi_history.items():
                 if tf not in self.LONG_TERM_TIMEFRAMES or not history:
                     continue
                 hours_per_bar = self.TIMEFRAME_HOURS.get(tf)
                 if not hours_per_bar:
                     continue
-                bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)  # ceil division
+                bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)
                 recent = history[-bars_in_window:]
                 for rsi_val in recent:
                     if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
-                        if rsi_val <= self.thresholds.oversold:
-                            recently_oversold = True
-                        if rsi_val >= self.thresholds.overbought:
-                            recently_overbought = True
+                        if rsi_val >= 70:  # VIX overbought = fear spike (fixed threshold)
+                            vix_recently_spiked = True
 
-            if signal == 'SHORT_TERM_SELL' and recently_oversold:
-                signal = 'NEUTRAL'
-                confluence_score = 0
-                suppressed = True
-            elif signal == 'SHORT_TERM_BUY' and recently_overbought:
-                signal = 'NEUTRAL'
-                confluence_score = 0
-                suppressed = True
+            if vix_recently_spiked:
+                # VIX spiked recently — check if THIS symbol was at extremes
+                recently_oversold = False
+                recently_overbought = False
+                if rsi_history:
+                    for tf, history in rsi_history.items():
+                        if tf not in self.LONG_TERM_TIMEFRAMES or not history:
+                            continue
+                        hours_per_bar = self.TIMEFRAME_HOURS.get(tf)
+                        if not hours_per_bar:
+                            continue
+                        bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)
+                        recent = history[-bars_in_window:]
+                        for rsi_val in recent:
+                            if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
+                                if rsi_val <= 30:  # Fixed threshold
+                                    recently_oversold = True
+                                if rsi_val >= 70:  # Fixed threshold
+                                    recently_overbought = True
+
+                if signal == 'SHORT_TERM_SELL' and recently_oversold:
+                    signal = 'NEUTRAL'
+                    confluence_score = 0
+                    suppressed = True
+                elif signal == 'SHORT_TERM_BUY' and recently_overbought:
+                    signal = 'NEUTRAL'
+                    confluence_score = 0
+                    suppressed = True
 
         # Calculate strength (with optional VIX confirmation bonus)
         strength = self._calculate_strength(rsi_data, timeframe_status, confluence_score, signal, vix_confirmation)
