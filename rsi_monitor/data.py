@@ -105,29 +105,35 @@ class DataFetcher:
             _, data = self._cache[cache_key]
             return data.copy()
 
-        # Fetch from yfinance
-        try:
-            logger.debug(f"Fetching {symbol} with interval={interval}, period={period}, prepost={prepost}")
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period=period, interval=interval, prepost=prepost)
+        # Fetch from yfinance with retry on rate limit
+        for attempt in range(3):
+            try:
+                logger.debug(f"Fetching {symbol} with interval={interval}, period={period}, prepost={prepost}")
+                ticker = yf.Ticker(symbol)
+                df = ticker.history(period=period, interval=interval, prepost=prepost)
 
-            if df.empty:
-                logger.warning(f"No data returned for {symbol} ({interval}, {period})")
+                if df.empty:
+                    logger.warning(f"No data returned for {symbol} ({interval}, {period})")
+                    return None
+
+                # Keep only OHLCV columns (drop Dividends, Stock Splits if present)
+                ohlcv_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+                df = df[[col for col in ohlcv_columns if col in df.columns]]
+
+                # Cache the result
+                self._cache[cache_key] = (time.time(), df)
+                logger.debug(f"Cached {len(df)} rows for {symbol} {interval}")
+
+                return df.copy()
+
+            except Exception as e:
+                if 'Too Many Requests' in str(e) and attempt < 2:
+                    wait = 2 ** attempt  # 1s, 2s
+                    logger.info(f"Rate limited for {symbol}, retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                logger.warning(f"Failed to fetch data for {symbol}: {e}")
                 return None
-
-            # Keep only OHLCV columns (drop Dividends, Stock Splits if present)
-            ohlcv_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-            df = df[[col for col in ohlcv_columns if col in df.columns]]
-
-            # Cache the result
-            self._cache[cache_key] = (time.time(), df)
-            logger.debug(f"Cached {len(df)} rows for {symbol} {interval}")
-
-            return df.copy()
-
-        except Exception as e:
-            logger.warning(f"Failed to fetch data for {symbol}: {e}")
-            return None
 
     def fetch_batch(
         self,
