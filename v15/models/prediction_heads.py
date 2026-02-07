@@ -34,7 +34,7 @@ class DurationHead(nn.Module):
         """
         h = self.net(x)
         mean = F.softplus(self.mean_head(h))  # Duration must be positive
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -127,7 +127,7 @@ class PerTFPredictionHeads(nn.Module):
         # Duration predictions
         h = self.duration_net(flat_embeddings)
         duration_mean = F.softplus(self.duration_mean(h))  # Must be positive
-        duration_log_std = self.duration_log_std(h).clamp(-5, 5)
+        duration_log_std = self.duration_log_std(h).clamp(-2, 5)
 
         # Direction predictions
         direction_logits = self.direction_net(flat_embeddings)
@@ -272,7 +272,7 @@ class TSLABarsToBreakHead(nn.Module):
         """
         h = self.net(x)
         mean = F.softplus(self.mean_head(h))  # Bars must be positive
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -323,7 +323,7 @@ class TSLABreakMagnitudeHead(nn.Module):
         """
         h = self.net(x)
         mean = self.mean_head(h)  # Can be positive or negative
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -374,7 +374,7 @@ class TSLABouncesAfterReturnHead(nn.Module):
         """
         h = self.net(x)
         mean = F.softplus(self.mean_head(h))  # Bounces must be positive
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -430,7 +430,7 @@ class SPYBarsToBreakHead(nn.Module):
         """
         h = self.net(x)
         mean = F.softplus(self.mean_head(h))  # Bars must be positive
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -481,7 +481,7 @@ class SPYBreakMagnitudeHead(nn.Module):
         """
         h = self.net(x)
         mean = self.mean_head(h)  # Can be positive or negative
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -532,7 +532,7 @@ class SPYBouncesAfterReturnHead(nn.Module):
         """
         h = self.net(x)
         mean = F.softplus(self.mean_head(h))  # Bounces must be positive
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -595,7 +595,7 @@ class TSLARSIAtBreakHead(nn.Module):
         """
         h = self.net(x)
         mean = self.mean_head(h)  # RSI can be any value, sigmoid applied if needed
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -693,7 +693,7 @@ class SPYRSIAtBreakHead(nn.Module):
         """
         h = self.net(x)
         mean = self.mean_head(h)  # RSI can be any value, sigmoid applied if needed
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -810,7 +810,7 @@ class CrossRSISpreadHead(nn.Module):
         """
         h = self.net(x)
         mean = self.mean_head(h)  # Spread can be positive or negative
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -888,7 +888,7 @@ class TSLADurabilityHead(nn.Module):
         """
         h = self.net(x)
         mean = F.softplus(self.mean_head(h))  # Durability must be positive
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -923,7 +923,7 @@ class TSLABarsToPermanentHead(nn.Module):
         """
         h = self.net(x)
         mean = F.softplus(self.mean_head(h))  # Bars must be positive
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -955,7 +955,7 @@ class SPYDurabilityHead(nn.Module):
         """
         h = self.net(x)
         mean = F.softplus(self.mean_head(h))  # Durability must be positive
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -987,7 +987,7 @@ class SPYBarsToPermanentHead(nn.Module):
         """
         h = self.net(x)
         mean = F.softplus(self.mean_head(h))  # Bars must be positive
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -1022,7 +1022,7 @@ class CrossDurabilitySpreadHead(nn.Module):
         """
         h = self.net(x)
         mean = self.mean_head(h)  # Spread can be positive or negative
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
@@ -1097,7 +1097,7 @@ class BreakLagHead(nn.Module):
         """
         h = self.net(x)
         mean = self.mean_head(h)  # Can be positive or negative
-        log_std = self.log_std_head(h).clamp(-5, 5)
+        log_std = self.log_std_head(h).clamp(-2, 5)
         return mean.squeeze(-1), log_std.squeeze(-1)
 
 
