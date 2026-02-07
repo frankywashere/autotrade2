@@ -265,7 +265,7 @@ class SignalGenerator:
             f"Signal strength is {strength_desc} ({strength:.1%}), suggesting a potential {action}."
         )
 
-    def analyze(self, rsi_data: Dict[str, Any], vix_confirmation: Optional[Any] = None, rsi_history: Optional[Dict[str, list]] = None, vix_rsi_history: Optional[Dict[str, list]] = None) -> Dict[str, Any]:
+    def analyze(self, rsi_data: Dict[str, Any], vix_confirmation: Optional[Any] = None, rsi_history: Optional[Dict[str, list]] = None, vix_rsi_history: Optional[Dict[str, list]] = None, vix_daily_changes: Optional[list] = None) -> Dict[str, Any]:
         """
         Analyze RSI data and generate a trading signal.
 
@@ -385,21 +385,37 @@ class SignalGenerator:
                 suppressed = True
 
         # Option 3: VIX-conditional recovery suppression (data-driven, 48h lookback)
-        # Only suppress short-term signals when VIX recently spiked (fear event)
+        # Combined approach: detect VIX fear spike via daily % change OR RSI with price floor
+        # Then suppress short-term signals when the symbol was recently at extremes
         vix_recently_spiked = False
-        if vix_rsi_history and signal in ('SHORT_TERM_SELL', 'SHORT_TERM_BUY'):
-            for tf, history in vix_rsi_history.items():
-                if tf not in self.LONG_TERM_TIMEFRAMES or not history:
-                    continue
-                hours_per_bar = self.TIMEFRAME_HOURS.get(tf)
-                if not hours_per_bar:
-                    continue
-                bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)
-                recent = history[-bars_in_window:]
-                for rsi_val in recent:
-                    if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
-                        if rsi_val >= 70:  # VIX overbought = fear spike (fixed threshold)
-                            vix_recently_spiked = True
+        if signal in ('SHORT_TERM_SELL', 'SHORT_TERM_BUY'):
+            # Trigger A: VIX daily change >= 15% within lookback window
+            if vix_daily_changes:
+                for change in vix_daily_changes:
+                    if isinstance(change, (int, float)) and abs(change) >= 15:
+                        vix_recently_spiked = True
+                        break
+            if not vix_recently_spiked and vix_confirmation is not None:
+                vix_change = getattr(vix_confirmation, 'vix_change_pct', 0.0)
+                if abs(vix_change) >= 15:
+                    vix_recently_spiked = True
+
+            # Trigger B: VIX RSI-14 >= 65 on long-term TF within 48h AND VIX > 18
+            if not vix_recently_spiked and vix_rsi_history:
+                vix_price = getattr(vix_confirmation, 'vix_price', 0.0) if vix_confirmation else 0.0
+                if vix_price > 18:
+                    for tf, history in vix_rsi_history.items():
+                        if tf not in self.LONG_TERM_TIMEFRAMES or not history:
+                            continue
+                        hours_per_bar = self.TIMEFRAME_HOURS.get(tf)
+                        if not hours_per_bar:
+                            continue
+                        bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)
+                        recent = history[-bars_in_window:]
+                        for rsi_val in recent:
+                            if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
+                                if rsi_val >= 65:
+                                    vix_recently_spiked = True
 
             if vix_recently_spiked:
                 # VIX spiked recently — check if THIS symbol was at extremes
@@ -416,9 +432,9 @@ class SignalGenerator:
                         recent = history[-bars_in_window:]
                         for rsi_val in recent:
                             if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
-                                if rsi_val <= 30:  # Fixed threshold
+                                if rsi_val <= 35:  # Near-oversold threshold
                                     recently_oversold = True
-                                if rsi_val >= 70:  # Fixed threshold
+                                if rsi_val >= 65:  # Near-overbought threshold
                                     recently_overbought = True
 
                 if signal == 'SHORT_TERM_SELL' and recently_oversold:

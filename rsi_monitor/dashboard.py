@@ -607,6 +607,18 @@ def main():
     vix3m_df = data_fetcher.fetch("^VIX3M", interval="1d", period="5d")
     vvix_df = data_fetcher.fetch("^VVIX", interval="1d", period="5d")
     vix_confirmation = vix_analyzer.analyze_from_dataframe(vix_df, vix3m_df, vvix_df)
+
+    # Extract recent VIX daily % changes for recovery lookback
+    vix_daily_changes = []
+    if vix_df is not None and len(vix_df) >= 3:
+        closes = vix_df["Close"].dropna()
+        if len(closes) >= 3:
+            for i in range(-2, 0):  # Last 2 daily changes
+                prev = float(closes.iloc[i - 1])
+                curr = float(closes.iloc[i])
+                if prev > 0:
+                    vix_daily_changes.append(((curr - prev) / prev) * 100)
+
     vix_color = get_vix_confirmation_color(vix_confirmation)
 
     # Extract VIX RSI history for recovery window detection
@@ -636,7 +648,7 @@ def main():
                 else:
                     plain_rsi[tf] = data
             signal_input = {'symbol': symbol, 'timeframes': plain_rsi}
-            signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation, rsi_history=rsi_history, vix_rsi_history=vix_rsi_history)
+            signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation, rsi_history=rsi_history, vix_rsi_history=vix_rsi_history, vix_daily_changes=vix_daily_changes)
         except Exception as e:
             st.warning(f"Error generating signal for {symbol}: {e}")
             signals[symbol] = {"signal": "NEUTRAL", "strength": 0}
