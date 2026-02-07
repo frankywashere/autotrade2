@@ -386,65 +386,66 @@ class SignalGenerator:
 
         # Option 3: VIX-conditional recovery suppression (data-driven, 48h lookback)
         # Combined approach: detect VIX fear spike via daily % change OR RSI with price floor
-        # Then suppress short-term signals when the symbol was recently at extremes
+        # Detection runs ALWAYS (so cooldown pill shows regardless of signal type)
+        # Suppression only applies to SHORT_TERM_SELL/BUY
         vix_recently_spiked = False
-        if signal in ('SHORT_TERM_SELL', 'SHORT_TERM_BUY'):
-            # Trigger A: VIX daily change >= 15% within lookback window
-            if vix_daily_changes:
-                for change in vix_daily_changes:
-                    if isinstance(change, (int, float)) and abs(change) >= 15:
-                        vix_recently_spiked = True
-                        break
-            if not vix_recently_spiked and vix_confirmation is not None:
-                vix_change = getattr(vix_confirmation, 'vix_change_pct', 0.0)
-                if abs(vix_change) >= 15:
+
+        # Trigger A: VIX daily change >= 15% within lookback window
+        if vix_daily_changes:
+            for change in vix_daily_changes:
+                if isinstance(change, (int, float)) and abs(change) >= 15:
                     vix_recently_spiked = True
+                    break
+        if not vix_recently_spiked and vix_confirmation is not None:
+            vix_change = getattr(vix_confirmation, 'vix_change_pct', 0.0)
+            if abs(vix_change) >= 15:
+                vix_recently_spiked = True
 
-            # Trigger B: VIX RSI-14 >= 65 on long-term TF within 48h AND VIX > 18
-            if not vix_recently_spiked and vix_rsi_history:
-                vix_price = getattr(vix_confirmation, 'vix_price', 0.0) if vix_confirmation else 0.0
-                if vix_price > 18:
-                    for tf, history in vix_rsi_history.items():
-                        if tf not in self.LONG_TERM_TIMEFRAMES or not history:
-                            continue
-                        hours_per_bar = self.TIMEFRAME_HOURS.get(tf)
-                        if not hours_per_bar:
-                            continue
-                        bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)
-                        recent = history[-bars_in_window:]
-                        for rsi_val in recent:
-                            if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
-                                if rsi_val >= 65:
-                                    vix_recently_spiked = True
+        # Trigger B: VIX RSI-14 >= 65 on long-term TF within 48h AND VIX > 18
+        if not vix_recently_spiked and vix_rsi_history:
+            vix_price = getattr(vix_confirmation, 'vix_price', 0.0) if vix_confirmation else 0.0
+            if vix_price > 18:
+                for tf, history in vix_rsi_history.items():
+                    if tf not in self.LONG_TERM_TIMEFRAMES or not history:
+                        continue
+                    hours_per_bar = self.TIMEFRAME_HOURS.get(tf)
+                    if not hours_per_bar:
+                        continue
+                    bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)
+                    recent = history[-bars_in_window:]
+                    for rsi_val in recent:
+                        if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
+                            if rsi_val >= 65:
+                                vix_recently_spiked = True
 
-            if vix_recently_spiked:
-                # VIX spiked recently — check if THIS symbol was at extremes
-                recently_oversold = False
-                recently_overbought = False
-                if rsi_history:
-                    for tf, history in rsi_history.items():
-                        if tf not in self.LONG_TERM_TIMEFRAMES or not history:
-                            continue
-                        hours_per_bar = self.TIMEFRAME_HOURS.get(tf)
-                        if not hours_per_bar:
-                            continue
-                        bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)
-                        recent = history[-bars_in_window:]
-                        for rsi_val in recent:
-                            if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
-                                if rsi_val <= 35:  # Near-oversold threshold
-                                    recently_oversold = True
-                                if rsi_val >= 65:  # Near-overbought threshold
-                                    recently_overbought = True
+        # Suppress short-term signals when VIX spiked and symbol was at extremes
+        if vix_recently_spiked and signal in ('SHORT_TERM_SELL', 'SHORT_TERM_BUY'):
+            recently_oversold = False
+            recently_overbought = False
+            if rsi_history:
+                for tf, history in rsi_history.items():
+                    if tf not in self.LONG_TERM_TIMEFRAMES or not history:
+                        continue
+                    hours_per_bar = self.TIMEFRAME_HOURS.get(tf)
+                    if not hours_per_bar:
+                        continue
+                    bars_in_window = -(-self.RECOVERY_WINDOW_HOURS // hours_per_bar)
+                    recent = history[-bars_in_window:]
+                    for rsi_val in recent:
+                        if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
+                            if rsi_val <= 35:  # Near-oversold threshold
+                                recently_oversold = True
+                            if rsi_val >= 65:  # Near-overbought threshold
+                                recently_overbought = True
 
-                if signal == 'SHORT_TERM_SELL' and recently_oversold:
-                    signal = 'NEUTRAL'
-                    confluence_score = 0
-                    suppressed = True
-                elif signal == 'SHORT_TERM_BUY' and recently_overbought:
-                    signal = 'NEUTRAL'
-                    confluence_score = 0
-                    suppressed = True
+            if signal == 'SHORT_TERM_SELL' and recently_oversold:
+                signal = 'NEUTRAL'
+                confluence_score = 0
+                suppressed = True
+            elif signal == 'SHORT_TERM_BUY' and recently_overbought:
+                signal = 'NEUTRAL'
+                confluence_score = 0
+                suppressed = True
 
         # Weekly extreme oversold detection (RSI < 20 within last 2 weeks)
         # Historical backtest: 100% win rate at 8+ weeks, +72% avg return at 26 weeks
@@ -475,6 +476,7 @@ class SignalGenerator:
             'strength': strength,
             'reason': reason,
             'recovery_suppressed': suppressed,
+            'vix_cooldown_active': vix_recently_spiked,
             'weekly_extreme_buy': weekly_extreme_buy,
         }
 
