@@ -446,6 +446,21 @@ class SignalGenerator:
                     confluence_score = 0
                     suppressed = True
 
+        # Weekly extreme oversold detection (RSI < 20 within last 2 weeks)
+        # Historical backtest: 100% win rate at 8+ weeks, +72% avg return at 26 weeks
+        weekly_extreme_buy = False
+        if rsi_history:
+            for tf, history in rsi_history.items():
+                # Check weekly timeframes only
+                if tf not in ('1wk', '1w', 'weekly', 'W') or not history:
+                    continue
+                # Last 2 weekly bars = ~2 weeks lookback
+                recent = history[-2:]
+                for rsi_val in recent:
+                    if isinstance(rsi_val, (int, float)) and rsi_val == rsi_val:
+                        if rsi_val < 20:
+                            weekly_extreme_buy = True
+
         # Calculate strength (with optional VIX confirmation bonus)
         strength = self._calculate_strength(rsi_data, timeframe_status, confluence_score, signal, vix_confirmation)
 
@@ -460,6 +475,7 @@ class SignalGenerator:
             'strength': strength,
             'reason': reason,
             'recovery_suppressed': suppressed,
+            'weekly_extreme_buy': weekly_extreme_buy,
         }
 
     def vix_confirms_signal(self, vix_rsi: Optional[float] = None, signal_type: Optional[str] = None) -> bool:
