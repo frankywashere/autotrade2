@@ -47,6 +47,12 @@ def compute_metrics(
             ((valid_pred_dur - valid_true_dur) ** 2).mean()
         ).item()
 
+        # Mean predicted std (if Gaussian NLL mode)
+        if all_predictions[0].get('duration_log_std') is not None:
+            pred_log_std = torch.cat([p['duration_log_std'] for p in all_predictions])
+            valid_pred_std = torch.exp(pred_log_std[valid_mask])
+            metrics['duration_mean_pred_std'] = valid_pred_std.mean().item()
+
         # MAPE (avoid division by zero)
         nonzero_mask = valid_true_dur > 0
         if nonzero_mask.any():

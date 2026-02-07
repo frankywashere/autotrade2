@@ -263,6 +263,15 @@ def cmd_train(args):
         config=config,
     )
 
+    # Resume from checkpoint if requested
+    if getattr(args, 'resume', None):
+        checkpoint_path = Path(args.resume)
+        if not checkpoint_path.exists():
+            logger.error(f"Checkpoint not found: {checkpoint_path}")
+            cleanup_distributed()
+            return
+        trainer.load_checkpoint(checkpoint_path)
+
     history = trainer.train()
 
     logger.info("Training complete!")
@@ -558,6 +567,8 @@ def main():
         help='Weight for per-timeframe direction loss (0.0 = disabled, try 0.3 to enable)')
     train_parser.add_argument('--per-tf-loss-ramp-epochs', type=int, default=20,
         help='Epochs to ramp per-TF loss from 0 to full weight (default: 20)')
+    train_parser.add_argument('--resume', type=str, default=None,
+                              help='Resume from checkpoint (path to .pt file)')
     train_parser.add_argument('--seed', type=int, default=42,
         help='Random seed for reproducibility (default: 42)')
 

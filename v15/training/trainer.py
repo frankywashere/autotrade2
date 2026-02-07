@@ -12,6 +12,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts, LambdaLR, SequentialLR
 from torch.utils.data import DataLoader
 from typing import Dict, Optional, Tuple, List, Any
+from collections import defaultdict
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
@@ -405,6 +406,7 @@ class Trainer:
         self.metrics_tracker = MetricsTracker()
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
+        self.start_epoch = 1  # Can be overridden by load_checkpoint()
 
         # Window selection metrics
         self.window_selection_metrics = {
@@ -574,6 +576,21 @@ class Trainer:
         else:  # mse
             per_tf_loss = F.mse_loss(pred_mean_valid, target_valid)
 
+        losses['per_tf_duration_mae'] = (pred_mean_valid - target_valid).abs().mean().item()
+        if self.config.duration_loss_type == 'gaussian_nll':
+            losses['per_tf_duration_mean_pred_std'] = torch.exp(pred_log_std_valid).mean().item()
+
+        # Per-individual-TF MAE (iterate over TF indices)
+        pred_mean = per_tf_preds['duration_mean']  # [batch, n_tfs]
+        per_tf_duration = labels.get('per_tf_duration')  # [batch, n_tfs]
+        n_tfs = valid_mask.shape[1] if valid_mask.dim() > 1 else 0
+        for tf_idx in range(n_tfs):
+            tf_valid = valid_mask[:, tf_idx] if valid_mask.dim() > 1 else valid_mask
+            if tf_valid.any():
+                tf_pred = pred_mean[:, tf_idx][tf_valid]
+                tf_target = per_tf_duration[:, tf_idx][tf_valid].float()
+                losses[f'per_tf_duration_mae_tf{tf_idx}'] = (tf_pred - tf_target).abs().mean().item()
+
         losses['per_tf_duration'] = per_tf_loss.item()
         losses['per_tf_n_valid'] = int(valid_mask.sum().item())
 
@@ -685,6 +702,9 @@ class Trainer:
             else:  # mse
                 duration_loss = F.mse_loss(duration_mean, duration_target)
 
+            losses['duration_mae'] = (duration_mean - duration_target).abs().mean().item()
+            if self.config.duration_loss_type == 'gaussian_nll':
+                losses['duration_mean_pred_std'] = torch.exp(predictions['duration_log_std'][duration_valid]).mean().item()
             losses['duration'] = duration_loss.item()
             losses['duration_n_valid'] = int(duration_valid.sum().item())
         else:
@@ -2135,12 +2155,20 @@ class Trainer:
         self.feature_names = checkpoint.get('feature_names')
         self.correlation_info = checkpoint.get('correlation_info')
 
+        # Resume epoch: next epoch after the saved one
+        saved_epoch = checkpoint.get('epoch', 0)
+        self.start_epoch = saved_epoch + 1
+
+        # Restore metrics history
+        if 'metrics' in checkpoint:
+            self.metrics_tracker.history = defaultdict(list, checkpoint['metrics'])
+
         # Load window selection metrics
         if 'window_selection_metrics' in checkpoint:
             self.window_selection_metrics = checkpoint['window_selection_metrics']
 
         if is_main_process():
-            logger.info(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+            logger.info(f"Loaded checkpoint from epoch {saved_epoch}, resuming at epoch {self.start_epoch}")
 
     def train(self) -> Dict[str, List[float]]:
         """
@@ -2190,7 +2218,10 @@ class Trainer:
         if self.distributed:
             barrier()
 
-        for epoch in range(1, self.max_epochs + 1):
+        if self.start_epoch > 1 and is_main_process():
+            logger.info(f"Resuming from epoch {self.start_epoch} (max {self.max_epochs})")
+
+        for epoch in range(self.start_epoch, self.max_epochs + 1):
             # Train
             train_losses = self.train_epoch(epoch)
             self.metrics_tracker.update('train', train_losses)
@@ -2206,6 +2237,14 @@ class Trainer:
                 log_msg += f", val_loss={val_losses.get('val_total', 0):.4f}"
             log_msg += f", lr={current_lr:.6e}"
 
+            # Add duration MAE and predicted std to log
+            if 'duration_mae' in train_losses:
+                log_msg += f", dur_mae={train_losses['duration_mae']:.1f}"
+            if 'val_duration_mae' in val_losses:
+                log_msg += f", val_mae={val_losses['val_duration_mae']:.1f}"
+            if 'duration_mean_pred_std' in train_losses:
+                log_msg += f", dur_std={train_losses['duration_mean_pred_std']:.2f}"
+
             # Add window selection metrics to log
             if self.use_end_to_end:
                 if 'ws_accuracy' in train_losses:
@@ -2216,6 +2255,17 @@ class Trainer:
 
             if is_main_process():
                 logger.info(log_msg)
+
+            # Log per-TF duration MAE every 10 epochs
+            if epoch % 10 == 0 and is_main_process():
+                tf_names = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
+                tf_mae_parts = []
+                for tf_idx, tf_name in enumerate(tf_names):
+                    key = f'per_tf_duration_mae_tf{tf_idx}'
+                    if key in train_losses:
+                        tf_mae_parts.append(f"{tf_name}={train_losses[key]:.1f}")
+                if tf_mae_parts:
+                    logger.info(f"  Per-TF duration MAE: {', '.join(tf_mae_parts)}")
 
             # Log detailed window selection info periodically
             if self.use_end_to_end and epoch % 10 == 0 and is_main_process():
