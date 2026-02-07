@@ -265,7 +265,7 @@ class SignalGenerator:
             f"Signal strength is {strength_desc} ({strength:.1%}), suggesting a potential {action}."
         )
 
-    def analyze(self, rsi_data: Dict[str, Any], vix_confirmation: Optional[Any] = None, rsi_history: Optional[Dict[str, list]] = None, vix_rsi_history: Optional[Dict[str, list]] = None, vix_daily_changes: Optional[list] = None) -> Dict[str, Any]:
+    def analyze(self, rsi_data: Dict[str, Any], vix_confirmation: Optional[Any] = None, rsi_history: Optional[Dict[str, list]] = None, vix_rsi_history: Optional[Dict[str, list]] = None, vix_daily_changes: Optional[list] = None, channel_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Analyze RSI data and generate a trading signal.
 
@@ -464,6 +464,65 @@ class SignalGenerator:
                         if rsi_val < 20:
                             weekly_extreme_buy = True
 
+        # Channel confluence detection (TSLA only)
+        # Adds context from linear regression channels on 5m, 15m, 1h, 4h
+        channel_confluence = False
+        channel_near_lower = False
+        channel_near_upper = False
+        channel_in_valid = False
+        channel_details = {}
+
+        if symbol == 'TSLA' and channel_context:
+            # Check each timeframe's channel data
+            for tf, ch_data in channel_context.items():
+                if not isinstance(ch_data, dict):
+                    continue
+                channel = ch_data.get('channel', {})
+                meets = ch_data.get('meets_criteria', False)
+
+                if not meets or not channel.get('valid', False):
+                    continue
+
+                # Track which TFs have valid channels
+                channel_in_valid = True
+
+                if channel.get('near_lower', False):
+                    channel_near_lower = True
+                if channel.get('near_upper', False):
+                    channel_near_upper = True
+
+            # Channel confluence: RSI signal + channel position agree
+            # BUY signals: RSI oversold + price near channel lower band
+            if channel_near_lower and signal in ('SHORT_TERM_BUY', 'BUY', 'STRONG_BUY', 'LONG_TERM_BUY'):
+                channel_confluence = True
+            # SELL signals: RSI overbought + price near channel upper band
+            elif channel_near_upper and signal in ('SHORT_TERM_SELL', 'SELL', 'STRONG_SELL', 'LONG_TERM_SELL'):
+                channel_confluence = True
+
+            # Build details for dashboard display
+            channel_details = {
+                'in_valid_channel': channel_in_valid,
+                'near_lower_band': channel_near_lower,
+                'near_upper_band': channel_near_upper,
+                'confluence': channel_confluence,
+                'timeframes': {}  # Per-TF details
+            }
+            for tf, ch_data in channel_context.items():
+                if not isinstance(ch_data, dict):
+                    continue
+                channel = ch_data.get('channel', {})
+                if channel.get('valid', False):
+                    channel_details['timeframes'][tf] = {
+                        'r_squared': channel.get('r_squared', 0),
+                        'position': channel.get('position', 0.5),
+                        'direction': channel.get('direction', 'unknown'),
+                        'near_lower': channel.get('near_lower', False),
+                        'near_upper': channel.get('near_upper', False),
+                        'width_pct': channel.get('width_pct', 0),
+                        'age': channel.get('age', 0),
+                        'meets_criteria': ch_data.get('meets_criteria', False),
+                    }
+
         # Calculate strength (with optional VIX confirmation bonus)
         strength = self._calculate_strength(rsi_data, timeframe_status, confluence_score, signal, vix_confirmation)
 
@@ -480,6 +539,8 @@ class SignalGenerator:
             'recovery_suppressed': suppressed,
             'vix_cooldown_active': vix_recently_spiked,
             'weekly_extreme_buy': weekly_extreme_buy,
+            'channel_confluence': channel_confluence,
+            'channel_details': channel_details,
         }
 
     def vix_confirms_signal(self, vix_rsi: Optional[float] = None, signal_type: Optional[str] = None) -> bool:

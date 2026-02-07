@@ -15,6 +15,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rsi_monitor import RSIMonitor, DataFetcher, SignalGenerator, VIXAnalyzer
+from rsi_monitor.channel import get_channel_context, CHANNEL_WIN_RATES
 
 
 # Signal color mapping
@@ -630,6 +631,19 @@ def main():
             if hist:
                 vix_rsi_history[tf] = hist
 
+    # Compute channel context for TSLA only (5m, 15m, 1h, 4h)
+    tsla_channel_context = {}
+    if "TSLA" in all_symbols:
+        try:
+            tsla_channel_context = get_channel_context(
+                rsi_results=rsi_results,
+                data_fetcher=data_fetcher,
+                symbol="TSLA",
+                prepost=prepost
+            )
+        except Exception:
+            tsla_channel_context = {}
+
     # Generate signals for all symbols (with VIX confirmation for strength bonus)
     signals = {}
 
@@ -648,7 +662,8 @@ def main():
                 else:
                     plain_rsi[tf] = data
             signal_input = {'symbol': symbol, 'timeframes': plain_rsi}
-            signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation, rsi_history=rsi_history, vix_rsi_history=vix_rsi_history, vix_daily_changes=vix_daily_changes)
+            ch_ctx = tsla_channel_context if symbol == 'TSLA' else None
+            signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation, rsi_history=rsi_history, vix_rsi_history=vix_rsi_history, vix_daily_changes=vix_daily_changes, channel_context=ch_ctx)
         except Exception as e:
             st.warning(f"Error generating signal for {symbol}: {e}")
             signals[symbol] = {"signal": "NEUTRAL", "strength": 0}
@@ -814,6 +829,29 @@ def main():
                         if weekly_extreme:
                             weekly_extreme_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #00C85122; color: #00C851; font-size: 0.7em; font-weight: 500; margin-left: 6px;">WEEKLY EXTREME BUY</span>'
 
+                        # Channel confluence indicator (TSLA only)
+                        channel_confluence = signal_data.get("channel_confluence", False)
+                        channel_details = signal_data.get("channel_details", {})
+                        channel_html = ""
+                        if channel_details.get("in_valid_channel", False):
+                            if channel_confluence:
+                                # RSI + channel agree — show win rate
+                                # Determine which TF has the strongest channel
+                                best_tf = None
+                                best_r2 = 0
+                                for tf, td in channel_details.get("timeframes", {}).items():
+                                    if td.get("meets_criteria") and td.get("r_squared", 0) > best_r2:
+                                        best_r2 = td["r_squared"]
+                                        best_tf = tf
+                                win_key = (best_tf, 'rsi_channel_buy') if 'BUY' in signal else (best_tf, 'rsi_channel_buy')
+                                win_rate = CHANNEL_WIN_RATES.get(win_key, 0)
+                                pf_key = (best_tf, 'rsi_channel_pf')
+                                pf = CHANNEL_WIN_RATES.get(pf_key, 0)
+                                channel_html = f'<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #3A82FF22; color: #3A82FF; font-size: 0.7em; font-weight: 500; margin-left: 6px;">CHANNEL CONFLUENCE ({win_rate:.0f}% win)</span>'
+                            else:
+                                # In valid channel but no RSI+channel agreement
+                                channel_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #3A82FF11; color: #3A82FF88; font-size: 0.7em; font-weight: 500; margin-left: 6px;">in channel</span>'
+
                         # Styled card with top accent bar
                         st.markdown(f"""
                         <div style="background-color: #1a1c23; border: 1px solid #2d3039; border-radius: 12px; padding: 0; margin-bottom: 16px; overflow: hidden;">
@@ -824,7 +862,7 @@ def main():
                                         <span style="font-size: 1.3em; font-weight: 700; color: #e1e3ea;">{symbol}</span>
                                         <span style="font-size: 1.15em; font-weight: 600; color: #8b8fa3;">{price_str}</span>
                                     </div>
-                                    <div style="display: flex; align-items: center;"><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{SIGNAL_DISPLAY.get(signal, signal)}</span>{cooldown_html}{weekly_extreme_html}</div>
+                                    <div style="display: flex; align-items: center; flex-wrap: wrap;"><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{SIGNAL_DISPLAY.get(signal, signal)}</span>{cooldown_html}{weekly_extreme_html}{channel_html}</div>
                                 </div>
                                 <div style="display: flex; gap: 10px; margin-bottom: 6px;">
                                     <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">
@@ -866,6 +904,34 @@ def main():
                                 width='stretch',
                                 hide_index=True
                             )
+
+                            # Channel details expander (TSLA only)
+                            if symbol == 'TSLA' and channel_details.get("timeframes"):
+                                with st.expander("Channel Analysis", expanded=False):
+                                    ch_tfs = channel_details.get("timeframes", {})
+                                    if ch_tfs:
+                                        ch_rows = []
+                                        for tf in ['5m', '15m', '1h', '4h']:
+                                            td = ch_tfs.get(tf)
+                                            if td:
+                                                pos = td.get('position', 0.5)
+                                                pos_label = "Near Lower" if pos < 0.25 else "Near Upper" if pos > 0.75 else "Middle"
+                                                ch_rows.append({
+                                                    "Timeframe": tf,
+                                                    "R²": f"{td.get('r_squared', 0):.3f}",
+                                                    "Direction": td.get('direction', '?').title(),
+                                                    "Position": f"{pos:.0%}",
+                                                    "Zone": pos_label,
+                                                    "Width": f"{td.get('width_pct', 0):.1f}%",
+                                                    "Age": td.get('age', 0),
+                                                    "Valid": "Yes" if td.get('meets_criteria') else "No",
+                                                })
+                                        if ch_rows:
+                                            st.dataframe(pd.DataFrame(ch_rows), hide_index=True, use_container_width=True)
+                                        else:
+                                            st.caption("No valid channels detected on any timeframe")
+                                    else:
+                                        st.caption("No channel data available")
                         else:
                             st.warning("No RSI data available")
 
