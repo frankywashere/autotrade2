@@ -766,7 +766,6 @@ def main():
     st.markdown('<div style="margin: 1.5rem 0;"></div>', unsafe_allow_html=True)
 
     # Individual Symbol Cards
-    st.markdown('<h3 style="color: #a0a3b0; font-weight: 500; margin-bottom: 16px;">Symbol Details</h3>', unsafe_allow_html=True)
 
     if not selected_symbols:
         st.info("Select at least one symbol from the sidebar to view RSI data.")
