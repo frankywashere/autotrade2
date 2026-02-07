@@ -1052,14 +1052,28 @@ def main():
     data_dir = st.sidebar.text_input("Data Directory", value="data")
     models_dir = Path("models")
     model_files = sorted(models_dir.glob("*.pt")) if models_dir.exists() else []
+
+    def _model_label(p: Path) -> str:
+        """Format model path with file modification timestamp."""
+        try:
+            import datetime
+            mtime = p.stat().st_mtime
+            ts = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            return f"{p.name}  ({ts})"
+        except OSError:
+            return str(p)
+
     model_options = [str(f) for f in model_files]
+    model_labels = [_model_label(f) for f in model_files]
 
     if model_options:
-        checkpoint_path = st.sidebar.selectbox(
+        selected_idx = st.sidebar.selectbox(
             "Model Checkpoint",
-            options=model_options,
+            options=range(len(model_options)),
+            format_func=lambda i: model_labels[i],
             index=0,
         )
+        checkpoint_path = model_options[selected_idx]
     else:
         checkpoint_path = st.sidebar.text_input(
             "Model Checkpoint",
