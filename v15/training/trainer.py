@@ -576,9 +576,9 @@ class Trainer:
         else:  # mse
             per_tf_loss = F.mse_loss(pred_mean_valid, target_valid)
 
-        losses['per_tf_duration_mae'] = (pred_mean_valid - target_valid).abs().mean().item()
+        losses['per_tf_duration_mae'] = (pred_mean_valid - target_valid).abs().mean().detach()
         if self.config.duration_loss_type == 'gaussian_nll':
-            losses['per_tf_duration_mean_pred_std'] = torch.exp(pred_log_std_valid).mean().item()
+            losses['per_tf_duration_mean_pred_std'] = torch.exp(pred_log_std_valid).mean().detach()
 
         # Per-individual-TF MAE (iterate over TF indices)
         pred_mean = per_tf_preds['duration_mean']  # [batch, n_tfs]
@@ -589,10 +589,10 @@ class Trainer:
             if tf_valid.any():
                 tf_pred = pred_mean[:, tf_idx][tf_valid]
                 tf_target = per_tf_duration[:, tf_idx][tf_valid].float()
-                losses[f'per_tf_duration_mae_tf{tf_idx}'] = (tf_pred - tf_target).abs().mean().item()
+                losses[f'per_tf_duration_mae_tf{tf_idx}'] = (tf_pred - tf_target).abs().mean().detach()
 
-        losses['per_tf_duration'] = per_tf_loss.item()
-        losses['per_tf_n_valid'] = int(valid_mask.sum().item())
+        losses['per_tf_duration'] = per_tf_loss.detach()
+        losses['per_tf_n_valid'] = valid_mask.sum().detach()
 
         return per_tf_loss, losses
 
@@ -635,7 +635,7 @@ class Trainer:
         bce = F.binary_cross_entropy_with_logits(pred_logits, targets, reduction='none')
         loss = (focal_weight * bce).mean()
 
-        return loss, {'per_tf_direction': loss.item(), 'per_tf_dir_n_valid': int(valid_mask.sum().item())}
+        return loss, {'per_tf_direction': loss.detach(), 'per_tf_dir_n_valid': valid_mask.sum().detach()}
 
     def _get_per_tf_ramp(self, epoch: int) -> float:
         """Get per-TF loss ramp factor (0.0 to 1.0) based on epoch."""
@@ -702,11 +702,11 @@ class Trainer:
             else:  # mse
                 duration_loss = F.mse_loss(duration_mean, duration_target)
 
-            losses['duration_mae'] = (duration_mean - duration_target).abs().mean().item()
+            losses['duration_mae'] = (duration_mean - duration_target).abs().mean().detach()
             if self.config.duration_loss_type == 'gaussian_nll':
-                losses['duration_mean_pred_std'] = torch.exp(predictions['duration_log_std'][duration_valid]).mean().item()
-            losses['duration'] = duration_loss.item()
-            losses['duration_n_valid'] = int(duration_valid.sum().item())
+                losses['duration_mean_pred_std'] = torch.exp(predictions['duration_log_std'][duration_valid]).mean().detach()
+            losses['duration'] = duration_loss.detach()
+            losses['duration_n_valid'] = duration_valid.sum().detach()
         else:
             duration_loss = torch.tensor(0.0, device=self.device)
             losses['duration'] = 0.0
@@ -730,8 +730,8 @@ class Trainer:
                 direction_loss = F.binary_cross_entropy_with_logits(
                     direction_logits, direction_target
                 )
-            losses['direction'] = direction_loss.item()
-            losses['direction_n_valid'] = int(direction_valid.sum().item())
+            losses['direction'] = direction_loss.detach()
+            losses['direction_n_valid'] = direction_valid.sum().detach()
         else:
             direction_loss = torch.tensor(0.0, device=self.device)
             losses['direction'] = 0.0
@@ -744,8 +744,8 @@ class Trainer:
             new_channel_loss = F.cross_entropy(
                 new_channel_logits, new_channel_target
             )
-            losses['new_channel'] = new_channel_loss.item()
-            losses['new_channel_n_valid'] = int(new_channel_valid.sum().item())
+            losses['new_channel'] = new_channel_loss.detach()
+            losses['new_channel_n_valid'] = new_channel_valid.sum().detach()
         else:
             new_channel_loss = torch.tensor(0.0, device=self.device)
             losses['new_channel'] = 0.0
@@ -772,8 +772,8 @@ class Trainer:
             else:
                 tsla_btb_loss = F.huber_loss(tsla_btb_mean, tsla_btb_target, delta=self.config.huber_delta)
 
-            losses['tsla_bars_to_break'] = tsla_btb_loss.item()
-            losses['tsla_bars_to_break_n_valid'] = int(tsla_break_scan_valid.sum().item())
+            losses['tsla_bars_to_break'] = tsla_btb_loss.detach()
+            losses['tsla_bars_to_break_n_valid'] = tsla_break_scan_valid.sum().detach()
         else:
             tsla_btb_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_bars_to_break'] = 0.0
@@ -793,7 +793,7 @@ class Trainer:
             else:
                 tsla_dir_loss = F.binary_cross_entropy_with_logits(tsla_dir_logits, tsla_dir_target)
 
-            losses['tsla_break_direction'] = tsla_dir_loss.item()
+            losses['tsla_break_direction'] = tsla_dir_loss.detach()
         else:
             tsla_dir_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_break_direction'] = 0.0
@@ -814,7 +814,7 @@ class Trainer:
             else:
                 tsla_mag_loss = F.huber_loss(tsla_mag_mean, tsla_mag_target, delta=self.config.huber_delta)
 
-            losses['tsla_break_magnitude'] = tsla_mag_loss.item()
+            losses['tsla_break_magnitude'] = tsla_mag_loss.detach()
         else:
             tsla_mag_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_break_magnitude'] = 0.0
@@ -833,7 +833,7 @@ class Trainer:
             else:
                 tsla_ret_loss = F.binary_cross_entropy_with_logits(tsla_ret_logits, tsla_ret_target)
 
-            losses['tsla_returned'] = tsla_ret_loss.item()
+            losses['tsla_returned'] = tsla_ret_loss.detach()
         else:
             tsla_ret_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_returned'] = 0.0
@@ -854,7 +854,7 @@ class Trainer:
             else:
                 tsla_bounces_loss = F.huber_loss(tsla_bounces_mean, tsla_bounces_target, delta=self.config.huber_delta)
 
-            losses['tsla_bounces'] = tsla_bounces_loss.item()
+            losses['tsla_bounces'] = tsla_bounces_loss.detach()
         else:
             tsla_bounces_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_bounces'] = 0.0
@@ -873,7 +873,7 @@ class Trainer:
             else:
                 tsla_cc_loss = F.binary_cross_entropy_with_logits(tsla_cc_logits, tsla_cc_target)
 
-            losses['tsla_channel_continued'] = tsla_cc_loss.item()
+            losses['tsla_channel_continued'] = tsla_cc_loss.detach()
         else:
             tsla_cc_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_channel_continued'] = 0.0
@@ -899,8 +899,8 @@ class Trainer:
             else:
                 spy_btb_loss = F.huber_loss(spy_btb_mean, spy_btb_target, delta=self.config.huber_delta)
 
-            losses['spy_bars_to_break'] = spy_btb_loss.item()
-            losses['spy_bars_to_break_n_valid'] = int(spy_break_scan_valid.sum().item())
+            losses['spy_bars_to_break'] = spy_btb_loss.detach()
+            losses['spy_bars_to_break_n_valid'] = spy_break_scan_valid.sum().detach()
         else:
             spy_btb_loss = torch.tensor(0.0, device=self.device)
             losses['spy_bars_to_break'] = 0.0
@@ -920,7 +920,7 @@ class Trainer:
             else:
                 spy_dir_loss = F.binary_cross_entropy_with_logits(spy_dir_logits, spy_dir_target)
 
-            losses['spy_break_direction'] = spy_dir_loss.item()
+            losses['spy_break_direction'] = spy_dir_loss.detach()
         else:
             spy_dir_loss = torch.tensor(0.0, device=self.device)
             losses['spy_break_direction'] = 0.0
@@ -941,7 +941,7 @@ class Trainer:
             else:
                 spy_mag_loss = F.huber_loss(spy_mag_mean, spy_mag_target, delta=self.config.huber_delta)
 
-            losses['spy_break_magnitude'] = spy_mag_loss.item()
+            losses['spy_break_magnitude'] = spy_mag_loss.detach()
         else:
             spy_mag_loss = torch.tensor(0.0, device=self.device)
             losses['spy_break_magnitude'] = 0.0
@@ -960,7 +960,7 @@ class Trainer:
             else:
                 spy_ret_loss = F.binary_cross_entropy_with_logits(spy_ret_logits, spy_ret_target)
 
-            losses['spy_returned'] = spy_ret_loss.item()
+            losses['spy_returned'] = spy_ret_loss.detach()
         else:
             spy_ret_loss = torch.tensor(0.0, device=self.device)
             losses['spy_returned'] = 0.0
@@ -981,7 +981,7 @@ class Trainer:
             else:
                 spy_bounces_loss = F.huber_loss(spy_bounces_mean, spy_bounces_target, delta=self.config.huber_delta)
 
-            losses['spy_bounces'] = spy_bounces_loss.item()
+            losses['spy_bounces'] = spy_bounces_loss.detach()
         else:
             spy_bounces_loss = torch.tensor(0.0, device=self.device)
             losses['spy_bounces'] = 0.0
@@ -1000,7 +1000,7 @@ class Trainer:
             else:
                 spy_cc_loss = F.binary_cross_entropy_with_logits(spy_cc_logits, spy_cc_target)
 
-            losses['spy_channel_continued'] = spy_cc_loss.item()
+            losses['spy_channel_continued'] = spy_cc_loss.detach()
         else:
             spy_cc_loss = torch.tensor(0.0, device=self.device)
             losses['spy_channel_continued'] = 0.0
@@ -1024,8 +1024,8 @@ class Trainer:
             else:
                 cross_dir_loss = F.binary_cross_entropy_with_logits(cross_dir_logits, cross_dir_target)
 
-            losses['cross_direction_aligned'] = cross_dir_loss.item()
-            losses['cross_direction_aligned_n_valid'] = int(cross_valid.sum().item())
+            losses['cross_direction_aligned'] = cross_dir_loss.detach()
+            losses['cross_direction_aligned_n_valid'] = cross_valid.sum().detach()
         else:
             cross_dir_loss = torch.tensor(0.0, device=self.device)
             losses['cross_direction_aligned'] = 0.0
@@ -1037,7 +1037,7 @@ class Trainer:
             cross_who_target = labels['cross_who_broke_first'][cross_valid].long()
             cross_who_loss = F.cross_entropy(cross_who_logits, cross_who_target)
 
-            losses['cross_who_broke_first'] = cross_who_loss.item()
+            losses['cross_who_broke_first'] = cross_who_loss.detach()
         else:
             cross_who_loss = torch.tensor(0.0, device=self.device)
             losses['cross_who_broke_first'] = 0.0
@@ -1058,7 +1058,7 @@ class Trainer:
             else:
                 cross_lag_loss = F.huber_loss(cross_lag_mean, cross_lag_target, delta=self.config.huber_delta)
 
-            losses['cross_break_lag'] = cross_lag_loss.item()
+            losses['cross_break_lag'] = cross_lag_loss.detach()
         else:
             cross_lag_loss = torch.tensor(0.0, device=self.device)
             losses['cross_break_lag'] = 0.0
@@ -1077,7 +1077,7 @@ class Trainer:
             else:
                 cross_perm_loss = F.binary_cross_entropy_with_logits(cross_perm_logits, cross_perm_target)
 
-            losses['cross_both_permanent'] = cross_perm_loss.item()
+            losses['cross_both_permanent'] = cross_perm_loss.detach()
         else:
             cross_perm_loss = torch.tensor(0.0, device=self.device)
             losses['cross_both_permanent'] = 0.0
@@ -1096,7 +1096,7 @@ class Trainer:
             else:
                 cross_ret_loss = F.binary_cross_entropy_with_logits(cross_ret_logits, cross_ret_target)
 
-            losses['cross_return_aligned'] = cross_ret_loss.item()
+            losses['cross_return_aligned'] = cross_ret_loss.detach()
         else:
             cross_ret_loss = torch.tensor(0.0, device=self.device)
             losses['cross_return_aligned'] = 0.0
@@ -1121,7 +1121,7 @@ class Trainer:
             else:
                 tsla_dur_loss = F.huber_loss(tsla_dur_mean, tsla_dur_target, delta=self.config.huber_delta)
 
-            losses['tsla_durability'] = tsla_dur_loss.item()
+            losses['tsla_durability'] = tsla_dur_loss.detach()
         else:
             tsla_dur_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_durability'] = 0.0
@@ -1149,7 +1149,7 @@ class Trainer:
             else:
                 tsla_btp_loss = torch.tensor(0.0, device=self.device)
 
-            losses['tsla_bars_to_permanent'] = tsla_btp_loss.item()
+            losses['tsla_bars_to_permanent'] = tsla_btp_loss.detach()
         else:
             tsla_btp_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_bars_to_permanent'] = 0.0
@@ -1170,7 +1170,7 @@ class Trainer:
             else:
                 spy_dur_loss = F.huber_loss(spy_dur_mean, spy_dur_target, delta=self.config.huber_delta)
 
-            losses['spy_durability'] = spy_dur_loss.item()
+            losses['spy_durability'] = spy_dur_loss.detach()
         else:
             spy_dur_loss = torch.tensor(0.0, device=self.device)
             losses['spy_durability'] = 0.0
@@ -1198,7 +1198,7 @@ class Trainer:
             else:
                 spy_btp_loss = torch.tensor(0.0, device=self.device)
 
-            losses['spy_bars_to_permanent'] = spy_btp_loss.item()
+            losses['spy_bars_to_permanent'] = spy_btp_loss.detach()
         else:
             spy_btp_loss = torch.tensor(0.0, device=self.device)
             losses['spy_bars_to_permanent'] = 0.0
@@ -1219,7 +1219,7 @@ class Trainer:
             else:
                 cross_dur_spread_loss = F.huber_loss(cross_dur_mean, cross_dur_target, delta=self.config.huber_delta)
 
-            losses['cross_durability_spread'] = cross_dur_spread_loss.item()
+            losses['cross_durability_spread'] = cross_dur_spread_loss.detach()
         else:
             cross_dur_spread_loss = torch.tensor(0.0, device=self.device)
             losses['cross_durability_spread'] = 0.0
@@ -1244,7 +1244,7 @@ class Trainer:
             else:
                 tsla_rsi_loss = F.huber_loss(tsla_rsi_mean, tsla_rsi_target, delta=self.config.huber_delta)
 
-            losses['tsla_rsi_at_break'] = tsla_rsi_loss.item()
+            losses['tsla_rsi_at_break'] = tsla_rsi_loss.detach()
         else:
             tsla_rsi_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_rsi_at_break'] = 0.0
@@ -1263,7 +1263,7 @@ class Trainer:
             else:
                 tsla_ob_loss = F.binary_cross_entropy_with_logits(tsla_ob_logits, tsla_ob_target)
 
-            losses['tsla_rsi_overbought'] = tsla_ob_loss.item()
+            losses['tsla_rsi_overbought'] = tsla_ob_loss.detach()
         else:
             tsla_ob_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_rsi_overbought'] = 0.0
@@ -1282,7 +1282,7 @@ class Trainer:
             else:
                 tsla_os_loss = F.binary_cross_entropy_with_logits(tsla_os_logits, tsla_os_target)
 
-            losses['tsla_rsi_oversold'] = tsla_os_loss.item()
+            losses['tsla_rsi_oversold'] = tsla_os_loss.detach()
         else:
             tsla_os_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_rsi_oversold'] = 0.0
@@ -1293,7 +1293,7 @@ class Trainer:
             tsla_div_target = labels['tsla_rsi_divergence_at_break'][tsla_break_scan_valid].long()
             tsla_div_loss = F.cross_entropy(tsla_div_logits, tsla_div_target)
 
-            losses['tsla_rsi_divergence'] = tsla_div_loss.item()
+            losses['tsla_rsi_divergence'] = tsla_div_loss.detach()
         else:
             tsla_div_loss = torch.tensor(0.0, device=self.device)
             losses['tsla_rsi_divergence'] = 0.0
@@ -1318,7 +1318,7 @@ class Trainer:
             else:
                 spy_rsi_loss = F.huber_loss(spy_rsi_mean, spy_rsi_target, delta=self.config.huber_delta)
 
-            losses['spy_rsi_at_break'] = spy_rsi_loss.item()
+            losses['spy_rsi_at_break'] = spy_rsi_loss.detach()
         else:
             spy_rsi_loss = torch.tensor(0.0, device=self.device)
             losses['spy_rsi_at_break'] = 0.0
@@ -1337,7 +1337,7 @@ class Trainer:
             else:
                 spy_ob_loss = F.binary_cross_entropy_with_logits(spy_ob_logits, spy_ob_target)
 
-            losses['spy_rsi_overbought'] = spy_ob_loss.item()
+            losses['spy_rsi_overbought'] = spy_ob_loss.detach()
         else:
             spy_ob_loss = torch.tensor(0.0, device=self.device)
             losses['spy_rsi_overbought'] = 0.0
@@ -1356,7 +1356,7 @@ class Trainer:
             else:
                 spy_os_loss = F.binary_cross_entropy_with_logits(spy_os_logits, spy_os_target)
 
-            losses['spy_rsi_oversold'] = spy_os_loss.item()
+            losses['spy_rsi_oversold'] = spy_os_loss.detach()
         else:
             spy_os_loss = torch.tensor(0.0, device=self.device)
             losses['spy_rsi_oversold'] = 0.0
@@ -1367,7 +1367,7 @@ class Trainer:
             spy_div_target = labels['spy_rsi_divergence_at_break'][spy_break_scan_valid].long()
             spy_div_loss = F.cross_entropy(spy_div_logits, spy_div_target)
 
-            losses['spy_rsi_divergence'] = spy_div_loss.item()
+            losses['spy_rsi_divergence'] = spy_div_loss.detach()
         else:
             spy_div_loss = torch.tensor(0.0, device=self.device)
             losses['spy_rsi_divergence'] = 0.0
@@ -1390,7 +1390,7 @@ class Trainer:
             else:
                 cross_rsi_aligned_loss = F.binary_cross_entropy_with_logits(cross_rsi_aligned_logits, cross_rsi_aligned_target)
 
-            losses['cross_rsi_aligned'] = cross_rsi_aligned_loss.item()
+            losses['cross_rsi_aligned'] = cross_rsi_aligned_loss.detach()
         else:
             cross_rsi_aligned_loss = torch.tensor(0.0, device=self.device)
             losses['cross_rsi_aligned'] = 0.0
@@ -1411,7 +1411,7 @@ class Trainer:
             else:
                 cross_rsi_spread_loss = F.huber_loss(cross_rsi_spread_mean, cross_rsi_spread_target, delta=self.config.huber_delta)
 
-            losses['cross_rsi_spread'] = cross_rsi_spread_loss.item()
+            losses['cross_rsi_spread'] = cross_rsi_spread_loss.detach()
         else:
             cross_rsi_spread_loss = torch.tensor(0.0, device=self.device)
             losses['cross_rsi_spread'] = 0.0
@@ -1430,7 +1430,7 @@ class Trainer:
             else:
                 cross_ob_down_loss = F.binary_cross_entropy_with_logits(cross_ob_down_logits, cross_ob_down_target)
 
-            losses['cross_overbought_predicts_down'] = cross_ob_down_loss.item()
+            losses['cross_overbought_predicts_down'] = cross_ob_down_loss.detach()
         else:
             cross_ob_down_loss = torch.tensor(0.0, device=self.device)
             losses['cross_overbought_predicts_down'] = 0.0
@@ -1449,7 +1449,7 @@ class Trainer:
             else:
                 cross_os_up_loss = F.binary_cross_entropy_with_logits(cross_os_up_logits, cross_os_up_target)
 
-            losses['cross_oversold_predicts_up'] = cross_os_up_loss.item()
+            losses['cross_oversold_predicts_up'] = cross_os_up_loss.detach()
         else:
             cross_os_up_loss = torch.tensor(0.0, device=self.device)
             losses['cross_oversold_predicts_up'] = 0.0
@@ -1513,7 +1513,7 @@ class Trainer:
             eps = 1e-8
             entropy = -(window_selection_probs * (window_selection_probs + eps).log()).sum(dim=-1)
             entropy_loss = entropy.mean()
-            losses['entropy'] = entropy_loss.item()
+            losses['entropy'] = entropy_loss.detach()
 
             # Consistency loss: match heuristic best_window (warm-start)
             if heuristic_best_window is not None and self.config.consistency_weight > 0:
@@ -1524,7 +1524,7 @@ class Trainer:
                     window_selection_probs.log() + eps,  # log probs for CE
                     heuristic_best_window
                 )
-                losses['consistency'] = consistency_loss.item()
+                losses['consistency'] = consistency_loss.detach()
             else:
                 consistency_loss = torch.tensor(0.0, device=self.device)
                 losses['consistency'] = 0.0
@@ -1538,17 +1538,17 @@ class Trainer:
 
             # Track window selection statistics
             max_prob = window_selection_probs.max(dim=-1)[0].mean()
-            losses['window_max_prob'] = max_prob.item()
+            losses['window_max_prob'] = max_prob.detach()
 
             # Most selected window (mode of argmax)
             selected_windows = window_selection_probs.argmax(dim=-1)
             window_counts = torch.bincount(selected_windows, minlength=n_windows)
-            losses['window_mode'] = window_counts.argmax().item()
+            losses['window_mode'] = window_counts.argmax().detach()
 
             # Selection accuracy vs heuristic
             if heuristic_best_window is not None:
                 selection_accuracy = (selected_windows == heuristic_best_window).float().mean()
-                losses['selection_accuracy'] = selection_accuracy.item()
+                losses['selection_accuracy'] = selection_accuracy.detach()
 
         # Auxiliary window selection loss (Phase 2a style - without end-to-end)
         elif self.use_window_selection_loss and 'window_logits' in predictions:
@@ -1556,10 +1556,10 @@ class Trainer:
                 window_logits = predictions['window_logits']  # [batch, n_windows]
                 best_window_target = labels['best_window'].long()
                 window_selection_loss = F.cross_entropy(window_logits, best_window_target)
-                losses['window_selection'] = window_selection_loss.item()
+                losses['window_selection'] = window_selection_loss.detach()
                 total_loss = total_loss + self.config.window_selection_weight * window_selection_loss
 
-        losses['total'] = total_loss.item()
+        losses['total'] = total_loss.detach()
 
         return total_loss, losses
 
@@ -1630,16 +1630,16 @@ class Trainer:
             if self.use_end_to_end and isinstance(batch_data, tuple) and len(batch_data) == 3:
                 # End-to-end format: (per_window_features, labels, metadata)
                 per_window_features, labels, metadata = batch_data
-                per_window_features = per_window_features.to(self.device)
-                labels = {k: v.to(self.device) for k, v in labels.items()}
+                per_window_features = per_window_features.to(self.device, non_blocking=True)
+                labels = {k: v.to(self.device, non_blocking=True) for k, v in labels.items()}
 
                 # Get window validity mask and heuristic best window
                 window_valid = metadata.get('window_valid')
                 if window_valid is not None:
-                    window_valid = window_valid.to(self.device)
+                    window_valid = window_valid.to(self.device, non_blocking=True)
                 heuristic_best_window = labels.get('best_window')
                 if heuristic_best_window is not None:
-                    heuristic_best_window = heuristic_best_window.to(self.device)
+                    heuristic_best_window = heuristic_best_window.to(self.device, non_blocking=True)
 
                 # Initialize window selection head on first batch
                 self._init_window_selection_head(per_window_features)
@@ -1648,8 +1648,6 @@ class Trainer:
 
                 # Forward pass with mixed precision (bfloat16 on CUDA, float32 elsewhere)
                 amp_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if self.use_amp else torch.no_grad.__class__()
-
-                self.optimizer.zero_grad()
 
                 with amp_ctx if self.use_amp else torch.enable_grad():
                     # Window selection: select features via learned soft attention
@@ -1660,7 +1658,7 @@ class Trainer:
                     )
 
                     # Model forward on selected features
-                    predictions = self.model(selected_features)
+                    predictions = self.model(selected_features, validate=False)
 
                     # Compute loss including window selection terms
                     loss, loss_components = self.compute_loss(
@@ -1690,8 +1688,8 @@ class Trainer:
             else:
                 # Standard format: (features, labels)
                 features, labels = batch_data
-                features = features.to(self.device)
-                labels = {k: v.to(self.device) for k, v in labels.items()}
+                features = features.to(self.device, non_blocking=True)
+                labels = {k: v.to(self.device, non_blocking=True) for k, v in labels.items()}
 
                 self.optimizer.zero_grad()
 
@@ -1702,15 +1700,13 @@ class Trainer:
                 # Forward pass with mixed precision (bfloat16 on CUDA, float32 elsewhere)
                 amp_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if self.use_amp else torch.enable_grad()
 
-                self.optimizer.zero_grad()
-
                 with amp_ctx:
                     # Use return_per_tf when per-TF loss is enabled
                     if use_per_tf_loss:
-                        predictions = self.model(features, return_per_tf=True)
+                        predictions = self.model(features, return_per_tf=True, validate=False)
                         per_tf_preds = predictions.pop('per_tf')
                     else:
-                        predictions = self.model(features)
+                        predictions = self.model(features, validate=False)
                         per_tf_preds = None
 
                     # Compute main loss
@@ -1734,7 +1730,7 @@ class Trainer:
                         loss_components.update(dur_comp)
                         loss_components.update(dir_comp)
                         loss_components['per_tf_ramp'] = ramp
-                        loss_components['total'] = loss.item()
+                        loss_components['total'] = loss.detach()
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
@@ -1744,14 +1740,12 @@ class Trainer:
                 self.scheduler.step()
             epoch_losses.append(loss_components)
 
-            # Update progress bar
-            postfix = {'loss': f"{loss.item():.4f}"}
-            if self.use_end_to_end and 'selection_accuracy' in loss_components:
-                postfix['sel_acc'] = f"{loss_components['selection_accuracy']:.2f}"
-            if hasattr(pbar, 'set_postfix'):
+            # Update progress bar (use detached loss to avoid sync every batch)
+            if hasattr(pbar, 'set_postfix') and batch_idx % 50 == 0:
+                postfix = {'loss': f"{loss.detach().item():.4f}"}
                 pbar.set_postfix(postfix)
 
-        # Average losses (handle varying keys across batches)
+        # Average losses - convert detached GPU tensors to floats in one sync
         all_keys = set()
         for d in epoch_losses:
             all_keys.update(d.keys())
@@ -1760,7 +1754,9 @@ class Trainer:
         for k in all_keys:
             values = [d.get(k, 0.0) for d in epoch_losses if k in d]
             if values:
-                avg_losses[k] = sum(values) / len(values)
+                # Convert any remaining GPU tensors to Python floats
+                float_values = [v.item() if hasattr(v, 'item') else float(v) for v in values]
+                avg_losses[k] = sum(float_values) / len(float_values)
 
         # Sync losses across ranks
         if self.distributed:
@@ -1799,16 +1795,16 @@ class Trainer:
             if self.use_end_to_end and isinstance(batch_data, tuple) and len(batch_data) == 3:
                 # End-to-end format: (per_window_features, labels, metadata)
                 per_window_features, labels, metadata = batch_data
-                per_window_features = per_window_features.to(self.device)
-                labels = {k: v.to(self.device) for k, v in labels.items()}
+                per_window_features = per_window_features.to(self.device, non_blocking=True)
+                labels = {k: v.to(self.device, non_blocking=True) for k, v in labels.items()}
 
                 # Get window validity mask and heuristic best window
                 window_valid = metadata.get('window_valid')
                 if window_valid is not None:
-                    window_valid = window_valid.to(self.device)
+                    window_valid = window_valid.to(self.device, non_blocking=True)
                 heuristic_best_window = labels.get('best_window')
                 if heuristic_best_window is not None:
-                    heuristic_best_window = heuristic_best_window.to(self.device)
+                    heuristic_best_window = heuristic_best_window.to(self.device, non_blocking=True)
 
                 # Use hard selection for validation (argmax instead of soft)
                 if self.window_selection_head is not None:
@@ -1824,7 +1820,7 @@ class Trainer:
                     selected_features = per_window_features[:, 0, :]
                     selection_probs = None
 
-                predictions = self.model(selected_features)
+                predictions = self.model(selected_features, validate=False)
                 loss, loss_components = self.compute_loss(
                     predictions, labels,
                     window_selection_probs=selection_probs,
@@ -1841,8 +1837,8 @@ class Trainer:
             else:
                 # Standard format: (features, labels)
                 features, labels = batch_data
-                features = features.to(self.device)
-                labels = {k: v.to(self.device) for k, v in labels.items()}
+                features = features.to(self.device, non_blocking=True)
+                labels = {k: v.to(self.device, non_blocking=True) for k, v in labels.items()}
 
                 # Check if per-TF loss is enabled
                 use_per_tf_loss = (self.config.per_tf_loss_weight > 0 or
@@ -1850,10 +1846,10 @@ class Trainer:
 
                 # Use return_per_tf when per-TF loss is enabled
                 if use_per_tf_loss:
-                    predictions = self.model(features, return_per_tf=True)
+                    predictions = self.model(features, return_per_tf=True, validate=False)
                     per_tf_preds = predictions.pop('per_tf')
                 else:
-                    predictions = self.model(features)
+                    predictions = self.model(features, validate=False)
                     per_tf_preds = None
 
                 # Compute main loss
@@ -1874,7 +1870,7 @@ class Trainer:
 
                     loss_components.update(dur_comp)
                     loss_components.update(dir_comp)
-                    loss_components['total'] = loss.item()
+                    loss_components['total'] = loss.detach()
 
             val_losses.append(loss_components)
             all_predictions.append({k: v.cpu() for k, v in predictions.items()})
@@ -1889,7 +1885,8 @@ class Trainer:
         for k in all_keys:
             values = [d.get(k, 0.0) for d in val_losses if k in d]
             if values:
-                avg_losses[f'val_{k}'] = sum(values) / len(values)
+                float_values = [v.item() if hasattr(v, 'item') else float(v) for v in values]
+                avg_losses[f'val_{k}'] = sum(float_values) / len(float_values)
 
         # Sync losses across ranks
         if self.distributed:

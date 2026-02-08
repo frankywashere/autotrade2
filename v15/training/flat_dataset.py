@@ -206,20 +206,25 @@ class FlatDataset(Dataset):
         )
 
         # Load labels into RAM (small relative to features)
-        self.labels: Dict[str, np.ndarray] = {}
+        labels_np: Dict[str, np.ndarray] = {}
         labels_dir = flat_dir / 'labels'
         for npy_file in sorted(labels_dir.glob('*.npy')):
-            self.labels[npy_file.stem] = np.load(str(npy_file))
+            labels_np[npy_file.stem] = np.load(str(npy_file))
 
         # Fix 1D validity arrays that should be [N, n_cols] to match their companion data arrays
-        for key in list(self.labels.keys()):
-            if key.endswith('_valid') and self.labels[key].ndim == 1:
+        for key in list(labels_np.keys()):
+            if key.endswith('_valid') and labels_np[key].ndim == 1:
                 data_key = key.replace('_valid', '')
-                if data_key in self.labels and self.labels[data_key].ndim == 2:
-                    n_cols = self.labels[data_key].shape[1]
-                    if self.labels[key].shape[0] == self.num_samples * n_cols:
-                        self.labels[key] = self.labels[key].reshape(self.num_samples, n_cols)
+                if data_key in labels_np and labels_np[data_key].ndim == 2:
+                    n_cols = labels_np[data_key].shape[1]
+                    if labels_np[key].shape[0] == self.num_samples * n_cols:
+                        labels_np[key] = labels_np[key].reshape(self.num_samples, n_cols)
                         print(f"  Reshaped {key}: [{self.num_samples * n_cols}] -> [{self.num_samples}, {n_cols}]")
+
+        # Pre-convert labels to tensors once (avoids 55 torch.tensor() calls per __getitem__)
+        self.labels: Dict[str, torch.Tensor] = {
+            k: torch.from_numpy(v) for k, v in labels_np.items()
+        }
 
         print(f"FlatDataset loaded: {self.num_samples:,} samples, "
               f"{self.num_features:,} features, {len(self.labels)} label arrays")
@@ -230,8 +235,8 @@ class FlatDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         # .copy() needed because mmap returns read-only view
         features = torch.from_numpy(self.features[idx].copy())
-        # torch.tensor handles both numpy scalars and arrays
-        labels = {k: torch.tensor(v[idx]) for k, v in self.labels.items()}
+        # Index pre-converted tensors (zero-copy views, no allocation)
+        labels = {k: v[idx] for k, v in self.labels.items()}
         return features, labels
 
     def get_num_features(self) -> int:
@@ -290,13 +295,20 @@ def create_flat_dataloaders(
     else:
         val_sampler = None
 
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = 2
+
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
 
     val_loader = DataLoader(
@@ -304,8 +316,7 @@ def create_flat_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         sampler=val_sampler,
-        num_workers=num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
 
     return train_loader, val_loader, dataset.get_num_features()
