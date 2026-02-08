@@ -1748,7 +1748,8 @@ class Trainer:
             postfix = {'loss': f"{loss.item():.4f}"}
             if self.use_end_to_end and 'selection_accuracy' in loss_components:
                 postfix['sel_acc'] = f"{loss_components['selection_accuracy']:.2f}"
-            pbar.set_postfix(postfix)
+            if hasattr(pbar, 'set_postfix'):
+                pbar.set_postfix(postfix)
 
         # Average losses (handle varying keys across batches)
         all_keys = set()
