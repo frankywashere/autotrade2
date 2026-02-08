@@ -2155,13 +2155,30 @@ class Trainer:
             if is_main_process():
                 logger.info("Loaded window selection head state")
 
-        # Load optimizer state
+        # Load optimizer state (skip if parameter count changed, e.g. V1->V2 head upgrade)
         if 'optimizer_state_dict' in checkpoint:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except (ValueError, RuntimeError) as e:
+                if is_main_process():
+                    logger.warning(f"Could not load optimizer state (param count changed?): {e}")
+                    logger.warning("Optimizer will start fresh — momentum/variance rebuild in ~1 epoch")
 
-        # Load scheduler state
+        # Load scheduler state — skip if total_steps changed (e.g. different --epochs)
+        # OneCycleLR bakes total_steps into its schedule; loading stale state corrupts LR
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None and checkpoint['scheduler_state_dict'] is not None:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            saved_total = checkpoint['scheduler_state_dict'].get('total_steps')
+            current_total = getattr(self.scheduler, 'total_steps', None)
+            if saved_total and current_total and saved_total != current_total:
+                if is_main_process():
+                    logger.warning(f"Scheduler total_steps changed ({saved_total} -> {current_total}), "
+                                 "using fresh LR schedule")
+            else:
+                try:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except (ValueError, RuntimeError) as e:
+                    if is_main_process():
+                        logger.warning(f"Could not load scheduler state: {e}")
 
         # Load training state
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
