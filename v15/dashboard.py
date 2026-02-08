@@ -836,7 +836,8 @@ def load_market_data(data_dir: str):
     return _load(data_dir)
 
 
-CHECKPOINT_RELEASE_URL = "https://api.github.com/repos/frankywashere/autotrade2/releases/assets/352382026"
+CHECKPOINT_RELEASE_TAG = "v0.1-model"
+CHECKPOINT_REPO = "frankywashere/autotrade2"
 DEFAULT_MODEL_PATH = "models/best.pt"
 
 
@@ -858,12 +859,32 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> str:
             token = ""
 
     import urllib.request
-    req = urllib.request.Request(CHECKPOINT_RELEASE_URL)
+    import json as _json
+
+    # Fetch release by tag to get the latest asset URL (no hardcoded asset ID)
+    release_url = f"https://api.github.com/repos/{CHECKPOINT_REPO}/releases/tags/{CHECKPOINT_RELEASE_TAG}"
+    req = urllib.request.Request(release_url)
+    if token:
+        req.add_header("Authorization", f"token {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+
+    print(f"[MODEL] Fetching release info from {CHECKPOINT_RELEASE_TAG} ...")
+    with urllib.request.urlopen(req) as resp:
+        release = _json.loads(resp.read())
+
+    assets = release.get("assets", [])
+    if not assets:
+        raise RuntimeError(f"No assets found in release {CHECKPOINT_RELEASE_TAG}")
+
+    asset_url = assets[0]["url"]  # First asset in the release
+    print(f"[MODEL] Downloading {assets[0]['name']} ({assets[0]['size'] / 1e6:.1f} MB) ...")
+
+    # Download the actual asset binary
+    req = urllib.request.Request(asset_url)
     if token:
         req.add_header("Authorization", f"token {token}")
     req.add_header("Accept", "application/octet-stream")
 
-    print(f"[MODEL] Downloading checkpoint to {p} ...")
     with urllib.request.urlopen(req) as resp, open(p, "wb") as f:
         import shutil
         shutil.copyfileobj(resp, f)
