@@ -836,7 +836,7 @@ def load_market_data(data_dir: str):
     return _load(data_dir)
 
 
-CHECKPOINT_RELEASE_URL = "https://api.github.com/repos/frankywashere/autotrade2/releases/assets/352325538"
+CHECKPOINT_RELEASE_URL = "https://api.github.com/repos/frankywashere/autotrade2/releases/assets/352382026"
 DEFAULT_MODEL_PATH = "models/best.pt"
 
 
