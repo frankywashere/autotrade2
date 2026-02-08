@@ -219,6 +219,7 @@ class V15Model(nn.Module):
         self,
         x: torch.Tensor,
         return_attention: bool = False,
+        return_per_tf: bool = False,
         validate: bool = True,
         window_selector_temperature: float = 1.0,
         window_selector_hard: bool = False,
@@ -229,6 +230,7 @@ class V15Model(nn.Module):
         Args:
             x: [batch, input_dim] raw features
             return_attention: If True, include attention weights in output
+            return_per_tf: If True, include per-TF predictions under 'per_tf' key
             validate: If True, check for NaN/Inf (LOUD failure)
             window_selector_temperature: Temperature for window selection softmax (default: 1.0)
             window_selector_hard: If True, use argmax for window selection (inference mode)
@@ -260,10 +262,14 @@ class V15Model(nn.Module):
             tf_embeddings, return_attention=return_attention
         )
 
-        # 7. Aggregate
+        # 7. Per-TF predictions (before aggregation)
+        if return_per_tf:
+            per_tf_predictions = self.per_tf_heads(tf_embeddings)
+
+        # 8. Aggregate
         aggregated, agg_weights = self.tf_aggregator(tf_embeddings)
 
-        # 8. Predictions
+        # 9. Predictions
         predictions = self.prediction_heads(
             aggregated,
             window_selector_temperature=window_selector_temperature,
@@ -273,6 +279,9 @@ class V15Model(nn.Module):
         if return_attention:
             predictions['tf_attention_weights'] = attn_weights
             predictions['aggregation_weights'] = agg_weights
+
+        if return_per_tf:
+            predictions['per_tf'] = per_tf_predictions
 
         return predictions
 

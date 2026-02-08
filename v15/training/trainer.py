@@ -1705,9 +1705,10 @@ class Trainer:
                 self.optimizer.zero_grad()
 
                 with amp_ctx:
-                    # Use forward_with_per_tf when per-TF loss is enabled
+                    # Use return_per_tf when per-TF loss is enabled
                     if use_per_tf_loss:
-                        predictions, per_tf_preds = self.model.forward_with_per_tf(features)
+                        predictions = self.model(features, return_per_tf=True)
+                        per_tf_preds = predictions.pop('per_tf')
                     else:
                         predictions = self.model(features)
                         per_tf_preds = None
@@ -1846,9 +1847,10 @@ class Trainer:
                 use_per_tf_loss = (self.config.per_tf_loss_weight > 0 or
                                    self.config.per_tf_direction_loss_weight > 0)
 
-                # Use forward_with_per_tf when per-TF loss is enabled
+                # Use return_per_tf when per-TF loss is enabled
                 if use_per_tf_loss:
-                    predictions, per_tf_preds = self.model.forward_with_per_tf(features)
+                    predictions = self.model(features, return_per_tf=True)
+                    per_tf_preds = predictions.pop('per_tf')
                 else:
                     predictions = self.model(features)
                     per_tf_preds = None
