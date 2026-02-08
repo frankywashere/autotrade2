@@ -15,7 +15,7 @@ from typing import Dict, Optional, Tuple
 from .feature_weights import ExplicitFeatureWeights, FeatureGating
 from .tf_encoder import MultiTFEncoder
 from .cross_tf_attention import CrossTFAttention, TFAggregator
-from .prediction_heads import PredictionHeads, PerTFPredictionHeads
+from .prediction_heads import PredictionHeads, PerTFPredictionHeads, PerTFPredictionHeadsV2
 from ..config import (
     TOTAL_FEATURES, N_TIMEFRAMES, FEATURES_PER_TF,
     FEATURE_COUNTS, MODEL_CONFIG
@@ -74,6 +74,8 @@ class V15Model(nn.Module):
         # Durability and RSI head flags
         enable_durability_heads: bool = False,
         enable_rsi_heads: bool = False,
+        # Per-TF head version: 1 = original lightweight, 2 = with TF embedding + bigger
+        per_tf_head_version: int = 1,
     ):
         super().__init__()
 
@@ -166,10 +168,17 @@ class V15Model(nn.Module):
         )
 
         # 7. Per-TF Prediction Heads for per-timeframe breakdown
-        self.per_tf_heads = PerTFPredictionHeads(
-            embed_dim=embed_dim,
-            hidden_dim=hidden_dim // 4,
-        )
+        if per_tf_head_version == 2:
+            self.per_tf_heads = PerTFPredictionHeadsV2(
+                embed_dim=embed_dim,
+                hidden_dim=hidden_dim // 2,
+                n_timeframes=n_timeframes,
+            )
+        else:
+            self.per_tf_heads = PerTFPredictionHeads(
+                embed_dim=embed_dim,
+                hidden_dim=hidden_dim // 4,
+            )
 
     def validate_input(self, x: torch.Tensor) -> None:
         """Check for NaN/Inf in input - LOUD failure."""
@@ -402,4 +411,5 @@ def create_model(config: Optional[Dict] = None) -> V15Model:
         enable_cross_correlation_heads=cfg.get('enable_cross_correlation_heads', False),
         enable_durability_heads=cfg.get('enable_durability_heads', False),
         enable_rsi_heads=cfg.get('enable_rsi_heads', False),
+        per_tf_head_version=cfg.get('per_tf_head_version', 1),
     )

@@ -177,6 +177,7 @@ def cmd_train(args):
         'enable_cross_correlation_heads': args.enable_cross_correlation_heads,
         'enable_durability_heads': args.enable_durability_heads,
         'enable_rsi_heads': args.enable_rsi_heads,
+        'per_tf_head_version': getattr(args, 'per_tf_head_version', 1),
     })
     logger.info(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
 
@@ -565,6 +566,9 @@ def main():
         help='Weight for per-timeframe duration loss (0.0 = disabled, try 0.5 to enable)')
     train_parser.add_argument('--per-tf-direction-loss-weight', type=float, default=0.0,
         help='Weight for per-timeframe direction loss (0.0 = disabled, try 0.3 to enable)')
+    train_parser.add_argument('--per-tf-head-version', type=int, default=1,
+                              choices=[1, 2],
+                              help='Per-TF head version: 1=lightweight, 2=TF-embedding+bigger')
     train_parser.add_argument('--per-tf-loss-ramp-epochs', type=int, default=20,
         help='Epochs to ramp per-TF loss from 0 to full weight (default: 20)')
     train_parser.add_argument('--resume', type=str, default=None,

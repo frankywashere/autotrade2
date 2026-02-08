@@ -140,6 +140,80 @@ class PerTFPredictionHeads(nn.Module):
         }
 
 
+class PerTFPredictionHeadsV2(nn.Module):
+    """
+    Enhanced per-TF prediction heads with TF-index embedding.
+
+    Key differences from V1:
+    - Learned TF embedding so the head knows which timeframe it's processing
+      (5min duration scales are very different from monthly)
+    - Larger hidden dim for more capacity
+    - Residual connection from input to output layers
+    """
+
+    def __init__(self, embed_dim: int = 128, hidden_dim: int = 128, n_timeframes: int = 11):
+        super().__init__()
+
+        self.n_timeframes = n_timeframes
+
+        # Learned embedding per TF index (tells the head which TF it's processing)
+        self.tf_embedding = nn.Embedding(n_timeframes, embed_dim)
+
+        # Duration head (mean + log_std) — bigger than V1
+        combined_dim = embed_dim  # TF embedding is added, not concatenated
+        self.duration_net = nn.Sequential(
+            nn.Linear(combined_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+        )
+        self.duration_mean = nn.Linear(hidden_dim // 2, 1)
+        self.duration_log_std = nn.Linear(hidden_dim // 2, 1)
+
+        # Direction head
+        self.direction_net = nn.Sequential(
+            nn.Linear(combined_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, tf_embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            tf_embeddings: [batch, n_timeframes, embed_dim]
+
+        Returns:
+            Dict with duration_mean, duration_log_std, direction_logits
+        """
+        batch_size, n_tf, embed_dim = tf_embeddings.shape
+
+        # Create TF index embeddings: [n_tf, embed_dim]
+        tf_indices = torch.arange(n_tf, device=tf_embeddings.device)
+        tf_emb = self.tf_embedding(tf_indices)  # [n_tf, embed_dim]
+
+        # Add TF embedding to each sample's TF embeddings
+        # tf_emb is broadcast across batch: [1, n_tf, embed_dim]
+        enriched = tf_embeddings + tf_emb.unsqueeze(0)
+
+        # Flatten for batch processing
+        flat = enriched.view(batch_size * n_tf, embed_dim)
+
+        # Duration predictions
+        h = self.duration_net(flat)
+        duration_mean = F.softplus(self.duration_mean(h))
+        duration_log_std = self.duration_log_std(h).clamp(-2, 5)
+
+        # Direction predictions
+        direction_logits = self.direction_net(flat)
+
+        return {
+            'duration_mean': duration_mean.view(batch_size, n_tf),
+            'duration_log_std': duration_log_std.view(batch_size, n_tf),
+            'direction_logits': direction_logits.view(batch_size, n_tf),
+        }
+
+
 class WindowSelectorHead(nn.Module):
     """
     Learned window selection head for end-to-end window selection.
