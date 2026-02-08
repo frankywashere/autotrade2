@@ -2113,20 +2113,33 @@ class Trainer:
         """
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
-        # Load model state dict with graceful handling of missing per_tf_heads weights
-        # Older checkpoints may not have per_tf_heads - use strict=False and warn
+        # Load model state dict with graceful handling of per_tf_heads differences
+        # Filter out per_tf_heads keys with shape mismatches (e.g. V1->V2 upgrade)
+        saved_state = checkpoint['model_state_dict']
+        model_state = self.raw_model.state_dict()
+        filtered_state = {}
+        skipped_keys = []
+        for k, v in saved_state.items():
+            if k in model_state and v.shape != model_state[k].shape:
+                skipped_keys.append(k)
+            else:
+                filtered_state[k] = v
+
+        if skipped_keys and is_main_process():
+            logger.warning(f"Skipped {len(skipped_keys)} keys with shape mismatch (will reinitialize): "
+                         f"{skipped_keys[:5]}{'...' if len(skipped_keys) > 5 else ''}")
+
         missing_keys, unexpected_keys = self.raw_model.load_state_dict(
-            checkpoint['model_state_dict'], strict=False
+            filtered_state, strict=False
         )
 
-        # Check if per_tf_heads weights are missing (expected for older checkpoints)
+        # Check if per_tf_heads weights are missing (expected for older checkpoints or V1->V2)
         per_tf_missing = [k for k in missing_keys if 'per_tf_heads' in k]
         other_missing = [k for k in missing_keys if 'per_tf_heads' not in k]
 
         if per_tf_missing and is_main_process():
             logger.warning(
-                f"Checkpoint missing per_tf_heads weights ({len(per_tf_missing)} keys) - "
-                "per-TF predictions will be untrained"
+                f"per_tf_heads: {len(per_tf_missing)} keys will be randomly initialized"
             )
 
         # Warn about any other missing keys (these might be actual problems)
