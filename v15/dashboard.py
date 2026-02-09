@@ -841,11 +841,16 @@ CHECKPOINT_REPO = "frankywashere/autotrade2"
 DEFAULT_MODEL_PATH = "models/best.pt"
 
 
-def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> str:
-    """Download checkpoint from GitHub Releases if not present locally."""
+def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
+    """Download checkpoint from GitHub Releases if not present locally.
+
+    Returns:
+        (path, asset_info) where asset_info is a dict with 'id', 'name',
+        'uploaded_at' from GitHub, or None if loaded from local file.
+    """
     p = Path(path)
     if p.exists():
-        return str(p)
+        return str(p), None
 
     p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -876,8 +881,9 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> str:
     if not assets:
         raise RuntimeError(f"No assets found in release {CHECKPOINT_RELEASE_TAG}")
 
-    asset_url = assets[0]["url"]  # First asset in the release
-    print(f"[MODEL] Downloading {assets[0]['name']} ({assets[0]['size'] / 1e6:.1f} MB) ...")
+    asset = assets[0]
+    asset_url = asset["url"]
+    print(f"[MODEL] Downloading {asset['name']} ({asset['size'] / 1e6:.1f} MB) ...")
 
     # Download the actual asset binary
     req = urllib.request.Request(asset_url)
@@ -889,7 +895,13 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> str:
         import shutil
         shutil.copyfileobj(resp, f)
     print(f"[MODEL] Downloaded {p.stat().st_size / 1e6:.1f} MB")
-    return str(p)
+
+    asset_info = {
+        'id': asset.get('id'),
+        'name': asset.get('name'),
+        'uploaded_at': asset.get('updated_at', asset.get('created_at', '')),
+    }
+    return str(p), asset_info
 
 
 @st.cache_resource
@@ -1121,9 +1133,14 @@ def main():
     predictor = None
     with st.spinner("Loading model..."):
         try:
-            checkpoint_path = _ensure_checkpoint(checkpoint_path)
+            checkpoint_path, asset_info = _ensure_checkpoint(checkpoint_path)
             predictor = load_predictor(checkpoint_path)
-            st.sidebar.success("Model loaded")
+            if asset_info:
+                asset_id = str(asset_info['id'])
+                uploaded = asset_info['uploaded_at'][:10] if asset_info['uploaded_at'] else '?'
+                st.sidebar.success(f"Model loaded — {asset_info['name']} (RA_...{asset_id[-4:]}, uploaded {uploaded})")
+            else:
+                st.sidebar.success("Model loaded")
         except Exception as e:
             st.sidebar.warning(f"Model not loaded: {e}")
             logger.exception("Model loading error")
