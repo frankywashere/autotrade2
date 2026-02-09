@@ -156,8 +156,8 @@ def _fetch_yfinance_data(
     interval: str,
     start_date: str,
     end_date: str,
-    max_retries: int = 3,
-    retry_delay: float = 1.0
+    max_retries: int = 5,
+    retry_delay: float = 2.0
 ) -> pd.DataFrame:
     """
     Fetch data from yfinance with retry logic.
@@ -466,7 +466,11 @@ def load_native_tf_data(
     for symbol in symbols:
         result[symbol] = {}
 
-        for tf in timeframes:
+        for tf_idx, tf in enumerate(timeframes):
+            # Throttle requests to avoid yfinance rate limiting
+            if tf_idx > 0:
+                time.sleep(0.5)
+
             try:
                 if verbose:
                     print(f"  Fetching {symbol} {tf}... ", end='', flush=True)
