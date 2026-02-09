@@ -74,9 +74,13 @@ YF_INTERVAL_MAX_PERIOD = {
 DEFAULT_SYMBOLS = ['TSLA', 'SPY', '^VIX']
 
 # All supported timeframes (10 total)
+# Ordered: least rate-limit-prone first (daily/weekly/monthly have no
+# retention limits), then 1h-based (2h/3h/4h reuse cached 1h), then
+# intraday last (most likely to hit Yahoo rate limits).
 ALL_TIMEFRAMES = [
-    '5min', '15min', '30min', '1h', '2h', '3h', '4h',
-    'daily', 'weekly', 'monthly'
+    'daily', 'weekly', 'monthly',
+    '1h', '2h', '3h', '4h',
+    '5min', '15min', '30min',
 ]
 
 
@@ -349,8 +353,9 @@ def fetch_native_tf(
                 f"Requested {requested_days} days but {yf_interval} interval "
                 f"only supports ~{max_days} days. Clamping start date."
             )
+            # Subtract extra day to account for +1 day added in _fetch_yfinance_data
             adjusted_start = (
-                pd.to_datetime(end_date) - timedelta(days=max_days)
+                pd.to_datetime(end_date) - timedelta(days=max_days - 1)
             ).strftime('%Y-%m-%d')
             start_date = adjusted_start
 
@@ -463,13 +468,16 @@ def load_native_tf_data(
     completed = 0
     failed = []
 
+    rate_limited = False
+
     for symbol in symbols:
         result[symbol] = {}
 
         for tf_idx, tf in enumerate(timeframes):
-            # Throttle requests to avoid yfinance rate limiting
+            # Throttle: longer cooldown after rate-limit failures
             if tf_idx > 0:
-                time.sleep(0.5)
+                delay = 5.0 if rate_limited else 0.5
+                time.sleep(delay)
 
             try:
                 if verbose:
@@ -487,12 +495,15 @@ def load_native_tf_data(
 
                 result[symbol][tf] = df
                 completed += 1
+                rate_limited = False  # Reset on success
 
                 if verbose:
                     print(f"OK ({len(df)} bars)")
 
             except Exception as e:
                 failed.append((symbol, tf, str(e)))
+                if 'rate limit' in str(e).lower() or 'too many requests' in str(e).lower():
+                    rate_limited = True
                 if verbose:
                     print(f"FAILED: {e}")
                 logger.error(f"Failed to fetch {symbol} {tf}: {e}")
