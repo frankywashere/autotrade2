@@ -892,19 +892,54 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
         # Fallback: use the last .pt asset (most recently uploaded)
         asset = pt_assets[-1] if pt_assets else assets[-1]
 
-    asset_url = asset["url"]
-    print(f"[MODEL] Downloading {asset['name']} ({asset['size'] / 1e6:.1f} MB) ...")
+    expected_size = asset["size"]
+    print(f"[MODEL] Downloading {asset['name']} ({expected_size / 1e6:.1f} MB) ...")
+
+    def _download_asset(asset_dict, dest_path):
+        """Download a GitHub release asset, handling auth + redirects."""
+        import shutil
+        # First, request the API URL to get the redirect location
+        # Then download from the redirect URL (S3) without auth headers
+        req = urllib.request.Request(asset_dict["url"])
+        if token:
+            req.add_header("Authorization", f"token {token}")
+        req.add_header("Accept", "application/octet-stream")
+
+        # Use a custom opener that doesn't auto-follow redirects
+        class NoRedirect(urllib.request.HTTPErrorProcessor):
+            def http_response(self, request, response):
+                if response.code in (301, 302, 303, 307, 308):
+                    return response
+                return super().http_response(request, response)
+            https_response = http_response
+
+        opener = urllib.request.build_opener(NoRedirect)
+        resp = opener.open(req)
+
+        if resp.code in (301, 302, 303, 307, 308):
+            # Follow redirect WITHOUT auth header (the S3 URL has its own token)
+            redirect_url = resp.headers['Location']
+            req2 = urllib.request.Request(redirect_url)
+            with urllib.request.urlopen(req2) as resp2, open(dest_path, "wb") as f:
+                shutil.copyfileobj(resp2, f)
+        else:
+            # No redirect, write directly
+            with open(dest_path, "wb") as f:
+                shutil.copyfileobj(resp, f)
+
+        actual_size = dest_path.stat().st_size
+        # Validate download — if file is <1% of expected, it's probably an error page
+        if asset_dict["size"] > 1000 and actual_size < asset_dict["size"] * 0.01:
+            dest_path.unlink()
+            raise RuntimeError(
+                f"Download appears corrupt: got {actual_size} bytes, "
+                f"expected ~{asset_dict['size']} bytes"
+            )
+        return actual_size
 
     # Download the checkpoint binary
-    req = urllib.request.Request(asset_url)
-    if token:
-        req.add_header("Authorization", f"token {token}")
-    req.add_header("Accept", "application/octet-stream")
-
-    with urllib.request.urlopen(req) as resp, open(p, "wb") as f:
-        import shutil
-        shutil.copyfileobj(resp, f)
-    print(f"[MODEL] Downloaded checkpoint: {p.stat().st_size / 1e6:.1f} MB")
+    dl_size = _download_asset(asset, p)
+    print(f"[MODEL] Downloaded checkpoint: {dl_size / 1e6:.1f} MB")
 
     # Also download temperature_calibration.json if available
     cal_assets = [a for a in assets if a["name"] == "temperature_calibration.json"]
@@ -912,12 +947,7 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
         cal_asset = cal_assets[0]
         cal_path = p.parent / "temperature_calibration.json"
         print(f"[MODEL] Downloading {cal_asset['name']} ...")
-        req = urllib.request.Request(cal_asset["url"])
-        if token:
-            req.add_header("Authorization", f"token {token}")
-        req.add_header("Accept", "application/octet-stream")
-        with urllib.request.urlopen(req) as resp, open(cal_path, "wb") as f:
-            shutil.copyfileobj(resp, f)
+        _download_asset(cal_asset, cal_path)
         print(f"[MODEL] Downloaded calibration: {cal_path}")
 
     asset_info = {
