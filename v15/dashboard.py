@@ -838,6 +838,7 @@ def load_market_data(data_dir: str):
 CHECKPOINT_RELEASE_TAG = "v0.1-model"
 CHECKPOINT_REPO = "frankywashere/autotrade2"
 DEFAULT_MODEL_PATH = "models/best.pt"
+CHECKPOINT_ASSET_NAME = "oncycle_v4_horizon_best_per_tf.pt"
 
 
 def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
@@ -880,11 +881,21 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
     if not assets:
         raise RuntimeError(f"No assets found in release {CHECKPOINT_RELEASE_TAG}")
 
-    asset = assets[0]
+    # Find the target .pt asset by name
+    pt_assets = [a for a in assets if a["name"].endswith(".pt")]
+    asset = None
+    for a in pt_assets:
+        if a["name"] == CHECKPOINT_ASSET_NAME:
+            asset = a
+            break
+    if asset is None:
+        # Fallback: use the last .pt asset (most recently uploaded)
+        asset = pt_assets[-1] if pt_assets else assets[-1]
+
     asset_url = asset["url"]
     print(f"[MODEL] Downloading {asset['name']} ({asset['size'] / 1e6:.1f} MB) ...")
 
-    # Download the actual asset binary
+    # Download the checkpoint binary
     req = urllib.request.Request(asset_url)
     if token:
         req.add_header("Authorization", f"token {token}")
@@ -893,7 +904,21 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
     with urllib.request.urlopen(req) as resp, open(p, "wb") as f:
         import shutil
         shutil.copyfileobj(resp, f)
-    print(f"[MODEL] Downloaded {p.stat().st_size / 1e6:.1f} MB")
+    print(f"[MODEL] Downloaded checkpoint: {p.stat().st_size / 1e6:.1f} MB")
+
+    # Also download temperature_calibration.json if available
+    cal_assets = [a for a in assets if a["name"] == "temperature_calibration.json"]
+    if cal_assets:
+        cal_asset = cal_assets[0]
+        cal_path = p.parent / "temperature_calibration.json"
+        print(f"[MODEL] Downloading {cal_asset['name']} ...")
+        req = urllib.request.Request(cal_asset["url"])
+        if token:
+            req.add_header("Authorization", f"token {token}")
+        req.add_header("Accept", "application/octet-stream")
+        with urllib.request.urlopen(req) as resp, open(cal_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        print(f"[MODEL] Downloaded calibration: {cal_path}")
 
     asset_info = {
         'id': asset.get('id'),
@@ -1133,6 +1158,9 @@ def main():
         p = Path(checkpoint_path)
         if p.exists():
             p.unlink()
+        cal_path = p.parent / "temperature_calibration.json"
+        if cal_path.exists():
+            cal_path.unlink()
         load_predictor.clear()
         st.rerun()
 
