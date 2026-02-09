@@ -256,17 +256,29 @@ def _aggregate_from_hourly(
     if hourly_df.empty:
         return hourly_df
 
-    rule = f'{target_hours}h'
+    results = []
+    # Group by trading day to avoid cross-day aggregation
+    for date, day_bars in hourly_df.groupby(hourly_df.index.date):
+        # Sequential aggregation within the day (matches C++ scanner)
+        for i in range(0, len(day_bars), target_hours):
+            chunk = day_bars.iloc[i:i + target_hours]
+            if len(chunk) == 0:
+                continue
+            results.append({
+                'timestamp': chunk.index[0],
+                'open': chunk['open'].iloc[0],
+                'high': chunk['high'].max(),
+                'low': chunk['low'].min(),
+                'close': chunk['close'].iloc[-1],
+                'volume': chunk['volume'].sum(),
+            })
 
-    resampled = hourly_df.resample(rule, origin='start').agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }).dropna()
+    if not results:
+        return pd.DataFrame(columns=hourly_df.columns)
 
-    return resampled
+    result_df = pd.DataFrame(results).set_index('timestamp')
+    result_df.index.name = hourly_df.index.name
+    return result_df
 
 
 # =============================================================================
