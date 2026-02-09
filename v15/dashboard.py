@@ -1129,6 +1129,14 @@ def main():
     else:
         st.sidebar.info("No local data — using live yfinance data")
 
+    # Force re-download button
+    if st.sidebar.button("Re-download model from GitHub"):
+        p = Path(checkpoint_path)
+        if p.exists():
+            p.unlink()
+        load_predictor.clear()
+        st.rerun()
+
     # Load model (auto-download from GitHub Releases if not present)
     predictor = None
     with st.spinner("Loading model..."):
