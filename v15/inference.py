@@ -225,11 +225,21 @@ class Predictor:
             input_dim = model_config.get('total_features', TOTAL_FEATURES)
             logger.info(f"Using input_dim={input_dim} from checkpoint config")
 
+        # Detect per-TF head version from state dict
+        # V2 has 'per_tf_heads.tf_embedding.weight', V1 does not
+        has_tf_embedding = any('per_tf_heads.tf_embedding' in k for k in state_dict)
+        per_tf_head_version = 2 if has_tf_embedding else 1
+
+        # Detect horizon attention from state dict
+        has_horizon_attention = any('horizon_attention' in k for k in state_dict)
+
         # Create model with appropriate configuration
         config = {
             'input_dim': input_dim,
             'use_window_selector': has_window_selector,
             'num_windows': model_config.get('num_windows', 8),
+            'per_tf_head_version': per_tf_head_version,
+            'use_horizon_attention': has_horizon_attention,
         }
 
         model = create_model(config)
