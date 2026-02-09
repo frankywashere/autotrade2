@@ -272,6 +272,9 @@ def cmd_train(args):
             cleanup_distributed()
             return
         trainer.load_checkpoint(checkpoint_path)
+        if getattr(args, 'reset_best_val_loss', False):
+            trainer.best_val_loss = float('inf')
+            logger.info("Reset best_val_loss to inf (fresh early stopping tracking)")
 
     history = trainer.train()
 
@@ -573,6 +576,8 @@ def main():
         help='Epochs to ramp per-TF loss from 0 to full weight (default: 20)')
     train_parser.add_argument('--resume', type=str, default=None,
                               help='Resume from checkpoint (path to .pt file)')
+    train_parser.add_argument('--reset-best-val-loss', action='store_true',
+                              help='Reset best_val_loss to inf when resuming (use when changing batch size/config)')
     train_parser.add_argument('--seed', type=int, default=42,
         help='Random seed for reproducibility (default: 42)')
 
