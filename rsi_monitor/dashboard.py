@@ -814,11 +814,14 @@ def main():
 
                         strength_display = f"{strength:.0%}" if isinstance(strength, float) else str(strength)
 
-                        # VIX cooldown indicator (shows whenever VIX spike detected, regardless of signal)
+                        # VIX cooldown / recovery indicators
                         vix_cooldown = signal_data.get("vix_cooldown_active", False)
                         recovery_suppressed = signal_data.get("recovery_suppressed", False)
+                        recovery_type = signal_data.get("recovery_suppressed_signal")
                         cooldown_html = ""
-                        if recovery_suppressed:
+                        if recovery_suppressed and recovery_type == 'sell':
+                            cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #00C85122; color: #00C851; font-size: 0.7em; font-weight: 500; margin-left: 6px;">RECOVERY RALLY</span>'
+                        elif recovery_suppressed:
                             cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #ff980022; color: #ff9800; font-size: 0.7em; font-weight: 500; margin-left: 6px;">(recovery mode)</span>'
                         elif vix_cooldown:
                             cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #ffeb3b22; color: #ffeb3b; font-size: 0.7em; font-weight: 500; margin-left: 6px;">(VIX cooldown)</span>'

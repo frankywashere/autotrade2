@@ -363,6 +363,7 @@ class SignalGenerator:
 
         # Track recovery suppression
         suppressed = False
+        suppressed_signal = None  # Track what was suppressed ('sell' or 'buy')
 
         # Option 1: Suppress short-term signals when long-term RSI disagrees
         if signal == 'SHORT_TERM_SELL':
@@ -374,6 +375,7 @@ class SignalGenerator:
                 signal = 'NEUTRAL'
                 confluence_score = 0
                 suppressed = True
+                suppressed_signal = 'sell'
         elif signal == 'SHORT_TERM_BUY':
             long_rsi_values = [timeframes[tf] for tf in timeframes
                                if tf in self.LONG_TERM_TIMEFRAMES
@@ -383,6 +385,7 @@ class SignalGenerator:
                 signal = 'NEUTRAL'
                 confluence_score = 0
                 suppressed = True
+                suppressed_signal = 'buy'
 
         # Option 3: VIX-conditional recovery suppression (data-driven, 48h lookback)
         # Combined approach: detect VIX fear spike via daily % change OR RSI with price floor
@@ -443,10 +446,12 @@ class SignalGenerator:
                     signal = 'NEUTRAL'
                     confluence_score = 0
                     suppressed = True
+                    suppressed_signal = 'sell'
                 elif signal == 'SHORT_TERM_BUY' and recently_overbought:
                     signal = 'NEUTRAL'
                     confluence_score = 0
                     suppressed = True
+                    suppressed_signal = 'buy'
 
         # Weekly extreme oversold detection (RSI < 20 within last 2 weeks)
         # Historical backtest: 100% win rate at 8+ weeks, +72% avg return at 26 weeks
@@ -537,6 +542,7 @@ class SignalGenerator:
             'strength': strength,
             'reason': reason,
             'recovery_suppressed': suppressed,
+            'recovery_suppressed_signal': suppressed_signal,
             'vix_cooldown_active': vix_recently_spiked,
             'weekly_extreme_buy': weekly_extreme_buy,
             'channel_confluence': channel_confluence,
