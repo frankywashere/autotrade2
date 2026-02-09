@@ -342,7 +342,7 @@ def show_window_details_table(analysis: Dict[str, Any]):
             return ['background-color: #f8d7da'] * len(row)
 
     styled_df = df.style.apply(highlight_valid, axis=1)
-    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+    st.dataframe(styled_df, width="stretch", hide_index=True)
 
 
 def show_strategy_picks(analysis: Dict[str, Any]):
@@ -442,7 +442,7 @@ def show_per_tf_predictions_table(prediction):
     styled_df = df.style.apply(style_row, axis=1)
     # Hide the internal columns in the styled output
     styled_df = styled_df.hide(subset=['_direction', '_confidence'], axis='columns')
-    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+    st.dataframe(styled_df, width="stretch", hide_index=True)
 
 
 # =============================================================================
@@ -556,7 +556,7 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                             tf_name=tf_name,
                         )
 
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
                     # Show channel metrics
                     col1, col2, col3, col4 = st.columns(4)
@@ -582,7 +582,7 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                         title=f"{tf_name} - No Valid Channel",
                         height=350
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
 
             except Exception as e:
                 st.error(f"Error processing {tf_name}: {e}")
@@ -1053,7 +1053,7 @@ def show_feature_importance(predictor, top_k: int = 50):
         labels={'x': 'Importance', 'y': 'Feature'}
     )
     fig.update_layout(height=800, yaxis={'categoryorder': 'total ascending'})
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def show_tf_attention(prediction_output: Dict[str, Any]):
@@ -1073,7 +1073,7 @@ def show_tf_attention(prediction_output: Dict[str, Any]):
         title="Timeframe Attention Weights",
         labels={'x': 'Timeframe', 'y': 'Weight'}
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def main():
@@ -1293,7 +1293,7 @@ def main():
                                                 tf_name='daily',
                                             )
 
-                                        st.plotly_chart(fig, use_container_width=True)
+                                        st.plotly_chart(fig, width="stretch")
 
                                         # Metrics row
                                         c1, c2, c3, c4 = st.columns(4)
@@ -1310,7 +1310,7 @@ def main():
                                     else:
                                         fig = create_candlestick_chart(daily_chart_df, tf_name='daily')
                                         fig.update_layout(title="Daily - No Valid Channel", height=400)
-                                        st.plotly_chart(fig, use_container_width=True)
+                                        st.plotly_chart(fig, width="stretch")
                                 else:
                                     st.info("Insufficient daily data for channel detection")
                             except Exception as e:
@@ -1358,7 +1358,7 @@ def main():
                                     ]
                                     st.dataframe(
                                         pd.DataFrame(comp_data),
-                                        use_container_width=True,
+                                        width="stretch",
                                         hide_index=True
                                     )
 
@@ -1454,12 +1454,12 @@ def main():
             with col1:
                 st.subheader("Window Validity & Scores")
                 fig = create_window_validity_chart(analysis)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
             with col2:
                 st.subheader("Strategy Selection Comparison")
                 fig = create_strategy_comparison_chart(analysis)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
             st.divider()
 
@@ -1569,7 +1569,7 @@ def main():
                         })
                     st.dataframe(
                         pd.DataFrame(hist_data),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True
                     )
 
