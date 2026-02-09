@@ -820,7 +820,7 @@ def main():
                         recovery_type = signal_data.get("recovery_suppressed_signal")
                         cooldown_html = ""
                         if recovery_suppressed and recovery_type == 'sell':
-                            cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #00C85122; color: #00C851; font-size: 0.7em; font-weight: 500; margin-left: 6px;">RECOVERY RALLY</span>'
+                            cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #00C85122; color: #00C851; font-size: 0.7em; font-weight: 500; margin-left: 6px;">RECOVERY RALLY BUY</span>'
                         elif recovery_suppressed:
                             cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #ff980022; color: #ff9800; font-size: 0.7em; font-weight: 500; margin-left: 6px;">(recovery mode)</span>'
                         elif vix_cooldown:
