@@ -181,10 +181,13 @@ def _fetch_yfinance_data(
 
     for attempt in range(max_retries):
         try:
-            # yfinance uses 'start' and 'end' for date range
+            # yfinance 'end' is exclusive, so +1 day to include today's bars
+            end_inclusive = (
+                pd.to_datetime(end_date) + timedelta(days=1)
+            ).strftime('%Y-%m-%d')
             df = ticker.history(
                 start=start_date,
-                end=end_date,
+                end=end_inclusive,
                 interval=interval,
                 auto_adjust=True,  # Adjust for splits/dividends
                 prepost=False,     # Exclude pre/post market
