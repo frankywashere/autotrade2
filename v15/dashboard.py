@@ -50,9 +50,8 @@ from v15.live_data import (
 # Import native TF data loader for per-TF yfinance fetching
 from v15.data.native_tf import load_native_tf_data as _load_native_tf_data
 
-# Higher TFs that benefit from native yfinance fetching
-# (daily/weekly/monthly have unlimited history vs 60d for 5-min)
-NATIVE_TF_LIST = ['1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
+# All TFs fetched natively from yfinance (intraday capped at ~60 days)
+NATIVE_TF_LIST = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
 
 logger = logging.getLogger(__name__)
 
