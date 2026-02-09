@@ -567,7 +567,7 @@ def main():
 
         with col2:
             st.session_state.auto_refresh = st.checkbox(
-                "Auto (60s)",
+                "Auto (5m)",
                 value=st.session_state.auto_refresh
             )
 
@@ -941,7 +941,7 @@ def main():
 
     # Auto-refresh logic
     if st.session_state.auto_refresh:
-        time.sleep(60)
+        time.sleep(300)
         st.rerun()
 
 
