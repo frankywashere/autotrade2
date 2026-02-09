@@ -850,7 +850,12 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
     """
     p = Path(path)
     if p.exists():
-        return str(p), None
+        # Validate existing file isn't corrupt (e.g. from a failed previous download)
+        if p.stat().st_size > 1_000_000:  # >1MB = plausible checkpoint
+            return str(p), None
+        else:
+            print(f"[MODEL] Removing suspect file {p} ({p.stat().st_size} bytes)")
+            p.unlink()
 
     p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -863,19 +868,16 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
         except (KeyError, AttributeError):
             token = ""
 
-    import urllib.request
-    import json as _json
+    import requests as _requests
 
-    # Fetch release by tag to get the latest asset URL (no hardcoded asset ID)
+    # Fetch release by tag
     release_url = f"https://api.github.com/repos/{CHECKPOINT_REPO}/releases/tags/{CHECKPOINT_RELEASE_TAG}"
-    req = urllib.request.Request(release_url)
+    headers = {"Accept": "application/vnd.github+json"}
     if token:
-        req.add_header("Authorization", f"token {token}")
-    req.add_header("Accept", "application/vnd.github+json")
+        headers["Authorization"] = f"token {token}"
 
     print(f"[MODEL] Fetching release info from {CHECKPOINT_RELEASE_TAG} ...")
-    with urllib.request.urlopen(req) as resp:
-        release = _json.loads(resp.read())
+    release = _requests.get(release_url, headers=headers).json()
 
     assets = release.get("assets", [])
     if not assets:
@@ -889,50 +891,29 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
             asset = a
             break
     if asset is None:
-        # Fallback: use the last .pt asset (most recently uploaded)
         asset = pt_assets[-1] if pt_assets else assets[-1]
 
-    expected_size = asset["size"]
-    print(f"[MODEL] Downloading {asset['name']} ({expected_size / 1e6:.1f} MB) ...")
+    print(f"[MODEL] Downloading {asset['name']} ({asset['size'] / 1e6:.1f} MB) ...")
 
     def _download_asset(asset_dict, dest_path):
-        """Download a GitHub release asset, handling auth + redirects."""
-        import shutil
-        # First, request the API URL to get the redirect location
-        # Then download from the redirect URL (S3) without auth headers
-        req = urllib.request.Request(asset_dict["url"])
+        """Download a GitHub release asset via browser_download_url."""
+        # Use browser_download_url — works for public repos directly,
+        # for private repos pass token in Authorization header
+        url = asset_dict["browser_download_url"]
+        dl_headers = {}
         if token:
-            req.add_header("Authorization", f"token {token}")
-        req.add_header("Accept", "application/octet-stream")
-
-        # Use a custom opener that doesn't auto-follow redirects
-        class NoRedirect(urllib.request.HTTPErrorProcessor):
-            def http_response(self, request, response):
-                if response.code in (301, 302, 303, 307, 308):
-                    return response
-                return super().http_response(request, response)
-            https_response = http_response
-
-        opener = urllib.request.build_opener(NoRedirect)
-        resp = opener.open(req)
-
-        if resp.code in (301, 302, 303, 307, 308):
-            # Follow redirect WITHOUT auth header (the S3 URL has its own token)
-            redirect_url = resp.headers['Location']
-            req2 = urllib.request.Request(redirect_url)
-            with urllib.request.urlopen(req2) as resp2, open(dest_path, "wb") as f:
-                shutil.copyfileobj(resp2, f)
-        else:
-            # No redirect, write directly
-            with open(dest_path, "wb") as f:
-                shutil.copyfileobj(resp, f)
+            dl_headers["Authorization"] = f"token {token}"
+        resp = _requests.get(url, headers=dl_headers, stream=True)
+        resp.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
 
         actual_size = dest_path.stat().st_size
-        # Validate download — if file is <1% of expected, it's probably an error page
-        if asset_dict["size"] > 1000 and actual_size < asset_dict["size"] * 0.01:
+        if asset_dict["size"] > 1000 and actual_size < asset_dict["size"] * 0.5:
             dest_path.unlink()
             raise RuntimeError(
-                f"Download appears corrupt: got {actual_size} bytes, "
+                f"Download corrupt: got {actual_size} bytes, "
                 f"expected ~{asset_dict['size']} bytes"
             )
         return actual_size
