@@ -927,7 +927,7 @@ def main():
                                                     "Valid": "Yes" if td.get('meets_criteria') else "No",
                                                 })
                                         if ch_rows:
-                                            st.dataframe(pd.DataFrame(ch_rows), hide_index=True, use_container_width=True)
+                                            st.dataframe(pd.DataFrame(ch_rows), hide_index=True, width='stretch')
                                         else:
                                             st.caption("No valid channels detected on any timeframe")
                                     else:
