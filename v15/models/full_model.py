@@ -14,7 +14,7 @@ from typing import Dict, Optional, Tuple
 
 from .feature_weights import ExplicitFeatureWeights, FeatureGating
 from .tf_encoder import MultiTFEncoder
-from .cross_tf_attention import CrossTFAttention, TFAggregator
+from .cross_tf_attention import CrossTFAttention, HorizonGroupedAttention, TFAggregator
 from .prediction_heads import PredictionHeads, PerTFPredictionHeads, PerTFPredictionHeadsV2
 from ..config import (
     TOTAL_FEATURES, N_TIMEFRAMES, FEATURES_PER_TF,
@@ -76,6 +76,8 @@ class V15Model(nn.Module):
         enable_rsi_heads: bool = False,
         # Per-TF head version: 1 = original lightweight, 2 = with TF embedding + bigger
         per_tf_head_version: int = 1,
+        # Use horizon-grouped attention instead of global cross-TF attention
+        use_horizon_attention: bool = False,
     ):
         super().__init__()
 
@@ -140,11 +142,18 @@ class V15Model(nn.Module):
         )
 
         # 4. Cross-TF Attention
-        self.cross_tf_attention = CrossTFAttention(
-            embed_dim=embed_dim,
-            n_heads=n_attention_heads,
-            dropout=dropout
-        )
+        if use_horizon_attention:
+            self.cross_tf_attention = HorizonGroupedAttention(
+                embed_dim=embed_dim,
+                n_heads=n_attention_heads,
+                dropout=dropout,
+            )
+        else:
+            self.cross_tf_attention = CrossTFAttention(
+                embed_dim=embed_dim,
+                n_heads=n_attention_heads,
+                dropout=dropout
+            )
 
         # 5. TF Aggregator
         self.tf_aggregator = TFAggregator(
@@ -421,4 +430,5 @@ def create_model(config: Optional[Dict] = None) -> V15Model:
         enable_durability_heads=cfg.get('enable_durability_heads', False),
         enable_rsi_heads=cfg.get('enable_rsi_heads', False),
         per_tf_head_version=cfg.get('per_tf_head_version', 1),
+        use_horizon_attention=cfg.get('use_horizon_attention', False),
     )

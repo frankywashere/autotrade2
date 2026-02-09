@@ -178,6 +178,7 @@ def cmd_train(args):
         'enable_durability_heads': args.enable_durability_heads,
         'enable_rsi_heads': args.enable_rsi_heads,
         'per_tf_head_version': getattr(args, 'per_tf_head_version', 1),
+        'use_horizon_attention': getattr(args, 'use_horizon_attention', False),
     })
     logger.info(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
 
@@ -573,6 +574,8 @@ def main():
     train_parser.add_argument('--per-tf-head-version', type=int, default=1,
                               choices=[1, 2],
                               help='Per-TF head version: 1=lightweight, 2=TF-embedding+bigger')
+    train_parser.add_argument('--use-horizon-attention', action='store_true',
+        help='Use horizon-grouped attention (short/medium/long pools) instead of global cross-TF attention')
     train_parser.add_argument('--per-tf-loss-ramp-epochs', type=int, default=20,
         help='Epochs to ramp per-TF loss from 0 to full weight (default: 20)')
     train_parser.add_argument('--resume', type=str, default=None,
