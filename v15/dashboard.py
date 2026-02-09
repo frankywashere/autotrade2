@@ -1001,11 +1001,11 @@ def show_prediction_card(prediction):
 
     # Aggregated summary
     st.subheader("Aggregated")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         st.metric(
-            "Direction",
+            "Break Direction",
             prediction.direction.upper(),
             f"{prediction.direction_prob:.1%}"
         )
@@ -1018,6 +1018,17 @@ def show_prediction_card(prediction):
         )
 
     with col3:
+        # Next channel direction with top probability
+        nc = prediction.new_channel.upper() if prediction.new_channel else "?"
+        nc_probs = prediction.new_channel_probs or {}
+        nc_conf = max(nc_probs.values()) if nc_probs else 0
+        st.metric(
+            "Next Channel",
+            nc,
+            f"{nc_conf:.1%}"
+        )
+
+    with col4:
         st.metric(
             "Confidence",
             f"{prediction.confidence:.1%}",
