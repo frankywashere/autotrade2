@@ -1170,6 +1170,25 @@ def main():
         try:
             checkpoint_path, asset_info = _ensure_checkpoint(checkpoint_path)
             predictor = load_predictor(checkpoint_path)
+
+            # Log checkpoint details to terminal
+            cp = Path(checkpoint_path)
+            import torch as _torch
+            _ckpt = _torch.load(cp, map_location='cpu', weights_only=False)
+            _epoch = _ckpt.get('epoch', '?')
+            _mae = _ckpt.get('best_per_tf_mae', '?')
+            if isinstance(_mae, float):
+                _mae = f"{_mae:.3f}"
+            _cal_path = cp.parent / 'temperature_calibration.json'
+            if _cal_path.exists():
+                import json as _json
+                _cal = _json.loads(_cal_path.read_text())
+                _temp = f"T={_cal['temperature']:.4f}, ECE={_cal['ece_after']:.4f}"
+            else:
+                _temp = "none"
+            print(f"[MODEL] Loaded: {cp.name} | epoch {_epoch} | per-TF MAE {_mae} | calibration: {_temp}")
+            del _ckpt
+
             if asset_info:
                 asset_id = str(asset_info['id'])
                 uploaded = asset_info['uploaded_at'][:10] if asset_info['uploaded_at'] else '?'
