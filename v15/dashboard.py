@@ -1197,7 +1197,27 @@ def main():
         else:
             st.caption(f"Available: {len(current_tsla):,} bars")
 
-            if st.button("Make Prediction", type="primary"):
+            # Validate native TF data completeness before allowing prediction
+            missing_tfs = []
+            if native_tf_data is None:
+                missing_tfs = NATIVE_TF_LIST.copy()
+            else:
+                required_symbols = ['TSLA', 'SPY', '^VIX']
+                for tf in NATIVE_TF_LIST:
+                    for sym in required_symbols:
+                        sym_data = native_tf_data.get(sym, {})
+                        tf_df = sym_data.get(tf)
+                        if tf_df is None or len(tf_df) < 10:
+                            missing_tfs.append(f"{sym} {tf}")
+
+            if missing_tfs:
+                st.error(
+                    f"Cannot predict: missing data for {len(missing_tfs)} timeframe(s). "
+                    f"Missing: {', '.join(missing_tfs)}"
+                )
+                st.info("Refresh the page to re-fetch. Rate-limited fetches may need a few minutes.")
+
+            if st.button("Make Prediction", type="primary", disabled=bool(missing_tfs)):
                 with st.spinner("Loading data and predicting..."):
                     try:
                         # Use all available data (LivePredictor trims internally)
