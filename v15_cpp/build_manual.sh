@@ -38,8 +38,26 @@ else
     exit 1
 fi
 
-# Compiler flags
-CXXFLAGS="-std=c++17 -O3 -march=native -Wall -Wextra -fPIC -fopenmp"
+# Compiler flags (OpenMP detection for macOS vs Linux)
+OPENMP_FLAGS=""
+OPENMP_LINK=""
+if [[ "$(uname)" == "Darwin" ]]; then
+    # macOS: clang needs libomp from Homebrew
+    LIBOMP_PREFIX="$(brew --prefix libomp 2>/dev/null || true)"
+    if [ -n "$LIBOMP_PREFIX" ] && [ -d "$LIBOMP_PREFIX" ]; then
+        OPENMP_FLAGS="-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include"
+        OPENMP_LINK="-L${LIBOMP_PREFIX}/lib -lomp"
+        echo -e "${GREEN}Found libomp at ${LIBOMP_PREFIX}${NC}"
+    else
+        echo -e "${YELLOW}Warning: libomp not found (brew install libomp). Building without OpenMP (single-threaded).${NC}"
+    fi
+else
+    # Linux: gcc/g++ has built-in OpenMP support
+    OPENMP_FLAGS="-fopenmp"
+    OPENMP_LINK="-fopenmp"
+fi
+
+CXXFLAGS="-std=c++17 -O3 -march=native -Wall -Wextra -fPIC ${OPENMP_FLAGS}"
 INCLUDE_FLAGS="-I${PROJECT_ROOT}/include"
 EIGEN_INCLUDE=""
 
@@ -243,7 +261,7 @@ compile_scanner() {
     print_step "Compiling v15_scanner executable..."
     ${CXX} ${CXXFLAGS} ${INCLUDE_FLAGS} ${EIGEN_INCLUDE} \
         "${MAIN_SOURCE}" \
-        -L"${LIB_DIR}" -lv15scanner \
+        -L"${LIB_DIR}" -lv15scanner ${OPENMP_LINK} \
         -o "${SCANNER_EXEC}"
 
     if [ -f "${SCANNER_EXEC}" ]; then
@@ -282,7 +300,7 @@ compile_tests() {
         print_step "Compiling ${test_name}..."
         ${CXX} ${CXXFLAGS} ${INCLUDE_FLAGS} ${EIGEN_INCLUDE} \
             "${PROJECT_ROOT}/${test_src}" \
-            -L"${LIB_DIR}" -lv15scanner \
+            -L"${LIB_DIR}" -lv15scanner ${OPENMP_LINK} \
             -o "${test_exec}"
 
         if [ -f "${test_exec}" ]; then
@@ -318,7 +336,7 @@ compile_examples() {
         print_step "Compiling ${example_name}..."
         ${CXX} ${CXXFLAGS} ${INCLUDE_FLAGS} ${EIGEN_INCLUDE} \
             "${PROJECT_ROOT}/${example_src}" \
-            -L"${LIB_DIR}" -lv15scanner \
+            -L"${LIB_DIR}" -lv15scanner ${OPENMP_LINK} \
             -o "${example_exec}"
 
         if [ -f "${example_exec}" ]; then
