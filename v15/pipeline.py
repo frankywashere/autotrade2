@@ -274,7 +274,8 @@ def cmd_train(args):
         trainer.load_checkpoint(checkpoint_path)
         if getattr(args, 'reset_best_val_loss', False):
             trainer.best_val_loss = float('inf')
-            logger.info("Reset best_val_loss to inf (fresh early stopping tracking)")
+            trainer.best_per_tf_mae = float('inf')
+            logger.info("Reset best_val_loss and best_per_tf_mae to inf (fresh early stopping tracking)")
 
     history = trainer.train()
 

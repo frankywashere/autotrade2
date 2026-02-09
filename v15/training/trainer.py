@@ -405,6 +405,7 @@ class Trainer:
         # Metrics tracking
         self.metrics_tracker = MetricsTracker()
         self.best_val_loss = float('inf')
+        self.best_per_tf_mae = float('inf')
         self.epochs_without_improvement = 0
         self.start_epoch = 1  # Can be overridden by load_checkpoint()
 
@@ -2002,7 +2003,7 @@ class Trainer:
             logger.warning(f"Feature analysis failed: {e}")
             logger.warning("Continuing with training anyway...")
 
-    def save_checkpoint(self, epoch: int, is_best: bool = False):
+    def save_checkpoint(self, epoch: int, is_best: bool = False, is_best_per_tf: bool = False):
         """Save model checkpoint including window selection head if present."""
         if self.checkpoint_dir is None:
             return
@@ -2018,6 +2019,7 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'best_val_loss': self.best_val_loss,
+            'best_per_tf_mae': self.best_per_tf_mae,
             'metrics': self.metrics_tracker.get_history(),
             'feature_names': self.feature_names,
             'correlation_info': self.correlation_info,
@@ -2101,6 +2103,11 @@ class Trainer:
             torch.save(checkpoint, self.checkpoint_dir / 'best.pt')
             logger.info(f"Saved best model at epoch {epoch}")
 
+        # Save best per-TF checkpoint
+        if is_best_per_tf:
+            torch.save(checkpoint, self.checkpoint_dir / 'best_per_tf.pt')
+            logger.info(f"Saved best per-TF model at epoch {epoch} (per_tf_mae={self.best_per_tf_mae:.4f})")
+
         if self.distributed:
             barrier()  # Signal non-rank-0 processes that save is done
 
@@ -2182,6 +2189,7 @@ class Trainer:
 
         # Load training state
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        self.best_per_tf_mae = checkpoint.get('best_per_tf_mae', float('inf'))
         self.feature_names = checkpoint.get('feature_names')
         self.correlation_info = checkpoint.get('correlation_info')
 
@@ -2312,8 +2320,14 @@ class Trainer:
             else:
                 self.epochs_without_improvement += 1
 
+            # Check for per-TF MAE improvement
+            per_tf_mae = val_losses.get('val_per_tf_duration_mae', float('inf'))
+            is_best_per_tf = per_tf_mae < self.best_per_tf_mae
+            if is_best_per_tf:
+                self.best_per_tf_mae = per_tf_mae
+
             # Save checkpoint
-            self.save_checkpoint(epoch, is_best)
+            self.save_checkpoint(epoch, is_best, is_best_per_tf)
 
             # Early stopping (broadcast from rank 0 so all ranks stop together)
             should_stop = self.epochs_without_improvement >= self.early_stopping_patience
