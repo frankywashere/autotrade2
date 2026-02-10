@@ -27,7 +27,7 @@ from .distributed import (
 )
 
 from ..models import V15Model, create_model
-from ..config import TRAINING_CONFIG, TOTAL_FEATURES, TIMEFRAMES, N_WINDOWS
+from ..config import TRAINING_CONFIG, TOTAL_FEATURES, TIMEFRAMES, N_WINDOWS, BARS_PER_TF
 from ..exceptions import ModelError
 from .metrics import compute_metrics, MetricsTracker
 from ..features.validation import analyze_correlations, check_for_constant_features
@@ -738,17 +738,20 @@ class Trainer:
             return None
 
         # direction_logits: [batch, n_tfs]
+        n_tfs = direction_logits.size(1)
         probs = torch.sigmoid(direction_logits)  # [batch, n_tfs]
 
         # Adjacent TF disagreement
         diff = torch.abs(probs[:, :-1] - probs[:, 1:])  # [batch, n_tfs-1]
 
         # Weight by TF proximity (closer TFs should agree more)
+        # Compute gaps dynamically from TIMEFRAMES config
         # TF gaps in minutes: 5→15(10), 15→30(15), 30→1h(30), 1h→2h(60), 2h→3h(60),
         # 3h→4h(60), 4h→daily(1200), daily→weekly(6720), weekly→monthly(20160)
-        tf_gaps = torch.tensor([10, 15, 30, 60, 60, 60, 1200, 6720, 20160],
-                               dtype=torch.float32, device=direction_logits.device)
-        weights = 1.0 / (1.0 + torch.log1p(tf_gaps))  # Log-scale weighting
+        tf_bar_mins = [BARS_PER_TF[tf] * 5 for tf in TIMEFRAMES[:n_tfs]]  # Convert to minutes
+        tf_gaps = [tf_bar_mins[i+1] - tf_bar_mins[i] for i in range(n_tfs-1)]
+        tf_gaps_tensor = torch.tensor(tf_gaps, dtype=torch.float32, device=direction_logits.device)
+        weights = 1.0 / (1.0 + torch.log1p(tf_gaps_tensor))  # Log-scale weighting
 
         return (diff * weights.unsqueeze(0)).mean()
 
@@ -758,17 +761,23 @@ class Trainer:
             return None
 
         # durations: [batch, n_tfs] in bars
-        # TF bar lengths in minutes: 5, 15, 30, 60, 120, 180, 240, 390, 2730, 21900
-        tf_bar_mins = torch.tensor([5, 15, 30, 60, 120, 180, 240, 390, 2730, 21900],
-                                   dtype=torch.float32, device=durations.device)
+        n_tfs = durations.size(1)
+
+        # TF bar lengths in minutes: dynamically computed from BARS_PER_TF config
+        # Examples: 5, 15, 30, 60, 120, 180, 240, 390, 2730, 21900
+        tf_bar_mins = torch.tensor(
+            [BARS_PER_TF[tf] * 5 for tf in TIMEFRAMES[:n_tfs]],
+            dtype=torch.float32,
+            device=durations.device
+        )
 
         # Convert to absolute time (minutes)
         abs_durations = durations * tf_bar_mins.unsqueeze(0)  # [batch, n_tfs]
 
         # Soft monotonic constraint: abs_duration[i] should <= abs_duration[j] for i < j
         violations = []
-        for i in range(9):  # 0-8
-            for j in range(i+1, 10):  # i+1 to 9
+        for i in range(n_tfs - 1):  # 0 to n_tfs-2
+            for j in range(i+1, n_tfs):  # i+1 to n_tfs-1
                 # Penalize if shorter TF (i) predicts longer absolute duration than longer TF (j)
                 margin = 5.0  # 5 minute slack
                 violation = F.relu(abs_durations[:, i] - abs_durations[:, j] + margin)

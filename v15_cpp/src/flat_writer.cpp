@@ -5,6 +5,7 @@
 #include "flat_writer.hpp"
 #include "npy_writer.hpp"
 #include "sample.hpp"
+#include "feature_array.hpp"
 #include <fstream>
 #include <stdexcept>
 #include <algorithm>
@@ -149,13 +150,13 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
     float cross_mag_spread = 0.0f;
     float cross_dur_spread = 0.0f;
 
-    // Per-TF duration and direction (10 timeframes)
-    std::vector<float> per_tf_dur(10, 0.0f);
-    std::vector<uint8_t> per_tf_valid(10, 0);
-    std::vector<int64_t> per_tf_dir(10, 0);
-    std::vector<uint8_t> per_tf_dir_valid(10, 0);
-    std::vector<int64_t> per_tf_nc(10, 1);  // default=sideways
-    std::vector<uint8_t> per_tf_nc_valid(10, 0);
+    // Per-TF duration and direction (NUM_TFS timeframes)
+    std::vector<float> per_tf_dur(FeatureOffsets::NUM_TFS, 0.0f);
+    std::vector<uint8_t> per_tf_valid(FeatureOffsets::NUM_TFS, 0);
+    std::vector<int64_t> per_tf_dir(FeatureOffsets::NUM_TFS, 0);
+    std::vector<uint8_t> per_tf_dir_valid(FeatureOffsets::NUM_TFS, 0);
+    std::vector<int64_t> per_tf_nc(FeatureOffsets::NUM_TFS, 1);  // default=sideways
+    std::vector<uint8_t> per_tf_nc_valid(FeatureOffsets::NUM_TFS, 0);
 
     // Try to get labels from the sample
     // Structure: labels_per_window[window][tf] = ChannelLabels (no asset level)
@@ -244,6 +245,18 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
     static const std::vector<std::string> TIMEFRAMES = {
         "5min", "15min", "30min", "1h", "2h", "3h", "4h", "daily", "weekly", "monthly"
     };
+    // Verify TIMEFRAMES size matches NUM_TFS at runtime (first call only)
+    static bool size_checked = false;
+    if (!size_checked) {
+        if (TIMEFRAMES.size() != FeatureOffsets::NUM_TFS) {
+            throw std::runtime_error(
+                "TIMEFRAMES size mismatch: expected " +
+                std::to_string(FeatureOffsets::NUM_TFS) +
+                ", got " + std::to_string(TIMEFRAMES.size())
+            );
+        }
+        size_checked = true;
+    }
 
     if (window_it != sample.labels_per_window.end()) {
         for (size_t i = 0; i < TIMEFRAMES.size(); ++i) {
@@ -396,17 +409,17 @@ void FlatWriter::write_labels_npy() {
     NpyWriter::write_float32_1d(labels_dir + "cross_durability_spread.npy", L_cross_durability_spread);
 
     // Per-TF duration (2D arrays)
-    NpyWriter::write_float32_2d(labels_dir + "per_tf_duration.npy", L_per_tf_duration, num_samples_, 10);
+    NpyWriter::write_float32_2d(labels_dir + "per_tf_duration.npy", L_per_tf_duration, num_samples_, FeatureOffsets::NUM_TFS);
     // Per-TF valid needs special handling for bool 2D
     // For now write as 1D and reshape in Python
     NpyWriter::write_bool_1d(labels_dir + "per_tf_duration_valid.npy", L_per_tf_duration_valid);
 
     // Per-TF direction (2D arrays)
-    NpyWriter::write_int64_2d(labels_dir + "per_tf_direction.npy", L_per_tf_direction, num_samples_, 10);
+    NpyWriter::write_int64_2d(labels_dir + "per_tf_direction.npy", L_per_tf_direction, num_samples_, FeatureOffsets::NUM_TFS);
     NpyWriter::write_bool_1d(labels_dir + "per_tf_direction_valid.npy", L_per_tf_direction_valid);
 
     // Per-TF new_channel
-    NpyWriter::write_int64_2d(labels_dir + "per_tf_new_channel.npy", L_per_tf_new_channel, num_samples_, 10);
+    NpyWriter::write_int64_2d(labels_dir + "per_tf_new_channel.npy", L_per_tf_new_channel, num_samples_, FeatureOffsets::NUM_TFS);
     NpyWriter::write_bool_1d(labels_dir + "per_tf_new_channel_valid.npy", L_per_tf_new_channel_valid);
 
     std::cout << "  Wrote " << 53 << " label arrays to " << labels_dir << std::endl;

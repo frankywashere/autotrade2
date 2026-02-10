@@ -331,7 +331,7 @@ class Predictor:
         direction_prob = torch.sigmoid(outputs['direction_logits']).item()
         direction = 'up' if direction_prob > 0.5 else 'down'
 
-        new_channel_probs = torch.softmax(outputs['new_channel_logits'], dim=-1).squeeze()
+        new_channel_probs = torch.softmax(outputs['new_channel_logits'], dim=-1)[0]  # Remove batch dim
         new_channel_idx = new_channel_probs.argmax().item()
         new_channel_names = ['bear', 'sideways', 'bull']
         new_channel = new_channel_names[new_channel_idx]
@@ -350,7 +350,7 @@ class Predictor:
             used_learned_selection = True
 
             # Get probabilities for all windows
-            probs = window_sel['probs'].squeeze()
+            probs = window_sel['probs'][0]  # Remove batch dim
             learned_window_probs = {
                 STANDARD_WINDOWS[i]: probs[i].item()
                 for i in range(len(STANDARD_WINDOWS))
@@ -421,7 +421,7 @@ class Predictor:
         direction_prob = torch.sigmoid(outputs['direction_logits']).item()
         direction = 'up' if direction_prob > 0.5 else 'down'
 
-        new_channel_probs = torch.softmax(outputs['new_channel_logits'], dim=-1).squeeze()
+        new_channel_probs = torch.softmax(outputs['new_channel_logits'], dim=-1)[0]  # Remove batch dim
         new_channel_idx = new_channel_probs.argmax().item()
         new_channel_names = ['bear', 'sideways', 'bull']
         new_channel = new_channel_names[new_channel_idx]
@@ -437,7 +437,7 @@ class Predictor:
             learned_window = STANDARD_WINDOWS[selected_idx]
             used_learned_selection = True
 
-            probs = window_sel['probs'].squeeze()
+            probs = window_sel['probs'][0]  # Remove batch dim
             learned_window_probs = {
                 STANDARD_WINDOWS[i]: probs[i].item()
                 for i in range(len(STANDARD_WINDOWS))
