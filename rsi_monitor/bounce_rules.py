@@ -1,5 +1,5 @@
 """
-Channel Bounce Rule Engine for TSLA.
+Channel Bounce Rule Engine.
 
 Evaluates 13 backtest-validated rules to score the probability of a channel
 bounce vs. breakout. Rules are grouped into Core (20 pts each), Modifier
@@ -53,7 +53,7 @@ class BounceAssessment:
 
 class BounceRuleEngine:
     """
-    Evaluates 13 backtest-validated rules for TSLA channel bounces.
+    Evaluates 13 backtest-validated rules for channel bounces.
 
     Call evaluate() with channel context, RSI results, VIX confirmation,
     and raw OHLCV DataFrames. Returns a BounceAssessment.
@@ -69,16 +69,18 @@ class BounceRuleEngine:
         vix_confirmation: Optional[Any] = None,
         ohlcv_data: Optional[Dict[str, Any]] = None,
         spy_rsi_results: Optional[Dict[str, Any]] = None,
+        symbol: str = "TSLA",
     ) -> BounceAssessment:
         """
         Evaluate all 13 rules and return a BounceAssessment.
 
         Args:
             channel_context: Dict of {tf: {channel: {...}, meets_criteria: bool}}
-            rsi_results: RSI data for TSLA from rsi_monitor (with rsi_history)
+            rsi_results: RSI data for the symbol from rsi_monitor (with rsi_history)
             vix_confirmation: VIXAnalyzer confirmation object
             ohlcv_data: Dict of {tf: DataFrame} with OHLCV columns
             spy_rsi_results: RSI data for SPY (optional, for rule 4)
+            symbol: Ticker symbol being analyzed (for display in rule names)
         """
         rules = []
 
@@ -91,14 +93,14 @@ class BounceRuleEngine:
             if isinstance(ch, dict) and ch.get('meets_criteria', False)
         )
 
-        # Extract TSLA RSI history for the best TF
-        tsla_rsi_history = self._get_rsi_history(rsi_results, best_tf)
+        # Extract RSI history for the best TF
+        symbol_rsi_history = self._get_rsi_history(rsi_results, best_tf)
 
         # --- Core Rules (20 pts each) ---
-        rules.append(self._rule_rsi_momentum_reversing(tsla_rsi_history, band, best_channel))
+        rules.append(self._rule_rsi_momentum_reversing(symbol_rsi_history, band, best_channel))
         rules.append(self._rule_prior_bounces(best_channel))
         rules.append(self._rule_break_dir_vs_slope(best_channel, band))
-        rules.append(self._rule_both_oversold(rsi_results, spy_rsi_results, band))
+        rules.append(self._rule_both_oversold(rsi_results, spy_rsi_results, band, symbol))
 
         # --- Modifier Rules (5-10 pts each) ---
         rules.append(self._rule_open_window())
@@ -111,7 +113,7 @@ class BounceRuleEngine:
         rules.append(self._rule_high_volume(ohlcv_data, best_tf))
         rules.append(self._rule_close_window())
         rules.append(self._rule_double_lower(channel_context))
-        rules.append(self._rule_rsi_momentum_continuing(tsla_rsi_history, band, best_channel))
+        rules.append(self._rule_rsi_momentum_continuing(symbol_rsi_history, band, best_channel))
 
         # Score
         raw_points = sum(r.points for r in rules if r.fired)
@@ -288,32 +290,32 @@ class BounceRuleEngine:
             win_rate=92.5, description=desc,
         )
 
-    def _rule_both_oversold(self, rsi_results: Dict[str, Any], spy_rsi_results: Optional[Dict[str, Any]], band: str) -> RuleResult:
-        """Rule 4: TSLA + SPY both oversold on any short-term TF near lower band (79% win rate)."""
+    def _rule_both_oversold(self, rsi_results: Dict[str, Any], spy_rsi_results: Optional[Dict[str, Any]], band: str, symbol: str = "TSLA") -> RuleResult:
+        """Rule 4: Symbol + SPY both oversold on any short-term TF near lower band (79% win rate)."""
         fired = False
-        desc = "TSLA+SPY not both oversold"
+        desc = f"{symbol}+SPY not both oversold"
 
         if band == 'lower' and spy_rsi_results:
-            tsla_oversold = False
+            symbol_oversold = False
             spy_oversold = False
 
             for tf in self.SHORT_TERM_TFS:
-                tsla_data = rsi_results.get(tf, {})
-                tsla_rsi = tsla_data.get('rsi') if isinstance(tsla_data, dict) else tsla_data
-                if isinstance(tsla_rsi, (int, float)) and tsla_rsi < 30:
-                    tsla_oversold = True
+                sym_data = rsi_results.get(tf, {})
+                sym_rsi = sym_data.get('rsi') if isinstance(sym_data, dict) else sym_data
+                if isinstance(sym_rsi, (int, float)) and sym_rsi < 30:
+                    symbol_oversold = True
 
                 spy_data = spy_rsi_results.get(tf, {})
                 spy_rsi = spy_data.get('rsi') if isinstance(spy_data, dict) else spy_data
                 if isinstance(spy_rsi, (int, float)) and spy_rsi < 30:
                     spy_oversold = True
 
-            if tsla_oversold and spy_oversold:
+            if symbol_oversold and spy_oversold:
                 fired = True
-                desc = "Both TSLA and SPY oversold on short-term TF"
+                desc = f"Both {symbol} and SPY oversold on short-term TF"
 
         return RuleResult(
-            name="TSLA + SPY Both Oversold",
+            name=f"{symbol} + SPY Both Oversold",
             fired=fired, direction='bounce', category='core',
             points=20 if fired else 0, max_points=20,
             win_rate=79.0, description=desc,

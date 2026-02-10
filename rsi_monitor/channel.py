@@ -1,7 +1,7 @@
 """
 Channel detection module for RSI Monitor.
 
-Provides linear regression channel detection for TSLA across multiple
+Provides linear regression channel detection across multiple
 intraday timeframes. Uses scipy.stats.linregress for fitting and
 computes channel bands, position, direction, and age.
 """
@@ -51,7 +51,7 @@ CHANNEL_WIN_RATES = {
     ('4h', 'rsi_channel_pf'): 1.46,
 }
 
-# Default timeframes for channel analysis (skip 1d, 1wk -- useless for TSLA)
+# Default timeframes for channel analysis (skip 1d, 1wk -- optimized for intraday)
 DEFAULT_TIMEFRAMES = ['5m', '15m', '1h', '4h']
 
 # Period to fetch for each interval (enough bars for lookback)
@@ -320,7 +320,7 @@ def get_channel_context(
 ) -> dict:
     """
     Get channel analysis across multiple timeframes for a symbol.
-    Called from dashboard.py for TSLA only.
+    Called from dashboard.py for the selected bounce symbol.
 
     Args:
         rsi_results: Not used directly, but available if needed later.

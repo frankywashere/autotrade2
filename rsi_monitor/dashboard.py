@@ -635,20 +635,29 @@ def main():
             if hist:
                 vix_rsi_history[tf] = hist
 
-    # Compute channel context for TSLA only (5m, 15m, 1h, 4h)
-    tsla_channel_context = {}
-    tsla_ohlcv_data = {}
-    if "TSLA" in all_symbols:
+    # Determine which symbol to analyze in Channel Bounce tab
+    equity_symbols = [s for s in all_symbols if not s.startswith("^")]
+    if "bounce_symbol" not in st.session_state:
+        st.session_state.bounce_symbol = equity_symbols[0] if equity_symbols else "TSLA"
+    # If the stored symbol was deselected, fall back to first available
+    if st.session_state.bounce_symbol not in equity_symbols and equity_symbols:
+        st.session_state.bounce_symbol = equity_symbols[0]
+    bounce_symbol = st.session_state.bounce_symbol
+
+    # Compute channel context for the selected bounce symbol (5m, 15m, 1h, 4h)
+    bounce_channel_context = {}
+    bounce_ohlcv_data = {}
+    if bounce_symbol in all_symbols:
         try:
-            tsla_channel_context, tsla_ohlcv_data = get_channel_context_with_data(
+            bounce_channel_context, bounce_ohlcv_data = get_channel_context_with_data(
                 rsi_results=rsi_results,
                 data_fetcher=data_fetcher,
-                symbol="TSLA",
+                symbol=bounce_symbol,
                 prepost=prepost
             )
         except Exception:
-            tsla_channel_context = {}
-            tsla_ohlcv_data = {}
+            bounce_channel_context = {}
+            bounce_ohlcv_data = {}
 
     # Generate signals for all symbols (with VIX confirmation for strength bonus)
     signals = {}
@@ -668,7 +677,7 @@ def main():
                 else:
                     plain_rsi[tf] = data
             signal_input = {'symbol': symbol, 'timeframes': plain_rsi}
-            ch_ctx = tsla_channel_context if symbol == 'TSLA' else None
+            ch_ctx = bounce_channel_context if symbol == bounce_symbol else None
             signals[symbol] = signal_generator.analyze(signal_input, vix_confirmation, rsi_history=rsi_history, vix_rsi_history=vix_rsi_history, vix_daily_changes=vix_daily_changes, channel_context=ch_ctx)
         except Exception as e:
             st.warning(f"Error generating signal for {symbol}: {e}")
@@ -681,29 +690,26 @@ def main():
     )
     st.session_state.recovery_mode_active = any_recovery
 
-    # Compute bounce assessment for TSLA (used in Channel Bounce tab)
+    # Compute bounce assessment for selected symbol (used in Channel Bounce tab)
     bounce_assessment = None
-    if "TSLA" in all_symbols and tsla_channel_context:
+    if bounce_symbol in all_symbols and bounce_channel_context:
         try:
             bounce_engine = BounceRuleEngine()
-            tsla_rsi_data = rsi_results.get("TSLA", {})
+            symbol_rsi_data = rsi_results.get(bounce_symbol, {})
             spy_rsi_data = rsi_results.get("SPY", {})
             bounce_assessment = bounce_engine.evaluate(
-                channel_context=tsla_channel_context,
-                rsi_results=tsla_rsi_data,
+                channel_context=bounce_channel_context,
+                rsi_results=symbol_rsi_data,
                 vix_confirmation=vix_confirmation,
-                ohlcv_data=tsla_ohlcv_data,
+                ohlcv_data=bounce_ohlcv_data,
                 spy_rsi_results=spy_rsi_data if "SPY" in all_symbols else None,
+                symbol=bounce_symbol,
             )
         except Exception as e:
-            logger.warning("Bounce assessment failed: %s", e)
+            logger.warning("Bounce assessment failed for %s: %s", bounce_symbol, e)
 
     # --- Tabs ---
-    tab_names = ["Market Pulse"]
-    if "TSLA" in all_symbols:
-        tab_names.append("Channel Bounce")
-
-    tabs = st.tabs(tab_names)
+    tabs = st.tabs(["Market Pulse", "Channel Bounce"])
 
     # === Market Pulse Tab ===
     with tabs[0]:
@@ -887,7 +893,7 @@ def main():
                                     hide_index=True
                                 )
 
-                                if symbol == 'TSLA' and channel_details.get("timeframes"):
+                                if symbol == bounce_symbol and channel_details.get("timeframes"):
                                     with st.expander("Channel Analysis", expanded=False):
                                         ch_tfs = channel_details.get("timeframes", {})
                                         if ch_tfs:
@@ -917,9 +923,8 @@ def main():
                                 st.warning("No RSI data available")
 
     # === Channel Bounce Tab ===
-    if "TSLA" in all_symbols and len(tabs) > 1:
-        with tabs[1]:
-            render_bounce_tab(bounce_assessment, tsla_channel_context)
+    with tabs[1]:
+        render_bounce_tab(bounce_assessment, bounce_channel_context, bounce_symbol, all_symbols)
 
     # Footer
     st.divider()
@@ -931,10 +936,27 @@ def main():
         st.rerun()
 
 
-def render_bounce_tab(assessment, channel_context):
-    """Render the Channel Bounce tab for TSLA."""
+def render_bounce_tab(assessment, channel_context, symbol, all_symbols):
+    """Render the Channel Bounce tab for the selected symbol."""
+    # Symbol selector — exclude VIX (^VIX) since it's not a tradeable equity channel
+    equity_symbols = [s for s in all_symbols if not s.startswith("^")]
+    if not equity_symbols:
+        st.info("No equity symbols selected. Add at least one symbol to use Channel Bounce.")
+        return
+
+    current_idx = equity_symbols.index(symbol) if symbol in equity_symbols else 0
+    selected = st.selectbox(
+        "Symbol",
+        options=equity_symbols,
+        index=current_idx,
+        key="bounce_symbol_select",
+    )
+    if selected != st.session_state.bounce_symbol:
+        st.session_state.bounce_symbol = selected
+        st.rerun()
+
     if assessment is None:
-        st.info("No active channels detected for TSLA. Channel bounce analysis requires at least one valid channel.")
+        st.info(f"No active channels detected for {symbol}. Channel bounce analysis requires at least one valid channel.")
         return
 
     # Score color
@@ -965,7 +987,7 @@ def render_bounce_tab(assessment, channel_context):
     break_label, break_color = break_map.get(assessment.predicted_break_dir, ('Unknown', '#6c757d'))
 
     # --- Score Card ---
-    st.markdown(f"""<div style="background-color: #1a1c23; border: 1px solid #2d3039; border-radius: 12px; padding: 0; margin-bottom: 16px; overflow: hidden;"><div style="height: 3px; background-color: {score_color};"></div><div style="padding: 20px;"><div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;"><span style="font-size: 1.6em; font-weight: 700; color: #e0e0e0; margin-right: 4px;">TSLA</span><div style="display: flex; align-items: baseline; gap: 8px;"><span style="font-size: 2em; font-weight: 700; color: {score_color};">{score:.0f}</span><span style="font-size: 1em; color: #6b7080;">/100</span></div><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {score_color}22; color: {score_color}; font-size: 0.85em; font-weight: 600;">{assessment.confidence_label.upper()}</span><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {dir_color}22; color: {dir_color}; font-size: 0.85em; font-weight: 600;">{dir_label}</span><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {break_color}22; color: {break_color}; font-size: 0.85em; font-weight: 600;">Break: {break_label}</span><span style="color: #6b7080; font-size: 0.85em;">{assessment.active_channels} active channel{'s' if assessment.active_channels != 1 else ''}</span></div></div></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div style="background-color: #1a1c23; border: 1px solid #2d3039; border-radius: 12px; padding: 0; margin-bottom: 16px; overflow: hidden;"><div style="height: 3px; background-color: {score_color};"></div><div style="padding: 20px;"><div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;"><span style="font-size: 1.6em; font-weight: 700; color: #e0e0e0; margin-right: 4px;">{symbol}</span><div style="display: flex; align-items: baseline; gap: 8px;"><span style="font-size: 2em; font-weight: 700; color: {score_color};">{score:.0f}</span><span style="font-size: 1em; color: #6b7080;">/100</span></div><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {score_color}22; color: {score_color}; font-size: 0.85em; font-weight: 600;">{assessment.confidence_label.upper()}</span><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {dir_color}22; color: {dir_color}; font-size: 0.85em; font-weight: 600;">{dir_label}</span><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {break_color}22; color: {break_color}; font-size: 0.85em; font-weight: 600;">Break: {break_label}</span><span style="color: #6b7080; font-size: 0.85em;">{assessment.active_channels} active channel{'s' if assessment.active_channels != 1 else ''}</span></div></div></div>""", unsafe_allow_html=True)
 
     # --- Channel Status Grid ---
     st.markdown('<h4 style="margin: 0.8rem 0 0.4rem 0; font-weight: 600; color: #e0e0e0;">Channel Status</h4>', unsafe_allow_html=True)
