@@ -94,6 +94,7 @@ class V15Model(nn.Module):
         self.enable_cross_correlation_heads = enable_cross_correlation_heads
         self.enable_durability_heads = enable_durability_heads
         self.enable_rsi_heads = enable_rsi_heads
+        # Will be set to False if input_dim doesn't match TOTAL_FEATURES
         self.use_sequence_branch = use_sequence_branch
 
         # Shared features = events + bar metadata
@@ -194,7 +195,8 @@ class V15Model(nn.Module):
             )
 
         # 8. Optional LSTM branch over per-TF window channel sequences
-        if use_sequence_branch:
+        # CRITICAL: Only enable if using full 15350-feature format (offset calculations require it)
+        if use_sequence_branch and input_dim == TOTAL_FEATURES:
             channel_per_window = (
                 FEATURE_COUNTS['channel_per_window'] +
                 FEATURE_COUNTS['spy_channel_per_window']
@@ -218,6 +220,15 @@ class V15Model(nn.Module):
             self._window_offset = WINDOW_INDEPENDENT_PER_TF
             self._n_windows = N_WINDOWS
             self._channel_per_window = channel_per_window
+            logger.info(f"LSTM sequence branch enabled (requires 15350 features)")
+        elif use_sequence_branch and input_dim != TOTAL_FEATURES:
+            logger.warning(
+                f"LSTM sequence branch disabled: requires {TOTAL_FEATURES} features, got {input_dim}. "
+                f"Old data format detected. LSTM will be skipped."
+            )
+            self.use_sequence_branch = False  # Disable to prevent NaN
+        else:
+            self.use_sequence_branch = use_sequence_branch
 
     def validate_input(self, x: torch.Tensor) -> None:
         """Check for NaN/Inf in input - LOUD failure."""
