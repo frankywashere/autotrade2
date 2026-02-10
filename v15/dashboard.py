@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from v15.config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES
 from v15.dtypes import ChannelSample
+from v15.signals.bounce_signal import SignalStrategy
 
 # Import new visualization modules
 from v15.visualization.plotly_charts import (
@@ -397,11 +398,21 @@ def show_per_tf_predictions_table(prediction):
         if tf_name in prediction.per_tf_predictions:
             tf_pred = prediction.per_tf_predictions[tf_name]
             horizon = TF_TO_HORIZON.get(tf_name, '?')
+            # Extract next_channel if available
+            nc_str = 'N/A'
+            nc_prob_str = 'N/A'
+            if hasattr(tf_pred, 'next_channel') and hasattr(tf_pred, 'next_channel_probs'):
+                nc_str = tf_pred.next_channel.upper()
+                nc_prob = max(tf_pred.next_channel_probs.values())
+                nc_prob_str = f"{nc_prob:.0%}"
+
             data.append({
                 'Horizon': horizon.title(),
                 'Timeframe': tf_name,
                 'Direction': tf_pred.direction.upper(),
                 'Dir Prob': f"{tf_pred.direction_prob:.0%}",
+                'Next Channel': nc_str,
+                'NC Prob': nc_prob_str,
                 'Confidence': f"{tf_pred.confidence:.0%}",
                 'Duration': f"{tf_pred.duration_mean:.0f} +/- {tf_pred.duration_std:.0f}",
                 'Window': tf_pred.best_window,
@@ -414,6 +425,8 @@ def show_per_tf_predictions_table(prediction):
                 'Timeframe': tf_name,
                 'Direction': 'N/A',
                 'Dir Prob': 'N/A',
+                'Next Channel': 'N/A',
+                'NC Prob': 'N/A',
                 'Confidence': 'N/A',
                 'Duration': 'N/A',
                 'Window': 'N/A',
@@ -477,6 +490,7 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
         confidence = 0.0
         tf_window = 50
         tf_direction = None
+        tf_next_channel = None
         tf_pred = None
 
         if prediction is not None and prediction.per_tf_predictions is not None:
@@ -486,10 +500,13 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                 confidence = tf_pred.confidence
                 tf_window = tf_pred.best_window
                 tf_direction = tf_pred.direction
+                if hasattr(tf_pred, 'next_channel'):
+                    tf_next_channel = tf_pred.next_channel
 
         # Create expander with summary in header
         dir_str = tf_direction.upper() if tf_direction else '?'
-        expander_header = f"{tf_name} - {dir_str} - Duration: {duration:.0f} bars - Conf: {confidence:.0%}"
+        nc_str = f" → {tf_next_channel.upper()}" if tf_next_channel else ""
+        expander_header = f"{tf_name} - {dir_str}{nc_str} - Duration: {duration:.0f} bars - Conf: {confidence:.0%}"
 
         with st.expander(expander_header, expanded=False):
             try:
@@ -1324,7 +1341,90 @@ def main():
                                 f"(latency: {live_pred.latency_ms:.0f}ms, "
                                 f"bars: {live_pred.source_bar_count:,})"
                             )
+
+                            # Signal strategy selection
+                            signal_strategy_map = {
+                                'Most Confident TF': SignalStrategy.MOST_CONFIDENT,
+                                'Shortest Confident TF (>70%)': SignalStrategy.SHORTEST_CONFIDENT,
+                                'Consensus (7/10 TFs agree)': SignalStrategy.CONSENSUS,
+                            }
+                            selected_strategy_name = st.selectbox(
+                                "Signal Selection Strategy",
+                                options=list(signal_strategy_map.keys()),
+                                index=0,
+                                help="How to select which timeframe to use for trading signals"
+                            )
+                            selected_strategy = signal_strategy_map[selected_strategy_name]
+
+                            # Recompute signal with selected strategy
+                            if prediction.per_tf_predictions:
+                                from v15.signals.bounce_signal import BounceSignalEngine
+                                engine = BounceSignalEngine()
+                                prediction.bounce_signal = engine.generate_signal(
+                                    per_tf_predictions=prediction.per_tf_predictions,
+                                    strategy=selected_strategy,
+                                )
+
                             show_prediction_card(prediction)
+
+                            # Bounce Signal Alert
+                            st.divider()
+                            st.subheader("Bounce Signal")
+                            if prediction.bounce_signal and prediction.bounce_signal.actionable:
+                                signal = prediction.bounce_signal
+
+                                if signal.signal_type.value == 'buy':
+                                    st.success(f"🟢 BUY SIGNAL - {signal.strength}")
+                                elif signal.signal_type.value == 'sell':
+                                    st.error(f"🔴 SELL SIGNAL - {signal.strength}")
+
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("Primary TF", signal.primary_tf)
+                                with col2:
+                                    st.metric("Confidence", f"{signal.primary_confidence:.0%}")
+                                with col3:
+                                    st.metric("Time to Breach", f"{signal.time_to_breach_bars:.1f} bars")
+                                with col4:
+                                    st.metric("Boundary", signal.trigger_boundary.upper())
+
+                                # Risk warnings
+                                if signal.risk_warnings:
+                                    st.warning("⚠️ " + " | ".join(signal.risk_warnings))
+
+                                # Expandable per-TF breakdown
+                                with st.expander("📊 Signal Breakdown by Timeframe"):
+                                    signal_data = []
+                                    for tf in TIMEFRAMES:
+                                        if tf in signal.per_tf_scores:
+                                            score = signal.per_tf_scores[tf]
+                                            pred = prediction.per_tf_predictions[tf]
+                                            signal_data.append({
+                                                'TF': tf,
+                                                'Signal Score': f"{score:.0%}",
+                                                'Direction': pred.direction.upper(),
+                                                'Confidence': f"{pred.confidence:.0%}",
+                                                'Duration': f"{pred.duration_mean:.1f}±{pred.duration_std:.1f}",
+                                                '_score': score,  # hidden, for styling
+                                            })
+
+                                    signal_df = pd.DataFrame(signal_data)
+
+                                    def style_signal_row(row):
+                                        score = row.get('_score', 0.0)
+                                        if score >= 0.70:
+                                            return ['background-color: #d4edda'] * len(row)  # Green
+                                        elif score >= 0.60:
+                                            return ['background-color: #fff3cd'] * len(row)  # Yellow
+                                        else:
+                                            return [''] * len(row)
+
+                                    display_df = signal_df.drop(columns=['_score'])
+                                    styled = signal_df.style.apply(style_signal_row, axis=1)
+                                    styled = styled.hide(subset=['_score'], axis='columns')
+                                    st.dataframe(styled, hide_index=True)
+                            elif prediction.bounce_signal:
+                                st.info(f"ℹ️ {selected_strategy_name}: Signal not actionable (confidence={prediction.bounce_signal.primary_confidence:.0%})")
 
                             # Daily channel chart with aggregate projection
                             st.divider()

@@ -6984,24 +6984,24 @@ double FeatureExtractor::calculate_beta(
 
 std::vector<std::string> FeatureExtractor::get_all_feature_names() {
     std::vector<std::string> names;
-    names.reserve(14190);
+    names.reserve(TOTAL_FEATURE_COUNT);
 
-    // This would generate all 14,190 feature names in consistent order
+    // Generate all feature names in consistent order
     // For each TF:
-    //   - Price features (58)
+    //   - Price features (65)
     //   - Technical features (59)
-    //   - SPY features (117)
-    //   - VIX features (25)
-    //   - Cross-asset features (59)
-    //   - Channel features per window (58 × 8)
-    //   - SPY channel features per window (58 × 8)
+    //   - SPY features (121)
+    //   - VIX features (32)
+    //   - Cross-asset features (61)
+    //   - Channel features per window (128 × 8)
+    //   - Channel correlation (50)
     //   - Window scores (50)
     //   - Channel history (67)
     // Then event features (30)
     // Then bar metadata (30)
 
     // For brevity, returning placeholder
-    for (int i = 0; i < 14190; ++i) {
+    for (size_t i = 0; i < TOTAL_FEATURE_COUNT; ++i) {
         names.push_back("feature_" + std::to_string(i));
     }
 

@@ -5,6 +5,7 @@
 #include "indicators.hpp"
 #include "channel_history.hpp"  // For ChannelHistoryEntry
 #include "scanner.hpp"          // For SlimLabeledChannelMap, SlimLabeledChannel
+#include "feature_array.hpp"    // For TOTAL_FEATURE_COUNT
 #include <vector>
 #include <unordered_map>
 #include <string>
@@ -186,10 +187,10 @@ public:
     );
 
     /**
-     * Get expected total feature count (14,840)
-     * Updated after adding price-agnostic normalized features
+     * Get expected total feature count.
+     * Derived from TOTAL_FEATURE_COUNT in feature_array.hpp.
      */
-    static int get_total_feature_count() { return 14840; }
+    static int get_total_feature_count() { return static_cast<int>(TOTAL_FEATURE_COUNT); }
 
     /**
      * Get all feature names in consistent order

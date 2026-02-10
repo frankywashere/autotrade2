@@ -1021,6 +1021,10 @@ class ChannelDataset(Dataset):
         label_tensors['per_tf_duration'] = per_tf_duration
         label_tensors['per_tf_duration_valid'] = per_tf_duration_valid
 
+        per_tf_nc, per_tf_nc_valid = self._extract_per_tf_new_channel_labels(sample)
+        label_tensors['per_tf_new_channel'] = per_tf_nc
+        label_tensors['per_tf_new_channel_valid'] = per_tf_nc_valid
+
         return features, label_tensors
 
     def _extract_per_window_features(self, sample: ChannelSample) -> torch.Tensor:
@@ -1167,6 +1171,39 @@ class ChannelDataset(Dataset):
                 per_tf_duration_valid[tf_idx] = bool(is_valid)
 
         return per_tf_duration, per_tf_duration_valid
+
+    def _extract_per_tf_new_channel_labels(
+        self, sample: ChannelSample
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract next_channel_direction labels for all 10 TFs from the sample's best window.
+
+        Returns:
+            Tuple of:
+                - per_tf_new_channel: [n_tfs] tensor of direction class (0=bear, 1=sideways, 2=bull)
+                - per_tf_new_channel_valid: [n_tfs] boolean tensor of validity flags
+        """
+        n_tfs = len(TIMEFRAMES)
+        per_tf_new_channel = torch.ones(n_tfs, dtype=torch.long)  # default=sideways
+        per_tf_new_channel_valid = torch.zeros(n_tfs, dtype=torch.bool)
+
+        window = sample.best_window
+        window_labels = sample.labels_per_window.get(window, {})
+
+        if 'tsla' in window_labels:
+            tf_labels_dict = window_labels.get('tsla', {})
+        else:
+            tf_labels_dict = window_labels
+
+        for tf_idx, tf in enumerate(TIMEFRAMES):
+            tf_label = tf_labels_dict.get(tf)
+            if tf_label is not None:
+                ncd = getattr(tf_label, 'next_channel_direction', 1)
+                ncv = getattr(tf_label, 'next_channel_valid', False)
+                per_tf_new_channel[tf_idx] = int(ncd) if ncd is not None else 1
+                per_tf_new_channel_valid[tf_idx] = bool(ncv)
+
+        return per_tf_new_channel, per_tf_new_channel_valid
 
     def get_metadata(self, idx: int) -> Dict[str, Any]:
         """Get metadata for a sample (timestamp, window, bar_metadata)."""

@@ -648,6 +648,8 @@ class ChunkedStreamingDataset(Dataset):
         # Per-TF vectors
         L_per_tf_duration = np.zeros((n, n_tfs), dtype=np.float32)
         L_per_tf_duration_valid = np.zeros((n, n_tfs), dtype=np.bool_)
+        L_per_tf_new_channel = np.zeros((n, n_tfs), dtype=np.int64)
+        L_per_tf_new_channel_valid = np.zeros((n, n_tfs), dtype=np.bool_)
 
         # --- Fill raw values per sample (no torch.tensor calls) ---
         for i, sample in enumerate(samples):
@@ -850,6 +852,10 @@ class ChunkedStreamingDataset(Dataset):
                     dur = getattr(tf_label, 'duration_bars', 0)
                     L_per_tf_duration[i, tf_idx] = float(dur) if dur is not None else 0.0
                     L_per_tf_duration_valid[i, tf_idx] = bool(getattr(tf_label, 'duration_valid', False))
+                    ncd = getattr(tf_label, 'next_channel_direction', 1)
+                    ncv = getattr(tf_label, 'next_channel_valid', False)
+                    L_per_tf_new_channel[i, tf_idx] = int(ncd) if ncd is not None else 1
+                    L_per_tf_new_channel_valid[i, tf_idx] = bool(ncv)
 
             if (i + 1) % 5000 == 0:
                 elapsed = _time.perf_counter() - t1
@@ -980,6 +986,8 @@ class ChunkedStreamingDataset(Dataset):
             # Per-TF
             'per_tf_duration': torch.from_numpy(L_per_tf_duration),
             'per_tf_duration_valid': torch.from_numpy(L_per_tf_duration_valid),
+            'per_tf_new_channel': torch.from_numpy(L_per_tf_new_channel),
+            'per_tf_new_channel_valid': torch.from_numpy(L_per_tf_new_channel_valid),
         }
 
         label_elapsed = _time.perf_counter() - t1
@@ -1121,6 +1129,11 @@ class ChunkedStreamingDataset(Dataset):
         per_tf_duration, per_tf_duration_valid = self._extract_per_tf_duration_labels(sample)
         labels['per_tf_duration'] = per_tf_duration
         labels['per_tf_duration_valid'] = per_tf_duration_valid
+
+        # Per-TF new_channel labels
+        per_tf_nc, per_tf_nc_valid = self._extract_per_tf_new_channel_labels(sample)
+        labels['per_tf_new_channel'] = per_tf_nc
+        labels['per_tf_new_channel_valid'] = per_tf_nc_valid
 
         return labels
 
@@ -1585,6 +1598,32 @@ class ChunkedStreamingDataset(Dataset):
 
         return per_tf_duration, per_tf_duration_valid
 
+    def _extract_per_tf_new_channel_labels(
+        self, sample: ChannelSample
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract next_channel_direction labels for all TFs from the sample's best window."""
+        n_tfs = len(TIMEFRAMES)
+        per_tf_new_channel = torch.ones(n_tfs, dtype=torch.long)  # default=1 (sideways)
+        per_tf_new_channel_valid = torch.zeros(n_tfs, dtype=torch.bool)
+
+        window = sample.best_window
+        window_labels = sample.labels_per_window.get(window, {})
+
+        if 'tsla' in window_labels:
+            tf_labels_dict = window_labels.get('tsla', {})
+        else:
+            tf_labels_dict = window_labels
+
+        for tf_idx, tf in enumerate(TIMEFRAMES):
+            tf_label = tf_labels_dict.get(tf)
+            if tf_label is not None:
+                ncd = getattr(tf_label, 'next_channel_direction', 1)
+                ncv = getattr(tf_label, 'next_channel_valid', False)
+                per_tf_new_channel[tf_idx] = int(ncd) if ncd is not None else 1
+                per_tf_new_channel_valid[tf_idx] = bool(ncv)
+
+        return per_tf_new_channel, per_tf_new_channel_valid
+
     def _get_default_labels(self) -> Dict[str, torch.Tensor]:
         """Get default labels for invalid/missing data."""
         n_tfs = len(TIMEFRAMES)
@@ -1653,6 +1692,8 @@ class ChunkedStreamingDataset(Dataset):
             # Per-TF
             'per_tf_duration': torch.zeros(n_tfs, dtype=torch.float32),
             'per_tf_duration_valid': torch.zeros(n_tfs, dtype=torch.bool),
+            'per_tf_new_channel': torch.ones(n_tfs, dtype=torch.long),
+            'per_tf_new_channel_valid': torch.zeros(n_tfs, dtype=torch.bool),
         }
 
     def get_feature_names(self) -> List[str]:

@@ -15,12 +15,12 @@ namespace v15 {
 // FEATURE STORAGE CONSTANTS
 // =============================================================================
 
-// Total number of features extracted per sample
-// Updated to 14840 after adding price-agnostic normalized features
+// Total number of features extracted per sample (15,350)
+// = 1529 per TF × 10 TFs + 30 event + 30 bar metadata
 constexpr size_t TOTAL_FEATURE_COUNT = 15350;
 
-// Pre-calculated bucket count for unordered_map (prime number > 14840 / 0.7 load factor)
-constexpr size_t FEATURE_MAP_BUCKET_COUNT = 21211;
+// Pre-calculated bucket count for unordered_map (prime number > 15350 / 0.7 load factor ≈ 21929)
+constexpr size_t FEATURE_MAP_BUCKET_COUNT = 21943;
 
 // =============================================================================
 // OPTIMIZED FEATURE MAP
@@ -28,7 +28,7 @@ constexpr size_t FEATURE_MAP_BUCKET_COUNT = 21211;
 
 /**
  * Create a pre-reserved unordered_map for feature storage.
- * This avoids rehashing during the 14,840 insertions.
+ * This avoids rehashing during feature insertions.
  *
  * Usage:
  *   auto features = create_feature_map();
@@ -65,7 +65,7 @@ inline std::unordered_map<std::string, double> create_feature_map(size_t capacit
  * - During extraction: Use indices for O(1) writes
  * - For serialization: Convert to map once at the end
  *
- * Memory: ~114KB per instance (14190 * 8 bytes)
+ * Memory: ~120KB per instance (15350 * 8 bytes)
  */
 class FeatureArray {
 public:

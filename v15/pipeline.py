@@ -1,14 +1,25 @@
 """
-V15 Pipeline - CLI entry point for scanning, training, and evaluation.
+V15 Pipeline - CLI entry point for training, evaluation, and inference.
 
 Usage:
-    python -m v15.pipeline scan --data-dir data --output samples.pkl
-    python -m v15.pipeline train --samples samples.pkl --output model.pt
-    python -m v15.pipeline eval --model model.pt --samples test.pkl
-    python -m v15.pipeline analyze --samples samples.pkl
-    python -m v15.pipeline infer --model model.pt --data-dir data
+    # Scan with C++ scanner (outputs .flat directly)
+    cd v15_cpp/build && ./v15_scanner --data-dir ../../data --output samples.flat
+
+    # Train
+    python -m v15.pipeline train --samples samples.flat --output checkpoints/
+
+    # Calibrate (after training)
+    python -m v15.pipeline calibrate --checkpoint checkpoints/best_per_tf.pt --data samples.flat
+
+    # Other commands
+    python -m v15.pipeline analyze --samples samples.flat
+    python -m v15.pipeline infer --model checkpoints/best.pt --data-dir data
     python -m v15.pipeline dashboard
     python -m v15.pipeline info
+
+Deprecated:
+    scan    - Use C++ scanner: v15_cpp/build/v15_scanner
+    convert - Scanner writes .flat directly (use --output samples.flat)
 """
 import argparse
 import logging
@@ -32,13 +43,36 @@ def cmd_scan(args):
     DEPRECATED: Python scanner has been removed.
 
     Use the C++ scanner instead for 10x faster performance:
-        cd v15_cpp/build && ./v15_scanner --data-dir ../../data --output samples.bin
+        cd v15_cpp/build && ./v15_scanner --data-dir ../../data --output samples.flat
 
     Then train with:
-        python -m v15.pipeline train --samples samples.bin --output model.pt
+        python -m v15.pipeline train --samples samples.flat --output model.pt
     """
     logger.error("Python scanner has been removed. Use v15_cpp/build/v15_scanner instead.")
-    logger.error("Example: cd v15_cpp/build && ./v15_scanner --data-dir ../../data --output samples.bin")
+    logger.error("Example: cd v15_cpp/build && ./v15_scanner --data-dir ../../data --output samples.flat")
+    sys.exit(1)
+
+
+def cmd_convert(args):
+    """
+    DEPRECATED: C++ scanner writes .flat format directly.
+
+    Instead of:
+        ./v15_scanner --output samples.bin
+        python -m v15.pipeline convert --samples samples.bin --output samples.flat
+
+    Use directly:
+        ./v15_scanner --output samples.flat
+
+    The scanner auto-detects .flat extension and writes the optimized format.
+    This is faster and uses less disk space than .bin + convert.
+    """
+    logger.error("Convert command is deprecated. C++ scanner writes .flat format directly.")
+    logger.error("Use: ./v15_scanner --output samples.flat (no conversion needed)")
+    logger.error("")
+    logger.error("If you have an OLD .bin file and need to convert it, use:")
+    logger.error("  from v15.training.flat_dataset import convert_bin_to_flat")
+    logger.error("  convert_bin_to_flat(bin_path='old.bin', output_dir='new.flat')")
     sys.exit(1)
 
 
@@ -179,6 +213,7 @@ def cmd_train(args):
         'enable_rsi_heads': args.enable_rsi_heads,
         'per_tf_head_version': getattr(args, 'per_tf_head_version', 1),
         'use_horizon_attention': getattr(args, 'use_horizon_attention', False),
+        'use_sequence_branch': getattr(args, 'use_sequence_branch', False),
     })
     logger.info(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
 
@@ -254,7 +289,12 @@ def cmd_train(args):
         # Per-timeframe loss
         per_tf_loss_weight=args.per_tf_loss_weight,
         per_tf_direction_loss_weight=args.per_tf_direction_loss_weight,
+        per_tf_new_channel_loss_weight=args.per_tf_new_channel_loss_weight,
         per_tf_loss_ramp_epochs=args.per_tf_loss_ramp_epochs,
+        # Consistency loss weights
+        consistency_direction_weight=args.consistency_direction_weight,
+        consistency_duration_weight=args.consistency_duration_weight,
+        consistency_new_channel_weight=args.consistency_new_channel_weight,
     )
 
     # Train
@@ -571,11 +611,21 @@ def main():
         help='Weight for per-timeframe duration loss (0.0 = disabled, try 0.5 to enable)')
     train_parser.add_argument('--per-tf-direction-loss-weight', type=float, default=0.0,
         help='Weight for per-timeframe direction loss (0.0 = disabled, try 0.3 to enable)')
+    train_parser.add_argument('--per-tf-new-channel-loss-weight', type=float, default=0.0,
+        help='Weight for per-timeframe new_channel_direction loss (0.0 = disabled, try 0.5 to enable)')
+    train_parser.add_argument('--consistency-direction-weight', type=float, default=0.0,
+        help='Weight for direction coherence loss (adjacent TFs should agree, try 0.05)')
+    train_parser.add_argument('--consistency-duration-weight', type=float, default=0.0,
+        help='Weight for duration ordering loss (enforce temporal hierarchy, try 0.05)')
+    train_parser.add_argument('--consistency-new-channel-weight', type=float, default=0.0,
+        help='Weight for next_channel consensus loss (TFs should agree, try 0.05)')
     train_parser.add_argument('--per-tf-head-version', type=int, default=1,
                               choices=[1, 2],
                               help='Per-TF head version: 1=lightweight, 2=TF-embedding+bigger')
     train_parser.add_argument('--use-horizon-attention', action='store_true',
         help='Use horizon-grouped attention (short/medium/long pools) instead of global cross-TF attention')
+    train_parser.add_argument('--use-sequence-branch', action='store_true',
+        help='Enable LSTM branch over per-TF window channel sequences (~33K extra params)')
     train_parser.add_argument('--per-tf-loss-ramp-epochs', type=int, default=20,
         help='Epochs to ramp per-TF loss from 0 to full weight (default: 20)')
     train_parser.add_argument('--resume', type=str, default=None,
@@ -585,8 +635,8 @@ def main():
     train_parser.add_argument('--seed', type=int, default=42,
         help='Random seed for reproducibility (default: 42)')
 
-    # Convert command
-    convert_parser = subparsers.add_parser('convert', help='Convert .bin to .flat format for instant loading')
+    # Convert command (DEPRECATED - scanner writes .flat directly)
+    convert_parser = subparsers.add_parser('convert', help='[DEPRECATED] Use C++ scanner with .flat output instead')
     convert_parser.add_argument('--samples', required=True, help='Input .bin sample file')
     convert_parser.add_argument('--output', required=True, help='Output .flat directory')
     convert_parser.add_argument('--chunk-size', type=int, default=15000,
@@ -636,13 +686,7 @@ def main():
         elif args.command == 'calibrate':
             cmd_calibrate(args)
         elif args.command == 'convert':
-            from .training.flat_dataset import convert_bin_to_flat
-            convert_bin_to_flat(
-                bin_path=args.samples,
-                output_dir=args.output,
-                chunk_size=args.chunk_size,
-                target_tf=args.target_tf,
-            )
+            cmd_convert(args)
         elif args.command == 'analyze':
             cmd_analyze(args)
         elif args.command == 'infer':

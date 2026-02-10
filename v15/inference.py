@@ -28,6 +28,7 @@ from .features.tf_extractor import (
 )
 from .config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES, HORIZON_GROUPS, TF_TO_HORIZON
 from .exceptions import ModelError, FeatureExtractionError
+from .signals.bounce_signal import BounceSignalEngine, BounceSignal, SignalStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ class PerTFPrediction:
     direction_prob: float   # P(break_up), calibrated if temp scaler available
     confidence: float       # max(direction_prob, 1-direction_prob)
     best_window: int        # Heuristic window for this TF
+    next_channel: str       # 'bear', 'sideways', 'bull'
+    next_channel_probs: Dict[str, float]  # probabilities for each class
 
 
 @dataclass
@@ -97,6 +100,8 @@ class Prediction:
     horizon_summaries: Optional[Dict[str, HorizonSummary]] = None
     trade_recommendations: Optional[Dict[str, TradeRecommendation]] = None
     conflicts: Optional[List[HorizonConflict]] = None
+    # Bounce signal (buy/sell from channel boundaries)
+    bounce_signal: Optional['BounceSignal'] = None
 
 
 class TemperatureScaler:
@@ -159,6 +164,9 @@ class Predictor:
             logger.info("Model has learned window selection - will use model predictions for window choice")
         else:
             logger.debug("Model does not have learned window selection - using heuristic best_window")
+
+        # Initialize bounce signal engine
+        self._signal_engine = BounceSignalEngine()
 
     def _detect_window_selector(self) -> bool:
         """
@@ -369,6 +377,7 @@ class Predictor:
             learned_window=learned_window,
             learned_window_probs=learned_window_probs,
             used_learned_selection=used_learned_selection,
+            bounce_signal=None,  # No per-TF, so no bounce signal
         )
 
     @torch.no_grad()
@@ -449,6 +458,22 @@ class Predictor:
             tf_direction = 'up' if tf_dir_prob > 0.5 else 'down'
             tf_confidence = max(tf_dir_prob, 1.0 - tf_dir_prob)
 
+            # Extract next_channel predictions (3-class: bear/sideways/bull)
+            tf_nc_logits = per_tf_outputs.get('new_channel_logits')
+            if tf_nc_logits is not None:
+                nc_probs = torch.softmax(tf_nc_logits[0, i], dim=0)  # [3]
+                nc_probs_dict = {
+                    'bear': nc_probs[0].item(),
+                    'sideways': nc_probs[1].item(),
+                    'bull': nc_probs[2].item(),
+                }
+                tf_nc_idx = nc_probs.argmax().item()
+                tf_nc_name = ['bear', 'sideways', 'bull'][tf_nc_idx]
+            else:
+                # Fallback if model doesn't have per-TF new_channel head
+                nc_probs_dict = {'bear': 0.33, 'sideways': 0.34, 'bull': 0.33}
+                tf_nc_name = 'sideways'
+
             # Get heuristic window for this TF (default to 50 if not provided)
             tf_best_window = 50
             if heuristic_windows_by_tf and tf_name in heuristic_windows_by_tf:
@@ -461,6 +486,8 @@ class Predictor:
                 direction_prob=tf_dir_prob,
                 confidence=tf_confidence,
                 best_window=tf_best_window,
+                next_channel=tf_nc_name,
+                next_channel_probs=nc_probs_dict,
             )
 
         # Aggregated confidence from per-TF
@@ -470,6 +497,12 @@ class Predictor:
         horizon_summaries = self._compute_horizon_summaries(per_tf_predictions)
         trade_recommendations = self._compute_trade_recommendations(per_tf_predictions)
         conflicts = self._detect_conflicts(horizon_summaries)
+
+        # Compute bounce signal (default to most_confident strategy)
+        bounce_signal = self._signal_engine.generate_signal(
+            per_tf_predictions=per_tf_predictions,
+            strategy=SignalStrategy.MOST_CONFIDENT,
+        )
 
         return Prediction(
             timestamp=pd.Timestamp.now(),
@@ -491,6 +524,7 @@ class Predictor:
             horizon_summaries=horizon_summaries,
             trade_recommendations=trade_recommendations,
             conflicts=conflicts,
+            bounce_signal=bounce_signal,
         )
 
     @staticmethod

@@ -106,6 +106,13 @@ class PerTFPredictionHeads(nn.Module):
             nn.Linear(hidden_dim // 2, 1),  # raw logit, no sigmoid
         )
 
+        # New channel direction head (3-class: bear/sideways/bull)
+        self.new_channel_net = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 3),
+        )
+
     def forward(self, tf_embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Run prediction heads on per-TF embeddings.
@@ -118,6 +125,7 @@ class PerTFPredictionHeads(nn.Module):
                 'duration_mean': [batch, n_timeframes] predicted durations
                 'duration_log_std': [batch, n_timeframes] log std of durations
                 'direction_logits': [batch, n_timeframes] raw direction logits
+                'new_channel_logits': [batch, n_timeframes, 3] new channel direction logits
         """
         batch_size, n_tf, embed_dim = tf_embeddings.shape
 
@@ -132,11 +140,15 @@ class PerTFPredictionHeads(nn.Module):
         # Direction predictions
         direction_logits = self.direction_net(flat_embeddings)
 
+        # New channel direction predictions
+        new_channel_logits = self.new_channel_net(flat_embeddings)
+
         # Reshape back to [batch, n_timeframes]
         return {
             'duration_mean': duration_mean.view(batch_size, n_tf),
             'duration_log_std': duration_log_std.view(batch_size, n_tf),
             'direction_logits': direction_logits.view(batch_size, n_tf),
+            'new_channel_logits': new_channel_logits.view(batch_size, n_tf, 3),
         }
 
 
@@ -178,13 +190,20 @@ class PerTFPredictionHeadsV2(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
+        # New channel direction head (3-class: bear/sideways/bull)
+        self.new_channel_net = nn.Sequential(
+            nn.Linear(combined_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 3),
+        )
+
     def forward(self, tf_embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
             tf_embeddings: [batch, n_timeframes, embed_dim]
 
         Returns:
-            Dict with duration_mean, duration_log_std, direction_logits
+            Dict with duration_mean, duration_log_std, direction_logits, new_channel_logits
         """
         batch_size, n_tf, embed_dim = tf_embeddings.shape
 
@@ -207,10 +226,14 @@ class PerTFPredictionHeadsV2(nn.Module):
         # Direction predictions
         direction_logits = self.direction_net(flat)
 
+        # New channel direction predictions
+        new_channel_logits = self.new_channel_net(flat)
+
         return {
             'duration_mean': duration_mean.view(batch_size, n_tf),
             'duration_log_std': duration_log_std.view(batch_size, n_tf),
             'direction_logits': direction_logits.view(batch_size, n_tf),
+            'new_channel_logits': new_channel_logits.view(batch_size, n_tf, 3),
         }
 
 

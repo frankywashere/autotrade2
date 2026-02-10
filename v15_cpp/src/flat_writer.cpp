@@ -154,6 +154,8 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
     std::vector<uint8_t> per_tf_valid(10, 0);
     std::vector<int64_t> per_tf_dir(10, 0);
     std::vector<uint8_t> per_tf_dir_valid(10, 0);
+    std::vector<int64_t> per_tf_nc(10, 1);  // default=sideways
+    std::vector<uint8_t> per_tf_nc_valid(10, 0);
 
     // Try to get labels from the sample
     // Structure: labels_per_window[window][tf] = ChannelLabels (no asset level)
@@ -251,6 +253,8 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
                 per_tf_valid[i] = tf_it->second.duration_valid ? 1 : 0;
                 per_tf_dir[i] = tf_it->second.break_direction;
                 per_tf_dir_valid[i] = tf_it->second.direction_valid ? 1 : 0;
+                per_tf_nc[i] = tf_it->second.next_channel_direction;
+                per_tf_nc_valid[i] = tf_it->second.next_channel_valid ? 1 : 0;
             }
         }
     }
@@ -319,6 +323,8 @@ void FlatWriter::extract_labels(const ChannelSample& sample) {
     L_per_tf_duration_valid.insert(L_per_tf_duration_valid.end(), per_tf_valid.begin(), per_tf_valid.end());
     L_per_tf_direction.insert(L_per_tf_direction.end(), per_tf_dir.begin(), per_tf_dir.end());
     L_per_tf_direction_valid.insert(L_per_tf_direction_valid.end(), per_tf_dir_valid.begin(), per_tf_dir_valid.end());
+    L_per_tf_new_channel.insert(L_per_tf_new_channel.end(), per_tf_nc.begin(), per_tf_nc.end());
+    L_per_tf_new_channel_valid.insert(L_per_tf_new_channel_valid.end(), per_tf_nc_valid.begin(), per_tf_nc_valid.end());
 }
 
 void FlatWriter::write_features_npy() {
@@ -398,6 +404,10 @@ void FlatWriter::write_labels_npy() {
     // Per-TF direction (2D arrays)
     NpyWriter::write_int64_2d(labels_dir + "per_tf_direction.npy", L_per_tf_direction, num_samples_, 10);
     NpyWriter::write_bool_1d(labels_dir + "per_tf_direction_valid.npy", L_per_tf_direction_valid);
+
+    // Per-TF new_channel
+    NpyWriter::write_int64_2d(labels_dir + "per_tf_new_channel.npy", L_per_tf_new_channel, num_samples_, 10);
+    NpyWriter::write_bool_1d(labels_dir + "per_tf_new_channel_valid.npy", L_per_tf_new_channel_valid);
 
     std::cout << "  Wrote " << 53 << " label arrays to " << labels_dir << std::endl;
 }

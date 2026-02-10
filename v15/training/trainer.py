@@ -145,7 +145,13 @@ class TrainingConfig:
     # Set to 0.0 to disable (default, backward compatible)
     per_tf_loss_weight: float = 0.0
     per_tf_direction_loss_weight: float = 0.0
+    per_tf_new_channel_loss_weight: float = 0.0
     per_tf_loss_ramp_epochs: int = 20  # Epochs to ramp from 0 to full weight
+
+    # Consistency loss weights (enforce cross-TF coherence)
+    consistency_direction_weight: float = 0.0    # Adjacent TF direction agreement
+    consistency_duration_weight: float = 0.0     # Duration ordering in absolute time
+    consistency_new_channel_weight: float = 0.0  # Next channel consensus
 
 
 # =============================================================================
@@ -637,6 +643,161 @@ class Trainer:
         loss = (focal_weight * bce).mean()
 
         return loss, {'per_tf_direction': loss.detach(), 'per_tf_dir_n_valid': valid_mask.sum().detach()}
+
+    def compute_per_tf_new_channel_loss(
+        self,
+        per_tf_preds: Dict[str, torch.Tensor],
+        labels: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute per-TF new_channel_direction loss using cross-entropy.
+
+        Args:
+            per_tf_preds: Dict containing 'new_channel_logits': [batch, n_tfs, 3]
+            labels: Dict with 'per_tf_new_channel': [batch, n_tfs] (int64, 0/1/2)
+                    and 'per_tf_new_channel_valid': [batch, n_tfs] (bool)
+
+        Returns:
+            loss: Scalar tensor
+            loss_components: Dict with breakdown for logging
+        """
+        per_tf_nc = labels.get('per_tf_new_channel')
+        per_tf_nc_valid = labels.get('per_tf_new_channel_valid')
+
+        if per_tf_nc is None or per_tf_nc_valid is None:
+            return torch.tensor(0.0, device=self.device), {
+                'per_tf_new_channel': 0.0, 'per_tf_nc_n_valid': 0
+            }
+
+        valid_mask = per_tf_nc_valid.bool()
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=self.device), {
+                'per_tf_new_channel': 0.0, 'per_tf_nc_n_valid': 0
+            }
+
+        # new_channel_logits: [batch, n_tfs, 3]
+        logits = per_tf_preds.get('new_channel_logits')
+        if logits is None:
+            return torch.tensor(0.0, device=self.device), {
+                'per_tf_new_channel': 0.0, 'per_tf_nc_n_valid': 0
+            }
+
+        # Extract valid entries
+        pred_logits = logits[valid_mask]  # [n_valid, 3]
+        targets = per_tf_nc[valid_mask].long()  # [n_valid]
+
+        # Clamp targets to valid range [0, 2]
+        targets = targets.clamp(0, 2)
+
+        loss = F.cross_entropy(pred_logits, targets)
+
+        # Accuracy for logging
+        pred_classes = pred_logits.argmax(dim=-1)
+        accuracy = (pred_classes == targets).float().mean()
+
+        return loss, {
+            'per_tf_new_channel': loss.detach(),
+            'per_tf_nc_n_valid': valid_mask.sum().detach(),
+            'per_tf_nc_accuracy': accuracy.detach(),
+        }
+
+    def compute_consistency_losses(
+        self,
+        per_tf_preds: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute cross-TF consistency regularization losses."""
+        losses = {}
+        total = torch.tensor(0.0, device=self.device)
+
+        # 1. Direction coherence (adjacent TFs should agree)
+        if self.config.consistency_direction_weight > 0:
+            dir_loss = self._direction_coherence_loss(per_tf_preds.get('direction_logits'))
+            if dir_loss is not None:
+                losses['consistency_direction'] = dir_loss.detach()
+                total = total + self.config.consistency_direction_weight * dir_loss
+
+        # 2. Duration ordering (longer TFs should have >= duration in absolute time)
+        if self.config.consistency_duration_weight > 0:
+            dur_loss = self._duration_ordering_loss(per_tf_preds.get('duration_mean'))
+            if dur_loss is not None:
+                losses['consistency_duration'] = dur_loss.detach()
+                total = total + self.config.consistency_duration_weight * dur_loss
+
+        # 3. Next channel consensus (TFs should predict similar next_channel)
+        if self.config.consistency_new_channel_weight > 0:
+            nc_loss = self._new_channel_consistency_loss(per_tf_preds.get('new_channel_logits'))
+            if nc_loss is not None:
+                losses['consistency_new_channel'] = nc_loss.detach()
+                total = total + self.config.consistency_new_channel_weight * nc_loss
+
+        return total, losses
+
+    def _direction_coherence_loss(self, direction_logits: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Penalize direction disagreements between adjacent timeframes."""
+        if direction_logits is None:
+            return None
+
+        # direction_logits: [batch, n_tfs]
+        probs = torch.sigmoid(direction_logits)  # [batch, n_tfs]
+
+        # Adjacent TF disagreement
+        diff = torch.abs(probs[:, :-1] - probs[:, 1:])  # [batch, n_tfs-1]
+
+        # Weight by TF proximity (closer TFs should agree more)
+        # TF gaps in minutes: 5→15(10), 15→30(15), 30→1h(30), 1h→2h(60), 2h→3h(60),
+        # 3h→4h(60), 4h→daily(1200), daily→weekly(6720), weekly→monthly(20160)
+        tf_gaps = torch.tensor([10, 15, 30, 60, 60, 60, 1200, 6720, 20160],
+                               dtype=torch.float32, device=direction_logits.device)
+        weights = 1.0 / (1.0 + torch.log1p(tf_gaps))  # Log-scale weighting
+
+        return (diff * weights.unsqueeze(0)).mean()
+
+    def _duration_ordering_loss(self, durations: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Enforce monotonic ordering: longer TFs should predict >= durations in absolute time."""
+        if durations is None:
+            return None
+
+        # durations: [batch, n_tfs] in bars
+        # TF bar lengths in minutes: 5, 15, 30, 60, 120, 180, 240, 390, 2730, 21900
+        tf_bar_mins = torch.tensor([5, 15, 30, 60, 120, 180, 240, 390, 2730, 21900],
+                                   dtype=torch.float32, device=durations.device)
+
+        # Convert to absolute time (minutes)
+        abs_durations = durations * tf_bar_mins.unsqueeze(0)  # [batch, n_tfs]
+
+        # Soft monotonic constraint: abs_duration[i] should <= abs_duration[j] for i < j
+        violations = []
+        for i in range(9):  # 0-8
+            for j in range(i+1, 10):  # i+1 to 9
+                # Penalize if shorter TF (i) predicts longer absolute duration than longer TF (j)
+                margin = 5.0  # 5 minute slack
+                violation = F.relu(abs_durations[:, i] - abs_durations[:, j] + margin)
+                violations.append(violation)
+
+        if violations:
+            return torch.stack(violations).mean()
+        return torch.tensor(0.0, device=durations.device)
+
+    def _new_channel_consistency_loss(self, new_channel_logits: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Encourage consensus on next_channel across timeframes (KL divergence from mean)."""
+        if new_channel_logits is None:
+            return None
+
+        # new_channel_logits: [batch, n_tfs, 3]
+        probs = F.softmax(new_channel_logits, dim=-1)  # [batch, n_tfs, 3]
+
+        # Compute consensus (average probability across TFs)
+        consensus_probs = probs.mean(dim=1, keepdim=True)  # [batch, 1, 3]
+
+        # KL divergence: penalize per-TF predictions that deviate from consensus
+        log_probs = F.log_softmax(new_channel_logits, dim=-1)  # [batch, n_tfs, 3]
+        kl = F.kl_div(
+            log_probs,
+            consensus_probs.expand_as(probs),
+            reduction='batchmean',
+            log_target=False
+        )
+        return kl
 
     def _get_per_tf_ramp(self, epoch: int) -> float:
         """Get per-TF loss ramp factor (0.0 to 1.0) based on epoch."""
@@ -1696,7 +1857,8 @@ class Trainer:
 
                 # Check if per-TF loss is enabled
                 use_per_tf_loss = (self.config.per_tf_loss_weight > 0 or
-                                   self.config.per_tf_direction_loss_weight > 0)
+                                   self.config.per_tf_direction_loss_weight > 0 or
+                                   self.config.per_tf_new_channel_loss_weight > 0)
 
                 # Forward pass with mixed precision (bfloat16 on CUDA, float32 elsewhere)
                 amp_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if self.use_amp else torch.enable_grad()
@@ -1723,14 +1885,25 @@ class Trainer:
                         per_tf_dir_loss, dir_comp = self.compute_per_tf_direction_loss(
                             per_tf_preds, labels
                         )
+                        per_tf_nc_loss, nc_comp = self.compute_per_tf_new_channel_loss(
+                            per_tf_preds, labels
+                        )
 
                         per_tf_total = (self.config.per_tf_loss_weight * per_tf_dur_loss +
-                                        self.config.per_tf_direction_loss_weight * per_tf_dir_loss)
+                                        self.config.per_tf_direction_loss_weight * per_tf_dir_loss +
+                                        self.config.per_tf_new_channel_loss_weight * per_tf_nc_loss)
                         loss = loss + ramp * per_tf_total
 
                         loss_components.update(dur_comp)
                         loss_components.update(dir_comp)
+                        loss_components.update(nc_comp)
                         loss_components['per_tf_ramp'] = ramp
+
+                        # Add consistency losses (cross-TF coherence)
+                        consistency_loss, consistency_comp = self.compute_consistency_losses(per_tf_preds)
+                        loss = loss + consistency_loss
+                        loss_components.update(consistency_comp)
+
                         loss_components['total'] = loss.detach()
 
                 loss.backward()
@@ -1843,7 +2016,8 @@ class Trainer:
 
                 # Check if per-TF loss is enabled
                 use_per_tf_loss = (self.config.per_tf_loss_weight > 0 or
-                                   self.config.per_tf_direction_loss_weight > 0)
+                                   self.config.per_tf_direction_loss_weight > 0 or
+                                   self.config.per_tf_new_channel_loss_weight > 0)
 
                 # Use return_per_tf when per-TF loss is enabled
                 if use_per_tf_loss:
@@ -1864,13 +2038,24 @@ class Trainer:
                     per_tf_dir_loss, dir_comp = self.compute_per_tf_direction_loss(
                         per_tf_preds, labels
                     )
+                    per_tf_nc_loss, nc_comp = self.compute_per_tf_new_channel_loss(
+                        per_tf_preds, labels
+                    )
 
                     per_tf_total = (self.config.per_tf_loss_weight * per_tf_dur_loss +
-                                    self.config.per_tf_direction_loss_weight * per_tf_dir_loss)
+                                    self.config.per_tf_direction_loss_weight * per_tf_dir_loss +
+                                    self.config.per_tf_new_channel_loss_weight * per_tf_nc_loss)
                     loss = loss + per_tf_total
 
                     loss_components.update(dur_comp)
                     loss_components.update(dir_comp)
+                    loss_components.update(nc_comp)
+
+                    # Add consistency losses (cross-TF coherence)
+                    consistency_loss, consistency_comp = self.compute_consistency_losses(per_tf_preds)
+                    loss = loss + consistency_loss
+                    loss_components.update(consistency_comp)
+
                     loss_components['total'] = loss.detach()
 
             val_losses.append(loss_components)
@@ -2083,6 +2268,15 @@ class Trainer:
                 'cross_rsi_spread_weight': self.config.cross_rsi_spread_weight,
                 'cross_overbought_predicts_down_weight': self.config.cross_overbought_predicts_down_weight,
                 'cross_oversold_predicts_up_weight': self.config.cross_oversold_predicts_up_weight,
+                # Per-TF auxiliary loss weights
+                'per_tf_loss_weight': self.config.per_tf_loss_weight,
+                'per_tf_direction_loss_weight': self.config.per_tf_direction_loss_weight,
+                'per_tf_new_channel_loss_weight': self.config.per_tf_new_channel_loss_weight,
+                'per_tf_loss_ramp_epochs': self.config.per_tf_loss_ramp_epochs,
+                # Consistency loss weights
+                'consistency_direction_weight': self.config.consistency_direction_weight,
+                'consistency_duration_weight': self.config.consistency_duration_weight,
+                'consistency_new_channel_weight': self.config.consistency_new_channel_weight,
             },
         }
 

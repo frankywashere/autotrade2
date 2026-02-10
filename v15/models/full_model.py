@@ -16,9 +16,10 @@ from .feature_weights import ExplicitFeatureWeights, FeatureGating
 from .tf_encoder import MultiTFEncoder
 from .cross_tf_attention import CrossTFAttention, HorizonGroupedAttention, TFAggregator
 from .prediction_heads import PredictionHeads, PerTFPredictionHeads, PerTFPredictionHeadsV2
+from .sequence_branch import PerTFWindowLSTM
 from ..config import (
     TOTAL_FEATURES, N_TIMEFRAMES, FEATURES_PER_TF,
-    FEATURE_COUNTS, MODEL_CONFIG
+    FEATURE_COUNTS, MODEL_CONFIG, WINDOW_INDEPENDENT_PER_TF, N_WINDOWS
 )
 from ..exceptions import ModelError
 
@@ -78,6 +79,8 @@ class V15Model(nn.Module):
         per_tf_head_version: int = 1,
         # Use horizon-grouped attention instead of global cross-TF attention
         use_horizon_attention: bool = False,
+        # LSTM branch over 8-window channel sequences per TF
+        use_sequence_branch: bool = False,
     ):
         super().__init__()
 
@@ -91,6 +94,7 @@ class V15Model(nn.Module):
         self.enable_cross_correlation_heads = enable_cross_correlation_heads
         self.enable_durability_heads = enable_durability_heads
         self.enable_rsi_heads = enable_rsi_heads
+        self.use_sequence_branch = use_sequence_branch
 
         # Shared features = events + bar metadata
         self.shared_features_dim = (
@@ -189,6 +193,32 @@ class V15Model(nn.Module):
                 hidden_dim=hidden_dim // 4,
             )
 
+        # 8. Optional LSTM branch over per-TF window channel sequences
+        if use_sequence_branch:
+            channel_per_window = (
+                FEATURE_COUNTS['channel_per_window'] +
+                FEATURE_COUNTS['spy_channel_per_window']
+            )  # 128
+            lstm_hidden = embed_dim // 2  # 64
+            self.window_lstm = PerTFWindowLSTM(
+                input_dim=channel_per_window,
+                hidden_dim=lstm_hidden,
+                num_layers=1,
+                dropout=dropout,
+            )
+            # Fusion: concat TF embedding [embed_dim] + LSTM output [2*lstm_hidden]
+            lstm_out_dim = lstm_hidden * 2  # 128 (bidirectional)
+            self.sequence_fusion = nn.Linear(embed_dim + lstm_out_dim, embed_dim)
+            # Gating: sigmoid gate to blend LSTM info with MLP output
+            self.sequence_gate = nn.Sequential(
+                nn.Linear(embed_dim + lstm_out_dim, embed_dim),
+                nn.Sigmoid(),
+            )
+            # Store layout info for window extraction
+            self._window_offset = WINDOW_INDEPENDENT_PER_TF
+            self._n_windows = N_WINDOWS
+            self._channel_per_window = channel_per_window
+
     def validate_input(self, x: torch.Tensor) -> None:
         """Check for NaN/Inf in input - LOUD failure."""
         if torch.isnan(x).any():
@@ -223,6 +253,53 @@ class V15Model(nn.Module):
         shared_features = x[:, tf_dim:]
 
         return tf_features, shared_features
+
+    def extract_window_sequences(
+        self, tf_features: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Extract per-TF window channel features as a sequence.
+
+        Within each TF block of features_per_tf, the channel features for the
+        8 windows start at offset WINDOW_INDEPENDENT_PER_TF (338) and span
+        N_WINDOWS * channel_per_window (8 * 128 = 1024).
+
+        Args:
+            tf_features: [batch, n_tfs, features_per_tf]
+
+        Returns:
+            [batch, n_tfs, 8, 128] - 8 windows × 128 channel features per window
+        """
+        batch, n_tf, feat = tf_features.shape
+        offset = self._window_offset
+        n_win = self._n_windows
+        cpw = self._channel_per_window
+        # Extract the contiguous window block: [batch, n_tfs, 1024]
+        window_flat = tf_features[:, :, offset:offset + n_win * cpw]
+        # Reshape to [batch, n_tfs, 8, 128]
+        return window_flat.view(batch, n_tf, n_win, cpw)
+
+    def _fuse_sequence_branch(
+        self,
+        tf_embeddings: torch.Tensor,
+        window_sequences: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Fuse LSTM output with TF embeddings using gated fusion.
+
+        Args:
+            tf_embeddings: [batch, n_tfs, embed_dim] from TFEncoder + CrossTFAttention
+            window_sequences: [batch, n_tfs, 8, 128] raw window channel features
+
+        Returns:
+            [batch, n_tfs, embed_dim] fused embeddings
+        """
+        lstm_out = self.window_lstm(window_sequences)  # [batch, n_tfs, lstm_out_dim]
+        combined = torch.cat([tf_embeddings, lstm_out], dim=-1)  # [B, n_tfs, embed_dim + lstm_out_dim]
+        gate = self.sequence_gate(combined)  # [B, n_tfs, embed_dim]
+        fused = self.sequence_fusion(combined)  # [B, n_tfs, embed_dim]
+        # Gate blends: gate * fused + (1 - gate) * tf_embeddings
+        return gate * fused + (1 - gate) * tf_embeddings
 
     def forward(
         self,
@@ -270,6 +347,11 @@ class V15Model(nn.Module):
         tf_embeddings, attn_weights = self.cross_tf_attention(
             tf_embeddings, return_attention=return_attention
         )
+
+        # 6b. LSTM sequence branch fusion (if enabled)
+        if self.use_sequence_branch:
+            window_seqs = self.extract_window_sequences(tf_features)
+            tf_embeddings = self._fuse_sequence_branch(tf_embeddings, window_seqs)
 
         # 7. Per-TF predictions (before aggregation)
         if return_per_tf:
@@ -344,6 +426,13 @@ class V15Model(nn.Module):
         tf_embeddings_attended, _ = self.cross_tf_attention(
             tf_embeddings, return_attention=False
         )
+
+        # 6b. LSTM sequence branch fusion (if enabled)
+        if self.use_sequence_branch:
+            window_seqs = self.extract_window_sequences(tf_features)
+            tf_embeddings_attended = self._fuse_sequence_branch(
+                tf_embeddings_attended, window_seqs
+            )
 
         # 7. Per-TF predictions (before aggregation)
         per_tf_predictions = self.per_tf_heads(tf_embeddings_attended)
@@ -431,4 +520,5 @@ def create_model(config: Optional[Dict] = None) -> V15Model:
         enable_rsi_heads=cfg.get('enable_rsi_heads', False),
         per_tf_head_version=cfg.get('per_tf_head_version', 1),
         use_horizon_attention=cfg.get('use_horizon_attention', False),
+        use_sequence_branch=cfg.get('use_sequence_branch', False),
     )
