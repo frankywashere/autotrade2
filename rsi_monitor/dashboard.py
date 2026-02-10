@@ -1004,6 +1004,10 @@ def _render_channel_chart(df, channel, tf, symbol):
         xaxis=dict(
             showgrid=False, zeroline=False,
             color='#6b7080', rangeslider=dict(visible=False),
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),          # hide weekends
+                dict(bounds=[20, 4], pattern="hour"),  # hide overnight (8pm-4am)
+            ],
         ),
         yaxis=dict(
             showgrid=True, gridcolor='#1e2028', zeroline=False,
