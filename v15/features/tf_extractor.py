@@ -182,10 +182,10 @@ TF_FEATURE_COUNTS = {
     'price_per_tf': 60,               # tsla_price features
     'technical_per_tf': 77,           # technical indicators
     'spy_per_tf': 135,                # SPY features (updated from config.py)
-    'vix_per_tf': 25,                 # VIX features
-    'cross_asset_per_tf': 59,         # correlations (updated from config.py)
-    'channel_per_window': 58,         # TSLA channel (50 base + 8 excursion)
-    'spy_channel_per_window': 58,     # SPY channel (50 base + 8 excursion)
+    'vix_per_tf': 26,                 # VIX features (25 base + 1 cooldown)
+    'cross_asset_per_tf': 61,         # correlations (59 base + 2 beta-adj/spread)
+    'channel_per_window': 61,         # TSLA channel (50 base + 8 excursion + 3 touch geometry)
+    'spy_channel_per_window': 61,     # SPY channel (50 base + 8 excursion + 3 touch geometry)
     'channel_correlation_per_tf': 50, # Cross-correlation features
     'window_scores_per_tf': 50,       # window score features
     'channel_history_per_tf': 67,     # channel history features (updated from config.py)
@@ -199,15 +199,15 @@ TOTAL_PER_TF_WINDOW_INDEPENDENT = (
     TF_FEATURE_COUNTS['spy_per_tf'] +
     TF_FEATURE_COUNTS['vix_per_tf'] +
     TF_FEATURE_COUNTS['cross_asset_per_tf']
-)  # 356 (60 + 77 + 135 + 25 + 59)
+)  # 359 (60 + 77 + 135 + 26 + 61)
 
-# TSLA channel features per TF: 58 * 8 windows = 464
-TOTAL_TSLA_CHANNEL_PER_TF = TF_FEATURE_COUNTS['channel_per_window'] * len(STANDARD_WINDOWS)  # 464
+# TSLA channel features per TF: 61 * 8 windows = 488
+TOTAL_TSLA_CHANNEL_PER_TF = TF_FEATURE_COUNTS['channel_per_window'] * len(STANDARD_WINDOWS)  # 488
 
-# SPY channel features per TF: 58 * 8 windows = 464
-TOTAL_SPY_CHANNEL_PER_TF = TF_FEATURE_COUNTS['spy_channel_per_window'] * len(STANDARD_WINDOWS)  # 464
+# SPY channel features per TF: 61 * 8 windows = 488
+TOTAL_SPY_CHANNEL_PER_TF = TF_FEATURE_COUNTS['spy_channel_per_window'] * len(STANDARD_WINDOWS)  # 488
 
-TOTAL_PER_TF_WINDOW_DEPENDENT = TOTAL_TSLA_CHANNEL_PER_TF + TOTAL_SPY_CHANNEL_PER_TF  # 928
+TOTAL_PER_TF_WINDOW_DEPENDENT = TOTAL_TSLA_CHANNEL_PER_TF + TOTAL_SPY_CHANNEL_PER_TF  # 976
 
 TOTAL_PER_TF = (
     TOTAL_PER_TF_WINDOW_INDEPENDENT +
@@ -215,10 +215,10 @@ TOTAL_PER_TF = (
     TF_FEATURE_COUNTS['channel_correlation_per_tf'] +
     TF_FEATURE_COUNTS['window_scores_per_tf'] +
     TF_FEATURE_COUNTS['channel_history_per_tf']
-)  # 1,451 (356 + 928 + 50 + 50 + 67)
+)  # 1,502 (359 + 976 + 50 + 50 + 67)
 
 # bar_metadata adds 30 features (BAR_METADATA_TOTAL from config.py)
-TOTAL_FEATURES = TOTAL_PER_TF * len(TIMEFRAMES) + TF_FEATURE_COUNTS['events'] + 30  # 14,510 + 30 + 30 = 14,570 (matches config.py)
+TOTAL_FEATURES = TOTAL_PER_TF * len(TIMEFRAMES) + TF_FEATURE_COUNTS['events'] + 30  # 15,020 + 30 + 30 = 15,080
 
 
 # =============================================================================

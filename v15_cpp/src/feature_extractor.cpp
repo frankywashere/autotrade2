@@ -236,9 +236,9 @@ static std::unordered_map<std::string, double> extract_channel_features_slim(
     const SlimLabeledChannel& slim,
     const std::vector<OHLCV>& data
 ) {
-    // Pre-reserve for 58 channel features
+    // Pre-reserve for 61 channel features
     std::unordered_map<std::string, double> features;
-    features.reserve(64);
+    features.reserve(68);
 
     // Extract OHLCV arrays from data
     std::vector<double> close, high, low;
@@ -831,6 +831,43 @@ static std::unordered_map<std::string, double> extract_channel_features_slim(
     // 58. last_excursion_direction
     features["last_excursion_direction"] = safe_float(last_excursion_dir, 0.5);
 
+    // 59. approach_speed - rate of price approach to band (last 4 bars)
+    if (n >= 4 && close[n-1] != 0.0) {
+        features["approach_speed"] = safe_float((close[n-1] - close[n-4]) / close[n-1] * 100.0, 0.0);
+    } else {
+        features["approach_speed"] = 0.0;
+    }
+
+    // 60. penetration_depth - how far price penetrated beyond band (in std_devs)
+    if (n > 0 && std_dev > 0) {
+        double lower_band = slope * (n - 1) + intercept - 2.0 * std_dev;
+        double upper_band = slope * (n - 1) + intercept + 2.0 * std_dev;
+        double pen_below = std::max(lower_band - low[n-1], 0.0);
+        double pen_above = std::max(high[n-1] - upper_band, 0.0);
+        features["penetration_depth"] = safe_float(std::max(pen_below, pen_above) / std_dev, 0.0);
+    } else {
+        features["penetration_depth"] = 0.0;
+    }
+
+    // 61. rejection_wick_size - wick ratio indicating band rejection
+    if (n > 0) {
+        double h = high[n-1], l = low[n-1], c = close[n-1];
+        double total_range = h - l;
+        if (total_range > 0) {
+            if (position < 0.25) {
+                features["rejection_wick_size"] = safe_float((c - l) / total_range, 0.0);
+            } else if (position > 0.75) {
+                features["rejection_wick_size"] = safe_float((h - c) / total_range, 0.0);
+            } else {
+                features["rejection_wick_size"] = 0.0;
+            }
+        } else {
+            features["rejection_wick_size"] = 0.0;
+        }
+    } else {
+        features["rejection_wick_size"] = 0.0;
+    }
+
     return features;
 }
 
@@ -840,9 +877,9 @@ static std::unordered_map<std::string, double> extract_spy_channel_features_slim
     const std::vector<OHLCV>& spy_data,
     int window_param
 ) {
-    // Pre-reserve for 58 SPY channel features
+    // Pre-reserve for 61 SPY channel features (58 base + 3 touch geometry)
     std::unordered_map<std::string, double> features;
-    features.reserve(64);
+    features.reserve(68);
 
     // Extract OHLCV arrays
     std::vector<double> close, high, low;
@@ -1398,6 +1435,43 @@ static std::unordered_map<std::string, double> extract_spy_channel_features_slim
 
     // 58. last_excursion_direction
     features["spy_last_excursion_direction"] = safe_float(last_excursion_dir, 0.5);
+
+    // 59. spy_approach_speed
+    if (n >= 4 && close[n-1] != 0.0) {
+        features["spy_approach_speed"] = safe_float((close[n-1] - close[n-4]) / close[n-1] * 100.0, 0.0);
+    } else {
+        features["spy_approach_speed"] = 0.0;
+    }
+
+    // 60. spy_penetration_depth
+    if (n > 0 && std_dev > 0) {
+        double lower_band = slim.channel_slope * (n - 1) + intercept - 2.0 * std_dev;
+        double upper_band = slim.channel_slope * (n - 1) + intercept + 2.0 * std_dev;
+        double pen_below = std::max(lower_band - low[n-1], 0.0);
+        double pen_above = std::max(high[n-1] - upper_band, 0.0);
+        features["spy_penetration_depth"] = safe_float(std::max(pen_below, pen_above) / std_dev, 0.0);
+    } else {
+        features["spy_penetration_depth"] = 0.0;
+    }
+
+    // 61. spy_rejection_wick_size
+    if (n > 0) {
+        double h = high[n-1], l = low[n-1], c = close[n-1];
+        double total_range = h - l;
+        if (total_range > 0) {
+            if (position < 0.25) {
+                features["spy_rejection_wick_size"] = safe_float((c - l) / total_range, 0.0);
+            } else if (position > 0.75) {
+                features["spy_rejection_wick_size"] = safe_float((h - c) / total_range, 0.0);
+            } else {
+                features["spy_rejection_wick_size"] = 0.0;
+            }
+        } else {
+            features["spy_rejection_wick_size"] = 0.0;
+        }
+    } else {
+        features["spy_rejection_wick_size"] = 0.0;
+    }
 
     return features;
 }
@@ -3358,11 +3432,27 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_vix_features(
     }
     features["vix_volatility"] = vix_volatility;
 
+    // 26. bars_since_vix_spike - count bars since abs(pct_change) > 20%
+    double bars_since_spike = 250.0;
+    if (close.size() >= 2) {
+        for (int i = static_cast<int>(close.size()) - 1; i > 0; --i) {
+            double prev = close[i - 1];
+            if (prev > 0) {
+                double pct_change = std::abs((close[i] - prev) / prev * 100.0);
+                if (pct_change > 20.0) {
+                    bars_since_spike = static_cast<double>(static_cast<int>(close.size()) - 1 - i);
+                    break;
+                }
+            }
+        }
+    }
+    features["bars_since_vix_spike"] = bars_since_spike;
+
     return features;
 }
 
 // =============================================================================
-// CROSS-ASSET FEATURES (59)
+// CROSS-ASSET FEATURES (61)
 // =============================================================================
 
 std::unordered_map<std::string, double> FeatureExtractor::extract_cross_asset_features(
@@ -3375,12 +3465,12 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_cross_asset_fe
     double spy_position_in_channel,
     double vix_level
 ) {
-    // Pre-reserve for 59 cross-asset features
+    // Pre-reserve for 61 cross-asset features
     auto features = create_feature_map(FeatureOffsets::CROSS_ASSET_COUNT);
 
     if (tsla_data.empty() || spy_data.empty() || vix_data.empty()) {
         // Return defaults
-        for (int i = 0; i < 59; ++i) {
+        for (int i = 0; i < 61; ++i) {
             features["cross_" + std::to_string(i)] = 0.0;
         }
         return features;
@@ -3399,7 +3489,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_cross_asset_fe
     // Align to minimum length
     int min_len = static_cast<int>(std::min({tsla_close.size(), spy_close.size(), vix_close.size()}));
     if (min_len < 2) {
-        for (int i = 0; i < 59; ++i) {
+        for (int i = 0; i < 61; ++i) {
             features["cross_" + std::to_string(i)] = 0.0;
         }
         return features;
@@ -3685,6 +3775,12 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_cross_asset_fe
     features["bullish_alignment"] = (tsla_rsi_14 > 50 && position_in_channel > 0.5 && vix_level < 20) ? 1.0 : 0.0;
     features["bearish_alignment"] = (tsla_rsi_14 < 50 && position_in_channel < 0.5 && vix_level > 25) ? 1.0 : 0.0;
     features["contrarian_signal"] = (tsla_rsi_14 < 30 && position_in_channel < 0.2 && vix_level > 30) ? 1.0 : 0.0;
+
+    // Beta-Adjusted RSI (1 feature)
+    features["beta_adjusted_rsi"] = safe_float(tsla_rsi_14 - tsla_spy_beta_20 * (spy_rsi_14 - 50.0), 50.0);
+
+    // TSLA-SPY RSI Spread (1 feature)
+    features["tsla_spy_rsi_spread"] = safe_float(tsla_rsi_14 - spy_rsi_14, 0.0);
 
     return features;
 }
@@ -4403,6 +4499,43 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     // 58. last_excursion_direction
     features["last_excursion_direction"] = safe_float(last_excursion_dir, 0.5);
 
+    // 59. approach_speed
+    if (n >= 4 && close[n-1] != 0.0) {
+        features["approach_speed"] = safe_float((close[n-1] - close[n-4]) / close[n-1] * 100.0, 0.0);
+    } else {
+        features["approach_speed"] = 0.0;
+    }
+
+    // 60. penetration_depth
+    if (n > 0 && std_dev > 0) {
+        double lower_band = slope * (n - 1) + intercept - 2.0 * std_dev;
+        double upper_band = slope * (n - 1) + intercept + 2.0 * std_dev;
+        double pen_below = std::max(lower_band - low[n-1], 0.0);
+        double pen_above = std::max(high[n-1] - upper_band, 0.0);
+        features["penetration_depth"] = safe_float(std::max(pen_below, pen_above) / std_dev, 0.0);
+    } else {
+        features["penetration_depth"] = 0.0;
+    }
+
+    // 61. rejection_wick_size
+    if (n > 0) {
+        double h = high[n-1], l = low[n-1], c = close[n-1];
+        double total_range = h - l;
+        if (total_range > 0) {
+            if (position < 0.25) {
+                features["rejection_wick_size"] = safe_float((c - l) / total_range, 0.0);
+            } else if (position > 0.75) {
+                features["rejection_wick_size"] = safe_float((h - c) / total_range, 0.0);
+            } else {
+                features["rejection_wick_size"] = 0.0;
+            }
+        } else {
+            features["rejection_wick_size"] = 0.0;
+        }
+    } else {
+        features["rejection_wick_size"] = 0.0;
+    }
+
     // Final safety check - ensure all values are finite
     for (auto& [key, value] : features) {
         if (!std::isfinite(value)) {
@@ -4413,7 +4546,7 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_channel_featur
     return features;
 }
 
-// Helper function to return default channel features (58 features)
+// Helper function to return default channel features (61 features)
 std::unordered_map<std::string, double> FeatureExtractor::get_default_channel_features() {
     return {
         {"channel_valid", 0.0},
@@ -4476,7 +4609,10 @@ std::unordered_map<std::string, double> FeatureExtractor::get_default_channel_fe
         {"bars_since_last_excursion", 50.0},
         {"excursion_return_speed_avg", 0.0},
         {"excursion_rate", 0.0},
-        {"last_excursion_direction", 0.5}
+        {"last_excursion_direction", 0.5},
+        {"approach_speed", 0.0},
+        {"penetration_depth", 0.0},
+        {"rejection_wick_size", 0.0}
     };
 }
 
@@ -4490,8 +4626,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
     const std::vector<OHLCV>& spy_data,
     int window
 ) {
-    // Pre-reserve for 58 SPY channel features
-    auto features = create_feature_map(58);
+    // Pre-reserve for 61 SPY channel features (58 base + 3 touch geometry)
+    auto features = create_feature_map(64);
 
     // Handle invalid channel - return all defaults
     if (!channel.valid) {
@@ -4558,6 +4694,10 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
         features["spy_excursion_return_speed_avg"] = 0.0;
         features["spy_excursion_rate"] = 0.0;
         features["spy_last_excursion_direction"] = 0.0;
+        // 3 touch geometry features
+        features["spy_approach_speed"] = 0.0;
+        features["spy_penetration_depth"] = 0.0;
+        features["spy_rejection_wick_size"] = 0.0;
         return features;
     }
 
@@ -5165,6 +5305,45 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_spy_channel_fe
 
     // 58. spy_last_excursion_direction
     features["spy_last_excursion_direction"] = last_excursion_dir;
+
+    // 59. spy_approach_speed
+    size_t n = ch_close.size();
+    if (n >= 4 && ch_close[n-1] != 0.0) {
+        features["spy_approach_speed"] = safe_float((ch_close[n-1] - ch_close[n-4]) / ch_close[n-1] * 100.0, 0.0);
+    } else {
+        features["spy_approach_speed"] = 0.0;
+    }
+
+    // 60. spy_penetration_depth
+    double std_dev = safe_float(channel.std_dev, 0.0);
+    if (n > 0 && std_dev > 0) {
+        double lower_band = slope * (n - 1) + channel.intercept - 2.0 * std_dev;
+        double upper_band = slope * (n - 1) + channel.intercept + 2.0 * std_dev;
+        double pen_below = std::max(lower_band - ch_low[n-1], 0.0);
+        double pen_above = std::max(ch_high[n-1] - upper_band, 0.0);
+        features["spy_penetration_depth"] = safe_float(std::max(pen_below, pen_above) / std_dev, 0.0);
+    } else {
+        features["spy_penetration_depth"] = 0.0;
+    }
+
+    // 61. spy_rejection_wick_size
+    if (n > 0) {
+        double h = ch_high[n-1], l = ch_low[n-1], c = ch_close[n-1];
+        double total_range = h - l;
+        if (total_range > 0) {
+            if (position < 0.25) {
+                features["spy_rejection_wick_size"] = safe_float((c - l) / total_range, 0.0);
+            } else if (position > 0.75) {
+                features["spy_rejection_wick_size"] = safe_float((h - c) / total_range, 0.0);
+            } else {
+                features["spy_rejection_wick_size"] = 0.0;
+            }
+        } else {
+            features["spy_rejection_wick_size"] = 0.0;
+        }
+    } else {
+        features["spy_rejection_wick_size"] = 0.0;
+    }
 
     return features;
 }

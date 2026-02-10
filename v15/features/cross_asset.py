@@ -2,7 +2,7 @@
 Cross-Asset Feature Extraction
 
 This module calculates correlations and relationships between TSLA, SPY, and VIX.
-It extracts 59 features across eight main categories:
+It extracts 61 features across nine main categories:
 
 ROLLING CORRELATIONS (15): Correlation coefficients across different timeframes
 BETA METRICS (8): Market beta and regime classifications
@@ -13,6 +13,7 @@ SPY RSI vs CHANNEL POSITION (2): SPY RSI and channel position correlations
 RSI vs VIX (4): RSI and VIX level correlations
 POSITION vs VIX (4): Channel position and VIX level correlations
 COMBINED SIGNALS (3): Multi-factor alignment signals (RSI + Position + VIX)
+BETA-ADJUSTED + RSI SPREAD (2): Beta-adjusted RSI and TSLA-SPY RSI spread
 """
 
 from __future__ import annotations
@@ -323,6 +324,9 @@ def _get_default_features() -> Dict[str, float]:
         'bullish_alignment': 0.0,
         'bearish_alignment': 0.0,
         'contrarian_signal': 0.0,
+        # Beta-Adjusted RSI + RSI Spread (2)
+        'beta_adjusted_rsi': 50.0,
+        'tsla_spy_rsi_spread': 0.0,
     }
 
 
@@ -752,6 +756,14 @@ def extract_cross_asset_features(
     features['bearish_alignment'] = 1.0 if (_tsla_rsi < 50 and _position < 0.5 and _vix > 25) else 0.0
     features['contrarian_signal'] = 1.0 if (_tsla_rsi < 30 and _position < 0.2 and _vix > 30) else 0.0  # Oversold + fear = buy?
 
+    # Beta-Adjusted RSI (1 feature)
+    # Adjusts TSLA RSI by its beta-weighted SPY RSI deviation from neutral
+    beta_20 = features.get('tsla_spy_beta_20', 1.0)
+    features['beta_adjusted_rsi'] = safe_float(_tsla_rsi - beta_20 * (_spy_rsi - 50), 50.0)
+
+    # TSLA-SPY RSI Spread (1 feature)
+    features['tsla_spy_rsi_spread'] = safe_float(_tsla_rsi - _spy_rsi, 0.0)
+
     # Final safety check: ensure all features are valid floats
     for key in features:
         features[key] = safe_float(features[key], _get_default_features().get(key, 0.0))
@@ -783,7 +795,7 @@ def extract_cross_asset_features_tf(
 
 
 def get_cross_asset_feature_names() -> List[str]:
-    """Get base cross-asset feature names (59 features)."""
+    """Get base cross-asset feature names (61 features)."""
     return list(_get_default_features().keys())
 
 
@@ -805,10 +817,10 @@ def get_all_cross_asset_feature_names() -> List[str]:
 
 
 def get_cross_asset_feature_count() -> int:
-    """Base feature count (59)."""
-    return 59
+    """Base feature count (61)."""
+    return 61
 
 
 def get_total_cross_asset_features() -> int:
-    """Total cross-asset features: 59 * 10 TFs = 590"""
-    return 59 * 10
+    """Total cross-asset features: 61 * 10 TFs = 610"""
+    return 61 * 10

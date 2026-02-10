@@ -2,7 +2,7 @@
 VIX Feature Extraction
 
 The VIX (CBOE Volatility Index) measures market fear and expected volatility.
-This module extracts 25 features from VIX data across multiple categories:
+This module extracts 26 features from VIX data across multiple categories:
 
 LEVEL (5): Current value and moving average relationships
 CHANGES (4): Short and medium-term momentum
@@ -10,6 +10,7 @@ PERCENTILES (3): Historical context at multiple timeframes
 REGIME (4): Market fear classification and extreme events
 TECHNICALS (5): RSI, Bollinger Bands, momentum indicators
 STRUCTURE (4): Recent highs, lows, and volatility of volatility
+COOLDOWN (1): bars_since_vix_spike — persistence timer for VIX shock events
 """
 
 from __future__ import annotations
@@ -220,6 +221,18 @@ def extract_vix_features(vix_df: pd.DataFrame) -> Dict[str, float]:
     else:
         features['vix_volatility'] = 0.0
 
+    # 26. bars_since_vix_spike - count bars since abs(pct_change) > 20%
+    bars_since_spike = 250.0  # default: no spike in lookback
+    if len(close) >= 2:
+        for i in range(len(close) - 1, 0, -1):
+            prev = close[i - 1]
+            if prev > 0:
+                pct_change = abs((close[i] - prev) / prev * 100)
+                if pct_change > 20.0:
+                    bars_since_spike = float(len(close) - 1 - i)
+                    break
+    features['bars_since_vix_spike'] = safe_float(bars_since_spike, 250.0)
+
     # Final safety check: ensure all values are valid floats
     for key, value in features.items():
         if not isinstance(value, (int, float)) or not np.isfinite(value):
@@ -344,6 +357,8 @@ def _get_default_features() -> Dict[str, float]:
         'vix_5d_low': 20.0,
         'vix_range_5d': 0.0,
         'vix_volatility': 0.0,
+        # COOLDOWN (1)
+        'bars_since_vix_spike': 250.0,
     }
 
 
@@ -352,7 +367,7 @@ def get_vix_feature_names() -> list:
     Get the list of all VIX feature names in order.
 
     Returns:
-        List of 25 feature name strings
+        List of 26 feature name strings
     """
     return [
         # LEVEL (5)
@@ -386,6 +401,8 @@ def get_vix_feature_names() -> list:
         'vix_5d_low',
         'vix_range_5d',
         'vix_volatility',
+        # COOLDOWN (1)
+        'bars_since_vix_spike',
     ]
 
 
@@ -443,9 +460,9 @@ def get_vix_feature_count() -> int:
     Get base VIX feature count.
 
     Returns:
-        25 (number of VIX features per timeframe)
+        26 (number of VIX features per timeframe)
     """
-    return 25
+    return 26
 
 
 def get_total_vix_features() -> int:
@@ -453,6 +470,6 @@ def get_total_vix_features() -> int:
     Get total VIX features across all timeframes.
 
     Returns:
-        250 (25 features x 10 TFs)
+        260 (26 features x 10 TFs)
     """
-    return 25 * 10
+    return 26 * 10

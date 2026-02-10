@@ -106,10 +106,10 @@ FEATURE_COUNTS = {
     'tsla_price_per_tf': 65,       # 58 base + 7 price-agnostic normalized features
     'technical_per_tf': 59,        # Technical indicators (shared)
     'spy_per_tf': 121,             # 60 SPY-specific + 59 technical + 4 normalized - 2 overlap
-    'vix_per_tf': 31,              # 25 base + 6 normalized (vix_level, sma_10/20, 5d_high/low, atr)
-    'cross_asset_per_tf': 59,      # Cross-asset correlations
-    'channel_per_window': 61,      # 58 base + 3 normalized (slope, high, low)
-    'spy_channel_per_window': 61,  # 58 base + 3 normalized (slope, high, low)
+    'vix_per_tf': 32,              # 26 base + 6 normalized (vix_level, sma_10/20, 5d_high/low, atr)
+    'cross_asset_per_tf': 61,      # Cross-asset correlations
+    'channel_per_window': 64,      # 61 base + 3 normalized (slope, high, low)
+    'spy_channel_per_window': 64,  # 61 base + 3 normalized (slope, high, low)
     'window_scores_per_tf': 50,    # Window quality scores
     'channel_history_per_tf': 67,  # Last 5 channels history
     'events_total': 30,            # TF-independent event features
@@ -130,13 +130,13 @@ WINDOW_INDEPENDENT_PER_TF = (
     FEATURE_COUNTS['spy_per_tf'] +
     FEATURE_COUNTS['vix_per_tf'] +
     FEATURE_COUNTS['cross_asset_per_tf']
-)  # Currently: 65 + 59 + 121 + 31 + 59 = 335
+)  # Currently: 65 + 59 + 121 + 32 + 61 = 338
 
 # TSLA channel + SPY channel, both per window
 WINDOW_DEPENDENT_PER_TF = (
     FEATURE_COUNTS['channel_per_window'] +      # TSLA channel features
     FEATURE_COUNTS['spy_channel_per_window']    # SPY channel features
-) * N_WINDOWS  # Currently: (61 + 61) * 8 = 976
+) * N_WINDOWS  # Currently: (64 + 64) * 8 = 1024
 
 AGGREGATED_PER_TF = (
     FEATURE_COUNTS['window_scores_per_tf'] +

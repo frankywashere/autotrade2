@@ -712,6 +712,45 @@ def _extract_excursion_features(
         else:
             features['spy_last_excursion_direction'] = 0.0
 
+    # ==========================================================================
+    # 59-61. Touch Geometry Features
+    # ==========================================================================
+
+    # 59. spy_approach_speed
+    if close is not None and len(close) >= 4:
+        approach = safe_float((close[-1] - close[-4]) / close[-1] * 100, 0.0) if close[-1] != 0 else 0.0
+        features['spy_approach_speed'] = approach
+    else:
+        features['spy_approach_speed'] = 0.0
+
+    # 60. spy_penetration_depth
+    intercept_val = getattr(channel, 'intercept', 0.0)
+    if close is not None and len(close) > 0 and low is not None and high is not None and len(low) > 0 and len(high) > 0 and std_dev > 0:
+        lower_band_val = slope * (len(close) - 1) + intercept_val - 2 * std_dev
+        upper_band_val = slope * (len(close) - 1) + intercept_val + 2 * std_dev
+        pen_below = max(lower_band_val - low[-1], 0.0)
+        pen_above = max(high[-1] - upper_band_val, 0.0)
+        features['spy_penetration_depth'] = safe_float(max(pen_below, pen_above) / std_dev, 0.0)
+    else:
+        features['spy_penetration_depth'] = 0.0
+
+    # 61. spy_rejection_wick_size
+    if close is not None and high is not None and low is not None and len(close) > 0 and len(high) > 0 and len(low) > 0:
+        h, l, c = high[-1], low[-1], close[-1]
+        total_range = h - l
+        if total_range > 0:
+            pos = features.get('spy_position_in_channel', 0.5)
+            if pos < 0.25:
+                features['spy_rejection_wick_size'] = safe_float((c - l) / total_range, 0.0)
+            elif pos > 0.75:
+                features['spy_rejection_wick_size'] = safe_float((h - c) / total_range, 0.0)
+            else:
+                features['spy_rejection_wick_size'] = 0.0
+        else:
+            features['spy_rejection_wick_size'] = 0.0
+    else:
+        features['spy_rejection_wick_size'] = 0.0
+
     return features
 
 
@@ -778,6 +817,10 @@ def _get_default_features() -> Dict[str, float]:
         'spy_excursion_return_speed_avg': 0.0,
         'spy_excursion_rate': 0.0,
         'spy_last_excursion_direction': 0.0,
+        # Touch geometry features (59-61)
+        'spy_approach_speed': 0.0,
+        'spy_penetration_depth': 0.0,
+        'spy_rejection_wick_size': 0.0,
     }
 
 

@@ -1,15 +1,15 @@
 """
 v15/features/tsla_channel.py - TSLA Channel Feature Extraction
 
-Extracts 58 channel-specific features from a Channel object.
+Extracts 61 channel-specific features from a Channel object.
 All features return valid floats with safe defaults (no NaN, no Inf).
 
 Supports two extraction modes:
-1. Base extraction: extract_tsla_channel_features(channel) -> 58 features
+1. Base extraction: extract_tsla_channel_features(channel) -> 61 features
 2. TF-prefixed extraction: extract_tsla_channel_features_tf(channel, tf, window)
-   -> 58 features with keys like 'daily_w50_channel_slope'
+   -> 61 features with keys like 'daily_w50_channel_slope'
 
-Total features across all TFs and windows: 58 * 8 windows * 10 TFs = 4,640
+Total features across all TFs and windows: 61 * 8 windows * 10 TFs = 4,880
 """
 
 from __future__ import annotations
@@ -626,6 +626,46 @@ def extract_tsla_channel_features(channel: "Channel") -> Dict[str, float]:
     # 0=below, 0.5=none, 1=above
     features['last_excursion_direction'] = safe_float(last_excursion_dir, 0.5)
 
+    # ==========================================================================
+    # 59-61. Touch Geometry Features (approach speed, penetration, rejection wick)
+    # ==========================================================================
+
+    # 59. approach_speed - rate of price approach to band (last 4 bars)
+    if close is not None and len(close) >= 4:
+        approach = safe_float((close[-1] - close[-4]) / close[-1] * 100, 0.0) if close[-1] != 0 else 0.0
+        features['approach_speed'] = approach
+    else:
+        features['approach_speed'] = 0.0
+
+    # 60. penetration_depth - how far price penetrated beyond band (in std_devs)
+    if close is not None and len(close) > 0 and low is not None and high is not None and len(low) > 0 and len(high) > 0 and std_dev > 0:
+        lower_band_val = slope * (len(close) - 1) + intercept - 2 * std_dev
+        upper_band_val = slope * (len(close) - 1) + intercept + 2 * std_dev
+        pen_below = max(lower_band_val - low[-1], 0.0)
+        pen_above = max(high[-1] - upper_band_val, 0.0)
+        features['penetration_depth'] = safe_float(max(pen_below, pen_above) / std_dev, 0.0)
+    else:
+        features['penetration_depth'] = 0.0
+
+    # 61. rejection_wick_size - wick ratio indicating band rejection
+    if close is not None and high is not None and low is not None and len(close) > 0 and len(high) > 0 and len(low) > 0:
+        h, l, c = high[-1], low[-1], close[-1]
+        total_range = h - l
+        if total_range > 0:
+            pos = features.get('position_in_channel', 0.5)
+            if pos < 0.25:
+                # Near lower: lower wick = (close - low) / range
+                features['rejection_wick_size'] = safe_float((c - l) / total_range, 0.0)
+            elif pos > 0.75:
+                # Near upper: upper wick = (high - close) / range
+                features['rejection_wick_size'] = safe_float((h - c) / total_range, 0.0)
+            else:
+                features['rejection_wick_size'] = 0.0
+        else:
+            features['rejection_wick_size'] = 0.0
+    else:
+        features['rejection_wick_size'] = 0.0
+
     # Final safety check
     for key, value in features.items():
         if not isinstance(value, (int, float)) or not np.isfinite(value):
@@ -696,6 +736,10 @@ def _get_default_features() -> Dict[str, float]:
         'excursion_return_speed_avg': 0.0,
         'excursion_rate': 0.0,
         'last_excursion_direction': 0.5,
+        # Touch geometry features (59-61)
+        'approach_speed': 0.0,
+        'penetration_depth': 0.0,
+        'rejection_wick_size': 0.0,
     }
 
 
@@ -749,5 +793,5 @@ def get_all_tsla_channel_feature_names() -> List[str]:
 
 
 def get_total_channel_features() -> int:
-    """Total channel features: 58 * 8 windows * 10 TFs = 4,640"""
-    return 58 * 8 * 10
+    """Total channel features: 61 * 8 windows * 10 TFs = 4,880"""
+    return 61 * 8 * 10
