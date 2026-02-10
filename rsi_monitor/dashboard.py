@@ -924,7 +924,7 @@ def main():
 
     # === Channel Bounce Tab ===
     with tabs[1]:
-        render_bounce_tab(bounce_assessment, bounce_channel_context, bounce_symbol, all_symbols)
+        render_bounce_tab(bounce_assessment, bounce_channel_context, bounce_symbol, all_symbols, bounce_ohlcv_data)
 
     # Footer
     st.divider()
@@ -936,7 +936,93 @@ def main():
         st.rerun()
 
 
-def render_bounce_tab(assessment, channel_context, symbol, all_symbols):
+def _render_channel_chart(df, channel, tf, symbol):
+    """Render a plotly chart showing price with channel bands."""
+    import plotly.graph_objects as go
+
+    if df is None or df.empty:
+        st.caption("No data available")
+        return
+
+    # Use last N bars for display
+    display_bars = min(80, len(df))
+    df_plot = df.tail(display_bars).copy()
+
+    slope = channel.get('slope', 0)
+    intercept = channel.get('intercept', 0)
+    std_dev = channel.get('std_dev', 0)
+    lookback = min(50, len(df))
+
+    # Compute channel lines over the displayed range
+    # The regression was fit on the last `lookback` bars of the full data
+    # We need to map display indices to regression indices
+    full_len = len(df)
+    display_start = full_len - display_bars
+    reg_start = full_len - lookback  # where regression x=0 starts
+
+    x_vals = list(range(display_bars))
+    mid_line = []
+    upper_line = []
+    lower_line = []
+    for i in range(display_bars):
+        reg_x = (display_start + i) - reg_start  # regression-relative x
+        mid = slope * reg_x + intercept
+        mid_line.append(mid)
+        upper_line.append(mid + 2 * std_dev)
+        lower_line.append(mid - 2 * std_dev)
+
+    fig = go.Figure()
+
+    # Channel band fill
+    fig.add_trace(go.Scatter(
+        x=df_plot.index, y=upper_line, mode='lines',
+        line=dict(color='rgba(255, 165, 0, 0.4)', width=1, dash='dash'),
+        name='Upper', showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=df_plot.index, y=lower_line, mode='lines',
+        line=dict(color='rgba(255, 165, 0, 0.4)', width=1, dash='dash'),
+        name='Lower', fill='tonexty', fillcolor='rgba(255, 165, 0, 0.05)',
+        showlegend=False,
+    ))
+
+    # Midline
+    fig.add_trace(go.Scatter(
+        x=df_plot.index, y=mid_line, mode='lines',
+        line=dict(color='rgba(100, 149, 237, 0.5)', width=1, dash='dot'),
+        name='Midline', showlegend=False,
+    ))
+
+    # Candlesticks
+    fig.add_trace(go.Candlestick(
+        x=df_plot.index,
+        open=df_plot['Open'], high=df_plot['High'],
+        low=df_plot['Low'], close=df_plot['Close'],
+        increasing_line_color='#00C851', decreasing_line_color='#ff4444',
+        increasing_fillcolor='#00C851', decreasing_fillcolor='#ff4444',
+        name=symbol, showlegend=False,
+    ))
+
+    fig.update_layout(
+        height=280,
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor='#14161b',
+        plot_bgcolor='#14161b',
+        xaxis=dict(
+            showgrid=False, zeroline=False,
+            color='#6b7080', rangeslider=dict(visible=False),
+        ),
+        yaxis=dict(
+            showgrid=True, gridcolor='#1e2028', zeroline=False,
+            color='#6b7080', side='right',
+        ),
+        font=dict(color='#8b8fa3', size=10),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_bounce_tab(assessment, channel_context, symbol, all_symbols, ohlcv_data=None):
     """Render the Channel Bounce tab for the selected symbol."""
     # Symbol selector — exclude VIX (^VIX) since it's not a tradeable equity channel
     equity_symbols = [s for s in all_symbols if not s.startswith("^")]
@@ -989,30 +1075,47 @@ def render_bounce_tab(assessment, channel_context, symbol, all_symbols):
     # --- Score Card ---
     st.markdown(f"""<div style="background-color: #1a1c23; border: 1px solid #2d3039; border-radius: 12px; padding: 0; margin-bottom: 16px; overflow: hidden;"><div style="height: 3px; background-color: {score_color};"></div><div style="padding: 20px;"><div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;"><span style="font-size: 1.6em; font-weight: 700; color: #e0e0e0; margin-right: 4px;">{symbol}</span><div style="display: flex; align-items: baseline; gap: 8px;"><span style="font-size: 2em; font-weight: 700; color: {score_color};">{score:.0f}</span><span style="font-size: 1em; color: #6b7080;">/100</span></div><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {score_color}22; color: {score_color}; font-size: 0.85em; font-weight: 600;">{assessment.confidence_label.upper()}</span><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {dir_color}22; color: {dir_color}; font-size: 0.85em; font-weight: 600;">{dir_label}</span><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {break_color}22; color: {break_color}; font-size: 0.85em; font-weight: 600;">Break: {break_label}</span><span style="color: #6b7080; font-size: 0.85em;">{assessment.active_channels} active channel{'s' if assessment.active_channels != 1 else ''}</span></div></div></div>""", unsafe_allow_html=True)
 
-    # --- Channel Status Grid ---
-    st.markdown('<h4 style="margin: 0.8rem 0 0.4rem 0; font-weight: 600; color: #e0e0e0;">Channel Status</h4>', unsafe_allow_html=True)
+    # --- Channel Cards with Position Gauge ---
+    st.markdown('<h4 style="margin: 0.8rem 0 0.4rem 0; font-weight: 600; color: #e0e0e0;">Channels</h4>', unsafe_allow_html=True)
 
-    ch_cols = st.columns(4)
-    for idx, tf in enumerate(['5m', '15m', '1h', '4h']):
-        with ch_cols[idx]:
-            ch_data = channel_context.get(tf, {})
-            ch = ch_data.get('channel', {}) if isinstance(ch_data, dict) else {}
-            valid = ch.get('valid', False)
-            r2 = ch.get('r_squared', 0)
-            direction = ch.get('direction', 'N/A').title()
-            pos = ch.get('position', 0.5)
-            pos_label = "Lower" if pos < 0.25 else "Upper" if pos > 0.75 else "Mid"
+    for tf in ['5m', '15m', '1h', '4h']:
+        ch_data = channel_context.get(tf, {})
+        ch = ch_data.get('channel', {}) if isinstance(ch_data, dict) else {}
+        valid = ch.get('valid', False)
+        r2 = ch.get('r_squared', 0)
+        direction = ch.get('direction', 'N/A').title()
+        pos = ch.get('position', 0.5)
+        upper_band = ch.get('upper_band', 0)
+        lower_band = ch.get('lower_band', 0)
+        midline = ch.get('midline', 0)
+        age = ch.get('age', 0)
 
-            if valid:
-                border_color = "#3A82FF"
-                r2_display = f"{r2:.3f}"
-            else:
-                border_color = "#2d3039"
-                r2_display = f"{r2:.3f}"
-                direction = "N/A"
-                pos_label = "N/A"
+        if not valid:
+            st.markdown(f"""<div style="background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 12px; margin-bottom: 8px; display: flex; align-items: center; gap: 16px;"><span style="font-size: 0.85em; font-weight: 600; color: #555; min-width: 36px;">{tf.upper()}</span><span style="font-size: 0.8em; color: #555;">No valid channel (R² {r2:.3f})</span></div>""", unsafe_allow_html=True)
+            continue
 
-            st.markdown(f"""<div style="background-color: #14161b; border: 1px solid {border_color}; border-radius: 8px; padding: 12px; text-align: center;"><div style="font-size: 0.75em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;">{tf}</div><div style="font-size: 1.1em; font-weight: 600; color: {'#e1e3ea' if valid else '#555'};">R² {r2_display}</div><div style="font-size: 0.8em; color: #8b8fa3; margin-top: 4px;">{direction} · {pos_label}</div></div>""", unsafe_allow_html=True)
+        # Position-based signal
+        if pos < 0.2:
+            signal_text, signal_color = "BUY ZONE", "#00C851"
+        elif pos < 0.35:
+            signal_text, signal_color = "Near Support", "#4CAF50"
+        elif pos > 0.8:
+            signal_text, signal_color = "SELL ZONE", "#ff4444"
+        elif pos > 0.65:
+            signal_text, signal_color = "Near Resistance", "#ff9800"
+        else:
+            signal_text, signal_color = "Mid-Channel", "#6c757d"
+
+        # Gauge: position bar with green (lower) → yellow (mid) → red (upper)
+        pos_pct = max(0, min(100, pos * 100))
+        price_display = f"${midline:,.2f}" if midline > 0 else ""
+
+        st.markdown(f"""<div style="background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 14px 16px; margin-bottom: 8px;"><div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;"><div style="display: flex; align-items: center; gap: 12px;"><span style="font-size: 0.9em; font-weight: 700; color: #e1e3ea; min-width: 36px;">{tf.upper()}</span><span style="font-size: 0.75em; color: #8b8fa3;">{direction} · R² {r2:.3f} · Age {age}</span></div><span style="display: inline-block; padding: 3px 10px; border-radius: 12px; background-color: {signal_color}22; color: {signal_color}; font-size: 0.8em; font-weight: 600;">{signal_text}</span></div><div style="position: relative; height: 24px; background: linear-gradient(to right, #1a472a, #1a3a1a 20%, #2d2d1a 40%, #3a2a1a 70%, #3a1a1a); border-radius: 12px; overflow: visible; border: 1px solid #2d3039;"><div style="position: absolute; left: {pos_pct}%; top: -2px; transform: translateX(-50%); width: 14px; height: 28px; background-color: #e1e3ea; border-radius: 7px; border: 2px solid {signal_color}; box-shadow: 0 0 6px {signal_color}88;"></div></div><div style="display: flex; justify-content: space-between; margin-top: 4px; font-size: 0.7em; color: #6b7080;"><span>${lower_band:,.2f}</span><span>{price_display}</span><span>${upper_band:,.2f}</span></div></div>""", unsafe_allow_html=True)
+
+        # Expandable plotly chart
+        if ohlcv_data and tf in ohlcv_data:
+            with st.expander(f"{tf.upper()} Chart", expanded=False):
+                _render_channel_chart(ohlcv_data[tf], ch, tf, symbol)
 
     # --- Timing ---
     try:
