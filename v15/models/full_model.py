@@ -306,6 +306,11 @@ class V15Model(nn.Module):
             [batch, n_tfs, embed_dim] fused embeddings
         """
         lstm_out = self.window_lstm(window_sequences)  # [batch, n_tfs, lstm_out_dim]
+
+        # Convert LSTM output to match embedding dtype (LSTM runs in FP32, embeddings might be bfloat16)
+        if lstm_out.dtype != tf_embeddings.dtype:
+            lstm_out = lstm_out.to(tf_embeddings.dtype)
+
         combined = torch.cat([tf_embeddings, lstm_out], dim=-1)  # [B, n_tfs, embed_dim + lstm_out_dim]
         gate = self.sequence_gate(combined)  # [B, n_tfs, embed_dim]
         fused = self.sequence_fusion(combined)  # [B, n_tfs, embed_dim]
