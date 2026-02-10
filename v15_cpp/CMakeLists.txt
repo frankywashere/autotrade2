@@ -103,6 +103,8 @@ file(GLOB SCANNER_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/serialization.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/feature_extractor.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/label_generator.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/flat_writer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/npy_writer.cpp"
 )
 
 # Collect all header files
