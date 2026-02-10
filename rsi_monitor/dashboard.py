@@ -944,7 +944,7 @@ def _render_channel_chart(df, channel, tf, symbol):
         st.caption("No data available")
         return
 
-    # Use last N bars for display
+    # Show enough bars for context, but only draw channel over the regression window
     display_bars = min(80, len(df))
     df_plot = df.tail(display_bars).copy()
 
@@ -953,42 +953,35 @@ def _render_channel_chart(df, channel, tf, symbol):
     std_dev = channel.get('std_dev', 0)
     lookback = min(50, len(df))
 
-    # Compute channel lines over the displayed range
-    # The regression was fit on the last `lookback` bars of the full data
-    # We need to map display indices to regression indices
-    full_len = len(df)
-    display_start = full_len - display_bars
-    reg_start = full_len - lookback  # where regression x=0 starts
-
-    x_vals = list(range(display_bars))
-    mid_line = []
-    upper_line = []
-    lower_line = []
-    for i in range(display_bars):
-        reg_x = (display_start + i) - reg_start  # regression-relative x
-        mid = slope * reg_x + intercept
-        mid_line.append(mid)
-        upper_line.append(mid + 2 * std_dev)
-        lower_line.append(mid - 2 * std_dev)
+    # Channel lines only over the regression window (last `lookback` bars)
+    df_channel = df.tail(lookback)
+    ch_mid = []
+    ch_upper = []
+    ch_lower = []
+    for i in range(len(df_channel)):
+        mid = slope * i + intercept
+        ch_mid.append(mid)
+        ch_upper.append(mid + 2 * std_dev)
+        ch_lower.append(mid - 2 * std_dev)
 
     fig = go.Figure()
 
-    # Channel band fill
+    # Channel band fill (only over regression window)
     fig.add_trace(go.Scatter(
-        x=df_plot.index, y=upper_line, mode='lines',
-        line=dict(color='rgba(255, 165, 0, 0.4)', width=1, dash='dash'),
+        x=df_channel.index, y=ch_upper, mode='lines',
+        line=dict(color='rgba(255, 165, 0, 0.5)', width=1, dash='dash'),
         name='Upper', showlegend=False,
     ))
     fig.add_trace(go.Scatter(
-        x=df_plot.index, y=lower_line, mode='lines',
-        line=dict(color='rgba(255, 165, 0, 0.4)', width=1, dash='dash'),
-        name='Lower', fill='tonexty', fillcolor='rgba(255, 165, 0, 0.05)',
+        x=df_channel.index, y=ch_lower, mode='lines',
+        line=dict(color='rgba(255, 165, 0, 0.5)', width=1, dash='dash'),
+        name='Lower', fill='tonexty', fillcolor='rgba(255, 165, 0, 0.06)',
         showlegend=False,
     ))
 
     # Midline
     fig.add_trace(go.Scatter(
-        x=df_plot.index, y=mid_line, mode='lines',
+        x=df_channel.index, y=ch_mid, mode='lines',
         line=dict(color='rgba(100, 149, 237, 0.5)', width=1, dash='dot'),
         name='Midline', showlegend=False,
     ))
