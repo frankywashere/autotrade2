@@ -937,7 +937,12 @@ def main():
 
 
 def _render_channel_chart(df, channel, tf, symbol):
-    """Render a plotly chart showing price with channel bands."""
+    """Render a plotly chart showing price with channel bands.
+
+    Uses integer bar indices for the x-axis (like x22 inspector) to avoid
+    gaps from weekends and overnight hours. Sparse date labels are shown
+    as tick text for orientation.
+    """
     import plotly.graph_objects as go
 
     if df is None or df.empty:
@@ -947,33 +952,52 @@ def _render_channel_chart(df, channel, tf, symbol):
     # Show enough bars for context, but only draw channel over the regression window
     display_bars = min(80, len(df))
     df_plot = df.tail(display_bars).copy()
+    df_plot = df_plot.reset_index()  # move DatetimeIndex into a column
+
+    # Integer x-axis: 0..N-1
+    x_candle = list(range(len(df_plot)))
 
     slope = channel.get('slope', 0)
     intercept = channel.get('intercept', 0)
     std_dev = channel.get('std_dev', 0)
     lookback = min(50, len(df))
 
-    # Channel lines only over the regression window (last `lookback` bars)
-    df_channel = df.tail(lookback)
-    ch_mid = []
-    ch_upper = []
-    ch_lower = []
-    for i in range(len(df_channel)):
+    # Channel lines span the last `lookback` bars of the display window
+    ch_len = min(lookback, len(df_plot))
+    ch_start = len(df_plot) - ch_len
+    x_channel = list(range(ch_start, len(df_plot)))
+
+    ch_mid, ch_upper, ch_lower = [], [], []
+    for i in range(ch_len):
         mid = slope * i + intercept
         ch_mid.append(mid)
         ch_upper.append(mid + 2 * std_dev)
         ch_lower.append(mid - 2 * std_dev)
 
+    # Sparse date tick labels (~6 ticks)
+    n_ticks = min(6, len(df_plot))
+    step = max(1, len(df_plot) // n_ticks)
+    tick_vals = list(range(0, len(df_plot), step))
+    # Determine the datetime column name after reset_index
+    dt_col = df_plot.columns[0] if df_plot.columns[0] != 'Open' else 'Date'
+    tick_labels = []
+    for idx in tick_vals:
+        ts = df_plot[dt_col].iloc[idx]
+        try:
+            tick_labels.append(ts.strftime('%b %d %H:%M'))
+        except Exception:
+            tick_labels.append(str(ts))
+
     fig = go.Figure()
 
     # Channel band fill (only over regression window)
     fig.add_trace(go.Scatter(
-        x=df_channel.index, y=ch_upper, mode='lines',
+        x=x_channel, y=ch_upper, mode='lines',
         line=dict(color='rgba(255, 165, 0, 0.5)', width=1, dash='dash'),
         name='Upper', showlegend=False,
     ))
     fig.add_trace(go.Scatter(
-        x=df_channel.index, y=ch_lower, mode='lines',
+        x=x_channel, y=ch_lower, mode='lines',
         line=dict(color='rgba(255, 165, 0, 0.5)', width=1, dash='dash'),
         name='Lower', fill='tonexty', fillcolor='rgba(255, 165, 0, 0.06)',
         showlegend=False,
@@ -981,14 +1005,14 @@ def _render_channel_chart(df, channel, tf, symbol):
 
     # Midline
     fig.add_trace(go.Scatter(
-        x=df_channel.index, y=ch_mid, mode='lines',
+        x=x_channel, y=ch_mid, mode='lines',
         line=dict(color='rgba(100, 149, 237, 0.5)', width=1, dash='dot'),
         name='Midline', showlegend=False,
     ))
 
     # Candlesticks
     fig.add_trace(go.Candlestick(
-        x=df_plot.index,
+        x=x_candle,
         open=df_plot['Open'], high=df_plot['High'],
         low=df_plot['Low'], close=df_plot['Close'],
         increasing_line_color='#00C851', decreasing_line_color='#ff4444',
@@ -1004,10 +1028,7 @@ def _render_channel_chart(df, channel, tf, symbol):
         xaxis=dict(
             showgrid=False, zeroline=False,
             color='#6b7080', rangeslider=dict(visible=False),
-            rangebreaks=[
-                dict(bounds=["sat", "mon"]),          # hide weekends
-                dict(bounds=[20, 4], pattern="hour"),  # hide overnight (8pm-4am)
-            ],
+            tickvals=tick_vals, ticktext=tick_labels,
         ),
         yaxis=dict(
             showgrid=True, gridcolor='#1e2028', zeroline=False,
@@ -1091,15 +1112,40 @@ def render_bounce_tab(assessment, channel_context, symbol, all_symbols, ohlcv_da
             st.markdown(f"""<div style="background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 12px; margin-bottom: 8px; display: flex; align-items: center; gap: 16px;"><span style="font-size: 0.85em; font-weight: 600; color: #555; min-width: 36px;">{tf.upper()}</span><span style="font-size: 0.8em; color: #555;">No valid channel (R² {r2:.3f})</span></div>""", unsafe_allow_html=True)
             continue
 
-        # Position-based signal
+        # Context-aware signal using channel direction + position (Rule 3 mean reversion)
+        # Uptrend + near lower → bounce ↑ (92.5% win rate)
+        # Downtrend + near upper → bounce ↓ (92.5% win rate)
+        # Uptrend + near upper → expected break ↓ direction
+        # Downtrend + near lower → expected break ↑ direction
+        ch_dir = ch.get('direction', 'sideways')
         if pos < 0.2:
-            signal_text, signal_color = "BUY ZONE", "#00C851"
+            if ch_dir == 'uptrend':
+                signal_text, signal_color = "Bounce \u2191", "#00C851"
+            elif ch_dir == 'downtrend':
+                signal_text, signal_color = "Break \u2191 ?", "#ff9800"
+            else:
+                signal_text, signal_color = "BUY ZONE", "#00C851"
         elif pos < 0.35:
-            signal_text, signal_color = "Near Support", "#4CAF50"
+            if ch_dir == 'uptrend':
+                signal_text, signal_color = "Near Support", "#4CAF50"
+            elif ch_dir == 'downtrend':
+                signal_text, signal_color = "Near Support", "#ff9800"
+            else:
+                signal_text, signal_color = "Near Support", "#4CAF50"
         elif pos > 0.8:
-            signal_text, signal_color = "SELL ZONE", "#ff4444"
+            if ch_dir == 'downtrend':
+                signal_text, signal_color = "Bounce \u2193", "#ff4444"
+            elif ch_dir == 'uptrend':
+                signal_text, signal_color = "Break \u2193 ?", "#ff9800"
+            else:
+                signal_text, signal_color = "SELL ZONE", "#ff4444"
         elif pos > 0.65:
-            signal_text, signal_color = "Near Resistance", "#ff9800"
+            if ch_dir == 'downtrend':
+                signal_text, signal_color = "Near Resistance", "#ff9800"
+            elif ch_dir == 'uptrend':
+                signal_text, signal_color = "Near Resistance", "#ff9800"
+            else:
+                signal_text, signal_color = "Near Resistance", "#ff9800"
         else:
             signal_text, signal_color = "Mid-Channel", "#6c757d"
 
