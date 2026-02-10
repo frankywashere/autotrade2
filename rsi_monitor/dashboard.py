@@ -4,6 +4,7 @@ Market Pulse Dashboard
 A Streamlit dashboard for monitoring RSI signals across multiple timeframes and symbols.
 """
 
+import logging
 import streamlit as st
 import pandas as pd
 import time
@@ -11,11 +12,14 @@ import sys
 import os
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
+
 # Add parent directory to path for Streamlit Cloud deployment
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rsi_monitor import RSIMonitor, DataFetcher, SignalGenerator, VIXAnalyzer
-from rsi_monitor.channel import get_channel_context, CHANNEL_WIN_RATES
+from rsi_monitor.channel import get_channel_context_with_data, CHANNEL_WIN_RATES
+from rsi_monitor.bounce_rules import BounceRuleEngine
 
 
 # Signal color mapping
@@ -633,9 +637,10 @@ def main():
 
     # Compute channel context for TSLA only (5m, 15m, 1h, 4h)
     tsla_channel_context = {}
+    tsla_ohlcv_data = {}
     if "TSLA" in all_symbols:
         try:
-            tsla_channel_context = get_channel_context(
+            tsla_channel_context, tsla_ohlcv_data = get_channel_context_with_data(
                 rsi_results=rsi_results,
                 data_fetcher=data_fetcher,
                 symbol="TSLA",
@@ -643,6 +648,7 @@ def main():
             )
         except Exception:
             tsla_channel_context = {}
+            tsla_ohlcv_data = {}
 
     # Generate signals for all symbols (with VIX confirmation for strength bonus)
     signals = {}
@@ -675,268 +681,245 @@ def main():
     )
     st.session_state.recovery_mode_active = any_recovery
 
-    # Summary Section
-    st.markdown('<h3 style="margin: 0 0 0.5rem 0; font-weight: 600; color: #e0e0e0; letter-spacing: 0.02em;">Market Summary</h3>', unsafe_allow_html=True)
-
-    summary_cols = st.columns([2, 1, 1])
-
-    with summary_cols[0]:
-        # Overall market status based on VIX fear level
-        fear_pct = getattr(vix_confirmation, 'fear_percentage', 0.0)
-        greed_pct = getattr(vix_confirmation, 'greed_percentage', 0.0)
-        confirms_sell = getattr(vix_confirmation, 'confirms_sell', False)
-
-        if fear_pct >= 70:
-            overall_status = "BUY THE DIP"
-            overall_color = "#00C851"
-        elif fear_pct >= 50:
-            overall_status = "BUY THE DIP"
-            overall_color = "#4CAF50"
-        elif fear_pct >= 35:
-            overall_status = "CAUTIOUS - BUY"
-            overall_color = "#ffeb3b"
-        elif fear_pct < 10 and confirms_sell:
-            overall_status = "SELL THE RIP"
-            overall_color = "#ff4444" if greed_pct >= 50 else "#ff9800"
-        else:
-            overall_status = "NEUTRAL"
-            overall_color = "#6c757d"
-
-        # Sub-label always shows fear level
-        sub_label = f"Fear {fear_pct:.0f}%"
-        if fear_pct >= 50:
-            sub_color = "#ff4444"
-        elif fear_pct >= 35:
-            sub_color = "#ffeb3b"
-        else:
-            sub_color = "#888"
-
-        # Signal count pills (group BUY-family and SELL-family)
-        strong_buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_BUY")
-        buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") in ("BUY", "SHORT_TERM_BUY", "LONG_TERM_BUY"))
-        sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") in ("SELL", "SHORT_TERM_SELL", "LONG_TERM_SELL"))
-        strong_sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_SELL")
-
-        def _pill(label, count, color):
-            return (
-                f'<span style="display:inline-block;padding:2px 10px;margin:0 4px;'
-                f'border-radius:20px;font-size:0.75rem;font-weight:600;'
-                f'background:{color}22;color:{color};border:1px solid {color}44;">'
-                f'{label} {count}</span>'
+    # Compute bounce assessment for TSLA (used in Channel Bounce tab)
+    bounce_assessment = None
+    if "TSLA" in all_symbols and tsla_channel_context:
+        try:
+            bounce_engine = BounceRuleEngine()
+            tsla_rsi_data = rsi_results.get("TSLA", {})
+            spy_rsi_data = rsi_results.get("SPY", {})
+            bounce_assessment = bounce_engine.evaluate(
+                channel_context=tsla_channel_context,
+                rsi_results=tsla_rsi_data,
+                vix_confirmation=vix_confirmation,
+                ohlcv_data=tsla_ohlcv_data,
+                spy_rsi_results=spy_rsi_data if "SPY" in all_symbols else None,
             )
+        except Exception as e:
+            logger.warning("Bounce assessment failed: %s", e)
 
-        pills_html = (
-            _pill("Strong Buy", strong_buy_count, "#00C851")
-            + _pill("Buy", buy_count, "#4CAF50")
-            + _pill("Sell", sell_count, "#ff9800")
-            + _pill("Strong Sell", strong_sell_count, "#ff4444")
-        )
+    # --- Tabs ---
+    tab_names = ["Market Pulse"]
+    if "TSLA" in all_symbols:
+        tab_names.append("Channel Bounce")
 
-        st.markdown(f"""
-        <div style="padding: 20px 24px; border-radius: 12px; background-color: #1a1c23; border: 1px solid #2d3039;">
-            <div style="margin: 0 0 10px 0; font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Overall Market</div>
-            <div style="font-size: 1.6rem; font-weight: 700; color: {overall_color}; margin: 0 0 8px 0;">{overall_status}</div>
-            <div style="font-size: 0.85rem; color: {sub_color}; font-weight: 600; margin: 0 0 12px 0;">{sub_label}</div>
-            <div>{pills_html}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    tabs = st.tabs(tab_names)
 
-    with summary_cols[1]:
-        # VIX Confirmation - Comprehensive Display
-        render_vix_confirmation_card(vix_confirmation, data_fetcher)
+    # === Market Pulse Tab ===
+    with tabs[0]:
+        # Summary Section
+        st.markdown('<h3 style="margin: 0 0 0.5rem 0; font-weight: 600; color: #e0e0e0; letter-spacing: 0.02em;">Market Summary</h3>', unsafe_allow_html=True)
 
-    with summary_cols[2]:
-        # Active alerts
-        alerts = []
-        for symbol in selected_symbols:
-            signal = signals.get(symbol, {}).get("signal", "NEUTRAL")
-            if signal in ["STRONG_BUY", "LONG_TERM_BUY", "BUY", "SHORT_TERM_BUY",
-                         "SHORT_TERM_SELL", "SELL", "LONG_TERM_SELL", "STRONG_SELL"]:
-                display_signal = SIGNAL_DISPLAY.get(signal, signal)
-                alerts.append(f"{symbol}: {display_signal}")
+        summary_cols = st.columns([2, 1, 1])
 
-        alert_color = "#ff4444" if alerts else "#00C851"
-        alert_count_text = f"{len(alerts)} alert{'s' if len(alerts) != 1 else ''}"
-        alerts_list_html = ""
-        if alerts:
-            for alert in alerts:
-                parts = alert.split(": ")
-                sym = parts[0]
-                sig = parts[1] if len(parts) > 1 else ""
-                sig_color = "#ff4444" if "SELL" in sig else "#00C851"
-                alerts_list_html += (
-                    f'<div style="padding:4px 0;font-size:0.82rem;color:#ccc;">'
-                    f'<span style="font-weight:600;">{sym}</span> '
-                    f'<span style="color:{sig_color};font-weight:600;">{sig}</span></div>'
+        with summary_cols[0]:
+            # Overall market status based on VIX fear level
+            fear_pct = getattr(vix_confirmation, 'fear_percentage', 0.0)
+            greed_pct = getattr(vix_confirmation, 'greed_percentage', 0.0)
+            confirms_sell = getattr(vix_confirmation, 'confirms_sell', False)
+
+            if fear_pct >= 70:
+                overall_status = "BUY THE DIP"
+                overall_color = "#00C851"
+            elif fear_pct >= 50:
+                overall_status = "BUY THE DIP"
+                overall_color = "#4CAF50"
+            elif fear_pct >= 35:
+                overall_status = "CAUTIOUS - BUY"
+                overall_color = "#ffeb3b"
+            elif fear_pct < 10 and confirms_sell:
+                overall_status = "SELL THE RIP"
+                overall_color = "#ff4444" if greed_pct >= 50 else "#ff9800"
+            else:
+                overall_status = "NEUTRAL"
+                overall_color = "#6c757d"
+
+            # Sub-label always shows fear level
+            sub_label = f"Fear {fear_pct:.0f}%"
+            if fear_pct >= 50:
+                sub_color = "#ff4444"
+            elif fear_pct >= 35:
+                sub_color = "#ffeb3b"
+            else:
+                sub_color = "#888"
+
+            # Signal count pills (group BUY-family and SELL-family)
+            strong_buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_BUY")
+            buy_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") in ("BUY", "SHORT_TERM_BUY", "LONG_TERM_BUY"))
+            sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") in ("SELL", "SHORT_TERM_SELL", "LONG_TERM_SELL"))
+            strong_sell_count = sum(1 for s in selected_symbols if signals.get(s, {}).get("signal") == "STRONG_SELL")
+
+            def _pill(label, count, color):
+                return (
+                    f'<span style="display:inline-block;padding:2px 10px;margin:0 4px;'
+                    f'border-radius:20px;font-size:0.75rem;font-weight:600;'
+                    f'background:{color}22;color:{color};border:1px solid {color}44;">'
+                    f'{label} {count}</span>'
                 )
 
-        st.markdown(f"""
-        <div style="padding: 20px 24px; border-radius: 12px; background-color: #1a1c23; border: 1px solid #2d3039;">
-            <div style="margin: 0 0 10px 0; font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Active Alerts</div>
-            <div style="font-size: 1.6rem; font-weight: 700; color: {alert_color}; margin: 0 0 8px 0;">{alert_count_text}</div>
-            {alerts_list_html}
-        </div>
-        """, unsafe_allow_html=True)
+            pills_html = (
+                _pill("Strong Buy", strong_buy_count, "#00C851")
+                + _pill("Buy", buy_count, "#4CAF50")
+                + _pill("Sell", sell_count, "#ff9800")
+                + _pill("Strong Sell", strong_sell_count, "#ff4444")
+            )
 
-    st.markdown('<div style="margin: 1.5rem 0;"></div>', unsafe_allow_html=True)
+            st.markdown(f"""<div style="padding: 20px 24px; border-radius: 12px; background-color: #1a1c23; border: 1px solid #2d3039;"><div style="margin: 0 0 10px 0; font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Overall Market</div><div style="font-size: 1.6rem; font-weight: 700; color: {overall_color}; margin: 0 0 8px 0;">{overall_status}</div><div style="font-size: 0.85rem; color: {sub_color}; font-weight: 600; margin: 0 0 12px 0;">{sub_label}</div><div>{pills_html}</div></div>""", unsafe_allow_html=True)
 
-    # Individual Symbol Cards
+        with summary_cols[1]:
+            # VIX Confirmation - Comprehensive Display
+            render_vix_confirmation_card(vix_confirmation, data_fetcher)
 
-    if not selected_symbols:
-        st.info("Select at least one symbol from the sidebar to view RSI data.")
-    else:
-        # Create columns for symbols (2 per row)
-        for i in range(0, len(selected_symbols), 2):
-            cols = st.columns(2)
+        with summary_cols[2]:
+            # Active alerts
+            alerts = []
+            for symbol in selected_symbols:
+                signal = signals.get(symbol, {}).get("signal", "NEUTRAL")
+                if signal in ["STRONG_BUY", "LONG_TERM_BUY", "BUY", "SHORT_TERM_BUY",
+                             "SHORT_TERM_SELL", "SELL", "LONG_TERM_SELL", "STRONG_SELL"]:
+                    display_signal = SIGNAL_DISPLAY.get(signal, signal)
+                    alerts.append(f"{symbol}: {display_signal}")
 
-            for j, col in enumerate(cols):
-                if i + j < len(selected_symbols):
-                    symbol = selected_symbols[i + j]
-                    signal_data = signals.get(symbol, {"signal": "NEUTRAL", "strength": 0})
-                    signal = signal_data.get("signal", "NEUTRAL")
-                    strength = signal_data.get("strength", 0)
-                    signal_color = SIGNAL_COLORS.get(signal, "#6c757d")
+            alert_color = "#ff4444" if alerts else "#00C851"
+            alert_count_text = f"{len(alerts)} alert{'s' if len(alerts) != 1 else ''}"
+            alerts_list_html = ""
+            if alerts:
+                for alert in alerts:
+                    parts = alert.split(": ")
+                    sym = parts[0]
+                    sig = parts[1] if len(parts) > 1 else ""
+                    sig_color = "#ff4444" if "SELL" in sig else "#00C851"
+                    alerts_list_html += (
+                        f'<div style="padding:4px 0;font-size:0.82rem;color:#ccc;">'
+                        f'<span style="font-weight:600;">{sym}</span> '
+                        f'<span style="color:{sig_color};font-weight:600;">{sig}</span></div>'
+                    )
 
-                    with col:
-                        # Get current price (use intraday data for after-hours price)
-                        if prepost:
-                            price_df = data_fetcher.fetch(symbol, interval="5m", period="1d", prepost=True)
-                        else:
-                            price_df = data_fetcher.fetch(symbol, interval="1d", period="5d")
-                        current_price = float(price_df["Close"].iloc[-1]) if price_df is not None and not price_df.empty else None
-                        price_str = f"${current_price:.2f}" if current_price else "N/A"
+            st.markdown(f"""<div style="padding: 20px 24px; border-radius: 12px; background-color: #1a1c23; border: 1px solid #2d3039;"><div style="margin: 0 0 10px 0; font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em;">Active Alerts</div><div style="font-size: 1.6rem; font-weight: 700; color: {alert_color}; margin: 0 0 8px 0;">{alert_count_text}</div>{alerts_list_html}</div>""", unsafe_allow_html=True)
 
-                        # Confluence score
-                        rsi_data = rsi_results.get(symbol, {})
-                        oversold_count, overbought_count, total = calculate_confluence(
-                            rsi_data, oversold_threshold, overbought_threshold
-                        )
+        st.markdown('<div style="margin: 1.5rem 0;"></div>', unsafe_allow_html=True)
 
-                        strength_display = f"{strength:.0%}" if isinstance(strength, float) else str(strength)
+        # Individual Symbol Cards
+        if not selected_symbols:
+            st.info("Select at least one symbol from the sidebar to view RSI data.")
+        else:
+            for i in range(0, len(selected_symbols), 2):
+                cols = st.columns(2)
 
-                        # VIX cooldown / recovery indicators
-                        vix_cooldown = signal_data.get("vix_cooldown_active", False)
-                        recovery_suppressed = signal_data.get("recovery_suppressed", False)
-                        recovery_type = signal_data.get("recovery_suppressed_signal")
-                        cooldown_html = ""
-                        if recovery_suppressed and recovery_type == 'sell':
-                            cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #00C85122; color: #00C851; font-size: 0.7em; font-weight: 500; margin-left: 6px;">RECOVERY RALLY BUY</span>'
-                        elif recovery_suppressed:
-                            cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #ff980022; color: #ff9800; font-size: 0.7em; font-weight: 500; margin-left: 6px;">(recovery mode)</span>'
-                        elif vix_cooldown:
-                            cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #ffeb3b22; color: #ffeb3b; font-size: 0.7em; font-weight: 500; margin-left: 6px;">(VIX cooldown)</span>'
+                for j, col in enumerate(cols):
+                    if i + j < len(selected_symbols):
+                        symbol = selected_symbols[i + j]
+                        signal_data = signals.get(symbol, {"signal": "NEUTRAL", "strength": 0})
+                        signal = signal_data.get("signal", "NEUTRAL")
+                        strength = signal_data.get("strength", 0)
+                        signal_color = SIGNAL_COLORS.get(signal, "#6c757d")
 
-                        # Weekly extreme buy indicator
-                        weekly_extreme = signal_data.get("weekly_extreme_buy", False)
-                        weekly_extreme_html = ""
-                        if weekly_extreme:
-                            weekly_extreme_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #00C85122; color: #00C851; font-size: 0.7em; font-weight: 500; margin-left: 6px;">WEEKLY EXTREME BUY</span>'
-
-                        # Channel confluence indicator (TSLA only)
-                        channel_confluence = signal_data.get("channel_confluence", False)
-                        channel_details = signal_data.get("channel_details", {})
-                        channel_html = ""
-                        if channel_details.get("in_valid_channel", False):
-                            if channel_confluence:
-                                # RSI + channel agree — show win rate
-                                # Determine which TF has the strongest channel
-                                best_tf = None
-                                best_r2 = 0
-                                for tf, td in channel_details.get("timeframes", {}).items():
-                                    if td.get("meets_criteria") and td.get("r_squared", 0) > best_r2:
-                                        best_r2 = td["r_squared"]
-                                        best_tf = tf
-                                win_key = (best_tf, 'rsi_channel_buy') if 'BUY' in signal else (best_tf, 'rsi_channel_buy')
-                                win_rate = CHANNEL_WIN_RATES.get(win_key, 0)
-                                pf_key = (best_tf, 'rsi_channel_pf')
-                                pf = CHANNEL_WIN_RATES.get(pf_key, 0)
-                                channel_html = f'<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #3A82FF22; color: #3A82FF; font-size: 0.7em; font-weight: 500; margin-left: 6px;">CHANNEL CONFLUENCE ({win_rate:.0f}% win)</span>'
+                        with col:
+                            if prepost:
+                                price_df = data_fetcher.fetch(symbol, interval="5m", period="1d", prepost=True)
                             else:
-                                # In valid channel but no RSI+channel agreement
-                                channel_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #3A82FF11; color: #3A82FF88; font-size: 0.7em; font-weight: 500; margin-left: 6px;">in channel</span>'
+                                price_df = data_fetcher.fetch(symbol, interval="1d", period="5d")
+                            current_price = float(price_df["Close"].iloc[-1]) if price_df is not None and not price_df.empty else None
+                            price_str = f"${current_price:.2f}" if current_price else "N/A"
 
-                        # Styled card with top accent bar
-                        st.markdown(f"""
-                        <div style="background-color: #1a1c23; border: 1px solid #2d3039; border-radius: 12px; padding: 0; margin-bottom: 16px; overflow: hidden;">
-                            <div style="height: 3px; background-color: {signal_color};"></div>
-                            <div style="padding: 20px;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-                                    <div style="display: flex; align-items: baseline; gap: 12px;">
-                                        <span style="font-size: 1.3em; font-weight: 700; color: #e1e3ea;">{symbol}</span>
-                                        <span style="font-size: 1.15em; font-weight: 600; color: #8b8fa3;">{price_str}</span>
-                                    </div>
-                                    <div style="display: flex; align-items: center; flex-wrap: wrap;"><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{SIGNAL_DISPLAY.get(signal, signal)}</span>{cooldown_html}{weekly_extreme_html}{channel_html}</div>
-                                </div>
-                                <div style="display: flex; gap: 10px; margin-bottom: 6px;">
-                                    <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">
-                                        <div style="font-size: 0.7em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Oversold TFs</div>
-                                        <div style="font-size: 1.1em; font-weight: 600; color: #e1e3ea;">{oversold_count}/{total}</div>
-                                    </div>
-                                    <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">
-                                        <div style="font-size: 0.7em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Overbought TFs</div>
-                                        <div style="font-size: 1.1em; font-weight: 600; color: #e1e3ea;">{overbought_count}/{total}</div>
-                                    </div>
-                                    <div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;">
-                                        <div style="font-size: 0.7em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Strength</div>
-                                        <div style="font-size: 1.1em; font-weight: 600; color: #e1e3ea;">{strength_display}</div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                        # RSI Table
-                        if rsi_data:
-                            df = create_rsi_table(rsi_data, oversold_threshold, overbought_threshold)
-
-                            # Style the dataframe with 7-level colors
-                            def color_status(val):
-                                # Extract base status (before any percentile info)
-                                base_status = val.split(" (")[0] if " (" in val else val
-                                color = RSI_LEVEL_COLORS.get(base_status)
-                                if color:
-                                    return f"background-color: {color}15; color: {color}; font-weight: 600"
-                                return ""
-
-                            styled_df = df.style.map(
-                                color_status, subset=["Status"]
+                            rsi_data = rsi_results.get(symbol, {})
+                            oversold_count, overbought_count, total = calculate_confluence(
+                                rsi_data, oversold_threshold, overbought_threshold
                             )
 
-                            st.dataframe(
-                                styled_df,
-                                width='stretch',
-                                hide_index=True
-                            )
+                            strength_display = f"{strength:.0%}" if isinstance(strength, float) else str(strength)
 
-                            # Channel details expander (TSLA only)
-                            if symbol == 'TSLA' and channel_details.get("timeframes"):
-                                with st.expander("Channel Analysis", expanded=False):
-                                    ch_tfs = channel_details.get("timeframes", {})
-                                    if ch_tfs:
-                                        ch_rows = []
-                                        for tf in ['5m', '15m', '1h', '4h']:
-                                            td = ch_tfs.get(tf)
-                                            if td:
-                                                pos = td.get('position', 0.5)
-                                                pos_label = "Near Lower" if pos < 0.25 else "Near Upper" if pos > 0.75 else "Middle"
-                                                ch_rows.append({
-                                                    "Timeframe": tf,
-                                                    "R²": f"{td.get('r_squared', 0):.3f}",
-                                                    "Direction": td.get('direction', '?').title(),
-                                                    "Position": f"{pos:.0%}",
-                                                    "Zone": pos_label,
-                                                    "Width": f"{td.get('width_pct', 0):.1f}%",
-                                                    "Age": td.get('age', 0),
-                                                    "Valid": "Yes" if td.get('meets_criteria') else "No",
-                                                })
-                                        if ch_rows:
-                                            st.dataframe(pd.DataFrame(ch_rows), hide_index=True, width='stretch')
+                            vix_cooldown = signal_data.get("vix_cooldown_active", False)
+                            recovery_suppressed = signal_data.get("recovery_suppressed", False)
+                            recovery_type = signal_data.get("recovery_suppressed_signal")
+                            cooldown_html = ""
+                            if recovery_suppressed and recovery_type == 'sell':
+                                cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #00C85122; color: #00C851; font-size: 0.7em; font-weight: 500; margin-left: 6px;">RECOVERY RALLY BUY</span>'
+                            elif recovery_suppressed:
+                                cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #ff980022; color: #ff9800; font-size: 0.7em; font-weight: 500; margin-left: 6px;">(recovery mode)</span>'
+                            elif vix_cooldown:
+                                cooldown_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #ffeb3b22; color: #ffeb3b; font-size: 0.7em; font-weight: 500; margin-left: 6px;">(VIX cooldown)</span>'
+
+                            weekly_extreme = signal_data.get("weekly_extreme_buy", False)
+                            weekly_extreme_html = ""
+                            if weekly_extreme:
+                                weekly_extreme_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #00C85122; color: #00C851; font-size: 0.7em; font-weight: 500; margin-left: 6px;">WEEKLY EXTREME BUY</span>'
+
+                            channel_confluence = signal_data.get("channel_confluence", False)
+                            channel_details = signal_data.get("channel_details", {})
+                            channel_html = ""
+                            if channel_details.get("in_valid_channel", False):
+                                if channel_confluence:
+                                    best_tf = None
+                                    best_r2 = 0
+                                    for tf, td in channel_details.get("timeframes", {}).items():
+                                        if td.get("meets_criteria") and td.get("r_squared", 0) > best_r2:
+                                            best_r2 = td["r_squared"]
+                                            best_tf = tf
+                                    win_key = (best_tf, 'rsi_channel_buy') if 'BUY' in signal else (best_tf, 'rsi_channel_buy')
+                                    win_rate = CHANNEL_WIN_RATES.get(win_key, 0)
+                                    pf_key = (best_tf, 'rsi_channel_pf')
+                                    pf = CHANNEL_WIN_RATES.get(pf_key, 0)
+                                    channel_html = f'<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #3A82FF22; color: #3A82FF; font-size: 0.7em; font-weight: 500; margin-left: 6px;">CHANNEL CONFLUENCE ({win_rate:.0f}% win)</span>'
+                                else:
+                                    channel_html = '<span style="display: inline-block; padding: 2px 8px; border-radius: 12px; background-color: #3A82FF11; color: #3A82FF88; font-size: 0.7em; font-weight: 500; margin-left: 6px;">in channel</span>'
+
+                            st.markdown(f"""<div style="background-color: #1a1c23; border: 1px solid #2d3039; border-radius: 12px; padding: 0; margin-bottom: 16px; overflow: hidden;"><div style="height: 3px; background-color: {signal_color};"></div><div style="padding: 20px;"><div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;"><div style="display: flex; align-items: baseline; gap: 12px;"><span style="font-size: 1.3em; font-weight: 700; color: #e1e3ea;">{symbol}</span><span style="font-size: 1.15em; font-weight: 600; color: #8b8fa3;">{price_str}</span></div><div style="display: flex; align-items: center; flex-wrap: wrap;"><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {signal_color}33; color: {signal_color}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.3px;">{SIGNAL_DISPLAY.get(signal, signal)}</span>{cooldown_html}{weekly_extreme_html}{channel_html}</div></div><div style="display: flex; gap: 10px; margin-bottom: 6px;"><div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;"><div style="font-size: 0.7em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Oversold TFs</div><div style="font-size: 1.1em; font-weight: 600; color: #e1e3ea;">{oversold_count}/{total}</div></div><div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;"><div style="font-size: 0.7em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Overbought TFs</div><div style="font-size: 1.1em; font-weight: 600; color: #e1e3ea;">{overbought_count}/{total}</div></div><div style="flex: 1; background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 12px; text-align: center;"><div style="font-size: 0.7em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;">Strength</div><div style="font-size: 1.1em; font-weight: 600; color: #e1e3ea;">{strength_display}</div></div></div></div></div>""", unsafe_allow_html=True)
+
+                            # RSI Table
+                            if rsi_data:
+                                df = create_rsi_table(rsi_data, oversold_threshold, overbought_threshold)
+
+                                def color_status(val):
+                                    base_status = val.split(" (")[0] if " (" in val else val
+                                    color = RSI_LEVEL_COLORS.get(base_status)
+                                    if color:
+                                        return f"background-color: {color}15; color: {color}; font-weight: 600"
+                                    return ""
+
+                                styled_df = df.style.map(
+                                    color_status, subset=["Status"]
+                                )
+
+                                st.dataframe(
+                                    styled_df,
+                                    width='stretch',
+                                    hide_index=True
+                                )
+
+                                if symbol == 'TSLA' and channel_details.get("timeframes"):
+                                    with st.expander("Channel Analysis", expanded=False):
+                                        ch_tfs = channel_details.get("timeframes", {})
+                                        if ch_tfs:
+                                            ch_rows = []
+                                            for tf in ['5m', '15m', '1h', '4h']:
+                                                td = ch_tfs.get(tf)
+                                                if td:
+                                                    pos = td.get('position', 0.5)
+                                                    pos_label = "Near Lower" if pos < 0.25 else "Near Upper" if pos > 0.75 else "Middle"
+                                                    ch_rows.append({
+                                                        "Timeframe": tf,
+                                                        "R²": f"{td.get('r_squared', 0):.3f}",
+                                                        "Direction": td.get('direction', '?').title(),
+                                                        "Position": f"{pos:.0%}",
+                                                        "Zone": pos_label,
+                                                        "Width": f"{td.get('width_pct', 0):.1f}%",
+                                                        "Age": td.get('age', 0),
+                                                        "Valid": "Yes" if td.get('meets_criteria') else "No",
+                                                    })
+                                            if ch_rows:
+                                                st.dataframe(pd.DataFrame(ch_rows), hide_index=True, width='stretch')
+                                            else:
+                                                st.caption("No valid channels detected on any timeframe")
                                         else:
-                                            st.caption("No valid channels detected on any timeframe")
-                                    else:
-                                        st.caption("No channel data available")
-                        else:
-                            st.warning("No RSI data available")
+                                            st.caption("No channel data available")
+                            else:
+                                st.warning("No RSI data available")
+
+    # === Channel Bounce Tab ===
+    if "TSLA" in all_symbols and len(tabs) > 1:
+        with tabs[1]:
+            render_bounce_tab(bounce_assessment, tsla_channel_context)
 
     # Footer
     st.divider()
@@ -946,6 +929,124 @@ def main():
     if st.session_state.auto_refresh:
         time.sleep(300)
         st.rerun()
+
+
+def render_bounce_tab(assessment, channel_context):
+    """Render the Channel Bounce tab for TSLA."""
+    if assessment is None:
+        st.info("No active channels detected for TSLA. Channel bounce analysis requires at least one valid channel.")
+        return
+
+    # Score color
+    score = assessment.score
+    if score >= 65:
+        score_color = "#00C851"
+    elif score >= 40:
+        score_color = "#ffeb3b"
+    elif score >= 20:
+        score_color = "#ff9800"
+    else:
+        score_color = "#ff4444"
+
+    # Direction display
+    dir_map = {
+        'bounce_likely': ('Bounce Likely', '#00C851'),
+        'break_likely': ('Break Likely', '#ff4444'),
+        'neutral': ('Neutral', '#6c757d'),
+    }
+    dir_label, dir_color = dir_map.get(assessment.direction, ('Unknown', '#6c757d'))
+
+    # Break direction display
+    break_map = {
+        'down': ('Down', '#ff4444'),
+        'up': ('Up', '#00C851'),
+        'unknown': ('Unknown', '#6c757d'),
+    }
+    break_label, break_color = break_map.get(assessment.predicted_break_dir, ('Unknown', '#6c757d'))
+
+    # --- Score Card ---
+    st.markdown(f"""<div style="background-color: #1a1c23; border: 1px solid #2d3039; border-radius: 12px; padding: 0; margin-bottom: 16px; overflow: hidden;"><div style="height: 3px; background-color: {score_color};"></div><div style="padding: 20px;"><div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;"><div style="display: flex; align-items: baseline; gap: 8px;"><span style="font-size: 2em; font-weight: 700; color: {score_color};">{score:.0f}</span><span style="font-size: 1em; color: #6b7080;">/100</span></div><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {score_color}22; color: {score_color}; font-size: 0.85em; font-weight: 600;">{assessment.confidence_label.upper()}</span><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {dir_color}22; color: {dir_color}; font-size: 0.85em; font-weight: 600;">{dir_label}</span><span style="display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: {break_color}22; color: {break_color}; font-size: 0.85em; font-weight: 600;">Break: {break_label}</span><span style="color: #6b7080; font-size: 0.85em;">{assessment.active_channels} active channel{'s' if assessment.active_channels != 1 else ''}</span></div></div></div>""", unsafe_allow_html=True)
+
+    # --- Channel Status Grid ---
+    st.markdown('<h4 style="margin: 0.8rem 0 0.4rem 0; font-weight: 600; color: #e0e0e0;">Channel Status</h4>', unsafe_allow_html=True)
+
+    ch_cols = st.columns(4)
+    for idx, tf in enumerate(['5m', '15m', '1h', '4h']):
+        with ch_cols[idx]:
+            ch_data = channel_context.get(tf, {})
+            ch = ch_data.get('channel', {}) if isinstance(ch_data, dict) else {}
+            valid = ch.get('valid', False)
+            r2 = ch.get('r_squared', 0)
+            direction = ch.get('direction', 'N/A').title()
+            pos = ch.get('position', 0.5)
+            pos_label = "Lower" if pos < 0.25 else "Upper" if pos > 0.75 else "Mid"
+
+            if valid:
+                border_color = "#3A82FF"
+                r2_display = f"{r2:.3f}"
+            else:
+                border_color = "#2d3039"
+                r2_display = f"{r2:.3f}"
+                direction = "N/A"
+                pos_label = "N/A"
+
+            st.markdown(f"""<div style="background-color: #14161b; border: 1px solid {border_color}; border-radius: 8px; padding: 12px; text-align: center;"><div style="font-size: 0.75em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;">{tf}</div><div style="font-size: 1.1em; font-weight: 600; color: {'#e1e3ea' if valid else '#555'};">R² {r2_display}</div><div style="font-size: 0.8em; color: #8b8fa3; margin-top: 4px;">{direction} · {pos_label}</div></div>""", unsafe_allow_html=True)
+
+    # --- Timing ---
+    try:
+        import pytz
+        now_et = datetime.now(pytz.timezone('US/Eastern'))
+        time_str = now_et.strftime('%H:%M ET')
+        day_str = now_et.strftime('%A')
+        minutes_since_open = now_et.hour * 60 + now_et.minute - (9 * 60 + 30)
+        if 0 <= minutes_since_open <= 30:
+            window = "Open 30min"
+        elif 360 <= minutes_since_open <= 390:
+            window = "Close 30min"
+        elif 0 <= minutes_since_open <= 390:
+            window = "Regular Hours"
+        else:
+            window = "After Hours"
+    except Exception:
+        time_str = "N/A"
+        day_str = "N/A"
+        window = "N/A"
+
+    st.markdown(f"""<div style="background-color: #14161b; border: 1px solid #2d3039; border-radius: 8px; padding: 10px 16px; margin: 12px 0; display: flex; gap: 24px;"><span style="color: #6b7080; font-size: 0.85em;">Time: <strong style="color: #e1e3ea;">{time_str}</strong></span><span style="color: #6b7080; font-size: 0.85em;">Day: <strong style="color: #e1e3ea;">{day_str}</strong></span><span style="color: #6b7080; font-size: 0.85em;">Window: <strong style="color: #e1e3ea;">{window}</strong></span></div>""", unsafe_allow_html=True)
+
+    # --- Rules Breakdown ---
+    st.markdown('<h4 style="margin: 0.8rem 0 0.4rem 0; font-weight: 600; color: #e0e0e0;">Rules</h4>', unsafe_allow_html=True)
+
+    for category, cat_label in [('core', 'Core Rules'), ('modifier', 'Modifier Rules'), ('avoid', 'Avoid Rules')]:
+        cat_rules = [r for r in assessment.rules if r.category == category]
+        if not cat_rules:
+            continue
+
+        st.markdown(f'<div style="font-size: 0.8em; color: #6b7080; text-transform: uppercase; letter-spacing: 0.5px; margin: 12px 0 6px 0;">{cat_label}</div>', unsafe_allow_html=True)
+
+        for rule in cat_rules:
+            if rule.fired:
+                if rule.points > 0:
+                    icon = "&#x2705;"  # green check
+                    pts_color = "#00C851"
+                else:
+                    icon = "&#x274C;"  # red X
+                    pts_color = "#ff4444"
+            else:
+                icon = "&#x2796;"  # gray dash
+                pts_color = "#555"
+
+            pts_str = f"{rule.points:+d}" if rule.fired else "—"
+            wr_str = f"{rule.win_rate:.0f}%" if rule.win_rate > 0 else ""
+
+            st.markdown(f"""<div style="display: flex; align-items: center; gap: 10px; padding: 6px 12px; margin: 2px 0; background-color: #14161b; border-radius: 6px;"><span style="font-size: 0.9em; width: 20px; text-align: center;">{icon}</span><span style="flex: 1; font-size: 0.85em; color: #e1e3ea;">{rule.name}</span><span style="font-size: 0.75em; color: #8b8fa3; min-width: 40px; text-align: right;">{wr_str}</span><span style="font-size: 0.85em; font-weight: 600; color: {pts_color}; min-width: 36px; text-align: right;">{pts_str}</span></div>""", unsafe_allow_html=True)
+
+        # Show description for fired rules in an expander
+        fired_in_cat = [r for r in cat_rules if r.fired]
+        if fired_in_cat:
+            with st.expander(f"{cat_label} Details", expanded=False):
+                for rule in fired_in_cat:
+                    st.caption(f"**{rule.name}**: {rule.description}")
 
 
 if __name__ == "__main__":

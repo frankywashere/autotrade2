@@ -237,6 +237,80 @@ def analyze_channels(
         }
 
 
+def get_channel_context_with_data(
+    rsi_results: dict,
+    data_fetcher,
+    symbol: str = "TSLA",
+    timeframes: Optional[list] = None,
+    prepost: bool = True,
+) -> tuple:
+    """
+    Get channel analysis across multiple timeframes, also returning raw OHLCV data.
+
+    Returns:
+        Tuple of (channel_results, ohlcv_data) where:
+        - channel_results: Dict mapping timeframe -> channel analysis result.
+        - ohlcv_data: Dict mapping timeframe -> pandas DataFrame (OHLCV).
+    """
+    if timeframes is None:
+        timeframes = list(DEFAULT_TIMEFRAMES)
+
+    skip_tf = {'1d', '1wk', '5d', '1mo'}
+    timeframes = [tf for tf in timeframes if tf not in skip_tf]
+
+    results = {}
+    ohlcv_data = {}
+
+    df_1h = None
+
+    for tf in timeframes:
+        try:
+            if tf == '4h':
+                if df_1h is None:
+                    df_1h = data_fetcher.fetch(
+                        symbol, interval='1h', period=FETCH_PERIODS['4h'], prepost=prepost
+                    )
+                if df_1h is None or df_1h.empty:
+                    results[tf] = {
+                        'channel': _invalid_channel(),
+                        'meets_criteria': False,
+                    }
+                    continue
+
+                df_4h = df_1h.resample('4h').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last',
+                    'Volume': 'sum',
+                }).dropna()
+
+                ohlcv_data[tf] = df_4h
+                results[tf] = analyze_channels(df_4h)
+            else:
+                period = FETCH_PERIODS.get(tf, '5d')
+                fetch_interval = tf
+
+                df = data_fetcher.fetch(
+                    symbol, interval=fetch_interval, period=period, prepost=prepost
+                )
+
+                if tf == '1h':
+                    df_1h = df
+
+                ohlcv_data[tf] = df
+                results[tf] = analyze_channels(df)
+
+        except Exception as e:
+            logger.warning("get_channel_context failed for %s/%s: %s", symbol, tf, e)
+            results[tf] = {
+                'channel': _invalid_channel(),
+                'meets_criteria': False,
+            }
+
+    return results, ohlcv_data
+
+
 def get_channel_context(
     rsi_results: dict,
     data_fetcher,
@@ -259,61 +333,7 @@ def get_channel_context(
         Dict mapping timeframe -> channel analysis result.
         Skips '1d' and '1wk' even if passed in timeframes.
     """
-    if timeframes is None:
-        timeframes = list(DEFAULT_TIMEFRAMES)
-
-    # Filter out daily/weekly -- channels are useless on those for TSLA
-    skip_tf = {'1d', '1wk', '5d', '1mo'}
-    timeframes = [tf for tf in timeframes if tf not in skip_tf]
-
-    results = {}
-
-    # We may need 1h data for both '1h' and '4h', so cache it
-    df_1h = None
-
-    for tf in timeframes:
-        try:
-            if tf == '4h':
-                # yfinance doesn't support 4h directly -- resample from 1h
-                if df_1h is None:
-                    df_1h = data_fetcher.fetch(
-                        symbol, interval='1h', period=FETCH_PERIODS['4h'], prepost=prepost
-                    )
-                if df_1h is None or df_1h.empty:
-                    results[tf] = {
-                        'channel': _invalid_channel(),
-                        'meets_criteria': False,
-                    }
-                    continue
-
-                df_4h = df_1h.resample('4h').agg({
-                    'Open': 'first',
-                    'High': 'max',
-                    'Low': 'min',
-                    'Close': 'last',
-                    'Volume': 'sum',
-                }).dropna()
-
-                results[tf] = analyze_channels(df_4h)
-            else:
-                period = FETCH_PERIODS.get(tf, '5d')
-                fetch_interval = tf
-
-                df = data_fetcher.fetch(
-                    symbol, interval=fetch_interval, period=period, prepost=prepost
-                )
-
-                # Cache 1h data in case we need it for 4h later
-                if tf == '1h':
-                    df_1h = df
-
-                results[tf] = analyze_channels(df)
-
-        except Exception as e:
-            logger.warning("get_channel_context failed for %s/%s: %s", symbol, tf, e)
-            results[tf] = {
-                'channel': _invalid_channel(),
-                'meets_criteria': False,
-            }
-
+    results, _ = get_channel_context_with_data(
+        rsi_results, data_fetcher, symbol, timeframes, prepost
+    )
     return results

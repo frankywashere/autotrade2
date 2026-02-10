@@ -1,4 +1,4 @@
-__all__ = ['RSIMonitor', 'DataFetcher', 'SignalGenerator', 'VIXAnalyzer']
+__all__ = ['RSIMonitor', 'DataFetcher', 'SignalGenerator', 'VIXAnalyzer', 'BounceRuleEngine']
 
 
 def __getattr__(name):
@@ -14,4 +14,7 @@ def __getattr__(name):
     elif name == 'VIXAnalyzer':
         from .vix_analyzer import VIXAnalyzer
         return VIXAnalyzer
+    elif name == 'BounceRuleEngine':
+        from .bounce_rules import BounceRuleEngine
+        return BounceRuleEngine
     raise AttributeError(f"module 'rsi_monitor' has no attribute {name!r}")
