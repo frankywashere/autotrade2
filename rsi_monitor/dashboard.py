@@ -1037,7 +1037,7 @@ def _render_channel_chart(df, channel, tf, symbol):
         font=dict(color='#8b8fa3', size=10),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_bounce_tab(assessment, channel_context, symbol, all_symbols, ohlcv_data=None):
