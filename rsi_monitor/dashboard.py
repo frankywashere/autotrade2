@@ -10,7 +10,7 @@ import pandas as pd
 import time
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -930,10 +930,12 @@ def main():
     st.divider()
     st.caption(f"RSI Period: {rsi_period} | Oversold: <{oversold_threshold} | Overbought: >{overbought_threshold}")
 
-    # Auto-refresh logic
-    if st.session_state.auto_refresh:
-        time.sleep(300)
-        st.rerun()
+    # Auto-refresh logic (non-blocking)
+    @st.fragment(run_every=timedelta(minutes=5) if st.session_state.auto_refresh else None)
+    def _auto_refresh():
+        st.session_state.last_refresh = datetime.now()
+
+    _auto_refresh()
 
 
 def _render_channel_chart(df, channel, tf, symbol):
