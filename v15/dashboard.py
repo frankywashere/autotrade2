@@ -855,7 +855,8 @@ def load_market_data(data_dir: str):
 CHECKPOINT_RELEASE_TAG = "v0.1-model"
 CHECKPOINT_REPO = "frankywashere/autotrade2"
 DEFAULT_MODEL_PATH = "models/best.pt"
-CHECKPOINT_ASSET_NAME = "oncycle_v4_horizon_best_per_tf.pt"
+CHECKPOINT_ASSET_NAME = "x23_best_per_tf.pt"
+CALIBRATION_ASSET_NAME = "temperature_calibration_x23.json"
 
 
 def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
@@ -939,8 +940,8 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
     dl_size = _download_asset(asset, p)
     print(f"[MODEL] Downloaded checkpoint: {dl_size / 1e6:.1f} MB")
 
-    # Also download temperature_calibration.json if available
-    cal_assets = [a for a in assets if a["name"] == "temperature_calibration.json"]
+    # Also download temperature_calibration_x23.json if available
+    cal_assets = [a for a in assets if a["name"] == CALIBRATION_ASSET_NAME]
     if cal_assets:
         cal_asset = cal_assets[0]
         cal_path = p.parent / "temperature_calibration.json"
