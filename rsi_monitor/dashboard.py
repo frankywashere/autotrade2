@@ -129,6 +129,7 @@ def create_rsi_table(rsi_data: dict, oversold: float, overbought: float) -> pd.D
     Old format: {timeframe: rsi_value}
     New format: {timeframe: {'rsi': value, 'percentile': value_or_none}}
     """
+    tf_order = {'5m': 0, '15m': 1, '1h': 2, '4h': 3, '1d': 4, '1wk': 5}
     rows = []
     for timeframe, data in rsi_data.items():
         # Handle both old format (just rsi value) and new format (dict with rsi and percentile)
@@ -146,6 +147,7 @@ def create_rsi_table(rsi_data: dict, oversold: float, overbought: float) -> pd.D
                 "RSI": round(rsi_value, 2),
                 "Status": status,
             })
+    rows.sort(key=lambda r: tf_order.get(r["Timeframe"], 99))
     return pd.DataFrame(rows)
 
 
