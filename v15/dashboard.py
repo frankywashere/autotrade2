@@ -1,5 +1,5 @@
 """
-V15 Streamlit Dashboard
+X23 Streamlit Dashboard
 
 Run with: streamlit run v15/dashboard.py
 
@@ -839,7 +839,7 @@ def show_data_status_bar(is_live: bool, error_msg: Optional[str], last_update: O
 
 # Page config
 st.set_page_config(
-    page_title="V15 Channel Predictor",
+    page_title="X23 Channel Predictor",
     page_icon="",
     layout="wide"
 )
@@ -1140,7 +1140,7 @@ def show_tf_attention(prediction_output: Dict[str, Any]):
 
 
 def main():
-    st.title("V15 Channel Break Predictor")
+    st.title("X23 Channel Break Predictor")
 
     # Sidebar config
     st.sidebar.header("Configuration")
