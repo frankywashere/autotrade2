@@ -936,6 +936,7 @@ def main():
     @st.fragment(run_every=timedelta(minutes=5) if st.session_state.auto_refresh else None)
     def _auto_refresh():
         st.session_state.last_refresh = datetime.now()
+        st.rerun()
 
     _auto_refresh()
 
@@ -1138,7 +1139,7 @@ def render_bounce_tab(assessment, channel_context, symbol, all_symbols, ohlcv_da
                 signal_text, signal_color = "Near Support", "#4CAF50"
         elif pos > 0.8:
             if ch_dir == 'downtrend':
-                signal_text, signal_color = "Bounce \u2193", "#ff4444"
+                signal_text, signal_color = "Rejection \u2193", "#ff4444"
             elif ch_dir == 'uptrend':
                 signal_text, signal_color = "Break \u2193 ?", "#ff9800"
             else:
