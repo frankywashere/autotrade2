@@ -935,8 +935,10 @@ def main():
     # Auto-refresh logic (non-blocking)
     @st.fragment(run_every=timedelta(minutes=5) if st.session_state.auto_refresh else None)
     def _auto_refresh():
-        st.session_state.last_refresh = datetime.now()
-        st.rerun()
+        elapsed = (datetime.now() - st.session_state.last_refresh).total_seconds()
+        if elapsed >= 290:
+            st.session_state.last_refresh = datetime.now()
+            st.rerun()
 
     _auto_refresh()
 
