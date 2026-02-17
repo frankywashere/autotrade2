@@ -1,0 +1,3 @@
+cmake
+build-essential
+libeigen3-dev
