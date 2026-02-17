@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from v15.config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES
 from v15.dtypes import ChannelSample
 from v15.signals.bounce_signal import SignalStrategy
+from v15.inference import get_cpp_status
 
 # Import new visualization modules
 from v15.visualization.plotly_charts import (
@@ -547,14 +548,17 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                 # so the first window_bars of chart_df align with the channel.
                 # The extra bar at the end is the current bar (shown as a
                 # candle but outside the channel overlay).
-                window_bars = min(tf_window, len(tf_df) - 1)
+                # Ensure at least MIN_CHART_BARS so small best_window values
+                # (e.g. 5-6 for 30min) don't produce tiny charts.
+                MIN_CHART_BARS = 50
+                display_bars = max(tf_window, MIN_CHART_BARS)
+                window_bars = min(display_bars, len(tf_df) - 1)
                 chart_df = tf_df.iloc[-(window_bars + 1):].copy()
 
-                # DIAGNOSTIC: Log slicing for weekly/monthly
-                if tf_name in ['weekly', 'monthly']:
-                    print(f"[VIZ] {tf_name} SLICE: total_bars={len(tf_df)}, window={tf_window}, chart_bars={len(chart_df)}, used_native={used_native}")
-                    if len(chart_df) > 0:
-                        print(f"[VIZ] {tf_name} DATE RANGE: {chart_df.index[0]} to {chart_df.index[-1]}")
+                # DIAGNOSTIC: Log slicing for all timeframes
+                print(f"[VIZ] {tf_name} SLICE: total_bars={len(tf_df)}, tf_window={tf_window}, display_bars={display_bars}, chart_bars={len(chart_df)}, used_native={used_native}")
+                if len(chart_df) > 0:
+                    print(f"[VIZ] {tf_name} DATE RANGE: {chart_df.index[0]} to {chart_df.index[-1]}")
 
                 if channel is not None and getattr(channel, 'valid', False):
                     # Create chart with channel
@@ -1288,6 +1292,18 @@ def main():
         except Exception as e:
             st.sidebar.warning(f"Model not loaded: {e}")
             logger.exception("Model loading error")
+
+    # Show C++ feature extraction status
+    cpp_status = get_cpp_status()
+    if cpp_status['available']:
+        st.sidebar.success(
+            f"C++ features: {cpp_status['feature_count']:,}/{cpp_status['expected']:,}"
+        )
+    else:
+        st.sidebar.error(
+            "C++ features: UNAVAILABLE — predictions will fail. "
+            "Build with: pip install -e ."
+        )
 
     # Fetch native TF data for TFs that benefit from longer Yahoo history.
     # (1h ~2 years, daily/weekly/monthly effectively unlimited)

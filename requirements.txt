@@ -1,3 +1,5 @@
+pybind11>=2.11
+
 # Core ML
 torch>=2.0.0
 numpy
@@ -27,3 +29,6 @@ scipy
 # Utilities
 python-dateutil
 tqdm
+
+# Build C++ extension (must be last)
+.

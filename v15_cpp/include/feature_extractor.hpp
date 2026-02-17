@@ -187,6 +187,34 @@ public:
     );
 
     /**
+     * Extract all features for live inference from raw OHLCV data.
+     *
+     * Convenience wrapper that handles the full pipeline:
+     * 1. Resamples 5-min data to all 10 timeframes
+     * 2. Detects channels at all 8 windows for TSLA and SPY
+     * 3. Builds SlimLabeledChannelMap from detected channels
+     * 4. Calls extract_all_features() with the channel maps
+     *
+     * This is the entry point for Python inference via pybind11.
+     *
+     * @param tsla_5min TSLA 5-minute OHLCV data
+     * @param spy_5min SPY 5-minute OHLCV data
+     * @param vix_5min VIX 5-minute OHLCV data
+     * @param timestamp_ms Timestamp in milliseconds for event features
+     * @param source_bar_count Number of 5min bars (-1 = use data size)
+     * @param include_bar_metadata Include 30 bar metadata features
+     * @return Map of feature names to values (15,350 features)
+     */
+    static std::unordered_map<std::string, double> extract_features_for_inference(
+        const std::vector<OHLCV>& tsla_5min,
+        const std::vector<OHLCV>& spy_5min,
+        const std::vector<OHLCV>& vix_5min,
+        int64_t timestamp_ms,
+        int source_bar_count = -1,
+        bool include_bar_metadata = true
+    );
+
+    /**
      * Get expected total feature count.
      * Derived from TOTAL_FEATURE_COUNT in feature_array.hpp.
      */

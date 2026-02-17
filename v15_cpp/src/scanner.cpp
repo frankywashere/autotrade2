@@ -2,7 +2,9 @@
 #include "label_generator.hpp"
 #include "feature_extractor.hpp"
 #include "serialization.hpp"
+#ifndef PYBIND11_BUILD
 #include "flat_writer.hpp"
+#endif
 #include "progress_bar.hpp"
 #include <algorithm>
 #include <chrono>
@@ -592,7 +594,9 @@ std::vector<ChannelSample> Scanner::scan(
     // =========================================================================
     bool use_streaming = config_.streaming && !config_.output_path.empty();
     std::unique_ptr<StreamingSampleWriter> streaming_writer;
+#ifndef PYBIND11_BUILD
     std::unique_ptr<FlatWriter> flat_writer;
+#endif
     std::mutex writer_mutex;  // Protect streaming writer in parallel mode
 
     // Detect output format from file extension
@@ -616,7 +620,9 @@ std::vector<ChannelSample> Scanner::scan(
                 std::cout << "\n  [FLAT OUTPUT MODE] Writing samples directly to .flat format\n";
                 std::cout << "    Output: " << config_.output_path << "\n";
             }
+#ifndef PYBIND11_BUILD
             flat_writer = std::make_unique<FlatWriter>(config_.output_path, "daily");
+#endif
         } else {
             if (config_.verbose) {
                 std::cout << "\n  [STREAMING MODE] Writing samples directly to disk\n";
@@ -659,7 +665,9 @@ std::vector<ChannelSample> Scanner::scan(
                 if (sample.is_valid()) {
                     if (use_streaming) {
                         if (use_flat_output) {
+#ifndef PYBIND11_BUILD
                             flat_writer->write(sample);
+#endif
                         } else {
                             streaming_writer->write(sample);
                         }
@@ -714,7 +722,9 @@ std::vector<ChannelSample> Scanner::scan(
                     if (use_streaming) {
                         std::lock_guard<std::mutex> lock(writer_mutex);
                         if (use_flat_output) {
+#ifndef PYBIND11_BUILD
                             flat_writer->write(sample);
+#endif
                         } else {
                             streaming_writer->write(sample);
                         }
@@ -739,13 +749,16 @@ std::vector<ChannelSample> Scanner::scan(
 
     // Close streaming/flat writer if used
     if (use_streaming) {
+#ifndef PYBIND11_BUILD
         if (use_flat_output && flat_writer) {
             flat_writer->close();
             if (config_.verbose) {
                 std::cout << "\n  [FLAT] Wrote " << flat_writer->samples_written()
                           << " samples to " << config_.output_path << "\n";
             }
-        } else if (streaming_writer) {
+        } else
+#endif
+        if (streaming_writer) {
             streaming_writer->close();
             if (config_.verbose) {
                 std::cout << "\n  [STREAMING] Wrote " << streaming_writer->samples_written()

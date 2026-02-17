@@ -1,10 +1,12 @@
 """
 V15 Inference Module - Make predictions with trained models.
 
-Supports:
-- Partial bar feature extraction (critical for live trading)
-- Multi-timeframe feature extraction via extract_all_tf_features()
-- TF-prefixed feature structure (see config.py TOTAL_FEATURES for current count)
+IMPORTANT: Requires the C++ feature extraction extension (v15scanner_cpp).
+The Python feature extractor is DEPRECATED and will NOT be used — it only
+produces ~9,820 of the 15,350 features the model expects, causing ~36% of
+inputs to be zero-padded and predictions to be unreliable.
+
+Build the C++ extension with: pip install -e .
 
 Usage:
     from v15.inference import Predictor
@@ -21,16 +23,44 @@ from dataclasses import dataclass
 import logging
 
 from .models import V15Model, create_model
+# Python feature extraction is DEPRECATED for inference — C++ is required.
+# These imports are kept only for backward compatibility with scripts that
+# may reference them, but they MUST NOT be used for model predictions.
 from .features.tf_extractor import (
-    extract_all_tf_features,
-    get_tf_feature_names,
-    get_tf_feature_count,
+    extract_all_tf_features as _deprecated_extract_all_tf_features,
+    get_tf_feature_names as _deprecated_get_tf_feature_names,
+    get_tf_feature_count as _deprecated_get_tf_feature_count,
 )
 from .config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES, HORIZON_GROUPS, TF_TO_HORIZON
 from .exceptions import ModelError, FeatureExtractionError
 from .signals.bounce_signal import BounceSignalEngine, BounceSignal, SignalStrategy
 
 logger = logging.getLogger(__name__)
+
+# C++ feature extraction — REQUIRED for correct predictions.
+# The Python extractor only produces ~9,820 features vs the 15,350 the model expects,
+# meaning ~36% of inputs are silently zero-padded. Predictions are unreliable without C++.
+try:
+    import v15scanner_cpp
+    _cpp_available = True
+    _cpp_feature_count = v15scanner_cpp.get_feature_count()
+    logger.info(f"C++ feature extraction available ({_cpp_feature_count} features)")
+except ImportError:
+    _cpp_available = False
+    _cpp_feature_count = 0
+    logger.error(
+        "C++ feature extraction NOT available. Predictions will be UNRELIABLE. "
+        "Build with: pip install -e .  (requires pybind11 and Eigen3)"
+    )
+
+
+def get_cpp_status() -> dict:
+    """Return C++ feature extraction status for diagnostics."""
+    return {
+        'available': _cpp_available,
+        'feature_count': _cpp_feature_count,
+        'expected': 15350,
+    }
 
 
 @dataclass
@@ -686,18 +716,21 @@ class Predictor:
         heuristic_channel, heuristic_window = select_best_channel(channels)
         heuristic_window = heuristic_window if heuristic_window is not None else 50
 
-        # Extract all TF features with partial bar support
-        # This resamples to all 10 TFs and extracts ~7,880 features
-        features = extract_all_tf_features(
-            tsla_df=tsla_df,
-            spy_df=spy_df,
-            vix_df=vix_df,
-            timestamp=timestamp,
-            channel_history_by_tf=channel_history_by_tf,
-            source_bar_count=source_bar_count,
-            include_bar_metadata=True,  # Include bar_completion_pct features
-            native_bars_by_tf=native_bars_by_tf,
+        # Extract features via C++ for bit-identical parity with training data.
+        # Python extraction is DEPRECATED — it produces only ~9,820 of 15,350 features.
+        if not _cpp_available:
+            raise FeatureExtractionError(
+                "C++ feature extraction is required but not available. "
+                "The Python extractor only produces ~9,820 of 15,350 features "
+                "(~36% zero-padded), making predictions unreliable. "
+                "Build with: pip install -e ."
+            )
+        timestamp_ms = int(timestamp.timestamp() * 1000) if hasattr(timestamp, 'timestamp') else int(timestamp)
+        features = v15scanner_cpp.extract_features(
+            tsla_df, spy_df, vix_df,
+            timestamp_ms, source_bar_count
         )
+        logger.info(f"[FEATURES] C++ extraction complete: {len(features)} features")
 
         # Make prediction
         prediction = self.predict_features(features)
@@ -797,17 +830,21 @@ class Predictor:
                 logger.debug(f"Could not detect channel for {tf_name}: {e}")
                 heuristic_windows_by_tf[tf_name] = 50
 
-        # Extract all TF features
-        features = extract_all_tf_features(
-            tsla_df=tsla_df,
-            spy_df=spy_df,
-            vix_df=vix_df,
-            timestamp=timestamp,
-            channel_history_by_tf=channel_history_by_tf,
-            source_bar_count=source_bar_count,
-            include_bar_metadata=True,
-            native_bars_by_tf=native_bars_by_tf,
+        # Extract features via C++ for bit-identical parity with training data.
+        # Python extraction is DEPRECATED — it produces only ~9,820 of 15,350 features.
+        if not _cpp_available:
+            raise FeatureExtractionError(
+                "C++ feature extraction is required but not available. "
+                "The Python extractor only produces ~9,820 of 15,350 features "
+                "(~36% zero-padded), making predictions unreliable. "
+                "Build with: pip install -e ."
+            )
+        timestamp_ms = int(timestamp.timestamp() * 1000) if hasattr(timestamp, 'timestamp') else int(timestamp)
+        features = v15scanner_cpp.extract_features(
+            tsla_df, spy_df, vix_df,
+            timestamp_ms, source_bar_count
         )
+        logger.info(f"[FEATURES] C++ extraction complete: {len(features)} features")
 
         # Make prediction with per-TF breakdown
         prediction = self.predict_features_with_per_tf(

@@ -22,6 +22,7 @@
 #include "sample.hpp"
 #include "labels.hpp"
 #include "types.hpp"
+#include "feature_extractor.hpp"
 
 namespace py = pybind11;
 
@@ -557,4 +558,72 @@ PYBIND11_MODULE(v15scanner_cpp, m) {
             return "<Scanner step=" + std::to_string(cfg.step) +
                    " workers=" + std::to_string(cfg.workers) + ">";
         });
+
+    // =========================================================================
+    // Feature Extraction (for live inference)
+    // =========================================================================
+
+    m.def("extract_features",
+        [](py::object tsla_df, py::object spy_df, py::object vix_df,
+           int64_t timestamp_ms, int source_bar_count) -> py::dict {
+            // Convert DataFrames to C++ OHLCV vectors
+            std::vector<v15::OHLCV> tsla = python_to_ohlcv(tsla_df);
+            std::vector<v15::OHLCV> spy = python_to_ohlcv(spy_df);
+            std::vector<v15::OHLCV> vix = python_to_ohlcv(vix_df);
+
+            // Run full feature extraction pipeline
+            auto features = v15::FeatureExtractor::extract_features_for_inference(
+                tsla, spy, vix, timestamp_ms, source_bar_count, true
+            );
+
+            // Convert to Python dict
+            py::dict result;
+            for (const auto& [name, value] : features) {
+                result[py::str(name)] = value;
+            }
+            return result;
+        },
+        py::arg("tsla_df"),
+        py::arg("spy_df"),
+        py::arg("vix_df"),
+        py::arg("timestamp_ms"),
+        py::arg("source_bar_count") = -1,
+        R"pbdoc(
+            Extract all features from raw OHLCV data for model inference.
+
+            This runs the full C++ feature extraction pipeline:
+            1. Resamples 5-min data to all 10 timeframes
+            2. Detects channels at all 8 windows for TSLA and SPY
+            3. Extracts ~15,350 features matching training data exactly
+
+            Args:
+                tsla_df: TSLA 5-min OHLCV DataFrame with DatetimeIndex
+                spy_df: SPY 5-min OHLCV DataFrame aligned to TSLA
+                vix_df: VIX 5-min OHLCV DataFrame aligned to TSLA
+                timestamp_ms: Current timestamp in milliseconds
+                source_bar_count: Number of 5min bars (-1 = use data size)
+
+            Returns:
+                Dict of feature name -> value (matching training features)
+        )pbdoc"
+    );
+
+    m.def("get_feature_names",
+        []() -> py::list {
+            auto names = v15::FeatureExtractor::get_all_feature_names();
+            py::list result;
+            for (const auto& name : names) {
+                result.append(py::str(name));
+            }
+            return result;
+        },
+        "Get all feature names in consistent order"
+    );
+
+    m.def("get_feature_count",
+        []() -> int {
+            return v15::FeatureExtractor::get_total_feature_count();
+        },
+        "Get expected total feature count (15,350)"
+    );
 }

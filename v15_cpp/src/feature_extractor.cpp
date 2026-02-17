@@ -1,5 +1,6 @@
 #include "feature_extractor.hpp"
 #include "feature_array.hpp"
+#include "channel_detector.hpp"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -6983,29 +6984,175 @@ double FeatureExtractor::calculate_beta(
 // =============================================================================
 
 std::vector<std::string> FeatureExtractor::get_all_feature_names() {
-    std::vector<std::string> names;
-    names.reserve(TOTAL_FEATURE_COUNT);
+    // Run a single extraction on minimal dummy data to discover actual feature names.
+    // This guarantees the names match the extraction code exactly.
+    static std::vector<std::string> cached_names;
+    static bool cached = false;
 
-    // Generate all feature names in consistent order
-    // For each TF:
-    //   - Price features (65)
-    //   - Technical features (59)
-    //   - SPY features (121)
-    //   - VIX features (32)
-    //   - Cross-asset features (61)
-    //   - Channel features per window (128 × 8)
-    //   - Channel correlation (50)
-    //   - Window scores (50)
-    //   - Channel history (67)
-    // Then event features (30)
-    // Then bar metadata (30)
+    if (cached) return cached_names;
 
-    // For brevity, returning placeholder
-    for (size_t i = 0; i < TOTAL_FEATURE_COUNT; ++i) {
-        names.push_back("feature_" + std::to_string(i));
+    // Build OHLCV data with enough bars for ALL TFs including weekly/monthly.
+    // Monthly needs ~1638 5-min bars per monthly bar (21 trading days × 78 bars/day).
+    // We need at least 82 (max window) monthly bars = 82 × 1638 ≈ 134K bars.
+    // Use 150,000 bars (~3 years of 5-min trading data) to cover all TFs.
+    const int num_bars = 150000;
+
+    std::vector<OHLCV> dummy_data;
+    dummy_data.reserve(num_bars);
+    for (int i = 0; i < num_bars; ++i) {
+        OHLCV bar;
+        bar.timestamp = 1700000000 + i * 300;  // 5-min intervals
+        bar.open = 100.0 + 0.01 * (i % 1000);
+        bar.high = 100.5 + 0.01 * (i % 1000);
+        bar.low = 99.5 + 0.01 * (i % 1000);
+        bar.close = 100.2 + 0.01 * (i % 1000);
+        bar.volume = 1000000.0;
+        dummy_data.push_back(bar);
     }
 
-    return names;
+    // Empty slim maps (no channel data, but extract_all_features still produces
+    // default channel features for all windows)
+    SlimLabeledChannelMap empty_tsla_map, empty_spy_map;
+
+    auto features = extract_all_features(
+        dummy_data, dummy_data, dummy_data,
+        dummy_data.back().timestamp * 1000,  // timestamp_ms
+        empty_tsla_map, empty_spy_map,
+        num_bars, true
+    );
+
+    // Collect and sort names for consistent ordering
+    cached_names.reserve(features.size());
+    for (const auto& [name, _] : features) {
+        cached_names.push_back(name);
+    }
+    std::sort(cached_names.begin(), cached_names.end());
+
+    cached = true;
+    std::cerr << "[FeatureExtractor] get_all_feature_names(): discovered "
+              << cached_names.size() << " features (expected " << TOTAL_FEATURE_COUNT << ")\n";
+
+    return cached_names;
+}
+
+// =============================================================================
+// INFERENCE CONVENIENCE WRAPPER
+// =============================================================================
+
+std::unordered_map<std::string, double> FeatureExtractor::extract_features_for_inference(
+    const std::vector<OHLCV>& tsla_5min,
+    const std::vector<OHLCV>& spy_5min,
+    const std::vector<OHLCV>& vix_5min,
+    int64_t timestamp_ms,
+    int source_bar_count,
+    bool include_bar_metadata
+) {
+    if (tsla_5min.empty() || spy_5min.empty() || vix_5min.empty()) {
+        std::cerr << "[ERROR] extract_features_for_inference: empty input data\n";
+        return {};
+    }
+
+    if (source_bar_count < 0) {
+        source_bar_count = static_cast<int>(tsla_5min.size());
+    }
+
+    // Build SlimLabeledChannelMaps by detecting channels at all windows for all TFs
+    SlimLabeledChannelMap tsla_slim_map, spy_slim_map;
+
+    // For each timeframe, resample and detect channels at all 8 windows
+    for (int tf_idx = 0; tf_idx < NUM_TIMEFRAMES; ++tf_idx) {
+        Timeframe tf = static_cast<Timeframe>(tf_idx);
+        std::string tf_str = std::string(timeframe_to_string(tf));
+
+        // Resample TSLA and SPY to this timeframe
+        auto [tsla_tf, tsla_meta] = resample_to_tf(tsla_5min, tf, source_bar_count);
+        auto [spy_tf, spy_meta] = resample_to_tf(spy_5min, tf, source_bar_count);
+
+        if (tsla_tf.size() < 11 || spy_tf.size() < 11) {
+            continue;  // Not enough data for channel detection
+        }
+
+        // Extract OHLCV arrays for channel detection
+        OHLCVArrays tsla_arrays, spy_arrays;
+        extract_ohlcv_arrays_optimized(tsla_tf, tsla_arrays);
+        extract_ohlcv_arrays_optimized(spy_tf, spy_arrays);
+
+        // Detect channels at all 8 standard windows
+        for (size_t win_idx = 0; win_idx < STANDARD_WINDOWS.size(); ++win_idx) {
+            int window = STANDARD_WINDOWS[win_idx];
+
+            // Skip if not enough data for this window
+            if (static_cast<int>(tsla_arrays.close.size()) < window + 1) continue;
+
+            TFWindowKey key{tf_str, window};
+
+            // Detect TSLA channel
+            Channel tsla_ch = ChannelDetector::detect_channel(
+                tsla_arrays.high, tsla_arrays.low, tsla_arrays.close,
+                window, 2.0, 0.10, 1
+            );
+
+            // Helper lambda to convert Channel -> SlimLabeledChannel
+            auto channel_to_slim = [&](const Channel& ch, int64_t ts_ms,
+                                       const std::vector<OHLCV>& tf_data) -> SlimLabeledChannel {
+                SlimLabeledChannel slim;
+                slim.channel_valid = ch.valid;
+                slim.channel_slope = ch.slope;
+                slim.channel_intercept = ch.intercept;
+                slim.channel_std_dev = ch.std_dev;
+                slim.channel_r_squared = ch.r_squared;
+                slim.channel_direction = static_cast<int>(ch.direction);
+                slim.channel_window = ch.window;
+                slim.channel_bounce_count = ch.bounce_count;
+                slim.start_idx = ch.start_idx;
+                slim.end_idx = ch.end_idx;
+                slim.start_timestamp = (!tf_data.empty() && ch.start_idx >= 0 &&
+                    ch.start_idx < static_cast<int>(tf_data.size()))
+                    ? static_cast<int64_t>(tf_data[ch.start_idx].timestamp) * 1000 : 0;
+                slim.end_timestamp = ts_ms;
+                slim.tf = tf_str;
+
+                // Copy cached line values (set by ChannelDetector)
+                slim.first_upper_val = ch.first_upper_val;
+                slim.last_upper_val = ch.last_upper_val;
+                slim.first_lower_val = ch.first_lower_val;
+                slim.last_lower_val = ch.last_lower_val;
+                slim.first_center_val = ch.first_center_val;
+                slim.last_center_val = ch.last_center_val;
+                slim.upper_line_tail = ch.upper_line_tail;
+                slim.lower_line_tail = ch.lower_line_tail;
+                slim.tail_count = ch.tail_count;
+
+                // Copy touches for derived metric computation
+                slim.touches = ch.touches;
+
+                return slim;
+            };
+
+            tsla_slim_map[key].push_back(channel_to_slim(tsla_ch, timestamp_ms, tsla_tf));
+
+            // Detect SPY channel
+            if (static_cast<int>(spy_arrays.close.size()) >= window + 1) {
+                Channel spy_ch = ChannelDetector::detect_channel(
+                    spy_arrays.high, spy_arrays.low, spy_arrays.close,
+                    window, 2.0, 0.10, 1
+                );
+
+                spy_slim_map[key].push_back(channel_to_slim(spy_ch, timestamp_ms, spy_tf));
+            }
+        }
+    }
+
+    // Call the main feature extraction with real channel data
+    auto features = extract_all_features(
+        tsla_5min, spy_5min, vix_5min,
+        timestamp_ms,
+        tsla_slim_map, spy_slim_map,
+        source_bar_count,
+        include_bar_metadata
+    );
+
+    return features;
 }
 
 } // namespace v15
