@@ -51,8 +51,10 @@ from v15.live_data import (
 # Import native TF data loader for per-TF yfinance fetching
 from v15.data.native_tf import load_native_tf_data as _load_native_tf_data
 
-# All TFs fetched natively from yfinance (intraday capped at ~60 days)
-NATIVE_TF_LIST = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
+# Native TFs fetched from yfinance.
+# Keep long-history TFs first so critical weekly/monthly data is available early.
+# 5min/15min/30min are derived locally from the base 5-min feed.
+NATIVE_TF_LIST = ['daily', 'weekly', 'monthly', '1h', '2h', '3h', '4h']
 
 logger = logging.getLogger(__name__)
 
@@ -985,13 +987,17 @@ def load_native_tf():
             start_date='2015-01-01',
             use_cache=True,
             cache_max_age_hours=5 / 60,  # ~5 min, matches Streamlit TTL
+            max_retries=2,              # keep cloud startup bounded
+            retry_delay=0.75,
+            yf_request_timeout=8.0,
+            inter_request_delay=0.25,
             verbose=True,
         )
         # DIAGNOSTIC LOGGING
         print("[DATA] ===== NATIVE TF FETCH RESULTS =====")
-        for symbol in data:
-            for tf in data[symbol]:
-                df = data[symbol][tf]
+        for symbol in ['TSLA', 'SPY', '^VIX']:
+            for tf in NATIVE_TF_LIST:
+                df = data.get(symbol, {}).get(tf)
                 if df is not None and not df.empty:
                     first_date = df.index[0].strftime('%Y-%m-%d') if hasattr(df.index[0], 'strftime') else str(df.index[0])
                     last_date = df.index[-1].strftime('%Y-%m-%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
@@ -1269,8 +1275,8 @@ def main():
             st.sidebar.warning(f"Model not loaded: {e}")
             logger.exception("Model loading error")
 
-    # Fetch native TF data for higher timeframes (daily/weekly/monthly)
-    # These have unlimited yfinance history vs 60-day limit for 5-min
+    # Fetch native TF data for TFs that benefit from longer Yahoo history.
+    # (1h ~2 years, daily/weekly/monthly effectively unlimited)
     native_tf_data = None
     if YFINANCE_AVAILABLE:
         with st.spinner("Fetching native TF data..."):
