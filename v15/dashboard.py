@@ -1231,6 +1231,7 @@ def main():
         if cal_path.exists():
             cal_path.unlink()
         load_predictor.clear()
+        load_native_tf.clear()  # Clear native TF cache to force fresh yfinance fetch
         st.rerun()
 
     # Load model (auto-download from GitHub Releases if not present)
