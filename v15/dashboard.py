@@ -1061,52 +1061,7 @@ def load_predictor(checkpoint_path: str):
                          calibration_path=cal_path)
 
 
-@st.cache_data(ttl=300)
-def load_native_tf():
-    """Fetch and cache native TF data from yfinance for higher timeframes."""
-    print("[DATA] Fetching native TF data (daily/weekly/monthly) from yfinance...")
-    try:
-        data = _load_native_tf_data(
-            symbols=['TSLA', 'SPY', '^VIX'],
-            timeframes=NATIVE_TF_LIST,
-            start_date='2015-01-01',
-            use_cache=True,
-            cache_max_age_hours=5 / 60,  # ~5 min, matches Streamlit TTL
-            max_retries=2,              # keep cloud startup bounded
-            retry_delay=0.75,
-            yf_request_timeout=8.0,
-            request_wall_timeout=20.0,
-            inter_request_delay=0.25,
-            verbose=True,
-        )
-        # DIAGNOSTIC LOGGING
-        print("[DATA] ===== NATIVE TF FETCH RESULTS =====")
-        for symbol in ['TSLA', 'SPY', '^VIX']:
-            for tf in NATIVE_TF_LIST:
-                df = data.get(symbol, {}).get(tf)
-                if df is not None and not df.empty:
-                    first_date = df.index[0].strftime('%Y-%m-%d') if hasattr(df.index[0], 'strftime') else str(df.index[0])
-                    last_date = df.index[-1].strftime('%Y-%m-%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
-                    print(f"[DATA] ✓ {symbol:5s} {tf:8s}: {len(df):4d} bars ({first_date} to {last_date})")
-                else:
-                    print(f"[DATA] ✗ {symbol:5s} {tf:8s}: EMPTY or None")
-
-        # Check critical weekly/monthly
-        print("[DATA] ===== CRITICAL WEEKLY/MONTHLY CHECK =====")
-        for symbol in ['TSLA', 'SPY']:
-            for tf in ['weekly', 'monthly']:
-                bars = len(data.get(symbol, {}).get(tf, [])) if data.get(symbol, {}).get(tf) is not None else 0
-                min_expected = 40 if tf == 'weekly' else 10
-                status = '✓ OK' if bars >= min_expected else f'✗ LOW ({bars} < {min_expected})'
-                print(f"[DATA] {symbol} {tf}: {status}")
-
-        return data
-    except Exception as e:
-        print(f"[DATA] ✗✗✗ Native TF fetch FAILED: {e}")
-        logger.exception("Native TF data fetch failed")
-        import traceback
-        traceback.print_exc()
-        return None
+## load_native_tf() removed — replaced by fetch_all_market_data()
 
 
 def show_prediction_card(prediction):
@@ -1324,7 +1279,6 @@ def main():
             cal_path.unlink()
         load_predictor.clear()
         fetch_all_market_data.clear()  # Clear unified data cache
-        load_native_tf.clear()  # Clear legacy native TF cache
         _fetch_live_5min.clear()  # Clear legacy 5-min cache
         st.rerun()
 
