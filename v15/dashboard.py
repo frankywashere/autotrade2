@@ -990,6 +990,7 @@ def load_native_tf():
             max_retries=2,              # keep cloud startup bounded
             retry_delay=0.75,
             yf_request_timeout=8.0,
+            request_wall_timeout=20.0,
             inter_request_delay=0.25,
             verbose=True,
         )

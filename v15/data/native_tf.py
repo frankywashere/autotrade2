@@ -27,6 +27,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 import pickle
+import concurrent.futures
 from datetime import datetime, timedelta
 import time
 import hashlib
@@ -436,6 +437,7 @@ def load_native_tf_data(
     max_retries: int = 5,
     retry_delay: float = 2.0,
     yf_request_timeout: float = 10.0,
+    request_wall_timeout: Optional[float] = None,
     inter_request_delay: float = 0.5,
     verbose: bool = True
 ) -> Dict[str, Dict[str, pd.DataFrame]]:
@@ -453,6 +455,8 @@ def load_native_tf_data(
         max_retries: Maximum retries for each yfinance fetch
         retry_delay: Initial retry delay in seconds (exponential backoff)
         yf_request_timeout: Timeout (seconds) for each yfinance request
+        request_wall_timeout: Hard timeout (seconds) per fetch call.
+                            If exceeded, request is marked failed and loop continues.
         inter_request_delay: Delay between network requests (seconds)
         verbose: Print progress information
 
@@ -516,18 +520,32 @@ def load_native_tf_data(
                         flush=True
                     )
 
-                df = fetch_native_tf(
-                    symbol=symbol,
-                    tf=tf,
-                    start_date=start_date,
-                    end_date=end_date,
-                    cache_dir=cache_dir,
-                    use_cache=use_cache,
-                    cache_max_age_hours=cache_max_age_hours,
-                    max_retries=max_retries,
-                    retry_delay=retry_delay,
-                    yf_request_timeout=yf_request_timeout,
-                )
+                fetch_kwargs = {
+                    'symbol': symbol,
+                    'tf': tf,
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'cache_dir': cache_dir,
+                    'use_cache': use_cache,
+                    'cache_max_age_hours': cache_max_age_hours,
+                    'max_retries': max_retries,
+                    'retry_delay': retry_delay,
+                    'yf_request_timeout': yf_request_timeout,
+                }
+                if request_wall_timeout is not None and request_wall_timeout > 0:
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    future = executor.submit(fetch_native_tf, **fetch_kwargs)
+                    try:
+                        df = future.result(timeout=request_wall_timeout)
+                    except concurrent.futures.TimeoutError as te:
+                        future.cancel()
+                        raise DataLoadError(
+                            f"Timed out after {request_wall_timeout:.1f}s"
+                        ) from te
+                    finally:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    df = fetch_native_tf(**fetch_kwargs)
 
                 result[symbol][tf] = df
                 completed += 1
