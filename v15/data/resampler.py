@@ -325,9 +325,11 @@ def resample_with_partial(
         # Resample WITHOUT dropping NaN - this keeps partial bars
         resampled = df_normalized.resample(rule).agg(agg_dict)
 
-        # Remove completely empty bars (no data at all)
-        # But keep partial bars (bars with some data)
-        resampled = resampled.dropna(how='all')
+        # Remove bars with no price data.
+        # NOTE: dropna(how='all') is insufficient because volume.sum()
+        # returns 0 (not NaN) for empty bins, keeping thousands of
+        # overnight/weekend rows. Drop where close is NaN instead.
+        resampled = resampled.dropna(subset=['close'])
 
         # For partial bars, forward-fill missing OHLC from close
         # This handles the case where we have some but not all data
