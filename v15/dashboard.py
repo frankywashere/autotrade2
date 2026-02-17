@@ -511,15 +511,19 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
         with st.expander(expander_header, expanded=False):
             try:
                 # Use native TF data if available for this timeframe
+                used_native = False
                 if (native_bars_by_tf
                         and native_bars_by_tf.get('TSLA', {}).get(tf_name) is not None
                         and len(native_bars_by_tf['TSLA'][tf_name]) >= 20):
                     tf_df = native_bars_by_tf['TSLA'][tf_name].copy()
+                    used_native = True
+                    print(f"[VIZ] {tf_name}: Using NATIVE data ({len(tf_df)} bars)")
                 else:
                     tf_df = resample_to_timeframe(tsla_df, tf_name)
+                    print(f"[VIZ] {tf_name}: Using RESAMPLED from 5min ({len(tf_df)} bars)")
 
                 if len(tf_df) < 20:
-                    st.warning(f"Insufficient data for {tf_name} ({len(tf_df)} bars)")
+                    st.warning(f"⚠️ Insufficient data for {tf_name}: {len(tf_df)} bars (used_native={used_native})")
                     continue
 
                 # Detect channel at this timeframe
@@ -543,6 +547,12 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                 # candle but outside the channel overlay).
                 window_bars = min(tf_window, len(tf_df) - 1)
                 chart_df = tf_df.iloc[-(window_bars + 1):].copy()
+
+                # DIAGNOSTIC: Log slicing for weekly/monthly
+                if tf_name in ['weekly', 'monthly']:
+                    print(f"[VIZ] {tf_name} SLICE: total_bars={len(tf_df)}, window={tf_window}, chart_bars={len(chart_df)}, used_native={used_native}")
+                    if len(chart_df) > 0:
+                        print(f"[VIZ] {tf_name} DATE RANGE: {chart_df.index[0]} to {chart_df.index[-1]}")
 
                 if channel is not None and getattr(channel, 'valid', False):
                     # Create chart with channel
@@ -977,14 +987,33 @@ def load_native_tf():
             cache_max_age_hours=5 / 60,  # ~5 min, matches Streamlit TTL
             verbose=True,
         )
+        # DIAGNOSTIC LOGGING
+        print("[DATA] ===== NATIVE TF FETCH RESULTS =====")
         for symbol in data:
             for tf in data[symbol]:
                 df = data[symbol][tf]
-                print(f"[DATA] Native TF: {symbol} {tf} = {len(df)} bars")
+                if df is not None and not df.empty:
+                    first_date = df.index[0].strftime('%Y-%m-%d') if hasattr(df.index[0], 'strftime') else str(df.index[0])
+                    last_date = df.index[-1].strftime('%Y-%m-%d') if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
+                    print(f"[DATA] ✓ {symbol:5s} {tf:8s}: {len(df):4d} bars ({first_date} to {last_date})")
+                else:
+                    print(f"[DATA] ✗ {symbol:5s} {tf:8s}: EMPTY or None")
+
+        # Check critical weekly/monthly
+        print("[DATA] ===== CRITICAL WEEKLY/MONTHLY CHECK =====")
+        for symbol in ['TSLA', 'SPY']:
+            for tf in ['weekly', 'monthly']:
+                bars = len(data.get(symbol, {}).get(tf, [])) if data.get(symbol, {}).get(tf) is not None else 0
+                min_expected = 40 if tf == 'weekly' else 10
+                status = '✓ OK' if bars >= min_expected else f'✗ LOW ({bars} < {min_expected})'
+                print(f"[DATA] {symbol} {tf}: {status}")
+
         return data
     except Exception as e:
-        print(f"[DATA] Native TF fetch failed: {e}")
+        print(f"[DATA] ✗✗✗ Native TF fetch FAILED: {e}")
         logger.exception("Native TF data fetch failed")
+        import traceback
+        traceback.print_exc()
         return None
 
 
