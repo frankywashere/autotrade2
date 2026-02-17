@@ -161,7 +161,8 @@ def _fetch_yfinance_data(
     start_date: str,
     end_date: str,
     max_retries: int = 5,
-    retry_delay: float = 2.0
+    retry_delay: float = 2.0,
+    request_timeout: float = 10.0
 ) -> pd.DataFrame:
     """
     Fetch data from yfinance with retry logic.
@@ -173,6 +174,7 @@ def _fetch_yfinance_data(
         end_date: End date string (YYYY-MM-DD)
         max_retries: Maximum number of retry attempts
         retry_delay: Delay between retries in seconds
+        request_timeout: Timeout (seconds) for each Yahoo request
 
     Returns:
         DataFrame with OHLCV data
@@ -196,6 +198,8 @@ def _fetch_yfinance_data(
                 auto_adjust=True,  # Adjust for splits/dividends
                 prepost=False,     # Exclude pre/post market
                 actions=False,     # Exclude dividends/splits columns
+                timeout=request_timeout,
+                raise_errors=True,
             )
 
             if df.empty:
@@ -235,8 +239,8 @@ def _fetch_yfinance_data(
             last_error = e
             if attempt < max_retries - 1:
                 logger.warning(
-                    f"Attempt {attempt + 1}/{max_retries} failed for {symbol}: {e}. "
-                    f"Retrying in {retry_delay}s..."
+                    f"Attempt {attempt + 1}/{max_retries} failed for "
+                    f"{symbol} {interval}: {e}. Retrying in {retry_delay}s..."
                 )
                 time.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
@@ -299,7 +303,10 @@ def fetch_native_tf(
     end_date: str,
     cache_dir: Optional[Path] = None,
     use_cache: bool = True,
-    cache_max_age_hours: int = 24
+    cache_max_age_hours: int = 24,
+    max_retries: int = 5,
+    retry_delay: float = 2.0,
+    yf_request_timeout: float = 10.0
 ) -> pd.DataFrame:
     """
     Fetch native TF data from yfinance with caching.
@@ -312,6 +319,9 @@ def fetch_native_tf(
         cache_dir: Directory for caching data. If None, uses default.
         use_cache: Whether to use caching (default True)
         cache_max_age_hours: Maximum age of cached data before refetch
+        max_retries: Maximum retries for yfinance fetches
+        retry_delay: Initial retry delay in seconds (exponential backoff)
+        yf_request_timeout: Timeout (seconds) for each yfinance request
 
     Returns:
         DataFrame with OHLCV data at the requested timeframe
@@ -386,7 +396,10 @@ def fetch_native_tf(
             end_date=end_date,
             cache_dir=cache_dir,
             use_cache=use_cache,
-            cache_max_age_hours=cache_max_age_hours
+            cache_max_age_hours=cache_max_age_hours,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            yf_request_timeout=yf_request_timeout,
         )
 
         # Aggregate to target timeframe
@@ -398,7 +411,10 @@ def fetch_native_tf(
             symbol=symbol,
             interval=yf_interval,
             start_date=start_date,
-            end_date=end_date
+            end_date=end_date,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            request_timeout=yf_request_timeout,
         )
 
     # Cache the result
@@ -417,6 +433,10 @@ def load_native_tf_data(
     cache_dir: Optional[Path] = None,
     use_cache: bool = True,
     cache_max_age_hours: int = 24,
+    max_retries: int = 5,
+    retry_delay: float = 2.0,
+    yf_request_timeout: float = 10.0,
+    inter_request_delay: float = 0.5,
     verbose: bool = True
 ) -> Dict[str, Dict[str, pd.DataFrame]]:
     """
@@ -430,6 +450,10 @@ def load_native_tf_data(
         cache_dir: Directory for caching. If None, uses default.
         use_cache: Whether to use caching (default True)
         cache_max_age_hours: Maximum age of cached data
+        max_retries: Maximum retries for each yfinance fetch
+        retry_delay: Initial retry delay in seconds (exponential backoff)
+        yf_request_timeout: Timeout (seconds) for each yfinance request
+        inter_request_delay: Delay between network requests (seconds)
         verbose: Print progress information
 
     Returns:
@@ -467,6 +491,7 @@ def load_native_tf_data(
     total_requests = len(symbols) * len(timeframes)
     completed = 0
     failed = []
+    request_idx = 0
 
     rate_limited = False
 
@@ -474,14 +499,22 @@ def load_native_tf_data(
         result[symbol] = {}
 
         for tf_idx, tf in enumerate(timeframes):
-            # Throttle: longer cooldown after rate-limit failures
-            if tf_idx > 0:
-                delay = 5.0 if rate_limited else 0.5
+            request_idx += 1
+            needs_network = TF_TO_YF_INTERVAL.get(tf) is not None
+
+            # Throttle network calls only; aggregated TFs (2h/3h/4h) reuse 1h data.
+            if tf_idx > 0 and needs_network:
+                delay = 5.0 if rate_limited else inter_request_delay
                 time.sleep(delay)
 
+            request_start = time.perf_counter()
             try:
                 if verbose:
-                    print(f"  Fetching {symbol} {tf}... ", end='', flush=True)
+                    print(
+                        f"  [{request_idx:02d}/{total_requests:02d}] "
+                        f"Fetching {symbol} {tf}...",
+                        flush=True
+                    )
 
                 df = fetch_native_tf(
                     symbol=symbol,
@@ -490,7 +523,10 @@ def load_native_tf_data(
                     end_date=end_date,
                     cache_dir=cache_dir,
                     use_cache=use_cache,
-                    cache_max_age_hours=cache_max_age_hours
+                    cache_max_age_hours=cache_max_age_hours,
+                    max_retries=max_retries,
+                    retry_delay=retry_delay,
+                    yf_request_timeout=yf_request_timeout,
                 )
 
                 result[symbol][tf] = df
@@ -498,14 +534,24 @@ def load_native_tf_data(
                 rate_limited = False  # Reset on success
 
                 if verbose:
-                    print(f"OK ({len(df)} bars)")
+                    elapsed = time.perf_counter() - request_start
+                    print(
+                        f"  [{request_idx:02d}/{total_requests:02d}] "
+                        f"OK {symbol} {tf}: {len(df)} bars ({elapsed:.2f}s)",
+                        flush=True
+                    )
 
             except Exception as e:
                 failed.append((symbol, tf, str(e)))
                 if 'rate limit' in str(e).lower() or 'too many requests' in str(e).lower():
                     rate_limited = True
                 if verbose:
-                    print(f"FAILED: {e}")
+                    elapsed = time.perf_counter() - request_start
+                    print(
+                        f"  [{request_idx:02d}/{total_requests:02d}] "
+                        f"FAILED {symbol} {tf}: {e} ({elapsed:.2f}s)",
+                        flush=True
+                    )
                 logger.error(f"Failed to fetch {symbol} {tf}: {e}")
 
     if verbose:
