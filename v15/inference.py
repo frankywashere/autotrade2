@@ -196,7 +196,8 @@ class Predictor:
         return self._has_learned_window_selection
 
     @classmethod
-    def load(cls, checkpoint_path: str, device: str = 'auto') -> 'Predictor':
+    def load(cls, checkpoint_path: str, device: str = 'auto',
+             calibration_path: str = None) -> 'Predictor':
         """
         Load predictor from checkpoint.
 
@@ -206,6 +207,8 @@ class Predictor:
         Args:
             checkpoint_path: Path to model checkpoint
             device: Device to use ('auto', 'cuda', 'cpu', etc.)
+            calibration_path: Path to temperature calibration JSON. If None,
+                looks for temperature_calibration.json in checkpoint's directory.
 
         Returns:
             Predictor instance with model loaded
@@ -239,7 +242,11 @@ class Predictor:
         per_tf_head_version = 2 if has_tf_embedding else 1
 
         # Detect horizon attention from state dict
-        has_horizon_attention = any('horizon_attention' in k for k in state_dict)
+        # HorizonGroupedAttention creates 'cross_tf_attention.group_attention.*' keys
+        has_horizon_attention = any('group_attention' in k for k in state_dict)
+
+        # Detect LSTM sequence branch from state dict
+        has_sequence_branch = any('window_lstm' in k for k in state_dict)
 
         # Create model with appropriate configuration
         config = {
@@ -248,6 +255,7 @@ class Predictor:
             'num_windows': model_config.get('num_windows', 8),
             'per_tf_head_version': per_tf_head_version,
             'use_horizon_attention': has_horizon_attention,
+            'use_sequence_branch': has_sequence_branch,
         }
 
         model = create_model(config)
@@ -266,12 +274,24 @@ class Predictor:
                 "per-TF predictions will be untrained"
             )
 
-        # Warn about any other missing keys (these might be actual problems)
+        # Any other missing keys are real architecture mismatches
         if other_missing:
-            logger.warning(f"Checkpoint missing unexpected keys: {other_missing}")
+            logger.error(f"Checkpoint missing unexpected keys: {other_missing}")
+            raise ModelError(
+                f"Architecture mismatch: {len(other_missing)} unexpected missing keys. "
+                f"First 5: {other_missing[:5]}. "
+                "This likely means the checkpoint was trained with a different model config "
+                "than what was auto-detected."
+            )
 
         if unexpected_keys:
-            logger.warning(f"Checkpoint has unexpected keys: {unexpected_keys}")
+            logger.error(f"Checkpoint has unexpected keys: {unexpected_keys}")
+            raise ModelError(
+                f"Architecture mismatch: {len(unexpected_keys)} unexpected keys in checkpoint. "
+                f"First 5: {unexpected_keys[:5]}. "
+                "This likely means the checkpoint was trained with features "
+                "(LSTM, horizon attention, etc.) that weren't auto-detected."
+            )
 
         # Get feature names from checkpoint (must match training data exactly)
         feature_names = checkpoint.get('feature_names')
@@ -282,7 +302,10 @@ class Predictor:
 
         # Load temperature scaler if available
         temperature_scaler = None
-        temp_path = path.parent / 'temperature_calibration.json'
+        if calibration_path:
+            temp_path = Path(calibration_path)
+        else:
+            temp_path = path.parent / 'temperature_calibration.json'
         if temp_path.exists():
             try:
                 temperature_scaler = TemperatureScaler.load(str(temp_path))

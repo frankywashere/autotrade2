@@ -866,9 +866,9 @@ def load_market_data(data_dir: str):
 
 CHECKPOINT_RELEASE_TAG = "v0.1-model"
 CHECKPOINT_REPO = "frankywashere/autotrade2"
-DEFAULT_MODEL_PATH = "models/best.pt"
 CHECKPOINT_ASSET_NAME = "x23_best_per_tf.pt"
 CALIBRATION_ASSET_NAME = "temperature_calibration_x23.json"
+DEFAULT_MODEL_PATH = f"models/{CHECKPOINT_ASSET_NAME}"
 
 
 def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
@@ -907,11 +907,22 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
         headers["Authorization"] = f"token {token}"
 
     print(f"[MODEL] Fetching release info from {CHECKPOINT_RELEASE_TAG} ...")
-    release = _requests.get(release_url, headers=headers).json()
+    resp = _requests.get(release_url, headers=headers)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"GitHub API returned HTTP {resp.status_code} for release "
+            f"{CHECKPOINT_RELEASE_TAG}: {resp.text[:500]}"
+        )
+    release = resp.json()
 
     assets = release.get("assets", [])
     if not assets:
-        raise RuntimeError(f"No assets found in release {CHECKPOINT_RELEASE_TAG}")
+        # Log the full response so we can debug if this is an auth/rate issue
+        msg = release.get("message", "no error message")
+        raise RuntimeError(
+            f"No assets found in release {CHECKPOINT_RELEASE_TAG}. "
+            f"GitHub response message: {msg}"
+        )
 
     # Find the target .pt asset by name
     pt_assets = [a for a in assets if a["name"].endswith(".pt")]
@@ -956,7 +967,7 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
     cal_assets = [a for a in assets if a["name"] == CALIBRATION_ASSET_NAME]
     if cal_assets:
         cal_asset = cal_assets[0]
-        cal_path = p.parent / "temperature_calibration.json"
+        cal_path = p.parent / CALIBRATION_ASSET_NAME
         print(f"[MODEL] Downloading {cal_asset['name']} ...")
         _download_asset(cal_asset, cal_path)
         print(f"[MODEL] Downloaded calibration: {cal_path}")
@@ -973,7 +984,9 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
 def load_predictor(checkpoint_path: str):
     """Load and cache live predictor with channel history tracking."""
     from v15.live import LivePredictor
-    return LivePredictor(checkpoint_path, track_channel_history=True)
+    cal_path = str(Path(checkpoint_path).parent / CALIBRATION_ASSET_NAME)
+    return LivePredictor(checkpoint_path, track_channel_history=True,
+                         calibration_path=cal_path)
 
 
 @st.cache_data(ttl=300)
@@ -1210,7 +1223,7 @@ def main():
     else:
         checkpoint_path = st.sidebar.text_input(
             "Model Checkpoint",
-            value="models/best.pt"
+            value=DEFAULT_MODEL_PATH
         )
         st.sidebar.warning("No .pt files found in models/")
 
@@ -1234,7 +1247,7 @@ def main():
         p = Path(checkpoint_path)
         if p.exists():
             p.unlink()
-        cal_path = p.parent / "temperature_calibration.json"
+        cal_path = p.parent / CALIBRATION_ASSET_NAME
         if cal_path.exists():
             cal_path.unlink()
         load_predictor.clear()
@@ -1256,7 +1269,7 @@ def main():
             _mae = _ckpt.get('best_per_tf_mae', '?')
             if isinstance(_mae, float):
                 _mae = f"{_mae:.3f}"
-            _cal_path = cp.parent / 'temperature_calibration.json'
+            _cal_path = cp.parent / CALIBRATION_ASSET_NAME
             if _cal_path.exists():
                 import json as _json
                 _cal = _json.loads(_cal_path.read_text())
