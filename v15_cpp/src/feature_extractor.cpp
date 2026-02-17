@@ -1532,7 +1532,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
     const SlimLabeledChannelMap& tsla_slim_map,
     const SlimLabeledChannelMap& spy_slim_map,
     int source_bar_count,
-    bool include_bar_metadata
+    bool include_bar_metadata,
+    const NativeTFData* native_tf_data
 ) {
     // Pre-reserve the feature map to avoid rehashing during 14,190 insertions
     auto all_features = create_feature_map();
@@ -1592,10 +1593,39 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_all_features(
         std::unordered_map<std::string, double>& local_features = tf_features[tf_idx];
 
         try {
-            // 1. Resample data to this timeframe
-            auto [tsla_tf, tsla_meta] = resample_to_tf(tsla_5min, tf, source_bar_count);
-            auto [spy_tf, spy_meta] = resample_to_tf(spy_5min, tf, source_bar_count);
-            auto [vix_tf, vix_meta] = resample_to_tf(vix_5min, tf, source_bar_count);
+            // 1. Get data for this timeframe (native bars or resample from 5min)
+            std::vector<OHLCV> tsla_tf;
+            ResampleMetadata tsla_meta;
+            if (native_tf_data &&
+                native_tf_data->tsla.count(tf_str) &&
+                native_tf_data->tsla.at(tf_str).size() >= 10) {
+                tsla_tf = native_tf_data->tsla.at(tf_str);
+                tsla_meta = build_native_metadata(tsla_tf.size(), tf, source_bar_count);
+            } else {
+                std::tie(tsla_tf, tsla_meta) = resample_to_tf(tsla_5min, tf, source_bar_count);
+            }
+
+            std::vector<OHLCV> spy_tf;
+            ResampleMetadata spy_meta;
+            if (native_tf_data &&
+                native_tf_data->spy.count(tf_str) &&
+                native_tf_data->spy.at(tf_str).size() >= 10) {
+                spy_tf = native_tf_data->spy.at(tf_str);
+                spy_meta = build_native_metadata(spy_tf.size(), tf, source_bar_count);
+            } else {
+                std::tie(spy_tf, spy_meta) = resample_to_tf(spy_5min, tf, source_bar_count);
+            }
+
+            std::vector<OHLCV> vix_tf;
+            ResampleMetadata vix_meta;
+            if (native_tf_data &&
+                native_tf_data->vix.count(tf_str) &&
+                native_tf_data->vix.at(tf_str).size() >= 10) {
+                vix_tf = native_tf_data->vix.at(tf_str);
+                vix_meta = build_native_metadata(vix_tf.size(), tf, source_bar_count);
+            } else {
+                std::tie(vix_tf, vix_meta) = resample_to_tf(vix_5min, tf, source_bar_count);
+            }
 
             // Store metadata for this timeframe
             tf_metadata[tf_idx] = tsla_meta;
@@ -7045,7 +7075,8 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_features_for_i
     const std::vector<OHLCV>& vix_5min,
     int64_t timestamp_ms,
     int source_bar_count,
-    bool include_bar_metadata
+    bool include_bar_metadata,
+    const NativeTFData* native_tf_data
 ) {
     if (tsla_5min.empty() || spy_5min.empty() || vix_5min.empty()) {
         std::cerr << "[ERROR] extract_features_for_inference: empty input data\n";
@@ -7064,9 +7095,34 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_features_for_i
         Timeframe tf = static_cast<Timeframe>(tf_idx);
         std::string tf_str = std::string(timeframe_to_string(tf));
 
-        // Resample TSLA and SPY to this timeframe
-        auto [tsla_tf, tsla_meta] = resample_to_tf(tsla_5min, tf, source_bar_count);
-        auto [spy_tf, spy_meta] = resample_to_tf(spy_5min, tf, source_bar_count);
+        // Use native bars if available and sufficient, else resample
+        std::vector<OHLCV> tsla_tf;
+        ResampleMetadata tsla_meta;
+        if (native_tf_data &&
+            native_tf_data->tsla.count(tf_str) &&
+            native_tf_data->tsla.at(tf_str).size() >= 11) {
+            tsla_tf = native_tf_data->tsla.at(tf_str);
+            tsla_meta = build_native_metadata(tsla_tf.size(), tf, source_bar_count);
+            static bool logged_native = false;
+            if (!logged_native) {
+                std::cerr << "[DATA] Using NATIVE bars for " << tf_str
+                          << ": " << tsla_tf.size() << " bars (TSLA)\n";
+                logged_native = true;
+            }
+        } else {
+            std::tie(tsla_tf, tsla_meta) = resample_to_tf(tsla_5min, tf, source_bar_count);
+        }
+
+        std::vector<OHLCV> spy_tf;
+        ResampleMetadata spy_meta;
+        if (native_tf_data &&
+            native_tf_data->spy.count(tf_str) &&
+            native_tf_data->spy.at(tf_str).size() >= 11) {
+            spy_tf = native_tf_data->spy.at(tf_str);
+            spy_meta = build_native_metadata(spy_tf.size(), tf, source_bar_count);
+        } else {
+            std::tie(spy_tf, spy_meta) = resample_to_tf(spy_5min, tf, source_bar_count);
+        }
 
         if (tsla_tf.size() < 11 || spy_tf.size() < 11) {
             continue;  // Not enough data for channel detection
@@ -7149,10 +7205,35 @@ std::unordered_map<std::string, double> FeatureExtractor::extract_features_for_i
         timestamp_ms,
         tsla_slim_map, spy_slim_map,
         source_bar_count,
-        include_bar_metadata
+        include_bar_metadata,
+        native_tf_data
     );
 
     return features;
+}
+
+// =============================================================================
+// build_native_metadata - construct ResampleMetadata for native TF bars
+// =============================================================================
+
+FeatureExtractor::ResampleMetadata FeatureExtractor::build_native_metadata(
+    size_t native_bar_count, Timeframe tf, int source_bar_count) {
+    int bars_per = get_bars_per_tf(tf);
+    ResampleMetadata meta;
+    if (bars_per <= 0) bars_per = 1;  // safety
+    int bars_into_current = source_bar_count % bars_per;
+    if (bars_into_current == 0) {
+        meta.bar_completion_pct = 1.0;
+        meta.is_partial = false;
+    } else {
+        meta.bar_completion_pct = static_cast<double>(bars_into_current) / bars_per;
+        meta.is_partial = true;
+    }
+    meta.bars_in_partial = bars_into_current > 0 ? bars_into_current : bars_per;
+    meta.expected_bars = bars_per;
+    meta.total_bars = static_cast<int>(native_bar_count);
+    meta.source_bars = source_bar_count;
+    return meta;
 }
 
 } // namespace v15

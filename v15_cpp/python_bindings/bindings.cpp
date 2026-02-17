@@ -273,6 +273,38 @@ py::dict sample_to_dict(const v15::ChannelSample& sample) {
 }
 
 // =============================================================================
+// Native TF Data Conversion Helper
+// =============================================================================
+
+/**
+ * Convert Python dict to C++ NativeTFData.
+ *
+ * Expected Python format:
+ *   {'tsla': {'daily': DataFrame, ...}, 'spy': {...}, 'vix': {...}}
+ *
+ * Keys are lowercase asset names and timeframe strings matching
+ * timeframe_to_string() output (e.g., "daily", "weekly", "monthly").
+ */
+v15::NativeTFData convert_native_tf_dict(py::dict dict) {
+    v15::NativeTFData result;
+    for (auto& [asset_key, tf_dict_obj] : dict) {
+        std::string asset = asset_key.cast<std::string>();
+        auto& target = (asset == "tsla") ? result.tsla :
+                       (asset == "spy")  ? result.spy : result.vix;
+        py::dict tf_dict = tf_dict_obj.cast<py::dict>();
+        for (auto& [tf_key, df_obj] : tf_dict) {
+            std::string tf_name = tf_key.cast<std::string>();
+            py::object df = df_obj.cast<py::object>();
+            // Skip None or empty DataFrames
+            if (df.is_none()) continue;
+            if (py::hasattr(df, "__len__") && py::len(df) == 0) continue;
+            target[tf_name] = python_to_ohlcv(df);
+        }
+    }
+    return result;
+}
+
+// =============================================================================
 // Python Module Definition
 // =============================================================================
 
@@ -565,15 +597,24 @@ PYBIND11_MODULE(v15scanner_cpp, m) {
 
     m.def("extract_features",
         [](py::object tsla_df, py::object spy_df, py::object vix_df,
-           int64_t timestamp_ms, int source_bar_count) -> py::dict {
+           int64_t timestamp_ms, int source_bar_count,
+           py::object native_tf_dict) -> py::dict {
             // Convert DataFrames to C++ OHLCV vectors
             std::vector<v15::OHLCV> tsla = python_to_ohlcv(tsla_df);
             std::vector<v15::OHLCV> spy = python_to_ohlcv(spy_df);
             std::vector<v15::OHLCV> vix = python_to_ohlcv(vix_df);
 
+            // Convert native TF dict if provided
+            v15::NativeTFData native_data;
+            v15::NativeTFData* native_ptr = nullptr;
+            if (!native_tf_dict.is_none()) {
+                native_data = convert_native_tf_dict(native_tf_dict.cast<py::dict>());
+                native_ptr = &native_data;
+            }
+
             // Run full feature extraction pipeline
             auto features = v15::FeatureExtractor::extract_features_for_inference(
-                tsla, spy, vix, timestamp_ms, source_bar_count, true
+                tsla, spy, vix, timestamp_ms, source_bar_count, true, native_ptr
             );
 
             // Convert to Python dict
@@ -588,11 +629,12 @@ PYBIND11_MODULE(v15scanner_cpp, m) {
         py::arg("vix_df"),
         py::arg("timestamp_ms"),
         py::arg("source_bar_count") = -1,
+        py::arg("native_tf_data") = py::none(),
         R"pbdoc(
             Extract all features from raw OHLCV data for model inference.
 
             This runs the full C++ feature extraction pipeline:
-            1. Resamples 5-min data to all 10 timeframes
+            1. Uses native TF bars (from yfinance) when available, else resamples
             2. Detects channels at all 8 windows for TSLA and SPY
             3. Extracts ~15,350 features matching training data exactly
 
@@ -602,6 +644,8 @@ PYBIND11_MODULE(v15scanner_cpp, m) {
                 vix_df: VIX 5-min OHLCV DataFrame aligned to TSLA
                 timestamp_ms: Current timestamp in milliseconds
                 source_bar_count: Number of 5min bars (-1 = use data size)
+                native_tf_data: Optional dict of native TF bars from yfinance.
+                    Format: {'tsla': {'daily': df, ...}, 'spy': {...}, 'vix': {...}}
 
             Returns:
                 Dict of feature name -> value (matching training features)

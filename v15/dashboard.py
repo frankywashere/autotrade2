@@ -630,21 +630,83 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
 # Live Data Integration
 # =============================================================================
 
+@st.cache_data(ttl=60)
+def _fetch_live_5min() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Cached 5-min yfinance fetch (TTL=60s to avoid redundant API calls)."""
+    print("[DATA] Fetching live 5-min data from yfinance (cache miss)...")
+    data_feed = YFinanceLiveData(cache_ttl=60)
+    return data_feed.get_historical(period='60d', interval='5m')
+
+
+@st.cache_data(ttl=60)
+def fetch_all_market_data():
+    """Single source of truth: fetch ALL yfinance data (5-min + native TFs).
+
+    Returns:
+        Tuple of (native_data, live_5min) where:
+        - native_data: dict from _load_native_tf_data() or None
+        - live_5min: tuple of (tsla, spy, vix) DataFrames or None
+    """
+    native_data = None
+    live_5min = None
+
+    if not YFINANCE_AVAILABLE:
+        return native_data, live_5min
+
+    # 1. Fetch native TFs (daily/weekly/monthly/1h-4h) — years of history
+    try:
+        print("[DATA] fetch_all_market_data: fetching native TFs...")
+        native_data = _load_native_tf_data(
+            symbols=['TSLA', 'SPY', '^VIX'],
+            timeframes=NATIVE_TF_LIST,
+            start_date='2015-01-01',
+            use_cache=True,
+            cache_max_age_hours=5 / 60,
+            max_retries=2,
+            retry_delay=0.75,
+            yf_request_timeout=8.0,
+            request_wall_timeout=20.0,
+            inter_request_delay=0.25,
+            verbose=True,
+        )
+        if native_data:
+            for symbol in ['TSLA', 'SPY', '^VIX']:
+                for tf in NATIVE_TF_LIST:
+                    df = native_data.get(symbol, {}).get(tf)
+                    if df is not None and not df.empty:
+                        print(f"[DATA]   {symbol:5s} {tf:8s}: {len(df):4d} bars")
+    except Exception as e:
+        print(f"[DATA] Native TF fetch failed: {e}")
+        logger.exception("Native TF data fetch failed")
+
+    # 2. Fetch 5-min data (60 days, yfinance limit)
+    try:
+        print("[DATA] fetch_all_market_data: fetching 5-min data...")
+        data_feed = YFinanceLiveData(cache_ttl=60)
+        live_5min = data_feed.get_historical(period='60d', interval='5m')
+    except Exception as e:
+        print(f"[DATA] 5-min yfinance failed: {e}")
+
+    return native_data, live_5min
+
+
 def get_live_data_with_fallback(
     use_live: bool,
     loaded_data: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    live_5min: Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = None,
     lookback: int = 35000
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, bool, Optional[str]]:
     """
     Get market data, merging CSV history with fresh yfinance data.
 
-    When use_live=True, fetches recent data from yfinance and appends it
-    to the CSV historical data. This gives us years of history plus
+    When use_live=True, uses provided live 5-min data (or fetches it)
+    and appends to CSV historical data. This gives us years of history plus
     current market data — both are needed for all 10 timeframes.
 
     Args:
-        use_live: Whether to attempt live data fetch
+        use_live: Whether to attempt live data merge
         loaded_data: Tuple of (tsla, spy, vix) loaded from CSV files
+        live_5min: Optional pre-fetched 5-min data tuple from fetch_all_market_data()
         lookback: Number of bars to return (from the end)
 
     Returns:
@@ -666,12 +728,13 @@ def get_live_data_with_fallback(
             return tsla, spy, vix, False, error_msg
 
         try:
-            print("[DATA] Fetching live data from yfinance...")
-            data_feed = YFinanceLiveData(cache_ttl=60)
-            tsla_live, spy_live, vix_live = data_feed.get_historical(
-                period='60d',
-                interval='5m'
-            )
+            # Use pre-fetched 5-min data or fall back to direct fetch
+            if live_5min is not None:
+                tsla_live, spy_live, vix_live = live_5min
+                print(f"[DATA] Using pre-fetched 5-min data")
+            else:
+                print("[DATA] Fetching live data from yfinance...")
+                tsla_live, spy_live, vix_live = _fetch_live_5min()
             print(f"[DATA] yfinance returned: TSLA={len(tsla_live):,} bars "
                   f"({tsla_live.index[0]} to {tsla_live.index[-1]}, "
                   f"tz={tsla_live.index.tz})")
@@ -1260,7 +1323,9 @@ def main():
         if cal_path.exists():
             cal_path.unlink()
         load_predictor.clear()
-        load_native_tf.clear()  # Clear native TF cache to force fresh yfinance fetch
+        fetch_all_market_data.clear()  # Clear unified data cache
+        load_native_tf.clear()  # Clear legacy native TF cache
+        _fetch_live_5min.clear()  # Clear legacy 5-min cache
         st.rerun()
 
     # Load model (auto-download from GitHub Releases if not present)
@@ -1310,21 +1375,22 @@ def main():
             "Build with: pip install -e ."
         )
 
-    # Fetch native TF data for TFs that benefit from longer Yahoo history.
-    # (1h ~2 years, daily/weekly/monthly effectively unlimited)
+    # Unified data fetch: native TFs + 5-min in one call
     native_tf_data = None
+    live_5min = None
     if YFINANCE_AVAILABLE:
-        with st.spinner("Fetching native TF data..."):
-            native_tf_data = load_native_tf()
+        with st.spinner("Fetching market data..."):
+            native_tf_data, live_5min = fetch_all_market_data()
             if native_tf_data:
                 st.session_state['native_tf_data'] = native_tf_data
                 if predictor is not None:
                     predictor.load_native_tf_data(native_tf_data)
 
-    # Get data (live or loaded)
+    # Get data (live or loaded), passing pre-fetched 5-min data
     current_tsla, current_spy, current_vix, is_live, error_msg = get_live_data_with_fallback(
         use_live=live_config['use_live'],
         loaded_data=(tsla, spy, vix),
+        live_5min=live_5min,
         lookback=35000
     )
 

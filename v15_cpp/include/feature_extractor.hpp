@@ -15,6 +15,27 @@
 namespace v15 {
 
 // =============================================================================
+// NATIVE TF DATA (from yfinance daily/weekly/monthly/1h-4h)
+// =============================================================================
+
+/**
+ * NativeTFData - Pre-fetched native timeframe bars from yfinance.
+ *
+ * Higher timeframes (daily, weekly, monthly) have years of history when
+ * fetched natively from yfinance, vs only ~60 bars when resampled from
+ * 5-min data (60 days / 1 day = 60). This struct allows the feature
+ * extractor to use native bars instead of resampled ones.
+ *
+ * Keys are timeframe strings matching timeframe_to_string() output:
+ * "daily", "weekly", "monthly", "1h", "2h", "3h", "4h"
+ */
+struct NativeTFData {
+    std::unordered_map<std::string, std::vector<OHLCV>> tsla;
+    std::unordered_map<std::string, std::vector<OHLCV>> spy;
+    std::unordered_map<std::string, std::vector<OHLCV>> vix;
+};
+
+// =============================================================================
 // OPTIMIZED DATA STRUCTURES FOR FEATURE EXTRACTION
 // =============================================================================
 
@@ -152,7 +173,8 @@ public:
         const SlimLabeledChannelMap& tsla_slim_map,
         const SlimLabeledChannelMap& spy_slim_map,
         int source_bar_count = -1,
-        bool include_bar_metadata = true
+        bool include_bar_metadata = true,
+        const NativeTFData* native_tf_data = nullptr
     );
 
     /**
@@ -211,7 +233,8 @@ public:
         const std::vector<OHLCV>& vix_5min,
         int64_t timestamp_ms,
         int source_bar_count = -1,
-        bool include_bar_metadata = true
+        bool include_bar_metadata = true,
+        const NativeTFData* native_tf_data = nullptr
     );
 
     /**
@@ -252,6 +275,10 @@ private:
         int total_bars;
         int source_bars;
     };
+
+    // Build ResampleMetadata for native (non-resampled) bars
+    static ResampleMetadata build_native_metadata(
+        size_t native_bar_count, Timeframe tf, int source_bar_count);
 
     static std::pair<std::vector<OHLCV>, ResampleMetadata> resample_to_tf(
         const std::vector<OHLCV>& data_5min,

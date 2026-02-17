@@ -726,9 +726,20 @@ class Predictor:
                 "Build with: pip install -e ."
             )
         timestamp_ms = int(timestamp.timestamp() * 1000) if hasattr(timestamp, 'timestamp') else int(timestamp)
+
+        # Convert native bars to format expected by C++ (if provided)
+        cpp_native = None
+        if native_bars_by_tf:
+            cpp_native = {}
+            for asset in ['tsla', 'spy', 'vix']:
+                asset_data = native_bars_by_tf.get(asset, {})
+                if asset_data:
+                    cpp_native[asset] = asset_data  # {tf_name: DataFrame}
+
         features = v15scanner_cpp.extract_features(
             tsla_df, spy_df, vix_df,
-            timestamp_ms, source_bar_count
+            timestamp_ms, source_bar_count,
+            native_tf_data=cpp_native
         )
         logger.info(f"[FEATURES] C++ extraction complete: {len(features)} features")
 
@@ -840,9 +851,20 @@ class Predictor:
                 "Build with: pip install -e ."
             )
         timestamp_ms = int(timestamp.timestamp() * 1000) if hasattr(timestamp, 'timestamp') else int(timestamp)
+
+        # Convert native bars to format expected by C++ (if provided)
+        cpp_native = None
+        if native_bars_by_tf:
+            cpp_native = {}
+            for asset in ['tsla', 'spy', 'vix']:
+                asset_data = native_bars_by_tf.get(asset, {})
+                if asset_data:
+                    cpp_native[asset] = asset_data  # {tf_name: DataFrame}
+
         features = v15scanner_cpp.extract_features(
             tsla_df, spy_df, vix_df,
-            timestamp_ms, source_bar_count
+            timestamp_ms, source_bar_count,
+            native_tf_data=cpp_native
         )
         logger.info(f"[FEATURES] C++ extraction complete: {len(features)} features")
 
