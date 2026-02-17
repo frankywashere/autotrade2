@@ -29,7 +29,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from v15.config import TIMEFRAMES, STANDARD_WINDOWS, TOTAL_FEATURES
 from v15.dtypes import ChannelSample
 from v15.signals.bounce_signal import SignalStrategy
-from v15.inference import get_cpp_status
+
+try:
+    from v15.inference import get_cpp_status
+except ImportError:
+    def get_cpp_status():
+        return {'available': False, 'feature_count': 0, 'expected': 15350}
 
 # Import new visualization modules
 from v15.visualization.plotly_charts import (
