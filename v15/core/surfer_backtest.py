@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -413,6 +413,19 @@ def run_backtest(
                 ml_stats['ca_rotation_boost'] = 0
                 ml_stats['ca_selloff_skip'] = 0
                 ml_stats['ca_scale_applied'] = 0
+            except Exception:
+                pass
+
+        # Try to load Stop Loss Predictor
+        stop_loss_model = None
+        sl_path = _os.path.join(model_dir, 'stop_loss_model.pkl')
+        if _os.path.exists(sl_path):
+            try:
+                stop_loss_model = StopLossPredictor.load(sl_path)
+                print(f"[ML] Stop Loss Predictor loaded")
+                ml_stats['sl_danger_skip'] = 0
+                ml_stats['sl_caution_scale'] = 0
+                ml_stats['sl_safe_boost'] = 0
             except Exception:
                 pass
 
@@ -1059,6 +1072,10 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Stop Loss Predictor: disabled (60% base rate, weak discrimination)
+                    # Model trained but not integrated — binary classifier too weak
+                    # MAE regressor (corr 0.535) available for future stop widening
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -1291,6 +1308,8 @@ def run_backtest(
             print(f"    CA rotation boost:  {ml_stats.get('ca_rotation_boost', 0)}")
             print(f"    CA selloff skip:    {ml_stats.get('ca_selloff_skip', 0)}")
             print(f"    CA scale applied:   {ml_stats.get('ca_scale_applied', 0)}")
+        if stop_loss_model is not None:
+            print(f"    SL stop widened:    {ml_stats.get('sl_stop_widened', 0)}")
 
     # Breakdown by exit reason
     if trades:

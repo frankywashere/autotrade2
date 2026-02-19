@@ -6964,6 +6964,282 @@ class CrossAssetAmplifier:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 18: Stop Loss Hit Predictor
+# ---------------------------------------------------------------------------
+
+class StopLossPredictor:
+    """
+    Directly predicts whether a trade will hit its stop loss.
+
+    This is the most targeted attack on the biggest loss source:
+    ALL stop-loss exits are 100% losers in the backtest.
+
+    Unlike other models that adjust confidence by small amounts,
+    this one asks a binary question: "Will this specific trade
+    hit its stop?"
+
+    Uses all base features + derived features focused on:
+    - Price behavior that precedes stop-outs (gaps, sudden moves)
+    - Channel instability that leads to false breakouts
+    - Volume patterns that indicate unsustainable moves
+
+    Target: Max adverse excursion > stop distance within 20 bars
+    """
+
+    def __init__(self):
+        self.stop_model = None         # Binary: will trade hit stop?
+        self.mae_model = None          # Regression: max adverse excursion
+        self.feature_names = None
+        self.stop_feature_names = None
+
+    @staticmethod
+    def derive_stop_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive features specifically targeting stop-loss prediction."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+
+        feats = []
+        feat_names = []
+
+        # Use ALL base features (they're all relevant for stop prediction)
+        feats.append(X)
+        feat_names.extend(feature_names)
+
+        # Derived: position extremity across TFs
+        for tf in ['5min', '1h', '4h', 'daily']:
+            pos_idx = name_to_idx.get(f'{tf}_position_pct')
+            if pos_idx is not None:
+                pos = X[:, pos_idx]
+                # Extreme positions (near 0 or 1) are stop-out risk
+                feats.append((pos * (1 - pos)).reshape(-1, 1))  # Parabolic: 0 at edges, 0.25 at center
+                feat_names.append(f'stop_{tf}_edge_risk')
+
+        # Derived: momentum vs channel position divergence
+        pm3_idx = name_to_idx.get('price_momentum_3bar')
+        if pm3_idx is not None:
+            pm3 = X[:, pm3_idx]
+            for tf in ['5min', '1h']:
+                pos_idx = name_to_idx.get(f'{tf}_position_pct')
+                mom_dir_idx = name_to_idx.get(f'{tf}_momentum_direction')
+                if pos_idx is not None:
+                    pos = X[:, pos_idx]
+                    # Buying at top or selling at bottom (contrarian danger)
+                    feats.append((pm3 * (pos - 0.5)).reshape(-1, 1))
+                    feat_names.append(f'stop_{tf}_momentum_position')
+
+        # Derived: volume anomaly (abnormal volume often precedes whipsaws)
+        vr_idx = name_to_idx.get('volume_ratio_20')
+        if vr_idx is not None:
+            vr = X[:, vr_idx]
+            feats.append((vr > 2.0).astype(np.float32).reshape(-1, 1))
+            feat_names.append('stop_volume_spike')
+            feats.append((vr < 0.5).astype(np.float32).reshape(-1, 1))
+            feat_names.append('stop_volume_dry')
+
+        # Derived: health × break_prob interaction (weak channel + high break = stop risk)
+        hmin_idx = name_to_idx.get('health_min')
+        bp_idx = name_to_idx.get('break_prob_max')
+        if hmin_idx is not None and bp_idx is not None:
+            feats.append((X[:, bp_idx] * (1 - X[:, hmin_idx])).reshape(-1, 1))
+            feat_names.append('stop_fragility_score')
+
+        # Derived: consecutive bars (long streaks about to reverse)
+        up_idx = name_to_idx.get('consecutive_up_bars')
+        dn_idx = name_to_idx.get('consecutive_down_bars')
+        if up_idx is not None and dn_idx is not None:
+            streak_max = np.maximum(X[:, up_idx], X[:, dn_idx])
+            feats.append(streak_max.reshape(-1, 1))
+            feat_names.append('stop_max_streak')
+
+        # Derived: ATR vs channel width (wide ATR + narrow channel = stop risk)
+        atr_idx = name_to_idx.get('atr_pct')
+        for tf in ['5min', '1h']:
+            width_idx = name_to_idx.get(f'{tf}_width_pct')
+            if atr_idx is not None and width_idx is not None:
+                width = X[:, width_idx]
+                safe_width = np.where(width > 1e-8, width, 1e-8)
+                feats.append((X[:, atr_idx] / safe_width).reshape(-1, 1))
+                feat_names.append(f'stop_{tf}_atr_width_ratio')
+
+        return np.column_stack(feats), feat_names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """
+        Train stop loss prediction models.
+
+        Target: Will the next 10 bars see maximum adverse excursion > typical stop distance?
+        We use 0.5% as the typical stop distance (matching backtester's ATR-based stops).
+        """
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        stop_X_train, self.stop_feature_names = self.derive_stop_features(
+            X_train, feature_names)
+        stop_X_val, _ = self.derive_stop_features(X_val, feature_names)
+
+        ret5_train = Y_train['future_return_5']
+        ret20_train = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # Approximate MAE from returns:
+        # If 5-bar return is X and 20-bar return is Y, and they have different signs,
+        # the max adverse was at least |min(X,Y)| (conservative estimate)
+        # If same sign, MAE ≈ max(0, -min(ret5, ret20))
+
+        # For BUY trades: adverse = price going down significantly
+        # We compute for both directions and use the worse one
+        mae_buy_train = np.maximum(0, -np.minimum(ret5_train, ret20_train))
+        mae_sell_train = np.maximum(0, np.maximum(ret5_train, ret20_train))
+        mae_approx_train = np.maximum(mae_buy_train, mae_sell_train)
+
+        mae_buy_val = np.maximum(0, -np.minimum(ret5_val, ret20_val))
+        mae_sell_val = np.maximum(0, np.maximum(ret5_val, ret20_val))
+        mae_approx_val = np.maximum(mae_buy_val, mae_sell_val)
+
+        # Stop hit = MAE > 0.5% (typical stop distance)
+        STOP_THRESHOLD = 0.005
+        stop_hit_train = (mae_approx_train > STOP_THRESHOLD).astype(np.float32)
+        stop_hit_val = (mae_approx_val > STOP_THRESHOLD).astype(np.float32)
+
+        metrics = {}
+
+        print(f"\n  Stop features: {len(self.stop_feature_names)}")
+        print(f"  Stop hit rate: {stop_hit_train.mean():.1%}")
+
+        # --- Model 1: Stop hit classifier ---
+        print("  Training stop hit classifier...")
+        dtrain = lgb.Dataset(stop_X_train, label=stop_hit_train,
+                            feature_name=self.stop_feature_names)
+        dval = lgb.Dataset(stop_X_val, label=stop_hit_val,
+                          feature_name=self.stop_feature_names, reference=dtrain)
+
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'num_leaves': 63,
+            'learning_rate': 0.03,
+            'feature_fraction': 0.7,
+            'bagging_fraction': 0.7,
+            'bagging_freq': 5,
+            'verbose': -1,
+            'is_unbalance': True,
+            'min_child_samples': 10,
+        }
+
+        callbacks = [lgb.early_stopping(80), lgb.log_evaluation(0)]
+        self.stop_model = lgb.train(
+            params, dtrain, num_boost_round=1000,
+            valid_sets=[dval], callbacks=callbacks,
+        )
+
+        stop_pred = self.stop_model.predict(stop_X_val)
+        stop_auc = roc_auc_score(stop_hit_val, stop_pred)
+        metrics['stop_hit_auc'] = float(stop_auc)
+        print(f"    Stop Hit AUC: {stop_auc:.3f}")
+
+        # Precision at various thresholds
+        for thresh in [0.5, 0.6, 0.7]:
+            high_conf = stop_pred > thresh
+            if high_conf.sum() > 5:
+                precision = stop_hit_val[high_conf].mean()
+                coverage = high_conf.mean()
+                metrics[f'stop_precision_{int(thresh*100)}'] = float(precision)
+                print(f"    Threshold {thresh}: precision={precision:.1%}, "
+                      f"coverage={coverage:.1%} ({high_conf.sum()} samples)")
+
+        # --- Model 2: MAE regressor ---
+        print("  Training MAE regressor...")
+        dtrain2 = lgb.Dataset(stop_X_train, label=mae_approx_train.astype(np.float32),
+                             feature_name=self.stop_feature_names)
+        dval2 = lgb.Dataset(stop_X_val, label=mae_approx_val.astype(np.float32),
+                           feature_name=self.stop_feature_names, reference=dtrain2)
+
+        params_reg = {
+            'objective': 'regression',
+            'metric': 'mae',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+        }
+
+        self.mae_model = lgb.train(
+            params_reg, dtrain2, num_boost_round=500,
+            valid_sets=[dval2], callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+        )
+
+        mae_pred = self.mae_model.predict(stop_X_val)
+        mae_mae = np.mean(np.abs(mae_pred - mae_approx_val))
+        mae_corr = np.corrcoef(mae_pred, mae_approx_val)[0, 1]
+        metrics['mae_regression_mae'] = float(mae_mae)
+        metrics['mae_regression_corr'] = float(mae_corr)
+        print(f"    MAE regression: MAE={mae_mae:.5f}, Corr={mae_corr:.3f}")
+
+        # Feature importance
+        imp = self.stop_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 stop-loss features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.stop_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        """
+        Predict stop loss hit probability.
+
+        Returns:
+            stop_prob: probability of hitting stop loss
+            expected_mae: expected max adverse excursion (as % of price)
+            risk_level: 'safe', 'caution', 'danger'
+        """
+        if self.stop_model is None:
+            return {}
+
+        stop_X, _ = self.derive_stop_features(X, self.feature_names)
+
+        stop_prob = self.stop_model.predict(stop_X)
+        expected_mae = self.mae_model.predict(stop_X)
+
+        risk = np.where(
+            stop_prob > 0.55, 2,  # danger
+            np.where(stop_prob > 0.35, 1, 0)  # caution / safe
+        )
+        risk_labels = np.array(['safe', 'caution', 'danger'])
+
+        return {
+            'stop_prob': stop_prob,
+            'expected_mae': expected_mae,
+            'risk_level': risk_labels[risk],
+            'risk_level_id': risk,
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'stop_model': self.stop_model,
+                'mae_model': self.mae_model,
+                'feature_names': self.feature_names,
+                'stop_feature_names': self.stop_feature_names,
+            }, f)
+        print(f"  Saved StopLossPredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'StopLossPredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.stop_model = data['stop_model']
+        model.mae_model = data['mae_model']
+        model.feature_names = data['feature_names']
+        model.stop_feature_names = data['stop_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -7592,7 +7868,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -7764,6 +8040,13 @@ def main():
                 )
                 ca.save(os.path.join(args.output, 'cross_asset_model.pkl'))
                 print(f"\n  Cross-Asset metrics: {ca_metrics}")
+            elif args.arch == 'stop_loss':
+                slp = StopLossPredictor()
+                slp_metrics = slp.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                slp.save(os.path.join(args.output, 'stop_loss_model.pkl'))
+                print(f"\n  Stop Loss metrics: {slp_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
