@@ -230,7 +230,7 @@ class Backtester:
                     # Long horizon has proven edge; others are disabled
                     # Evidence: 1h = 0% win rate across ALL runs, monthly = 50%+ win
                     HORIZON_MIN_CONF = {
-                        'short': 0.68,   # Bounce strategy: ranging regime only, 100%WR
+                        'short': 0.68,   # Bounce strategy: ranging regime only
                         'medium': 0.60,  # Low gate; real filter in medium block (long-validated)
                         'long': 0.75,    # Trend strategy: 100%WR, PF=inf
                     }
@@ -411,8 +411,8 @@ class Backtester:
                                         agreeing_horizons += 1
                             if total_horizons >= 2:
                                 agreement_pct = agreeing_horizons / total_horizons
-                                # 100% agreement = 2.0x, 50% = 1.0x, 0% = 0.0x (skip trade)
-                                cross_horizon_mult = agreement_pct * 2.0
+                                # 100% agreement = 5.0x, 50% = 2.5x, 0% = 0.0x (skip trade)
+                                cross_horizon_mult = agreement_pct * 5.0
                             else:
                                 cross_horizon_mult = 1.0
 
