@@ -915,29 +915,30 @@ def generate_signal(
     if primary_state.break_prob > 0.6:
         confidence *= (1.0 - 0.5 * (primary_state.break_prob - 0.6))
 
-    # Trend alignment: penalize signals that fight the channel direction
+    # Trend alignment: BOOST signals that align with channel and higher TF direction
     ch_dir = primary_state.channel_direction
-    if raw_action == 'BUY' and ch_dir == 'bear':
-        # Buying at bottom of a bearish channel = risky (channel slopes down)
-        confidence *= 0.7  # 30% penalty
+    if raw_action == 'BUY' and ch_dir == 'bull':
+        confidence *= 1.15  # 15% boost for buying in bullish channel
+    elif raw_action == 'SELL' and ch_dir == 'bear':
+        confidence *= 1.15  # 15% boost for selling in bearish channel
+    elif raw_action == 'BUY' and ch_dir == 'bear':
+        confidence *= 0.85  # Mild penalty for counter-trend
     elif raw_action == 'SELL' and ch_dir == 'bull':
-        # Selling at top of a bullish channel = risky (channel slopes up)
-        confidence *= 0.7
+        confidence *= 0.85
 
-    # Multi-TF trend alignment: check if higher TFs agree
+    # Multi-TF trend alignment: boost/penalty based on higher TF agreement
     higher_tf_dirs = []
     for tf in SIGNAL_TFS[1:]:  # Skip 5min
         if tf in tf_states and tf_states[tf].valid:
             higher_tf_dirs.append(tf_states[tf].channel_direction)
     if higher_tf_dirs:
+        bullish_frac = sum(1 for d in higher_tf_dirs if d == 'bull') / len(higher_tf_dirs)
+        bearish_frac = sum(1 for d in higher_tf_dirs if d == 'bear') / len(higher_tf_dirs)
         if raw_action == 'BUY':
-            bearish_count = sum(1 for d in higher_tf_dirs if d == 'bear')
-            if bearish_count >= len(higher_tf_dirs) * 0.6:
-                confidence *= 0.6  # Most higher TFs are bearish
+            # Boost if higher TFs are bullish, mild penalty if bearish
+            confidence *= (1.0 + 0.15 * bullish_frac - 0.10 * bearish_frac)
         elif raw_action == 'SELL':
-            bullish_count = sum(1 for d in higher_tf_dirs if d == 'bull')
-            if bullish_count >= len(higher_tf_dirs) * 0.6:
-                confidence *= 0.6  # Most higher TFs are bullish
+            confidence *= (1.0 + 0.15 * bearish_frac - 0.10 * bullish_frac)
 
     # Determine action
     if confidence < MIN_SIGNAL_CONFIDENCE or raw_action == 'HOLD':

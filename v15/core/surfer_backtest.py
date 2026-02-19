@@ -98,6 +98,7 @@ def run_backtest(
     max_hold_bars: int = 60,    # Max 5 hours (60 * 5min)
     position_size: float = 10000.0,  # $10k per trade
     min_confidence: float = 0.45,
+    use_multi_tf: bool = True,  # Use higher TF data for context
 ) -> tuple:
     """
     Run Channel Surfer backtest on historical 5-min TSLA data.
@@ -107,7 +108,7 @@ def run_backtest(
     """
     import yfinance as yf
     from v15.core.channel import detect_channels_multi_window, select_best_channel
-    from v15.core.channel_surfer import analyze_channels, SIGNAL_TFS
+    from v15.core.channel_surfer import analyze_channels, SIGNAL_TFS, TF_WINDOWS
 
     # Fetch data
     print(f"Fetching {days}d of 5-min TSLA data...")
@@ -116,6 +117,21 @@ def run_backtest(
         tsla.columns = tsla.columns.get_level_values(0)
     tsla.columns = [c.lower() for c in tsla.columns]
     print(f"Got {len(tsla)} bars")
+
+    # Fetch higher TF data for context
+    higher_tf_data = {}
+    if use_multi_tf:
+        for tf_label, yf_interval, yf_period in [
+            ('1h', '1h', '2y'),
+            ('daily', '1d', '5y'),
+        ]:
+            print(f"  Fetching {tf_label} data...")
+            df = yf.download('TSLA', period=yf_period, interval=yf_interval, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.columns = [c.lower() for c in df.columns]
+            higher_tf_data[tf_label] = df
+            print(f"  {tf_label}: {len(df)} bars")
 
     if len(tsla) < 200:
         print("Not enough data for backtest")
@@ -268,21 +284,40 @@ def run_backtest(
             if best_ch is None or not best_ch.valid:
                 continue
 
-            # Run channel surfer analysis (5min only for speed)
+            # Build multi-TF channels
             slice_closes = df_slice['close'].values
             channels_by_tf = {'5min': best_ch}
             prices_by_tf = {'5min': slice_closes}
             current_prices_dict = {'5min': current_price}
+            volumes_dict = {}
 
-            # Volume data
-            volumes_dict = None
             if 'volume' in df_slice.columns:
-                volumes_dict = {'5min': df_slice['volume'].values}
+                volumes_dict['5min'] = df_slice['volume'].values
+
+            # Add higher TF channels (use recent window, not full history)
+            if use_multi_tf:
+                for tf_label, tf_df in higher_tf_data.items():
+                    # Use last 100 bars for channel detection (not full history)
+                    tf_recent = tf_df.tail(100)
+                    if len(tf_recent) < 30:
+                        continue
+                    tf_windows = TF_WINDOWS.get(tf_label, [20, 30, 40])
+                    try:
+                        tf_multi = detect_channels_multi_window(tf_recent, windows=tf_windows)
+                        tf_ch, _ = select_best_channel(tf_multi)
+                        if tf_ch and tf_ch.valid:
+                            channels_by_tf[tf_label] = tf_ch
+                            prices_by_tf[tf_label] = tf_recent['close'].values
+                            current_prices_dict[tf_label] = float(tf_recent['close'].iloc[-1])
+                            if 'volume' in tf_recent.columns:
+                                volumes_dict[tf_label] = tf_recent['volume'].values
+                    except Exception:
+                        pass
 
             try:
                 analysis = analyze_channels(
                     channels_by_tf, prices_by_tf, current_prices_dict,
-                    volumes_by_tf=volumes_dict,
+                    volumes_by_tf=volumes_dict if volumes_dict else None,
                 )
             except Exception:
                 continue
