@@ -89,7 +89,11 @@ def run_single_engine_backtest(
     signal_engine = RegimeAdaptiveSignalEngine(
         min_confidence=min_confidence,
     )
-    sizer = PositionSizer(capital=initial_capital)
+    sizer = PositionSizer(
+        capital=initial_capital,
+        kelly_fraction=0.7,   # 70% Kelly (aggressive, safe with 90%+ WR)
+        max_position_pct=0.50,  # Allow up to 50% per trade
+    )
     backtester = Backtester(
         predictor=predictor,
         signal_engine=signal_engine,

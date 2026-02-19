@@ -88,7 +88,11 @@ def run_walk_forward(checkpoint_path: str, calibration_path: str = None):
             max_hold_bars=390,
         )
         signal_engine = RegimeAdaptiveSignalEngine()
-        sizer = PositionSizer(capital=100000.0)
+        sizer = PositionSizer(
+            capital=100000.0,
+            kelly_fraction=0.7,
+            max_position_pct=0.50,
+        )
         backtester = Backtester(
             predictor=predictor,
             signal_engine=signal_engine,
