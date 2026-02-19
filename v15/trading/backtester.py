@@ -131,13 +131,15 @@ class Backtester:
         self.position_sizer.current_equity = equity
         self.position_sizer.peak_equity = equity
 
-        open_position: Optional[OpenPosition] = None
+        # Concurrent positions: one per strategy
+        # trend and bounce can run simultaneously
+        positions: Dict[str, OpenPosition] = {}  # strategy -> position
+        MAX_TOTAL_POSITION_PCT = 0.60  # Max 60% of capital in positions total
+
         prev_hazard: Optional[HazardClock] = None
 
-        # Re-entry tracking
-        last_exit_bar = 0
-        last_exit_direction = None
-        last_exit_profitable = False
+        # Re-entry tracking per strategy
+        last_exit_by_strategy: Dict[str, dict] = {}  # strategy -> {bar, direction, profitable}
         REENTRY_COOLDOWN = 12  # 1 hour cooldown before re-entry (sweep-optimized)
 
         total_bars = len(tsla_df)
@@ -159,31 +161,37 @@ class Backtester:
         for bar_idx in range(start_bar, total_bars, eval_interval):
             current_time = _to_datetime(tsla_df.index[bar_idx])
             current_price = float(tsla_df.iloc[bar_idx]['close'])
+            high = float(tsla_df.iloc[bar_idx]['high'])
+            low = float(tsla_df.iloc[bar_idx]['low'])
 
-            # Check open position for stop/TP/timeout
-            if open_position is not None:
-                high = float(tsla_df.iloc[bar_idx]['high'])
-                low = float(tsla_df.iloc[bar_idx]['low'])
-                bars_held = bar_idx - open_position.entry_bar
+            # Check all open positions for exit
+            closed_strategies = []
+            for strat_key, pos in list(positions.items()):
+                bars_held = bar_idx - pos.entry_bar
 
                 exit_price, exit_reason = self._check_exit(
-                    open_position, current_price, high, low, bars_held
+                    pos, current_price, high, low, bars_held
                 )
 
                 if exit_price is not None:
                     trade = self._close_position(
-                        open_position, exit_price, current_time,
+                        pos, exit_price, current_time,
                         bars_held, exit_reason
                     )
                     metrics.add_trade(trade)
                     equity += trade.pnl
                     self.position_sizer.update_equity(equity)
                     equity_curve.add_point(current_time, equity)
-                    # Track for re-entry
-                    last_exit_bar = bar_idx
-                    last_exit_direction = open_position.direction
-                    last_exit_profitable = trade.pnl > 0
-                    open_position = None
+                    # Track for re-entry per strategy
+                    last_exit_by_strategy[strat_key] = {
+                        'bar': bar_idx,
+                        'direction': pos.direction,
+                        'profitable': trade.pnl > 0,
+                    }
+                    closed_strategies.append(strat_key)
+
+            for strat_key in closed_strategies:
+                del positions[strat_key]
 
             # Generate signal at evaluation intervals
             try:
@@ -245,16 +253,14 @@ class Backtester:
                     MOM_1D_THRESHOLD = -0.005  # Allow slight 1d pullback
                     MOM_3D_THRESHOLD = -0.01   # 3d must not be deeply negative
 
-                    best_signal = None
-                    best_score = -1.0
-                    chosen_strategy = None
+                    # Collect candidate signals per strategy
+                    strategy_signals = {}  # strategy -> (signal, score)
 
                     for horizon, sig in horizon_signals.items():
                         signals_generated += 1
                         if sig.actionable:
                             signals_actionable += 1
 
-                        # Apply horizon-specific min confidence
                         min_conf = HORIZON_MIN_CONF.get(horizon, 0.99)
                         if sig.confidence < min_conf:
                             continue
@@ -262,7 +268,6 @@ class Backtester:
                             continue
 
                         if horizon == 'long':
-                            # TREND STRATEGY: require positive momentum
                             if sig.regime.regime == MarketRegime.TRANSITIONING:
                                 continue
                             if sig.signal_type == SignalType.LONG:
@@ -271,85 +276,85 @@ class Backtester:
                             elif sig.signal_type == SignalType.SHORT:
                                 if mom_1d > -MOM_1D_THRESHOLD or mom_3d > -MOM_3D_THRESHOLD:
                                     continue
-                            score = sig.confidence * sig.entry_urgency * 2.0  # Priority boost
-                            if score > best_score:
-                                best_score = score
-                                best_signal = sig
-                                chosen_strategy = 'trend'
+                            score = sig.confidence * sig.entry_urgency * 2.0
+                            prev = strategy_signals.get('trend')
+                            if prev is None or score > prev[1]:
+                                strategy_signals['trend'] = (sig, score)
 
                         elif horizon == 'short':
-                            # BOUNCE STRATEGY: only ranging regime, mean-reversion
                             if sig.regime.regime != MarketRegime.RANGING:
                                 continue
-                            # Bounce: no positive momentum filter
-                            # (bounces happen during pullbacks)
                             score = sig.confidence * sig.entry_urgency
-                            if score > best_score:
-                                best_score = score
-                                best_signal = sig
-                                chosen_strategy = 'bounce'
+                            prev = strategy_signals.get('bounce')
+                            if prev is None or score > prev[1]:
+                                strategy_signals['bounce'] = (sig, score)
 
-                        # Medium horizon: disabled (0% WR proven)
+                    # Current total position value
+                    total_position_value = sum(
+                        p.shares * current_price for p in positions.values()
+                    )
+                    total_position_pct = total_position_value / max(equity, 1)
 
-                    signal = best_signal
+                    # Try to open positions for each strategy independently
+                    atr_pct = _compute_atr(tsla_df, bar_idx, period=78)
 
-                    # Open position if no current position and signal is actionable
-                    if open_position is None and signal is not None:
-                        # Re-entry cooldown: after profitable exit, wait before re-entering same direction
-                        # (avoids whipsaw on pullbacks)
-                        in_cooldown = (
-                            last_exit_profitable
-                            and (bar_idx - last_exit_bar) < REENTRY_COOLDOWN
-                            and last_exit_direction is not None
-                        )
-                        # Allow re-entry in SAME direction after cooldown
-                        # (trend continuation). Block re-entry in same direction during cooldown.
-                        signal_dir = 'long' if signal.signal_type == SignalType.LONG else 'short'
-                        if in_cooldown and signal_dir == last_exit_direction:
-                            signal = None  # Skip: too soon to re-enter same direction
+                    for strat_key, (signal, score) in strategy_signals.items():
+                        # Skip if already have a position for this strategy
+                        if strat_key in positions:
+                            continue
 
-                    if open_position is None and signal is not None:
-                        if signal.entry_urgency > 0.3:  # Lower urgency threshold
-                            # Compute ATR at entry for adaptive trailing stop
-                            atr_pct = _compute_atr(tsla_df, bar_idx, period=78)  # 1-day ATR
+                        # Total position limit
+                        if total_position_pct >= MAX_TOTAL_POSITION_PCT:
+                            break
 
-                            position = self.position_sizer.size_position(
-                                signal, current_price, atr_pct=atr_pct
+                        # Re-entry cooldown per strategy
+                        last_exit = last_exit_by_strategy.get(strat_key)
+                        if last_exit is not None:
+                            signal_dir = 'long' if signal.signal_type == SignalType.LONG else 'short'
+                            in_cooldown = (
+                                last_exit['profitable']
+                                and (bar_idx - last_exit['bar']) < REENTRY_COOLDOWN
+                                and signal_dir == last_exit['direction']
                             )
-                            if position.should_trade:
-                                # Scale by confidence: higher conf = bigger bet
-                                # conf 0.72 → 0.7x, conf 0.76 → 1.0x, conf 0.80 → 1.5x
-                                conf_scale = max(0.5, min(1.5,
-                                    0.7 + (signal.confidence - 0.72) * 10.0
-                                ))
-                                if conf_scale != 1.0:
-                                    position.shares = max(1, int(position.shares * conf_scale))
-                                    position.dollar_amount = position.shares * current_price
-                                    position.fraction *= conf_scale
+                            if in_cooldown:
+                                continue
 
-                                open_position = self._open_position(
-                                    signal, position, current_price,
-                                    current_time, bar_idx,
-                                    atr_pct=atr_pct,
-                                    strategy=chosen_strategy or 'trend',
-                                )
+                        if signal.entry_urgency <= 0.3:
+                            continue
 
-                    # Check for signal flip (close current position)
-                    elif open_position is not None and signal is not None:
-                        should_flip = self._should_flip(
-                            open_position, signal
+                        # Size position (reduced if concurrent)
+                        remaining_capacity = MAX_TOTAL_POSITION_PCT - total_position_pct
+                        effective_max = min(
+                            self.position_sizer.max_position_pct,
+                            remaining_capacity,
                         )
-                        if should_flip:
-                            trade = self._close_position(
-                                open_position, current_price, current_time,
-                                bar_idx - open_position.entry_bar,
-                                'signal_flip'
+                        # Temporarily adjust sizer's max
+                        orig_max = self.position_sizer.max_position_pct
+                        self.position_sizer.max_position_pct = effective_max
+
+                        position = self.position_sizer.size_position(
+                            signal, current_price, atr_pct=atr_pct
+                        )
+                        self.position_sizer.max_position_pct = orig_max
+
+                        if position.should_trade:
+                            conf_scale = max(0.5, min(1.5,
+                                0.7 + (signal.confidence - 0.72) * 10.0
+                            ))
+                            if conf_scale != 1.0:
+                                position.shares = max(1, int(position.shares * conf_scale))
+                                position.dollar_amount = position.shares * current_price
+                                position.fraction *= conf_scale
+
+                            new_pos = self._open_position(
+                                signal, position, current_price,
+                                current_time, bar_idx,
+                                atr_pct=atr_pct,
+                                strategy=strat_key,
                             )
-                            metrics.add_trade(trade)
-                            equity += trade.pnl
-                            self.position_sizer.update_equity(equity)
-                            equity_curve.add_point(current_time, equity)
-                            open_position = None
+                            positions[strat_key] = new_pos
+                            total_position_value += new_pos.shares * current_price
+                            total_position_pct = total_position_value / max(equity, 1)
 
             except Exception as e:
                 # Log but don't crash — skip this eval point
@@ -376,16 +381,17 @@ class Backtester:
                     f"tf={t.primary_tf} regime={t.regime}"
                 )
 
-        # Close any remaining position at market
-        if open_position is not None:
+        # Close any remaining positions at market
+        if positions:
             final_price = float(tsla_df.iloc[-1]['close'])
             final_time = _to_datetime(tsla_df.index[-1])
-            trade = self._close_position(
-                open_position, final_price, final_time,
-                total_bars - open_position.entry_bar, 'end_of_data'
-            )
-            metrics.add_trade(trade)
-            equity += trade.pnl
+            for strat_key, pos in positions.items():
+                trade = self._close_position(
+                    pos, final_price, final_time,
+                    total_bars - pos.entry_bar, 'end_of_data'
+                )
+                metrics.add_trade(trade)
+                equity += trade.pnl
 
         # Final equity
         equity_curve.add_point(_to_datetime(tsla_df.index[-1]), equity)
