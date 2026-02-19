@@ -62,6 +62,8 @@ class TFChannelState:
     # Momentum turn
     momentum_turn_score: float = 0.5 # Momentum deceleration at boundary (0-1)
     momentum_is_turning: bool = False # Is momentum turning around?
+    # Squeeze
+    squeeze_score: float = 0.0       # Channel compression (0 = expanding, 1 = tight squeeze)
 
 
 @dataclass
@@ -892,6 +894,52 @@ def detect_market_regime(
     )
 
 
+def compute_squeeze_score(
+    prices: np.ndarray,
+    channel: Channel,
+    lookback: int = 50,
+) -> float:
+    """
+    Detect if the channel is in a squeeze (narrowing width).
+
+    A squeeze precedes explosive breakouts. Measured by comparing
+    current channel width to its average over the lookback period.
+
+    Returns:
+        Score 0-1 where 1 = tight squeeze (width much below average)
+    """
+    if len(channel.upper_line) < 10 or len(channel.lower_line) < 10:
+        return 0.0
+
+    # Current width
+    current_width = channel.upper_line[-1] - channel.lower_line[-1]
+    if current_width <= 0:
+        return 0.0
+
+    # Historical widths over the channel
+    widths = channel.upper_line - channel.lower_line
+    widths = widths[widths > 0]
+
+    if len(widths) < 5:
+        return 0.0
+
+    avg_width = np.mean(widths)
+    if avg_width <= 0:
+        return 0.0
+
+    # Compression ratio: < 1.0 means channel is narrower than average
+    compression = current_width / avg_width
+
+    if compression < 0.7:
+        return 1.0  # Strong squeeze: 70%+ compression
+    elif compression < 0.85:
+        return 0.7  # Moderate squeeze
+    elif compression < 1.0:
+        return 0.3  # Slight squeeze
+    else:
+        return 0.0  # No squeeze (expanding)
+
+
 def generate_breakout_signal(
     tf_states: Dict[str, TFChannelState],
     confluence: Dict[str, float],
@@ -951,14 +999,18 @@ def generate_breakout_signal(
     else:
         return None  # Not near a boundary with aligned momentum
 
+    # Squeeze boost: if channel is compressed, breakout will be explosive
+    squeeze = getattr(primary_state, 'squeeze_score', 0.0)
+
     # --- Confidence for breakout ---
-    # Components: break_prob, energy_ratio, direction_score, entropy (high = chaotic = breakout)
+    # Components: break_prob, energy_ratio, direction_score, entropy, squeeze
     conf = (
-        0.30 * min(1.0, break_prob / 0.8) +         # Break probability
-        0.25 * min(1.0, energy_ratio / 2.0) +        # Energy exceeding binding
-        0.20 * direction_score +                       # Position near boundary
-        0.15 * primary_state.entropy +                 # High entropy = channel failing
-        0.10 * primary_state.kinetic_energy            # Momentum strength
+        0.25 * min(1.0, break_prob / 0.8) +         # Break probability
+        0.20 * min(1.0, energy_ratio / 2.0) +        # Energy exceeding binding
+        0.15 * direction_score +                       # Position near boundary
+        0.10 * primary_state.entropy +                 # High entropy = channel failing
+        0.10 * primary_state.kinetic_energy +          # Momentum strength
+        0.20 * squeeze                                 # Squeeze = explosive breakout
     )
 
     # Higher-TF trend alignment for breakouts (more important than for bounces)
@@ -1188,6 +1240,22 @@ def generate_signal(
         elif raw_action == 'SELL':
             confidence *= (1.0 + 0.15 * bearish_frac - 0.10 * bullish_frac)
 
+    # --- Stacked Multi-TF Signal Boost ---
+    # When multiple TFs agree on the same zone, boost confidence significantly
+    if raw_action in ('BUY', 'SELL'):
+        stacked_count = 0
+        for tf in SIGNAL_TFS[1:]:  # Check higher TFs
+            if tf in tf_states and tf_states[tf].valid:
+                other_pos = tf_states[tf].position_pct
+                if raw_action == 'BUY' and other_pos < 0.35:
+                    stacked_count += 1
+                elif raw_action == 'SELL' and other_pos > 0.65:
+                    stacked_count += 1
+        if stacked_count >= 2:
+            confidence *= 1.30  # 30% boost: two higher TFs confirm the zone
+        elif stacked_count >= 1:
+            confidence *= 1.10  # 10% boost: one higher TF confirms
+
     # Determine action
     if confidence < MIN_SIGNAL_CONFIDENCE or raw_action == 'HOLD':
         # Try breakout signal when bounce doesn't trigger
@@ -1359,6 +1427,9 @@ def analyze_channels(
         else:
             vol_score = 0.5
 
+        # 13. Squeeze detection
+        squeeze = compute_squeeze_score(prices, channel)
+
         # Direction
         dir_map = {
             Direction.BULL: 'bull',
@@ -1394,6 +1465,7 @@ def analyze_channels(
             volume_score=round(vol_score, 3),
             momentum_turn_score=round(turn_score, 3),
             momentum_is_turning=is_turning,
+            squeeze_score=round(squeeze, 3),
         )
 
     # Multi-TF confluence
