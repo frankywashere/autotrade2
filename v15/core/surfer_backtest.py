@@ -233,13 +233,14 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel,
+            RegimeConditionalModel, TrendGBTModel,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
         )
         ml_feature_names = get_feature_names()
         ml_history_buffer: List[Dict] = []
+        ml_feature_window: List[np.ndarray] = []  # For TrendGBT sliding window
         ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0,
                      'quality_filtered': 0, 'quality_boosted': 0, 'ensemble_filtered': 0}
         print(f"[ML] Model loaded with {len(ml_feature_names)} features")
@@ -300,6 +301,18 @@ def run_backtest(
                 print(f"[ML] Regime model loaded (regime-augmented)")
                 ml_stats['regime_boosted'] = 0
                 ml_stats['regime_penalized'] = 0
+            except Exception:
+                pass
+
+        # Try to load TrendGBT model
+        trend_gbt_model = None
+        tg_path = _os.path.join(model_dir, 'trend_gbt_model.pkl')
+        if _os.path.exists(tg_path):
+            try:
+                trend_gbt_model = TrendGBTModel.load(tg_path)
+                print(f"[ML] TrendGBT loaded (top-{trend_gbt_model.TOP_K} features + trends)")
+                ml_stats['trend_gbt_confirmed'] = 0
+                ml_stats['trend_gbt_filtered'] = 0
             except Exception:
                 pass
 
@@ -621,6 +634,11 @@ def run_backtest(
                     )
                     feature_vec[offset:offset + len(CORRELATION_FEATURES)] = corr_feats
 
+                    # Update feature window for TrendGBT
+                    ml_feature_window.append(feature_vec.copy())
+                    if len(ml_feature_window) > TrendGBTModel.WINDOW_SIZE:
+                        ml_feature_window.pop(0)
+
                     # Run ML prediction
                     ml_prediction = ml_model.predict(feature_vec.reshape(1, -1))
 
@@ -726,6 +744,31 @@ def run_backtest(
                                 if sig.action == 'SELL':
                                     sig.confidence *= 1.10  # Trend-aligned boost
                                     ml_stats['regime_boosted'] += 1
+                        except Exception:
+                            pass
+
+                    # TrendGBT break direction confirmation
+                    if trend_gbt_model is not None and len(ml_feature_window) >= TrendGBTModel.WINDOW_SIZE:
+                        try:
+                            window = np.stack(ml_feature_window[-TrendGBTModel.WINDOW_SIZE:])
+                            tg_pred = trend_gbt_model.predict(window)
+                            tg_bd = int(tg_pred['break_dir'][0])
+                            # 0=down, 1=up, 2=survive
+
+                            # BUY expects break_up (1), SELL expects break_down (0)
+                            if sig.action == 'BUY' and tg_bd == 0:
+                                # TrendGBT says break DOWN but we're buying
+                                sig.confidence *= 0.80
+                                ml_stats['trend_gbt_filtered'] += 1
+                            elif sig.action == 'SELL' and tg_bd == 1:
+                                # TrendGBT says break UP but we're selling
+                                sig.confidence *= 0.80
+                                ml_stats['trend_gbt_filtered'] += 1
+                            elif (sig.action == 'BUY' and tg_bd == 1) or \
+                                 (sig.action == 'SELL' and tg_bd == 0):
+                                # TrendGBT confirms direction
+                                sig.confidence *= 1.15
+                                ml_stats['trend_gbt_confirmed'] += 1
                         except Exception:
                             pass
 
@@ -930,6 +973,9 @@ def run_backtest(
         if regime_model is not None:
             print(f"    Regime boosted:   {ml_stats.get('regime_boosted', 0)}")
             print(f"    Regime penalized: {ml_stats.get('regime_penalized', 0)}")
+        if trend_gbt_model is not None:
+            print(f"    TrendGBT confirmed: {ml_stats.get('trend_gbt_confirmed', 0)}")
+            print(f"    TrendGBT filtered:  {ml_stats.get('trend_gbt_filtered', 0)}")
 
     # Breakdown by exit reason
     if trades:
