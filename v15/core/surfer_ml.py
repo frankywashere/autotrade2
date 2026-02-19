@@ -1129,11 +1129,11 @@ class GBTModel:
         metrics['lifetime_mae'] = float(mae)
         print(f"    Lifetime MAE: {mae:.1f} bars")
 
-        # Feature importance for lifetime
+        # Feature importance for lifetime (save all, sorted by importance)
         imp = self.models['lifetime'].feature_importance(importance_type='gain')
-        top_idx = np.argsort(imp)[-10:][::-1]
+        sorted_idx = np.argsort(imp)[::-1]
         self.feature_importance['lifetime'] = [
-            (feature_names[i], float(imp[i])) for i in top_idx
+            (feature_names[i], float(imp[i])) for i in sorted_idx
         ]
 
         # 2. Break direction (3-class)
@@ -3106,6 +3106,717 @@ class RegimeConditionalModel:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 7: Temporal Attention Network (Sliding Window)
+# ---------------------------------------------------------------------------
+
+import torch
+import torch.nn as nn
+
+
+class TemporalAttentionNet(nn.Module):
+    """
+    Compact model that processes a sliding window of top-K feature snapshots.
+
+    Architecture:
+    1. Per-timestep projection (n_features → d_model)
+    2. Single-layer self-attention with 2 heads
+    3. Attention-weighted pooling
+    4. Concatenate with hand-crafted window trend features
+    5. Task-specific heads
+
+    Input: (batch, window_size, n_features) for window features
+           (batch, n_trend_features) for hand-crafted trends
+    """
+
+    def __init__(self, n_features: int, n_trend_features: int,
+                 window_size: int = 8, d_model: int = 24,
+                 n_heads: int = 2, dropout: float = 0.2):
+        super().__init__()
+        self.n_features = n_features
+        self.window_size = window_size
+        self.d_model = d_model
+
+        # Project features to d_model
+        self.input_proj = nn.Sequential(
+            nn.Linear(n_features, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+
+        # Learnable positional encoding
+        self.pos_embedding = nn.Parameter(torch.randn(1, window_size, d_model) * 0.02)
+
+        # Single-layer self-attention
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 2,
+            dropout=dropout, batch_first=True, activation='gelu',
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+
+        # Attention pooling
+        self.attn_pool_q = nn.Linear(d_model, 1)
+
+        # Combine attention output + trend features
+        combined_dim = d_model + n_trend_features
+
+        # Task heads
+        self.action_head = nn.Sequential(
+            nn.Linear(combined_dim, 16), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(16, 3),
+        )
+        self.break_dir_head = nn.Sequential(
+            nn.Linear(combined_dim, 16), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(16, 3),
+        )
+        self.lifetime_head = nn.Sequential(
+            nn.Linear(combined_dim, 16), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, x_window, x_trends):
+        """
+        x_window: (batch, window_size, n_features)
+        x_trends: (batch, n_trend_features)
+        """
+        h = self.input_proj(x_window)
+        h = h + self.pos_embedding[:, :h.size(1), :]
+        h = self.encoder(h)
+
+        # Attention pooling
+        attn_weights = torch.softmax(self.attn_pool_q(h), dim=1)
+        pooled = (h * attn_weights).sum(dim=1)  # (B, d_model)
+
+        # Concatenate with trend features
+        combined = torch.cat([pooled, x_trends], dim=1)
+
+        return {
+            'action_logits': self.action_head(combined),
+            'break_dir_logits': self.break_dir_head(combined),
+            'lifetime': self.lifetime_head(combined).squeeze(-1),
+            'attn_weights': attn_weights.squeeze(-1),
+        }
+
+
+class TemporalAttentionModel:
+    """
+    Wrapper for TemporalAttentionNet with training, prediction, and
+    windowed data generation. Uses feature selection (top-K from GBT)
+    and hand-crafted trend features for robustness with small samples.
+    """
+
+    WINDOW_SIZE = 8
+    TOP_K_FEATURES = 30  # Select top-K by GBT importance
+
+    def __init__(self, n_features: int = 169, window_size: int = 8):
+        self.window_size = window_size
+        self.n_features = n_features
+        self.n_selected = self.TOP_K_FEATURES
+        self.net = None
+        self._device = 'cpu'
+        self.feature_names = None
+        self.selected_indices = None  # Top-K feature indices
+        self.selected_names = None
+
+    @staticmethod
+    def create_windows(X: np.ndarray, window_size: int) -> np.ndarray:
+        """Convert (N, F) into (N - window_size + 1, window_size, F) sliding windows."""
+        n, f = X.shape
+        if n < window_size:
+            raise ValueError(f"Need at least {window_size} samples, got {n}")
+        n_windows = n - window_size + 1
+        windows = np.zeros((n_windows, window_size, f), dtype=np.float32)
+        for i in range(n_windows):
+            windows[i] = X[i:i + window_size]
+        return windows
+
+    @staticmethod
+    def compute_trend_features(windows: np.ndarray) -> np.ndarray:
+        """
+        Compute hand-crafted trend features from each window.
+        For each feature: slope (last - first), mean, std, delta (last - second-to-last).
+        Returns (N_windows, n_features * 4) trend array.
+
+        These capture temporal dynamics that attention alone struggles with
+        on small datasets.
+        """
+        n_windows, ws, n_feat = windows.shape
+        # Use vectorized operations for speed
+        # Slope: last timestep - first timestep
+        slopes = windows[:, -1, :] - windows[:, 0, :]
+        # Mean across window
+        means = windows.mean(axis=1)
+        # Std across window
+        stds = windows.std(axis=1)
+        # Recent delta: last - second-to-last
+        deltas = windows[:, -1, :] - windows[:, -2, :]
+
+        return np.hstack([slopes, means, stds, deltas]).astype(np.float32)
+
+    def _select_features(self, X: np.ndarray, feature_names: List[str]) -> Tuple[np.ndarray, List[int]]:
+        """Select top-K features using GBT importance. Returns (X_selected, indices)."""
+        try:
+            import lightgbm as lgb
+        except ImportError:
+            # Fallback: use variance-based selection
+            variances = X.var(axis=0)
+            indices = np.argsort(variances)[-self.TOP_K_FEATURES:]
+            return X[:, indices], indices.tolist()
+
+        # Quick GBT to rank features
+        n = len(X)
+        train_end = int(n * 0.7)
+        dummy_y = np.zeros(n)  # We'll use a combined importance across tasks
+
+        # Train brief action classifier for importance
+        train_ds = lgb.Dataset(X[:train_end], label=dummy_y[:train_end],
+                               feature_name=feature_names)
+        # Use variance as proxy importance (faster than training multiple GBTs)
+        variances = X.var(axis=0)
+        indices = np.argsort(variances)[-self.TOP_K_FEATURES:]
+        return X[:, indices], sorted(indices.tolist())
+
+    def train(
+        self,
+        X_train: np.ndarray, Y_train: Dict[str, np.ndarray],
+        X_val: np.ndarray, Y_val: Dict[str, np.ndarray],
+        feature_names: List[str],
+        gbt_importance: Optional[List[Tuple[str, float]]] = None,
+    ) -> Dict[str, float]:
+        """Train the temporal attention model on windowed + trend data."""
+        import torch
+        import torch.nn.functional as F
+
+        self.feature_names = feature_names
+        ws = self.window_size
+
+        # Feature selection: use GBT importance if provided, else variance
+        if gbt_importance:
+            name_to_idx = {name: i for i, name in enumerate(feature_names)}
+            indices = []
+            for name, _ in gbt_importance[:self.TOP_K_FEATURES]:
+                if name in name_to_idx:
+                    indices.append(name_to_idx[name])
+            self.selected_indices = sorted(indices)
+        else:
+            variances = X_train.var(axis=0)
+            self.selected_indices = sorted(np.argsort(variances)[-self.TOP_K_FEATURES:].tolist())
+
+        self.selected_names = [feature_names[i] for i in self.selected_indices]
+        self.n_selected = len(self.selected_indices)
+        print(f"\n  Selected {self.n_selected} features: {self.selected_names[:10]}...")
+
+        # Select features
+        X_train_sel = X_train[:, self.selected_indices]
+        X_val_sel = X_val[:, self.selected_indices]
+
+        # Create windows from selected features
+        X_train_w = self.create_windows(X_train_sel, ws)
+        X_val_w = self.create_windows(X_val_sel, ws)
+
+        # Labels: aligned to the LAST element of each window
+        Y_train_w = {k: v[ws - 1:] for k, v in Y_train.items()}
+        Y_val_w = {k: v[ws - 1:] for k, v in Y_val.items()}
+
+        # Compute trend features (slopes, means, stds, deltas)
+        trends_train = self.compute_trend_features(X_train_w)
+        trends_val = self.compute_trend_features(X_val_w)
+        n_trend_features = trends_train.shape[1]
+
+        print(f"  Windows: train={X_train_w.shape}, val={X_val_w.shape}")
+        print(f"  Trend features: {n_trend_features}")
+
+        # Z-score normalize windows
+        flat_train = X_train_w.reshape(-1, self.n_selected)
+        self._mean = flat_train.mean(axis=0)
+        self._std = flat_train.std(axis=0)
+        self._std[self._std < 1e-8] = 1.0
+
+        X_train_w = (X_train_w - self._mean) / self._std
+        X_val_w = (X_val_w - self._mean) / self._std
+
+        # Normalize trend features
+        self._trend_mean = trends_train.mean(axis=0)
+        self._trend_std = trends_train.std(axis=0)
+        self._trend_std[self._trend_std < 1e-8] = 1.0
+
+        trends_train = (trends_train - self._trend_mean) / self._trend_std
+        trends_val = (trends_val - self._trend_mean) / self._trend_std
+
+        # Device
+        if torch.backends.mps.is_available():
+            self._device = 'mps'
+        elif torch.cuda.is_available():
+            self._device = 'cuda'
+        device = torch.device(self._device)
+
+        # Build model
+        self.net = TemporalAttentionNet(
+            n_features=self.n_selected, n_trend_features=n_trend_features,
+            window_size=ws, d_model=24, n_heads=2, dropout=0.2,
+        ).to(device)
+
+        n_params = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+        print(f"  TemporalAttentionNet: {n_params:,} params, device={device}")
+
+        # Training setup
+        optimizer = torch.optim.AdamW(self.net.parameters(), lr=1e-3, weight_decay=0.05)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+
+        # Class weights
+        action_counts = np.bincount(Y_train_w['optimal_action'].astype(int), minlength=3)
+        action_weights = torch.FloatTensor(1.0 / (action_counts + 1)).to(device)
+        action_weights /= action_weights.sum()
+
+        bd_counts = np.bincount(Y_train_w['break_direction'].astype(int), minlength=3)
+        bd_weights = torch.FloatTensor(1.0 / (bd_counts + 1)).to(device)
+        bd_weights /= bd_weights.sum()
+
+        # Convert to tensors
+        t_train_X = torch.FloatTensor(X_train_w).to(device)
+        t_train_T = torch.FloatTensor(trends_train).to(device)
+        t_val_X = torch.FloatTensor(X_val_w).to(device)
+        t_val_T = torch.FloatTensor(trends_val).to(device)
+        t_train_action = torch.LongTensor(Y_train_w['optimal_action']).to(device)
+        t_val_action = torch.LongTensor(Y_val_w['optimal_action']).to(device)
+        t_train_bd = torch.LongTensor(Y_train_w['break_direction']).to(device)
+        t_val_bd = torch.LongTensor(Y_val_w['break_direction']).to(device)
+        t_train_lt = torch.FloatTensor(Y_train_w['channel_lifetime']).to(device)
+        t_val_lt = torch.FloatTensor(Y_val_w['channel_lifetime']).to(device)
+
+        best_val_loss = float('inf')
+        best_state = None
+        patience = 50
+        no_improve = 0
+        batch_size = 64
+        metrics = {}
+
+        for epoch in range(300):
+            self.net.train()
+            perm = torch.randperm(len(t_train_X))
+            epoch_loss = 0
+            n_batches = 0
+
+            for start in range(0, len(t_train_X), batch_size):
+                idx = perm[start:start + batch_size]
+                out = self.net(t_train_X[idx], t_train_T[idx])
+
+                loss_action = F.cross_entropy(out['action_logits'], t_train_action[idx],
+                                              weight=action_weights)
+                loss_bd = F.cross_entropy(out['break_dir_logits'], t_train_bd[idx],
+                                          weight=bd_weights)
+                loss_lt = F.l1_loss(out['lifetime'], t_train_lt[idx])
+
+                loss = loss_action + loss_bd + 0.01 * loss_lt
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            scheduler.step()
+
+            # Validation every 10 epochs
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                self.net.eval()
+                with torch.no_grad():
+                    val_out = self.net(t_val_X, t_val_T)
+                    val_loss_a = F.cross_entropy(val_out['action_logits'], t_val_action).item()
+                    val_loss_bd = F.cross_entropy(val_out['break_dir_logits'], t_val_bd).item()
+                    val_loss_lt = F.l1_loss(val_out['lifetime'], t_val_lt).item()
+                    val_loss = val_loss_a + val_loss_bd + 0.01 * val_loss_lt
+
+                    val_action_acc = (val_out['action_logits'].argmax(1) == t_val_action).float().mean().item()
+                    val_bd_acc = (val_out['break_dir_logits'].argmax(1) == t_val_bd).float().mean().item()
+                    attn = val_out['attn_weights'].mean(0).cpu().numpy()
+
+                if (epoch + 1) % 50 == 0 or epoch == 0:
+                    attn_str = ' '.join(f'{a:.2f}' for a in attn)
+                    print(f"    Epoch {epoch+1:3d}/300 | Loss: {val_loss:.4f} | "
+                          f"Act: {val_action_acc:.1%} | BD: {val_bd_acc:.1%} | "
+                          f"LT_MAE: {val_loss_lt:.1f} | Attn: [{attn_str}]")
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state = {k: v.cpu().clone() for k, v in self.net.state_dict().items()}
+                    no_improve = 0
+                else:
+                    no_improve += 10
+
+                if no_improve >= patience:
+                    print(f"    Early stopping at epoch {epoch + 1}")
+                    break
+
+        # Load best weights
+        if best_state:
+            self.net.load_state_dict(best_state)
+
+        # Final evaluation
+        self.net.eval()
+        with torch.no_grad():
+            val_out = self.net(t_val_X, t_val_T)
+            val_action_pred = val_out['action_logits'].argmax(1).cpu().numpy()
+            val_bd_pred = val_out['break_dir_logits'].argmax(1).cpu().numpy()
+            val_lt_pred = val_out['lifetime'].cpu().numpy()
+
+        metrics['action_accuracy'] = float(np.mean(val_action_pred == Y_val_w['optimal_action'].astype(int)))
+        metrics['break_dir_accuracy'] = float(np.mean(val_bd_pred == Y_val_w['break_direction'].astype(int)))
+        metrics['lifetime_mae'] = float(np.mean(np.abs(val_lt_pred - Y_val_w['channel_lifetime'])))
+        metrics['best_val_loss'] = float(best_val_loss)
+
+        print(f"\n  Temporal Attention Results:")
+        print(f"    Action accuracy: {metrics['action_accuracy']:.1%}")
+        print(f"    Break dir accuracy: {metrics['break_dir_accuracy']:.1%}")
+        print(f"    Lifetime MAE: {metrics['lifetime_mae']:.1f} bars")
+
+        # Attention analysis
+        with torch.no_grad():
+            val_out = self.net(t_val_X, t_val_T)
+            attn = val_out['attn_weights'].mean(0).cpu().numpy()
+        print(f"    Attention weights (recent→old): {' '.join(f'{a:.3f}' for a in attn)}")
+        most_attended = np.argmax(attn)
+        print(f"    Most attended: t-{most_attended} (0=most recent)")
+
+        return metrics
+
+    def predict(self, X_window: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Predict from a window of full features (will select features internally).
+        X_window: (N, window_size, n_all_features) or (window_size, n_all_features)
+        """
+        import torch
+
+        if X_window.ndim == 2:
+            X_window = X_window[np.newaxis, :, :]
+
+        # Select features
+        X_sel = X_window[:, :, self.selected_indices]
+
+        # Compute trends
+        trends = self.compute_trend_features(X_sel)
+
+        # Normalize
+        X_norm = (X_sel - self._mean) / self._std
+        trends_norm = (trends - self._trend_mean) / self._trend_std
+
+        device = torch.device(self._device)
+        self.net.eval()
+        with torch.no_grad():
+            t_X = torch.FloatTensor(X_norm).to(device)
+            t_T = torch.FloatTensor(trends_norm).to(device)
+            out = self.net(t_X, t_T)
+
+        return {
+            'action': out['action_logits'].argmax(1).cpu().numpy(),
+            'break_dir': out['break_dir_logits'].argmax(1).cpu().numpy(),
+            'lifetime': out['lifetime'].cpu().numpy(),
+            'attn_weights': out['attn_weights'].cpu().numpy(),
+        }
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        torch.save({
+            'model_state_dict': self.net.state_dict(),
+            'n_features': self.n_features,
+            'n_selected': self.n_selected,
+            'window_size': self.window_size,
+            'feature_names': self.feature_names,
+            'selected_indices': self.selected_indices,
+            'selected_names': self.selected_names,
+            '_mean': self._mean,
+            '_std': self._std,
+            '_trend_mean': self._trend_mean,
+            '_trend_std': self._trend_std,
+            'n_trend_features': self._trend_mean.shape[0],
+        }, path)
+        print(f"  Saved TemporalAttentionModel to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'TemporalAttentionModel':
+        data = torch.load(path, map_location='cpu', weights_only=False)
+        model = cls(n_features=data['n_features'], window_size=data['window_size'])
+        model.n_selected = data['n_selected']
+        model.feature_names = data['feature_names']
+        model.selected_indices = data['selected_indices']
+        model.selected_names = data.get('selected_names')
+        model._mean = data['_mean']
+        model._std = data['_std']
+        model._trend_mean = data['_trend_mean']
+        model._trend_std = data['_trend_std']
+
+        model.net = TemporalAttentionNet(
+            n_features=data['n_selected'],
+            n_trend_features=data['n_trend_features'],
+            window_size=data['window_size'],
+        )
+        model.net.load_state_dict(data['model_state_dict'])
+
+        if torch.backends.mps.is_available():
+            model._device = 'mps'
+        model.net = model.net.to(torch.device(model._device))
+        model.net.eval()
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 8: Feature-Selected Trend GBT (Best of Both Worlds)
+# ---------------------------------------------------------------------------
+
+class TrendGBTModel:
+    """
+    Combines feature selection with temporal trend features in GBT.
+
+    Strategy:
+    1. Select top-K features by GBT importance (removes noise)
+    2. Create sliding windows and compute trend features (slopes, means, stds, deltas)
+    3. Concatenate: selected_features + trend_features → compact GBT
+    4. Much fewer features = better generalization with small sample counts
+
+    This is the "temporal attention but in GBT form" — captures the same
+    temporal dynamics but uses GBT's native strength on tabular data.
+    """
+
+    WINDOW_SIZE = 8
+    TOP_K = 15  # Sweet spot: 10 was too aggressive, 30 overfits
+
+    def __init__(self):
+        self.action_model = None
+        self.break_dir_model = None
+        self.lifetime_model = None
+        self.feature_names = None
+        self.selected_indices = None
+        self.selected_names = None
+        self.augmented_feature_names = None
+        self.feature_importance = {}
+
+    def train(
+        self,
+        X_train: np.ndarray, Y_train: Dict[str, np.ndarray],
+        X_val: np.ndarray, Y_val: Dict[str, np.ndarray],
+        feature_names: List[str],
+        gbt_importance: Optional[List[Tuple[str, float]]] = None,
+    ) -> Dict[str, float]:
+        """Train feature-selected trend GBT."""
+        import lightgbm as lgb
+
+        self.feature_names = feature_names
+        ws = self.WINDOW_SIZE
+        metrics = {}
+
+        # Step 1: Feature selection via GBT importance
+        if gbt_importance:
+            name_to_idx = {name: i for i, name in enumerate(feature_names)}
+            indices = []
+            for name, _ in gbt_importance[:self.TOP_K]:
+                if name in name_to_idx:
+                    indices.append(name_to_idx[name])
+            self.selected_indices = sorted(indices)
+        else:
+            variances = X_train.var(axis=0)
+            self.selected_indices = sorted(np.argsort(variances)[-self.TOP_K:].tolist())
+
+        self.selected_names = [feature_names[i] for i in self.selected_indices]
+        n_sel = len(self.selected_indices)
+        print(f"\n  Selected {n_sel} features by importance")
+        print(f"  Top features: {self.selected_names[:10]}")
+
+        # Step 2: Create windows and compute trend features
+        X_train_sel = X_train[:, self.selected_indices]
+        X_val_sel = X_val[:, self.selected_indices]
+
+        X_train_w = TemporalAttentionModel.create_windows(X_train_sel, ws)
+        X_val_w = TemporalAttentionModel.create_windows(X_val_sel, ws)
+
+        trends_train = TemporalAttentionModel.compute_trend_features(X_train_w)
+        trends_val = TemporalAttentionModel.compute_trend_features(X_val_w)
+
+        # Labels aligned to window end
+        Y_train_w = {k: v[ws - 1:] for k, v in Y_train.items()}
+        Y_val_w = {k: v[ws - 1:] for k, v in Y_val.items()}
+
+        # Step 3: Concatenate current snapshot (last in window) + trend features
+        X_train_current = X_train_sel[ws - 1:]  # Current snapshot
+        X_val_current = X_val_sel[ws - 1:]
+
+        X_train_aug = np.hstack([X_train_current, trends_train])
+        X_val_aug = np.hstack([X_val_current, trends_val])
+
+        # Build augmented feature names
+        trend_prefixes = ['slope', 'mean', 'std', 'delta']
+        trend_names = []
+        for prefix in trend_prefixes:
+            for name in self.selected_names:
+                trend_names.append(f'{prefix}_{name}')
+
+        self.augmented_feature_names = list(self.selected_names) + trend_names
+        print(f"  Augmented features: {n_sel} selected + {len(trend_names)} trends = {X_train_aug.shape[1]}")
+        print(f"  Samples: train={len(X_train_aug)}, val={len(X_val_aug)}")
+
+        # Step 4: Train GBT models
+        # Action model
+        print("\n  Training TrendGBT action model...")
+        train_ds = lgb.Dataset(X_train_aug, label=Y_train_w['optimal_action'],
+                               feature_name=self.augmented_feature_names)
+        val_ds = lgb.Dataset(X_val_aug, label=Y_val_w['optimal_action'],
+                             feature_name=self.augmented_feature_names, reference=train_ds)
+
+        params = {
+            'objective': 'multiclass',
+            'num_class': 3,
+            'metric': 'multi_logloss',
+            'num_leaves': 20,
+            'learning_rate': 0.03,
+            'min_child_samples': 8,
+            'feature_fraction': 0.8,
+            'lambda_l1': 0.1,
+            'lambda_l2': 1.0,
+            'verbose': -1,
+        }
+        self.action_model = lgb.train(
+            params, train_ds, num_boost_round=500,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(50)],
+        )
+
+        val_pred = self.action_model.predict(X_val_aug)
+        val_pred_class = np.argmax(val_pred, axis=1)
+        acc = np.mean(val_pred_class == Y_val_w['optimal_action'].astype(int))
+        metrics['action_accuracy'] = float(acc)
+        print(f"    Action accuracy: {acc:.1%}")
+
+        # Feature importance
+        importance = self.action_model.feature_importance(importance_type='gain')
+        sorted_imp = sorted(zip(self.augmented_feature_names, importance), key=lambda x: -x[1])
+        self.feature_importance['action'] = sorted_imp
+        print("    Top action features:")
+        for name, imp in sorted_imp[:10]:
+            print(f"      {name}: {imp:.0f}")
+
+        # Break direction model
+        print("\n  Training TrendGBT break direction model...")
+        train_ds = lgb.Dataset(X_train_aug, label=Y_train_w['break_direction'],
+                               feature_name=self.augmented_feature_names)
+        val_ds = lgb.Dataset(X_val_aug, label=Y_val_w['break_direction'],
+                             feature_name=self.augmented_feature_names, reference=train_ds)
+
+        self.break_dir_model = lgb.train(
+            params, train_ds, num_boost_round=500,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(50)],
+        )
+
+        val_pred = self.break_dir_model.predict(X_val_aug)
+        acc = np.mean(np.argmax(val_pred, axis=1) == Y_val_w['break_direction'].astype(int))
+        metrics['break_dir_accuracy'] = float(acc)
+        print(f"    Break dir accuracy: {acc:.1%}")
+
+        importance = self.break_dir_model.feature_importance(importance_type='gain')
+        sorted_imp = sorted(zip(self.augmented_feature_names, importance), key=lambda x: -x[1])
+        self.feature_importance['break_dir'] = sorted_imp
+
+        # Lifetime model
+        print("\n  Training TrendGBT lifetime model...")
+        reg_params = {
+            'objective': 'mae',
+            'metric': 'mae',
+            'num_leaves': 20,
+            'learning_rate': 0.03,
+            'min_child_samples': 8,
+            'feature_fraction': 0.8,
+            'lambda_l1': 0.1,
+            'verbose': -1,
+        }
+        train_ds = lgb.Dataset(X_train_aug, label=Y_train_w['channel_lifetime'],
+                               feature_name=self.augmented_feature_names)
+        val_ds = lgb.Dataset(X_val_aug, label=Y_val_w['channel_lifetime'],
+                             feature_name=self.augmented_feature_names, reference=train_ds)
+
+        self.lifetime_model = lgb.train(
+            reg_params, train_ds, num_boost_round=500,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(50)],
+        )
+
+        val_pred = self.lifetime_model.predict(X_val_aug)
+        mae = np.mean(np.abs(val_pred - Y_val_w['channel_lifetime']))
+        metrics['lifetime_mae'] = float(mae)
+        print(f"    Lifetime MAE: {mae:.1f} bars")
+
+        importance = self.lifetime_model.feature_importance(importance_type='gain')
+        sorted_imp = sorted(zip(self.augmented_feature_names, importance), key=lambda x: -x[1])
+        self.feature_importance['lifetime'] = sorted_imp
+        print("    Top lifetime features:")
+        for name, imp in sorted_imp[:10]:
+            print(f"      {name}: {imp:.0f}")
+
+        return metrics
+
+    def _build_augmented_input(self, X_window: np.ndarray) -> np.ndarray:
+        """Build augmented input from a window of full features."""
+        X_sel = X_window[:, :, self.selected_indices]
+        trends = TemporalAttentionModel.compute_trend_features(X_sel)
+        current = X_sel[:, -1, :]  # Last timestep
+        return np.hstack([current, trends])
+
+    def predict(self, X_window: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Predict from windowed full features.
+        X_window: (N, window_size, n_all_features) or (window_size, n_all_features)
+        """
+        if X_window.ndim == 2:
+            X_window = X_window[np.newaxis, :, :]
+
+        X_aug = self._build_augmented_input(X_window)
+        results = {}
+
+        if self.action_model is not None:
+            probs = self.action_model.predict(X_aug)
+            results['action'] = np.argmax(probs, axis=1).astype(np.int64)
+            results['action_probs'] = probs
+
+        if self.break_dir_model is not None:
+            probs = self.break_dir_model.predict(X_aug)
+            results['break_dir'] = np.argmax(probs, axis=1).astype(np.int64)
+
+        if self.lifetime_model is not None:
+            results['lifetime'] = self.lifetime_model.predict(X_aug)
+
+        return results
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'action_model': self.action_model,
+                'break_dir_model': self.break_dir_model,
+                'lifetime_model': self.lifetime_model,
+                'feature_names': self.feature_names,
+                'selected_indices': self.selected_indices,
+                'selected_names': self.selected_names,
+                'augmented_feature_names': self.augmented_feature_names,
+                'feature_importance': self.feature_importance,
+            }, f)
+        print(f"  Saved TrendGBTModel to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'TrendGBTModel':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.action_model = data['action_model']
+        model.break_dir_model = data['break_dir_model']
+        model.lifetime_model = data['lifetime_model']
+        model.feature_names = data['feature_names']
+        model.selected_indices = data['selected_indices']
+        model.selected_names = data['selected_names']
+        model.augmented_feature_names = data['augmented_feature_names']
+        model.feature_importance = data.get('feature_importance', {})
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -3433,6 +4144,90 @@ def train_all_architectures(
         traceback.print_exc()
         all_results['regime'] = {'error': str(e)}
 
+    # ---- Architecture 7: Temporal Attention Network ----
+    print("\n" + "=" * 70)
+    print("ARCHITECTURE 7: Temporal Attention Network")
+    print("=" * 70)
+
+    try:
+        ws = TemporalAttentionModel.WINDOW_SIZE
+        temporal_attn = TemporalAttentionModel(n_features=X_train.shape[1], window_size=ws)
+
+        # Pass GBT importance if available
+        gbt_imp = None
+        if 'gbt' in all_results and gbt.feature_importance.get('lifetime'):
+            gbt_imp = gbt.feature_importance['lifetime']
+
+        ta_metrics = temporal_attn.train(
+            X_train, Y_train_dict, X_val, Y_val_dict, feature_names,
+            gbt_importance=gbt_imp,
+        )
+        temporal_attn.save(os.path.join(output_dir, 'temporal_attention_model.pt'))
+
+        # Test evaluation (pass full features; predict() selects internally)
+        X_test_w = TemporalAttentionModel.create_windows(X_test, ws)
+        Y_test_w = {k: v[ws - 1:] for k, v in Y_test_dict.items()}
+
+        ta_test = temporal_attn.predict(X_test_w)
+        ta_metrics['test_action_acc'] = float(np.mean(
+            ta_test['action'] == Y_test_w['optimal_action'].astype(int)))
+        ta_metrics['test_break_dir_acc'] = float(np.mean(
+            ta_test['break_dir'] == Y_test_w['break_direction'].astype(int)))
+        ta_metrics['test_lifetime_mae'] = float(np.mean(np.abs(
+            ta_test['lifetime'] - Y_test_w['channel_lifetime'])))
+
+        print(f"\n  Test action accuracy: {ta_metrics['test_action_acc']:.1%}")
+        print(f"  Test break dir accuracy: {ta_metrics['test_break_dir_acc']:.1%}")
+        print(f"  Test lifetime MAE: {ta_metrics['test_lifetime_mae']:.1f} bars")
+
+        all_results['temporal_attention'] = ta_metrics
+    except Exception as e:
+        print(f"  Temporal Attention failed: {e}")
+        import traceback
+        traceback.print_exc()
+        all_results['temporal_attention'] = {'error': str(e)}
+
+    # ---- Architecture 8: Feature-Selected Trend GBT ----
+    print("\n" + "=" * 70)
+    print("ARCHITECTURE 8: Feature-Selected Trend GBT")
+    print("=" * 70)
+
+    try:
+        trend_gbt = TrendGBTModel()
+        gbt_imp = None
+        if 'gbt' in all_results and gbt.feature_importance.get('lifetime'):
+            gbt_imp = gbt.feature_importance['lifetime']
+
+        ws = TrendGBTModel.WINDOW_SIZE
+        tg_metrics = trend_gbt.train(
+            X_train, Y_train_dict, X_val, Y_val_dict, feature_names,
+            gbt_importance=gbt_imp,
+        )
+        trend_gbt.save(os.path.join(output_dir, 'trend_gbt_model.pkl'))
+
+        # Test evaluation
+        X_test_w = TemporalAttentionModel.create_windows(X_test, ws)
+        Y_test_w = {k: v[ws - 1:] for k, v in Y_test_dict.items()}
+
+        tg_test = trend_gbt.predict(X_test_w)
+        tg_metrics['test_action_acc'] = float(np.mean(
+            tg_test['action'] == Y_test_w['optimal_action'].astype(int)))
+        tg_metrics['test_break_dir_acc'] = float(np.mean(
+            tg_test['break_dir'] == Y_test_w['break_direction'].astype(int)))
+        tg_metrics['test_lifetime_mae'] = float(np.mean(np.abs(
+            tg_test['lifetime'] - Y_test_w['channel_lifetime'])))
+
+        print(f"\n  Test action accuracy: {tg_metrics['test_action_acc']:.1%}")
+        print(f"  Test break dir accuracy: {tg_metrics['test_break_dir_acc']:.1%}")
+        print(f"  Test lifetime MAE: {tg_metrics['test_lifetime_mae']:.1f} bars")
+
+        all_results['trend_gbt'] = tg_metrics
+    except Exception as e:
+        print(f"  Trend GBT failed: {e}")
+        import traceback
+        traceback.print_exc()
+        all_results['trend_gbt'] = {'error': str(e)}
+
     # ---- Compare ----
     print("\n" + "=" * 70)
     print("ARCHITECTURE COMPARISON")
@@ -3517,7 +4312,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -3595,6 +4390,38 @@ def main():
                 )
                 regime.save(os.path.join(args.output, 'regime_model.pkl'))
                 print(f"\n  Regime metrics: {regime_metrics}")
+            elif args.arch == 'temporal':
+                ws = TemporalAttentionModel.WINDOW_SIZE
+                ta = TemporalAttentionModel(n_features=X_train.shape[1], window_size=ws)
+                # Try to load GBT importance for feature selection
+                gbt_imp = None
+                gbt_path = os.path.join(args.output, 'gbt_model.pkl')
+                if os.path.exists(gbt_path):
+                    try:
+                        _gbt = GBTModel.load(gbt_path)
+                        gbt_imp = _gbt.feature_importance.get('lifetime')
+                        print("  Using GBT importance for feature selection")
+                    except Exception:
+                        pass
+                ta_metrics = ta.train(X_train, Y_train, X_val, Y_val, feature_names,
+                                      gbt_importance=gbt_imp)
+                ta.save(os.path.join(args.output, 'temporal_attention_model.pt'))
+                print(f"\n  Temporal Attention metrics: {ta_metrics}")
+            elif args.arch == 'trend_gbt':
+                trend = TrendGBTModel()
+                gbt_imp = None
+                gbt_path = os.path.join(args.output, 'gbt_model.pkl')
+                if os.path.exists(gbt_path):
+                    try:
+                        _gbt = GBTModel.load(gbt_path)
+                        gbt_imp = _gbt.feature_importance.get('lifetime')
+                        print("  Using GBT importance for feature selection")
+                    except Exception:
+                        pass
+                tg_metrics = trend.train(X_train, Y_train, X_val, Y_val, feature_names,
+                                         gbt_importance=gbt_imp)
+                trend.save(os.path.join(args.output, 'trend_gbt_model.pkl'))
+                print(f"\n  Trend GBT metrics: {tg_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

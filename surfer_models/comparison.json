@@ -14,24 +14,24 @@
     "test_action_acc": 0.4791666666666667
   },
   "survival": {
-    "concordance_index": 0.6000336577567105,
-    "best_val_loss": 5.144207954406738,
-    "median_survival_mae": 15.331658363342285,
-    "test_concordance": 0.5849107407307682,
-    "test_median_mae": 20.863636016845703
+    "concordance_index": 0.6212660926149273,
+    "best_val_loss": 5.129554748535156,
+    "median_survival_mae": 18.783920288085938,
+    "test_concordance": 0.5682974770456932,
+    "test_median_mae": 25.922727584838867
   },
   "transformer": {
-    "lifetime_mae": 63.79498839378357,
-    "break_dir_accuracy": 0.5505226254463196,
-    "action_accuracy": 0.4216027855873108,
-    "return_5_dir_acc": 0.5017421841621399,
-    "return_20_dir_acc": 0.48083624243736267,
-    "return_60_dir_acc": 0.5156794190406799,
-    "best_val_loss": 2.179032564163208,
-    "test_lifetime_mae": 63.27764129638672,
-    "test_break_dir_acc": 0.375,
-    "test_action_acc": 0.34375,
-    "test_return_20_dir_acc": 0.375
+    "lifetime_mae": 70.15306353569031,
+    "break_dir_accuracy": 0.5609756112098694,
+    "action_accuracy": 0.407665491104126,
+    "return_5_dir_acc": 0.5052264928817749,
+    "return_20_dir_acc": 0.5156794190406799,
+    "return_60_dir_acc": 0.37979093194007874,
+    "best_val_loss": 2.181424617767334,
+    "test_lifetime_mae": 66.56143951416016,
+    "test_break_dir_acc": 0.3715277777777778,
+    "test_action_acc": 0.3680555555555556,
+    "test_return_20_dir_acc": 0.4930555555555556
   },
   "trade_quality": {
     "win_accuracy": 0.6132404181184669,
@@ -66,5 +66,22 @@
     "quiet_break_dir_acc": 0.5045871559633027,
     "test_action_acc": 0.4652777777777778,
     "test_break_dir_acc": 0.4652777777777778
+  },
+  "temporal_attention": {
+    "action_accuracy": 0.4392857142857143,
+    "break_dir_accuracy": 0.4392857142857143,
+    "lifetime_mae": 72.84134674072266,
+    "best_val_loss": 2.8653363466262816,
+    "test_action_acc": 0.47686832740213525,
+    "test_break_dir_acc": 0.3594306049822064,
+    "test_lifetime_mae": 58.488746643066406
+  },
+  "trend_gbt": {
+    "action_accuracy": 0.375,
+    "break_dir_accuracy": 0.6642857142857143,
+    "lifetime_mae": 52.091083106898814,
+    "test_action_acc": 0.5444839857651246,
+    "test_break_dir_acc": 0.4804270462633452,
+    "test_lifetime_mae": 46.64352448575654
   }
 }
