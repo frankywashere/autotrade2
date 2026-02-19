@@ -149,6 +149,24 @@ def run_backtest(
     highs = tsla['high'].values
     lows = tsla['low'].values
 
+    # Compute ATR(14) for volatility-adjusted stops
+    atr_period = 14
+    tr = np.maximum(
+        highs[1:] - lows[1:],
+        np.maximum(
+            np.abs(highs[1:] - closes[:-1]),
+            np.abs(lows[1:] - closes[:-1])
+        )
+    )
+    tr = np.concatenate([[highs[0] - lows[0]], tr])  # First bar uses H-L
+    atr = np.full_like(closes, np.nan)
+    atr[atr_period - 1] = np.mean(tr[:atr_period])
+    for i in range(atr_period, len(tr)):
+        atr[i] = (atr[i - 1] * (atr_period - 1) + tr[i]) / atr_period
+    # Fill initial NaN with first valid ATR
+    first_valid = atr[atr_period - 1]
+    atr[:atr_period - 1] = first_valid
+
     trades: List[Trade] = []
     equity_curve: List[Tuple[int, float]] = []  # (bar_idx, equity)
     position: Optional[OpenPosition] = None
@@ -426,11 +444,18 @@ def run_backtest(
                 if consecutive_losses >= 4:
                     trade_size *= 0.50  # Half size after 4+ consecutive losses
 
+                # Volatility-adjusted stops: blend channel width with ATR
+                # Floor at 1.5*ATR (survive noise), cap at 2.5*ATR (don't overexpose)
+                current_atr = atr[bar]
+                atr_floor = (1.5 * current_atr) / entry_price
+                atr_cap = (2.5 * current_atr) / entry_price
+                adjusted_stop_pct = np.clip(sig.suggested_stop_pct, atr_floor, atr_cap)
+
                 if sig.action == 'BUY':
-                    stop = entry_price * (1 - sig.suggested_stop_pct)
+                    stop = entry_price * (1 - adjusted_stop_pct)
                     tp = entry_price * (1 + sig.suggested_tp_pct)
                 else:
-                    stop = entry_price * (1 + sig.suggested_stop_pct)
+                    stop = entry_price * (1 + adjusted_stop_pct)
                     tp = entry_price * (1 - sig.suggested_tp_pct)
 
                 # Breakout trades get longer max hold (trends persist)
