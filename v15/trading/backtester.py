@@ -296,8 +296,8 @@ class Backtester:
                             long_sig = horizon_signals.get('long')
                             if (long_sig
                                     and long_sig.signal_type == sig.signal_type
-                                    and long_sig.confidence >= 0.70
-                                    and sig.confidence >= 0.68):
+                                    and long_sig.confidence >= 0.73
+                                    and sig.confidence >= 0.70):
                                 # Also apply momentum filter
                                 if sig.signal_type == SignalType.LONG:
                                     if mom_1d < MOM_1D_THRESHOLD or mom_3d < MOM_3D_THRESHOLD:
