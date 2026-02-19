@@ -399,8 +399,8 @@ class Backtester:
                                         agreeing_horizons += 1
                             if total_horizons >= 2:
                                 agreement_pct = agreeing_horizons / total_horizons
-                                # 100% agreement = 1.4x, 50% = 1.0x, 0% = 0.6x
-                                cross_horizon_mult = 0.6 + agreement_pct * 0.8
+                                # 100% agreement = 1.6x, 50% = 1.0x, 0% = 0.4x
+                                cross_horizon_mult = 0.4 + agreement_pct * 1.2
                             else:
                                 cross_horizon_mult = 1.0
 
