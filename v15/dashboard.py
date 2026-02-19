@@ -1618,12 +1618,27 @@ def _render_position_gauge(position_pct: float, width_px: int = 300) -> str:
 
 
 def _render_signal_banner(signal) -> None:
-    """Render a prominent BUY/SELL/HOLD banner."""
+    """Render a prominent BUY/SELL/HOLD banner with signal type indicator."""
+    sig_type = getattr(signal, 'signal_type', 'bounce')
+    type_label = 'BREAKOUT' if sig_type == 'break' else 'BOUNCE'
+    type_icon = '&#x26A1;' if sig_type == 'break' else '&#x21C4;'  # ⚡ vs ⇄
+
     if signal.action == 'BUY':
+        # Breakout = orange-green gradient, Bounce = green gradient
+        if sig_type == 'break':
+            bg = "linear-gradient(135deg,#1a3300,#336600)"
+            border = "#76ff03"
+            glow = "#76ff03"
+        else:
+            bg = "linear-gradient(135deg,#004d1a,#00802b)"
+            border = "#00c853"
+            glow = "#00ff55"
         st.markdown(
-            f"""<div style="background:linear-gradient(135deg,#004d1a,#00802b);border:2px solid #00c853;
+            f"""<div style="background:{bg};border:2px solid {border};
             border-radius:12px;padding:20px;text-align:center;margin:10px 0;">
-            <div style="font-size:48px;font-weight:900;color:#00ff55;text-shadow:0 0 20px #00ff55;">
+            <div style="font-size:12px;font-weight:700;color:#ffcc00;letter-spacing:2px;margin-bottom:4px;">
+            {type_icon} {type_label}</div>
+            <div style="font-size:48px;font-weight:900;color:{glow};text-shadow:0 0 20px {glow};">
             BUY</div>
             <div style="font-size:18px;color:#aaffcc;margin-top:8px;">
             Confidence: {signal.confidence:.0%} | {signal.primary_tf} | Stop: {signal.suggested_stop_pct:.2%} | TP: {signal.suggested_tp_pct:.2%}
@@ -1633,10 +1648,20 @@ def _render_signal_banner(signal) -> None:
             unsafe_allow_html=True,
         )
     elif signal.action == 'SELL':
+        if sig_type == 'break':
+            bg = "linear-gradient(135deg,#330000,#661a00)"
+            border = "#ff6d00"
+            glow = "#ff6d00"
+        else:
+            bg = "linear-gradient(135deg,#4d0000,#800000)"
+            border = "#ff1744"
+            glow = "#ff4444"
         st.markdown(
-            f"""<div style="background:linear-gradient(135deg,#4d0000,#800000);border:2px solid #ff1744;
+            f"""<div style="background:{bg};border:2px solid {border};
             border-radius:12px;padding:20px;text-align:center;margin:10px 0;">
-            <div style="font-size:48px;font-weight:900;color:#ff4444;text-shadow:0 0 20px #ff4444;">
+            <div style="font-size:12px;font-weight:700;color:#ffcc00;letter-spacing:2px;margin-bottom:4px;">
+            {type_icon} {type_label}</div>
+            <div style="font-size:48px;font-weight:900;color:{glow};text-shadow:0 0 20px {glow};">
             SELL</div>
             <div style="font-size:18px;color:#ffaaaa;margin-top:8px;">
             Confidence: {signal.confidence:.0%} | {signal.primary_tf} | Stop: {signal.suggested_stop_pct:.2%} | TP: {signal.suggested_tp_pct:.2%}
@@ -1843,24 +1868,49 @@ def show_channel_surfer_tab(
         _play_alert_sound(sig.action)
     st.session_state['surfer_prev_action'] = sig.action
 
+    # --- Regime indicator ---
+    regime = getattr(analysis, 'regime', None)
+    if regime is not None:
+        regime_colors = {'ranging': '#4fc3f7', 'trending': '#ff9800', 'transitioning': '#ce93d8'}
+        r_color = regime_colors.get(regime.regime, '#888')
+        trend_arrow = '&#x2191;' if regime.trend_direction > 0 else ('&#x2193;' if regime.trend_direction < 0 else '&#x2194;')
+        st.markdown(
+            f"""<div style="text-align:center;margin:5px 0;font-size:13px;">
+            <span style="color:{r_color};font-weight:700;">Market: {regime.regime.upper()}</span>
+            <span style="color:#888;margin:0 10px;">|</span>
+            <span style="color:#aaa;">Health: {regime.avg_health:.0%}</span>
+            <span style="color:#888;margin:0 10px;">|</span>
+            <span style="color:#aaa;">Trend: {trend_arrow}</span>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
     # --- Section 1b: 5min Channel Chart ---
     if current_tsla is not None and len(current_tsla) > 0 and 'close' in current_tsla.columns:
         _show_surfer_chart(current_tsla, analysis)
 
     # --- Section 2: Signal Score Breakdown ---
-    st.subheader("Signal Components")
-    cols = st.columns(6)
+    sig_type_label = getattr(sig, 'signal_type', 'bounce').upper()
+    st.subheader(f"Signal Components ({sig_type_label})")
+    cols = st.columns(7)
     components = [
+        ("Type", sig_type_label, "bounce = mean-reversion, break = breakout"),
         ("Position", sig.position_score, "Where price sits in channel"),
-        ("Energy", sig.energy_score, "Momentum toward boundary"),
+        ("Energy", sig.energy_score, "Momentum/energy ratio"),
         ("Entropy", sig.entropy_score, "Channel predictability"),
         ("Confluence", sig.confluence_score, "Multi-TF agreement"),
         ("Timing", sig.timing_score, "Oscillation phase alignment"),
-        ("OU Revert", getattr(sig, '_ou_score', 0.0), "OU mean-reversion strength"),
+        ("Health", sig.channel_health, "Channel structural integrity"),
     ]
     for col, (name, val, help_text) in zip(cols, components):
         with col:
-            st.metric(name, f"{val:.0%}", help=help_text)
+            if isinstance(val, str):
+                color = "#4fc3f7" if val == "BOUNCE" else "#ff9800"
+                st.markdown(f"**{name}**")
+                st.markdown(f"<span style='color:{color};font-weight:bold;font-size:20px;'>{val}</span>",
+                           unsafe_allow_html=True)
+            else:
+                st.metric(name, f"{val:.0%}", help=help_text)
 
     # --- Section 3: Per-TF Channel Positions ---
     st.subheader("Channel Positions by Timeframe")
@@ -1986,6 +2036,7 @@ def show_channel_surfer_tab(
         entry = {
             'time': analysis.timestamp,
             'action': analysis.signal.action,
+            'type': getattr(analysis.signal, 'signal_type', 'bounce'),
             'confidence': analysis.signal.confidence,
             'primary_tf': analysis.signal.primary_tf,
             'reason': analysis.signal.reason,
@@ -2020,7 +2071,7 @@ def show_channel_surfer_tab(
                     from v15.core.surfer_backtest import run_backtest as surfer_backtest
                     metrics, trades, eq_curve = surfer_backtest(
                         days=bt_days,
-                        eval_interval=12,
+                        eval_interval=3,
                         max_hold_bars=60,
                         position_size=bt_pos_size,
                         min_confidence=0.45,
@@ -2061,8 +2112,22 @@ def show_channel_surfer_tab(
                 )
                 st.plotly_chart(fig_eq, use_container_width=True)
 
+            # Signal type breakdown
             if trades:
+                bounce_t = [t for t in trades if getattr(t, 'signal_type', 'bounce') == 'bounce']
+                break_t = [t for t in trades if getattr(t, 'signal_type', 'bounce') == 'break']
+                b_cols = st.columns(2)
+                if bounce_t:
+                    bwr = sum(1 for t in bounce_t if t.pnl > 0) / len(bounce_t)
+                    bpnl = sum(t.pnl for t in bounce_t)
+                    b_cols[0].metric("Bounce", f"{len(bounce_t)} trades | {bwr:.0%} WR | ${bpnl:,.0f}")
+                if break_t:
+                    kwr = sum(1 for t in break_t if t.pnl > 0) / len(break_t)
+                    kpnl = sum(t.pnl for t in break_t)
+                    b_cols[1].metric("Breakout", f"{len(break_t)} trades | {kwr:.0%} WR | ${kpnl:,.0f}")
+
                 trade_data = [{
+                    'Type': getattr(t, 'signal_type', 'bounce')[:3].upper(),
                     'Dir': t.direction,
                     'Entry$': f"${t.entry_price:.2f}",
                     'Exit$': f"${t.exit_price:.2f}",
@@ -2071,6 +2136,7 @@ def show_channel_surfer_tab(
                     'Hold': f"{t.hold_bars}b",
                     'Reason': t.exit_reason,
                     'Conf': f"{t.confidence:.2f}",
+                    'Size': f"${getattr(t, 'trade_size', 10000):,.0f}",
                 } for t in trades]
                 st.dataframe(pd.DataFrame(trade_data), hide_index=True, use_container_width=True)
 
