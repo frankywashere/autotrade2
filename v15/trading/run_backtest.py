@@ -9,6 +9,7 @@ Fetches historical TSLA/SPY/VIX data from yfinance, runs the model on each
 evaluation point, generates signals, simulates trades, and reports results.
 """
 import argparse
+import pickle
 import sys
 import time
 from pathlib import Path
@@ -16,9 +17,24 @@ from datetime import datetime
 
 import pandas as pd
 
+# Data cache path for stable backtesting iterations
+_DATA_CACHE_PATH = Path('/tmp/backtest_data_cache.pkl')
 
-def fetch_data(days: int = 60) -> tuple:
-    """Fetch historical 5-min data for TSLA, SPY, VIX from yfinance."""
+
+def fetch_data(days: int = 60, use_cache: bool = True) -> tuple:
+    """Fetch historical 5-min data for TSLA, SPY, VIX from yfinance.
+
+    If use_cache=True and a cache file exists, loads from cache for consistent
+    results across iterations. Delete /tmp/backtest_data_cache.pkl to refresh.
+    """
+    if use_cache and _DATA_CACHE_PATH.exists():
+        print(f"[DATA] Loading cached data from {_DATA_CACHE_PATH}")
+        with open(_DATA_CACHE_PATH, 'rb') as f:
+            cached = pickle.load(f)
+        tsla, spy, vix = cached['tsla'], cached['spy'], cached['vix']
+        print(f"[DATA] TSLA: {len(tsla)} bars, SPY: {len(spy)} bars, VIX: {len(vix)} bars (cached)")
+        return tsla, spy, vix
+
     import yfinance as yf
 
     period = f'{days}d'
@@ -44,6 +60,12 @@ def fetch_data(days: int = 60) -> tuple:
     spy = spy.loc[common_idx]
     vix = vix.loc[common_idx]
     print(f"[DATA] After alignment: {len(common_idx)} common bars")
+
+    # Cache for subsequent runs
+    if use_cache:
+        with open(_DATA_CACHE_PATH, 'wb') as f:
+            pickle.dump({'tsla': tsla, 'spy': spy, 'vix': vix}, f)
+        print(f"[DATA] Cached to {_DATA_CACHE_PATH}")
 
     return tsla, spy, vix
 
@@ -154,6 +176,7 @@ def run_backtest(
     max_hold_bars: int = 390,
     calibration_path: str = None,
     mode: str = 'both',
+    use_cache: bool = True,
 ):
     """Run the full backtest."""
     from v15.inference import Predictor
@@ -167,7 +190,7 @@ def run_backtest(
     print(f"[MODEL] Loaded successfully")
 
     # Fetch data
-    tsla_df, spy_df, vix_df = fetch_data(days)
+    tsla_df, spy_df, vix_df = fetch_data(days, use_cache=use_cache)
     native_data = fetch_native_tf_data()
 
     print(f"\n{'='*60}")
@@ -254,8 +277,21 @@ def main():
         '--mode', choices=['single', 'meta', 'both'], default='both',
         help='Which backtester to run (default: both)'
     )
+    parser.add_argument(
+        '--refresh', action='store_true',
+        help='Force refresh yfinance data (delete cache)'
+    )
+    parser.add_argument(
+        '--no-cache', action='store_true',
+        help='Disable data caching entirely'
+    )
 
     args = parser.parse_args()
+
+    # Handle data cache
+    if args.refresh and _DATA_CACHE_PATH.exists():
+        _DATA_CACHE_PATH.unlink()
+        print("[DATA] Cache cleared")
 
     # Auto-detect checkpoint
     checkpoint = args.checkpoint
@@ -291,6 +327,7 @@ def main():
         max_hold_bars=args.max_hold,
         calibration_path=calibration,
         mode=args.mode,
+        use_cache=not args.no_cache,
     )
 
 

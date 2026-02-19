@@ -195,6 +195,7 @@ class Backtester:
                         'bar': bar_idx,
                         'direction': pos.direction,
                         'profitable': trade.pnl > 0,
+                        'exit_price': trade.exit_price,
                     }
                     closed_strategies.append(strat_key)
 
@@ -362,6 +363,17 @@ class Backtester:
                             )
                             if in_cooldown:
                                 continue
+
+                            # Anti-chase filter for trend re-entries:
+                            # Don't re-enter LONG if price has run >1% above last exit
+                            # (prevents chasing into tops after profitable exits)
+                            if strat_key == 'trend' and last_exit['profitable']:
+                                last_px = last_exit.get('exit_price', 0)
+                                if last_px > 0:
+                                    if signal_dir == 'long' and current_price > last_px * 1.01:
+                                        continue
+                                    elif signal_dir == 'short' and current_price < last_px * 0.99:
+                                        continue
 
                         if signal.entry_urgency <= 0.3:
                             continue
