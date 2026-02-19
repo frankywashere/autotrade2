@@ -185,28 +185,38 @@ def run_backtest(
             window_high = float(np.max(window_highs))
             window_low = float(np.min(window_lows))
 
-            # Trailing stop distance (tightens as we profit)
+            # Trailing stop logic (different for bounces vs breakouts)
             entry = position.entry_price
-            trail_pct = abs(position.stop_price - entry) / entry  # Initial stop distance
-
-            # Breakout trades: wider trail, let them run
-            # Bounce trades: tighter trail, capture mean-reversion
+            initial_stop_dist = abs(position.stop_price - entry) / entry
+            tp_dist = abs(position.tp_price - entry) / entry
             is_breakout = position.signal_type == 'break'
-            trail_tighten = 0.3 if is_breakout else 0.5  # Breakout: 30% tighten, bounce: 50%
-            profit_threshold = 0.008 if is_breakout else 0.003  # Breakout needs more room
 
             if position.direction == 'BUY':
-                # Update best price
                 if window_high > position.trailing_stop:
                     position.trailing_stop = window_high
 
-                # Progressive trail: tighten as profit grows
-                profit_from_best = (position.trailing_stop - entry) / entry
-                if profit_from_best > profit_threshold:
-                    trail_from_best = position.trailing_stop * (1 - trail_pct * trail_tighten)
-                    effective_stop = max(position.stop_price, trail_from_best)
+                if is_breakout:
+                    # Breakouts: simple progressive trail (let them run)
+                    profit_from_best = (position.trailing_stop - entry) / entry
+                    if profit_from_best > 0.008:
+                        trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.3)
+                        effective_stop = max(position.stop_price, trail_from_best)
+                    else:
+                        effective_stop = position.stop_price
                 else:
-                    effective_stop = position.stop_price
+                    # Bounces: multi-stage profit locking
+                    profit_from_entry = (position.trailing_stop - entry) / entry
+                    profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+                    if profit_ratio >= 0.80:
+                        trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.15)
+                        effective_stop = max(position.stop_price, trail_from_best)
+                    elif profit_ratio >= 0.50:
+                        trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.40)
+                        effective_stop = max(position.stop_price, trail_from_best)
+                    elif profit_ratio >= 0.25:
+                        effective_stop = max(position.stop_price, entry * 0.999)
+                    else:
+                        effective_stop = position.stop_price
 
                 if window_low <= effective_stop:
                     should_exit = True
@@ -224,12 +234,26 @@ def run_backtest(
                 if position.trailing_stop == 0 or window_low < position.trailing_stop:
                     position.trailing_stop = window_low
 
-                profit_from_best = (entry - position.trailing_stop) / entry
-                if profit_from_best > profit_threshold:
-                    trail_from_best = position.trailing_stop * (1 + trail_pct * trail_tighten)
-                    effective_stop = min(position.stop_price, trail_from_best)
+                if is_breakout:
+                    profit_from_best = (entry - position.trailing_stop) / entry
+                    if profit_from_best > 0.008:
+                        trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.3)
+                        effective_stop = min(position.stop_price, trail_from_best)
+                    else:
+                        effective_stop = position.stop_price
                 else:
-                    effective_stop = position.stop_price
+                    profit_from_entry = (entry - position.trailing_stop) / entry
+                    profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+                    if profit_ratio >= 0.80:
+                        trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.15)
+                        effective_stop = min(position.stop_price, trail_from_best)
+                    elif profit_ratio >= 0.50:
+                        trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.40)
+                        effective_stop = min(position.stop_price, trail_from_best)
+                    elif profit_ratio >= 0.25:
+                        effective_stop = min(position.stop_price, entry * 1.001)
+                    else:
+                        effective_stop = position.stop_price
 
                 if window_high >= effective_stop:
                     should_exit = True
