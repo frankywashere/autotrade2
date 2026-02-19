@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -365,6 +365,31 @@ def run_backtest(
             except Exception:
                 pass
 
+        # Try to load Volatility Transition model
+        vol_model = None
+        vol_path = _os.path.join(model_dir, 'vol_transition_model.pkl')
+        if _os.path.exists(vol_path):
+            try:
+                vol_model = VolatilityTransitionModel.load(vol_path)
+                print(f"[ML] Volatility Transition model loaded")
+                ml_stats['vol_danger_skip'] = 0
+                ml_stats['vol_warning_scale'] = 0
+                ml_stats['vol_calm_boost'] = 0
+            except Exception:
+                pass
+
+        # Try to load Exit Timing model
+        exit_timing_model = None
+        exit_path = _os.path.join(model_dir, 'exit_timing_opt.pkl')
+        if _os.path.exists(exit_path):
+            try:
+                exit_timing_model = ExitTimingOptimizer.load(exit_path)
+                print(f"[ML] Exit Timing model loaded")
+                ml_stats['exit_tightened'] = 0
+                ml_stats['exit_early'] = 0
+            except Exception:
+                pass
+
     # Fetch data
     print(f"Fetching {days}d of 5-min TSLA data...")
     tsla = yf.download('TSLA', period=f'{days}d', interval='5m', progress=False)
@@ -474,6 +499,7 @@ def run_backtest(
 
     print(f"\nBacktesting from bar {start_bar} to {total_bars} (interval={eval_interval})...")
     t_start = time.time()
+    feature_vec = None  # Will be set when ML evaluates signals
 
     for bar in range(start_bar, total_bars, eval_interval):
         # Progress
@@ -499,6 +525,37 @@ def run_backtest(
 
         closed_indices = []
         for pi, position in enumerate(positions):
+            # Exit timing ML: tighten max_hold or force early exit
+            if ml_active and exit_timing_model is not None and feature_vec is not None:
+                try:
+                    if len(feature_vec) == len(ml_feature_names):
+                        et_pred = exit_timing_model.predict(feature_vec.reshape(1, -1))
+                        pnl_fcast = float(et_pred['pnl_forecast'][0])
+                        bars_held = bar - position.entry_bar
+
+                        # If P&L forecast is strongly negative AND we've held >3 bars
+                        if pnl_fcast < -0.003 and bars_held >= 4:
+                            # Reduce max_hold to force earlier timeout
+                            position.max_hold_bars = min(
+                                position.max_hold_bars,
+                                bars_held + 3  # Exit within 3 more bars
+                            )
+                            ml_stats['exit_tightened'] += 1
+
+                        # If P&L forecast is very negative, tighten stop
+                        if pnl_fcast < -0.005 and bars_held >= 2:
+                            # Move stop closer (tighter by 30%)
+                            entry = position.entry_price
+                            if position.direction == 'BUY':
+                                tighter = entry + (position.stop_price - entry) * 0.7
+                                position.stop_price = max(position.stop_price, tighter)
+                            else:
+                                tighter = entry + (position.stop_price - entry) * 0.7
+                                position.stop_price = min(position.stop_price, tighter)
+                            ml_stats['exit_early'] += 1
+                except Exception:
+                    pass
+
             result = _check_position_exit(
                 position, bar, current_price, window_high, window_low, eval_interval)
 
@@ -919,6 +976,28 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Volatility Transition: avoid entries during vol spikes
+                    if vol_model is not None:
+                        try:
+                            vol_pred = vol_model.predict(feature_vec.reshape(1, -1))
+                            spike_p = float(vol_pred['spike_prob'][0])
+                            vol_regime = str(vol_pred['vol_regime'][0])
+
+                            if vol_regime == 'danger':
+                                # High vol spike probability → strong penalty
+                                sig.confidence *= 0.65
+                                ml_stats['vol_danger_skip'] += 1
+                            elif vol_regime == 'warning':
+                                # Moderate vol risk → mild penalty
+                                sig.confidence *= 0.90
+                                ml_stats['vol_warning_scale'] += 1
+                            else:
+                                # Calm → slight boost (low vol = favorable for channel trading)
+                                sig.confidence *= 1.05
+                                ml_stats['vol_calm_boost'] += 1
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -1136,6 +1215,13 @@ def run_backtest(
         if composite_model is not None:
             print(f"    Composite agreed:   {ml_stats.get('composite_agreed', 0)}")
             print(f"    Composite filtered: {ml_stats.get('composite_filtered', 0)}")
+        if vol_model is not None:
+            print(f"    Vol danger skip:    {ml_stats.get('vol_danger_skip', 0)}")
+            print(f"    Vol warning scale:  {ml_stats.get('vol_warning_scale', 0)}")
+            print(f"    Vol calm boost:     {ml_stats.get('vol_calm_boost', 0)}")
+        if exit_timing_model is not None:
+            print(f"    Exit tightened:     {ml_stats.get('exit_tightened', 0)}")
+            print(f"    Exit early:         {ml_stats.get('exit_early', 0)}")
 
     # Breakdown by exit reason
     if trades:

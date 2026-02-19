@@ -5508,6 +5508,764 @@ class CompositeSignalScorer:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 14: Volatility Regime Transition Model
+# ---------------------------------------------------------------------------
+
+class VolatilityTransitionModel:
+    """
+    Predicts volatility regime transitions: low→high vol spikes.
+
+    Key insight from backtest: ALL 7 stop-loss trades are 100% losers.
+    These happen during sudden volatility expansions. If we can predict
+    when volatility is about to spike (1-5 bars ahead), we can:
+    - Skip entries during transition periods
+    - Tighten stops on existing positions
+    - Scale down position sizes
+
+    Uses existing features + derived volatility acceleration features.
+    Targets: binary classification (vol spike within next N bars).
+    """
+
+    def __init__(self):
+        self.spike_model = None       # Predicts vol spike within 5 bars
+        self.expansion_model = None   # Predicts sustained vol expansion (10 bars)
+        self.magnitude_model = None   # Predicts magnitude of vol change (regression)
+        self.feature_names = None
+        self.vol_feature_names = None
+
+    @staticmethod
+    def compute_vol_targets(closes: np.ndarray, atr_pcts: np.ndarray) -> dict:
+        """
+        Compute volatility transition targets from price data.
+
+        Args:
+            closes: array of close prices (aligned with feature samples)
+            atr_pcts: array of ATR-as-%-of-price values from features
+
+        Returns dict with:
+            vol_spike_5: binary - will ATR increase >40% in next 5 bars
+            vol_expansion_10: binary - will ATR increase >30% sustained over 10 bars
+            vol_change_magnitude: float - actual % change in realized vol
+        """
+        n = len(closes)
+        spike_5 = np.zeros(n, dtype=np.float32)
+        expansion_10 = np.zeros(n, dtype=np.float32)
+        magnitude = np.zeros(n, dtype=np.float32)
+
+        for i in range(n):
+            current_vol = atr_pcts[i] if atr_pcts[i] > 1e-8 else 1e-8
+
+            # Forward 5-bar realized vol (range-based)
+            end5 = min(i + 6, n)
+            if end5 - i >= 3:
+                fwd_prices = closes[i:end5]
+                fwd_returns = np.abs(np.diff(fwd_prices) / fwd_prices[:-1])
+                fwd_vol_5 = np.mean(fwd_returns) * 100  # as percentage
+                change_5 = (fwd_vol_5 - current_vol) / current_vol
+                if change_5 > 0.40:  # >40% vol increase
+                    spike_5[i] = 1.0
+
+            # Forward 10-bar sustained expansion
+            end10 = min(i + 11, n)
+            if end10 - i >= 6:
+                fwd_prices_10 = closes[i:end10]
+                fwd_returns_10 = np.abs(np.diff(fwd_prices_10) / fwd_prices_10[:-1])
+                fwd_vol_10 = np.mean(fwd_returns_10) * 100
+                change_10 = (fwd_vol_10 - current_vol) / current_vol
+                if change_10 > 0.30:  # >30% sustained vol expansion
+                    expansion_10[i] = 1.0
+                magnitude[i] = float(change_10)
+
+        return {
+            'vol_spike_5': spike_5,
+            'vol_expansion_10': expansion_10,
+            'vol_change_magnitude': magnitude,
+        }
+
+    @staticmethod
+    def derive_vol_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """
+        Derive volatility-specific features from the base feature set.
+
+        Creates acceleration/jerk features from existing volatility indicators
+        to capture the RATE OF CHANGE of volatility (not just level).
+        """
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+
+        vol_feats = []
+        vol_names = []
+
+        # 1. ATR acceleration: atr_pct is level, we want rate-of-change
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            atr = X[:, atr_idx]
+            vol_feats.append(atr)
+            vol_names.append('vol_atr_level')
+
+        # 2. Entropy features (channel entropy = disorder = vol proxy)
+        for tf in ['5min', '1h', '4h', 'daily']:
+            ent_idx = name_to_idx.get(f'{tf}_entropy')
+            if ent_idx is not None:
+                vol_feats.append(X[:, ent_idx])
+                vol_names.append(f'vol_{tf}_entropy')
+
+        # 3. Entropy delta (rate of entropy change)
+        ent_delta_idx = name_to_idx.get('entropy_delta_3bar')
+        if ent_delta_idx is not None:
+            vol_feats.append(X[:, ent_delta_idx])
+            vol_names.append('vol_entropy_accel')
+
+        # 4. Width delta (channel narrowing → imminent breakout)
+        width_delta_idx = name_to_idx.get('width_delta_3bar')
+        if width_delta_idx is not None:
+            wd = X[:, width_delta_idx]
+            vol_feats.append(wd)
+            vol_names.append('vol_width_delta')
+            # Squared width delta (captures extreme squeezes)
+            vol_feats.append(wd ** 2 * np.sign(wd))
+            vol_names.append('vol_width_delta_sq')
+
+        # 5. Break probability features (high break prob → vol transition)
+        bp_max_idx = name_to_idx.get('break_prob_max')
+        bp_wt_idx = name_to_idx.get('break_prob_weighted')
+        if bp_max_idx is not None:
+            vol_feats.append(X[:, bp_max_idx])
+            vol_names.append('vol_break_prob_max')
+        if bp_wt_idx is not None:
+            vol_feats.append(X[:, bp_wt_idx])
+            vol_names.append('vol_break_prob_weighted')
+
+        # 6. Break prob delta
+        bp_delta_idx = name_to_idx.get('break_prob_delta_3bar')
+        if bp_delta_idx is not None:
+            vol_feats.append(X[:, bp_delta_idx])
+            vol_names.append('vol_break_prob_accel')
+
+        # 7. Energy features (kinetic energy = price momentum intensity)
+        for tf in ['5min', '1h', '4h']:
+            ke_idx = name_to_idx.get(f'{tf}_kinetic_energy')
+            te_idx = name_to_idx.get(f'{tf}_total_energy')
+            if ke_idx is not None:
+                vol_feats.append(X[:, ke_idx])
+                vol_names.append(f'vol_{tf}_kinetic_energy')
+            if te_idx is not None:
+                vol_feats.append(X[:, te_idx])
+                vol_names.append(f'vol_{tf}_total_energy')
+
+        # 8. Energy delta (rising energy = building pressure)
+        energy_delta_idx = name_to_idx.get('energy_delta_3bar')
+        if energy_delta_idx is not None:
+            ed = X[:, energy_delta_idx]
+            vol_feats.append(ed)
+            vol_names.append('vol_energy_accel')
+
+        # 9. Squeeze features (squeeze = vol compression → expansion imminent)
+        sq_any_idx = name_to_idx.get('squeeze_any')
+        if sq_any_idx is not None:
+            vol_feats.append(X[:, sq_any_idx])
+            vol_names.append('vol_squeeze_any')
+        for tf in ['5min', '1h', '4h']:
+            sq_idx = name_to_idx.get(f'{tf}_squeeze_score')
+            if sq_idx is not None:
+                vol_feats.append(X[:, sq_idx])
+                vol_names.append(f'vol_{tf}_squeeze')
+
+        # 10. Volume surge (volume spike often precedes vol expansion)
+        vr_idx = name_to_idx.get('volume_ratio_20')
+        vt_idx = name_to_idx.get('volume_trend_5')
+        vm_idx = name_to_idx.get('vol_momentum_3bar')
+        if vr_idx is not None:
+            vol_feats.append(X[:, vr_idx])
+            vol_names.append('vol_volume_ratio')
+        if vt_idx is not None:
+            vol_feats.append(X[:, vt_idx])
+            vol_names.append('vol_volume_trend')
+        if vm_idx is not None:
+            vol_feats.append(X[:, vm_idx])
+            vol_names.append('vol_volume_momentum')
+
+        # 11. RSI extremes (oversold/overbought → reversal → vol spike)
+        rsi_idx = name_to_idx.get('rsi_14')
+        if rsi_idx is not None:
+            rsi = X[:, rsi_idx]
+            vol_feats.append(rsi)
+            vol_names.append('vol_rsi')
+            # Distance from neutral (50) — extremes predict vol
+            vol_feats.append(np.abs(rsi - 50.0))
+            vol_names.append('vol_rsi_extremity')
+
+        # 12. VIX features
+        vix_idx = name_to_idx.get('vix_level')
+        vix_chg_idx = name_to_idx.get('vix_change_5d')
+        if vix_idx is not None:
+            vol_feats.append(X[:, vix_idx])
+            vol_names.append('vol_vix_level')
+        if vix_chg_idx is not None:
+            vol_feats.append(X[:, vix_chg_idx])
+            vol_names.append('vol_vix_change')
+
+        # 13. Health min/spread (divergent TF health → unstable = vol)
+        hmin_idx = name_to_idx.get('health_min')
+        hspread_idx = name_to_idx.get('health_spread')
+        if hmin_idx is not None:
+            vol_feats.append(X[:, hmin_idx])
+            vol_names.append('vol_health_min')
+        if hspread_idx is not None:
+            vol_feats.append(X[:, hspread_idx])
+            vol_names.append('vol_health_spread')
+
+        # 14. Health delta (deteriorating health → imminent break)
+        hd_idx = name_to_idx.get('health_delta_3bar')
+        if hd_idx is not None:
+            vol_feats.append(X[:, hd_idx])
+            vol_names.append('vol_health_accel')
+
+        # 15. Price momentum (sharp momentum → vol expansion)
+        pm3_idx = name_to_idx.get('price_momentum_3bar')
+        pm12_idx = name_to_idx.get('price_momentum_12bar')
+        if pm3_idx is not None:
+            pm3 = X[:, pm3_idx]
+            vol_feats.append(np.abs(pm3))
+            vol_names.append('vol_price_mom_abs_3')
+        if pm12_idx is not None:
+            pm12 = X[:, pm12_idx]
+            vol_feats.append(np.abs(pm12))
+            vol_names.append('vol_price_mom_abs_12')
+
+        # 16. Cross-TF interactions
+        # Entropy * break_prob (both high → very likely vol spike)
+        avg_ent_idx = name_to_idx.get('avg_entropy')
+        if avg_ent_idx is not None and bp_max_idx is not None:
+            vol_feats.append(X[:, avg_ent_idx] * X[:, bp_max_idx])
+            vol_names.append('vol_entropy_x_breakprob')
+
+        # Squeeze * energy (compressed + energetic → explosive)
+        if sq_any_idx is not None and energy_delta_idx is not None:
+            vol_feats.append(X[:, sq_any_idx] * np.abs(X[:, energy_delta_idx]))
+            vol_names.append('vol_squeeze_x_energy')
+
+        if len(vol_feats) == 0:
+            return X, feature_names  # Fallback: use all features
+
+        vol_X = np.column_stack(vol_feats)
+        return vol_X, vol_names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names,
+              closes_train=None, closes_val=None):
+        """
+        Train volatility transition models.
+
+        If closes are provided, computes vol targets from price data.
+        Otherwise uses existing return-based proxies from labels.
+        """
+        import lightgbm as lgb
+
+        self.feature_names = list(feature_names)
+
+        # Derive vol-specific features
+        vol_X_train, self.vol_feature_names = self.derive_vol_features(
+            X_train, feature_names)
+        vol_X_val, _ = self.derive_vol_features(X_val, feature_names)
+
+        # Compute targets from returns if closes not provided
+        # Use future_return_5 as proxy: large absolute returns = vol spike
+        ret5_train = Y_train['future_return_5']
+        ret20_train = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # Vol spike: |5-bar return| > 0.8% (top ~20% of moves)
+        threshold_5 = np.percentile(np.abs(ret5_train), 80)
+        spike_5_train = (np.abs(ret5_train) > threshold_5).astype(np.float32)
+        spike_5_val = (np.abs(ret5_val) > threshold_5).astype(np.float32)
+
+        # Vol expansion: |20-bar return| > 1.5% (sustained move)
+        threshold_20 = np.percentile(np.abs(ret20_train), 75)
+        expansion_train = (np.abs(ret20_train) > threshold_20).astype(np.float32)
+        expansion_val = (np.abs(ret20_val) > threshold_20).astype(np.float32)
+
+        # Magnitude: absolute 5-bar return (regression)
+        mag_train = np.abs(ret5_train).astype(np.float32)
+        mag_val = np.abs(ret5_val).astype(np.float32)
+
+        metrics = {}
+
+        print(f"\n  Vol features: {len(self.vol_feature_names)}")
+        print(f"  Spike threshold (|ret5| > {threshold_5:.4f}): "
+              f"{spike_5_train.mean():.1%} positive rate")
+        print(f"  Expansion threshold (|ret20| > {threshold_20:.4f}): "
+              f"{expansion_train.mean():.1%} positive rate")
+
+        # --- Model 1: Vol Spike (5-bar) ---
+        print("\n  Training vol_spike_5 classifier...")
+        dtrain = lgb.Dataset(vol_X_train, label=spike_5_train,
+                            feature_name=self.vol_feature_names)
+        dval = lgb.Dataset(vol_X_val, label=spike_5_val,
+                          feature_name=self.vol_feature_names, reference=dtrain)
+
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+            'is_unbalance': True,
+        }
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        self.spike_model = lgb.train(
+            params, dtrain, num_boost_round=500,
+            valid_sets=[dval], callbacks=callbacks,
+        )
+
+        spike_pred = self.spike_model.predict(vol_X_val)
+        from sklearn.metrics import roc_auc_score
+        spike_auc = roc_auc_score(spike_5_val, spike_pred)
+        metrics['spike_5_auc'] = float(spike_auc)
+        print(f"    Spike AUC: {spike_auc:.3f}")
+
+        # --- Model 2: Vol Expansion (10-bar) ---
+        print("  Training vol_expansion classifier...")
+        dtrain2 = lgb.Dataset(vol_X_train, label=expansion_train,
+                             feature_name=self.vol_feature_names)
+        dval2 = lgb.Dataset(vol_X_val, label=expansion_val,
+                           feature_name=self.vol_feature_names, reference=dtrain2)
+
+        self.expansion_model = lgb.train(
+            params, dtrain2, num_boost_round=500,
+            valid_sets=[dval2], callbacks=callbacks,
+        )
+
+        exp_pred = self.expansion_model.predict(vol_X_val)
+        exp_auc = roc_auc_score(expansion_val, exp_pred)
+        metrics['expansion_auc'] = float(exp_auc)
+        print(f"    Expansion AUC: {exp_auc:.3f}")
+
+        # --- Model 3: Vol Magnitude (regression) ---
+        print("  Training vol_magnitude regressor...")
+        dtrain3 = lgb.Dataset(vol_X_train, label=mag_train,
+                             feature_name=self.vol_feature_names)
+        dval3 = lgb.Dataset(vol_X_val, label=mag_val,
+                           feature_name=self.vol_feature_names, reference=dtrain3)
+
+        params_reg = {
+            'objective': 'regression',
+            'metric': 'mae',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+        }
+
+        self.magnitude_model = lgb.train(
+            params_reg, dtrain3, num_boost_round=500,
+            valid_sets=[dval3], callbacks=callbacks,
+        )
+
+        mag_pred = self.magnitude_model.predict(vol_X_val)
+        mag_mae = np.mean(np.abs(mag_pred - mag_val))
+        # Correlation between predicted and actual magnitude
+        mag_corr = np.corrcoef(mag_pred, mag_val)[0, 1]
+        metrics['magnitude_mae'] = float(mag_mae)
+        metrics['magnitude_corr'] = float(mag_corr)
+        print(f"    Magnitude MAE: {mag_mae:.5f}, Corr: {mag_corr:.3f}")
+
+        # Feature importance
+        imp = self.spike_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 spike features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.vol_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        """
+        Predict volatility regime transition probabilities.
+
+        Returns dict with:
+            spike_prob: probability of vol spike in next 5 bars
+            expansion_prob: probability of sustained vol expansion
+            predicted_magnitude: expected absolute return magnitude
+            vol_regime: 'calm', 'warning', 'danger' based on thresholds
+        """
+        if self.spike_model is None:
+            return {}
+
+        vol_X, _ = self.derive_vol_features(X, self.feature_names)
+
+        spike_prob = self.spike_model.predict(vol_X)
+        expansion_prob = self.expansion_model.predict(vol_X)
+        magnitude = self.magnitude_model.predict(vol_X)
+
+        # Classify regime
+        regime = np.where(
+            spike_prob > 0.6, 2,  # danger
+            np.where(spike_prob > 0.35, 1, 0)  # warning / calm
+        )
+        regime_labels = np.array(['calm', 'warning', 'danger'])
+
+        return {
+            'spike_prob': spike_prob,
+            'expansion_prob': expansion_prob,
+            'predicted_magnitude': magnitude,
+            'vol_regime': regime_labels[regime],
+            'vol_regime_id': regime,
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'spike_model': self.spike_model,
+                'expansion_model': self.expansion_model,
+                'magnitude_model': self.magnitude_model,
+                'feature_names': self.feature_names,
+                'vol_feature_names': self.vol_feature_names,
+            }, f)
+        print(f"  Saved VolatilityTransitionModel to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'VolatilityTransitionModel':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.spike_model = data['spike_model']
+        model.expansion_model = data['expansion_model']
+        model.magnitude_model = data['magnitude_model']
+        model.feature_names = data['feature_names']
+        model.vol_feature_names = data['vol_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 15: Exit Timing Optimizer
+# ---------------------------------------------------------------------------
+
+class ExitTimingOptimizer:
+    """
+    Predicts the optimal exit point DURING a trade.
+
+    Unlike entry timing (Arch 12, which failed), exit timing has stronger signal
+    because we know we're IN a position and can observe how the trade develops.
+
+    Key question: Given current features + trade state, should we:
+    1. Hold (trade still has momentum in our favor)
+    2. Tighten trail (momentum fading, protect profits)
+    3. Exit now (reversal imminent)
+
+    Features: base features + trade-specific context (bars held, unrealized P&L,
+    distance from stop, distance from TP, trail distance).
+
+    Target: Forward 5-bar P&L change from current position.
+    """
+
+    def __init__(self):
+        self.exit_classifier = None    # HOLD=0, TIGHTEN=1, EXIT=2
+        self.pnl_forecast = None       # Regression: expected 5-bar P&L change
+        self.feature_names = None
+        self.exit_feature_names = None
+
+    @staticmethod
+    def derive_exit_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """
+        Derive features relevant to exit timing from base features.
+        Focuses on momentum exhaustion and reversal signals.
+        """
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+
+        exit_feats = []
+        exit_names = []
+
+        # Momentum features
+        for key in ['price_momentum_3bar', 'price_momentum_12bar',
+                     'rsi_14', 'rsi_5', 'rsi_slope_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                exit_feats.append(X[:, idx])
+                exit_names.append(f'exit_{key}')
+
+        # RSI divergence (RSI vs momentum disagreement = exhaustion)
+        rsi_idx = name_to_idx.get('rsi_14')
+        pm3_idx = name_to_idx.get('price_momentum_3bar')
+        if rsi_idx is not None and pm3_idx is not None:
+            rsi = X[:, rsi_idx]
+            pm3 = X[:, pm3_idx]
+            # Normalize both to [-1, 1] range for comparison
+            rsi_norm = (rsi - 50.0) / 50.0
+            pm3_clip = np.clip(pm3 / 0.01, -1, 1)
+            divergence = rsi_norm - pm3_clip
+            exit_feats.append(divergence)
+            exit_names.append('exit_rsi_momentum_divergence')
+
+        # Channel health trajectory
+        for key in ['health_delta_3bar', 'health_delta_6bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                exit_feats.append(X[:, idx])
+                exit_names.append(f'exit_{key}')
+
+        # Position in channel (near boundary = potential exit point)
+        for tf in ['5min', '1h', '4h']:
+            pos_idx = name_to_idx.get(f'{tf}_position_pct')
+            if pos_idx is not None:
+                pos = X[:, pos_idx]
+                exit_feats.append(pos)
+                exit_names.append(f'exit_{tf}_position')
+                # Distance from boundary (0 or 1)
+                exit_feats.append(np.minimum(pos, 1.0 - pos))
+                exit_names.append(f'exit_{tf}_boundary_dist')
+
+        # Break probability (rising = potential reversal)
+        for key in ['break_prob_max', 'break_prob_weighted', 'break_prob_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                exit_feats.append(X[:, idx])
+                exit_names.append(f'exit_{key}')
+
+        # Entropy (rising entropy = channel failing)
+        for key in ['avg_entropy', 'entropy_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                exit_feats.append(X[:, idx])
+                exit_names.append(f'exit_{key}')
+
+        # Volume features (volume drying up = momentum exhaustion)
+        for key in ['volume_ratio_20', 'volume_trend_5', 'vol_momentum_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                exit_feats.append(X[:, idx])
+                exit_names.append(f'exit_{key}')
+
+        # ATR (changing volatility affects optimal exit)
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            exit_feats.append(X[:, atr_idx])
+            exit_names.append('exit_atr_pct')
+
+        # Direction consensus (fading consensus = trend weakening)
+        dc_idx = name_to_idx.get('direction_consensus')
+        if dc_idx is not None:
+            exit_feats.append(X[:, dc_idx])
+            exit_names.append('exit_direction_consensus')
+
+        # Consecutive bars (long streak → reversal more likely)
+        for key in ['consecutive_up_bars', 'consecutive_down_bars']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                exit_feats.append(X[:, idx])
+                exit_names.append(f'exit_{key}')
+
+        if len(exit_feats) == 0:
+            return X, feature_names
+
+        return np.column_stack(exit_feats), exit_names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """
+        Train exit timing models.
+
+        Uses future returns to determine optimal action:
+        - EXIT: 5-bar return goes against direction significantly (>0.3%)
+        - TIGHTEN: 5-bar return is flat or slightly negative (-0.3% to 0%)
+        - HOLD: 5-bar return is positive (in favorable direction)
+        """
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+
+        exit_X_train, self.exit_feature_names = self.derive_exit_features(
+            X_train, feature_names)
+        exit_X_val, _ = self.derive_exit_features(X_val, feature_names)
+
+        ret5_train = Y_train['future_return_5']
+        ret5_val = Y_val['future_return_5']
+
+        # For exit timing, we consider BOTH directions (buy and sell trades)
+        # A "bad" outcome is large adverse move regardless of direction
+        # We use absolute return and classify:
+        # EXIT (2): return < -0.3% (adverse)
+        # TIGHTEN (1): -0.3% <= return < 0.1% (flat/slightly negative)
+        # HOLD (0): return >= 0.1% (favorable)
+
+        # Since we don't know trade direction at training time,
+        # we train on: |return| magnitude + direction of move
+        abs_ret = np.abs(ret5_train)
+
+        # Target: will the next 5 bars see a reversal (directional change)?
+        # Reversal = price moves significantly in OPPOSITE direction from recent momentum
+        pm3_idx = {n: i for i, n in enumerate(feature_names)}.get('price_momentum_3bar')
+
+        if pm3_idx is not None:
+            momentum = X_train[:, pm3_idx]
+            momentum_val = X_val[:, pm3_idx]
+
+            # Reversal: momentum positive but future return negative (or vice versa)
+            reversal_strength = -momentum * ret5_train  # Positive = reversal
+
+            # 3-class: HOLD, TIGHTEN, EXIT based on reversal strength
+            exit_target_train = np.where(
+                reversal_strength > 0.00003, 2,  # Strong reversal → EXIT
+                np.where(reversal_strength > 0.000005, 1, 0)  # Mild → TIGHTEN, else HOLD
+            ).astype(np.int32)
+
+            reversal_val = -momentum_val * ret5_val
+            exit_target_val = np.where(
+                reversal_val > 0.00003, 2,
+                np.where(reversal_val > 0.000005, 1, 0)
+            ).astype(np.int32)
+        else:
+            # Fallback: just use return thresholds
+            exit_target_train = np.where(
+                ret5_train < -0.003, 2,
+                np.where(ret5_train < 0.001, 1, 0)
+            ).astype(np.int32)
+            exit_target_val = np.where(
+                ret5_val < -0.003, 2,
+                np.where(ret5_val < 0.001, 1, 0)
+            ).astype(np.int32)
+
+        metrics = {}
+
+        print(f"\n  Exit features: {len(self.exit_feature_names)}")
+        print(f"  Target distribution (train): "
+              f"HOLD={np.mean(exit_target_train==0):.1%}, "
+              f"TIGHTEN={np.mean(exit_target_train==1):.1%}, "
+              f"EXIT={np.mean(exit_target_train==2):.1%}")
+
+        # --- Classifier: HOLD/TIGHTEN/EXIT ---
+        print("  Training exit classifier...")
+        dtrain = lgb.Dataset(exit_X_train, label=exit_target_train,
+                            feature_name=self.exit_feature_names)
+        dval = lgb.Dataset(exit_X_val, label=exit_target_val,
+                          feature_name=self.exit_feature_names, reference=dtrain)
+
+        params = {
+            'objective': 'multiclass',
+            'num_class': 3,
+            'metric': 'multi_logloss',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+        }
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        self.exit_classifier = lgb.train(
+            params, dtrain, num_boost_round=500,
+            valid_sets=[dval], callbacks=callbacks,
+        )
+
+        exit_probs = self.exit_classifier.predict(exit_X_val).reshape(-1, 3)
+        exit_pred = np.argmax(exit_probs, axis=1)
+        exit_acc = np.mean(exit_pred == exit_target_val)
+        metrics['exit_accuracy'] = float(exit_acc)
+
+        # Per-class accuracy
+        for c, name in enumerate(['HOLD', 'TIGHTEN', 'EXIT']):
+            mask = exit_target_val == c
+            if mask.sum() > 0:
+                class_acc = np.mean(exit_pred[mask] == c)
+                metrics[f'{name.lower()}_acc'] = float(class_acc)
+                print(f"    {name} accuracy: {class_acc:.1%} ({mask.sum()} samples)")
+
+        print(f"    Overall accuracy: {exit_acc:.1%}")
+
+        # --- PnL Forecast (regression) ---
+        print("  Training P&L forecaster...")
+        dtrain_reg = lgb.Dataset(exit_X_train, label=ret5_train.astype(np.float32),
+                                feature_name=self.exit_feature_names)
+        dval_reg = lgb.Dataset(exit_X_val, label=ret5_val.astype(np.float32),
+                              feature_name=self.exit_feature_names, reference=dtrain_reg)
+
+        params_reg = {
+            'objective': 'regression',
+            'metric': 'mae',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+        }
+
+        self.pnl_forecast = lgb.train(
+            params_reg, dtrain_reg, num_boost_round=500,
+            valid_sets=[dval_reg], callbacks=callbacks,
+        )
+
+        pnl_pred = self.pnl_forecast.predict(exit_X_val)
+        pnl_mae = np.mean(np.abs(pnl_pred - ret5_val))
+        pnl_corr = np.corrcoef(pnl_pred, ret5_val)[0, 1]
+        pnl_dir_acc = np.mean(np.sign(pnl_pred) == np.sign(ret5_val))
+        metrics['pnl_forecast_mae'] = float(pnl_mae)
+        metrics['pnl_forecast_corr'] = float(pnl_corr)
+        metrics['pnl_dir_acc'] = float(pnl_dir_acc)
+        print(f"    P&L MAE: {pnl_mae:.5f}, Corr: {pnl_corr:.3f}, Dir Acc: {pnl_dir_acc:.1%}")
+
+        # Feature importance
+        imp = self.exit_classifier.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 exit features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.exit_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        """
+        Predict exit timing recommendations.
+
+        Returns:
+            exit_action: 0=HOLD, 1=TIGHTEN, 2=EXIT
+            exit_probs: [hold_prob, tighten_prob, exit_prob]
+            pnl_forecast: expected 5-bar forward return
+        """
+        if self.exit_classifier is None:
+            return {}
+
+        exit_X, _ = self.derive_exit_features(X, self.feature_names)
+
+        probs = self.exit_classifier.predict(exit_X).reshape(-1, 3)
+        action = np.argmax(probs, axis=1)
+        pnl = self.pnl_forecast.predict(exit_X)
+
+        return {
+            'exit_action': action,
+            'exit_probs': probs,
+            'pnl_forecast': pnl,
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'exit_classifier': self.exit_classifier,
+                'pnl_forecast': self.pnl_forecast,
+                'feature_names': self.feature_names,
+                'exit_feature_names': self.exit_feature_names,
+            }, f)
+        print(f"  Saved ExitTimingOptimizer to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'ExitTimingOptimizer':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.exit_classifier = data['exit_classifier']
+        model.pnl_forecast = data['pnl_forecast']
+        model.feature_names = data['feature_names']
+        model.exit_feature_names = data['exit_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -6136,7 +6894,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -6280,6 +7038,20 @@ def main():
                 )
                 composite.save(os.path.join(args.output, 'composite_scorer.pkl'))
                 print(f"\n  Composite Scorer metrics: {comp_metrics}")
+            elif args.arch == 'vol_transition':
+                vol = VolatilityTransitionModel()
+                vol_metrics = vol.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                vol.save(os.path.join(args.output, 'vol_transition_model.pkl'))
+                print(f"\n  Vol Transition metrics: {vol_metrics}")
+            elif args.arch == 'exit_timing':
+                exit_opt = ExitTimingOptimizer()
+                exit_metrics = exit_opt.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                exit_opt.save(os.path.join(args.output, 'exit_timing_opt.pkl'))
+                print(f"\n  Exit Timing metrics: {exit_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
