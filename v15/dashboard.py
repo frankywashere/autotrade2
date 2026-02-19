@@ -94,6 +94,22 @@ except ImportError:
 # Import channel detection from v15 (was v7)
 from v15.core.channel import detect_channels_multi_window, select_best_channel, STANDARD_WINDOWS as V7_WINDOWS
 
+# Import Channel Surfer
+try:
+    from v15.core.channel_surfer import (
+        prepare_multi_tf_analysis,
+        ChannelAnalysis,
+        SIGNAL_TFS,
+        ZONE_OVERSOLD,
+        ZONE_LOWER,
+        ZONE_UPPER,
+        ZONE_OVERBOUGHT,
+    )
+    CHANNEL_SURFER_AVAILABLE = True
+except ImportError:
+    CHANNEL_SURFER_AVAILABLE = False
+    logger.warning("Channel Surfer not available")
+
 # Try to import streamlit-autorefresh
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -1567,6 +1583,429 @@ def show_trading_monitor_tab(
             st.dataframe(pd.DataFrame(trade_data), hide_index=True)
 
 
+# =============================================================================
+# Channel Surfer Tab
+# =============================================================================
+
+def _render_position_gauge(position_pct: float, width_px: int = 300) -> str:
+    """Render a horizontal gauge showing price position in channel as HTML."""
+    pos = max(0, min(1, position_pct))
+    pct = pos * 100
+
+    # Color based on zone
+    if pos <= ZONE_OVERSOLD:
+        color = '#00c853'  # Strong buy green
+        zone = 'STRONG BUY'
+    elif pos <= ZONE_LOWER:
+        color = '#69f0ae'  # Light buy green
+        zone = 'BUY ZONE'
+    elif pos >= ZONE_OVERBOUGHT:
+        color = '#ff1744'  # Strong sell red
+        zone = 'STRONG SELL'
+    elif pos >= ZONE_UPPER:
+        color = '#ff8a80'  # Light sell red
+        zone = 'SELL ZONE'
+    else:
+        color = '#ffab40'  # Neutral orange
+        zone = 'NEUTRAL'
+
+    return f"""
+    <div style="position:relative;height:32px;background:linear-gradient(90deg,#00c853 0%,#00c853 15%,#69f0ae 15%,#69f0ae 30%,#555 30%,#555 70%,#ff8a80 70%,#ff8a80 85%,#ff1744 85%,#ff1744 100%);border-radius:6px;width:{width_px}px;margin:2px 0;">
+        <div style="position:absolute;left:{pct}%;top:-2px;transform:translateX(-50%);width:4px;height:36px;background:white;border-radius:2px;box-shadow:0 0 4px rgba(255,255,255,0.8);"></div>
+        <div style="position:absolute;left:{pct}%;top:34px;transform:translateX(-50%);font-size:11px;color:{color};font-weight:bold;white-space:nowrap;">{pct:.0f}% {zone}</div>
+    </div>
+    """
+
+
+def _render_signal_banner(signal) -> None:
+    """Render a prominent BUY/SELL/HOLD banner."""
+    if signal.action == 'BUY':
+        st.markdown(
+            f"""<div style="background:linear-gradient(135deg,#004d1a,#00802b);border:2px solid #00c853;
+            border-radius:12px;padding:20px;text-align:center;margin:10px 0;">
+            <div style="font-size:48px;font-weight:900;color:#00ff55;text-shadow:0 0 20px #00ff55;">
+            BUY</div>
+            <div style="font-size:18px;color:#aaffcc;margin-top:8px;">
+            Confidence: {signal.confidence:.0%} | {signal.primary_tf} | Stop: {signal.suggested_stop_pct:.2%} | TP: {signal.suggested_tp_pct:.2%}
+            </div>
+            <div style="font-size:14px;color:#88cc99;margin-top:4px;">{signal.reason}</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    elif signal.action == 'SELL':
+        st.markdown(
+            f"""<div style="background:linear-gradient(135deg,#4d0000,#800000);border:2px solid #ff1744;
+            border-radius:12px;padding:20px;text-align:center;margin:10px 0;">
+            <div style="font-size:48px;font-weight:900;color:#ff4444;text-shadow:0 0 20px #ff4444;">
+            SELL</div>
+            <div style="font-size:18px;color:#ffaaaa;margin-top:8px;">
+            Confidence: {signal.confidence:.0%} | {signal.primary_tf} | Stop: {signal.suggested_stop_pct:.2%} | TP: {signal.suggested_tp_pct:.2%}
+            </div>
+            <div style="font-size:14px;color:#cc8888;margin-top:4px;">{signal.reason}</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"""<div style="background:linear-gradient(135deg,#1a1a2e,#2a2a4e);border:2px solid #555;
+            border-radius:12px;padding:16px;text-align:center;margin:10px 0;">
+            <div style="font-size:36px;font-weight:700;color:#aaa;">
+            HOLD</div>
+            <div style="font-size:14px;color:#888;margin-top:4px;">
+            {signal.reason} (conf: {signal.confidence:.0%})</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+
+def _play_alert_sound(action: str) -> None:
+    """Inject HTML5 audio to play a BUY/SELL alert sound."""
+    if action == 'BUY':
+        # Rising tone sequence
+        freq_start, freq_end = 400, 800
+    elif action == 'SELL':
+        # Falling tone sequence
+        freq_start, freq_end = 800, 400
+    else:
+        return
+
+    st.markdown(
+        f"""<script>
+        (function() {{
+            try {{
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime({freq_start}, ctx.currentTime);
+                osc.frequency.linearRampToValueAtTime({freq_end}, ctx.currentTime + 0.3);
+                gain.gain.setValueAtTime(0.3, ctx.currentTime);
+                gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+                osc.start(ctx.currentTime);
+                osc.stop(ctx.currentTime + 0.5);
+            }} catch(e) {{}}
+        }})();
+        </script>""",
+        unsafe_allow_html=True,
+    )
+
+
+def _show_surfer_chart(tsla_df, analysis):
+    """Show interactive 5min candlestick chart with channel overlay and signal markers."""
+    from v15.core.channel import detect_channels_multi_window, select_best_channel
+
+    # Show last 200 bars of 5min data
+    n_bars = min(200, len(tsla_df))
+    df_chart = tsla_df.tail(n_bars).copy()
+
+    # Detect the 5min channel
+    windows = [10, 15, 20, 30, 40]
+    try:
+        multi_ch = detect_channels_multi_window(df_chart, windows=windows)
+        best_ch, best_w = select_best_channel(multi_ch)
+    except Exception:
+        best_ch = None
+
+    fig = go.Figure()
+
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=df_chart.index,
+        open=df_chart['open'],
+        high=df_chart['high'],
+        low=df_chart['low'],
+        close=df_chart['close'],
+        name='TSLA 5min',
+        increasing_line_color='#00c853',
+        decreasing_line_color='#ff1744',
+    ))
+
+    # Channel overlay
+    if best_ch and best_ch.valid:
+        ch_len = len(best_ch.center_line)
+        ch_start = max(0, len(df_chart) - ch_len)
+        ch_idx = df_chart.index[ch_start:ch_start + ch_len]
+
+        fig.add_trace(go.Scatter(
+            x=ch_idx, y=best_ch.upper_line[:len(ch_idx)],
+            mode='lines', name='Upper',
+            line=dict(color='rgba(255,100,100,0.6)', width=1, dash='dash'),
+        ))
+        fig.add_trace(go.Scatter(
+            x=ch_idx, y=best_ch.lower_line[:len(ch_idx)],
+            mode='lines', name='Lower',
+            line=dict(color='rgba(100,255,100,0.6)', width=1, dash='dash'),
+            fill='tonexty', fillcolor='rgba(100,100,255,0.05)',
+        ))
+        fig.add_trace(go.Scatter(
+            x=ch_idx, y=best_ch.center_line[:len(ch_idx)],
+            mode='lines', name='Center',
+            line=dict(color='rgba(200,200,200,0.4)', width=1, dash='dot'),
+        ))
+
+    # Signal marker
+    sig = analysis.signal
+    if sig.action in ('BUY', 'SELL') and len(df_chart) > 0:
+        last_bar = df_chart.index[-1]
+        last_price = float(df_chart['close'].iloc[-1])
+        color = '#00ff55' if sig.action == 'BUY' else '#ff4444'
+        symbol = 'triangle-up' if sig.action == 'BUY' else 'triangle-down'
+        fig.add_trace(go.Scatter(
+            x=[last_bar], y=[last_price],
+            mode='markers+text',
+            marker=dict(size=18, color=color, symbol=symbol),
+            text=[sig.action],
+            textposition='top center' if sig.action == 'BUY' else 'bottom center',
+            textfont=dict(size=14, color=color),
+            name=sig.action,
+        ))
+
+    # Get 5min state for position annotation
+    state_5m = analysis.tf_states.get('5min')
+    title_extra = ""
+    if state_5m and state_5m.valid:
+        title_extra = f" | Pos: {state_5m.position_pct:.0%} | Health: {state_5m.channel_health:.0%} | Break: {state_5m.break_prob:.0%}"
+
+    fig.update_layout(
+        title=f"TSLA 5min Channel{title_extra}",
+        template='plotly_dark',
+        height=450,
+        xaxis_rangeslider_visible=False,
+        showlegend=False,
+        margin=dict(l=50, r=20, t=40, b=30),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def show_channel_surfer_tab(
+    current_tsla,
+    native_tf_data,
+    live_config,
+    is_live,
+):
+    """Channel Surfer tab — physics-inspired multi-TF channel trading."""
+    st.header("Channel Surfer")
+
+    if not CHANNEL_SURFER_AVAILABLE:
+        st.error("Channel Surfer module not available. Check v15/core/channel_surfer.py")
+        return
+
+    # Auto-run or manual analysis
+    auto_refresh = live_config.get('auto_refresh', False)
+
+    # Analysis button
+    run_analysis = False
+    if auto_refresh:
+        run_analysis = True
+        st.caption("Auto-analyzing on refresh...")
+    else:
+        if st.button("Analyze Channels", type="primary", key="surfer_analyze"):
+            run_analysis = True
+
+    # Get cached result or run new analysis
+    analysis = st.session_state.get('surfer_analysis')
+
+    if run_analysis:
+        with st.spinner("Running Channel Surfer analysis..."):
+            try:
+                analysis = prepare_multi_tf_analysis(
+                    native_data=native_tf_data,
+                    live_5min_tsla=current_tsla,
+                    target_tfs=['5min', '1h', '4h', 'daily', 'weekly'],
+                )
+                st.session_state['surfer_analysis'] = analysis
+                st.session_state['surfer_last_update'] = datetime.now()
+            except Exception as e:
+                st.error(f"Analysis failed: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+                return
+
+    if analysis is None:
+        st.info("Click 'Analyze Channels' to run the Channel Surfer engine, or enable auto-refresh.")
+        return
+
+    # Show last update time
+    last_update = st.session_state.get('surfer_last_update')
+    if last_update:
+        st.caption(f"Last analysis: {last_update.strftime('%H:%M:%S')}")
+
+    sig = analysis.signal
+
+    # --- Section 1: Signal Banner ---
+    _render_signal_banner(sig)
+
+    # Play audio for BUY/SELL signals (only if new)
+    prev_action = st.session_state.get('surfer_prev_action', 'HOLD')
+    if sig.action != 'HOLD' and sig.action != prev_action:
+        _play_alert_sound(sig.action)
+    st.session_state['surfer_prev_action'] = sig.action
+
+    # --- Section 1b: 5min Channel Chart ---
+    if current_tsla is not None and len(current_tsla) > 0 and 'close' in current_tsla.columns:
+        _show_surfer_chart(current_tsla, analysis)
+
+    # --- Section 2: Signal Score Breakdown ---
+    st.subheader("Signal Components")
+    cols = st.columns(6)
+    components = [
+        ("Position", sig.position_score, "Where price sits in channel"),
+        ("Energy", sig.energy_score, "Momentum toward boundary"),
+        ("Entropy", sig.entropy_score, "Channel predictability"),
+        ("Confluence", sig.confluence_score, "Multi-TF agreement"),
+        ("Timing", sig.timing_score, "Oscillation phase alignment"),
+        ("OU Revert", getattr(sig, '_ou_score', 0.0), "OU mean-reversion strength"),
+    ]
+    for col, (name, val, help_text) in zip(cols, components):
+        with col:
+            st.metric(name, f"{val:.0%}", help=help_text)
+
+    # --- Section 3: Per-TF Channel Positions ---
+    st.subheader("Channel Positions by Timeframe")
+
+    if analysis.tf_states:
+        # Sort by our preferred TF order
+        tf_order = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
+        sorted_tfs = sorted(
+            analysis.tf_states.items(),
+            key=lambda x: tf_order.index(x[0]) if x[0] in tf_order else 99,
+        )
+
+        # Visual position gauges
+        for tf, state in sorted_tfs:
+            if not state.valid:
+                continue
+
+            col1, col2, col3 = st.columns([1, 3, 2])
+            with col1:
+                dir_emoji = {'bull': '+', 'bear': '-', 'sideways': '~'}.get(state.channel_direction, '?')
+                st.markdown(f"**{tf}** ({dir_emoji})")
+
+            with col2:
+                st.markdown(
+                    _render_position_gauge(state.position_pct),
+                    unsafe_allow_html=True,
+                )
+                st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+            with col3:
+                health_color = '#00c853' if state.channel_health > 0.6 else '#ffab40' if state.channel_health > 0.3 else '#ff1744'
+                break_color = '#ff1744' if state.break_prob > 0.5 else '#ffab40' if state.break_prob > 0.3 else '#888'
+                st.markdown(
+                    f"<span style='color:{health_color};font-weight:bold;'>Health: {state.channel_health:.0%}</span> "
+                    f"| <span style='color:{break_color}'>Break: {state.break_prob:.0%}</span> "
+                    f"| OU: {state.ou_half_life:.0f}bars "
+                    f"| R2: {state.r_squared:.2f}",
+                    unsafe_allow_html=True,
+                )
+
+        # --- Section 4: Detailed TF Table ---
+        with st.expander("Detailed Per-TF Analysis", expanded=False):
+            table_data = []
+            for tf, state in sorted_tfs:
+                if not state.valid:
+                    continue
+                table_data.append({
+                    'TF': tf,
+                    'Pos': f"{state.position_pct:.0%}",
+                    'Dir': state.channel_direction,
+                    'Health': f"{state.channel_health:.0%}",
+                    'OU theta': f"{state.ou_theta:.3f}",
+                    'OU t1/2': f"{state.ou_half_life:.0f}",
+                    'Revert': f"{state.ou_reversion_score:.0%}",
+                    'Break%': f"{state.break_prob:.0%}",
+                    'PE': f"{state.potential_energy:.2f}",
+                    'KE': f"{state.kinetic_energy:.2f}",
+                    'Bind': f"{state.binding_energy:.2f}",
+                    'Entropy': f"{state.entropy:.2f}",
+                    'R2': f"{state.r_squared:.2f}",
+                    'Bounces': state.bounce_count,
+                    'Width%': f"{state.width_pct:.2f}",
+                })
+            if table_data:
+                st.dataframe(pd.DataFrame(table_data), hide_index=True, use_container_width=True)
+
+        # --- Section 5: Confluence Matrix ---
+        with st.expander("Multi-TF Confluence", expanded=False):
+            conf_data = []
+            for tf, score in analysis.confluence_matrix.items():
+                if score > 0:
+                    conf_data.append({
+                        'Timeframe': tf,
+                        'Alignment': f"{score:.0%}",
+                        'Direction': ('Bullish' if score > 0.6 else 'Bearish' if score < 0.4 else 'Neutral'),
+                    })
+            if conf_data:
+                st.dataframe(pd.DataFrame(conf_data), hide_index=True)
+            else:
+                st.info("No confluence data available")
+
+        # --- Section 6: Energy Diagram ---
+        with st.expander("Energy State Diagram", expanded=False):
+            valid_states = [(tf, s) for tf, s in sorted_tfs if s.valid]
+            if valid_states:
+                import plotly.graph_objects as go
+
+                tfs = [tf for tf, _ in valid_states]
+                pe_vals = [s.potential_energy for _, s in valid_states]
+                ke_vals = [s.kinetic_energy for _, s in valid_states]
+                bind_vals = [s.binding_energy for _, s in valid_states]
+
+                fig = go.Figure()
+                fig.add_trace(go.Bar(name='Potential Energy', x=tfs, y=pe_vals, marker_color='#ff6b35'))
+                fig.add_trace(go.Bar(name='Kinetic Energy', x=tfs, y=ke_vals, marker_color='#00b4d8'))
+                fig.add_trace(go.Scatter(
+                    name='Binding Energy', x=tfs, y=bind_vals,
+                    mode='lines+markers', marker=dict(size=10, color='#e63946'),
+                    line=dict(width=3, dash='dash'),
+                ))
+                fig.update_layout(
+                    title='Channel Energy vs Binding Energy',
+                    yaxis_title='Energy (0-1)',
+                    barmode='stack',
+                    template='plotly_dark',
+                    height=350,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption(
+                    "When total energy (PE+KE) exceeds binding energy, channel breakout is likely."
+                )
+
+    else:
+        st.warning("No valid channels detected at any timeframe.")
+
+    # --- Section 7: Signal History ---
+    if 'surfer_history' not in st.session_state:
+        st.session_state['surfer_history'] = []
+
+    # Append current signal to history
+    if analysis and analysis.signal.action != 'HOLD':
+        history = st.session_state['surfer_history']
+        entry = {
+            'time': analysis.timestamp,
+            'action': analysis.signal.action,
+            'confidence': analysis.signal.confidence,
+            'primary_tf': analysis.signal.primary_tf,
+            'reason': analysis.signal.reason,
+            'health': analysis.signal.channel_health,
+        }
+        # Don't add duplicate timestamps
+        if not history or history[-1]['time'] != entry['time']:
+            history.append(entry)
+            # Keep last 100
+            st.session_state['surfer_history'] = history[-100:]
+
+    with st.expander("Signal History", expanded=False):
+        history = st.session_state.get('surfer_history', [])
+        if history:
+            hist_df = pd.DataFrame(reversed(history))
+            st.dataframe(hist_df, hide_index=True, use_container_width=True)
+        else:
+            st.info("No BUY/SELL signals recorded yet.")
+
+
 def main():
     st.title("X23 Channel Break Predictor")
 
@@ -1706,7 +2145,7 @@ def main():
         st.session_state['last_update'] = datetime.now()
 
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "Live Prediction",
         "Channel Visualization",
         "Window Selection",
@@ -1714,6 +2153,7 @@ def main():
         "Model Info",
         "Data Explorer",
         "Trading Monitor",
+        "Channel Surfer",
     ])
 
     # Validate native TF data completeness (shared across tabs)
@@ -2331,6 +2771,14 @@ def main():
             live_config=live_config,
             is_live=is_live,
             missing_tfs=missing_tfs,
+        )
+
+    with tab8:
+        show_channel_surfer_tab(
+            current_tsla=current_tsla,
+            native_tf_data=native_tf_data,
+            live_config=live_config,
+            is_live=is_live,
         )
 
 
