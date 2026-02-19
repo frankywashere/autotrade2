@@ -205,9 +205,16 @@ def run_backtest(
     position_size: float = 10000.0,  # $10k per trade
     min_confidence: float = 0.45,
     use_multi_tf: bool = True,  # Use higher TF data for context
+    ml_model=None,              # Optional ML model for signal enhancement
 ) -> tuple:
     """
     Run Channel Surfer backtest on historical 5-min TSLA data.
+
+    If ml_model is provided, uses ML predictions to:
+    - Filter out signals where ML predicts HOLD
+    - Boost confidence when ML agrees with physics
+    - Adjust stop/TP based on predicted channel lifetime
+    - Skip trades where ML predicts imminent break in wrong direction
 
     Returns:
         (metrics, trades) tuple
@@ -215,6 +222,18 @@ def run_backtest(
     import yfinance as yf
     from v15.core.channel import detect_channels_multi_window, select_best_channel
     from v15.core.channel_surfer import analyze_channels, SIGNAL_TFS, TF_WINDOWS
+
+    ml_active = ml_model is not None
+    if ml_active:
+        from v15.core.surfer_ml import (
+            extract_tf_features, extract_cross_tf_features,
+            extract_context_features, extract_correlation_features,
+            get_feature_names, ML_TFS, PER_TF_FEATURES,
+            CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
+        )
+        ml_feature_names = get_feature_names()
+        ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0}
+        print(f"[ML] Model loaded with {len(ml_feature_names)} features")
 
     # Fetch data
     print(f"Fetching {days}d of 5-min TSLA data...")
@@ -226,11 +245,20 @@ def run_backtest(
 
     # Fetch higher TF data for context
     higher_tf_data = {}
-    if use_multi_tf:
-        for tf_label, yf_interval, yf_period in [
+    tf_list = [('1h', '1h', '2y'), ('daily', '1d', '5y')]
+    if ml_active or use_multi_tf:
+        tf_list = [
             ('1h', '1h', '2y'),
             ('daily', '1d', '5y'),
-        ]:
+        ]
+        if ml_active:
+            # ML needs 4h and weekly too
+            tf_list.extend([
+                ('weekly', '1wk', '5y'),
+            ])
+
+    if use_multi_tf or ml_active:
+        for tf_label, yf_interval, yf_period in tf_list:
             print(f"  Fetching {tf_label} data...")
             df = yf.download('TSLA', period=yf_period, interval=yf_interval, progress=False)
             if isinstance(df.columns, pd.MultiIndex):
@@ -238,6 +266,36 @@ def run_backtest(
             df.columns = [c.lower() for c in df.columns]
             higher_tf_data[tf_label] = df
             print(f"  {tf_label}: {len(df)} bars")
+
+    # Resample 1h to 4h for ML features
+    if ml_active and '1h' in higher_tf_data and '4h' not in higher_tf_data:
+        h1 = higher_tf_data['1h']
+        resampled = h1.resample('4h').agg({
+            'open': 'first', 'high': 'max', 'low': 'min',
+            'close': 'last', 'volume': 'sum',
+        }).dropna()
+        higher_tf_data['4h'] = resampled
+        print(f"  4h: {len(resampled)} bars (resampled from 1h)")
+
+    # Fetch SPY + VIX for ML correlation features
+    spy_df = None
+    vix_df = None
+    if ml_active:
+        print("  Fetching SPY for ML correlations...")
+        spy_df = yf.download('SPY', period=f'{days}d', interval='5m', progress=False)
+        if isinstance(spy_df.columns, pd.MultiIndex):
+            spy_df.columns = spy_df.columns.get_level_values(0)
+        spy_df.columns = [c.lower() for c in spy_df.columns]
+        print(f"  SPY: {len(spy_df)} bars")
+
+        try:
+            vix_df = yf.download('^VIX', period='1y', interval='1d', progress=False)
+            if isinstance(vix_df.columns, pd.MultiIndex):
+                vix_df.columns = vix_df.columns.get_level_values(0)
+            vix_df.columns = [c.lower() for c in vix_df.columns]
+            print(f"  VIX: {len(vix_df)} bars")
+        except Exception:
+            vix_df = None
 
     if len(tsla) < 200:
         print("Not enough data for backtest")
@@ -439,6 +497,93 @@ def run_backtest(
 
             sig = analysis.signal
 
+            # --- ML Enhancement ---
+            ml_prediction = None
+            if ml_active and sig.action in ('BUY', 'SELL'):
+                ml_stats['total_signals'] += 1
+                try:
+                    # Extract features
+                    num_features = len(ml_feature_names)
+                    feature_vec = np.zeros(num_features, dtype=np.float32)
+                    offset = 0
+
+                    for tf in ML_TFS:
+                        state = analysis.tf_states.get(tf)
+                        if state:
+                            tf_feats = extract_tf_features(state)
+                        else:
+                            tf_feats = np.zeros(len(PER_TF_FEATURES), dtype=np.float32)
+                        feature_vec[offset:offset + len(PER_TF_FEATURES)] = tf_feats
+                        offset += len(PER_TF_FEATURES)
+
+                    cross_feats = extract_cross_tf_features(analysis.tf_states)
+                    feature_vec[offset:offset + len(CROSS_TF_FEATURES)] = cross_feats
+                    offset += len(CROSS_TF_FEATURES)
+
+                    ctx_feats = extract_context_features(tsla, bar)
+                    feature_vec[offset:offset + len(CONTEXT_FEATURES)] = ctx_feats
+                    offset += len(CONTEXT_FEATURES)
+
+                    corr_feats = extract_correlation_features(
+                        bar, closes, spy_df=spy_df, vix_df=vix_df,
+                        tsla_index=tsla.index,
+                    )
+                    feature_vec[offset:offset + len(CORRELATION_FEATURES)] = corr_feats
+
+                    # Run ML prediction
+                    ml_prediction = ml_model.predict(feature_vec.reshape(1, -1))
+
+                    # ML Action: 0=HOLD, 1=BUY, 2=SELL
+                    if 'action' in ml_prediction:
+                        ml_action_id = int(ml_prediction['action'][0])
+                        physics_action_id = 1 if sig.action == 'BUY' else 2
+
+                        # If ML says HOLD → filter the signal
+                        if ml_action_id == 0:
+                            ml_stats['ml_filtered'] += 1
+                            continue
+
+                        # If ML agrees with physics → boost confidence
+                        if ml_action_id == physics_action_id:
+                            sig.confidence *= 1.25  # 25% boost
+                            ml_stats['ml_agreed'] += 1
+
+                        # If ML disagrees (says opposite direction) → reduce confidence
+                        elif ml_action_id != 0 and ml_action_id != physics_action_id:
+                            sig.confidence *= 0.60  # 40% penalty
+                            ml_stats['ml_filtered'] += 1
+
+                    # ML Break direction: if imminent break against our position, skip
+                    if 'break_dir' in ml_prediction:
+                        bd = int(ml_prediction['break_dir'][0])
+                        if 'lifetime' in ml_prediction:
+                            lifetime = float(ml_prediction['lifetime'][0])
+                            # If channel breaks in < 5 bars in wrong direction, skip
+                            if lifetime < 5:
+                                if sig.action == 'BUY' and bd == 2:  # Break down
+                                    ml_stats['ml_filtered'] += 1
+                                    continue
+                                elif sig.action == 'SELL' and bd == 1:  # Break up
+                                    ml_stats['ml_filtered'] += 1
+                                    continue
+
+                    # Adjust max hold based on predicted lifetime
+                    if 'lifetime' in ml_prediction:
+                        predicted_life = float(ml_prediction['lifetime'][0])
+                        # Don't hold longer than predicted channel life
+                        if predicted_life > 3:
+                            ml_max_hold = max(6, int(predicted_life * 0.8))
+                        else:
+                            ml_max_hold = None
+                    else:
+                        ml_max_hold = None
+
+                except Exception:
+                    ml_prediction = None
+                    ml_max_hold = None
+            else:
+                ml_max_hold = None
+
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
                 # Daily circuit breaker: stop trading if down $500+ today
                 if daily_breaker_active:
@@ -503,6 +648,9 @@ def run_backtest(
 
                 # Breakout trades get longer max hold (trends persist)
                 effective_max_hold = max_hold_bars * 2 if sig.signal_type == 'break' else max_hold_bars
+                # ML-adjusted max hold: don't hold past predicted channel lifetime
+                if ml_max_hold is not None:
+                    effective_max_hold = min(effective_max_hold, ml_max_hold)
 
                 # Get OU half-life from primary TF state
                 primary_state = analysis.tf_states.get(sig.primary_tf)
@@ -578,9 +726,21 @@ def run_backtest(
 
     print(f"\nCompleted in {elapsed:.1f}s")
     print(f"\n{'='*70}")
-    print(f"CHANNEL SURFER BACKTEST RESULTS")
+    title = "CHANNEL SURFER BACKTEST RESULTS"
+    if ml_active:
+        title += " [ML-ENHANCED]"
+    print(title)
     print(f"{'='*70}")
     print(metrics.summary())
+
+    if ml_active:
+        print(f"\n  ML Enhancement Stats:")
+        print(f"    Total physics signals: {ml_stats['total_signals']}")
+        print(f"    ML filtered (skipped): {ml_stats['ml_filtered']}")
+        print(f"    ML agreed (boosted):   {ml_stats['ml_agreed']}")
+        filter_rate = ml_stats['ml_filtered'] / max(ml_stats['total_signals'], 1)
+        agree_rate = ml_stats['ml_agreed'] / max(ml_stats['total_signals'], 1)
+        print(f"    Filter rate: {filter_rate:.1%} | Agree rate: {agree_rate:.1%}")
 
     # Breakdown by exit reason
     if trades:
@@ -787,9 +947,83 @@ def main():
     parser.add_argument('--max-hold', type=int, default=60, help='Max bars to hold')
     parser.add_argument('--min-conf', type=float, default=0.45, help='Minimum signal confidence')
     parser.add_argument('--walk-forward', action='store_true', help='Run walk-forward validation')
+    parser.add_argument('--ml', type=str, default=None,
+                       help='Path to ML model for signal enhancement (e.g. surfer_models/gbt_model.pkl)')
+    parser.add_argument('--ml-compare', action='store_true',
+                       help='Run both physics-only and ML-enhanced, then compare')
     args = parser.parse_args()
 
-    if args.walk_forward:
+    ml_model = None
+    if args.ml:
+        print(f"\nLoading ML model from {args.ml}...")
+        if args.ml.endswith('.pkl'):
+            from v15.core.surfer_ml import GBTModel
+            ml_model = GBTModel.load(args.ml)
+        elif 'transformer' in args.ml:
+            from v15.core.surfer_ml import MultiTFTransformer
+            ml_model = MultiTFTransformer.load(args.ml)
+        elif 'survival' in args.ml:
+            from v15.core.surfer_ml import SurvivalModel
+            ml_model = SurvivalModel.load(args.ml)
+        print(f"  Loaded: {type(ml_model).__name__}")
+
+    if args.ml_compare:
+        # Run physics-only first
+        print("\n" + "=" * 70)
+        print("RUN 1: PHYSICS-ONLY (baseline)")
+        print("=" * 70)
+        m1, t1, _ = run_backtest(
+            days=args.days, eval_interval=args.eval_interval,
+            max_hold_bars=args.max_hold, min_confidence=args.min_conf,
+        )
+
+        # Then ML-enhanced
+        if ml_model is None:
+            print("\nLoading default ML model...")
+            from v15.core.surfer_ml import GBTModel
+            import os
+            model_path = 'surfer_models/gbt_model.pkl'
+            if os.path.exists(model_path):
+                ml_model = GBTModel.load(model_path)
+            else:
+                print(f"  No model found at {model_path}. Run: python3 -m v15.core.surfer_ml train")
+                return
+
+        print("\n" + "=" * 70)
+        print("RUN 2: ML-ENHANCED")
+        print("=" * 70)
+        m2, t2, _ = run_backtest(
+            days=args.days, eval_interval=args.eval_interval,
+            max_hold_bars=args.max_hold, min_confidence=args.min_conf,
+            ml_model=ml_model,
+        )
+
+        # Compare
+        print("\n" + "=" * 70)
+        print("COMPARISON: Physics-Only vs ML-Enhanced")
+        print("=" * 70)
+        print(f"{'Metric':<20s} {'Physics':<15s} {'ML-Enhanced':<15s} {'Change':<15s}")
+        print("-" * 65)
+
+        comparisons = [
+            ('Trades', m1.total_trades, m2.total_trades),
+            ('Win Rate', f"{m1.win_rate:.0%}", f"{m2.win_rate:.0%}"),
+            ('Profit Factor', f"{m1.profit_factor:.2f}", f"{m2.profit_factor:.2f}"),
+            ('Total P&L', f"${m1.total_pnl:,.0f}", f"${m2.total_pnl:,.0f}"),
+            ('Expectancy', f"${m1.expectancy:,.2f}", f"${m2.expectancy:,.2f}"),
+            ('Max DD', f"{m1.max_drawdown_pct:.1%}", f"{m2.max_drawdown_pct:.1%}"),
+        ]
+        for name, v1, v2 in comparisons:
+            if isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+                if v1 > 0:
+                    change = f"{(v2 - v1) / v1 * 100:+.1f}%"
+                else:
+                    change = "N/A"
+                print(f"  {name:<18s} {str(v1):<15s} {str(v2):<15s} {change:<15s}")
+            else:
+                print(f"  {name:<18s} {str(v1):<15s} {str(v2):<15s}")
+
+    elif args.walk_forward:
         run_walk_forward(
             eval_interval=args.eval_interval,
             max_hold_bars=args.max_hold,
@@ -801,6 +1035,7 @@ def main():
             eval_interval=args.eval_interval,
             max_hold_bars=args.max_hold,
             min_confidence=args.min_conf,
+            ml_model=ml_model,
         )
 
 
