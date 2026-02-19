@@ -39,6 +39,8 @@ class Trade:
     primary_tf: str = ''
     signal_type: str = 'bounce'  # 'bounce' or 'break'
     trade_size: float = 10000.0
+    mae_pct: float = 0.0  # Maximum Adverse Excursion (worst unrealized loss %)
+    mfe_pct: float = 0.0  # Maximum Favorable Excursion (best unrealized gain %)
 
 
 @dataclass
@@ -56,6 +58,8 @@ class OpenPosition:
     ou_half_life: float = 5.0
     max_hold_bars: int = 60  # 5 hours max
     trailing_stop: float = 0.0  # Best price seen for trailing
+    worst_price: float = 0.0    # Worst price seen (for MAE)
+    best_price: float = 0.0     # Best price seen (for MFE)
 
 
 @dataclass
@@ -151,6 +155,7 @@ def run_backtest(
     equity = position_size * 10  # Start with 100k
     peak_equity = equity
     max_dd = 0.0
+    consecutive_losses = 0  # Track losing streak for position reduction
 
 
 
@@ -184,6 +189,18 @@ def run_backtest(
             window_lows = lows[max(0, bar - eval_interval):bar + 1]
             window_high = float(np.max(window_highs))
             window_low = float(np.min(window_lows))
+
+            # Track MAE/MFE
+            if position.direction == 'BUY':
+                if position.worst_price == 0 or window_low < position.worst_price:
+                    position.worst_price = window_low
+                if window_high > position.best_price:
+                    position.best_price = window_high
+            else:
+                if position.worst_price == 0 or window_high > position.worst_price:
+                    position.worst_price = window_high
+                if position.best_price == 0 or window_low < position.best_price:
+                    position.best_price = window_low
 
             # Trailing stop logic (different for bounces vs breakouts)
             entry = position.entry_price
@@ -280,6 +297,14 @@ def run_backtest(
 
                 pnl = pnl_pct * position.trade_size
 
+                # Compute MAE/MFE
+                if position.direction == 'BUY':
+                    mae = (position.entry_price - position.worst_price) / position.entry_price if position.worst_price > 0 else 0
+                    mfe = (position.best_price - position.entry_price) / position.entry_price if position.best_price > 0 else 0
+                else:
+                    mae = (position.worst_price - position.entry_price) / position.entry_price if position.worst_price > 0 else 0
+                    mfe = (position.entry_price - position.best_price) / position.entry_price if position.best_price > 0 else 0
+
                 trade = Trade(
                     entry_bar=position.entry_bar,
                     exit_bar=bar,
@@ -296,6 +321,8 @@ def run_backtest(
                     primary_tf=position.primary_tf,
                     signal_type=position.signal_type,
                     trade_size=position.trade_size,
+                    mae_pct=round(mae, 6),
+                    mfe_pct=round(mfe, 6),
                 )
                 trades.append(trade)
                 equity += pnl
@@ -303,6 +330,12 @@ def run_backtest(
                 peak_equity = max(peak_equity, equity)
                 dd = (peak_equity - equity) / peak_equity
                 max_dd = max(max_dd, dd)
+
+                # Track consecutive losses for position sizing
+                if pnl <= 0:
+                    consecutive_losses += 1
+                else:
+                    consecutive_losses = 0
 
                 position = None
 
@@ -387,6 +420,11 @@ def run_backtest(
                     trade_size = position_size * 1.2
                 else:
                     trade_size = position_size
+
+                # Consecutive loss protection (defensive — keep for live trading)
+                # With 0.6% max DD in backtest, this rarely activates
+                if consecutive_losses >= 4:
+                    trade_size *= 0.50  # Half size after 4+ consecutive losses
 
                 if sig.action == 'BUY':
                     stop = entry_price * (1 - sig.suggested_stop_pct)
@@ -496,6 +534,28 @@ def run_backtest(
                 print(f"  {stype:12s}: {len(type_trades):3d} trades, "
                       f"WR={type_wins/len(type_trades):.0%}, P&L=${type_pnl:,.2f}, "
                       f"avg size=${avg_size:,.0f}")
+
+        # MAE/MFE analysis (trade quality indicators)
+        maes = [t.mae_pct for t in trades if t.mae_pct > 0]
+        mfes = [t.mfe_pct for t in trades if t.mfe_pct > 0]
+        if maes and mfes:
+            winners = [t for t in trades if t.pnl > 0]
+            losers = [t for t in trades if t.pnl <= 0]
+            win_eff = [t.pnl_pct / max(t.mfe_pct, 1e-6) for t in winners if t.mfe_pct > 0]
+            loss_eff = [t.mae_pct / max(t.mfe_pct, 1e-6) for t in losers if t.mfe_pct > 0]
+            print(f"\nTrade quality (MAE/MFE):")
+            print(f"  Avg MAE: {np.mean(maes):.3%} (worst drawdown before exit)")
+            print(f"  Avg MFE: {np.mean(mfes):.3%} (best unrealized gain)")
+            if win_eff:
+                print(f"  Winner efficiency: {np.mean(win_eff):.0%} (% of MFE captured at exit)")
+            if loss_eff:
+                print(f"  Loser MAE/MFE: {np.mean(loss_eff):.1f}x (how far wrong vs best)")
+            win_maes = [t.mae_pct for t in winners if t.mae_pct > 0]
+            loss_maes = [t.mae_pct for t in losers if t.mae_pct > 0]
+            if win_maes:
+                print(f"  Winner MAE: {np.mean(win_maes):.3%}")
+            if loss_maes:
+                print(f"  Loser  MAE: {np.mean(loss_maes):.3%}")
 
     return metrics, trades, equity_curve
 
