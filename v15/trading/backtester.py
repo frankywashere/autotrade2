@@ -422,6 +422,16 @@ class Backtester:
                                 position.dollar_amount = position.shares * current_price
                                 position.fraction *= total_scale
 
+                            # Safety cap: limit max position to 500% of current equity
+                            # Prevents catastrophic single-trade losses
+                            MAX_POSITION_VALUE_PCT = 10.0
+                            max_position_value = equity * MAX_POSITION_VALUE_PCT
+                            if position.dollar_amount > max_position_value:
+                                ratio = max_position_value / position.dollar_amount
+                                position.shares = max(1, int(position.shares * ratio))
+                                position.dollar_amount = position.shares * current_price
+                                position.fraction *= ratio
+
                             new_pos = self._open_position(
                                 signal, position, current_price,
                                 current_time, bar_idx,
