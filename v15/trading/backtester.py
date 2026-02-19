@@ -395,7 +395,7 @@ class Backtester:
 
                         if position.should_trade:
                             # Confidence-based scaling
-                            conf_scale = max(0.5, min(3.0,
+                            conf_scale = max(0.5, min(5.0,
                                 0.7 + (signal.confidence - 0.72) * 100.0
                             ))
 
@@ -422,9 +422,9 @@ class Backtester:
                                 position.dollar_amount = position.shares * current_price
                                 position.fraction *= total_scale
 
-                            # Safety cap: limit max position to 500% of current equity
+                            # Safety cap: limit max position value
                             # Prevents catastrophic single-trade losses
-                            MAX_POSITION_VALUE_PCT = 10.0
+                            MAX_POSITION_VALUE_PCT = 15.0
                             max_position_value = equity * MAX_POSITION_VALUE_PCT
                             if position.dollar_amount > max_position_value:
                                 ratio = max_position_value / position.dollar_amount
