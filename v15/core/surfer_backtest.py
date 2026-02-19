@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -438,6 +438,42 @@ def run_backtest(
                 print(f"[ML] Dynamic Trail Optimizer loaded (AUC 0.700)")
                 ml_stats['trail_tightened'] = 0
                 ml_stats['trail_loosened'] = 0
+            except Exception:
+                pass
+
+        # Architecture 21: Intraday Session Model
+        session_model = None
+        session_path = _os.path.join(model_dir, 'session_model.pkl')
+        if _os.path.exists(session_path):
+            try:
+                session_model = IntradaySessionModel.load(session_path)
+                print(f"[ML] Intraday Session Model loaded (Quality AUC 0.648)")
+                ml_stats['session_boost'] = 0
+                ml_stats['session_penalty'] = 0
+            except Exception:
+                pass
+
+        # Architecture 22: Channel Maturity Predictor
+        maturity_model = None
+        maturity_path = _os.path.join(model_dir, 'maturity_model.pkl')
+        if _os.path.exists(maturity_path):
+            try:
+                maturity_model = ChannelMaturityPredictor.load(maturity_path)
+                print(f"[ML] Channel Maturity Predictor loaded (AUC 0.677)")
+                ml_stats['maturity_skip'] = 0
+                ml_stats['maturity_boost'] = 0
+            except Exception:
+                pass
+
+        # Architecture 24: Return Asymmetry Predictor
+        asymmetry_model = None
+        asymmetry_path = _os.path.join(model_dir, 'asymmetry_model.pkl')
+        if _os.path.exists(asymmetry_path):
+            try:
+                asymmetry_model = ReturnAsymmetryPredictor.load(asymmetry_path)
+                print(f"[ML] Return Asymmetry Predictor loaded (Spike AUC 0.680)")
+                ml_stats['asym_widen_stop'] = 0
+                ml_stats['asym_tighten_trail'] = 0
             except Exception:
                 pass
 
@@ -1114,6 +1150,53 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Intraday Session Model: session quality confidence scaling
+                    if session_model is not None:
+                        try:
+                            sess_pred = session_model.predict(feature_vec.reshape(1, -1))
+                            sess_quality = float(sess_pred['session_quality'][0])
+
+                            if sess_quality < 0.20:
+                                sig.confidence *= 0.80  # Poor session → reduce confidence
+                                ml_stats['session_penalty'] += 1
+                            elif sess_quality > 0.55:
+                                sig.confidence *= 1.05  # Good session → slight boost
+                                ml_stats['session_boost'] += 1
+                        except Exception:
+                            pass
+
+                    # Channel Maturity Predictor: skip mature channels or boost young ones
+                    if maturity_model is not None:
+                        try:
+                            mat_pred = maturity_model.predict(feature_vec.reshape(1, -1))
+                            mat_prob = float(mat_pred['maturity_prob'][0])
+                            rem_life = float(mat_pred['remaining_life'][0])
+
+                            if mat_prob > 0.75 and rem_life < 8:
+                                sig.confidence *= 0.75  # Channel about to break → risky
+                                ml_stats['maturity_skip'] += 1
+                            elif mat_prob < 0.20 and rem_life > 50:
+                                sig.confidence *= 1.05  # Young channel → more room
+                                ml_stats['maturity_boost'] += 1
+                        except Exception:
+                            pass
+
+                    # Return Asymmetry Predictor: adjust stops/targets based on expected move type
+                    if asymmetry_model is not None:
+                        try:
+                            asym_pred = asymmetry_model.predict(feature_vec.reshape(1, -1))
+                            spike_prob = float(asym_pred['spike_prob'][0])
+                            expected_skew = float(asym_pred['expected_skewness'][0])
+
+                            # High spike probability → widen stop to avoid stop-out
+                            if spike_prob > 0.40:
+                                # Don't change confidence, but store for exit logic
+                                ml_stats['asym_widen_stop'] += 1
+                            elif spike_prob < 0.10:
+                                ml_stats['asym_tighten_trail'] += 1
+                        except Exception:
+                            pass
+
                     # Stop Loss Predictor: disabled (60% base rate, weak discrimination)
                     # Model trained but not integrated — binary classifier too weak
                     # MAE regressor (corr 0.535) available for future stop widening
@@ -1355,6 +1438,15 @@ def run_backtest(
         if trail_model is not None:
             print(f"    Trail tightened:    {ml_stats.get('trail_tightened', 0)}")
             print(f"    Trail loosened:     {ml_stats.get('trail_loosened', 0)}")
+        if session_model is not None:
+            print(f"    Session boost:     {ml_stats.get('session_boost', 0)}")
+            print(f"    Session penalty:   {ml_stats.get('session_penalty', 0)}")
+        if maturity_model is not None:
+            print(f"    Maturity skip:     {ml_stats.get('maturity_skip', 0)}")
+            print(f"    Maturity boost:    {ml_stats.get('maturity_boost', 0)}")
+        if asymmetry_model is not None:
+            print(f"    Asym widen stop:   {ml_stats.get('asym_widen_stop', 0)}")
+            print(f"    Asym tight trail:  {ml_stats.get('asym_tighten_trail', 0)}")
 
     # Breakdown by exit reason
     if trades:
