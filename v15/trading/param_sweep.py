@@ -58,12 +58,12 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
 
     # === Phase 2: Sweep parameters using cached predictions ===
     param_grid = {
-        'min_confidence': [0.72, 0.75, 0.78],
-        'mom_1d_threshold': [0.0, -0.005],
+        'min_confidence': [0.73, 0.74, 0.75, 0.78],
+        'mom_1d_threshold': [0.0, -0.005, -0.01],
         'mom_3d_threshold': [-0.01, -0.02],
         'max_position_pct': [0.35, 0.40],
-        'bounce_min_confidence': [0.70, 0.75, 0.99],  # 0.99 = disabled
-        'reentry_cooldown': [12, 24, 48],  # bars: 1h, 2h, 4h
+        'bounce_min_confidence': [0.68, 0.70, 0.75, 0.99],
+        'reentry_cooldown': [12, 24],
     }
 
     keys = list(param_grid.keys())

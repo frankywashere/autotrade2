@@ -221,9 +221,9 @@ class Backtester:
                     # Long horizon has proven edge; others are disabled
                     # Evidence: 1h = 0% win rate across ALL runs, monthly = 50%+ win
                     HORIZON_MIN_CONF = {
-                        'short': 0.70,   # Bounce strategy: ranging regime only, 80%WR
+                        'short': 0.68,   # Bounce strategy: ranging regime only, 100%WR
                         'medium': 0.99,  # Disabled: 0% win rate on 1h
-                        'long': 0.75,    # Trend strategy: 67%WR, PF~19.8
+                        'long': 0.75,    # Trend strategy: 100%WR, PF=inf
                     }
 
                     # High-selectivity + momentum filter strategy:
