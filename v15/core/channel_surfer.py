@@ -1268,13 +1268,20 @@ def generate_signal(
     else:
         action = raw_action
 
-    # Adaptive R:R based on OU half-life and channel width
+    # Adaptive R:R based on OU theta, half-life, and channel width
     width = primary_state.width_pct / 100.0  # Convert to fraction
     dist_to_center = abs(primary_state.center_distance)  # 0 = at center, 1 = at boundary
+    theta = primary_state.ou_theta
     # Target = distance to center (the OU equilibrium point)
     suggested_tp = max(0.003, width * 0.45 * dist_to_center)
-    # Stop = outside channel boundary (catastrophic stop, not tight)
-    suggested_stop = max(0.005, width * 0.7)
+    # Stop adapts to OU theta: strong reversion → tighter stop (more reliable)
+    if theta > 0.2:
+        stop_mult = 0.55  # Strong mean-reversion → tight stop
+    elif theta > 0.1:
+        stop_mult = 0.70  # Moderate
+    else:
+        stop_mult = 0.85  # Weak — need wider stop
+    suggested_stop = max(0.005, width * stop_mult)
 
     # Build reason
     reasons = []
