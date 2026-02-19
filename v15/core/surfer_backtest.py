@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -224,16 +224,33 @@ def run_backtest(
     from v15.core.channel_surfer import analyze_channels, SIGNAL_TFS, TF_WINDOWS
 
     ml_active = ml_model is not None
+    quality_scorer = None
     if ml_active:
         from v15.core.surfer_ml import (
             extract_tf_features, extract_cross_tf_features,
             extract_context_features, extract_correlation_features,
+            extract_temporal_features, TradeQualityScorer,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
+            TEMPORAL_FEATURES,
         )
         ml_feature_names = get_feature_names()
-        ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0}
+        ml_history_buffer: List[Dict] = []
+        ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0,
+                     'quality_filtered': 0, 'quality_boosted': 0}
         print(f"[ML] Model loaded with {len(ml_feature_names)} features")
+
+        # Try to load quality scorer
+        import os as _os
+        quality_path = _os.path.join(_os.path.dirname(__file__), '..', '..', 'surfer_models', 'trade_quality_scorer.pkl')
+        if not _os.path.exists(quality_path):
+            quality_path = 'surfer_models/trade_quality_scorer.pkl'
+        if _os.path.exists(quality_path):
+            try:
+                quality_scorer = TradeQualityScorer.load(quality_path)
+                print(f"[ML] Quality scorer loaded")
+            except Exception:
+                pass
 
     # Fetch data
     print(f"Fetching {days}d of 5-min TSLA data...")
@@ -524,6 +541,29 @@ def run_backtest(
                     feature_vec[offset:offset + len(CONTEXT_FEATURES)] = ctx_feats
                     offset += len(CONTEXT_FEATURES)
 
+                    # Build snapshot for temporal features
+                    bt_snapshot = {}
+                    for tf in ML_TFS:
+                        state = analysis.tf_states.get(tf)
+                        if state and state.valid:
+                            for feat_name in PER_TF_FEATURES:
+                                val = getattr(state, feat_name, 0.0)
+                                if isinstance(val, (int, float)):
+                                    bt_snapshot[f'{tf}_{feat_name}'] = float(val)
+                    bt_snapshot['rsi_14'] = float(ctx_feats[0])
+                    bt_snapshot['volume_ratio_20'] = float(ctx_feats[2])
+
+                    temporal_feats = extract_temporal_features(
+                        bt_snapshot, ml_history_buffer,
+                        closes=closes, bar_idx=bar, eval_interval=3,
+                    )
+                    feature_vec[offset:offset + len(TEMPORAL_FEATURES)] = temporal_feats
+                    offset += len(TEMPORAL_FEATURES)
+
+                    ml_history_buffer.append(bt_snapshot)
+                    if len(ml_history_buffer) > 20:
+                        ml_history_buffer.pop(0)
+
                     corr_feats = extract_correlation_features(
                         bar, closes, spy_df=spy_df, vix_df=vix_df,
                         tsla_index=tsla.index,
@@ -608,6 +648,36 @@ def run_backtest(
                     avg_vol = tsla['volume'].iloc[max(0, bar-20):bar].mean()
                     if avg_vol > 0 and current_vol < avg_vol * 0.8:
                         continue  # Below-average volume → weak breakout
+
+                # Quality scorer: predict win probability for this exact trade
+                if quality_scorer is not None and ml_active:
+                    try:
+                        base_feats = feature_vec[:len(ml_feature_names)]
+                        qs_features = quality_scorer.feature_names or []
+                        qs_vec = np.zeros(len(qs_features), dtype=np.float32)
+                        qs_vec[:len(ml_feature_names)] = base_feats
+                        n_base = len(ml_feature_names)
+                        qs_vec[n_base + 0] = sig.confidence
+                        qs_vec[n_base + 1] = 1.0 if sig.signal_type == 'bounce' else 0.0
+                        qs_vec[n_base + 2] = 1.0 if sig.action == 'BUY' else 0.0
+                        qs_vec[n_base + 3] = sig.stop_pct if hasattr(sig, 'stop_pct') else 0.005
+                        qs_vec[n_base + 4] = sig.tp_pct if hasattr(sig, 'tp_pct') else 0.012
+                        qs_vec[n_base + 5] = 1.0
+
+                        qs_pred = quality_scorer.predict(qs_vec.reshape(1, -1))
+                        win_prob = float(qs_pred.get('win_prob', [0.5])[0])
+
+                        # Filter: skip if quality scorer is quite pessimistic
+                        if win_prob < 0.35:
+                            ml_stats['quality_filtered'] += 1
+                            continue
+
+                        # Boost: if quality scorer is very confident about a win
+                        if win_prob > 0.65:
+                            sig.confidence *= 1.15  # 15% boost
+                            ml_stats['quality_boosted'] += 1
+                    except Exception:
+                        pass  # Quality scorer failure doesn't block trade
 
                 # Enter position
                 entry_price = current_price
@@ -741,6 +811,9 @@ def run_backtest(
         filter_rate = ml_stats['ml_filtered'] / max(ml_stats['total_signals'], 1)
         agree_rate = ml_stats['ml_agreed'] / max(ml_stats['total_signals'], 1)
         print(f"    Filter rate: {filter_rate:.1%} | Agree rate: {agree_rate:.1%}")
+        if quality_scorer is not None:
+            print(f"    Quality filtered: {ml_stats.get('quality_filtered', 0)}")
+            print(f"    Quality boosted:  {ml_stats.get('quality_boosted', 0)}")
 
     # Breakdown by exit reason
     if trades:

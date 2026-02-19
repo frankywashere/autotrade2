@@ -1836,8 +1836,10 @@ def _show_ml_predictions(analysis, current_tsla, native_tf_data):
         from v15.core.surfer_ml import (
             GBTModel, extract_tf_features, extract_cross_tf_features,
             extract_context_features, extract_correlation_features,
+            extract_temporal_features,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
+            TEMPORAL_FEATURES,
         )
     except ImportError:
         return  # ML module not available
@@ -1884,11 +1886,40 @@ def _show_ml_predictions(analysis, current_tsla, native_tf_data):
         offset += len(CROSS_TF_FEATURES)
 
         # Context features from current data
+        ctx_feats = np.zeros(len(CONTEXT_FEATURES), dtype=np.float32)
         if current_tsla is not None and len(current_tsla) > 20:
             bar_idx = len(current_tsla) - 1
             ctx_feats = extract_context_features(current_tsla, bar_idx)
             feature_vec[offset:offset + len(CONTEXT_FEATURES)] = ctx_feats
         offset += len(CONTEXT_FEATURES)
+
+        # Temporal features (use session state for history buffer)
+        if 'ml_history_buffer' not in st.session_state:
+            st.session_state['ml_history_buffer'] = []
+        dash_snapshot = {}
+        for tf in ML_TFS:
+            state = analysis.tf_states.get(tf)
+            if state and state.valid:
+                for feat_name in PER_TF_FEATURES:
+                    val = getattr(state, feat_name, 0.0)
+                    if isinstance(val, (int, float)):
+                        dash_snapshot[f'{tf}_{feat_name}'] = float(val)
+        dash_snapshot['rsi_14'] = float(ctx_feats[0])
+        dash_snapshot['volume_ratio_20'] = float(ctx_feats[2])
+
+        closes_arr = current_tsla['close'].values if current_tsla is not None else None
+        temporal_feats = extract_temporal_features(
+            dash_snapshot, st.session_state['ml_history_buffer'],
+            closes=closes_arr,
+            bar_idx=len(current_tsla) - 1 if current_tsla is not None else 0,
+            eval_interval=1,
+        )
+        feature_vec[offset:offset + len(TEMPORAL_FEATURES)] = temporal_feats
+        offset += len(TEMPORAL_FEATURES)
+
+        st.session_state['ml_history_buffer'].append(dash_snapshot)
+        if len(st.session_state['ml_history_buffer']) > 20:
+            st.session_state['ml_history_buffer'].pop(0)
 
         # Correlation features (zeros for now — dashboard doesn't have SPY/VIX 5min)
         offset += len(CORRELATION_FEATURES)

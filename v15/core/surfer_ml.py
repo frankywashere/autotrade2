@@ -115,6 +115,22 @@ CONTEXT_FEATURES = [
     'minutes_since_open',     # Minutes since market open
 ]
 
+# Temporal/trajectory features (rate of change of key metrics)
+TEMPORAL_FEATURES = [
+    'pos_delta_3bar',         # Position change over 3 eval intervals
+    'pos_delta_6bar',         # Position change over 6 eval intervals
+    'health_delta_3bar',      # Health change over 3 eval intervals
+    'health_delta_6bar',      # Health change over 6 eval intervals
+    'entropy_delta_3bar',     # Entropy change (rising = channel failing)
+    'break_prob_delta_3bar',  # Break prob change (rising = imminent break)
+    'energy_delta_3bar',      # Total energy trajectory
+    'rsi_slope_5bar',         # RSI trajectory (rising/falling)
+    'price_momentum_3bar',    # Normalized price change over 3 intervals
+    'price_momentum_12bar',   # Normalized price change over 12 intervals
+    'vol_momentum_3bar',      # Volume trend over 3 intervals
+    'width_delta_3bar',       # Channel width change (narrowing = squeeze)
+]
+
 # SPY/VIX correlation features
 CORRELATION_FEATURES = [
     'spy_return_5bar',        # SPY 5-bar return
@@ -136,6 +152,8 @@ def get_feature_names() -> List[str]:
     names.extend(CROSS_TF_FEATURES)
     # Context
     names.extend(CONTEXT_FEATURES)
+    # Temporal
+    names.extend(TEMPORAL_FEATURES)
     # Correlations
     names.extend(CORRELATION_FEATURES)
     return names
@@ -359,6 +377,73 @@ def extract_context_features(
         utc_minutes = hour * 60 + dt.minute
         market_open_utc = 14 * 60 + 30
         features[13] = max(0, utc_minutes - market_open_utc)
+
+    return features
+
+
+def extract_temporal_features(
+    current_state: Dict,
+    history_buffer: List[Dict],
+    closes: Optional[np.ndarray] = None,
+    bar_idx: int = 0,
+    eval_interval: int = 3,
+) -> np.ndarray:
+    """
+    Extract temporal/trajectory features by comparing current snapshot to recent history.
+
+    Args:
+        current_state: Dict with current feature values {name: float}
+        history_buffer: List of recent feature dicts (oldest first), one per eval interval
+        closes: Price array for computing price momentum
+        bar_idx: Current bar index into closes
+        eval_interval: Bars between evaluations (for converting lookback to bar count)
+
+    Returns:
+        Array of temporal features.
+    """
+    features = np.zeros(len(TEMPORAL_FEATURES), dtype=np.float32)
+
+    def delta(key, lookback_steps):
+        """Compute feature change from lookback_steps evaluations ago to current."""
+        if lookback_steps <= len(history_buffer) and key in current_state:
+            past = history_buffer[-lookback_steps].get(key, 0)
+            return current_state.get(key, 0) - past
+        return 0.0
+
+    # Position trajectory
+    features[0] = delta('5min_position_pct', 3)
+    features[1] = delta('5min_position_pct', 6)
+
+    # Health trajectory
+    features[2] = delta('5min_channel_health', 3)
+    features[3] = delta('5min_channel_health', 6)
+
+    # Entropy trajectory (rising entropy = channel failing)
+    features[4] = delta('5min_entropy', 3)
+
+    # Break prob trajectory
+    features[5] = delta('5min_break_prob', 3)
+
+    # Energy trajectory
+    features[6] = delta('5min_total_energy', 3)
+
+    # RSI slope
+    features[7] = delta('rsi_14', 5)
+
+    # Price momentum (computed from closes, normalized by price)
+    if closes is not None and bar_idx >= 12 * eval_interval:
+        price = closes[bar_idx]
+        if price > 0:
+            bars_3 = 3 * eval_interval
+            bars_12 = 12 * eval_interval
+            features[8] = (price - closes[bar_idx - bars_3]) / price
+            features[9] = (price - closes[bar_idx - bars_12]) / price
+
+    # Volume momentum
+    features[10] = delta('volume_ratio_20', 3)
+
+    # Width trajectory
+    features[11] = delta('5min_width_pct', 3)
 
     return features
 
@@ -807,6 +892,7 @@ def generate_training_data(
     start_bar = 100
     sample_count = 0
     t_start = time.time()
+    history_buffer: List[Dict] = []  # Stores feature snapshots for temporal features
 
     if verbose:
         print(f"\nExtracting features from bar {start_bar} to {total_bars}...")
@@ -905,6 +991,31 @@ def generate_training_data(
         ctx_feats = extract_context_features(tsla, bar)
         feature_vec[offset:offset + len(CONTEXT_FEATURES)] = ctx_feats
         offset += len(CONTEXT_FEATURES)
+
+        # Build current state snapshot for temporal features
+        current_snapshot = {}
+        for tf in ML_TFS:
+            state = analysis.tf_states.get(tf)
+            if state and state.valid:
+                for feat_name in PER_TF_FEATURES:
+                    val = getattr(state, feat_name, 0.0)
+                    if isinstance(val, (int, float)):
+                        current_snapshot[f'{tf}_{feat_name}'] = float(val)
+        current_snapshot['rsi_14'] = float(ctx_feats[0])
+        current_snapshot['volume_ratio_20'] = float(ctx_feats[2])
+
+        # Temporal features
+        temporal_feats = extract_temporal_features(
+            current_snapshot, history_buffer,
+            closes=closes, bar_idx=bar, eval_interval=eval_interval,
+        )
+        feature_vec[offset:offset + len(TEMPORAL_FEATURES)] = temporal_feats
+        offset += len(TEMPORAL_FEATURES)
+
+        # Update history buffer (keep last 20 snapshots)
+        history_buffer.append(current_snapshot)
+        if len(history_buffer) > 20:
+            history_buffer.pop(0)
 
         # Correlation features
         corr_feats = extract_correlation_features(
@@ -2003,6 +2114,346 @@ class MultiTFTransformer:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 4: Trade Quality Scorer
+# ---------------------------------------------------------------------------
+
+class TradeQualityScorer:
+    """
+    Binary win/loss predictor trained on actual backtest outcomes.
+
+    Instead of predicting abstract labels (break direction, optimal action),
+    this model directly predicts whether a trade taken at the current bar
+    will be profitable, using physics features + signal metadata.
+
+    Training approach (bootstrapped learning):
+    1. Run physics-only backtest to generate trades with known outcomes
+    2. For each trade, extract ML features at entry_bar + signal metadata
+    3. Train GBT to predict: win probability, expected PnL %, exit type
+
+    Additional features beyond standard ML features:
+    - signal_confidence: physics confidence score
+    - signal_type: bounce vs break (encoded)
+    - signal_direction: BUY vs SELL (encoded)
+    - hour_of_day, day_of_week (from entry time)
+    """
+
+    # Extra features on top of the standard feature vector
+    SIGNAL_FEATURES = [
+        'signal_confidence',   # Physics confidence score
+        'signal_type_bounce',  # 1.0 for bounce, 0.0 for break
+        'signal_direction_buy',  # 1.0 for BUY, 0.0 for SELL
+        'stop_pct',            # Stop loss distance %
+        'tp_pct',              # Take profit distance %
+        'position_size_ratio', # Size relative to base (shows conviction)
+    ]
+
+    def __init__(self):
+        self.models = {}
+        self.feature_names = None
+        self.feature_importance = {}
+
+    def generate_training_data(
+        self,
+        X_base: np.ndarray,
+        Y_base: Dict[str, np.ndarray],
+        base_feature_names: List[str],
+        verbose: bool = True,
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray], List[str]]:
+        """
+        Generate trade quality labels from existing training data.
+
+        Uses forward-looking returns to create quality labels:
+        - buy_win: would a long position at this bar be profitable?
+        - sell_win: would a short position at this bar be profitable?
+        - best_action: which action has the best risk-adjusted return?
+        - quality_score: continuous quality metric
+
+        This uses the same 1400+ samples from the standard training pipeline
+        rather than the sparse 176 trades from a backtest.
+        """
+        all_feature_names = base_feature_names + self.SIGNAL_FEATURES
+        num_base = len(base_feature_names)
+        num_signal = len(self.SIGNAL_FEATURES)
+        num_total = len(all_feature_names)
+
+        # We create 2x samples: one for "what if we BUY" and one for "what if we SELL"
+        # at each bar, with different signal metadata
+        X_list = []
+        Y_win = []
+        Y_pnl = []
+        Y_quality = []
+
+        for i in range(len(X_base)):
+            ret_5 = Y_base['future_return_5'][i]
+            ret_20 = Y_base['future_return_20'][i]
+            ret_60 = Y_base['future_return_60'][i]
+
+            # Compute MFE/MAE proxy from the 3 return horizons
+            # For a BUY: positive returns are favorable, negative are adverse
+            buy_returns = [ret_5, ret_20, ret_60]
+            buy_mfe = max(buy_returns)  # Best upside seen
+            buy_mae = abs(min(buy_returns))  # Worst downside
+
+            # For a SELL: negative returns are favorable, positive are adverse
+            sell_mfe = abs(min(buy_returns))  # Best downside for short
+            sell_mae = max(buy_returns)  # Worst upside for short
+
+            # BUY quality: weighted return with MFE/MAE ratio
+            buy_win = 1.0 if ret_20 > 0.001 and (buy_mfe > buy_mae * 1.2 or ret_5 > 0) else 0.0
+            sell_win = 1.0 if ret_20 < -0.001 and (sell_mfe > sell_mae * 1.2 or ret_5 < 0) else 0.0
+
+            # Quality score: normalized expected value
+            buy_quality = ret_20 * 100  # In % terms
+            sell_quality = -ret_20 * 100
+
+            # BUY sample
+            buy_vec = np.zeros(num_total, dtype=np.float32)
+            buy_vec[:num_base] = X_base[i]
+            buy_vec[num_base + 0] = 0.6  # Default confidence
+            buy_vec[num_base + 1] = 0.5  # Mix of bounce/break
+            buy_vec[num_base + 2] = 1.0  # BUY direction
+            buy_vec[num_base + 3] = 0.005  # Default stop
+            buy_vec[num_base + 4] = 0.012  # Default TP
+            buy_vec[num_base + 5] = 1.0  # Default size ratio
+
+            X_list.append(buy_vec)
+            Y_win.append(buy_win)
+            Y_pnl.append(ret_20 * 100)
+            Y_quality.append(buy_quality)
+
+            # SELL sample
+            sell_vec = np.zeros(num_total, dtype=np.float32)
+            sell_vec[:num_base] = X_base[i]
+            sell_vec[num_base + 0] = 0.6
+            sell_vec[num_base + 1] = 0.5
+            sell_vec[num_base + 2] = 0.0  # SELL direction
+            sell_vec[num_base + 3] = 0.005
+            sell_vec[num_base + 4] = 0.012
+            sell_vec[num_base + 5] = 1.0
+
+            X_list.append(sell_vec)
+            Y_win.append(sell_win)
+            Y_pnl.append(-ret_20 * 100)
+            Y_quality.append(sell_quality)
+
+        X = np.array(X_list, dtype=np.float32)
+        Y = {
+            'win': np.array(Y_win, dtype=np.float32),
+            'pnl_pct': np.array(Y_pnl, dtype=np.float32),
+            'quality_score': np.array(Y_quality, dtype=np.float32),
+        }
+
+        if verbose:
+            total = len(X)
+            win_rate = Y['win'].mean()
+            print(f"  Generated {total} samples ({total//2} bars × 2 directions)")
+            print(f"  Win rate: {win_rate:.1%}")
+            print(f"  Quality score: mean={Y['quality_score'].mean():.3f}, std={Y['quality_score'].std():.3f}")
+
+        return X, Y, all_feature_names
+
+    def train(
+        self,
+        X_train: np.ndarray,
+        Y_train: Dict[str, np.ndarray],
+        X_val: np.ndarray,
+        Y_val: Dict[str, np.ndarray],
+        feature_names: List[str],
+    ) -> Dict[str, float]:
+        """Train trade quality scorer models."""
+        try:
+            import lightgbm as lgb
+            use_lgb = True
+        except ImportError:
+            use_lgb = False
+            print("  WARNING: LightGBM not available, falling back to sklearn")
+
+        self.feature_names = feature_names
+        metrics = {}
+
+        # --- Win/Loss binary classifier ---
+        print("\n  Training: win/loss classifier...")
+        if use_lgb:
+            train_ds = lgb.Dataset(X_train, label=Y_train['win'],
+                                   feature_name=feature_names)
+            val_ds = lgb.Dataset(X_val, label=Y_val['win'],
+                                 feature_name=feature_names, reference=train_ds)
+
+            params = {
+                'objective': 'binary',
+                'metric': 'binary_logloss',
+                'num_leaves': 31,
+                'learning_rate': 0.05,
+                'min_child_samples': 5,
+                'feature_fraction': 0.8,
+                'bagging_fraction': 0.8,
+                'bagging_freq': 5,
+                'verbose': -1,
+                'is_unbalanced': True,
+            }
+
+            model = lgb.train(
+                params, train_ds, num_boost_round=500,
+                valid_sets=[val_ds],
+                callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(50)],
+            )
+            self.models['win'] = model
+
+            # Feature importance
+            importance = sorted(
+                zip(feature_names, model.feature_importance(importance_type='gain')),
+                key=lambda x: x[1], reverse=True,
+            )
+            self.feature_importance['win'] = importance
+
+            val_pred = model.predict(X_val)
+            val_pred_binary = (val_pred > 0.5).astype(int)
+            val_acc = np.mean(val_pred_binary == Y_val['win'].astype(int))
+            metrics['win_accuracy'] = float(val_acc)
+
+            # AUC
+            from sklearn.metrics import roc_auc_score
+            try:
+                val_auc = roc_auc_score(Y_val['win'], val_pred)
+                metrics['win_auc'] = float(val_auc)
+            except Exception:
+                pass
+
+            print(f"    Win accuracy: {val_acc:.1%}")
+            if 'win_auc' in metrics:
+                print(f"    Win AUC: {metrics['win_auc']:.3f}")
+        else:
+            from sklearn.ensemble import GradientBoostingClassifier
+            clf = GradientBoostingClassifier(
+                n_estimators=100, max_depth=4, learning_rate=0.1,
+            )
+            clf.fit(X_train, Y_train['win'])
+            self.models['win'] = clf
+            val_acc = clf.score(X_val, Y_val['win'])
+            metrics['win_accuracy'] = float(val_acc)
+            print(f"    Win accuracy: {val_acc:.1%}")
+
+        # --- PnL regression ---
+        print("\n  Training: PnL % predictor...")
+        if use_lgb:
+            train_ds = lgb.Dataset(X_train, label=Y_train['pnl_pct'],
+                                   feature_name=feature_names)
+            val_ds = lgb.Dataset(X_val, label=Y_val['pnl_pct'],
+                                 feature_name=feature_names, reference=train_ds)
+
+            params = {
+                'objective': 'regression',
+                'metric': 'mae',
+                'num_leaves': 31,
+                'learning_rate': 0.05,
+                'min_child_samples': 5,
+                'feature_fraction': 0.8,
+                'verbose': -1,
+            }
+
+            model = lgb.train(
+                params, train_ds, num_boost_round=500,
+                valid_sets=[val_ds],
+                callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(50)],
+            )
+            self.models['pnl_pct'] = model
+
+            val_pred = model.predict(X_val)
+            mae = np.mean(np.abs(val_pred - Y_val['pnl_pct']))
+            dir_acc = np.mean(np.sign(val_pred) == np.sign(Y_val['pnl_pct']))
+            metrics['pnl_mae'] = float(mae)
+            metrics['pnl_dir_acc'] = float(dir_acc)
+            print(f"    PnL MAE: {mae:.4f}")
+            print(f"    PnL direction accuracy: {dir_acc:.1%}")
+
+        # --- Quality score regression ---
+        if 'quality_score' in Y_train:
+            print("\n  Training: quality score predictor...")
+            if use_lgb:
+                train_ds = lgb.Dataset(X_train, label=Y_train['quality_score'],
+                                       feature_name=feature_names)
+                val_ds = lgb.Dataset(X_val, label=Y_val['quality_score'],
+                                     feature_name=feature_names, reference=train_ds)
+
+                params = {
+                    'objective': 'regression',
+                    'metric': 'mae',
+                    'num_leaves': 31,
+                    'learning_rate': 0.05,
+                    'min_child_samples': 5,
+                    'feature_fraction': 0.8,
+                    'verbose': -1,
+                }
+
+                model = lgb.train(
+                    params, train_ds, num_boost_round=500,
+                    valid_sets=[val_ds],
+                    callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(50)],
+                )
+                self.models['quality_score'] = model
+
+                val_pred = model.predict(X_val)
+                q_mae = np.mean(np.abs(val_pred - Y_val['quality_score']))
+                q_dir_acc = np.mean(np.sign(val_pred) == np.sign(Y_val['quality_score']))
+                metrics['quality_mae'] = float(q_mae)
+                metrics['quality_dir_acc'] = float(q_dir_acc)
+                print(f"    Quality score MAE: {q_mae:.4f}")
+                print(f"    Quality direction accuracy: {q_dir_acc:.1%}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> Dict[str, np.ndarray]:
+        """Predict trade quality for feature array(s)."""
+        results = {}
+
+        if 'win' in self.models:
+            model = self.models['win']
+            if hasattr(model, 'predict'):
+                raw = model.predict(X)
+                # LightGBM binary returns probabilities directly
+                if isinstance(raw, np.ndarray) and raw.ndim == 1:
+                    if raw.max() <= 1.0 and raw.min() >= 0.0:
+                        results['win_prob'] = raw
+                        results['win'] = (raw > 0.5).astype(int)
+                    else:
+                        results['win'] = raw.astype(int)
+                        results['win_prob'] = raw.astype(float)
+                else:
+                    results['win'] = np.array(raw).flatten()
+                    results['win_prob'] = results['win'].astype(float)
+
+        if 'pnl_pct' in self.models:
+            results['pnl_pct'] = self.models['pnl_pct'].predict(X)
+
+        if 'quality_score' in self.models:
+            results['quality_score'] = self.models['quality_score'].predict(X)
+
+        return results
+
+    def save(self, path: str):
+        """Save model to disk."""
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'models': self.models,
+                'feature_names': self.feature_names,
+                'feature_importance': self.feature_importance,
+            }, f)
+        print(f"  Saved TradeQualityScorer to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'TradeQualityScorer':
+        """Load model from disk."""
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.models = data['models']
+        model.feature_names = data['feature_names']
+        model.feature_importance = data.get('feature_importance', {})
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -2145,6 +2596,68 @@ def train_all_architectures(
         traceback.print_exc()
         all_results['transformer'] = {'error': str(e)}
 
+    # ---- Architecture 4: Trade Quality Scorer ----
+    print("\n" + "=" * 70)
+    print("ARCHITECTURE 4: Trade Quality Scorer")
+    print("=" * 70)
+
+    try:
+        scorer = TradeQualityScorer()
+        tq_X, tq_Y, tq_features = scorer.generate_training_data(
+            X_base=X, Y_base=Y, base_feature_names=feature_names, verbose=True,
+        )
+
+        # Temporal split
+        tq_n = len(tq_X)
+        tq_train_end = int(tq_n * 0.6)
+        tq_val_end = int(tq_n * 0.8)
+
+        tq_X_train = tq_X[:tq_train_end]
+        tq_Y_train = {k: v[:tq_train_end] for k, v in tq_Y.items()}
+        tq_X_val = tq_X[tq_train_end:tq_val_end]
+        tq_Y_val = {k: v[tq_train_end:tq_val_end] for k, v in tq_Y.items()}
+        tq_X_test = tq_X[tq_val_end:]
+        tq_Y_test = {k: v[tq_val_end:] for k, v in tq_Y.items()}
+
+        print(f"  Splits: Train={len(tq_X_train)}, Val={len(tq_X_val)}, Test={len(tq_X_test)}")
+        print(f"  Win rate in data: {tq_Y['win'].mean():.1%}")
+
+        tq_metrics = scorer.train(tq_X_train, tq_Y_train, tq_X_val, tq_Y_val, tq_features)
+        scorer.save(os.path.join(output_dir, 'trade_quality_scorer.pkl'))
+
+        # Test evaluation
+        if len(tq_X_test) > 0:
+            tq_test = scorer.predict(tq_X_test)
+            if 'win' in tq_test:
+                tq_metrics['test_win_accuracy'] = float(np.mean(
+                    tq_test['win'] == tq_Y_test['win'].astype(int)))
+                print(f"\n  Test win accuracy: {tq_metrics['test_win_accuracy']:.1%}")
+            if 'win_prob' in tq_test:
+                from sklearn.metrics import roc_auc_score
+                try:
+                    tq_metrics['test_win_auc'] = float(roc_auc_score(
+                        tq_Y_test['win'], tq_test['win_prob']))
+                    print(f"  Test win AUC: {tq_metrics['test_win_auc']:.3f}")
+                except Exception:
+                    pass
+            if 'pnl_pct' in tq_test:
+                tq_metrics['test_pnl_dir_acc'] = float(np.mean(
+                    np.sign(tq_test['pnl_pct']) == np.sign(tq_Y_test['pnl_pct'])))
+                print(f"  Test PnL dir accuracy: {tq_metrics['test_pnl_dir_acc']:.1%}")
+
+        # Feature importance for win model
+        if 'win' in scorer.feature_importance:
+            print("\n  Win Predictor — Top Features:")
+            for name, imp in scorer.feature_importance['win'][:15]:
+                print(f"    {name}: {imp:.0f}")
+
+        all_results['trade_quality'] = tq_metrics
+    except Exception as e:
+        print(f"  Trade Quality Scorer failed: {e}")
+        import traceback
+        traceback.print_exc()
+        all_results['trade_quality'] = {'error': str(e)}
+
     # ---- Compare ----
     print("\n" + "=" * 70)
     print("ARCHITECTURE COMPARISON")
@@ -2229,7 +2742,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -2279,6 +2792,20 @@ def main():
                 model = MultiTFTransformer()
                 model.train(X_train, Y_train, X_val, Y_val, feature_names)
                 model.save(os.path.join(args.output, 'transformer_model.pt'))
+            elif args.arch == 'quality':
+                scorer = TradeQualityScorer()
+                tq_X, tq_Y, tq_features = scorer.generate_training_data(
+                    X_base=X, Y_base=Y, base_feature_names=feature_names, verbose=True,
+                )
+                tq_n = len(tq_X)
+                tq_train_end = int(tq_n * 0.6)
+                tq_val_end = int(tq_n * 0.8)
+                tq_X_train = tq_X[:tq_train_end]
+                tq_Y_train = {k: v[:tq_train_end] for k, v in tq_Y.items()}
+                tq_X_val = tq_X[tq_train_end:tq_val_end]
+                tq_Y_val = {k: v[tq_train_end:tq_val_end] for k, v in tq_Y.items()}
+                scorer.train(tq_X_train, tq_Y_train, tq_X_val, tq_Y_val, tq_features)
+                scorer.save(os.path.join(args.output, 'trade_quality_scorer.pkl'))
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
