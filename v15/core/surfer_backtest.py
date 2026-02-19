@@ -274,8 +274,16 @@ def run_backtest(
             prices_by_tf = {'5min': slice_closes}
             current_prices_dict = {'5min': current_price}
 
+            # Volume data
+            volumes_dict = None
+            if 'volume' in df_slice.columns:
+                volumes_dict = {'5min': df_slice['volume'].values}
+
             try:
-                analysis = analyze_channels(channels_by_tf, prices_by_tf, current_prices_dict)
+                analysis = analyze_channels(
+                    channels_by_tf, prices_by_tf, current_prices_dict,
+                    volumes_by_tf=volumes_dict,
+                )
             except Exception:
                 continue
 

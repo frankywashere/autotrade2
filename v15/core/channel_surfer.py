@@ -57,6 +57,8 @@ class TFChannelState:
     break_prob: float = 0.0          # Probability of channel break
     break_prob_up: float = 0.0       # Probability of upward break
     break_prob_down: float = 0.0     # Probability of downward break
+    # Volume
+    volume_score: float = 0.5        # Volume confirmation (0-1)
 
 
 @dataclass
@@ -376,6 +378,53 @@ def estimate_break_probability(
         entropy_trend=round(state.entropy, 3),
         duration_risk=round(duration_risk, 3),
     )
+
+
+# ---------------------------------------------------------------------------
+# Volume Analysis
+# ---------------------------------------------------------------------------
+
+def compute_volume_score(
+    volumes: np.ndarray,
+    position_pct: float,
+    lookback: int = 20,
+) -> float:
+    """
+    Compute volume confirmation score for boundary bounces.
+
+    High volume at a channel boundary = strong bounce confirmation.
+    Low volume at boundary = weak bounce, less reliable.
+    Volume spike at center = potential breakout in progress.
+
+    Returns:
+        Score 0-1 (higher = more volume confirmation for current signal)
+    """
+    if len(volumes) < lookback + 1:
+        return 0.5  # No data
+
+    recent = volumes[-(lookback + 1):]
+    current_vol = recent[-1]
+    avg_vol = np.mean(recent[:-1])
+
+    if avg_vol <= 0:
+        return 0.5
+
+    # Relative volume (how much above/below average)
+    rel_vol = current_vol / avg_vol
+
+    # At boundaries (buy/sell zones), high volume confirms the bounce
+    if position_pct <= ZONE_LOWER or position_pct >= ZONE_UPPER:
+        # Boundary: high vol = strong bounce confirmation
+        if rel_vol > 1.5:
+            return min(1.0, 0.6 + 0.4 * (rel_vol - 1) / 2)
+        elif rel_vol > 1.0:
+            return 0.5 + 0.1 * (rel_vol - 1) / 0.5
+        else:
+            # Low volume at boundary = weak bounce
+            return max(0.1, 0.5 * rel_vol)
+    else:
+        # Center zone: volume doesn't help much
+        return 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +796,7 @@ def generate_signal(
             channel_health=0, suggested_stop_pct=0.02, suggested_tp_pct=0.02,
         )
 
-    # --- Position Score ---
+    # --- Position Score with Adaptive Zones ---
     pos = primary_state.position_pct
 
     # Require minimum channel quality for signals
@@ -760,21 +809,45 @@ def generate_signal(
         # Weak channel — don't generate signals
         position_score = 0.0
         raw_action = 'HOLD'
-    elif pos <= ZONE_OVERSOLD:
-        position_score = 1.0
-        raw_action = 'BUY'
-    elif pos <= ZONE_LOWER:
-        position_score = (ZONE_LOWER - pos) / (ZONE_LOWER - ZONE_OVERSOLD)
-        raw_action = 'BUY'
-    elif pos >= ZONE_OVERBOUGHT:
-        position_score = 1.0
-        raw_action = 'SELL'
-    elif pos >= ZONE_UPPER:
-        position_score = (pos - ZONE_UPPER) / (ZONE_OVERBOUGHT - ZONE_UPPER)
-        raw_action = 'SELL'
     else:
-        position_score = 0.0
-        raw_action = 'HOLD'
+        # Adaptive zones based on OU theta:
+        # Strong mean-reversion (high theta) → tighter zones (trade more often)
+        # Weak mean-reversion (low theta) → wider zones (need extreme position)
+        theta = primary_state.ou_theta
+        if theta > 0.2:
+            # Strong reversion: zones can be tighter
+            zone_lower = 0.32
+            zone_oversold = 0.18
+            zone_upper = 0.68
+            zone_overbought = 0.82
+        elif theta > 0.1:
+            # Moderate reversion: standard zones
+            zone_lower = ZONE_LOWER
+            zone_oversold = ZONE_OVERSOLD
+            zone_upper = ZONE_UPPER
+            zone_overbought = ZONE_OVERBOUGHT
+        else:
+            # Weak reversion: need extreme positions
+            zone_lower = 0.20
+            zone_oversold = 0.08
+            zone_upper = 0.80
+            zone_overbought = 0.92
+
+        if pos <= zone_oversold:
+            position_score = 1.0
+            raw_action = 'BUY'
+        elif pos <= zone_lower:
+            position_score = (zone_lower - pos) / max(zone_lower - zone_oversold, 0.01)
+            raw_action = 'BUY'
+        elif pos >= zone_overbought:
+            position_score = 1.0
+            raw_action = 'SELL'
+        elif pos >= zone_upper:
+            position_score = (pos - zone_upper) / max(zone_overbought - zone_upper, 0.01)
+            raw_action = 'SELL'
+        else:
+            position_score = 0.0
+            raw_action = 'HOLD'
 
     # --- Energy Score ---
     # High potential + low kinetic moving away from boundary = good bounce setup
@@ -816,15 +889,19 @@ def generate_signal(
     # --- OU Reversion Score ---
     ou_score = primary_state.ou_reversion_score
 
+    # --- Volume Score ---
+    vol_score = primary_state.volume_score
+
     # --- Composite Confidence ---
     # Reversion score is the key statistical edge — weight it heavily
     confidence = (
-        0.20 * position_score +
-        0.15 * energy_score +
-        0.10 * entropy_score +
-        0.15 * confluence_score +
-        0.10 * timing_score +
-        0.30 * ou_score       # OU mean-reversion is the strongest signal
+        0.18 * position_score +
+        0.12 * energy_score +
+        0.08 * entropy_score +
+        0.12 * confluence_score +
+        0.08 * timing_score +
+        0.28 * ou_score +      # OU mean-reversion is the strongest signal
+        0.14 * vol_score       # Volume confirms the bounce
     )
 
     # Channel health penalty
@@ -837,6 +914,30 @@ def generate_signal(
     # Break probability penalty: if channel is likely to break, reduce signal
     if primary_state.break_prob > 0.6:
         confidence *= (1.0 - 0.5 * (primary_state.break_prob - 0.6))
+
+    # Trend alignment: penalize signals that fight the channel direction
+    ch_dir = primary_state.channel_direction
+    if raw_action == 'BUY' and ch_dir == 'bear':
+        # Buying at bottom of a bearish channel = risky (channel slopes down)
+        confidence *= 0.7  # 30% penalty
+    elif raw_action == 'SELL' and ch_dir == 'bull':
+        # Selling at top of a bullish channel = risky (channel slopes up)
+        confidence *= 0.7
+
+    # Multi-TF trend alignment: check if higher TFs agree
+    higher_tf_dirs = []
+    for tf in SIGNAL_TFS[1:]:  # Skip 5min
+        if tf in tf_states and tf_states[tf].valid:
+            higher_tf_dirs.append(tf_states[tf].channel_direction)
+    if higher_tf_dirs:
+        if raw_action == 'BUY':
+            bearish_count = sum(1 for d in higher_tf_dirs if d == 'bear')
+            if bearish_count >= len(higher_tf_dirs) * 0.6:
+                confidence *= 0.6  # Most higher TFs are bearish
+        elif raw_action == 'SELL':
+            bullish_count = sum(1 for d in higher_tf_dirs if d == 'bull')
+            if bullish_count >= len(higher_tf_dirs) * 0.6:
+                confidence *= 0.6  # Most higher TFs are bullish
 
     # Determine action
     if confidence < MIN_SIGNAL_CONFIDENCE or raw_action == 'HOLD':
@@ -898,6 +999,7 @@ def analyze_channels(
     channels_by_tf: Dict[str, Channel],
     prices_by_tf: Dict[str, np.ndarray],
     current_prices: Dict[str, float],
+    volumes_by_tf: Optional[Dict[str, np.ndarray]] = None,
 ) -> ChannelAnalysis:
     """
     Run complete multi-TF channel analysis.
@@ -991,6 +1093,13 @@ def analyze_channels(
             temp_state, ou=ou_params, channel_age_bars=len(channel.center_line),
         )
 
+        # 11. Volume score
+        vol_data = volumes_by_tf.get(tf) if volumes_by_tf else None
+        if vol_data is not None and len(vol_data) > 10:
+            vol_score = compute_volume_score(vol_data, pos_pct)
+        else:
+            vol_score = 0.5
+
         # Direction
         dir_map = {
             Direction.BULL: 'bull',
@@ -1023,6 +1132,7 @@ def analyze_channels(
             break_prob=break_prob.prob_break,
             break_prob_up=break_prob.prob_break_up,
             break_prob_down=break_prob.prob_break_down,
+            volume_score=round(vol_score, 3),
         )
 
     # Multi-TF confluence
@@ -1085,6 +1195,7 @@ def prepare_multi_tf_analysis(
     channels_by_tf: Dict[str, 'Channel'] = {}
     prices_by_tf: Dict[str, np.ndarray] = {}
     current_prices: Dict[str, float] = {}
+    volumes_by_tf: Dict[str, np.ndarray] = {}
 
     for tf in target_tfs:
         df = None
@@ -1127,6 +1238,10 @@ def prepare_multi_tf_analysis(
         prices_by_tf[tf] = closes
         current_prices[tf] = float(closes[-1])
 
+        # Collect volume data if available
+        if 'volume' in df.columns:
+            volumes_by_tf[tf] = df['volume'].values
+
     # If no channels detected, return empty analysis
     if not channels_by_tf:
         return ChannelAnalysis(
@@ -1142,4 +1257,7 @@ def prepare_multi_tf_analysis(
             timestamp=__import__('datetime').datetime.now().isoformat(),
         )
 
-    return analyze_channels(channels_by_tf, prices_by_tf, current_prices)
+    return analyze_channels(
+        channels_by_tf, prices_by_tf, current_prices,
+        volumes_by_tf=volumes_by_tf if volumes_by_tf else None,
+    )
