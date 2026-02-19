@@ -61,8 +61,8 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
         'min_confidence': [0.73, 0.74, 0.75, 0.78],
         'mom_1d_threshold': [0.0, -0.005, -0.01],
         'mom_3d_threshold': [-0.01, -0.02],
-        'max_position_pct': [0.35, 0.40],
-        'bounce_min_confidence': [0.68, 0.70, 0.75, 0.99],
+        'max_position_pct': [0.35, 0.40, 0.50],
+        'bounce_min_confidence': [0.65, 0.68, 0.70, 0.99],
         'reentry_cooldown': [12, 24],
     }
 
@@ -319,13 +319,21 @@ def _simulate_with_params(cached_bars, tsla_df, params):
             bars_held = bar_idx - open_position.entry_bar
 
             exit_price, exit_reason = None, None
+
+            # Progressive trail tightening (matches backtester)
+            horizon = TF_TO_HORIZON.get(open_position.primary_tf, 'medium')
+            max_hold = min(HORIZON_MAX_HOLD.get(horizon, 390), 390)
+            hold_pct = min(1.0, bars_held / max(max_hold, 1))
+            tightening = 1.0 - hold_pct * 0.4
+            effective_trail = open_position.trailing_stop_pct * tightening
+
             if open_position.direction == 'long':
                 if high > open_position.best_price:
                     open_position.best_price = high
                 if low <= open_position.stop_loss_price:
                     exit_price, exit_reason = open_position.stop_loss_price, 'stop_loss'
                 elif open_position.best_price > open_position.entry_price:
-                    ts = open_position.best_price * (1 - open_position.trailing_stop_pct)
+                    ts = open_position.best_price * (1 - effective_trail)
                     if ts > open_position.stop_loss_price and low <= ts:
                         exit_price, exit_reason = ts, 'trailing_stop'
                 if exit_price is None and high >= open_position.take_profit_price:
@@ -336,14 +344,12 @@ def _simulate_with_params(cached_bars, tsla_df, params):
                 if high >= open_position.stop_loss_price:
                     exit_price, exit_reason = open_position.stop_loss_price, 'stop_loss'
                 elif open_position.best_price > 0 and open_position.best_price < open_position.entry_price:
-                    ts = open_position.best_price * (1 + open_position.trailing_stop_pct)
+                    ts = open_position.best_price * (1 + effective_trail)
                     if ts < open_position.stop_loss_price and high >= ts:
                         exit_price, exit_reason = ts, 'trailing_stop'
                 if exit_price is None and low <= open_position.take_profit_price:
                     exit_price, exit_reason = open_position.take_profit_price, 'take_profit'
 
-            horizon = TF_TO_HORIZON.get(open_position.primary_tf, 'medium')
-            max_hold = min(HORIZON_MAX_HOLD.get(horizon, 390), 390)
             if exit_price is None and bars_held >= max_hold:
                 exit_price, exit_reason = current_price, 'timeout'
 
@@ -377,6 +383,7 @@ def _simulate_with_params(cached_bars, tsla_df, params):
                 metrics.add_trade(trade)
                 equity += net_pnl
                 sizer.update_equity(equity)
+                sizer.record_trade_result(net_pnl > 0)
                 last_exit_bar = bar_idx
                 last_exit_direction = open_position.direction
                 last_exit_profitable = net_pnl > 0
@@ -433,11 +440,29 @@ def _simulate_with_params(cached_bars, tsla_df, params):
             if best_signal is not None and best_signal.entry_urgency > 0.3:
                 position = sizer.size_position(best_signal, current_price, atr_pct=cb.atr_pct)
                 if position.should_trade:
+                    # Confidence scaling
                     conf_scale = max(0.5, min(1.5,
                         0.7 + (best_signal.confidence - 0.72) * 10.0
                     ))
-                    if conf_scale != 1.0:
-                        position.shares = max(1, int(position.shares * conf_scale))
+
+                    # Cross-horizon agreement bonus (matches backtester)
+                    signal_dir = best_signal.signal_type
+                    agreeing_horizons = 0
+                    total_horizons = 0
+                    for h, hsig in cb.horizon_signals.items():
+                        if hsig.signal_type != SignalType.FLAT:
+                            total_horizons += 1
+                            if hsig.signal_type == signal_dir:
+                                agreeing_horizons += 1
+                    if total_horizons >= 2:
+                        agreement_pct = agreeing_horizons / total_horizons
+                        cross_horizon_mult = 0.8 + agreement_pct * 0.4
+                    else:
+                        cross_horizon_mult = 1.0
+
+                    total_scale = conf_scale * cross_horizon_mult
+                    if total_scale != 1.0:
+                        position.shares = max(1, int(position.shares * total_scale))
 
                     slippage = current_price * 0.0001
                     signal_dir = 'long' if best_signal.signal_type == SignalType.LONG else 'short'
