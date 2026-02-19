@@ -223,7 +223,7 @@ class Backtester:
                     # Evidence: 1h = 0% win rate across ALL runs, monthly = 50%+ win
                     HORIZON_MIN_CONF = {
                         'short': 0.68,   # Bounce strategy: ranging regime only, 100%WR
-                        'medium': 0.99,  # Disabled: 0% win rate on 1h
+                        'medium': 0.60,  # Low gate; real filter in medium block (long-validated)
                         'long': 0.75,    # Trend strategy: 100%WR, PF=inf
                     }
 
@@ -281,6 +281,27 @@ class Backtester:
                             prev = strategy_signals.get('trend')
                             if prev is None or score > prev[1]:
                                 strategy_signals['trend'] = (sig, score)
+
+                        elif horizon == 'medium':
+                            # Medium horizon: only when validated by long horizon
+                            # The long horizon provides directional edge;
+                            # medium provides faster entry timing
+                            long_sig = horizon_signals.get('long')
+                            if (long_sig
+                                    and long_sig.signal_type == sig.signal_type
+                                    and long_sig.confidence >= 0.70
+                                    and sig.confidence >= 0.68):
+                                # Also apply momentum filter
+                                if sig.signal_type == SignalType.LONG:
+                                    if mom_1d < MOM_1D_THRESHOLD or mom_3d < MOM_3D_THRESHOLD:
+                                        continue
+                                elif sig.signal_type == SignalType.SHORT:
+                                    if mom_1d > -MOM_1D_THRESHOLD or mom_3d > -MOM_3D_THRESHOLD:
+                                        continue
+                                score = sig.confidence * sig.entry_urgency * 1.5
+                                prev = strategy_signals.get('medium_trend')
+                                if prev is None or score > prev[1]:
+                                    strategy_signals['medium_trend'] = (sig, score)
 
                         elif horizon == 'short':
                             if sig.regime.regime != MarketRegime.RANGING:
