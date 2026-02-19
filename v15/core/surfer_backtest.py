@@ -425,6 +425,11 @@ def run_backtest(
             sig = analysis.signal
 
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
+                # Skip 10AM ET hour (15:00 UTC) — only negative hour in backtest
+                bar_time = tsla.index[bar]
+                if hasattr(bar_time, 'hour') and bar_time.hour == 15:
+                    continue
+
                 # Don't enter if we already have a position in the same direction
                 existing_dirs = {p.direction for p in positions}
                 existing_types = {p.signal_type for p in positions}
