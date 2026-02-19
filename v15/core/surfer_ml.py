@@ -3817,6 +3817,242 @@ class TrendGBTModel:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 9: Cross-Validated Ensemble with Uncertainty
+# ---------------------------------------------------------------------------
+
+class CVEnsembleModel:
+    """
+    Trains K GBT models on different folds, averages predictions.
+
+    Key insight: prediction disagreement = uncertainty.
+    When K models agree → high confidence → trade.
+    When K models disagree → uncertain → skip/reduce size.
+
+    This provides calibrated confidence without temperature scaling.
+    """
+
+    N_FOLDS = 5
+
+    def __init__(self):
+        self.fold_models = {}  # {fold_id: {task: model}}
+        self.feature_names = None
+        self.val_calibration = {}  # Calibration stats from validation
+
+    def train(
+        self,
+        X: np.ndarray, Y: Dict[str, np.ndarray],
+        feature_names: List[str],
+    ) -> Dict[str, float]:
+        """Train K-fold ensemble on all data."""
+        import lightgbm as lgb
+
+        self.feature_names = feature_names
+        n = len(X)
+        k = self.N_FOLDS
+        fold_size = n // k
+        metrics = {}
+
+        print(f"\n  Training {k}-fold ensemble ({n} samples, {fold_size}/fold)...")
+
+        all_action_preds = np.zeros((n, 3))
+        all_bd_preds = np.zeros((n, 3))
+        all_lt_preds = np.zeros(n)
+        in_val = np.zeros(n, dtype=bool)
+
+        for fold in range(k):
+            val_start = fold * fold_size
+            val_end = min((fold + 1) * fold_size, n)
+
+            val_mask = np.zeros(n, dtype=bool)
+            val_mask[val_start:val_end] = True
+            train_mask = ~val_mask
+
+            X_train_f = X[train_mask]
+            X_val_f = X[val_mask]
+
+            print(f"\n  Fold {fold+1}/{k}: train={train_mask.sum()}, val={val_mask.sum()}")
+
+            self.fold_models[fold] = {}
+
+            # Action model
+            y_train = Y['optimal_action'][train_mask]
+            y_val = Y['optimal_action'][val_mask]
+            train_ds = lgb.Dataset(X_train_f, label=y_train, feature_name=feature_names)
+            val_ds = lgb.Dataset(X_val_f, label=y_val, feature_name=feature_names, reference=train_ds)
+
+            params = {
+                'objective': 'multiclass', 'num_class': 3,
+                'metric': 'multi_logloss', 'num_leaves': 20,
+                'learning_rate': 0.05, 'min_child_samples': 8,
+                'feature_fraction': 0.8, 'verbose': -1,
+            }
+            model = lgb.train(
+                params, train_ds, num_boost_round=300,
+                valid_sets=[val_ds],
+                callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(0)],
+            )
+            self.fold_models[fold]['action'] = model
+            all_action_preds[val_mask] = model.predict(X_val_f)
+
+            # Break direction model
+            y_train = Y['break_direction'][train_mask]
+            y_val = Y['break_direction'][val_mask]
+            train_ds = lgb.Dataset(X_train_f, label=y_train, feature_name=feature_names)
+            val_ds = lgb.Dataset(X_val_f, label=y_val, feature_name=feature_names, reference=train_ds)
+
+            model = lgb.train(
+                params, train_ds, num_boost_round=300,
+                valid_sets=[val_ds],
+                callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(0)],
+            )
+            self.fold_models[fold]['break_dir'] = model
+            all_bd_preds[val_mask] = model.predict(X_val_f)
+
+            # Lifetime model
+            y_train = Y['channel_lifetime'][train_mask]
+            y_val = Y['channel_lifetime'][val_mask]
+            train_ds = lgb.Dataset(X_train_f, label=y_train, feature_name=feature_names)
+            val_ds = lgb.Dataset(X_val_f, label=y_val, feature_name=feature_names, reference=train_ds)
+
+            reg_params = {
+                'objective': 'mae', 'metric': 'mae',
+                'num_leaves': 20, 'learning_rate': 0.05,
+                'min_child_samples': 8, 'verbose': -1,
+            }
+            model = lgb.train(
+                reg_params, train_ds, num_boost_round=300,
+                valid_sets=[val_ds],
+                callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(0)],
+            )
+            self.fold_models[fold]['lifetime'] = model
+            all_lt_preds[val_mask] = model.predict(X_val_f)
+
+            in_val |= val_mask
+
+        # Compute out-of-fold metrics
+        action_pred = np.argmax(all_action_preds, axis=1)
+        bd_pred = np.argmax(all_bd_preds, axis=1)
+
+        metrics['action_accuracy'] = float(np.mean(action_pred == Y['optimal_action'].astype(int)))
+        metrics['break_dir_accuracy'] = float(np.mean(bd_pred == Y['break_direction'].astype(int)))
+        metrics['lifetime_mae'] = float(np.mean(np.abs(all_lt_preds - Y['channel_lifetime'])))
+
+        print(f"\n  Out-of-fold results:")
+        print(f"    Action accuracy: {metrics['action_accuracy']:.1%}")
+        print(f"    Break dir accuracy: {metrics['break_dir_accuracy']:.1%}")
+        print(f"    Lifetime MAE: {metrics['lifetime_mae']:.1f} bars")
+
+        # Calibrate uncertainty: compute per-sample agreement stats
+        # Run all folds on all data, measure prediction variance
+        fold_action_probs = []
+        fold_bd_probs = []
+        for fold in range(k):
+            fold_action_probs.append(self.fold_models[fold]['action'].predict(X))
+            fold_bd_probs.append(self.fold_models[fold]['break_dir'].predict(X))
+
+        action_stack = np.stack(fold_action_probs)  # (K, N, 3)
+        bd_stack = np.stack(fold_bd_probs)
+
+        # Agreement: std of max-class probabilities across folds
+        action_max_probs = action_stack.max(axis=2)  # (K, N) - max class prob per fold
+        action_agreement = 1.0 - action_max_probs.std(axis=0)  # High = agree
+
+        # For break direction, check if majority of folds agree on the same class
+        bd_classes = bd_stack.argmax(axis=2)  # (K, N)
+        bd_consensus = np.zeros(n)
+        for i in range(n):
+            most_common = np.bincount(bd_classes[:, i].astype(int), minlength=3)
+            bd_consensus[i] = most_common.max() / k
+
+        metrics['avg_action_agreement'] = float(action_agreement.mean())
+        metrics['avg_bd_consensus'] = float(bd_consensus.mean())
+        print(f"    Avg action agreement: {metrics['avg_action_agreement']:.3f}")
+        print(f"    Avg BD consensus: {metrics['avg_bd_consensus']:.1%}")
+
+        # Calibration: when agreement > threshold, what's the accuracy?
+        for thresh in [0.6, 0.7, 0.8, 0.9]:
+            mask = bd_consensus >= thresh
+            if mask.sum() > 10:
+                acc = np.mean(bd_pred[mask] == Y['break_direction'][mask].astype(int))
+                pct = mask.mean()
+                print(f"    BD consensus >= {thresh:.0%}: acc={acc:.1%}, coverage={pct:.1%}")
+
+        self.val_calibration = {
+            'action_agreement_mean': float(action_agreement.mean()),
+            'bd_consensus_mean': float(bd_consensus.mean()),
+        }
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> Dict[str, np.ndarray]:
+        """Predict using all K folds, return averaged predictions + uncertainty."""
+        n = len(X)
+        k = len(self.fold_models)
+
+        fold_action_probs = []
+        fold_bd_probs = []
+        fold_lt_preds = []
+
+        for fold in range(k):
+            fold_action_probs.append(self.fold_models[fold]['action'].predict(X))
+            fold_bd_probs.append(self.fold_models[fold]['break_dir'].predict(X))
+            fold_lt_preds.append(self.fold_models[fold]['lifetime'].predict(X))
+
+        # Average probabilities
+        action_probs = np.mean(fold_action_probs, axis=0)
+        bd_probs = np.mean(fold_bd_probs, axis=0)
+        lifetime = np.mean(fold_lt_preds, axis=0)
+
+        # Uncertainty metrics
+        action_stack = np.stack(fold_action_probs)
+        bd_stack = np.stack(fold_bd_probs)
+
+        # Action agreement: how much folds agree
+        action_classes = action_stack.argmax(axis=2)  # (K, N)
+        action_consensus = np.zeros(n)
+        for i in range(n):
+            counts = np.bincount(action_classes[:, i].astype(int), minlength=3)
+            action_consensus[i] = counts.max() / k
+
+        # BD consensus
+        bd_classes = bd_stack.argmax(axis=2)
+        bd_consensus = np.zeros(n)
+        for i in range(n):
+            counts = np.bincount(bd_classes[:, i].astype(int), minlength=3)
+            bd_consensus[i] = counts.max() / k
+
+        return {
+            'action': np.argmax(action_probs, axis=1).astype(np.int64),
+            'action_probs': action_probs,
+            'break_dir': np.argmax(bd_probs, axis=1).astype(np.int64),
+            'break_dir_probs': bd_probs,
+            'lifetime': lifetime,
+            'action_consensus': action_consensus,
+            'bd_consensus': bd_consensus,
+        }
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'fold_models': self.fold_models,
+                'feature_names': self.feature_names,
+                'val_calibration': self.val_calibration,
+            }, f)
+        print(f"  Saved CVEnsembleModel to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'CVEnsembleModel':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.fold_models = data['fold_models']
+        model.feature_names = data['feature_names']
+        model.val_calibration = data.get('val_calibration', {})
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -4228,6 +4464,47 @@ def train_all_architectures(
         traceback.print_exc()
         all_results['trend_gbt'] = {'error': str(e)}
 
+    # ---- Architecture 9: Cross-Validated Ensemble ----
+    print("\n" + "=" * 70)
+    print("ARCHITECTURE 9: Cross-Validated Ensemble (Uncertainty)")
+    print("=" * 70)
+
+    try:
+        cv_ensemble = CVEnsembleModel()
+        # Use ALL data (not split) — CV does its own splitting
+        cv_metrics = cv_ensemble.train(X, Y, feature_names)
+        cv_ensemble.save(os.path.join(output_dir, 'cv_ensemble_model.pkl'))
+
+        # Test on held-out set using averaged predictions
+        cv_test = cv_ensemble.predict(X_test)
+        cv_metrics['test_action_acc'] = float(np.mean(
+            cv_test['action'] == Y_test_dict['optimal_action'].astype(int)))
+        cv_metrics['test_break_dir_acc'] = float(np.mean(
+            cv_test['break_dir'] == Y_test_dict['break_direction'].astype(int)))
+        cv_metrics['test_lifetime_mae'] = float(np.mean(np.abs(
+            cv_test['lifetime'] - Y_test_dict['channel_lifetime'])))
+
+        # High-consensus test accuracy
+        high_cons_mask = cv_test['bd_consensus'] >= 0.8
+        if high_cons_mask.sum() > 5:
+            cv_metrics['test_bd_high_consensus_acc'] = float(np.mean(
+                cv_test['break_dir'][high_cons_mask] == Y_test_dict['break_direction'][high_cons_mask].astype(int)))
+            cv_metrics['test_bd_high_consensus_coverage'] = float(high_cons_mask.mean())
+
+        print(f"\n  Test action accuracy: {cv_metrics['test_action_acc']:.1%}")
+        print(f"  Test break dir accuracy: {cv_metrics['test_break_dir_acc']:.1%}")
+        print(f"  Test lifetime MAE: {cv_metrics['test_lifetime_mae']:.1f} bars")
+        if 'test_bd_high_consensus_acc' in cv_metrics:
+            print(f"  High-consensus BD acc: {cv_metrics['test_bd_high_consensus_acc']:.1%} "
+                  f"(coverage: {cv_metrics['test_bd_high_consensus_coverage']:.1%})")
+
+        all_results['cv_ensemble'] = cv_metrics
+    except Exception as e:
+        print(f"  CV Ensemble failed: {e}")
+        import traceback
+        traceback.print_exc()
+        all_results['cv_ensemble'] = {'error': str(e)}
+
     # ---- Compare ----
     print("\n" + "=" * 70)
     print("ARCHITECTURE COMPARISON")
@@ -4312,7 +4589,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -4422,6 +4699,11 @@ def main():
                                          gbt_importance=gbt_imp)
                 trend.save(os.path.join(args.output, 'trend_gbt_model.pkl'))
                 print(f"\n  Trend GBT metrics: {tg_metrics}")
+            elif args.arch == 'cv_ensemble':
+                cv = CVEnsembleModel()
+                cv_metrics = cv.train(X, Y, feature_names)
+                cv.save(os.path.join(args.output, 'cv_ensemble_model.pkl'))
+                print(f"\n  CV Ensemble metrics: {cv_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -313,6 +313,18 @@ def run_backtest(
                 print(f"[ML] TrendGBT loaded (top-{trend_gbt_model.TOP_K} features + trends)")
                 ml_stats['trend_gbt_confirmed'] = 0
                 ml_stats['trend_gbt_filtered'] = 0
+            except Exception:
+                pass
+
+        # Try to load CV Ensemble model
+        cv_ensemble_model = None
+        cv_path = _os.path.join(model_dir, 'cv_ensemble_model.pkl')
+        if _os.path.exists(cv_path):
+            try:
+                cv_ensemble_model = CVEnsembleModel.load(cv_path)
+                print(f"[ML] CV Ensemble loaded ({cv_ensemble_model.N_FOLDS}-fold)")
+                ml_stats['cv_high_consensus'] = 0
+                ml_stats['cv_low_consensus'] = 0
             except Exception:
                 pass
 
@@ -772,6 +784,29 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # CV Ensemble: consensus-based confidence scaling
+                    if cv_ensemble_model is not None:
+                        try:
+                            cv_pred = cv_ensemble_model.predict(feature_vec.reshape(1, -1))
+                            bd_consensus = float(cv_pred['bd_consensus'][0])
+                            cv_bd = int(cv_pred['break_dir'][0])
+
+                            if bd_consensus >= 0.8:
+                                # 4+/5 folds agree — high confidence
+                                if (sig.action == 'BUY' and cv_bd == 1) or \
+                                   (sig.action == 'SELL' and cv_bd == 0):
+                                    sig.confidence *= 1.15  # Moderate boost
+                                    ml_stats['cv_high_consensus'] += 1
+                                elif (sig.action == 'BUY' and cv_bd == 0) or \
+                                     (sig.action == 'SELL' and cv_bd == 1):
+                                    sig.confidence *= 0.75  # Penalize mismatch
+                                    ml_stats['cv_low_consensus'] += 1
+                            elif bd_consensus < 0.6:
+                                sig.confidence *= 0.90  # Mild penalty
+                                ml_stats['cv_low_consensus'] += 1
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -976,6 +1011,9 @@ def run_backtest(
         if trend_gbt_model is not None:
             print(f"    TrendGBT confirmed: {ml_stats.get('trend_gbt_confirmed', 0)}")
             print(f"    TrendGBT filtered:  {ml_stats.get('trend_gbt_filtered', 0)}")
+        if cv_ensemble_model is not None:
+            print(f"    CV high consensus:  {ml_stats.get('cv_high_consensus', 0)}")
+            print(f"    CV low consensus:   {ml_stats.get('cv_low_consensus', 0)}")
 
     # Breakdown by exit reason
     if trades:
