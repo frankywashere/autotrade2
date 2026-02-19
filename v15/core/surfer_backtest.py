@@ -275,6 +275,7 @@ def run_backtest(
     peak_equity = equity
     max_dd = 0.0
     consecutive_losses = 0  # Track losing streak for position reduction
+    consecutive_wins = 0    # Track winning streak for position ramping
     # Walk forward from bar 100 (need lookback)
     start_bar = 100
     total_bars = len(tsla)
@@ -340,8 +341,10 @@ def run_backtest(
 
                 if pnl <= 0:
                     consecutive_losses += 1
+                    consecutive_wins = 0
                 else:
                     consecutive_losses = 0
+                    consecutive_wins += 1
 
                 closed_indices.append(pi)
                 trade_signals.append(position_signals[pi])
@@ -448,8 +451,10 @@ def run_backtest(
                 else:
                     trade_size = position_size
 
-                # Consecutive loss protection (defensive — keep for live trading)
-                # With 0.6% max DD in backtest, this rarely activates
+                # Adaptive sizing: ramp up on win streaks, halve on losing streaks
+                if consecutive_wins >= 3:
+                    streak_boost = min(2.0, 1.0 + 0.15 * (consecutive_wins - 2))
+                    trade_size *= streak_boost
                 if consecutive_losses >= 4:
                     trade_size *= 0.50  # Half size after 4+ consecutive losses
 
