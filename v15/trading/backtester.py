@@ -134,7 +134,7 @@ class Backtester:
         # Concurrent positions: one per strategy
         # trend and bounce can run simultaneously
         positions: Dict[str, OpenPosition] = {}  # strategy -> position
-        MAX_TOTAL_POSITION_PCT = 0.80  # Max 80% of capital in positions total
+        MAX_TOTAL_POSITION_PCT = 0.90  # Max 90% of capital in positions total
 
         prev_hazard: Optional[HazardClock] = None
 
