@@ -100,6 +100,104 @@ class BacktestMetrics:
         )
 
 
+def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
+                          window_high: float, window_low: float,
+                          eval_interval: int) -> Optional[Tuple[str, float]]:
+    """
+    Check if a position should exit. Returns (exit_reason, exit_price) or None.
+    Also updates position's trailing stop and MAE/MFE tracking in-place.
+    """
+    bars_held = bar - position.entry_bar
+
+    # Track MAE/MFE
+    if position.direction == 'BUY':
+        if position.worst_price == 0 or window_low < position.worst_price:
+            position.worst_price = window_low
+        if window_high > position.best_price:
+            position.best_price = window_high
+    else:
+        if position.worst_price == 0 or window_high > position.worst_price:
+            position.worst_price = window_high
+        if position.best_price == 0 or window_low < position.best_price:
+            position.best_price = window_low
+
+    entry = position.entry_price
+    tp_dist = abs(position.tp_price - entry) / entry
+    initial_stop_dist = abs(position.stop_price - entry) / entry
+    is_breakout = position.signal_type == 'break'
+
+    if position.direction == 'BUY':
+        if window_high > position.trailing_stop:
+            position.trailing_stop = window_high
+
+        if is_breakout:
+            profit_from_best = (position.trailing_stop - entry) / entry
+            if profit_from_best > 0.008:
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.3)
+                effective_stop = max(position.stop_price, trail_from_best)
+            else:
+                effective_stop = position.stop_price
+        else:
+            profit_from_entry = (position.trailing_stop - entry) / entry
+            profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+            if profit_ratio >= 0.80:
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.15)
+                effective_stop = max(position.stop_price, trail_from_best)
+            elif profit_ratio >= 0.50:
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.40)
+                effective_stop = max(position.stop_price, trail_from_best)
+            elif profit_ratio >= 0.25:
+                effective_stop = max(position.stop_price, entry * 0.999)
+            else:
+                effective_stop = position.stop_price
+
+        if window_low <= effective_stop:
+            reason = 'stop' if effective_stop == position.stop_price else 'trail'
+            return (reason, effective_stop)
+        elif window_high >= position.tp_price:
+            return ('tp', position.tp_price)
+        elif not is_breakout and bars_held >= max(6, int(position.ou_half_life * 3)):
+            return ('ou_timeout', current_price)
+
+    else:  # SELL
+        if position.trailing_stop == 0 or window_low < position.trailing_stop:
+            position.trailing_stop = window_low
+
+        if is_breakout:
+            profit_from_best = (entry - position.trailing_stop) / entry
+            if profit_from_best > 0.008:
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.3)
+                effective_stop = min(position.stop_price, trail_from_best)
+            else:
+                effective_stop = position.stop_price
+        else:
+            profit_from_entry = (entry - position.trailing_stop) / entry
+            profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+            if profit_ratio >= 0.80:
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.15)
+                effective_stop = min(position.stop_price, trail_from_best)
+            elif profit_ratio >= 0.50:
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.40)
+                effective_stop = min(position.stop_price, trail_from_best)
+            elif profit_ratio >= 0.25:
+                effective_stop = min(position.stop_price, entry * 1.001)
+            else:
+                effective_stop = position.stop_price
+
+        if window_high >= effective_stop:
+            reason = 'stop' if effective_stop == position.stop_price else 'trail'
+            return (reason, effective_stop)
+        elif window_low <= position.tp_price:
+            return ('tp', position.tp_price)
+        elif not is_breakout and bars_held >= max(6, int(position.ou_half_life * 3)):
+            return ('ou_timeout', current_price)
+
+    if bars_held >= position.max_hold_bars:
+        return ('timeout', current_price)
+
+    return None
+
+
 def run_backtest(
     days: int = 30,
     eval_interval: int = 3,     # Check every 3 bars = 15 min
@@ -169,7 +267,8 @@ def run_backtest(
 
     trades: List[Trade] = []
     equity_curve: List[Tuple[int, float]] = []  # (bar_idx, equity)
-    position: Optional[OpenPosition] = None
+    positions: List[OpenPosition] = []  # Multi-position support (max 2)
+    max_positions = 2
     equity = position_size * 10  # Start with 100k
     peak_equity = equity
     max_dd = 0.0
@@ -191,128 +290,27 @@ def run_backtest(
 
         current_price = float(closes[bar])
 
-        # --- Check exits for open position ---
-        if position is not None:
-            bars_held = bar - position.entry_bar
-            should_exit = False
-            exit_reason = ''
-            exit_price = current_price
+        # --- Check exits for all open positions ---
+        window_highs = highs[max(0, bar - eval_interval):bar + 1]
+        window_lows = lows[max(0, bar - eval_interval):bar + 1]
+        window_high = float(np.max(window_highs))
+        window_low = float(np.min(window_lows))
 
-            # Check high/low for stop/TP hit within the evaluation window
-            window_highs = highs[max(0, bar - eval_interval):bar + 1]
-            window_lows = lows[max(0, bar - eval_interval):bar + 1]
-            window_high = float(np.max(window_highs))
-            window_low = float(np.min(window_lows))
+        closed_indices = []
+        for pi, position in enumerate(positions):
+            result = _check_position_exit(
+                position, bar, current_price, window_high, window_low, eval_interval)
 
-            # Track MAE/MFE
-            if position.direction == 'BUY':
-                if position.worst_price == 0 or window_low < position.worst_price:
-                    position.worst_price = window_low
-                if window_high > position.best_price:
-                    position.best_price = window_high
-            else:
-                if position.worst_price == 0 or window_high > position.worst_price:
-                    position.worst_price = window_high
-                if position.best_price == 0 or window_low < position.best_price:
-                    position.best_price = window_low
+            if result is not None:
+                exit_reason, exit_price = result
+                bars_held = bar - position.entry_bar
 
-            entry = position.entry_price
-            tp_dist = abs(position.tp_price - entry) / entry
-
-            # Trailing stop logic (different for bounces vs breakouts)
-            initial_stop_dist = abs(position.stop_price - entry) / entry
-            is_breakout = position.signal_type == 'break'
-
-            if position.direction == 'BUY':
-                if window_high > position.trailing_stop:
-                    position.trailing_stop = window_high
-
-                if is_breakout:
-                    # Breakouts: simple progressive trail (let them run)
-                    profit_from_best = (position.trailing_stop - entry) / entry
-                    if profit_from_best > 0.008:
-                        trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.3)
-                        effective_stop = max(position.stop_price, trail_from_best)
-                    else:
-                        effective_stop = position.stop_price
-                else:
-                    # Bounces: multi-stage profit locking
-                    profit_from_entry = (position.trailing_stop - entry) / entry
-                    profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
-                    if profit_ratio >= 0.80:
-                        trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.15)
-                        effective_stop = max(position.stop_price, trail_from_best)
-                    elif profit_ratio >= 0.50:
-                        trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.40)
-                        effective_stop = max(position.stop_price, trail_from_best)
-                    elif profit_ratio >= 0.25:
-                        effective_stop = max(position.stop_price, entry * 0.999)
-                    else:
-                        effective_stop = position.stop_price
-
-                if window_low <= effective_stop:
-                    should_exit = True
-                    exit_reason = 'stop' if effective_stop == position.stop_price else 'trail'
-                    exit_price = effective_stop
-                elif window_high >= position.tp_price:
-                    should_exit = True
-                    exit_reason = 'tp'
-                    exit_price = position.tp_price
-                elif not is_breakout and bars_held >= max(6, int(position.ou_half_life * 3)):
-                    should_exit = True
-                    exit_reason = 'ou_timeout'
-
-            else:  # SELL
-                if position.trailing_stop == 0 or window_low < position.trailing_stop:
-                    position.trailing_stop = window_low
-
-                if is_breakout:
-                    profit_from_best = (entry - position.trailing_stop) / entry
-                    if profit_from_best > 0.008:
-                        trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.3)
-                        effective_stop = min(position.stop_price, trail_from_best)
-                    else:
-                        effective_stop = position.stop_price
-                else:
-                    profit_from_entry = (entry - position.trailing_stop) / entry
-                    profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
-                    if profit_ratio >= 0.80:
-                        trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.15)
-                        effective_stop = min(position.stop_price, trail_from_best)
-                    elif profit_ratio >= 0.50:
-                        trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.40)
-                        effective_stop = min(position.stop_price, trail_from_best)
-                    elif profit_ratio >= 0.25:
-                        effective_stop = min(position.stop_price, entry * 1.001)
-                    else:
-                        effective_stop = position.stop_price
-
-                if window_high >= effective_stop:
-                    should_exit = True
-                    exit_reason = 'stop' if effective_stop == position.stop_price else 'trail'
-                    exit_price = effective_stop
-                elif window_low <= position.tp_price:
-                    should_exit = True
-                    exit_reason = 'tp'
-                    exit_price = position.tp_price
-                elif not is_breakout and bars_held >= max(6, int(position.ou_half_life * 3)):
-                    should_exit = True
-                    exit_reason = 'ou_timeout'
-
-            if not should_exit and bars_held >= position.max_hold_bars:
-                should_exit = True
-                exit_reason = 'timeout'
-
-            if should_exit:
-                # Compute P&L
                 if position.direction == 'BUY':
                     pnl_pct = (exit_price - position.entry_price) / position.entry_price
                 else:
                     pnl_pct = (position.entry_price - exit_price) / position.entry_price
-
                 pnl = pnl_pct * position.trade_size
 
-                # Compute MAE/MFE
                 if position.direction == 'BUY':
                     mae = (position.entry_price - position.worst_price) / position.entry_price if position.worst_price > 0 else 0
                     mfe = (position.best_price - position.entry_price) / position.entry_price if position.best_price > 0 else 0
@@ -321,23 +319,15 @@ def run_backtest(
                     mfe = (position.entry_price - position.best_price) / position.entry_price if position.best_price > 0 else 0
 
                 trade = Trade(
-                    entry_bar=position.entry_bar,
-                    exit_bar=bar,
-                    entry_price=position.entry_price,
-                    exit_price=exit_price,
-                    direction=position.direction,
-                    confidence=position.confidence,
+                    entry_bar=position.entry_bar, exit_bar=bar,
+                    entry_price=position.entry_price, exit_price=exit_price,
+                    direction=position.direction, confidence=position.confidence,
                     stop_pct=(abs(position.stop_price - position.entry_price) / position.entry_price),
                     tp_pct=(abs(position.tp_price - position.entry_price) / position.entry_price),
-                    exit_reason=exit_reason,
-                    pnl=pnl,
-                    pnl_pct=pnl_pct,
-                    hold_bars=bars_held,
-                    primary_tf=position.primary_tf,
-                    signal_type=position.signal_type,
-                    trade_size=position.trade_size,
-                    mae_pct=round(mae, 6),
-                    mfe_pct=round(mfe, 6),
+                    exit_reason=exit_reason, pnl=pnl, pnl_pct=pnl_pct,
+                    hold_bars=bars_held, primary_tf=position.primary_tf,
+                    signal_type=position.signal_type, trade_size=position.trade_size,
+                    mae_pct=round(mae, 6), mfe_pct=round(mfe, 6),
                 )
                 trades.append(trade)
                 equity += pnl
@@ -346,16 +336,19 @@ def run_backtest(
                 dd = (peak_equity - equity) / peak_equity
                 max_dd = max(max_dd, dd)
 
-                # Track consecutive losses for position sizing
                 if pnl <= 0:
                     consecutive_losses += 1
                 else:
                     consecutive_losses = 0
 
-                position = None
+                closed_indices.append(pi)
 
-        # --- Generate new signal (only if flat) ---
-        if position is None:
+        # Remove closed positions (reverse order to preserve indices)
+        for pi in sorted(closed_indices, reverse=True):
+            positions.pop(pi)
+
+        # --- Generate new signal (if room for more positions) ---
+        if len(positions) < max_positions:
             # Get lookback data for channel detection
             lookback = min(bar + 1, 100)
             df_slice = tsla.iloc[bar - lookback + 1:bar + 1]
@@ -425,6 +418,14 @@ def run_backtest(
             sig = analysis.signal
 
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
+                # Don't enter if we already have a position in the same direction
+                existing_dirs = {p.direction for p in positions}
+                existing_types = {p.signal_type for p in positions}
+                if sig.action in existing_dirs:
+                    continue  # No pyramiding
+                if sig.signal_type in existing_types:
+                    continue  # No double-bounce or double-break
+
                 # Volume confirmation: skip breakouts on thin volume
                 if sig.signal_type == 'break' and 'volume' in tsla.columns:
                     current_vol = tsla['volume'].iloc[bar]
@@ -469,7 +470,7 @@ def run_backtest(
                 primary_state = analysis.tf_states.get(sig.primary_tf)
                 ou_hl = primary_state.ou_half_life if primary_state else 5.0
 
-                position = OpenPosition(
+                positions.append(OpenPosition(
                     entry_bar=bar,
                     entry_price=entry_price,
                     direction=sig.action,
@@ -482,10 +483,10 @@ def run_backtest(
                     ou_half_life=ou_hl,
                     max_hold_bars=effective_max_hold,
                     trailing_stop=entry_price,
-                )
+                ))
 
-    # Close any remaining position
-    if position is not None:
+    # Close any remaining positions
+    for position in positions:
         exit_price = float(closes[-1])
         if position.direction == 'BUY':
             pnl_pct = (exit_price - position.entry_price) / position.entry_price
