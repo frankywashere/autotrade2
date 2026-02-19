@@ -181,6 +181,7 @@ class Backtester:
                     metrics.add_trade(trade)
                     equity += trade.pnl
                     self.position_sizer.update_equity(equity)
+                    self.position_sizer.record_trade_result(trade.pnl > 0)
                     equity_curve.add_point(current_time, equity)
                     # Track for re-entry per strategy
                     last_exit_by_strategy[strat_key] = {

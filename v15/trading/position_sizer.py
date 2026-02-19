@@ -76,10 +76,29 @@ class PositionSizer:
         self.peak_equity = capital
         self.current_equity = capital
 
+        # Win streak tracking (anti-martingale position scaling)
+        self.consecutive_wins = 0
+        self.streak_base_pct = max_position_pct  # Base position size
+        self.streak_increment = 0.05  # +5% per consecutive win
+        self.streak_max_pct = 0.60  # Never exceed 60%
+
     def update_equity(self, new_equity: float):
         """Update current equity (call after each trade closes)."""
         self.current_equity = new_equity
         self.peak_equity = max(self.peak_equity, new_equity)
+
+    def record_trade_result(self, won: bool):
+        """Update win streak tracking for anti-martingale sizing."""
+        if won:
+            self.consecutive_wins += 1
+        else:
+            self.consecutive_wins = 0
+        # Adjust max position based on streak
+        streak_bonus = self.consecutive_wins * self.streak_increment
+        self.max_position_pct = min(
+            self.streak_max_pct,
+            self.streak_base_pct + streak_bonus,
+        )
 
     @property
     def current_drawdown(self) -> float:
@@ -158,8 +177,12 @@ class PositionSizer:
         # Confidence factor (boost for high confidence, reduce for low)
         conf_factor = 0.5 + signal.confidence  # Range: 0.5 - 1.5
 
+        # Win-streak multiplier (anti-martingale: compound after wins)
+        streak_mult = 1.0 + self.consecutive_wins * 0.15  # +15% per consecutive win
+        streak_mult = min(streak_mult, 2.0)  # Cap at 2x
+
         # Final position fraction
-        fraction = kelly_adjusted * dd_factor * regime_factor * conf_factor
+        fraction = kelly_adjusted * dd_factor * regime_factor * conf_factor * streak_mult
 
         # Clamp to limits
         fraction = max(self.min_position_pct, min(self.max_position_pct, fraction))
