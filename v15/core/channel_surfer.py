@@ -91,6 +91,7 @@ class ChannelAnalysis:
     signal: SurferSignal
     confluence_matrix: Dict[str, float]  # TF -> alignment score
     timestamp: str                        # When analysis was computed
+    regime: Optional[MarketRegime] = None # Current market regime
 
 
 # ---------------------------------------------------------------------------
@@ -823,9 +824,78 @@ def compute_confluence(
 # Signal Generation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Market Regime Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MarketRegime:
+    """Current market regime classification."""
+    regime: str          # 'ranging', 'trending', 'transitioning'
+    confidence: float    # 0-1 how confident we are
+    avg_health: float    # Average channel health across TFs
+    break_bias: float    # 0 = ranging, 1 = trending
+    trend_direction: float  # -1 = bearish trend, +1 = bullish trend, 0 = no trend
+
+
+def detect_market_regime(
+    tf_states: Dict[str, TFChannelState],
+) -> MarketRegime:
+    """
+    Detect market regime from multi-TF channel health.
+
+    Ranging: channels healthy (high health, low break_prob) → favor bounces
+    Trending: channels failing (low health, high break_prob) → favor breakouts
+    """
+    valid_states = [s for s in tf_states.values() if s.valid]
+
+    if not valid_states:
+        return MarketRegime(
+            regime='ranging', confidence=0.0,
+            avg_health=0.5, break_bias=0.5, trend_direction=0.0,
+        )
+
+    # Average health and break probability across TFs
+    avg_health = np.mean([s.channel_health for s in valid_states])
+    avg_break_prob = np.mean([s.break_prob for s in valid_states])
+
+    # Trend direction from higher-TF slopes
+    weighted_slope = 0.0
+    total_weight = 0.0
+    for s in valid_states:
+        w = TF_WEIGHTS.get(s.tf, 0.05)
+        weighted_slope += w * s.slope_pct
+        total_weight += w
+
+    trend_direction = np.sign(weighted_slope / max(total_weight, 1e-6))
+
+    # Regime classification
+    if avg_health > 0.55 and avg_break_prob < 0.4:
+        regime = 'ranging'
+        break_bias = max(0.0, 0.3 * (1.0 - avg_health))
+        confidence = avg_health
+    elif avg_health < 0.35 or avg_break_prob > 0.55:
+        regime = 'trending'
+        break_bias = min(1.0, 0.6 + 0.4 * avg_break_prob)
+        confidence = 1.0 - avg_health
+    else:
+        regime = 'transitioning'
+        break_bias = 0.5
+        confidence = 0.3
+
+    return MarketRegime(
+        regime=regime,
+        confidence=round(confidence, 3),
+        avg_health=round(avg_health, 3),
+        break_bias=round(break_bias, 3),
+        trend_direction=round(trend_direction, 1),
+    )
+
+
 def generate_breakout_signal(
     tf_states: Dict[str, TFChannelState],
     confluence: Dict[str, float],
+    regime: Optional[MarketRegime] = None,
 ) -> Optional[SurferSignal]:
     """
     Generate a breakout signal when a channel is about to break.
@@ -943,11 +1013,13 @@ def generate_breakout_signal(
 def generate_signal(
     tf_states: Dict[str, TFChannelState],
     confluence: Dict[str, float],
+    regime: Optional[MarketRegime] = None,
 ) -> SurferSignal:
     """
     Generate a trading signal from multi-TF channel analysis.
 
     Priority: 5min position + higher-TF confirmation.
+    Regime-aware: boosts bounce signals in ranging, breakout in trending.
     """
     # Find the best TF for signal generation (prefer 5min if valid)
     primary_tf = None
@@ -1119,7 +1191,7 @@ def generate_signal(
     # Determine action
     if confidence < MIN_SIGNAL_CONFIDENCE or raw_action == 'HOLD':
         # Try breakout signal when bounce doesn't trigger
-        break_signal = generate_breakout_signal(tf_states, confluence)
+        break_signal = generate_breakout_signal(tf_states, confluence, regime)
         if break_signal is not None:
             return break_signal
         action = 'HOLD'
@@ -1327,14 +1399,18 @@ def analyze_channels(
     # Multi-TF confluence
     confluence = compute_confluence(tf_states)
 
-    # Generate signal
-    signal = generate_signal(tf_states, confluence)
+    # Detect market regime
+    regime = detect_market_regime(tf_states)
+
+    # Generate signal (regime-aware)
+    signal = generate_signal(tf_states, confluence, regime)
 
     return ChannelAnalysis(
         tf_states=tf_states,
         signal=signal,
         confluence_matrix=confluence,
         timestamp=datetime.now().isoformat(),
+        regime=regime,
     )
 
 
