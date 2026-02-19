@@ -54,6 +54,14 @@ from v15.live_data import (
     YFINANCE_AVAILABLE
 )
 
+# Import live trading monitor
+try:
+    from v15.trading.live_monitor import TradingMonitor
+    from v15.trading.signals import SignalType as RASignalType
+    TRADING_MONITOR_AVAILABLE = True
+except ImportError:
+    TRADING_MONITOR_AVAILABLE = False
+
 # Import native TF data loader for per-TF yfinance fetching
 from v15.data.native_tf import load_native_tf_data as _load_native_tf_data
 
@@ -967,7 +975,7 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
     if not token:
         try:
             token = st.secrets["GITHUB_TOKEN"]
-        except (KeyError, AttributeError):
+        except Exception:
             token = ""
 
     import requests as _requests
@@ -1216,6 +1224,323 @@ def show_tf_attention(prediction_output: Dict[str, Any]):
     st.plotly_chart(fig, width="stretch")
 
 
+def _get_trading_monitor() -> 'TradingMonitor':
+    """Get or create the TradingMonitor singleton in session state."""
+    if 'trading_monitor' not in st.session_state:
+        st.session_state['trading_monitor'] = TradingMonitor()
+    return st.session_state['trading_monitor']
+
+
+def _run_prediction_for_monitor(predictor, current_tsla, current_spy, current_vix):
+    """Run prediction and cache result. Returns (prediction, live_pred) or (None, None)."""
+    try:
+        predictor.load_historical_data(current_tsla, current_spy, current_vix)
+        live_pred = predictor.predict_with_per_tf()
+        if live_pred is not None:
+            prediction = live_pred.prediction
+            st.session_state['last_prediction'] = prediction
+            st.session_state['last_live_pred'] = live_pred
+            st.session_state['prediction_data'] = (current_tsla, current_spy, current_vix)
+            return prediction, live_pred
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
+    return None, None
+
+
+def show_trading_monitor_tab(
+    predictor,
+    current_tsla,
+    current_spy,
+    current_vix,
+    native_tf_data,
+    live_config,
+    is_live,
+    missing_tfs,
+):
+    """Tab 7: Live Trading Monitor — signals, positions, risk, history."""
+    st.header("Trading Monitor")
+
+    if not TRADING_MONITOR_AVAILABLE:
+        st.error("Trading monitor not available. Check v15/trading/ imports.")
+        return
+
+    if predictor is None:
+        st.warning("Load a trained model to use the trading monitor.")
+        return
+
+    monitor = _get_trading_monitor()
+
+    # --- Auto-predict on refresh ---
+    auto_predict = live_config.get('auto_refresh', False)
+    if auto_predict and not missing_tfs:
+        prediction = st.session_state.get('last_prediction')
+        # Always re-run prediction on auto-refresh to keep signals fresh
+        with st.spinner("Evaluating signals..."):
+            prediction, live_pred = _run_prediction_for_monitor(
+                predictor, current_tsla, current_spy, current_vix
+            )
+    else:
+        prediction = st.session_state.get('last_prediction')
+
+    # Manual predict button when auto-refresh is off
+    if not auto_predict:
+        col_pred, col_status = st.columns([1, 3])
+        with col_pred:
+            if st.button("Evaluate Signals", type="primary", disabled=bool(missing_tfs)):
+                with st.spinner("Evaluating signals..."):
+                    prediction, live_pred = _run_prediction_for_monitor(
+                        predictor, current_tsla, current_spy, current_vix
+                    )
+        with col_status:
+            if missing_tfs:
+                st.error(f"Missing data for {len(missing_tfs)} TFs — cannot evaluate.")
+
+    # Get current price and VIX
+    current_price = 0.0
+    vix_level = 20.0
+    if len(current_tsla) > 0 and 'close' in current_tsla.columns:
+        current_price = float(current_tsla.iloc[-1]['close'])
+    if len(current_vix) > 0 and 'close' in current_vix.columns:
+        vix_level = float(current_vix.iloc[-1]['close'])
+
+    # =====================================================================
+    # Section A: Active Signal Alerts
+    # =====================================================================
+    st.subheader("Signal Alerts")
+
+    signals = []
+    if prediction is not None and prediction.per_tf_predictions:
+        close_series = current_tsla['close'] if 'close' in current_tsla.columns else None
+        signals = monitor.evaluate(
+            prediction.per_tf_predictions,
+            current_price,
+            vix_level,
+            tsla_close_series=close_series,
+        )
+
+    if signals:
+        for fs in signals:
+            sig = fs.signal
+            pos = fs.position
+            direction = sig.signal_type.value.upper()
+            color = "#28a745" if sig.signal_type == RASignalType.LONG else "#dc3545"
+            rr = f"{pos.risk_reward_ratio:.1f}" if pos else "?"
+            shares = pos.shares if pos else 0
+            sl_pct = f"{pos.stop_loss_pct:.1%}" if pos else "?"
+            tp_pct = f"{pos.take_profit_pct:.1%}" if pos else "?"
+
+            st.markdown(
+                f"<div style='background-color:{color};color:white;padding:12px;"
+                f"border-radius:8px;margin-bottom:8px;font-weight:bold'>"
+                f"{direction} — {fs.strategy.upper()} | "
+                f"Conf: {sig.confidence:.0%} | TF: {sig.primary_tf} | "
+                f"Shares: {shares} | SL: {sl_pct} | TP: {tp_pct} | R:R {rr}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Enter position button
+            with st.expander(f"Enter {fs.strategy} position", expanded=False):
+                entry_price = st.number_input(
+                    "Entry Price",
+                    value=current_price,
+                    step=0.01,
+                    key=f"entry_price_{fs.strategy}",
+                )
+                shares_input = st.number_input(
+                    "Shares",
+                    value=shares,
+                    min_value=1,
+                    step=1,
+                    key=f"entry_shares_{fs.strategy}",
+                )
+                if st.button(
+                    f"Confirm Entry: {fs.strategy}",
+                    key=f"confirm_entry_{fs.strategy}",
+                ):
+                    pos_id = monitor.enter_position(
+                        fs,
+                        actual_entry_price=entry_price,
+                        shares_override=shares_input,
+                    )
+                    st.success(f"Position entered: {pos_id}")
+                    st.rerun()
+    else:
+        if prediction is not None:
+            st.info("No actionable signals at current evaluation.")
+        else:
+            st.info("Run 'Evaluate Signals' or enable auto-refresh to scan for signals.")
+
+    # =====================================================================
+    # Section B: Open Positions
+    # =====================================================================
+    st.subheader("Open Positions")
+
+    if monitor.positions:
+        # Check for exit alerts
+        exit_alerts = []
+        if current_price > 0:
+            high = current_price * 1.001  # approximate intra-bar high
+            low = current_price * 0.999
+            if len(current_tsla) > 0:
+                high = float(current_tsla.iloc[-1].get('high', current_price))
+                low = float(current_tsla.iloc[-1].get('low', current_price))
+            exit_alerts = monitor.check_exits(current_price, high, low)
+
+        # Show exit alerts prominently
+        alert_map = {pos_id: (reason, price) for pos_id, reason, price in exit_alerts}
+        for strat_key, pos in monitor.positions.items():
+            if pos.pos_id in alert_map:
+                reason, alert_price = alert_map[pos.pos_id]
+                st.markdown(
+                    f"<div style='background-color:#dc3545;color:white;padding:10px;"
+                    f"border-radius:8px;margin-bottom:4px;font-weight:bold'>"
+                    f"EXIT ALERT: {strat_key.upper()} — {reason} "
+                    f"@ ${alert_price:.2f}</div>",
+                    unsafe_allow_html=True,
+                )
+
+        # Positions table
+        pos_data = []
+        for strat_key, pos in monitor.positions.items():
+            if pos.direction == 'long':
+                pnl = (current_price - pos.entry_price) * pos.shares
+            else:
+                pnl = (pos.entry_price - current_price) * pos.shares
+            entry_value = pos.entry_price * pos.shares
+            pnl_pct = pnl / entry_value if entry_value > 0 else 0.0
+
+            entry_dt = datetime.fromisoformat(pos.entry_time)
+            hold_td = datetime.now() - entry_dt
+            hold_str = str(hold_td).split('.')[0]  # HH:MM:SS
+
+            # Trail distance
+            if pos.direction == 'long' and pos.best_price > pos.entry_price:
+                trail_dist = (pos.best_price - current_price) / pos.best_price
+            elif pos.direction == 'short' and pos.best_price > 0 and pos.best_price < pos.entry_price:
+                trail_dist = (current_price - pos.best_price) / pos.best_price
+            else:
+                trail_dist = 0.0
+
+            pos_data.append({
+                'Strategy': strat_key,
+                'Dir': pos.direction.upper(),
+                'Entry': f"${pos.entry_price:.2f}",
+                'Current': f"${current_price:.2f}",
+                'P&L ($)': f"${pnl:+,.0f}",
+                'P&L (%)': f"{pnl_pct:+.1%}",
+                'Stop': f"${pos.stop_loss_price:.2f}",
+                'TP': f"${pos.take_profit_price:.2f}",
+                'Trail Dist': f"{trail_dist:.2%}",
+                'Hold Time': hold_str,
+            })
+
+        st.dataframe(pd.DataFrame(pos_data), hide_index=True)
+
+        # Close position buttons
+        for strat_key, pos in list(monitor.positions.items()):
+            with st.expander(f"Close {strat_key} position", expanded=False):
+                exit_price = st.number_input(
+                    "Exit Price",
+                    value=current_price,
+                    step=0.01,
+                    key=f"exit_price_{strat_key}",
+                )
+                if st.button(
+                    f"Confirm Exit: {strat_key}",
+                    key=f"confirm_exit_{strat_key}",
+                ):
+                    reason = alert_map.get(pos.pos_id, ('manual', 0))[0] if pos.pos_id in alert_map else 'manual'
+                    trade = monitor.exit_position(strat_key, exit_price, exit_reason=reason)
+                    if trade:
+                        st.success(
+                            f"Closed {strat_key}: P&L ${trade.pnl:+,.2f} ({trade.pnl_pct:+.1%})"
+                        )
+                    st.rerun()
+    else:
+        st.info("No open positions. Enter a position from the Signal Alerts section above.")
+
+    # =====================================================================
+    # Section C: Risk Dashboard
+    # =====================================================================
+    with st.expander("Risk Dashboard", expanded=len(monitor.positions) > 0):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Equity", f"${monitor.equity:,.0f}")
+        with c2:
+            dd = monitor.current_drawdown
+            dd_color = "red" if dd > 0.10 else ("orange" if dd > 0.05 else "green")
+            st.metric("Drawdown", f"{dd:.1%}")
+            if dd > 0.10:
+                st.error("Drawdown > 10%")
+        with c3:
+            exp_pct = monitor.exposure_pct(current_price) if current_price > 0 else 0
+            st.metric("Exposure", f"{exp_pct:.0%}")
+            if exp_pct > 0.60:
+                st.warning("Exposure > 60%")
+        with c4:
+            st.metric("Positions", len(monitor.positions))
+
+        # Unrealized P&L
+        if monitor.positions and current_price > 0:
+            unreal = monitor.unrealized_pnl(current_price)
+            st.metric("Unrealized P&L", f"${unreal:+,.0f}")
+
+        # Equity curve from closed trades
+        if monitor.closed_trades:
+            equity_points = [monitor.closed_trades[0].entry_price]  # placeholder
+            running_equity = monitor.equity - sum(t.pnl for t in monitor.closed_trades)
+            eq_data = [{'Trade': 0, 'Equity': running_equity}]
+            for i, t in enumerate(monitor.closed_trades):
+                running_equity += t.pnl
+                eq_data.append({'Trade': i + 1, 'Equity': running_equity})
+            eq_df = pd.DataFrame(eq_data)
+            st.line_chart(eq_df.set_index('Trade')['Equity'])
+
+    # =====================================================================
+    # Section D: Signal History
+    # =====================================================================
+    with st.expander("Signal History (last 50)"):
+        history = monitor.signal_history[-50:]
+        if history:
+            history_reversed = list(reversed(history))
+            hist_data = []
+            for entry in history_reversed:
+                hist_data.append({
+                    'Time': entry.get('time', '?')[:19],
+                    'Strategy': entry.get('strategy', '?'),
+                    'Dir': entry.get('direction', '?').upper(),
+                    'Conf': f"{entry.get('confidence', 0):.0%}",
+                    'Urgency': f"{entry.get('urgency', 0):.0%}",
+                    'TF': entry.get('primary_tf', '?'),
+                    'Regime': entry.get('regime', '?'),
+                    'Acted': 'Yes' if entry.get('acted') else '',
+                })
+            st.dataframe(pd.DataFrame(hist_data), hide_index=True)
+        else:
+            st.info("No signal history yet.")
+
+    # =====================================================================
+    # Section E: Closed Trades
+    # =====================================================================
+    if monitor.closed_trades:
+        with st.expander("Closed Trades"):
+            trade_data = []
+            for t in reversed(monitor.closed_trades):
+                trade_data.append({
+                    'Strategy': t.strategy,
+                    'Dir': t.direction.upper(),
+                    'Entry': f"${t.entry_price:.2f}",
+                    'Exit': f"${t.exit_price:.2f}",
+                    'Shares': t.shares,
+                    'P&L ($)': f"${t.pnl:+,.0f}",
+                    'P&L (%)': f"{t.pnl_pct:+.1%}",
+                    'Reason': t.exit_reason,
+                    'Hold': f"{t.hold_minutes:.0f}m",
+                })
+            st.dataframe(pd.DataFrame(trade_data), hide_index=True)
+
+
 def main():
     st.title("X23 Channel Break Predictor")
 
@@ -1355,14 +1680,28 @@ def main():
         st.session_state['last_update'] = datetime.now()
 
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Live Prediction",
         "Channel Visualization",
         "Window Selection",
         "Feature Analysis",
         "Model Info",
-        "Data Explorer"
+        "Data Explorer",
+        "Trading Monitor",
     ])
+
+    # Validate native TF data completeness (shared across tabs)
+    missing_tfs = []
+    if native_tf_data is None:
+        missing_tfs = NATIVE_TF_LIST.copy()
+    else:
+        required_symbols = ['TSLA', 'SPY', '^VIX']
+        for tf in NATIVE_TF_LIST:
+            for sym in required_symbols:
+                sym_data = native_tf_data.get(sym, {})
+                tf_df = sym_data.get(tf)
+                if tf_df is None or len(tf_df) < 10:
+                    missing_tfs.append(f"{sym} {tf}")
 
     with tab1:
         st.header("Live Prediction")
@@ -1374,19 +1713,6 @@ def main():
             st.warning("Load a trained model to make predictions")
         else:
             st.caption(f"Available: {len(current_tsla):,} bars")
-
-            # Validate native TF data completeness before allowing prediction
-            missing_tfs = []
-            if native_tf_data is None:
-                missing_tfs = NATIVE_TF_LIST.copy()
-            else:
-                required_symbols = ['TSLA', 'SPY', '^VIX']
-                for tf in NATIVE_TF_LIST:
-                    for sym in required_symbols:
-                        sym_data = native_tf_data.get(sym, {})
-                        tf_df = sym_data.get(tf)
-                        if tf_df is None or len(tf_df) < 10:
-                            missing_tfs.append(f"{sym} {tf}")
 
             if missing_tfs:
                 st.error(
@@ -1968,6 +2294,18 @@ def main():
                 st.metric("Last Close", f"${current_tsla['close'].iloc[-1]:.2f}")
         else:
             st.info("No TSLA data available")
+
+    with tab7:
+        show_trading_monitor_tab(
+            predictor=predictor,
+            current_tsla=current_tsla,
+            current_spy=current_spy,
+            current_vix=current_vix,
+            native_tf_data=native_tf_data,
+            live_config=live_config,
+            is_live=is_live,
+            missing_tfs=missing_tfs,
+        )
 
 
 if __name__ == "__main__":

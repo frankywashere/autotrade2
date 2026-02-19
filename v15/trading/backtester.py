@@ -21,6 +21,7 @@ from .signals import (
 )
 from .position_sizer import PositionSizer, PositionRecommendation
 from .metrics import Trade, TradeMetrics, EquityCurve
+from .signal_filter import classify_strategy_signals, scale_position, compute_momentum
 
 if TYPE_CHECKING:
     from ..inference import Predictor, PerTFPrediction
@@ -226,113 +227,23 @@ class Backtester:
                     )
                     prev_hazard = unified.hazard
 
-                    # Horizon-specific minimum confidence
-                    # Long horizon has proven edge; others are disabled
-                    # Evidence: 1h = 0% win rate across ALL runs, monthly = 50%+ win
-                    HORIZON_MIN_CONF = {
-                        'short': 0.68,   # Bounce strategy: ranging regime only
-                        'medium': 0.60,  # Low gate; real filter in medium block (long-validated)
-                        'long': 0.75,    # Trend strategy: 100%WR, PF=inf
-                    }
-
-                    # High-selectivity + momentum filter strategy:
-                    # 1. Only trade long horizon (monthly/weekly/daily)
-                    # 2. High confidence threshold (0.72+)
-                    # 3. Price momentum must confirm direction
-                    #    → avoids going long during corrections
-
                     # Compute multi-timeframe price momentum
                     # Short: 78 bars (1 day), Medium: 234 bars (3 days)
                     # Both must agree for entry
-                    def _calc_momentum(lookback):
-                        if bar_idx >= lookback:
-                            past = float(tsla_df.iloc[bar_idx - lookback]['close'])
-                            return (current_price - past) / past
-                        return 0.0
+                    close_series = tsla_df.iloc[:bar_idx + 1]['close']
+                    mom_1d = compute_momentum(close_series, current_price, 78)
+                    mom_3d = compute_momentum(close_series, current_price, 234)
 
-                    mom_1d = _calc_momentum(78)
-                    mom_3d = _calc_momentum(234)
-
-                    # === DUAL STRATEGY: Trend + Bounce ===
-                    # Strategy 1: Long horizon trend-following (monthly TF)
-                    # Strategy 2: Short horizon bounce capture (ranging markets)
-                    # Priority: long horizon first, short horizon as backup
-
-                    # Sweep-optimized momentum thresholds
-                    MOM_1D_THRESHOLD = -0.005  # Allow slight 1d pullback
-                    MOM_3D_THRESHOLD = -0.01   # 3d must not be deeply negative
-
-                    # Collect candidate signals per strategy
-                    strategy_signals = {}  # strategy -> (signal, score)
-
+                    # Count signals for statistics
                     for horizon, sig in horizon_signals.items():
                         signals_generated += 1
                         if sig.actionable:
                             signals_actionable += 1
 
-                        min_conf = HORIZON_MIN_CONF.get(horizon, 0.99)
-                        if sig.confidence < min_conf:
-                            continue
-                        if not sig.actionable:
-                            continue
-
-                        if horizon == 'long':
-                            if sig.regime.regime == MarketRegime.TRANSITIONING:
-                                continue
-                            if sig.signal_type == SignalType.LONG:
-                                if mom_1d < MOM_1D_THRESHOLD or mom_3d < MOM_3D_THRESHOLD:
-                                    continue
-                            elif sig.signal_type == SignalType.SHORT:
-                                if mom_1d > -MOM_1D_THRESHOLD or mom_3d > -MOM_3D_THRESHOLD:
-                                    continue
-                            score = sig.confidence * sig.entry_urgency * 2.0
-                            prev = strategy_signals.get('trend')
-                            if prev is None or score > prev[1]:
-                                strategy_signals['trend'] = (sig, score)
-
-                        elif horizon == 'medium':
-                            # Medium horizon: only when validated by long horizon
-                            # The long horizon provides directional edge;
-                            # medium provides faster entry timing
-                            long_sig = horizon_signals.get('long')
-                            if (long_sig
-                                    and long_sig.signal_type == sig.signal_type
-                                    and long_sig.confidence >= 0.73
-                                    and sig.confidence >= 0.70):
-                                # Also apply momentum filter
-                                if sig.signal_type == SignalType.LONG:
-                                    if mom_1d < MOM_1D_THRESHOLD or mom_3d < MOM_3D_THRESHOLD:
-                                        continue
-                                elif sig.signal_type == SignalType.SHORT:
-                                    if mom_1d > -MOM_1D_THRESHOLD or mom_3d > -MOM_3D_THRESHOLD:
-                                        continue
-                                score = sig.confidence * sig.entry_urgency * 1.5
-                                prev = strategy_signals.get('medium_trend')
-                                if prev is None or score > prev[1]:
-                                    strategy_signals['medium_trend'] = (sig, score)
-
-                        elif horizon == 'short':
-                            if sig.regime.regime == MarketRegime.RANGING:
-                                # Bounce strategy: ranging markets, channel bounce
-                                score = sig.confidence * sig.entry_urgency
-                                prev = strategy_signals.get('bounce')
-                                if prev is None or score > prev[1]:
-                                    strategy_signals['bounce'] = (sig, score)
-                            elif sig.regime.regime in (MarketRegime.TRENDING_BULL, MarketRegime.TRENDING_BEAR):
-                                # Short-horizon trend: trending markets, 1d momentum confirmation
-                                # Only when confidence is high AND 1d momentum confirms
-                                # (skip 3d check — catches V-shaped recoveries)
-                                if sig.confidence >= 0.72:
-                                    if sig.signal_type == SignalType.LONG:
-                                        if mom_1d < 0.01:  # Strong 1d momentum required
-                                            continue
-                                    elif sig.signal_type == SignalType.SHORT:
-                                        if mom_1d > -0.01:
-                                            continue
-                                    score = sig.confidence * sig.entry_urgency * 1.2
-                                    prev = strategy_signals.get('short_trend')
-                                    if prev is None or score > prev[1]:
-                                        strategy_signals['short_trend'] = (sig, score)
+                    # Classify into strategy buckets (shared with live monitor)
+                    strategy_signals = classify_strategy_signals(
+                        horizon_signals, mom_1d, mom_3d
+                    )
 
                     # Current total position value
                     total_position_value = sum(
@@ -394,57 +305,11 @@ class Backtester:
                         self.position_sizer.max_position_pct = orig_max
 
                         if position.should_trade:
-                            # Confidence-based scaling
-                            conf_scale = max(0.5, min(5.0,
-                                0.7 + (signal.confidence - 0.72) * 100.0
-                            ))
-
-                            # Cross-horizon agreement bonus:
-                            # If other horizons agree on direction, size up
-                            signal_dir = signal.signal_type
-                            agreeing_horizons = 0
-                            total_horizons = 0
-                            for h, hsig in horizon_signals.items():
-                                if hsig.signal_type != SignalType.FLAT:
-                                    total_horizons += 1
-                                    if hsig.signal_type == signal_dir:
-                                        agreeing_horizons += 1
-                            if total_horizons >= 2:
-                                agreement_pct = agreeing_horizons / total_horizons
-                                # 100% agreement = 5.0x, 50% = 2.5x, 0% = 0.0x (skip trade)
-                                cross_horizon_mult = agreement_pct * 5.0
-                                # Unanimous bonus: extra 40% when ALL non-flat horizons agree
-                                if agreeing_horizons == total_horizons and total_horizons >= 3:
-                                    cross_horizon_mult *= 1.5
-                            else:
-                                cross_horizon_mult = 1.0
-
-                            # VIX-inverse scaling: size up in calm markets, down in fearful
                             vix_level = float(vix_df.iloc[bar_idx]['close'])
-                            if vix_level <= 16:
-                                vix_scale = 1.3  # Calm: size up
-                            elif vix_level <= 22:
-                                vix_scale = 1.0  # Normal
-                            elif vix_level <= 30:
-                                vix_scale = 0.7  # Elevated: size down
-                            else:
-                                vix_scale = 0.4  # Fear: minimal
-
-                            total_scale = conf_scale * cross_horizon_mult * vix_scale
-                            if total_scale != 1.0:
-                                position.shares = max(1, int(position.shares * total_scale))
-                                position.dollar_amount = position.shares * current_price
-                                position.fraction *= total_scale
-
-                            # Safety cap: limit max position value
-                            # Prevents catastrophic single-trade losses
-                            MAX_POSITION_VALUE_PCT = 15.0
-                            max_position_value = equity * MAX_POSITION_VALUE_PCT
-                            if position.dollar_amount > max_position_value:
-                                ratio = max_position_value / position.dollar_amount
-                                position.shares = max(1, int(position.shares * ratio))
-                                position.dollar_amount = position.shares * current_price
-                                position.fraction *= ratio
+                            scale_position(
+                                signal, position, horizon_signals,
+                                vix_level, equity, current_price,
+                            )
 
                             new_pos = self._open_position(
                                 signal, position, current_price,
