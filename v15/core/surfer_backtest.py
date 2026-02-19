@@ -276,6 +276,9 @@ def run_backtest(
     max_dd = 0.0
     consecutive_losses = 0  # Track losing streak for position reduction
     consecutive_wins = 0    # Track winning streak for position ramping
+    daily_pnl = 0.0         # Running P&L for current trading day
+    daily_breaker_active = False
+    current_day = None
     # Walk forward from bar 100 (need lookback)
     start_bar = 100
     total_bars = len(tsla)
@@ -292,6 +295,13 @@ def run_backtest(
             last_print = bar
 
         current_price = float(closes[bar])
+
+        # Reset daily P&L at day boundary
+        bar_date = tsla.index[bar].date() if hasattr(tsla.index[bar], 'date') else None
+        if bar_date and bar_date != current_day:
+            current_day = bar_date
+            daily_pnl = 0.0
+            daily_breaker_active = False
 
         # --- Check exits for all open positions ---
         window_highs = highs[max(0, bar - eval_interval):bar + 1]
@@ -345,6 +355,11 @@ def run_backtest(
                 else:
                     consecutive_losses = 0
                     consecutive_wins += 1
+
+                # Track daily P&L for circuit breaker
+                daily_pnl += pnl
+                if daily_pnl < -500:
+                    daily_breaker_active = True
 
                 closed_indices.append(pi)
                 trade_signals.append(position_signals[pi])
@@ -425,6 +440,10 @@ def run_backtest(
             sig = analysis.signal
 
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
+                # Daily circuit breaker: stop trading if down $500+ today
+                if daily_breaker_active:
+                    continue
+
                 # Skip 10AM ET hour (15:00 UTC) — only negative hour in backtest
                 bar_time = tsla.index[bar]
                 if hasattr(bar_time, 'hour') and bar_time.hour == 15:
@@ -462,6 +481,11 @@ def run_backtest(
                     trade_size *= streak_boost
                 if consecutive_losses >= 4:
                     trade_size *= 0.50  # Half size after 4+ consecutive losses
+
+                # Max exposure check: total open position value < 3x equity
+                total_exposure = sum(p.trade_size for p in positions)
+                if total_exposure + trade_size > equity * 3:
+                    continue  # At exposure limit
 
                 # Volatility-adjusted stops: blend channel width with ATR
                 # Floor at 1.5*ATR (survive noise), cap at 2.5*ATR (don't overexpose)
