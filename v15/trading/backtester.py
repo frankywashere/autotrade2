@@ -396,7 +396,7 @@ class Backtester:
                         if position.should_trade:
                             # Confidence-based scaling
                             conf_scale = max(0.5, min(3.0,
-                                0.7 + (signal.confidence - 0.72) * 25.0
+                                0.7 + (signal.confidence - 0.72) * 100.0
                             ))
 
                             # Cross-horizon agreement bonus:
