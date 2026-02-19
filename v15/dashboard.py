@@ -1830,6 +1830,157 @@ def _show_surfer_chart(tsla_df, analysis):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _show_ml_predictions(analysis, current_tsla, native_tf_data):
+    """Show ML model predictions for channel lifetime, break direction, and action."""
+    try:
+        from v15.core.surfer_ml import (
+            GBTModel, extract_tf_features, extract_cross_tf_features,
+            extract_context_features, extract_correlation_features,
+            get_feature_names, ML_TFS, PER_TF_FEATURES,
+            CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
+        )
+    except ImportError:
+        return  # ML module not available
+
+    # Load model (cached in session state)
+    if 'surfer_ml_model' not in st.session_state:
+        import os
+        model_path = os.path.join(os.path.dirname(__file__), '..', 'surfer_models', 'gbt_model.pkl')
+        if not os.path.exists(model_path):
+            model_path = 'surfer_models/gbt_model.pkl'
+        if os.path.exists(model_path):
+            try:
+                st.session_state['surfer_ml_model'] = GBTModel.load(model_path)
+            except Exception:
+                st.session_state['surfer_ml_model'] = None
+        else:
+            st.session_state['surfer_ml_model'] = None
+
+    model = st.session_state.get('surfer_ml_model')
+    if model is None:
+        return  # No ML model available
+
+    if analysis is None or not analysis.tf_states:
+        return
+
+    # Extract features
+    try:
+        feature_names = get_feature_names()
+        num_features = len(feature_names)
+        feature_vec = np.zeros(num_features, dtype=np.float32)
+        offset = 0
+
+        for tf in ML_TFS:
+            state = analysis.tf_states.get(tf)
+            if state:
+                tf_feats = extract_tf_features(state)
+            else:
+                tf_feats = np.zeros(len(PER_TF_FEATURES), dtype=np.float32)
+            feature_vec[offset:offset + len(PER_TF_FEATURES)] = tf_feats
+            offset += len(PER_TF_FEATURES)
+
+        cross_feats = extract_cross_tf_features(analysis.tf_states)
+        feature_vec[offset:offset + len(CROSS_TF_FEATURES)] = cross_feats
+        offset += len(CROSS_TF_FEATURES)
+
+        # Context features from current data
+        if current_tsla is not None and len(current_tsla) > 20:
+            bar_idx = len(current_tsla) - 1
+            ctx_feats = extract_context_features(current_tsla, bar_idx)
+            feature_vec[offset:offset + len(CONTEXT_FEATURES)] = ctx_feats
+        offset += len(CONTEXT_FEATURES)
+
+        # Correlation features (zeros for now — dashboard doesn't have SPY/VIX 5min)
+        offset += len(CORRELATION_FEATURES)
+
+        # Predict
+        prediction = model.predict(feature_vec.reshape(1, -1))
+
+    except Exception as e:
+        logger.warning(f"ML prediction failed: {e}")
+        return
+
+    # --- Display ML Predictions ---
+    st.markdown("---")
+    st.subheader("ML Predictions")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    # Channel Lifetime
+    with col1:
+        lifetime = float(prediction.get('lifetime', [0])[0])
+        hours = lifetime * 5 / 60  # Convert 5min bars to hours
+        if lifetime > 100:
+            lt_color = "#00c853"
+            lt_label = "LONG"
+        elif lifetime > 30:
+            lt_color = "#ffab40"
+            lt_label = "MEDIUM"
+        else:
+            lt_color = "#ff1744"
+            lt_label = "SHORT"
+        st.metric("Channel Life", f"~{lifetime:.0f} bars", help=f"~{hours:.1f} hours remaining")
+        st.markdown(f"<div style='text-align:center;color:{lt_color};font-weight:bold;'>{lt_label}</div>",
+                   unsafe_allow_html=True)
+
+    # Break Direction
+    with col2:
+        bd = int(prediction.get('break_dir', [0])[0])
+        bd_labels = {0: "SURVIVE", 1: "BREAK UP", 2: "BREAK DOWN"}
+        bd_colors = {0: "#4fc3f7", 1: "#00c853", 2: "#ff1744"}
+        bd_emojis = {0: "~", 1: "+", 2: "-"}
+        bd_label = bd_labels.get(bd, "?")
+        bd_color = bd_colors.get(bd, "#888")
+
+        # Show probabilities if available
+        if 'break_dir_probs' in prediction:
+            probs = prediction['break_dir_probs'][0]
+            conf_str = f"{probs[bd]:.0%}"
+        else:
+            conf_str = ""
+
+        st.metric("Break Direction", f"{bd_emojis.get(bd, '?')} {bd_label}")
+        st.markdown(f"<div style='text-align:center;color:{bd_color};font-weight:bold;'>{conf_str}</div>",
+                   unsafe_allow_html=True)
+
+    # ML Action
+    with col3:
+        action = int(prediction.get('action', [0])[0])
+        action_labels = {0: "HOLD", 1: "BUY", 2: "SELL"}
+        action_colors = {0: "#888", 1: "#00c853", 2: "#ff1744"}
+        action_label = action_labels.get(action, "?")
+        action_color = action_colors.get(action, "#888")
+
+        if 'action_probs' in prediction:
+            probs = prediction['action_probs'][0]
+            conf_str = f"{probs[action]:.0%}"
+        else:
+            conf_str = ""
+
+        st.metric("ML Signal", action_label)
+        st.markdown(f"<div style='text-align:center;color:{action_color};font-weight:bold;font-size:18px;'>"
+                   f"{conf_str}</div>", unsafe_allow_html=True)
+
+    # Future Return Prediction
+    with col4:
+        ret_20 = float(prediction.get('future_return_20', [0])[0])
+        ret_color = "#00c853" if ret_20 > 0 else "#ff1744"
+        st.metric("20-bar Return", f"{ret_20:+.2%}")
+        st.markdown(f"<div style='text-align:center;color:{ret_color};font-size:12px;'>Predicted</div>",
+                   unsafe_allow_html=True)
+
+    # Agreement indicator
+    physics_action = analysis.signal.action
+    ml_action = action_labels.get(action, "HOLD")
+
+    if physics_action == ml_action and physics_action != 'HOLD':
+        st.success(f"PHYSICS + ML AGREE: {physics_action} (high confidence setup)")
+    elif physics_action != 'HOLD' and ml_action != 'HOLD' and physics_action != ml_action:
+        st.warning(f"CONFLICT: Physics says {physics_action}, ML says {ml_action} (proceed with caution)")
+    elif physics_action == 'HOLD' and ml_action != 'HOLD':
+        st.info(f"ML sees opportunity: {ml_action} (but physics says HOLD)")
+
+
 def show_channel_surfer_tab(
     current_tsla,
     native_tf_data,
@@ -1911,6 +2062,9 @@ def show_channel_surfer_tab(
             </div>""",
             unsafe_allow_html=True,
         )
+
+    # --- ML Predictions Section ---
+    _show_ml_predictions(analysis, current_tsla, native_tf_data)
 
     # --- Section 1b: 5min Channel Chart ---
     if current_tsla is not None and len(current_tsla) > 0 and 'close' in current_tsla.columns:
