@@ -5046,6 +5046,204 @@ class AdverseMovementPredictor:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 12: Entry Timing Optimizer
+# ---------------------------------------------------------------------------
+
+class EntryTimingOptimizer:
+    """
+    Predicts whether NOW is the best entry or if waiting 1-5 bars yields better.
+
+    Insight: In winning trades, avg MAE = 0.331% — that's money left on the table
+    from suboptimal entry timing. If we could enter 1-3 bars later at a better
+    price, that's 0.1-0.3% improvement per trade.
+
+    Targets:
+    1. immediate_best: binary — is current bar's price within 0.1% of the
+       best entry price in the next 5 bars?
+    2. improvement_pct: regression — how much better could we do by waiting?
+    """
+
+    LOOKAHEAD = 5
+
+    def __init__(self):
+        self.models = {}
+        self.feature_names = None
+
+    def train(
+        self,
+        X_train: np.ndarray, Y_train: Dict[str, np.ndarray],
+        X_val: np.ndarray, Y_val: Dict[str, np.ndarray],
+        feature_names: List[str],
+    ) -> Dict[str, float]:
+        """Train the entry timing optimizer."""
+        import lightgbm as lgb
+
+        self.feature_names = feature_names
+        metrics = {}
+        n_train = len(X_train)
+        n_val = len(X_val)
+
+        print("\n  Computing entry timing targets...")
+
+        train_ret5 = Y_train['future_return_5']
+        train_ret20 = Y_train['future_return_20']
+        val_ret5 = Y_val['future_return_5']
+        val_ret20 = Y_val['future_return_20']
+
+        # BUY: improvement = how much price drops in next 5 bars (better buy price)
+        train_buy_improve = np.maximum(-train_ret5, 0) * 100
+        train_sell_improve = np.maximum(train_ret5, 0) * 100
+        val_buy_improve = np.maximum(-val_ret5, 0) * 100
+        val_sell_improve = np.maximum(val_ret5, 0) * 100
+
+        # immediate_best: improvement < 0.1%
+        IMMEDIATE_THRESH = 0.10
+        train_buy_immediate = (train_buy_improve < IMMEDIATE_THRESH).astype(float)
+        train_sell_immediate = (train_sell_improve < IMMEDIATE_THRESH).astype(float)
+        val_buy_immediate = (val_buy_improve < IMMEDIATE_THRESH).astype(float)
+        val_sell_immediate = (val_sell_improve < IMMEDIATE_THRESH).astype(float)
+
+        print(f"  BUY immediate-best rate: train={train_buy_immediate.mean():.1%}, val={val_buy_immediate.mean():.1%}")
+        print(f"  SELL immediate-best rate: train={train_sell_immediate.mean():.1%}, val={val_sell_immediate.mean():.1%}")
+        print(f"  BUY avg improvement: train={train_buy_improve.mean():.3f}%, val={val_buy_improve.mean():.3f}%")
+        print(f"  SELL avg improvement: train={train_sell_improve.mean():.3f}%, val={val_sell_improve.mean():.3f}%")
+
+        X_train_combined = np.vstack([
+            np.column_stack([X_train, np.ones(n_train)]),
+            np.column_stack([X_train, np.zeros(n_train)]),
+        ])
+        X_val_combined = np.vstack([
+            np.column_stack([X_val, np.ones(n_val)]),
+            np.column_stack([X_val, np.zeros(n_val)]),
+        ])
+
+        y_train_immediate = np.concatenate([train_buy_immediate, train_sell_immediate])
+        y_val_immediate = np.concatenate([val_buy_immediate, val_sell_immediate])
+        y_train_improve = np.concatenate([train_buy_improve, train_sell_improve])
+        y_val_improve = np.concatenate([val_buy_improve, val_sell_improve])
+
+        combined_names = feature_names + ['is_buy']
+
+        print(f"  Combined: train={len(X_train_combined)}, val={len(X_val_combined)}")
+        print(f"  Immediate-best rate: train={y_train_immediate.mean():.1%}, val={y_val_immediate.mean():.1%}")
+
+        # Model 1: Is NOW the best entry? (binary)
+        print("\n  Training: immediate_best (is NOW optimal?)...")
+        train_ds = lgb.Dataset(X_train_combined, label=y_train_immediate, feature_name=combined_names)
+        val_ds = lgb.Dataset(X_val_combined, label=y_val_immediate, feature_name=combined_names, reference=train_ds)
+
+        params = {
+            'objective': 'binary', 'metric': 'auc',
+            'num_leaves': 28, 'learning_rate': 0.05,
+            'min_child_samples': 12, 'feature_fraction': 0.8,
+            'bagging_fraction': 0.9, 'bagging_freq': 5,
+            'verbose': -1,
+        }
+        model = lgb.train(
+            params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['immediate_best'] = model
+
+        val_pred_prob = model.predict(X_val_combined)
+        from sklearn.metrics import roc_auc_score
+        try:
+            auc = roc_auc_score(y_val_immediate, val_pred_prob)
+        except Exception:
+            auc = 0.5
+        acc = np.mean((val_pred_prob > 0.5).astype(int) == y_val_immediate)
+        metrics['immediate_best_auc'] = float(auc)
+        metrics['immediate_best_acc'] = float(acc)
+        print(f"    Val AUC: {auc:.3f}")
+        print(f"    Val accuracy: {acc:.1%}")
+
+        enter_now = val_pred_prob > 0.7
+        if enter_now.sum() > 5:
+            actual_good = y_val_immediate[enter_now].mean()
+            metrics['enter_now_precision'] = float(actual_good)
+            metrics['enter_now_coverage'] = float(enter_now.mean())
+            print(f"    'Enter now' (>0.7): precision={actual_good:.1%}, "
+                  f"coverage={enter_now.mean():.1%}")
+
+        wait_mask = val_pred_prob < 0.3
+        if wait_mask.sum() > 5:
+            avg_improve = y_val_improve[wait_mask].mean()
+            metrics['wait_avg_improvement'] = float(avg_improve)
+            metrics['wait_coverage'] = float(wait_mask.mean())
+            print(f"    'Wait' (<0.3): avg improve={avg_improve:.3f}%, "
+                  f"coverage={wait_mask.mean():.1%}")
+
+        # Model 2: Expected improvement by waiting (regression)
+        print("\n  Training: improvement_pct (how much better by waiting?)...")
+        train_ds = lgb.Dataset(X_train_combined, label=y_train_improve, feature_name=combined_names)
+        val_ds = lgb.Dataset(X_val_combined, label=y_val_improve, feature_name=combined_names, reference=train_ds)
+
+        reg_params = {
+            'objective': 'mae', 'metric': 'mae',
+            'num_leaves': 24, 'learning_rate': 0.05,
+            'min_child_samples': 10, 'verbose': -1,
+        }
+        model = lgb.train(
+            reg_params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['improvement'] = model
+
+        val_pred_improve = model.predict(X_val_combined)
+        imp_error = np.mean(np.abs(val_pred_improve - y_val_improve))
+        metrics['improvement_mae'] = float(imp_error)
+        print(f"    Val MAE: {imp_error:.4f}%")
+        corr = np.corrcoef(val_pred_improve, y_val_improve)[0, 1]
+        metrics['improvement_correlation'] = float(corr) if not np.isnan(corr) else 0.0
+        print(f"    Correlation: {metrics['improvement_correlation']:.3f}")
+
+        # Feature importance
+        imp_arr = self.models['immediate_best'].feature_importance(importance_type='gain')
+        sorted_idx = np.argsort(imp_arr)[::-1]
+        print("\n  Top 15 features for entry timing:")
+        for rank, i in enumerate(sorted_idx[:15]):
+            print(f"    {rank+1}. {combined_names[i]}: {imp_arr[i]:.0f}")
+        self.feature_importance = [(combined_names[i], float(imp_arr[i])) for i in sorted_idx]
+
+        return metrics
+
+    def predict(self, X: np.ndarray, is_buy: bool = True) -> Dict[str, np.ndarray]:
+        """Predict entry timing quality."""
+        n = len(X)
+        direction_col = np.ones(n) if is_buy else np.zeros(n)
+        X_aug = np.column_stack([X, direction_col])
+
+        results = {}
+        if 'immediate_best' in self.models:
+            results['immediate_best_prob'] = self.models['immediate_best'].predict(X_aug)
+        if 'improvement' in self.models:
+            results['expected_improvement'] = self.models['improvement'].predict(X_aug) / 100.0
+        return results
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'models': self.models,
+                'feature_names': self.feature_names,
+                'feature_importance': getattr(self, 'feature_importance', []),
+            }, f)
+        print(f"  Saved EntryTimingOptimizer to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'EntryTimingOptimizer':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.models = data['models']
+        model.feature_names = data['feature_names']
+        model.feature_importance = data.get('feature_importance', [])
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -5674,7 +5872,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -5803,6 +6001,13 @@ def main():
                 )
                 adv.save(os.path.join(args.output, 'adverse_movement_model.pkl'))
                 print(f"\n  Adverse Movement metrics: {adv_metrics}")
+            elif args.arch == 'entry_timing':
+                timing = EntryTimingOptimizer()
+                timing_metrics = timing.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                timing.save(os.path.join(args.output, 'entry_timing_model.pkl'))
+                print(f"\n  Entry Timing metrics: {timing_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
