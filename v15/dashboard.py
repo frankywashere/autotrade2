@@ -1617,7 +1617,7 @@ def _render_position_gauge(position_pct: float, width_px: int = 300) -> str:
     """
 
 
-def _render_signal_banner(signal) -> None:
+def _render_signal_banner(signal, current_price: float = 0.0) -> None:
     """Render a prominent BUY/SELL/HOLD banner with signal type indicator."""
     sig_type = getattr(signal, 'signal_type', 'bounce')
     type_label = 'BREAKOUT' if sig_type == 'break' else 'BOUNCE'
@@ -1633,6 +1633,18 @@ def _render_signal_banner(signal) -> None:
             bg = "linear-gradient(135deg,#004d1a,#00802b)"
             border = "#00c853"
             glow = "#00ff55"
+        # Compute entry instructions
+        entry_info = ""
+        if current_price > 0:
+            stop = current_price * (1 - signal.suggested_stop_pct)
+            tp = current_price * (1 + signal.suggested_tp_pct)
+            rr = signal.suggested_tp_pct / max(signal.suggested_stop_pct, 0.001)
+            entry_info = (
+                f"<div style='font-size:16px;color:#ccffcc;margin-top:8px;font-family:monospace;'>"
+                f"Entry: ${current_price:.2f} &nbsp; Stop: ${stop:.2f} &nbsp; TP: ${tp:.2f} &nbsp; R:R {rr:.1f}:1"
+                f"</div>"
+            )
+
         st.markdown(
             f"""<div style="background:{bg};border:2px solid {border};
             border-radius:12px;padding:20px;text-align:center;margin:10px 0;">
@@ -1643,6 +1655,7 @@ def _render_signal_banner(signal) -> None:
             <div style="font-size:18px;color:#aaffcc;margin-top:8px;">
             Confidence: {signal.confidence:.0%} | {signal.primary_tf} | Stop: {signal.suggested_stop_pct:.2%} | TP: {signal.suggested_tp_pct:.2%}
             </div>
+            {entry_info}
             <div style="font-size:14px;color:#88cc99;margin-top:4px;">{signal.reason}</div>
             </div>""",
             unsafe_allow_html=True,
@@ -1656,6 +1669,18 @@ def _render_signal_banner(signal) -> None:
             bg = "linear-gradient(135deg,#4d0000,#800000)"
             border = "#ff1744"
             glow = "#ff4444"
+        # Compute entry instructions for SELL
+        entry_info = ""
+        if current_price > 0:
+            stop = current_price * (1 + signal.suggested_stop_pct)
+            tp = current_price * (1 - signal.suggested_tp_pct)
+            rr = signal.suggested_tp_pct / max(signal.suggested_stop_pct, 0.001)
+            entry_info = (
+                f"<div style='font-size:16px;color:#ffcccc;margin-top:8px;font-family:monospace;'>"
+                f"Entry: ${current_price:.2f} &nbsp; Stop: ${stop:.2f} &nbsp; TP: ${tp:.2f} &nbsp; R:R {rr:.1f}:1"
+                f"</div>"
+            )
+
         st.markdown(
             f"""<div style="background:{bg};border:2px solid {border};
             border-radius:12px;padding:20px;text-align:center;margin:10px 0;">
@@ -1666,6 +1691,7 @@ def _render_signal_banner(signal) -> None:
             <div style="font-size:18px;color:#ffaaaa;margin-top:8px;">
             Confidence: {signal.confidence:.0%} | {signal.primary_tf} | Stop: {signal.suggested_stop_pct:.2%} | TP: {signal.suggested_tp_pct:.2%}
             </div>
+            {entry_info}
             <div style="font-size:14px;color:#cc8888;margin-top:4px;">{signal.reason}</div>
             </div>""",
             unsafe_allow_html=True,
@@ -1860,7 +1886,8 @@ def show_channel_surfer_tab(
     sig = analysis.signal
 
     # --- Section 1: Signal Banner ---
-    _render_signal_banner(sig)
+    current_price = float(current_tsla['close'].iloc[-1]) if current_tsla is not None and len(current_tsla) > 0 else 0.0
+    _render_signal_banner(sig, current_price=current_price)
 
     # Play audio for BUY/SELL signals (only if new)
     prev_action = st.session_state.get('surfer_prev_action', 'HOLD')
