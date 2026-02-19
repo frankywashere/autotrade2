@@ -51,7 +51,8 @@ from v15.live_data import (
     should_refresh,
     fetch_live_data,
     get_market_status,
-    YFINANCE_AVAILABLE
+    YFINANCE_AVAILABLE,
+    FINNHUB_AVAILABLE,
 )
 
 # Import live trading monitor
@@ -644,6 +645,22 @@ def _fetch_live_5min() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     print("[DATA] Fetching live 5-min data from yfinance (cache miss)...")
     data_feed = YFinanceLiveData(cache_ttl=60)
     return data_feed.get_historical(period='60d', interval='5m')
+
+
+@st.cache_data(ttl=5)
+def _get_realtime_prices() -> Dict[str, Optional[float]]:
+    """Get real-time prices via Finnhub (TSLA/SPY) + yfinance (VIX).
+
+    Short TTL (5s) — Finnhub quotes are sub-second fresh.
+    """
+    if not FINNHUB_AVAILABLE:
+        return {}
+    try:
+        data_feed = YFinanceLiveData(cache_ttl=5)
+        return data_feed.get_realtime_prices()
+    except Exception as e:
+        logger.warning(f"Real-time price fetch failed: {e}")
+        return {}
 
 
 @st.cache_data(ttl=60)
@@ -1296,12 +1313,21 @@ def show_trading_monitor_tab(
                 st.error(f"Missing data for {len(missing_tfs)} TFs — cannot evaluate.")
 
     # Get current price and VIX
+    # Prefer Finnhub real-time for TSLA/SPY, fall back to last yfinance candle
     current_price = 0.0
     vix_level = 20.0
-    if len(current_tsla) > 0 and 'close' in current_tsla.columns:
+    rt_prices = _get_realtime_prices()
+    if rt_prices.get('TSLA'):
+        current_price = rt_prices['TSLA']
+        _price_source = "Finnhub (real-time)"
+    elif len(current_tsla) > 0 and 'close' in current_tsla.columns:
         current_price = float(current_tsla.iloc[-1]['close'])
+        _price_source = "yfinance (delayed)"
+    else:
+        _price_source = "unavailable"
     if len(current_vix) > 0 and 'close' in current_vix.columns:
         vix_level = float(current_vix.iloc[-1]['close'])
+    st.caption(f"TSLA ${current_price:.2f} ({_price_source}) | VIX {vix_level:.1f}")
 
     # =====================================================================
     # Section A: Active Signal Alerts

@@ -1,8 +1,13 @@
 """
-V15 Live Data Module - Real-time market data using yfinance.
+V15 Live Data Module - Real-time market data using Finnhub + yfinance.
 
 Provides live and historical data for TSLA, SPY, and VIX for the dashboard
 and live prediction systems.
+
+Data sources:
+- Finnhub (free tier): Real-time quotes for TSLA and SPY (sub-second latency)
+- yfinance: Historical OHLCV candles for all symbols (15-min delayed but full history)
+- VIX always via yfinance (Finnhub free tier doesn't support indices)
 
 Usage:
     from v15.live_data import YFinanceLiveData, should_refresh
@@ -13,24 +18,14 @@ Usage:
     # Get historical data for warm-up
     tsla, spy, vix = data_feed.get_historical(period='60d', interval='5m')
 
-    # Get latest bars for live prediction
-    tsla, spy, vix = data_feed.get_latest_bars(lookback_bars=100)
+    # Get real-time prices (Finnhub for TSLA/SPY, yfinance for VIX)
+    prices = data_feed.get_realtime_prices()
+    # prices = {'TSLA': 409.59, 'SPY': 598.12, '^VIX': 15.3}
 
     # Check if market is open
     if data_feed.is_market_open():
         # Make predictions...
         pass
-
-    # Check if refresh is needed (for Streamlit auto-refresh)
-    if should_refresh(last_refresh, interval_seconds=300):
-        st.rerun()
-
-Note on yfinance quirks:
-- VIX symbol is '^VIX' (not 'VIX')
-- 5-minute data only available for last 60 days
-- Column names come as 'Open', 'High', etc. - we lowercase them
-- Rate limits can cause failures - we implement retry logic
-- Data is cached to avoid repeated API calls
 """
 import pandas as pd
 import numpy as np
@@ -52,6 +47,14 @@ try:
 except ImportError:
     YFINANCE_AVAILABLE = False
     logger.warning("yfinance not installed. Install with: pip install yfinance")
+
+# Try to import Finnhub client
+try:
+    from .data.finnhub_client import FinnhubClient, FinnhubQuote
+    FINNHUB_AVAILABLE = True
+except ImportError:
+    FINNHUB_AVAILABLE = False
+    logger.info("Finnhub client not available, using yfinance only")
 
 
 class YFinanceLiveData:
@@ -116,12 +119,22 @@ class YFinanceLiveData:
         # Track last update time
         self._last_update_time: Optional[datetime] = None
 
+        # Finnhub client for real-time quotes (TSLA, SPY only)
+        self._finnhub: Optional['FinnhubClient'] = None
+        if FINNHUB_AVAILABLE:
+            try:
+                self._finnhub = FinnhubClient(cache_ttl=5.0)
+                logger.info("Finnhub real-time quotes enabled for TSLA/SPY")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Finnhub client: {e}")
+
         # Validate symbols
         self._validate_symbols()
 
         logger.info(
             f"YFinanceLiveData initialized for symbols: {self.symbols}, "
-            f"cache_ttl={cache_ttl}s, max_retries={max_retries}"
+            f"cache_ttl={cache_ttl}s, max_retries={max_retries}, "
+            f"finnhub={'enabled' if self._finnhub else 'disabled'}"
         )
 
     def _validate_symbols(self) -> None:
@@ -505,6 +518,56 @@ class YFinanceLiveData:
         logger.debug(f"Fetched {len(tsla_df)} latest bars")
 
         return tsla_df, spy_df, vix_df
+
+    def get_realtime_prices(self) -> Dict[str, Optional[float]]:
+        """
+        Get real-time prices for TSLA, SPY, VIX.
+
+        Uses Finnhub for TSLA and SPY (sub-second latency).
+        Falls back to yfinance for VIX and when Finnhub is unavailable.
+
+        Returns:
+            Dict mapping symbol to current price (or None if unavailable).
+            Keys: 'TSLA', 'SPY', '^VIX'
+        """
+        prices: Dict[str, Optional[float]] = {}
+
+        # Finnhub for TSLA and SPY
+        if self._finnhub:
+            for symbol in ['TSLA', 'SPY']:
+                quote = self._finnhub.get_quote(symbol)
+                if quote and quote.current_price > 0:
+                    prices[symbol] = quote.current_price
+
+        # Fallback to yfinance for symbols not yet fetched
+        for symbol in self.symbols:
+            if symbol in prices:
+                continue
+            try:
+                ticker = yf.Ticker(symbol)
+                info = ticker.fast_info
+                price = getattr(info, 'last_price', None)
+                if price and price > 0:
+                    prices[symbol] = float(price)
+            except Exception as e:
+                logger.debug(f"yfinance fast_info failed for {symbol}: {e}")
+                prices[symbol] = None
+
+        return prices
+
+    def get_realtime_quote(self, symbol: str) -> Optional['FinnhubQuote']:
+        """
+        Get full Finnhub quote for a symbol (includes OHLC, change, etc.).
+
+        Args:
+            symbol: Stock symbol (e.g., 'TSLA', 'SPY').
+
+        Returns:
+            FinnhubQuote or None if Finnhub unavailable or symbol unsupported.
+        """
+        if self._finnhub:
+            return self._finnhub.get_quote(symbol)
+        return None
 
     def is_market_open(self) -> bool:
         """
