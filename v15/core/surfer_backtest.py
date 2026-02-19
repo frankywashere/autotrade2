@@ -225,11 +225,14 @@ def run_backtest(
 
     ml_active = ml_model is not None
     quality_scorer = None
+    ensemble_model = None
+    ensemble_base_models = {}
     if ml_active:
         from v15.core.surfer_ml import (
             extract_tf_features, extract_cross_tf_features,
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
+            EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -237,20 +240,55 @@ def run_backtest(
         ml_feature_names = get_feature_names()
         ml_history_buffer: List[Dict] = []
         ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0,
-                     'quality_filtered': 0, 'quality_boosted': 0}
+                     'quality_filtered': 0, 'quality_boosted': 0, 'ensemble_filtered': 0}
         print(f"[ML] Model loaded with {len(ml_feature_names)} features")
 
         # Try to load quality scorer
         import os as _os
-        quality_path = _os.path.join(_os.path.dirname(__file__), '..', '..', 'surfer_models', 'trade_quality_scorer.pkl')
-        if not _os.path.exists(quality_path):
-            quality_path = 'surfer_models/trade_quality_scorer.pkl'
+        model_dir = _os.path.join(_os.path.dirname(__file__), '..', '..', 'surfer_models')
+        if not _os.path.isdir(model_dir):
+            model_dir = 'surfer_models'
+
+        quality_path = _os.path.join(model_dir, 'trade_quality_scorer.pkl')
         if _os.path.exists(quality_path):
             try:
                 quality_scorer = TradeQualityScorer.load(quality_path)
                 print(f"[ML] Quality scorer loaded")
             except Exception:
                 pass
+
+        # Try to load ensemble + base models
+        ens_path = _os.path.join(model_dir, 'ensemble_model.pkl')
+        if _os.path.exists(ens_path):
+            try:
+                ensemble_model = EnsembleModel.load(ens_path)
+                print(f"[ML] Ensemble meta-learner loaded")
+
+                # Load base models for ensemble
+                gbt_path = _os.path.join(model_dir, 'gbt_model.pkl')
+                if _os.path.exists(gbt_path):
+                    ensemble_base_models['gbt'] = GBTModel.load(gbt_path)
+
+                trans_path = _os.path.join(model_dir, 'transformer_model.pt')
+                if _os.path.exists(trans_path):
+                    try:
+                        ensemble_base_models['transformer'] = MultiTFTransformer.load(trans_path)
+                    except Exception:
+                        pass
+
+                surv_path = _os.path.join(model_dir, 'survival_model.pt')
+                if _os.path.exists(surv_path):
+                    try:
+                        ensemble_base_models['survival'] = SurvivalModel.load(surv_path)
+                    except Exception:
+                        pass
+
+                if quality_scorer:
+                    ensemble_base_models['quality'] = quality_scorer
+
+                print(f"[ML] Ensemble base models: {list(ensemble_base_models.keys())}")
+            except Exception:
+                ensemble_model = None
 
     # Fetch data
     print(f"Fetching {days}d of 5-min TSLA data...")
@@ -618,6 +656,39 @@ def run_backtest(
                     else:
                         ml_max_hold = None
 
+                    # Ensemble override: if ensemble is loaded, use its prediction
+                    if ensemble_model is not None:
+                        try:
+                            ens_pred = ensemble_model.predict(
+                                feature_vec.reshape(1, -1),
+                                gbt=ensemble_base_models.get('gbt'),
+                                transformer=ensemble_base_models.get('transformer'),
+                                survival=ensemble_base_models.get('survival'),
+                                quality=ensemble_base_models.get('quality'),
+                                feature_names=ml_feature_names,
+                            )
+
+                            # Ensemble action: override base ML if different
+                            if 'action' in ens_pred:
+                                ens_action = int(ens_pred['action'][0])
+                                physics_action_id = 1 if sig.action == 'BUY' else 2
+
+                                if ens_action == 0:  # Ensemble says HOLD
+                                    ml_stats['ensemble_filtered'] += 1
+                                    continue
+                                elif ens_action != physics_action_id:
+                                    # Ensemble disagrees with physics → penalize
+                                    sig.confidence *= 0.70
+                                    ml_stats['ensemble_filtered'] += 1
+
+                            # Ensemble lifetime: use for hold time if available
+                            if 'lifetime' in ens_pred:
+                                ens_life = float(ens_pred['lifetime'][0])
+                                if ens_life > 3:
+                                    ml_max_hold = max(6, int(ens_life * 0.8))
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -814,6 +885,8 @@ def run_backtest(
         if quality_scorer is not None:
             print(f"    Quality filtered: {ml_stats.get('quality_filtered', 0)}")
             print(f"    Quality boosted:  {ml_stats.get('quality_boosted', 0)}")
+        if ensemble_model is not None:
+            print(f"    Ensemble filtered: {ml_stats.get('ensemble_filtered', 0)}")
 
     # Breakdown by exit reason
     if trades:
