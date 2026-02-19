@@ -2791,6 +2791,321 @@ class EnsembleModel:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 6: Regime-Conditional Model (Mixture of Experts)
+# ---------------------------------------------------------------------------
+
+class RegimeConditionalModel:
+    """
+    Regime-augmented model: classifies market regime, then uses regime
+    probabilities as extra features in a single unified GBT.
+
+    Regimes (derived from physics features):
+    0. TRENDING_UP: mostly bullish TFs
+    1. TRENDING_DOWN: mostly bearish TFs
+    2. VOLATILE: high entropy or high break probability (p75+)
+    3. QUIET: everything else (mixed, ranging, squeezing)
+
+    Instead of per-regime expert models (which suffer from small sample sizes),
+    this uses regime probabilities as 4 additional features in the main GBT.
+    This lets the model learn regime-conditional patterns while training on
+    ALL samples.
+    """
+
+    REGIME_NAMES = ['trending_up', 'trending_down', 'volatile', 'quiet']
+
+    def __init__(self):
+        self.regime_classifier = None
+        self.action_model = None
+        self.break_dir_model = None
+        self.feature_names = None
+        self.augmented_feature_names = None
+        self.feature_importance = {}
+
+    @staticmethod
+    def classify_regime(X: np.ndarray, feature_names: List[str]) -> np.ndarray:
+        """
+        Classify market regime from features using physics rules.
+
+        Returns array of regime IDs (0-3) for each sample.
+        """
+        regimes = np.zeros(len(X), dtype=np.int32)
+
+        # Get feature indices
+        name_to_idx = {name: i for i, name in enumerate(feature_names)}
+
+        bull_idx = name_to_idx.get('bullish_fraction')
+        bear_idx = name_to_idx.get('bearish_fraction')
+        entropy_idx = name_to_idx.get('avg_entropy')
+        bp_max_idx = name_to_idx.get('break_prob_max')
+        health_max_idx = name_to_idx.get('health_max')
+        squeeze_idx = name_to_idx.get('squeeze_any')
+        health_min_idx = name_to_idx.get('health_min')
+
+        # Compute adaptive thresholds from data distribution using percentiles
+        all_ent = X[:, entropy_idx] if entropy_idx is not None else np.full(len(X), 0.5)
+        all_bp = X[:, bp_max_idx] if bp_max_idx is not None else np.full(len(X), 0.3)
+        # Top 25% = volatile territory
+        ent_p75 = np.percentile(all_ent[all_ent > 0], 75) if np.any(all_ent > 0) else 0.7
+        bp_p75 = np.percentile(all_bp[all_bp > 0], 75) if np.any(all_bp > 0) else 0.5
+
+        for i in range(len(X)):
+            bull_frac = X[i, bull_idx] if bull_idx is not None else 0
+            bear_frac = X[i, bear_idx] if bear_idx is not None else 0
+            avg_ent = X[i, entropy_idx] if entropy_idx is not None else 0.5
+            bp_max = X[i, bp_max_idx] if bp_max_idx is not None else 0
+            h_max = X[i, health_max_idx] if health_max_idx is not None else 0.5
+            h_min = X[i, health_min_idx] if health_min_idx is not None else 0.5
+            squeeze = X[i, squeeze_idx] if squeeze_idx is not None else 0
+
+            high_entropy = avg_ent > ent_p75
+            high_bp = bp_max > bp_p75
+
+            # Volatile first (priority check): high entropy OR high break prob
+            if high_entropy or high_bp:
+                regimes[i] = 2  # VOLATILE
+            # Trending up: majority bullish
+            elif bull_frac > 0.4:
+                regimes[i] = 0  # TRENDING_UP
+            # Trending down: majority bearish
+            elif bear_frac > 0.4:
+                regimes[i] = 1  # TRENDING_DOWN
+            # Quiet: everything else (mixed, ranging)
+            else:
+                regimes[i] = 3  # QUIET
+
+        return regimes
+
+    def _augment_features(self, X: np.ndarray, feature_names: List[str]) -> np.ndarray:
+        """Add regime probabilities as extra features to X."""
+        # Get rule-based regime labels for classifier training
+        regimes = self.classify_regime(X, feature_names)
+
+        if self.regime_classifier is not None:
+            # Use learned soft probabilities
+            regime_probs = self.regime_classifier.predict(X)
+        else:
+            # One-hot encode rule-based regimes
+            regime_probs = np.zeros((len(X), 4))
+            for i, r in enumerate(regimes):
+                regime_probs[i, r] = 1.0
+
+        # Also add regime interaction features:
+        # regime × key physics features for conditional patterns
+        name_to_idx = {name: i for i, name in enumerate(feature_names)}
+        bp_max_idx = name_to_idx.get('break_prob_max')
+        ent_idx = name_to_idx.get('avg_entropy')
+
+        interactions = np.zeros((len(X), 8))  # 4 regimes × 2 key features
+        bp = X[:, bp_max_idx] if bp_max_idx is not None else np.zeros(len(X))
+        ent = X[:, ent_idx] if ent_idx is not None else np.zeros(len(X))
+        for r in range(4):
+            interactions[:, r * 2] = regime_probs[:, r] * bp
+            interactions[:, r * 2 + 1] = regime_probs[:, r] * ent
+
+        return np.hstack([X, regime_probs, interactions])
+
+    def train(
+        self,
+        X_train: np.ndarray, Y_train: Dict[str, np.ndarray],
+        X_val: np.ndarray, Y_val: Dict[str, np.ndarray],
+        feature_names: List[str],
+    ) -> Dict[str, float]:
+        """Train regime-augmented model (single GBT with regime features)."""
+        import lightgbm as lgb
+
+        self.feature_names = feature_names
+        metrics = {}
+
+        # Classify regimes for distribution reporting
+        train_regimes = self.classify_regime(X_train, feature_names)
+        val_regimes = self.classify_regime(X_val, feature_names)
+
+        print(f"\n  Regime distribution (train):")
+        for r in range(4):
+            count = np.sum(train_regimes == r)
+            pct = count / len(train_regimes) * 100
+            print(f"    {self.REGIME_NAMES[r]}: {count} ({pct:.0f}%)")
+
+        # Step 1: Train regime classifier
+        print("\n  Training regime classifier (GBT)...")
+        train_ds = lgb.Dataset(X_train, label=train_regimes,
+                               feature_name=feature_names)
+        val_ds = lgb.Dataset(X_val, label=val_regimes,
+                             feature_name=feature_names, reference=train_ds)
+
+        params = {
+            'objective': 'multiclass',
+            'num_class': 4,
+            'metric': 'multi_logloss',
+            'num_leaves': 20,
+            'learning_rate': 0.05,
+            'min_child_samples': 10,
+            'feature_fraction': 0.8,
+            'verbose': -1,
+        }
+        self.regime_classifier = lgb.train(
+            params, train_ds, num_boost_round=300,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(50)],
+        )
+
+        val_pred = self.regime_classifier.predict(X_val)
+        val_acc = np.mean(np.argmax(val_pred, axis=1) == val_regimes)
+        metrics['regime_accuracy'] = float(val_acc)
+        print(f"    Regime classification accuracy: {val_acc:.1%}")
+
+        # Step 2: Augment features with regime probabilities
+        aug_feature_names = (
+            list(feature_names)
+            + [f'regime_prob_{n}' for n in self.REGIME_NAMES]
+            + [f'regime_{n}_x_bp_max' for n in self.REGIME_NAMES]
+            + [f'regime_{n}_x_entropy' for n in self.REGIME_NAMES]
+        )
+        self.augmented_feature_names = aug_feature_names
+
+        X_train_aug = self._augment_features(X_train, feature_names)
+        X_val_aug = self._augment_features(X_val, feature_names)
+        print(f"\n  Augmented features: {X_train.shape[1]} → {X_train_aug.shape[1]}")
+
+        # Step 3: Train action model on ALL samples with regime-augmented features
+        print("\n  Training regime-augmented action model...")
+        train_ds = lgb.Dataset(X_train_aug, label=Y_train['optimal_action'],
+                               feature_name=aug_feature_names)
+        val_ds = lgb.Dataset(X_val_aug, label=Y_val['optimal_action'],
+                             feature_name=aug_feature_names, reference=train_ds)
+
+        action_params = {
+            'objective': 'multiclass',
+            'num_class': 3,
+            'metric': 'multi_logloss',
+            'num_leaves': 31,
+            'learning_rate': 0.03,
+            'min_child_samples': 10,
+            'feature_fraction': 0.8,
+            'lambda_l1': 0.1,
+            'lambda_l2': 1.0,
+            'verbose': -1,
+        }
+        self.action_model = lgb.train(
+            action_params, train_ds, num_boost_round=500,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(50)],
+        )
+
+        val_pred = self.action_model.predict(X_val_aug)
+        val_pred_class = np.argmax(val_pred, axis=1)
+        acc = np.mean(val_pred_class == Y_val['optimal_action'].astype(int))
+        metrics['action_accuracy'] = float(acc)
+        print(f"    Action accuracy: {acc:.1%}")
+
+        # Per-regime action accuracy
+        for r in range(4):
+            mask = val_regimes == r
+            if np.sum(mask) > 0:
+                r_acc = np.mean(val_pred_class[mask] == Y_val['optimal_action'][mask].astype(int))
+                metrics[f'{self.REGIME_NAMES[r]}_action_acc'] = float(r_acc)
+                print(f"    {self.REGIME_NAMES[r]} action acc: {r_acc:.1%} (n={np.sum(mask)})")
+
+        # Feature importance for action
+        importance = self.action_model.feature_importance(importance_type='gain')
+        sorted_imp = sorted(zip(aug_feature_names, importance), key=lambda x: -x[1])
+        self.feature_importance['action'] = sorted_imp
+
+        # Step 4: Train break direction model
+        print("\n  Training regime-augmented break direction model...")
+        train_ds = lgb.Dataset(X_train_aug, label=Y_train['break_direction'],
+                               feature_name=aug_feature_names)
+        val_ds = lgb.Dataset(X_val_aug, label=Y_val['break_direction'],
+                             feature_name=aug_feature_names, reference=train_ds)
+
+        self.break_dir_model = lgb.train(
+            action_params, train_ds, num_boost_round=500,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(50)],
+        )
+
+        val_pred = self.break_dir_model.predict(X_val_aug)
+        val_pred_class = np.argmax(val_pred, axis=1)
+        acc = np.mean(val_pred_class == Y_val['break_direction'].astype(int))
+        metrics['break_dir_accuracy'] = float(acc)
+        print(f"    Break dir accuracy: {acc:.1%}")
+
+        # Per-regime break dir accuracy
+        for r in range(4):
+            mask = val_regimes == r
+            if np.sum(mask) > 0:
+                r_acc = np.mean(val_pred_class[mask] == Y_val['break_direction'][mask].astype(int))
+                metrics[f'{self.REGIME_NAMES[r]}_break_dir_acc'] = float(r_acc)
+                print(f"    {self.REGIME_NAMES[r]} break_dir acc: {r_acc:.1%} (n={np.sum(mask)})")
+
+        importance = self.break_dir_model.feature_importance(importance_type='gain')
+        sorted_imp = sorted(zip(aug_feature_names, importance), key=lambda x: -x[1])
+        self.feature_importance['break_dir'] = sorted_imp
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> Dict[str, np.ndarray]:
+        """Predict using regime-augmented features."""
+        n = len(X)
+        results = {
+            'action': np.ones(n, dtype=np.int64),  # Default HOLD
+            'break_dir': np.zeros(n, dtype=np.int64),
+            'regime': np.zeros(n, dtype=np.int64),
+        }
+
+        # Classify regimes
+        if self.regime_classifier is not None:
+            regime_probs = self.regime_classifier.predict(X)
+            regimes = np.argmax(regime_probs, axis=1)
+            results['regime_probs'] = regime_probs
+        else:
+            regimes = self.classify_regime(X, self.feature_names)
+
+        results['regime'] = regimes
+
+        # Augment and predict
+        X_aug = self._augment_features(X, self.feature_names)
+
+        if self.action_model is not None:
+            probs = self.action_model.predict(X_aug)
+            results['action'] = np.argmax(probs, axis=1).astype(np.int64)
+            results['action_probs'] = probs
+
+        if self.break_dir_model is not None:
+            probs = self.break_dir_model.predict(X_aug)
+            results['break_dir'] = np.argmax(probs, axis=1).astype(np.int64)
+            results['break_dir_probs'] = probs
+
+        return results
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'regime_classifier': self.regime_classifier,
+                'action_model': self.action_model,
+                'break_dir_model': self.break_dir_model,
+                'feature_names': self.feature_names,
+                'augmented_feature_names': self.augmented_feature_names,
+                'feature_importance': self.feature_importance,
+            }, f)
+        print(f"  Saved RegimeConditionalModel to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'RegimeConditionalModel':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.regime_classifier = data['regime_classifier']
+        model.action_model = data.get('action_model')
+        model.break_dir_model = data.get('break_dir_model')
+        model.feature_names = data['feature_names']
+        model.augmented_feature_names = data.get('augmented_feature_names')
+        model.feature_importance = data.get('feature_importance', {})
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -3077,6 +3392,47 @@ def train_all_architectures(
         traceback.print_exc()
         all_results['ensemble'] = {'error': str(e)}
 
+    # ---- Architecture 6: Regime-Conditional Model ----
+    print("\n" + "=" * 70)
+    print("ARCHITECTURE 6: Regime-Augmented Model")
+    print("=" * 70)
+
+    try:
+        regime_model = RegimeConditionalModel()
+        regime_metrics = regime_model.train(
+            X_train, Y_train_dict, X_val, Y_val_dict, feature_names,
+        )
+        regime_model.save(os.path.join(output_dir, 'regime_model.pkl'))
+
+        # Test evaluation
+        regime_test = regime_model.predict(X_test)
+
+        if 'action' in regime_test:
+            regime_metrics['test_action_acc'] = float(np.mean(
+                regime_test['action'] == Y_test_dict['optimal_action'].astype(int)))
+            print(f"\n  Test action accuracy: {regime_metrics['test_action_acc']:.1%}")
+
+        if 'break_dir' in regime_test:
+            regime_metrics['test_break_dir_acc'] = float(np.mean(
+                regime_test['break_dir'] == Y_test_dict['break_direction'].astype(int)))
+            print(f"  Test break dir accuracy: {regime_metrics['test_break_dir_acc']:.1%}")
+
+        # Test regime distribution
+        test_regimes = regime_test['regime']
+        print(f"  Test regime distribution:")
+        for r in range(4):
+            count = np.sum(test_regimes == r)
+            pct = count / len(test_regimes) * 100
+            name = RegimeConditionalModel.REGIME_NAMES[r]
+            print(f"    {name}: {count} ({pct:.0f}%)")
+
+        all_results['regime'] = regime_metrics
+    except Exception as e:
+        print(f"  Regime model failed: {e}")
+        import traceback
+        traceback.print_exc()
+        all_results['regime'] = {'error': str(e)}
+
     # ---- Compare ----
     print("\n" + "=" * 70)
     print("ARCHITECTURE COMPARISON")
@@ -3161,7 +3517,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -3225,6 +3581,20 @@ def main():
                 tq_Y_val = {k: v[tq_train_end:tq_val_end] for k, v in tq_Y.items()}
                 scorer.train(tq_X_train, tq_Y_train, tq_X_val, tq_Y_val, tq_features)
                 scorer.save(os.path.join(args.output, 'trade_quality_scorer.pkl'))
+            elif args.arch == 'ensemble':
+                ensemble = EnsembleModel()
+                ensemble_metrics = ensemble.train(
+                    X_train, Y_train, X_val, Y_val, feature_names, args.output,
+                )
+                ensemble.save(os.path.join(args.output, 'ensemble_model.pkl'))
+                print(f"\n  Ensemble metrics: {ensemble_metrics}")
+            elif args.arch == 'regime':
+                regime = RegimeConditionalModel()
+                regime_metrics = regime.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                regime.save(os.path.join(args.output, 'regime_model.pkl'))
+                print(f"\n  Regime metrics: {regime_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

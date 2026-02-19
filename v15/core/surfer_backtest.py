@@ -233,6 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
+            RegimeConditionalModel,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -289,6 +290,18 @@ def run_backtest(
                 print(f"[ML] Ensemble base models: {list(ensemble_base_models.keys())}")
             except Exception:
                 ensemble_model = None
+
+        # Try to load regime model
+        regime_model = None
+        regime_path = _os.path.join(model_dir, 'regime_model.pkl')
+        if _os.path.exists(regime_path):
+            try:
+                regime_model = RegimeConditionalModel.load(regime_path)
+                print(f"[ML] Regime model loaded (regime-augmented)")
+                ml_stats['regime_boosted'] = 0
+                ml_stats['regime_penalized'] = 0
+            except Exception:
+                pass
 
     # Fetch data
     print(f"Fetching {days}d of 5-min TSLA data...")
@@ -689,6 +702,33 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Regime-conditional adjustment
+                    if regime_model is not None:
+                        try:
+                            reg_pred = regime_model.predict(feature_vec.reshape(1, -1))
+                            regime_id = int(reg_pred['regime'][0])
+                            regime_name = RegimeConditionalModel.REGIME_NAMES[regime_id]
+
+                            # Use regime to adjust confidence
+                            if regime_id == 2:  # VOLATILE
+                                # In volatile regimes, require higher confidence
+                                if sig.confidence < 0.55:
+                                    ml_stats['regime_penalized'] += 1
+                                    continue
+                                # Tighten hold time in volatile
+                                if ml_max_hold and ml_max_hold > 12:
+                                    ml_max_hold = 12
+                            elif regime_id == 0:  # TRENDING_UP
+                                if sig.action == 'BUY':
+                                    sig.confidence *= 1.10  # Trend-aligned boost
+                                    ml_stats['regime_boosted'] += 1
+                            elif regime_id == 1:  # TRENDING_DOWN
+                                if sig.action == 'SELL':
+                                    sig.confidence *= 1.10  # Trend-aligned boost
+                                    ml_stats['regime_boosted'] += 1
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -887,6 +927,9 @@ def run_backtest(
             print(f"    Quality boosted:  {ml_stats.get('quality_boosted', 0)}")
         if ensemble_model is not None:
             print(f"    Ensemble filtered: {ml_stats.get('ensemble_filtered', 0)}")
+        if regime_model is not None:
+            print(f"    Regime boosted:   {ml_stats.get('regime_boosted', 0)}")
+            print(f"    Regime penalized: {ml_stats.get('regime_penalized', 0)}")
 
     # Breakdown by exit reason
     if trades:
