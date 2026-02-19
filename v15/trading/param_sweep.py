@@ -56,10 +56,11 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
 
     # === Phase 2: Sweep parameters using cached predictions ===
     param_grid = {
-        'min_confidence': [0.60, 0.65, 0.68, 0.70, 0.72, 0.75, 0.78],
-        'mom_1d_threshold': [0.005, 0.0, -0.005, -0.01],
-        'mom_3d_threshold': [0.0, -0.005, -0.01, -0.02, -0.03],
-        'max_position_pct': [0.25, 0.30, 0.35, 0.40, 0.45],
+        'min_confidence': [0.72, 0.75, 0.78],
+        'mom_1d_threshold': [0.0, -0.005],
+        'mom_3d_threshold': [-0.01, -0.02],
+        'max_position_pct': [0.35, 0.40],
+        'bounce_min_confidence': [0.70, 0.73, 0.75, 0.78, 0.99],  # 0.99 = disabled
     }
 
     keys = list(param_grid.keys())
@@ -68,10 +69,10 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
     total = len(combinations)
 
     print(f"Sweeping {total} parameter combinations (in-memory, fast)...")
-    print(f"{'='*110}")
-    print(f"{'#':>4s} {'MinConf':>7s} {'Mom1d':>7s} {'Mom3d':>7s} {'MaxPos':>6s} | "
+    print(f"{'='*120}")
+    print(f"{'#':>4s} {'MinConf':>7s} {'Mom1d':>7s} {'Mom3d':>7s} {'MaxPos':>6s} {'Bounce':>6s} | "
           f"{'Trades':>6s} {'WR%':>5s} {'P&L':>10s} {'PF':>6s} {'Sharpe':>7s} {'MaxDD':>6s}")
-    print(f"{'-'*110}")
+    print(f"{'-'*120}")
 
     results = []
 
@@ -83,11 +84,12 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
             results.append({**params, **result})
 
             # Print row
+            bounce_str = f"{params.get('bounce_min_confidence', 0.99):6.2f}"
             print(
                 f"{idx+1:4d} {params['min_confidence']:7.2f} "
                 f"{params['mom_1d_threshold']:7.3f} "
                 f"{params['mom_3d_threshold']:7.3f} "
-                f"{params['max_position_pct']:6.2f} | "
+                f"{params['max_position_pct']:6.2f} {bounce_str} | "
                 f"{result['trades']:6d} {result['win_rate']:5.1f} "
                 f"${result['pnl']:9,.2f} {result['pf']:6.2f} "
                 f"{result['sharpe']:7.2f} {result['max_dd']:6.1%}"
@@ -95,7 +97,7 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
         except Exception as e:
             print(f"{idx+1:4d} ERROR: {e}")
 
-    print(f"{'='*110}")
+    print(f"{'='*120}")
 
     # Sort results
     valid = [r for r in results if r['trades'] >= 3]
@@ -111,7 +113,8 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
             f"  conf={r['min_confidence']:.2f} "
             f"m1d={r['mom_1d_threshold']:+.3f} "
             f"m3d={r['mom_3d_threshold']:+.3f} "
-            f"pos={r['max_position_pct']:.2f} -> "
+            f"pos={r['max_position_pct']:.2f} "
+            f"bnc={r.get('bounce_min_confidence', 0.99):.2f} -> "
             f"${r['pnl']:,.0f} PF={r['pf']:.2f} "
             f"Sharpe={r['sharpe']:.2f} "
             f"DD={r['max_dd']:.1%} "
@@ -126,7 +129,8 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
             f"  conf={r['min_confidence']:.2f} "
             f"m1d={r['mom_1d_threshold']:+.3f} "
             f"m3d={r['mom_3d_threshold']:+.3f} "
-            f"pos={r['max_position_pct']:.2f} -> "
+            f"pos={r['max_position_pct']:.2f} "
+            f"bnc={r.get('bounce_min_confidence', 0.99):.2f} -> "
             f"Sharpe={r['sharpe']:.2f} "
             f"${r['pnl']:,.0f} PF={r['pf']:.2f} "
             f"DD={r['max_dd']:.1%} "
@@ -141,7 +145,8 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
             f"  conf={r['min_confidence']:.2f} "
             f"m1d={r['mom_1d_threshold']:+.3f} "
             f"m3d={r['mom_3d_threshold']:+.3f} "
-            f"pos={r['max_position_pct']:.2f} -> "
+            f"pos={r['max_position_pct']:.2f} "
+            f"bnc={r.get('bounce_min_confidence', 0.99):.2f} -> "
             f"PF={r['pf']:.2f} "
             f"${r['pnl']:,.0f} Sharpe={r['sharpe']:.2f} "
             f"DD={r['max_dd']:.1%} "
@@ -345,22 +350,37 @@ def _simulate_with_params(cached_bars, tsla_df, params):
             best_signal = None
             best_score = -1.0
             for horizon, sig in cb.horizon_signals.items():
-                if horizon != 'long':
+                if not sig.actionable:
                     continue
-                if sig.regime.regime == MarketRegime.TRANSITIONING:
-                    continue
-                if sig.confidence < params['min_confidence']:
-                    continue
-                if sig.signal_type == SignalType.LONG:
-                    if cb.mom_1d < params['mom_1d_threshold'] or cb.mom_3d < params['mom_3d_threshold']:
+
+                if horizon == 'long':
+                    # Trend strategy
+                    if sig.confidence < params['min_confidence']:
                         continue
-                elif sig.signal_type == SignalType.SHORT:
-                    if cb.mom_1d > -params['mom_1d_threshold'] or cb.mom_3d > -params['mom_3d_threshold']:
+                    if sig.regime.regime == MarketRegime.TRANSITIONING:
                         continue
-                score = sig.confidence * sig.entry_urgency
-                if score > best_score and sig.actionable:
-                    best_score = score
-                    best_signal = sig
+                    if sig.signal_type == SignalType.LONG:
+                        if cb.mom_1d < params['mom_1d_threshold'] or cb.mom_3d < params['mom_3d_threshold']:
+                            continue
+                    elif sig.signal_type == SignalType.SHORT:
+                        if cb.mom_1d > -params['mom_1d_threshold'] or cb.mom_3d > -params['mom_3d_threshold']:
+                            continue
+                    score = sig.confidence * sig.entry_urgency * 2.0
+                    if score > best_score:
+                        best_score = score
+                        best_signal = sig
+
+                elif horizon == 'short':
+                    # Bounce strategy: ranging only
+                    bounce_conf = params.get('bounce_min_confidence', 0.75)
+                    if sig.confidence < bounce_conf:
+                        continue
+                    if sig.regime.regime != MarketRegime.RANGING:
+                        continue
+                    score = sig.confidence * sig.entry_urgency
+                    if score > best_score:
+                        best_score = score
+                        best_signal = sig
 
             if best_signal is not None and best_signal.entry_urgency > 0.3:
                 position = sizer.size_position(best_signal, current_price)

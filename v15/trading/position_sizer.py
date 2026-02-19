@@ -94,6 +94,7 @@ class PositionSizer:
         current_price: float,
         win_rate: Optional[float] = None,
         avg_win_loss_ratio: Optional[float] = None,
+        atr_pct: Optional[float] = None,
     ) -> PositionRecommendation:
         """
         Compute position size for a trade signal.
@@ -172,8 +173,8 @@ class PositionSizer:
 
         dollar_amount = shares * current_price
 
-        # Stop loss and take profit
-        stop_loss, take_profit = self._compute_stops(signal, current_price)
+        # Stop loss and take profit (ATR-based if available)
+        stop_loss, take_profit = self._compute_stops(signal, current_price, atr_pct=atr_pct)
 
         return PositionRecommendation(
             fraction=fraction,
@@ -208,16 +209,15 @@ class PositionSizer:
             return 0.5
 
     def _compute_stops(
-        self, signal: TradeSignal, price: float
+        self, signal: TradeSignal, price: float,
+        atr_pct: Optional[float] = None,
     ) -> tuple:
         """Compute stop loss and take profit percentages."""
-        # Base stop adjusted by regime
+        # Fixed percentage stops (proven to work for trend-following)
         if signal.regime.regime in (MarketRegime.TRENDING_BULL, MarketRegime.TRENDING_BEAR):
-            # Wider stops in trends (give room to breathe)
-            stop = self.base_stop_loss_pct * 1.5
-            tp = self.base_take_profit_pct * 2.0  # 8% TP for trends
+            stop = self.base_stop_loss_pct * 1.5  # 3% in trends
+            tp = self.base_take_profit_pct * 2.0  # 8% in trends
         elif signal.regime.regime == MarketRegime.RANGING:
-            # Tighter stops in range (quicker mean-reversion)
             stop = self.base_stop_loss_pct * 0.8
             tp = self.base_take_profit_pct * 0.7
         else:

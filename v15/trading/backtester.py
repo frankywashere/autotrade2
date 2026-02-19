@@ -200,9 +200,9 @@ class Backtester:
                     # Long horizon has proven edge; others are disabled
                     # Evidence: 1h = 0% win rate across ALL runs, monthly = 50%+ win
                     HORIZON_MIN_CONF = {
-                        'short': 0.99,   # Disabled: too noisy standalone
+                        'short': 0.70,   # Bounce strategy: ranging regime only, 80%WR
                         'medium': 0.99,  # Disabled: 0% win rate on 1h
-                        'long': 0.75,    # Sweep-optimized: 67%WR, PF~19.8, 3T/60d
+                        'long': 0.75,    # Trend strategy: 67%WR, PF~19.8
                     }
 
                     # High-selectivity + momentum filter strategy:
@@ -223,43 +223,57 @@ class Backtester:
                     mom_1d = _calc_momentum(78)
                     mom_3d = _calc_momentum(234)
 
-                    # Find best horizon signal (focus on long horizon)
+                    # === DUAL STRATEGY: Trend + Bounce ===
+                    # Strategy 1: Long horizon trend-following (monthly TF)
+                    # Strategy 2: Short horizon bounce capture (ranging markets)
+                    # Priority: long horizon first, short horizon as backup
+
                     best_signal = None
                     best_score = -1.0
+                    chosen_strategy = None
+
                     for horizon, sig in horizon_signals.items():
                         signals_generated += 1
                         if sig.actionable:
                             signals_actionable += 1
 
-                        # Only trade long horizon signals
-                        if horizon != 'long':
-                            continue
-
-                        # Filter: skip transitioning regime (no edge)
-                        if sig.regime.regime == MarketRegime.TRANSITIONING:
-                            continue
-
                         # Apply horizon-specific min confidence
-                        min_conf = HORIZON_MIN_CONF.get(horizon, 0.50)
+                        min_conf = HORIZON_MIN_CONF.get(horizon, 0.99)
                         if sig.confidence < min_conf:
                             continue
+                        if not sig.actionable:
+                            continue
 
-                        # Momentum filter: require positive momentum
-                        # 1-day must be positive, 3-day must not be deeply negative
-                        if sig.signal_type == SignalType.LONG:
-                            if mom_1d < 0 or mom_3d < -0.01:
+                        if horizon == 'long':
+                            # TREND STRATEGY: require positive momentum
+                            if sig.regime.regime == MarketRegime.TRANSITIONING:
                                 continue
-                        elif sig.signal_type == SignalType.SHORT:
-                            if mom_1d > 0 or mom_3d > 0.01:
+                            if sig.signal_type == SignalType.LONG:
+                                if mom_1d < 0 or mom_3d < -0.01:
+                                    continue
+                            elif sig.signal_type == SignalType.SHORT:
+                                if mom_1d > 0 or mom_3d > 0.01:
+                                    continue
+                            score = sig.confidence * sig.entry_urgency * 2.0  # Priority boost
+                            if score > best_score:
+                                best_score = score
+                                best_signal = sig
+                                chosen_strategy = 'trend'
+
+                        elif horizon == 'short':
+                            # BOUNCE STRATEGY: only ranging regime, mean-reversion
+                            if sig.regime.regime != MarketRegime.RANGING:
                                 continue
+                            # Bounce: no positive momentum filter
+                            # (bounces happen during pullbacks)
+                            score = sig.confidence * sig.entry_urgency
+                            if score > best_score:
+                                best_score = score
+                                best_signal = sig
+                                chosen_strategy = 'bounce'
 
-                        score = sig.confidence * sig.entry_urgency
-                        if score > best_score and sig.actionable:
-                            best_score = score
-                            best_signal = sig
+                        # Medium horizon: disabled (0% WR proven)
 
-                    # No fallback to unified signal — it mixes medium TFs
-                    # which have 0% win rate and contaminate the edge
                     signal = best_signal
 
                     # Open position if no current position and signal is actionable
