@@ -1002,18 +1002,20 @@ def generate_breakout_signal(
     # Squeeze boost: if channel is compressed, breakout will be explosive
     squeeze = getattr(primary_state, 'squeeze_score', 0.0)
 
-    # --- Confidence for breakout ---
-    # Components: break_prob, energy_ratio, direction_score, entropy, squeeze
+    # --- Confidence for breakout (data-calibrated weights) ---
+    # Energy is anti-correlated with break success → minimize
+    # Entropy is positively correlated → emphasize
+    # Confluence (higher-TF) is the strongest predictor → boost
     conf = (
-        0.25 * min(1.0, break_prob / 0.8) +         # Break probability
-        0.20 * min(1.0, energy_ratio / 2.0) +        # Energy exceeding binding
-        0.15 * direction_score +                       # Position near boundary
-        0.10 * primary_state.entropy +                 # High entropy = channel failing
+        0.30 * min(1.0, break_prob / 0.8) +         # Break probability (primary signal)
+        0.05 * min(1.0, energy_ratio / 2.0) +        # Energy (anti-correlated, minimal weight)
+        0.10 * direction_score +                       # Position near boundary (weak signal)
+        0.20 * primary_state.entropy +                 # High entropy = channel failing (positive)
         0.10 * primary_state.kinetic_energy +          # Momentum strength
-        0.20 * squeeze                                 # Squeeze = explosive breakout
+        0.25 * squeeze                                 # Squeeze = explosive breakout
     )
 
-    # Higher-TF trend alignment for breakouts (more important than for bounces)
+    # Higher-TF trend alignment (strongest predictor per correlation analysis)
     higher_tf_dirs = []
     for tf in SIGNAL_TFS[1:]:
         if tf in tf_states and tf_states[tf].valid:
@@ -1022,9 +1024,9 @@ def generate_breakout_signal(
         bullish_frac = sum(1 for d in higher_tf_dirs if d == 'bull') / len(higher_tf_dirs)
         bearish_frac = sum(1 for d in higher_tf_dirs if d == 'bear') / len(higher_tf_dirs)
         if action == 'BUY':
-            conf *= (1.0 + 0.25 * bullish_frac - 0.15 * bearish_frac)
+            conf *= (1.0 + 0.35 * bullish_frac - 0.20 * bearish_frac)
         else:
-            conf *= (1.0 + 0.25 * bearish_frac - 0.15 * bullish_frac)
+            conf *= (1.0 + 0.35 * bearish_frac - 0.20 * bullish_frac)
 
     # Minimum confidence for breakout signals (higher than bounce to avoid false breaks)
     min_break_conf = 0.50
