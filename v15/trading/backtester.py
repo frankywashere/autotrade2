@@ -413,6 +413,9 @@ class Backtester:
                                 agreement_pct = agreeing_horizons / total_horizons
                                 # 100% agreement = 5.0x, 50% = 2.5x, 0% = 0.0x (skip trade)
                                 cross_horizon_mult = agreement_pct * 5.0
+                                # Unanimous bonus: extra 40% when ALL non-flat horizons agree
+                                if agreeing_horizons == total_horizons and total_horizons >= 3:
+                                    cross_horizon_mult *= 1.5
                             else:
                                 cross_horizon_mult = 1.0
 
