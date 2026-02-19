@@ -4589,6 +4589,463 @@ class PhysicsResidualModel:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 11: Adverse Movement Predictor (Stop-Loss Avoidance)
+# ---------------------------------------------------------------------------
+
+class AdverseMovementPredictor:
+    """
+    Predicts probability of adverse movement — will the trade hit stop before TP?
+
+    Insight: In the backtest, stop-loss exits have 0% WR and are pure losses.
+    If we can predict when a trade is likely to stop out, we can either:
+    1. Skip the trade entirely
+    2. Widen the stop (at the cost of larger potential loss)
+    3. Reduce position size
+
+    Training: For each bar, simulate both BUY and SELL trades with standard
+    stop/TP distances. Track which hits first. Train a classifier on
+    P(stop_hit_first | features).
+
+    Additional targets:
+    - max_adverse_excursion: worst drawdown before recovery (regression)
+    - time_to_adverse: how quickly the adverse move happens (regression)
+    - recovery_probability: if adverse, probability of recovery (binary)
+    """
+
+    # Standard stop/TP distances to simulate (in % of price)
+    STOP_DISTANCES = [0.003, 0.005, 0.008]  # 0.3%, 0.5%, 0.8%
+    TP_DISTANCES = [0.006, 0.010, 0.015]     # 0.6%, 1.0%, 1.5%
+    LOOKFORWARD = 40  # 40 bars (3+ hours) to evaluate outcome
+
+    def __init__(self):
+        self.models = {}  # {target_name: lgb.Booster}
+        self.feature_names = None
+        self.calibration = {}
+
+    @staticmethod
+    def simulate_trade_outcomes(
+        closes: np.ndarray,
+        bar_indices: np.ndarray,
+        stop_pct: float = 0.005,
+        tp_pct: float = 0.010,
+        lookforward: int = 40,
+    ) -> Dict[str, np.ndarray]:
+        """
+        For each bar, simulate BUY and SELL trades and track outcome.
+
+        Returns arrays for each bar:
+        - buy_stop_first: 1 if stop hit before TP for BUY trade
+        - sell_stop_first: 1 if stop hit before TP for SELL trade
+        - buy_mae: maximum adverse excursion for BUY (worst drawdown %)
+        - sell_mae: maximum adverse excursion for SELL
+        - buy_mfe: maximum favorable excursion for BUY (best unrealized gain %)
+        - sell_mfe: maximum favorable excursion for SELL
+        - buy_bars_to_adverse: how quickly worst drawdown happens
+        - sell_bars_to_adverse: how quickly worst drawdown happens
+        """
+        n = len(bar_indices)
+        total_bars = len(closes)
+
+        results = {
+            'buy_stop_first': np.zeros(n),
+            'sell_stop_first': np.zeros(n),
+            'buy_mae': np.zeros(n),
+            'sell_mae': np.zeros(n),
+            'buy_mfe': np.zeros(n),
+            'sell_mfe': np.zeros(n),
+            'buy_bars_to_adverse': np.zeros(n),
+            'sell_bars_to_adverse': np.zeros(n),
+        }
+
+        for i, bar in enumerate(bar_indices):
+            entry_price = closes[bar]
+            end_bar = min(bar + lookforward, total_bars)
+            future_prices = closes[bar + 1:end_bar]
+
+            if len(future_prices) < 3:
+                continue
+
+            # BUY trade simulation
+            buy_stop = entry_price * (1 - stop_pct)
+            buy_tp = entry_price * (1 + tp_pct)
+
+            buy_worst = entry_price
+            buy_best = entry_price
+            buy_stopped = False
+            buy_tped = False
+            buy_worst_bar = 0
+
+            for j, price in enumerate(future_prices):
+                if price < buy_worst:
+                    buy_worst = price
+                    buy_worst_bar = j + 1
+                if price > buy_best:
+                    buy_best = price
+                if price <= buy_stop and not buy_tped:
+                    buy_stopped = True
+                    break
+                if price >= buy_tp and not buy_stopped:
+                    buy_tped = True
+                    break
+
+            results['buy_mae'][i] = (entry_price - buy_worst) / entry_price
+            results['buy_mfe'][i] = (buy_best - entry_price) / entry_price
+            results['buy_bars_to_adverse'][i] = buy_worst_bar
+            results['buy_stop_first'][i] = 1.0 if buy_stopped else 0.0
+
+            # SELL trade simulation
+            sell_stop = entry_price * (1 + stop_pct)
+            sell_tp = entry_price * (1 - tp_pct)
+
+            sell_worst = entry_price
+            sell_best = entry_price
+            sell_stopped = False
+            sell_tped = False
+            sell_worst_bar = 0
+
+            for j, price in enumerate(future_prices):
+                if price > sell_worst:
+                    sell_worst = price
+                    sell_worst_bar = j + 1
+                if price < sell_best:
+                    sell_best = price
+                if price >= sell_stop and not sell_tped:
+                    sell_stopped = True
+                    break
+                if price <= sell_tp and not sell_stopped:
+                    sell_tped = True
+                    break
+
+            results['sell_mae'][i] = (sell_worst - entry_price) / entry_price
+            results['sell_mfe'][i] = (entry_price - sell_best) / entry_price
+            results['sell_bars_to_adverse'][i] = sell_worst_bar
+            results['sell_stop_first'][i] = 1.0 if sell_stopped else 0.0
+
+        return results
+
+    def train(
+        self,
+        X_train: np.ndarray, Y_train: Dict[str, np.ndarray],
+        X_val: np.ndarray, Y_val: Dict[str, np.ndarray],
+        feature_names: List[str],
+        closes_train: Optional[np.ndarray] = None,
+        bar_indices_train: Optional[np.ndarray] = None,
+        closes_val: Optional[np.ndarray] = None,
+        bar_indices_val: Optional[np.ndarray] = None,
+    ) -> Dict[str, float]:
+        """
+        Train the adverse movement predictor.
+
+        If closes/bar_indices are provided, simulates actual trades.
+        Otherwise, uses forward returns to approximate MFE/MAE.
+        """
+        import lightgbm as lgb
+
+        self.feature_names = feature_names
+        metrics = {}
+
+        # Compute trade outcomes from forward returns
+        # Use multi-target approach with cleaner signals
+        print("\n  Computing trade outcomes from forward returns...")
+
+        n_train = len(X_train)
+        n_val = len(X_val)
+
+        train_ret5 = Y_train['future_return_5']
+        train_ret20 = Y_train['future_return_20']
+        train_ret60 = Y_train['future_return_60']
+
+        val_ret5 = Y_val['future_return_5']
+        val_ret20 = Y_val['future_return_20']
+        val_ret60 = Y_val['future_return_60']
+
+        # Target 1: Quick adverse movement (5-bar return goes against you)
+        # For BUY: ret_5 < -0.003 (price drops >0.3% in first 25 min)
+        # For SELL: ret_5 > 0.003 (price rises >0.3% in first 25 min)
+        ADVERSE_THRESH = 0.003
+
+        train_buy_adverse = (train_ret5 < -ADVERSE_THRESH).astype(float)
+        train_sell_adverse = (train_ret5 > ADVERSE_THRESH).astype(float)
+        val_buy_adverse = (val_ret5 < -ADVERSE_THRESH).astype(float)
+        val_sell_adverse = (val_ret5 > ADVERSE_THRESH).astype(float)
+
+        # Target 2: Trade viability (20-bar return in the right direction)
+        # For BUY: ret_20 > 0 and |ret_20| > 0.001
+        # For SELL: ret_20 < 0 and |ret_20| > 0.001
+        train_buy_viable = (train_ret20 > 0.001).astype(float)
+        train_sell_viable = (train_ret20 < -0.001).astype(float)
+        val_buy_viable = (val_ret20 > 0.001).astype(float)
+        val_sell_viable = (val_ret20 < -0.001).astype(float)
+
+        # Target 3: Worst-case return ratio (how bad is the worst return relative to best)
+        # risk_ratio = min(ret5,ret20,ret60) / max(ret5,ret20,ret60)
+        # For BUY: negative ratio = adverse excursion dominates
+        buy_best = np.maximum(train_ret5, np.maximum(train_ret20, train_ret60))
+        buy_worst = np.minimum(train_ret5, np.minimum(train_ret20, train_ret60))
+        sell_best = np.abs(np.minimum(train_ret5, np.minimum(train_ret20, train_ret60)))
+        sell_worst = np.maximum(train_ret5, np.maximum(train_ret20, train_ret60))
+
+        print(f"  BUY adverse (5-bar) rate: train={train_buy_adverse.mean():.1%}, val={val_buy_adverse.mean():.1%}")
+        print(f"  SELL adverse (5-bar) rate: train={train_sell_adverse.mean():.1%}, val={val_sell_adverse.mean():.1%}")
+        print(f"  BUY viable (20-bar) rate: train={train_buy_viable.mean():.1%}, val={val_buy_viable.mean():.1%}")
+        print(f"  SELL viable (20-bar) rate: train={train_sell_viable.mean():.1%}, val={val_sell_viable.mean():.1%}")
+
+        # Combine BUY and SELL samples: features + direction indicator
+        X_train_combined = np.vstack([
+            np.column_stack([X_train, np.ones(n_train)]),   # BUY
+            np.column_stack([X_train, np.zeros(n_train)]),  # SELL
+        ])
+        X_val_combined = np.vstack([
+            np.column_stack([X_val, np.ones(n_val)]),
+            np.column_stack([X_val, np.zeros(n_val)]),
+        ])
+
+        # Combine targets
+        y_train_adverse = np.concatenate([train_buy_adverse, train_sell_adverse])
+        y_val_adverse = np.concatenate([val_buy_adverse, val_sell_adverse])
+        y_train_viable = np.concatenate([train_buy_viable, train_sell_viable])
+        y_val_viable = np.concatenate([val_buy_viable, val_sell_viable])
+
+        # Combined stop target: adverse AND NOT viable
+        y_train_stop = ((y_train_adverse > 0.5) & (y_train_viable < 0.5)).astype(float)
+        y_val_stop = ((y_val_adverse > 0.5) & (y_val_viable < 0.5)).astype(float)
+
+        combined_names = feature_names + ['is_buy']
+
+        print(f"  Training samples: {len(X_train_combined)} ({n_train} BUY + {n_train} SELL)")
+        print(f"  Val samples: {len(X_val_combined)}")
+        print(f"  Combined stop-out rate: train={y_train_stop.mean():.1%}, val={y_val_stop.mean():.1%}")
+
+        # --- Model 1: Stop-out classifier (binary: will trade hit stop?) ---
+        print("\n  Training: stop_out_classifier (will trade hit stop?)...")
+        train_ds = lgb.Dataset(X_train_combined, label=y_train_stop, feature_name=combined_names)
+        val_ds = lgb.Dataset(X_val_combined, label=y_val_stop, feature_name=combined_names, reference=train_ds)
+
+        params = {
+            'objective': 'binary', 'metric': 'auc',
+            'num_leaves': 28, 'learning_rate': 0.05,
+            'min_child_samples': 12, 'feature_fraction': 0.8,
+            'bagging_fraction': 0.9, 'bagging_freq': 5,
+            'verbose': -1,
+        }
+        model = lgb.train(
+            params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['stop_out'] = model
+
+        val_pred_prob = model.predict(X_val_combined)
+        val_pred = (val_pred_prob > 0.5).astype(int)
+        from sklearn.metrics import roc_auc_score
+        try:
+            auc = roc_auc_score(y_val_stop, val_pred_prob)
+        except Exception:
+            auc = 0.5
+        acc = np.mean(val_pred == y_val_stop)
+        metrics['stop_out_auc'] = float(auc)
+        metrics['stop_out_acc'] = float(acc)
+        print(f"    Val AUC: {auc:.3f}")
+        print(f"    Val accuracy: {acc:.1%}")
+
+        # Calibration: when model says safe (<0.3 stop prob), actual stop rate?
+        safe_mask = val_pred_prob < 0.3
+        if safe_mask.sum() > 5:
+            safe_stop_rate = y_val_stop[safe_mask].mean()
+            metrics['safe_signal_stop_rate'] = float(safe_stop_rate)
+            metrics['safe_signal_coverage'] = float(safe_mask.mean())
+            print(f"    Safe signals (P(stop)<0.3): stop_rate={safe_stop_rate:.1%}, "
+                  f"coverage={safe_mask.mean():.1%}")
+
+        # When model says dangerous (>0.7 stop prob), actual stop rate?
+        danger_mask = val_pred_prob > 0.7
+        if danger_mask.sum() > 5:
+            danger_stop_rate = y_val_stop[danger_mask].mean()
+            metrics['danger_signal_stop_rate'] = float(danger_stop_rate)
+            metrics['danger_signal_coverage'] = float(danger_mask.mean())
+            print(f"    Danger signals (P(stop)>0.7): stop_rate={danger_stop_rate:.1%}, "
+                  f"coverage={danger_mask.mean():.1%}")
+
+        # --- Model 2: Viability classifier (will trade be profitable?) ---
+        print("\n  Training: viability_classifier (will trade be profitable?)...")
+        train_ds = lgb.Dataset(X_train_combined, label=y_train_viable, feature_name=combined_names)
+        val_ds = lgb.Dataset(X_val_combined, label=y_val_viable, feature_name=combined_names, reference=train_ds)
+
+        model = lgb.train(
+            params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['viable'] = model
+
+        val_viable_pred = model.predict(X_val_combined)
+        val_viable_cls = (val_viable_pred > 0.5).astype(int)
+        try:
+            viable_auc = roc_auc_score(y_val_viable, val_viable_pred)
+        except Exception:
+            viable_auc = 0.5
+        viable_acc = np.mean(val_viable_cls == y_val_viable)
+        metrics['viable_auc'] = float(viable_auc)
+        metrics['viable_acc'] = float(viable_acc)
+        print(f"    Val AUC: {viable_auc:.3f}")
+        print(f"    Val accuracy: {viable_acc:.1%}")
+
+        # When model says "viable" (>0.7), what fraction actually are?
+        high_viable = val_viable_pred > 0.7
+        if high_viable.sum() > 5:
+            hv_acc = np.mean(y_val_viable[high_viable])
+            metrics['high_viable_precision'] = float(hv_acc)
+            metrics['high_viable_coverage'] = float(high_viable.mean())
+            print(f"    High viability (>0.7): precision={hv_acc:.1%}, coverage={high_viable.mean():.1%}")
+
+        # --- Model 3: Adverse return regression (how bad is the 5-bar return?) ---
+        print("\n  Training: adverse_return_regressor (expected 5-bar adverse %)...")
+        # Use abs(ret_5) for adverse direction
+        train_adverse_mag = np.concatenate([
+            np.abs(np.minimum(train_ret5, 0)) * 100,  # BUY adverse = negative returns
+            np.maximum(train_ret5, 0) * 100,           # SELL adverse = positive returns
+        ])
+        val_adverse_mag = np.concatenate([
+            np.abs(np.minimum(val_ret5, 0)) * 100,
+            np.maximum(val_ret5, 0) * 100,
+        ])
+
+        train_ds = lgb.Dataset(X_train_combined, label=train_adverse_mag,
+                               feature_name=combined_names)
+        val_ds = lgb.Dataset(X_val_combined, label=val_adverse_mag,
+                             feature_name=combined_names, reference=train_ds)
+
+        reg_params = {
+            'objective': 'mae', 'metric': 'mae',
+            'num_leaves': 24, 'learning_rate': 0.05,
+            'min_child_samples': 10, 'verbose': -1,
+        }
+        model = lgb.train(
+            reg_params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['adverse_regressor'] = model
+
+        val_pred_adverse = model.predict(X_val_combined)
+        adverse_error = np.mean(np.abs(val_pred_adverse - val_adverse_mag))
+        metrics['adverse_return_mae'] = float(adverse_error)
+        print(f"    Val MAE: {adverse_error:.4f}%")
+        print(f"    Predicted range: [{val_pred_adverse.min():.4f}%, {val_pred_adverse.max():.4f}%]")
+        print(f"    Actual range: [{val_adverse_mag.min():.4f}%, {val_adverse_mag.max():.4f}%]")
+
+        # --- Model 4: Favorable return regression ---
+        print("\n  Training: favorable_return_regressor (expected 20-bar return %)...")
+        train_favorable = np.concatenate([
+            np.maximum(train_ret20, 0) * 100,  # BUY favorable = positive 20-bar return
+            np.abs(np.minimum(train_ret20, 0)) * 100,  # SELL favorable = negative 20-bar return
+        ])
+        val_favorable = np.concatenate([
+            np.maximum(val_ret20, 0) * 100,
+            np.abs(np.minimum(val_ret20, 0)) * 100,
+        ])
+
+        train_ds = lgb.Dataset(X_train_combined, label=train_favorable,
+                               feature_name=combined_names)
+        val_ds = lgb.Dataset(X_val_combined, label=val_favorable,
+                             feature_name=combined_names, reference=train_ds)
+
+        model = lgb.train(
+            reg_params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['favorable_regressor'] = model
+
+        val_pred_fav = model.predict(X_val_combined)
+        fav_error = np.mean(np.abs(val_pred_fav - val_favorable))
+        metrics['favorable_return_mae'] = float(fav_error)
+        print(f"    Val MAE: {fav_error:.4f}%")
+
+        # Derived: favorable/adverse ratio (expected reward/risk)
+        predicted_rr = val_pred_fav / np.clip(val_pred_adverse, 0.01, None)
+        actual_rr = val_favorable / np.clip(val_adverse_mag, 0.01, None)
+        rr_corr = np.corrcoef(predicted_rr, actual_rr)[0, 1]
+        metrics['rr_correlation'] = float(rr_corr) if not np.isnan(rr_corr) else 0.0
+        print(f"    Predicted R:R correlation with actual: {metrics['rr_correlation']:.3f}")
+
+        # Feature importance
+        imp = self.models['stop_out'].feature_importance(importance_type='gain')
+        sorted_idx = np.argsort(imp)[::-1]
+        print("\n  Top 15 features for predicting stop-outs:")
+        for rank, i in enumerate(sorted_idx[:15]):
+            print(f"    {rank+1}. {combined_names[i]}: {imp[i]:.0f}")
+
+        self.feature_importance = [(combined_names[i], float(imp[i])) for i in sorted_idx]
+        self.calibration = {
+            'train_stop_rate': float(y_train_stop.mean()),
+            'val_stop_rate': float(y_val_stop.mean()),
+        }
+
+        return metrics
+
+    def predict(self, X: np.ndarray, is_buy: bool = True) -> Dict[str, np.ndarray]:
+        """
+        Predict adverse movement probability for a trade.
+
+        Args:
+            X: feature matrix (N, num_features)
+            is_buy: True for BUY trades, False for SELL
+
+        Returns:
+            stop_prob: P(will hit stop loss) [0, 1]
+            expected_mae: predicted maximum adverse excursion (%)
+            expected_mfe: predicted maximum favorable excursion (%)
+            risk_reward: predicted MFE/MAE ratio
+        """
+        n = len(X)
+        direction_col = np.ones(n) if is_buy else np.zeros(n)
+        X_aug = np.column_stack([X, direction_col])
+
+        results = {}
+
+        if 'stop_out' in self.models:
+            results['stop_prob'] = self.models['stop_out'].predict(X_aug)
+
+        if 'viable' in self.models:
+            results['viable_prob'] = self.models['viable'].predict(X_aug)
+
+        if 'adverse_regressor' in self.models:
+            results['expected_adverse'] = self.models['adverse_regressor'].predict(X_aug) / 100.0
+
+        if 'favorable_regressor' in self.models:
+            results['expected_favorable'] = self.models['favorable_regressor'].predict(X_aug) / 100.0
+
+        if 'expected_adverse' in results and 'expected_favorable' in results:
+            results['risk_reward'] = results['expected_favorable'] / np.clip(
+                results['expected_adverse'], 0.0001, None)
+
+        return results
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'models': self.models,
+                'feature_names': self.feature_names,
+                'calibration': self.calibration,
+                'feature_importance': getattr(self, 'feature_importance', []),
+            }, f)
+        print(f"  Saved AdverseMovementPredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'AdverseMovementPredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.models = data['models']
+        model.feature_names = data['feature_names']
+        model.calibration = data.get('calibration', {})
+        model.feature_importance = data.get('feature_importance', [])
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -5095,6 +5552,44 @@ def train_all_architectures(
         traceback.print_exc()
         all_results['physics_residual'] = {'error': str(e)}
 
+    # ---- Architecture 11: Adverse Movement Predictor ----
+    print("\n" + "=" * 70)
+    print("ARCHITECTURE 11: Adverse Movement Predictor (Stop-Loss Avoidance)")
+    print("=" * 70)
+
+    try:
+        adv_model = AdverseMovementPredictor()
+        adv_metrics = adv_model.train(
+            X_train, Y_train_dict, X_val, Y_val_dict, feature_names,
+        )
+        adv_model.save(os.path.join(output_dir, 'adverse_movement_model.pkl'))
+
+        # Test evaluation
+        for direction, is_buy in [('BUY', True), ('SELL', False)]:
+            adv_test = adv_model.predict(X_test, is_buy=is_buy)
+            if 'stop_prob' in adv_test:
+                test_returns = Y_test_dict['future_return_20']
+                if is_buy:
+                    actual_stop = ((np.abs(np.minimum(Y_test_dict['future_return_5'], Y_test_dict['future_return_20'])) > 0.005) &
+                                   (np.maximum(Y_test_dict['future_return_5'], Y_test_dict['future_return_20']) < 0.010))
+                else:
+                    actual_stop = ((np.maximum(Y_test_dict['future_return_5'], Y_test_dict['future_return_20']) > 0.005) &
+                                   (np.abs(np.minimum(Y_test_dict['future_return_5'], Y_test_dict['future_return_20'])) < 0.010))
+
+                safe = adv_test['stop_prob'] < 0.3
+                if safe.sum() > 5:
+                    key = f'test_{direction.lower()}_safe_stop_rate'
+                    adv_metrics[key] = float(actual_stop[safe].mean())
+                    print(f"\n  Test {direction} safe signals: stop_rate={adv_metrics[key]:.1%}, "
+                          f"coverage={safe.mean():.1%}")
+
+        all_results['adverse_movement'] = adv_metrics
+    except Exception as e:
+        print(f"  Adverse Movement failed: {e}")
+        import traceback
+        traceback.print_exc()
+        all_results['adverse_movement'] = {'error': str(e)}
+
     # ---- Compare ----
     print("\n" + "=" * 70)
     print("ARCHITECTURE COMPARISON")
@@ -5179,7 +5674,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -5301,6 +5796,13 @@ def main():
                 )
                 residual.save(os.path.join(args.output, 'physics_residual_model.pkl'))
                 print(f"\n  Physics Residual metrics: {res_metrics}")
+            elif args.arch == 'adverse_movement':
+                adv = AdverseMovementPredictor()
+                adv_metrics = adv.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                adv.save(os.path.join(args.output, 'adverse_movement_model.pkl'))
+                print(f"\n  Adverse Movement metrics: {adv_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

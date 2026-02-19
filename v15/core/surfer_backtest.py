@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -338,6 +338,18 @@ def run_backtest(
                 ml_stats['residual_boosted'] = 0
                 ml_stats['residual_penalized'] = 0
                 ml_stats['residual_lifetime_adj'] = 0
+            except Exception:
+                pass
+
+        # Try to load Adverse Movement model
+        adverse_model = None
+        adv_path = _os.path.join(model_dir, 'adverse_movement_model.pkl')
+        if _os.path.exists(adv_path):
+            try:
+                adverse_model = AdverseMovementPredictor.load(adv_path)
+                print(f"[ML] Adverse Movement model loaded")
+                ml_stats['adverse_filtered'] = 0
+                ml_stats['adverse_boosted'] = 0
             except Exception:
                 pass
 
@@ -844,6 +856,30 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Adverse Movement: filter high stop-out probability trades
+                    if adverse_model is not None:
+                        try:
+                            is_buy = (sig.action == 'BUY')
+                            adv_pred = adverse_model.predict(feature_vec.reshape(1, -1), is_buy=is_buy)
+
+                            # If stop probability is high (>0.4) → penalize confidence
+                            if 'stop_prob' in adv_pred:
+                                stop_p = float(adv_pred['stop_prob'][0])
+                                if stop_p > 0.4:
+                                    sig.confidence *= 0.80
+                                    ml_stats['adverse_filtered'] += 1
+                                elif stop_p < 0.1:
+                                    sig.confidence *= 1.10
+                                    ml_stats['adverse_boosted'] += 1
+
+                            # If viability is high, boost
+                            if 'viable_prob' in adv_pred:
+                                viable_p = float(adv_pred['viable_prob'][0])
+                                if viable_p > 0.65:
+                                    sig.confidence *= 1.05
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -1055,6 +1091,9 @@ def run_backtest(
             print(f"    Residual boosted:   {ml_stats.get('residual_boosted', 0)}")
             print(f"    Residual penalized: {ml_stats.get('residual_penalized', 0)}")
             print(f"    Residual life adj:  {ml_stats.get('residual_lifetime_adj', 0)}")
+        if adverse_model is not None:
+            print(f"    Adverse filtered:   {ml_stats.get('adverse_filtered', 0)}")
+            print(f"    Adverse boosted:    {ml_stats.get('adverse_boosted', 0)}")
 
     # Breakdown by exit reason
     if trades:
