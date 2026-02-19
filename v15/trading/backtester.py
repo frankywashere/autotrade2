@@ -339,13 +339,33 @@ class Backtester:
                         self.position_sizer.max_position_pct = orig_max
 
                         if position.should_trade:
+                            # Confidence-based scaling
                             conf_scale = max(0.5, min(1.5,
                                 0.7 + (signal.confidence - 0.72) * 10.0
                             ))
-                            if conf_scale != 1.0:
-                                position.shares = max(1, int(position.shares * conf_scale))
+
+                            # Cross-horizon agreement bonus:
+                            # If other horizons agree on direction, size up
+                            signal_dir = signal.signal_type
+                            agreeing_horizons = 0
+                            total_horizons = 0
+                            for h, hsig in horizon_signals.items():
+                                if hsig.signal_type != SignalType.FLAT:
+                                    total_horizons += 1
+                                    if hsig.signal_type == signal_dir:
+                                        agreeing_horizons += 1
+                            if total_horizons >= 2:
+                                agreement_pct = agreeing_horizons / total_horizons
+                                # 100% agreement = 1.2x, 50% = 1.0x, 0% = 0.8x
+                                cross_horizon_mult = 0.8 + agreement_pct * 0.4
+                            else:
+                                cross_horizon_mult = 1.0
+
+                            total_scale = conf_scale * cross_horizon_mult
+                            if total_scale != 1.0:
+                                position.shares = max(1, int(position.shares * total_scale))
                                 position.dollar_amount = position.shares * current_price
-                                position.fraction *= conf_scale
+                                position.fraction *= total_scale
 
                             new_pos = self._open_position(
                                 signal, position, current_price,
@@ -372,9 +392,12 @@ class Backtester:
             for i, t in enumerate(metrics.trades):
                 win = "W" if t.pnl > 0 else "L"
                 strat = getattr(t, 'strategy', '?')
+                entry_t = t.entry_time.strftime('%m/%d %H:%M') if hasattr(t, 'entry_time') else '?'
+                exit_t = t.exit_time.strftime('%m/%d %H:%M') if hasattr(t, 'exit_time') else '?'
                 print(
                     f"  #{i+1} {win} {t.direction:5s} "
-                    f"entry=${t.entry_price:.2f} exit=${t.exit_price:.2f} "
+                    f"entry=${t.entry_price:.2f}@{entry_t} "
+                    f"exit=${t.exit_price:.2f}@{exit_t} "
                     f"pnl=${t.pnl:+.2f} ({t.pnl_pct:+.1%}) "
                     f"hold={t.hold_bars}bars "
                     f"exit={t.exit_reason} "
