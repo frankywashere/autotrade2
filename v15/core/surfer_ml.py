@@ -6266,6 +6266,704 @@ class ExitTimingOptimizer:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 16: Momentum Exhaustion Detector
+# ---------------------------------------------------------------------------
+
+class MomentumExhaustionDetector:
+    """
+    Detects when a price move is running out of steam.
+
+    Models the 2nd derivative of price momentum (deceleration/jerk).
+    Key signals:
+    - RSI divergence (price making new highs but RSI declining)
+    - Volume decline during rally (fuel running out)
+    - Consecutive bar range shrinkage (moves getting smaller)
+    - Momentum slope change (acceleration → deceleration)
+
+    This identifies the inflection point BEFORE a reversal happens,
+    giving time to tighten stops or exit before stop-losses trigger.
+
+    Target: Will the next 5-10 bars reverse the current momentum direction?
+    """
+
+    def __init__(self):
+        self.exhaustion_model = None   # Binary: exhaustion imminent?
+        self.severity_model = None     # Regression: how severe is the reversal?
+        self.feature_names = None
+        self.exh_feature_names = None
+
+    @staticmethod
+    def derive_exhaustion_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive features specifically targeting momentum exhaustion."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+
+        feats = []
+        names = []
+
+        # Core momentum features
+        pm3_idx = name_to_idx.get('price_momentum_3bar')
+        pm12_idx = name_to_idx.get('price_momentum_12bar')
+
+        if pm3_idx is not None and pm12_idx is not None:
+            pm3 = X[:, pm3_idx]
+            pm12 = X[:, pm12_idx]
+
+            # 1. Momentum deceleration (short-term < long-term = slowing)
+            feats.append(pm3 - pm12)
+            names.append('exh_momentum_decel')
+
+            # 2. Momentum ratio (divergence between timeframes)
+            safe_pm12 = np.where(np.abs(pm12) > 1e-8, pm12, 1e-8)
+            feats.append(pm3 / safe_pm12)
+            names.append('exh_momentum_ratio')
+
+            # 3. Absolute momentum (high momentum = more room to exhaust)
+            feats.append(np.abs(pm3))
+            names.append('exh_abs_momentum_3')
+            feats.append(np.abs(pm12))
+            names.append('exh_abs_momentum_12')
+
+        # RSI features (overbought/oversold extremes = exhaustion)
+        rsi14_idx = name_to_idx.get('rsi_14')
+        rsi5_idx = name_to_idx.get('rsi_5')
+        rsi_slope_idx = name_to_idx.get('rsi_slope_5bar')
+
+        if rsi14_idx is not None:
+            rsi14 = X[:, rsi14_idx]
+            feats.append(rsi14)
+            names.append('exh_rsi_14')
+            # RSI extremity (distance from 50)
+            feats.append(np.abs(rsi14 - 50))
+            names.append('exh_rsi_extremity')
+
+        if rsi5_idx is not None:
+            rsi5 = X[:, rsi5_idx]
+            feats.append(rsi5)
+            names.append('exh_rsi_5')
+
+        if rsi_slope_idx is not None:
+            feats.append(X[:, rsi_slope_idx])
+            names.append('exh_rsi_slope')
+
+        # RSI divergence (RSI declining while price rising)
+        if rsi_slope_idx is not None and pm3_idx is not None:
+            rsi_slope = X[:, rsi_slope_idx]
+            pm3 = X[:, pm3_idx]
+            # Divergence: momentum positive but RSI slope negative (or vice versa)
+            feats.append(pm3 * -rsi_slope)
+            names.append('exh_rsi_divergence')
+
+        # Volume exhaustion features
+        vr_idx = name_to_idx.get('volume_ratio_20')
+        vt_idx = name_to_idx.get('volume_trend_5')
+        vm_idx = name_to_idx.get('vol_momentum_3bar')
+
+        if vr_idx is not None:
+            feats.append(X[:, vr_idx])
+            names.append('exh_volume_ratio')
+        if vt_idx is not None:
+            feats.append(X[:, vt_idx])
+            names.append('exh_volume_trend')
+        if vm_idx is not None:
+            feats.append(X[:, vm_idx])
+            names.append('exh_volume_momentum')
+
+        # Volume-momentum divergence (price up but volume declining)
+        if vt_idx is not None and pm3_idx is not None:
+            vt = X[:, vt_idx]
+            pm3 = X[:, pm3_idx]
+            feats.append(pm3 * -vt)  # Positive = momentum up, volume down
+            names.append('exh_vol_momentum_divergence')
+
+        # Consecutive bar features (streaks about to end)
+        up_idx = name_to_idx.get('consecutive_up_bars')
+        dn_idx = name_to_idx.get('consecutive_down_bars')
+        if up_idx is not None:
+            feats.append(X[:, up_idx])
+            names.append('exh_consecutive_up')
+        if dn_idx is not None:
+            feats.append(X[:, dn_idx])
+            names.append('exh_consecutive_down')
+
+        # Bar range as % of ATR (shrinking ranges = exhaustion)
+        bar_range_idx = name_to_idx.get('bar_range_pct')
+        if bar_range_idx is not None:
+            feats.append(X[:, bar_range_idx])
+            names.append('exh_bar_range_pct')
+
+        # Close position in bar (doji-like = indecision)
+        close_pos_idx = name_to_idx.get('close_position_in_bar')
+        if close_pos_idx is not None:
+            cp = X[:, close_pos_idx]
+            feats.append(cp)
+            names.append('exh_close_position')
+            # Distance from extremes (near 0.5 = doji = indecision)
+            feats.append(np.abs(cp - 0.5))
+            names.append('exh_doji_score')
+
+        # Channel health trajectory (deteriorating health = momentum failing)
+        hd3_idx = name_to_idx.get('health_delta_3bar')
+        hd6_idx = name_to_idx.get('health_delta_6bar')
+        if hd3_idx is not None:
+            feats.append(X[:, hd3_idx])
+            names.append('exh_health_delta_3')
+        if hd6_idx is not None:
+            feats.append(X[:, hd6_idx])
+            names.append('exh_health_delta_6')
+
+        # Position in channel (extreme positions = reversal likely)
+        for tf in ['5min', '1h', '4h']:
+            pos_idx = name_to_idx.get(f'{tf}_position_pct')
+            if pos_idx is not None:
+                pos = X[:, pos_idx]
+                feats.append(pos)
+                names.append(f'exh_{tf}_position')
+                # Quadratic distance from center (captures extremes)
+                feats.append((pos - 0.5) ** 2)
+                names.append(f'exh_{tf}_pos_extreme')
+
+        # Entropy (rising entropy = increasing disorder = momentum failing)
+        ent_d_idx = name_to_idx.get('entropy_delta_3bar')
+        if ent_d_idx is not None:
+            feats.append(X[:, ent_d_idx])
+            names.append('exh_entropy_delta')
+
+        # Break probability (rising = structural change imminent)
+        bp_d_idx = name_to_idx.get('break_prob_delta_3bar')
+        if bp_d_idx is not None:
+            feats.append(X[:, bp_d_idx])
+            names.append('exh_break_prob_delta')
+
+        # ATR (absolute vol level)
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            feats.append(X[:, atr_idx])
+            names.append('exh_atr')
+
+        # Direction consensus (fading consensus = exhaustion)
+        dc_idx = name_to_idx.get('direction_consensus')
+        if dc_idx is not None:
+            feats.append(X[:, dc_idx])
+            names.append('exh_direction_consensus')
+
+        # SPY correlation (decorrelation can signal exhaustion)
+        spy_corr_idx = name_to_idx.get('spy_tsla_corr_20')
+        if spy_corr_idx is not None:
+            feats.append(X[:, spy_corr_idx])
+            names.append('exh_spy_corr')
+
+        if len(feats) == 0:
+            return X, feature_names
+
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train momentum exhaustion detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        exh_X_train, self.exh_feature_names = self.derive_exhaustion_features(
+            X_train, feature_names)
+        exh_X_val, _ = self.derive_exhaustion_features(X_val, feature_names)
+
+        # Target: momentum reversal in next 5 bars
+        # Look at price_momentum_3bar to determine current direction,
+        # then check if future_return_5 goes OPPOSITE
+        pm3_idx = {n: i for i, n in enumerate(feature_names)}.get('price_momentum_3bar')
+        ret5_train = Y_train['future_return_5']
+        ret5_val = Y_val['future_return_5']
+        ret20_train = Y_train['future_return_20']
+        ret20_val = Y_val['future_return_20']
+
+        if pm3_idx is not None:
+            mom_train = X_train[:, pm3_idx]
+            mom_val = X_val[:, pm3_idx]
+
+            # Exhaustion = current momentum positive but future return negative (or vice versa)
+            # AND the reversal is significant (>0.2%)
+            reversal_train = (
+                ((mom_train > 0.001) & (ret5_train < -0.002)) |
+                ((mom_train < -0.001) & (ret5_train > 0.002))
+            ).astype(np.float32)
+
+            reversal_val = (
+                ((mom_val > 0.001) & (ret5_val < -0.002)) |
+                ((mom_val < -0.001) & (ret5_val > 0.002))
+            ).astype(np.float32)
+        else:
+            # Fallback: large absolute return change
+            reversal_train = (np.abs(ret5_train) > 0.005).astype(np.float32)
+            reversal_val = (np.abs(ret5_val) > 0.005).astype(np.float32)
+
+        # Severity: magnitude of reversal (how far against current direction)
+        severity_train = np.abs(ret5_train).astype(np.float32)
+        severity_val = np.abs(ret5_val).astype(np.float32)
+
+        metrics = {}
+
+        print(f"\n  Exhaustion features: {len(self.exh_feature_names)}")
+        print(f"  Reversal rate: {reversal_train.mean():.1%}")
+
+        # --- Model 1: Exhaustion classifier ---
+        print("  Training exhaustion classifier...")
+        dtrain = lgb.Dataset(exh_X_train, label=reversal_train,
+                            feature_name=self.exh_feature_names)
+        dval = lgb.Dataset(exh_X_val, label=reversal_val,
+                          feature_name=self.exh_feature_names, reference=dtrain)
+
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+            'is_unbalance': True,
+        }
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        self.exhaustion_model = lgb.train(
+            params, dtrain, num_boost_round=500,
+            valid_sets=[dval], callbacks=callbacks,
+        )
+
+        exh_pred = self.exhaustion_model.predict(exh_X_val)
+        exh_auc = roc_auc_score(reversal_val, exh_pred)
+        metrics['exhaustion_auc'] = float(exh_auc)
+        print(f"    Exhaustion AUC: {exh_auc:.3f}")
+
+        # High-confidence precision
+        high_conf_mask = exh_pred > 0.6
+        if high_conf_mask.sum() > 10:
+            high_conf_precision = reversal_val[high_conf_mask].mean()
+            metrics['high_conf_precision'] = float(high_conf_precision)
+            print(f"    High-conf (>0.6) precision: {high_conf_precision:.1%} "
+                  f"({high_conf_mask.sum()} samples)")
+
+        # --- Model 2: Severity regressor ---
+        print("  Training severity regressor...")
+        dtrain2 = lgb.Dataset(exh_X_train, label=severity_train,
+                             feature_name=self.exh_feature_names)
+        dval2 = lgb.Dataset(exh_X_val, label=severity_val,
+                           feature_name=self.exh_feature_names, reference=dtrain2)
+
+        params_reg = {
+            'objective': 'regression',
+            'metric': 'mae',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+        }
+
+        self.severity_model = lgb.train(
+            params_reg, dtrain2, num_boost_round=500,
+            valid_sets=[dval2], callbacks=callbacks,
+        )
+
+        sev_pred = self.severity_model.predict(exh_X_val)
+        sev_mae = np.mean(np.abs(sev_pred - severity_val))
+        sev_corr = np.corrcoef(sev_pred, severity_val)[0, 1]
+        metrics['severity_mae'] = float(sev_mae)
+        metrics['severity_corr'] = float(sev_corr)
+        print(f"    Severity MAE: {sev_mae:.5f}, Corr: {sev_corr:.3f}")
+
+        # Feature importance
+        imp = self.exhaustion_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 exhaustion features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.exh_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        """
+        Predict momentum exhaustion.
+
+        Returns:
+            exhaustion_prob: probability of momentum reversal in next 5 bars
+            reversal_severity: expected magnitude of reversal
+            exhaustion_level: 'fresh', 'tiring', 'exhausted'
+        """
+        if self.exhaustion_model is None:
+            return {}
+
+        exh_X, _ = self.derive_exhaustion_features(X, self.feature_names)
+
+        exh_prob = self.exhaustion_model.predict(exh_X)
+        severity = self.severity_model.predict(exh_X)
+
+        level = np.where(
+            exh_prob > 0.55, 2,  # exhausted
+            np.where(exh_prob > 0.35, 1, 0)  # tiring / fresh
+        )
+        level_labels = np.array(['fresh', 'tiring', 'exhausted'])
+
+        return {
+            'exhaustion_prob': exh_prob,
+            'reversal_severity': severity,
+            'exhaustion_level': level_labels[level],
+            'exhaustion_level_id': level,
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'exhaustion_model': self.exhaustion_model,
+                'severity_model': self.severity_model,
+                'feature_names': self.feature_names,
+                'exh_feature_names': self.exh_feature_names,
+            }, f)
+        print(f"  Saved MomentumExhaustionDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'MomentumExhaustionDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.exhaustion_model = data['exhaustion_model']
+        model.severity_model = data['severity_model']
+        model.feature_names = data['feature_names']
+        model.exh_feature_names = data['exh_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 17: Cross-Asset Signal Amplifier
+# ---------------------------------------------------------------------------
+
+class CrossAssetAmplifier:
+    """
+    Uses SPY/VIX co-movement patterns to amplify or dampen TSLA signals.
+
+    Key insight: When TSLA and SPY are highly correlated, TSLA moves are
+    market-driven (less predictable from channel analysis). When decorrelated,
+    TSLA moves are idiosyncratic (channels are more reliable).
+
+    Also models VIX regime effects: low VIX = channels hold longer,
+    high VIX = channels break faster.
+
+    Targets:
+    - Whether channel-based trading outperforms in current market regime
+    - Optimal confidence scaling factor for current cross-asset conditions
+    """
+
+    def __init__(self):
+        self.regime_model = None       # Market regime classifier
+        self.scale_model = None        # Confidence scaling regressor
+        self.feature_names = None
+        self.cross_feature_names = None
+
+    @staticmethod
+    def derive_cross_asset_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive cross-asset interaction features."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+
+        feats = []
+        names_list = []
+
+        # Core cross-asset features
+        spy_ret5_idx = name_to_idx.get('spy_return_5bar')
+        spy_ret20_idx = name_to_idx.get('spy_return_20bar')
+        spy_corr_idx = name_to_idx.get('spy_tsla_corr_20')
+        vix_idx = name_to_idx.get('vix_level')
+        vix_chg_idx = name_to_idx.get('vix_change_5d')
+
+        if spy_ret5_idx is not None:
+            feats.append(X[:, spy_ret5_idx])
+            names_list.append('ca_spy_ret5')
+        if spy_ret20_idx is not None:
+            feats.append(X[:, spy_ret20_idx])
+            names_list.append('ca_spy_ret20')
+        if spy_corr_idx is not None:
+            corr = X[:, spy_corr_idx]
+            feats.append(corr)
+            names_list.append('ca_spy_corr')
+            # Absolute correlation (high = market-driven)
+            feats.append(np.abs(corr))
+            names_list.append('ca_spy_abs_corr')
+            # Decorrelation (1 - |corr|, high = TSLA-specific moves)
+            feats.append(1.0 - np.abs(corr))
+            names_list.append('ca_decorrelation')
+
+        if vix_idx is not None:
+            vix = X[:, vix_idx]
+            feats.append(vix)
+            names_list.append('ca_vix_level')
+            # VIX regimes
+            feats.append((vix > 20).astype(np.float32))
+            names_list.append('ca_vix_elevated')
+            feats.append((vix > 30).astype(np.float32))
+            names_list.append('ca_vix_high')
+
+        if vix_chg_idx is not None:
+            feats.append(X[:, vix_chg_idx])
+            names_list.append('ca_vix_change')
+
+        # TSLA momentum vs SPY momentum (relative strength)
+        pm3_idx = name_to_idx.get('price_momentum_3bar')
+        pm12_idx = name_to_idx.get('price_momentum_12bar')
+        if pm3_idx is not None and spy_ret5_idx is not None:
+            feats.append(X[:, pm3_idx] - X[:, spy_ret5_idx])
+            names_list.append('ca_relative_momentum_short')
+        if pm12_idx is not None and spy_ret20_idx is not None:
+            feats.append(X[:, pm12_idx] - X[:, spy_ret20_idx])
+            names_list.append('ca_relative_momentum_long')
+
+        # VIX × TSLA correlation interaction
+        if vix_idx is not None and spy_corr_idx is not None:
+            feats.append(X[:, vix_idx] * np.abs(X[:, spy_corr_idx]))
+            names_list.append('ca_vix_corr_interaction')
+
+        # VIX × ATR interaction (vol regime matching)
+        atr_idx = name_to_idx.get('atr_pct')
+        if vix_idx is not None and atr_idx is not None:
+            feats.append(X[:, vix_idx] * X[:, atr_idx])
+            names_list.append('ca_vix_atr_interaction')
+
+        # Channel health features (to model when cross-asset matters more)
+        hmin_idx = name_to_idx.get('health_min')
+        hmax_idx = name_to_idx.get('health_max')
+        if hmin_idx is not None:
+            feats.append(X[:, hmin_idx])
+            names_list.append('ca_health_min')
+        if hmax_idx is not None:
+            feats.append(X[:, hmax_idx])
+            names_list.append('ca_health_max')
+
+        # Direction consensus (to model when TSLA-specific vs market-driven)
+        dc_idx = name_to_idx.get('direction_consensus')
+        if dc_idx is not None:
+            feats.append(X[:, dc_idx])
+            names_list.append('ca_direction_consensus')
+
+        # Break probability (channel stability measure)
+        bp_idx = name_to_idx.get('break_prob_max')
+        if bp_idx is not None:
+            feats.append(X[:, bp_idx])
+            names_list.append('ca_break_prob')
+
+        # ATR
+        if atr_idx is not None:
+            feats.append(X[:, atr_idx])
+            names_list.append('ca_atr')
+
+        # RSI (market condition)
+        rsi_idx = name_to_idx.get('rsi_14')
+        if rsi_idx is not None:
+            feats.append(X[:, rsi_idx])
+            names_list.append('ca_rsi')
+
+        if len(feats) == 0:
+            return X, feature_names
+
+        return np.column_stack(feats), names_list
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """
+        Train cross-asset amplifier.
+
+        Target 1 (regime): 4-class market regime
+            0 = risk-on (SPY up, VIX low) → channels reliable
+            1 = risk-off (SPY down, VIX high) → shorts reliable
+            2 = rotation (SPY flat, TSLA moving) → highest alpha
+            3 = correlated selloff → avoid trading
+
+        Target 2 (scale): Optimal confidence scale factor based on
+            whether the next 20-bar return aligns with channel prediction.
+        """
+        import lightgbm as lgb
+
+        self.feature_names = list(feature_names)
+        cross_X_train, self.cross_feature_names = self.derive_cross_asset_features(
+            X_train, feature_names)
+        cross_X_val, _ = self.derive_cross_asset_features(X_val, feature_names)
+
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+
+        # Compute market regime targets
+        spy5_idx = name_to_idx.get('spy_return_5bar')
+        vix_idx = name_to_idx.get('vix_level')
+        corr_idx = name_to_idx.get('spy_tsla_corr_20')
+
+        def compute_regime(X_data):
+            n = len(X_data)
+            regime = np.zeros(n, dtype=np.int32)
+            for i in range(n):
+                spy_ret = X_data[i, spy5_idx] if spy5_idx is not None else 0
+                vix = X_data[i, vix_idx] if vix_idx is not None else 15
+                corr = X_data[i, corr_idx] if corr_idx is not None else 0.5
+
+                if spy_ret > 0.002 and vix < 20:
+                    regime[i] = 0  # risk-on
+                elif spy_ret < -0.002 and vix > 25:
+                    regime[i] = 3  # correlated selloff
+                elif abs(corr) < 0.3:
+                    regime[i] = 2  # rotation (decorrelated)
+                else:
+                    regime[i] = 1  # risk-off
+            return regime
+
+        regime_train = compute_regime(X_train)
+        regime_val = compute_regime(X_val)
+
+        # Confidence scale target: based on whether action was correct
+        # Scale = 1.0 (neutral), >1 if good trade opportunity, <1 if bad
+        action_train = Y_train['optimal_action']
+        ret20_train = Y_train['future_return_20']
+        ret20_val = Y_val['future_return_20']
+
+        # Good outcome = large absolute return (more profit opportunity)
+        # Scale it relative to typical return
+        typical_ret = np.percentile(np.abs(ret20_train), 50)
+        scale_train = np.clip(np.abs(ret20_train) / max(typical_ret, 1e-6), 0.3, 2.0).astype(np.float32)
+        scale_val = np.clip(np.abs(ret20_val) / max(typical_ret, 1e-6), 0.3, 2.0).astype(np.float32)
+
+        metrics = {}
+
+        print(f"\n  Cross-asset features: {len(self.cross_feature_names)}")
+        print(f"  Regime distribution (train): "
+              f"risk-on={np.mean(regime_train==0):.1%}, "
+              f"risk-off={np.mean(regime_train==1):.1%}, "
+              f"rotation={np.mean(regime_train==2):.1%}, "
+              f"selloff={np.mean(regime_train==3):.1%}")
+
+        # --- Model 1: Market regime classifier ---
+        print("  Training market regime classifier...")
+        dtrain = lgb.Dataset(cross_X_train, label=regime_train,
+                            feature_name=self.cross_feature_names)
+        dval = lgb.Dataset(cross_X_val, label=regime_val,
+                          feature_name=self.cross_feature_names, reference=dtrain)
+
+        params = {
+            'objective': 'multiclass',
+            'num_class': 4,
+            'metric': 'multi_logloss',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+        }
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        self.regime_model = lgb.train(
+            params, dtrain, num_boost_round=500,
+            valid_sets=[dval], callbacks=callbacks,
+        )
+
+        regime_probs = self.regime_model.predict(cross_X_val).reshape(-1, 4)
+        regime_pred = np.argmax(regime_probs, axis=1)
+        regime_acc = np.mean(regime_pred == regime_val)
+        metrics['regime_accuracy'] = float(regime_acc)
+
+        regime_names = ['risk-on', 'risk-off', 'rotation', 'selloff']
+        for c, name in enumerate(regime_names):
+            mask = regime_val == c
+            if mask.sum() > 0:
+                class_acc = np.mean(regime_pred[mask] == c)
+                metrics[f'{name}_acc'] = float(class_acc)
+                print(f"    {name}: {class_acc:.1%} ({mask.sum()} samples)")
+
+        print(f"    Overall regime accuracy: {regime_acc:.1%}")
+
+        # --- Model 2: Confidence scale regressor ---
+        print("  Training confidence scale regressor...")
+        dtrain2 = lgb.Dataset(cross_X_train, label=scale_train,
+                             feature_name=self.cross_feature_names)
+        dval2 = lgb.Dataset(cross_X_val, label=scale_val,
+                           feature_name=self.cross_feature_names, reference=dtrain2)
+
+        params_reg = {
+            'objective': 'regression',
+            'metric': 'mae',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+        }
+
+        self.scale_model = lgb.train(
+            params_reg, dtrain2, num_boost_round=500,
+            valid_sets=[dval2], callbacks=callbacks,
+        )
+
+        scale_pred = self.scale_model.predict(cross_X_val)
+        scale_mae = np.mean(np.abs(scale_pred - scale_val))
+        scale_corr = np.corrcoef(scale_pred, scale_val)[0, 1]
+        metrics['scale_mae'] = float(scale_mae)
+        metrics['scale_corr'] = float(scale_corr)
+        print(f"    Scale MAE: {scale_mae:.3f}, Corr: {scale_corr:.3f}")
+
+        # Feature importance
+        imp = self.regime_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 cross-asset features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.cross_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        """
+        Predict cross-asset regime and confidence scaling.
+
+        Returns:
+            market_regime: 0=risk-on, 1=risk-off, 2=rotation, 3=selloff
+            regime_probs: [risk_on, risk_off, rotation, selloff]
+            confidence_scale: suggested scaling factor for confidence
+            regime_label: human-readable regime name
+        """
+        if self.regime_model is None:
+            return {}
+
+        cross_X, _ = self.derive_cross_asset_features(X, self.feature_names)
+
+        regime_probs = self.regime_model.predict(cross_X).reshape(-1, 4)
+        regime = np.argmax(regime_probs, axis=1)
+        scale = self.scale_model.predict(cross_X)
+
+        regime_labels = np.array(['risk-on', 'risk-off', 'rotation', 'selloff'])
+
+        return {
+            'market_regime': regime,
+            'regime_probs': regime_probs,
+            'confidence_scale': scale,
+            'regime_label': regime_labels[regime],
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'regime_model': self.regime_model,
+                'scale_model': self.scale_model,
+                'feature_names': self.feature_names,
+                'cross_feature_names': self.cross_feature_names,
+            }, f)
+        print(f"  Saved CrossAssetAmplifier to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'CrossAssetAmplifier':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.regime_model = data['regime_model']
+        model.scale_model = data['scale_model']
+        model.feature_names = data['feature_names']
+        model.cross_feature_names = data['cross_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -6894,7 +7592,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -7052,6 +7750,20 @@ def main():
                 )
                 exit_opt.save(os.path.join(args.output, 'exit_timing_opt.pkl'))
                 print(f"\n  Exit Timing metrics: {exit_metrics}")
+            elif args.arch == 'exhaustion':
+                exh = MomentumExhaustionDetector()
+                exh_metrics = exh.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                exh.save(os.path.join(args.output, 'exhaustion_model.pkl'))
+                print(f"\n  Exhaustion metrics: {exh_metrics}")
+            elif args.arch == 'cross_asset':
+                ca = CrossAssetAmplifier()
+                ca_metrics = ca.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                ca.save(os.path.join(args.output, 'cross_asset_model.pkl'))
+                print(f"\n  Cross-Asset metrics: {ca_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

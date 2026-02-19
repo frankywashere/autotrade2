@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -387,6 +387,32 @@ def run_backtest(
                 print(f"[ML] Exit Timing model loaded")
                 ml_stats['exit_tightened'] = 0
                 ml_stats['exit_early'] = 0
+            except Exception:
+                pass
+
+        # Try to load Momentum Exhaustion model
+        exhaustion_model = None
+        exh_path = _os.path.join(model_dir, 'exhaustion_model.pkl')
+        if _os.path.exists(exh_path):
+            try:
+                exhaustion_model = MomentumExhaustionDetector.load(exh_path)
+                print(f"[ML] Momentum Exhaustion model loaded")
+                ml_stats['exh_exhausted_skip'] = 0
+                ml_stats['exh_tiring_scale'] = 0
+                ml_stats['exh_fresh_boost'] = 0
+            except Exception:
+                pass
+
+        # Try to load Cross-Asset Amplifier model
+        cross_asset_model = None
+        ca_path = _os.path.join(model_dir, 'cross_asset_model.pkl')
+        if _os.path.exists(ca_path):
+            try:
+                cross_asset_model = CrossAssetAmplifier.load(ca_path)
+                print(f"[ML] Cross-Asset Amplifier loaded")
+                ml_stats['ca_rotation_boost'] = 0
+                ml_stats['ca_selloff_skip'] = 0
+                ml_stats['ca_scale_applied'] = 0
             except Exception:
                 pass
 
@@ -998,6 +1024,41 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Momentum Exhaustion: avoid entering exhausted moves
+                    if exhaustion_model is not None:
+                        try:
+                            exh_pred = exhaustion_model.predict(feature_vec.reshape(1, -1))
+                            exh_prob = float(exh_pred['exhaustion_prob'][0])
+
+                            if exh_prob > 0.60:
+                                sig.confidence *= 0.75
+                                ml_stats['exh_exhausted_skip'] += 1
+                            elif exh_prob > 0.45:
+                                sig.confidence *= 0.95
+                                ml_stats['exh_tiring_scale'] += 1
+                            elif exh_prob < 0.25:
+                                sig.confidence *= 1.03
+                                ml_stats['exh_fresh_boost'] += 1
+                        except Exception:
+                            pass
+
+                    # Cross-Asset Amplifier: regime-based confidence scaling
+                    if cross_asset_model is not None:
+                        try:
+                            ca_pred = cross_asset_model.predict(feature_vec.reshape(1, -1))
+                            ca_regime = int(ca_pred['market_regime'][0])
+
+                            if ca_regime == 2:  # rotation — TSLA-specific, channels most reliable
+                                sig.confidence *= 1.08
+                                ml_stats['ca_rotation_boost'] += 1
+                            elif ca_regime == 3:  # correlated selloff — avoid
+                                sig.confidence *= 0.65
+                                ml_stats['ca_selloff_skip'] += 1
+
+                            ml_stats['ca_scale_applied'] += 1
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -1222,6 +1283,14 @@ def run_backtest(
         if exit_timing_model is not None:
             print(f"    Exit tightened:     {ml_stats.get('exit_tightened', 0)}")
             print(f"    Exit early:         {ml_stats.get('exit_early', 0)}")
+        if exhaustion_model is not None:
+            print(f"    Exh exhausted skip: {ml_stats.get('exh_exhausted_skip', 0)}")
+            print(f"    Exh tiring scale:   {ml_stats.get('exh_tiring_scale', 0)}")
+            print(f"    Exh fresh boost:    {ml_stats.get('exh_fresh_boost', 0)}")
+        if cross_asset_model is not None:
+            print(f"    CA rotation boost:  {ml_stats.get('ca_rotation_boost', 0)}")
+            print(f"    CA selloff skip:    {ml_stats.get('ca_selloff_skip', 0)}")
+            print(f"    CA scale applied:   {ml_stats.get('ca_scale_applied', 0)}")
 
     # Breakdown by exit reason
     if trades:
