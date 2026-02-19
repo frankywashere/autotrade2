@@ -40,9 +40,12 @@ class OpenPosition:
     regime: str
     primary_tf: str
     commission_entry: float
+    strategy: str = 'trend'  # 'trend' or 'bounce'
     # Trailing stop tracking
     best_price: float = 0.0  # Best price seen since entry (for trailing stop)
     trailing_stop_pct: float = 0.02  # Trail by 2%
+    # Re-entry tracking
+    exit_bar: int = 0  # Bar when position was closed (for cooldown)
 
 
 @dataclass
@@ -131,6 +134,12 @@ class Backtester:
         open_position: Optional[OpenPosition] = None
         prev_hazard: Optional[HazardClock] = None
 
+        # Re-entry tracking
+        last_exit_bar = 0
+        last_exit_direction = None
+        last_exit_profitable = False
+        REENTRY_COOLDOWN = 12  # 1 hour cooldown before re-entry (sweep-optimized)
+
         total_bars = len(tsla_df)
         signals_generated = 0
         signals_actionable = 0
@@ -170,6 +179,10 @@ class Backtester:
                     equity += trade.pnl
                     self.position_sizer.update_equity(equity)
                     equity_curve.add_point(current_time, equity)
+                    # Track for re-entry
+                    last_exit_bar = bar_idx
+                    last_exit_direction = open_position.direction
+                    last_exit_profitable = trade.pnl > 0
                     open_position = None
 
             # Generate signal at evaluation intervals
@@ -228,6 +241,10 @@ class Backtester:
                     # Strategy 2: Short horizon bounce capture (ranging markets)
                     # Priority: long horizon first, short horizon as backup
 
+                    # Sweep-optimized momentum thresholds
+                    MOM_1D_THRESHOLD = -0.005  # Allow slight 1d pullback
+                    MOM_3D_THRESHOLD = -0.01   # 3d must not be deeply negative
+
                     best_signal = None
                     best_score = -1.0
                     chosen_strategy = None
@@ -249,10 +266,10 @@ class Backtester:
                             if sig.regime.regime == MarketRegime.TRANSITIONING:
                                 continue
                             if sig.signal_type == SignalType.LONG:
-                                if mom_1d < 0 or mom_3d < -0.01:
+                                if mom_1d < MOM_1D_THRESHOLD or mom_3d < MOM_3D_THRESHOLD:
                                     continue
                             elif sig.signal_type == SignalType.SHORT:
-                                if mom_1d > 0 or mom_3d > 0.01:
+                                if mom_1d > -MOM_1D_THRESHOLD or mom_3d > -MOM_3D_THRESHOLD:
                                     continue
                             score = sig.confidence * sig.entry_urgency * 2.0  # Priority boost
                             if score > best_score:
@@ -278,9 +295,26 @@ class Backtester:
 
                     # Open position if no current position and signal is actionable
                     if open_position is None and signal is not None:
+                        # Re-entry cooldown: after profitable exit, wait before re-entering same direction
+                        # (avoids whipsaw on pullbacks)
+                        in_cooldown = (
+                            last_exit_profitable
+                            and (bar_idx - last_exit_bar) < REENTRY_COOLDOWN
+                            and last_exit_direction is not None
+                        )
+                        # Allow re-entry in SAME direction after cooldown
+                        # (trend continuation). Block re-entry in same direction during cooldown.
+                        signal_dir = 'long' if signal.signal_type == SignalType.LONG else 'short'
+                        if in_cooldown and signal_dir == last_exit_direction:
+                            signal = None  # Skip: too soon to re-enter same direction
+
+                    if open_position is None and signal is not None:
                         if signal.entry_urgency > 0.3:  # Lower urgency threshold
+                            # Compute ATR at entry for adaptive trailing stop
+                            atr_pct = _compute_atr(tsla_df, bar_idx, period=78)  # 1-day ATR
+
                             position = self.position_sizer.size_position(
-                                signal, current_price
+                                signal, current_price, atr_pct=atr_pct
                             )
                             if position.should_trade:
                                 # Scale by confidence: higher conf = bigger bet
@@ -295,7 +329,9 @@ class Backtester:
 
                                 open_position = self._open_position(
                                     signal, position, current_price,
-                                    current_time, bar_idx
+                                    current_time, bar_idx,
+                                    atr_pct=atr_pct,
+                                    strategy=chosen_strategy or 'trend',
                                 )
 
                     # Check for signal flip (close current position)
@@ -329,6 +365,7 @@ class Backtester:
             print("\n--- TRADE LOG ---")
             for i, t in enumerate(metrics.trades):
                 win = "W" if t.pnl > 0 else "L"
+                strat = getattr(t, 'strategy', '?')
                 print(
                     f"  #{i+1} {win} {t.direction:5s} "
                     f"entry=${t.entry_price:.2f} exit=${t.exit_price:.2f} "
@@ -431,7 +468,15 @@ class Backtester:
 
         return None, None
 
-    # Trailing stop percentages by horizon
+    # ATR multipliers by horizon (used with ATR to compute trail width)
+    # Lower multiplier = tighter trail (bounce = quick exit)
+    # Higher multiplier = wider trail (trend = ride the wave)
+    HORIZON_ATR_MULT = {
+        'short': 1.5,    # Tight: 1.5x ATR trail for bounces
+        'medium': 2.0,   # Medium: 2x ATR
+        'long': 2.5,     # Wide: 2.5x ATR for trend-following
+    }
+    # Fallback fixed percentages (used if ATR is unavailable)
     HORIZON_TRAIL_PCT = {
         'short': 0.015,   # 1.5% trail for short TFs (tight)
         'medium': 0.020,  # 2% trail for medium TFs
@@ -445,6 +490,8 @@ class Backtester:
         price: float,
         time: datetime,
         bar_idx: int,
+        atr_pct: float = 0.02,
+        strategy: str = 'trend',
     ) -> OpenPosition:
         """Open a new position."""
         from ..config import TF_TO_HORIZON
@@ -464,9 +511,15 @@ class Backtester:
 
         commission = sizing.shares * self.config.commission_per_share
 
-        # Horizon-specific trailing stop
+        # ATR-adaptive trailing stop
         horizon = TF_TO_HORIZON.get(signal.primary_tf, 'medium')
-        trail_pct = self.HORIZON_TRAIL_PCT.get(horizon, 0.020)
+        atr_mult = self.HORIZON_ATR_MULT.get(horizon, 2.0)
+        trail_pct = atr_pct * atr_mult
+
+        # Clamp to reasonable range
+        min_trail = self.HORIZON_TRAIL_PCT.get(horizon, 0.020) * 0.5  # At least half the fixed %
+        max_trail = 0.06  # Never more than 6%
+        trail_pct = max(min_trail, min(max_trail, trail_pct))
 
         return OpenPosition(
             entry_time=time,
@@ -480,6 +533,7 @@ class Backtester:
             regime=signal.regime.regime.value,
             primary_tf=signal.primary_tf,
             commission_entry=commission,
+            strategy=strategy,
             best_price=entry_price,
             trailing_stop_pct=trail_pct,
         )
@@ -537,6 +591,31 @@ class Backtester:
         if signal.signal_type == SignalType.SHORT and pos.direction == 'long':
             return signal.confidence > 0.65
         return False
+
+
+def _compute_atr(df: pd.DataFrame, bar_idx: int, period: int = 14) -> float:
+    """Compute Average True Range as a percentage of price."""
+    if bar_idx < period + 1:
+        return 0.02  # Default 2% if insufficient data
+    start = max(0, bar_idx - period)
+    high = df.iloc[start:bar_idx + 1]['high'].values
+    low = df.iloc[start:bar_idx + 1]['low'].values
+    close = df.iloc[start:bar_idx + 1]['close'].values
+
+    tr_values = []
+    for i in range(1, len(high)):
+        tr = max(
+            high[i] - low[i],
+            abs(high[i] - close[i - 1]),
+            abs(low[i] - close[i - 1])
+        )
+        tr_values.append(tr)
+
+    if not tr_values:
+        return 0.02
+    atr = sum(tr_values) / len(tr_values)
+    atr_pct = atr / close[-1] if close[-1] > 0 else 0.02
+    return atr_pct
 
 
 def _to_datetime(ts) -> datetime:

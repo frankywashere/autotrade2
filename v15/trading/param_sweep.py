@@ -30,6 +30,8 @@ class CachedBar:
     # Momentum
     mom_1d: float
     mom_3d: float
+    # Volatility
+    atr_pct: float = 0.02  # ATR as fraction of price
 
 
 def run_sweep(checkpoint_path: str, calibration_path: str = None):
@@ -60,7 +62,8 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
         'mom_1d_threshold': [0.0, -0.005],
         'mom_3d_threshold': [-0.01, -0.02],
         'max_position_pct': [0.35, 0.40],
-        'bounce_min_confidence': [0.70, 0.73, 0.75, 0.78, 0.99],  # 0.99 = disabled
+        'bounce_min_confidence': [0.70, 0.75, 0.99],  # 0.99 = disabled
+        'reentry_cooldown': [12, 24, 48],  # bars: 1h, 2h, 4h
     }
 
     keys = list(param_grid.keys())
@@ -69,10 +72,10 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
     total = len(combinations)
 
     print(f"Sweeping {total} parameter combinations (in-memory, fast)...")
-    print(f"{'='*120}")
-    print(f"{'#':>4s} {'MinConf':>7s} {'Mom1d':>7s} {'Mom3d':>7s} {'MaxPos':>6s} {'Bounce':>6s} | "
+    print(f"{'='*130}")
+    print(f"{'#':>4s} {'MinConf':>7s} {'Mom1d':>7s} {'Mom3d':>7s} {'MaxPos':>6s} {'Bounce':>6s} {'CD':>3s} | "
           f"{'Trades':>6s} {'WR%':>5s} {'P&L':>10s} {'PF':>6s} {'Sharpe':>7s} {'MaxDD':>6s}")
-    print(f"{'-'*120}")
+    print(f"{'-'*130}")
 
     results = []
 
@@ -85,11 +88,12 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
 
             # Print row
             bounce_str = f"{params.get('bounce_min_confidence', 0.99):6.2f}"
+            cd_str = f"{params.get('reentry_cooldown', 24):3d}"
             print(
                 f"{idx+1:4d} {params['min_confidence']:7.2f} "
                 f"{params['mom_1d_threshold']:7.3f} "
                 f"{params['mom_3d_threshold']:7.3f} "
-                f"{params['max_position_pct']:6.2f} {bounce_str} | "
+                f"{params['max_position_pct']:6.2f} {bounce_str} {cd_str} | "
                 f"{result['trades']:6d} {result['win_rate']:5.1f} "
                 f"${result['pnl']:9,.2f} {result['pf']:6.2f} "
                 f"{result['sharpe']:7.2f} {result['max_dd']:6.1%}"
@@ -97,7 +101,7 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
         except Exception as e:
             print(f"{idx+1:4d} ERROR: {e}")
 
-    print(f"{'='*120}")
+    print(f"{'='*130}")
 
     # Sort results
     valid = [r for r in results if r['trades'] >= 3]
@@ -114,7 +118,8 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
             f"m1d={r['mom_1d_threshold']:+.3f} "
             f"m3d={r['mom_3d_threshold']:+.3f} "
             f"pos={r['max_position_pct']:.2f} "
-            f"bnc={r.get('bounce_min_confidence', 0.99):.2f} -> "
+            f"bnc={r.get('bounce_min_confidence', 0.99):.2f} "
+            f"cd={r.get('reentry_cooldown', 24)} -> "
             f"${r['pnl']:,.0f} PF={r['pf']:.2f} "
             f"Sharpe={r['sharpe']:.2f} "
             f"DD={r['max_dd']:.1%} "
@@ -130,7 +135,8 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
             f"m1d={r['mom_1d_threshold']:+.3f} "
             f"m3d={r['mom_3d_threshold']:+.3f} "
             f"pos={r['max_position_pct']:.2f} "
-            f"bnc={r.get('bounce_min_confidence', 0.99):.2f} -> "
+            f"bnc={r.get('bounce_min_confidence', 0.99):.2f} "
+            f"cd={r.get('reentry_cooldown', 24)} -> "
             f"Sharpe={r['sharpe']:.2f} "
             f"${r['pnl']:,.0f} PF={r['pf']:.2f} "
             f"DD={r['max_dd']:.1%} "
@@ -146,7 +152,8 @@ def run_sweep(checkpoint_path: str, calibration_path: str = None):
             f"m1d={r['mom_1d_threshold']:+.3f} "
             f"m3d={r['mom_3d_threshold']:+.3f} "
             f"pos={r['max_position_pct']:.2f} "
-            f"bnc={r.get('bounce_min_confidence', 0.99):.2f} -> "
+            f"bnc={r.get('bounce_min_confidence', 0.99):.2f} "
+            f"cd={r.get('reentry_cooldown', 24)} -> "
             f"PF={r['pf']:.2f} "
             f"${r['pnl']:,.0f} Sharpe={r['sharpe']:.2f} "
             f"DD={r['max_dd']:.1%} "
@@ -207,6 +214,10 @@ def _precompute_predictions(predictor, tsla_df, spy_df, vix_df, native_data):
         high = float(tsla_df.iloc[bar_idx]['high'])
         low = float(tsla_df.iloc[bar_idx]['low'])
 
+        # Compute ATR (78-bar / 1 trading day)
+        from v15.trading.backtester import _compute_atr
+        atr_pct = _compute_atr(tsla_df, bar_idx, period=78)
+
         # Momentum
         def _mom(lookback):
             if bar_idx >= lookback:
@@ -251,6 +262,7 @@ def _precompute_predictions(predictor, tsla_df, spy_df, vix_df, native_data):
             unified_hazard=unified_hazard,
             mom_1d=mom_1d,
             mom_3d=mom_3d,
+            atr_pct=atr_pct,
         ))
 
         # Progress
@@ -286,6 +298,13 @@ def _simulate_with_params(cached_bars, tsla_df, params):
 
     open_position = None
 
+    # Re-entry tracking
+    last_exit_bar = 0
+    last_exit_direction = None
+    last_exit_profitable = False
+    REENTRY_COOLDOWN = params.get('reentry_cooldown', 24)
+
+    HORIZON_ATR_MULT = {'short': 1.5, 'medium': 2.0, 'long': 2.5}
     HORIZON_TRAIL_PCT = {'short': 0.015, 'medium': 0.020, 'long': 0.030}
     HORIZON_MAX_HOLD = {'short': 78, 'medium': 156, 'long': 390}
 
@@ -311,6 +330,17 @@ def _simulate_with_params(cached_bars, tsla_df, params):
                         exit_price, exit_reason = ts, 'trailing_stop'
                 if exit_price is None and high >= open_position.take_profit_price:
                     exit_price, exit_reason = open_position.take_profit_price, 'take_profit'
+            else:  # short
+                if open_position.best_price == 0 or low < open_position.best_price:
+                    open_position.best_price = low
+                if high >= open_position.stop_loss_price:
+                    exit_price, exit_reason = open_position.stop_loss_price, 'stop_loss'
+                elif open_position.best_price > 0 and open_position.best_price < open_position.entry_price:
+                    ts = open_position.best_price * (1 + open_position.trailing_stop_pct)
+                    if ts < open_position.stop_loss_price and high >= ts:
+                        exit_price, exit_reason = ts, 'trailing_stop'
+                if exit_price is None and low <= open_position.take_profit_price:
+                    exit_price, exit_reason = open_position.take_profit_price, 'take_profit'
 
             horizon = TF_TO_HORIZON.get(open_position.primary_tf, 'medium')
             max_hold = min(HORIZON_MAX_HOLD.get(horizon, 390), 390)
@@ -319,8 +349,12 @@ def _simulate_with_params(cached_bars, tsla_df, params):
 
             if exit_price is not None:
                 slippage = exit_price * 0.0001
-                actual_exit = exit_price - slippage if open_position.direction == 'long' else exit_price + slippage
-                raw_pnl = (actual_exit - open_position.entry_price) * open_position.shares
+                if open_position.direction == 'long':
+                    actual_exit = exit_price - slippage
+                    raw_pnl = (actual_exit - open_position.entry_price) * open_position.shares
+                else:
+                    actual_exit = exit_price + slippage
+                    raw_pnl = (open_position.entry_price - actual_exit) * open_position.shares
                 commission = open_position.shares * 0.005 * 2
                 net_pnl = raw_pnl - commission
                 trade = Trade(
@@ -343,6 +377,9 @@ def _simulate_with_params(cached_bars, tsla_df, params):
                 metrics.add_trade(trade)
                 equity += net_pnl
                 sizer.update_equity(equity)
+                last_exit_bar = bar_idx
+                last_exit_direction = open_position.direction
+                last_exit_profitable = net_pnl > 0
                 open_position = None
 
         # Entry logic using cached signals
@@ -383,7 +420,18 @@ def _simulate_with_params(cached_bars, tsla_df, params):
                         best_signal = sig
 
             if best_signal is not None and best_signal.entry_urgency > 0.3:
-                position = sizer.size_position(best_signal, current_price)
+                # Re-entry cooldown check
+                signal_dir = 'long' if best_signal.signal_type == SignalType.LONG else 'short'
+                in_cooldown = (
+                    last_exit_profitable
+                    and (bar_idx - last_exit_bar) < REENTRY_COOLDOWN
+                    and signal_dir == last_exit_direction
+                )
+                if in_cooldown:
+                    best_signal = None
+
+            if best_signal is not None and best_signal.entry_urgency > 0.3:
+                position = sizer.size_position(best_signal, current_price, atr_pct=cb.atr_pct)
                 if position.should_trade:
                     conf_scale = max(0.5, min(1.5,
                         0.7 + (best_signal.confidence - 0.72) * 10.0
@@ -392,18 +440,31 @@ def _simulate_with_params(cached_bars, tsla_df, params):
                         position.shares = max(1, int(position.shares * conf_scale))
 
                     slippage = current_price * 0.0001
-                    entry_price = current_price + slippage
+                    signal_dir = 'long' if best_signal.signal_type == SignalType.LONG else 'short'
+                    entry_price = current_price + slippage if signal_dir == 'long' else current_price - slippage
+
+                    # ATR-adaptive trailing stop
                     h = TF_TO_HORIZON.get(best_signal.primary_tf, 'medium')
-                    trail_pct = HORIZON_TRAIL_PCT.get(h, 0.020)
+                    atr_mult = HORIZON_ATR_MULT.get(h, 2.0)
+                    trail_pct = cb.atr_pct * atr_mult
+                    min_trail = HORIZON_TRAIL_PCT.get(h, 0.020) * 0.5
+                    trail_pct = max(min_trail, min(0.06, trail_pct))
+
+                    if signal_dir == 'long':
+                        stop_price = entry_price * (1 - position.stop_loss_pct)
+                        tp_price = entry_price * (1 + position.take_profit_pct)
+                    else:
+                        stop_price = entry_price * (1 + position.stop_loss_pct)
+                        tp_price = entry_price * (1 - position.take_profit_pct)
 
                     open_position = OpenPosition(
                         entry_time=_to_datetime(cb.timestamp),
                         entry_bar=bar_idx,
-                        direction='long' if best_signal.signal_type == SignalType.LONG else 'short',
+                        direction=signal_dir,
                         entry_price=entry_price,
                         shares=position.shares,
-                        stop_loss_price=entry_price * (1 - position.stop_loss_pct),
-                        take_profit_price=entry_price * (1 + position.take_profit_pct),
+                        stop_loss_price=stop_price,
+                        take_profit_price=tp_price,
                         signal_confidence=best_signal.confidence,
                         regime=best_signal.regime.regime.value,
                         primary_tf=best_signal.primary_tf,
