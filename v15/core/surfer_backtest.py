@@ -174,10 +174,6 @@ def run_backtest(
     peak_equity = equity
     max_dd = 0.0
     consecutive_losses = 0  # Track losing streak for position reduction
-
-
-
-
     # Walk forward from bar 100 (need lookback)
     start_bar = 100
     total_bars = len(tsla)
@@ -220,10 +216,11 @@ def run_backtest(
                 if position.best_price == 0 or window_low < position.best_price:
                     position.best_price = window_low
 
-            # Trailing stop logic (different for bounces vs breakouts)
             entry = position.entry_price
-            initial_stop_dist = abs(position.stop_price - entry) / entry
             tp_dist = abs(position.tp_price - entry) / entry
+
+            # Trailing stop logic (different for bounces vs breakouts)
+            initial_stop_dist = abs(position.stop_price - entry) / entry
             is_breakout = position.signal_type == 'break'
 
             if position.direction == 'BUY':
@@ -428,6 +425,13 @@ def run_backtest(
             sig = analysis.signal
 
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
+                # Volume confirmation: skip breakouts on thin volume
+                if sig.signal_type == 'break' and 'volume' in tsla.columns:
+                    current_vol = tsla['volume'].iloc[bar]
+                    avg_vol = tsla['volume'].iloc[max(0, bar-20):bar].mean()
+                    if avg_vol > 0 and current_vol < avg_vol * 0.8:
+                        continue  # Below-average volume → weak breakout
+
                 # Enter position
                 entry_price = current_price
 
