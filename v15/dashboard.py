@@ -1518,6 +1518,99 @@ def main():
                             elif prediction.bounce_signal:
                                 st.info(f"ℹ️ {selected_strategy_name}: Signal not actionable (confidence={prediction.bounce_signal.primary_confidence:.0%})")
 
+                            # === REGIME-ADAPTIVE TRADING ENGINE (c3) ===
+                            st.divider()
+                            st.subheader("Regime-Adaptive Trading Engine")
+                            try:
+                                from v15.trading.signals import RegimeAdaptiveSignalEngine, SignalType as RASignalType
+                                from v15.trading.position_sizer import PositionSizer
+                                from v15.trading.meta_strategy import MetaStrategy
+
+                                if prediction.per_tf_predictions:
+                                    ra_engine = RegimeAdaptiveSignalEngine()
+                                    ra_signal = ra_engine.generate_signal(prediction.per_tf_predictions)
+
+                                    # Regime indicator
+                                    regime = ra_signal.regime
+                                    regime_colors = {
+                                        'trending_bull': ('TRENDING BULL', '#28a745'),
+                                        'trending_bear': ('TRENDING BEAR', '#dc3545'),
+                                        'ranging': ('RANGING', '#ffc107'),
+                                        'transitioning': ('TRANSITIONING', '#6c757d'),
+                                    }
+                                    regime_label, regime_color = regime_colors.get(
+                                        regime.regime.value, ('UNKNOWN', '#999')
+                                    )
+                                    st.markdown(
+                                        f"<div style='background-color:{regime_color};color:white;padding:10px;border-radius:5px;text-align:center;font-size:1.2em;font-weight:bold'>"
+                                        f"{regime_label} (conf: {regime.confidence:.0%})</div>",
+                                        unsafe_allow_html=True
+                                    )
+
+                                    # Signal
+                                    if ra_signal.signal_type == RASignalType.LONG:
+                                        st.success(f"LONG - {ra_signal.strength} (conf: {ra_signal.confidence:.0%})")
+                                    elif ra_signal.signal_type == RASignalType.SHORT:
+                                        st.error(f"SHORT - {ra_signal.strength} (conf: {ra_signal.confidence:.0%})")
+                                    else:
+                                        st.info(f"FLAT - No trade ({ra_signal.confidence:.0%})")
+
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        st.metric("Primary TF", ra_signal.primary_tf)
+                                    with col2:
+                                        st.metric("Edge Est.", f"{ra_signal.edge_estimate:.2%}")
+                                    with col3:
+                                        st.metric("Entry Urgency", f"{ra_signal.entry_urgency:.0%}")
+                                    with col4:
+                                        hazard_pct = ra_signal.hazard.aggregate_hazard
+                                        st.metric("Break Risk", f"{hazard_pct:.0%}")
+
+                                    # Position sizing
+                                    if ra_signal.actionable:
+                                        current_price = float(current_tsla.iloc[-1]['close']) if 'close' in current_tsla.columns else float(current_tsla.iloc[-1]['Close'])
+                                        sizer = PositionSizer(capital=100000)
+                                        pos = sizer.size_position(ra_signal, current_price)
+                                        if pos.should_trade:
+                                            st.markdown(
+                                                f"**Position:** {pos.shares} shares (${pos.dollar_amount:,.0f}) | "
+                                                f"SL: {pos.stop_loss_pct:.1%} | TP: {pos.take_profit_pct:.1%} | "
+                                                f"R:R {pos.risk_reward_ratio:.1f}"
+                                            )
+
+                                    # Warnings
+                                    if ra_signal.risk_warnings:
+                                        st.warning(" | ".join(ra_signal.risk_warnings))
+
+                                    # Regime detail
+                                    with st.expander("Regime & Strategy Detail"):
+                                        st.markdown(f"**Bull:** {regime.bull_score:.0%} | **Bear:** {regime.bear_score:.0%} | **Sideways:** {regime.sideways_score:.0%}")
+                                        st.markdown(f"**TF Agreement:** {regime.tf_agreement:.0%} | **Dominant Horizon:** {regime.dominant_horizon}")
+                                        st.markdown(f"**Hazard Velocity:** {ra_signal.hazard.hazard_velocity:+.3f}")
+
+                                        # Meta-strategy
+                                        meta = MetaStrategy()
+                                        best_meta, all_meta = meta.evaluate(
+                                            prediction.per_tf_predictions, regime, ra_signal.hazard
+                                        )
+                                        meta_data = []
+                                        for name, sig in all_meta.items():
+                                            meta_data.append({
+                                                'Strategy': name,
+                                                'Signal': sig.signal_type.value.upper(),
+                                                'Confidence': f"{sig.confidence:.0%}",
+                                                'Edge': f"{sig.edge_estimate:.2%}",
+                                            })
+                                        st.dataframe(pd.DataFrame(meta_data), hide_index=True)
+                                        st.markdown(f"**Meta Winner:** {best_meta.name} ({best_meta.signal_type.value})")
+                                        st.markdown(f"**Reasoning:** {best_meta.reasoning}")
+                                else:
+                                    st.info("Per-TF predictions required for regime engine")
+                            except ImportError as e:
+                                st.warning(f"Trading engine not available: {e}")
+                            except Exception as e:
+                                st.error(f"Trading engine error: {e}")
+
                             # Daily channel chart with aggregate projection
                             st.divider()
                             st.subheader("Daily Channel")

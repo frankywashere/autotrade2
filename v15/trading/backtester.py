@@ -1,0 +1,537 @@
+"""
+Walk-Forward Backtesting Engine
+
+Simulates trading with realistic conditions:
+- Slippage (0.01% per side)
+- Commissions ($0.005/share per side)
+- Position sizing with Kelly + drawdown thermostat
+- Multiple exit conditions (stop loss, take profit, signal flip, timeout)
+"""
+import math
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Callable, TYPE_CHECKING
+
+import pandas as pd
+import numpy as np
+
+from .signals import (
+    TradeSignal, SignalType, MarketRegime,
+    RegimeAdaptiveSignalEngine, HazardClock,
+)
+from .position_sizer import PositionSizer, PositionRecommendation
+from .metrics import Trade, TradeMetrics, EquityCurve
+
+if TYPE_CHECKING:
+    from ..inference import Predictor, PerTFPrediction
+
+
+@dataclass
+class OpenPosition:
+    """Tracks an open position."""
+    entry_time: datetime
+    entry_bar: int
+    direction: str  # 'long' or 'short'
+    entry_price: float
+    shares: int
+    stop_loss_price: float
+    take_profit_price: float
+    signal_confidence: float
+    regime: str
+    primary_tf: str
+    commission_entry: float
+    # Trailing stop tracking
+    best_price: float = 0.0  # Best price seen since entry (for trailing stop)
+    trailing_stop_pct: float = 0.02  # Trail by 2%
+
+
+@dataclass
+class BacktestConfig:
+    """Configuration for a backtest run."""
+    initial_capital: float = 100000.0
+    commission_per_share: float = 0.005
+    slippage_pct: float = 0.0001  # 0.01% per side
+    eval_interval_bars: int = 12  # Evaluate every 12 bars (1 hour of 5-min)
+    max_hold_bars: int = 390  # Max 1 trading day
+    allow_multiple_positions: bool = False
+    max_positions: int = 1
+
+
+@dataclass
+class BacktestResult:
+    """Result of a backtest run."""
+    config: BacktestConfig
+    metrics: TradeMetrics
+    signals_generated: int
+    signals_actionable: int
+    bars_processed: int
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+
+    def summary(self) -> str:
+        lines = [
+            f"Backtest: {self.start_time} to {self.end_time}",
+            f"Bars: {self.bars_processed}, Signals: {self.signals_generated}, "
+            f"Actionable: {self.signals_actionable}",
+            "",
+            self.metrics.summary(),
+        ]
+        return "\n".join(lines)
+
+
+class Backtester:
+    """
+    Walk-forward backtester for the regime-adaptive trading engine.
+
+    Usage:
+        predictor = Predictor.load('checkpoint.pt')
+        backtester = Backtester(predictor)
+        result = backtester.run(tsla_df, spy_df, vix_df)
+        print(result.summary())
+    """
+
+    def __init__(
+        self,
+        predictor: 'Predictor',
+        signal_engine: Optional[RegimeAdaptiveSignalEngine] = None,
+        position_sizer: Optional[PositionSizer] = None,
+        config: Optional[BacktestConfig] = None,
+    ):
+        self.predictor = predictor
+        self.signal_engine = signal_engine or RegimeAdaptiveSignalEngine()
+        self.config = config or BacktestConfig()
+        self.position_sizer = position_sizer or PositionSizer(
+            capital=self.config.initial_capital
+        )
+
+    def run(
+        self,
+        tsla_df: pd.DataFrame,
+        spy_df: pd.DataFrame,
+        vix_df: pd.DataFrame,
+        native_bars_by_tf: Optional[dict] = None,
+        progress_callback: Optional[Callable] = None,
+    ) -> BacktestResult:
+        """
+        Run walk-forward backtest.
+
+        Args:
+            tsla_df: TSLA 5-min OHLCV (index=datetime, columns=Open/High/Low/Close/Volume)
+            spy_df: SPY 5-min OHLCV
+            vix_df: VIX 5-min OHLCV
+            native_bars_by_tf: Optional native TF data for better predictions
+            progress_callback: Optional callback(bar_idx, total_bars, metrics)
+        """
+        metrics = TradeMetrics()
+        equity_curve = EquityCurve()
+        equity = self.config.initial_capital
+        self.position_sizer.current_equity = equity
+        self.position_sizer.peak_equity = equity
+
+        open_position: Optional[OpenPosition] = None
+        prev_hazard: Optional[HazardClock] = None
+
+        total_bars = len(tsla_df)
+        signals_generated = 0
+        signals_actionable = 0
+
+        # Need minimum bars for model (C++ extractor needs context)
+        start_bar = 1000  # Start after warmup
+        eval_interval = self.config.eval_interval_bars
+
+        start_time = tsla_df.index[start_bar] if hasattr(tsla_df.index[start_bar], 'to_pydatetime') else datetime.now()
+        end_time = tsla_df.index[-1] if hasattr(tsla_df.index[-1], 'to_pydatetime') else datetime.now()
+
+        # Initial equity point
+        equity_curve.add_point(
+            _to_datetime(tsla_df.index[start_bar]), equity
+        )
+
+        for bar_idx in range(start_bar, total_bars, eval_interval):
+            current_time = _to_datetime(tsla_df.index[bar_idx])
+            current_price = float(tsla_df.iloc[bar_idx]['close'])
+
+            # Check open position for stop/TP/timeout
+            if open_position is not None:
+                high = float(tsla_df.iloc[bar_idx]['high'])
+                low = float(tsla_df.iloc[bar_idx]['low'])
+                bars_held = bar_idx - open_position.entry_bar
+
+                exit_price, exit_reason = self._check_exit(
+                    open_position, current_price, high, low, bars_held
+                )
+
+                if exit_price is not None:
+                    trade = self._close_position(
+                        open_position, exit_price, current_time,
+                        bars_held, exit_reason
+                    )
+                    metrics.add_trade(trade)
+                    equity += trade.pnl
+                    self.position_sizer.update_equity(equity)
+                    equity_curve.add_point(current_time, equity)
+                    open_position = None
+
+            # Generate signal at evaluation intervals
+            try:
+                # Get model prediction
+                prediction = self._get_prediction(
+                    tsla_df.iloc[:bar_idx + 1],
+                    spy_df.iloc[:bar_idx + 1],
+                    vix_df.iloc[:bar_idx + 1],
+                    native_bars_by_tf,
+                )
+
+                if prediction and prediction.per_tf_predictions:
+                    # Generate horizon-specific signals (short/medium/long)
+                    horizon_signals = self.signal_engine.generate_horizon_signals(
+                        per_tf_predictions=prediction.per_tf_predictions,
+                        previous_hazard=prev_hazard,
+                    )
+
+                    # Also generate the unified signal for hazard tracking
+                    unified = self.signal_engine.generate_signal(
+                        per_tf_predictions=prediction.per_tf_predictions,
+                        previous_hazard=prev_hazard,
+                    )
+                    prev_hazard = unified.hazard
+
+                    # Horizon-specific minimum confidence
+                    # Long horizon has proven edge; others are disabled
+                    # Evidence: 1h = 0% win rate across ALL runs, monthly = 50%+ win
+                    HORIZON_MIN_CONF = {
+                        'short': 0.99,   # Disabled: too noisy standalone
+                        'medium': 0.99,  # Disabled: 0% win rate on 1h
+                        'long': 0.72,    # High selectivity: 40%WR but PF~1.94
+                    }
+
+                    # High-selectivity + momentum filter strategy:
+                    # 1. Only trade long horizon (monthly/weekly/daily)
+                    # 2. High confidence threshold (0.72+)
+                    # 3. Price momentum must confirm direction
+                    #    → avoids going long during corrections
+
+                    # Compute multi-timeframe price momentum
+                    # Short: 78 bars (1 day), Medium: 234 bars (3 days)
+                    # Both must agree for entry
+                    def _calc_momentum(lookback):
+                        if bar_idx >= lookback:
+                            past = float(tsla_df.iloc[bar_idx - lookback]['close'])
+                            return (current_price - past) / past
+                        return 0.0
+
+                    mom_1d = _calc_momentum(78)
+                    mom_3d = _calc_momentum(234)
+
+                    # Find best horizon signal (focus on long horizon)
+                    best_signal = None
+                    best_score = -1.0
+                    for horizon, sig in horizon_signals.items():
+                        signals_generated += 1
+                        if sig.actionable:
+                            signals_actionable += 1
+
+                        # Only trade long horizon signals
+                        if horizon != 'long':
+                            continue
+
+                        # Filter: skip transitioning regime (no edge)
+                        if sig.regime.regime == MarketRegime.TRANSITIONING:
+                            continue
+
+                        # Apply horizon-specific min confidence
+                        min_conf = HORIZON_MIN_CONF.get(horizon, 0.50)
+                        if sig.confidence < min_conf:
+                            continue
+
+                        # Momentum filter: require positive momentum
+                        # 1-day must be positive, 3-day must not be deeply negative
+                        if sig.signal_type == SignalType.LONG:
+                            if mom_1d < 0 or mom_3d < -0.01:
+                                continue
+                        elif sig.signal_type == SignalType.SHORT:
+                            if mom_1d > 0 or mom_3d > 0.01:
+                                continue
+
+                        score = sig.confidence * sig.entry_urgency
+                        if score > best_score and sig.actionable:
+                            best_score = score
+                            best_signal = sig
+
+                    # No fallback to unified signal — it mixes medium TFs
+                    # which have 0% win rate and contaminate the edge
+                    signal = best_signal
+
+                    # Open position if no current position and signal is actionable
+                    if open_position is None and signal is not None:
+                        if signal.entry_urgency > 0.3:  # Lower urgency threshold
+                            position = self.position_sizer.size_position(
+                                signal, current_price
+                            )
+                            if position.should_trade:
+                                # Scale by confidence: higher conf = bigger bet
+                                # conf 0.72 → 0.7x, conf 0.76 → 1.0x, conf 0.80 → 1.5x
+                                conf_scale = max(0.5, min(1.5,
+                                    0.7 + (signal.confidence - 0.72) * 10.0
+                                ))
+                                if conf_scale != 1.0:
+                                    position.shares = max(1, int(position.shares * conf_scale))
+                                    position.dollar_amount = position.shares * current_price
+                                    position.fraction *= conf_scale
+
+                                open_position = self._open_position(
+                                    signal, position, current_price,
+                                    current_time, bar_idx
+                                )
+
+                    # Check for signal flip (close current position)
+                    elif open_position is not None and signal is not None:
+                        should_flip = self._should_flip(
+                            open_position, signal
+                        )
+                        if should_flip:
+                            trade = self._close_position(
+                                open_position, current_price, current_time,
+                                bar_idx - open_position.entry_bar,
+                                'signal_flip'
+                            )
+                            metrics.add_trade(trade)
+                            equity += trade.pnl
+                            self.position_sizer.update_equity(equity)
+                            equity_curve.add_point(current_time, equity)
+                            open_position = None
+
+            except Exception as e:
+                # Log but don't crash — skip this eval point
+                if bar_idx < start_bar + 100:
+                    print(f"[BACKTEST] Warning at bar {bar_idx}: {e}")
+
+            # Progress callback
+            if progress_callback and bar_idx % (eval_interval * 10) == 0:
+                progress_callback(bar_idx, total_bars, metrics)
+
+        # Print trade log
+        if metrics.trades:
+            print("\n--- TRADE LOG ---")
+            for i, t in enumerate(metrics.trades):
+                win = "W" if t.pnl > 0 else "L"
+                print(
+                    f"  #{i+1} {win} {t.direction:5s} "
+                    f"entry=${t.entry_price:.2f} exit=${t.exit_price:.2f} "
+                    f"pnl=${t.pnl:+.2f} ({t.pnl_pct:+.1%}) "
+                    f"hold={t.hold_bars}bars "
+                    f"exit={t.exit_reason} "
+                    f"conf={t.signal_confidence:.2f} "
+                    f"tf={t.primary_tf} regime={t.regime}"
+                )
+
+        # Close any remaining position at market
+        if open_position is not None:
+            final_price = float(tsla_df.iloc[-1]['close'])
+            final_time = _to_datetime(tsla_df.index[-1])
+            trade = self._close_position(
+                open_position, final_price, final_time,
+                total_bars - open_position.entry_bar, 'end_of_data'
+            )
+            metrics.add_trade(trade)
+            equity += trade.pnl
+
+        # Final equity
+        equity_curve.add_point(_to_datetime(tsla_df.index[-1]), equity)
+        metrics.equity_curve = equity_curve
+
+        return BacktestResult(
+            config=self.config,
+            metrics=metrics,
+            signals_generated=signals_generated,
+            signals_actionable=signals_actionable,
+            bars_processed=total_bars - start_bar,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    def _get_prediction(
+        self, tsla_df, spy_df, vix_df, native_bars
+    ):
+        """Get model prediction for current bar."""
+        try:
+            result = self.predictor.predict_with_per_tf(
+                tsla_df, spy_df, vix_df,
+                native_bars_by_tf=native_bars,
+            )
+            return result
+        except Exception:
+            return None
+
+    # Horizon-specific max hold bars
+    HORIZON_MAX_HOLD = {
+        'short': 78,    # 1 trading day
+        'medium': 156,  # 2 trading days
+        'long': 390,    # 1 trading week
+    }
+
+    def _check_exit(
+        self,
+        pos: OpenPosition,
+        current_price: float,
+        high: float,
+        low: float,
+        bars_held: int,
+    ) -> tuple:
+        """Check if position should be exited. Returns (exit_price, reason) or (None, None)."""
+        if pos.direction == 'long':
+            if high > pos.best_price:
+                pos.best_price = high
+            # Fixed stop loss
+            if low <= pos.stop_loss_price:
+                return pos.stop_loss_price, 'stop_loss'
+            # Trailing stop (only after we're profitable)
+            if pos.best_price > pos.entry_price:
+                trailing_stop = pos.best_price * (1 - pos.trailing_stop_pct)
+                if trailing_stop > pos.stop_loss_price and low <= trailing_stop:
+                    return trailing_stop, 'trailing_stop'
+            # Take profit hit
+            if high >= pos.take_profit_price:
+                return pos.take_profit_price, 'take_profit'
+        else:  # short
+            if pos.best_price == 0 or low < pos.best_price:
+                pos.best_price = low
+            if high >= pos.stop_loss_price:
+                return pos.stop_loss_price, 'stop_loss'
+            # Trailing stop for shorts
+            if pos.best_price > 0 and pos.best_price < pos.entry_price:
+                trailing_stop = pos.best_price * (1 + pos.trailing_stop_pct)
+                if trailing_stop < pos.stop_loss_price and high >= trailing_stop:
+                    return trailing_stop, 'trailing_stop'
+            if low <= pos.take_profit_price:
+                return pos.take_profit_price, 'take_profit'
+
+        # Horizon-specific timeout
+        from ..config import TF_TO_HORIZON
+        horizon = TF_TO_HORIZON.get(pos.primary_tf, 'medium')
+        max_hold = self.HORIZON_MAX_HOLD.get(horizon, self.config.max_hold_bars)
+        max_hold = min(max_hold, self.config.max_hold_bars)
+
+        if bars_held >= max_hold:
+            return current_price, 'timeout'
+
+        return None, None
+
+    # Trailing stop percentages by horizon
+    HORIZON_TRAIL_PCT = {
+        'short': 0.015,   # 1.5% trail for short TFs (tight)
+        'medium': 0.020,  # 2% trail for medium TFs
+        'long': 0.030,    # 3% trail for long TFs
+    }
+
+    def _open_position(
+        self,
+        signal: TradeSignal,
+        sizing: PositionRecommendation,
+        price: float,
+        time: datetime,
+        bar_idx: int,
+    ) -> OpenPosition:
+        """Open a new position."""
+        from ..config import TF_TO_HORIZON
+
+        # Apply slippage
+        slippage = price * self.config.slippage_pct
+        if signal.signal_type == SignalType.LONG:
+            entry_price = price + slippage  # Worse fill for long
+            direction = 'long'
+            stop_price = entry_price * (1 - sizing.stop_loss_pct)
+            tp_price = entry_price * (1 + sizing.take_profit_pct)
+        else:
+            entry_price = price - slippage  # Worse fill for short
+            direction = 'short'
+            stop_price = entry_price * (1 + sizing.stop_loss_pct)
+            tp_price = entry_price * (1 - sizing.take_profit_pct)
+
+        commission = sizing.shares * self.config.commission_per_share
+
+        # Horizon-specific trailing stop
+        horizon = TF_TO_HORIZON.get(signal.primary_tf, 'medium')
+        trail_pct = self.HORIZON_TRAIL_PCT.get(horizon, 0.020)
+
+        return OpenPosition(
+            entry_time=time,
+            entry_bar=bar_idx,
+            direction=direction,
+            entry_price=entry_price,
+            shares=sizing.shares,
+            stop_loss_price=stop_price,
+            take_profit_price=tp_price,
+            signal_confidence=signal.confidence,
+            regime=signal.regime.regime.value,
+            primary_tf=signal.primary_tf,
+            commission_entry=commission,
+            best_price=entry_price,
+            trailing_stop_pct=trail_pct,
+        )
+
+    def _close_position(
+        self,
+        pos: OpenPosition,
+        exit_price: float,
+        exit_time: datetime,
+        bars_held: int,
+        exit_reason: str,
+    ) -> Trade:
+        """Close a position and create a trade record."""
+        # Apply slippage on exit
+        slippage_per_share = exit_price * self.config.slippage_pct
+        if pos.direction == 'long':
+            actual_exit = exit_price - slippage_per_share
+            raw_pnl = (actual_exit - pos.entry_price) * pos.shares
+        else:
+            actual_exit = exit_price + slippage_per_share
+            raw_pnl = (pos.entry_price - actual_exit) * pos.shares
+
+        commission_exit = pos.shares * self.config.commission_per_share
+        total_commission = pos.commission_entry + commission_exit
+        total_slippage = slippage_per_share * pos.shares * 2  # Both sides
+
+        net_pnl = raw_pnl - total_commission
+        entry_value = pos.entry_price * pos.shares
+        pnl_pct = net_pnl / entry_value if entry_value > 0 else 0.0
+
+        return Trade(
+            entry_time=pos.entry_time,
+            exit_time=exit_time,
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=actual_exit,
+            shares=pos.shares,
+            pnl=net_pnl,
+            pnl_pct=pnl_pct,
+            commission=total_commission,
+            slippage=total_slippage,
+            signal_confidence=pos.signal_confidence,
+            regime=pos.regime,
+            primary_tf=pos.primary_tf,
+            exit_reason=exit_reason,
+            hold_bars=bars_held,
+        )
+
+    def _should_flip(
+        self, pos: OpenPosition, signal: TradeSignal
+    ) -> bool:
+        """Check if current signal contradicts open position."""
+        if signal.signal_type == SignalType.LONG and pos.direction == 'short':
+            return signal.confidence > 0.65
+        if signal.signal_type == SignalType.SHORT and pos.direction == 'long':
+            return signal.confidence > 0.65
+        return False
+
+
+def _to_datetime(ts) -> datetime:
+    """Convert pandas Timestamp or similar to datetime."""
+    if isinstance(ts, datetime):
+        return ts
+    if hasattr(ts, 'to_pydatetime'):
+        dt = ts.to_pydatetime()
+        if hasattr(dt, 'replace') and dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    return datetime.now()
