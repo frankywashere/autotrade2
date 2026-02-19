@@ -1714,6 +1714,7 @@ class MultiTFTransformer:
         n_tf_features: int = len(PER_TF_FEATURES),
         n_cross_features: int = len(CROSS_TF_FEATURES),
         n_context_features: int = len(CONTEXT_FEATURES),
+        n_temporal_features: int = len(TEMPORAL_FEATURES),
         n_corr_features: int = len(CORRELATION_FEATURES),
         d_model: int = 64,
         n_heads: int = 4,
@@ -1723,6 +1724,7 @@ class MultiTFTransformer:
         self.n_tf_features = n_tf_features
         self.n_cross_features = n_cross_features
         self.n_context_features = n_context_features
+        self.n_temporal_features = n_temporal_features
         self.n_corr_features = n_corr_features
         self.d_model = d_model
         self.n_heads = n_heads
@@ -1776,7 +1778,7 @@ class MultiTFTransformer:
                 return x
 
         class MultiTFNet(nn.Module):
-            def __init__(self, n_tf_features, n_cross, n_context, n_corr,
+            def __init__(self, n_tf_features, n_cross, n_context, n_temporal, n_corr,
                          d_model, n_heads, n_layers, dropout):
                 super().__init__()
 
@@ -1794,8 +1796,8 @@ class MultiTFTransformer:
                     for _ in range(n_layers)
                 ])
 
-                # Context encoder (global features: cross-TF, context, correlation)
-                context_dim = n_cross + n_context + n_corr
+                # Context encoder (global features: cross-TF, context, temporal, correlation)
+                context_dim = n_cross + n_context + n_temporal + n_corr
                 self.context_encoder = nn.Sequential(
                     nn.Linear(context_dim, d_model),
                     nn.LayerNorm(d_model),
@@ -1879,7 +1881,7 @@ class MultiTFTransformer:
 
         self.net = MultiTFNet(
             self.n_tf_features, self.n_cross_features,
-            self.n_context_features, self.n_corr_features,
+            self.n_context_features, self.n_temporal_features, self.n_corr_features,
             self.d_model, self.n_heads, self.n_layers, self.dropout,
         )
         return self.net
@@ -2085,6 +2087,7 @@ class MultiTFTransformer:
                 'n_tf_features': self.n_tf_features,
                 'n_cross_features': self.n_cross_features,
                 'n_context_features': self.n_context_features,
+                'n_temporal_features': self.n_temporal_features,
                 'n_corr_features': self.n_corr_features,
                 'd_model': self.d_model,
                 'n_heads': self.n_heads,
@@ -2454,6 +2457,340 @@ class TradeQualityScorer:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 5: Stacked Ensemble (Meta-Learner)
+# ---------------------------------------------------------------------------
+
+class EnsembleModel:
+    """
+    Stacked ensemble that combines predictions from GBT, Transformer,
+    Survival, and Quality Scorer using a GBT meta-learner.
+
+    Meta-features per sample:
+    - GBT: action (3 probs), break_dir (3 probs), lifetime, future_return_5/20/60
+    - Transformer: action (3 probs), break_dir (3 probs), lifetime, returns
+    - Survival: predicted median lifetime, hazard score
+    - Quality Scorer: win_prob, quality_score
+    - Agreement features: how many models agree on direction, spread in lifetime predictions
+
+    The meta-learner is a lightweight GBT that learns when each model
+    is trustworthy and how to weight disagreements.
+    """
+
+    META_FEATURES = [
+        # GBT outputs
+        'gbt_action_hold', 'gbt_action_buy', 'gbt_action_sell',
+        'gbt_break_survive', 'gbt_break_up', 'gbt_break_down',
+        'gbt_lifetime', 'gbt_return5', 'gbt_return20', 'gbt_return60',
+        # Transformer outputs
+        'trans_action_hold', 'trans_action_buy', 'trans_action_sell',
+        'trans_break_survive', 'trans_break_up', 'trans_break_down',
+        'trans_lifetime', 'trans_return5', 'trans_return20', 'trans_return60',
+        # Survival outputs
+        'surv_median_lifetime', 'surv_hazard',
+        # Quality Scorer outputs
+        'qs_win_prob_buy', 'qs_win_prob_sell', 'qs_quality_buy', 'qs_quality_sell',
+        # Agreement / disagreement features
+        'action_consensus',    # Fraction of models agreeing on action
+        'lifetime_spread',     # Max - min predicted lifetime
+        'lifetime_mean',       # Mean predicted lifetime
+        'direction_agreement', # GBT and Transformer agree on break direction
+    ]
+
+    def __init__(self):
+        self.models = {}
+        self.base_models = {}
+        self.feature_names = None
+
+    def extract_meta_features(
+        self,
+        X: np.ndarray,
+        gbt: Optional['GBTModel'] = None,
+        transformer: Optional['MultiTFTransformer'] = None,
+        survival: Optional['SurvivalModel'] = None,
+        quality: Optional['TradeQualityScorer'] = None,
+        base_feature_names: Optional[List[str]] = None,
+    ) -> np.ndarray:
+        """Extract meta-features from base model predictions."""
+        n = len(X)
+        meta_X = np.zeros((n, len(self.META_FEATURES)), dtype=np.float32)
+
+        # GBT predictions
+        if gbt is not None:
+            gbt_pred = gbt.predict(X)
+            if 'action_probs' in gbt_pred:
+                meta_X[:, 0:3] = gbt_pred['action_probs']
+            elif 'action' in gbt_pred:
+                for i in range(n):
+                    meta_X[i, int(gbt_pred['action'][i])] = 1.0
+            if 'break_dir_probs' in gbt_pred:
+                meta_X[:, 3:6] = gbt_pred['break_dir_probs']
+            elif 'break_dir' in gbt_pred:
+                for i in range(n):
+                    meta_X[i, 3 + int(gbt_pred['break_dir'][i])] = 1.0
+            if 'lifetime' in gbt_pred:
+                meta_X[:, 6] = gbt_pred['lifetime']
+            for j, key in enumerate(['future_return_5', 'future_return_20', 'future_return_60']):
+                if key in gbt_pred:
+                    meta_X[:, 7 + j] = gbt_pred[key]
+
+        # Transformer predictions
+        if transformer is not None:
+            try:
+                trans_pred = transformer.predict(X)
+                if 'action_probs' in trans_pred:
+                    meta_X[:, 10:13] = trans_pred['action_probs']
+                if 'break_dir_probs' in trans_pred:
+                    meta_X[:, 13:16] = trans_pred['break_dir_probs']
+                if 'lifetime' in trans_pred:
+                    meta_X[:, 16] = trans_pred['lifetime']
+                for j, key in enumerate(['future_return_5', 'future_return_20', 'future_return_60']):
+                    if key in trans_pred:
+                        meta_X[:, 17 + j] = trans_pred[key]
+            except Exception:
+                pass
+
+        # Survival predictions
+        if survival is not None:
+            try:
+                medians = survival.predict_median_survival(X)
+                meta_X[:, 20] = medians
+
+                import torch
+                survival.net.eval()
+                device = torch.device(survival._device)
+                with torch.no_grad():
+                    risk = survival.net(torch.FloatTensor(X).to(device))
+                    meta_X[:, 21] = risk.squeeze(-1).cpu().numpy()
+            except Exception:
+                pass
+
+        # Quality Scorer predictions
+        if quality is not None:
+            try:
+                # Need extended features for quality scorer
+                qs_features = quality.feature_names or []
+                n_base = len(base_feature_names) if base_feature_names else X.shape[1]
+                n_extra = len(TradeQualityScorer.SIGNAL_FEATURES)
+
+                # BUY prediction
+                qs_buy = np.zeros((n, n_base + n_extra), dtype=np.float32)
+                qs_buy[:, :min(n_base, X.shape[1])] = X[:, :min(n_base, X.shape[1])]
+                qs_buy[:, n_base + 2] = 1.0  # BUY direction
+                qs_buy_pred = quality.predict(qs_buy)
+                if 'win_prob' in qs_buy_pred:
+                    meta_X[:, 22] = qs_buy_pred['win_prob']
+                if 'quality_score' in qs_buy_pred:
+                    meta_X[:, 24] = qs_buy_pred['quality_score']
+
+                # SELL prediction
+                qs_sell = np.zeros((n, n_base + n_extra), dtype=np.float32)
+                qs_sell[:, :min(n_base, X.shape[1])] = X[:, :min(n_base, X.shape[1])]
+                qs_sell[:, n_base + 2] = 0.0  # SELL direction
+                qs_sell_pred = quality.predict(qs_sell)
+                if 'win_prob' in qs_sell_pred:
+                    meta_X[:, 23] = qs_sell_pred['win_prob']
+                if 'quality_score' in qs_sell_pred:
+                    meta_X[:, 25] = qs_sell_pred['quality_score']
+            except Exception:
+                pass
+
+        # Agreement features
+        # Action consensus: how many models agree on the best action
+        gbt_action = meta_X[:, 0:3].argmax(axis=1)
+        trans_action = meta_X[:, 10:13].argmax(axis=1)
+        actions_agree = (gbt_action == trans_action).astype(float)
+        meta_X[:, 26] = actions_agree
+
+        # Lifetime spread
+        lifetimes = np.column_stack([
+            meta_X[:, 6],   # GBT lifetime
+            meta_X[:, 16],  # Transformer lifetime
+            meta_X[:, 20],  # Survival median lifetime
+        ])
+        valid = lifetimes > 0
+        for i in range(n):
+            valid_lt = lifetimes[i, valid[i]]
+            if len(valid_lt) > 1:
+                meta_X[i, 27] = np.max(valid_lt) - np.min(valid_lt)
+                meta_X[i, 28] = np.mean(valid_lt)
+            elif len(valid_lt) == 1:
+                meta_X[i, 28] = valid_lt[0]
+
+        # Direction agreement
+        gbt_dir = meta_X[:, 3:6].argmax(axis=1)
+        trans_dir = meta_X[:, 13:16].argmax(axis=1)
+        meta_X[:, 29] = (gbt_dir == trans_dir).astype(float)
+
+        return meta_X
+
+    def train(
+        self,
+        X_train: np.ndarray, Y_train: Dict[str, np.ndarray],
+        X_val: np.ndarray, Y_val: Dict[str, np.ndarray],
+        gbt=None, transformer=None, survival=None, quality=None,
+        feature_names: List[str] = None,
+    ) -> Dict[str, float]:
+        """Train ensemble meta-learner on stacked base model predictions."""
+        try:
+            import lightgbm as lgb
+            use_lgb = True
+        except ImportError:
+            use_lgb = False
+
+        self.feature_names = self.META_FEATURES
+
+        print("\n  Extracting meta-features from base models...")
+        meta_train = self.extract_meta_features(
+            X_train, gbt, transformer, survival, quality, feature_names,
+        )
+        meta_val = self.extract_meta_features(
+            X_val, gbt, transformer, survival, quality, feature_names,
+        )
+
+        print(f"  Meta features shape: {meta_train.shape}")
+        metrics = {}
+
+        # Train action meta-learner
+        print("\n  Training: ensemble action classifier...")
+        if use_lgb:
+            train_ds = lgb.Dataset(meta_train, label=Y_train['optimal_action'],
+                                   feature_name=self.META_FEATURES)
+            val_ds = lgb.Dataset(meta_val, label=Y_val['optimal_action'],
+                                 feature_name=self.META_FEATURES, reference=train_ds)
+
+            params = {
+                'objective': 'multiclass',
+                'num_class': 3,
+                'metric': 'multi_logloss',
+                'num_leaves': 15,
+                'learning_rate': 0.05,
+                'min_child_samples': 5,
+                'feature_fraction': 0.7,
+                'verbose': -1,
+            }
+
+            model = lgb.train(
+                params, train_ds, num_boost_round=300,
+                valid_sets=[val_ds],
+                callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(50)],
+            )
+            self.models['action'] = model
+
+            val_pred = model.predict(meta_val)
+            val_pred_class = np.argmax(val_pred, axis=1)
+            val_acc = np.mean(val_pred_class == Y_val['optimal_action'].astype(int))
+            metrics['action_accuracy'] = float(val_acc)
+            print(f"    Action accuracy: {val_acc:.1%}")
+
+            # Feature importance
+            importance = sorted(
+                zip(self.META_FEATURES, model.feature_importance(importance_type='gain')),
+                key=lambda x: x[1], reverse=True,
+            )
+            print(f"    Top meta-features:")
+            for name, imp in importance[:10]:
+                if imp > 0:
+                    print(f"      {name}: {imp:.0f}")
+
+        # Train break direction meta-learner
+        print("\n  Training: ensemble break direction classifier...")
+        if use_lgb:
+            train_ds = lgb.Dataset(meta_train, label=Y_train['break_direction'],
+                                   feature_name=self.META_FEATURES)
+            val_ds = lgb.Dataset(meta_val, label=Y_val['break_direction'],
+                                 feature_name=self.META_FEATURES, reference=train_ds)
+
+            params['num_class'] = 3
+            model = lgb.train(
+                params, train_ds, num_boost_round=300,
+                valid_sets=[val_ds],
+                callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(50)],
+            )
+            self.models['break_dir'] = model
+
+            val_pred = model.predict(meta_val)
+            val_pred_class = np.argmax(val_pred, axis=1)
+            val_acc = np.mean(val_pred_class == Y_val['break_direction'].astype(int))
+            metrics['break_dir_accuracy'] = float(val_acc)
+            print(f"    Break dir accuracy: {val_acc:.1%}")
+
+        # Train lifetime meta-learner
+        print("\n  Training: ensemble lifetime regressor...")
+        if use_lgb:
+            train_ds = lgb.Dataset(meta_train, label=Y_train['channel_lifetime'],
+                                   feature_name=self.META_FEATURES)
+            val_ds = lgb.Dataset(meta_val, label=Y_val['channel_lifetime'],
+                                 feature_name=self.META_FEATURES, reference=train_ds)
+
+            params = {
+                'objective': 'regression',
+                'metric': 'mae',
+                'num_leaves': 15,
+                'learning_rate': 0.05,
+                'min_child_samples': 5,
+                'feature_fraction': 0.7,
+                'verbose': -1,
+            }
+
+            model = lgb.train(
+                params, train_ds, num_boost_round=300,
+                valid_sets=[val_ds],
+                callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(50)],
+            )
+            self.models['lifetime'] = model
+
+            val_pred = model.predict(meta_val)
+            mae = np.mean(np.abs(val_pred - Y_val['channel_lifetime']))
+            metrics['lifetime_mae'] = float(mae)
+            print(f"    Lifetime MAE: {mae:.1f} bars")
+
+        return metrics
+
+    def predict(self, X: np.ndarray,
+                gbt=None, transformer=None, survival=None, quality=None,
+                feature_names=None) -> Dict[str, np.ndarray]:
+        """Run ensemble prediction."""
+        meta_X = self.extract_meta_features(
+            X, gbt, transformer, survival, quality, feature_names,
+        )
+
+        results = {}
+
+        if 'action' in self.models:
+            probs = self.models['action'].predict(meta_X)
+            results['action_probs'] = probs
+            results['action'] = np.argmax(probs, axis=1)
+
+        if 'break_dir' in self.models:
+            probs = self.models['break_dir'].predict(meta_X)
+            results['break_dir_probs'] = probs
+            results['break_dir'] = np.argmax(probs, axis=1)
+
+        if 'lifetime' in self.models:
+            results['lifetime'] = self.models['lifetime'].predict(meta_X)
+
+        return results
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'models': self.models,
+                'feature_names': self.feature_names,
+            }, f)
+        print(f"  Saved EnsembleModel to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'EnsembleModel':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.models = data['models']
+        model.feature_names = data.get('feature_names', cls.META_FEATURES)
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -2658,6 +2995,88 @@ def train_all_architectures(
         traceback.print_exc()
         all_results['trade_quality'] = {'error': str(e)}
 
+    # ---- Architecture 5: Stacked Ensemble ----
+    print("\n" + "=" * 70)
+    print("ARCHITECTURE 5: Stacked Ensemble (Meta-Learner)")
+    print("=" * 70)
+
+    try:
+        # Load base models for stacking
+        gbt_model = None
+        trans_model = None
+        surv_model = None
+        qual_model = None
+
+        gbt_path = os.path.join(output_dir, 'gbt_model.pkl')
+        if os.path.exists(gbt_path):
+            gbt_model = GBTModel.load(gbt_path)
+            print("  Loaded GBT base model")
+
+        trans_path = os.path.join(output_dir, 'transformer_model.pt')
+        if os.path.exists(trans_path):
+            try:
+                trans_model = MultiTFTransformer.load(trans_path)
+                print("  Loaded Transformer base model")
+            except Exception:
+                print("  Transformer base model failed to load")
+
+        surv_path = os.path.join(output_dir, 'survival_model.pt')
+        if os.path.exists(surv_path):
+            try:
+                surv_model = SurvivalModel.load(surv_path)
+                print("  Loaded Survival base model")
+            except Exception:
+                print("  Survival base model failed to load")
+
+        qual_path = os.path.join(output_dir, 'trade_quality_scorer.pkl')
+        if os.path.exists(qual_path):
+            try:
+                qual_model = TradeQualityScorer.load(qual_path)
+                print("  Loaded Quality Scorer base model")
+            except Exception:
+                print("  Quality Scorer base model failed to load")
+
+        if gbt_model is None:
+            raise ValueError("GBT base model required for ensemble")
+
+        ensemble = EnsembleModel()
+        ens_metrics = ensemble.train(
+            X_train, Y_train_dict, X_val, Y_val_dict,
+            gbt=gbt_model, transformer=trans_model,
+            survival=surv_model, quality=qual_model,
+            feature_names=feature_names,
+        )
+        ensemble.save(os.path.join(output_dir, 'ensemble_model.pkl'))
+
+        # Test evaluation
+        ens_test = ensemble.predict(
+            X_test, gbt=gbt_model, transformer=trans_model,
+            survival=surv_model, quality=qual_model,
+            feature_names=feature_names,
+        )
+
+        if 'action' in ens_test:
+            ens_metrics['test_action_acc'] = float(np.mean(
+                ens_test['action'] == Y_test_dict['optimal_action'].astype(int)))
+            print(f"\n  Test action accuracy: {ens_metrics['test_action_acc']:.1%}")
+
+        if 'break_dir' in ens_test:
+            ens_metrics['test_break_dir_acc'] = float(np.mean(
+                ens_test['break_dir'] == Y_test_dict['break_direction'].astype(int)))
+            print(f"  Test break dir accuracy: {ens_metrics['test_break_dir_acc']:.1%}")
+
+        if 'lifetime' in ens_test:
+            ens_metrics['test_lifetime_mae'] = float(np.mean(np.abs(
+                ens_test['lifetime'] - Y_test_dict['channel_lifetime'])))
+            print(f"  Test lifetime MAE: {ens_metrics['test_lifetime_mae']:.1f} bars")
+
+        all_results['ensemble'] = ens_metrics
+    except Exception as e:
+        print(f"  Ensemble failed: {e}")
+        import traceback
+        traceback.print_exc()
+        all_results['ensemble'] = {'error': str(e)}
+
     # ---- Compare ----
     print("\n" + "=" * 70)
     print("ARCHITECTURE COMPARISON")
@@ -2742,7 +3161,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
