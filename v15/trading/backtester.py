@@ -174,10 +174,16 @@ class Backtester:
                 )
 
                 if exit_price is not None:
+                    # Track max unrealized P&L for efficiency analysis
+                    if pos.direction == 'long':
+                        max_unreal = (pos.best_price - pos.entry_price) * pos.shares
+                    else:
+                        max_unreal = (pos.entry_price - pos.best_price) * pos.shares
                     trade = self._close_position(
                         pos, exit_price, current_time,
                         bars_held, exit_reason
                     )
+                    trade._max_unrealized = max_unreal  # Attach for logging
                     metrics.add_trade(trade)
                     equity += trade.pnl
                     self.position_sizer.update_equity(equity)
@@ -415,6 +421,11 @@ class Backtester:
                 strat = getattr(t, 'strategy', '?')
                 entry_t = t.entry_time.strftime('%m/%d %H:%M') if hasattr(t, 'entry_time') else '?'
                 exit_t = t.exit_time.strftime('%m/%d %H:%M') if hasattr(t, 'exit_time') else '?'
+                max_ur = getattr(t, '_max_unrealized', None)
+                eff_str = ''
+                if max_ur is not None and max_ur > 0:
+                    capture_eff = t.pnl / max_ur * 100
+                    eff_str = f" eff={capture_eff:.0f}%"
                 print(
                     f"  #{i+1} {win} {t.direction:5s} "
                     f"entry=${t.entry_price:.2f}@{entry_t} "
@@ -423,7 +434,7 @@ class Backtester:
                     f"hold={t.hold_bars}bars "
                     f"exit={t.exit_reason} "
                     f"conf={t.signal_confidence:.2f} "
-                    f"tf={t.primary_tf} regime={t.regime}"
+                    f"tf={t.primary_tf}{eff_str}"
                 )
 
         # Close any remaining positions at market
@@ -491,6 +502,17 @@ class Backtester:
         hold_pct = min(1.0, bars_held / max(max_hold, 1))
         tightening = 1.0 - hold_pct * 0.4  # Trail shrinks to 60% of original at max hold
         effective_trail = pos.trailing_stop_pct * tightening
+
+        # Profit lock: once trade reaches 50%+ of TP target,
+        # switch to a tighter trail (50% of normal width)
+        if pos.direction == 'long':
+            tp_dist = pos.take_profit_price - pos.entry_price
+            current_profit_pct = (pos.best_price - pos.entry_price) / tp_dist if tp_dist > 0 else 0
+        else:
+            tp_dist = pos.entry_price - pos.take_profit_price
+            current_profit_pct = (pos.entry_price - pos.best_price) / tp_dist if tp_dist > 0 else 0
+        if current_profit_pct >= 0.50:
+            effective_trail *= 0.6  # 40% tighter trail when deeply profitable
 
         if pos.direction == 'long':
             if high > pos.best_price:
