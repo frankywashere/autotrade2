@@ -202,7 +202,7 @@ class Backtester:
                     HORIZON_MIN_CONF = {
                         'short': 0.99,   # Disabled: too noisy standalone
                         'medium': 0.99,  # Disabled: 0% win rate on 1h
-                        'long': 0.72,    # High selectivity: 40%WR but PF~1.94
+                        'long': 0.75,    # Sweep-optimized: 67%WR, PF~19.8, 3T/60d
                     }
 
                     # High-selectivity + momentum filter strategy:

@@ -509,10 +509,10 @@ class Predictor:
             else:
                 tf_dir_prob = torch.sigmoid(per_tf_outputs['direction_logits'][0, i]).item()
 
-            # Log raw logit vs calibrated probability for diagnosis
-            raw_prob = 1.0 / (1.0 + math.exp(-tf_dir_logit)) if abs(tf_dir_logit) < 500 else (1.0 if tf_dir_logit > 0 else 0.0)
-            T = self._temperature_scaler.temperature if self._temperature_scaler else 1.0
-            print(f"[DIAG] {tf_name}: raw_logit={tf_dir_logit:+.3f}, raw_prob={raw_prob:.1%}, T={T:.1f}, calibrated={tf_dir_prob:.1%}")
+            # Log raw logit vs calibrated probability for diagnosis (disabled for perf)
+            # raw_prob = 1.0 / (1.0 + math.exp(-tf_dir_logit)) if abs(tf_dir_logit) < 500 else (1.0 if tf_dir_logit > 0 else 0.0)
+            # T = self._temperature_scaler.temperature if self._temperature_scaler else 1.0
+            # print(f"[DIAG] {tf_name}: raw_logit={tf_dir_logit:+.3f}, raw_prob={raw_prob:.1%}, T={T:.1f}, calibrated={tf_dir_prob:.1%}")
 
             tf_direction = 'up' if tf_dir_prob > 0.5 else 'down'
             tf_confidence = max(tf_dir_prob, 1.0 - tf_dir_prob)
