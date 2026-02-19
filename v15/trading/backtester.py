@@ -419,7 +419,18 @@ class Backtester:
                             else:
                                 cross_horizon_mult = 1.0
 
-                            total_scale = conf_scale * cross_horizon_mult
+                            # VIX-inverse scaling: size up in calm markets, down in fearful
+                            vix_level = float(vix_df.iloc[bar_idx]['close'])
+                            if vix_level <= 16:
+                                vix_scale = 1.3  # Calm: size up
+                            elif vix_level <= 22:
+                                vix_scale = 1.0  # Normal
+                            elif vix_level <= 30:
+                                vix_scale = 0.7  # Elevated: size down
+                            else:
+                                vix_scale = 0.4  # Fear: minimal
+
+                            total_scale = conf_scale * cross_horizon_mult * vix_scale
                             if total_scale != 1.0:
                                 position.shares = max(1, int(position.shares * total_scale))
                                 position.dollar_amount = position.shares * current_price
