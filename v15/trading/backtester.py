@@ -517,7 +517,7 @@ class Backtester:
         # Progressive trail tightening: as hold time increases, tighten the trail
         # This captures more profit on aging trades
         hold_pct = min(1.0, bars_held / max(max_hold, 1))
-        tightening = 1.0 - hold_pct * 0.4  # Trail shrinks to 60% of original at max hold
+        tightening = 1.0 - hold_pct * 0.5  # Trail shrinks to 50% of original at max hold
         effective_trail = pos.trailing_stop_pct * tightening
 
         # Profit lock: once trade reaches 50%+ of TP target,
