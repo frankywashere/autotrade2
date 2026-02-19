@@ -582,6 +582,49 @@ def run_backtest(
             if loss_maes:
                 print(f"  Loser  MAE: {np.mean(loss_maes):.3%}")
 
+        # Time-of-day and day-of-week analysis
+        timestamps = tsla.index
+        from collections import defaultdict
+        hour_stats = defaultdict(lambda: {'pnl': 0, 'wins': 0, 'total': 0})
+        day_stats = defaultdict(lambda: {'pnl': 0, 'wins': 0, 'total': 0})
+        day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+        for t in trades:
+            if t.entry_bar < len(timestamps):
+                ts = timestamps[t.entry_bar]
+                # Convert to ET (UTC-5) for display
+                hour_et = (ts.hour - 5) % 24 if hasattr(ts, 'hour') else 0
+                dow = ts.dayofweek if hasattr(ts, 'dayofweek') else 0
+                hour_stats[hour_et]['pnl'] += t.pnl
+                hour_stats[hour_et]['total'] += 1
+                if t.pnl > 0:
+                    hour_stats[hour_et]['wins'] += 1
+                day_stats[dow]['pnl'] += t.pnl
+                day_stats[dow]['total'] += 1
+                if t.pnl > 0:
+                    day_stats[dow]['wins'] += 1
+
+        if hour_stats:
+            print(f"\nPerformance by hour (ET):")
+            for h in sorted(hour_stats.keys()):
+                s = hour_stats[h]
+                wr = s['wins'] / s['total'] if s['total'] > 0 else 0
+                avg_pnl = s['pnl'] / s['total'] if s['total'] > 0 else 0
+                bar = '█' * max(1, int(abs(avg_pnl) / 5))
+                sign = '+' if avg_pnl >= 0 else ''
+                print(f"  {h:2d}:00  {s['total']:3d} trades  WR={wr:.0%}  "
+                      f"avg={sign}${avg_pnl:.1f}  {'🟢' if avg_pnl > 0 else '🔴'}{bar}")
+
+        if day_stats:
+            print(f"\nPerformance by day:")
+            for d in sorted(day_stats.keys()):
+                s = day_stats[d]
+                wr = s['wins'] / s['total'] if s['total'] > 0 else 0
+                avg_pnl = s['pnl'] / s['total'] if s['total'] > 0 else 0
+                sign = '+' if avg_pnl >= 0 else ''
+                print(f"  {day_names[d]:3s}  {s['total']:3d} trades  WR={wr:.0%}  "
+                      f"P&L=${s['pnl']:,.0f}  avg={sign}${avg_pnl:.1f}")
+
     return metrics, trades, equity_curve
 
 
