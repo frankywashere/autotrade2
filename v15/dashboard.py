@@ -2140,6 +2140,43 @@ def show_channel_surfer_tab(
                 } for t in trades]
                 st.dataframe(pd.DataFrame(trade_data), hide_index=True, use_container_width=True)
 
+                # --- MAE/MFE Scatter Plot ---
+                maes = [getattr(t, 'mae_pct', 0) for t in trades]
+                mfes = [getattr(t, 'mfe_pct', 0) for t in trades]
+                if any(m > 0 for m in maes) and any(m > 0 for m in mfes):
+                    with st.expander("Trade Quality (MAE/MFE)", expanded=False):
+                        winners = [t for t in trades if t.pnl > 0]
+                        losers = [t for t in trades if t.pnl <= 0]
+
+                        q_cols = st.columns(4)
+                        avg_mae = np.mean([m for m in maes if m > 0]) if any(m > 0 for m in maes) else 0
+                        avg_mfe = np.mean([m for m in mfes if m > 0]) if any(m > 0 for m in mfes) else 0
+                        win_eff_vals = [t.pnl_pct / max(t.mfe_pct, 1e-6) for t in winners if getattr(t, 'mfe_pct', 0) > 0]
+                        win_eff = np.mean(win_eff_vals) if win_eff_vals else 0
+                        q_cols[0].metric("Avg MAE", f"{avg_mae:.2%}")
+                        q_cols[1].metric("Avg MFE", f"{avg_mfe:.2%}")
+                        q_cols[2].metric("Win Efficiency", f"{win_eff:.0%}")
+                        q_cols[3].metric("Max DD", f"{metrics.max_drawdown_pct:.1%}")
+
+                        fig_mfe = go.Figure()
+                        for label, group, color in [('Winners', winners, '#00c853'), ('Losers', losers, '#ff1744')]:
+                            fig_mfe.add_trace(go.Scatter(
+                                x=[getattr(t, 'mae_pct', 0) * 100 for t in group],
+                                y=[getattr(t, 'mfe_pct', 0) * 100 for t in group],
+                                mode='markers',
+                                name=label,
+                                marker=dict(color=color, size=8, opacity=0.7),
+                                text=[f"{t.signal_type} {t.direction} {t.pnl_pct:+.2%}" for t in group],
+                            ))
+                        fig_mfe.update_layout(
+                            title='MAE vs MFE (closer to top-left = better)',
+                            xaxis_title='MAE % (worst drawdown)',
+                            yaxis_title='MFE % (best unrealized)',
+                            template='plotly_dark', height=350,
+                            margin=dict(l=50, r=20, t=40, b=30),
+                        )
+                        st.plotly_chart(fig_mfe, use_container_width=True)
+
 
 def main():
     st.title("X23 Channel Break Predictor")
