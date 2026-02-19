@@ -7240,6 +7240,354 @@ class StopLossPredictor:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 19: Bayesian Signal Combiner
+# ---------------------------------------------------------------------------
+
+class BayesianSignalCombiner:
+    """
+    Replaces sequential confidence multipliers with a single learned model.
+
+    Problem: 15 active models each apply confidence *= {0.60..1.15},
+    creating a multiplicative chain where small errors compound.
+    A signal penalized by 5 models at 0.90 each becomes 0.59x — too aggressive.
+
+    Solution: Collect ALL model outputs as features, learn one optimal
+    combination model that outputs a single confidence adjustment.
+
+    This model is trained to predict:
+    1. Whether the signal results in a winning trade (binary)
+    2. The optimal confidence scaling factor (regression)
+
+    Replaces: All the ad-hoc confidence *= 0.XX rules in the backtest loop.
+    """
+
+    def __init__(self):
+        self.win_model = None          # Binary: will this signal win?
+        self.scale_model = None        # Regression: optimal confidence scale
+        self.feature_names = None
+        self.combined_feature_names = None
+
+    def _collect_all_model_outputs(self, X, feature_names, model_dir='surfer_models'):
+        """
+        Run all available models and collect their outputs as features.
+        Returns (meta_X, meta_names).
+        """
+        import os as _os
+
+        n = len(X)
+        meta_feats = []
+        meta_names = []
+
+        # 1. Base physics features (subset — most informative)
+        KEY_FEATURES = [
+            'break_prob_max', 'break_prob_weighted', 'avg_entropy',
+            'direction_consensus', 'health_min', 'health_max',
+            'health_spread', 'confluence_score', 'atr_pct', 'rsi_14',
+            'rsi_5', 'volume_ratio_20', 'price_momentum_3bar',
+            'price_momentum_12bar', 'vix_level',
+        ]
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        for key in KEY_FEATURES:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                meta_feats.append(X[:, idx])
+                meta_names.append(f'bc_{key}')
+
+        # 2. GBT model outputs
+        gbt_path = _os.path.join(model_dir, 'gbt_model.pkl')
+        if _os.path.exists(gbt_path):
+            try:
+                gbt = GBTModel.load(gbt_path)
+                pred = gbt.predict(X)
+                if 'action_probs' in pred:
+                    for i, name in enumerate(['hold', 'buy', 'sell']):
+                        meta_feats.append(pred['action_probs'][:, i])
+                        meta_names.append(f'bc_gbt_{name}_prob')
+                if 'lifetime' in pred:
+                    meta_feats.append(pred['lifetime'])
+                    meta_names.append('bc_gbt_lifetime')
+            except Exception:
+                pass
+
+        # 3. Regime model
+        regime_path = _os.path.join(model_dir, 'regime_model.pkl')
+        if _os.path.exists(regime_path):
+            try:
+                regime = RegimeConditionalModel.load(regime_path)
+                pred = regime.predict(X)
+                if 'action' in pred:
+                    meta_feats.append(pred['action'].astype(np.float32))
+                    meta_names.append('bc_regime_action')
+                if 'regime_id' in pred:
+                    meta_feats.append(pred['regime_id'].astype(np.float32))
+                    meta_names.append('bc_regime_id')
+            except Exception:
+                pass
+
+        # 4. CV Ensemble
+        cv_path = _os.path.join(model_dir, 'cv_ensemble_model.pkl')
+        if _os.path.exists(cv_path):
+            try:
+                cv = CVEnsembleModel.load(cv_path)
+                pred = cv.predict(X)
+                if 'action' in pred:
+                    meta_feats.append(pred['action'].astype(np.float32))
+                    meta_names.append('bc_cv_action')
+                if 'consensus' in pred:
+                    meta_feats.append(pred['consensus'])
+                    meta_names.append('bc_cv_consensus')
+            except Exception:
+                pass
+
+        # 5. Physics Residual
+        res_path = _os.path.join(model_dir, 'physics_residual_model.pkl')
+        if _os.path.exists(res_path):
+            try:
+                res = PhysicsResidualModel.load(res_path)
+                pred = res.predict(X)
+                if 'confidence_scale' in pred:
+                    meta_feats.append(pred['confidence_scale'])
+                    meta_names.append('bc_residual_conf_scale')
+                if 'lifetime_correction' in pred:
+                    meta_feats.append(pred['lifetime_correction'])
+                    meta_names.append('bc_residual_life_corr')
+            except Exception:
+                pass
+
+        # 6. Adverse Movement
+        adv_path = _os.path.join(model_dir, 'adverse_movement_model.pkl')
+        if _os.path.exists(adv_path):
+            try:
+                adv = AdverseMovementPredictor.load(adv_path)
+                # Predict for buy direction
+                pred_buy = adv.predict(X, is_buy=True)
+                if 'stop_prob' in pred_buy:
+                    meta_feats.append(pred_buy['stop_prob'])
+                    meta_names.append('bc_adv_stop_prob_buy')
+                if 'viable_prob' in pred_buy:
+                    meta_feats.append(pred_buy['viable_prob'])
+                    meta_names.append('bc_adv_viable_buy')
+                # Predict for sell
+                pred_sell = adv.predict(X, is_buy=False)
+                if 'stop_prob' in pred_sell:
+                    meta_feats.append(pred_sell['stop_prob'])
+                    meta_names.append('bc_adv_stop_prob_sell')
+            except Exception:
+                pass
+
+        # 7. Volatility Transition
+        vol_path = _os.path.join(model_dir, 'vol_transition_model.pkl')
+        if _os.path.exists(vol_path):
+            try:
+                vol = VolatilityTransitionModel.load(vol_path)
+                pred = vol.predict(X)
+                if 'spike_prob' in pred:
+                    meta_feats.append(pred['spike_prob'])
+                    meta_names.append('bc_vol_spike_prob')
+                if 'expansion_prob' in pred:
+                    meta_feats.append(pred['expansion_prob'])
+                    meta_names.append('bc_vol_expansion_prob')
+            except Exception:
+                pass
+
+        # 8. Exhaustion
+        exh_path = _os.path.join(model_dir, 'exhaustion_model.pkl')
+        if _os.path.exists(exh_path):
+            try:
+                exh = MomentumExhaustionDetector.load(exh_path)
+                pred = exh.predict(X)
+                if 'exhaustion_prob' in pred:
+                    meta_feats.append(pred['exhaustion_prob'])
+                    meta_names.append('bc_exhaustion_prob')
+                if 'reversal_severity' in pred:
+                    meta_feats.append(pred['reversal_severity'])
+                    meta_names.append('bc_reversal_severity')
+            except Exception:
+                pass
+
+        # 9. Cross-Asset
+        ca_path = _os.path.join(model_dir, 'cross_asset_model.pkl')
+        if _os.path.exists(ca_path):
+            try:
+                ca = CrossAssetAmplifier.load(ca_path)
+                pred = ca.predict(X)
+                if 'market_regime' in pred:
+                    meta_feats.append(pred['market_regime'].astype(np.float32))
+                    meta_names.append('bc_market_regime')
+                if 'confidence_scale' in pred:
+                    meta_feats.append(pred['confidence_scale'])
+                    meta_names.append('bc_ca_conf_scale')
+            except Exception:
+                pass
+
+        # 10. Stop Loss
+        sl_path = _os.path.join(model_dir, 'stop_loss_model.pkl')
+        if _os.path.exists(sl_path):
+            try:
+                sl = StopLossPredictor.load(sl_path)
+                pred = sl.predict(X)
+                if 'stop_prob' in pred:
+                    meta_feats.append(pred['stop_prob'])
+                    meta_names.append('bc_stop_loss_prob')
+                if 'expected_mae' in pred:
+                    meta_feats.append(pred['expected_mae'])
+                    meta_names.append('bc_expected_mae')
+            except Exception:
+                pass
+
+        if len(meta_feats) == 0:
+            return X, list(feature_names)
+
+        return np.column_stack(meta_feats), meta_names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names, model_dir='surfer_models'):
+        """
+        Train Bayesian combiner on all model outputs.
+
+        Target 1: Binary — is this a winning trade?
+        Target 2: Regression — optimal confidence scale (1.0 = neutral)
+        """
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+
+        print("  Collecting all model outputs as features...")
+        meta_X_train, self.combined_feature_names = self._collect_all_model_outputs(
+            X_train, feature_names, model_dir)
+        meta_X_val, _ = self._collect_all_model_outputs(
+            X_val, feature_names, model_dir)
+
+        # Target 1: Winning trade (would a BUY or SELL be profitable?)
+        ret20 = Y_train['future_return_20']
+        ret5 = Y_train['future_return_5']
+        # Win = positive return in the dominant direction (max of |ret5|, |ret20|)
+        win_train = (np.abs(ret20) > 0.003).astype(np.float32)  # Significant move
+        win_val = (np.abs(Y_val['future_return_20']) > 0.003).astype(np.float32)
+
+        # Target 2: Confidence scale (based on magnitude of favorable move)
+        # Higher return = should have been higher confidence
+        scale_train = np.clip(1.0 + ret20 * 50, 0.3, 2.0).astype(np.float32)
+        scale_val = np.clip(1.0 + Y_val['future_return_20'] * 50, 0.3, 2.0).astype(np.float32)
+
+        metrics = {}
+
+        print(f"  Combined features: {len(self.combined_feature_names)}")
+        print(f"  Win rate: {win_train.mean():.1%}")
+
+        # --- Model 1: Win classifier ---
+        print("  Training win classifier...")
+        dtrain = lgb.Dataset(meta_X_train, label=win_train,
+                            feature_name=self.combined_feature_names)
+        dval = lgb.Dataset(meta_X_val, label=win_val,
+                          feature_name=self.combined_feature_names, reference=dtrain)
+
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+        }
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        self.win_model = lgb.train(
+            params, dtrain, num_boost_round=500,
+            valid_sets=[dval], callbacks=callbacks,
+        )
+
+        win_pred = self.win_model.predict(meta_X_val)
+        win_auc = roc_auc_score(win_val, win_pred)
+        metrics['win_auc'] = float(win_auc)
+        print(f"    Win AUC: {win_auc:.3f}")
+
+        # --- Model 2: Scale regressor ---
+        print("  Training confidence scale regressor...")
+        dtrain2 = lgb.Dataset(meta_X_train, label=scale_train,
+                             feature_name=self.combined_feature_names)
+        dval2 = lgb.Dataset(meta_X_val, label=scale_val,
+                           feature_name=self.combined_feature_names, reference=dtrain2)
+
+        params_reg = {
+            'objective': 'regression',
+            'metric': 'mae',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+        }
+
+        self.scale_model = lgb.train(
+            params_reg, dtrain2, num_boost_round=500,
+            valid_sets=[dval2], callbacks=callbacks,
+        )
+
+        scale_pred = self.scale_model.predict(meta_X_val)
+        scale_mae = np.mean(np.abs(scale_pred - scale_val))
+        scale_corr = np.corrcoef(scale_pred, scale_val)[0, 1]
+        metrics['scale_mae'] = float(scale_mae)
+        metrics['scale_corr'] = float(scale_corr)
+        print(f"    Scale MAE: {scale_mae:.3f}, Corr: {scale_corr:.3f}")
+
+        # Feature importance
+        imp = self.win_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:15]
+        print("\n  Top 15 Bayesian combiner features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.combined_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray, model_dir='surfer_models') -> dict:
+        """
+        Predict optimal confidence scaling.
+
+        Returns:
+            win_prob: probability this is a winning trade
+            confidence_scale: optimal confidence multiplier [0.3, 2.0]
+        """
+        if self.win_model is None:
+            return {}
+
+        meta_X, _ = self._collect_all_model_outputs(X, self.feature_names, model_dir)
+
+        win_prob = self.win_model.predict(meta_X)
+        conf_scale = self.scale_model.predict(meta_X)
+        conf_scale = np.clip(conf_scale, 0.5, 1.5)
+
+        return {
+            'win_prob': win_prob,
+            'confidence_scale': conf_scale,
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'win_model': self.win_model,
+                'scale_model': self.scale_model,
+                'feature_names': self.feature_names,
+                'combined_feature_names': self.combined_feature_names,
+            }, f)
+        print(f"  Saved BayesianSignalCombiner to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'BayesianSignalCombiner':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.win_model = data['win_model']
+        model.scale_model = data['scale_model']
+        model.feature_names = data['feature_names']
+        model.combined_feature_names = data['combined_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -7868,7 +8216,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -8047,6 +8395,14 @@ def main():
                 )
                 slp.save(os.path.join(args.output, 'stop_loss_model.pkl'))
                 print(f"\n  Stop Loss metrics: {slp_metrics}")
+            elif args.arch == 'bayesian':
+                bay = BayesianSignalCombiner()
+                bay_metrics = bay.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                    model_dir=args.output,
+                )
+                bay.save(os.path.join(args.output, 'bayesian_combiner.pkl'))
+                print(f"\n  Bayesian Combiner metrics: {bay_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
