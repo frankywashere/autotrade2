@@ -184,6 +184,7 @@ class Backtester:
                         bars_held, exit_reason
                     )
                     trade._max_unrealized = max_unreal  # Attach for logging
+                    trade._strategy = strat_key
                     metrics.add_trade(trade)
                     equity += trade.pnl
                     self.position_sizer.update_equity(equity)
@@ -310,12 +311,27 @@ class Backtester:
                                     strategy_signals['medium_trend'] = (sig, score)
 
                         elif horizon == 'short':
-                            if sig.regime.regime != MarketRegime.RANGING:
-                                continue
-                            score = sig.confidence * sig.entry_urgency
-                            prev = strategy_signals.get('bounce')
-                            if prev is None or score > prev[1]:
-                                strategy_signals['bounce'] = (sig, score)
+                            if sig.regime.regime == MarketRegime.RANGING:
+                                # Bounce strategy: ranging markets, channel bounce
+                                score = sig.confidence * sig.entry_urgency
+                                prev = strategy_signals.get('bounce')
+                                if prev is None or score > prev[1]:
+                                    strategy_signals['bounce'] = (sig, score)
+                            elif sig.regime.regime in (MarketRegime.TRENDING_BULL, MarketRegime.TRENDING_BEAR):
+                                # Short-horizon trend: trending markets, 1d momentum confirmation
+                                # Only when confidence is high AND 1d momentum confirms
+                                # (skip 3d check — catches V-shaped recoveries)
+                                if sig.confidence >= 0.72:
+                                    if sig.signal_type == SignalType.LONG:
+                                        if mom_1d < 0.01:  # Strong 1d momentum required
+                                            continue
+                                    elif sig.signal_type == SignalType.SHORT:
+                                        if mom_1d > -0.01:
+                                            continue
+                                    score = sig.confidence * sig.entry_urgency * 1.2
+                                    prev = strategy_signals.get('short_trend')
+                                    if prev is None or score > prev[1]:
+                                        strategy_signals['short_trend'] = (sig, score)
 
                     # Current total position value
                     total_position_value = sum(
@@ -418,7 +434,7 @@ class Backtester:
             print("\n--- TRADE LOG ---")
             for i, t in enumerate(metrics.trades):
                 win = "W" if t.pnl > 0 else "L"
-                strat = getattr(t, 'strategy', '?')
+                strat = getattr(t, '_strategy', '?')
                 entry_t = t.entry_time.strftime('%m/%d %H:%M') if hasattr(t, 'entry_time') else '?'
                 exit_t = t.exit_time.strftime('%m/%d %H:%M') if hasattr(t, 'exit_time') else '?'
                 max_ur = getattr(t, '_max_unrealized', None)
@@ -427,7 +443,7 @@ class Backtester:
                     capture_eff = t.pnl / max_ur * 100
                     eff_str = f" eff={capture_eff:.0f}%"
                 print(
-                    f"  #{i+1} {win} {t.direction:5s} "
+                    f"  #{i+1} {win} {strat:13s} {t.direction:5s} "
                     f"entry=${t.entry_price:.2f}@{entry_t} "
                     f"exit=${t.exit_price:.2f}@{exit_t} "
                     f"pnl=${t.pnl:+.2f} ({t.pnl_pct:+.1%}) "
@@ -446,6 +462,7 @@ class Backtester:
                     pos, final_price, final_time,
                     total_bars - pos.entry_bar, 'end_of_data'
                 )
+                trade._strategy = strat_key
                 metrics.add_trade(trade)
                 equity += trade.pnl
 
