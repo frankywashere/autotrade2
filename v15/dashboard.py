@@ -50,8 +50,9 @@ from v15.live_data import (
 # Import native TF data loader for per-TF yfinance fetching
 from v15.data.native_tf import load_native_tf_data as _load_native_tf_data
 
-# All TFs fetched natively from yfinance (intraday capped at ~60 days)
-NATIVE_TF_LIST = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
+# Native TFs fetched from yfinance (longer history than 5-min base).
+# Sub-hourly TFs (5min/15min/30min) are derived from the 5-min base feed.
+NATIVE_TF_LIST = ['daily', 'weekly', 'monthly', '1h', '2h', '3h', '4h']
 
 logger = logging.getLogger(__name__)
 
@@ -494,12 +495,16 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
         with st.expander(expander_header, expanded=False):
             try:
                 # Use native TF data if available for this timeframe
+                used_native = False
                 if (native_bars_by_tf
                         and native_bars_by_tf.get('TSLA', {}).get(tf_name) is not None
                         and len(native_bars_by_tf['TSLA'][tf_name]) >= 20):
                     tf_df = native_bars_by_tf['TSLA'][tf_name].copy()
+                    used_native = True
+                    print(f"[VIZ] {tf_name}: Using NATIVE data ({len(tf_df)} bars)")
                 else:
                     tf_df = resample_to_timeframe(tsla_df, tf_name)
+                    print(f"[VIZ] {tf_name}: Using RESAMPLED from 5min ({len(tf_df)} bars)")
 
                 if len(tf_df) < 20:
                     st.warning(f"Insufficient data for {tf_name} ({len(tf_df)} bars)")
@@ -519,13 +524,16 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
                 # Get the channel for the selected window
                 channel = tf_channels.get(tf_window)
 
-                # Slice data: channel window + current bar for display.
-                # detect_channel uses df.iloc[-(window+1):-1] internally,
-                # so the first window_bars of chart_df align with the channel.
-                # The extra bar at the end is the current bar (shown as a
-                # candle but outside the channel overlay).
-                window_bars = min(tf_window, len(tf_df) - 1)
+                # Ensure minimum chart bars for readable display
+                MIN_CHART_BARS = 50
+                display_bars = max(tf_window, MIN_CHART_BARS)
+                window_bars = min(display_bars, len(tf_df) - 1)
                 chart_df = tf_df.iloc[-(window_bars + 1):].copy()
+
+                print(f"[VIZ] {tf_name} SLICE: total_bars={len(tf_df)}, tf_window={tf_window}, "
+                      f"display_bars={display_bars}, chart_bars={window_bars + 1}, used_native={used_native}")
+                if len(chart_df) > 0:
+                    print(f"[VIZ] {tf_name} DATE RANGE: {chart_df.index[0]} to {chart_df.index[-1]}")
 
                 if channel is not None and getattr(channel, 'valid', False):
                     # Create chart with channel
@@ -837,8 +845,9 @@ def load_market_data(data_dir: str):
 
 CHECKPOINT_RELEASE_TAG = "v0.1-model"
 CHECKPOINT_REPO = "frankywashere/autotrade2"
-DEFAULT_MODEL_PATH = "models/best.pt"
 CHECKPOINT_ASSET_NAME = "oncycle_v4_horizon_best_per_tf.pt"
+CALIBRATION_ASSET_NAME = "temperature_calibration.json"
+DEFAULT_MODEL_PATH = f"models/{CHECKPOINT_ASSET_NAME}"
 
 
 def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
@@ -877,11 +886,21 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
         headers["Authorization"] = f"token {token}"
 
     print(f"[MODEL] Fetching release info from {CHECKPOINT_RELEASE_TAG} ...")
-    release = _requests.get(release_url, headers=headers).json()
+    resp = _requests.get(release_url, headers=headers)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"GitHub API returned HTTP {resp.status_code} for release "
+            f"{CHECKPOINT_RELEASE_TAG}: {resp.text[:500]}"
+        )
+    release = resp.json()
 
     assets = release.get("assets", [])
     if not assets:
-        raise RuntimeError(f"No assets found in release {CHECKPOINT_RELEASE_TAG}")
+        msg = release.get("message", "no error message")
+        raise RuntimeError(
+            f"No assets found in release {CHECKPOINT_RELEASE_TAG}. "
+            f"GitHub response message: {msg}"
+        )
 
     # Find the target .pt asset by name
     pt_assets = [a for a in assets if a["name"].endswith(".pt")]
@@ -922,11 +941,11 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
     dl_size = _download_asset(asset, p)
     print(f"[MODEL] Downloaded checkpoint: {dl_size / 1e6:.1f} MB")
 
-    # Also download temperature_calibration.json if available
-    cal_assets = [a for a in assets if a["name"] == "temperature_calibration.json"]
+    # Also download calibration file if available
+    cal_assets = [a for a in assets if a["name"] == CALIBRATION_ASSET_NAME]
     if cal_assets:
         cal_asset = cal_assets[0]
-        cal_path = p.parent / "temperature_calibration.json"
+        cal_path = p.parent / CALIBRATION_ASSET_NAME
         print(f"[MODEL] Downloading {cal_asset['name']} ...")
         _download_asset(cal_asset, cal_path)
         print(f"[MODEL] Downloaded calibration: {cal_path}")
@@ -943,13 +962,15 @@ def _ensure_checkpoint(path: str = DEFAULT_MODEL_PATH) -> tuple:
 def load_predictor(checkpoint_path: str):
     """Load and cache live predictor with channel history tracking."""
     from v15.live import LivePredictor
-    return LivePredictor(checkpoint_path, track_channel_history=True)
+    cal_path = str(Path(checkpoint_path).parent / CALIBRATION_ASSET_NAME)
+    return LivePredictor(checkpoint_path, track_channel_history=True,
+                         calibration_path=cal_path)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_native_tf():
     """Fetch and cache native TF data from yfinance for higher timeframes."""
-    print("[DATA] Fetching native TF data (daily/weekly/monthly) from yfinance...")
+    print("[DATA] Fetching native TF data (daily/weekly/monthly/1h-4h) from yfinance...")
     try:
         data = _load_native_tf_data(
             symbols=['TSLA', 'SPY', '^VIX'],
@@ -1156,7 +1177,7 @@ def main():
     else:
         checkpoint_path = st.sidebar.text_input(
             "Model Checkpoint",
-            value="models/best.pt"
+            value=DEFAULT_MODEL_PATH
         )
         st.sidebar.warning("No .pt files found in models/")
 
@@ -1180,7 +1201,7 @@ def main():
         p = Path(checkpoint_path)
         if p.exists():
             p.unlink()
-        cal_path = p.parent / "temperature_calibration.json"
+        cal_path = p.parent / CALIBRATION_ASSET_NAME
         if cal_path.exists():
             cal_path.unlink()
         load_predictor.clear()
@@ -1201,7 +1222,7 @@ def main():
             _mae = _ckpt.get('best_per_tf_mae', '?')
             if isinstance(_mae, float):
                 _mae = f"{_mae:.3f}"
-            _cal_path = cp.parent / 'temperature_calibration.json'
+            _cal_path = cp.parent / CALIBRATION_ASSET_NAME
             if _cal_path.exists():
                 import json as _json
                 _cal = _json.loads(_cal_path.read_text())

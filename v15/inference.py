@@ -15,6 +15,7 @@ Usage:
 import torch
 import pandas as pd
 import numpy as np
+import math
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 from dataclasses import dataclass
@@ -188,7 +189,8 @@ class Predictor:
         return self._has_learned_window_selection
 
     @classmethod
-    def load(cls, checkpoint_path: str, device: str = 'auto') -> 'Predictor':
+    def load(cls, checkpoint_path: str, device: str = 'auto',
+             calibration_path: str = None) -> 'Predictor':
         """
         Load predictor from checkpoint.
 
@@ -198,6 +200,8 @@ class Predictor:
         Args:
             checkpoint_path: Path to model checkpoint
             device: Device to use ('auto', 'cuda', 'cpu', etc.)
+            calibration_path: Path to temperature calibration JSON. If None,
+                looks for temperature_calibration.json in checkpoint's directory.
 
         Returns:
             Predictor instance with model loaded
@@ -231,7 +235,8 @@ class Predictor:
         per_tf_head_version = 2 if has_tf_embedding else 1
 
         # Detect horizon attention from state dict
-        has_horizon_attention = any('horizon_attention' in k for k in state_dict)
+        # HorizonGroupedAttention creates 'cross_tf_attention.group_attention.*' keys
+        has_horizon_attention = any('group_attention' in k for k in state_dict)
 
         # Create model with appropriate configuration
         config = {
@@ -258,12 +263,24 @@ class Predictor:
                 "per-TF predictions will be untrained"
             )
 
-        # Warn about any other missing keys (these might be actual problems)
+        # Any other missing keys are real architecture mismatches
         if other_missing:
-            logger.warning(f"Checkpoint missing unexpected keys: {other_missing}")
+            logger.error(f"Checkpoint missing unexpected keys: {other_missing}")
+            raise ModelError(
+                f"Architecture mismatch: {len(other_missing)} unexpected missing keys. "
+                f"First 5: {other_missing[:5]}. "
+                "This likely means the checkpoint was trained with a different model config "
+                "than what was auto-detected."
+            )
 
         if unexpected_keys:
-            logger.warning(f"Checkpoint has unexpected keys: {unexpected_keys}")
+            logger.error(f"Checkpoint has unexpected keys: {unexpected_keys}")
+            raise ModelError(
+                f"Architecture mismatch: {len(unexpected_keys)} unexpected keys in checkpoint. "
+                f"First 5: {unexpected_keys[:5]}. "
+                "This likely means the checkpoint was trained with features "
+                "that weren't auto-detected."
+            )
 
         # Get feature names from checkpoint (must match training data exactly)
         feature_names = checkpoint.get('feature_names')
@@ -274,7 +291,10 @@ class Predictor:
 
         # Load temperature scaler if available
         temperature_scaler = None
-        temp_path = path.parent / 'temperature_calibration.json'
+        if calibration_path:
+            temp_path = Path(calibration_path)
+        else:
+            temp_path = path.parent / 'temperature_calibration.json'
         if temp_path.exists():
             try:
                 temperature_scaler = TemperatureScaler.load(str(temp_path))
@@ -323,7 +343,7 @@ class Predictor:
         direction_prob = torch.sigmoid(outputs['direction_logits']).item()
         direction = 'up' if direction_prob > 0.5 else 'down'
 
-        new_channel_probs = torch.softmax(outputs['new_channel_logits'], dim=-1).squeeze()
+        new_channel_probs = torch.softmax(outputs['new_channel_logits'], dim=-1)[0]  # Remove batch dim
         new_channel_idx = new_channel_probs.argmax().item()
         new_channel_names = ['bear', 'sideways', 'bull']
         new_channel = new_channel_names[new_channel_idx]
@@ -342,7 +362,7 @@ class Predictor:
             used_learned_selection = True
 
             # Get probabilities for all windows
-            probs = window_sel['probs'].squeeze()
+            probs = window_sel['probs'][0]  # Remove batch dim
             learned_window_probs = {
                 STANDARD_WINDOWS[i]: probs[i].item()
                 for i in range(len(STANDARD_WINDOWS))
@@ -412,7 +432,7 @@ class Predictor:
         direction_prob = torch.sigmoid(outputs['direction_logits']).item()
         direction = 'up' if direction_prob > 0.5 else 'down'
 
-        new_channel_probs = torch.softmax(outputs['new_channel_logits'], dim=-1).squeeze()
+        new_channel_probs = torch.softmax(outputs['new_channel_logits'], dim=-1)[0]  # Remove batch dim
         new_channel_idx = new_channel_probs.argmax().item()
         new_channel_names = ['bear', 'sideways', 'bull']
         new_channel = new_channel_names[new_channel_idx]
@@ -428,7 +448,7 @@ class Predictor:
             learned_window = STANDARD_WINDOWS[selected_idx]
             used_learned_selection = True
 
-            probs = window_sel['probs'].squeeze()
+            probs = window_sel['probs'][0]  # Remove batch dim
             learned_window_probs = {
                 STANDARD_WINDOWS[i]: probs[i].item()
                 for i in range(len(STANDARD_WINDOWS))
@@ -445,6 +465,11 @@ class Predictor:
                 tf_dir_prob = self._temperature_scaler.calibrate(tf_dir_logit)
             else:
                 tf_dir_prob = torch.sigmoid(per_tf_outputs['direction_logits'][0, i]).item()
+
+            # Log raw logit vs calibrated probability for diagnosis
+            raw_prob = 1.0 / (1.0 + math.exp(-tf_dir_logit)) if abs(tf_dir_logit) < 500 else (1.0 if tf_dir_logit > 0 else 0.0)
+            T = self._temperature_scaler.temperature if self._temperature_scaler else 1.0
+            print(f"[DIAG] {tf_name}: raw_logit={tf_dir_logit:+.3f}, raw_prob={raw_prob:.1%}, T={T:.1f}, calibrated={tf_dir_prob:.1%}")
 
             tf_direction = 'up' if tf_dir_prob > 0.5 else 'down'
             tf_confidence = max(tf_dir_prob, 1.0 - tf_dir_prob)

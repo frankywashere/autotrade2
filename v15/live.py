@@ -88,8 +88,9 @@ class LivePredictor:
         min_bars: int = 35000,
         on_prediction: Optional[Callable[[LivePrediction], None]] = None,
         track_channel_history: bool = True,
+        calibration_path: str = None,
     ):
-        self.predictor = Predictor.load(checkpoint_path)
+        self.predictor = Predictor.load(checkpoint_path, calibration_path=calibration_path)
         self.min_bars = min_bars
         self.on_prediction = on_prediction
         self.track_channel_history = track_channel_history
