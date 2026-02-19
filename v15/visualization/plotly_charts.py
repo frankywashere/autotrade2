@@ -553,12 +553,19 @@ def create_tf_channel_chart(
             f"Bounces: {bounce_count} | Window: {window}</span>"
         )
 
+        # Right-align: channel was detected on the LAST `window` bars,
+        # but chart may show more bars due to MIN_CHART_BARS.
+        # The channel's bar 0 corresponds to chart bar (n - 1 - channel_len),
+        # where n-1 is the last candle (current bar sits after the channel).
+        channel_len = len(channel.center_line)
+        channel_start = max(0, len(df) - 1 - channel_len)
+
         fig = add_channel_overlay(
-            fig, channel, start_idx=0, project_forward=project_forward,
+            fig, channel, start_idx=channel_start, project_forward=project_forward,
         )
 
         if show_bounces:
-            fig = add_bounce_markers(fig, channel, df, start_idx=0)
+            fig = add_bounce_markers(fig, channel, df, start_idx=channel_start)
     else:
         title = (
             f"<b>{tf_name}</b> | NO VALID CHANNEL<br>"
