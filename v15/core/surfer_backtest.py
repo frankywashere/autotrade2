@@ -266,8 +266,10 @@ def run_backtest(
     atr[:atr_period - 1] = first_valid
 
     trades: List[Trade] = []
+    trade_signals: list = []  # Parallel list of signal components per trade
     equity_curve: List[Tuple[int, float]] = []  # (bar_idx, equity)
     positions: List[OpenPosition] = []  # Multi-position support (max 2)
+    position_signals: list = []  # Signal data for each open position
     max_positions = 2
     equity = position_size * 10  # Start with 100k
     peak_equity = equity
@@ -342,10 +344,12 @@ def run_backtest(
                     consecutive_losses = 0
 
                 closed_indices.append(pi)
+                trade_signals.append(position_signals[pi])
 
         # Remove closed positions (reverse order to preserve indices)
         for pi in sorted(closed_indices, reverse=True):
             positions.pop(pi)
+            position_signals.pop(pi)
 
         # --- Generate new signal (if room for more positions) ---
         if len(positions) < max_positions:
@@ -484,6 +488,15 @@ def run_backtest(
                     max_hold_bars=effective_max_hold,
                     trailing_stop=entry_price,
                 ))
+                position_signals.append({
+                    'position_score': sig.position_score,
+                    'energy_score': sig.energy_score,
+                    'entropy_score': sig.entropy_score,
+                    'confluence_score': sig.confluence_score,
+                    'timing_score': sig.timing_score,
+                    'channel_health': sig.channel_health,
+                    'confidence': sig.confidence,
+                })
 
     # Close any remaining positions
     for position in positions:
@@ -629,6 +642,36 @@ def run_backtest(
                 sign = '+' if avg_pnl >= 0 else ''
                 print(f"  {day_names[d]:3s}  {s['total']:3d} trades  WR={wr:.0%}  "
                       f"P&L=${s['pnl']:,.0f}  avg={sign}${avg_pnl:.1f}")
+
+        # Signal component correlation analysis
+        if trade_signals and len(trade_signals) == len(trades):
+            components = ['position_score', 'energy_score', 'entropy_score',
+                          'confluence_score', 'channel_health', 'confidence']
+
+            for label, mask in [('ALL', [True]*len(trades)),
+                                ('BOUNCE', [t.signal_type == 'bounce' for t in trades]),
+                                ('BREAK', [t.signal_type == 'break' for t in trades])]:
+                idx = [i for i, m in enumerate(mask) if m]
+                if len(idx) < 10:
+                    continue
+                sub_trades = [trades[i] for i in idx]
+                sub_sigs = [trade_signals[i] for i in idx]
+                outcomes = np.array([1 if t.pnl > 0 else 0 for t in sub_trades])
+                pnl_vals = np.array([t.pnl_pct for t in sub_trades])
+
+                print(f"\nSignal component analysis — {label} ({len(idx)} trades):")
+                print(f"  {'Component':<18s} {'Avg(Win)':<10s} {'Avg(Loss)':<10s} {'WinCorr':<10s} {'PnlCorr':<10s}")
+                for comp in components:
+                    vals = np.array([s.get(comp, 0) for s in sub_sigs])
+                    if np.std(vals) < 1e-6:
+                        continue
+                    win_vals = vals[outcomes == 1]
+                    loss_vals = vals[outcomes == 0]
+                    win_corr = np.corrcoef(vals, outcomes)[0, 1] if len(vals) > 2 else 0
+                    pnl_corr = np.corrcoef(vals, pnl_vals)[0, 1] if len(vals) > 2 else 0
+                    flag = '**' if abs(win_corr) > 0.1 else '  '
+                    print(f"  {comp:<18s} {np.mean(win_vals):<10.3f} {np.mean(loss_vals):<10.3f} "
+                          f"{win_corr:<+10.3f} {pnl_corr:<+10.3f} {flag}")
 
     return metrics, trades, equity_curve
 
