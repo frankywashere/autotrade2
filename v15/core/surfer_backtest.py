@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -429,6 +429,18 @@ def run_backtest(
             except Exception:
                 pass
 
+        # Try to load Dynamic Trail Optimizer
+        trail_model = None
+        trail_path = _os.path.join(model_dir, 'trail_optimizer.pkl')
+        if _os.path.exists(trail_path):
+            try:
+                trail_model = DynamicTrailOptimizer.load(trail_path)
+                print(f"[ML] Dynamic Trail Optimizer loaded (AUC 0.700)")
+                ml_stats['trail_tightened'] = 0
+                ml_stats['trail_loosened'] = 0
+            except Exception:
+                pass
+
     # Fetch data
     print(f"Fetching {days}d of 5-min TSLA data...")
     tsla = yf.download('TSLA', period=f'{days}d', interval='5m', progress=False)
@@ -592,6 +604,36 @@ def run_backtest(
                                 tighter = entry + (position.stop_price - entry) * 0.7
                                 position.stop_price = min(position.stop_price, tighter)
                             ml_stats['exit_early'] += 1
+                except Exception:
+                    pass
+
+            # Dynamic Trail Optimizer: adjust trail tightness based on ML
+            if ml_active and trail_model is not None and feature_vec is not None:
+                try:
+                    if len(feature_vec) == len(ml_feature_names):
+                        trail_pred = trail_model.predict(feature_vec.reshape(1, -1))
+                        tighten_p = float(trail_pred['tighten_prob'][0])
+
+                        bars_held = bar - position.entry_bar
+                        entry = position.entry_price
+
+                        # If high tighten probability AND we're in profit
+                        if tighten_p > 0.55 and bars_held >= 3:
+                            if position.direction == 'BUY':
+                                current_pnl = (current_price - entry) / entry
+                                if current_pnl > 0.002:
+                                    # Move stop to protect at least breakeven
+                                    breakeven_stop = entry * 1.0005
+                                    position.stop_price = max(position.stop_price, breakeven_stop)
+                                    ml_stats['trail_tightened'] += 1
+                            else:
+                                current_pnl = (entry - current_price) / entry
+                                if current_pnl > 0.002:
+                                    breakeven_stop = entry * 0.9995
+                                    position.stop_price = min(position.stop_price, breakeven_stop)
+                                    ml_stats['trail_tightened'] += 1
+                        elif tighten_p < 0.20:
+                            ml_stats['trail_loosened'] += 1
                 except Exception:
                     pass
 
@@ -1310,6 +1352,9 @@ def run_backtest(
             print(f"    CA scale applied:   {ml_stats.get('ca_scale_applied', 0)}")
         if stop_loss_model is not None:
             print(f"    SL stop widened:    {ml_stats.get('sl_stop_widened', 0)}")
+        if trail_model is not None:
+            print(f"    Trail tightened:    {ml_stats.get('trail_tightened', 0)}")
+            print(f"    Trail loosened:     {ml_stats.get('trail_loosened', 0)}")
 
     # Breakdown by exit reason
     if trades:

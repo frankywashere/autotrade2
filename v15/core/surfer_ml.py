@@ -7588,6 +7588,226 @@ class BayesianSignalCombiner:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 20: Dynamic Trail Optimizer
+# ---------------------------------------------------------------------------
+
+class DynamicTrailOptimizer:
+    """
+    Learns optimal trailing stop distance from market conditions.
+
+    Instead of hardcoded trail tightening ratios, this model learns
+    WHEN to tighten vs relax based on current features.
+
+    Output: recommended trail_factor and tighten probability.
+    """
+
+    def __init__(self):
+        self.trail_model = None
+        self.tighten_model = None
+        self.feature_names = None
+        self.trail_feature_names = None
+
+    @staticmethod
+    def derive_trail_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive features for trail optimization."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Momentum features
+        for key in ['price_momentum_3bar', 'price_momentum_12bar',
+                     'rsi_14', 'rsi_5', 'rsi_slope_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trail_{key}')
+
+        # Momentum deceleration
+        pm3_idx = name_to_idx.get('price_momentum_3bar')
+        pm12_idx = name_to_idx.get('price_momentum_12bar')
+        if pm3_idx is not None and pm12_idx is not None:
+            feats.append(X[:, pm3_idx] - X[:, pm12_idx])
+            names.append('trail_momentum_decel')
+
+        # Volatility
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            feats.append(X[:, atr_idx])
+            names.append('trail_atr')
+
+        # Volume
+        for key in ['volume_ratio_20', 'volume_trend_5', 'vol_momentum_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trail_{key}')
+
+        # Channel health
+        for key in ['health_min', 'health_max', 'health_delta_3bar', 'health_delta_6bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trail_{key}')
+
+        # Break probability
+        for key in ['break_prob_max', 'break_prob_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trail_{key}')
+
+        # Entropy
+        for key in ['avg_entropy', 'entropy_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trail_{key}')
+
+        # Position in channel
+        for tf in ['5min', '1h', '4h']:
+            pos_idx = name_to_idx.get(f'{tf}_position_pct')
+            if pos_idx is not None:
+                pos = X[:, pos_idx]
+                feats.append(pos)
+                names.append(f'trail_{tf}_position')
+                feats.append(np.minimum(pos, 1.0 - pos))
+                names.append(f'trail_{tf}_boundary_dist')
+
+        # Direction consensus
+        dc_idx = name_to_idx.get('direction_consensus')
+        if dc_idx is not None:
+            feats.append(X[:, dc_idx])
+            names.append('trail_direction_consensus')
+
+        # Bar characteristics
+        for key in ['bar_range_pct', 'close_position_in_bar',
+                     'consecutive_up_bars', 'consecutive_down_bars']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trail_{key}')
+
+        # VIX
+        vix_idx = name_to_idx.get('vix_level')
+        if vix_idx is not None:
+            feats.append(X[:, vix_idx])
+            names.append('trail_vix')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train trail optimizer on optimal trail targets."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        trail_X_train, self.trail_feature_names = self.derive_trail_features(
+            X_train, feature_names)
+        trail_X_val, _ = self.derive_trail_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        pm3_idx = {n: i for i, n in enumerate(feature_names)}.get('price_momentum_3bar')
+
+        def compute_trail_target(X_data, r5, r20):
+            n = len(X_data)
+            trail = np.full(n, 0.4, dtype=np.float32)
+            if pm3_idx is not None:
+                mom = X_data[:, pm3_idx]
+                cont = ((mom > 0.001) & (r5 > 0.001)) | ((mom < -0.001) & (r5 < -0.001))
+                trail[cont] = 0.7
+                strong_cont = cont & (((mom > 0.001) & (r20 > 0.003)) | ((mom < -0.001) & (r20 < -0.003)))
+                trail[strong_cont] = 0.9
+                reversal = ((mom > 0.001) & (r5 < -0.002)) | ((mom < -0.001) & (r5 > 0.002))
+                trail[reversal] = 0.15
+                strong_rev = reversal & (np.abs(r5) > 0.005)
+                trail[strong_rev] = 0.08
+            return trail
+
+        trail_train = compute_trail_target(X_train, ret5, ret20)
+        trail_val = compute_trail_target(X_val, ret5_val, ret20_val)
+        tighten_train = (trail_train < 0.3).astype(np.float32)
+        tighten_val = (trail_val < 0.3).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Trail features: {len(self.trail_feature_names)}")
+        print(f"  Tighten rate: {tighten_train.mean():.1%}")
+
+        # Trail regressor
+        print("  Training trail factor regressor...")
+        dtrain = lgb.Dataset(trail_X_train, label=trail_train, feature_name=self.trail_feature_names)
+        dval = lgb.Dataset(trail_X_val, label=trail_val, feature_name=self.trail_feature_names, reference=dtrain)
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+
+        self.trail_model = lgb.train(
+            {'objective': 'regression', 'metric': 'mae', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        trail_pred = self.trail_model.predict(trail_X_val)
+        metrics['trail_mae'] = float(np.mean(np.abs(trail_pred - trail_val)))
+        metrics['trail_corr'] = float(np.corrcoef(trail_pred, trail_val)[0, 1])
+        print(f"    Trail MAE: {metrics['trail_mae']:.3f}, Corr: {metrics['trail_corr']:.3f}")
+
+        # Tighten classifier
+        print("  Training tighten classifier...")
+        dtrain2 = lgb.Dataset(trail_X_train, label=tighten_train, feature_name=self.trail_feature_names)
+        dval2 = lgb.Dataset(trail_X_val, label=tighten_val, feature_name=self.trail_feature_names, reference=dtrain2)
+
+        self.tighten_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain2, num_boost_round=500, valid_sets=[dval2], callbacks=callbacks)
+
+        tighten_pred = self.tighten_model.predict(trail_X_val)
+        metrics['tighten_auc'] = float(roc_auc_score(tighten_val, tighten_pred))
+        print(f"    Tighten AUC: {metrics['tighten_auc']:.3f}")
+
+        imp = self.trail_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 trail features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.trail_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.trail_model is None:
+            return {}
+        trail_X, _ = self.derive_trail_features(X, self.feature_names)
+        return {
+            'trail_factor': np.clip(self.trail_model.predict(trail_X), 0.05, 1.0),
+            'tighten_prob': self.tighten_model.predict(trail_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'trail_model': self.trail_model, 'tighten_model': self.tighten_model,
+                'feature_names': self.feature_names, 'trail_feature_names': self.trail_feature_names,
+            }, f)
+        print(f"  Saved DynamicTrailOptimizer to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'DynamicTrailOptimizer':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.trail_model = data['trail_model']
+        model.tighten_model = data['tighten_model']
+        model.feature_names = data['feature_names']
+        model.trail_feature_names = data['trail_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -8216,7 +8436,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -8403,6 +8623,13 @@ def main():
                 )
                 bay.save(os.path.join(args.output, 'bayesian_combiner.pkl'))
                 print(f"\n  Bayesian Combiner metrics: {bay_metrics}")
+            elif args.arch == 'trail':
+                trail = DynamicTrailOptimizer()
+                trail_metrics = trail.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                trail.save(os.path.join(args.output, 'trail_optimizer.pkl'))
+                print(f"\n  Trail Optimizer metrics: {trail_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
