@@ -4053,6 +4053,542 @@ class CVEnsembleModel:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 10: Physics-Residual Correction Model
+# ---------------------------------------------------------------------------
+
+class PhysicsResidualModel:
+    """
+    Learns WHEN physics is wrong.
+
+    Instead of predicting raw labels, this model predicts the residual between
+    what physics implies and actual outcomes. It answers:
+    - "Will this physics signal produce a winning trade?" (binary)
+    - "How much should we adjust the confidence?" (regression)
+    - "Is the physics break direction prediction correct?" (binary)
+
+    The key insight: the physics features (position_pct, momentum, break_prob,
+    channel_health, binding_energy) encode an *implicit* prediction. We derive
+    that prediction, compare to actual labels, and train on the ERROR.
+
+    This is a correction model, not a replacement.
+    """
+
+    def __init__(self):
+        self.models = {}
+        self.feature_names = None
+        self.augmented_names = None
+        self.physics_stats = {}  # Calibration stats
+
+    @staticmethod
+    def derive_physics_prediction(X: np.ndarray, feature_names: List[str]) -> Dict[str, np.ndarray]:
+        """
+        Derive the implicit physics prediction from feature vectors.
+
+        For each sample, compute what the physics engine *would suggest*
+        based on the raw physics features (position, momentum, break probs, etc.)
+        """
+        idx = {name: i for i, name in enumerate(feature_names)}
+        n = len(X)
+
+        implied_action = np.zeros(n, dtype=int)  # 0=hold, 1=buy, 2=sell
+        implied_confidence = np.zeros(n)
+        implied_break_dir = np.zeros(n, dtype=int)  # 0=survive, 1=up, 2=down
+        implied_lifetime = np.zeros(n)
+
+        for i in range(n):
+            x = X[i]
+
+            # --- Implied action from multi-TF position + momentum ---
+            buy_score = 0.0
+            sell_score = 0.0
+            tf_count = 0
+
+            for tf in ML_TFS:
+                pos_key = f'{tf}_position_pct'
+                mom_key = f'{tf}_momentum_direction'
+                health_key = f'{tf}_channel_health'
+
+                if pos_key in idx and mom_key in idx and health_key in idx:
+                    pos = x[idx[pos_key]]
+                    mom = x[idx[mom_key]]
+                    health = x[idx[health_key]]
+                    tf_count += 1
+
+                    # Near channel bottom with upward momentum → buy signal
+                    if pos < 0.25 and mom > 0:
+                        buy_score += health
+                    elif pos < 0.15:  # Very near bottom regardless of momentum
+                        buy_score += health * 0.5
+
+                    # Near channel top with downward momentum → sell signal
+                    if pos > 0.75 and mom < 0:
+                        sell_score += health
+                    elif pos > 0.85:  # Very near top
+                        sell_score += health * 0.5
+
+            if tf_count > 0:
+                buy_score /= tf_count
+                sell_score /= tf_count
+
+            if buy_score > sell_score + 0.1:
+                implied_action[i] = 1  # BUY
+            elif sell_score > buy_score + 0.1:
+                implied_action[i] = 2  # SELL
+            # else: HOLD
+
+            # --- Implied confidence from health + binding energy ---
+            healths = []
+            bindings = []
+            for tf in ML_TFS:
+                hk = f'{tf}_channel_health'
+                bk = f'{tf}_binding_energy'
+                if hk in idx:
+                    healths.append(x[idx[hk]])
+                if bk in idx:
+                    bindings.append(x[idx[bk]])
+
+            avg_health = np.mean(healths) if healths else 0.5
+            avg_binding = np.mean(bindings) if bindings else 0.5
+            implied_confidence[i] = np.clip(
+                avg_health * 0.6 + np.clip(avg_binding, 0, 1) * 0.4, 0, 1
+            )
+
+            # --- Implied break direction from break_prob_up/down ---
+            bp_ups = []
+            bp_downs = []
+            for tf in ML_TFS:
+                up_key = f'{tf}_break_prob_up'
+                dn_key = f'{tf}_break_prob_down'
+                if up_key in idx:
+                    bp_ups.append(x[idx[up_key]])
+                if dn_key in idx:
+                    bp_downs.append(x[idx[dn_key]])
+
+            avg_bp_up = np.mean(bp_ups) if bp_ups else 0.0
+            avg_bp_down = np.mean(bp_downs) if bp_downs else 0.0
+
+            if avg_bp_up > avg_bp_down + 0.03:
+                implied_break_dir[i] = 1
+            elif avg_bp_down > avg_bp_up + 0.03:
+                implied_break_dir[i] = 2
+            # else: survive (0)
+
+            # --- Implied lifetime from OU half-life ---
+            half_lives = []
+            for tf in ML_TFS:
+                hl_key = f'{tf}_ou_half_life'
+                if hl_key in idx:
+                    hl = x[idx[hl_key]]
+                    if 0 < hl < 500:  # Sanity check
+                        half_lives.append(hl)
+            implied_lifetime[i] = np.mean(half_lives) if half_lives else 30.0
+
+        return {
+            'implied_action': implied_action,
+            'implied_confidence': implied_confidence,
+            'implied_break_dir': implied_break_dir,
+            'implied_lifetime': implied_lifetime,
+        }
+
+    @staticmethod
+    def compute_residual_targets(
+        physics_preds: Dict[str, np.ndarray],
+        Y: Dict[str, np.ndarray],
+    ) -> Dict[str, np.ndarray]:
+        """
+        Compute residual targets: how wrong was physics?
+
+        Returns binary correctness + regression corrections.
+        """
+        n = len(Y['optimal_action'])
+        actual_action = Y['optimal_action'].astype(int)
+        actual_bd = Y['break_direction'].astype(int)
+        actual_lifetime = Y['channel_lifetime']
+
+        # 1. Action correctness (binary: was physics right?)
+        action_correct = (physics_preds['implied_action'] == actual_action).astype(float)
+
+        # 2. Break direction correctness (binary)
+        bd_correct = (physics_preds['implied_break_dir'] == actual_bd).astype(float)
+
+        # 3. Lifetime error (actual - predicted)
+        # Positive = physics underestimated lifetime (channel lasted longer)
+        # Negative = physics overestimated (channel broke sooner)
+        lifetime_error = actual_lifetime - physics_preds['implied_lifetime']
+
+        # 4. Confidence scale: how much to multiply physics confidence
+        # If physics was right AND future return is big → scale > 1
+        # If physics was wrong → scale < 1
+        confidence_scale = np.ones(n)
+        for i in range(n):
+            if action_correct[i]:
+                # Physics was right — scale up proportionally to return magnitude
+                ret_mag = abs(Y['future_return_20'][i])
+                confidence_scale[i] = 1.0 + min(ret_mag * 10, 0.5)  # 1.0 to 1.5
+            else:
+                # Physics was wrong — scale down
+                ret_mag = abs(Y['future_return_20'][i])
+                confidence_scale[i] = max(0.3, 1.0 - min(ret_mag * 10, 0.7))  # 0.3 to 1.0
+
+        return {
+            'action_correct': action_correct,
+            'bd_correct': bd_correct,
+            'lifetime_error': lifetime_error,
+            'confidence_scale': confidence_scale,
+        }
+
+    @staticmethod
+    def augment_features(
+        X: np.ndarray,
+        physics_preds: Dict[str, np.ndarray],
+        feature_names: List[str],
+    ) -> Tuple[np.ndarray, List[str]]:
+        """
+        Augment features with physics prediction + derived residual features.
+
+        Adds:
+        - Raw physics predictions (action, confidence, break_dir, lifetime)
+        - Cross-term features (confidence × health, action × momentum, etc.)
+        - Physics disagreement features (when TFs disagree on action)
+        """
+        idx = {name: i for i, name in enumerate(feature_names)}
+        n = len(X)
+
+        # Physics prediction features
+        phys_feats = np.column_stack([
+            physics_preds['implied_action'].astype(float),
+            physics_preds['implied_confidence'],
+            physics_preds['implied_break_dir'].astype(float),
+            physics_preds['implied_lifetime'],
+        ])
+        phys_names = [
+            'phys_implied_action', 'phys_implied_confidence',
+            'phys_implied_break_dir', 'phys_implied_lifetime',
+        ]
+
+        # Cross-term features: physics prediction × key feature interactions
+        cross_feats = []
+        cross_names = []
+
+        # Confidence × break_prob_max (how confident physics is vs how likely break is)
+        if 'break_prob_max' in idx:
+            bp_max = X[:, idx['break_prob_max']]
+            cross_feats.append(physics_preds['implied_confidence'] * bp_max)
+            cross_names.append('phys_conf_x_bp_max')
+
+        # Confidence × avg entropy (high entropy + high confidence = suspicious)
+        if 'avg_entropy' in idx:
+            entropy = X[:, idx['avg_entropy']]
+            cross_feats.append(physics_preds['implied_confidence'] * entropy)
+            cross_names.append('phys_conf_x_entropy')
+
+        # Confidence × health spread (disagreement across TFs)
+        if 'health_spread' in idx:
+            h_spread = X[:, idx['health_spread']]
+            cross_feats.append(physics_preds['implied_confidence'] * h_spread)
+            cross_names.append('phys_conf_x_health_spread')
+
+        # Action direction × direction_consensus
+        if 'direction_consensus' in idx:
+            dc = X[:, idx['direction_consensus']]
+            cross_feats.append(physics_preds['implied_action'].astype(float) * dc)
+            cross_names.append('phys_action_x_dir_consensus')
+
+        # Lifetime × break_prob_weighted
+        if 'break_prob_weighted' in idx:
+            bp_w = X[:, idx['break_prob_weighted']]
+            cross_feats.append(physics_preds['implied_lifetime'] * bp_w)
+            cross_names.append('phys_lifetime_x_bp_weighted')
+
+        # Per-TF disagreement features
+        # How many TFs agree with the implied action
+        tf_agreement_count = np.zeros(n)
+        for tf in ML_TFS:
+            pos_key = f'{tf}_position_pct'
+            mom_key = f'{tf}_momentum_direction'
+            if pos_key in idx and mom_key in idx:
+                pos = X[:, idx[pos_key]]
+                mom = X[:, idx[mom_key]]
+                tf_buy = ((pos < 0.25) & (mom > 0)).astype(float)
+                tf_sell = ((pos > 0.75) & (mom < 0)).astype(float)
+                agrees = np.where(
+                    physics_preds['implied_action'] == 1,
+                    tf_buy,
+                    np.where(physics_preds['implied_action'] == 2, tf_sell, 0.0),
+                )
+                tf_agreement_count += agrees
+
+        cross_feats.append(tf_agreement_count)
+        cross_names.append('phys_tf_agreement_count')
+
+        # Stack all augmented features
+        if cross_feats:
+            cross_array = np.column_stack(cross_feats)
+            aug_X = np.hstack([X, phys_feats, cross_array])
+            aug_names = feature_names + phys_names + cross_names
+        else:
+            aug_X = np.hstack([X, phys_feats])
+            aug_names = feature_names + phys_names
+
+        return aug_X, aug_names
+
+    def train(
+        self,
+        X_train: np.ndarray, Y_train: Dict[str, np.ndarray],
+        X_val: np.ndarray, Y_val: Dict[str, np.ndarray],
+        feature_names: List[str],
+    ) -> Dict[str, float]:
+        """Train the physics-residual correction models."""
+        import lightgbm as lgb
+
+        self.feature_names = feature_names
+        metrics = {}
+
+        # Step 1: Derive physics predictions
+        print("\n  Deriving physics predictions from features...")
+        train_phys = self.derive_physics_prediction(X_train, feature_names)
+        val_phys = self.derive_physics_prediction(X_val, feature_names)
+
+        # Physics baseline stats
+        train_actual_action = Y_train['optimal_action'].astype(int)
+        val_actual_action = Y_val['optimal_action'].astype(int)
+
+        train_phys_acc = np.mean(train_phys['implied_action'] == train_actual_action)
+        val_phys_acc = np.mean(val_phys['implied_action'] == val_actual_action)
+        print(f"  Physics baseline action accuracy: train={train_phys_acc:.1%}, val={val_phys_acc:.1%}")
+
+        train_phys_bd = np.mean(train_phys['implied_break_dir'] == Y_train['break_direction'].astype(int))
+        val_phys_bd = np.mean(val_phys['implied_break_dir'] == Y_val['break_direction'].astype(int))
+        print(f"  Physics baseline BD accuracy: train={train_phys_bd:.1%}, val={val_phys_bd:.1%}")
+
+        metrics['physics_action_acc'] = float(val_phys_acc)
+        metrics['physics_bd_acc'] = float(val_phys_bd)
+
+        self.physics_stats = {
+            'train_action_acc': float(train_phys_acc),
+            'val_action_acc': float(val_phys_acc),
+            'train_bd_acc': float(train_phys_bd),
+            'val_bd_acc': float(val_phys_bd),
+        }
+
+        # Step 2: Compute residual targets
+        print("  Computing residual targets...")
+        train_residuals = self.compute_residual_targets(train_phys, Y_train)
+        val_residuals = self.compute_residual_targets(val_phys, Y_val)
+
+        action_correct_rate = train_residuals['action_correct'].mean()
+        print(f"  Physics action correct rate: {action_correct_rate:.1%}")
+        print(f"  Avg confidence scale: {train_residuals['confidence_scale'].mean():.3f}")
+        print(f"  Avg lifetime error: {train_residuals['lifetime_error'].mean():.1f} bars")
+
+        # Step 3: Augment features
+        print("  Augmenting features with physics predictions...")
+        X_train_aug, aug_names = self.augment_features(X_train, train_phys, feature_names)
+        X_val_aug, _ = self.augment_features(X_val, val_phys, feature_names)
+        self.augmented_names = aug_names
+        print(f"  Augmented features: {len(aug_names)} ({len(feature_names)} base + {len(aug_names) - len(feature_names)} new)")
+
+        # Step 4: Train models on residual targets
+
+        # 4a: Action correctness (binary: will physics signal be right?)
+        print("\n  Training: action_correct (binary, will physics be right?)...")
+        y_train = train_residuals['action_correct']
+        y_val = val_residuals['action_correct']
+        train_ds = lgb.Dataset(X_train_aug, label=y_train, feature_name=aug_names)
+        val_ds = lgb.Dataset(X_val_aug, label=y_val, feature_name=aug_names, reference=train_ds)
+
+        params = {
+            'objective': 'binary', 'metric': 'auc',
+            'num_leaves': 24, 'learning_rate': 0.05,
+            'min_child_samples': 10, 'feature_fraction': 0.8,
+            'bagging_fraction': 0.9, 'bagging_freq': 5,
+            'verbose': -1,
+        }
+        model = lgb.train(
+            params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['action_correct'] = model
+
+        val_pred_prob = model.predict(X_val_aug)
+        val_pred = (val_pred_prob > 0.5).astype(int)
+        acc = np.mean(val_pred == y_val)
+        metrics['action_correct_acc'] = float(acc)
+        print(f"    Val accuracy: {acc:.1%}")
+
+        # When model says "physics is right" (>0.7), what's actual correctness?
+        high_conf = val_pred_prob > 0.7
+        if high_conf.sum() > 5:
+            high_conf_acc = np.mean(y_val[high_conf] == 1)
+            metrics['action_correct_high_conf'] = float(high_conf_acc)
+            metrics['action_correct_high_conf_coverage'] = float(high_conf.mean())
+            print(f"    High-confidence (>0.7) accuracy: {high_conf_acc:.1%} "
+                  f"(coverage: {high_conf.mean():.1%})")
+
+        # When model says "physics is wrong" (<0.3), what's actual correctness?
+        low_conf = val_pred_prob < 0.3
+        if low_conf.sum() > 5:
+            low_conf_err = np.mean(y_val[low_conf] == 0)
+            metrics['action_wrong_low_conf'] = float(low_conf_err)
+            metrics['action_wrong_low_conf_coverage'] = float(low_conf.mean())
+            print(f"    Low-confidence (<0.3) error rate: {low_conf_err:.1%} "
+                  f"(coverage: {low_conf.mean():.1%})")
+
+        # 4b: Break direction correctness
+        print("\n  Training: bd_correct (binary, will physics BD be right?)...")
+        y_train = train_residuals['bd_correct']
+        y_val = val_residuals['bd_correct']
+        train_ds = lgb.Dataset(X_train_aug, label=y_train, feature_name=aug_names)
+        val_ds = lgb.Dataset(X_val_aug, label=y_val, feature_name=aug_names, reference=train_ds)
+
+        model = lgb.train(
+            params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['bd_correct'] = model
+
+        val_pred_prob = model.predict(X_val_aug)
+        val_pred = (val_pred_prob > 0.5).astype(int)
+        acc = np.mean(val_pred == y_val)
+        metrics['bd_correct_acc'] = float(acc)
+        print(f"    Val accuracy: {acc:.1%}")
+
+        # 4c: Confidence scale (regression: how much to adjust)
+        print("\n  Training: confidence_scale (regression, adjustment factor)...")
+        y_train = train_residuals['confidence_scale']
+        y_val = val_residuals['confidence_scale']
+        train_ds = lgb.Dataset(X_train_aug, label=y_train, feature_name=aug_names)
+        val_ds = lgb.Dataset(X_val_aug, label=y_val, feature_name=aug_names, reference=train_ds)
+
+        reg_params = {
+            'objective': 'mae', 'metric': 'mae',
+            'num_leaves': 24, 'learning_rate': 0.05,
+            'min_child_samples': 10, 'feature_fraction': 0.8,
+            'verbose': -1,
+        }
+        model = lgb.train(
+            reg_params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['confidence_scale'] = model
+
+        val_pred = model.predict(X_val_aug)
+        mae = np.mean(np.abs(val_pred - y_val))
+        metrics['confidence_scale_mae'] = float(mae)
+        print(f"    Val MAE: {mae:.4f}")
+        print(f"    Val pred range: [{val_pred.min():.3f}, {val_pred.max():.3f}]")
+        print(f"    Val actual range: [{y_val.min():.3f}, {y_val.max():.3f}]")
+
+        # 4d: Lifetime error (regression)
+        print("\n  Training: lifetime_error (regression, actual - predicted)...")
+        y_train = train_residuals['lifetime_error']
+        y_val = val_residuals['lifetime_error']
+        train_ds = lgb.Dataset(X_train_aug, label=y_train, feature_name=aug_names)
+        val_ds = lgb.Dataset(X_val_aug, label=y_val, feature_name=aug_names, reference=train_ds)
+
+        model = lgb.train(
+            reg_params, train_ds, num_boost_round=400,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=40), lgb.log_evaluation(0)],
+        )
+        self.models['lifetime_error'] = model
+
+        val_pred = model.predict(X_val_aug)
+        mae = np.mean(np.abs(val_pred - y_val))
+        metrics['lifetime_error_mae'] = float(mae)
+        print(f"    Val MAE: {mae:.1f} bars")
+
+        # Corrected lifetime accuracy: physics_lifetime + predicted_error vs actual
+        corrected_lifetime = val_phys['implied_lifetime'] + val_pred
+        raw_mae = np.mean(np.abs(val_phys['implied_lifetime'] - Y_val['channel_lifetime']))
+        corrected_mae = np.mean(np.abs(corrected_lifetime - Y_val['channel_lifetime']))
+        metrics['raw_lifetime_mae'] = float(raw_mae)
+        metrics['corrected_lifetime_mae'] = float(corrected_mae)
+        improvement = (raw_mae - corrected_mae) / raw_mae * 100
+        metrics['lifetime_improvement_pct'] = float(improvement)
+        print(f"    Raw physics lifetime MAE: {raw_mae:.1f} bars")
+        print(f"    Corrected lifetime MAE: {corrected_mae:.1f} bars "
+              f"({improvement:+.1f}% improvement)")
+
+        # Feature importance (from action_correct model, most impactful)
+        imp = self.models['action_correct'].feature_importance(importance_type='gain')
+        sorted_idx = np.argsort(imp)[::-1]
+        print("\n  Top 15 features for predicting physics correctness:")
+        for rank, i in enumerate(sorted_idx[:15]):
+            print(f"    {rank+1}. {aug_names[i]}: {imp[i]:.0f}")
+
+        self.feature_importance = [(aug_names[i], float(imp[i])) for i in sorted_idx]
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Predict physics residuals.
+
+        Returns:
+            action_trustworthy: P(physics action is correct) [0, 1]
+            bd_trustworthy: P(physics BD prediction is correct) [0, 1]
+            confidence_scale: multiply physics confidence by this [0.3, 1.5]
+            lifetime_correction: add to physics lifetime estimate
+        """
+        # Derive physics predictions
+        physics_preds = self.derive_physics_prediction(X, self.feature_names)
+
+        # Augment features
+        X_aug, _ = self.augment_features(X, physics_preds, self.feature_names)
+
+        results = {}
+
+        if 'action_correct' in self.models:
+            results['action_trustworthy'] = self.models['action_correct'].predict(X_aug)
+
+        if 'bd_correct' in self.models:
+            results['bd_trustworthy'] = self.models['bd_correct'].predict(X_aug)
+
+        if 'confidence_scale' in self.models:
+            raw_scale = self.models['confidence_scale'].predict(X_aug)
+            results['confidence_scale'] = np.clip(raw_scale, 0.3, 1.5)
+
+        if 'lifetime_error' in self.models:
+            results['lifetime_correction'] = self.models['lifetime_error'].predict(X_aug)
+
+        # Also pass through derived physics predictions for backtest use
+        results['implied_action'] = physics_preds['implied_action']
+        results['implied_confidence'] = physics_preds['implied_confidence']
+        results['implied_break_dir'] = physics_preds['implied_break_dir']
+        results['implied_lifetime'] = physics_preds['implied_lifetime']
+
+        return results
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'models': self.models,
+                'feature_names': self.feature_names,
+                'augmented_names': self.augmented_names,
+                'physics_stats': self.physics_stats,
+                'feature_importance': getattr(self, 'feature_importance', []),
+            }, f)
+        print(f"  Saved PhysicsResidualModel to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'PhysicsResidualModel':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.models = data['models']
+        model.feature_names = data['feature_names']
+        model.augmented_names = data.get('augmented_names')
+        model.physics_stats = data.get('physics_stats', {})
+        model.feature_importance = data.get('feature_importance', [])
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -4505,6 +5041,60 @@ def train_all_architectures(
         traceback.print_exc()
         all_results['cv_ensemble'] = {'error': str(e)}
 
+    # ---- Architecture 10: Physics-Residual Correction ----
+    print("\n" + "=" * 70)
+    print("ARCHITECTURE 10: Physics-Residual Correction Model")
+    print("=" * 70)
+
+    try:
+        residual_model = PhysicsResidualModel()
+        res_metrics = residual_model.train(
+            X_train, Y_train_dict, X_val, Y_val_dict, feature_names,
+        )
+        residual_model.save(os.path.join(output_dir, 'physics_residual_model.pkl'))
+
+        # Test evaluation
+        res_test = residual_model.predict(X_test)
+
+        if 'action_trustworthy' in res_test:
+            # When model is confident physics is right, is it actually right?
+            test_phys = PhysicsResidualModel.derive_physics_prediction(X_test, feature_names)
+            test_action_correct = (test_phys['implied_action'] == Y_test_dict['optimal_action'].astype(int))
+
+            high_trust = res_test['action_trustworthy'] > 0.7
+            if high_trust.sum() > 5:
+                res_metrics['test_high_trust_acc'] = float(np.mean(test_action_correct[high_trust]))
+                res_metrics['test_high_trust_coverage'] = float(high_trust.mean())
+                print(f"\n  Test high-trust accuracy: {res_metrics['test_high_trust_acc']:.1%} "
+                      f"(coverage: {res_metrics['test_high_trust_coverage']:.1%})")
+
+            low_trust = res_test['action_trustworthy'] < 0.3
+            if low_trust.sum() > 5:
+                res_metrics['test_low_trust_err'] = float(np.mean(~test_action_correct[low_trust]))
+                res_metrics['test_low_trust_coverage'] = float(low_trust.mean())
+                print(f"  Test low-trust error rate: {res_metrics['test_low_trust_err']:.1%} "
+                      f"(coverage: {res_metrics['test_low_trust_coverage']:.1%})")
+
+            # Overall test: does corrected confidence improve trade quality?
+            res_metrics['test_action_correct_rate'] = float(test_action_correct.mean())
+
+            test_bd_correct = (test_phys['implied_break_dir'] == Y_test_dict['break_direction'].astype(int))
+            high_bd_trust = res_test['bd_trustworthy'] > 0.7
+            if high_bd_trust.sum() > 5:
+                res_metrics['test_bd_high_trust_acc'] = float(np.mean(test_bd_correct[high_bd_trust]))
+                res_metrics['test_bd_high_trust_coverage'] = float(high_bd_trust.mean())
+                print(f"  Test BD high-trust accuracy: {res_metrics['test_bd_high_trust_acc']:.1%} "
+                      f"(coverage: {res_metrics['test_bd_high_trust_coverage']:.1%})")
+
+        print(f"\n  Test physics action correct rate: {res_metrics.get('test_action_correct_rate', 'N/A')}")
+
+        all_results['physics_residual'] = res_metrics
+    except Exception as e:
+        print(f"  Physics Residual failed: {e}")
+        import traceback
+        traceback.print_exc()
+        all_results['physics_residual'] = {'error': str(e)}
+
     # ---- Compare ----
     print("\n" + "=" * 70)
     print("ARCHITECTURE COMPARISON")
@@ -4589,7 +5179,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -4704,6 +5294,13 @@ def main():
                 cv_metrics = cv.train(X, Y, feature_names)
                 cv.save(os.path.join(args.output, 'cv_ensemble_model.pkl'))
                 print(f"\n  CV Ensemble metrics: {cv_metrics}")
+            elif args.arch == 'physics_residual':
+                residual = PhysicsResidualModel()
+                res_metrics = residual.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                residual.save(os.path.join(args.output, 'physics_residual_model.pkl'))
+                print(f"\n  Physics Residual metrics: {res_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

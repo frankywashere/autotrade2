@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -325,6 +325,19 @@ def run_backtest(
                 print(f"[ML] CV Ensemble loaded ({cv_ensemble_model.N_FOLDS}-fold)")
                 ml_stats['cv_high_consensus'] = 0
                 ml_stats['cv_low_consensus'] = 0
+            except Exception:
+                pass
+
+        # Try to load Physics-Residual model
+        residual_model = None
+        res_path = _os.path.join(model_dir, 'physics_residual_model.pkl')
+        if _os.path.exists(res_path):
+            try:
+                residual_model = PhysicsResidualModel.load(res_path)
+                print(f"[ML] Physics-Residual model loaded")
+                ml_stats['residual_boosted'] = 0
+                ml_stats['residual_penalized'] = 0
+                ml_stats['residual_lifetime_adj'] = 0
             except Exception:
                 pass
 
@@ -807,6 +820,30 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Physics-Residual: correct confidence + lifetime using residuals
+                    if residual_model is not None:
+                        try:
+                            res_pred = residual_model.predict(feature_vec.reshape(1, -1))
+
+                            # Confidence scale: direct multiplier from residual model
+                            if 'confidence_scale' in res_pred:
+                                conf_scale = float(res_pred['confidence_scale'][0])
+                                sig.confidence *= conf_scale
+                                if conf_scale > 1.0:
+                                    ml_stats['residual_boosted'] += 1
+                                elif conf_scale < 0.9:
+                                    ml_stats['residual_penalized'] += 1
+
+                            # Lifetime correction: adjust max hold time
+                            if 'lifetime_correction' in res_pred and ml_max_hold is not None:
+                                lt_corr = float(res_pred['lifetime_correction'][0])
+                                corrected_hold = max(6, int(ml_max_hold + lt_corr * 0.3))
+                                if corrected_hold != ml_max_hold:
+                                    ml_max_hold = corrected_hold
+                                    ml_stats['residual_lifetime_adj'] += 1
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -1014,6 +1051,10 @@ def run_backtest(
         if cv_ensemble_model is not None:
             print(f"    CV high consensus:  {ml_stats.get('cv_high_consensus', 0)}")
             print(f"    CV low consensus:   {ml_stats.get('cv_low_consensus', 0)}")
+        if residual_model is not None:
+            print(f"    Residual boosted:   {ml_stats.get('residual_boosted', 0)}")
+            print(f"    Residual penalized: {ml_stats.get('residual_penalized', 0)}")
+            print(f"    Residual life adj:  {ml_stats.get('residual_lifetime_adj', 0)}")
 
     # Breakdown by exit reason
     if trades:
