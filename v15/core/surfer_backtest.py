@@ -628,20 +628,98 @@ def run_backtest(
     return metrics, trades, equity_curve
 
 
+def run_walk_forward(eval_interval: int = 3, max_hold_bars: int = 60,
+                      min_confidence: float = 0.45):
+    """
+    Walk-forward validation: run 60-day backtest, split trades into
+    in-sample (first 40 days) and out-of-sample (last 20 days).
+    Compares metrics side by side.
+    """
+    metrics, trades, equity_curve = run_backtest(
+        days=60, eval_interval=eval_interval,
+        max_hold_bars=max_hold_bars, min_confidence=min_confidence,
+    )
+
+    if not trades:
+        print("No trades to analyze")
+        return
+
+    # Split by entry bar — first 2/3 of bars = IS, last 1/3 = OOS
+    total_bars = max(t.exit_bar for t in trades)
+    split_bar = int(total_bars * 2 / 3)
+
+    is_trades = [t for t in trades if t.entry_bar < split_bar]
+    oos_trades = [t for t in trades if t.entry_bar >= split_bar]
+
+    def summarize(label, tlist):
+        if not tlist:
+            print(f"\n  {label}: No trades")
+            return
+        wins = sum(1 for t in tlist if t.pnl > 0)
+        total_pnl = sum(t.pnl for t in tlist)
+        gross_win = sum(t.pnl for t in tlist if t.pnl > 0)
+        gross_loss = abs(sum(t.pnl for t in tlist if t.pnl <= 0))
+        pf = gross_win / gross_loss if gross_loss > 0 else float('inf')
+        avg_win = np.mean([t.pnl_pct for t in tlist if t.pnl > 0]) if wins > 0 else 0
+        avg_loss = np.mean([t.pnl_pct for t in tlist if t.pnl <= 0]) if len(tlist) - wins > 0 else 0
+        bounce = [t for t in tlist if t.signal_type == 'bounce']
+        brk = [t for t in tlist if t.signal_type == 'break']
+        bounce_wr = sum(1 for t in bounce if t.pnl > 0) / len(bounce) if bounce else 0
+        brk_wr = sum(1 for t in brk if t.pnl > 0) / len(brk) if brk else 0
+        print(f"\n  {label}:")
+        print(f"    Trades: {len(tlist)} | WR: {wins/len(tlist):.0%} | PF: {pf:.2f} | "
+              f"P&L: ${total_pnl:,.0f} | Exp: ${total_pnl/len(tlist):.1f}/trade")
+        print(f"    Avg Win: {avg_win:.2%} | Avg Loss: {avg_loss:.2%}")
+        print(f"    Bounce: {len(bounce)} trades, {bounce_wr:.0%} WR | "
+              f"Break: {len(brk)} trades, {brk_wr:.0%} WR")
+
+    print(f"\n{'='*60}")
+    print(f"WALK-FORWARD VALIDATION (split at bar {split_bar}/{total_bars})")
+    print(f"{'='*60}")
+    summarize("IN-SAMPLE (first ~40 days)", is_trades)
+    summarize("OUT-OF-SAMPLE (last ~20 days)", oos_trades)
+
+    # Stability metrics
+    if is_trades and oos_trades:
+        is_wr = sum(1 for t in is_trades if t.pnl > 0) / len(is_trades)
+        oos_wr = sum(1 for t in oos_trades if t.pnl > 0) / len(oos_trades)
+        is_exp = sum(t.pnl for t in is_trades) / len(is_trades)
+        oos_exp = sum(t.pnl for t in oos_trades) / len(oos_trades)
+        wr_decay = (oos_wr - is_wr) / is_wr if is_wr > 0 else 0
+        exp_decay = (oos_exp - is_exp) / is_exp if is_exp > 0 else 0
+        print(f"\n  Stability:")
+        print(f"    WR decay: {wr_decay:+.0%} (IS→OOS)")
+        print(f"    Exp decay: {exp_decay:+.0%} (IS→OOS)")
+        if abs(wr_decay) < 0.15 and abs(exp_decay) < 0.40:
+            print(f"    ✅ Strategy appears STABLE out-of-sample")
+        elif abs(wr_decay) < 0.25:
+            print(f"    ⚠️  Moderate OOS degradation — monitor closely")
+        else:
+            print(f"    ❌ Significant OOS degradation — possible overfit")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Channel Surfer Backtest')
     parser.add_argument('--days', type=int, default=30, help='Days of 5min data')
     parser.add_argument('--eval-interval', type=int, default=6, help='Bars between evaluations')
     parser.add_argument('--max-hold', type=int, default=60, help='Max bars to hold')
     parser.add_argument('--min-conf', type=float, default=0.45, help='Minimum signal confidence')
+    parser.add_argument('--walk-forward', action='store_true', help='Run walk-forward validation')
     args = parser.parse_args()
 
-    run_backtest(
-        days=args.days,
-        eval_interval=args.eval_interval,
-        max_hold_bars=args.max_hold,
-        min_confidence=args.min_conf,
-    )
+    if args.walk_forward:
+        run_walk_forward(
+            eval_interval=args.eval_interval,
+            max_hold_bars=args.max_hold,
+            min_confidence=args.min_conf,
+        )
+    else:
+        run_backtest(
+            days=args.days,
+            eval_interval=args.eval_interval,
+            max_hold_bars=args.max_hold,
+            min_confidence=args.min_conf,
+        )
 
 
 if __name__ == '__main__':
