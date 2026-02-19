@@ -59,6 +59,9 @@ class TFChannelState:
     break_prob_down: float = 0.0     # Probability of downward break
     # Volume
     volume_score: float = 0.5        # Volume confirmation (0-1)
+    # Momentum turn
+    momentum_turn_score: float = 0.5 # Momentum deceleration at boundary (0-1)
+    momentum_is_turning: bool = False # Is momentum turning around?
 
 
 @dataclass
@@ -383,6 +386,57 @@ def estimate_break_probability(
 # ---------------------------------------------------------------------------
 # Volume Analysis
 # ---------------------------------------------------------------------------
+
+def compute_momentum_turn(
+    prices: np.ndarray,
+    lookback: int = 10,
+) -> Tuple[float, bool]:
+    """
+    Detect if momentum is turning at current position.
+
+    Computes rate-of-change of rate-of-change (acceleration).
+    At channel boundaries, we want deceleration (momentum turning back toward center).
+
+    Returns:
+        (turn_score, is_decelerating) where:
+        - turn_score: 0-1 (1 = strong momentum turn, 0 = accelerating away)
+        - is_decelerating: True if momentum is slowing down
+    """
+    if len(prices) < lookback + 2:
+        return 0.5, False
+
+    recent = prices[-(lookback + 2):]
+
+    # ROC (momentum)
+    roc = np.diff(recent) / recent[:-1]
+    if len(roc) < 3:
+        return 0.5, False
+
+    # Rate of change of ROC (acceleration)
+    roc_roc = np.diff(roc)
+
+    # Current acceleration
+    current_accel = roc_roc[-1]
+    current_momentum = roc[-1]
+
+    # Check if momentum is turning:
+    # Positive momentum + negative acceleration = turning down from top
+    # Negative momentum + positive acceleration = turning up from bottom
+    is_turning_up = (current_momentum < 0 and current_accel > 0)
+    is_turning_down = (current_momentum > 0 and current_accel < 0)
+
+    is_decelerating = is_turning_up or is_turning_down
+
+    if is_decelerating:
+        # Score based on magnitude of turn
+        turn_magnitude = abs(current_accel) / max(abs(np.mean(np.abs(roc_roc))), 1e-8)
+        turn_score = min(1.0, turn_magnitude / 3.0)
+    else:
+        # Accelerating away from boundary — not a good time to trade
+        turn_score = max(0.0, 0.3 - abs(current_accel) * 100)
+
+    return turn_score, is_decelerating
+
 
 def compute_volume_score(
     volumes: np.ndarray,
@@ -892,16 +946,20 @@ def generate_signal(
     # --- Volume Score ---
     vol_score = primary_state.volume_score
 
+    # --- Momentum Turn Score ---
+    turn_score = primary_state.momentum_turn_score
+
     # --- Composite Confidence ---
     # Reversion score is the key statistical edge — weight it heavily
     confidence = (
-        0.18 * position_score +
-        0.12 * energy_score +
-        0.08 * entropy_score +
-        0.12 * confluence_score +
-        0.08 * timing_score +
-        0.28 * ou_score +      # OU mean-reversion is the strongest signal
-        0.14 * vol_score       # Volume confirms the bounce
+        0.15 * position_score +
+        0.10 * energy_score +
+        0.06 * entropy_score +
+        0.10 * confluence_score +
+        0.06 * timing_score +
+        0.25 * ou_score +      # OU mean-reversion is the strongest signal
+        0.13 * vol_score +     # Volume confirms the bounce
+        0.15 * turn_score      # Momentum turning at boundary
     )
 
     # Channel health penalty
@@ -967,6 +1025,9 @@ def generate_signal(
     if confluence_score > 0.6:
         agreeing = sum(1 for v in confluence.values() if v > 0.6)
         reasons.append(f"{agreeing} TFs confirm direction")
+
+    if turn_score > 0.5 and primary_state.momentum_is_turning:
+        reasons.append("Momentum turning at boundary")
 
     if entropy_score > 0.7:
         reasons.append("Channel highly predictable")
@@ -1094,7 +1155,10 @@ def analyze_channels(
             temp_state, ou=ou_params, channel_age_bars=len(channel.center_line),
         )
 
-        # 11. Volume score
+        # 11. Momentum turn detection
+        turn_score, is_turning = compute_momentum_turn(prices, lookback=10)
+
+        # 12. Volume score
         vol_data = volumes_by_tf.get(tf) if volumes_by_tf else None
         if vol_data is not None and len(vol_data) > 10:
             vol_score = compute_volume_score(vol_data, pos_pct)
@@ -1134,6 +1198,8 @@ def analyze_channels(
             break_prob_up=break_prob.prob_break_up,
             break_prob_down=break_prob.prob_break_down,
             volume_score=round(vol_score, 3),
+            momentum_turn_score=round(turn_score, 3),
+            momentum_is_turning=is_turning,
         )
 
     # Multi-TF confluence
