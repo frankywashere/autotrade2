@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -350,6 +350,18 @@ def run_backtest(
                 print(f"[ML] Adverse Movement model loaded")
                 ml_stats['adverse_filtered'] = 0
                 ml_stats['adverse_boosted'] = 0
+            except Exception:
+                pass
+
+        # Try to load Composite Signal Scorer
+        composite_model = None
+        comp_path = _os.path.join(model_dir, 'composite_scorer.pkl')
+        if _os.path.exists(comp_path):
+            try:
+                composite_model = CompositeSignalScorer.load(comp_path)
+                print(f"[ML] Composite scorer loaded ({len(composite_model.meta_feature_names or [])} meta-features)")
+                ml_stats['composite_agreed'] = 0
+                ml_stats['composite_filtered'] = 0
             except Exception:
                 pass
 
@@ -880,6 +892,33 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Composite Signal Scorer: learned combination of all model outputs
+                    if composite_model is not None:
+                        try:
+                            comp_pred = composite_model.predict(
+                                feature_vec.reshape(1, -1), model_dir=model_dir)
+                            comp_action = int(comp_pred['action'][0])
+                            comp_conf = float(comp_pred['max_confidence'][0])
+
+                            physics_action_id = 1 if sig.action == 'BUY' else 2
+
+                            if comp_action == 0:  # Composite says HOLD
+                                if comp_conf > 0.5:
+                                    sig.confidence *= 0.80
+                                    ml_stats['composite_filtered'] += 1
+                            elif comp_action == physics_action_id:
+                                # Composite agrees with physics direction
+                                if comp_conf > 0.5:
+                                    sig.confidence *= 1.10
+                                    ml_stats['composite_agreed'] += 1
+                            else:
+                                # Composite disagrees (opposite direction)
+                                if comp_conf > 0.5:
+                                    sig.confidence *= 0.75
+                                    ml_stats['composite_filtered'] += 1
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -1094,6 +1133,9 @@ def run_backtest(
         if adverse_model is not None:
             print(f"    Adverse filtered:   {ml_stats.get('adverse_filtered', 0)}")
             print(f"    Adverse boosted:    {ml_stats.get('adverse_boosted', 0)}")
+        if composite_model is not None:
+            print(f"    Composite agreed:   {ml_stats.get('composite_agreed', 0)}")
+            print(f"    Composite filtered: {ml_stats.get('composite_filtered', 0)}")
 
     # Breakdown by exit reason
     if trades:

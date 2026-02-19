@@ -5244,6 +5244,270 @@ class EntryTimingOptimizer:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 13: Composite Signal Scorer (Final Meta-Meta Model)
+# ---------------------------------------------------------------------------
+
+class CompositeSignalScorer:
+    """
+    Final-stage composite scorer that takes ALL model outputs and learns
+    the optimal combination. Unlike the stacking ensemble (Arch 5) which
+    only uses 4 base models, this uses all 11+ model outputs.
+
+    The current integration uses hand-tuned multipliers (1.15x, 0.75x, etc.).
+    This model learns the optimal nonlinear combination.
+
+    Meta-features:
+    - GBT: action_probs, bd_probs, lifetime
+    - Regime: regime_id, regime_probs
+    - TrendGBT: break_dir
+    - CV Ensemble: bd_consensus, action_consensus
+    - Physics Residual: action_trustworthy, confidence_scale, lifetime_correction
+    - Adverse Movement: stop_prob, viable_prob
+    - Key physics features: break_prob_max, avg_entropy, direction_consensus
+
+    Target: optimal_action (3-class) with emphasis on accuracy
+    """
+
+    KEY_PHYSICS_FEATURES = [
+        'break_prob_max', 'break_prob_weighted', 'avg_entropy',
+        'direction_consensus', 'health_min', 'health_max',
+        'confluence_score', 'atr_pct', 'rsi_14',
+    ]
+
+    def __init__(self):
+        self.model = None
+        self.meta_feature_names = None
+        self.feature_names = None  # Base feature names (for model loading)
+
+    def _collect_meta_features(
+        self,
+        X: np.ndarray,
+        feature_names: List[str],
+        model_dir: str,
+    ) -> Tuple[np.ndarray, List[str]]:
+        """
+        Run all models and collect their outputs as meta-features.
+        Falls back to zeros if a model isn't available.
+        """
+        idx = {name: i for i, name in enumerate(feature_names)}
+        n = len(X)
+
+        meta_features = []
+        meta_names = []
+
+        # Key physics features (passthrough)
+        for feat in self.KEY_PHYSICS_FEATURES:
+            if feat in idx:
+                meta_features.append(X[:, idx[feat]])
+            else:
+                meta_features.append(np.zeros(n))
+            meta_names.append(f'phys_{feat}')
+
+        # GBT predictions
+        gbt_path = os.path.join(model_dir, 'gbt_model.pkl')
+        if os.path.exists(gbt_path):
+            try:
+                gbt = GBTModel.load(gbt_path)
+                gbt_pred = gbt.predict(X)
+                if 'action_probs' in gbt_pred:
+                    for c in range(3):
+                        meta_features.append(gbt_pred['action_probs'][:, c])
+                        meta_names.append(f'gbt_action_prob_{c}')
+                elif 'action' in gbt_pred:
+                    meta_features.append(gbt_pred['action'].astype(float))
+                    meta_names.append('gbt_action')
+                if 'break_dir' in gbt_pred:
+                    meta_features.append(gbt_pred['break_dir'].astype(float))
+                    meta_names.append('gbt_break_dir')
+                if 'lifetime' in gbt_pred:
+                    meta_features.append(gbt_pred['lifetime'])
+                    meta_names.append('gbt_lifetime')
+            except Exception:
+                pass
+
+        # Regime predictions
+        regime_path = os.path.join(model_dir, 'regime_model.pkl')
+        if os.path.exists(regime_path):
+            try:
+                regime = RegimeConditionalModel.load(regime_path)
+                reg_pred = regime.predict(X)
+                meta_features.append(reg_pred['regime'].astype(float))
+                meta_names.append('regime_id')
+                if 'action' in reg_pred:
+                    meta_features.append(reg_pred['action'].astype(float))
+                    meta_names.append('regime_action')
+            except Exception:
+                pass
+
+        # CV Ensemble
+        cv_path = os.path.join(model_dir, 'cv_ensemble_model.pkl')
+        if os.path.exists(cv_path):
+            try:
+                cv = CVEnsembleModel.load(cv_path)
+                cv_pred = cv.predict(X)
+                meta_features.append(cv_pred['bd_consensus'])
+                meta_names.append('cv_bd_consensus')
+                meta_features.append(cv_pred['action_consensus'])
+                meta_names.append('cv_action_consensus')
+                meta_features.append(cv_pred['break_dir'].astype(float))
+                meta_names.append('cv_break_dir')
+                meta_features.append(cv_pred['action'].astype(float))
+                meta_names.append('cv_action')
+            except Exception:
+                pass
+
+        # Physics Residual
+        res_path = os.path.join(model_dir, 'physics_residual_model.pkl')
+        if os.path.exists(res_path):
+            try:
+                residual = PhysicsResidualModel.load(res_path)
+                res_pred = residual.predict(X)
+                if 'action_trustworthy' in res_pred:
+                    meta_features.append(res_pred['action_trustworthy'])
+                    meta_names.append('residual_action_trust')
+                if 'confidence_scale' in res_pred:
+                    meta_features.append(res_pred['confidence_scale'])
+                    meta_names.append('residual_conf_scale')
+                if 'lifetime_correction' in res_pred:
+                    meta_features.append(res_pred['lifetime_correction'])
+                    meta_names.append('residual_lt_correction')
+            except Exception:
+                pass
+
+        # Adverse Movement (BUY and SELL)
+        adv_path = os.path.join(model_dir, 'adverse_movement_model.pkl')
+        if os.path.exists(adv_path):
+            try:
+                adv = AdverseMovementPredictor.load(adv_path)
+                for direction, is_buy in [('buy', True), ('sell', False)]:
+                    adv_pred = adv.predict(X, is_buy=is_buy)
+                    if 'stop_prob' in adv_pred:
+                        meta_features.append(adv_pred['stop_prob'])
+                        meta_names.append(f'adv_{direction}_stop_prob')
+                    if 'viable_prob' in adv_pred:
+                        meta_features.append(adv_pred['viable_prob'])
+                        meta_names.append(f'adv_{direction}_viable_prob')
+            except Exception:
+                pass
+
+        meta_X = np.column_stack(meta_features) if meta_features else np.zeros((n, 1))
+        return meta_X, meta_names
+
+    def train(
+        self,
+        X_train: np.ndarray, Y_train: Dict[str, np.ndarray],
+        X_val: np.ndarray, Y_val: Dict[str, np.ndarray],
+        feature_names: List[str],
+        model_dir: str = 'surfer_models',
+    ) -> Dict[str, float]:
+        """Train the composite scorer on all model outputs."""
+        import lightgbm as lgb
+
+        self.feature_names = feature_names
+        metrics = {}
+
+        print("\n  Collecting meta-features from all models...")
+        meta_X_train, meta_names = self._collect_meta_features(X_train, feature_names, model_dir)
+        meta_X_val, _ = self._collect_meta_features(X_val, feature_names, model_dir)
+        self.meta_feature_names = meta_names
+
+        print(f"  Meta-features: {len(meta_names)}")
+        for name in meta_names:
+            print(f"    {name}")
+
+        # Train composite action classifier
+        print(f"\n  Training: composite_action (3-class, {len(meta_names)} meta-features)...")
+        y_train = Y_train['optimal_action'].astype(int)
+        y_val = Y_val['optimal_action'].astype(int)
+
+        train_ds = lgb.Dataset(meta_X_train, label=y_train, feature_name=meta_names)
+        val_ds = lgb.Dataset(meta_X_val, label=y_val, feature_name=meta_names, reference=train_ds)
+
+        params = {
+            'objective': 'multiclass', 'num_class': 3,
+            'metric': 'multi_logloss', 'num_leaves': 16,
+            'learning_rate': 0.03, 'min_child_samples': 15,
+            'feature_fraction': 0.9, 'bagging_fraction': 0.9,
+            'bagging_freq': 5, 'verbose': -1,
+            'lambda_l1': 0.1, 'lambda_l2': 0.1,  # Regularize — small meta-feature set
+        }
+        model = lgb.train(
+            params, train_ds, num_boost_round=500,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(0)],
+        )
+        self.model = model
+
+        val_probs = model.predict(meta_X_val)
+        val_pred = np.argmax(val_probs, axis=1)
+        acc = np.mean(val_pred == y_val)
+        metrics['composite_action_acc'] = float(acc)
+        print(f"    Val accuracy: {acc:.1%}")
+
+        # Per-class accuracy
+        for cls, cls_name in enumerate(['HOLD', 'BUY', 'SELL']):
+            mask = y_val == cls
+            if mask.sum() > 5:
+                cls_acc = np.mean(val_pred[mask] == cls)
+                metrics[f'composite_{cls_name.lower()}_acc'] = float(cls_acc)
+                print(f"    {cls_name} accuracy: {cls_acc:.1%} ({mask.sum()} samples)")
+
+        # High-confidence predictions
+        max_probs = np.max(val_probs, axis=1)
+        high_conf = max_probs > 0.6
+        if high_conf.sum() > 5:
+            hc_acc = np.mean(val_pred[high_conf] == y_val[high_conf])
+            metrics['composite_high_conf_acc'] = float(hc_acc)
+            metrics['composite_high_conf_coverage'] = float(high_conf.mean())
+            print(f"    High-confidence (>0.6): acc={hc_acc:.1%}, "
+                  f"coverage={high_conf.mean():.1%}")
+
+        # Feature importance
+        imp = model.feature_importance(importance_type='gain')
+        sorted_idx = np.argsort(imp)[::-1]
+        print("\n  Feature importance (which model outputs matter most):")
+        for rank, i in enumerate(sorted_idx):
+            if imp[i] > 0:
+                print(f"    {rank+1}. {meta_names[i]}: {imp[i]:.0f}")
+
+        self.feature_importance = [(meta_names[i], float(imp[i])) for i in sorted_idx]
+
+        return metrics
+
+    def predict(self, X: np.ndarray, model_dir: str = 'surfer_models') -> Dict[str, np.ndarray]:
+        """Predict using composite model."""
+        meta_X, _ = self._collect_meta_features(X, self.feature_names, model_dir)
+        probs = self.model.predict(meta_X)
+        return {
+            'action': np.argmax(probs, axis=1).astype(np.int64),
+            'action_probs': probs,
+            'max_confidence': np.max(probs, axis=1),
+        }
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'meta_feature_names': self.meta_feature_names,
+                'feature_importance': getattr(self, 'feature_importance', []),
+            }, f)
+        print(f"  Saved CompositeSignalScorer to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'CompositeSignalScorer':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.meta_feature_names = data.get('meta_feature_names')
+        model.feature_importance = data.get('feature_importance', [])
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -5872,7 +6136,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -6008,6 +6272,14 @@ def main():
                 )
                 timing.save(os.path.join(args.output, 'entry_timing_model.pkl'))
                 print(f"\n  Entry Timing metrics: {timing_metrics}")
+            elif args.arch == 'composite':
+                composite = CompositeSignalScorer()
+                comp_metrics = composite.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                    model_dir=args.output,
+                )
+                composite.save(os.path.join(args.output, 'composite_scorer.pkl'))
+                print(f"\n  Composite Scorer metrics: {comp_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
