@@ -2005,6 +2005,75 @@ def show_channel_surfer_tab(
         else:
             st.info("No BUY/SELL signals recorded yet.")
 
+    # --- Section 8: Quick Backtest ---
+    with st.expander("Quick Backtest", expanded=False):
+        st.caption("Run a quick backtest of Channel Surfer on recent 5min data")
+        bt_col1, bt_col2 = st.columns(2)
+        with bt_col1:
+            bt_days = st.selectbox("Backtest period", [30, 60], index=1, key="bt_days")
+        with bt_col2:
+            bt_pos_size = st.number_input("Position size ($)", value=10000, step=5000, key="bt_pos")
+
+        if st.button("Run Backtest", key="run_bt"):
+            with st.spinner("Running Channel Surfer backtest..."):
+                try:
+                    from v15.core.surfer_backtest import run_backtest as surfer_backtest
+                    metrics, trades, eq_curve = surfer_backtest(
+                        days=bt_days,
+                        eval_interval=12,
+                        max_hold_bars=60,
+                        position_size=bt_pos_size,
+                        min_confidence=0.45,
+                        use_multi_tf=True,
+                    )
+                    st.session_state['bt_results'] = (metrics, trades, eq_curve)
+                except Exception as e:
+                    st.error(f"Backtest failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        bt_data = st.session_state.get('bt_results')
+        if bt_data:
+            metrics, trades, eq_curve = bt_data
+            m_cols = st.columns(5)
+            m_cols[0].metric("Trades", metrics.total_trades)
+            m_cols[1].metric("Win Rate", f"{metrics.win_rate:.0%}")
+            m_cols[2].metric("Profit Factor", f"{metrics.profit_factor:.1f}")
+            m_cols[3].metric("Total P&L", f"${metrics.total_pnl:,.2f}")
+            m_cols[4].metric("$/Trade", f"${metrics.expectancy:,.2f}")
+
+            if eq_curve:
+                eq_df = pd.DataFrame(eq_curve, columns=['bar', 'equity'])
+                fig_eq = go.Figure()
+                fig_eq.add_trace(go.Scatter(
+                    x=eq_df['bar'], y=eq_df['equity'],
+                    mode='lines+markers',
+                    line=dict(color='#00c853', width=2),
+                    marker=dict(size=6),
+                    fill='tozeroy',
+                    fillcolor='rgba(0,200,83,0.1)',
+                ))
+                fig_eq.update_layout(
+                    title='Equity Curve',
+                    xaxis_title='Bar', yaxis_title='Equity ($)',
+                    template='plotly_dark', height=300,
+                    margin=dict(l=50, r=20, t=40, b=30),
+                )
+                st.plotly_chart(fig_eq, use_container_width=True)
+
+            if trades:
+                trade_data = [{
+                    'Dir': t.direction,
+                    'Entry$': f"${t.entry_price:.2f}",
+                    'Exit$': f"${t.exit_price:.2f}",
+                    'P&L': f"${t.pnl:+.2f}",
+                    '%': f"{t.pnl_pct:+.2%}",
+                    'Hold': f"{t.hold_bars}b",
+                    'Reason': t.exit_reason,
+                    'Conf': f"{t.confidence:.2f}",
+                } for t in trades]
+                st.dataframe(pd.DataFrame(trade_data), hide_index=True, use_container_width=True)
+
 
 def main():
     st.title("X23 Channel Break Predictor")

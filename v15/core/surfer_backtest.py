@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -142,6 +142,7 @@ def run_backtest(
     lows = tsla['low'].values
 
     trades: List[Trade] = []
+    equity_curve: List[Tuple[int, float]] = []  # (bar_idx, equity)
     position: Optional[OpenPosition] = None
     equity = position_size * 10  # Start with 100k
     peak_equity = equity
@@ -260,6 +261,7 @@ def run_backtest(
                 )
                 trades.append(trade)
                 equity += pnl
+                equity_curve.append((bar, equity))
                 peak_equity = max(peak_equity, equity)
                 dd = (peak_equity - equity) / peak_equity
                 max_dd = max(max_dd, dd)
@@ -418,7 +420,7 @@ def run_backtest(
                 print(f"  {direction:12s}: {len(dir_trades):3d} trades, "
                       f"WR={dir_wins/len(dir_trades):.0%}, P&L=${dir_pnl:,.2f}")
 
-    return metrics, trades
+    return metrics, trades, equity_curve
 
 
 def main():
