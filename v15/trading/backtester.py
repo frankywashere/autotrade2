@@ -437,6 +437,17 @@ class Backtester:
         bars_held: int,
     ) -> tuple:
         """Check if position should be exited. Returns (exit_price, reason) or (None, None)."""
+        from ..config import TF_TO_HORIZON
+        horizon = TF_TO_HORIZON.get(pos.primary_tf, 'medium')
+        max_hold = self.HORIZON_MAX_HOLD.get(horizon, self.config.max_hold_bars)
+        max_hold = min(max_hold, self.config.max_hold_bars)
+
+        # Progressive trail tightening: as hold time increases, tighten the trail
+        # This captures more profit on aging trades
+        hold_pct = min(1.0, bars_held / max(max_hold, 1))
+        tightening = 1.0 - hold_pct * 0.4  # Trail shrinks to 60% of original at max hold
+        effective_trail = pos.trailing_stop_pct * tightening
+
         if pos.direction == 'long':
             if high > pos.best_price:
                 pos.best_price = high
@@ -445,7 +456,7 @@ class Backtester:
                 return pos.stop_loss_price, 'stop_loss'
             # Trailing stop (only after we're profitable)
             if pos.best_price > pos.entry_price:
-                trailing_stop = pos.best_price * (1 - pos.trailing_stop_pct)
+                trailing_stop = pos.best_price * (1 - effective_trail)
                 if trailing_stop > pos.stop_loss_price and low <= trailing_stop:
                     return trailing_stop, 'trailing_stop'
             # Take profit hit
@@ -458,18 +469,13 @@ class Backtester:
                 return pos.stop_loss_price, 'stop_loss'
             # Trailing stop for shorts
             if pos.best_price > 0 and pos.best_price < pos.entry_price:
-                trailing_stop = pos.best_price * (1 + pos.trailing_stop_pct)
+                trailing_stop = pos.best_price * (1 + effective_trail)
                 if trailing_stop < pos.stop_loss_price and high >= trailing_stop:
                     return trailing_stop, 'trailing_stop'
             if low <= pos.take_profit_price:
                 return pos.take_profit_price, 'take_profit'
 
         # Horizon-specific timeout
-        from ..config import TF_TO_HORIZON
-        horizon = TF_TO_HORIZON.get(pos.primary_tf, 'medium')
-        max_hold = self.HORIZON_MAX_HOLD.get(horizon, self.config.max_hold_bars)
-        max_hold = min(max_hold, self.config.max_hold_bars)
-
         if bars_held >= max_hold:
             return current_price, 'timeout'
 
