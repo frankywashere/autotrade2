@@ -71,16 +71,17 @@ class SurferSignal:
     confidence: float                # 0-1 composite confidence
     primary_tf: str                  # Timeframe driving the signal
     reason: str                      # Human-readable explanation
+    signal_type: str = 'bounce'      # 'bounce' (mean-reversion) or 'break' (breakout)
     # Components
-    position_score: float            # How close to boundary (0-1)
-    energy_score: float              # Energy-based signal (0-1)
-    entropy_score: float             # Predictability (0-1, higher = more predictable)
-    confluence_score: float          # Multi-TF agreement (0-1)
-    timing_score: float              # Oscillation timing (0-1)
+    position_score: float = 0.0      # How close to boundary (0-1)
+    energy_score: float = 0.0        # Energy-based signal (0-1)
+    entropy_score: float = 0.0       # Predictability (0-1, higher = more predictable)
+    confluence_score: float = 0.0    # Multi-TF agreement (0-1)
+    timing_score: float = 0.0       # Oscillation timing (0-1)
     # Risk
-    channel_health: float            # Risk of channel break (0-1)
-    suggested_stop_pct: float        # Suggested stop-loss %
-    suggested_tp_pct: float          # Suggested take-profit %
+    channel_health: float = 0.0      # Risk of channel break (0-1)
+    suggested_stop_pct: float = 0.02 # Suggested stop-loss %
+    suggested_tp_pct: float = 0.02   # Suggested take-profit %
 
 
 @dataclass
@@ -822,6 +823,123 @@ def compute_confluence(
 # Signal Generation
 # ---------------------------------------------------------------------------
 
+def generate_breakout_signal(
+    tf_states: Dict[str, TFChannelState],
+    confluence: Dict[str, float],
+) -> Optional[SurferSignal]:
+    """
+    Generate a breakout signal when a channel is about to break.
+
+    Breakout trading is the OPPOSITE of bounce trading:
+    - Trades WITH momentum, not against it
+    - Entry at channel boundary being broken
+    - Stop INSIDE the channel (false breakout protection)
+    - Wide target OUTSIDE (ride the breakout)
+
+    Only fires when:
+    1. Break probability > 0.55
+    2. Total energy > binding energy (energy ratio > 1.2)
+    3. Momentum is accelerating (NOT decelerating)
+    4. Price is near a boundary (position < 0.15 or > 0.85)
+    """
+    primary_tf = None
+    primary_state = None
+
+    for tf in SIGNAL_TFS:
+        if tf in tf_states and tf_states[tf].valid:
+            primary_tf = tf
+            primary_state = tf_states[tf]
+            break
+
+    if primary_state is None:
+        return None
+
+    # --- Breakout conditions ---
+    pos = primary_state.position_pct
+    break_prob = primary_state.break_prob
+    energy_ratio = primary_state.total_energy / max(primary_state.binding_energy, 0.01)
+    is_turning = primary_state.momentum_is_turning
+    mom_dir = primary_state.momentum_direction
+
+    # Need: high break probability, high energy, NOT turning (accelerating)
+    if break_prob < 0.55 or energy_ratio < 1.2:
+        return None
+
+    # Momentum should NOT be turning — breakouts need sustained momentum
+    if is_turning:
+        return None
+
+    # Determine break direction from position and momentum
+    if pos > 0.80 and mom_dir > 0:
+        # Near top, momentum pushing up → upward breakout
+        action = 'BUY'
+        direction_score = pos  # Closer to top = stronger signal
+    elif pos < 0.20 and mom_dir < 0:
+        # Near bottom, momentum pushing down → downward breakout
+        action = 'SELL'
+        direction_score = 1.0 - pos  # Closer to bottom = stronger signal
+    else:
+        return None  # Not near a boundary with aligned momentum
+
+    # --- Confidence for breakout ---
+    # Components: break_prob, energy_ratio, direction_score, entropy (high = chaotic = breakout)
+    conf = (
+        0.30 * min(1.0, break_prob / 0.8) +         # Break probability
+        0.25 * min(1.0, energy_ratio / 2.0) +        # Energy exceeding binding
+        0.20 * direction_score +                       # Position near boundary
+        0.15 * primary_state.entropy +                 # High entropy = channel failing
+        0.10 * primary_state.kinetic_energy            # Momentum strength
+    )
+
+    # Higher-TF trend alignment for breakouts (more important than for bounces)
+    higher_tf_dirs = []
+    for tf in SIGNAL_TFS[1:]:
+        if tf in tf_states and tf_states[tf].valid:
+            higher_tf_dirs.append(tf_states[tf].channel_direction)
+    if higher_tf_dirs:
+        bullish_frac = sum(1 for d in higher_tf_dirs if d == 'bull') / len(higher_tf_dirs)
+        bearish_frac = sum(1 for d in higher_tf_dirs if d == 'bear') / len(higher_tf_dirs)
+        if action == 'BUY':
+            conf *= (1.0 + 0.25 * bullish_frac - 0.15 * bearish_frac)
+        else:
+            conf *= (1.0 + 0.25 * bearish_frac - 0.15 * bullish_frac)
+
+    # Minimum confidence for breakout signals (higher than bounce to avoid false breaks)
+    min_break_conf = 0.50
+    if conf < min_break_conf:
+        return None
+
+    # R:R for breakouts: generous stop (survive whipsaw), wide target
+    width = primary_state.width_pct / 100.0
+    # Stop = 65% of channel width back inside (survive false breaks)
+    suggested_stop = max(0.006, width * 0.65)
+    # Target = 2.0x channel width (ride the breakout)
+    suggested_tp = max(0.010, width * 2.0)
+
+    reasons = []
+    if action == 'BUY':
+        reasons.append(f"Upward breakout at {pos:.0%} (break prob {break_prob:.0%})")
+    else:
+        reasons.append(f"Downward breakout at {pos:.0%} (break prob {break_prob:.0%})")
+    reasons.append(f"Energy ratio {energy_ratio:.2f} (channel weakening)")
+
+    return SurferSignal(
+        action=action,
+        confidence=round(conf, 3),
+        primary_tf=primary_tf,
+        reason=' | '.join(reasons),
+        signal_type='break',
+        position_score=round(direction_score, 3),
+        energy_score=round(min(1.0, energy_ratio / 2.0), 3),
+        entropy_score=round(primary_state.entropy, 3),
+        confluence_score=round(np.mean([v for v in confluence.values() if v > 0]) if confluence else 0.0, 3),
+        timing_score=0.0,
+        channel_health=round(primary_state.channel_health, 3),
+        suggested_stop_pct=round(suggested_stop, 4),
+        suggested_tp_pct=round(suggested_tp, 4),
+    )
+
+
 def generate_signal(
     tf_states: Dict[str, TFChannelState],
     confluence: Dict[str, float],
@@ -1000,6 +1118,10 @@ def generate_signal(
 
     # Determine action
     if confidence < MIN_SIGNAL_CONFIDENCE or raw_action == 'HOLD':
+        # Try breakout signal when bounce doesn't trigger
+        break_signal = generate_breakout_signal(tf_states, confluence)
+        if break_signal is not None:
+            return break_signal
         action = 'HOLD'
     else:
         action = raw_action

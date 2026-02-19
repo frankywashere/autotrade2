@@ -37,6 +37,8 @@ class Trade:
     pnl_pct: float = 0.0
     hold_bars: int = 0
     primary_tf: str = ''
+    signal_type: str = 'bounce'  # 'bounce' or 'break'
+    trade_size: float = 10000.0
 
 
 @dataclass
@@ -49,6 +51,8 @@ class OpenPosition:
     stop_price: float
     tp_price: float
     primary_tf: str
+    signal_type: str = 'bounce'     # 'bounce' or 'break'
+    trade_size: float = 10000.0     # Confidence-scaled position size
     ou_half_life: float = 5.0
     max_hold_bars: int = 60  # 5 hours max
     trailing_stop: float = 0.0  # Best price seen for trailing
@@ -94,7 +98,7 @@ class BacktestMetrics:
 
 def run_backtest(
     days: int = 30,
-    eval_interval: int = 6,     # Check every 6 bars = 30 min
+    eval_interval: int = 3,     # Check every 3 bars = 15 min
     max_hold_bars: int = 60,    # Max 5 hours (60 * 5min)
     position_size: float = 10000.0,  # $10k per trade
     min_confidence: float = 0.45,
@@ -148,6 +152,9 @@ def run_backtest(
     peak_equity = equity
     max_dd = 0.0
 
+
+
+
     # Walk forward from bar 100 (need lookback)
     start_bar = 100
     total_bars = len(tsla)
@@ -182,6 +189,12 @@ def run_backtest(
             entry = position.entry_price
             trail_pct = abs(position.stop_price - entry) / entry  # Initial stop distance
 
+            # Breakout trades: wider trail, let them run
+            # Bounce trades: tighter trail, capture mean-reversion
+            is_breakout = position.signal_type == 'break'
+            trail_tighten = 0.3 if is_breakout else 0.5  # Breakout: 30% tighten, bounce: 50%
+            profit_threshold = 0.008 if is_breakout else 0.003  # Breakout needs more room
+
             if position.direction == 'BUY':
                 # Update best price
                 if window_high > position.trailing_stop:
@@ -189,9 +202,8 @@ def run_backtest(
 
                 # Progressive trail: tighten as profit grows
                 profit_from_best = (position.trailing_stop - entry) / entry
-                if profit_from_best > 0.003:  # Once 0.3% profit locked in
-                    # Trail from the best price at 50% of initial stop
-                    trail_from_best = position.trailing_stop * (1 - trail_pct * 0.5)
+                if profit_from_best > profit_threshold:
+                    trail_from_best = position.trailing_stop * (1 - trail_pct * trail_tighten)
                     effective_stop = max(position.stop_price, trail_from_best)
                 else:
                     effective_stop = position.stop_price
@@ -204,7 +216,7 @@ def run_backtest(
                     should_exit = True
                     exit_reason = 'tp'
                     exit_price = position.tp_price
-                elif bars_held >= max(6, int(position.ou_half_life * 3)):
+                elif not is_breakout and bars_held >= max(6, int(position.ou_half_life * 3)):
                     should_exit = True
                     exit_reason = 'ou_timeout'
 
@@ -213,8 +225,8 @@ def run_backtest(
                     position.trailing_stop = window_low
 
                 profit_from_best = (entry - position.trailing_stop) / entry
-                if profit_from_best > 0.003:
-                    trail_from_best = position.trailing_stop * (1 + trail_pct * 0.5)
+                if profit_from_best > profit_threshold:
+                    trail_from_best = position.trailing_stop * (1 + trail_pct * trail_tighten)
                     effective_stop = min(position.stop_price, trail_from_best)
                 else:
                     effective_stop = position.stop_price
@@ -227,7 +239,7 @@ def run_backtest(
                     should_exit = True
                     exit_reason = 'tp'
                     exit_price = position.tp_price
-                elif bars_held >= max(6, int(position.ou_half_life * 3)):
+                elif not is_breakout and bars_held >= max(6, int(position.ou_half_life * 3)):
                     should_exit = True
                     exit_reason = 'ou_timeout'
 
@@ -242,7 +254,7 @@ def run_backtest(
                 else:
                     pnl_pct = (position.entry_price - exit_price) / position.entry_price
 
-                pnl = pnl_pct * position_size
+                pnl = pnl_pct * position.trade_size
 
                 trade = Trade(
                     entry_bar=position.entry_bar,
@@ -258,6 +270,8 @@ def run_backtest(
                     pnl_pct=pnl_pct,
                     hold_bars=bars_held,
                     primary_tf=position.primary_tf,
+                    signal_type=position.signal_type,
+                    trade_size=position.trade_size,
                 )
                 trades.append(trade)
                 equity += pnl
@@ -265,6 +279,7 @@ def run_backtest(
                 peak_equity = max(peak_equity, equity)
                 dd = (peak_equity - equity) / peak_equity
                 max_dd = max(max_dd, dd)
+
                 position = None
 
         # --- Generate new signal (only if flat) ---
@@ -296,11 +311,22 @@ def run_backtest(
             if 'volume' in df_slice.columns:
                 volumes_dict['5min'] = df_slice['volume'].values
 
-            # Add higher TF channels (use recent window, not full history)
+            # Add higher TF channels (rolling window relative to current bar time)
             if use_multi_tf:
+                current_time = tsla.index[bar]
+                # Normalize to tz-naive for comparison
+                if current_time.tzinfo is not None:
+                    current_time_naive = current_time.tz_localize(None)
+                else:
+                    current_time_naive = current_time
                 for tf_label, tf_df in higher_tf_data.items():
-                    # Use last 100 bars for channel detection (not full history)
-                    tf_recent = tf_df.tail(100)
+                    # Only use higher-TF data available at current time (no lookahead)
+                    tf_idx = tf_df.index
+                    if tf_idx.tz is not None:
+                        tf_available = tf_df[tf_idx <= current_time]
+                    else:
+                        tf_available = tf_df[tf_idx <= current_time_naive]
+                    tf_recent = tf_available.tail(100)
                     if len(tf_recent) < 30:
                         continue
                     tf_windows = TF_WINDOWS.get(tf_label, [20, 30, 40])
@@ -329,12 +355,24 @@ def run_backtest(
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
                 # Enter position
                 entry_price = current_price
+
+                # Confidence-scaled position sizing
+                if sig.confidence >= 0.70:
+                    trade_size = position_size * 1.5
+                elif sig.confidence >= 0.60:
+                    trade_size = position_size * 1.2
+                else:
+                    trade_size = position_size
+
                 if sig.action == 'BUY':
                     stop = entry_price * (1 - sig.suggested_stop_pct)
                     tp = entry_price * (1 + sig.suggested_tp_pct)
                 else:
                     stop = entry_price * (1 + sig.suggested_stop_pct)
                     tp = entry_price * (1 - sig.suggested_tp_pct)
+
+                # Breakout trades get longer max hold (trends persist)
+                effective_max_hold = max_hold_bars * 2 if sig.signal_type == 'break' else max_hold_bars
 
                 # Get OU half-life from primary TF state
                 primary_state = analysis.tf_states.get(sig.primary_tf)
@@ -348,8 +386,10 @@ def run_backtest(
                     stop_price=stop,
                     tp_price=tp,
                     primary_tf=sig.primary_tf,
+                    signal_type=sig.signal_type,
+                    trade_size=trade_size,
                     ou_half_life=ou_hl,
-                    max_hold_bars=max_hold_bars,
+                    max_hold_bars=effective_max_hold,
                     trailing_stop=entry_price,
                 )
 
@@ -360,7 +400,7 @@ def run_backtest(
             pnl_pct = (exit_price - position.entry_price) / position.entry_price
         else:
             pnl_pct = (position.entry_price - exit_price) / position.entry_price
-        pnl = pnl_pct * position_size
+        pnl = pnl_pct * position.trade_size
         trades.append(Trade(
             entry_bar=position.entry_bar,
             exit_bar=total_bars - 1,
@@ -373,6 +413,8 @@ def run_backtest(
             pnl=pnl, pnl_pct=pnl_pct,
             hold_bars=total_bars - 1 - position.entry_bar,
             primary_tf=position.primary_tf,
+            signal_type=position.signal_type,
+            trade_size=position.trade_size,
         ))
         equity += pnl
 
@@ -419,6 +461,17 @@ def run_backtest(
                 dir_pnl = sum(t.pnl for t in dir_trades)
                 print(f"  {direction:12s}: {len(dir_trades):3d} trades, "
                       f"WR={dir_wins/len(dir_trades):.0%}, P&L=${dir_pnl:,.2f}")
+
+        # Signal type breakdown (bounce vs break)
+        for stype in ('bounce', 'break'):
+            type_trades = [t for t in trades if t.signal_type == stype]
+            if type_trades:
+                type_wins = sum(1 for t in type_trades if t.pnl > 0)
+                type_pnl = sum(t.pnl for t in type_trades)
+                avg_size = np.mean([t.trade_size for t in type_trades])
+                print(f"  {stype:12s}: {len(type_trades):3d} trades, "
+                      f"WR={type_wins/len(type_trades):.0%}, P&L=${type_pnl:,.2f}, "
+                      f"avg size=${avg_size:,.0f}")
 
     return metrics, trades, equity_curve
 
