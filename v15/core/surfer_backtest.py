@@ -1824,6 +1824,12 @@ def run_backtest(
                 if sig.signal_type == 'break' and sig.channel_health > 0.35:
                     trade_size *= 0.60
 
+                # Double-negative breakout penalty: high conf + high health
+                # Both inversely correlated with winning — combined = worst case
+                if (sig.signal_type == 'break' and sig.confidence > 0.90
+                        and sig.channel_health > 0.25):
+                    trade_size *= 0.50
+
                 # Energy boost for bounces: higher energy → bigger P&L (+0.390 PnlCorr)
                 if sig.signal_type == 'bounce' and sig.energy_score > 0.40:
                     trade_size *= 1.30
