@@ -14277,6 +14277,552 @@ class VolReturnRegimeClassifier:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 53: Multi-Horizon Loser Detector
+# ---------------------------------------------------------------------------
+# A trade that loses across ALL horizons (ret5 < 0, ret20 < 0, ret60 < 0)
+# is the worst kind of trade — it never even temporarily goes your way.
+# Much higher value to avoid than a temporary dip.
+
+class MultiHorizonLoserDetector:
+    """Detect trades that lose across all three time horizons."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.mh_feature_names = None
+
+    def derive_mh_features(self, X, feature_names):
+        """Use ALL features — let LightGBM find what matters."""
+        # Use all raw features (no feature engineering)
+        # This gives the model maximum information to detect multi-horizon losers
+        return X, list(feature_names)
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train multi-horizon loser detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        self.mh_feature_names = list(feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret60 = Y_train['future_return_60']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+        ret60_val = Y_val['future_return_60']
+
+        # Multi-horizon loser: loses at ALL three horizons
+        mh_loser_train = (
+            (ret5 < -0.001) & (ret20 < -0.002) & (ret60 < -0.003)
+        ).astype(np.float32)
+        mh_loser_val = (
+            (ret5_val < -0.001) & (ret20_val < -0.002) & (ret60_val < -0.003)
+        ).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Multi-horizon loser features: {len(self.mh_feature_names)}")
+        print(f"  MH loser rate (train): {mh_loser_train.mean():.1%}")
+        print(f"  MH loser rate (val): {mh_loser_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(X_train, label=mh_loser_train,
+                            feature_name=self.mh_feature_names)
+        dval = lgb.Dataset(X_val, label=mh_loser_val,
+                          feature_name=self.mh_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.7, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1,
+             'scale_pos_weight': 4.0},  # Heavy emphasis on losers
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        mh_pred = self.model.predict(X_val)
+        try:
+            auc = roc_auc_score(mh_loser_val, mh_pred)
+            metrics['mh_loser_auc'] = float(auc)
+            print(f"  Multi-Horizon Loser AUC: {auc:.3f}")
+        except Exception:
+            metrics['mh_loser_auc'] = 0.5
+
+        # Precision at various thresholds
+        for thr in [0.2, 0.3, 0.4]:
+            flagged = mh_pred > thr
+            if flagged.sum() > 0:
+                precision = mh_loser_val[flagged].mean()
+                print(f"    Threshold {thr:.1f}: {flagged.sum()} flagged, {precision:.1%} precision")
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 multi-horizon loser features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.mh_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        return {
+            'mh_loser_prob': self.model.predict(X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'mh_feature_names': self.mh_feature_names,
+            }, f)
+        print(f"  Saved MultiHorizonLoserDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'MultiHorizonLoserDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.mh_feature_names = data['mh_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 54: Bounce-Specific Loser Detector
+# ---------------------------------------------------------------------------
+# Bounces have different failure modes than breaks. Train a specialized
+# loser detector ONLY on bounce-like conditions (position near boundary).
+
+class BounceLoserDetector:
+    """Detect losers specifically in bounce-type trade conditions."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train bounce-specific loser detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+
+        # Filter to bounce-like conditions: 5min position near boundary (<0.15 or >0.85)
+        pos_idx = name_to_idx.get('5min_position_in_channel', 0)
+        pos_train = X_train[:, pos_idx]
+        pos_val = X_val[:, pos_idx]
+
+        bounce_mask_train = (pos_train < 0.15) | (pos_train > 0.85)
+        bounce_mask_val = (pos_val < 0.15) | (pos_val > 0.85)
+
+        ret20 = Y_train['future_return_20']
+        ret20_val = Y_val['future_return_20']
+
+        # Loser = ret20 < -0.5% (significant loss)
+        loser_train = (ret20 < -0.005).astype(np.float32)
+        loser_val = (ret20_val < -0.005).astype(np.float32)
+
+        metrics = {}
+        n_bounce_train = bounce_mask_train.sum()
+        n_bounce_val = bounce_mask_val.sum()
+        print(f"\n  Bounce-like samples: train={n_bounce_train}, val={n_bounce_val}")
+
+        if n_bounce_train < 50 or n_bounce_val < 10:
+            print("  Not enough bounce samples, training on all data with position weighting")
+            # Weight boundary samples 3x
+            weights = np.where(bounce_mask_train, 3.0, 1.0).astype(np.float32)
+        else:
+            weights = None
+
+        X_t = X_train
+        y_t = loser_train
+        X_v = X_val
+        y_v = loser_val
+
+        print(f"  Features: {len(feature_names)}")
+        print(f"  Loser rate (train): {y_t.mean():.1%}")
+        print(f"  Loser rate (val): {y_v.mean():.1%}")
+        if bounce_mask_train.sum() > 0:
+            print(f"  Loser rate at boundary (train): {loser_train[bounce_mask_train].mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(X_t, label=y_t, feature_name=list(feature_names),
+                            weight=weights)
+        dval = lgb.Dataset(X_v, label=y_v, feature_name=list(feature_names),
+                          reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.7, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'scale_pos_weight': 3.0},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        pred = self.model.predict(X_v)
+        try:
+            auc = roc_auc_score(y_v, pred)
+            metrics['bounce_loser_auc'] = float(auc)
+            print(f"  Bounce Loser AUC (all): {auc:.3f}")
+        except Exception:
+            metrics['bounce_loser_auc'] = 0.5
+
+        if bounce_mask_val.sum() > 5:
+            try:
+                b_auc = roc_auc_score(y_v[bounce_mask_val], pred[bounce_mask_val])
+                metrics['bounce_loser_boundary_auc'] = float(b_auc)
+                print(f"  Bounce Loser AUC (boundary only): {b_auc:.3f}")
+            except Exception:
+                pass
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 bounce loser features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        return {
+            'bounce_loser_prob': self.model.predict(X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+            }, f)
+        print(f"  Saved BounceLoserDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'BounceLoserDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 55: Feature Interaction Loser
+# ---------------------------------------------------------------------------
+# Create pairwise interaction features from the top-10 most important
+# features. LightGBM can discover splits but explicit interactions
+# may capture patterns it misses with individual features.
+
+class FeatureInteractionLoser:
+    """Use pairwise feature interactions to detect losers."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.int_feature_names = None
+        self.top_feature_indices = None
+
+    def derive_interaction_features(self, X, feature_names, top_indices=None):
+        """Create pairwise interaction features from top features."""
+        if top_indices is None:
+            # Use first call to determine top features
+            return X, list(feature_names), None
+
+        feats = [X]  # Start with original features
+        names = list(feature_names)
+
+        # Add pairwise products of top features
+        for i in range(len(top_indices)):
+            for j in range(i + 1, len(top_indices)):
+                idx_i, idx_j = top_indices[i], top_indices[j]
+                interaction = X[:, idx_i] * X[:, idx_j]
+                feats.append(interaction.reshape(-1, 1))
+                names.append(f'int_{feature_names[idx_i]}_x_{feature_names[idx_j]}')
+
+        # Add ratios of top features
+        for i in range(len(top_indices)):
+            for j in range(len(top_indices)):
+                if i != j:
+                    idx_i, idx_j = top_indices[i], top_indices[j]
+                    denom = np.abs(X[:, idx_j]) + 1e-8
+                    ratio = X[:, idx_i] / denom
+                    ratio = np.clip(ratio, -10, 10)
+                    feats.append(ratio.reshape(-1, 1))
+                    names.append(f'rat_{feature_names[idx_i]}/{feature_names[idx_j]}')
+
+        return np.column_stack(feats), names, top_indices
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train feature interaction loser detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+
+        ret20 = Y_train['future_return_20']
+        ret20_val = Y_val['future_return_20']
+
+        # Bottom 15% = extreme loser (same target as Arch 45)
+        threshold = np.percentile(ret20, 15)
+        loser_train = (ret20 < threshold).astype(np.float32)
+        loser_val = (ret20_val < threshold).astype(np.float32)
+
+        # First: train a quick model to find top features
+        print(f"\n  Phase 1: Finding top features...")
+        callbacks_quick = [lgb.early_stopping(30), lgb.log_evaluation(0)]
+        dtrain_quick = lgb.Dataset(X_train, label=loser_train,
+                                  feature_name=list(feature_names))
+        dval_quick = lgb.Dataset(X_val, label=loser_val,
+                                feature_name=list(feature_names), reference=dtrain_quick)
+
+        quick_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 15,
+             'learning_rate': 0.1, 'verbose': -1},
+            dtrain_quick, num_boost_round=100, valid_sets=[dval_quick],
+            callbacks=callbacks_quick)
+
+        imp = quick_model.feature_importance(importance_type='gain')
+        self.top_feature_indices = list(np.argsort(imp)[::-1][:10])
+
+        print(f"  Top 10 features for interactions:")
+        for rank, idx in enumerate(self.top_feature_indices):
+            print(f"    {rank+1}. {feature_names[idx]}: {imp[idx]:.0f}")
+
+        # Phase 2: Create interaction features and retrain
+        print(f"\n  Phase 2: Training with interaction features...")
+        int_X_train, self.int_feature_names, _ = self.derive_interaction_features(
+            X_train, feature_names, self.top_feature_indices)
+        int_X_val, _, _ = self.derive_interaction_features(
+            X_val, feature_names, self.top_feature_indices)
+
+        n_interactions = len(self.int_feature_names) - len(feature_names)
+        print(f"  Original features: {len(feature_names)}")
+        print(f"  Interaction features added: {n_interactions}")
+        print(f"  Total features: {len(self.int_feature_names)}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(int_X_train, label=loser_train,
+                            feature_name=self.int_feature_names)
+        dval = lgb.Dataset(int_X_val, label=loser_val,
+                          feature_name=self.int_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.6, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'scale_pos_weight': 3.0},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        pred = self.model.predict(int_X_val)
+        metrics = {}
+        try:
+            auc = roc_auc_score(loser_val, pred)
+            metrics['int_loser_auc'] = float(auc)
+            print(f"  Interaction Loser AUC: {auc:.3f}")
+        except Exception:
+            metrics['int_loser_auc'] = 0.5
+
+        # Compare to base (quick model)
+        base_pred = quick_model.predict(X_val)
+        base_auc = roc_auc_score(loser_val, base_pred)
+        metrics['base_auc'] = float(base_auc)
+        print(f"  Base (no interactions) AUC: {base_auc:.3f}")
+        print(f"  Improvement: {auc - base_auc:+.3f}")
+
+        # Show top interaction features used
+        final_imp = self.model.feature_importance(importance_type='gain')
+        top_final = np.argsort(final_imp)[::-1][:10]
+        print("\n  Top 10 features (with interactions):")
+        for rank, idx in enumerate(top_final):
+            is_int = "🔗" if idx >= len(feature_names) else ""
+            print(f"    {rank+1}. {self.int_feature_names[idx]}: {final_imp[idx]:.0f} {is_int}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        int_X, _, _ = self.derive_interaction_features(
+            X, self.feature_names, self.top_feature_indices)
+        return {
+            'int_loser_prob': self.model.predict(int_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'int_feature_names': self.int_feature_names,
+                'top_feature_indices': self.top_feature_indices,
+            }, f)
+        print(f"  Saved FeatureInteractionLoser to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'FeatureInteractionLoser':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.int_feature_names = data['int_feature_names']
+        model.top_feature_indices = data['top_feature_indices']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 56: Momentum Reversal Detector
+# ---------------------------------------------------------------------------
+# Predict "false starts" — trades that start profitable (ret5 > 0)
+# but then reverse (ret20 < 0). These are the most frustrating trades
+# and tighter trails or earlier exits can help.
+
+class MomentumReversalDetector:
+    """Detect trades that start well but reverse (ret5 > 0, ret20 < 0)."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.mr_feature_names = None
+
+    def derive_mr_features(self, X, feature_names):
+        """Extract features relevant to momentum reversals."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Channel stability (unstable = more reversals)
+        for tf in ML_TFS:
+            for key in ['health', 'r_squared', 'break_prob', 'width_pct',
+                        'slope_normalized', 'position_in_channel',
+                        'bars_since_touch']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'mr_{tf}_{key}')
+
+        # Temporal dynamics (accelerating changes = reversal signal)
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                    'break_prob_delta_3bar', 'entropy_delta_3bar',
+                    'avg_entropy', 'rsi_slope_5bar', 'vol_trend_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'mr_{key}')
+
+        # Cross-TF disagreement (conflicting signals = reversals)
+        for key in ['direction_agreement', 'avg_health', 'health_min',
+                    'health_std', 'avg_break_prob', 'width_dispersion']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'mr_{key}')
+
+        # Context
+        for key in ['rsi_14', 'atr_pct', 'volume_ratio_20',
+                    'bar_range_pct', 'minutes_since_open']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'mr_{key}')
+
+        # Correlation features
+        for key in ['vix_level', 'tsla_spy_corr_20']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'mr_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train momentum reversal detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        mr_X_train, self.mr_feature_names = self.derive_mr_features(
+            X_train, feature_names)
+        mr_X_val, _ = self.derive_mr_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # "False start": starts positive (ret5 > 0.1%) then reverses (ret20 < -0.2%)
+        reversal_train = (
+            (ret5 > 0.001) & (ret20 < -0.002)
+        ).astype(np.float32)
+        reversal_val = (
+            (ret5_val > 0.001) & (ret20_val < -0.002)
+        ).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Momentum reversal features: {len(self.mr_feature_names)}")
+        print(f"  Reversal rate (train): {reversal_train.mean():.1%}")
+        print(f"  Reversal rate (val): {reversal_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(mr_X_train, label=reversal_train,
+                            feature_name=self.mr_feature_names)
+        dval = lgb.Dataset(mr_X_val, label=reversal_val,
+                          feature_name=self.mr_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'scale_pos_weight': 3.0},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        mr_pred = self.model.predict(mr_X_val)
+        try:
+            auc = roc_auc_score(reversal_val, mr_pred)
+            metrics['reversal_auc'] = float(auc)
+            print(f"  Momentum Reversal AUC: {auc:.3f}")
+        except Exception:
+            metrics['reversal_auc'] = 0.5
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 momentum reversal features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.mr_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        mr_X, _ = self.derive_mr_features(X, self.feature_names)
+        return {
+            'reversal_prob': self.model.predict(mr_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'mr_feature_names': self.mr_feature_names,
+            }, f)
+        print(f"  Saved MomentumReversalDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'MomentumReversalDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.mr_feature_names = data['mr_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -14905,7 +15451,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -15324,6 +15870,34 @@ def main():
                 )
                 vr.save(os.path.join(args.output, 'vol_return_regime_model.pkl'))
                 print(f"\n  Vol-Return Regime metrics: {vr_metrics}")
+            elif args.arch == 'multi_horizon_loser':
+                mh = MultiHorizonLoserDetector()
+                mh_metrics = mh.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                mh.save(os.path.join(args.output, 'multi_horizon_loser_model.pkl'))
+                print(f"\n  Multi-Horizon Loser metrics: {mh_metrics}")
+            elif args.arch == 'bounce_loser':
+                bl = BounceLoserDetector()
+                bl_metrics = bl.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                bl.save(os.path.join(args.output, 'bounce_loser_model.pkl'))
+                print(f"\n  Bounce Loser metrics: {bl_metrics}")
+            elif args.arch == 'feature_interaction':
+                fi = FeatureInteractionLoser()
+                fi_metrics = fi.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                fi.save(os.path.join(args.output, 'feature_interaction_model.pkl'))
+                print(f"\n  Feature Interaction metrics: {fi_metrics}")
+            elif args.arch == 'momentum_reversal':
+                mr = MomentumReversalDetector()
+                mr_metrics = mr.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                mr.save(os.path.join(args.output, 'momentum_reversal_model.pkl'))
+                print(f"\n  Momentum Reversal metrics: {mr_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

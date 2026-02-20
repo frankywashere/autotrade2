@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -615,6 +615,39 @@ def run_backtest(
                 win_streak_model = WinStreakDetector.load(ws_path)
                 print(f"[ML] Win Streak Detector loaded (AUC 0.620)")
                 ml_stats['ws_boost'] = 0
+            except Exception:
+                pass
+
+        # Architecture 54: Bounce Loser Detector
+        bounce_loser_model = None
+        bl_path = _os.path.join(model_dir, 'bounce_loser_model.pkl')
+        if _os.path.exists(bl_path):
+            try:
+                bounce_loser_model = BounceLoserDetector.load(bl_path)
+                print(f"[ML] Bounce Loser Detector loaded (AUC 0.670)")
+                ml_stats['bl_penalty'] = 0
+            except Exception:
+                pass
+
+        # Architecture 55: Feature Interaction Loser
+        feat_int_model = None
+        fi_path = _os.path.join(model_dir, 'feature_interaction_model.pkl')
+        if _os.path.exists(fi_path):
+            try:
+                feat_int_model = FeatureInteractionLoser.load(fi_path)
+                print(f"[ML] Feature Interaction Loser loaded (AUC 0.733)")
+                ml_stats['fi_penalty'] = 0
+            except Exception:
+                pass
+
+        # Architecture 56: Momentum Reversal Detector
+        mom_rev_model = None
+        mr_path = _os.path.join(model_dir, 'momentum_reversal_model.pkl')
+        if _os.path.exists(mr_path):
+            try:
+                mom_rev_model = MomentumReversalDetector.load(mr_path)
+                print(f"[ML] Momentum Reversal loaded (AUC 0.663)")
+                ml_stats['mr_penalty'] = 0
             except Exception:
                 pass
 
@@ -1439,6 +1472,17 @@ def run_backtest(
                     # Stop Distance (Arch 43): disabled (MAE corr 0.346, 0 triggers at all thresholds)
                     # Vol Clustering (Arch 44): disabled (AUC 0.683, 11 pen/1 boost, PF unchanged)
 
+                    # Feature Interaction Loser (Arch 55): AUC 0.733 but 1 boosting round
+                    # Disabled: predictions cluster 0.14-0.19, median split adds noise (PF 9.04→8.88)
+                    # if feat_int_model is not None: ...
+
+                    # Bounce Loser (Arch 54): AUC 0.670, 18 pen on bounces, PF unchanged
+                    # Disabled: bounce penalties don't change outcomes
+                    # if bounce_loser_model is not None: ...
+
+                    # Momentum Reversal (Arch 56): AUC 0.663, testing disabled
+                    # if mom_rev_model is not None: ...
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -1718,6 +1762,12 @@ def run_backtest(
             print(f"    DM low dd boost:   {ml_stats.get('dm_low_dd_boost', 0)}")
         if win_streak_model is not None:
             print(f"    WS boost:          {ml_stats.get('ws_boost', 0)}")
+        if feat_int_model is not None:
+            print(f"    FI penalty:        {ml_stats.get('fi_penalty', 0)}")
+        if bounce_loser_model is not None:
+            print(f"    BL bounce pen:     {ml_stats.get('bl_penalty', 0)}")
+        if mom_rev_model is not None:
+            print(f"    MR reversal pen:   {ml_stats.get('mr_penalty', 0)}")
 
     # Breakdown by exit reason
     if trades:
