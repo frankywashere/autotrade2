@@ -1909,7 +1909,7 @@ def run_backtest(
 
                 # Direction boost: both directions performing well
                 if sig.signal_type == 'break':
-                    trade_size *= 1.60
+                    trade_size *= 1.65
 
                 # BUY direction boost: 100% WR across all types
                 if sig.action == 'BUY':
