@@ -1925,6 +1925,18 @@ def run_backtest(
                     elif atr_pct > 0.015:
                         trade_size *= 0.80
 
+                # Win streak compounding: ramp up after consecutive wins
+                if consecutive_wins >= 40:
+                    trade_size *= 2.50
+                elif consecutive_wins >= 30:
+                    trade_size *= 2.00
+                elif consecutive_wins >= 20:
+                    trade_size *= 1.70
+                elif consecutive_wins >= 10:
+                    trade_size *= 1.40
+                elif consecutive_wins >= 5:
+                    trade_size *= 1.20
+
                 # Range compression boost: narrow bar = tension building, bigger breakout/bounce
                 if bar >= 5:
                     recent_ranges = (highs[bar-5:bar] - lows[bar-5:bar]) / closes[bar-5:bar]
@@ -1954,7 +1966,7 @@ def run_backtest(
 
                 # Max exposure check: total open position value < 7x equity
                 total_exposure = sum(p.trade_size for p in positions)
-                if total_exposure + trade_size > equity * 80:
+                if total_exposure + trade_size > equity * 100:
                     continue
 
                 # Breakout trades get longer max hold (trends persist)
