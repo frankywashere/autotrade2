@@ -1929,11 +1929,11 @@ def run_backtest(
                 bar_dt = tsla.index[bar]
                 dow = bar_dt.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
                 if dow == 2:  # Wednesday
-                    trade_size *= 1.40
+                    trade_size *= 1.60
                 elif dow == 3:  # Thursday
-                    trade_size *= 1.20
+                    trade_size *= 1.30
                 elif dow == 1:  # Tuesday
-                    trade_size *= 1.10
+                    trade_size *= 1.15
 
                 # Time-of-day boost: first/last hour typically bigger moves
                 bar_time = tsla.index[bar]
@@ -1941,13 +1941,13 @@ def run_backtest(
                 minute = bar_time.minute if hasattr(bar_time, 'minute') else 0
                 minutes_from_open = (hour - 9) * 60 + minute - 30  # EST
                 if minutes_from_open < 60:  # First hour
-                    trade_size *= 1.20
+                    trade_size *= 1.35
                 elif minutes_from_open > 330:  # Last 30 min
-                    trade_size *= 1.15
+                    trade_size *= 1.25
 
                 # Max exposure check: total open position value < 7x equity
                 total_exposure = sum(p.trade_size for p in positions)
-                if total_exposure + trade_size > equity * 60:
+                if total_exposure + trade_size > equity * 80:
                     continue
 
                 # Breakout trades get longer max hold (trends persist)
