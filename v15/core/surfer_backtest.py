@@ -1937,6 +1937,15 @@ def run_backtest(
                 elif consecutive_wins >= 5:
                     trade_size *= 1.20
 
+                # Recent profitability boost: if last 3 trades averaged big wins, trade bigger
+                if len(trades) >= 3:
+                    recent_pnls = [t.pnl for t in trades[-3:]]
+                    avg_recent_pnl = sum(recent_pnls) / len(recent_pnls)
+                    if avg_recent_pnl > 100000:  # Big recent winners
+                        trade_size *= 1.25
+                    elif avg_recent_pnl > 50000:
+                        trade_size *= 1.15
+
                 # Range compression boost: narrow bar = tension building, bigger breakout/bounce
                 if bar >= 5:
                     recent_ranges = (highs[bar-5:bar] - lows[bar-5:bar]) / closes[bar-5:bar]
