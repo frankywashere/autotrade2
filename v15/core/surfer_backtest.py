@@ -1434,12 +1434,13 @@ def run_backtest(
                             pass
 
                     # Extreme Loser Detector: high loser probability → penalize hard
+                    el_loser_prob = 0.0  # Track for stop tightening
                     if extreme_loser_model is not None:
                         try:
                             el_pred = extreme_loser_model.predict(feature_vec.reshape(1, -1))
-                            loser_prob = float(el_pred['loser_prob'][0])
+                            el_loser_prob = float(el_pred['loser_prob'][0])
 
-                            if loser_prob > 0.18:
+                            if el_loser_prob > 0.18:
                                 sig.confidence *= 0.80
                                 ml_stats['el_penalty'] += 1
                         except Exception:
@@ -1573,6 +1574,12 @@ def run_backtest(
                 atr_floor = (1.5 * current_atr) / entry_price
                 atr_cap = (2.5 * current_atr) / entry_price
                 adjusted_stop_pct = np.clip(sig.suggested_stop_pct, atr_floor, atr_cap)
+
+                # ML stop tightening: if Extreme Loser flags risk, tighten stop by 25%
+                if el_loser_prob > 0.18:
+                    adjusted_stop_pct *= 0.65
+                    ml_stats.setdefault('el_stop_tighten', 0)
+                    ml_stats['el_stop_tighten'] += 1
 
                 if sig.action == 'BUY':
                     stop = entry_price * (1 - adjusted_stop_pct)
