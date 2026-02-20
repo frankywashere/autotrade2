@@ -1897,6 +1897,14 @@ def run_backtest(
                     if avg_vol > 0 and current_vol > avg_vol * 2.0:
                         trade_size *= 1.20
 
+                # Volume-price divergence boost: high vol + small move = accumulation
+                if 'volume' in tsla.columns and bar >= 5:
+                    recent_vol = tsla['volume'].iloc[bar-5:bar].mean()
+                    avg_vol_20 = tsla['volume'].iloc[max(0, bar-20):bar].mean()
+                    recent_move = abs(closes[bar] - closes[max(0, bar-5)]) / closes[max(0, bar-5)]
+                    if avg_vol_20 > 0 and recent_vol > avg_vol_20 * 1.5 and recent_move < 0.003:
+                        trade_size *= 1.15
+
                 # Price momentum confirmation for breakouts
                 if sig.signal_type == 'break' and bar >= 3:
                     lookback_prices = tsla['close'].iloc[bar-3:bar+1].values
