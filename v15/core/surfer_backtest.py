@@ -166,13 +166,13 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             # EL: lower thresholds and tighter trails
             # Fast reversion: even tighter — mean reversion resolves quickly
             tight = el or fast_rev
-            if profit_ratio >= (0.60 if tight else 0.80):
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.10 if tight else 0.15))
+            if profit_ratio >= (0.60 if tight else 0.70):
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.10 if tight else 0.12))
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_ratio >= (0.30 if tight else 0.50):
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.25 if tight else 0.40))
+            elif profit_ratio >= (0.30 if tight else 0.40):
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.25 if tight else 0.30))
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_ratio >= (0.15 if tight else 0.25):
+            elif profit_ratio >= (0.15 if tight else 0.20):
                 effective_stop = max(position.stop_price, entry * 0.999)
             else:
                 effective_stop = position.stop_price
@@ -208,13 +208,13 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             profit_from_entry = (entry - position.trailing_stop) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
             tight = el or fast_rev
-            if profit_ratio >= (0.60 if tight else 0.80):
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.10 if tight else 0.15))
+            if profit_ratio >= (0.60 if tight else 0.70):
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.10 if tight else 0.12))
                 effective_stop = min(position.stop_price, trail_from_best)
-            elif profit_ratio >= (0.30 if tight else 0.50):
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.25 if tight else 0.40))
+            elif profit_ratio >= (0.30 if tight else 0.40):
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.25 if tight else 0.30))
                 effective_stop = min(position.stop_price, trail_from_best)
-            elif profit_ratio >= (0.15 if tight else 0.25):
+            elif profit_ratio >= (0.15 if tight else 0.20):
                 effective_stop = min(position.stop_price, entry * 1.001)
             else:
                 effective_stop = position.stop_price
