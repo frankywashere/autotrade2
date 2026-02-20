@@ -1855,7 +1855,7 @@ def run_backtest(
                     trade_size *= 1.30
 
                 # Timing boost for bounces: timing_score +0.359 PnlCorr
-                if sig.signal_type == 'bounce' and sig.timing_score > 0.30:
+                if sig.signal_type == 'bounce' and sig.timing_score > 0.10:
                     trade_size *= 1.20
 
                 # Confidence boost for bounces: confidence +0.360 PnlCorr
