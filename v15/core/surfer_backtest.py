@@ -179,7 +179,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             elif profit_ratio >= (0.30 if tight else 0.40):
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.12 if tight else 0.15))
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_ratio >= (0.15 if tight else 0.20):
+            elif profit_ratio >= (0.10 if tight else 0.15):
                 effective_stop = max(position.stop_price, entry * 0.999)
             else:
                 effective_stop = position.stop_price
@@ -224,7 +224,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             elif profit_ratio >= (0.30 if tight else 0.40):
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.12 if tight else 0.15))
                 effective_stop = min(position.stop_price, trail_from_best)
-            elif profit_ratio >= (0.15 if tight else 0.20):
+            elif profit_ratio >= (0.10 if tight else 0.15):
                 effective_stop = min(position.stop_price, entry * 1.001)
             else:
                 effective_stop = position.stop_price
@@ -1862,10 +1862,10 @@ def run_backtest(
                 if sig.signal_type == 'bounce' and sig.confidence > 0.55:
                     trade_size *= 1.55
 
-                # BUY bounce low-conf penalty: BUY bounces with conf < 0.50 lose more
-                if (sig.signal_type == 'bounce' and sig.action == 'BUY'
-                        and sig.confidence < 0.50):
-                    trade_size *= 0.50
+                # BUY bounce low-conf penalty: disabled — 100% WR on BUY bounces
+                # if (sig.signal_type == 'bounce' and sig.action == 'BUY'
+                #         and sig.confidence < 0.50):
+                #     trade_size *= 0.50
 
                 # Position score boost for bounces: position_score +0.354 PnlCorr
                 if sig.signal_type == 'bounce' and sig.position_score > 0.95:
@@ -1915,7 +1915,7 @@ def run_backtest(
                 if sig.action == 'BUY':
                     trade_size *= 1.30
 
-                # Max exposure check: total open position value < 4x equity
+                # Max exposure check: total open position value < 7x equity
                 total_exposure = sum(p.trade_size for p in positions)
                 if total_exposure + trade_size > equity * 7:
                     continue
