@@ -1808,7 +1808,7 @@ def run_backtest(
                 # Wider stops → smaller position, tighter stops → larger position
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
                 # Higher cap for bounces (0% stop rate, 87%+ WR)
-                size_cap = position_size * (5 if sig.signal_type == 'bounce' else 3)
+                size_cap = position_size * (7 if sig.signal_type == 'bounce' else 3)
                 trade_size = min(trade_size, size_cap)
 
                 # Channel health penalty: high health breakouts are less decisive
