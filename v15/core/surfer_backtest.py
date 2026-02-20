@@ -1717,7 +1717,6 @@ def run_backtest(
                 entry_price = current_price
 
                 # Risk-normalized position sizing: each trade risks same $ amount
-                # target_risk = base_risk * confidence_multiplier
                 base_risk = position_size * 0.012  # $120 risk per $10K base
                 if sig.confidence >= 0.70:
                     risk_budget = base_risk * 1.5
@@ -1737,7 +1736,8 @@ def run_backtest(
                 # Floor at 1.5*ATR (survive noise), cap at 2.5*ATR (don't overexpose)
                 current_atr = atr[bar]
                 atr_floor = (1.5 * current_atr) / entry_price
-                atr_cap = (2.5 * current_atr) / entry_price
+                atr_mult = 3.0 if sig.signal_type == 'break' else 2.5
+                atr_cap = (atr_mult * current_atr) / entry_price
                 adjusted_stop_pct = np.clip(sig.suggested_stop_pct, atr_floor, atr_cap)
 
                 # ML stop tightening: if Extreme Loser flags risk, tighten stop by 35%
