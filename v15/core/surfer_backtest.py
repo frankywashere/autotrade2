@@ -1860,7 +1860,7 @@ def run_backtest(
 
                 # Confidence boost for bounces: confidence +0.360 PnlCorr
                 if sig.signal_type == 'bounce' and sig.confidence > 0.55:
-                    trade_size *= 1.15
+                    trade_size *= 1.55
 
                 # BUY bounce low-conf penalty: BUY bounces with conf < 0.50 lose more
                 if (sig.signal_type == 'bounce' and sig.action == 'BUY'
