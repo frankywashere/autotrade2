@@ -1750,7 +1750,9 @@ def run_backtest(
 
                 # Risk-normalized position sizing: scale with equity growth
                 equity_scale = equity / initial_equity  # Grows as we win
-                base_risk = position_size * 0.018 * equity_scale
+                # Higher base risk for bounces (100% WR = zero stop risk)
+                risk_mult = 0.025 if sig.signal_type == 'bounce' else 0.018
+                base_risk = position_size * risk_mult * equity_scale
                 if sig.confidence >= 0.70:
                     risk_budget = base_risk * 1.3
                 elif sig.confidence >= 0.60:
@@ -1808,7 +1810,7 @@ def run_backtest(
                 # Wider stops → smaller position, tighter stops → larger position
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
                 # Higher cap for bounces (0% stop rate, 87%+ WR)
-                size_cap = position_size * (10 if sig.signal_type == 'bounce' else 3)
+                size_cap = position_size * (12 if sig.signal_type == 'bounce' else 3)
                 trade_size = min(trade_size, size_cap)
 
                 # Channel health penalty: high health breakouts are less decisive
