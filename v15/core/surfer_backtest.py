@@ -1878,6 +1878,15 @@ def run_backtest(
                 if sig.signal_type == 'bounce' and last_breakout_loss:
                     trade_size *= 1.40
 
+                # OU half-life inverse boost for bounces: short half-life = fast reversion
+                primary_state = analysis.tf_states.get(sig.primary_tf)
+                if primary_state and sig.signal_type == 'bounce':
+                    ou_hl = primary_state.ou_half_life
+                    if ou_hl < 3.0:
+                        trade_size *= 1.25  # Fast mean reversion
+                    elif ou_hl < 5.0:
+                        trade_size *= 1.10
+
                 # Position score boost for breakouts: high position_score = good entry
                 if sig.signal_type == 'break' and sig.position_score > 0.90:
                     trade_size *= 1.20
