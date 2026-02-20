@@ -1948,6 +1948,13 @@ def run_backtest(
                 else:
                     trade_size *= 1.10
 
+                # Range expansion detection: contraction→expansion = trend beginning
+                if bar >= 10:
+                    recent_range = (highs[bar-3:bar].max() - lows[bar-3:bar].min()) / closes[bar]
+                    prior_range = (highs[bar-10:bar-3].max() - lows[bar-10:bar-3].min()) / closes[bar]
+                    if prior_range > 0 and recent_range > prior_range * 1.5:
+                        trade_size *= 1.15  # Range expanding = trend forming
+
                 # Entropy-inverse boost: low entropy = predictable = bigger position
                 if hasattr(sig, 'entropy_score') and sig.entropy_score < 0.85:
                     trade_size *= 1.25
