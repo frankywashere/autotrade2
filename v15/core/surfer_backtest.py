@@ -1692,10 +1692,8 @@ def run_backtest(
                 if daily_breaker_active:
                     continue
 
-                # Skip 10AM ET hour (15:00 UTC) — only negative hour in backtest
-                bar_time = tsla.index[bar]
-                if hasattr(bar_time, 'hour') and bar_time.hour == 15:
-                    continue
+                # 10AM ET skip disabled — testing without in new data window
+                pass
 
                 # Don't enter if we already have a position in the same direction
                 existing_dirs = {p.direction for p in positions}
