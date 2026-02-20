@@ -152,10 +152,10 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             # because BUY break losers have MFE 0.08-0.14%
             tier3_thresh = 0.002 if el else 0.0008
             if profit_from_best > 0.015:
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.06)
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.03)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.08)
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.04)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > tier3_thresh:
                 trail_mult = 0.20 if el else 0.06
@@ -200,10 +200,10 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             profit_from_best = (entry - position.trailing_stop) / entry
             # Three-tier breakout trail
             if profit_from_best > 0.015:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.06)
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.03)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.08)
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.04)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_from_best > (0.002 if el else 0.0015):
                 trail_mult = 0.20 if el else 0.06
