@@ -1744,6 +1744,10 @@ def run_backtest(
                     except Exception:
                         pass  # Quality scorer failure doesn't block trade
 
+                # Position score filter: skip breakouts with weak position
+                if sig.signal_type == 'break' and sig.position_score < 0.90:
+                    continue
+
                 # Enter position
                 entry_price = current_price
 
