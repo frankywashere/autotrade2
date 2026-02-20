@@ -1839,14 +1839,15 @@ def run_backtest(
                 trade_size = min(trade_size, size_cap)
 
                 # Channel health penalty: high health breakouts are less decisive
+                # Relaxed with improved trail system catching bad breaks
                 if sig.signal_type == 'break' and sig.channel_health > 0.35:
-                    trade_size *= 0.60
+                    trade_size *= 0.70
 
                 # Double-negative breakout penalty: high conf + high health
                 # Both inversely correlated with winning — combined = worst case
                 if (sig.signal_type == 'break' and sig.confidence > 0.90
                         and sig.channel_health > 0.25):
-                    trade_size *= 0.50
+                    trade_size *= 0.60
 
                 # Energy boost for bounces: low energy = bigger moves (-0.353 PnlCorr)
                 if sig.signal_type == 'bounce' and sig.energy_score < 0.30:
