@@ -1812,7 +1812,7 @@ def run_backtest(
                 # High-conf breakout tightening: high-conf breakouts have
                 # inverse reliability — tighter stops limit damage
                 if sig.signal_type == 'break' and sig.confidence > 0.90:
-                    adjusted_stop_pct *= 0.65
+                    adjusted_stop_pct *= 0.45
 
                 # BSP stop tightening: breakout-specific, AUC 0.794
                 # BSP stop tightening disabled — marginal impact (PF 9.67→9.70)
