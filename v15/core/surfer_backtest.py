@@ -144,8 +144,12 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
         if is_breakout:
             profit_from_best = (position.trailing_stop - entry) / entry
             # Two-tier breakout trail: tighter trail when running big
-            if profit_from_best > 0.008:
-                # Big runner (>1.5% from best): very tight trail to lock profits
+            if profit_from_best > 0.015:
+                # Super runner (>2%): lock hard
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.06)
+                effective_stop = max(position.stop_price, trail_from_best)
+            elif profit_from_best > 0.008:
+                # Big runner (>0.8%): tight trail
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.10)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > (0.004 if el else 0.006):
@@ -186,8 +190,11 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (entry - position.trailing_stop) / entry
-            # Two-tier breakout trail: tighter trail when running big
-            if profit_from_best > 0.008:
+            # Three-tier breakout trail
+            if profit_from_best > 0.015:
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.06)
+                effective_stop = min(position.stop_price, trail_from_best)
+            elif profit_from_best > 0.008:
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.10)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_from_best > (0.004 if el else 0.006):
