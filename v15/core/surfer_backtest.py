@@ -1833,6 +1833,11 @@ def run_backtest(
                 if sig.signal_type == 'bounce' and sig.position_score > 0.95:
                     trade_size *= 1.15
 
+                # Low channel health boost for bounces: health -0.521 PnlCorr
+                # Bounces from weaker channels = bigger mean-reversion moves
+                if sig.signal_type == 'bounce' and sig.channel_health < 0.65:
+                    trade_size *= 1.25
+
                 # High confluence + low confidence breakout boost
                 # Confluence (+0.196 WinCorr) and conf is inverse (-0.275 WinCorr)
                 if (sig.signal_type == 'break' and sig.confluence_score > 0.90
