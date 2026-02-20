@@ -1882,8 +1882,7 @@ def run_backtest(
 
                 # High confluence + low confidence breakout boost
                 # Confluence (+0.196 WinCorr) and conf is inverse (-0.275 WinCorr)
-                if (sig.signal_type == 'break' and sig.confluence_score > 0.90
-                        and sig.confidence < 0.80):
+                if sig.signal_type == 'break' and sig.confidence < 0.80:
                     trade_size *= 1.25
 
                 # Low confidence breakout boost: conf -0.275 WinCorr
