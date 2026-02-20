@@ -147,17 +147,14 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (position.trailing_stop - entry) / entry
-            # Three-tier breakout trail
+            # Three-tier breakout trail (with progressive tightening)
             if profit_from_best > 0.015:
-                # Super runner (>1.5%): lock hard
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.06)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
-                # Big runner (>0.8%): tight trail
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.10)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > (0.002 if el else 0.0035):
-                # Standard trail
                 trail_mult = 0.20 if el else 0.25
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
                 effective_stop = max(position.stop_price, trail_from_best)
@@ -1777,15 +1774,20 @@ def run_backtest(
 
                 # ML stop tightening: if Extreme Loser flags risk, tighten stop by 35%
                 if el_loser_prob > 0.18:
-                    adjusted_stop_pct *= 0.65
+                    adjusted_stop_pct *= 0.75
                     ml_stats.setdefault('el_stop_tighten', 0)
                     ml_stats['el_stop_tighten'] += 1
 
                 # IS stop tightening: if Immediate Stop flags risk, tighten stop by 20%
                 if imm_stop_prob > 0.35:
-                    adjusted_stop_pct *= 0.80
+                    adjusted_stop_pct *= 0.75
                     ml_stats.setdefault('is_stop_tighten', 0)
                     ml_stats['is_stop_tighten'] += 1
+
+                # High-conf breakout tightening: high-conf breakouts have
+                # inverse reliability — tighter stops limit damage
+                if sig.signal_type == 'break' and sig.confidence > 0.90:
+                    adjusted_stop_pct *= 0.65
 
                 # BSP stop tightening: breakout-specific, AUC 0.794
                 # BSP stop tightening disabled — marginal impact (PF 9.67→9.70)
