@@ -1885,6 +1885,10 @@ def run_backtest(
                         elif sig.action == 'SELL' and recent_return < -0.004:
                             trade_size *= 1.20
 
+                # SELL breakout boost: SELL breaks are 97% WR vs 90% BUY
+                if sig.signal_type == 'break' and sig.action == 'SELL':
+                    trade_size *= 1.25
+
                 # Max exposure check: total open position value < 3x equity
                 total_exposure = sum(p.trade_size for p in positions)
                 if total_exposure + trade_size > equity * 3:
