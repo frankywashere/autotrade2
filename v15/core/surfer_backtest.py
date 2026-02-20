@@ -140,13 +140,16 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
         if is_breakout:
             profit_from_best = (position.trailing_stop - entry) / entry
             # EL: tighter trail; FP: tighter trail to lock fast profit
-            trail_threshold = 0.004 if el else 0.008
-            trail_mult = 0.20 if el else 0.3
+            trail_threshold = 0.004 if el else 0.006
+            trail_mult = 0.20 if el else 0.25
             if profit_from_best > trail_threshold:
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
                 effective_stop = max(position.stop_price, trail_from_best)
             else:
                 effective_stop = position.stop_price
+            # Time-based breakeven disabled: cuts winners too much
+            # if el and bars_held >= 6 and position.best_price > entry * 1.002:
+            #     effective_stop = max(effective_stop, entry * 1.0005)
         else:
             profit_from_entry = (position.trailing_stop - entry) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
@@ -178,13 +181,16 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (entry - position.trailing_stop) / entry
-            trail_threshold = 0.004 if el else 0.008
-            trail_mult = 0.20 if el else 0.3
+            trail_threshold = 0.004 if el else 0.006
+            trail_mult = 0.20 if el else 0.25
             if profit_from_best > trail_threshold:
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult)
                 effective_stop = min(position.stop_price, trail_from_best)
             else:
                 effective_stop = position.stop_price
+            # Time-based breakeven disabled: cuts winners too much
+            # if el and bars_held >= 6 and position.best_price < entry * 0.998:
+            #     effective_stop = min(effective_stop, entry * 0.9995)
         else:
             profit_from_entry = (entry - position.trailing_stop) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
@@ -782,6 +788,7 @@ def run_backtest(
     positions: List[OpenPosition] = []  # Multi-position support (max 2)
     position_signals: list = []  # Signal data for each open position
     max_positions = 2
+    pending_entries = []  # Deferred entries: list of (bar, direction, signal_type, confidence, stop_pct, tp_pct, primary_tf, ou_hl, max_hold, el_flagged, fast_rev, trade_size, signal_data)
     equity = position_size * 10  # Start with 100k
     peak_equity = equity
     max_dd = 0.0
@@ -941,6 +948,60 @@ def run_backtest(
         for pi in sorted(closed_indices, reverse=True):
             positions.pop(pi)
             position_signals.pop(pi)
+
+        # --- Process pending (deferred) entries ---
+        expired_pending = []
+        for pi, pend in enumerate(pending_entries):
+            p_bar, p_dir, p_stype, p_conf, p_stop_pct, p_tp_pct, p_tf, p_ou, p_max_hold, p_el, p_fr, p_trade_size, p_sig_data = pend
+            # Only process if exactly 1 eval cycle has passed
+            if bar - p_bar != eval_interval:
+                if bar - p_bar > eval_interval:
+                    expired_pending.append(pi)
+                continue
+            # Check if price hasn't blown past stop already
+            delayed_price = current_price
+            if p_dir == 'BUY':
+                would_stop = delayed_price * (1 - p_stop_pct)
+                # If price dropped below where stop would be, skip
+                if window_low < would_stop:
+                    expired_pending.append(pi)
+                    continue
+            else:
+                would_stop = delayed_price * (1 + p_stop_pct)
+                if window_high > would_stop:
+                    expired_pending.append(pi)
+                    continue
+            # Check room for position
+            if len(positions) >= max_positions:
+                expired_pending.append(pi)
+                continue
+            existing_dirs = {p.direction for p in positions}
+            existing_types = {p.signal_type for p in positions}
+            if p_dir in existing_dirs or p_stype in existing_types:
+                expired_pending.append(pi)
+                continue
+            # Enter at delayed price
+            if p_dir == 'BUY':
+                stop = delayed_price * (1 - p_stop_pct)
+                tp = delayed_price * (1 + p_tp_pct)
+            else:
+                stop = delayed_price * (1 + p_stop_pct)
+                tp = delayed_price * (1 - p_tp_pct)
+            positions.append(OpenPosition(
+                entry_bar=bar, entry_price=delayed_price,
+                direction=p_dir, confidence=p_conf,
+                stop_price=stop, tp_price=tp,
+                primary_tf=p_tf, signal_type=p_stype,
+                trade_size=p_trade_size, ou_half_life=p_ou,
+                max_hold_bars=p_max_hold, trailing_stop=delayed_price,
+                el_flagged=p_el, fast_reversion=p_fr,
+            ))
+            position_signals.append(p_sig_data)
+            ml_stats.setdefault('delayed_entries', 0)
+            ml_stats['delayed_entries'] += 1
+            expired_pending.append(pi)
+        for pi in sorted(expired_pending, reverse=True):
+            pending_entries.pop(pi)
 
         # --- Generate new signal (if room for more positions) ---
         if len(positions) < max_positions:
@@ -1548,9 +1609,15 @@ def run_backtest(
                     ml_prediction = None
                     ml_max_hold = None
                     imm_stop_skip = False
+                    el_loser_prob = 0.0
+                    imm_stop_prob = 0.0
+                    fast_rev = 0.0
             else:
                 ml_max_hold = None
                 imm_stop_skip = False
+                el_loser_prob = 0.0
+                imm_stop_prob = 0.0
+                fast_rev = 0.0
 
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
                 # Daily circuit breaker: stop trading if down $500+ today
@@ -1666,23 +1733,9 @@ def run_backtest(
                 primary_state = analysis.tf_states.get(sig.primary_tf)
                 ou_hl = primary_state.ou_half_life if primary_state else 5.0
 
-                positions.append(OpenPosition(
-                    entry_bar=bar,
-                    entry_price=entry_price,
-                    direction=sig.action,
-                    confidence=sig.confidence,
-                    stop_price=stop,
-                    tp_price=tp,
-                    primary_tf=sig.primary_tf,
-                    signal_type=sig.signal_type,
-                    trade_size=trade_size,
-                    ou_half_life=ou_hl,
-                    max_hold_bars=effective_max_hold,
-                    trailing_stop=entry_price,
-                    el_flagged=(el_loser_prob > 0.18),
-                    fast_reversion=(fast_rev > 0.55),
-                ))
-                position_signals.append({
+                # Entry delay disabled — all deferred trades get skipped (PF 8.49→6.61)
+                defer_entry = False
+                sig_data = {
                     'position_score': sig.position_score,
                     'energy_score': sig.energy_score,
                     'entropy_score': sig.entropy_score,
@@ -1690,7 +1743,35 @@ def run_backtest(
                     'timing_score': sig.timing_score,
                     'channel_health': sig.channel_health,
                     'confidence': sig.confidence,
-                })
+                }
+                if defer_entry:
+                    pending_entries.append((
+                        bar, sig.action, sig.signal_type, sig.confidence,
+                        adjusted_stop_pct, sig.suggested_tp_pct, sig.primary_tf,
+                        ou_hl, effective_max_hold,
+                        (el_loser_prob > 0.18), (fast_rev > 0.55),
+                        trade_size, sig_data,
+                    ))
+                    ml_stats.setdefault('deferred_total', 0)
+                    ml_stats['deferred_total'] += 1
+                else:
+                    positions.append(OpenPosition(
+                        entry_bar=bar,
+                        entry_price=entry_price,
+                        direction=sig.action,
+                        confidence=sig.confidence,
+                        stop_price=stop,
+                        tp_price=tp,
+                        primary_tf=sig.primary_tf,
+                        signal_type=sig.signal_type,
+                        trade_size=trade_size,
+                        ou_half_life=ou_hl,
+                        max_hold_bars=effective_max_hold,
+                        trailing_stop=entry_price,
+                        el_flagged=(el_loser_prob > 0.18),
+                        fast_reversion=(fast_rev > 0.55),
+                    ))
+                    position_signals.append(sig_data)
 
     # Close any remaining positions
     for position in positions:
@@ -1848,6 +1929,9 @@ def run_backtest(
             print(f"    MR reversal pen:   {ml_stats.get('mr_penalty', 0)}")
         if imm_stop_model is not None:
             print(f"    IS skip:           {ml_stats.get('is_skip', 0)}")
+        if ml_stats.get('deferred_total', 0) > 0:
+            print(f"    Deferred total:    {ml_stats.get('deferred_total', 0)}")
+            print(f"    Delayed entries:   {ml_stats.get('delayed_entries', 0)}")
 
     # Breakdown by exit reason
     if trades:
@@ -2058,6 +2142,8 @@ def main():
                        help='Path to ML model for signal enhancement (e.g. surfer_models/gbt_model.pkl)')
     parser.add_argument('--ml-compare', action='store_true',
                        help='Run both physics-only and ML-enhanced, then compare')
+    parser.add_argument('--dump-trades', type=str, default=None,
+                       help='Filter to dump: stop, trail, timeout, losers, all')
     args = parser.parse_args()
 
     ml_model = None
@@ -2137,13 +2223,34 @@ def main():
             min_confidence=args.min_conf,
         )
     else:
-        run_backtest(
+        metrics, trades, eq = run_backtest(
             days=args.days,
             eval_interval=args.eval_interval,
             max_hold_bars=args.max_hold,
             min_confidence=args.min_conf,
             ml_model=ml_model,
         )
+
+        # Dump individual trade details if requested
+        if args.dump_trades and trades:
+            filt = args.dump_trades.lower()
+            if filt == 'all':
+                dump = trades
+            elif filt == 'losers':
+                dump = [t for t in trades if t.pnl <= 0]
+            else:
+                dump = [t for t in trades if t.exit_reason == filt]
+            print(f"\n{'='*80}")
+            print(f"TRADE DUMP: {filt} ({len(dump)} trades)")
+            print(f"{'='*80}")
+            for i, t in enumerate(dump):
+                print(f"  #{i+1} {t.direction:4s} {t.signal_type:6s} "
+                      f"conf={t.confidence:.2f} hold={t.hold_bars:2d} "
+                      f"pnl={t.pnl_pct:+.3%} (${t.pnl:+.0f}) "
+                      f"stop={t.stop_pct:.3%} "
+                      f"mae={t.mae_pct:.3%} mfe={t.mfe_pct:.3%} "
+                      f"exit={t.exit_reason} tf={t.primary_tf} "
+                      f"size=${t.trade_size:.0f}")
 
 
 if __name__ == '__main__':
