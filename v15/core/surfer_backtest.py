@@ -1935,6 +1935,16 @@ def run_backtest(
                 elif dow == 1:  # Tuesday
                     trade_size *= 1.10
 
+                # Time-of-day boost: first/last hour typically bigger moves
+                bar_time = tsla.index[bar]
+                hour = bar_time.hour if hasattr(bar_time, 'hour') else 12
+                minute = bar_time.minute if hasattr(bar_time, 'minute') else 0
+                minutes_from_open = (hour - 9) * 60 + minute - 30  # EST
+                if minutes_from_open < 60:  # First hour
+                    trade_size *= 1.20
+                elif minutes_from_open > 330:  # Last 30 min
+                    trade_size *= 1.15
+
                 # Max exposure check: total open position value < 7x equity
                 total_exposure = sum(p.trade_size for p in positions)
                 if total_exposure + trade_size > equity * 60:
