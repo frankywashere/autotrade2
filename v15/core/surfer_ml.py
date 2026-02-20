@@ -12603,6 +12603,1680 @@ class DrawdownRecoveryPredictor:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 43: Stop Distance Optimizer
+# ---------------------------------------------------------------------------
+
+class StopDistanceOptimizer:
+    """
+    Predicts the optimal stop loss distance for each trade setup.
+
+    Instead of a fixed stop % for all trades, this model predicts how much
+    "noise" to expect in the first 5-10 bars. A tight stop works in quiet
+    conditions but whipsaws in volatile ones. A wide stop loses too much
+    on genuine failures.
+
+    Target: the minimum adverse excursion (MAE) that a winning trade
+    experiences. If MAE < 0.3%, we can use a 0.4% stop. If MAE > 1%, we
+    need a 1.2% stop.
+
+    Output: predicted_mae (expected adverse move before recovery)
+    """
+
+    def __init__(self):
+        self.mae_model = None
+        self.feature_names = None
+        self.stop_feature_names = None
+
+    @staticmethod
+    def derive_stop_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive stop distance features."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # ATR (primary stop distance driver)
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            feats.append(X[:, atr_idx])
+            names.append('stop_atr')
+
+        # Channel widths (wider = more noise = wider stop needed)
+        for tf in ['5min', '1h', '4h']:
+            w_idx = name_to_idx.get(f'{tf}_width_pct')
+            if w_idx is not None:
+                feats.append(X[:, w_idx])
+                names.append(f'stop_{tf}_width')
+
+        # OU parameters (fast reversion = tighter stops OK)
+        for tf in ['5min', '1h']:
+            for key in ['ou_half_life', 'ou_theta']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'stop_{tf}_{key}')
+
+        # Position in channel
+        for tf in ['5min', '1h']:
+            pos_idx = name_to_idx.get(f'{tf}_position_pct')
+            if pos_idx is not None:
+                feats.append(X[:, pos_idx])
+                names.append(f'stop_{tf}_position')
+                feats.append(np.abs(X[:, pos_idx] - 0.5))
+                names.append(f'stop_{tf}_edge_dist')
+
+        # Health (healthy = less noise)
+        for key in ['health_min', 'health_max']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'stop_{key}')
+
+        # Volume (high volume = more noise in absolute terms)
+        vol_idx = name_to_idx.get('volume_ratio_20')
+        if vol_idx is not None:
+            feats.append(X[:, vol_idx])
+            names.append('stop_volume_ratio')
+
+        # VIX
+        vix_idx = name_to_idx.get('vix_level')
+        if vix_idx is not None:
+            feats.append(X[:, vix_idx])
+            names.append('stop_vix')
+
+        # Time of day (opening = more noise)
+        mso_idx = name_to_idx.get('minutes_since_open')
+        if mso_idx is not None:
+            feats.append(X[:, mso_idx])
+            names.append('stop_minutes_since_open')
+
+        # Break probability
+        bp_idx = name_to_idx.get('break_prob_max')
+        if bp_idx is not None:
+            feats.append(X[:, bp_idx])
+            names.append('stop_break_prob')
+
+        # Entropy
+        ent_idx = name_to_idx.get('avg_entropy')
+        if ent_idx is not None:
+            feats.append(X[:, ent_idx])
+            names.append('stop_entropy')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train stop distance optimizer."""
+        import lightgbm as lgb
+
+        self.feature_names = list(feature_names)
+        stop_X_train, self.stop_feature_names = self.derive_stop_features(
+            X_train, feature_names)
+        stop_X_val, _ = self.derive_stop_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # MAE proxy: the worst drawdown in the first window
+        # For a long trade: MAE ≈ min(ret5, 0) if ret5 < 0
+        # Use absolute value: how far against us did it go?
+        mae_train = np.abs(np.minimum(ret5, 0)).astype(np.float32)
+        mae_val = np.abs(np.minimum(ret5_val, 0)).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Stop features: {len(self.stop_feature_names)}")
+        print(f"  Mean MAE: {mae_train.mean():.4f} ({mae_train.mean()*100:.2f}%)")
+        print(f"  MAE > 0.5%: {(mae_train > 0.005).mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(stop_X_train, label=mae_train,
+                            feature_name=self.stop_feature_names)
+        dval = lgb.Dataset(stop_X_val, label=mae_val,
+                          feature_name=self.stop_feature_names, reference=dtrain)
+
+        self.mae_model = lgb.train(
+            {'objective': 'regression', 'metric': 'mae', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        mae_pred = self.mae_model.predict(stop_X_val)
+        metrics['mae_mae'] = float(np.mean(np.abs(mae_pred - mae_val)))
+        valid = np.isfinite(mae_pred) & np.isfinite(mae_val)
+        if valid.sum() > 10:
+            metrics['mae_corr'] = float(np.corrcoef(mae_pred[valid], mae_val[valid])[0, 1])
+        else:
+            metrics['mae_corr'] = 0
+        print(f"    MAE prediction MAE: {metrics['mae_mae']:.4f}")
+        print(f"    MAE prediction Corr: {metrics['mae_corr']:.3f}")
+
+        # Check: does predicted MAE separate good/bad situations?
+        from sklearn.metrics import roc_auc_score
+        high_mae = (mae_val > 0.005).astype(np.float32)
+        try:
+            metrics['high_mae_auc'] = float(roc_auc_score(high_mae, mae_pred))
+        except ValueError:
+            metrics['high_mae_auc'] = 0.5
+        print(f"    High MAE AUC (>0.5%): {metrics['high_mae_auc']:.3f}")
+
+        imp = self.mae_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 stop features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.stop_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.mae_model is None:
+            return {}
+        stop_X, _ = self.derive_stop_features(X, self.feature_names)
+        return {
+            'predicted_mae': np.clip(self.mae_model.predict(stop_X), 0, 0.05),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'mae_model': self.mae_model,
+                'feature_names': self.feature_names,
+                'stop_feature_names': self.stop_feature_names,
+            }, f)
+        print(f"  Saved StopDistanceOptimizer to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'StopDistanceOptimizer':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.mae_model = data['mae_model']
+        model.feature_names = data['feature_names']
+        model.stop_feature_names = data['stop_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 44: Volatility Clustering Predictor
+# ---------------------------------------------------------------------------
+
+class VolatilityClusteringPredictor:
+    """
+    Predicts whether current volatility will INCREASE or DECREASE in the
+    next 20 bars. Volatility clustering (GARCH effect) is one of the most
+    robust stylized facts in finance — high vol begets high vol.
+
+    Unlike the Vol Transition model (Arch 14, which predicted vol SPIKES),
+    this predicts the DIRECTION of vol change. This affects:
+    - Position sizing (increasing vol → reduce size)
+    - Stop distance (increasing vol → wider stops)
+    - Trade urgency (decreasing vol → act now before breakout)
+
+    Output: vol_increase_prob (>0.6 = vol will increase)
+    """
+
+    def __init__(self):
+        self.vol_model = None
+        self.feature_names = None
+        self.vc_feature_names = None
+
+    @staticmethod
+    def derive_vc_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive vol clustering features."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Current ATR
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            feats.append(X[:, atr_idx])
+            names.append('vc_atr')
+
+        # Channel widths (proxy for realized vol)
+        for tf in ['5min', '1h', '4h']:
+            w_idx = name_to_idx.get(f'{tf}_width_pct')
+            if w_idx is not None:
+                feats.append(X[:, w_idx])
+                names.append(f'vc_{tf}_width')
+
+        # Width/ATR ratio (how width compares to recent vol)
+        for tf in ['5min', '1h']:
+            w_idx = name_to_idx.get(f'{tf}_width_pct')
+            if w_idx is not None and atr_idx is not None:
+                safe_atr = np.where(X[:, atr_idx] > 1e-6, X[:, atr_idx], 1e-6)
+                feats.append(X[:, w_idx] / safe_atr)
+                names.append(f'vc_{tf}_width_per_atr')
+
+        # VIX (market-wide vol expectation)
+        vix_idx = name_to_idx.get('vix_level')
+        if vix_idx is not None:
+            feats.append(X[:, vix_idx])
+            names.append('vc_vix')
+
+        # Momentum (strong momentum → vol continuation)
+        for key in ['price_momentum_3bar', 'price_momentum_12bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(np.abs(X[:, idx]))
+                names.append(f'vc_abs_{key}')
+
+        # Volume (high volume = vol continuation)
+        vol_idx = name_to_idx.get('volume_ratio_20')
+        if vol_idx is not None:
+            feats.append(X[:, vol_idx])
+            names.append('vc_volume_ratio')
+
+        # Entropy (high entropy = uncertain, vol likely to persist)
+        for key in ['avg_entropy', 'entropy_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'vc_{key}')
+
+        # Health dynamics (deteriorating → vol increasing)
+        for key in ['health_delta_3bar', 'health_delta_6bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'vc_{key}')
+
+        # Break probability dynamics
+        bp_delta = name_to_idx.get('break_prob_delta_3bar')
+        if bp_delta is not None:
+            feats.append(X[:, bp_delta])
+            names.append('vc_break_prob_delta')
+
+        # RSI slope (rapid RSI changes = vol)
+        rsi_slope = name_to_idx.get('rsi_slope_5bar')
+        if rsi_slope is not None:
+            feats.append(np.abs(X[:, rsi_slope]))
+            names.append('vc_abs_rsi_slope')
+
+        # Time of day
+        mso_idx = name_to_idx.get('minutes_since_open')
+        if mso_idx is not None:
+            feats.append(X[:, mso_idx])
+            names.append('vc_minutes_since_open')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train vol clustering predictor."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        vc_X_train, self.vc_feature_names = self.derive_vc_features(
+            X_train, feature_names)
+        vc_X_val, _ = self.derive_vc_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # Vol increase: |ret20 - ret5| > |ret5|
+        # (the 5-20 bar window has more volatility than the 0-5 bar window)
+        vol5_train = np.abs(ret5)
+        vol20_train = np.abs(ret20 - ret5)
+        vol_increase_train = (vol20_train > vol5_train * 1.3).astype(np.float32)
+
+        vol5_val = np.abs(ret5_val)
+        vol20_val = np.abs(ret20_val - ret5_val)
+        vol_increase_val = (vol20_val > vol5_val * 1.3).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Vol clustering features: {len(self.vc_feature_names)}")
+        print(f"  Vol increase rate: {vol_increase_train.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(vc_X_train, label=vol_increase_train,
+                            feature_name=self.vc_feature_names)
+        dval = lgb.Dataset(vc_X_val, label=vol_increase_val,
+                          feature_name=self.vc_feature_names, reference=dtrain)
+
+        self.vol_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        vol_pred = self.vol_model.predict(vc_X_val)
+        try:
+            metrics['vol_increase_auc'] = float(roc_auc_score(vol_increase_val, vol_pred))
+        except ValueError:
+            metrics['vol_increase_auc'] = 0.5
+        print(f"    Vol Increase AUC: {metrics['vol_increase_auc']:.3f}")
+
+        imp = self.vol_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 vol clustering features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.vc_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.vol_model is None:
+            return {}
+        vc_X, _ = self.derive_vc_features(X, self.feature_names)
+        return {
+            'vol_increase_prob': self.vol_model.predict(vc_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'vol_model': self.vol_model,
+                'feature_names': self.feature_names,
+                'vc_feature_names': self.vc_feature_names,
+            }, f)
+        print(f"  Saved VolatilityClusteringPredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'VolatilityClusteringPredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.vol_model = data['vol_model']
+        model.feature_names = data['feature_names']
+        model.vc_feature_names = data['vc_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 45: Extreme Loser Avoidance
+# ---------------------------------------------------------------------------
+# Target: Is this trade in the bottom 15% of returns? (ret_20 < threshold)
+# The highest-value prediction: reliably identifying trades to SKIP.
+# Even a small reduction in losers dramatically improves PF.
+
+class ExtremeLoserDetector:
+    """Predict if a trade will be an extreme loser (bottom 15% of returns)."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.el_feature_names = None
+
+    def derive_el_features(self, X, feature_names):
+        """Extract features most relevant to identifying losers."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Channel health indicators (low health → more losers)
+        for tf in ML_TFS:
+            for key in ['health', 'width_pct', 'r_squared', 'break_prob',
+                        'position_in_channel', 'bars_since_touch']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'el_{tf}_{key}')
+
+        # Cross-TF disagreement (conflicting signals → losers)
+        for key in ['direction_agreement', 'avg_break_prob', 'avg_health',
+                    'health_min', 'health_std', 'width_dispersion',
+                    'channel_count_ratio']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'el_{key}')
+
+        # Context features
+        for key in ['rsi_14', 'atr_pct', 'volume_ratio_20', 'bar_range_pct',
+                    'upper_wick_pct', 'lower_wick_pct', 'body_pct',
+                    'minutes_since_open', 'day_of_week']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'el_{key}')
+
+        # Temporal dynamics
+        for key in ['avg_entropy', 'entropy_delta_3bar', 'health_delta_3bar',
+                    'health_delta_6bar', 'break_prob_delta_3bar',
+                    'rsi_slope_5bar', 'vol_trend_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'el_{key}')
+
+        # Derived: health × break_prob interaction
+        h_idx = name_to_idx.get('health_min')
+        bp_idx = name_to_idx.get('avg_break_prob')
+        if h_idx is not None and bp_idx is not None:
+            feats.append(X[:, h_idx] * X[:, bp_idx])
+            names.append('el_health_x_breakprob')
+
+        # Derived: position extremity (how close to boundary)
+        for tf in ML_TFS:
+            pos_idx = name_to_idx.get(f'{tf}_position_in_channel')
+            if pos_idx is not None:
+                pos = X[:, pos_idx]
+                feats.append(np.abs(pos - 0.5))  # Distance from center
+                names.append(f'el_{tf}_boundary_proximity')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train extreme loser detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        el_X_train, self.el_feature_names = self.derive_el_features(
+            X_train, feature_names)
+        el_X_val, _ = self.derive_el_features(X_val, feature_names)
+
+        ret20_train = Y_train['future_return_20']
+        ret20_val = Y_val['future_return_20']
+
+        # Bottom 15% of returns = extreme losers
+        threshold = np.percentile(ret20_train, 15)
+        loser_train = (ret20_train < threshold).astype(np.float32)
+        loser_val = (ret20_val < threshold).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Extreme loser features: {len(self.el_feature_names)}")
+        print(f"  Loser threshold: {threshold:.4f} ({threshold*100:.2f}%)")
+        print(f"  Loser rate (train): {loser_train.mean():.1%}")
+        print(f"  Loser rate (val): {loser_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(el_X_train, label=loser_train,
+                            feature_name=self.el_feature_names)
+        dval = lgb.Dataset(el_X_val, label=loser_val,
+                          feature_name=self.el_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1,
+             'scale_pos_weight': 3.0},  # Emphasize losers
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        loser_pred = self.model.predict(el_X_val)
+        try:
+            auc = roc_auc_score(loser_val, loser_pred)
+            metrics['loser_auc'] = float(auc)
+            print(f"  Extreme Loser AUC: {auc:.3f}")
+        except Exception:
+            metrics['loser_auc'] = 0.5
+
+        # Check precision at high-confidence threshold
+        for thr in [0.3, 0.4, 0.5]:
+            flagged = loser_pred > thr
+            if flagged.sum() > 0:
+                precision = loser_val[flagged].mean()
+                print(f"    Threshold {thr:.1f}: {flagged.sum()} flagged, {precision:.1%} precision")
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 extreme loser features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.el_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        el_X, _ = self.derive_el_features(X, self.feature_names)
+        return {
+            'loser_prob': self.model.predict(el_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'el_feature_names': self.el_feature_names,
+            }, f)
+        print(f"  Saved ExtremeLoserDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'ExtremeLoserDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.el_feature_names = data['el_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 46: Risk-Reward Classifier
+# ---------------------------------------------------------------------------
+# Target: Does this trade have a favorable risk-reward ratio?
+# Uses max adverse excursion (approximated from ret5/ret20) vs final return.
+# High R:R trades are worth boosting position size on.
+
+class RiskRewardClassifier:
+    """Predict if a trade will have favorable risk-reward (R:R > 2.0)."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.rr_feature_names = None
+
+    def derive_rr_features(self, X, feature_names):
+        """Extract features relevant to risk-reward assessment."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Channel width (narrow channels → better R:R typically)
+        for tf in ML_TFS:
+            for key in ['width_pct', 'position_in_channel', 'health',
+                        'r_squared', 'slope_normalized', 'break_prob']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'rr_{tf}_{key}')
+
+        # Cross-TF features
+        for key in ['direction_agreement', 'avg_health', 'health_min',
+                    'avg_break_prob', 'width_dispersion']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rr_{key}')
+
+        # Context (ATR, RSI for volatility assessment)
+        for key in ['rsi_14', 'atr_pct', 'volume_ratio_20', 'bar_range_pct',
+                    'minutes_since_open']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rr_{key}')
+
+        # Temporal dynamics
+        for key in ['health_delta_3bar', 'break_prob_delta_3bar',
+                    'vol_trend_5bar', 'rsi_slope_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rr_{key}')
+
+        # Correlation features
+        for key in ['tsla_spy_corr_20', 'tsla_spy_corr_60', 'vix_level']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rr_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train risk-reward classifier."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        rr_X_train, self.rr_feature_names = self.derive_rr_features(
+            X_train, feature_names)
+        rr_X_val, _ = self.derive_rr_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # Approximate max adverse excursion:
+        # If ret20 > 0 (winner), adverse = max(-ret5, 0) (worst drawdown early)
+        # If ret20 < 0 (loser), adverse = abs(ret20) (the loss itself)
+        # Risk-reward = |ret20| / (adverse + 0.001)
+        def compute_rr(r5, r20):
+            adverse = np.where(
+                r20 > 0,
+                np.maximum(-np.minimum(r5, 0), 0.0005),  # Winners: worst early drawdown
+                np.abs(r20) + 0.001  # Losers: the loss is the adverse
+            )
+            rr = np.abs(r20) / (adverse + 0.001)
+            # High R:R = reward > 2x the risk
+            return (rr > 2.0).astype(np.float32)
+
+        high_rr_train = compute_rr(ret5, ret20)
+        high_rr_val = compute_rr(ret5_val, ret20_val)
+
+        metrics = {}
+        print(f"\n  Risk-reward features: {len(self.rr_feature_names)}")
+        print(f"  High R:R rate (train): {high_rr_train.mean():.1%}")
+        print(f"  High R:R rate (val): {high_rr_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(rr_X_train, label=high_rr_train,
+                            feature_name=self.rr_feature_names)
+        dval = lgb.Dataset(rr_X_val, label=high_rr_val,
+                          feature_name=self.rr_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        rr_pred = self.model.predict(rr_X_val)
+        try:
+            auc = roc_auc_score(high_rr_val, rr_pred)
+            metrics['rr_auc'] = float(auc)
+            print(f"  Risk-Reward AUC: {auc:.3f}")
+        except Exception:
+            metrics['rr_auc'] = 0.5
+
+        # Correlation with actual R:R
+        actual_rr = np.abs(ret20_val) / (np.maximum(np.abs(np.minimum(ret5_val, 0)), 0.0005) + 0.001)
+        corr = np.corrcoef(rr_pred, actual_rr)[0, 1]
+        metrics['rr_corr'] = float(corr) if not np.isnan(corr) else 0.0
+        print(f"  R:R correlation: {corr:.3f}")
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 risk-reward features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.rr_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        rr_X, _ = self.derive_rr_features(X, self.feature_names)
+        return {
+            'high_rr_prob': self.model.predict(rr_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'rr_feature_names': self.rr_feature_names,
+            }, f)
+        print(f"  Saved RiskRewardClassifier to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'RiskRewardClassifier':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.rr_feature_names = data['rr_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 47: Return Consistency Predictor
+# ---------------------------------------------------------------------------
+# Target: Do short and medium returns agree? sign(ret5) == sign(ret20) AND |ret20| > |ret5|
+# "Consistent" trades build steadily — these are the easiest to manage.
+# Inconsistent trades (early win that reverses, or late reversal) are harder.
+
+class ReturnConsistencyPredictor:
+    """Predict if returns will be consistent across horizons."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.rc_feature_names = None
+
+    def derive_rc_features(self, X, feature_names):
+        """Extract features relevant to return consistency."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Channel slope consistency across TFs
+        slopes = []
+        for tf in ML_TFS:
+            s_idx = name_to_idx.get(f'{tf}_slope_normalized')
+            if s_idx is not None:
+                feats.append(X[:, s_idx])
+                names.append(f'rc_{tf}_slope')
+                slopes.append(X[:, s_idx])
+
+        # Slope agreement (std across TFs — low = consistent)
+        if len(slopes) >= 2:
+            slope_stack = np.column_stack(slopes)
+            feats.append(np.std(slope_stack, axis=1))
+            names.append('rc_slope_std')
+            feats.append(np.mean(np.sign(slope_stack), axis=1))
+            names.append('rc_slope_sign_avg')
+
+        # Health and break prob (stable channels = consistent returns)
+        for tf in ML_TFS:
+            for key in ['health', 'r_squared', 'break_prob',
+                        'position_in_channel', 'width_pct']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'rc_{tf}_{key}')
+
+        # Cross-TF agreement
+        for key in ['direction_agreement', 'avg_health', 'health_std',
+                    'avg_break_prob']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rc_{key}')
+
+        # Temporal stability (consistent price action = consistent returns)
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                    'break_prob_delta_3bar', 'entropy_delta_3bar',
+                    'rsi_slope_5bar', 'vol_trend_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rc_{key}')
+
+        # Context
+        for key in ['rsi_14', 'atr_pct', 'minutes_since_open']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rc_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train return consistency predictor."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        rc_X_train, self.rc_feature_names = self.derive_rc_features(
+            X_train, feature_names)
+        rc_X_val, _ = self.derive_rc_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # Consistent = same sign AND magnitude grows (steady trend)
+        consistent_train = (
+            (np.sign(ret5) == np.sign(ret20)) &
+            (np.abs(ret20) > np.abs(ret5))
+        ).astype(np.float32)
+        consistent_val = (
+            (np.sign(ret5_val) == np.sign(ret20_val)) &
+            (np.abs(ret20_val) > np.abs(ret5_val))
+        ).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Return consistency features: {len(self.rc_feature_names)}")
+        print(f"  Consistent rate (train): {consistent_train.mean():.1%}")
+        print(f"  Consistent rate (val): {consistent_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(rc_X_train, label=consistent_train,
+                            feature_name=self.rc_feature_names)
+        dval = lgb.Dataset(rc_X_val, label=consistent_val,
+                          feature_name=self.rc_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        rc_pred = self.model.predict(rc_X_val)
+        try:
+            auc = roc_auc_score(consistent_val, rc_pred)
+            metrics['consistency_auc'] = float(auc)
+            print(f"  Consistency AUC: {auc:.3f}")
+        except Exception:
+            metrics['consistency_auc'] = 0.5
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 consistency features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.rc_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        rc_X, _ = self.derive_rc_features(X, self.feature_names)
+        return {
+            'consistency_prob': self.model.predict(rc_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'rc_feature_names': self.rc_feature_names,
+            }, f)
+        print(f"  Saved ReturnConsistencyPredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'ReturnConsistencyPredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.rc_feature_names = data['rc_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 48: Horizon Divergence Predictor
+# ---------------------------------------------------------------------------
+# Target: Do ret_5 and ret_60 disagree in sign? If so, there's a reversal
+# coming within 60 bars. This is an early warning to tighten exits.
+# Also useful: ret_20 > 0 but ret_60 < 0 means "take profits before reversal".
+
+class HorizonDivergencePredictor:
+    """Predict if short-term and long-term returns will diverge (reversal ahead)."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.hd_feature_names = None
+
+    def derive_hd_features(self, X, feature_names):
+        """Extract features relevant to horizon divergence."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Channel maturity indicators (mature = more likely to reverse)
+        for tf in ML_TFS:
+            for key in ['health', 'lifetime_bars', 'break_prob',
+                        'slope_normalized', 'width_pct', 'r_squared']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'hd_{tf}_{key}')
+
+        # Cross-TF divergence signals
+        for key in ['direction_agreement', 'avg_break_prob', 'avg_health',
+                    'health_min', 'health_std', 'width_dispersion']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'hd_{key}')
+
+        # Temporal exhaustion indicators
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                    'break_prob_delta_3bar', 'entropy_delta_3bar',
+                    'avg_entropy', 'rsi_slope_5bar', 'vol_trend_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'hd_{key}')
+
+        # Context
+        for key in ['rsi_14', 'atr_pct', 'volume_ratio_20',
+                    'minutes_since_open', 'day_of_week']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'hd_{key}')
+
+        # Correlation features (market regime affects divergence)
+        for key in ['tsla_spy_corr_20', 'vix_level', 'spy_trend_20']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'hd_{key}')
+
+        # Derived: break_prob acceleration
+        bp3 = name_to_idx.get('break_prob_delta_3bar')
+        bp6 = name_to_idx.get('health_delta_6bar')
+        if bp3 is not None and bp6 is not None:
+            feats.append(X[:, bp3] - X[:, bp6])  # Acceleration
+            names.append('hd_break_prob_accel')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train horizon divergence predictor."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        hd_X_train, self.hd_feature_names = self.derive_hd_features(
+            X_train, feature_names)
+        hd_X_val, _ = self.derive_hd_features(X_val, feature_names)
+
+        ret20 = Y_train['future_return_20']
+        ret60 = Y_train['future_return_60']
+        ret20_val = Y_val['future_return_20']
+        ret60_val = Y_val['future_return_60']
+
+        # Divergence: ret20 and ret60 have opposite signs
+        # This means "profitable at 20 bars but reverses by 60" or vice versa
+        diverge_train = (np.sign(ret20) != np.sign(ret60)).astype(np.float32)
+        # Only count meaningful divergence (not just noise around zero)
+        meaningful = (np.abs(ret20) > 0.003) | (np.abs(ret60) > 0.003)
+        diverge_train = (diverge_train * meaningful).astype(np.float32)
+
+        diverge_val = (np.sign(ret20_val) != np.sign(ret60_val)).astype(np.float32)
+        meaningful_val = (np.abs(ret20_val) > 0.003) | (np.abs(ret60_val) > 0.003)
+        diverge_val = (diverge_val * meaningful_val).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Horizon divergence features: {len(self.hd_feature_names)}")
+        print(f"  Divergence rate (train): {diverge_train.mean():.1%}")
+        print(f"  Divergence rate (val): {diverge_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(hd_X_train, label=diverge_train,
+                            feature_name=self.hd_feature_names)
+        dval = lgb.Dataset(hd_X_val, label=diverge_val,
+                          feature_name=self.hd_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        hd_pred = self.model.predict(hd_X_val)
+        try:
+            auc = roc_auc_score(diverge_val, hd_pred)
+            metrics['divergence_auc'] = float(auc)
+            print(f"  Divergence AUC: {auc:.3f}")
+        except Exception:
+            metrics['divergence_auc'] = 0.5
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 horizon divergence features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.hd_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        hd_X, _ = self.derive_hd_features(X, self.feature_names)
+        return {
+            'divergence_prob': self.model.predict(hd_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'hd_feature_names': self.hd_feature_names,
+            }, f)
+        print(f"  Saved HorizonDivergencePredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'HorizonDivergencePredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.hd_feature_names = data['hd_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 49: Drawdown Magnitude Predictor
+# ---------------------------------------------------------------------------
+# Unlike binary models, this uses QUANTILE REGRESSION to predict the
+# distribution of max adverse excursion. Knowing "this trade will likely
+# draw down 0.5-1.0%" is more useful than "bad trade: yes/no".
+
+class DrawdownMagnitudePredictor:
+    """Predict the magnitude of adverse price excursion using quantile regression."""
+
+    def __init__(self):
+        self.p25_model = None
+        self.p50_model = None
+        self.p75_model = None
+        self.feature_names = None
+        self.dm_feature_names = None
+
+    def derive_dm_features(self, X, feature_names):
+        """Extract features relevant to drawdown magnitude."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Channel properties across TFs
+        for tf in ML_TFS:
+            for key in ['width_pct', 'health', 'position_in_channel',
+                        'r_squared', 'break_prob', 'bars_since_touch',
+                        'slope_normalized']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'dm_{tf}_{key}')
+
+        # Cross-TF
+        for key in ['direction_agreement', 'avg_health', 'health_min',
+                    'health_std', 'avg_break_prob', 'width_dispersion']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'dm_{key}')
+
+        # Volatility context
+        for key in ['atr_pct', 'bar_range_pct', 'volume_ratio_20',
+                    'rsi_14', 'minutes_since_open']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'dm_{key}')
+
+        # Temporal dynamics
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                    'break_prob_delta_3bar', 'vol_trend_5bar',
+                    'avg_entropy', 'entropy_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'dm_{key}')
+
+        # Correlation features
+        for key in ['vix_level', 'tsla_spy_corr_20']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'dm_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train drawdown magnitude predictor using quantile regression."""
+        import lightgbm as lgb
+
+        self.feature_names = list(feature_names)
+        dm_X_train, self.dm_feature_names = self.derive_dm_features(
+            X_train, feature_names)
+        dm_X_val, _ = self.derive_dm_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # Approximate max adverse excursion:
+        # For longs: max drawdown = max(-min(ret5, 0), abs(min(ret20, 0)))
+        # Simplified: use the worst of the early and full-period returns
+        mae_train = np.maximum(
+            np.abs(np.minimum(ret5, 0)),
+            np.abs(np.minimum(ret20, 0))
+        )
+        mae_val = np.maximum(
+            np.abs(np.minimum(ret5_val, 0)),
+            np.abs(np.minimum(ret20_val, 0))
+        )
+
+        metrics = {}
+        print(f"\n  Drawdown magnitude features: {len(self.dm_feature_names)}")
+        print(f"  MAE stats (train): mean={mae_train.mean():.4f}, "
+              f"p50={np.median(mae_train):.4f}, p75={np.percentile(mae_train, 75):.4f}")
+
+        base_params = {
+            'num_leaves': 31, 'learning_rate': 0.05,
+            'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+            'bagging_freq': 5, 'verbose': -1,
+        }
+
+        for alpha, name in [(0.25, 'p25'), (0.50, 'p50'), (0.75, 'p75')]:
+            callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+            params = {**base_params, 'objective': 'quantile', 'alpha': alpha,
+                     'metric': 'quantile'}
+            dtrain = lgb.Dataset(dm_X_train, label=mae_train,
+                                feature_name=self.dm_feature_names)
+            dval = lgb.Dataset(dm_X_val, label=mae_val,
+                              feature_name=self.dm_feature_names, reference=dtrain)
+
+            model = lgb.train(params, dtrain, num_boost_round=500,
+                            valid_sets=[dval], callbacks=callbacks)
+            setattr(self, f'{name}_model', model)
+
+            pred = model.predict(dm_X_val)
+            corr = np.corrcoef(pred, mae_val)[0, 1]
+            coverage = (mae_val <= pred).mean()
+            metrics[f'{name}_corr'] = float(corr) if not np.isnan(corr) else 0.0
+            metrics[f'{name}_coverage'] = float(coverage)
+            print(f"  {name.upper()}: corr={corr:.3f}, coverage={coverage:.1%}")
+
+        # Feature importance from p50 model
+        imp = self.p50_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 drawdown magnitude features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.dm_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.p50_model is None:
+            return {}
+        dm_X, _ = self.derive_dm_features(X, self.feature_names)
+        return {
+            'mae_p25': self.p25_model.predict(dm_X),
+            'mae_p50': self.p50_model.predict(dm_X),
+            'mae_p75': self.p75_model.predict(dm_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'p25_model': self.p25_model,
+                'p50_model': self.p50_model,
+                'p75_model': self.p75_model,
+                'feature_names': self.feature_names,
+                'dm_feature_names': self.dm_feature_names,
+            }, f)
+        print(f"  Saved DrawdownMagnitudePredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'DrawdownMagnitudePredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.p25_model = data['p25_model']
+        model.p50_model = data['p50_model']
+        model.p75_model = data['p75_model']
+        model.feature_names = data['feature_names']
+        model.dm_feature_names = data['dm_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 50: Win Streak Detector
+# ---------------------------------------------------------------------------
+# Use temporal features (deltas, trends) to predict if conditions favor
+# consecutive winning trades. During "hot streaks", the features show
+# stable health, low entropy, consistent direction — boost confidence.
+
+class WinStreakDetector:
+    """Predict if current conditions favor a cluster of winning trades."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.ws_feature_names = None
+
+    def derive_ws_features(self, X, feature_names):
+        """Extract features relevant to win streak detection."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Temporal stability (key for streaks)
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                    'break_prob_delta_3bar', 'entropy_delta_3bar',
+                    'avg_entropy', 'rsi_slope_5bar', 'vol_trend_5bar',
+                    'position_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'ws_{key}')
+
+        # Channel health across TFs (high health = stable = streaks)
+        for tf in ML_TFS:
+            for key in ['health', 'r_squared', 'break_prob', 'width_pct',
+                        'position_in_channel']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'ws_{tf}_{key}')
+
+        # Cross-TF agreement (high agreement = streaks)
+        for key in ['direction_agreement', 'avg_health', 'health_min',
+                    'health_std', 'avg_break_prob']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'ws_{key}')
+
+        # Context
+        for key in ['rsi_14', 'atr_pct', 'volume_ratio_20',
+                    'minutes_since_open', 'day_of_week']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'ws_{key}')
+
+        # Derived: stability score (low absolute deltas = stable)
+        delta_keys = ['health_delta_3bar', 'break_prob_delta_3bar', 'entropy_delta_3bar']
+        delta_vals = []
+        for key in delta_keys:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                delta_vals.append(np.abs(X[:, idx]))
+        if delta_vals:
+            feats.append(np.mean(delta_vals, axis=0))
+            names.append('ws_avg_abs_delta')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train win streak detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        ws_X_train, self.ws_feature_names = self.derive_ws_features(
+            X_train, feature_names)
+        ws_X_val, _ = self.derive_ws_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # "Streak-worthy" = both ret5 > 0 AND ret20 > 0.3%
+        # This identifies conditions that produce consistent winners
+        streak_train = (
+            (ret5 > 0) & (ret20 > 0.003)
+        ).astype(np.float32)
+        streak_val = (
+            (ret5_val > 0) & (ret20_val > 0.003)
+        ).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Win streak features: {len(self.ws_feature_names)}")
+        print(f"  Streak rate (train): {streak_train.mean():.1%}")
+        print(f"  Streak rate (val): {streak_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(ws_X_train, label=streak_train,
+                            feature_name=self.ws_feature_names)
+        dval = lgb.Dataset(ws_X_val, label=streak_val,
+                          feature_name=self.ws_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        ws_pred = self.model.predict(ws_X_val)
+        try:
+            auc = roc_auc_score(streak_val, ws_pred)
+            metrics['streak_auc'] = float(auc)
+            print(f"  Win Streak AUC: {auc:.3f}")
+        except Exception:
+            metrics['streak_auc'] = 0.5
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 win streak features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.ws_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        ws_X, _ = self.derive_ws_features(X, self.feature_names)
+        return {
+            'streak_prob': self.model.predict(ws_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'ws_feature_names': self.ws_feature_names,
+            }, f)
+        print(f"  Saved WinStreakDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'WinStreakDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.ws_feature_names = data['ws_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 51: Reversal Proximity Detector
+# ---------------------------------------------------------------------------
+# Combine channel maturity signals with break probability dynamics to
+# predict if we're about to hit a major reversal. Different from break_prob
+# because it uses ACCELERATION and cross-TF confirmation.
+
+class ReversalProximityDetector:
+    """Predict proximity to a channel break/reversal using acceleration signals."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.rp_feature_names = None
+
+    def derive_rp_features(self, X, feature_names):
+        """Extract features with emphasis on acceleration and cross-TF patterns."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Break probability and its derivatives
+        for tf in ML_TFS:
+            bp_idx = name_to_idx.get(f'{tf}_break_prob')
+            if bp_idx is not None:
+                feats.append(X[:, bp_idx])
+                names.append(f'rp_{tf}_break_prob')
+
+            h_idx = name_to_idx.get(f'{tf}_health')
+            if h_idx is not None:
+                feats.append(X[:, h_idx])
+                names.append(f'rp_{tf}_health')
+
+            lt_idx = name_to_idx.get(f'{tf}_lifetime_bars')
+            if lt_idx is not None:
+                feats.append(X[:, lt_idx])
+                names.append(f'rp_{tf}_lifetime_bars')
+
+            pos_idx = name_to_idx.get(f'{tf}_position_in_channel')
+            if pos_idx is not None:
+                feats.append(X[:, pos_idx])
+                names.append(f'rp_{tf}_position')
+
+        # Temporal dynamics — acceleration matters
+        for key in ['break_prob_delta_3bar', 'health_delta_3bar',
+                    'health_delta_6bar', 'entropy_delta_3bar',
+                    'avg_entropy', 'rsi_slope_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rp_{key}')
+
+        # Cross-TF divergence
+        for key in ['direction_agreement', 'avg_break_prob',
+                    'health_min', 'health_std']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rp_{key}')
+
+        # Derived: break_prob acceleration (3bar delta minus health delta)
+        bp3 = name_to_idx.get('break_prob_delta_3bar')
+        h3 = name_to_idx.get('health_delta_3bar')
+        if bp3 is not None and h3 is not None:
+            feats.append(X[:, bp3] + np.abs(X[:, h3]))  # Rising break + falling health
+            names.append('rp_reversal_pressure')
+
+        # Derived: max break_prob across TFs
+        bp_vals = []
+        for tf in ML_TFS:
+            idx = name_to_idx.get(f'{tf}_break_prob')
+            if idx is not None:
+                bp_vals.append(X[:, idx])
+        if bp_vals:
+            feats.append(np.max(bp_vals, axis=0))
+            names.append('rp_max_break_prob')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train reversal proximity detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        rp_X_train, self.rp_feature_names = self.derive_rp_features(
+            X_train, feature_names)
+        rp_X_val, _ = self.derive_rp_features(X_val, feature_names)
+
+        lifetime = Y_train['channel_lifetime']
+        lifetime_val = Y_val['channel_lifetime']
+
+        # "Near reversal" = channel will break within 10 bars
+        near_rev_train = (lifetime < 10).astype(np.float32)
+        near_rev_val = (lifetime_val < 10).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Reversal proximity features: {len(self.rp_feature_names)}")
+        print(f"  Near-reversal rate (train): {near_rev_train.mean():.1%}")
+        print(f"  Near-reversal rate (val): {near_rev_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(rp_X_train, label=near_rev_train,
+                            feature_name=self.rp_feature_names)
+        dval = lgb.Dataset(rp_X_val, label=near_rev_val,
+                          feature_name=self.rp_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        rp_pred = self.model.predict(rp_X_val)
+        try:
+            auc = roc_auc_score(near_rev_val, rp_pred)
+            metrics['reversal_auc'] = float(auc)
+            print(f"  Reversal Proximity AUC: {auc:.3f}")
+        except Exception:
+            metrics['reversal_auc'] = 0.5
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 reversal proximity features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.rp_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        rp_X, _ = self.derive_rp_features(X, self.feature_names)
+        return {
+            'reversal_prob': self.model.predict(rp_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'rp_feature_names': self.rp_feature_names,
+            }, f)
+        print(f"  Saved ReversalProximityDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'ReversalProximityDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.rp_feature_names = data['rp_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 52: Volatility-Return Regime
+# ---------------------------------------------------------------------------
+# Classify the current bar into one of 4 regimes based on the
+# vol-return relationship:
+# 1. Low vol + positive return (ideal: smooth trend)
+# 2. Low vol + negative return (quiet decline)
+# 3. High vol + positive return (volatile rally)
+# 4. High vol + negative return (volatile sell-off)
+# Each regime has different optimal sizing and exit behavior.
+
+class VolReturnRegimeClassifier:
+    """Classify volatility-return regimes for differential trading."""
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.vr_feature_names = None
+
+    def derive_vr_features(self, X, feature_names):
+        """Extract features for vol-return regime classification."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Vol indicators
+        for key in ['atr_pct', 'bar_range_pct', 'volume_ratio_20']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'vr_{key}')
+
+        # Channel width (proxy for vol regime)
+        for tf in ML_TFS:
+            for key in ['width_pct', 'health', 'slope_normalized',
+                        'r_squared', 'break_prob']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'vr_{tf}_{key}')
+
+        # Temporal vol dynamics
+        for key in ['vol_trend_5bar', 'entropy_delta_3bar', 'avg_entropy',
+                    'rsi_slope_5bar', 'health_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'vr_{key}')
+
+        # Cross-TF
+        for key in ['direction_agreement', 'avg_health', 'width_dispersion',
+                    'health_std']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'vr_{key}')
+
+        # Market context
+        for key in ['vix_level', 'tsla_spy_corr_20', 'rsi_14',
+                    'minutes_since_open']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'vr_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train vol-return regime classifier."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        vr_X_train, self.vr_feature_names = self.derive_vr_features(
+            X_train, feature_names)
+        vr_X_val, _ = self.derive_vr_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # Target: "smooth trend" regime (ideal for trading)
+        # Low vol (|ret5| < 0.5%) AND positive ret20 (> 0.3%)
+        # This is the ideal condition: calm market moving in our direction
+        smooth_trend_train = (
+            (np.abs(ret5) < 0.005) & (ret20 > 0.003)
+        ).astype(np.float32)
+        smooth_trend_val = (
+            (np.abs(ret5_val) < 0.005) & (ret20_val > 0.003)
+        ).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Vol-return regime features: {len(self.vr_feature_names)}")
+        print(f"  Smooth trend rate (train): {smooth_trend_train.mean():.1%}")
+        print(f"  Smooth trend rate (val): {smooth_trend_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(vr_X_train, label=smooth_trend_train,
+                            feature_name=self.vr_feature_names)
+        dval = lgb.Dataset(vr_X_val, label=smooth_trend_val,
+                          feature_name=self.vr_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        vr_pred = self.model.predict(vr_X_val)
+        try:
+            auc = roc_auc_score(smooth_trend_val, vr_pred)
+            metrics['smooth_auc'] = float(auc)
+            print(f"  Smooth Trend AUC: {auc:.3f}")
+        except Exception:
+            metrics['smooth_auc'] = 0.5
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 vol-return regime features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.vr_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        vr_X, _ = self.derive_vr_features(X, self.feature_names)
+        return {
+            'smooth_trend_prob': self.model.predict(vr_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'vr_feature_names': self.vr_feature_names,
+            }, f)
+        print(f"  Saved VolReturnRegimeClassifier to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'VolReturnRegimeClassifier':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.vr_feature_names = data['vr_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -13231,7 +14905,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -13580,6 +15254,76 @@ def main():
                 )
                 dr.save(os.path.join(args.output, 'drawdown_recovery_model.pkl'))
                 print(f"\n  Drawdown Recovery metrics: {dr_metrics}")
+            elif args.arch == 'stop_distance':
+                sd = StopDistanceOptimizer()
+                sd_metrics = sd.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                sd.save(os.path.join(args.output, 'stop_distance_model.pkl'))
+                print(f"\n  Stop Distance metrics: {sd_metrics}")
+            elif args.arch == 'vol_clustering':
+                vc = VolatilityClusteringPredictor()
+                vc_metrics = vc.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                vc.save(os.path.join(args.output, 'vol_clustering_model.pkl'))
+                print(f"\n  Vol Clustering metrics: {vc_metrics}")
+            elif args.arch == 'extreme_loser':
+                el = ExtremeLoserDetector()
+                el_metrics = el.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                el.save(os.path.join(args.output, 'extreme_loser_model.pkl'))
+                print(f"\n  Extreme Loser metrics: {el_metrics}")
+            elif args.arch == 'risk_reward':
+                rr = RiskRewardClassifier()
+                rr_metrics = rr.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                rr.save(os.path.join(args.output, 'risk_reward_model.pkl'))
+                print(f"\n  Risk-Reward metrics: {rr_metrics}")
+            elif args.arch == 'return_consistency':
+                rc = ReturnConsistencyPredictor()
+                rc_metrics = rc.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                rc.save(os.path.join(args.output, 'return_consistency_model.pkl'))
+                print(f"\n  Return Consistency metrics: {rc_metrics}")
+            elif args.arch == 'horizon_divergence':
+                hd = HorizonDivergencePredictor()
+                hd_metrics = hd.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                hd.save(os.path.join(args.output, 'horizon_divergence_model.pkl'))
+                print(f"\n  Horizon Divergence metrics: {hd_metrics}")
+            elif args.arch == 'drawdown_magnitude':
+                dm = DrawdownMagnitudePredictor()
+                dm_metrics = dm.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                dm.save(os.path.join(args.output, 'drawdown_magnitude_model.pkl'))
+                print(f"\n  Drawdown Magnitude metrics: {dm_metrics}")
+            elif args.arch == 'win_streak':
+                ws = WinStreakDetector()
+                ws_metrics = ws.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                ws.save(os.path.join(args.output, 'win_streak_model.pkl'))
+                print(f"\n  Win Streak metrics: {ws_metrics}")
+            elif args.arch == 'reversal_proximity':
+                rp = ReversalProximityDetector()
+                rp_metrics = rp.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                rp.save(os.path.join(args.output, 'reversal_proximity_model.pkl'))
+                print(f"\n  Reversal Proximity metrics: {rp_metrics}")
+            elif args.arch == 'vol_return_regime':
+                vr = VolReturnRegimeClassifier()
+                vr_metrics = vr.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                vr.save(os.path.join(args.output, 'vol_return_regime_model.pkl'))
+                print(f"\n  Vol-Return Regime metrics: {vr_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

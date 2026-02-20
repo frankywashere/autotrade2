@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -556,6 +556,65 @@ def run_backtest(
                 print(f"[ML] Tail Risk Detector loaded (AUC 0.743)")
                 ml_stats['tail_bounce_penalty'] = 0
                 ml_stats['tail_break_boost'] = 0
+            except Exception:
+                pass
+
+        # Architecture 43: Stop Distance Optimizer
+        stop_dist_model = None
+        sd_path = _os.path.join(model_dir, 'stop_distance_model.pkl')
+        if _os.path.exists(sd_path):
+            try:
+                stop_dist_model = StopDistanceOptimizer.load(sd_path)
+                print(f"[ML] Stop Distance loaded (MAE corr 0.346)")
+                ml_stats['sd_wide_stop'] = 0
+                ml_stats['sd_tight_stop'] = 0
+            except Exception:
+                pass
+
+        # Architecture 44: Volatility Clustering
+        vol_cluster_model = None
+        vcl_path = _os.path.join(model_dir, 'vol_clustering_model.pkl')
+        if _os.path.exists(vcl_path):
+            try:
+                vol_cluster_model = VolatilityClusteringPredictor.load(vcl_path)
+                print(f"[ML] Vol Clustering loaded (AUC 0.683)")
+                ml_stats['vc_vol_inc_penalty'] = 0
+                ml_stats['vc_vol_dec_boost'] = 0
+            except Exception:
+                pass
+
+        # Architecture 45: Extreme Loser Detector
+        extreme_loser_model = None
+        el_path = _os.path.join(model_dir, 'extreme_loser_model.pkl')
+        if _os.path.exists(el_path):
+            try:
+                extreme_loser_model = ExtremeLoserDetector.load(el_path)
+                print(f"[ML] Extreme Loser Detector loaded (AUC 0.654)")
+                ml_stats['el_penalty'] = 0
+                ml_stats['el_skip'] = 0
+            except Exception:
+                pass
+
+        # Architecture 49: Drawdown Magnitude Predictor
+        drawdown_mag_model = None
+        dm_path = _os.path.join(model_dir, 'drawdown_magnitude_model.pkl')
+        if _os.path.exists(dm_path):
+            try:
+                drawdown_mag_model = DrawdownMagnitudePredictor.load(dm_path)
+                print(f"[ML] Drawdown Magnitude loaded (P75 corr 0.283)")
+                ml_stats['dm_high_dd_pen'] = 0
+                ml_stats['dm_low_dd_boost'] = 0
+            except Exception:
+                pass
+
+        # Architecture 50: Win Streak Detector
+        win_streak_model = None
+        ws_path = _os.path.join(model_dir, 'win_streak_model.pkl')
+        if _os.path.exists(ws_path):
+            try:
+                win_streak_model = WinStreakDetector.load(ws_path)
+                print(f"[ML] Win Streak Detector loaded (AUC 0.620)")
+                ml_stats['ws_boost'] = 0
             except Exception:
                 pass
 
@@ -1341,6 +1400,26 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Extreme Loser Detector: high loser probability → penalize hard
+                    if extreme_loser_model is not None:
+                        try:
+                            el_pred = extreme_loser_model.predict(feature_vec.reshape(1, -1))
+                            loser_prob = float(el_pred['loser_prob'][0])
+
+                            if loser_prob > 0.18:
+                                sig.confidence *= 0.80
+                                ml_stats['el_penalty'] += 1
+                        except Exception:
+                            pass
+
+                    # Drawdown Magnitude (Arch 49): P75 corr 0.283 but compounds with EL
+                    # Disabled: too many penalties (41) overlap with Extreme Loser
+                    # if drawdown_mag_model is not None: ...
+
+                    # Win Streak (Arch 50): AUC 0.620, 18 boosts, PF unchanged
+                    # Disabled: boosts don't change trade outcomes
+                    # if win_streak_model is not None: ...
+
                     # Adversarial Selector (Arch 37): AUC 0.605 but 0 triggers in backtest
                     # Only 3 boosting rounds → predictions cluster, never hit thresholds
                     # Disabled: trained but not integrated
@@ -1357,6 +1436,8 @@ def run_backtest(
                     # Cascade Confidence (Arch 38): disabled (model preds contribute 1.8%)
                     # kNN Trade Analogy (Arch 39): disabled (AUC 0.549, random)
                     # Drawdown Recovery (Arch 42): disabled (AUC 0.500, completely random)
+                    # Stop Distance (Arch 43): disabled (MAE corr 0.346, 0 triggers at all thresholds)
+                    # Vol Clustering (Arch 44): disabled (AUC 0.683, 11 pen/1 boost, PF unchanged)
 
                 except Exception:
                     ml_prediction = None
@@ -1623,6 +1704,20 @@ def run_backtest(
         if tail_risk_model is not None:
             print(f"    Tail bounce pen:   {ml_stats.get('tail_bounce_penalty', 0)}")
             print(f"    Tail break boost:  {ml_stats.get('tail_break_boost', 0)}")
+        if stop_dist_model is not None:
+            print(f"    SD wide stop:      {ml_stats.get('sd_wide_stop', 0)}")
+            print(f"    SD tight stop:     {ml_stats.get('sd_tight_stop', 0)}")
+        if vol_cluster_model is not None:
+            print(f"    VC vol inc pen:    {ml_stats.get('vc_vol_inc_penalty', 0)}")
+            print(f"    VC vol dec boost:  {ml_stats.get('vc_vol_dec_boost', 0)}")
+        if extreme_loser_model is not None:
+            print(f"    EL penalty:        {ml_stats.get('el_penalty', 0)}")
+            print(f"    EL skip:           {ml_stats.get('el_skip', 0)}")
+        if drawdown_mag_model is not None:
+            print(f"    DM high dd pen:    {ml_stats.get('dm_high_dd_pen', 0)}")
+            print(f"    DM low dd boost:   {ml_stats.get('dm_low_dd_boost', 0)}")
+        if win_streak_model is not None:
+            print(f"    WS boost:          {ml_stats.get('ws_boost', 0)}")
 
     # Breakdown by exit reason
     if trades:
