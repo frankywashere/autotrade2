@@ -12218,6 +12218,391 @@ class QuantileRiskEstimator:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 41: Tail Risk Detector
+# ---------------------------------------------------------------------------
+
+class TailRiskDetector:
+    """
+    Predicts the probability of EXTREME adverse moves (tail events).
+
+    Most models predict "good" trades. This predicts "catastrophically bad" ones.
+    A 3% adverse move in 20 bars on TSLA can wipe out multiple winners. If we
+    can predict when these tail events are likely, we can avoid them entirely.
+
+    Key insight: Tail events have different drivers than normal moves —
+    they're driven by gap risk, volatility clustering, and regime changes.
+
+    Output: tail_risk_prob (>0.5 = dangerous, avoid or reduce size)
+    """
+
+    def __init__(self):
+        self.tail_model = None
+        self.feature_names = None
+        self.tail_feature_names = None
+
+    @staticmethod
+    def derive_tail_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive tail risk features."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Volatility features (high vol = tail risk)
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            feats.append(X[:, atr_idx])
+            names.append('tail_atr')
+            # Squared ATR (tail risk grows quadratically with vol)
+            feats.append(X[:, atr_idx] ** 2)
+            names.append('tail_atr_squared')
+
+        # Channel width (wider = more room for adverse move)
+        for tf in ['5min', '1h', '4h']:
+            w_idx = name_to_idx.get(f'{tf}_width_pct')
+            if w_idx is not None:
+                feats.append(X[:, w_idx])
+                names.append(f'tail_{tf}_width')
+
+        # Position at extremes (near edge = vulnerable)
+        for tf in ['5min', '1h']:
+            pos_idx = name_to_idx.get(f'{tf}_position_pct')
+            if pos_idx is not None:
+                edge = np.abs(X[:, pos_idx] - 0.5)
+                feats.append(edge)
+                names.append(f'tail_{tf}_edge_dist')
+
+        # Break probability (high = regime change imminent)
+        for key in ['break_prob_max', 'break_prob_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'tail_{key}')
+
+        # Health (deteriorating health = structural instability)
+        for key in ['health_min', 'health_delta_3bar', 'health_delta_6bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'tail_{key}')
+
+        # Entropy (high = unpredictable)
+        for key in ['avg_entropy', 'entropy_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'tail_{key}')
+
+        # VIX (market fear)
+        vix_idx = name_to_idx.get('vix_level')
+        if vix_idx is not None:
+            feats.append(X[:, vix_idx])
+            names.append('tail_vix')
+
+        # Time of day (opening/closing = volatile)
+        mso_idx = name_to_idx.get('minutes_since_open')
+        if mso_idx is not None:
+            feats.append(X[:, mso_idx])
+            names.append('tail_minutes_since_open')
+            # Near-close risk
+            feats.append((X[:, mso_idx] > 360).astype(np.float32))
+            names.append('tail_near_close')
+
+        # OU parameters (fast reversion = less tail risk)
+        for tf in ['5min', '1h']:
+            theta_idx = name_to_idx.get(f'{tf}_ou_theta')
+            if theta_idx is not None:
+                feats.append(X[:, theta_idx])
+                names.append(f'tail_{tf}_ou_theta')
+
+        # Volume (low volume = gap risk)
+        vol_idx = name_to_idx.get('volume_ratio_20')
+        if vol_idx is not None:
+            feats.append(X[:, vol_idx])
+            names.append('tail_volume_ratio')
+            feats.append((X[:, vol_idx] < 0.5).astype(np.float32))
+            names.append('tail_low_volume')
+
+        # RSI extremes
+        rsi_idx = name_to_idx.get('rsi_14')
+        if rsi_idx is not None:
+            feats.append(np.abs(X[:, rsi_idx] - 50))
+            names.append('tail_rsi_extreme')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train tail risk detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        tail_X_train, self.tail_feature_names = self.derive_tail_features(
+            X_train, feature_names)
+        tail_X_val, _ = self.derive_tail_features(X_val, feature_names)
+
+        ret20 = Y_train['future_return_20']
+        ret20_val = Y_val['future_return_20']
+
+        # Tail event: adverse move > 2% in 20 bars
+        # (direction-agnostic — large |ret20| regardless of sign)
+        tail_train = (np.abs(ret20) > 0.02).astype(np.float32)
+        tail_val = (np.abs(ret20_val) > 0.02).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Tail risk features: {len(self.tail_feature_names)}")
+        print(f"  Tail event rate (|ret20| > 2%): {tail_train.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(tail_X_train, label=tail_train,
+                            feature_name=self.tail_feature_names)
+        dval = lgb.Dataset(tail_X_val, label=tail_val,
+                          feature_name=self.tail_feature_names, reference=dtrain)
+
+        self.tail_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        tail_pred = self.tail_model.predict(tail_X_val)
+        try:
+            metrics['tail_auc'] = float(roc_auc_score(tail_val, tail_pred))
+        except ValueError:
+            metrics['tail_auc'] = 0.5
+        print(f"    Tail Risk AUC: {metrics['tail_auc']:.3f}")
+
+        imp = self.tail_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 tail risk features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.tail_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.tail_model is None:
+            return {}
+        tail_X, _ = self.derive_tail_features(X, self.feature_names)
+        return {
+            'tail_risk_prob': self.tail_model.predict(tail_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'tail_model': self.tail_model,
+                'feature_names': self.feature_names,
+                'tail_feature_names': self.tail_feature_names,
+            }, f)
+        print(f"  Saved TailRiskDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'TailRiskDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.tail_model = data['tail_model']
+        model.feature_names = data['feature_names']
+        model.tail_feature_names = data['tail_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 42: Drawdown Recovery Predictor
+# ---------------------------------------------------------------------------
+
+class DrawdownRecoveryPredictor:
+    """
+    Predicts whether a trade that initially goes against us will recover.
+
+    The physics engine generates signals where price bounces off channel edges.
+    Some bounces initially go wrong (drawdown) but recover. Others are genuine
+    failures. If we can distinguish these, we can:
+    - Hold through recoverable drawdowns instead of stopping out
+    - Exit faster on genuine failures
+
+    Uses the relationship between ret5 and ret20: if ret5 is negative but ret20
+    is positive, the trade "recovers." This is a distribution property, not direction.
+
+    Output: recovery_prob (>0.6 = likely to recover from initial drawdown)
+    """
+
+    def __init__(self):
+        self.recovery_model = None
+        self.feature_names = None
+        self.rec_feature_names = None
+
+    @staticmethod
+    def derive_recovery_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive recovery prediction features."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Mean reversion strength (strong = recovery likely)
+        for tf in ['5min', '1h']:
+            for key in ['ou_theta', 'ou_half_life', 'ou_reversion_score']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'rec_{tf}_{key}')
+
+        # Channel health (healthy = price respects boundaries = recovery)
+        for key in ['health_min', 'health_max', 'health_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rec_{key}')
+
+        # R-squared (high = channel is valid = bounces work)
+        for tf in ['5min', '1h', '4h']:
+            idx = name_to_idx.get(f'{tf}_r_squared')
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rec_{tf}_rsq')
+
+        # Position in channel (near edge = bounce expected)
+        for tf in ['5min', '1h']:
+            pos_idx = name_to_idx.get(f'{tf}_position_pct')
+            if pos_idx is not None:
+                feats.append(X[:, pos_idx])
+                names.append(f'rec_{tf}_position')
+                feats.append(np.abs(X[:, pos_idx] - 0.5))
+                names.append(f'rec_{tf}_edge_dist')
+
+        # Center distance (far from center = stronger reversion force)
+        for tf in ['5min', '1h']:
+            cd_idx = name_to_idx.get(f'{tf}_center_distance')
+            if cd_idx is not None:
+                feats.append(X[:, cd_idx])
+                names.append(f'rec_{tf}_center_dist')
+
+        # Bounce count (more bounces = channel holds)
+        for tf in ['5min', '1h']:
+            bc_idx = name_to_idx.get(f'{tf}_bounce_count')
+            if bc_idx is not None:
+                feats.append(X[:, bc_idx])
+                names.append(f'rec_{tf}_bounce_count')
+
+        # Break probability (low = channel will hold = recovery)
+        for key in ['break_prob_max', 'break_prob_weighted']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rec_{key}')
+
+        # Volume (high = more conviction for recovery)
+        vol_idx = name_to_idx.get('volume_ratio_20')
+        if vol_idx is not None:
+            feats.append(X[:, vol_idx])
+            names.append('rec_volume_ratio')
+
+        # ATR
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            feats.append(X[:, atr_idx])
+            names.append('rec_atr')
+
+        # Width (narrow = quick recovery, wide = slow)
+        for tf in ['5min', '1h']:
+            w_idx = name_to_idx.get(f'{tf}_width_pct')
+            if w_idx is not None:
+                feats.append(X[:, w_idx])
+                names.append(f'rec_{tf}_width')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train drawdown recovery predictor."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        rec_X_train, self.rec_feature_names = self.derive_recovery_features(
+            X_train, feature_names)
+        rec_X_val, _ = self.derive_recovery_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # "Recovery" = initial drawdown but ultimate profit
+        # ret5 < 0 (went against us) but ret20 > 0 (recovered)
+        # Also include: went right, then MORE right (sustained)
+        recovery_train = (
+            ((ret5 < -0.001) & (ret20 > 0.001)) |  # Recovered from drawdown
+            ((ret5 > 0.001) & (ret20 > ret5 * 1.5))   # Sustained and grew
+        ).astype(np.float32)
+        recovery_val = (
+            ((ret5_val < -0.001) & (ret20_val > 0.001)) |
+            ((ret5_val > 0.001) & (ret20_val > ret5_val * 1.5))
+        ).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Recovery features: {len(self.rec_feature_names)}")
+        print(f"  Recovery rate: {recovery_train.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(rec_X_train, label=recovery_train,
+                            feature_name=self.rec_feature_names)
+        dval = lgb.Dataset(rec_X_val, label=recovery_val,
+                          feature_name=self.rec_feature_names, reference=dtrain)
+
+        self.recovery_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        rec_pred = self.recovery_model.predict(rec_X_val)
+        try:
+            metrics['recovery_auc'] = float(roc_auc_score(recovery_val, rec_pred))
+        except ValueError:
+            metrics['recovery_auc'] = 0.5
+        print(f"    Recovery AUC: {metrics['recovery_auc']:.3f}")
+
+        imp = self.recovery_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 recovery features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.rec_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.recovery_model is None:
+            return {}
+        rec_X, _ = self.derive_recovery_features(X, self.feature_names)
+        return {
+            'recovery_prob': self.recovery_model.predict(rec_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'recovery_model': self.recovery_model,
+                'feature_names': self.feature_names,
+                'rec_feature_names': self.rec_feature_names,
+            }, f)
+        print(f"  Saved DrawdownRecoveryPredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'DrawdownRecoveryPredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.recovery_model = data['recovery_model']
+        model.feature_names = data['feature_names']
+        model.rec_feature_names = data['rec_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -12846,7 +13231,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -13181,6 +13566,20 @@ def main():
                 )
                 qr.save(os.path.join(args.output, 'quantile_risk_model.pkl'))
                 print(f"\n  Quantile Risk metrics: {qr_metrics}")
+            elif args.arch == 'tail_risk':
+                tr = TailRiskDetector()
+                tr_metrics = tr.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                tr.save(os.path.join(args.output, 'tail_risk_model.pkl'))
+                print(f"\n  Tail Risk metrics: {tr_metrics}")
+            elif args.arch == 'drawdown_recovery':
+                dr = DrawdownRecoveryPredictor()
+                dr_metrics = dr.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                dr.save(os.path.join(args.output, 'drawdown_recovery_model.pkl'))
+                print(f"\n  Drawdown Recovery metrics: {dr_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -544,6 +544,18 @@ def run_backtest(
                 print(f"[ML] Quantile Risk loaded (spread corr 0.298)")
                 ml_stats['qr_high_risk_penalty'] = 0
                 ml_stats['qr_favorable_asym'] = 0
+            except Exception:
+                pass
+
+        # Architecture 41: Tail Risk Detector
+        tail_risk_model = None
+        tr_path = _os.path.join(model_dir, 'tail_risk_model.pkl')
+        if _os.path.exists(tr_path):
+            try:
+                tail_risk_model = TailRiskDetector.load(tr_path)
+                print(f"[ML] Tail Risk Detector loaded (AUC 0.743)")
+                ml_stats['tail_bounce_penalty'] = 0
+                ml_stats['tail_break_boost'] = 0
             except Exception:
                 pass
 
@@ -1311,6 +1323,24 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Tail Risk: big move coming — good for breaks, bad for bounces
+                    if tail_risk_model is not None:
+                        try:
+                            tr_pred = tail_risk_model.predict(feature_vec.reshape(1, -1))
+                            tail_prob = float(tr_pred['tail_risk_prob'][0])
+
+                            if tail_prob > 0.15:
+                                if sig.signal_type == 'bounce':
+                                    # Big move may blow through channel → penalize bounce
+                                    sig.confidence *= 0.85
+                                    ml_stats['tail_bounce_penalty'] += 1
+                                elif sig.signal_type == 'break':
+                                    # Big move + breakout = ride the trend
+                                    sig.confidence *= 1.10
+                                    ml_stats['tail_break_boost'] += 1
+                        except Exception:
+                            pass
+
                     # Adversarial Selector (Arch 37): AUC 0.605 but 0 triggers in backtest
                     # Only 3 boosting rounds → predictions cluster, never hit thresholds
                     # Disabled: trained but not integrated
@@ -1325,6 +1355,8 @@ def run_backtest(
                     # Energy Momentum (Arch 35): disabled (AUC 0.543, near random)
                     # Multi-Exit Strategy (Arch 36): disabled (majority class collapse)
                     # Cascade Confidence (Arch 38): disabled (model preds contribute 1.8%)
+                    # kNN Trade Analogy (Arch 39): disabled (AUC 0.549, random)
+                    # Drawdown Recovery (Arch 42): disabled (AUC 0.500, completely random)
 
                 except Exception:
                     ml_prediction = None
@@ -1588,6 +1620,9 @@ def run_backtest(
         if quantile_risk_model is not None:
             print(f"    QR high risk pen:  {ml_stats.get('qr_high_risk_penalty', 0)}")
             print(f"    QR favorable asym: {ml_stats.get('qr_favorable_asym', 0)}")
+        if tail_risk_model is not None:
+            print(f"    Tail bounce pen:   {ml_stats.get('tail_bounce_penalty', 0)}")
+            print(f"    Tail break boost:  {ml_stats.get('tail_break_boost', 0)}")
 
     # Breakdown by exit reason
     if trades:
