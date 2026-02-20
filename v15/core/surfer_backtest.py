@@ -1808,7 +1808,7 @@ def run_backtest(
                 # Wider stops → smaller position, tighter stops → larger position
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
                 # Higher cap for bounces (0% stop rate, 87%+ WR)
-                size_cap = position_size * (7 if sig.signal_type == 'bounce' else 3)
+                size_cap = position_size * (10 if sig.signal_type == 'bounce' else 3)
                 trade_size = min(trade_size, size_cap)
 
                 # Channel health penalty: high health breakouts are less decisive
@@ -1818,6 +1818,24 @@ def run_backtest(
                 # Energy boost for bounces: higher energy → bigger P&L (+0.390 PnlCorr)
                 if sig.signal_type == 'bounce' and sig.energy_score > 0.40:
                     trade_size *= 1.30
+
+                # Timing boost for bounces: timing_score +0.359 PnlCorr
+                if sig.signal_type == 'bounce' and sig.timing_score > 0.30:
+                    trade_size *= 1.20
+
+                # Confidence boost for bounces: confidence +0.360 PnlCorr
+                if sig.signal_type == 'bounce' and sig.confidence > 0.55:
+                    trade_size *= 1.15
+
+                # Position score boost for bounces: position_score +0.354 PnlCorr
+                if sig.signal_type == 'bounce' and sig.position_score > 0.95:
+                    trade_size *= 1.15
+
+                # High confluence + low confidence breakout boost
+                # Confluence (+0.196 WinCorr) and conf is inverse (-0.275 WinCorr)
+                if (sig.signal_type == 'break' and sig.confluence_score > 0.90
+                        and sig.confidence < 0.80):
+                    trade_size *= 1.25
 
                 # Volume conviction boost: only at very high volume (2x+ avg)
                 if sig.signal_type == 'break' and 'volume' in tsla.columns:
@@ -2143,7 +2161,7 @@ def run_backtest(
         # Signal component correlation analysis
         if trade_signals and len(trade_signals) == len(trades):
             components = ['position_score', 'energy_score', 'entropy_score',
-                          'confluence_score', 'channel_health', 'confidence']
+                          'confluence_score', 'timing_score', 'channel_health', 'confidence']
 
             for label, mask in [('ALL', [True]*len(trades)),
                                 ('BOUNCE', [t.signal_type == 'bounce' for t in trades]),
