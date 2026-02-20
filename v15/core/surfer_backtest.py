@@ -1774,8 +1774,8 @@ def run_backtest(
                 current_atr = atr[bar]
                 if sig.signal_type == 'bounce':
                     # Bounces: tighter stops OK (100% WR, 0 stop-outs)
-                    atr_floor = (1.0 * current_atr) / entry_price
-                    atr_cap = (2.0 * current_atr) / entry_price
+                    atr_floor = (0.5 * current_atr) / entry_price
+                    atr_cap = (1.5 * current_atr) / entry_price
                 else:
                     # Breakouts: wider stops (survive noise)
                     atr_floor = (1.5 * current_atr) / entry_price
