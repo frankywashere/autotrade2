@@ -1832,7 +1832,7 @@ def run_backtest(
                 # Wider stops → smaller position, tighter stops → larger position
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
                 # Higher cap for bounces (0% stop rate, 87%+ WR)
-                size_cap = position_size * 12
+                size_cap = position_size * 20
                 trade_size = min(trade_size, size_cap)
 
                 # Channel health penalty: high health breakouts are less decisive
@@ -1909,9 +1909,9 @@ def run_backtest(
                 if sig.signal_type == 'break' and sig.action == 'SELL':
                     trade_size *= 1.25
 
-                # Max exposure check: total open position value < 3x equity
+                # Max exposure check: total open position value < 4x equity
                 total_exposure = sum(p.trade_size for p in positions)
-                if total_exposure + trade_size > equity * 3:
+                if total_exposure + trade_size > equity * 5:
                     continue
 
                 # Breakout trades get longer max hold (trends persist)
