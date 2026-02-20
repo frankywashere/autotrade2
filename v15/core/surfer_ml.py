@@ -8819,6 +8819,945 @@ class ReturnAsymmetryPredictor:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 25: Gap/Overnight Risk Predictor
+# ---------------------------------------------------------------------------
+
+class GapRiskPredictor:
+    """
+    Predicts overnight gap risk for positions held past close.
+
+    TSLA regularly gaps 2-5% at open. This model predicts:
+    1. Whether a large gap (>1%) is likely tonight
+    2. Expected gap direction (up/down)
+
+    Uses: close position, day-end momentum, VIX level, volume patterns,
+    day of week (gaps more common Mon open after weekend news).
+
+    Output: gap_risk_prob (>1% gap), gap_direction_prob (P(up gap))
+    """
+
+    def __init__(self):
+        self.gap_model = None
+        self.dir_model = None
+        self.feature_names = None
+        self.gap_feature_names = None
+
+    @staticmethod
+    def derive_gap_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive features for gap risk prediction."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Time features (gaps matter most near close)
+        for key in ['minutes_since_open', 'hour_sin', 'hour_cos', 'day_of_week']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'gap_{key}')
+
+        # Session progress (near close = higher gap relevance)
+        mso_idx = name_to_idx.get('minutes_since_open')
+        if mso_idx is not None:
+            mso = X[:, mso_idx]
+            feats.append(np.clip(mso / 390.0, 0.0, 1.0))
+            names.append('gap_session_progress')
+            feats.append((mso > 300).astype(np.float32))
+            names.append('gap_last_hour')
+
+        # Day of week interactions (Friday close → Monday gap)
+        dow_idx = name_to_idx.get('day_of_week')
+        if dow_idx is not None:
+            feats.append((X[:, dow_idx] > 3.5).astype(np.float32))
+            names.append('gap_is_friday')
+
+        # Momentum into close (strong momentum → continuation gap)
+        for key in ['price_momentum_3bar', 'price_momentum_12bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'gap_{key}')
+                feats.append(np.abs(X[:, idx]))
+                names.append(f'gap_abs_{key}')
+
+        # Volatility (high vol → bigger gaps)
+        for key in ['atr_pct', 'bar_range_pct']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'gap_{key}')
+
+        # VIX (elevated VIX = more gap risk)
+        for key in ['vix_level', 'vix_change_5d']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'gap_{key}')
+
+        # Volume patterns (declining volume into close = uncertainty)
+        for key in ['volume_ratio_20', 'volume_trend_5', 'vol_momentum_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'gap_{key}')
+
+        # RSI extremes (overbought/oversold → gap risk)
+        for key in ['rsi_14', 'rsi_5']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'gap_{key}')
+                feats.append(np.abs(X[:, idx] - 50))
+                names.append(f'gap_{key}_extremity')
+
+        # Break probability (high break prob + close = gap on open)
+        for key in ['break_prob_max', 'break_prob_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'gap_{key}')
+
+        # Channel health
+        for key in ['health_min', 'health_max']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'gap_{key}')
+
+        # SPY correlation (high correlation + SPY momentum = correlated gap)
+        for key in ['spy_return_5bar', 'spy_tsla_corr_20']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'gap_{key}')
+
+        # Close position in bar (hammer/doji patterns)
+        cp_idx = name_to_idx.get('close_position_in_bar')
+        if cp_idx is not None:
+            feats.append(X[:, cp_idx])
+            names.append('gap_close_pos_in_bar')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train gap risk models."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        gap_X_train, self.gap_feature_names = self.derive_gap_features(X_train, feature_names)
+        gap_X_val, _ = self.derive_gap_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret5_val = Y_val['future_return_5']
+
+        # Gap target: |future_return_5| > 1% (proxy for overnight gap)
+        # In 5-min bars, 5 bars = 25 minutes, so big moves within that timeframe
+        # approximate gap-like events
+        gap_train = (np.abs(ret5) > 0.01).astype(np.float32)
+        gap_val = (np.abs(ret5_val) > 0.01).astype(np.float32)
+
+        # Direction: positive return
+        dir_train = (ret5 > 0).astype(np.float32)
+        dir_val = (ret5_val > 0).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Gap features: {len(self.gap_feature_names)}")
+        print(f"  Gap rate (|ret5|>1%): {gap_train.mean():.1%}")
+
+        # Gap risk classifier
+        print("  Training gap risk classifier...")
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(gap_X_train, label=gap_train,
+                            feature_name=self.gap_feature_names)
+        dval = lgb.Dataset(gap_X_val, label=gap_val,
+                          feature_name=self.gap_feature_names, reference=dtrain)
+
+        self.gap_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        gap_pred = self.gap_model.predict(gap_X_val)
+        try:
+            metrics['gap_auc'] = float(roc_auc_score(gap_val, gap_pred))
+        except ValueError:
+            metrics['gap_auc'] = 0.5
+        print(f"    Gap AUC: {metrics['gap_auc']:.3f}")
+
+        # Direction classifier (only useful when gap is expected)
+        print("  Training gap direction classifier...")
+        dtrain2 = lgb.Dataset(gap_X_train, label=dir_train,
+                             feature_name=self.gap_feature_names)
+        dval2 = lgb.Dataset(gap_X_val, label=dir_val,
+                           feature_name=self.gap_feature_names, reference=dtrain2)
+
+        self.dir_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain2, num_boost_round=500, valid_sets=[dval2], callbacks=callbacks)
+
+        dir_pred = self.dir_model.predict(gap_X_val)
+        try:
+            metrics['dir_auc'] = float(roc_auc_score(dir_val, dir_pred))
+        except ValueError:
+            metrics['dir_auc'] = 0.5
+        print(f"    Direction AUC: {metrics['dir_auc']:.3f}")
+
+        # Feature importance
+        imp = self.gap_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 gap features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.gap_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.gap_model is None:
+            return {}
+        gap_X, _ = self.derive_gap_features(X, self.feature_names)
+        return {
+            'gap_risk_prob': self.gap_model.predict(gap_X),
+            'gap_up_prob': self.dir_model.predict(gap_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'gap_model': self.gap_model, 'dir_model': self.dir_model,
+                'feature_names': self.feature_names,
+                'gap_feature_names': self.gap_feature_names,
+            }, f)
+        print(f"  Saved GapRiskPredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'GapRiskPredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.gap_model = data['gap_model']
+        model.dir_model = data['dir_model']
+        model.feature_names = data['feature_names']
+        model.gap_feature_names = data['gap_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 26: Mean Reversion Speed Estimator
+# ---------------------------------------------------------------------------
+
+class MeanReversionSpeedModel:
+    """
+    Predicts how fast price will revert to channel center.
+
+    Fast reversion → bounce trades are excellent, use tighter trail
+    Slow reversion → wider stops needed, break trades preferred
+    No reversion → channel is breaking down
+
+    Uses OU parameters (theta = reversion strength), position in channel,
+    momentum, and volume to estimate reversion speed.
+
+    Output: reversion_speed (fast/slow/none), expected_bars_to_center
+    """
+
+    def __init__(self):
+        self.speed_model = None
+        self.bars_model = None
+        self.feature_names = None
+        self.rev_feature_names = None
+
+    @staticmethod
+    def derive_reversion_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive features for mean reversion speed prediction."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # OU parameters (direct reversion indicators)
+        for tf in ['5min', '1h', '4h', 'daily']:
+            for key in ['ou_theta', 'ou_half_life', 'ou_reversion_score']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'rev_{tf}_{key}')
+
+        # Position in channel (further from center = more reversion potential)
+        for tf in ['5min', '1h', '4h', 'daily']:
+            pos_idx = name_to_idx.get(f'{tf}_position_pct')
+            cd_idx = name_to_idx.get(f'{tf}_center_distance')
+            if pos_idx is not None:
+                pos = X[:, pos_idx]
+                feats.append(pos)
+                names.append(f'rev_{tf}_position')
+                # Distance from center (0.5)
+                feats.append(np.abs(pos - 0.5))
+                names.append(f'rev_{tf}_center_dist')
+            if cd_idx is not None:
+                feats.append(X[:, cd_idx])
+                names.append(f'rev_{tf}_raw_center_dist')
+
+        # Momentum (against-trend momentum = faster reversion)
+        for key in ['price_momentum_3bar', 'price_momentum_12bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rev_{key}')
+
+        # Channel health (healthy channels have stronger reversion)
+        for key in ['health_min', 'health_max', 'health_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rev_{key}')
+
+        # Bounce count (more bounces = proven reversion behavior)
+        for tf in ['5min', '1h', '4h']:
+            bc_idx = name_to_idx.get(f'{tf}_bounce_count')
+            if bc_idx is not None:
+                feats.append(X[:, bc_idx])
+                names.append(f'rev_{tf}_bounce_count')
+
+        # Width (narrow channels revert faster)
+        for tf in ['5min', '1h', '4h']:
+            w_idx = name_to_idx.get(f'{tf}_width_pct')
+            if w_idx is not None:
+                feats.append(X[:, w_idx])
+                names.append(f'rev_{tf}_width')
+
+        # Volume (high volume = faster price discovery/reversion)
+        for key in ['volume_ratio_20', 'vol_momentum_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rev_{key}')
+
+        # Cross-TF consensus
+        for key in ['direction_consensus', 'confluence_score', 'theta_spread']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'rev_{key}')
+
+        # Oscillation period (short period = fast reversion cycle)
+        for tf in ['5min', '1h']:
+            osc_idx = name_to_idx.get(f'{tf}_oscillation_period')
+            if osc_idx is not None:
+                feats.append(X[:, osc_idx])
+                names.append(f'rev_{tf}_osc_period')
+
+        # R-squared (high r² = more mean-reverting)
+        for tf in ['5min', '1h', '4h']:
+            r2_idx = name_to_idx.get(f'{tf}_r_squared')
+            if r2_idx is not None:
+                feats.append(X[:, r2_idx])
+                names.append(f'rev_{tf}_r_squared')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train mean reversion speed model."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        rev_X_train, self.rev_feature_names = self.derive_reversion_features(
+            X_train, feature_names)
+        rev_X_val, _ = self.derive_reversion_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # Speed target: "fast reversion" = ret5 and ret20 have opposite signs
+        # (price moved away then came back) OR ret5 is small while ret20 is bigger
+        # in same direction (steady trend)
+        # For mean reversion: |ret5| is small while position was extreme
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        pos_5m_idx = name_to_idx.get('5min_position_pct')
+
+        if pos_5m_idx is not None:
+            pos_train = X_train[:, pos_5m_idx]
+            pos_val = X_val[:, pos_5m_idx]
+            at_edge_train = (np.abs(pos_train - 0.5) > 0.3)
+            at_edge_val = (np.abs(pos_val - 0.5) > 0.3)
+            # Fast reversion = at edge AND small future return (came back)
+            fast_rev_train = (at_edge_train & (np.abs(ret5) < 0.003)).astype(np.float32)
+            fast_rev_val = (at_edge_val & (np.abs(ret5_val) < 0.003)).astype(np.float32)
+        else:
+            fast_rev_train = (np.abs(ret5) < 0.003).astype(np.float32)
+            fast_rev_val = (np.abs(ret5_val) < 0.003).astype(np.float32)
+
+        # Bars to center proxy: use |ret20|/|ret5| ratio (higher = price keeps moving)
+        bars_target_train = np.clip(np.abs(ret20) * 100, 0, 50).astype(np.float32)  # Scale to bars
+        bars_target_val = np.clip(np.abs(ret20_val) * 100, 0, 50).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Reversion features: {len(self.rev_feature_names)}")
+        print(f"  Fast reversion rate: {fast_rev_train.mean():.1%}")
+
+        # Speed classifier
+        print("  Training reversion speed classifier...")
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(rev_X_train, label=fast_rev_train,
+                            feature_name=self.rev_feature_names)
+        dval = lgb.Dataset(rev_X_val, label=fast_rev_val,
+                          feature_name=self.rev_feature_names, reference=dtrain)
+
+        self.speed_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        speed_pred = self.speed_model.predict(rev_X_val)
+        try:
+            metrics['speed_auc'] = float(roc_auc_score(fast_rev_val, speed_pred))
+        except ValueError:
+            metrics['speed_auc'] = 0.5
+        print(f"    Speed AUC: {metrics['speed_auc']:.3f}")
+
+        # Bars to center regressor
+        print("  Training bars-to-center regressor...")
+        dtrain2 = lgb.Dataset(rev_X_train, label=bars_target_train,
+                             feature_name=self.rev_feature_names)
+        dval2 = lgb.Dataset(rev_X_val, label=bars_target_val,
+                           feature_name=self.rev_feature_names, reference=dtrain2)
+
+        self.bars_model = lgb.train(
+            {'objective': 'regression', 'metric': 'mae', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain2, num_boost_round=500, valid_sets=[dval2], callbacks=callbacks)
+
+        bars_pred = self.bars_model.predict(rev_X_val)
+        metrics['bars_mae'] = float(np.mean(np.abs(bars_pred - bars_target_val)))
+        valid_mask = np.isfinite(bars_pred) & np.isfinite(bars_target_val)
+        if valid_mask.sum() > 10:
+            metrics['bars_corr'] = float(np.corrcoef(bars_pred[valid_mask], bars_target_val[valid_mask])[0, 1])
+        else:
+            metrics['bars_corr'] = 0.0
+        print(f"    Bars MAE: {metrics['bars_mae']:.1f}, Corr: {metrics['bars_corr']:.3f}")
+
+        # Feature importance
+        imp = self.speed_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 reversion features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.rev_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.speed_model is None:
+            return {}
+        rev_X, _ = self.derive_reversion_features(X, self.feature_names)
+        return {
+            'fast_reversion_prob': self.speed_model.predict(rev_X),
+            'expected_bars_to_center': np.clip(self.bars_model.predict(rev_X), 1, 100),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'speed_model': self.speed_model, 'bars_model': self.bars_model,
+                'feature_names': self.feature_names,
+                'rev_feature_names': self.rev_feature_names,
+            }, f)
+        print(f"  Saved MeanReversionSpeedModel to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'MeanReversionSpeedModel':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.speed_model = data['speed_model']
+        model.bars_model = data['bars_model']
+        model.feature_names = data['feature_names']
+        model.rev_feature_names = data['rev_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 27: Liquidity State Classifier
+# ---------------------------------------------------------------------------
+
+class LiquidityStateClassifier:
+    """
+    Classifies current market liquidity state.
+
+    Liquidity matters for:
+    - Fill quality (thin markets → slippage → worse fills)
+    - Move reliability (liquid markets → cleaner trends)
+    - Risk (drying liquidity → sudden moves likely)
+
+    Three states:
+    - Liquid (0): Good volume, tight ranges, reliable fills
+    - Thin (1): Below-average volume, wider ranges, slippage risk
+    - Drying (2): Volume declining sharply, about to move
+
+    Output: liquidity_state, slippage_risk
+    """
+
+    def __init__(self):
+        self.state_model = None
+        self.slippage_model = None
+        self.feature_names = None
+        self.liq_feature_names = None
+
+    @staticmethod
+    def derive_liquidity_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive features for liquidity classification."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Core volume features
+        for key in ['volume_ratio_20', 'volume_trend_5', 'vol_momentum_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'liq_{key}')
+
+        # Volume score per TF
+        for tf in ['5min', '1h', '4h']:
+            vs_idx = name_to_idx.get(f'{tf}_volume_score')
+            if vs_idx is not None:
+                feats.append(X[:, vs_idx])
+                names.append(f'liq_{tf}_volume_score')
+
+        # Bar characteristics (wide bars on low volume = thin market)
+        for key in ['bar_range_pct', 'close_position_in_bar', 'atr_pct']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'liq_{key}')
+
+        # Volume-range interaction (high range / low volume = thin)
+        vol_idx = name_to_idx.get('volume_ratio_20')
+        range_idx = name_to_idx.get('bar_range_pct')
+        if vol_idx is not None and range_idx is not None:
+            safe_vol = np.where(X[:, vol_idx] > 0.01, X[:, vol_idx], 0.01)
+            feats.append(X[:, range_idx] / safe_vol)
+            names.append('liq_range_per_volume')
+
+        # Time of day (liquidity varies by session)
+        for key in ['minutes_since_open', 'hour_sin', 'hour_cos']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'liq_{key}')
+
+        # Squeeze indicators (squeeze = liquidity drying up)
+        for tf in ['5min', '1h', '4h']:
+            sq_idx = name_to_idx.get(f'{tf}_squeeze_score')
+            if sq_idx is not None:
+                feats.append(X[:, sq_idx])
+                names.append(f'liq_{tf}_squeeze')
+        sq_any_idx = name_to_idx.get('squeeze_any')
+        if sq_any_idx is not None:
+            feats.append(X[:, sq_any_idx])
+            names.append('liq_squeeze_any')
+
+        # Width (narrow = potentially illiquid)
+        for tf in ['5min', '1h']:
+            w_idx = name_to_idx.get(f'{tf}_width_pct')
+            if w_idx is not None:
+                feats.append(X[:, w_idx])
+                names.append(f'liq_{tf}_width')
+
+        # VIX (high VIX = wider spreads = worse liquidity)
+        vix_idx = name_to_idx.get('vix_level')
+        if vix_idx is not None:
+            feats.append(X[:, vix_idx])
+            names.append('liq_vix')
+
+        # Consecutive same-direction bars (one-sided = thinning)
+        for key in ['consecutive_up_bars', 'consecutive_down_bars']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'liq_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train liquidity state model."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        liq_X_train, self.liq_feature_names = self.derive_liquidity_features(
+            X_train, feature_names)
+        liq_X_val, _ = self.derive_liquidity_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret5_val = Y_val['future_return_5']
+
+        # Slippage proxy: large bar ranges + small returns = choppy/illiquid
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        atr_idx = name_to_idx.get('atr_pct')
+        vol_idx = name_to_idx.get('volume_ratio_20')
+
+        if vol_idx is not None:
+            # "Thin" market = below-average volume
+            thin_train = (X_train[:, vol_idx] < 0.7).astype(np.float32)
+            thin_val = (X_val[:, vol_idx] < 0.7).astype(np.float32)
+        else:
+            thin_train = np.zeros(len(X_train), dtype=np.float32)
+            thin_val = np.zeros(len(X_val), dtype=np.float32)
+
+        # Slippage risk: high |ret5| relative to ATR (unexpected big move)
+        if atr_idx is not None:
+            atr_train = np.where(X_train[:, atr_idx] > 0.0001, X_train[:, atr_idx], 0.0001)
+            atr_val = np.where(X_val[:, atr_idx] > 0.0001, X_val[:, atr_idx], 0.0001)
+            slip_train = np.clip(np.abs(ret5) / atr_train, 0, 5).astype(np.float32)
+            slip_val = np.clip(np.abs(ret5_val) / atr_val, 0, 5).astype(np.float32)
+        else:
+            slip_train = np.abs(ret5).astype(np.float32)
+            slip_val = np.abs(ret5_val).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Liquidity features: {len(self.liq_feature_names)}")
+        print(f"  Thin market rate: {thin_train.mean():.1%}")
+
+        # Thin market classifier
+        print("  Training thin market classifier...")
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(liq_X_train, label=thin_train,
+                            feature_name=self.liq_feature_names)
+        dval = lgb.Dataset(liq_X_val, label=thin_val,
+                          feature_name=self.liq_feature_names, reference=dtrain)
+
+        self.state_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        state_pred = self.state_model.predict(liq_X_val)
+        try:
+            metrics['thin_auc'] = float(roc_auc_score(thin_val, state_pred))
+        except ValueError:
+            metrics['thin_auc'] = 0.5
+        print(f"    Thin Market AUC: {metrics['thin_auc']:.3f}")
+
+        # Slippage regressor
+        print("  Training slippage risk regressor...")
+        dtrain2 = lgb.Dataset(liq_X_train, label=slip_train,
+                             feature_name=self.liq_feature_names)
+        dval2 = lgb.Dataset(liq_X_val, label=slip_val,
+                           feature_name=self.liq_feature_names, reference=dtrain2)
+
+        self.slippage_model = lgb.train(
+            {'objective': 'regression', 'metric': 'mae', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain2, num_boost_round=500, valid_sets=[dval2], callbacks=callbacks)
+
+        slip_pred = self.slippage_model.predict(liq_X_val)
+        metrics['slippage_mae'] = float(np.mean(np.abs(slip_pred - slip_val)))
+        valid_mask = np.isfinite(slip_pred) & np.isfinite(slip_val)
+        if valid_mask.sum() > 10:
+            metrics['slippage_corr'] = float(np.corrcoef(slip_pred[valid_mask], slip_val[valid_mask])[0, 1])
+        else:
+            metrics['slippage_corr'] = 0.0
+        print(f"    Slippage MAE: {metrics['slippage_mae']:.3f}, Corr: {metrics['slippage_corr']:.3f}")
+
+        # Feature importance
+        imp = self.state_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 liquidity features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.liq_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.state_model is None:
+            return {}
+        liq_X, _ = self.derive_liquidity_features(X, self.feature_names)
+        return {
+            'thin_market_prob': self.state_model.predict(liq_X),
+            'slippage_risk': np.clip(self.slippage_model.predict(liq_X), 0, 5),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'state_model': self.state_model, 'slippage_model': self.slippage_model,
+                'feature_names': self.feature_names,
+                'liq_feature_names': self.liq_feature_names,
+            }, f)
+        print(f"  Saved LiquidityStateClassifier to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'LiquidityStateClassifier':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.state_model = data['state_model']
+        model.slippage_model = data['slippage_model']
+        model.feature_names = data['feature_names']
+        model.liq_feature_names = data['liq_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 28: Regime Transition Detector
+# ---------------------------------------------------------------------------
+
+class RegimeTransitionDetector:
+    """
+    Detects when the overall market regime is transitioning.
+
+    Regime transitions are dangerous for all strategies:
+    - Trending → Ranging: trend-following signals fail
+    - Calm → Volatile: stops get blown out
+    - Bull → Bear: direction signals flip
+
+    Uses rolling deltas of features over multiple lookbacks to detect
+    when the feature landscape is shifting.
+
+    Output: transition_prob, regime_stability
+    """
+
+    def __init__(self):
+        self.transition_model = None
+        self.stability_model = None
+        self.feature_names = None
+        self.trans_feature_names = None
+
+    @staticmethod
+    def derive_transition_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive features for regime transition detection."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Feature deltas (rate of change of key indicators)
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                     'entropy_delta_3bar', 'break_prob_delta_3bar',
+                     'energy_delta_3bar', 'rsi_slope_5bar',
+                     'width_delta_3bar', 'pos_delta_3bar', 'pos_delta_6bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trans_{key}')
+                feats.append(np.abs(X[:, idx]))
+                names.append(f'trans_abs_{key}')
+
+        # Health acceleration
+        hd3_idx = name_to_idx.get('health_delta_3bar')
+        hd6_idx = name_to_idx.get('health_delta_6bar')
+        if hd3_idx is not None and hd6_idx is not None:
+            feats.append(X[:, hd3_idx] - X[:, hd6_idx] / 2.0)
+            names.append('trans_health_accel')
+
+        # VIX dynamics (rising VIX = regime shifting)
+        for key in ['vix_level', 'vix_change_5d']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trans_{key}')
+
+        # VIX acceleration proxy
+        vix_idx = name_to_idx.get('vix_change_5d')
+        if vix_idx is not None:
+            feats.append(np.abs(X[:, vix_idx]))
+            names.append('trans_abs_vix_change')
+
+        # Cross-TF alignment changes (disagreement = transition)
+        for key in ['direction_consensus', 'confluence_score', 'theta_spread',
+                     'health_spread', 'bullish_fraction', 'bearish_fraction']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trans_{key}')
+
+        # SPY dynamics
+        for key in ['spy_return_5bar', 'spy_return_20bar', 'spy_tsla_corr_20']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trans_{key}')
+
+        # SPY momentum divergence
+        spy5_idx = name_to_idx.get('spy_return_5bar')
+        spy20_idx = name_to_idx.get('spy_return_20bar')
+        if spy5_idx is not None and spy20_idx is not None:
+            feats.append(X[:, spy5_idx] - X[:, spy20_idx])
+            names.append('trans_spy_momentum_divergence')
+
+        # Volatility state
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            feats.append(X[:, atr_idx])
+            names.append('trans_atr')
+
+        # Momentum divergence
+        pm3_idx = name_to_idx.get('price_momentum_3bar')
+        pm12_idx = name_to_idx.get('price_momentum_12bar')
+        if pm3_idx is not None and pm12_idx is not None:
+            feats.append(X[:, pm3_idx] - X[:, pm12_idx])
+            names.append('trans_momentum_divergence')
+            feats.append(np.sign(X[:, pm3_idx]) * np.sign(X[:, pm12_idx]))
+            names.append('trans_momentum_agreement')
+
+        # Break probability dynamics
+        for key in ['break_prob_max', 'break_prob_weighted']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trans_{key}')
+
+        # Entropy (rising entropy across TFs = instability)
+        for key in ['avg_entropy']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'trans_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train regime transition model."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        trans_X_train, self.trans_feature_names = self.derive_transition_features(
+            X_train, feature_names)
+        trans_X_val, _ = self.derive_transition_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret60 = Y_train['future_return_60']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+        ret60_val = Y_val['future_return_60']
+
+        # Transition target: regime instability
+        # When returns are unpredictable (sign changes between timeframes)
+        transition_train = (
+            (np.sign(ret5) != np.sign(ret20)) &
+            (np.abs(ret20) > 0.003)
+        ).astype(np.float32)
+        transition_val = (
+            (np.sign(ret5_val) != np.sign(ret20_val)) &
+            (np.abs(ret20_val) > 0.003)
+        ).astype(np.float32)
+
+        # Stability target: how consistent are multi-horizon returns
+        # High stability = all returns same sign and proportional
+        same_sign = (np.sign(ret5) == np.sign(ret20)).astype(np.float32)
+        same_sign2 = (np.sign(ret20) == np.sign(ret60)).astype(np.float32)
+        stability_train = ((same_sign + same_sign2) / 2.0).astype(np.float32)
+
+        same_sign_v = (np.sign(ret5_val) == np.sign(ret20_val)).astype(np.float32)
+        same_sign2_v = (np.sign(ret20_val) == np.sign(ret60_val)).astype(np.float32)
+        stability_val = ((same_sign_v + same_sign2_v) / 2.0).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Transition features: {len(self.trans_feature_names)}")
+        print(f"  Transition rate: {transition_train.mean():.1%}")
+        print(f"  Mean stability: {stability_train.mean():.2f}")
+
+        # Transition classifier
+        print("  Training transition classifier...")
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(trans_X_train, label=transition_train,
+                            feature_name=self.trans_feature_names)
+        dval = lgb.Dataset(trans_X_val, label=transition_val,
+                          feature_name=self.trans_feature_names, reference=dtrain)
+
+        self.transition_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        trans_pred = self.transition_model.predict(trans_X_val)
+        try:
+            metrics['transition_auc'] = float(roc_auc_score(transition_val, trans_pred))
+        except ValueError:
+            metrics['transition_auc'] = 0.5
+        print(f"    Transition AUC: {metrics['transition_auc']:.3f}")
+
+        # Stability regressor
+        print("  Training stability regressor...")
+        dtrain2 = lgb.Dataset(trans_X_train, label=stability_train,
+                             feature_name=self.trans_feature_names)
+        dval2 = lgb.Dataset(trans_X_val, label=stability_val,
+                           feature_name=self.trans_feature_names, reference=dtrain2)
+
+        self.stability_model = lgb.train(
+            {'objective': 'regression', 'metric': 'mae', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain2, num_boost_round=500, valid_sets=[dval2], callbacks=callbacks)
+
+        stab_pred = self.stability_model.predict(trans_X_val)
+        metrics['stability_mae'] = float(np.mean(np.abs(stab_pred - stability_val)))
+        valid_mask = np.isfinite(stab_pred) & np.isfinite(stability_val)
+        if valid_mask.sum() > 10:
+            metrics['stability_corr'] = float(np.corrcoef(stab_pred[valid_mask], stability_val[valid_mask])[0, 1])
+        else:
+            metrics['stability_corr'] = 0.0
+        print(f"    Stability MAE: {metrics['stability_mae']:.3f}, Corr: {metrics['stability_corr']:.3f}")
+
+        # Feature importance
+        imp = self.transition_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 transition features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.trans_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.transition_model is None:
+            return {}
+        trans_X, _ = self.derive_transition_features(X, self.feature_names)
+        return {
+            'transition_prob': self.transition_model.predict(trans_X),
+            'regime_stability': np.clip(self.stability_model.predict(trans_X), 0, 1),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'transition_model': self.transition_model,
+                'stability_model': self.stability_model,
+                'feature_names': self.feature_names,
+                'trans_feature_names': self.trans_feature_names,
+            }, f)
+        print(f"  Saved RegimeTransitionDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'RegimeTransitionDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.transition_model = data['transition_model']
+        model.stability_model = data['stability_model']
+        model.feature_names = data['feature_names']
+        model.trans_feature_names = data['trans_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -9447,7 +10386,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -9669,6 +10608,34 @@ def main():
                 )
                 asym.save(os.path.join(args.output, 'asymmetry_model.pkl'))
                 print(f"\n  Asymmetry Predictor metrics: {asym_metrics}")
+            elif args.arch == 'gap_risk':
+                gap = GapRiskPredictor()
+                gap_metrics = gap.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                gap.save(os.path.join(args.output, 'gap_risk_model.pkl'))
+                print(f"\n  Gap Risk metrics: {gap_metrics}")
+            elif args.arch == 'reversion':
+                rev = MeanReversionSpeedModel()
+                rev_metrics = rev.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                rev.save(os.path.join(args.output, 'reversion_model.pkl'))
+                print(f"\n  Reversion Speed metrics: {rev_metrics}")
+            elif args.arch == 'liquidity':
+                liq = LiquidityStateClassifier()
+                liq_metrics = liq.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                liq.save(os.path.join(args.output, 'liquidity_model.pkl'))
+                print(f"\n  Liquidity State metrics: {liq_metrics}")
+            elif args.arch == 'transition':
+                trans = RegimeTransitionDetector()
+                trans_metrics = trans.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                trans.save(os.path.join(args.output, 'transition_model.pkl'))
+                print(f"\n  Regime Transition metrics: {trans_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

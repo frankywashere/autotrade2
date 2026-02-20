@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -474,6 +474,40 @@ def run_backtest(
                 print(f"[ML] Return Asymmetry Predictor loaded (Spike AUC 0.680)")
                 ml_stats['asym_widen_stop'] = 0
                 ml_stats['asym_tighten_trail'] = 0
+            except Exception:
+                pass
+
+        # Architecture 25: Gap Risk Predictor
+        gap_risk_model = None
+        gap_path = _os.path.join(model_dir, 'gap_risk_model.pkl')
+        if _os.path.exists(gap_path):
+            try:
+                gap_risk_model = GapRiskPredictor.load(gap_path)
+                print(f"[ML] Gap Risk Predictor loaded (AUC 0.852)")
+                ml_stats['gap_risk_skip'] = 0
+            except Exception:
+                pass
+
+        # Architecture 26: Mean Reversion Speed
+        reversion_model = None
+        rev_path = _os.path.join(model_dir, 'reversion_model.pkl')
+        if _os.path.exists(rev_path):
+            try:
+                reversion_model = MeanReversionSpeedModel.load(rev_path)
+                print(f"[ML] Mean Reversion Speed loaded (AUC 0.873)")
+                ml_stats['rev_fast_boost'] = 0
+                ml_stats['rev_slow_penalty'] = 0
+            except Exception:
+                pass
+
+        # Architecture 27: Liquidity State (slippage risk only)
+        liquidity_model = None
+        liq_path = _os.path.join(model_dir, 'liquidity_model.pkl')
+        if _os.path.exists(liq_path):
+            try:
+                liquidity_model = LiquidityStateClassifier.load(liq_path)
+                print(f"[ML] Liquidity State loaded (slippage corr 0.499)")
+                ml_stats['liq_high_slippage'] = 0
             except Exception:
                 pass
 
@@ -1197,9 +1231,34 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Gap Risk Predictor: AUC 0.852 but too aggressive at all thresholds
+                    # minutes_since_open dominates features → penalizes all late-day entries
+                    # Disabled: trained but not integrated
+                    # if gap_risk_model is not None: ...
+
+                    # Mean Reversion Speed: boost bounce trades with fast reversion
+                    if reversion_model is not None:
+                        try:
+                            rev_pred = reversion_model.predict(feature_vec.reshape(1, -1))
+                            fast_rev = float(rev_pred['fast_reversion_prob'][0])
+
+                            if fast_rev > 0.55 and sig.signal_type == 'bounce':
+                                sig.confidence *= 1.10  # Fast reversion → bounce will work
+                                ml_stats['rev_fast_boost'] += 1
+                            elif fast_rev < 0.15:
+                                sig.confidence *= 0.85  # Slow reversion → less reliable
+                                ml_stats['rev_slow_penalty'] += 1
+                        except Exception:
+                            pass
+
+                    # Liquidity State: thin market AUC 1.0 (leaky target — volume_ratio < 0.7)
+                    # Slippage regressor (corr 0.499) too aggressive, penalizes 13/46 signals
+                    # Disabled: trained but not integrated
+                    # if liquidity_model is not None: ...
+
                     # Stop Loss Predictor: disabled (60% base rate, weak discrimination)
-                    # Model trained but not integrated — binary classifier too weak
-                    # MAE regressor (corr 0.535) available for future stop widening
+                    # Momentum Divergence (Arch 23): disabled (AUC 0.557, near random)
+                    # Regime Transition (Arch 28): disabled (stability corr 0.035)
 
                 except Exception:
                     ml_prediction = None
@@ -1447,6 +1506,13 @@ def run_backtest(
         if asymmetry_model is not None:
             print(f"    Asym widen stop:   {ml_stats.get('asym_widen_stop', 0)}")
             print(f"    Asym tight trail:  {ml_stats.get('asym_tighten_trail', 0)}")
+        if gap_risk_model is not None:
+            print(f"    Gap risk skip:     {ml_stats.get('gap_risk_skip', 0)}")
+        if reversion_model is not None:
+            print(f"    Rev fast boost:    {ml_stats.get('rev_fast_boost', 0)}")
+            print(f"    Rev slow penalty:  {ml_stats.get('rev_slow_penalty', 0)}")
+        if liquidity_model is not None:
+            print(f"    Liq high slippage: {ml_stats.get('liq_high_slippage', 0)}")
 
     # Breakdown by exit reason
     if trades:
