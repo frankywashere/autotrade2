@@ -1815,6 +1815,13 @@ def run_backtest(
                 if sig.signal_type == 'break' and sig.channel_health > 0.35:
                     trade_size *= 0.60
 
+                # Volume conviction boost: only at very high volume (2x+ avg)
+                if sig.signal_type == 'break' and 'volume' in tsla.columns:
+                    current_vol = tsla['volume'].iloc[bar]
+                    avg_vol = tsla['volume'].iloc[max(0, bar-20):bar].mean()
+                    if avg_vol > 0 and current_vol > avg_vol * 2.0:
+                        trade_size *= 1.20
+
                 # Max exposure check: total open position value < 3x equity
                 total_exposure = sum(p.trade_size for p in positions)
                 if total_exposure + trade_size > equity * 3:
