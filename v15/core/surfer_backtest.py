@@ -147,9 +147,9 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (position.trailing_stop - entry) / entry
-            # Two-tier breakout trail: tighter trail when running big
+            # Three-tier breakout trail
             if profit_from_best > 0.015:
-                # Super runner (>2%): lock hard
+                # Super runner (>1.5%): lock hard
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.06)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
@@ -241,7 +241,7 @@ def run_backtest(
     eval_interval: int = 3,     # Check every 3 bars = 15 min
     max_hold_bars: int = 60,    # Max 5 hours (60 * 5min)
     position_size: float = 10000.0,  # $10k per trade
-    min_confidence: float = 0.48,
+    min_confidence: float = 0.45,
     use_multi_tf: bool = True,  # Use higher TF data for context
     ml_model=None,              # Optional ML model for signal enhancement
 ) -> tuple:
@@ -1750,9 +1750,9 @@ def run_backtest(
                 # Risk-normalized position sizing: each trade risks same $ amount
                 base_risk = position_size * 0.012  # $120 risk per $10K base
                 if sig.confidence >= 0.70:
-                    risk_budget = base_risk * 1.5
+                    risk_budget = base_risk * 1.3
                 elif sig.confidence >= 0.60:
-                    risk_budget = base_risk * 1.2
+                    risk_budget = base_risk * 1.15
                 else:
                     risk_budget = base_risk
 
@@ -2224,7 +2224,7 @@ def main():
     parser.add_argument('--days', type=int, default=30, help='Days of 5min data')
     parser.add_argument('--eval-interval', type=int, default=6, help='Bars between evaluations')
     parser.add_argument('--max-hold', type=int, default=60, help='Max bars to hold')
-    parser.add_argument('--min-conf', type=float, default=0.48, help='Minimum signal confidence')
+    parser.add_argument('--min-conf', type=float, default=0.45, help='Minimum signal confidence')
     parser.add_argument('--walk-forward', action='store_true', help='Run walk-forward validation')
     parser.add_argument('--ml', type=str, default=None,
                        help='Path to ML model for signal enhancement (e.g. surfer_models/gbt_model.pkl)')
