@@ -1915,6 +1915,12 @@ def run_backtest(
                 else:
                     trade_size *= 1.10
 
+                # Continuous confidence scaling: higher conf = linearly bigger position
+                # conf 0.40 → 1.0x, conf 0.90 → 1.5x (linear interpolation)
+                conf_scale = 1.0 + (sig.confidence - 0.40) * (0.5 / 0.5)
+                conf_scale = max(1.0, min(conf_scale, 1.5))
+                trade_size *= conf_scale
+
                 # ATR-inverse sizing: low volatility → larger positions
                 if bar >= 14 and not np.isnan(atr[bar]):
                     atr_pct = atr[bar] / entry_price
@@ -1975,7 +1981,7 @@ def run_backtest(
 
                 # Max exposure check: total open position value < 7x equity
                 total_exposure = sum(p.trade_size for p in positions)
-                if total_exposure + trade_size > equity * 100:
+                if total_exposure + trade_size > equity * 150:
                     continue
 
                 # Breakout trades get longer max hold (trends persist)
