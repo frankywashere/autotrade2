@@ -1980,16 +1980,18 @@ def run_backtest(
                         trade_size *= 0.80
 
                 # Win streak compounding: ramp up after consecutive wins
-                if consecutive_wins >= 40:
-                    trade_size *= 2.50
+                if consecutive_wins >= 50:
+                    trade_size *= 3.50
+                elif consecutive_wins >= 40:
+                    trade_size *= 2.80
                 elif consecutive_wins >= 30:
-                    trade_size *= 2.00
+                    trade_size *= 2.20
                 elif consecutive_wins >= 20:
-                    trade_size *= 1.70
+                    trade_size *= 1.80
                 elif consecutive_wins >= 10:
-                    trade_size *= 1.40
+                    trade_size *= 1.50
                 elif consecutive_wins >= 5:
-                    trade_size *= 1.20
+                    trade_size *= 1.25
 
                 # Recent profitability boost: if last 3 trades averaged big wins, trade bigger
                 if len(trades) >= 3:
