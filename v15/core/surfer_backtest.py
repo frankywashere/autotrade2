@@ -1919,6 +1919,10 @@ def run_backtest(
                 if hasattr(sig, 'entropy_score') and sig.entropy_score < 0.85:
                     trade_size *= 1.25
 
+                # Confluence boost: multiple TFs agree on direction
+                if hasattr(sig, 'confluence_score') and sig.confluence_score > 0.80:
+                    trade_size *= 1.20
+
                 # Continuous confidence scaling: higher conf = linearly bigger position
                 # conf 0.40 → 1.0x, conf 0.90 → 1.5x (linear interpolation)
                 conf_scale = 1.0 + (sig.confidence - 0.40) * (0.5 / 0.5)
