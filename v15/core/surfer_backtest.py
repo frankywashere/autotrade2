@@ -1850,15 +1850,15 @@ def run_backtest(
 
                 # Energy boost for bounces: low energy = bigger moves (-0.353 PnlCorr)
                 if sig.signal_type == 'bounce' and sig.energy_score < 0.30:
-                    trade_size *= 1.50
+                    trade_size *= 1.65
 
                 # Timing boost for bounces: timing_score +0.359 PnlCorr
                 if sig.signal_type == 'bounce' and sig.timing_score > 0.10:
-                    trade_size *= 1.30
+                    trade_size *= 1.40
 
                 # Confidence boost for bounces: confidence +0.360 PnlCorr
                 if sig.signal_type == 'bounce' and sig.confidence > 0.55:
-                    trade_size *= 1.75
+                    trade_size *= 1.90
 
                 # BUY bounce low-conf penalty: disabled — 100% WR on BUY bounces
                 # if (sig.signal_type == 'bounce' and sig.action == 'BUY'
@@ -1940,13 +1940,13 @@ def run_backtest(
 
                 # Direction boost: both directions performing well
                 if sig.signal_type == 'break':
-                    trade_size *= 1.65
+                    trade_size *= 1.80
 
                 # Direction boost: 100% WR on both BUY and SELL
                 if sig.action == 'BUY':
-                    trade_size *= 1.50
+                    trade_size *= 1.60
                 else:
-                    trade_size *= 1.10
+                    trade_size *= 1.15
 
                 # Range expansion detection: contraction→expansion = trend beginning
                 if bar >= 10:
