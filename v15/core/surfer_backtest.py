@@ -60,6 +60,8 @@ class OpenPosition:
     trailing_stop: float = 0.0  # Best price seen for trailing
     worst_price: float = 0.0    # Worst price seen (for MAE)
     best_price: float = 0.0     # Best price seen (for MFE)
+    el_flagged: bool = False    # Extreme Loser flagged — trail more aggressively
+    fast_reversion: bool = False # Fast reversion detected — bounce trail tighter
 
 
 @dataclass
@@ -126,27 +128,38 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
     initial_stop_dist = abs(position.stop_price - entry) / entry
     is_breakout = position.signal_type == 'break'
 
+    # EL-flagged trades get more aggressive trailing to lock profits sooner
+    # Fast-reversion bounces get tighter trail to lock in mean-reversion profits
+    el = position.el_flagged
+    fast_rev = position.fast_reversion and not is_breakout
+
     if position.direction == 'BUY':
         if window_high > position.trailing_stop:
             position.trailing_stop = window_high
 
         if is_breakout:
             profit_from_best = (position.trailing_stop - entry) / entry
-            if profit_from_best > 0.008:
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.3)
+            # EL: activate trail earlier (0.004 vs 0.008) and tighter (0.20 vs 0.30)
+            trail_threshold = 0.004 if el else 0.008
+            trail_mult = 0.20 if el else 0.3
+            if profit_from_best > trail_threshold:
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
                 effective_stop = max(position.stop_price, trail_from_best)
             else:
                 effective_stop = position.stop_price
         else:
             profit_from_entry = (position.trailing_stop - entry) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
-            if profit_ratio >= 0.80:
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.15)
+            # EL: lower thresholds and tighter trails
+            # Fast reversion: even tighter — mean reversion resolves quickly
+            tight = el or fast_rev
+            if profit_ratio >= (0.60 if tight else 0.80):
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.10 if tight else 0.15))
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_ratio >= 0.50:
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.40)
+            elif profit_ratio >= (0.30 if tight else 0.50):
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.25 if tight else 0.40))
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_ratio >= 0.25:
+            elif profit_ratio >= (0.15 if tight else 0.25):
                 effective_stop = max(position.stop_price, entry * 0.999)
             else:
                 effective_stop = position.stop_price
@@ -165,21 +178,24 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (entry - position.trailing_stop) / entry
-            if profit_from_best > 0.008:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.3)
+            trail_threshold = 0.004 if el else 0.008
+            trail_mult = 0.20 if el else 0.3
+            if profit_from_best > trail_threshold:
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult)
                 effective_stop = min(position.stop_price, trail_from_best)
             else:
                 effective_stop = position.stop_price
         else:
             profit_from_entry = (entry - position.trailing_stop) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
-            if profit_ratio >= 0.80:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.15)
+            tight = el or fast_rev
+            if profit_ratio >= (0.60 if tight else 0.80):
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.10 if tight else 0.15))
                 effective_stop = min(position.stop_price, trail_from_best)
-            elif profit_ratio >= 0.50:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.40)
+            elif profit_ratio >= (0.30 if tight else 0.50):
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.25 if tight else 0.40))
                 effective_stop = min(position.stop_price, trail_from_best)
-            elif profit_ratio >= 0.25:
+            elif profit_ratio >= (0.15 if tight else 0.25):
                 effective_stop = min(position.stop_price, entry * 1.001)
             else:
                 effective_stop = position.stop_price
@@ -1377,6 +1393,7 @@ def run_backtest(
                     # if gap_risk_model is not None: ...
 
                     # Mean Reversion Speed: boost bounce trades with fast reversion
+                    fast_rev = 0.0  # Track for trail adjustment
                     if reversion_model is not None:
                         try:
                             rev_pred = reversion_model.predict(feature_vec.reshape(1, -1))
@@ -1416,6 +1433,7 @@ def run_backtest(
                             pass
 
                     # Tail Risk: big move coming — good for breaks, bad for bounces
+                    tail_prob = 0.0  # Track for TP widening
                     if tail_risk_model is not None:
                         try:
                             tr_pred = tail_risk_model.predict(feature_vec.reshape(1, -1))
@@ -1611,6 +1629,8 @@ def run_backtest(
                     ou_half_life=ou_hl,
                     max_hold_bars=effective_max_hold,
                     trailing_stop=entry_price,
+                    el_flagged=(el_loser_prob > 0.18),
+                    fast_reversion=(fast_rev > 0.55),
                 ))
                 position_signals.append({
                     'position_score': sig.position_score,
@@ -1764,6 +1784,7 @@ def run_backtest(
         if extreme_loser_model is not None:
             print(f"    EL penalty:        {ml_stats.get('el_penalty', 0)}")
             print(f"    EL skip:           {ml_stats.get('el_skip', 0)}")
+            print(f"    EL stop tighten:   {ml_stats.get('el_stop_tighten', 0)}")
         if drawdown_mag_model is not None:
             print(f"    DM high dd pen:    {ml_stats.get('dm_high_dd_pen', 0)}")
             print(f"    DM low dd boost:   {ml_stats.get('dm_low_dd_boost', 0)}")
