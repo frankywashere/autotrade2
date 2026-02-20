@@ -1913,6 +1913,10 @@ def run_backtest(
                 if sig.signal_type == 'break':
                     trade_size *= 1.50
 
+                # BUY direction boost: 100% WR across all types
+                if sig.action == 'BUY':
+                    trade_size *= 1.25
+
                 # Max exposure check: total open position value < 4x equity
                 total_exposure = sum(p.trade_size for p in positions)
                 if total_exposure + trade_size > equity * 5:
