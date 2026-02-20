@@ -1806,7 +1806,9 @@ def run_backtest(
                 # Risk-normalized sizing: trade_size = risk_budget / stop_pct
                 # Wider stops → smaller position, tighter stops → larger position
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
-                trade_size = min(trade_size, position_size * 3)  # Cap at 3x base
+                # Higher cap for bounces (0% stop rate, 87%+ WR)
+                size_cap = position_size * (5 if sig.signal_type == 'bounce' else 3)
+                trade_size = min(trade_size, size_cap)
 
                 # Max exposure check: total open position value < 3x equity
                 total_exposure = sum(p.trade_size for p in positions)
