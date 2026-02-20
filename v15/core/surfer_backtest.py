@@ -1838,11 +1838,9 @@ def run_backtest(
                     size_cap = position_size * 40
                 trade_size = min(trade_size, size_cap)
 
-                # Channel health penalty: high health breakouts are less decisive
-                # Relaxed with improved trail system catching bad breaks
-                # Channel health penalty: relaxed with tight trail system
-                if sig.signal_type == 'break' and sig.channel_health > 0.35:
-                    trade_size *= 0.90
+                # Channel health penalty: disabled — 100% WR, trails catch all bad breaks
+                # if sig.signal_type == 'break' and sig.channel_health > 0.35:
+                #     trade_size *= 0.90
 
                 # Double-negative breakout penalty: disabled — tight stops (0.25x) already limit damage
                 # High-conf breakouts get tiny stops, so penalty just reduces winners
