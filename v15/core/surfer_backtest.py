@@ -842,6 +842,7 @@ def run_backtest(
     max_positions = 2
     pending_entries = []  # Deferred entries: list of (bar, direction, signal_type, confidence, stop_pct, tp_pct, primary_tf, ou_hl, max_hold, el_flagged, fast_rev, trade_size, signal_data)
     equity = position_size * 10  # Start with 100k
+    initial_equity = equity
     peak_equity = equity
     max_dd = 0.0
     consecutive_losses = 0  # Track losing streak for position reduction
@@ -1749,8 +1750,9 @@ def run_backtest(
                 # Enter position
                 entry_price = current_price
 
-                # Risk-normalized position sizing: each trade risks same $ amount
-                base_risk = position_size * 0.018  # $180 risk per $10K base
+                # Risk-normalized position sizing: scale with equity growth
+                equity_scale = equity / initial_equity  # Grows as we win
+                base_risk = position_size * 0.018 * equity_scale
                 if sig.confidence >= 0.70:
                     risk_budget = base_risk * 1.3
                 elif sig.confidence >= 0.60:
