@@ -1932,6 +1932,8 @@ def run_backtest(
                     trade_size *= 1.40
                 elif dow == 3:  # Thursday
                     trade_size *= 1.20
+                elif dow == 1:  # Tuesday
+                    trade_size *= 1.10
 
                 # Max exposure check: total open position value < 7x equity
                 total_exposure = sum(p.trade_size for p in positions)
