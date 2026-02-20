@@ -150,7 +150,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             # Three-tier breakout trail (with progressive tightening)
             # BUY breakouts use lower tier-3 activation (0.10% vs 0.15%)
             # because BUY break losers have MFE 0.08-0.14%
-            tier3_thresh = 0.002 if el else 0.0010
+            tier3_thresh = 0.002 if el else 0.0008
             if profit_from_best > 0.015:
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.06)
                 effective_stop = max(position.stop_price, trail_from_best)
