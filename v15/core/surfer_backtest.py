@@ -1878,6 +1878,10 @@ def run_backtest(
                 if sig.signal_type == 'bounce' and last_breakout_loss:
                     trade_size *= 1.40
 
+                # Position score boost for breakouts: high position_score = good entry
+                if sig.signal_type == 'break' and sig.position_score > 0.90:
+                    trade_size *= 1.20
+
                 # Inverse confidence breakout boost: conf -0.275 WinCorr
                 # Low-conf breakouts are the biggest winners
                 if sig.signal_type == 'break':
