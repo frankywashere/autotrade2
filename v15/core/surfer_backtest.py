@@ -1750,7 +1750,7 @@ def run_backtest(
                 entry_price = current_price
 
                 # Risk-normalized position sizing: each trade risks same $ amount
-                base_risk = position_size * 0.012  # $120 risk per $10K base
+                base_risk = position_size * 0.018  # $180 risk per $10K base
                 if sig.confidence >= 0.70:
                     risk_budget = base_risk * 1.3
                 elif sig.confidence >= 0.60:
