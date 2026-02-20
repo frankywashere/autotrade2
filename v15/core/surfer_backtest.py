@@ -1925,6 +1925,14 @@ def run_backtest(
                     elif atr_pct > 0.015:
                         trade_size *= 0.80
 
+                # Day-of-week boost: Wed has 3x avg P&L of Fri
+                bar_dt = tsla.index[bar]
+                dow = bar_dt.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+                if dow == 2:  # Wednesday
+                    trade_size *= 1.40
+                elif dow == 3:  # Thursday
+                    trade_size *= 1.20
+
                 # Max exposure check: total open position value < 7x equity
                 total_exposure = sum(p.trade_size for p in positions)
                 if total_exposure + trade_size > equity * 60:
