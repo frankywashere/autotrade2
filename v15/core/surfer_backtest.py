@@ -156,7 +156,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
                 # Big runner (>0.8%): tight trail
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.10)
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_from_best > (0.003 if el else 0.004):
+            elif profit_from_best > (0.002 if el else 0.0035):
                 # Standard trail
                 trail_mult = 0.20 if el else 0.25
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
@@ -201,7 +201,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             elif profit_from_best > 0.008:
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.10)
                 effective_stop = min(position.stop_price, trail_from_best)
-            elif profit_from_best > (0.003 if el else 0.004):
+            elif profit_from_best > (0.002 if el else 0.0035):
                 trail_mult = 0.20 if el else 0.25
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult)
                 effective_stop = min(position.stop_price, trail_from_best)
