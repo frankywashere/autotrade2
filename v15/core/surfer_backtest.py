@@ -1918,16 +1918,16 @@ def run_backtest(
                 # ATR-inverse sizing: low volatility → larger positions
                 if bar >= 14 and not np.isnan(atr[bar]):
                     atr_pct = atr[bar] / entry_price
-                    # Low vol (ATR < 0.5%): boost 1.30x
+                    # Low vol (ATR < 1.0%): boost 1.30x
                     # High vol (ATR > 1.5%): reduce 0.80x
-                    if atr_pct < 0.005:
-                        trade_size *= 1.30
+                    if atr_pct < 0.010:
+                        trade_size *= 1.50
                     elif atr_pct > 0.015:
                         trade_size *= 0.80
 
                 # Max exposure check: total open position value < 7x equity
                 total_exposure = sum(p.trade_size for p in positions)
-                if total_exposure + trade_size > equity * 50:
+                if total_exposure + trade_size > equity * 60:
                     continue
 
                 # Breakout trades get longer max hold (trends persist)
