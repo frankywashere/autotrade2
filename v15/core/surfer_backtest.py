@@ -1855,6 +1855,11 @@ def run_backtest(
                         and sig.confidence < 0.80):
                     trade_size *= 1.25
 
+                # Low confidence breakout boost: conf -0.275 WinCorr
+                # Low-conf breakouts are the biggest winners ($535-$785)
+                if sig.signal_type == 'break' and sig.confidence < 0.60:
+                    trade_size *= 1.30
+
                 # Volume conviction boost: only at very high volume (2x+ avg)
                 if sig.signal_type == 'break' and 'volume' in tsla.columns:
                     current_vol = tsla['volume'].iloc[bar]
