@@ -1768,8 +1768,8 @@ def run_backtest(
 
                 # Risk-normalized position sizing: scale with equity growth
                 equity_scale = equity / initial_equity  # Grows as we win
-                # Higher base risk for bounces (100% WR = zero stop risk)
-                risk_mult = 0.060
+                # Higher base risk for bounces (94% WR = very safe)
+                risk_mult = 0.075 if sig.signal_type == 'bounce' else 0.060
                 base_risk = position_size * risk_mult * equity_scale
                 if sig.confidence >= 0.70:
                     risk_budget = base_risk * 1.3
