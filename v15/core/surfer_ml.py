@@ -14822,6 +14822,302 @@ class MomentumReversalDetector:
         return model
 
 
+class ImmediateStopDetector:
+    """Arch 57: Predict if price moves >0.5% against within 3 bars (before trail activates).
+
+    These are the "instant stop" losses — price gaps against us immediately.
+    If we can detect these, we can either skip the trade or use ultra-tight stops.
+
+    Label: max_adverse_3bar > 0.5% (binary).
+    Using future_return_5 as proxy: trades where ret5 is very negative.
+    """
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.is_feature_names = None
+
+    def derive_features(self, X, feature_names):
+        """Extract features relevant to immediate adverse movement."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Momentum and volatility — immediate move predictors
+        for tf in ML_TFS:
+            for key in ['momentum_direction', 'kinetic_energy', 'position_pct',
+                        'break_prob', 'slope_normalized', 'center_distance',
+                        'width_pct', 'bars_since_touch']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'is_{tf}_{key}')
+
+        # Temporal dynamics (recent changes = immediate pressure)
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                    'break_prob_delta_3bar', 'entropy_delta_3bar',
+                    'rsi_slope_5bar', 'vol_trend_5bar',
+                    'price_acceleration_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'is_{key}')
+
+        # Context (volatility, volume, time of day)
+        for key in ['atr_pct', 'volume_ratio_20', 'bar_range_pct',
+                    'minutes_since_open', 'rsi_14', 'bb_position']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'is_{key}')
+
+        # Cross-TF features
+        for key in ['direction_agreement', 'avg_break_prob', 'health_min',
+                    'health_std', 'width_dispersion']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'is_{key}')
+
+        # Market regime
+        for key in ['vix_level', 'tsla_spy_corr_20', 'spy_rsi_14']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'is_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train immediate stop detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        is_X_train, self.is_feature_names = self.derive_features(X_train, feature_names)
+        is_X_val, _ = self.derive_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret5_val = Y_val['future_return_5']
+
+        # "Immediate stop": price drops > 0.5% within 5 bars
+        # Using absolute returns — both directions
+        stop_train = (np.abs(ret5) > 0.005).astype(np.float32)
+        # But we want specifically ADVERSE moves, so combine with direction
+        # For simplicity: very negative ret5 = immediate adverse for longs
+        # We train on absolute adverse since direction is unknown at feature time
+        adverse_train = (ret5 < -0.005).astype(np.float32)
+        adverse_val = (ret5_val < -0.005).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Immediate stop features: {len(self.is_feature_names)}")
+        print(f"  Immediate adverse rate (train): {adverse_train.mean():.1%}")
+        print(f"  Immediate adverse rate (val): {adverse_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(is_X_train, label=adverse_train,
+                            feature_name=self.is_feature_names)
+        dval = lgb.Dataset(is_X_val, label=adverse_val,
+                          feature_name=self.is_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'scale_pos_weight': 2.0},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        is_pred = self.model.predict(is_X_val)
+        try:
+            auc = roc_auc_score(adverse_val, is_pred)
+            metrics['immediate_stop_auc'] = float(auc)
+            print(f"  Immediate Stop AUC: {auc:.3f}")
+        except Exception:
+            metrics['immediate_stop_auc'] = 0.5
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 immediate stop features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.is_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        is_X, _ = self.derive_features(X, self.feature_names)
+        return {
+            'immediate_stop_prob': self.model.predict(is_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'is_feature_names': self.is_feature_names,
+            }, f)
+        print(f"  Saved ImmediateStopDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'ImmediateStopDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.is_feature_names = data['is_feature_names']
+        return model
+
+
+class ProfitVelocityPredictor:
+    """Arch 58: Predict how quickly a trade reaches profit.
+
+    Fast-profit trades should have tighter trails (lock in the quick gain).
+    Slow-profit trades might need more patience.
+
+    Label: time_to_profit = bars until ret > +0.2% (regression, capped at 20).
+    Uses ratio of ret5/ret20 as proxy for profit velocity.
+    """
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.pv_feature_names = None
+
+    def derive_features(self, X, feature_names):
+        """Extract features relevant to profit velocity."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Channel momentum (trending = fast profit, range-bound = slow)
+        for tf in ML_TFS:
+            for key in ['slope_normalized', 'momentum_direction', 'kinetic_energy',
+                        'potential_energy', 'position_pct', 'break_prob',
+                        'width_pct', 'center_distance']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'pv_{tf}_{key}')
+
+        # Temporal features (acceleration of change)
+        for key in ['health_delta_3bar', 'break_prob_delta_3bar',
+                    'rsi_slope_5bar', 'vol_trend_5bar',
+                    'price_acceleration_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'pv_{key}')
+
+        # Volatility context
+        for key in ['atr_pct', 'volume_ratio_20', 'bar_range_pct',
+                    'rsi_14', 'bb_position', 'minutes_since_open']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'pv_{key}')
+
+        # Cross-TF agreement (unanimous = fast)
+        for key in ['direction_agreement', 'avg_health', 'health_std',
+                    'avg_break_prob']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'pv_{key}')
+
+        # VIX
+        for key in ['vix_level']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'pv_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train profit velocity predictor."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        pv_X_train, self.pv_feature_names = self.derive_features(X_train, feature_names)
+        pv_X_val, _ = self.derive_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # "Fast profit": reaches +0.3% within 5 bars (vs needing 20+)
+        fast_profit_train = (ret5 > 0.003).astype(np.float32)
+        fast_profit_val = (ret5_val > 0.003).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Profit velocity features: {len(self.pv_feature_names)}")
+        print(f"  Fast profit rate (train): {fast_profit_train.mean():.1%}")
+        print(f"  Fast profit rate (val): {fast_profit_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(pv_X_train, label=fast_profit_train,
+                            feature_name=self.pv_feature_names)
+        dval = lgb.Dataset(pv_X_val, label=fast_profit_val,
+                          feature_name=self.pv_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        pv_pred = self.model.predict(pv_X_val)
+        try:
+            auc = roc_auc_score(fast_profit_val, pv_pred)
+            metrics['fast_profit_auc'] = float(auc)
+            print(f"  Profit Velocity AUC: {auc:.3f}")
+        except Exception:
+            metrics['fast_profit_auc'] = 0.5
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 profit velocity features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.pv_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        pv_X, _ = self.derive_features(X, self.feature_names)
+        return {
+            'fast_profit_prob': self.model.predict(pv_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'pv_feature_names': self.pv_feature_names,
+            }, f)
+        print(f"  Saved ProfitVelocityPredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'ProfitVelocityPredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.pv_feature_names = data['pv_feature_names']
+        return model
+
+
 # ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
@@ -15451,7 +15747,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -15898,6 +16194,20 @@ def main():
                 )
                 mr.save(os.path.join(args.output, 'momentum_reversal_model.pkl'))
                 print(f"\n  Momentum Reversal metrics: {mr_metrics}")
+            elif args.arch == 'immediate_stop':
+                isd = ImmediateStopDetector()
+                isd_metrics = isd.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                isd.save(os.path.join(args.output, 'immediate_stop_model.pkl'))
+                print(f"\n  Immediate Stop metrics: {isd_metrics}")
+            elif args.arch == 'profit_velocity':
+                pv = ProfitVelocityPredictor()
+                pv_metrics = pv.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                pv.save(os.path.join(args.output, 'profit_velocity_model.pkl'))
+                print(f"\n  Profit Velocity metrics: {pv_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

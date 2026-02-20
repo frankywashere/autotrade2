@@ -129,7 +129,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
     is_breakout = position.signal_type == 'break'
 
     # EL-flagged trades get more aggressive trailing to lock profits sooner
-    # Fast-reversion bounces get tighter trail to lock in mean-reversion profits
+    # ML-guided trail adjustments
     el = position.el_flagged
     fast_rev = position.fast_reversion and not is_breakout
 
@@ -139,7 +139,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (position.trailing_stop - entry) / entry
-            # EL: activate trail earlier (0.004 vs 0.008) and tighter (0.20 vs 0.30)
+            # EL: tighter trail; FP: tighter trail to lock fast profit
             trail_threshold = 0.004 if el else 0.008
             trail_mult = 0.20 if el else 0.3
             if profit_from_best > trail_threshold:
@@ -249,7 +249,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -664,6 +664,27 @@ def run_backtest(
                 mom_rev_model = MomentumReversalDetector.load(mr_path)
                 print(f"[ML] Momentum Reversal loaded (AUC 0.663)")
                 ml_stats['mr_penalty'] = 0
+            except Exception:
+                pass
+
+        # Architecture 57: Immediate Stop Detector
+        imm_stop_model = None
+        is_path = _os.path.join(model_dir, 'immediate_stop_model.pkl')
+        if _os.path.exists(is_path):
+            try:
+                imm_stop_model = ImmediateStopDetector.load(is_path)
+                print(f"[ML] Immediate Stop Detector loaded (AUC 0.659)")
+                ml_stats['is_skip'] = 0
+            except Exception:
+                pass
+
+        # Architecture 58: Profit Velocity Predictor
+        profit_vel_model = None
+        pv_path = _os.path.join(model_dir, 'profit_velocity_model.pkl')
+        if _os.path.exists(pv_path):
+            try:
+                profit_vel_model = ProfitVelocityPredictor.load(pv_path)
+                print(f"[ML] Profit Velocity Predictor loaded (AUC 0.649)")
             except Exception:
                 pass
 
@@ -1502,11 +1523,34 @@ def run_backtest(
                     # Momentum Reversal (Arch 56): AUC 0.663, testing disabled
                     # if mom_rev_model is not None: ...
 
+                    # Profit Velocity (Arch 58): detect fast-profit setups
+                    fast_profit_prob = 0.0
+                    if profit_vel_model is not None:
+                        try:
+                            pv_pred = profit_vel_model.predict(feature_vec.reshape(1, -1))
+                            fast_profit_prob = float(pv_pred['fast_profit_prob'][0])
+                        except Exception:
+                            pass
+
+                    # Immediate Stop Detector (Arch 57): tighten stop on high-risk entries
+                    imm_stop_prob = 0.0
+                    imm_stop_skip = False
+                    if imm_stop_model is not None:
+                        try:
+                            is_pred = imm_stop_model.predict(feature_vec.reshape(1, -1))
+                            imm_stop_prob = float(is_pred['immediate_stop_prob'][0])
+                            if imm_stop_prob > 0.35:
+                                ml_stats['is_skip'] += 1  # Track triggers
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
+                    imm_stop_skip = False
             else:
                 ml_max_hold = None
+                imm_stop_skip = False
 
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
                 # Daily circuit breaker: stop trading if down $500+ today
@@ -1593,11 +1637,17 @@ def run_backtest(
                 atr_cap = (2.5 * current_atr) / entry_price
                 adjusted_stop_pct = np.clip(sig.suggested_stop_pct, atr_floor, atr_cap)
 
-                # ML stop tightening: if Extreme Loser flags risk, tighten stop by 25%
+                # ML stop tightening: if Extreme Loser flags risk, tighten stop by 35%
                 if el_loser_prob > 0.18:
                     adjusted_stop_pct *= 0.65
                     ml_stats.setdefault('el_stop_tighten', 0)
                     ml_stats['el_stop_tighten'] += 1
+
+                # IS stop tightening: if Immediate Stop flags risk, tighten stop by 20%
+                if imm_stop_prob > 0.35:
+                    adjusted_stop_pct *= 0.80
+                    ml_stats.setdefault('is_stop_tighten', 0)
+                    ml_stats['is_stop_tighten'] += 1
 
                 if sig.action == 'BUY':
                     stop = entry_price * (1 - adjusted_stop_pct)
@@ -1796,6 +1846,8 @@ def run_backtest(
             print(f"    BL bounce pen:     {ml_stats.get('bl_penalty', 0)}")
         if mom_rev_model is not None:
             print(f"    MR reversal pen:   {ml_stats.get('mr_penalty', 0)}")
+        if imm_stop_model is not None:
+            print(f"    IS skip:           {ml_stats.get('is_skip', 0)}")
 
     # Breakdown by exit reason
     if trades:
