@@ -9758,6 +9758,476 @@ class RegimeTransitionDetector:
 
 
 # ---------------------------------------------------------------------------
+# Architecture 29: Profit Target Optimizer
+# ---------------------------------------------------------------------------
+
+class ProfitTargetOptimizer:
+    """
+    Predicts optimal take-profit level for each trade setup.
+
+    Fixed TP ratios leave money on the table (strong setups) or
+    set unreachable targets (weak setups). This model predicts
+    how far price will move in the trade direction.
+
+    Output: tp_multiplier (scale factor for base TP), expected_move_pct
+    """
+
+    def __init__(self):
+        self.move_model = None
+        self.big_move_model = None
+        self.feature_names = None
+        self.tp_feature_names = None
+
+    @staticmethod
+    def derive_tp_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive features for TP optimization."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Channel width (wider = larger TP potential)
+        for tf in ['5min', '1h', '4h', 'daily']:
+            w_idx = name_to_idx.get(f'{tf}_width_pct')
+            if w_idx is not None:
+                feats.append(X[:, w_idx])
+                names.append(f'tp_{tf}_width')
+
+        # Position in channel (near boundary = more room to TP at center)
+        for tf in ['5min', '1h', '4h']:
+            pos_idx = name_to_idx.get(f'{tf}_position_pct')
+            if pos_idx is not None:
+                pos = X[:, pos_idx]
+                feats.append(pos)
+                names.append(f'tp_{tf}_position')
+                feats.append(np.abs(pos - 0.5))
+                names.append(f'tp_{tf}_room_to_center')
+
+        # Momentum (strong momentum = price will move further)
+        for key in ['price_momentum_3bar', 'price_momentum_12bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'tp_{key}')
+                feats.append(np.abs(X[:, idx]))
+                names.append(f'tp_abs_{key}')
+
+        # Volatility (high vol = bigger moves)
+        atr_idx = name_to_idx.get('atr_pct')
+        if atr_idx is not None:
+            feats.append(X[:, atr_idx])
+            names.append('tp_atr')
+
+        # Volume (high volume = more follow-through)
+        for key in ['volume_ratio_20', 'volume_trend_5']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'tp_{key}')
+
+        # Channel health (healthy channels = more reliable bounces)
+        for key in ['health_min', 'health_max']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'tp_{key}')
+
+        # Break probability (high break prob = potential for big move)
+        for key in ['break_prob_max', 'break_prob_weighted']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'tp_{key}')
+
+        # Direction consensus (aligned TFs = stronger move)
+        for key in ['direction_consensus', 'confluence_score',
+                     'bullish_fraction', 'bearish_fraction']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'tp_{key}')
+
+        # Squeeze indicators (squeezed = explosive move when breaks)
+        sq_any_idx = name_to_idx.get('squeeze_any')
+        if sq_any_idx is not None:
+            feats.append(X[:, sq_any_idx])
+            names.append('tp_squeeze_any')
+
+        # RSI (extreme RSI = larger reversal potential)
+        for key in ['rsi_14', 'rsi_5']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(np.abs(X[:, idx] - 50))
+                names.append(f'tp_{key}_extremity')
+
+        # Energy (high energy = more potential for movement)
+        for tf in ['5min', '1h']:
+            for key in ['total_energy', 'kinetic_energy']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'tp_{tf}_{key}')
+
+        # VIX
+        vix_idx = name_to_idx.get('vix_level')
+        if vix_idx is not None:
+            feats.append(X[:, vix_idx])
+            names.append('tp_vix')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train profit target optimizer."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        tp_X_train, self.tp_feature_names = self.derive_tp_features(X_train, feature_names)
+        tp_X_val, _ = self.derive_tp_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret60 = Y_train['future_return_60']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+        ret60_val = Y_val['future_return_60']
+
+        # Move magnitude target: max absolute return across horizons
+        move_train = np.maximum(np.abs(ret5), np.maximum(np.abs(ret20), np.abs(ret60)))
+        move_val = np.maximum(np.abs(ret5_val), np.maximum(np.abs(ret20_val), np.abs(ret60_val)))
+
+        # Big move target: will the move exceed 1.5%?
+        big_train = (move_train > 0.015).astype(np.float32)
+        big_val = (move_val > 0.015).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  TP features: {len(self.tp_feature_names)}")
+        print(f"  Mean move magnitude: {move_train.mean():.3f}")
+        print(f"  Big move (>1.5%) rate: {big_train.mean():.1%}")
+
+        # Move magnitude regressor
+        print("  Training move magnitude regressor...")
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(tp_X_train, label=move_train,
+                            feature_name=self.tp_feature_names)
+        dval = lgb.Dataset(tp_X_val, label=move_val,
+                          feature_name=self.tp_feature_names, reference=dtrain)
+
+        self.move_model = lgb.train(
+            {'objective': 'regression', 'metric': 'mae', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        move_pred = self.move_model.predict(tp_X_val)
+        metrics['move_mae'] = float(np.mean(np.abs(move_pred - move_val)))
+        valid = np.isfinite(move_pred) & np.isfinite(move_val)
+        metrics['move_corr'] = float(np.corrcoef(move_pred[valid], move_val[valid])[0, 1]) if valid.sum() > 10 else 0
+        print(f"    Move MAE: {metrics['move_mae']:.4f}, Corr: {metrics['move_corr']:.3f}")
+
+        # Big move classifier
+        print("  Training big move classifier...")
+        dtrain2 = lgb.Dataset(tp_X_train, label=big_train,
+                             feature_name=self.tp_feature_names)
+        dval2 = lgb.Dataset(tp_X_val, label=big_val,
+                           feature_name=self.tp_feature_names, reference=dtrain2)
+
+        self.big_move_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain2, num_boost_round=500, valid_sets=[dval2], callbacks=callbacks)
+
+        big_pred = self.big_move_model.predict(tp_X_val)
+        try:
+            metrics['big_move_auc'] = float(roc_auc_score(big_val, big_pred))
+        except ValueError:
+            metrics['big_move_auc'] = 0.5
+        print(f"    Big Move AUC: {metrics['big_move_auc']:.3f}")
+
+        imp = self.move_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 TP features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.tp_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.move_model is None:
+            return {}
+        tp_X, _ = self.derive_tp_features(X, self.feature_names)
+        return {
+            'expected_move': np.clip(self.move_model.predict(tp_X), 0, 0.1),
+            'big_move_prob': self.big_move_model.predict(tp_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'move_model': self.move_model, 'big_move_model': self.big_move_model,
+                'feature_names': self.feature_names,
+                'tp_feature_names': self.tp_feature_names,
+            }, f)
+        print(f"  Saved ProfitTargetOptimizer to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'ProfitTargetOptimizer':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.move_model = data['move_model']
+        model.big_move_model = data['big_move_model']
+        model.feature_names = data['feature_names']
+        model.tp_feature_names = data['tp_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
+# Architecture 30: Channel Alignment Scorer
+# ---------------------------------------------------------------------------
+
+class ChannelAlignmentScorer:
+    """
+    Scores how well multi-TF channels are aligned for a trade.
+
+    Perfect alignment = all channels same direction, positions consistent,
+    widths proportional → highest confidence, best trades.
+
+    Misalignment = channels at different angles, conflicting positions →
+    uncertain outcome, reduce confidence.
+
+    Uses structured per-TF features as pairs to compute alignment.
+
+    Output: alignment_score (0-1), alignment_regime (aligned/partial/conflicting)
+    """
+
+    def __init__(self):
+        self.alignment_model = None
+        self.win_model = None
+        self.feature_names = None
+        self.align_feature_names = None
+
+    @staticmethod
+    def derive_alignment_features(X: np.ndarray, feature_names: list) -> Tuple[np.ndarray, list]:
+        """Derive channel alignment features."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        tfs = ['5min', '1h', '4h', 'daily', 'weekly']
+
+        # Per-TF slope agreement
+        slopes = []
+        for tf in tfs:
+            idx = name_to_idx.get(f'{tf}_slope_pct')
+            if idx is not None:
+                slopes.append(X[:, idx])
+                feats.append(X[:, idx])
+                names.append(f'align_{tf}_slope')
+
+        if len(slopes) >= 2:
+            slope_stack = np.column_stack(slopes)
+            feats.append(np.std(slope_stack, axis=1))
+            names.append('align_slope_std')
+            feats.append(np.mean(slope_stack, axis=1))
+            names.append('align_slope_mean')
+            # Sign agreement
+            signs = np.sign(slope_stack)
+            feats.append(np.mean(signs, axis=1))
+            names.append('align_slope_sign_consensus')
+
+        # Per-TF position alignment
+        positions = []
+        for tf in tfs:
+            idx = name_to_idx.get(f'{tf}_position_pct')
+            if idx is not None:
+                positions.append(X[:, idx])
+                feats.append(X[:, idx])
+                names.append(f'align_{tf}_position')
+
+        if len(positions) >= 2:
+            pos_stack = np.column_stack(positions)
+            feats.append(np.std(pos_stack, axis=1))
+            names.append('align_position_std')
+            feats.append(np.mean(pos_stack, axis=1))
+            names.append('align_position_mean')
+            # All above/below center agreement
+            above = (pos_stack > 0.5).astype(np.float32)
+            feats.append(np.mean(above, axis=1))
+            names.append('align_above_center_fraction')
+
+        # Cross-TF position spreads (from existing features)
+        for key in ['pos_spread_5m_1h', 'pos_spread_5m_daily', 'pos_spread_1h_daily']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'align_{key}')
+                feats.append(np.abs(X[:, idx]))
+                names.append(f'align_abs_{key}')
+
+        # Per-TF momentum direction
+        mom_dirs = []
+        for tf in tfs:
+            idx = name_to_idx.get(f'{tf}_momentum_direction')
+            if idx is not None:
+                mom_dirs.append(X[:, idx])
+                feats.append(X[:, idx])
+                names.append(f'align_{tf}_momentum_dir')
+
+        if len(mom_dirs) >= 2:
+            md_stack = np.column_stack(mom_dirs)
+            feats.append(np.std(md_stack, axis=1))
+            names.append('align_momentum_dir_std')
+
+        # Existing cross-TF features
+        for key in ['direction_consensus', 'confluence_score', 'bullish_fraction',
+                     'bearish_fraction', 'health_spread', 'theta_spread',
+                     'energy_ratio_5m_1h', 'energy_ratio_5m_daily']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'align_{key}')
+
+        # Per-TF health (consistent health = aligned)
+        healths = []
+        for tf in tfs:
+            idx = name_to_idx.get(f'{tf}_channel_health')
+            if idx is not None:
+                healths.append(X[:, idx])
+
+        if len(healths) >= 2:
+            h_stack = np.column_stack(healths)
+            feats.append(np.std(h_stack, axis=1))
+            names.append('align_health_std')
+            feats.append(np.min(h_stack, axis=1))
+            names.append('align_health_min')
+
+        # Valid TF count
+        idx = name_to_idx.get('valid_tf_count')
+        if idx is not None:
+            feats.append(X[:, idx])
+            names.append('align_valid_tf_count')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train channel alignment model."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        align_X_train, self.align_feature_names = self.derive_alignment_features(
+            X_train, feature_names)
+        align_X_val, _ = self.derive_alignment_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # Alignment target: when channels are aligned, moves are directional
+        # Good alignment = |ret20| > 0.005 AND sign(ret5) == sign(ret20)
+        aligned_train = (
+            (np.abs(ret20) > 0.005) &
+            (np.sign(ret5) == np.sign(ret20))
+        ).astype(np.float32)
+        aligned_val = (
+            (np.abs(ret20_val) > 0.005) &
+            (np.sign(ret5_val) == np.sign(ret20_val))
+        ).astype(np.float32)
+
+        # Win probability from alignment perspective
+        win_train = (ret20 > 0.002).astype(np.float32)
+        win_val = (ret20_val > 0.002).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Alignment features: {len(self.align_feature_names)}")
+        print(f"  Aligned rate: {aligned_train.mean():.1%}")
+
+        # Alignment classifier
+        print("  Training alignment classifier...")
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(align_X_train, label=aligned_train,
+                            feature_name=self.align_feature_names)
+        dval = lgb.Dataset(align_X_val, label=aligned_val,
+                          feature_name=self.align_feature_names, reference=dtrain)
+
+        self.alignment_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        align_pred = self.alignment_model.predict(align_X_val)
+        try:
+            metrics['alignment_auc'] = float(roc_auc_score(aligned_val, align_pred))
+        except ValueError:
+            metrics['alignment_auc'] = 0.5
+        print(f"    Alignment AUC: {metrics['alignment_auc']:.3f}")
+
+        # Win model from alignment perspective
+        print("  Training alignment-win classifier...")
+        dtrain2 = lgb.Dataset(align_X_train, label=win_train,
+                             feature_name=self.align_feature_names)
+        dval2 = lgb.Dataset(align_X_val, label=win_val,
+                           feature_name=self.align_feature_names, reference=dtrain2)
+
+        self.win_model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'is_unbalance': True},
+            dtrain2, num_boost_round=500, valid_sets=[dval2], callbacks=callbacks)
+
+        win_pred = self.win_model.predict(align_X_val)
+        try:
+            metrics['win_auc'] = float(roc_auc_score(win_val, win_pred))
+        except ValueError:
+            metrics['win_auc'] = 0.5
+        print(f"    Win AUC: {metrics['win_auc']:.3f}")
+
+        imp = self.alignment_model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 alignment features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.align_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.alignment_model is None:
+            return {}
+        align_X, _ = self.derive_alignment_features(X, self.feature_names)
+        return {
+            'alignment_score': self.alignment_model.predict(align_X),
+            'alignment_win_prob': self.win_model.predict(align_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'alignment_model': self.alignment_model, 'win_model': self.win_model,
+                'feature_names': self.feature_names,
+                'align_feature_names': self.align_feature_names,
+            }, f)
+        print(f"  Saved ChannelAlignmentScorer to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'ChannelAlignmentScorer':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.alignment_model = data['alignment_model']
+        model.win_model = data['win_model']
+        model.feature_names = data['feature_names']
+        model.align_feature_names = data['align_feature_names']
+        return model
+
+
+# ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
 
@@ -10386,7 +10856,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -10636,6 +11106,20 @@ def main():
                 )
                 trans.save(os.path.join(args.output, 'transition_model.pkl'))
                 print(f"\n  Regime Transition metrics: {trans_metrics}")
+            elif args.arch == 'profit_target':
+                pt = ProfitTargetOptimizer()
+                pt_metrics = pt.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                pt.save(os.path.join(args.output, 'profit_target_model.pkl'))
+                print(f"\n  Profit Target metrics: {pt_metrics}")
+            elif args.arch == 'alignment':
+                align = ChannelAlignmentScorer()
+                align_metrics = align.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                align.save(os.path.join(args.output, 'alignment_model.pkl'))
+                print(f"\n  Alignment Scorer metrics: {align_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
