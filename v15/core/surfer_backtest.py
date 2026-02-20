@@ -1903,10 +1903,10 @@ def run_backtest(
                     if len(lookback_prices) >= 2:
                         recent_return = (lookback_prices[-1] - lookback_prices[0]) / lookback_prices[0]
                         # BUY break: boost if price already moving up
-                        if sig.action == 'BUY' and recent_return > 0.004:
+                        if sig.action == 'BUY' and recent_return > 0.002:
                             trade_size *= 1.20
                         # SELL break: boost if price already moving down
-                        elif sig.action == 'SELL' and recent_return < -0.004:
+                        elif sig.action == 'SELL' and recent_return < -0.002:
                             trade_size *= 1.20
 
                 # Direction boost: both directions performing well
