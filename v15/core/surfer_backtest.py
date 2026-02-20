@@ -1772,11 +1772,11 @@ def run_backtest(
                 risk_mult = 0.150 if sig.signal_type == 'bounce' else 0.150
                 base_risk = position_size * risk_mult * equity_scale
                 if sig.confidence >= 0.70:
-                    risk_budget = base_risk * 1.5
+                    risk_budget = base_risk * 1.8
                 elif sig.confidence >= 0.60:
-                    risk_budget = base_risk * 1.3
+                    risk_budget = base_risk * 1.5
                 else:
-                    risk_budget = base_risk * 1.15
+                    risk_budget = base_risk * 1.2
 
                 # Adaptive sizing: ramp up on win streaks, halve on losing streaks
                 if consecutive_wins >= 2:
@@ -1997,7 +1997,9 @@ def run_backtest(
                 if len(trades) >= 3:
                     recent_pnls = [t.pnl for t in trades[-3:]]
                     avg_recent_pnl = sum(recent_pnls) / len(recent_pnls)
-                    if avg_recent_pnl > 100000:  # Big recent winners
+                    if avg_recent_pnl > 500000:  # Very big recent winners
+                        trade_size *= 1.40
+                    elif avg_recent_pnl > 100000:
                         trade_size *= 1.25
                     elif avg_recent_pnl > 50000:
                         trade_size *= 1.15
