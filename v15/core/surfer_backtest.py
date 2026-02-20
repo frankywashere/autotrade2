@@ -1915,6 +1915,10 @@ def run_backtest(
                 else:
                     trade_size *= 1.10
 
+                # Entropy-inverse boost: low entropy = predictable = bigger position
+                if hasattr(sig, 'entropy_score') and sig.entropy_score < 0.85:
+                    trade_size *= 1.25
+
                 # Continuous confidence scaling: higher conf = linearly bigger position
                 # conf 0.40 → 1.0x, conf 0.90 → 1.5x (linear interpolation)
                 conf_scale = 1.0 + (sig.confidence - 0.40) * (0.5 / 0.5)
