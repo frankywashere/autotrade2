@@ -233,7 +233,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -508,6 +508,42 @@ def run_backtest(
                 liquidity_model = LiquidityStateClassifier.load(liq_path)
                 print(f"[ML] Liquidity State loaded (slippage corr 0.499)")
                 ml_stats['liq_high_slippage'] = 0
+            except Exception:
+                pass
+
+        # Architecture 31: Trade Duration Predictor
+        duration_model = None
+        dur_path = _os.path.join(model_dir, 'duration_model.pkl')
+        if _os.path.exists(dur_path):
+            try:
+                duration_model = TradeDurationPredictor.load(dur_path)
+                print(f"[ML] Trade Duration loaded (Quick AUC 0.617)")
+                ml_stats['dur_quick_exit'] = 0
+                ml_stats['dur_extend_hold'] = 0
+            except Exception:
+                pass
+
+        # Architecture 37: Adversarial Trade Selector
+        adversarial_model = None
+        adv_path = _os.path.join(model_dir, 'adversarial_model.pkl')
+        if _os.path.exists(adv_path):
+            try:
+                adversarial_model = AdversarialTradeSelector.load(adv_path)
+                print(f"[ML] Adversarial Selector loaded (AUC 0.605)")
+                ml_stats['adv_favorable_boost'] = 0
+                ml_stats['adv_unfavorable_penalty'] = 0
+            except Exception:
+                pass
+
+        # Architecture 40: Quantile Risk Estimator
+        quantile_risk_model = None
+        qr_path = _os.path.join(model_dir, 'quantile_risk_model.pkl')
+        if _os.path.exists(qr_path):
+            try:
+                quantile_risk_model = QuantileRiskEstimator.load(qr_path)
+                print(f"[ML] Quantile Risk loaded (spread corr 0.298)")
+                ml_stats['qr_high_risk_penalty'] = 0
+                ml_stats['qr_favorable_asym'] = 0
             except Exception:
                 pass
 
@@ -1256,9 +1292,39 @@ def run_backtest(
                     # Disabled: trained but not integrated
                     # if liquidity_model is not None: ...
 
+                    # Trade Duration (Arch 31): Quick AUC 0.617, Hold Corr 0.182
+                    # Neutral at all thresholds — doesn't improve PF
+                    # Disabled: trained but not integrated
+                    # if duration_model is not None: ...
+
+                    # Quantile Risk: use return spread to adjust confidence
+                    if quantile_risk_model is not None:
+                        try:
+                            qr_pred = quantile_risk_model.predict(feature_vec.reshape(1, -1))
+                            spread = float(qr_pred['return_spread'][0])
+                            risk_ratio = float(qr_pred['risk_ratio'][0])
+
+                            # Favorable asymmetry (P90 >> |P10|) → boost
+                            if risk_ratio > 1.5:
+                                sig.confidence *= 1.05
+                                ml_stats['qr_favorable_asym'] += 1
+                        except Exception:
+                            pass
+
+                    # Adversarial Selector (Arch 37): AUC 0.605 but 0 triggers in backtest
+                    # Only 3 boosting rounds → predictions cluster, never hit thresholds
+                    # Disabled: trained but not integrated
+                    # if adversarial_model is not None: ...
+
                     # Stop Loss Predictor: disabled (60% base rate, weak discrimination)
                     # Momentum Divergence (Arch 23): disabled (AUC 0.557, near random)
                     # Regime Transition (Arch 28): disabled (stability corr 0.035)
+                    # Winner Amplifier (Arch 32): disabled (AUC 0.492, magnitude corr -0.27)
+                    # Fractal Regime (Arch 33): disabled (AUC 0.546, near random)
+                    # Volume Conviction (Arch 34): disabled (AUC 0.529, near random)
+                    # Energy Momentum (Arch 35): disabled (AUC 0.543, near random)
+                    # Multi-Exit Strategy (Arch 36): disabled (majority class collapse)
+                    # Cascade Confidence (Arch 38): disabled (model preds contribute 1.8%)
 
                 except Exception:
                     ml_prediction = None
@@ -1513,6 +1579,15 @@ def run_backtest(
             print(f"    Rev slow penalty:  {ml_stats.get('rev_slow_penalty', 0)}")
         if liquidity_model is not None:
             print(f"    Liq high slippage: {ml_stats.get('liq_high_slippage', 0)}")
+        if duration_model is not None:
+            print(f"    Dur quick exit:    {ml_stats.get('dur_quick_exit', 0)}")
+            print(f"    Dur extend hold:   {ml_stats.get('dur_extend_hold', 0)}")
+        if adversarial_model is not None:
+            print(f"    Adv favorable:     {ml_stats.get('adv_favorable_boost', 0)}")
+            print(f"    Adv unfavorable:   {ml_stats.get('adv_unfavorable_penalty', 0)}")
+        if quantile_risk_model is not None:
+            print(f"    QR high risk pen:  {ml_stats.get('qr_high_risk_penalty', 0)}")
+            print(f"    QR favorable asym: {ml_stats.get('qr_favorable_asym', 0)}")
 
     # Breakdown by exit reason
     if trades:
