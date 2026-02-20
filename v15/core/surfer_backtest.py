@@ -1754,7 +1754,7 @@ def run_backtest(
                         pass  # Quality scorer failure doesn't block trade
 
                 # Position score filter: skip breakouts with weak position
-                if sig.signal_type == 'break' and sig.position_score < 0.90:
+                if sig.signal_type == 'break' and sig.position_score < 0.80:
                     continue
 
                 # Low-conf bounce filter: BUY bounces with conf < 0.46 lose more
