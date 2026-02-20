@@ -180,7 +180,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.12 if tight else 0.15))
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.10 if tight else 0.15):
-                effective_stop = max(position.stop_price, entry * 0.999)
+                effective_stop = max(position.stop_price, entry * 1.0005)
             else:
                 effective_stop = position.stop_price
 
@@ -225,7 +225,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.12 if tight else 0.15))
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.10 if tight else 0.15):
-                effective_stop = min(position.stop_price, entry * 1.001)
+                effective_stop = min(position.stop_price, entry * 0.9995)
             else:
                 effective_stop = position.stop_price
 
