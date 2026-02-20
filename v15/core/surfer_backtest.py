@@ -154,8 +154,8 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             elif profit_from_best > 0.008:
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.10)
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_from_best > (0.002 if el else 0.0035):
-                trail_mult = 0.20 if el else 0.25
+            elif profit_from_best > (0.002 if el else 0.0015):
+                trail_mult = 0.20 if el else 0.30
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
                 effective_stop = max(position.stop_price, trail_from_best)
             else:
@@ -198,8 +198,8 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             elif profit_from_best > 0.008:
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.10)
                 effective_stop = min(position.stop_price, trail_from_best)
-            elif profit_from_best > (0.002 if el else 0.0035):
-                trail_mult = 0.20 if el else 0.25
+            elif profit_from_best > (0.002 if el else 0.0015):
+                trail_mult = 0.20 if el else 0.30
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult)
                 effective_stop = min(position.stop_price, trail_from_best)
             else:
@@ -1830,8 +1830,8 @@ def run_backtest(
                         and sig.channel_health > 0.25):
                     trade_size *= 0.50
 
-                # Energy boost for bounces: higher energy → bigger P&L (+0.390 PnlCorr)
-                if sig.signal_type == 'bounce' and sig.energy_score > 0.40:
+                # Energy boost for bounces: low energy = bigger moves (-0.353 PnlCorr)
+                if sig.signal_type == 'bounce' and sig.energy_score < 0.30:
                     trade_size *= 1.30
 
                 # Timing boost for bounces: timing_score +0.359 PnlCorr
