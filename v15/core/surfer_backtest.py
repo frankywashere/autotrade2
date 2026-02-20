@@ -1745,6 +1745,7 @@ def run_backtest(
                 if sig.signal_type == 'break' and sig.position_score < 0.90:
                     continue
 
+
                 # Enter position
                 entry_price = current_price
 
@@ -1809,6 +1810,10 @@ def run_backtest(
                 # Higher cap for bounces (0% stop rate, 87%+ WR)
                 size_cap = position_size * (5 if sig.signal_type == 'bounce' else 3)
                 trade_size = min(trade_size, size_cap)
+
+                # Channel health penalty: high health breakouts are less decisive
+                if sig.signal_type == 'break' and sig.channel_health > 0.35:
+                    trade_size *= 0.60
 
                 # Max exposure check: total open position value < 3x equity
                 total_exposure = sum(p.trade_size for p in positions)
