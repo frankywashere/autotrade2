@@ -1815,6 +1815,10 @@ def run_backtest(
                 if sig.signal_type == 'break' and sig.channel_health > 0.35:
                     trade_size *= 0.60
 
+                # Energy boost for bounces: higher energy → bigger P&L (+0.390 PnlCorr)
+                if sig.signal_type == 'bounce' and sig.energy_score > 0.40:
+                    trade_size *= 1.30
+
                 # Volume conviction boost: only at very high volume (2x+ avg)
                 if sig.signal_type == 'break' and 'volume' in tsla.columns:
                     current_vol = tsla['volume'].iloc[bar]
