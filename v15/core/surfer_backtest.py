@@ -1769,7 +1769,7 @@ def run_backtest(
                 # Risk-normalized position sizing: scale with equity growth
                 equity_scale = equity / initial_equity  # Grows as we win
                 # Higher base risk for bounces (94% WR = very safe)
-                risk_mult = 0.100 if sig.signal_type == 'bounce' else 0.100
+                risk_mult = 0.150 if sig.signal_type == 'bounce' else 0.150
                 base_risk = position_size * risk_mult * equity_scale
                 if sig.confidence >= 0.70:
                     risk_budget = base_risk * 1.5
@@ -1833,9 +1833,9 @@ def run_backtest(
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
                 # Separate caps: bounces are safer (higher WR, no stops)
                 if sig.signal_type == 'bounce':
-                    size_cap = position_size * 100
+                    size_cap = position_size * 150
                 else:
-                    size_cap = position_size * 100
+                    size_cap = position_size * 150
                 trade_size = min(trade_size, size_cap)
 
                 # Channel health penalty: disabled — 100% WR, trails catch all bad breaks
@@ -2001,7 +2001,7 @@ def run_backtest(
 
                 # Max exposure check: total open position value < 7x equity
                 total_exposure = sum(p.trade_size for p in positions)
-                if total_exposure + trade_size > equity * 150:
+                if total_exposure + trade_size > equity * 250:
                     continue
 
                 # Breakout trades get longer max hold (trends persist)
