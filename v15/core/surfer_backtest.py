@@ -41,6 +41,8 @@ class Trade:
     trade_size: float = 10000.0
     mae_pct: float = 0.0  # Maximum Adverse Excursion (worst unrealized loss %)
     mfe_pct: float = 0.0  # Maximum Favorable Excursion (best unrealized gain %)
+    el_flagged: bool = False  # Was EL flagged at entry
+    is_flagged: bool = False  # Was IS flagged at entry
 
 
 @dataclass
@@ -62,6 +64,8 @@ class OpenPosition:
     best_price: float = 0.0     # Best price seen (for MFE)
     el_flagged: bool = False    # Extreme Loser flagged — trail more aggressively
     fast_reversion: bool = False # Fast reversion detected — bounce trail tighter
+    is_flagged: bool = False    # Immediate Stop flagged
+    extended: bool = False       # Hold time extended on profitable timeout
 
 
 @dataclass
@@ -139,17 +143,18 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (position.trailing_stop - entry) / entry
-            # EL: tighter trail; FP: tighter trail to lock fast profit
-            trail_threshold = 0.004 if el else 0.006
-            trail_mult = 0.20 if el else 0.25
-            if profit_from_best > trail_threshold:
+            # Two-tier breakout trail: tighter trail when running big
+            if profit_from_best > 0.008:
+                # Big runner (>1.5% from best): very tight trail to lock profits
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.10)
+                effective_stop = max(position.stop_price, trail_from_best)
+            elif profit_from_best > (0.004 if el else 0.006):
+                # Standard trail
+                trail_mult = 0.20 if el else 0.25
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
                 effective_stop = max(position.stop_price, trail_from_best)
             else:
                 effective_stop = position.stop_price
-            # Time-based breakeven disabled: cuts winners too much
-            # if el and bars_held >= 6 and position.best_price > entry * 1.002:
-            #     effective_stop = max(effective_stop, entry * 1.0005)
         else:
             profit_from_entry = (position.trailing_stop - entry) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
@@ -181,16 +186,16 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (entry - position.trailing_stop) / entry
-            trail_threshold = 0.004 if el else 0.006
-            trail_mult = 0.20 if el else 0.25
-            if profit_from_best > trail_threshold:
+            # Two-tier breakout trail: tighter trail when running big
+            if profit_from_best > 0.008:
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.10)
+                effective_stop = min(position.stop_price, trail_from_best)
+            elif profit_from_best > (0.004 if el else 0.006):
+                trail_mult = 0.20 if el else 0.25
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult)
                 effective_stop = min(position.stop_price, trail_from_best)
             else:
                 effective_stop = position.stop_price
-            # Time-based breakeven disabled: cuts winners too much
-            # if el and bars_held >= 6 and position.best_price < entry * 0.998:
-            #     effective_stop = min(effective_stop, entry * 0.9995)
         else:
             profit_from_entry = (entry - position.trailing_stop) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
@@ -255,7 +260,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor, BreakoutStopPredictor,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -694,6 +699,18 @@ def run_backtest(
             except Exception:
                 pass
 
+        # Architecture 59: Breakout Stop Predictor
+        breakout_stop_model = None
+        bsp_path = _os.path.join(model_dir, 'breakout_stop_model.pkl')
+        if _os.path.exists(bsp_path):
+            try:
+                breakout_stop_model = BreakoutStopPredictor.load(bsp_path)
+                print(f"[ML] Breakout Stop Predictor loaded (AUC 0.794)")
+                ml_stats['bsp_tighten'] = 0
+                ml_stats['bsp_skip'] = 0
+            except Exception:
+                pass
+
     # Fetch data
     print(f"Fetching {days}d of 5-min TSLA data...")
     tsla = yf.download('TSLA', period=f'{days}d', interval='5m', progress=False)
@@ -921,6 +938,7 @@ def run_backtest(
                     hold_bars=bars_held, primary_tf=position.primary_tf,
                     signal_type=position.signal_type, trade_size=position.trade_size,
                     mae_pct=round(mae, 6), mfe_pct=round(mfe, 6),
+                    el_flagged=position.el_flagged, is_flagged=getattr(position, 'is_flagged', False),
                 )
                 trades.append(trade)
                 equity += pnl
@@ -1605,6 +1623,18 @@ def run_backtest(
                         except Exception:
                             pass
 
+                    # Breakout Stop Predictor (Arch 59): AUC 0.794
+                    # Stop tightening only — confidence penalty hurts PF
+                    bsp_prob = 0.0
+                    if breakout_stop_model is not None and sig.signal_type == 'break':
+                        try:
+                            bsp_pred = breakout_stop_model.predict(feature_vec.reshape(1, -1))
+                            bsp_prob = float(bsp_pred['breakout_stop_prob'][0])
+                            if bsp_prob > 0.20:
+                                ml_stats['bsp_tighten'] += 1
+                        except Exception:
+                            pass
+
                 except Exception:
                     ml_prediction = None
                     ml_max_hold = None
@@ -1612,12 +1642,14 @@ def run_backtest(
                     el_loser_prob = 0.0
                     imm_stop_prob = 0.0
                     fast_rev = 0.0
+                    bsp_prob = 0.0
             else:
                 ml_max_hold = None
                 imm_stop_skip = False
                 el_loser_prob = 0.0
                 imm_stop_prob = 0.0
                 fast_rev = 0.0
+                bsp_prob = 0.0
 
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
                 # Daily circuit breaker: stop trading if down $500+ today
@@ -1677,25 +1709,22 @@ def run_backtest(
                 # Enter position
                 entry_price = current_price
 
-                # Confidence-scaled position sizing
+                # Risk-normalized position sizing: each trade risks same $ amount
+                # target_risk = base_risk * confidence_multiplier
+                base_risk = position_size * 0.012  # $120 risk per $10K base
                 if sig.confidence >= 0.70:
-                    trade_size = position_size * 1.5
+                    risk_budget = base_risk * 1.5
                 elif sig.confidence >= 0.60:
-                    trade_size = position_size * 1.2
+                    risk_budget = base_risk * 1.2
                 else:
-                    trade_size = position_size
+                    risk_budget = base_risk
 
                 # Adaptive sizing: ramp up on win streaks, halve on losing streaks
                 if consecutive_wins >= 3:
                     streak_boost = min(2.0, 1.0 + 0.15 * (consecutive_wins - 2))
-                    trade_size *= streak_boost
+                    risk_budget *= streak_boost
                 if consecutive_losses >= 4:
-                    trade_size *= 0.50  # Half size after 4+ consecutive losses
-
-                # Max exposure check: total open position value < 3x equity
-                total_exposure = sum(p.trade_size for p in positions)
-                if total_exposure + trade_size > equity * 3:
-                    continue  # At exposure limit
+                    risk_budget *= 0.50  # Half size after 4+ consecutive losses
 
                 # Volatility-adjusted stops: blend channel width with ATR
                 # Floor at 1.5*ATR (survive noise), cap at 2.5*ATR (don't overexpose)
@@ -1716,12 +1745,29 @@ def run_backtest(
                     ml_stats.setdefault('is_stop_tighten', 0)
                     ml_stats['is_stop_tighten'] += 1
 
+                # BSP stop tightening: breakout-specific, AUC 0.794
+                # BSP stop tightening disabled — marginal impact (PF 9.67→9.70)
+                # if bsp_prob > 0.20 and sig.signal_type == 'break':
+                #     adjusted_stop_pct *= 0.65  # 35% tighter
+                #     ml_stats.setdefault('bsp_stop_tighten', 0)
+                #     ml_stats['bsp_stop_tighten'] += 1
+
                 if sig.action == 'BUY':
                     stop = entry_price * (1 - adjusted_stop_pct)
                     tp = entry_price * (1 + sig.suggested_tp_pct)
                 else:
                     stop = entry_price * (1 + adjusted_stop_pct)
                     tp = entry_price * (1 - sig.suggested_tp_pct)
+
+                # Risk-normalized sizing: trade_size = risk_budget / stop_pct
+                # Wider stops → smaller position, tighter stops → larger position
+                trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
+                trade_size = min(trade_size, position_size * 3)  # Cap at 3x base
+
+                # Max exposure check: total open position value < 3x equity
+                total_exposure = sum(p.trade_size for p in positions)
+                if total_exposure + trade_size > equity * 3:
+                    continue
 
                 # Breakout trades get longer max hold (trends persist)
                 effective_max_hold = max_hold_bars * 2 if sig.signal_type == 'break' else max_hold_bars
@@ -1770,6 +1816,7 @@ def run_backtest(
                         trailing_stop=entry_price,
                         el_flagged=(el_loser_prob > 0.18),
                         fast_reversion=(fast_rev > 0.55),
+                        is_flagged=(imm_stop_prob > 0.35),
                     ))
                     position_signals.append(sig_data)
 
@@ -1929,6 +1976,9 @@ def run_backtest(
             print(f"    MR reversal pen:   {ml_stats.get('mr_penalty', 0)}")
         if imm_stop_model is not None:
             print(f"    IS skip:           {ml_stats.get('is_skip', 0)}")
+        if breakout_stop_model is not None:
+            print(f"    BSP tighten:       {ml_stats.get('bsp_tighten', 0)}")
+            print(f"    BSP stop tighten:  {ml_stats.get('bsp_stop_tighten', 0)}")
         if ml_stats.get('deferred_total', 0) > 0:
             print(f"    Deferred total:    {ml_stats.get('deferred_total', 0)}")
             print(f"    Delayed entries:   {ml_stats.get('delayed_entries', 0)}")
@@ -2244,13 +2294,17 @@ def main():
             print(f"TRADE DUMP: {filt} ({len(dump)} trades)")
             print(f"{'='*80}")
             for i, t in enumerate(dump):
+                flags = []
+                if t.el_flagged: flags.append('EL')
+                if t.is_flagged: flags.append('IS')
+                flag_str = f" [{','.join(flags)}]" if flags else ""
                 print(f"  #{i+1} {t.direction:4s} {t.signal_type:6s} "
                       f"conf={t.confidence:.2f} hold={t.hold_bars:2d} "
                       f"pnl={t.pnl_pct:+.3%} (${t.pnl:+.0f}) "
                       f"stop={t.stop_pct:.3%} "
                       f"mae={t.mae_pct:.3%} mfe={t.mfe_pct:.3%} "
                       f"exit={t.exit_reason} tf={t.primary_tf} "
-                      f"size=${t.trade_size:.0f}")
+                      f"size=${t.trade_size:.0f}{flag_str}")
 
 
 if __name__ == '__main__':

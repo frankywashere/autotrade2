@@ -15118,6 +15118,157 @@ class ProfitVelocityPredictor:
         return model
 
 
+class BreakoutStopPredictor:
+    """Arch 59: Predict if a breakout trade will hit its stop loss.
+
+    All 8 stop-loss exits in the current backtest are breakouts on 5min TF.
+    Key patterns: instant adverse (3 bars), high MAE/low MFE, high conf doesn't help.
+
+    Label: breakout that would hit stop = ret5 < -0.005 AND ret20 < -0.003
+    (sustained adverse, not just noise).
+    """
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.bs_feature_names = None
+
+    def derive_features(self, X, feature_names):
+        """Extract features most relevant to breakout failure."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Channel structure at breakout (health, width, break_prob indicate setup quality)
+        for tf in ML_TFS:
+            for key in ['break_prob', 'channel_health', 'width_pct',
+                        'position_pct', 'slope_normalized', 'center_distance',
+                        'kinetic_energy', 'potential_energy',
+                        'momentum_direction', 'bars_since_touch']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'bs_{tf}_{key}')
+
+        # Temporal (recent changes predict immediate breakout quality)
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                    'break_prob_delta_3bar', 'break_prob_delta_6bar',
+                    'entropy_delta_3bar', 'rsi_slope_5bar',
+                    'vol_trend_5bar', 'price_acceleration_5bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'bs_{key}')
+
+        # Context (volatility determines if breakout survives noise)
+        for key in ['atr_pct', 'volume_ratio_20', 'bar_range_pct',
+                    'rsi_14', 'bb_position', 'minutes_since_open']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'bs_{key}')
+
+        # Cross-TF agreement (aligned TFs = better breakout)
+        for key in ['direction_agreement', 'avg_break_prob', 'avg_health',
+                    'health_min', 'health_std', 'width_dispersion',
+                    'energy_alignment']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'bs_{key}')
+
+        # Market regime
+        for key in ['vix_level', 'tsla_spy_corr_20', 'spy_rsi_14',
+                    'tsla_spy_beta_20']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'bs_{key}')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train breakout stop predictor."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+        bs_X_train, self.bs_feature_names = self.derive_features(X_train, feature_names)
+        bs_X_val, _ = self.derive_features(X_val, feature_names)
+
+        ret5 = Y_train['future_return_5']
+        ret20 = Y_train['future_return_20']
+        ret5_val = Y_val['future_return_5']
+        ret20_val = Y_val['future_return_20']
+
+        # "Breakout stop": sustained adverse move (not just noise)
+        # ret5 < -0.005 AND ret20 < -0.003 → price keeps going wrong
+        stop_train = ((ret5 < -0.005) & (ret20 < -0.003)).astype(np.float32)
+        stop_val = ((ret5_val < -0.005) & (ret20_val < -0.003)).astype(np.float32)
+
+        metrics = {}
+        print(f"\n  Breakout stop features: {len(self.bs_feature_names)}")
+        print(f"  Breakout stop rate (train): {stop_train.mean():.1%}")
+        print(f"  Breakout stop rate (val): {stop_val.mean():.1%}")
+
+        callbacks = [lgb.early_stopping(50), lgb.log_evaluation(0)]
+        dtrain = lgb.Dataset(bs_X_train, label=stop_train,
+                            feature_name=self.bs_feature_names)
+        dval = lgb.Dataset(bs_X_val, label=stop_val,
+                          feature_name=self.bs_feature_names, reference=dtrain)
+
+        self.model = lgb.train(
+            {'objective': 'binary', 'metric': 'auc', 'num_leaves': 31,
+             'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+             'bagging_freq': 5, 'verbose': -1, 'scale_pos_weight': 2.0},
+            dtrain, num_boost_round=500, valid_sets=[dval], callbacks=callbacks)
+
+        bs_pred = self.model.predict(bs_X_val)
+        try:
+            auc = roc_auc_score(stop_val, bs_pred)
+            metrics['breakout_stop_auc'] = float(auc)
+            print(f"  Breakout Stop AUC: {auc:.3f}")
+        except Exception:
+            metrics['breakout_stop_auc'] = 0.5
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n  Top 10 breakout stop features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"    {rank+1}. {self.bs_feature_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        bs_X, _ = self.derive_features(X, self.feature_names)
+        return {
+            'breakout_stop_prob': self.model.predict(bs_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'bs_feature_names': self.bs_feature_names,
+            }, f)
+        print(f"  Saved BreakoutStopPredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'BreakoutStopPredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.bs_feature_names = data['bs_feature_names']
+        return model
+
+
 # ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
@@ -15747,7 +15898,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity', 'breakout_stop'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -16208,6 +16359,14 @@ def main():
                 )
                 pv.save(os.path.join(args.output, 'profit_velocity_model.pkl'))
                 print(f"\n  Profit Velocity metrics: {pv_metrics}")
+
+            elif args.arch == 'breakout_stop':
+                bs = BreakoutStopPredictor()
+                bs_metrics = bs.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                bs.save(os.path.join(args.output, 'breakout_stop_model.pkl'))
+                print(f"\n  Breakout Stop metrics: {bs_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
