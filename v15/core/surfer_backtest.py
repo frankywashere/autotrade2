@@ -230,7 +230,7 @@ def run_backtest(
     eval_interval: int = 3,     # Check every 3 bars = 15 min
     max_hold_bars: int = 60,    # Max 5 hours (60 * 5min)
     position_size: float = 10000.0,  # $10k per trade
-    min_confidence: float = 0.45,
+    min_confidence: float = 0.48,
     use_multi_tf: bool = True,  # Use higher TF data for context
     ml_model=None,              # Optional ML model for signal enhancement
 ) -> tuple:
@@ -2186,7 +2186,7 @@ def main():
     parser.add_argument('--days', type=int, default=30, help='Days of 5min data')
     parser.add_argument('--eval-interval', type=int, default=6, help='Bars between evaluations')
     parser.add_argument('--max-hold', type=int, default=60, help='Max bars to hold')
-    parser.add_argument('--min-conf', type=float, default=0.45, help='Minimum signal confidence')
+    parser.add_argument('--min-conf', type=float, default=0.48, help='Minimum signal confidence')
     parser.add_argument('--walk-forward', action='store_true', help='Run walk-forward validation')
     parser.add_argument('--ml', type=str, default=None,
                        help='Path to ML model for signal enhancement (e.g. surfer_models/gbt_model.pkl)')
