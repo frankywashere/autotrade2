@@ -1873,6 +1873,18 @@ def run_backtest(
                     if avg_vol > 0 and current_vol > avg_vol * 2.0:
                         trade_size *= 1.20
 
+                # Price momentum confirmation for breakouts
+                if sig.signal_type == 'break' and bar >= 3:
+                    lookback_prices = tsla['close'].iloc[bar-3:bar+1].values
+                    if len(lookback_prices) >= 2:
+                        recent_return = (lookback_prices[-1] - lookback_prices[0]) / lookback_prices[0]
+                        # BUY break: boost if price already moving up
+                        if sig.action == 'BUY' and recent_return > 0.004:
+                            trade_size *= 1.20
+                        # SELL break: boost if price already moving down
+                        elif sig.action == 'SELL' and recent_return < -0.004:
+                            trade_size *= 1.20
+
                 # Max exposure check: total open position value < 3x equity
                 total_exposure = sum(p.trade_size for p in positions)
                 if total_exposure + trade_size > equity * 3:
