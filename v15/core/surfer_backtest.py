@@ -148,13 +148,16 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
         if is_breakout:
             profit_from_best = (position.trailing_stop - entry) / entry
             # Three-tier breakout trail (with progressive tightening)
+            # BUY breakouts use lower tier-3 activation (0.10% vs 0.15%)
+            # because BUY break losers have MFE 0.08-0.14%
+            tier3_thresh = 0.002 if el else 0.0010
             if profit_from_best > 0.015:
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.06)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.08)
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_from_best > (0.002 if el else 0.0015):
+            elif profit_from_best > tier3_thresh:
                 trail_mult = 0.20 if el else 0.25
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
                 effective_stop = max(position.stop_price, trail_from_best)
@@ -1754,6 +1757,11 @@ def run_backtest(
                 if sig.signal_type == 'break' and sig.position_score < 0.90:
                     continue
 
+                # BUY bounce confidence filter: low-conf BUY bounces lose more
+                if (sig.signal_type == 'bounce' and sig.action == 'BUY'
+                        and sig.confidence < 0.46):
+                    continue
+
 
                 # Enter position
                 entry_price = current_price
@@ -1848,6 +1856,11 @@ def run_backtest(
                 # Confidence boost for bounces: confidence +0.360 PnlCorr
                 if sig.signal_type == 'bounce' and sig.confidence > 0.55:
                     trade_size *= 1.15
+
+                # BUY bounce low-conf penalty: BUY bounces with conf < 0.50 lose more
+                if (sig.signal_type == 'bounce' and sig.action == 'BUY'
+                        and sig.confidence < 0.50):
+                    trade_size *= 0.50
 
                 # Position score boost for bounces: position_score +0.354 PnlCorr
                 if sig.signal_type == 'bounce' and sig.position_score > 0.95:
