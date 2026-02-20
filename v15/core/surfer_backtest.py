@@ -1885,7 +1885,7 @@ def run_backtest(
                 if sig.signal_type == 'break':
                     if sig.confidence < 0.60:
                         trade_size *= 1.60
-                    elif sig.confidence < 0.80:
+                    elif sig.confidence < 0.90:
                         trade_size *= 1.30
 
                 # Volume conviction boost: only at very high volume (2x+ avg)
