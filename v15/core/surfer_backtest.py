@@ -1882,9 +1882,9 @@ def run_backtest(
                 # Low-conf breakouts are the biggest winners
                 if sig.signal_type == 'break':
                     if sig.confidence < 0.60:
-                        trade_size *= 1.60
+                        trade_size *= 1.70
                     elif sig.confidence < 0.90:
-                        trade_size *= 1.30
+                        trade_size *= 1.35
 
                 # Volume conviction boost: only at very high volume (2x+ avg)
                 if sig.signal_type == 'break' and 'volume' in tsla.columns:
