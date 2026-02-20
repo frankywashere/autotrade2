@@ -847,6 +847,7 @@ def run_backtest(
     max_dd = 0.0
     consecutive_losses = 0  # Track losing streak for position reduction
     consecutive_wins = 0    # Track winning streak for position ramping
+    last_breakout_loss = False  # Track if last loss was a breakout (confirms channel)
     daily_pnl = 0.0         # Running P&L for current trading day
     daily_breaker_active = False
     current_day = None
@@ -986,9 +987,11 @@ def run_backtest(
                 if pnl <= 0:
                     consecutive_losses += 1
                     consecutive_wins = 0
+                    last_breakout_loss = (position.signal_type == 'break')
                 else:
                     consecutive_losses = 0
                     consecutive_wins += 1
+                    last_breakout_loss = False
 
                 # Track daily P&L for circuit breaker
                 daily_pnl += pnl
@@ -1837,6 +1840,10 @@ def run_backtest(
                 # Bounces from weaker channels = bigger mean-reversion moves
                 if sig.signal_type == 'bounce' and sig.channel_health < 0.65:
                     trade_size *= 1.25
+
+                # Channel confirmed boost: bounce after breakout loss = channel held
+                if sig.signal_type == 'bounce' and last_breakout_loss:
+                    trade_size *= 1.30
 
                 # High confluence + low confidence breakout boost
                 # Confluence (+0.196 WinCorr) and conf is inverse (-0.275 WinCorr)
