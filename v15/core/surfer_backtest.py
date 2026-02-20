@@ -1762,7 +1762,7 @@ def run_backtest(
 
                 # Adaptive sizing: ramp up on win streaks, halve on losing streaks
                 if consecutive_wins >= 2:
-                    streak_boost = min(3.0, 1.0 + 0.35 * (consecutive_wins - 1))
+                    streak_boost = min(5.0, 1.0 + 0.50 * (consecutive_wins - 1))
                     risk_budget *= streak_boost
                 if consecutive_losses >= 3:
                     risk_budget *= 0.50  # Half size after 3+ consecutive losses
