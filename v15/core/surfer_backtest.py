@@ -1880,15 +1880,13 @@ def run_backtest(
                 if sig.signal_type == 'bounce' and last_breakout_loss:
                     trade_size *= 1.30
 
-                # High confluence + low confidence breakout boost
-                # Confluence (+0.196 WinCorr) and conf is inverse (-0.275 WinCorr)
-                if sig.signal_type == 'break' and sig.confidence < 0.80:
-                    trade_size *= 1.25
-
-                # Low confidence breakout boost: conf -0.275 WinCorr
-                # Low-conf breakouts are the biggest winners ($535-$785)
-                if sig.signal_type == 'break' and sig.confidence < 0.60:
-                    trade_size *= 1.30
+                # Inverse confidence breakout boost: conf -0.275 WinCorr
+                # Low-conf breakouts are the biggest winners
+                if sig.signal_type == 'break':
+                    if sig.confidence < 0.60:
+                        trade_size *= 1.60
+                    elif sig.confidence < 0.80:
+                        trade_size *= 1.30
 
                 # Volume conviction boost: only at very high volume (2x+ avg)
                 if sig.signal_type == 'break' and 'volume' in tsla.columns:
