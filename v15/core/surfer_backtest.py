@@ -155,10 +155,10 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.01)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.03)
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.02)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > tier3_thresh:
-                trail_mult = 0.20 if el else 0.06
+                trail_mult = 0.20 if el else 0.01
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
                 effective_stop = max(position.stop_price, trail_from_best)
             else:
@@ -203,10 +203,10 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.01)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.03)
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.02)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_from_best > (0.002 if el else 0.0005):
-                trail_mult = 0.20 if el else 0.06
+                trail_mult = 0.20 if el else 0.01
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult)
                 effective_stop = min(position.stop_price, trail_from_best)
             else:
