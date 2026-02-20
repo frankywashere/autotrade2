@@ -1925,6 +1925,13 @@ def run_backtest(
                     elif atr_pct > 0.015:
                         trade_size *= 0.80
 
+                # Range compression boost: narrow bar = tension building, bigger breakout/bounce
+                if bar >= 5:
+                    recent_ranges = (highs[bar-5:bar] - lows[bar-5:bar]) / closes[bar-5:bar]
+                    avg_range = recent_ranges.mean()
+                    if avg_range < 0.008:  # Compressed range (< 0.8%)
+                        trade_size *= 1.50
+
                 # Day-of-week boost: Wed has 3x avg P&L of Fri
                 bar_dt = tsla.index[bar]
                 dow = bar_dt.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
