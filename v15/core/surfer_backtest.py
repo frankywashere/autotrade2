@@ -1914,7 +1914,19 @@ def run_backtest(
                     if avg_vol_20 > 0 and recent_vol > avg_vol_20 * 1.5 and recent_move < 0.003:
                         trade_size *= 1.15
 
-                # Price momentum confirmation for breakouts
+                # Bounce momentum alignment: deep touch = stronger bounce
+                if sig.signal_type == 'bounce' and bar >= 3:
+                    bounce_lookback = tsla['close'].iloc[bar-3:bar+1].values
+                    if len(bounce_lookback) >= 2:
+                        bounce_momentum = (bounce_lookback[-1] - bounce_lookback[0]) / bounce_lookback[0]
+                        # BUY bounce after price dip = deep touch
+                        if sig.action == 'BUY' and bounce_momentum < -0.001:
+                            trade_size *= 1.20
+                        # SELL bounce after price rise = deep touch
+                        elif sig.action == 'SELL' and bounce_momentum > 0.001:
+                            trade_size *= 1.20
+
+                # Price momentum confirmation for breakouts (continuous scaling)
                 if sig.signal_type == 'break' and bar >= 3:
                     lookback_prices = tsla['close'].iloc[bar-3:bar+1].values
                     if len(lookback_prices) >= 2:
