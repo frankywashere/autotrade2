@@ -1852,11 +1852,11 @@ def run_backtest(
 
                 # Energy boost for bounces: low energy = bigger moves (-0.353 PnlCorr)
                 if sig.signal_type == 'bounce' and sig.energy_score < 0.30:
-                    trade_size *= 1.30
+                    trade_size *= 1.50
 
                 # Timing boost for bounces: timing_score +0.359 PnlCorr
                 if sig.signal_type == 'bounce' and sig.timing_score > 0.10:
-                    trade_size *= 1.20
+                    trade_size *= 1.30
 
                 # Confidence boost for bounces: confidence +0.360 PnlCorr
                 if sig.signal_type == 'bounce' and sig.confidence > 0.55:
@@ -1869,16 +1869,16 @@ def run_backtest(
 
                 # Position score boost for bounces: position_score +0.354 PnlCorr
                 if sig.signal_type == 'bounce' and sig.position_score > 0.95:
-                    trade_size *= 1.15
+                    trade_size *= 1.25
 
                 # Low channel health boost for bounces: health -0.521 PnlCorr
                 # Bounces from weaker channels = bigger mean-reversion moves
                 if sig.signal_type == 'bounce' and sig.channel_health < 0.65:
-                    trade_size *= 1.25
+                    trade_size *= 1.35
 
                 # Channel confirmed boost: bounce after breakout loss = channel held
                 if sig.signal_type == 'bounce' and last_breakout_loss:
-                    trade_size *= 1.30
+                    trade_size *= 1.40
 
                 # Inverse confidence breakout boost: conf -0.275 WinCorr
                 # Low-conf breakouts are the biggest winners
