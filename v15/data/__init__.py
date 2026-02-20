@@ -26,6 +26,13 @@ from .native_tf import (
 # Backward compatibility alias
 resample_ohlc = resample_with_partial
 
+# Twelve Data client (optional — not installed in all environments)
+try:
+    from .twelvedata_client import TwelveDataClient, TwelveDataQuote, TF_TO_TD_INTERVAL
+    _TWELVEDATA_EXPORTS = ['TwelveDataClient', 'TwelveDataQuote', 'TF_TO_TD_INTERVAL']
+except ImportError:
+    _TWELVEDATA_EXPORTS = []
+
 __all__ = [
     # Loader
     'load_market_data',
@@ -44,4 +51,4 @@ __all__ = [
     'TF_TO_YF_INTERVAL',
     'ALL_TIMEFRAMES',
     'DEFAULT_SYMBOLS',
-]
+] + _TWELVEDATA_EXPORTS

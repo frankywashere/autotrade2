@@ -35,6 +35,30 @@ import logging
 
 from ..exceptions import DataLoadError
 
+# Try to import Twelve Data client (used for TSLA/SPY native TF fetches)
+try:
+    from .twelvedata_client import TwelveDataClient, TF_TO_TD_INTERVAL
+    _TWELVEDATA_AVAILABLE = True
+except ImportError:
+    _TWELVEDATA_AVAILABLE = False
+
+# Lazy singleton for Twelve Data client
+_td_client_instance: Optional['TwelveDataClient'] = None
+
+
+def _get_td_client() -> Optional['TwelveDataClient']:
+    """Get or create the Twelve Data client singleton."""
+    global _td_client_instance
+    if not _TWELVEDATA_AVAILABLE:
+        return None
+    if _td_client_instance is None:
+        try:
+            _td_client_instance = TwelveDataClient()
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Failed to init TwelveData client: {e}")
+            return None
+    return _td_client_instance
+
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -377,46 +401,96 @@ def fetch_native_tf(
         if cached_data is not None:
             return cached_data
 
-    # Handle timeframes that need aggregation from hourly
-    if yf_interval is None:
-        # Need to aggregate from 1h data
-        if tf == '2h':
-            target_hours = 2
-        elif tf == '3h':
-            target_hours = 3
-        elif tf == '4h':
-            target_hours = 4
+    # Try Twelve Data for non-VIX symbols (saves yfinance rate limits,
+    # provides native 2h/4h without aggregation)
+    df = None
+    td_client = _get_td_client()
+    if td_client is not None and _TWELVEDATA_AVAILABLE and td_client.is_supported(symbol):
+        td_interval = TF_TO_TD_INTERVAL.get(tf)
+        if td_interval is not None:
+            try:
+                # Compute outputsize from date range
+                requested_days = (
+                    pd.to_datetime(end_date) - pd.to_datetime(start_date)
+                ).days
+                if td_interval in ('1day', '1week', '1month'):
+                    outputsize = min(requested_days + 50, 5000)
+                else:
+                    # Intraday: estimate bars from trading hours
+                    interval_minutes = {
+                        '5min': 5, '15min': 15, '30min': 30,
+                        '1h': 60, '2h': 120, '4h': 240,
+                    }.get(td_interval, 60)
+                    bars_per_day = int(6.5 * 60 / interval_minutes)
+                    outputsize = min(requested_days * bars_per_day + 50, 5000)
+
+                td_df = td_client.get_time_series(
+                    symbol, td_interval,
+                    outputsize=outputsize,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                if not td_df.empty and all(
+                    col in td_df.columns for col in ['open', 'high', 'low', 'close', 'volume']
+                ):
+                    df = td_df
+                    logger.info(
+                        f"TwelveData: {symbol} {tf} -> {len(df)} bars"
+                    )
+                else:
+                    logger.warning(
+                        f"TwelveData returned empty/invalid data for {symbol} {tf}, "
+                        f"falling back to yfinance"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"TwelveData fetch failed for {symbol} {tf}: {e}, "
+                    f"falling back to yfinance"
+                )
+
+    # Fall back to yfinance / aggregation if Twelve Data didn't provide data
+    if df is None:
+        logger.debug(f"Using yfinance for {symbol} {tf}")
+        # Handle timeframes that need aggregation from hourly
+        if yf_interval is None:
+            # Need to aggregate from 1h data
+            if tf == '2h':
+                target_hours = 2
+            elif tf == '3h':
+                target_hours = 3
+            elif tf == '4h':
+                target_hours = 4
+            else:
+                raise ValueError(f"Cannot aggregate for timeframe: {tf}")
+
+            # Fetch hourly data first
+            hourly_df = fetch_native_tf(
+                symbol=symbol,
+                tf='1h',
+                start_date=start_date,
+                end_date=end_date,
+                cache_dir=cache_dir,
+                use_cache=use_cache,
+                cache_max_age_hours=cache_max_age_hours,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                yf_request_timeout=yf_request_timeout,
+            )
+
+            # Aggregate to target timeframe
+            df = _aggregate_from_hourly(hourly_df, target_hours)
+
         else:
-            raise ValueError(f"Cannot aggregate for timeframe: {tf}")
-
-        # Fetch hourly data first
-        hourly_df = fetch_native_tf(
-            symbol=symbol,
-            tf='1h',
-            start_date=start_date,
-            end_date=end_date,
-            cache_dir=cache_dir,
-            use_cache=use_cache,
-            cache_max_age_hours=cache_max_age_hours,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            yf_request_timeout=yf_request_timeout,
-        )
-
-        # Aggregate to target timeframe
-        df = _aggregate_from_hourly(hourly_df, target_hours)
-
-    else:
-        # Fetch from yfinance
-        df = _fetch_yfinance_data(
-            symbol=symbol,
-            interval=yf_interval,
-            start_date=start_date,
-            end_date=end_date,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            request_timeout=yf_request_timeout,
-        )
+            # Fetch from yfinance
+            df = _fetch_yfinance_data(
+                symbol=symbol,
+                interval=yf_interval,
+                start_date=start_date,
+                end_date=end_date,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                request_timeout=yf_request_timeout,
+            )
 
     # Cache the result
     if use_cache and not df.empty:

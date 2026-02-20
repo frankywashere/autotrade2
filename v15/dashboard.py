@@ -54,6 +54,10 @@ from v15.live_data import (
     YFINANCE_AVAILABLE,
     FINNHUB_AVAILABLE,
 )
+try:
+    from v15.live_data import TWELVEDATA_AVAILABLE
+except ImportError:
+    TWELVEDATA_AVAILABLE = False
 
 # Import live trading monitor
 try:
@@ -649,11 +653,11 @@ def _fetch_live_5min() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 @st.cache_data(ttl=5)
 def _get_realtime_prices() -> Dict[str, Optional[float]]:
-    """Get real-time prices via Finnhub (TSLA/SPY) + yfinance (VIX).
+    """Get real-time prices via TwelveData/Finnhub (TSLA/SPY) + yfinance (VIX).
 
-    Short TTL (5s) — Finnhub quotes are sub-second fresh.
+    Short TTL (5s) — TwelveData/Finnhub quotes are sub-second fresh.
     """
-    if not FINNHUB_AVAILABLE:
+    if not (TWELVEDATA_AVAILABLE or FINNHUB_AVAILABLE):
         return {}
     try:
         data_feed = YFinanceLiveData(cache_ttl=5)
@@ -665,7 +669,7 @@ def _get_realtime_prices() -> Dict[str, Optional[float]]:
 
 @st.cache_data(ttl=60)
 def fetch_all_market_data():
-    """Single source of truth: fetch ALL yfinance data (5-min + native TFs).
+    """Single source of truth: fetch ALL market data (5-min + native TFs).
 
     Returns:
         Tuple of (native_data, live_5min) where:
@@ -690,7 +694,7 @@ def fetch_all_market_data():
             max_retries=2,
             retry_delay=0.75,
             yf_request_timeout=8.0,
-            request_wall_timeout=20.0,
+            request_wall_timeout=90.0,  # Allow time for TD rate limiter (8 credits/min)
             inter_request_delay=0.25,
             verbose=True,
         )
@@ -710,7 +714,7 @@ def fetch_all_market_data():
         data_feed = YFinanceLiveData(cache_ttl=60)
         live_5min = data_feed.get_historical(period='60d', interval='5m')
     except Exception as e:
-        print(f"[DATA] 5-min yfinance failed: {e}")
+        print(f"[DATA] 5-min data fetch failed: {e}")
 
     return native_data, live_5min
 
@@ -760,7 +764,7 @@ def get_live_data_with_fallback(
             else:
                 print("[DATA] Fetching live data from yfinance...")
                 tsla_live, spy_live, vix_live = _fetch_live_5min()
-            print(f"[DATA] yfinance returned: TSLA={len(tsla_live):,} bars "
+            print(f"[DATA] 5-min data: TSLA={len(tsla_live):,} bars "
                   f"({tsla_live.index[0]} to {tsla_live.index[-1]}, "
                   f"tz={tsla_live.index.tz})")
 
@@ -1313,16 +1317,16 @@ def show_trading_monitor_tab(
                 st.error(f"Missing data for {len(missing_tfs)} TFs — cannot evaluate.")
 
     # Get current price and VIX
-    # Prefer Finnhub real-time for TSLA/SPY, fall back to last yfinance candle
+    # Prefer TwelveData/Finnhub real-time for TSLA/SPY, fall back to last candle
     current_price = 0.0
     vix_level = 20.0
     rt_prices = _get_realtime_prices()
     if rt_prices.get('TSLA'):
         current_price = rt_prices['TSLA']
-        _price_source = "Finnhub (real-time)"
+        _price_source = "real-time"
     elif len(current_tsla) > 0 and 'close' in current_tsla.columns:
         current_price = float(current_tsla.iloc[-1]['close'])
-        _price_source = "yfinance (delayed)"
+        _price_source = "last candle (delayed)"
     else:
         _price_source = "unavailable"
     if len(current_vix) > 0 and 'close' in current_vix.columns:

@@ -21,8 +21,39 @@ import pandas as pd
 _DATA_CACHE_PATH = Path('/tmp/backtest_data_cache.pkl')
 
 
+def _fetch_td_5min(symbol: str, days: int) -> pd.DataFrame:
+    """Try fetching 5-min data from Twelve Data. Returns empty DataFrame on failure."""
+    try:
+        from v15.data.twelvedata_client import TwelveDataClient
+        client = TwelveDataClient()
+        if not client.is_supported(symbol):
+            return pd.DataFrame()
+        # ~78 five-min bars per trading day
+        outputsize = min(days * 78 + 50, 5000)
+        df = client.get_time_series(symbol, '5min', outputsize=outputsize)
+        if not df.empty:
+            print(f"[DATA] TwelveData: {symbol} -> {len(df)} bars")
+        return df
+    except Exception as e:
+        print(f"[DATA] TwelveData failed for {symbol}: {e}")
+        return pd.DataFrame()
+
+
+def _fetch_yf_5min(symbol: str, period: str) -> pd.DataFrame:
+    """Fetch 5-min data from yfinance with column normalization."""
+    import yfinance as yf
+    df = yf.download(symbol, period=period, interval='5m', progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.columns = [c.lower() for c in df.columns]
+    return df
+
+
 def fetch_data(days: int = 60, use_cache: bool = True) -> tuple:
-    """Fetch historical 5-min data for TSLA, SPY, VIX from yfinance.
+    """Fetch historical 5-min data for TSLA, SPY, VIX.
+
+    Uses Twelve Data for TSLA/SPY, yfinance for VIX.
+    Falls back to yfinance for TSLA/SPY if Twelve Data fails.
 
     If use_cache=True and a cache file exists, loads from cache for consistent
     results across iterations. Delete /tmp/backtest_data_cache.pkl to refresh.
@@ -35,22 +66,27 @@ def fetch_data(days: int = 60, use_cache: bool = True) -> tuple:
         print(f"[DATA] TSLA: {len(tsla)} bars, SPY: {len(spy)} bars, VIX: {len(vix)} bars (cached)")
         return tsla, spy, vix
 
-    import yfinance as yf
-
     period = f'{days}d'
-    print(f"[DATA] Fetching {period} of 5-min data from yfinance...")
+    print(f"[DATA] Fetching {period} of 5-min data...")
 
-    tsla = yf.download('TSLA', period=period, interval='5m', progress=False)
-    spy = yf.download('SPY', period=period, interval='5m', progress=False)
-    vix = yf.download('^VIX', period=period, interval='5m', progress=False)
+    # TSLA: try Twelve Data, fall back to yfinance
+    tsla = _fetch_td_5min('TSLA', days)
+    if tsla.empty:
+        print("[DATA] Falling back to yfinance for TSLA")
+        tsla = _fetch_yf_5min('TSLA', period)
 
-    # Flatten multi-level columns if present and normalize to lowercase
+    # SPY: try Twelve Data, fall back to yfinance
+    spy = _fetch_td_5min('SPY', days)
+    if spy.empty:
+        print("[DATA] Falling back to yfinance for SPY")
+        spy = _fetch_yf_5min('SPY', period)
+
+    # VIX: always yfinance (not available on Twelve Data)
+    vix = _fetch_yf_5min('^VIX', period)
+
+    # Normalize columns (TD already lowercase, yfinance may vary)
     for df in [tsla, spy, vix]:
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-    tsla.columns = [c.lower() for c in tsla.columns]
-    spy.columns = [c.lower() for c in spy.columns]
-    vix.columns = [c.lower() for c in vix.columns]
+        df.columns = [c.lower() for c in df.columns]
 
     print(f"[DATA] TSLA: {len(tsla)} bars, SPY: {len(spy)} bars, VIX: {len(vix)} bars")
 

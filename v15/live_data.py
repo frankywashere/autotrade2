@@ -1,13 +1,13 @@
 """
-V15 Live Data Module - Real-time market data using Finnhub + yfinance.
+V15 Live Data Module - Real-time market data using Twelve Data + yfinance.
 
 Provides live and historical data for TSLA, SPY, and VIX for the dashboard
 and live prediction systems.
 
 Data sources:
-- Finnhub (free tier): Real-time quotes for TSLA and SPY (sub-second latency)
-- yfinance: Historical OHLCV candles for all symbols (15-min delayed but full history)
-- VIX always via yfinance (Finnhub free tier doesn't support indices)
+- Twelve Data: Real-time quotes AND historical candles for TSLA/SPY
+- Finnhub (fallback): Real-time quotes for TSLA/SPY if Twelve Data unavailable
+- yfinance: VIX only (Twelve Data basic plan doesn't support VIX index)
 
 Usage:
     from v15.live_data import YFinanceLiveData, should_refresh
@@ -48,7 +48,15 @@ except ImportError:
     YFINANCE_AVAILABLE = False
     logger.warning("yfinance not installed. Install with: pip install yfinance")
 
-# Try to import Finnhub client
+# Try to import Twelve Data client (primary for TSLA/SPY)
+try:
+    from .data.twelvedata_client import TwelveDataClient, TwelveDataQuote
+    TWELVEDATA_AVAILABLE = True
+except ImportError:
+    TWELVEDATA_AVAILABLE = False
+    logger.info("TwelveData client not available")
+
+# Try to import Finnhub client (fallback for quotes)
 try:
     from .data.finnhub_client import FinnhubClient, FinnhubQuote
     FINNHUB_AVAILABLE = True
@@ -119,12 +127,21 @@ class YFinanceLiveData:
         # Track last update time
         self._last_update_time: Optional[datetime] = None
 
-        # Finnhub client for real-time quotes (TSLA, SPY only)
+        # Twelve Data client for TSLA/SPY candles + quotes (primary)
+        self._twelvedata: Optional['TwelveDataClient'] = None
+        if TWELVEDATA_AVAILABLE:
+            try:
+                self._twelvedata = TwelveDataClient(cache_ttl=5.0)
+                logger.info("TwelveData enabled for TSLA/SPY candles + quotes")
+            except Exception as e:
+                logger.warning(f"Failed to initialize TwelveData client: {e}")
+
+        # Finnhub client for real-time quotes (fallback)
         self._finnhub: Optional['FinnhubClient'] = None
         if FINNHUB_AVAILABLE:
             try:
                 self._finnhub = FinnhubClient(cache_ttl=5.0)
-                logger.info("Finnhub real-time quotes enabled for TSLA/SPY")
+                logger.info("Finnhub real-time quotes enabled (fallback)")
             except Exception as e:
                 logger.warning(f"Failed to initialize Finnhub client: {e}")
 
@@ -134,6 +151,7 @@ class YFinanceLiveData:
         logger.info(
             f"YFinanceLiveData initialized for symbols: {self.symbols}, "
             f"cache_ttl={cache_ttl}s, max_retries={max_retries}, "
+            f"twelvedata={'enabled' if self._twelvedata else 'disabled'}, "
             f"finnhub={'enabled' if self._finnhub else 'disabled'}"
         )
 
@@ -309,6 +327,70 @@ class YFinanceLiveData:
                 if df[col].isna().any():
                     df[col] = df[col].bfill()
 
+    # yfinance interval -> Twelve Data interval mapping
+    _YF_TO_TD_INTERVAL = {
+        '1m': '1min', '2m': '2min', '5m': '5min',
+        '15m': '15min', '30m': '30min',
+        '60m': '1h', '90m': None,
+        '1h': '1h', '1d': '1day', '1wk': '1week', '1mo': '1month',
+    }
+
+    def _try_twelvedata_fetch(
+        self,
+        symbol: str,
+        period: str,
+        interval: str,
+    ) -> Optional[pd.DataFrame]:
+        """Try fetching candle data from Twelve Data. Returns None on failure."""
+        td_interval = self._YF_TO_TD_INTERVAL.get(interval)
+        if td_interval is None:
+            return None
+
+        try:
+            # Compute outputsize from period
+            period_days = self._parse_period_days(period)
+            # Rough estimate of bars: trading day ≈ 6.5h = 78 five-min bars
+            interval_minutes = {
+                '1min': 1, '2min': 2, '5min': 5, '15min': 15, '30min': 30,
+                '1h': 60, '1day': 1440, '1week': 10080, '1month': 43200,
+            }.get(td_interval, 5)
+            if interval_minutes < 1440:
+                bars_per_day = int(6.5 * 60 / interval_minutes)
+            else:
+                bars_per_day = 1
+            outputsize = min(period_days * bars_per_day + 50, 5000)
+
+            df = self._twelvedata.get_time_series(
+                symbol, td_interval, outputsize=outputsize,
+            )
+
+            if df.empty:
+                logger.warning(f"TwelveData returned empty for {symbol} {td_interval}")
+                return None
+
+            # Ensure OHLCV columns present
+            required = ['open', 'high', 'low', 'close', 'volume']
+            if not all(col in df.columns for col in required):
+                return None
+
+            # TD returns tz-naive timestamps in exchange TZ (US/Eastern).
+            # Localize to match yfinance's tz-aware convention so alignment works.
+            if df.index.tz is None:
+                try:
+                    import pytz
+                    df.index = df.index.tz_localize('America/New_York')
+                except Exception:
+                    pass  # If tz localization fails, leave tz-naive
+
+            logger.info(
+                f"TwelveData: {symbol} {td_interval} -> {len(df)} bars"
+            )
+            return df
+
+        except Exception as e:
+            logger.warning(f"TwelveData fetch failed for {symbol}: {e}, falling back to yfinance")
+            return None
+
     def _fetch_symbol(
         self,
         symbol: str,
@@ -340,8 +422,16 @@ class YFinanceLiveData:
         display_name = self.SYMBOL_NAMES.get(symbol, symbol)
         logger.info(f"Fetching {display_name} data: period={period}, interval={interval}")
 
-        df = self._fetch_with_retry(symbol, period, interval)
-        df = self._normalize_columns(df)
+        # Try Twelve Data first for non-VIX symbols
+        df = None
+        if self._twelvedata and self._twelvedata.is_supported(symbol):
+            df = self._try_twelvedata_fetch(symbol, period, interval)
+
+        # Fall back to yfinance
+        if df is None:
+            logger.info(f"Using yfinance for {display_name} (period={period}, interval={interval})")
+            df = self._fetch_with_retry(symbol, period, interval)
+            df = self._normalize_columns(df)
 
         # VIX may not have volume
         require_volume = (symbol != '^VIX')
@@ -523,23 +613,35 @@ class YFinanceLiveData:
         """
         Get real-time prices for TSLA, SPY, VIX.
 
-        Uses Finnhub for TSLA and SPY (sub-second latency).
-        Falls back to yfinance for VIX and when Finnhub is unavailable.
+        Priority: Twelve Data -> Finnhub -> yfinance.
+        VIX always from yfinance (not available on TD or Finnhub).
 
         Returns:
             Dict mapping symbol to current price (or None if unavailable).
             Keys: 'TSLA', 'SPY', '^VIX'
         """
         prices: Dict[str, Optional[float]] = {}
+        sources: Dict[str, str] = {}
 
-        # Finnhub for TSLA and SPY
+        # Twelve Data for TSLA and SPY (primary)
+        if self._twelvedata:
+            for symbol in ['TSLA', 'SPY']:
+                quote = self._twelvedata.get_quote(symbol)
+                if quote and quote.current_price > 0:
+                    prices[symbol] = quote.current_price
+                    sources[symbol] = 'TwelveData'
+
+        # Finnhub fallback for TSLA/SPY if not yet obtained
         if self._finnhub:
             for symbol in ['TSLA', 'SPY']:
+                if symbol in prices:
+                    continue
                 quote = self._finnhub.get_quote(symbol)
                 if quote and quote.current_price > 0:
                     prices[symbol] = quote.current_price
+                    sources[symbol] = 'Finnhub'
 
-        # Fallback to yfinance for symbols not yet fetched
+        # yfinance for VIX and any remaining symbols
         for symbol in self.symbols:
             if symbol in prices:
                 continue
@@ -549,22 +651,36 @@ class YFinanceLiveData:
                 price = getattr(info, 'last_price', None)
                 if price and price > 0:
                     prices[symbol] = float(price)
+                    sources[symbol] = 'yfinance'
             except Exception as e:
                 logger.debug(f"yfinance fast_info failed for {symbol}: {e}")
                 prices[symbol] = None
+                sources[symbol] = 'failed'
+
+        logger.debug(
+            f"Realtime prices: "
+            + ", ".join(f"{s}=${p:.2f} ({sources.get(s, '?')})" if p else f"{s}=None ({sources.get(s, '?')})"
+                        for s, p in prices.items())
+        )
 
         return prices
 
-    def get_realtime_quote(self, symbol: str) -> Optional['FinnhubQuote']:
+    def get_realtime_quote(self, symbol: str):
         """
-        Get full Finnhub quote for a symbol (includes OHLC, change, etc.).
+        Get full quote for a symbol (includes OHLC, change, etc.).
+
+        Tries Twelve Data first, then Finnhub as fallback.
 
         Args:
             symbol: Stock symbol (e.g., 'TSLA', 'SPY').
 
         Returns:
-            FinnhubQuote or None if Finnhub unavailable or symbol unsupported.
+            TwelveDataQuote, FinnhubQuote, or None if unavailable.
         """
+        if self._twelvedata and self._twelvedata.is_supported(symbol):
+            quote = self._twelvedata.get_quote(symbol)
+            if quote is not None:
+                return quote
         if self._finnhub:
             return self._finnhub.get_quote(symbol)
         return None
