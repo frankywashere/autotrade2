@@ -11,6 +11,8 @@ Usage:
 """
 
 import argparse
+import os as _os_mod
+import pickle as _pickle
 import sys
 import time
 from dataclasses import dataclass, field
@@ -19,6 +21,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+_SURFER_DATA_CACHE = Path('/tmp/surfer_backtest_data_cache.pkl')
 
 
 @dataclass
@@ -718,67 +722,94 @@ def run_backtest(
             except Exception:
                 pass
 
-    # Fetch data
-    print(f"Fetching {days}d of 5-min TSLA data...")
-    tsla = yf.download('TSLA', period=f'{days}d', interval='5m', progress=False)
-    if isinstance(tsla.columns, pd.MultiIndex):
-        tsla.columns = tsla.columns.get_level_values(0)
-    tsla.columns = [c.lower() for c in tsla.columns]
-    print(f"Got {len(tsla)} bars")
-
-    # Fetch higher TF data for context
-    higher_tf_data = {}
-    tf_list = [('1h', '1h', '2y'), ('daily', '1d', '5y')]
-    if ml_active or use_multi_tf:
-        tf_list = [
-            ('1h', '1h', '2y'),
-            ('daily', '1d', '5y'),
-        ]
-        if ml_active:
-            # ML needs 4h and weekly too
-            tf_list.extend([
-                ('weekly', '1wk', '5y'),
-            ])
-
-    if use_multi_tf or ml_active:
-        for tf_label, yf_interval, yf_period in tf_list:
-            print(f"  Fetching {tf_label} data...")
-            df = yf.download('TSLA', period=yf_period, interval=yf_interval, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.columns = [c.lower() for c in df.columns]
-            higher_tf_data[tf_label] = df
-            print(f"  {tf_label}: {len(df)} bars")
-
-    # Resample 1h to 4h for ML features
-    if ml_active and '1h' in higher_tf_data and '4h' not in higher_tf_data:
-        h1 = higher_tf_data['1h']
-        resampled = h1.resample('4h').agg({
-            'open': 'first', 'high': 'max', 'low': 'min',
-            'close': 'last', 'volume': 'sum',
-        }).dropna()
-        higher_tf_data['4h'] = resampled
-        print(f"  4h: {len(resampled)} bars (resampled from 1h)")
-
-    # Fetch SPY + VIX for ML correlation features
-    spy_df = None
-    vix_df = None
-    if ml_active:
-        print("  Fetching SPY for ML correlations...")
-        spy_df = yf.download('SPY', period=f'{days}d', interval='5m', progress=False)
-        if isinstance(spy_df.columns, pd.MultiIndex):
-            spy_df.columns = spy_df.columns.get_level_values(0)
-        spy_df.columns = [c.lower() for c in spy_df.columns]
-        print(f"  SPY: {len(spy_df)} bars")
-
+    # Fetch data (with file cache for consistent iterations)
+    _cache_hit = False
+    if _SURFER_DATA_CACHE.exists() and not _os_mod.environ.get('SURFER_REFRESH'):
         try:
-            vix_df = yf.download('^VIX', period='1y', interval='1d', progress=False)
-            if isinstance(vix_df.columns, pd.MultiIndex):
-                vix_df.columns = vix_df.columns.get_level_values(0)
-            vix_df.columns = [c.lower() for c in vix_df.columns]
-            print(f"  VIX: {len(vix_df)} bars")
-        except Exception:
-            vix_df = None
+            with open(_SURFER_DATA_CACHE, 'rb') as _f:
+                _cached = _pickle.load(_f)
+            tsla = _cached['tsla']
+            higher_tf_data = _cached.get('higher_tf_data', {})
+            spy_df = _cached.get('spy_df')
+            vix_df = _cached.get('vix_df')
+            print(f"[CACHE] Loaded {len(tsla)} bars from {_SURFER_DATA_CACHE}")
+            print(f"  Date range: {tsla.index[0]} to {tsla.index[-1]}")
+            _cache_hit = True
+        except Exception as _e:
+            print(f"[CACHE] Failed to load: {_e}, fetching fresh...")
+
+    if not _cache_hit:
+        print(f"Fetching {days}d of 5-min TSLA data...")
+        tsla = yf.download('TSLA', period=f'{days}d', interval='5m', progress=False)
+        if isinstance(tsla.columns, pd.MultiIndex):
+            tsla.columns = tsla.columns.get_level_values(0)
+        tsla.columns = [c.lower() for c in tsla.columns]
+        print(f"Got {len(tsla)} bars")
+
+        # Fetch higher TF data for context
+        higher_tf_data = {}
+        tf_list = [('1h', '1h', '2y'), ('daily', '1d', '5y')]
+        if ml_active or use_multi_tf:
+            tf_list = [
+                ('1h', '1h', '2y'),
+                ('daily', '1d', '5y'),
+            ]
+            if ml_active:
+                # ML needs 4h and weekly too
+                tf_list.extend([
+                    ('weekly', '1wk', '5y'),
+                ])
+
+        if use_multi_tf or ml_active:
+            for tf_label, yf_interval, yf_period in tf_list:
+                print(f"  Fetching {tf_label} data...")
+                df = yf.download('TSLA', period=yf_period, interval=yf_interval, progress=False)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = [c.lower() for c in df.columns]
+                higher_tf_data[tf_label] = df
+                print(f"  {tf_label}: {len(df)} bars")
+
+        # Resample 1h to 4h for ML features
+        if ml_active and '1h' in higher_tf_data and '4h' not in higher_tf_data:
+            h1 = higher_tf_data['1h']
+            resampled = h1.resample('4h').agg({
+                'open': 'first', 'high': 'max', 'low': 'min',
+                'close': 'last', 'volume': 'sum',
+            }).dropna()
+            higher_tf_data['4h'] = resampled
+            print(f"  4h: {len(resampled)} bars (resampled from 1h)")
+
+        # Fetch SPY + VIX for ML correlation features
+        spy_df = None
+        vix_df = None
+        if ml_active:
+            print("  Fetching SPY for ML correlations...")
+            spy_df = yf.download('SPY', period=f'{days}d', interval='5m', progress=False)
+            if isinstance(spy_df.columns, pd.MultiIndex):
+                spy_df.columns = spy_df.columns.get_level_values(0)
+            spy_df.columns = [c.lower() for c in spy_df.columns]
+            print(f"  SPY: {len(spy_df)} bars")
+
+            try:
+                vix_df = yf.download('^VIX', period='1y', interval='1d', progress=False)
+                if isinstance(vix_df.columns, pd.MultiIndex):
+                    vix_df.columns = vix_df.columns.get_level_values(0)
+                vix_df.columns = [c.lower() for c in vix_df.columns]
+                print(f"  VIX: {len(vix_df)} bars")
+            except Exception:
+                vix_df = None
+
+        # Cache for subsequent runs
+        try:
+            with open(_SURFER_DATA_CACHE, 'wb') as _f:
+                _pickle.dump({
+                    'tsla': tsla, 'higher_tf_data': higher_tf_data,
+                    'spy_df': spy_df, 'vix_df': vix_df,
+                }, _f)
+            print(f"[CACHE] Saved to {_SURFER_DATA_CACHE}")
+        except Exception as _e:
+            print(f"[CACHE] Failed to save: {_e}")
 
     if len(tsla) < 200:
         print("Not enough data for backtest")
@@ -1726,11 +1757,11 @@ def run_backtest(
                     risk_budget = base_risk
 
                 # Adaptive sizing: ramp up on win streaks, halve on losing streaks
-                if consecutive_wins >= 3:
-                    streak_boost = min(2.0, 1.0 + 0.15 * (consecutive_wins - 2))
+                if consecutive_wins >= 2:
+                    streak_boost = min(3.0, 1.0 + 0.35 * (consecutive_wins - 1))
                     risk_budget *= streak_boost
-                if consecutive_losses >= 4:
-                    risk_budget *= 0.50  # Half size after 4+ consecutive losses
+                if consecutive_losses >= 3:
+                    risk_budget *= 0.50  # Half size after 3+ consecutive losses
 
                 # Volatility-adjusted stops: blend channel width with ATR
                 # Floor at 1.5*ATR (survive noise), cap at 2.5*ATR (don't overexpose)
@@ -2201,7 +2232,13 @@ def main():
                        help='Run both physics-only and ML-enhanced, then compare')
     parser.add_argument('--dump-trades', type=str, default=None,
                        help='Filter to dump: stop, trail, timeout, losers, all')
+    parser.add_argument('--refresh', action='store_true',
+                       help='Force refresh yfinance data (clear cache)')
     args = parser.parse_args()
+
+    if args.refresh and _SURFER_DATA_CACHE.exists():
+        _SURFER_DATA_CACHE.unlink()
+        print("[CACHE] Cleared")
 
     ml_model = None
     if args.ml:
