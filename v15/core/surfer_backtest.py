@@ -1895,9 +1895,9 @@ def run_backtest(
                 # Low-conf breakouts are the biggest winners
                 if sig.signal_type == 'break':
                     if sig.confidence < 0.60:
-                        trade_size *= 1.70
+                        trade_size *= 1.90
                     elif sig.confidence < 0.90:
-                        trade_size *= 1.35
+                        trade_size *= 1.45
 
                 # Volume conviction boost: only at very high volume (2x+ avg)
                 if sig.signal_type == 'break' and 'volume' in tsla.columns:
@@ -1933,10 +1933,10 @@ def run_backtest(
                         recent_return = (lookback_prices[-1] - lookback_prices[0]) / lookback_prices[0]
                         # BUY break: boost if price already moving up
                         if sig.action == 'BUY' and recent_return > 0.002:
-                            trade_size *= 1.80
+                            trade_size *= 2.00
                         # SELL break: boost if price already moving down
                         elif sig.action == 'SELL' and recent_return < -0.002:
-                            trade_size *= 1.80
+                            trade_size *= 2.00
 
                 # Direction boost: both directions performing well
                 if sig.signal_type == 'break':
