@@ -1771,11 +1771,15 @@ def run_backtest(
                     risk_budget *= 0.50  # Half size after 3+ consecutive losses
 
                 # Volatility-adjusted stops: blend channel width with ATR
-                # Floor at 1.5*ATR (survive noise), cap at 2.5*ATR (don't overexpose)
                 current_atr = atr[bar]
-                atr_floor = (1.5 * current_atr) / entry_price
-                atr_mult = 3.0 if sig.signal_type == 'break' else 2.5
-                atr_cap = (atr_mult * current_atr) / entry_price
+                if sig.signal_type == 'bounce':
+                    # Bounces: tighter stops OK (100% WR, 0 stop-outs)
+                    atr_floor = (1.0 * current_atr) / entry_price
+                    atr_cap = (2.0 * current_atr) / entry_price
+                else:
+                    # Breakouts: wider stops (survive noise)
+                    atr_floor = (1.5 * current_atr) / entry_price
+                    atr_cap = (3.0 * current_atr) / entry_price
                 adjusted_stop_pct = np.clip(sig.suggested_stop_pct, atr_floor, atr_cap)
 
                 # ML stop tightening: if Extreme Loser flags risk, tighten stop by 35%
