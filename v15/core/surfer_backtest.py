@@ -1772,11 +1772,11 @@ def run_backtest(
                 risk_mult = 0.100 if sig.signal_type == 'bounce' else 0.100
                 base_risk = position_size * risk_mult * equity_scale
                 if sig.confidence >= 0.70:
-                    risk_budget = base_risk * 1.3
+                    risk_budget = base_risk * 1.5
                 elif sig.confidence >= 0.60:
-                    risk_budget = base_risk * 1.15
+                    risk_budget = base_risk * 1.3
                 else:
-                    risk_budget = base_risk
+                    risk_budget = base_risk * 1.15
 
                 # Adaptive sizing: ramp up on win streaks, halve on losing streaks
                 if consecutive_wins >= 2:
