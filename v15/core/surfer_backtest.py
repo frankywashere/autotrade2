@@ -2558,14 +2558,6 @@ def run_backtest(
                             ml_stats.setdefault('vol_confirm', 0)
                             ml_stats['vol_confirm'] += 1
 
-                    # Arch 89: Short oscillation period bounce (predictable cycles)
-                    if realistic and sig.signal_type == 'bounce':
-                        ps89 = analysis.tf_states.get(sig.primary_tf)
-                        if ps89 and 5.0 < ps89.oscillation_period < 30.0:
-                            trade_size *= 1.15
-                            ml_stats.setdefault('short_osc_bounce', 0)
-                            ml_stats['short_osc_bounce'] += 1
-
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
