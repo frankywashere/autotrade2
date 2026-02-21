@@ -40,15 +40,15 @@ class TradeSnapshot:
 
 
 SIGNAL_META_NAMES = [
-    'signal_type_bounce',    # 0/1
-    'signal_direction_buy',  # 0/1
-    'position_score',
-    'energy_score',
-    'entropy_score',
-    'confluence_score',
-    'timing_score',
-    'channel_health',
-    'confidence',
+    'sig_type_bounce',       # 0/1
+    'sig_direction_buy',     # 0/1
+    'sig_position_score',
+    'sig_energy_score',
+    'sig_entropy_score',
+    'sig_confluence_score',
+    'sig_timing_score',
+    'sig_channel_health',
+    'sig_confidence',
 ]
 
 
