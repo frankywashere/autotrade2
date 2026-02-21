@@ -2673,6 +2673,13 @@ def run_backtest(
                         ml_stats.setdefault('post_loss_reduce', 0)
                         ml_stats['post_loss_reduce'] += 1
 
+                    # Arch 92: Consecutive loss progressive scaling
+                    if realistic and consecutive_losses >= 2:
+                        loss_scale = max(0.50, 1.0 - consecutive_losses * 0.15)
+                        trade_size *= loss_scale
+                        ml_stats.setdefault('consec_loss_reduce', 0)
+                        ml_stats['consec_loss_reduce'] += 1
+
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
