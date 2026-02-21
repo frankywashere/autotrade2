@@ -2995,6 +2995,28 @@ def run_backtest(
                             ml_stats.setdefault('be_cont_penalty', 0)
                             ml_stats['be_cont_penalty'] += 1
 
+
+                    # Arch 124: Multi-TF comprehensive bounce score (BE+PE+theta+edge → 0.5-1.5x)
+                    if realistic and sig.signal_type == 'bounce':
+                        be_vals, pe_vals, theta_vals, edge_vals = [], [], [], []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be_vals.append(tf_state.binding_energy)
+                                pe_vals.append(tf_state.potential_energy)
+                                theta_vals.append(tf_state.ou_theta)
+                                ep = max(0, 1.0 - min(tf_state.position_pct, 1.0 - tf_state.position_pct) / 0.15)
+                                edge_vals.append(min(ep, 1.0))
+                        if be_vals:
+                            avg_be = sum(be_vals) / len(be_vals)
+                            avg_pe = sum(pe_vals) / len(pe_vals)
+                            avg_theta = sum(theta_vals) / len(theta_vals)
+                            avg_edge = sum(edge_vals) / len(edge_vals)
+                            score = (1.0 - avg_be) * 0.4 + avg_pe * 0.3 + min(avg_theta/0.50, 1.0) * 0.15 + avg_edge * 0.15
+                            mult = 0.5 + 1.0 * score
+                            trade_size *= mult
+                            ml_stats.setdefault('comprehensive_score', 0)
+                            ml_stats['comprehensive_score'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
