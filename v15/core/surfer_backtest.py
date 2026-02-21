@@ -2537,7 +2537,7 @@ def run_backtest(
                     # Arch 86: Near-bounce timing (bounces where predicted bounce is imminent)
                     if realistic and sig.signal_type == 'bounce':
                         ps86 = analysis.tf_states.get(sig.primary_tf)
-                        if ps86 and ps86.bars_to_next_bounce < 8.0:
+                        if ps86 and ps86.bars_to_next_bounce < 5.0:
                             trade_size *= 1.15
                             ml_stats.setdefault('near_bounce_timing', 0)
                             ml_stats['near_bounce_timing'] += 1
@@ -2620,6 +2620,15 @@ def run_backtest(
                         trade_size *= pos_penalty
                         ml_stats.setdefault('pos_count_reduce', 0)
                         ml_stats['pos_count_reduce'] += 1
+
+                    # Arch 87: Return variance sizing — low variance = consolidation → bigger move
+                    if realistic and bar >= 10:
+                        ret_10 = np.diff(closes[bar-10:bar+1]) / closes[bar-10:bar]
+                        ret_var = np.var(ret_10)
+                        if ret_var < 0.00001:  # Very low variance (< 0.1% daily stdev)
+                            trade_size *= 1.15
+                            ml_stats.setdefault('low_var_boost', 0)
+                            ml_stats['low_var_boost'] += 1
 
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
