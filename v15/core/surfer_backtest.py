@@ -1076,6 +1076,7 @@ def run_backtest(
     recent_trade_wins = []  # Arch 67: Rolling window of win/loss for dynamic cap
     last_signal_bar = -10   # Arch 72: Track last signal bar for persistence
     last_signal_dir = None  # Arch 72: Track last signal direction
+    last_trade_entry_bar = -100  # Arch 85: Track last trade entry for drought detection
     last_breakout_loss = False  # Track if last loss was a breakout (confirms channel)
     daily_pnl = 0.0         # Running P&L for current trading day
     daily_breaker_active = False
@@ -2525,6 +2526,14 @@ def run_backtest(
                         ml_stats.setdefault('low_energy_bounce', 0)
                         ml_stats['low_energy_bounce'] += 1
 
+                    # Arch 85: Bounce count sizing (well-tested channels)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps85 = analysis.tf_states.get(sig.primary_tf)
+                        if ps85 and ps85.bounce_count >= 4:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('high_bc_bounce', 0)
+                            ml_stats['high_bc_bounce'] += 1
+
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
@@ -2567,15 +2576,16 @@ def run_backtest(
 
                     # Arch 85: Signal drought boost — rare signals after silence are highest quality
                     # Gap 4-6: 87.5% WR, Gap 26+: 90% WR (vs 80.6% for gap 2-3)
-                    if realistic and last_signal_bar >= 0:
-                        bars_since_last = bar - last_signal_bar
-                        if bars_since_last >= 7:
+                    if realistic and last_trade_entry_bar >= 0:
+                        bars_since_trade = bar - last_trade_entry_bar
+                        if bars_since_trade >= 7:
                             trade_size *= 1.15
                             ml_stats.setdefault('drought_boost', 0)
                             ml_stats['drought_boost'] += 1
 
                     last_signal_bar = bar
                     last_signal_dir = sig.action
+                    last_trade_entry_bar = bar
 
                     # Arch 74: Equity peak proximity boost
                     if realistic and peak_equity > 0:
