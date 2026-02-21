@@ -2492,6 +2492,12 @@ def run_backtest(
                         ml_stats.setdefault('confluence_boost', 0)
                         ml_stats['confluence_boost'] += 1
 
+                    # Arch 80: Position score sizing (proximity to channel boundary)
+                    if realistic and sig.signal_type == 'bounce' and sig.position_score > 0.90:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('pos_score_boost', 0)
+                        ml_stats['pos_score_boost'] += 1
+
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
