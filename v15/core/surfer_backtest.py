@@ -2441,6 +2441,14 @@ def run_backtest(
                             trade_size *= 1.2
                             ml_stats.setdefault('wide_bounce_boost', 0)
                             ml_stats['wide_bounce_boost'] += 1
+                    # Arch 84: Channel width bounce boost (wider = more reversion room)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps84 = analysis.tf_states.get(sig.primary_tf)
+                        if ps84 and ps84.width_pct > 0.02:
+                            trade_size *= 1.10
+                            ml_stats.setdefault('wide_ch_bounce', 0)
+                            ml_stats['wide_ch_bounce'] += 1
+
 
                     # Arch 84: Channel width bounce boost (wider = more reversion room)
                     if realistic and sig.signal_type == 'bounce':
