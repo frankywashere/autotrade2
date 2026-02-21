@@ -2460,8 +2460,16 @@ def run_backtest(
                             trade_size *= 1.15
                             ml_stats.setdefault('break_sell_boost', 0)
                             ml_stats['break_sell_boost'] += 1
-                        # Arch 78: OU half-life for breaks (long HL = trending)
+                        # Arch 83: Slope-aligned break boost
                         primary_st = analysis.tf_states.get(sig.primary_tf)
+                        if primary_st:
+                            slope = primary_st.slope_pct
+                            if (sig.action == 'BUY' and slope > 0.001) or \
+                               (sig.action == 'SELL' and slope < -0.001):
+                                trade_size *= 1.10
+                                ml_stats.setdefault('slope_aligned_break', 0)
+                                ml_stats['slope_aligned_break'] += 1
+                        # Arch 78: OU half-life for breaks (long HL = trending)
                         if primary_st:
                             ou_hl_b = primary_st.ou_half_life
                             if ou_hl_b > 8.0:
