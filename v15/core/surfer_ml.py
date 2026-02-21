@@ -15476,6 +15476,260 @@ class BreakoutMomentumValidator:
         return model
 
 
+class ExtendedRunPredictor:
+    """Arch 61: Predict which trades will have extended favorable runs (MFE > 1%).
+
+    Key insight: avg MFE is 0.515% and avg hold is 5 bars. Some trades have MFE > 1-2%
+    but the tight trail exits at 0.5%. If we can predict which entries will run big,
+    we can widen the trail multiplier to capture 2-3x more per-trade P&L on those trades.
+
+    Label: extended_run = (MFE_20bar > 1.0%)  — significant favorable excursion
+    Output: run_prob (0-1), used to set trail_width_multiplier:
+      - run_prob > 0.70: widen trail 2x (let winners run)
+      - run_prob > 0.50: widen trail 1.5x
+      - run_prob < 0.30: tighten trail 0.7x (capture quickly)
+
+    Features focus on momentum persistence signals:
+    - Multi-TF trend alignment (strong trends extend)
+    - Volatility regime (low vol breakouts often expand)
+    - Energy/momentum buildup across timeframes
+    - Channel width vs ATR ratio (narrow channels = bigger breaks)
+    - Time-of-day patterns (open/close runs are longer)
+    """
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.derived_names = None
+
+    def derive_features(self, X, feature_names):
+        """Extract extended run prediction features."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Per-TF trend strength indicators
+        for tf in ML_TFS:
+            for key in ['slope_pct', 'r_squared', 'channel_health', 'width_pct',
+                        'momentum_direction', 'kinetic_energy', 'potential_energy',
+                        'total_energy', 'binding_energy', 'entropy',
+                        'ou_theta', 'ou_half_life', 'break_prob',
+                        'break_prob_up', 'break_prob_down',
+                        'volume_score', 'squeeze_score', 'position_pct',
+                        'center_distance', 'bounce_count']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'er_{tf}_{key}')
+
+        # Temporal dynamics — momentum building or fading
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                    'break_prob_delta_3bar', 'break_prob_delta_6bar',
+                    'entropy_delta_3bar', 'rsi_slope_5bar',
+                    'vol_trend_5bar', 'price_acceleration_5bar',
+                    'momentum_delta_3bar', 'ke_delta_3bar',
+                    'slope_acceleration_5min', 'slope_acceleration_1h']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'er_{key}')
+
+        # Context features
+        for key in ['atr_pct', 'volume_ratio_20', 'bar_range_pct',
+                    'rsi_14', 'bb_position', 'minutes_since_open',
+                    'is_first_hour', 'is_last_hour', 'is_overnight',
+                    'day_of_week', 'session_progress']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'er_{key}')
+
+        # Cross-TF alignment features (strong alignment = extended runs)
+        for key in ['direction_agreement', 'avg_break_prob', 'avg_health',
+                    'health_min', 'health_std', 'width_dispersion',
+                    'energy_alignment', 'momentum_alignment',
+                    'pos_spread_5m_1h', 'pos_spread_5m_4h',
+                    'pos_spread_5m_daily']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'er_{key}')
+
+        # Correlation/regime features
+        for key in ['vix_level', 'tsla_spy_corr_20', 'spy_rsi_14',
+                    'tsla_spy_beta_20', 'spy_volume_ratio',
+                    'vix_percentile', 'realized_vol_20']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'er_{key}')
+
+        # Derived composites: trend strength
+        slope_indices = [name_to_idx.get(f'{tf}_slope_pct') for tf in ML_TFS]
+        slope_vals = [X[:, idx] for idx in slope_indices if idx is not None]
+        if slope_vals:
+            slope_stack = np.column_stack(slope_vals)
+            # All slopes same sign = strong directional trend
+            feats.append(np.abs(np.mean(np.sign(slope_stack), axis=1)))
+            names.append('er_slope_sign_agreement')
+            feats.append(np.abs(np.mean(slope_stack, axis=1)))
+            names.append('er_avg_abs_slope')
+            feats.append(np.std(slope_stack, axis=1))
+            names.append('er_slope_dispersion')
+
+        # Channel width narrowing = potential big breakout
+        width_indices = [name_to_idx.get(f'{tf}_width_pct') for tf in ML_TFS]
+        width_vals = [X[:, idx] for idx in width_indices if idx is not None]
+        if width_vals:
+            width_stack = np.column_stack(width_vals)
+            feats.append(np.min(width_stack, axis=1))
+            names.append('er_min_width')
+            feats.append(np.mean(width_stack, axis=1))
+            names.append('er_avg_width')
+
+        # Energy buildup: total energy relative to binding energy
+        te_indices = [name_to_idx.get(f'{tf}_total_energy') for tf in ML_TFS]
+        be_indices = [name_to_idx.get(f'{tf}_binding_energy') for tf in ML_TFS]
+        te_vals = [X[:, idx] for idx in te_indices if idx is not None]
+        be_vals = [X[:, idx] for idx in be_indices if idx is not None]
+        if te_vals and be_vals:
+            te_stack = np.column_stack(te_vals)
+            be_stack = np.column_stack(be_vals)
+            # Ratio > 1 means energy exceeds binding = breakout potential
+            with np.errstate(divide='ignore', invalid='ignore'):
+                energy_ratio = np.where(be_stack > 1e-8, te_stack / be_stack, 0)
+            feats.append(np.max(energy_ratio, axis=1))
+            names.append('er_max_energy_ratio')
+            feats.append(np.mean(energy_ratio, axis=1))
+            names.append('er_avg_energy_ratio')
+
+        # Squeeze across TFs: high squeeze = compressed energy = extended move
+        sq_indices = [name_to_idx.get(f'{tf}_squeeze_score') for tf in ML_TFS]
+        sq_vals = [X[:, idx] for idx in sq_indices if idx is not None]
+        if sq_vals:
+            sq_stack = np.column_stack(sq_vals)
+            feats.append(np.max(sq_stack, axis=1))
+            names.append('er_max_squeeze')
+            feats.append(np.mean(sq_stack, axis=1))
+            names.append('er_avg_squeeze')
+            feats.append(np.sum(sq_stack > 0.5, axis=1).astype(float))
+            names.append('er_high_squeeze_count')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train extended run predictor on 20-bar MFE labels."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+
+        # Label: extended run = forward 20-bar return > 1% (absolute)
+        if isinstance(Y_train, dict):
+            ret_train = Y_train.get('future_return_20', np.zeros(len(X_train)))
+            ret_val = Y_val.get('future_return_20', np.zeros(len(X_val)))
+        else:
+            ret_train = np.zeros(len(X_train))
+            ret_val = np.zeros(len(X_val))
+
+        # Extended run = absolute return > 1% (big directional move)
+        y_train = (np.abs(ret_train) > 0.01).astype(float)
+        y_val = (np.abs(ret_val) > 0.01).astype(float)
+
+        print(f"\n  Extended Run Predictor:")
+        print(f"    Training: {len(y_train)} samples, {y_train.sum():.0f} ({y_train.mean():.1%}) extended runs")
+        print(f"    Validation: {len(y_val)} samples, {y_val.sum():.0f} ({y_val.mean():.1%}) extended runs")
+
+        # Derive features
+        er_X_train, self.derived_names = self.derive_features(X_train, feature_names)
+        er_X_val, _ = self.derive_features(X_val, feature_names)
+
+        print(f"    Derived features: {len(self.derived_names)}")
+
+        # Train with LightGBM
+        train_data = lgb.Dataset(er_X_train, label=y_train, feature_name=self.derived_names)
+        val_data = lgb.Dataset(er_X_val, label=y_val, feature_name=self.derived_names, reference=train_data)
+
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'num_leaves': 63,
+            'learning_rate': 0.03,
+            'feature_fraction': 0.7,
+            'bagging_fraction': 0.7,
+            'bagging_freq': 5,
+            'min_child_samples': 30,
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.0,
+            'verbose': -1,
+            'seed': 42,
+        }
+
+        callbacks = [lgb.early_stopping(80, verbose=False), lgb.log_evaluation(0)]
+        self.model = lgb.train(
+            params, train_data,
+            num_boost_round=1000,
+            valid_sets=[val_data],
+            callbacks=callbacks,
+        )
+
+        # Evaluate
+        metrics = {}
+        er_pred = self.model.predict(er_X_val)
+        try:
+            auc = roc_auc_score(y_val, er_pred)
+            metrics['extended_run_auc'] = float(auc)
+            print(f"    AUC: {auc:.3f}")
+        except Exception:
+            metrics['extended_run_auc'] = 0.5
+            print(f"    AUC: N/A (single class)")
+
+        # Feature importance
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n    Top 10 extended run features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"      {rank+1}. {self.derived_names[idx]}: {imp[idx]:.0f}")
+
+        # Calibration: what % of high-prob predictions are actually extended runs
+        for thresh in [0.3, 0.5, 0.7]:
+            mask = er_pred > thresh
+            if mask.sum() > 0:
+                actual_rate = y_val[mask].mean()
+                print(f"    P(run|prob>{thresh:.1f}): {actual_rate:.1%} ({mask.sum()} samples)")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        er_X, _ = self.derive_features(X, self.feature_names)
+        return {
+            'run_prob': self.model.predict(er_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'derived_names': self.derived_names,
+            }, f)
+        print(f"  Saved ExtendedRunPredictor to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'ExtendedRunPredictor':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.derived_names = data['derived_names']
+        return model
+
+
 # ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
@@ -16105,7 +16359,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity', 'breakout_stop', 'breakout_momentum'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity', 'breakout_stop', 'breakout_momentum', 'extended_run'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -16582,6 +16836,13 @@ def main():
                 )
                 bm.save(os.path.join(args.output, 'breakout_momentum_model.pkl'))
                 print(f"\n  Breakout Momentum metrics: {bm_metrics}")
+            elif args.arch == 'extended_run':
+                er = ExtendedRunPredictor()
+                er_metrics = er.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                er.save(os.path.join(args.output, 'extended_run_model.pkl'))
+                print(f"\n  Extended Run metrics: {er_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

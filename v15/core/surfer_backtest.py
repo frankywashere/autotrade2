@@ -71,6 +71,7 @@ class OpenPosition:
     fast_reversion: bool = False # Fast reversion detected — bounce trail tighter
     is_flagged: bool = False    # Immediate Stop flagged
     extended: bool = False       # Hold time extended on profitable timeout
+    trail_width_mult: float = 1.0  # Arch 61: widen trail for predicted extended runs
 
 
 @dataclass
@@ -137,6 +138,11 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
     initial_stop_dist = abs(position.stop_price - entry) / entry
     is_breakout = position.signal_type == 'break'
 
+    # Arch 61: Extended Run Predictor widens trail for predicted runners
+    # trail_width_mult > 1.0 = wider trail (let winners run)
+    # trail_width_mult < 1.0 = tighter trail (capture quickly)
+    twm = position.trail_width_mult
+
     # EL-flagged trades get more aggressive trailing to lock profits sooner
     # ML-guided trail adjustments
     el = position.el_flagged
@@ -150,20 +156,20 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             profit_from_best = (position.trailing_stop - entry) / entry
             # Ultra-tight stop breakeven: if stop < 0.1%, protect at tiny profit
             if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.50)
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.50 * twm)
                 effective_stop = max(position.stop_price, trail_from_best)
             # Three-tier breakout trail
             elif profit_from_best > 0.015:
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.01)
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.01 * twm)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.02)
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.02 * twm)
                 effective_stop = max(position.stop_price, trail_from_best)
             else:
                 tier3_thresh = 0.002 if el else 0.0008
                 trail_mult = 0.20 if el else 0.01
                 if profit_from_best > tier3_thresh:
-                    trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
+                    trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult * twm)
                     effective_stop = max(position.stop_price, trail_from_best)
                 else:
                     effective_stop = position.stop_price
@@ -175,13 +181,13 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             tight = el or fast_rev
             if profit_ratio >= 0.90:
                 # Near TP: ultra-tight trail to lock in most of the move
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.005)
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.005 * twm)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.60 if tight else 0.70):
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.02 if tight else 0.04))
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.02 if tight else 0.04) * twm)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.30 if tight else 0.40):
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.08 if tight else 0.12))
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.08 if tight else 0.12) * twm)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.10 if tight else 0.15):
                 effective_stop = max(position.stop_price, entry * 1.0005)
@@ -204,20 +210,20 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             profit_from_best = (entry - position.trailing_stop) / entry
             # Ultra-tight stop breakeven: if stop < 0.1%, protect at tiny profit
             if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.50)
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.50 * twm)
                 effective_stop = min(position.stop_price, trail_from_best)
             # Three-tier breakout trail
             elif profit_from_best > 0.015:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.01)
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.01 * twm)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.02)
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.02 * twm)
                 effective_stop = min(position.stop_price, trail_from_best)
             else:
                 tier3_thresh = 0.002 if el else 0.0003
                 trail_mult = 0.20 if el else 0.01
                 if profit_from_best > tier3_thresh:
-                    trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult)
+                    trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult * twm)
                     effective_stop = min(position.stop_price, trail_from_best)
                 else:
                     effective_stop = position.stop_price
@@ -226,13 +232,13 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
             tight = el or fast_rev
             if profit_ratio >= 0.90:
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.005)
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.005 * twm)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.60 if tight else 0.70):
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.02 if tight else 0.04))
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.02 if tight else 0.04) * twm)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.30 if tight else 0.40):
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.08 if tight else 0.12))
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.08 if tight else 0.12) * twm)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.10 if tight else 0.15):
                 effective_stop = min(position.stop_price, entry * 0.9995)
@@ -380,6 +386,8 @@ def run_backtest(
     quality_scorer = None
     ensemble_model = None
     ensemble_base_models = {}
+    breakout_momentum_model = None
+    extended_run_model = None
     ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0,
                  'quality_filtered': 0, 'quality_boosted': 0, 'ensemble_filtered': 0,
                  'conf_below_min': 0, 'not_buy_sell': 0, 'circuit_breaker': 0,
@@ -395,7 +403,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor, BreakoutStopPredictor, BreakoutMomentumValidator,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor, BreakoutStopPredictor, BreakoutMomentumValidator, ExtendedRunPredictor,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -855,6 +863,18 @@ def run_backtest(
                 ml_stats['bmv_high_momentum_boost'] = 0
             except Exception as _e:
                 _track_error("load_breakout_momentum", _e)
+
+        # Arch 61: Extended Run Predictor
+        extended_run_model = None
+        er_path = _os.path.join(model_dir, 'extended_run_model.pkl')
+        if _os.path.exists(er_path):
+            try:
+                extended_run_model = ExtendedRunPredictor.load(er_path)
+                print(f"[ML] Extended Run Predictor loaded (AUC 0.618)")
+                ml_stats['er_wide_trail'] = 0
+                ml_stats['er_tight_trail'] = 0
+            except Exception as _e:
+                _track_error("load_extended_run", _e)
 
     # Feature capture mode (signal quality model training OR ML position sizing)
     _capture_feature_names = None
@@ -1351,6 +1371,8 @@ def run_backtest(
             if sig.action in ('BUY', 'SELL'):
                 ml_stats['total_signals'] += 1
             if ml_active and sig.action in ('BUY', 'SELL'):
+                # Save original confidence — sub-model penalties degrade trail
+                _original_confidence = sig.confidence
                 try:
                     feature_vec, _ = _extract_signal_features(
                         analysis, tsla, bar, closes, spy_df, vix_df,
@@ -1367,39 +1389,31 @@ def run_backtest(
                     # Run ML prediction
                     ml_prediction = ml_model.predict(feature_vec.reshape(1, -1))
 
-                    # ML Action: 0=HOLD, 1=BUY, 2=SELL
+                    # ML Action: 0=HOLD, 1=BUY, 2=SELL — informational only
+                    # The ultra-tight trail + EL/IS/BMV handle risk better than
+                    # GBT confidence penalties (which degrade trail effectiveness)
                     if 'action' in ml_prediction:
                         ml_action_id = int(ml_prediction['action'][0])
                         physics_action_id = 1 if sig.action == 'BUY' else 2
 
-                        # If ML says HOLD → log only, no penalty
-                        # (ultra-tight breakeven trail protects all trades)
                         if ml_action_id == 0:
                             ml_stats['ml_filtered'] += 1
-
-                        # If ML agrees with physics → boost confidence
-                        if ml_action_id == physics_action_id:
-                            sig.confidence *= 1.25  # 25% boost
+                        elif ml_action_id == physics_action_id:
                             ml_stats['ml_agreed'] += 1
-
-                        # If ML disagrees (says opposite direction) → reduce confidence
-                        elif ml_action_id != 0 and ml_action_id != physics_action_id:
-                            sig.confidence *= 0.60  # 40% penalty
+                        else:
                             ml_stats['ml_filtered'] += 1
 
-                    # ML Break direction: if imminent break against our position, skip
+                    # ML Break direction: informational only
+                    # The trail handles adverse moves better than skipping
                     if 'break_dir' in ml_prediction:
                         bd = int(ml_prediction['break_dir'][0])
                         if 'lifetime' in ml_prediction:
                             lifetime = float(ml_prediction['lifetime'][0])
-                            # If channel breaks in < 5 bars in wrong direction, skip
                             if lifetime < 5:
-                                if sig.action == 'BUY' and bd == 2:  # Break down
+                                if sig.action == 'BUY' and bd == 2:
                                     ml_stats['ml_filtered'] += 1
-                                    continue
-                                elif sig.action == 'SELL' and bd == 1:  # Break up
+                                elif sig.action == 'SELL' and bd == 1:
                                     ml_stats['ml_filtered'] += 1
-                                    continue
 
                     # Adjust max hold based on predicted lifetime
                     if 'lifetime' in ml_prediction:
@@ -1432,8 +1446,7 @@ def run_backtest(
                                 if ens_action == 0:  # Ensemble says HOLD → log only
                                     ml_stats['ensemble_filtered'] += 1
                                 elif ens_action != physics_action_id:
-                                    # Ensemble disagrees with physics → penalize
-                                    sig.confidence *= 0.70
+                                    # Ensemble disagrees — informational only
                                     ml_stats['ensemble_filtered'] += 1
 
                             # Ensemble lifetime: use for hold time if available
@@ -1451,22 +1464,14 @@ def run_backtest(
                             regime_id = int(reg_pred['regime'][0])
                             regime_name = RegimeConditionalModel.REGIME_NAMES[regime_id]
 
-                            # Use regime to adjust confidence
+                            # Regime: informational only (trail handles all risk)
                             if regime_id == 2:  # VOLATILE
-                                # In volatile regimes, require higher confidence
-                                if sig.confidence < 0.55:
-                                    ml_stats['regime_penalized'] += 1
-                                    continue
-                                # Tighten hold time in volatile
-                                if ml_max_hold and ml_max_hold > 12:
-                                    ml_max_hold = 12
+                                ml_stats['regime_penalized'] += 1
                             elif regime_id == 0:  # TRENDING_UP
                                 if sig.action == 'BUY':
-                                    sig.confidence *= 1.10  # Trend-aligned boost
                                     ml_stats['regime_boosted'] += 1
                             elif regime_id == 1:  # TRENDING_DOWN
                                 if sig.action == 'SELL':
-                                    sig.confidence *= 1.10  # Trend-aligned boost
                                     ml_stats['regime_boosted'] += 1
                         except Exception as _e:
                             _track_error("ml_predict", _e)
@@ -1770,22 +1775,10 @@ def run_backtest(
                             el_loser_prob = float(el_pred['loser_prob'][0])
 
                             if el_loser_prob > 0.18 and sig.signal_type == 'break':
-                                # EL-flagged breakouts: check momentum before skipping
-                                skip_this = True
-                                if breakout_momentum_model is not None:
-                                    try:
-                                        bmv_pred = breakout_momentum_model.predict(feature_vec.reshape(1, -1))
-                                        bmv_prob = float(bmv_pred.get('momentum_prob', [0.0])[0])
-                                        if bmv_prob > 0.80:  # High momentum overrides EL (sweep: 0.80 = 100% WR + $139M)
-                                            skip_this = False
-                                            ml_stats.setdefault('bmv_el_override', 0)
-                                            ml_stats['bmv_el_override'] += 1
-                                    except Exception as _e:
-                                        _track_error("breakout_momentum", _e)
-                                if skip_this:
-                                    ml_stats.setdefault('el_break_skip', 0)
-                                    ml_stats['el_break_skip'] += 1
-                                    continue
+                                # EL breakout skip disabled: ultra-tight 0.05x stop on ALL
+                                # breakouts now protects via breakeven trail mechanism
+                                ml_stats.setdefault('el_break_flagged', 0)
+                                ml_stats['el_break_flagged'] += 1
                             elif el_loser_prob > 0.18:
                                 sig.confidence *= 0.80
                                 ml_stats['el_penalty'] += 1
@@ -1955,6 +1948,11 @@ def run_backtest(
                     except Exception as _e:
                         _track_error("quality_scorer_predict", _e)
 
+                # Restore original confidence — ML sub-model confidence penalties
+                # degrade trail effectiveness (0.60x drops below ultra-tight threshold)
+                if ml_active:
+                    sig.confidence = _original_confidence
+
                 # Position score filter: disabled — EL+BMV handle breakout filtering
                 if sig.signal_type == 'break' and sig.position_score < 0.80:
                     ml_stats['pos_score_weak'] += 1
@@ -2024,9 +2022,10 @@ def run_backtest(
                     ml_stats.setdefault('is_stop_tighten', 0)
                     ml_stats['is_stop_tighten'] += 1
 
-                # High-conf breakout tightening: high-conf breakouts have
-                # inverse reliability — tighter stops limit damage
-                if sig.signal_type == 'break' and sig.confidence > 0.90:
+                # Ultra-tight breakout stops: enables the breakeven trail mechanism
+                # which protects at 0.01% profit. Previously gated on conf > 0.90,
+                # but trail protection works for ALL breakouts regardless of confidence.
+                if sig.signal_type == 'break':
                     adjusted_stop_pct *= 0.05
 
                 # BSP stop tightening: breakout-specific, AUC 0.794
@@ -2340,6 +2339,22 @@ def run_backtest(
                     ml_stats.setdefault('deferred_total', 0)
                     ml_stats['deferred_total'] += 1
                 else:
+                    # Arch 61: Extended Run Predictor — set trail width
+                    _trail_width = 1.0
+                    if extended_run_model is not None and feature_vec is not None:
+                        try:
+                            er_pred = extended_run_model.predict(feature_vec.reshape(1, -1))
+                            er_prob = float(er_pred.get('run_prob', [0.5])[0])
+                            if er_prob > 0.70:
+                                _trail_width = 2.0  # Let winners run
+                                ml_stats['er_wide_trail'] += 1
+                            elif er_prob > 0.50:
+                                _trail_width = 1.5
+                            elif er_prob < 0.30:
+                                _trail_width = 0.7  # Capture quickly
+                                ml_stats['er_tight_trail'] += 1
+                        except Exception as _e:
+                            _track_error("extended_run_predict", _e)
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
@@ -2356,6 +2371,7 @@ def run_backtest(
                         el_flagged=(el_loser_prob > 0.18),
                         fast_reversion=(fast_rev > 0.55),
                         is_flagged=(imm_stop_prob > 0.35),
+                        trail_width_mult=_trail_width,
                     ))
                     position_signals.append(sig_data)
                     if capture_features:
@@ -2808,7 +2824,19 @@ def main():
     ml_model = None
     if args.ml:
         print(f"\nLoading ML model from {args.ml}...")
-        if args.ml.endswith('.pkl'):
+        if _os_mod.path.isdir(args.ml):
+            # Directory mode: load gbt_model.pkl from the directory
+            gbt_path = _os_mod.path.join(args.ml, 'gbt_model.pkl')
+            if _os_mod.path.exists(gbt_path):
+                from v15.core.surfer_ml import GBTModel
+                ml_model = GBTModel.load(gbt_path)
+            else:
+                # Try best_model.pkl
+                best_path = _os_mod.path.join(args.ml, 'best_model.pkl')
+                if _os_mod.path.exists(best_path):
+                    from v15.core.surfer_ml import GBTModel
+                    ml_model = GBTModel.load(best_path)
+        elif args.ml.endswith('.pkl'):
             from v15.core.surfer_ml import GBTModel
             ml_model = GBTModel.load(args.ml)
         elif 'transformer' in args.ml:
