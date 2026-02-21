@@ -2803,7 +2803,7 @@ def run_walk_forward(eval_interval: int = 3, max_hold_bars: int = 60,
 def main():
     parser = argparse.ArgumentParser(description='Channel Surfer Backtest')
     parser.add_argument('--days', type=int, default=30, help='Days of 5min data')
-    parser.add_argument('--eval-interval', type=int, default=6, help='Bars between evaluations')
+    parser.add_argument('--eval-interval', type=int, default=3, help='Bars between evaluations (3=15min optimal)')
     parser.add_argument('--max-hold', type=int, default=60, help='Max bars to hold')
     parser.add_argument('--min-conf', type=float, default=0.01, help='Minimal gate: hard skips do real filtering')
     parser.add_argument('--walk-forward', action='store_true', help='Run walk-forward validation')
