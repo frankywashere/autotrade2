@@ -1901,13 +1901,13 @@ def run_backtest(
                     ml_stats['anti_double_type'] += 1
                     continue  # No double-bounce or double-break
 
-                # Volume confirmation: skip breakouts on thin volume
+                # Volume tracking: log low-volume breakouts (ultra-tight stop protects)
                 if sig.signal_type == 'break' and 'volume' in tsla.columns:
                     current_vol = tsla['volume'].iloc[bar]
                     avg_vol = tsla['volume'].iloc[max(0, bar-20):bar].mean()
                     if avg_vol > 0 and current_vol < avg_vol * 0.8:
                         ml_stats['low_volume'] += 1
-                        continue  # Below-average volume → weak breakout
+                        # continue  # Disabled: ultra-tight 0.05x stop protects all breakouts
 
                 # Quality scorer: predict win probability for this exact trade
                 if quality_scorer is not None and ml_active:
