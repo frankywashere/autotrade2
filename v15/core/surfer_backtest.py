@@ -2703,6 +2703,12 @@ def run_backtest(
                             ml_stats.setdefault('big_win_regime', 0)
                             ml_stats['big_win_regime'] += 1
 
+                    # Arch 96: Low confidence reduction (noisy signal = smaller bet)
+                    if realistic and sig.confidence < 0.50:
+                        trade_size *= 0.80
+                        ml_stats.setdefault('low_conf_reduce', 0)
+                        ml_stats['low_conf_reduce'] += 1
+
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
