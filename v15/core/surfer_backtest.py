@@ -2789,6 +2789,14 @@ def run_backtest(
                             ml_stats.setdefault('low_ke_reduce', 0)
                             ml_stats['low_ke_reduce'] += 1
 
+                    # Arch 105: High entropy break reduction (noisy channel = uncertain breakout)
+                    if realistic and sig.signal_type == 'break':
+                        ps105 = analysis.tf_states.get(sig.primary_tf)
+                        if ps105 and ps105.entropy > 0.85:
+                            trade_size *= 0.75
+                            ml_stats.setdefault('high_entropy_break_reduce', 0)
+                            ml_stats['high_entropy_break_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
