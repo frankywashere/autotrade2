@@ -2797,6 +2797,14 @@ def run_backtest(
                             ml_stats.setdefault('high_theta_bounce', 0)
                             ml_stats['high_theta_bounce'] += 1
 
+                    # Arch 107: Low OU half-life bounce boost (fast reversion = quick reliable bounce)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps107 = analysis.tf_states.get(sig.primary_tf)
+                        if ps107 and ps107.ou_half_life < 2.0:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('fast_hl_bounce', 0)
+                            ml_stats['fast_hl_bounce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
