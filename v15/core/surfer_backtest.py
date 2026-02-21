@@ -1757,7 +1757,13 @@ def run_backtest(
                             el_pred = extreme_loser_model.predict(feature_vec.reshape(1, -1))
                             el_loser_prob = float(el_pred['loser_prob'][0])
 
-                            if el_loser_prob > 0.18:
+                            if el_loser_prob > 0.18 and sig.signal_type == 'break':
+                                # EL-flagged breakouts: skip entirely
+                                # (conf penalty disables ultra-tight stop → bigger losses)
+                                ml_stats.setdefault('el_break_skip', 0)
+                                ml_stats['el_break_skip'] += 1
+                                continue
+                            elif el_loser_prob > 0.18:
                                 sig.confidence *= 0.80
                                 ml_stats['el_penalty'] += 1
                         except Exception as _e:
