@@ -2425,6 +2425,20 @@ def run_backtest(
                         ml_stats.setdefault('bounce_sized_up', 0)
                         ml_stats['bounce_sized_up'] += 1
 
+                    # Arch 68: Channel health inverse sizing for breakouts
+                    # Higher channel_health correlates with WORSE breakout P&L (-0.173 corr)
+                    # Healthy channels hold → breakouts tend to fade
+                    if realistic and sig.signal_type == 'break':
+                        ch = sig.channel_health
+                        if ch > 0.50:
+                            trade_size *= 0.6  # Healthy channel → likely to hold
+                            ml_stats.setdefault('ch_break_sizedown', 0)
+                            ml_stats['ch_break_sizedown'] += 1
+                        elif ch < 0.30:
+                            trade_size *= 1.4  # Weak channel → breakout more likely real
+                            ml_stats.setdefault('ch_break_sizeup', 0)
+                            ml_stats['ch_break_sizeup'] += 1
+
                     # Arch 63+64: Follow-through → position sizing + breakout gate
                     # Model has 0.44 correlation with actual 5-bar moves
                     if follow_through_model is not None and feature_vec is not None and realistic:
