@@ -2400,7 +2400,7 @@ def run_backtest(
                             _track_error("extended_run_predict", _e)
                     # Arch 65: Bounce premium sizing — bounces are 97.6% WR, size them up
                     if realistic and sig.signal_type == 'bounce':
-                        trade_size *= 1.5  # Size up on reliable bounces
+                        trade_size *= 2.0  # Size up on reliable bounces (97.6% WR)
                         ml_stats.setdefault('bounce_sized_up', 0)
                         ml_stats['bounce_sized_up'] += 1
 
