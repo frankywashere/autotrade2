@@ -2545,7 +2545,7 @@ def run_backtest(
                     # Arch 87: Low break-prob bounce boost (channel holding = reliable bounce)
                     if realistic and sig.signal_type == 'bounce':
                         ps87 = analysis.tf_states.get(sig.primary_tf)
-                        if ps87 and ps87.break_prob < 0.30:
+                        if ps87 and ps87.break_prob < 0.50:
                             trade_size *= 1.15
                             ml_stats.setdefault('low_bp_bounce', 0)
                             ml_stats['low_bp_bounce'] += 1
