@@ -2015,26 +2015,65 @@ def _show_ml_predictions(analysis, current_tsla, native_tf_data):
 def _load_signal_quality_model():
     """Load the signal quality model into session state (once)."""
     if 'signal_quality_model' not in st.session_state:
-        model_path = Path(__file__).parent / 'validation' / 'signal_quality_model.pkl'
+        _load_log = []
+        # Prefer tuned model (Optuna + calibrated), fall back to base
+        base_dir = Path(__file__).parent / 'validation'
+        model_path = base_dir / 'signal_quality_model_tuned.pkl'
+        if not model_path.exists():
+            model_path = base_dir / 'signal_quality_model.pkl'
+            _load_log.append(f"Tuned model not found, falling back to base: {model_path.name}")
         if model_path.exists():
             try:
                 from v15.validation.signal_quality_model import SignalQualityModel
-                st.session_state['signal_quality_model'] = SignalQualityModel.load(str(model_path))
-            except Exception:
+                model = SignalQualityModel.load(str(model_path))
+                st.session_state['signal_quality_model'] = model
+                cv = model.cv_metrics or {}
+                auc = cv.get('overall_auc', 'N/A')
+                calibrated = 'yes' if model.calibrator is not None else 'no'
+                n_feat = len(model.feature_names) if model.feature_names else '?'
+                msg = f"Model: {model_path.name} | AUC={auc} | calibrated={calibrated} | {n_feat} features"
+                _load_log.append(msg)
+                print(f"[SQ] Loaded {msg}")
+            except Exception as e:
                 st.session_state['signal_quality_model'] = None
+                _load_log.append(f"LOAD FAILED: {model_path.name}: {e}")
+                print(f"[SQ] LOAD FAILED: {model_path.name}: {e}")
         else:
             st.session_state['signal_quality_model'] = None
+            _load_log.append("No signal quality model file found")
+            print("[SQ] No signal quality model file found")
+        st.session_state['_sq_load_log'] = _load_log
     return st.session_state['signal_quality_model']
 
 
-def _render_ml_signal_quality(analysis, sig, current_tsla):
+def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=None):
     """Render ML signal quality panel below the signal banner (BUY/SELL only)."""
     if sig.action == 'HOLD':
         return
 
+    import datetime as _dt
+    log = []  # Fresh log each render
+    log.append(f"--- ML Signal Quality @ {_dt.datetime.now().strftime('%H:%M:%S')} ---")
+
     model = _load_signal_quality_model()
+    # Include model load info
+    for line in st.session_state.get('_sq_load_log', []):
+        log.append(line)
     if model is None:
+        log.append("NO MODEL LOADED — skipping")
+        st.session_state['_sq_log'] = log
+        for line in log:
+            print(f"[SQ] {line}")
         return
+
+    # Log the incoming signal
+    sig_type = getattr(sig, 'signal_type', 'unknown')
+    log.append(f"Signal: {sig.action} {sig_type} | TF={sig.primary_tf} | conf={sig.confidence:.0%}")
+    log.append(f"  stop={sig.suggested_stop_pct:.2%} | tp={sig.suggested_tp_pct:.2%} | "
+               f"R:R={sig.suggested_tp_pct/max(sig.suggested_stop_pct, 1e-6):.1f}:1")
+    log.append(f"  scores: pos={sig.position_score:.2f} energy={sig.energy_score:.2f} "
+               f"entropy={sig.entropy_score:.2f} confluence={sig.confluence_score:.2f} "
+               f"timing={sig.timing_score:.2f} health={sig.channel_health:.2f}")
 
     # Extract feature vector
     try:
@@ -2048,19 +2087,27 @@ def _render_ml_signal_quality(analysis, sig, current_tsla):
 
         feature_vec, _ = _extract_signal_features(
             analysis, current_tsla, bar, closes,
-            spy_df=None, vix_df=None,
+            spy_df=spy_df, vix_df=vix_df,
             feature_names=feature_names,
             history_buffer=history_buffer,
-            eval_interval=3,
+            eval_interval=6,  # Must match training default (signal_quality_model.py)
         )
         st.session_state['_sq_history_buffer'] = history_buffer
+        nz = int(np.count_nonzero(feature_vec))
+        log.append(f"Features: {len(feature_vec)}-dim base | {nz} non-zero | "
+                   f"range [{np.min(feature_vec):.2f}, {np.max(feature_vec):.2f}]")
 
-        # Append signal meta features
+        # Append signal meta features (extended=True for tuned model)
         from v15.validation.signal_quality_model import _append_signal_meta
-        # Build a minimal trade-like object for signal meta
         class _SigProxy:
-            signal_type = getattr(sig, 'signal_type', 'bounce')
-            direction = sig.action
+            pass
+        _sig_proxy = _SigProxy()
+        _sig_proxy.signal_type = getattr(sig, 'signal_type', 'bounce')
+        _sig_proxy.direction = sig.action
+        _sig_proxy.stop_pct = sig.suggested_stop_pct
+        _sig_proxy.tp_pct = sig.suggested_tp_pct
+        _sig_proxy.primary_tf = sig.primary_tf
+        _sig_proxy.entry_time = _dt.datetime.now().isoformat()
         sig_data = {
             'position_score': sig.position_score,
             'energy_score': sig.energy_score,
@@ -2070,16 +2117,53 @@ def _render_ml_signal_quality(analysis, sig, current_tsla):
             'channel_health': sig.channel_health,
             'confidence': sig.confidence,
         }
-        full_features = _append_signal_meta(feature_vec, _SigProxy(), sig_data)
+        full_features = _append_signal_meta(feature_vec, _sig_proxy, sig_data, extended=True)
+        log.append(f"Meta appended: {len(feature_vec)} + {len(full_features) - len(feature_vec)} → {len(full_features)}-dim")
 
         pred = model.predict(full_features)
-    except Exception:
+    except Exception as e:
+        log.append(f"ERROR: {type(e).__name__}: {e}")
+        st.warning(f"ML Signal Quality unavailable: {e}")
+        st.session_state['_sq_log'] = log
+        for line in log:
+            print(f"[SQ] {line}")
+        with st.expander("ML Signal Quality — Debug Log"):
+            st.code('\n'.join(log), language='text')
         return
 
     win_prob = pred['win_prob']
     expected_pnl = pred['expected_pnl_pct']
     quality_score = pred['quality_score']
     risk_rating = pred['risk_rating']
+
+    # Log prediction results
+    _sq_size = ('FULL+' if quality_score >= 80 else 'FULL' if quality_score >= 60
+                else 'REDUCED' if quality_score >= 40 else 'MINIMAL')
+    _sq_mult = 1.3 if quality_score >= 80 else 1.0 if quality_score >= 60 else 0.7 if quality_score >= 40 else 0.4
+    log.append(f"Result: win={win_prob:.0%} pnl={expected_pnl:+.2%} quality={quality_score:.0f} "
+               f"risk={risk_rating} → {_sq_mult:.1f}x {_sq_size}")
+    st.session_state['_sq_log'] = log
+    # Print to terminal
+    for line in log:
+        print(f"[SQ] {line}")
+
+    # Position sizing tier
+    if quality_score >= 80:
+        size_mult = 1.3
+        size_label = 'FULL+'
+        size_color = '#00c853'
+    elif quality_score >= 60:
+        size_mult = 1.0
+        size_label = 'FULL'
+        size_color = '#4caf50'
+    elif quality_score >= 40:
+        size_mult = 0.7
+        size_label = 'REDUCED'
+        size_color = '#ff9800'
+    else:
+        size_mult = 0.4
+        size_label = 'MINIMAL'
+        size_color = '#ff1744'
 
     # Risk badge colors
     risk_colors = {'LOW': '#00c853', 'MEDIUM': '#ff9800', 'HIGH': '#ff1744'}
@@ -2118,6 +2202,13 @@ def _render_ml_signal_quality(analysis, sig, current_tsla):
                 <div style="background:#333;border-radius:4px;height:6px;width:80px;margin:4px auto;">
                 <div style="background:{q_color};border-radius:4px;height:6px;width:{quality_score:.0f}%;"></div></div>
             </div>
+            <div>
+                <div style="font-size:11px;color:#aaa;">Position Size</div>
+                <div style="font-size:28px;font-weight:700;color:{size_color};">
+                {size_mult:.1f}x</div>
+                <div style="font-size:11px;"><span style="background:{size_color};color:#fff;
+                padding:2px 8px;border-radius:10px;font-weight:600;">{size_label}</span></div>
+            </div>
         </div>
         </div>""",
         unsafe_allow_html=True,
@@ -2145,12 +2236,19 @@ def _render_ml_signal_quality(analysis, sig, current_tsla):
                     })
                 st.dataframe(rows, use_container_width=True, hide_index=True)
 
+    # Debug log expander
+    if log:
+        with st.expander("ML Signal Quality — Debug Log"):
+            st.code('\n'.join(log), language='text')
+
 
 def show_channel_surfer_tab(
     current_tsla,
     native_tf_data,
     live_config,
     is_live,
+    current_spy=None,
+    current_vix=None,
 ):
     """Channel Surfer tab — physics-inspired multi-TF channel trading."""
     st.header("Channel Surfer")
@@ -2206,7 +2304,7 @@ def show_channel_surfer_tab(
     _render_signal_banner(sig, current_price=current_price)
 
     # --- ML Signal Quality Panel ---
-    _render_ml_signal_quality(analysis, sig, current_tsla)
+    _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=current_spy, vix_df=current_vix)
 
     # Play audio for BUY/SELL signals (only if new)
     prev_action = st.session_state.get('surfer_prev_action', 'HOLD')
@@ -2420,7 +2518,7 @@ def show_channel_surfer_tab(
                     from v15.core.surfer_backtest import run_backtest as surfer_backtest
                     metrics, trades, eq_curve = surfer_backtest(
                         days=bt_days,
-                        eval_interval=3,
+                        eval_interval=6,  # Must match training default
                         max_hold_bars=60,
                         position_size=bt_pos_size,
                         min_confidence=0.45,
@@ -3300,6 +3398,8 @@ def main():
             native_tf_data=native_tf_data,
             live_config=live_config,
             is_live=is_live,
+            current_spy=current_spy,
+            current_vix=current_vix,
         )
 
 

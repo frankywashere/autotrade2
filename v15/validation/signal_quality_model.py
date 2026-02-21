@@ -3,10 +3,15 @@
 Signal Quality Model — Predicts per-trade win probability and expected P&L.
 
 Trains a GBT model on the 169-dim ML feature vectors captured from backtests,
-plus 9 signal-meta features (signal type, direction, 7 signal scores).
+plus signal-meta features (9 base or 21 extended).
 
 Uses leave-one-year-out cross-validation on the 10-year backtest dataset
 (~10K trades) for honest performance estimation.
+
+Supports:
+  - Extended features (stop_pct, tp_pct, R:R, TF one-hots, interactions)
+  - Isotonic calibration for well-calibrated win probabilities
+  - Custom hyperparameters (from Optuna tuning)
 
 Usage:
     python3 -m v15.validation.signal_quality_model \
@@ -15,6 +20,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import pickle
 import sys
@@ -33,7 +39,7 @@ import numpy as np
 @dataclass
 class TradeSnapshot:
     """One trade's feature vector + outcome for training."""
-    features: np.ndarray   # 178-dim (169 base + 9 signal meta)
+    features: np.ndarray   # 178-dim (base) or 190-dim (extended)
     win: int               # 1 if pnl > 0
     pnl_pct: float         # P&L percentage
     year: int              # For CV fold assignment
@@ -51,10 +57,40 @@ SIGNAL_META_NAMES = [
     'sig_confidence',
 ]
 
+SIGNAL_META_EXTENDED_NAMES = SIGNAL_META_NAMES + [
+    'sig_stop_pct',
+    'sig_tp_pct',
+    'sig_rr_ratio',
+    'sig_primary_tf_5min',
+    'sig_primary_tf_1h',
+    'sig_primary_tf_4h',
+    'sig_primary_tf_daily',
+    'sig_primary_tf_weekly',
+    'sig_vix_x_position',
+    'sig_confluence_x_energy',
+    'sig_is_overnight',
+]
 
-def _append_signal_meta(base_features: np.ndarray, trade, sig_data: dict) -> np.ndarray:
-    """Append 9 signal-meta features to the 169-dim base vector."""
-    meta = np.zeros(len(SIGNAL_META_NAMES), dtype=np.float32)
+# TF names used for one-hot encoding of primary_tf
+_TF_ONEHOT_KEYS = ['5min', '1h', '4h', 'daily', 'weekly']
+
+
+def _append_signal_meta(
+    base_features: np.ndarray,
+    trade,
+    sig_data: dict,
+    extended: bool = False,
+) -> np.ndarray:
+    """Append signal-meta features to the 169-dim base vector.
+
+    Args:
+        extended: If True, append 21 features (9 base + 12 new).
+                  If False, append original 9 features for backward compat.
+    """
+    names = SIGNAL_META_EXTENDED_NAMES if extended else SIGNAL_META_NAMES
+    meta = np.zeros(len(names), dtype=np.float32)
+
+    # --- Original 9 features (indices 0-8) ---
     meta[0] = 1.0 if trade.signal_type == 'bounce' else 0.0
     meta[1] = 1.0 if trade.direction == 'BUY' else 0.0
     if sig_data:
@@ -65,6 +101,44 @@ def _append_signal_meta(base_features: np.ndarray, trade, sig_data: dict) -> np.
         meta[6] = sig_data.get('timing_score', 0.0)
         meta[7] = sig_data.get('channel_health', 0.0)
         meta[8] = sig_data.get('confidence', 0.0)
+
+    if extended:
+        # --- New features (indices 9-20) ---
+        stop_pct = getattr(trade, 'stop_pct', 0.0) or 0.0
+        tp_pct = getattr(trade, 'tp_pct', 0.0) or 0.0
+        meta[9] = stop_pct
+        meta[10] = tp_pct
+        meta[11] = stop_pct / tp_pct if tp_pct > 1e-8 else 1.0  # R:R ratio
+
+        # Primary TF one-hot
+        primary_tf = getattr(trade, 'primary_tf', '') or ''
+        for j, tf_key in enumerate(_TF_ONEHOT_KEYS):
+            meta[12 + j] = 1.0 if primary_tf == tf_key else 0.0
+
+        # Interaction features
+        pos_score = sig_data.get('position_score', 0.0) if sig_data else 0.0
+        confluence = sig_data.get('confluence_score', 0.0) if sig_data else 0.0
+        energy = sig_data.get('energy_score', 0.0) if sig_data else 0.0
+
+        # VIX level from base features (index for vix_level in correlation features)
+        # vix_level is the 4th correlation feature (0-indexed: 3)
+        # Correlation features start at 115+18+14+12 = 159, so vix_level is at 162
+        vix_level = float(base_features[162]) if len(base_features) > 162 else 0.0
+        meta[17] = vix_level * pos_score  # sig_vix_x_position
+
+        meta[18] = confluence * energy  # sig_confluence_x_energy
+
+        # Overnight flag: entry hour >= 15 (3pm ET)
+        entry_time = getattr(trade, 'entry_time', '') or ''
+        is_overnight = 0.0
+        if entry_time:
+            try:
+                hour = int(entry_time.split('T')[1].split(':')[0]) if 'T' in entry_time else 0
+                is_overnight = 1.0 if hour >= 15 else 0.0
+            except (IndexError, ValueError):
+                pass
+        meta[19] = is_overnight
+
     return np.concatenate([base_features, meta])
 
 
@@ -80,6 +154,7 @@ def build_dataset(
     min_confidence: float = 0.45,
     capital: float = 100_000.0,
     verbose: bool = True,
+    extended_features: bool = True,
 ) -> List[TradeSnapshot]:
     """
     Run year-by-year backtests with capture_features=True, no ML model.
@@ -158,7 +233,7 @@ def build_dataset(
             if feat is None:
                 continue
 
-            full_feat = _append_signal_meta(feat, trade, sig or {})
+            full_feat = _append_signal_meta(feat, trade, sig or {}, extended=extended_features)
             snapshots.append(TradeSnapshot(
                 features=full_feat,
                 win=1 if trade.pnl > 0 else 0,
@@ -195,14 +270,18 @@ class SignalQualityModel:
     Two sub-models:
       - win_classifier: P(win | features) — binary classifier
       - pnl_regressor: E[pnl_pct | features] — Huber regressor
+
+    Supports isotonic calibration and custom hyperparameters.
     """
 
-    def __init__(self):
+    def __init__(self, params: dict = None):
         self.win_model = None
         self.pnl_model = None
+        self.calibrator = None  # IsotonicRegression for calibrated win_prob
         self.feature_names: List[str] = []
         self.cv_metrics: Dict = {}
         self.feature_importance: Dict = {}
+        self.params = params  # Custom LightGBM hyperparameters
 
     def train(self, snapshots: List[TradeSnapshot], verbose: bool = True):
         """Train with leave-one-year-out CV, then retrain on all data."""
@@ -211,9 +290,16 @@ class SignalQualityModel:
         y_pnl = np.array([s.pnl_pct for s in snapshots], dtype=np.float32)
         years = np.array([s.year for s in snapshots])
 
-        # Build feature names
+        # Build feature names — auto-detect extended vs base from feature dim
         from v15.core.surfer_ml import get_feature_names
-        self.feature_names = get_feature_names() + SIGNAL_META_NAMES
+        base_names = get_feature_names()
+        n_base = len(base_names)
+        n_feat = X.shape[1]
+        n_meta = n_feat - n_base
+        if n_meta == len(SIGNAL_META_EXTENDED_NAMES):
+            self.feature_names = base_names + SIGNAL_META_EXTENDED_NAMES
+        else:
+            self.feature_names = base_names + SIGNAL_META_NAMES
 
         unique_years = sorted(int(y) for y in set(years))
         if verbose:
@@ -223,11 +309,16 @@ class SignalQualityModel:
             print(f"  Samples: {len(snapshots)}, Features: {X.shape[1]}")
             print(f"  Years: {unique_years}")
             print(f"  Win rate: {y_win.mean():.1%}")
+            if self.params:
+                print(f"  Custom params: yes ({len(self.params)} overrides)")
 
         # --- Leave-one-year-out CV ---
         cv_win_probs = np.zeros(len(snapshots))
         cv_pnl_preds = np.zeros(len(snapshots))
         per_year_metrics = {}
+
+        # Calibrated OOS predictions (nested calibration — no leak)
+        cv_cal_win_probs = np.zeros(len(snapshots))
 
         for held_year in unique_years:
             train_mask = years != held_year
@@ -240,7 +331,19 @@ class SignalQualityModel:
             if len(X_test) < 10:
                 continue
 
-            win_model, pnl_model = self._fit_models(X_train, y_win_train, y_pnl_train)
+            # Split train into model-train + calibration (use earliest year as cal)
+            train_years = sorted(set(years[train_mask].astype(int)))
+            cal_year = train_years[0]  # Hold out earliest train year for calibration
+            cal_mask_in_train = years[train_mask] == cal_year
+            model_mask_in_train = ~cal_mask_in_train
+
+            X_model = X_train[model_mask_in_train]
+            y_win_model = y_win_train[model_mask_in_train]
+            y_pnl_model = y_pnl_train[model_mask_in_train]
+            X_cal = X_train[cal_mask_in_train]
+            y_win_cal = y_win_train[cal_mask_in_train]
+
+            win_model, pnl_model = self._fit_models(X_model, y_win_model, y_pnl_model)
 
             # OOS predictions (wrap in DataFrame to match fit)
             X_test_df = self._make_df(X_test)
@@ -249,6 +352,19 @@ class SignalQualityModel:
 
             cv_win_probs[test_mask] = win_probs
             cv_pnl_preds[test_mask] = pnl_preds
+
+            # Nested calibration: fit on cal fold, apply to test fold
+            if len(X_cal) >= 30:
+                from sklearn.isotonic import IsotonicRegression
+                X_cal_df = self._make_df(X_cal)
+                cal_probs = win_model.predict_proba(X_cal_df)[:, 1]
+                fold_calibrator = IsotonicRegression(
+                    y_min=0.0, y_max=1.0, out_of_bounds='clip'
+                )
+                fold_calibrator.fit(cal_probs, y_win_cal)
+                cv_cal_win_probs[test_mask] = fold_calibrator.predict(win_probs)
+            else:
+                cv_cal_win_probs[test_mask] = win_probs
 
             # Per-year metrics
             from sklearn.metrics import roc_auc_score, brier_score_loss
@@ -285,16 +401,64 @@ class SignalQualityModel:
             overall_brier = 0.25
             overall_pnl_mae = 0.0
 
+        # --- Isotonic calibration (nested — honest OOS Brier) ---
+        cal_valid = cv_cal_win_probs > 0
+        if cal_valid.sum() > 50:
+            calibrated_brier = brier_score_loss(y_win[cal_valid], cv_cal_win_probs[cal_valid])
+            if verbose:
+                print(f"\n  Nested calibration: "
+                      f"Brier {overall_brier:.4f} → {calibrated_brier:.4f} (honest OOS)")
+        else:
+            calibrated_brier = overall_brier
+
+        # Fit final calibrator on ALL OOS predictions for production use
+        if valid.sum() > 50:
+            from sklearn.isotonic import IsotonicRegression
+            self.calibrator = IsotonicRegression(
+                y_min=0.0, y_max=1.0, out_of_bounds='clip'
+            )
+            self.calibrator.fit(cv_win_probs[valid], y_win[valid])
+
+
+        # --- Bootstrap 95% confidence intervals ---
+        auc_ci = [None, None]
+        brier_ci = [None, None]
+        if valid.sum() > 100:
+            rng = np.random.RandomState(42)
+            n = int(valid.sum())
+            _y = y_win[valid]
+            _p = cv_win_probs[valid]
+            boot_aucs, boot_briers = [], []
+            for _ in range(5000):
+                idx = rng.choice(n, n, replace=True)
+                if len(set(_y[idx])) < 2:
+                    continue
+                boot_aucs.append(roc_auc_score(_y[idx], _p[idx]))
+                boot_briers.append(brier_score_loss(_y[idx], _p[idx]))
+            if boot_aucs:
+                auc_ci = [float(np.percentile(boot_aucs, 2.5)),
+                          float(np.percentile(boot_aucs, 97.5))]
+                brier_ci = [float(np.percentile(boot_briers, 2.5)),
+                            float(np.percentile(boot_briers, 97.5))]
+
         self.cv_metrics = {
             'overall_auc': float(overall_auc),
+            'overall_auc_ci': auc_ci,
             'overall_brier': float(overall_brier),
+            'overall_brier_ci': brier_ci,
+            'calibrated_brier': float(calibrated_brier),
             'overall_pnl_mae': float(overall_pnl_mae),
             'per_year': per_year_metrics,
         }
 
         if verbose:
-            print(f"\n  Overall CV: AUC={overall_auc:.3f}, "
-                  f"Brier={overall_brier:.3f}, "
+            auc_ci_str = (f" [{auc_ci[0]:.3f}, {auc_ci[1]:.3f}]"
+                          if auc_ci[0] is not None else "")
+            brier_ci_str = (f" [{brier_ci[0]:.3f}, {brier_ci[1]:.3f}]"
+                            if brier_ci[0] is not None else "")
+            print(f"\n  Overall CV: AUC={overall_auc:.3f}{auc_ci_str}, "
+                  f"Brier={overall_brier:.3f}{brier_ci_str} "
+                  f"(calibrated: {calibrated_brier:.3f}), "
                   f"PnL MAE={overall_pnl_mae:.4f}")
 
         # --- Retrain on ALL data for production ---
@@ -322,7 +486,8 @@ class SignalQualityModel:
         try:
             import lightgbm as lgb
 
-            win_model = lgb.LGBMClassifier(
+            # Default params, overridden by self.params if set
+            default_params = dict(
                 n_estimators=500,
                 num_leaves=31,
                 learning_rate=0.03,
@@ -330,23 +495,23 @@ class SignalQualityModel:
                 feature_fraction=0.7,
                 bagging_fraction=0.7,
                 bagging_freq=5,
+            )
+            if self.params:
+                default_params.update(self.params)
+
+            win_model = lgb.LGBMClassifier(
                 is_unbalance=True,
                 verbose=-1,
                 n_jobs=-1,
+                **default_params,
             )
             win_model.fit(X_df, y_win)
 
             pnl_model = lgb.LGBMRegressor(
-                n_estimators=500,
-                num_leaves=31,
-                learning_rate=0.03,
-                min_child_samples=50,
-                feature_fraction=0.7,
-                bagging_fraction=0.7,
-                bagging_freq=5,
                 objective='huber',
                 verbose=-1,
                 n_jobs=-1,
+                **default_params,
             )
             pnl_model.fit(X_df, y_pnl)
 
@@ -415,7 +580,7 @@ class SignalQualityModel:
         Predict signal quality for a single feature vector.
 
         Args:
-            feature_vec: 178-dim array (169 base + 9 signal meta)
+            feature_vec: 178-dim or 190-dim array (169 base + 9/21 signal meta)
 
         Returns:
             dict with win_prob, expected_pnl_pct, quality_score, risk_rating
@@ -427,6 +592,10 @@ class SignalQualityModel:
         X = self._make_df(feature_vec.reshape(1, -1))
         win_prob = float(self.win_model.predict_proba(X)[0, 1])
         expected_pnl = float(self.pnl_model.predict(X)[0])
+
+        # Apply isotonic calibration if available
+        if self.calibrator is not None:
+            win_prob = float(self.calibrator.predict([win_prob])[0])
 
         # Quality score: weighted combination (0-100)
         # win_prob contributes 70%, pnl direction 30%
@@ -455,9 +624,11 @@ class SignalQualityModel:
             pickle.dump({
                 'win_model': self.win_model,
                 'pnl_model': self.pnl_model,
+                'calibrator': self.calibrator,
                 'feature_names': self.feature_names,
                 'cv_metrics': self.cv_metrics,
                 'feature_importance': self.feature_importance,
+                'params': self.params,
             }, f)
         print(f"  Saved signal quality model to {path}")
 
@@ -466,9 +637,10 @@ class SignalQualityModel:
         """Load model from disk."""
         with open(path, 'rb') as f:
             data = pickle.load(f)
-        model = cls()
+        model = cls(params=data.get('params'))
         model.win_model = data['win_model']
         model.pnl_model = data['pnl_model']
+        model.calibrator = data.get('calibrator')
         model.feature_names = data.get('feature_names', [])
         model.cv_metrics = data.get('cv_metrics', {})
         model.feature_importance = data.get('feature_importance', {})
@@ -497,6 +669,10 @@ def main():
                         help='Minimum signal confidence')
     parser.add_argument('--capital', type=float, default=100_000.0,
                         help='Initial capital')
+    parser.add_argument('--tuned-params', type=str, default=None,
+                        help='Path to tuned_params.json from Optuna')
+    parser.add_argument('--no-extended', action='store_true',
+                        help='Disable extended features (use original 9 meta)')
     args = parser.parse_args()
 
     # Parse year range
@@ -504,6 +680,23 @@ def main():
     start_year = int(parts[0])
     end_year = int(parts[1]) if len(parts) > 1 else start_year
     years = list(range(start_year, end_year + 1))
+
+    # Load tuned params if provided
+    custom_params = None
+    if args.tuned_params:
+        if not os.path.isfile(args.tuned_params):
+            print(f"\nERROR: --tuned-params file not found: {args.tuned_params}")
+            print("  Run optuna_tune.py first to generate it, or omit the flag.")
+            sys.exit(1)
+        with open(args.tuned_params) as f:
+            data = json.load(f)
+        custom_params = data.get('best_params', data)
+        if not custom_params:
+            print(f"\nERROR: No 'best_params' found in {args.tuned_params}")
+            sys.exit(1)
+        print(f"  Loaded tuned params from {args.tuned_params}")
+
+    extended = not args.no_extended
 
     # Build dataset
     snapshots = build_dataset(
@@ -513,6 +706,7 @@ def main():
         eval_interval=args.eval_interval,
         min_confidence=args.min_confidence,
         capital=args.capital,
+        extended_features=extended,
     )
 
     if len(snapshots) < 100:
@@ -520,7 +714,7 @@ def main():
         sys.exit(1)
 
     # Train model
-    model = SignalQualityModel()
+    model = SignalQualityModel(params=custom_params)
     model.train(snapshots, verbose=True)
 
     # Save
@@ -531,8 +725,13 @@ def main():
     print("SIGNAL QUALITY MODEL — SUMMARY")
     print(f"{'='*60}")
     print(f"  Trained on: {len(snapshots)} trades")
-    print(f"  CV AUC:     {model.cv_metrics['overall_auc']:.3f}")
-    print(f"  CV Brier:   {model.cv_metrics['overall_brier']:.3f}")
+    print(f"  Features:   {len(snapshots[0].features)}-dim "
+          f"({'extended' if extended else 'base'})")
+    _ci = model.cv_metrics.get('overall_auc_ci', [None, None])
+    _ci_str = f" [{_ci[0]:.3f}, {_ci[1]:.3f}]" if _ci[0] is not None else ""
+    print(f"  CV AUC:     {model.cv_metrics['overall_auc']:.3f}{_ci_str}")
+    print(f"  CV Brier:   {model.cv_metrics['overall_brier']:.3f} "
+          f"(calibrated: {model.cv_metrics.get('calibrated_brier', 'N/A')})")
     print(f"  CV PnL MAE: {model.cv_metrics['overall_pnl_mae']:.4f}")
     print(f"  Saved to:   {args.output}")
 
