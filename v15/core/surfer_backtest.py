@@ -2888,6 +2888,18 @@ def run_backtest(
                             ml_stats.setdefault('spring_bounce_boost', 0)
                             ml_stats['spring_bounce_boost'] += 1
 
+
+                    # Arch 116: Multi-TF confluence bounce boost (2+ TFs near boundary)
+                    if realistic and sig.signal_type == 'bounce':
+                        near_boundary_count = 0
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid and (tf_state.position_pct < 0.15 or tf_state.position_pct > 0.85):
+                                near_boundary_count += 1
+                        if near_boundary_count >= 2:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('multi_tf_edge_boost', 0)
+                            ml_stats['multi_tf_edge_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
