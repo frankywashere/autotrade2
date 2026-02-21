@@ -332,7 +332,7 @@ def run_backtest(
     eval_interval: int = 3,     # Check every 3 bars = 15 min
     max_hold_bars: int = 60,    # Max 5 hours (60 * 5min)
     position_size: float = 10000.0,  # $10k per trade
-    min_confidence: float = 0.15,  # Lowered from 0.45: ultra-tight trail protects, ML penalties informational only
+    min_confidence: float = 0.01,  # Minimal gate: hard skips (EL, volume, IS) do the real filtering
     use_multi_tf: bool = True,  # Use higher TF data for context
     ml_model=None,              # Optional ML model for signal enhancement
     # Pre-loaded data (skip yfinance when provided)
@@ -1955,16 +1955,16 @@ def run_backtest(
                     except Exception as _e:
                         _track_error("quality_scorer_predict", _e)
 
-                # Position score filter: skip breakouts with weak position
+                # Position score filter: disabled — EL+BMV handle breakout filtering
                 if sig.signal_type == 'break' and sig.position_score < 0.80:
                     ml_stats['pos_score_weak'] += 1
-                    continue
+                    # continue  # Disabled: EL+BMV are better breakout filters
 
-                # Low-conf bounce filter: BUY bounces with conf < 0.46 lose more
+                # Low-conf bounce filter: disabled — bounces are 100% WR with ultra-tight trail
                 if (sig.signal_type == 'bounce' and sig.action == 'BUY'
                         and sig.confidence < 0.46):
                     ml_stats['low_conf_buy_bounce'] += 1
-                    continue
+                    # continue  # Disabled: trail protects all bounces
 
 
                 # Enter position — use next bar's open (no look-ahead bias)
@@ -2789,7 +2789,7 @@ def main():
     parser.add_argument('--days', type=int, default=30, help='Days of 5min data')
     parser.add_argument('--eval-interval', type=int, default=6, help='Bars between evaluations')
     parser.add_argument('--max-hold', type=int, default=60, help='Max bars to hold')
-    parser.add_argument('--min-conf', type=float, default=0.15, help='Minimum signal confidence (lowered: trail protects)')
+    parser.add_argument('--min-conf', type=float, default=0.01, help='Minimal gate: hard skips do real filtering')
     parser.add_argument('--walk-forward', action='store_true', help='Run walk-forward validation')
     parser.add_argument('--ml', type=str, default=None,
                        help='Path to ML model for signal enhancement (e.g. surfer_models/gbt_model.pkl)')
