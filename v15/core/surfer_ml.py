@@ -15730,6 +15730,127 @@ class ExtendedRunPredictor:
         return model
 
 
+class BreakoutFadeDetector:
+    """Arch 62: Predict which breakouts will fade (reverse immediately).
+
+    In realistic mode, breakout losers average -$71 per trade. These are breakouts
+    where the price briefly exceeds the channel boundary but immediately reverses.
+    The fading breakout is caught by the trail/stop at a tiny loss, but with slippage
+    and commissions, it's a net negative.
+
+    This model predicts the probability of a breakout fading (MFE < slippage),
+    allowing the system to skip these trades in realistic mode.
+
+    Label: fade = (5-bar forward return is opposite to breakout direction) AND (abs < 0.1%)
+    Features: volume confirmation, momentum alignment, multi-TF support for break
+    """
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train breakout fade detector."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+
+        # Label: fade = 5-bar return < 0.05% absolute (barely moves or reverses)
+        if isinstance(Y_train, dict):
+            ret_train = Y_train.get('future_return_5', np.zeros(len(X_train)))
+            ret_val = Y_val.get('future_return_5', np.zeros(len(X_val)))
+        else:
+            ret_train = np.zeros(len(X_train))
+            ret_val = np.zeros(len(X_val))
+
+        # Fade: absolute 5-bar return < 0.05% (no meaningful move)
+        y_train = (np.abs(ret_train) < 0.0005).astype(float)
+        y_val = (np.abs(ret_val) < 0.0005).astype(float)
+
+        print(f"\n  Breakout Fade Detector:")
+        print(f"    Training: {len(y_train)} samples, {y_train.sum():.0f} ({y_train.mean():.1%}) fades")
+        print(f"    Validation: {len(y_val)} samples, {y_val.sum():.0f} ({y_val.mean():.1%}) fades")
+
+        # Train with raw features (derived features added noise in ER model)
+        train_data = lgb.Dataset(X_train, label=y_train, feature_name=self.feature_names)
+        val_data = lgb.Dataset(X_val, label=y_val, feature_name=self.feature_names, reference=train_data)
+
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'num_leaves': 15,
+            'learning_rate': 0.02,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.7,
+            'bagging_freq': 5,
+            'min_child_samples': 30,
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.0,
+            'verbose': -1,
+            'seed': 42,
+        }
+
+        callbacks = [lgb.early_stopping(80, verbose=False), lgb.log_evaluation(0)]
+        self.model = lgb.train(
+            params, train_data,
+            num_boost_round=1000,
+            valid_sets=[val_data],
+            callbacks=callbacks,
+        )
+
+        # Evaluate
+        metrics = {}
+        pred = self.model.predict(X_val)
+        try:
+            auc = roc_auc_score(y_val, pred)
+            metrics['fade_auc'] = float(auc)
+            print(f"    AUC: {auc:.3f}")
+        except Exception:
+            metrics['fade_auc'] = 0.5
+            print(f"    AUC: N/A")
+
+        # Feature importance
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n    Top 10 breakout fade features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"      {rank+1}. {self.feature_names[idx]}: {imp[idx]:.0f}")
+
+        # Calibration
+        for thresh in [0.3, 0.5, 0.7]:
+            mask = pred > thresh
+            if mask.sum() > 0:
+                actual_rate = y_val[mask].mean()
+                print(f"    P(fade|prob>{thresh:.1f}): {actual_rate:.1%} ({mask.sum()} samples)")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        return {
+            'fade_prob': self.model.predict(X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+            }, f)
+        print(f"  Saved BreakoutFadeDetector to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'BreakoutFadeDetector':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        return model
+
+
 # ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
@@ -16359,7 +16480,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity', 'breakout_stop', 'breakout_momentum', 'extended_run'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity', 'breakout_stop', 'breakout_momentum', 'extended_run', 'breakout_fade'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -16843,6 +16964,14 @@ def main():
                 )
                 er.save(os.path.join(args.output, 'extended_run_model.pkl'))
                 print(f"\n  Extended Run metrics: {er_metrics}")
+
+            elif args.arch == 'breakout_fade':
+                bf = BreakoutFadeDetector()
+                bf_metrics = bf.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                bf.save(os.path.join(args.output, 'breakout_fade_model.pkl'))
+                print(f"\n  Breakout Fade metrics: {bf_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

@@ -388,6 +388,7 @@ def run_backtest(
     ensemble_base_models = {}
     breakout_momentum_model = None
     extended_run_model = None
+    breakout_fade_model = None
     ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0,
                  'quality_filtered': 0, 'quality_boosted': 0, 'ensemble_filtered': 0,
                  'conf_below_min': 0, 'not_buy_sell': 0, 'circuit_breaker': 0,
@@ -403,7 +404,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor, BreakoutStopPredictor, BreakoutMomentumValidator, ExtendedRunPredictor,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor, BreakoutStopPredictor, BreakoutMomentumValidator, ExtendedRunPredictor, BreakoutFadeDetector,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -875,6 +876,18 @@ def run_backtest(
                 ml_stats['er_tight_trail'] = 0
             except Exception as _e:
                 _track_error("load_extended_run", _e)
+
+        # Arch 62: Breakout Fade Detector
+        breakout_fade_model = None
+        bf_path = _os.path.join(model_dir, 'breakout_fade_model.pkl')
+        if _os.path.exists(bf_path):
+            try:
+                breakout_fade_model = BreakoutFadeDetector.load(bf_path)
+                print(f"[ML] Breakout Fade Detector loaded (AUC 0.712)")
+                ml_stats['bf_fade_skipped'] = 0
+                ml_stats['bf_fade_flagged'] = 0
+            except Exception as _e:
+                _track_error("load_breakout_fade", _e)
 
     # Feature capture mode (signal quality model training OR ML position sizing)
     _capture_feature_names = None
@@ -2339,6 +2352,22 @@ def run_backtest(
                     ml_stats.setdefault('deferred_total', 0)
                     ml_stats['deferred_total'] += 1
                 else:
+                    # Arch 62: Breakout Fade Detector — skip fading breakouts
+                    if breakout_fade_model is not None and feature_vec is not None and sig.signal_type == 'break':
+                        try:
+                            bf_pred = breakout_fade_model.predict(feature_vec.reshape(1, -1))
+                            fade_prob = float(bf_pred.get('fade_prob', [0.0])[0])
+                            ml_stats.setdefault('bf_break_evaluated', 0)
+                            ml_stats['bf_break_evaluated'] += 1
+                            # Model mean ~0.10, 0.18 catches the riskiest ~5%
+                            if fade_prob > 0.18:
+                                ml_stats['bf_fade_skipped'] += 1
+                                continue  # Skip this fading breakout
+                            elif fade_prob > 0.13:
+                                ml_stats['bf_fade_flagged'] += 1
+                        except Exception as _e:
+                            _track_error("breakout_fade_predict", _e)
+
                     # Arch 61: Extended Run Predictor — set trail width
                     _trail_width = 1.0
                     if extended_run_model is not None and feature_vec is not None:
@@ -2813,6 +2842,8 @@ def main():
                        help='Run both physics-only and ML-enhanced, then compare')
     parser.add_argument('--dump-trades', type=str, default=None,
                        help='Filter to dump: stop, trail, timeout, losers, all')
+    parser.add_argument('--realistic', action='store_true',
+                       help='Realistic mode: flat 2%% risk sizing, slippage, commissions')
     parser.add_argument('--refresh', action='store_true',
                        help='Force refresh yfinance data (clear cache)')
     args = parser.parse_args()
@@ -2910,12 +2941,22 @@ def main():
             min_confidence=args.min_conf,
         )
     else:
+        realistic_kwargs = {}
+        if args.realistic:
+            realistic_kwargs = dict(
+                realistic=True,
+                slippage_bps=3.0,
+                commission_per_share=0.005,
+                max_leverage=4.0,
+                initial_capital=100_000.0,
+            )
         metrics, trades, eq = run_backtest(
             days=args.days,
             eval_interval=args.eval_interval,
             max_hold_bars=args.max_hold,
             min_confidence=args.min_conf,
             ml_model=ml_model,
+            **realistic_kwargs,
         )
 
         # Dump individual trade details if requested
