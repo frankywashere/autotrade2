@@ -2534,6 +2534,14 @@ def run_backtest(
                             ml_stats.setdefault('high_bc_bounce', 0)
                             ml_stats['high_bc_bounce'] += 1
 
+                    # Arch 86: Near-bounce timing (bounces where predicted bounce is imminent)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps86 = analysis.tf_states.get(sig.primary_tf)
+                        if ps86 and ps86.bars_to_next_bounce < 8.0:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('near_bounce_timing', 0)
+                            ml_stats['near_bounce_timing'] += 1
+
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
@@ -2605,6 +2613,13 @@ def run_backtest(
                         trade_size *= streak_mult
                         ml_stats.setdefault('streak_accel', 0)
                         ml_stats['streak_accel'] += 1
+
+                    # Arch 86: Open position count scaling — reduce concentration risk
+                    if realistic and len(positions) >= 3:
+                        pos_penalty = 0.85 ** (len(positions) - 2)  # 3→0.85, 4→0.72, 5→0.61
+                        trade_size *= pos_penalty
+                        ml_stats.setdefault('pos_count_reduce', 0)
+                        ml_stats['pos_count_reduce'] += 1
 
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
