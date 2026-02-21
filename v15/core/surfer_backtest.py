@@ -2103,7 +2103,7 @@ def run_backtest(
                 if realistic:
                     # Realistic: leverage-based cap, no multiplicative boosts
                     max_buying_power = equity * max_leverage
-                    size_cap = max_buying_power * 0.25  # Max 25% of buying power per trade
+                    size_cap = max_buying_power * 0.35  # Max 35% of buying power per trade
                     trade_size = min(trade_size, size_cap)
 
                     # Apply slippage to entry price
