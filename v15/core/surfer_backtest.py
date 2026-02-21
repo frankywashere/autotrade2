@@ -2460,6 +2460,18 @@ def run_backtest(
                             trade_size *= 1.15
                             ml_stats.setdefault('break_sell_boost', 0)
                             ml_stats['break_sell_boost'] += 1
+                        # Arch 78: OU half-life for breaks (long HL = trending)
+                        primary_st = analysis.tf_states.get(sig.primary_tf)
+                        if primary_st:
+                            ou_hl_b = primary_st.ou_half_life
+                            if ou_hl_b > 8.0:
+                                trade_size *= 1.2
+                                ml_stats.setdefault('ou_trend_break', 0)
+                                ml_stats['ou_trend_break'] += 1
+                            elif ou_hl_b < 3.0:
+                                trade_size *= 0.8
+                                ml_stats.setdefault('ou_revert_break', 0)
+                                ml_stats['ou_revert_break'] += 1
 
                     # Arch 76: Realized volatility sizing
                     if realistic and bar >= 20:
