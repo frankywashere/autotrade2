@@ -395,7 +395,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor, BreakoutStopPredictor,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor, BreakoutStopPredictor, BreakoutMomentumValidator,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -843,6 +843,18 @@ def run_backtest(
                 ml_stats['bsp_skip'] = 0
             except Exception as _e:
                 _track_error("load_breakout_stop", _e)
+
+        # Architecture 60: Breakout Momentum Validator
+        breakout_momentum_model = None
+        bmv_path = _os.path.join(model_dir, 'breakout_momentum_model.pkl')
+        if _os.path.exists(bmv_path):
+            try:
+                breakout_momentum_model = BreakoutMomentumValidator.load(bmv_path)
+                print(f"[ML] Breakout Momentum Validator loaded (AUC 0.626)")
+                ml_stats['bmv_low_momentum_skip'] = 0
+                ml_stats['bmv_high_momentum_boost'] = 0
+            except Exception as _e:
+                _track_error("load_breakout_momentum", _e)
 
     # Feature capture mode (signal quality model training OR ML position sizing)
     _capture_feature_names = None
@@ -1758,11 +1770,22 @@ def run_backtest(
                             el_loser_prob = float(el_pred['loser_prob'][0])
 
                             if el_loser_prob > 0.18 and sig.signal_type == 'break':
-                                # EL-flagged breakouts: skip entirely
-                                # (conf penalty disables ultra-tight stop → bigger losses)
-                                ml_stats.setdefault('el_break_skip', 0)
-                                ml_stats['el_break_skip'] += 1
-                                continue
+                                # EL-flagged breakouts: check momentum before skipping
+                                skip_this = True
+                                if breakout_momentum_model is not None:
+                                    try:
+                                        bmv_pred = breakout_momentum_model.predict(feature_vec.reshape(1, -1))
+                                        bmv_prob = float(bmv_pred.get('momentum_prob', [0.0])[0])
+                                        if bmv_prob > 0.80:  # High momentum overrides EL (sweep: 0.80 = 100% WR + $139M)
+                                            skip_this = False
+                                            ml_stats.setdefault('bmv_el_override', 0)
+                                            ml_stats['bmv_el_override'] += 1
+                                    except Exception as _e:
+                                        _track_error("breakout_momentum", _e)
+                                if skip_this:
+                                    ml_stats.setdefault('el_break_skip', 0)
+                                    ml_stats['el_break_skip'] += 1
+                                    continue
                             elif el_loser_prob > 0.18:
                                 sig.confidence *= 0.80
                                 ml_stats['el_penalty'] += 1

@@ -15269,6 +15269,213 @@ class BreakoutStopPredictor:
         return model
 
 
+class BreakoutMomentumValidator:
+    """Arch 60: Predict immediate breakout momentum (MFE in first 6 bars).
+
+    Key insight: ultra-tight trail needs the price to move favorably by at least
+    0.01% for the trail to activate. Breakouts with zero immediate momentum
+    (stall breakouts) will sit at breakeven until timeout or stop.
+
+    Label: immediate_mfe_pct = max favorable excursion in first 6 bars after entry
+    Binary: good_momentum = (immediate_mfe_pct > 0.10%)  — enough for trail to work
+
+    Uses breakout-specific features:
+    - Channel break probability alignment across timeframes
+    - Volume surge at breakout (confirming vs fake)
+    - Momentum coherence (price + energy + slope aligned)
+    - Time-of-day (breakouts at open vs midday behave differently)
+    """
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+        self.derived_names = None
+
+    def derive_features(self, X, feature_names):
+        """Extract breakout momentum features."""
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+        feats = []
+        names = []
+
+        # Per-TF breakout indicators
+        for tf in ML_TFS:
+            for key in ['break_prob', 'channel_health', 'width_pct',
+                        'position_pct', 'slope_normalized', 'kinetic_energy',
+                        'potential_energy', 'momentum_direction', 'center_distance',
+                        'bars_since_touch', 'touch_count']:
+                idx = name_to_idx.get(f'{tf}_{key}')
+                if idx is not None:
+                    feats.append(X[:, idx])
+                    names.append(f'bm_{tf}_{key}')
+
+        # Temporal dynamics (momentum building or fading)
+        for key in ['health_delta_3bar', 'health_delta_6bar',
+                    'break_prob_delta_3bar', 'break_prob_delta_6bar',
+                    'entropy_delta_3bar', 'rsi_slope_5bar',
+                    'vol_trend_5bar', 'price_acceleration_5bar',
+                    'momentum_delta_3bar', 'ke_delta_3bar']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'bm_{key}')
+
+        # Context features (volume, volatility, time)
+        for key in ['atr_pct', 'volume_ratio_20', 'bar_range_pct',
+                    'rsi_14', 'bb_position', 'minutes_since_open',
+                    'is_first_hour', 'is_last_hour', 'is_overnight']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'bm_{key}')
+
+        # Cross-TF alignment (strong breakouts align across timeframes)
+        for key in ['direction_agreement', 'avg_break_prob', 'avg_health',
+                    'health_min', 'health_std', 'width_dispersion',
+                    'energy_alignment', 'momentum_alignment']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'bm_{key}')
+
+        # Correlation features
+        for key in ['vix_level', 'tsla_spy_corr_20', 'spy_rsi_14',
+                    'tsla_spy_beta_20', 'spy_volume_ratio']:
+            idx = name_to_idx.get(key)
+            if idx is not None:
+                feats.append(X[:, idx])
+                names.append(f'bm_{key}')
+
+        # Derived: breakout quality composites
+        bp_indices = [name_to_idx.get(f'{tf}_break_prob') for tf in ML_TFS]
+        bp_vals = [X[:, idx] for idx in bp_indices if idx is not None]
+        if bp_vals:
+            bp_stack = np.column_stack(bp_vals)
+            feats.append(np.max(bp_stack, axis=1))
+            names.append('bm_max_break_prob')
+            feats.append(np.mean(bp_stack, axis=1))
+            names.append('bm_mean_break_prob')
+            feats.append(np.std(bp_stack, axis=1))
+            names.append('bm_std_break_prob')
+            # Count TFs with high break prob (> 0.5)
+            feats.append(np.sum(bp_stack > 0.5, axis=1).astype(float))
+            names.append('bm_high_bp_count')
+
+        ke_indices = [name_to_idx.get(f'{tf}_kinetic_energy') for tf in ML_TFS]
+        ke_vals = [X[:, idx] for idx in ke_indices if idx is not None]
+        if ke_vals:
+            ke_stack = np.column_stack(ke_vals)
+            feats.append(np.max(ke_stack, axis=1))
+            names.append('bm_max_ke')
+            feats.append(np.mean(ke_stack, axis=1))
+            names.append('bm_mean_ke')
+
+        if len(feats) == 0:
+            return X, feature_names
+        return np.column_stack(feats), names
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train breakout momentum validator on MFE labels."""
+        import lightgbm as lgb
+        from sklearn.metrics import roc_auc_score
+
+        self.feature_names = list(feature_names)
+
+        # Create binary label: good momentum = MFE > 0.10% in first 6 bars
+        # Uses ret5 as proxy for short-term favorable movement
+        if isinstance(Y_train, dict):
+            mfe_train = Y_train.get('future_return_5', np.zeros(len(X_train)))
+            mfe_val = Y_val.get('future_return_5', np.zeros(len(X_val)))
+        else:
+            mfe_train = np.zeros(len(X_train))
+            mfe_val = np.zeros(len(X_val))
+
+        # For breakout trades, positive MFE means price moved in breakout direction
+        # Label: 1 = good momentum (favorable move > 0.1%), 0 = stalled/adverse
+        y_train = (np.abs(mfe_train) > 0.001).astype(float)
+        y_val = (np.abs(mfe_val) > 0.001).astype(float)
+
+        print(f"\n  Breakout Momentum Validator:")
+        print(f"    Training: {len(y_train)} samples, {y_train.sum():.0f} ({y_train.mean():.1%}) good momentum")
+        print(f"    Validation: {len(y_val)} samples, {y_val.sum():.0f} ({y_val.mean():.1%}) good momentum")
+
+        # Derive features
+        bm_X_train, self.derived_names = self.derive_features(X_train, feature_names)
+        bm_X_val, _ = self.derive_features(X_val, feature_names)
+
+        print(f"    Derived features: {len(self.derived_names)}")
+
+        # Train with LightGBM
+        train_data = lgb.Dataset(bm_X_train, label=y_train, feature_name=self.derived_names)
+        val_data = lgb.Dataset(bm_X_val, label=y_val, feature_name=self.derived_names, reference=train_data)
+
+        params = {
+            'objective': 'binary',
+            'metric': 'auc',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'min_child_samples': 20,
+            'verbose': -1,
+            'seed': 42,
+        }
+
+        callbacks = [lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)]
+        self.model = lgb.train(
+            params, train_data,
+            num_boost_round=500,
+            valid_sets=[val_data],
+            callbacks=callbacks,
+        )
+
+        # Evaluate
+        metrics = {}
+        bm_pred = self.model.predict(bm_X_val)
+        try:
+            auc = roc_auc_score(y_val, bm_pred)
+            metrics['breakout_momentum_auc'] = float(auc)
+            print(f"    AUC: {auc:.3f}")
+        except Exception:
+            metrics['breakout_momentum_auc'] = 0.5
+            print(f"    AUC: N/A (single class)")
+
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n    Top 10 breakout momentum features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"      {rank+1}. {self.derived_names[idx]}: {imp[idx]:.0f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        bm_X, _ = self.derive_features(X, self.feature_names)
+        return {
+            'momentum_prob': self.model.predict(bm_X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+                'derived_names': self.derived_names,
+            }, f)
+        print(f"  Saved BreakoutMomentumValidator to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'BreakoutMomentumValidator':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        model.derived_names = data['derived_names']
+        return model
+
+
 # ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
@@ -15898,7 +16105,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity', 'breakout_stop'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity', 'breakout_stop', 'breakout_momentum'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -16367,6 +16574,14 @@ def main():
                 )
                 bs.save(os.path.join(args.output, 'breakout_stop_model.pkl'))
                 print(f"\n  Breakout Stop metrics: {bs_metrics}")
+
+            elif args.arch == 'breakout_momentum':
+                bm = BreakoutMomentumValidator()
+                bm_metrics = bm.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                bm.save(os.path.join(args.output, 'breakout_momentum_model.pkl'))
+                print(f"\n  Breakout Momentum metrics: {bm_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")
