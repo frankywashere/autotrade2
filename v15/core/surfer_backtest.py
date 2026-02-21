@@ -2826,6 +2826,14 @@ def run_backtest(
                                 ml_stats.setdefault('slope_align_bounce', 0)
                                 ml_stats['slope_align_bounce'] += 1
 
+                    # Arch 109: Long oscillation period bounce reduction (hard to time long cycles)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps109 = analysis.tf_states.get(sig.primary_tf)
+                        if ps109 and ps109.oscillation_period >= 50.0:
+                            trade_size *= 0.80
+                            ml_stats.setdefault('long_osc_reduce', 0)
+                            ml_stats['long_osc_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
