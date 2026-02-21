@@ -2910,6 +2910,20 @@ def run_backtest(
                             ml_stats.setdefault('single_tf_reduce', 0)
                             ml_stats['single_tf_reduce'] += 1
 
+
+                    # Arch 118: Daily TF trend-aligned break boost
+                    if realistic and sig.signal_type == 'break':
+                        daily_state = analysis.tf_states.get('daily')
+                        if daily_state and daily_state.valid:
+                            aligned = (
+                                (sig.action == 'BUY' and daily_state.channel_direction == 'bull') or
+                                (sig.action == 'SELL' and daily_state.channel_direction == 'bear')
+                            )
+                            if aligned:
+                                trade_size *= 1.20
+                                ml_stats.setdefault('trend_break_boost', 0)
+                                ml_stats['trend_break_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
