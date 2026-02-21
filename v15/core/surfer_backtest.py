@@ -2970,6 +2970,21 @@ def run_backtest(
                                 ml_stats.setdefault('multi_tf_pe_boost', 0)
                                 ml_stats['multi_tf_pe_boost'] += 1
 
+
+                    # Arch 122: Multi-TF continuous BE scaling (higher BE = more penalty)
+                    if realistic and sig.signal_type == 'bounce':
+                        be_vals = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be_vals.append(tf_state.binding_energy)
+                        if be_vals:
+                            avg_be = sum(be_vals) / len(be_vals)
+                            if avg_be > 0.40:
+                                be_mult = max(0.60, 1.0 - (avg_be - 0.40) * 1.0)
+                                trade_size *= be_mult
+                                ml_stats.setdefault('multi_tf_be_cont', 0)
+                                ml_stats['multi_tf_be_cont'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
