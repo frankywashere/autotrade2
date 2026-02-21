@@ -2667,21 +2667,6 @@ def run_backtest(
                             ml_stats.setdefault('high_pe_bounce', 0)
                             ml_stats['high_pe_bounce'] += 1
 
-                    # Arch 91: Multi-TF momentum agreement
-                    if realistic:
-                        agree_count = 0
-                        for _tf91, _st91 in analysis.tf_states.items():
-                            if not _st91.valid:
-                                continue
-                            if sig.action == 'BUY' and _st91.momentum_direction > 0.3:
-                                agree_count += 1
-                            elif sig.action == 'SELL' and _st91.momentum_direction < -0.3:
-                                agree_count += 1
-                        if agree_count >= 3:
-                            trade_size *= 1.15
-                            ml_stats.setdefault('multi_tf_agree', 0)
-                            ml_stats['multi_tf_agree'] += 1
-
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
