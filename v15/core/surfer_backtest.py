@@ -2486,6 +2486,12 @@ def run_backtest(
                             ml_stats.setdefault('high_vol_break', 0)
                             ml_stats['high_vol_break'] += 1
 
+                    # Arch 79: Confluence boost (multi-TF agreement)
+                    if realistic and hasattr(sig, 'confluence_score') and sig.confluence_score > 0.80:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('confluence_boost', 0)
+                        ml_stats['confluence_boost'] += 1
+
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
