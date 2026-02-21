@@ -2001,9 +2001,9 @@ def run_backtest(
 
                 # Risk-normalized position sizing
                 if realistic:
-                    # Realistic: flat 2% risk of initial capital, no compounding, no confidence tiers
+                    # Realistic: 2% risk of current equity (mild compounding)
                     risk_mult = 0.02
-                    risk_budget = initial_equity * risk_mult
+                    risk_budget = equity * risk_mult
                 else:
                     # Original: scale with equity growth + confidence tiers + streaks
                     equity_scale = equity / initial_equity  # Grows as we win
