@@ -2582,6 +2582,14 @@ def run_backtest(
                             ml_stats.setdefault('counter_trend_boost', 0)
                             ml_stats['counter_trend_boost'] += 1
 
+                    # Arch 101: R-squared quality — high fit channels are more reliable
+                    if realistic and sig.signal_type == 'bounce':
+                        ps101 = analysis.tf_states.get(sig.primary_tf)
+                        if ps101 and ps101.r_squared > 0.85:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('high_rsq_bounce', 0)
+                            ml_stats['high_rsq_bounce'] += 1
+
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
