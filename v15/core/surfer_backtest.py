@@ -2510,6 +2510,13 @@ def run_backtest(
                             ml_stats.setdefault('dd_reduce', 0)
                             ml_stats['dd_reduce'] += 1
 
+                    # Arch 75: Win streak acceleration
+                    if realistic and consecutive_wins >= 3:
+                        streak_mult = min(1.0 + consecutive_wins * 0.05, 1.25)
+                        trade_size *= streak_mult
+                        ml_stats.setdefault('streak_accel', 0)
+                        ml_stats['streak_accel'] += 1
+
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
