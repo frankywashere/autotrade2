@@ -3017,6 +3017,23 @@ def run_backtest(
                             ml_stats.setdefault('comprehensive_score', 0)
                             ml_stats['comprehensive_score'] += 1
 
+
+                    # Arch 125: BE-heavy comprehensive score (reinforces Arch 124 with BE emphasis)
+                    if realistic and sig.signal_type == 'bounce':
+                        be2, pe2, th2, ed2 = [], [], [], []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be2.append(tf_state.binding_energy)
+                                pe2.append(tf_state.potential_energy)
+                                th2.append(tf_state.ou_theta)
+                                ep = max(0, 1.0 - min(tf_state.position_pct, 1.0 - tf_state.position_pct) / 0.15)
+                                ed2.append(min(ep, 1.0))
+                        if be2:
+                            s = (1.0 - sum(be2)/len(be2)) * 0.5 + (sum(pe2)/len(pe2)) * 0.25 + min((sum(th2)/len(th2))/0.50, 1.0) * 0.15 + (sum(ed2)/len(ed2)) * 0.10
+                            trade_size *= (0.5 + 1.0 * s)
+                            ml_stats.setdefault('comprehensive_v2', 0)
+                            ml_stats['comprehensive_v2'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
