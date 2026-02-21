@@ -15851,6 +15851,121 @@ class BreakoutFadeDetector:
         return model
 
 
+class MomentumFollowThrough:
+    """Arch 63: Predict expected absolute 5-bar return magnitude (regression).
+
+    Uses LightGBM regression to predict how much price will move in the next
+    5 bars. Higher expected moves → wider trail to capture the full run.
+    Lower expected moves → tighter trail to protect against slippage erosion.
+
+    This is a regression model, not a classifier — it directly predicts
+    the magnitude of the move, which maps naturally to trail width.
+    """
+
+    def __init__(self):
+        self.model = None
+        self.feature_names = None
+
+    def train(self, X_train, Y_train, X_val, Y_val, feature_names):
+        """Train expected move magnitude predictor (regression)."""
+        import lightgbm as lgb
+
+        self.feature_names = list(feature_names)
+
+        # Target: absolute 5-bar forward return (regression)
+        if isinstance(Y_train, dict):
+            ret5_train = Y_train.get('future_return_5', np.zeros(len(X_train)))
+            ret5_val = Y_val.get('future_return_5', np.zeros(len(X_val)))
+        else:
+            ret5_train = np.zeros(len(X_train))
+            ret5_val = np.zeros(len(X_val))
+
+        y_train = np.abs(ret5_train).astype(np.float32)
+        y_val = np.abs(ret5_val).astype(np.float32)
+
+        print(f"\n  Momentum Follow-Through (Regression):")
+        print(f"    Training: {len(y_train)} samples, mean |ret5|={y_train.mean():.4f}, median={np.median(y_train):.4f}")
+        print(f"    Validation: {len(y_val)} samples, mean |ret5|={y_val.mean():.4f}, median={np.median(y_val):.4f}")
+
+        train_data = lgb.Dataset(X_train, label=y_train, feature_name=self.feature_names)
+        val_data = lgb.Dataset(X_val, label=y_val, feature_name=self.feature_names, reference=train_data)
+
+        params = {
+            'objective': 'regression',
+            'metric': 'mae',
+            'num_leaves': 31,
+            'learning_rate': 0.03,
+            'feature_fraction': 0.7,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'min_child_samples': 20,
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.0,
+            'verbose': -1,
+            'seed': 42,
+        }
+
+        callbacks = [lgb.early_stopping(80, verbose=False), lgb.log_evaluation(0)]
+        self.model = lgb.train(
+            params, train_data,
+            num_boost_round=1000,
+            valid_sets=[val_data],
+            callbacks=callbacks,
+        )
+
+        # Evaluate
+        metrics = {}
+        pred = self.model.predict(X_val)
+        mae = float(np.mean(np.abs(pred - y_val)))
+        corr = float(np.corrcoef(pred, y_val)[0, 1]) if len(pred) > 2 else 0.0
+        metrics['move_mae'] = mae
+        metrics['move_corr'] = corr
+        print(f"    MAE: {mae:.5f}")
+        print(f"    Correlation (pred vs actual): {corr:.3f}")
+        print(f"    Pred range: [{pred.min():.4f}, {pred.max():.4f}]")
+
+        # Feature importance
+        imp = self.model.feature_importance(importance_type='gain')
+        top_idx = np.argsort(imp)[::-1][:10]
+        print("\n    Top 10 expected-move features:")
+        for rank, idx in enumerate(top_idx):
+            print(f"      {rank+1}. {self.feature_names[idx]}: {imp[idx]:.0f}")
+
+        # Calibration: does higher predicted move correspond to higher actual move?
+        for pctile in [25, 50, 75]:
+            thresh = np.percentile(pred, pctile)
+            mask = pred > thresh
+            if mask.sum() > 0:
+                actual_mean = y_val[mask].mean()
+                print(f"    Mean actual |ret5| when pred > p{pctile}({thresh:.4f}): {actual_mean:.4f}")
+
+        return metrics
+
+    def predict(self, X: np.ndarray) -> dict:
+        if self.model is None:
+            return {}
+        return {
+            'expected_move': self.model.predict(X),
+        }
+
+    def save(self, path: str):
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'feature_names': self.feature_names,
+            }, f)
+        print(f"  Saved MomentumFollowThrough to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'MomentumFollowThrough':
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        model = cls()
+        model.model = data['model']
+        model.feature_names = data['feature_names']
+        return model
+
+
 # ---------------------------------------------------------------------------
 # Main Training Pipeline
 # ---------------------------------------------------------------------------
@@ -16480,7 +16595,7 @@ def main():
     train_parser = sub.add_parser('train', help='Train ML models')
     train_parser.add_argument('--days', type=int, default=60,
                              help='Days of historical data (default: 60)')
-    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity', 'breakout_stop', 'breakout_momentum', 'extended_run', 'breakout_fade'],
+    train_parser.add_argument('--arch', choices=['all', 'gbt', 'survival', 'transformer', 'quality', 'ensemble', 'regime', 'temporal', 'trend_gbt', 'cv_ensemble', 'physics_residual', 'adverse_movement', 'entry_timing', 'composite', 'vol_transition', 'exit_timing', 'exhaustion', 'cross_asset', 'stop_loss', 'bayesian', 'trail', 'session', 'maturity', 'momentum', 'asymmetry', 'gap_risk', 'reversion', 'liquidity', 'transition', 'profit_target', 'alignment', 'duration', 'winner', 'fractal', 'volume_conviction', 'energy_momentum', 'multi_exit', 'adversarial', 'cascade', 'knn', 'quantile_risk', 'tail_risk', 'drawdown_recovery', 'stop_distance', 'vol_clustering', 'extreme_loser', 'risk_reward', 'return_consistency', 'horizon_divergence', 'drawdown_magnitude', 'win_streak', 'reversal_proximity', 'vol_return_regime', 'multi_horizon_loser', 'bounce_loser', 'feature_interaction', 'momentum_reversal', 'immediate_stop', 'profit_velocity', 'breakout_stop', 'breakout_momentum', 'extended_run', 'breakout_fade', 'follow_through'],
                              default='all', help='Architecture to train')
     train_parser.add_argument('--output', type=str, default='surfer_models',
                              help='Output directory')
@@ -16972,6 +17087,14 @@ def main():
                 )
                 bf.save(os.path.join(args.output, 'breakout_fade_model.pkl'))
                 print(f"\n  Breakout Fade metrics: {bf_metrics}")
+
+            elif args.arch == 'follow_through':
+                ft = MomentumFollowThrough()
+                ft_metrics = ft.train(
+                    X_train, Y_train, X_val, Y_val, feature_names,
+                )
+                ft.save(os.path.join(args.output, 'follow_through_model.pkl'))
+                print(f"\n  Follow-Through metrics: {ft_metrics}")
 
     elif args.command == 'evaluate':
         print(f"Evaluating checkpoint: {args.checkpoint}")

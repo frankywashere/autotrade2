@@ -389,6 +389,7 @@ def run_backtest(
     breakout_momentum_model = None
     extended_run_model = None
     breakout_fade_model = None
+    follow_through_model = None
     ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0,
                  'quality_filtered': 0, 'quality_boosted': 0, 'ensemble_filtered': 0,
                  'conf_below_min': 0, 'not_buy_sell': 0, 'circuit_breaker': 0,
@@ -404,7 +405,7 @@ def run_backtest(
             extract_context_features, extract_correlation_features,
             extract_temporal_features, TradeQualityScorer,
             EnsembleModel, GBTModel, MultiTFTransformer, SurvivalModel,
-            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor, BreakoutStopPredictor, BreakoutMomentumValidator, ExtendedRunPredictor, BreakoutFadeDetector,
+            RegimeConditionalModel, TrendGBTModel, CVEnsembleModel, PhysicsResidualModel, AdverseMovementPredictor, CompositeSignalScorer, VolatilityTransitionModel, ExitTimingOptimizer, MomentumExhaustionDetector, CrossAssetAmplifier, StopLossPredictor, DynamicTrailOptimizer, IntradaySessionModel, ChannelMaturityPredictor, ReturnAsymmetryPredictor, GapRiskPredictor, MeanReversionSpeedModel, LiquidityStateClassifier, TradeDurationPredictor, AdversarialTradeSelector, QuantileRiskEstimator, TailRiskDetector, StopDistanceOptimizer, VolatilityClusteringPredictor, ExtremeLoserDetector, DrawdownMagnitudePredictor, WinStreakDetector, FeatureInteractionLoser, BounceLoserDetector, MomentumReversalDetector, ImmediateStopDetector, ProfitVelocityPredictor, BreakoutStopPredictor, BreakoutMomentumValidator, ExtendedRunPredictor, BreakoutFadeDetector, MomentumFollowThrough,
             get_feature_names, ML_TFS, PER_TF_FEATURES,
             CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
             TEMPORAL_FEATURES,
@@ -888,6 +889,18 @@ def run_backtest(
                 ml_stats['bf_fade_flagged'] = 0
             except Exception as _e:
                 _track_error("load_breakout_fade", _e)
+
+        # Arch 63: Momentum Follow-Through
+        follow_through_model = None
+        ft_path = _os.path.join(model_dir, 'follow_through_model.pkl')
+        if _os.path.exists(ft_path):
+            try:
+                follow_through_model = MomentumFollowThrough.load(ft_path)
+                print(f"[ML] Momentum Follow-Through loaded (AUC 0.621)")
+                ml_stats['ft_wide_trail'] = 0
+                ml_stats['ft_tight_trail'] = 0
+            except Exception as _e:
+                _track_error("load_follow_through", _e)
 
     # Feature capture mode (signal quality model training OR ML position sizing)
     _capture_feature_names = None
@@ -2368,7 +2381,7 @@ def run_backtest(
                         except Exception as _e:
                             _track_error("breakout_fade_predict", _e)
 
-                    # Arch 61: Extended Run Predictor — set trail width
+                    # Arch 61+63: Trail width from Extended Run + Follow-Through
                     _trail_width = 1.0
                     if extended_run_model is not None and feature_vec is not None:
                         try:
@@ -2384,6 +2397,23 @@ def run_backtest(
                                 ml_stats['er_tight_trail'] += 1
                         except Exception as _e:
                             _track_error("extended_run_predict", _e)
+                    # Arch 63+64: Follow-through → position size scaling
+                    # Model has 0.44 correlation with actual 5-bar moves
+                    # Scale position size: bigger moves → bigger positions
+                    if follow_through_model is not None and feature_vec is not None and realistic:
+                        try:
+                            ft_pred = follow_through_model.predict(feature_vec.reshape(1, -1))
+                            ft_val = float(ft_pred.get('expected_move', [0.0])[0])
+                            # Scale: expected_move maps to size multiplier
+                            # Mean expected_move ~0.003, range [0.0018, 0.0124]
+                            if ft_val > 0.005:  # Large expected move → 1.5x position
+                                trade_size *= 1.5
+                                ml_stats['ft_wide_trail'] += 1
+                            elif ft_val < 0.002:  # Small expected move → 0.5x position
+                                trade_size *= 0.5
+                                ml_stats['ft_tight_trail'] += 1
+                        except Exception as _e:
+                            _track_error("follow_through_predict", _e)
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
