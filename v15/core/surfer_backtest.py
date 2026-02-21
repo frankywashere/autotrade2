@@ -2398,6 +2398,12 @@ def run_backtest(
                                 ml_stats['er_tight_trail'] += 1
                         except Exception as _e:
                             _track_error("extended_run_predict", _e)
+                    # Arch 65: Bounce premium sizing — bounces are 97.6% WR, size them up
+                    if realistic and sig.signal_type == 'bounce':
+                        trade_size *= 1.5  # Size up on reliable bounces
+                        ml_stats.setdefault('bounce_sized_up', 0)
+                        ml_stats['bounce_sized_up'] += 1
+
                     # Arch 63+64: Follow-through → position sizing + breakout gate
                     # Model has 0.44 correlation with actual 5-bar moves
                     if follow_through_model is not None and feature_vec is not None and realistic:
