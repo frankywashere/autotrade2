@@ -2443,9 +2443,9 @@ def run_backtest(
                     # SELL bounces: 98% WR → aggressive, BUY bounces: 95% WR → moderate
                     if realistic and sig.signal_type == 'bounce':
                         if sig.action == 'SELL':
-                            trade_size *= 2.3  # SELL bounces: highest WR
+                            trade_size *= 1.2  # SELL bounces
                         else:
-                            trade_size *= 1.9  # BUY bounces: slightly lower WR
+                            trade_size *= 1.0  # BUY bounces
                         ml_stats.setdefault('bounce_sized_up', 0)
                         ml_stats['bounce_sized_up'] += 1
                         # Arch 77: Wide-stop bounce boost (98% WR vs 91% for narrow)
@@ -2796,6 +2796,14 @@ def run_backtest(
                             trade_size *= 0.75
                             ml_stats.setdefault('high_entropy_break_reduce', 0)
                             ml_stats['high_entropy_break_reduce'] += 1
+
+                    # Arch 105: High entropy break boost (volatile channel = big breakout move)
+                    if realistic and sig.signal_type == 'break':
+                        ps105 = analysis.tf_states.get(sig.primary_tf)
+                        if ps105 and ps105.entropy > 0.90:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('high_entropy_break_boost', 0)
+                            ml_stats['high_entropy_break_boost'] += 1
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
