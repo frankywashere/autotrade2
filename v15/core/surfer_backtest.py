@@ -2352,11 +2352,15 @@ def run_backtest(
                     bar_time = tsla.index[bar]
                     hour = bar_time.hour if hasattr(bar_time, 'hour') else 12
                     minute = bar_time.minute if hasattr(bar_time, 'minute') else 0
-                    minutes_from_open = (hour - 9) * 60 + minute - 30  # EST
-                    if minutes_from_open < 60:  # First hour
-                        trade_size *= 1.35
-                    elif minutes_from_open > 330:  # Last 30 min
-                        trade_size *= 1.25
+                    # Arch 99: Time-of-day sizing (fix UTC→EST)
+                    est_hour = (hour - 5) % 24
+                    minutes_from_open = (est_hour - 9) * 60 + minute - 30
+                    if 0 <= minutes_from_open < 15:
+                        trade_size *= 0.70  # Opening noise
+                    elif 0 <= minutes_from_open < 60:
+                        trade_size *= 1.35  # First hour
+                    elif minutes_from_open > 330:
+                        trade_size *= 1.25  # Last 30 min
 
                     # Max exposure check: total open position value < 7x equity
                     total_exposure = sum(p.trade_size for p in positions)
