@@ -2436,6 +2436,11 @@ def run_backtest(
                             trade_size *= 1.9  # BUY bounces: slightly lower WR
                         ml_stats.setdefault('bounce_sized_up', 0)
                         ml_stats['bounce_sized_up'] += 1
+                        # Arch 77: Wide-stop bounce boost (98% WR vs 91% for narrow)
+                        if adjusted_stop_pct >= 0.003:
+                            trade_size *= 1.2
+                            ml_stats.setdefault('wide_bounce_boost', 0)
+                            ml_stats['wide_bounce_boost'] += 1
 
                     # Arch 68: Channel health inverse sizing for breakouts
                     # Higher channel_health correlates with WORSE breakout P&L (-0.173 corr)
