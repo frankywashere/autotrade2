@@ -2695,6 +2695,14 @@ def run_backtest(
                             ml_stats.setdefault('post_stop_reduce', 0)
                             ml_stats['post_stop_reduce'] += 1
 
+                    # Arch 95: Win magnitude regime — big recent wins = favorable regime
+                    if realistic and len(trades) >= 5:
+                        recent_pnls = [t.pnl_pct for t in trades[-5:] if t.pnl > 0]
+                        if recent_pnls and np.mean(recent_pnls) > 0.002:
+                            trade_size *= 1.10
+                            ml_stats.setdefault('big_win_regime', 0)
+                            ml_stats['big_win_regime'] += 1
+
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
