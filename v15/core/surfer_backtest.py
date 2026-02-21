@@ -2558,6 +2558,19 @@ def run_backtest(
                             ml_stats.setdefault('vol_confirm', 0)
                             ml_stats['vol_confirm'] += 1
 
+                    # Arch 89: Counter-trend bounce boost (mean reversion against intraday trend)
+                    if realistic and sig.signal_type == 'bounce' and bar >= 78:
+                        day_open_bar = max(0, bar - 78)
+                        day_ret = (closes[bar] - closes[day_open_bar]) / closes[day_open_bar]
+                        counter_trend = (
+                            (day_ret > 0.005 and sig.action == 'SELL') or
+                            (day_ret < -0.005 and sig.action == 'BUY')
+                        )
+                        if counter_trend:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('counter_trend_boost', 0)
+                            ml_stats['counter_trend_boost'] += 1
+
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
@@ -2645,6 +2658,14 @@ def run_backtest(
                             trade_size *= 1.15
                             ml_stats.setdefault('low_var_boost', 0)
                             ml_stats['low_var_boost'] += 1
+
+                    # Arch 90: High potential energy bounce (near boundary = stronger reversion)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps90 = analysis.tf_states.get(sig.primary_tf)
+                        if ps90 and ps90.potential_energy > 0.50:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('high_pe_bounce', 0)
+                            ml_stats['high_pe_bounce'] += 1
 
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
