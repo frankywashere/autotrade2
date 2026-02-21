@@ -2870,6 +2870,15 @@ def run_backtest(
                             ml_stats.setdefault('edge_bounce_boost', 0)
                             ml_stats['edge_bounce_boost'] += 1
 
+
+                    # Arch 114: Double-high energy bounce super boost (hot zone - KE+PE both high)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps114 = analysis.tf_states.get(sig.primary_tf)
+                        if ps114 and ps114.kinetic_energy > 0.70 and ps114.potential_energy > 0.70:
+                            trade_size *= 1.30
+                            ml_stats.setdefault('hot_zone_boost', 0)
+                            ml_stats['hot_zone_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
