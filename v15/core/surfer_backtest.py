@@ -148,22 +148,25 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (position.trailing_stop - entry) / entry
-            # Three-tier breakout trail (with progressive tightening)
-            # BUY breakouts use lower tier-3 activation (0.10% vs 0.15%)
-            # because BUY break losers have MFE 0.08-0.14%
-            tier3_thresh = 0.002 if el else 0.0008
-            if profit_from_best > 0.015:
+            # Ultra-tight stop breakeven: if stop < 0.1%, protect at tiny profit
+            if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
+                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.50)
+                effective_stop = max(position.stop_price, trail_from_best)
+            # Three-tier breakout trail
+            elif profit_from_best > 0.015:
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.01)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.02)
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_from_best > tier3_thresh:
-                trail_mult = 0.20 if el else 0.01
-                trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
-                effective_stop = max(position.stop_price, trail_from_best)
             else:
-                effective_stop = position.stop_price
+                tier3_thresh = 0.002 if el else 0.0008
+                trail_mult = 0.20 if el else 0.01
+                if profit_from_best > tier3_thresh:
+                    trail_from_best = position.trailing_stop * (1 - initial_stop_dist * trail_mult)
+                    effective_stop = max(position.stop_price, trail_from_best)
+                else:
+                    effective_stop = position.stop_price
         else:
             profit_from_entry = (position.trailing_stop - entry) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
@@ -199,19 +202,25 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
         if is_breakout:
             profit_from_best = (entry - position.trailing_stop) / entry
+            # Ultra-tight stop breakeven: if stop < 0.1%, protect at tiny profit
+            if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
+                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.50)
+                effective_stop = min(position.stop_price, trail_from_best)
             # Three-tier breakout trail
-            if profit_from_best > 0.015:
+            elif profit_from_best > 0.015:
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.01)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_from_best > 0.008:
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.02)
                 effective_stop = min(position.stop_price, trail_from_best)
-            elif profit_from_best > (0.002 if el else 0.0003):
-                trail_mult = 0.20 if el else 0.01
-                trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult)
-                effective_stop = min(position.stop_price, trail_from_best)
             else:
-                effective_stop = position.stop_price
+                tier3_thresh = 0.002 if el else 0.0003
+                trail_mult = 0.20 if el else 0.01
+                if profit_from_best > tier3_thresh:
+                    trail_from_best = position.trailing_stop * (1 + initial_stop_dist * trail_mult)
+                    effective_stop = min(position.stop_price, trail_from_best)
+                else:
+                    effective_stop = position.stop_price
         else:
             profit_from_entry = (entry - position.trailing_stop) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
@@ -338,6 +347,8 @@ def run_backtest(
     max_leverage: float = 4.0,
     initial_capital: float = 0.0,       # 0 = use position_size * 10
     capture_features: bool = False,     # Save ML feature vectors per trade
+    signal_quality_model=None,          # SignalQualityModel for ML position sizing
+    ml_size_fn=None,                    # Callable(quality_score) -> scale_factor
 ) -> tuple:
     """
     Run Channel Surfer backtest on historical 5-min TSLA data.
@@ -820,13 +831,16 @@ def run_backtest(
             except Exception:
                 pass
 
-    # Feature capture mode (signal quality model training)
+    # Feature capture mode (signal quality model training OR ML position sizing)
     _capture_feature_names = None
     _capture_history_buffer: List[Dict] = []
-    if capture_features and not ml_active:
+    if (capture_features or signal_quality_model is not None) and not ml_active:
         from v15.core.surfer_ml import get_feature_names
         _capture_feature_names = get_feature_names()
-        print(f"[CAPTURE] Feature capture enabled ({len(_capture_feature_names)} features)")
+        if capture_features:
+            print(f"[CAPTURE] Feature capture enabled ({len(_capture_feature_names)} features)")
+        if signal_quality_model is not None:
+            print(f"[ML-SIZING] Signal quality model loaded ({len(_capture_feature_names)} base features)")
 
     # Use pre-loaded data if provided (skip yfinance entirely)
     if tsla_df is not None:
@@ -1283,9 +1297,9 @@ def run_backtest(
 
             sig = analysis.signal
 
-            # --- Feature Capture (signal quality model) ---
+            # --- Feature Capture (signal quality model / ML sizing) ---
             current_signal_features = None
-            if capture_features and not ml_active and sig.action in ('BUY', 'SELL'):
+            if (capture_features or signal_quality_model is not None) and not ml_active and sig.action in ('BUY', 'SELL'):
                 try:
                     current_signal_features, _ = _extract_signal_features(
                         analysis, tsla, bar, closes, spy_df, vix_df,
@@ -1947,6 +1961,34 @@ def run_backtest(
                 # Risk-normalized sizing: trade_size = risk_budget / stop_pct
                 # Wider stops → smaller position, tighter stops → larger position
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
+
+                # --- ML Position Sizing ---
+                if signal_quality_model is not None and ml_size_fn is not None and current_signal_features is not None:
+                    try:
+                        from v15.validation.signal_quality_model import _append_signal_meta
+                        class _TradeLike:
+                            pass
+                        _t = _TradeLike()
+                        _t.signal_type = sig.signal_type
+                        _t.direction = sig.action
+                        _t.stop_pct = adjusted_stop_pct
+                        _t.tp_pct = sig.suggested_tp_pct
+                        _t.primary_tf = sig.primary_tf
+                        _t.entry_time = str(tsla.index[bar]) if bar < len(tsla) else ''
+                        _sig_data = {
+                            'position_score': sig.position_score,
+                            'energy_score': sig.energy_score,
+                            'entropy_score': sig.entropy_score,
+                            'confluence_score': sig.confluence_score,
+                            'timing_score': sig.timing_score,
+                            'channel_health': sig.channel_health,
+                            'confidence': sig.confidence,
+                        }
+                        full_vec = _append_signal_meta(current_signal_features, _t, _sig_data, extended=True)
+                        pred = signal_quality_model.predict(full_vec)
+                        trade_size *= ml_size_fn(pred['quality_score'])
+                    except Exception:
+                        pass  # On failure, use unscaled trade_size
 
                 if realistic:
                     # Realistic: leverage-based cap, no multiplicative boosts
