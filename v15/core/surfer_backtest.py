@@ -2753,6 +2753,16 @@ def run_backtest(
                         ml_stats.setdefault('low_conf_reduce', 0)
                         ml_stats['low_conf_reduce'] += 1
 
+                    # Arch 102: Break direction alignment — directional break_prob confirms signal
+                    if realistic and sig.signal_type == 'break':
+                        ps102 = analysis.tf_states.get(sig.primary_tf)
+                        if ps102:
+                            dir_prob = ps102.break_prob_up if sig.action == 'BUY' else ps102.break_prob_down
+                            if dir_prob > 0.40:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('break_dir_align', 0)
+                                ml_stats['break_dir_align'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
