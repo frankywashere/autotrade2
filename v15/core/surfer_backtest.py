@@ -2765,7 +2765,7 @@ def run_backtest(
 
                     # Arch 103: Intraday PnL cap — protect daily gains
                     if realistic and daily_pnl > equity * 0.03:
-                        trade_size *= 0.50  # Half-size after 3% daily gain
+                        trade_size *= 0.30  # 30% size after 3% daily gain
                         ml_stats.setdefault('daily_pnl_cap', 0)
                         ml_stats['daily_pnl_cap'] += 1
 
