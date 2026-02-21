@@ -2667,6 +2667,12 @@ def run_backtest(
                             ml_stats.setdefault('high_pe_bounce', 0)
                             ml_stats['high_pe_bounce'] += 1
 
+                    # Arch 91: Recent loser avoidance — reduce if last trade was a loss
+                    if realistic and trades and trades[-1].pnl < 0:
+                        trade_size *= 0.80
+                        ml_stats.setdefault('post_loss_reduce', 0)
+                        ml_stats['post_loss_reduce'] += 1
+
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
