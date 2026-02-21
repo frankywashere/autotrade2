@@ -2456,6 +2456,19 @@ def run_backtest(
                             ml_stats.setdefault('break_sell_boost', 0)
                             ml_stats['break_sell_boost'] += 1
 
+                    # Arch 76: Realized volatility sizing
+                    if realistic and bar >= 20:
+                        recent_rets = [(closes[b] - closes[b-1]) / closes[b-1] for b in range(bar-19, bar+1)]
+                        rvol = np.std(recent_rets) * 100  # as percentage
+                        if sig.signal_type == 'bounce' and rvol < 0.40:
+                            trade_size *= 1.2  # Low vol → cleaner bounces
+                            ml_stats.setdefault('low_vol_bounce', 0)
+                            ml_stats['low_vol_bounce'] += 1
+                        elif sig.signal_type == 'break' and rvol > 0.50:
+                            trade_size *= 1.2  # High vol → real breakouts
+                            ml_stats.setdefault('high_vol_break', 0)
+                            ml_stats['high_vol_break'] += 1
+
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
