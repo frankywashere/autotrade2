@@ -2703,6 +2703,15 @@ def run_backtest(
                             ml_stats.setdefault('big_win_regime', 0)
                             ml_stats['big_win_regime'] += 1
 
+                    # Arch 96: High MFE regime (recent trades had large favorable excursions)
+                    if realistic and len(trades) >= 5:
+                        avg_mfe = np.mean([t.mfe_pct for t in trades[-5:]])
+                        if avg_mfe > 0.003:
+                            trade_size *= 1.10
+                            ml_stats.setdefault('high_mfe_regime', 0)
+                            ml_stats['high_mfe_regime'] += 1
+
+
                     # Arch 96: Low confidence reduction (noisy signal = smaller bet)
                     if realistic and sig.confidence < 0.50:
                         trade_size *= 0.80
