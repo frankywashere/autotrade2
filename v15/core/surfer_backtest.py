@@ -2070,7 +2070,7 @@ def run_backtest(
                 #     ml_stats['bsp_stop_tighten'] += 1
 
                 # Arch 73: Skip ultra-narrow breakouts (stop<0.025%) — slippage eats profit
-                if realistic and sig.signal_type == 'break' and adjusted_stop_pct < 0.00025:
+                if realistic and sig.signal_type == 'break' and adjusted_stop_pct < 0.00030:
                     ml_stats.setdefault('narrow_break_skip', 0)
                     ml_stats['narrow_break_skip'] += 1
                     continue
@@ -2465,7 +2465,7 @@ def run_backtest(
                             (sig.action == 'SELL' and lookback_ret < -0.002)
                         )
                         if momentum_confirms:
-                            trade_size *= 1.3
+                            trade_size *= 1.2
                             ml_stats.setdefault('momentum_confirmed', 0)
                             ml_stats['momentum_confirmed'] += 1
 
@@ -2492,7 +2492,7 @@ def run_backtest(
 
                     # Arch 71: Signal persistence boost — same dir within 2 bars
                     if realistic and last_signal_dir == sig.action and (bar - last_signal_bar) <= 2:
-                        trade_size *= 1.2
+                        trade_size *= 1.1
                         ml_stats.setdefault('persist_boost', 0)
                         ml_stats['persist_boost'] += 1
                     last_signal_bar = bar
