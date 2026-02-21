@@ -2343,7 +2343,8 @@ def run_backtest(
                 primary_state = analysis.tf_states.get(sig.primary_tf)
                 ou_hl = primary_state.ou_half_life if primary_state else 5.0
 
-                # Entry delay disabled — all deferred trades get skipped (PF 8.49→6.61)
+                # Entry delay disabled — deferred entries don't work with ultra-tight 0.05x stops
+                # The stop check invalidates most deferred breakouts within 1 bar
                 defer_entry = False
                 sig_data = {
                     'position_score': sig.position_score,
@@ -2397,15 +2398,18 @@ def run_backtest(
                                 ml_stats['er_tight_trail'] += 1
                         except Exception as _e:
                             _track_error("extended_run_predict", _e)
-                    # Arch 63+64: Follow-through → position size scaling
+                    # Arch 63+64: Follow-through → position sizing + breakout gate
                     # Model has 0.44 correlation with actual 5-bar moves
-                    # Scale position size: bigger moves → bigger positions
                     if follow_through_model is not None and feature_vec is not None and realistic:
                         try:
                             ft_pred = follow_through_model.predict(feature_vec.reshape(1, -1))
                             ft_val = float(ft_pred.get('expected_move', [0.0])[0])
-                            # Scale: expected_move maps to size multiplier
-                            # Mean expected_move ~0.003, range [0.0018, 0.0124]
+                            # Arch 64: Skip low-move breakouts (not worth the slippage)
+                            if ft_val < 0.0022 and sig.signal_type == 'break':
+                                ml_stats.setdefault('ft_break_skipped', 0)
+                                ml_stats['ft_break_skipped'] += 1
+                                continue
+                            # Scale position size: bigger moves → bigger positions
                             if ft_val > 0.005:  # Large expected move → 1.5x position
                                 trade_size *= 1.5
                                 ml_stats['ft_wide_trail'] += 1
