@@ -2861,6 +2861,15 @@ def run_backtest(
                             ml_stats.setdefault('worst_bounce_reduce', 0)
                             ml_stats['worst_bounce_reduce'] += 1
 
+
+                    # Arch 113: Edge bounce boost (right at channel boundary = strong signal)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps113 = analysis.tf_states.get(sig.primary_tf)
+                        if ps113 and (ps113.position_pct < 0.05 or ps113.position_pct > 0.95):
+                            trade_size *= 1.20
+                            ml_stats.setdefault('edge_bounce_boost', 0)
+                            ml_stats['edge_bounce_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
