@@ -47,6 +47,7 @@ class Trade:
     mfe_pct: float = 0.0  # Maximum Favorable Excursion (best unrealized gain %)
     el_flagged: bool = False  # Was EL flagged at entry
     is_flagged: bool = False  # Was IS flagged at entry
+    entry_time: str = ''     # ISO timestamp of entry bar
 
 
 @dataclass
@@ -251,6 +252,16 @@ def run_backtest(
     min_confidence: float = 0.45,
     use_multi_tf: bool = True,  # Use higher TF data for context
     ml_model=None,              # Optional ML model for signal enhancement
+    # Pre-loaded data (skip yfinance when provided)
+    tsla_df: 'pd.DataFrame | None' = None,
+    higher_tf_dict: 'dict | None' = None,
+    spy_df_input: 'pd.DataFrame | None' = None,
+    # Realistic mode constraints
+    realistic: bool = False,
+    slippage_bps: float = 3.0,          # 3 basis points per side
+    commission_per_share: float = 0.005, # $0.005/share round trip
+    max_leverage: float = 4.0,
+    initial_capital: float = 0.0,       # 0 = use position_size * 10
 ) -> tuple:
     """
     Run Channel Surfer backtest on historical 5-min TSLA data.
@@ -729,9 +740,22 @@ def run_backtest(
             except Exception:
                 pass
 
+    # Use pre-loaded data if provided (skip yfinance entirely)
+    if tsla_df is not None:
+        tsla = tsla_df
+        higher_tf_data = higher_tf_dict or {}
+        spy_df = spy_df_input
+        vix_df = None
+        print(f"[PRE-LOADED] {len(tsla)} bars: {tsla.index[0]} to {tsla.index[-1]}")
+        if realistic:
+            print(f"[REALISTIC] max_leverage={max_leverage}x, slippage={slippage_bps}bps, "
+                  f"commission=${commission_per_share}/share")
+        _cache_hit = True
+    else:
+        _cache_hit = False
+
     # Fetch data (with file cache for consistent iterations)
-    _cache_hit = False
-    if _SURFER_DATA_CACHE.exists() and not _os_mod.environ.get('SURFER_REFRESH'):
+    if not _cache_hit and _SURFER_DATA_CACHE.exists() and not _os_mod.environ.get('SURFER_REFRESH'):
         try:
             with open(_SURFER_DATA_CACHE, 'rb') as _f:
                 _cached = _pickle.load(_f)
@@ -851,7 +875,7 @@ def run_backtest(
     position_signals: list = []  # Signal data for each open position
     max_positions = 2
     pending_entries = []  # Deferred entries: list of (bar, direction, signal_type, confidence, stop_pct, tp_pct, primary_tf, ou_hl, max_hold, el_flagged, fast_rev, trade_size, signal_data)
-    equity = position_size * 10  # Start with 100k
+    equity = initial_capital if initial_capital > 0 else position_size * 10
     initial_equity = equity
     peak_equity = equity
     max_dd = 0.0
@@ -962,11 +986,25 @@ def run_backtest(
                 exit_reason, exit_price = result
                 bars_held = bar - position.entry_bar
 
+                # Realistic: apply exit slippage
+                if realistic:
+                    slip = exit_price * slippage_bps / 10000
+                    if position.direction == 'BUY':
+                        exit_price -= slip  # Sell at worse (lower) price
+                    else:
+                        exit_price += slip  # Cover at worse (higher) price
+
                 if position.direction == 'BUY':
                     pnl_pct = (exit_price - position.entry_price) / position.entry_price
                 else:
                     pnl_pct = (position.entry_price - exit_price) / position.entry_price
                 pnl = pnl_pct * position.trade_size
+
+                # Realistic: deduct round-trip commission
+                if realistic:
+                    shares = position.trade_size / position.entry_price
+                    total_commission = commission_per_share * shares * 2
+                    pnl -= total_commission
 
                 if position.direction == 'BUY':
                     mae = (position.entry_price - position.worst_price) / position.entry_price if position.worst_price > 0 else 0
@@ -986,6 +1024,7 @@ def run_backtest(
                     signal_type=position.signal_type, trade_size=position.trade_size,
                     mae_pct=round(mae, 6), mfe_pct=round(mfe, 6),
                     el_flagged=position.el_flagged, is_flagged=getattr(position, 'is_flagged', False),
+                    entry_time=str(tsla.index[position.entry_bar]) if position.entry_bar < len(tsla) else '',
                 )
                 trades.append(trade)
                 equity += pnl
@@ -1100,6 +1139,13 @@ def run_backtest(
                 volumes_dict['5min'] = df_slice['volume'].values
 
             # Add higher TF channels (rolling window relative to current bar time)
+            # Only include COMPLETED bars — a bar timestamped at period start
+            # contains data through period end, so exclude it until then.
+            _TF_PERIOD = {
+                '1h': pd.Timedelta(hours=1),
+                '4h': pd.Timedelta(hours=4),
+                'daily': pd.Timedelta(days=1),
+            }
             if use_multi_tf:
                 current_time = tsla.index[bar]
                 # Normalize to tz-naive for comparison
@@ -1108,12 +1154,13 @@ def run_backtest(
                 else:
                     current_time_naive = current_time
                 for tf_label, tf_df in higher_tf_data.items():
-                    # Only use higher-TF data available at current time (no lookahead)
+                    # Only use completed higher-TF bars (no lookahead)
+                    tf_period = _TF_PERIOD.get(tf_label, pd.Timedelta(hours=1))
                     tf_idx = tf_df.index
                     if tf_idx.tz is not None:
-                        tf_available = tf_df[tf_idx <= current_time]
+                        tf_available = tf_df[(tf_idx + tf_period) <= current_time]
                     else:
-                        tf_available = tf_df[tf_idx <= current_time_naive]
+                        tf_available = tf_df[(tf_idx + tf_period) <= current_time_naive]
                     tf_recent = tf_available.tail(100)
                     if len(tf_recent) < 30:
                         continue
@@ -1766,24 +1813,30 @@ def run_backtest(
                 # Enter position
                 entry_price = current_price
 
-                # Risk-normalized position sizing: scale with equity growth
-                equity_scale = equity / initial_equity  # Grows as we win
-                # Higher base risk for bounces (94% WR = very safe)
-                risk_mult = 0.150 if sig.signal_type == 'bounce' else 0.150
-                base_risk = position_size * risk_mult * equity_scale
-                if sig.confidence >= 0.70:
-                    risk_budget = base_risk * 1.8
-                elif sig.confidence >= 0.60:
-                    risk_budget = base_risk * 1.5
+                # Risk-normalized position sizing
+                if realistic:
+                    # Realistic: flat 2% risk of initial capital, no compounding, no confidence tiers
+                    risk_mult = 0.02
+                    risk_budget = initial_equity * risk_mult
                 else:
-                    risk_budget = base_risk * 1.2
+                    # Original: scale with equity growth + confidence tiers + streaks
+                    equity_scale = equity / initial_equity  # Grows as we win
+                    # Higher base risk for bounces (94% WR = very safe)
+                    risk_mult = 0.150 if sig.signal_type == 'bounce' else 0.150
+                    base_risk = position_size * risk_mult * equity_scale
+                    if sig.confidence >= 0.70:
+                        risk_budget = base_risk * 1.8
+                    elif sig.confidence >= 0.60:
+                        risk_budget = base_risk * 1.5
+                    else:
+                        risk_budget = base_risk * 1.2
 
-                # Adaptive sizing: ramp up on win streaks, halve on losing streaks
-                if consecutive_wins >= 2:
-                    streak_boost = min(5.0, 1.0 + 0.50 * (consecutive_wins - 1))
-                    risk_budget *= streak_boost
-                if consecutive_losses >= 3:
-                    risk_budget *= 0.50  # Half size after 3+ consecutive losses
+                    # Adaptive sizing: ramp up on win streaks, halve on losing streaks
+                    if consecutive_wins >= 2:
+                        streak_boost = min(5.0, 1.0 + 0.50 * (consecutive_wins - 1))
+                        risk_budget *= streak_boost
+                    if consecutive_losses >= 3:
+                        risk_budget *= 0.50  # Half size after 3+ consecutive losses
 
                 # Volatility-adjusted stops: blend channel width with ATR
                 current_atr = atr[bar]
@@ -1831,210 +1884,238 @@ def run_backtest(
                 # Risk-normalized sizing: trade_size = risk_budget / stop_pct
                 # Wider stops → smaller position, tighter stops → larger position
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
-                # Separate caps: bounces are safer (higher WR, no stops)
-                if sig.signal_type == 'bounce':
-                    size_cap = position_size * 250
+
+                if realistic:
+                    # Realistic: leverage-based cap, no multiplicative boosts
+                    max_buying_power = equity * max_leverage
+                    size_cap = max_buying_power * 0.25  # Max 25% of buying power per trade
+                    trade_size = min(trade_size, size_cap)
+
+                    # Apply slippage to entry price
+                    slip = entry_price * slippage_bps / 10000
+                    if sig.action == 'BUY':
+                        entry_price += slip  # Buy at worse (higher) price
+                    else:
+                        entry_price -= slip  # Sell at worse (lower) price
+
+                    # Recalculate stop/tp with slipped entry
+                    if sig.action == 'BUY':
+                        stop = entry_price * (1 - adjusted_stop_pct)
+                        tp = entry_price * (1 + sig.suggested_tp_pct)
+                    else:
+                        stop = entry_price * (1 + adjusted_stop_pct)
+                        tp = entry_price * (1 - sig.suggested_tp_pct)
+
+                    # Max exposure check: leverage-based
+                    total_exposure = sum(p.trade_size for p in positions)
+                    if total_exposure + trade_size > equity * max_leverage:
+                        continue
                 else:
-                    size_cap = position_size * 250
-                trade_size = min(trade_size, size_cap)
+                    # Original mode: all multiplicative boosts
+                    # Separate caps: bounces are safer (higher WR, no stops)
+                    if sig.signal_type == 'bounce':
+                        size_cap = position_size * 250
+                    else:
+                        size_cap = position_size * 250
+                    trade_size = min(trade_size, size_cap)
 
-                # Channel health penalty: disabled — 100% WR, trails catch all bad breaks
-                # if sig.signal_type == 'break' and sig.channel_health > 0.35:
-                #     trade_size *= 0.90
+                    # Channel health penalty: disabled — 100% WR, trails catch all bad breaks
+                    # if sig.signal_type == 'break' and sig.channel_health > 0.35:
+                    #     trade_size *= 0.90
 
-                # Double-negative breakout penalty: disabled — tight stops (0.25x) already limit damage
-                # High-conf breakouts get tiny stops, so penalty just reduces winners
-                # if (sig.signal_type == 'break' and sig.confidence > 0.90
-                #         and sig.channel_health > 0.25):
-                #     trade_size *= 0.70
+                    # Double-negative breakout penalty: disabled — tight stops (0.25x) already limit damage
+                    # High-conf breakouts get tiny stops, so penalty just reduces winners
+                    # if (sig.signal_type == 'break' and sig.confidence > 0.90
+                    #         and sig.channel_health > 0.25):
+                    #     trade_size *= 0.70
 
-                # Energy boost for bounces: low energy = bigger moves (-0.353 PnlCorr)
-                if sig.signal_type == 'bounce' and sig.energy_score < 0.30:
-                    trade_size *= 1.65
+                    # Energy boost for bounces: low energy = bigger moves (-0.353 PnlCorr)
+                    if sig.signal_type == 'bounce' and sig.energy_score < 0.30:
+                        trade_size *= 1.65
 
-                # Timing boost for bounces: timing_score +0.359 PnlCorr
-                if sig.signal_type == 'bounce' and sig.timing_score > 0.10:
-                    trade_size *= 1.40
+                    # Timing boost for bounces: timing_score +0.359 PnlCorr
+                    if sig.signal_type == 'bounce' and sig.timing_score > 0.10:
+                        trade_size *= 1.40
 
-                # Confidence boost for bounces: confidence +0.360 PnlCorr
-                if sig.signal_type == 'bounce' and sig.confidence > 0.55:
-                    trade_size *= 1.90
-
-                # BUY bounce low-conf penalty: disabled — 100% WR on BUY bounces
-                # if (sig.signal_type == 'bounce' and sig.action == 'BUY'
-                #         and sig.confidence < 0.50):
-                #     trade_size *= 0.50
-
-                # Position score boost for bounces: position_score +0.354 PnlCorr
-                if sig.signal_type == 'bounce' and sig.position_score > 0.95:
-                    trade_size *= 1.25
-
-                # Low channel health boost for bounces: health -0.521 PnlCorr
-                # Bounces from weaker channels = bigger mean-reversion moves
-                if sig.signal_type == 'bounce' and sig.channel_health < 0.65:
-                    trade_size *= 1.35
-
-                # Channel confirmed boost: bounce after breakout loss = channel held
-                if sig.signal_type == 'bounce' and last_breakout_loss:
-                    trade_size *= 1.40
-
-                # OU half-life inverse boost for bounces: short half-life = fast reversion
-                primary_state = analysis.tf_states.get(sig.primary_tf)
-                if primary_state and sig.signal_type == 'bounce':
-                    ou_hl = primary_state.ou_half_life
-                    if ou_hl < 3.0:
-                        trade_size *= 1.25  # Fast mean reversion
-                    elif ou_hl < 5.0:
-                        trade_size *= 1.10
-
-                # Position score boost for breakouts: high position_score = good entry
-                if sig.signal_type == 'break' and sig.position_score > 0.90:
-                    trade_size *= 1.20
-
-                # Inverse confidence breakout boost: conf -0.275 WinCorr
-                # Low-conf breakouts are the biggest winners
-                if sig.signal_type == 'break':
-                    if sig.confidence < 0.60:
+                    # Confidence boost for bounces: confidence +0.360 PnlCorr
+                    if sig.signal_type == 'bounce' and sig.confidence > 0.55:
                         trade_size *= 1.90
-                    elif sig.confidence < 0.90:
-                        trade_size *= 1.45
 
-                # Volume conviction boost: only at very high volume (2x+ avg)
-                if sig.signal_type == 'break' and 'volume' in tsla.columns:
-                    current_vol = tsla['volume'].iloc[bar]
-                    avg_vol = tsla['volume'].iloc[max(0, bar-20):bar].mean()
-                    if avg_vol > 0 and current_vol > avg_vol * 2.0:
+                    # BUY bounce low-conf penalty: disabled — 100% WR on BUY bounces
+                    # if (sig.signal_type == 'bounce' and sig.action == 'BUY'
+                    #         and sig.confidence < 0.50):
+                    #     trade_size *= 0.50
+
+                    # Position score boost for bounces: position_score +0.354 PnlCorr
+                    if sig.signal_type == 'bounce' and sig.position_score > 0.95:
+                        trade_size *= 1.25
+
+                    # Low channel health boost for bounces: health -0.521 PnlCorr
+                    # Bounces from weaker channels = bigger mean-reversion moves
+                    if sig.signal_type == 'bounce' and sig.channel_health < 0.65:
+                        trade_size *= 1.35
+
+                    # Channel confirmed boost: bounce after breakout loss = channel held
+                    if sig.signal_type == 'bounce' and last_breakout_loss:
+                        trade_size *= 1.40
+
+                    # OU half-life inverse boost for bounces: short half-life = fast reversion
+                    primary_state = analysis.tf_states.get(sig.primary_tf)
+                    if primary_state and sig.signal_type == 'bounce':
+                        ou_hl = primary_state.ou_half_life
+                        if ou_hl < 3.0:
+                            trade_size *= 1.25  # Fast mean reversion
+                        elif ou_hl < 5.0:
+                            trade_size *= 1.10
+
+                    # Position score boost for breakouts: high position_score = good entry
+                    if sig.signal_type == 'break' and sig.position_score > 0.90:
                         trade_size *= 1.20
 
-                # Volume-price divergence boost: high vol + small move = accumulation
-                if 'volume' in tsla.columns and bar >= 5:
-                    recent_vol = tsla['volume'].iloc[bar-5:bar].mean()
-                    avg_vol_20 = tsla['volume'].iloc[max(0, bar-20):bar].mean()
-                    recent_move = abs(closes[bar] - closes[max(0, bar-5)]) / closes[max(0, bar-5)]
-                    if avg_vol_20 > 0 and recent_vol > avg_vol_20 * 1.5 and recent_move < 0.003:
+                    # Inverse confidence breakout boost: conf -0.275 WinCorr
+                    # Low-conf breakouts are the biggest winners
+                    if sig.signal_type == 'break':
+                        if sig.confidence < 0.60:
+                            trade_size *= 1.90
+                        elif sig.confidence < 0.90:
+                            trade_size *= 1.45
+
+                    # Volume conviction boost: only at very high volume (2x+ avg)
+                    if sig.signal_type == 'break' and 'volume' in tsla.columns:
+                        current_vol = tsla['volume'].iloc[bar]
+                        avg_vol = tsla['volume'].iloc[max(0, bar-20):bar].mean()
+                        if avg_vol > 0 and current_vol > avg_vol * 2.0:
+                            trade_size *= 1.20
+
+                    # Volume-price divergence boost: high vol + small move = accumulation
+                    if 'volume' in tsla.columns and bar >= 5:
+                        recent_vol = tsla['volume'].iloc[bar-5:bar].mean()
+                        avg_vol_20 = tsla['volume'].iloc[max(0, bar-20):bar].mean()
+                        recent_move = abs(closes[bar] - closes[max(0, bar-5)]) / closes[max(0, bar-5)]
+                        if avg_vol_20 > 0 and recent_vol > avg_vol_20 * 1.5 and recent_move < 0.003:
+                            trade_size *= 1.15
+
+                    # Bounce momentum alignment: deep touch = stronger bounce
+                    if sig.signal_type == 'bounce' and bar >= 3:
+                        bounce_lookback = tsla['close'].iloc[bar-3:bar+1].values
+                        if len(bounce_lookback) >= 2:
+                            bounce_momentum = (bounce_lookback[-1] - bounce_lookback[0]) / bounce_lookback[0]
+                            # BUY bounce after price dip = deep touch
+                            if sig.action == 'BUY' and bounce_momentum < -0.001:
+                                trade_size *= 1.20
+                            # SELL bounce after price rise = deep touch
+                            elif sig.action == 'SELL' and bounce_momentum > 0.001:
+                                trade_size *= 1.20
+
+                    # Price momentum confirmation for breakouts (continuous scaling)
+                    if sig.signal_type == 'break' and bar >= 3:
+                        lookback_prices = tsla['close'].iloc[bar-3:bar+1].values
+                        if len(lookback_prices) >= 2:
+                            recent_return = (lookback_prices[-1] - lookback_prices[0]) / lookback_prices[0]
+                            # BUY break: boost if price already moving up
+                            if sig.action == 'BUY' and recent_return > 0.002:
+                                trade_size *= 2.00
+                            # SELL break: boost if price already moving down
+                            elif sig.action == 'SELL' and recent_return < -0.002:
+                                trade_size *= 2.00
+
+                    # Direction boost: both directions performing well
+                    if sig.signal_type == 'break':
+                        trade_size *= 1.80
+
+                    # Direction boost: 100% WR on both BUY and SELL
+                    if sig.action == 'BUY':
+                        trade_size *= 1.60
+                    else:
                         trade_size *= 1.15
 
-                # Bounce momentum alignment: deep touch = stronger bounce
-                if sig.signal_type == 'bounce' and bar >= 3:
-                    bounce_lookback = tsla['close'].iloc[bar-3:bar+1].values
-                    if len(bounce_lookback) >= 2:
-                        bounce_momentum = (bounce_lookback[-1] - bounce_lookback[0]) / bounce_lookback[0]
-                        # BUY bounce after price dip = deep touch
-                        if sig.action == 'BUY' and bounce_momentum < -0.001:
-                            trade_size *= 1.20
-                        # SELL bounce after price rise = deep touch
-                        elif sig.action == 'SELL' and bounce_momentum > 0.001:
-                            trade_size *= 1.20
+                    # Range expansion detection: contraction→expansion = trend beginning
+                    if bar >= 10:
+                        recent_range = (highs[bar-3:bar].max() - lows[bar-3:bar].min()) / closes[bar]
+                        prior_range = (highs[bar-10:bar-3].max() - lows[bar-10:bar-3].min()) / closes[bar]
+                        if prior_range > 0 and recent_range > prior_range * 1.5:
+                            trade_size *= 1.15  # Range expanding = trend forming
 
-                # Price momentum confirmation for breakouts (continuous scaling)
-                if sig.signal_type == 'break' and bar >= 3:
-                    lookback_prices = tsla['close'].iloc[bar-3:bar+1].values
-                    if len(lookback_prices) >= 2:
-                        recent_return = (lookback_prices[-1] - lookback_prices[0]) / lookback_prices[0]
-                        # BUY break: boost if price already moving up
-                        if sig.action == 'BUY' and recent_return > 0.002:
-                            trade_size *= 2.00
-                        # SELL break: boost if price already moving down
-                        elif sig.action == 'SELL' and recent_return < -0.002:
-                            trade_size *= 2.00
-
-                # Direction boost: both directions performing well
-                if sig.signal_type == 'break':
-                    trade_size *= 1.80
-
-                # Direction boost: 100% WR on both BUY and SELL
-                if sig.action == 'BUY':
-                    trade_size *= 1.60
-                else:
-                    trade_size *= 1.15
-
-                # Range expansion detection: contraction→expansion = trend beginning
-                if bar >= 10:
-                    recent_range = (highs[bar-3:bar].max() - lows[bar-3:bar].min()) / closes[bar]
-                    prior_range = (highs[bar-10:bar-3].max() - lows[bar-10:bar-3].min()) / closes[bar]
-                    if prior_range > 0 and recent_range > prior_range * 1.5:
-                        trade_size *= 1.15  # Range expanding = trend forming
-
-                # Entropy-inverse boost: low entropy = predictable = bigger position
-                if hasattr(sig, 'entropy_score') and sig.entropy_score < 0.85:
-                    trade_size *= 1.25
-
-                # Confluence boost: multiple TFs agree on direction
-                if hasattr(sig, 'confluence_score') and sig.confluence_score > 0.80:
-                    trade_size *= 1.20
-
-                # Continuous confidence scaling: higher conf = linearly bigger position
-                # conf 0.40 → 1.0x, conf 0.90 → 1.5x (linear interpolation)
-                conf_scale = 1.0 + (sig.confidence - 0.40) * (0.5 / 0.5)
-                conf_scale = max(1.0, min(conf_scale, 1.5))
-                trade_size *= conf_scale
-
-                # ATR-inverse sizing: low volatility → larger positions
-                if bar >= 14 and not np.isnan(atr[bar]):
-                    atr_pct = atr[bar] / entry_price
-                    # Low vol (ATR < 1.0%): boost 1.30x
-                    # High vol (ATR > 1.5%): reduce 0.80x
-                    if atr_pct < 0.010:
-                        trade_size *= 1.50
-                    elif atr_pct > 0.015:
-                        trade_size *= 0.80
-
-                # Win streak compounding: ramp up after consecutive wins
-                if consecutive_wins >= 50:
-                    trade_size *= 3.50
-                elif consecutive_wins >= 40:
-                    trade_size *= 2.80
-                elif consecutive_wins >= 30:
-                    trade_size *= 2.20
-                elif consecutive_wins >= 20:
-                    trade_size *= 1.80
-                elif consecutive_wins >= 10:
-                    trade_size *= 1.50
-                elif consecutive_wins >= 5:
-                    trade_size *= 1.25
-
-                # Recent profitability boost: if last 3 trades averaged big wins, trade bigger
-                if len(trades) >= 3:
-                    recent_pnls = [t.pnl for t in trades[-3:]]
-                    avg_recent_pnl = sum(recent_pnls) / len(recent_pnls)
-                    if avg_recent_pnl > 500000:  # Very big recent winners
-                        trade_size *= 1.40
-                    elif avg_recent_pnl > 100000:
+                    # Entropy-inverse boost: low entropy = predictable = bigger position
+                    if hasattr(sig, 'entropy_score') and sig.entropy_score < 0.85:
                         trade_size *= 1.25
-                    elif avg_recent_pnl > 50000:
+
+                    # Confluence boost: multiple TFs agree on direction
+                    if hasattr(sig, 'confluence_score') and sig.confluence_score > 0.80:
+                        trade_size *= 1.20
+
+                    # Continuous confidence scaling: higher conf = linearly bigger position
+                    # conf 0.40 → 1.0x, conf 0.90 → 1.5x (linear interpolation)
+                    conf_scale = 1.0 + (sig.confidence - 0.40) * (0.5 / 0.5)
+                    conf_scale = max(1.0, min(conf_scale, 1.5))
+                    trade_size *= conf_scale
+
+                    # ATR-inverse sizing: low volatility → larger positions
+                    if bar >= 14 and not np.isnan(atr[bar]):
+                        atr_pct = atr[bar] / entry_price
+                        # Low vol (ATR < 1.0%): boost 1.30x
+                        # High vol (ATR > 1.5%): reduce 0.80x
+                        if atr_pct < 0.010:
+                            trade_size *= 1.50
+                        elif atr_pct > 0.015:
+                            trade_size *= 0.80
+
+                    # Win streak compounding: ramp up after consecutive wins
+                    if consecutive_wins >= 50:
+                        trade_size *= 3.50
+                    elif consecutive_wins >= 40:
+                        trade_size *= 2.80
+                    elif consecutive_wins >= 30:
+                        trade_size *= 2.20
+                    elif consecutive_wins >= 20:
+                        trade_size *= 1.80
+                    elif consecutive_wins >= 10:
+                        trade_size *= 1.50
+                    elif consecutive_wins >= 5:
+                        trade_size *= 1.25
+
+                    # Recent profitability boost: if last 3 trades averaged big wins, trade bigger
+                    if len(trades) >= 3:
+                        recent_pnls = [t.pnl for t in trades[-3:]]
+                        avg_recent_pnl = sum(recent_pnls) / len(recent_pnls)
+                        if avg_recent_pnl > 500000:  # Very big recent winners
+                            trade_size *= 1.40
+                        elif avg_recent_pnl > 100000:
+                            trade_size *= 1.25
+                        elif avg_recent_pnl > 50000:
+                            trade_size *= 1.15
+
+                    # Range compression boost: narrow bar = tension building, bigger breakout/bounce
+                    if bar >= 5:
+                        recent_ranges = (highs[bar-5:bar] - lows[bar-5:bar]) / closes[bar-5:bar]
+                        avg_range = recent_ranges.mean()
+                        if avg_range < 0.008:  # Compressed range (< 0.8%)
+                            trade_size *= 1.50
+
+                    # Day-of-week boost: Wed has 3x avg P&L of Fri
+                    bar_dt = tsla.index[bar]
+                    dow = bar_dt.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+                    if dow == 2:  # Wednesday
+                        trade_size *= 1.60
+                    elif dow == 3:  # Thursday
+                        trade_size *= 1.30
+                    elif dow == 1:  # Tuesday
                         trade_size *= 1.15
 
-                # Range compression boost: narrow bar = tension building, bigger breakout/bounce
-                if bar >= 5:
-                    recent_ranges = (highs[bar-5:bar] - lows[bar-5:bar]) / closes[bar-5:bar]
-                    avg_range = recent_ranges.mean()
-                    if avg_range < 0.008:  # Compressed range (< 0.8%)
-                        trade_size *= 1.50
+                    # Time-of-day boost: first/last hour typically bigger moves
+                    bar_time = tsla.index[bar]
+                    hour = bar_time.hour if hasattr(bar_time, 'hour') else 12
+                    minute = bar_time.minute if hasattr(bar_time, 'minute') else 0
+                    minutes_from_open = (hour - 9) * 60 + minute - 30  # EST
+                    if minutes_from_open < 60:  # First hour
+                        trade_size *= 1.35
+                    elif minutes_from_open > 330:  # Last 30 min
+                        trade_size *= 1.25
 
-                # Day-of-week boost: Wed has 3x avg P&L of Fri
-                bar_dt = tsla.index[bar]
-                dow = bar_dt.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
-                if dow == 2:  # Wednesday
-                    trade_size *= 1.60
-                elif dow == 3:  # Thursday
-                    trade_size *= 1.30
-                elif dow == 1:  # Tuesday
-                    trade_size *= 1.15
-
-                # Time-of-day boost: first/last hour typically bigger moves
-                bar_time = tsla.index[bar]
-                hour = bar_time.hour if hasattr(bar_time, 'hour') else 12
-                minute = bar_time.minute if hasattr(bar_time, 'minute') else 0
-                minutes_from_open = (hour - 9) * 60 + minute - 30  # EST
-                if minutes_from_open < 60:  # First hour
-                    trade_size *= 1.35
-                elif minutes_from_open > 330:  # Last 30 min
-                    trade_size *= 1.25
-
-                # Max exposure check: total open position value < 7x equity
-                total_exposure = sum(p.trade_size for p in positions)
-                if total_exposure + trade_size > equity * 500:
-                    continue
+                    # Max exposure check: total open position value < 7x equity
+                    total_exposure = sum(p.trade_size for p in positions)
+                    if total_exposure + trade_size > equity * 500:
+                        continue
 
                 # Breakout trades get longer max hold (trends persist)
                 effective_max_hold = max_hold_bars * 2 if sig.signal_type == 'break' else max_hold_bars
@@ -2090,11 +2171,20 @@ def run_backtest(
     # Close any remaining positions
     for position in positions:
         exit_price = float(closes[-1])
+        if realistic:
+            slip = exit_price * slippage_bps / 10000
+            if position.direction == 'BUY':
+                exit_price -= slip
+            else:
+                exit_price += slip
         if position.direction == 'BUY':
             pnl_pct = (exit_price - position.entry_price) / position.entry_price
         else:
             pnl_pct = (position.entry_price - exit_price) / position.entry_price
         pnl = pnl_pct * position.trade_size
+        if realistic:
+            shares = position.trade_size / position.entry_price
+            pnl -= commission_per_share * shares * 2
         trades.append(Trade(
             entry_bar=position.entry_bar,
             exit_bar=total_bars - 1,
@@ -2109,6 +2199,7 @@ def run_backtest(
             primary_tf=position.primary_tf,
             signal_type=position.signal_type,
             trade_size=position.trade_size,
+            entry_time=str(tsla.index[position.entry_bar]) if position.entry_bar < len(tsla) else '',
         ))
         equity += pnl
 
