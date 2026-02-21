@@ -2781,6 +2781,14 @@ def run_backtest(
                             ml_stats.setdefault('_diag_state_ok', 0)
                             ml_stats['_diag_state_ok'] += 1
 
+                    # Arch 104: Low kinetic energy bounce reduction (slow approach = weak bounce)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps104 = analysis.tf_states.get(sig.primary_tf)
+                        if ps104 and ps104.kinetic_energy < 0.10:
+                            trade_size *= 0.80
+                            ml_stats.setdefault('low_ke_reduce', 0)
+                            ml_stats['low_ke_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
