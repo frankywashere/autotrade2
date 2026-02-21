@@ -2852,6 +2852,15 @@ def run_backtest(
                             ml_stats.setdefault('dead_zone_reduce', 0)
                             ml_stats['dead_zone_reduce'] += 1
 
+
+                    # Arch 112: Low KE + mid-channel double-penalty (worst bounces)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps112 = analysis.tf_states.get(sig.primary_tf)
+                        if ps112 and ps112.kinetic_energy < 0.10 and 0.20 < ps112.position_pct < 0.80:
+                            trade_size *= 0.50
+                            ml_stats.setdefault('worst_bounce_reduce', 0)
+                            ml_stats['worst_bounce_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
