@@ -2942,6 +2942,20 @@ def run_backtest(
                             ml_stats.setdefault('quality_scored', 0)
                             ml_stats['quality_scored'] += 1
 
+
+                    # Arch 120: Multi-TF binding energy penalty (high avg BE = trapped)
+                    if realistic and sig.signal_type == 'bounce':
+                        be_values = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be_values.append(tf_state.binding_energy)
+                        if be_values:
+                            avg_be = sum(be_values) / len(be_values)
+                            if avg_be > 0.55:
+                                trade_size *= 0.75
+                                ml_stats.setdefault('multi_tf_be_penalty', 0)
+                                ml_stats['multi_tf_be_penalty'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
