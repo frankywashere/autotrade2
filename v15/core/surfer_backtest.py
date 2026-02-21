@@ -2550,6 +2550,14 @@ def run_backtest(
                             ml_stats.setdefault('low_bp_bounce', 0)
                             ml_stats['low_bp_bounce'] += 1
 
+                    # Arch 88: Volume confirmation boost
+                    if realistic:
+                        ps88 = analysis.tf_states.get(sig.primary_tf)
+                        if ps88 and ps88.volume_score > 0.65:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('vol_confirm', 0)
+                            ml_stats['vol_confirm'] += 1
+
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
