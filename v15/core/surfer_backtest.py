@@ -2805,6 +2805,14 @@ def run_backtest(
                             ml_stats.setdefault('high_entropy_break_boost', 0)
                             ml_stats['high_entropy_break_boost'] += 1
 
+                    # Arch 107: Low OU theta break reduction (weak mean reversion but break fails to follow through)
+                    if realistic and sig.signal_type == 'break':
+                        ps107 = analysis.tf_states.get(sig.primary_tf)
+                        if ps107 and ps107.ou_theta < 0.05:
+                            trade_size *= 0.80
+                            ml_stats.setdefault('low_theta_break_reduce', 0)
+                            ml_stats['low_theta_break_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
