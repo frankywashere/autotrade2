@@ -2985,6 +2985,16 @@ def run_backtest(
                                 ml_stats.setdefault('multi_tf_be_cont', 0)
                                 ml_stats['multi_tf_be_cont'] += 1
 
+
+                    # Arch 123: Single-TF binding energy continuous penalty
+                    if realistic and sig.signal_type == 'bounce':
+                        ps123 = analysis.tf_states.get(sig.primary_tf)
+                        if ps123 and ps123.binding_energy > 0.50:
+                            be_penalty = 1.0 - 0.40 * (ps123.binding_energy - 0.50)
+                            trade_size *= max(0.80, be_penalty)
+                            ml_stats.setdefault('be_cont_penalty', 0)
+                            ml_stats['be_cont_penalty'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
