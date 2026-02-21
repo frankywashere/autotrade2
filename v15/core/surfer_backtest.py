@@ -2483,6 +2483,15 @@ def run_backtest(
                                 ml_stats['ft_tight_trail'] += 1
                         except Exception as _e:
                             _track_error("follow_through_predict", _e)
+
+                    # Arch 72: Signal persistence boost — same dir on consecutive bars
+                    if realistic and last_signal_dir == sig.action and (bar - last_signal_bar) <= 1:
+                        trade_size *= 1.2
+                        ml_stats.setdefault('persist_boost', 0)
+                        ml_stats['persist_boost'] += 1
+                    last_signal_bar = bar
+                    last_signal_dir = sig.action
+
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
