@@ -2924,6 +2924,21 @@ def run_backtest(
                                 ml_stats.setdefault('trend_break_boost', 0)
                                 ml_stats['trend_break_boost'] += 1
 
+
+                    # Arch 119: Composite bounce quality score (PE + theta + edge position)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps119 = analysis.tf_states.get(sig.primary_tf)
+                        if ps119:
+                            pe_q = min(ps119.potential_energy, 1.0)
+                            theta_q = min(ps119.ou_theta / 0.50, 1.0)
+                            edge_q = max(0, 1.0 - min(ps119.position_pct, 1.0 - ps119.position_pct) / 0.15)
+                            edge_q = min(edge_q, 1.0)
+                            quality = pe_q * 0.4 + theta_q * 0.3 + edge_q * 0.3
+                            mult = 0.6 + 0.8 * quality
+                            trade_size *= mult
+                            ml_stats.setdefault('quality_scored', 0)
+                            ml_stats['quality_scored'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
