@@ -2012,6 +2012,140 @@ def _show_ml_predictions(analysis, current_tsla, native_tf_data):
         st.info(f"ML sees opportunity: {ml_action} (but physics says HOLD)")
 
 
+def _load_signal_quality_model():
+    """Load the signal quality model into session state (once)."""
+    if 'signal_quality_model' not in st.session_state:
+        model_path = Path(__file__).parent / 'validation' / 'signal_quality_model.pkl'
+        if model_path.exists():
+            try:
+                from v15.validation.signal_quality_model import SignalQualityModel
+                st.session_state['signal_quality_model'] = SignalQualityModel.load(str(model_path))
+            except Exception:
+                st.session_state['signal_quality_model'] = None
+        else:
+            st.session_state['signal_quality_model'] = None
+    return st.session_state['signal_quality_model']
+
+
+def _render_ml_signal_quality(analysis, sig, current_tsla):
+    """Render ML signal quality panel below the signal banner (BUY/SELL only)."""
+    if sig.action == 'HOLD':
+        return
+
+    model = _load_signal_quality_model()
+    if model is None:
+        return
+
+    # Extract feature vector
+    try:
+        from v15.core.surfer_backtest import _extract_signal_features
+        from v15.core.surfer_ml import get_feature_names
+
+        feature_names = get_feature_names()
+        history_buffer = st.session_state.get('_sq_history_buffer', [])
+        closes = current_tsla['close'].values if current_tsla is not None else None
+        bar = len(current_tsla) - 1 if current_tsla is not None else 0
+
+        feature_vec, _ = _extract_signal_features(
+            analysis, current_tsla, bar, closes,
+            spy_df=None, vix_df=None,
+            feature_names=feature_names,
+            history_buffer=history_buffer,
+            eval_interval=3,
+        )
+        st.session_state['_sq_history_buffer'] = history_buffer
+
+        # Append signal meta features
+        from v15.validation.signal_quality_model import _append_signal_meta
+        # Build a minimal trade-like object for signal meta
+        class _SigProxy:
+            signal_type = getattr(sig, 'signal_type', 'bounce')
+            direction = sig.action
+        sig_data = {
+            'position_score': sig.position_score,
+            'energy_score': sig.energy_score,
+            'entropy_score': sig.entropy_score,
+            'confluence_score': sig.confluence_score,
+            'timing_score': sig.timing_score,
+            'channel_health': sig.channel_health,
+            'confidence': sig.confidence,
+        }
+        full_features = _append_signal_meta(feature_vec, _SigProxy(), sig_data)
+
+        pred = model.predict(full_features)
+    except Exception:
+        return
+
+    win_prob = pred['win_prob']
+    expected_pnl = pred['expected_pnl_pct']
+    quality_score = pred['quality_score']
+    risk_rating = pred['risk_rating']
+
+    # Risk badge colors
+    risk_colors = {'LOW': '#00c853', 'MEDIUM': '#ff9800', 'HIGH': '#ff1744'}
+    risk_color = risk_colors.get(risk_rating, '#888')
+
+    # Quality bar color
+    if quality_score >= 70:
+        q_color = '#00c853'
+    elif quality_score >= 40:
+        q_color = '#ff9800'
+    else:
+        q_color = '#ff1744'
+
+    st.markdown(
+        f"""<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);
+        border:1px solid #334;border-radius:8px;padding:12px 16px;margin:8px 0;">
+        <div style="text-align:center;font-size:12px;color:#888;letter-spacing:1px;margin-bottom:8px;">
+        ML SIGNAL QUALITY</div>
+        <div style="display:flex;justify-content:space-around;text-align:center;">
+            <div>
+                <div style="font-size:11px;color:#aaa;">Win Probability</div>
+                <div style="font-size:28px;font-weight:700;color:{'#00c853' if win_prob >= 0.65 else '#ff9800' if win_prob >= 0.50 else '#ff1744'};">
+                {win_prob:.0%}</div>
+                <div style="font-size:11px;"><span style="background:{risk_color};color:#fff;
+                padding:2px 8px;border-radius:10px;font-weight:600;">{risk_rating} RISK</span></div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#aaa;">Expected P&L</div>
+                <div style="font-size:28px;font-weight:700;color:{'#00c853' if expected_pnl > 0 else '#ff1744'};">
+                {expected_pnl:+.2%}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#aaa;">Quality Score</div>
+                <div style="font-size:28px;font-weight:700;color:{q_color};">
+                {quality_score:.0f}</div>
+                <div style="background:#333;border-radius:4px;height:6px;width:80px;margin:4px auto;">
+                <div style="background:{q_color};border-radius:4px;height:6px;width:{quality_score:.0f}%;"></div></div>
+            </div>
+        </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Expandable CV performance
+    cv = model.cv_metrics
+    if cv:
+        with st.expander("Model CV Performance"):
+            col1, col2, col3 = st.columns(3)
+            col1.metric("AUC-ROC", f"{cv.get('overall_auc', 0):.3f}")
+            col2.metric("Brier Score", f"{cv.get('overall_brier', 0):.3f}")
+            col3.metric("PnL MAE", f"{cv.get('overall_pnl_mae', 0):.4f}")
+
+            per_year = cv.get('per_year', {})
+            if per_year:
+                rows = []
+                for yr, m in sorted(per_year.items()):
+                    rows.append({
+                        'Year': yr,
+                        'Trades': m['n_trades'],
+                        'WR': f"{m['win_rate']:.0%}",
+                        'AUC': f"{m['auc']:.3f}",
+                        'Brier': f"{m['brier']:.3f}",
+                    })
+                st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
 def show_channel_surfer_tab(
     current_tsla,
     native_tf_data,
@@ -2070,6 +2204,9 @@ def show_channel_surfer_tab(
     # --- Section 1: Signal Banner ---
     current_price = float(current_tsla['close'].iloc[-1]) if current_tsla is not None and len(current_tsla) > 0 else 0.0
     _render_signal_banner(sig, current_price=current_price)
+
+    # --- ML Signal Quality Panel ---
+    _render_ml_signal_quality(analysis, sig, current_tsla)
 
     # Play audio for BUY/SELL signals (only if new)
     prev_action = st.session_state.get('surfer_prev_action', 'HOLD')

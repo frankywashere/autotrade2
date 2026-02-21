@@ -244,6 +244,80 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
     return None
 
 
+def _extract_signal_features(analysis, tsla, bar, closes, spy_df, vix_df,
+                              feature_names, history_buffer, eval_interval):
+    """Extract full ML feature vector at signal time.
+
+    Shared by both the ML-enhanced backtest path and the feature-capture path.
+    Mutates history_buffer in-place (appends current snapshot, trims to 20).
+
+    Returns:
+        (feature_vec, snapshot_dict)
+    """
+    from v15.core.surfer_ml import (
+        extract_tf_features, extract_cross_tf_features,
+        extract_context_features, extract_correlation_features,
+        extract_temporal_features,
+        ML_TFS, PER_TF_FEATURES,
+        CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
+        TEMPORAL_FEATURES,
+    )
+
+    num_features = len(feature_names)
+    feature_vec = np.zeros(num_features, dtype=np.float32)
+    offset = 0
+
+    for tf in ML_TFS:
+        state = analysis.tf_states.get(tf)
+        if state:
+            tf_feats = extract_tf_features(state)
+        else:
+            tf_feats = np.zeros(len(PER_TF_FEATURES), dtype=np.float32)
+        feature_vec[offset:offset + len(PER_TF_FEATURES)] = tf_feats
+        offset += len(PER_TF_FEATURES)
+
+    cross_feats = extract_cross_tf_features(analysis.tf_states)
+    feature_vec[offset:offset + len(CROSS_TF_FEATURES)] = cross_feats
+    offset += len(CROSS_TF_FEATURES)
+
+    ctx_feats = extract_context_features(tsla, bar)
+    feature_vec[offset:offset + len(CONTEXT_FEATURES)] = ctx_feats
+    offset += len(CONTEXT_FEATURES)
+
+    bt_snapshot = {}
+    for tf in ML_TFS:
+        state = analysis.tf_states.get(tf)
+        if state and state.valid:
+            for feat_name in PER_TF_FEATURES:
+                val = getattr(state, feat_name, 0.0)
+                if isinstance(val, (int, float)):
+                    bt_snapshot[f'{tf}_{feat_name}'] = float(val)
+    bt_snapshot['rsi_14'] = float(ctx_feats[0])
+    bt_snapshot['volume_ratio_20'] = float(ctx_feats[2])
+
+    temporal_feats = extract_temporal_features(
+        bt_snapshot, history_buffer,
+        closes=closes, bar_idx=bar, eval_interval=eval_interval,
+    )
+    feature_vec[offset:offset + len(TEMPORAL_FEATURES)] = temporal_feats
+    offset += len(TEMPORAL_FEATURES)
+
+    history_buffer.append(bt_snapshot)
+    if len(history_buffer) > 20:
+        history_buffer.pop(0)
+
+    corr_feats = extract_correlation_features(
+        bar, closes, spy_df=spy_df, vix_df=vix_df,
+        tsla_index=tsla.index,
+    )
+    feature_vec[offset:offset + len(CORRELATION_FEATURES)] = corr_feats
+
+    # Safety: replace NaN/inf with 0 (physics engine can occasionally produce them)
+    np.nan_to_num(feature_vec, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return feature_vec, bt_snapshot
+
+
 def run_backtest(
     days: int = 30,
     eval_interval: int = 3,     # Check every 3 bars = 15 min
@@ -256,12 +330,14 @@ def run_backtest(
     tsla_df: 'pd.DataFrame | None' = None,
     higher_tf_dict: 'dict | None' = None,
     spy_df_input: 'pd.DataFrame | None' = None,
+    vix_df_input: 'pd.DataFrame | None' = None,
     # Realistic mode constraints
     realistic: bool = False,
     slippage_bps: float = 3.0,          # 3 basis points per side
     commission_per_share: float = 0.005, # $0.005/share round trip
     max_leverage: float = 4.0,
     initial_capital: float = 0.0,       # 0 = use position_size * 10
+    capture_features: bool = False,     # Save ML feature vectors per trade
 ) -> tuple:
     """
     Run Channel Surfer backtest on historical 5-min TSLA data.
@@ -272,8 +348,12 @@ def run_backtest(
     - Adjust stop/TP based on predicted channel lifetime
     - Skip trades where ML predicts imminent break in wrong direction
 
+    If capture_features is True, extracts and saves the 169-dim ML feature
+    vector for each trade (used by signal quality model training).
+
     Returns:
-        (metrics, trades) tuple
+        (metrics, trades, equity_curve) or
+        (metrics, trades, equity_curve, trade_features, trade_signals) when capture_features=True
     """
     import yfinance as yf
     from v15.core.channel import detect_channels_multi_window, select_best_channel
@@ -740,12 +820,20 @@ def run_backtest(
             except Exception:
                 pass
 
+    # Feature capture mode (signal quality model training)
+    _capture_feature_names = None
+    _capture_history_buffer: List[Dict] = []
+    if capture_features and not ml_active:
+        from v15.core.surfer_ml import get_feature_names
+        _capture_feature_names = get_feature_names()
+        print(f"[CAPTURE] Feature capture enabled ({len(_capture_feature_names)} features)")
+
     # Use pre-loaded data if provided (skip yfinance entirely)
     if tsla_df is not None:
         tsla = tsla_df
         higher_tf_data = higher_tf_dict or {}
         spy_df = spy_df_input
-        vix_df = None
+        vix_df = vix_df_input
         print(f"[PRE-LOADED] {len(tsla)} bars: {tsla.index[0]} to {tsla.index[-1]}")
         if realistic:
             print(f"[REALISTIC] max_leverage={max_leverage}x, slippage={slippage_bps}bps, "
@@ -873,6 +961,8 @@ def run_backtest(
     equity_curve: List[Tuple[int, float]] = []  # (bar_idx, equity)
     positions: List[OpenPosition] = []  # Multi-position support (max 2)
     position_signals: list = []  # Signal data for each open position
+    trade_features: list = []      # Full feature vectors per closed trade (capture_features)
+    position_features: list = []   # Feature vectors for each open position (capture_features)
     max_positions = 2
     pending_entries = []  # Deferred entries: list of (bar, direction, signal_type, confidence, stop_pct, tp_pct, primary_tf, ou_hl, max_hold, el_flagged, fast_rev, trade_size, signal_data)
     equity = initial_capital if initial_capital > 0 else position_size * 10
@@ -1049,11 +1139,15 @@ def run_backtest(
 
                 closed_indices.append(pi)
                 trade_signals.append(position_signals[pi])
+                if capture_features:
+                    trade_features.append(position_features[pi])
 
         # Remove closed positions (reverse order to preserve indices)
         for pi in sorted(closed_indices, reverse=True):
             positions.pop(pi)
             position_signals.pop(pi)
+            if capture_features:
+                position_features.pop(pi)
 
         # --- Process pending (deferred) entries ---
         expired_pending = []
@@ -1103,6 +1197,8 @@ def run_backtest(
                 el_flagged=p_el, fast_reversion=p_fr,
             ))
             position_signals.append(p_sig_data)
+            if capture_features:
+                position_features.append(None)  # Features not captured for deferred entries
             ml_stats.setdefault('delayed_entries', 0)
             ml_stats['delayed_entries'] += 1
             expired_pending.append(pi)
@@ -1187,61 +1283,28 @@ def run_backtest(
 
             sig = analysis.signal
 
+            # --- Feature Capture (signal quality model) ---
+            current_signal_features = None
+            if capture_features and not ml_active and sig.action in ('BUY', 'SELL'):
+                try:
+                    current_signal_features, _ = _extract_signal_features(
+                        analysis, tsla, bar, closes, spy_df, vix_df,
+                        _capture_feature_names, _capture_history_buffer, eval_interval,
+                    )
+                except Exception:
+                    pass
+
             # --- ML Enhancement ---
             ml_prediction = None
             if ml_active and sig.action in ('BUY', 'SELL'):
                 ml_stats['total_signals'] += 1
                 try:
-                    # Extract features
-                    num_features = len(ml_feature_names)
-                    feature_vec = np.zeros(num_features, dtype=np.float32)
-                    offset = 0
-
-                    for tf in ML_TFS:
-                        state = analysis.tf_states.get(tf)
-                        if state:
-                            tf_feats = extract_tf_features(state)
-                        else:
-                            tf_feats = np.zeros(len(PER_TF_FEATURES), dtype=np.float32)
-                        feature_vec[offset:offset + len(PER_TF_FEATURES)] = tf_feats
-                        offset += len(PER_TF_FEATURES)
-
-                    cross_feats = extract_cross_tf_features(analysis.tf_states)
-                    feature_vec[offset:offset + len(CROSS_TF_FEATURES)] = cross_feats
-                    offset += len(CROSS_TF_FEATURES)
-
-                    ctx_feats = extract_context_features(tsla, bar)
-                    feature_vec[offset:offset + len(CONTEXT_FEATURES)] = ctx_feats
-                    offset += len(CONTEXT_FEATURES)
-
-                    # Build snapshot for temporal features
-                    bt_snapshot = {}
-                    for tf in ML_TFS:
-                        state = analysis.tf_states.get(tf)
-                        if state and state.valid:
-                            for feat_name in PER_TF_FEATURES:
-                                val = getattr(state, feat_name, 0.0)
-                                if isinstance(val, (int, float)):
-                                    bt_snapshot[f'{tf}_{feat_name}'] = float(val)
-                    bt_snapshot['rsi_14'] = float(ctx_feats[0])
-                    bt_snapshot['volume_ratio_20'] = float(ctx_feats[2])
-
-                    temporal_feats = extract_temporal_features(
-                        bt_snapshot, ml_history_buffer,
-                        closes=closes, bar_idx=bar, eval_interval=3,
+                    feature_vec, _ = _extract_signal_features(
+                        analysis, tsla, bar, closes, spy_df, vix_df,
+                        ml_feature_names, ml_history_buffer, eval_interval,
                     )
-                    feature_vec[offset:offset + len(TEMPORAL_FEATURES)] = temporal_feats
-                    offset += len(TEMPORAL_FEATURES)
-
-                    ml_history_buffer.append(bt_snapshot)
-                    if len(ml_history_buffer) > 20:
-                        ml_history_buffer.pop(0)
-
-                    corr_feats = extract_correlation_features(
-                        bar, closes, spy_df=spy_df, vix_df=vix_df,
-                        tsla_index=tsla.index,
-                    )
-                    feature_vec[offset:offset + len(CORRELATION_FEATURES)] = corr_feats
+                    if capture_features:
+                        current_signal_features = feature_vec.copy()
 
                     # Update feature window for TrendGBT
                     ml_feature_window.append(feature_vec.copy())
@@ -2167,9 +2230,11 @@ def run_backtest(
                         is_flagged=(imm_stop_prob > 0.35),
                     ))
                     position_signals.append(sig_data)
+                    if capture_features:
+                        position_features.append(current_signal_features)
 
     # Close any remaining positions
-    for position in positions:
+    for pi_end, position in enumerate(positions):
         exit_price = float(closes[-1])
         if realistic:
             slip = exit_price * slippage_bps / 10000
@@ -2202,6 +2267,11 @@ def run_backtest(
             entry_time=str(tsla.index[position.entry_bar]) if position.entry_bar < len(tsla) else '',
         ))
         equity += pnl
+        if pi_end < len(position_signals):
+            trade_signals.append(position_signals[pi_end])
+        if capture_features:
+            feat = position_features[pi_end] if pi_end < len(position_features) else None
+            trade_features.append(feat)
 
     elapsed = time.time() - t_start
 
@@ -2466,6 +2536,8 @@ def run_backtest(
                     print(f"  {comp:<18s} {np.mean(win_vals):<10.3f} {np.mean(loss_vals):<10.3f} "
                           f"{win_corr:<+10.3f} {pnl_corr:<+10.3f} {flag}")
 
+    if capture_features:
+        return metrics, trades, equity_curve, trade_features, trade_signals
     return metrics, trades, equity_curve
 
 
