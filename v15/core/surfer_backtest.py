@@ -1073,6 +1073,7 @@ def run_backtest(
     max_dd = 0.0
     consecutive_losses = 0  # Track losing streak for position reduction
     consecutive_wins = 0    # Track winning streak for position ramping
+    recent_trade_wins = []  # Arch 67: Rolling window of win/loss for dynamic cap
     last_breakout_loss = False  # Track if last loss was a breakout (confirms channel)
     daily_pnl = 0.0         # Running P&L for current trading day
     daily_breaker_active = False
@@ -1227,10 +1228,15 @@ def run_backtest(
                     consecutive_losses += 1
                     consecutive_wins = 0
                     last_breakout_loss = (position.signal_type == 'break')
+                    recent_trade_wins.append(0)
                 else:
                     consecutive_losses = 0
                     consecutive_wins += 1
                     last_breakout_loss = False
+                    recent_trade_wins.append(1)
+                # Arch 67: Keep rolling window of last 20 trades
+                if len(recent_trade_wins) > 20:
+                    recent_trade_wins.pop(0)
 
                 # Track daily P&L for circuit breaker
                 daily_pnl += pnl
@@ -2103,7 +2109,22 @@ def run_backtest(
                 if realistic:
                     # Realistic: leverage-based cap, no multiplicative boosts
                     max_buying_power = equity * max_leverage
-                    size_cap = max_buying_power * 0.35  # Max 35% of buying power per trade
+                    # Arch 67: Dynamic cap based on rolling 20-trade win rate
+                    # Hot streaks are reliable in this system (84% base WR)
+                    # so sizing up when rolling WR > 90% captures compounding
+                    if len(recent_trade_wins) >= 10:
+                        rolling_wr = sum(recent_trade_wins) / len(recent_trade_wins)
+                        if rolling_wr >= 0.90:
+                            cap_pct = 0.70  # Hot streak → lean in (2x normal)
+                            ml_stats.setdefault('dyn_cap_hot', 0)
+                            ml_stats['dyn_cap_hot'] += 1
+                        else:
+                            cap_pct = 0.35  # Normal
+                            ml_stats.setdefault('dyn_cap_normal', 0)
+                            ml_stats['dyn_cap_normal'] += 1
+                    else:
+                        cap_pct = 0.35  # Not enough history
+                    size_cap = max_buying_power * cap_pct
                     trade_size = min(trade_size, size_cap)
 
                     # Apply slippage to entry price
