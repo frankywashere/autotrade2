@@ -2419,9 +2419,13 @@ def run_backtest(
                                 ml_stats['er_tight_trail'] += 1
                         except Exception as _e:
                             _track_error("extended_run_predict", _e)
-                    # Arch 65: Bounce premium sizing — bounces are 97.6% WR, size them up
+                    # Arch 65+69: Directional bounce premium
+                    # SELL bounces: 98% WR → aggressive, BUY bounces: 95% WR → moderate
                     if realistic and sig.signal_type == 'bounce':
-                        trade_size *= 2.0  # Size up on reliable bounces (97.6% WR)
+                        if sig.action == 'SELL':
+                            trade_size *= 2.3  # SELL bounces: highest WR
+                        else:
+                            trade_size *= 1.9  # BUY bounces: slightly lower WR
                         ml_stats.setdefault('bounce_sized_up', 0)
                         ml_stats['bounce_sized_up'] += 1
 
@@ -2438,6 +2442,19 @@ def run_backtest(
                             trade_size *= 1.4  # Weak channel → breakout more likely real
                             ml_stats.setdefault('ch_break_sizeup', 0)
                             ml_stats['ch_break_sizeup'] += 1
+
+                    # Arch 69: Momentum confirmation sizing
+                    # If recent price action confirms signal direction, size up
+                    if realistic and bar >= 5:
+                        lookback_ret = (closes[bar] - closes[bar - 5]) / closes[bar - 5]
+                        momentum_confirms = (
+                            (sig.action == 'BUY' and lookback_ret > 0.008) or
+                            (sig.action == 'SELL' and lookback_ret < -0.008)
+                        )
+                        if momentum_confirms:
+                            trade_size *= 1.3
+                            ml_stats.setdefault('momentum_confirmed', 0)
+                            ml_stats['momentum_confirmed'] += 1
 
                     # Arch 63+64: Follow-through → position sizing + breakout gate
                     # Model has 0.44 correlation with actual 5-bar moves
