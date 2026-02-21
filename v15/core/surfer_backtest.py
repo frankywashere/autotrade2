@@ -2069,6 +2069,12 @@ def run_backtest(
                 #     ml_stats.setdefault('bsp_stop_tighten', 0)
                 #     ml_stats['bsp_stop_tighten'] += 1
 
+                # Arch 73: Skip ultra-narrow breakouts (stop<0.025%) — slippage eats profit
+                if realistic and sig.signal_type == 'break' and adjusted_stop_pct < 0.00025:
+                    ml_stats.setdefault('narrow_break_skip', 0)
+                    ml_stats['narrow_break_skip'] += 1
+                    continue
+
                 if sig.action == 'BUY':
                     stop = entry_price * (1 - adjusted_stop_pct)
                     tp = entry_price * (1 + sig.suggested_tp_pct)
@@ -2484,8 +2490,8 @@ def run_backtest(
                         except Exception as _e:
                             _track_error("follow_through_predict", _e)
 
-                    # Arch 72: Signal persistence boost — same dir on consecutive bars
-                    if realistic and last_signal_dir == sig.action and (bar - last_signal_bar) <= 1:
+                    # Arch 71: Signal persistence boost — same dir within 2 bars
+                    if realistic and last_signal_dir == sig.action and (bar - last_signal_bar) <= 2:
                         trade_size *= 1.2
                         ml_stats.setdefault('persist_boost', 0)
                         ml_stats['persist_boost'] += 1
