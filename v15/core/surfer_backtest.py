@@ -2834,6 +2834,15 @@ def run_backtest(
                             ml_stats.setdefault('long_osc_reduce', 0)
                             ml_stats['long_osc_reduce'] += 1
 
+
+                    # Arch 110: High potential energy bounce boost (stored energy = strong bounce)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps110 = analysis.tf_states.get(sig.primary_tf)
+                        if ps110 and ps110.potential_energy > 0.70:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('high_pe_boost', 0)
+                            ml_stats['high_pe_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
