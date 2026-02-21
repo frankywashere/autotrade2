@@ -2925,15 +2925,18 @@ def run_backtest(
                                 ml_stats['trend_break_boost'] += 1
 
 
-                    # Arch 119: Composite bounce quality score (PE + theta + edge position)
+                    # Arch 119: Multi-TF quality score (avg quality across all valid TFs)
                     if realistic and sig.signal_type == 'bounce':
-                        ps119 = analysis.tf_states.get(sig.primary_tf)
-                        if ps119:
-                            pe_q = min(ps119.potential_energy, 1.0)
-                            theta_q = min(ps119.ou_theta / 0.50, 1.0)
-                            edge_q = max(0, 1.0 - min(ps119.position_pct, 1.0 - ps119.position_pct) / 0.15)
-                            edge_q = min(edge_q, 1.0)
-                            quality = pe_q * 0.4 + theta_q * 0.3 + edge_q * 0.3
+                        tf_qualities = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                pe_q = min(tf_state.potential_energy, 1.0)
+                                theta_q = min(tf_state.ou_theta / 0.50, 1.0)
+                                edge_q = max(0, 1.0 - min(tf_state.position_pct, 1.0 - tf_state.position_pct) / 0.15)
+                                edge_q = min(edge_q, 1.0)
+                                tf_qualities.append(pe_q * 0.4 + theta_q * 0.3 + edge_q * 0.3)
+                        if tf_qualities:
+                            quality = sum(tf_qualities) / len(tf_qualities)
                             mult = 0.6 + 0.8 * quality
                             trade_size *= mult
                             ml_stats.setdefault('quality_scored', 0)
