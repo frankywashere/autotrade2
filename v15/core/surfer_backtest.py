@@ -1074,6 +1074,8 @@ def run_backtest(
     consecutive_losses = 0  # Track losing streak for position reduction
     consecutive_wins = 0    # Track winning streak for position ramping
     recent_trade_wins = []  # Arch 67: Rolling window of win/loss for dynamic cap
+    last_signal_bar = -10   # Arch 72: Track last signal bar for persistence
+    last_signal_dir = None  # Arch 72: Track last signal direction
     last_breakout_loss = False  # Track if last loss was a breakout (confirms channel)
     daily_pnl = 0.0         # Running P&L for current trading day
     daily_breaker_active = False
