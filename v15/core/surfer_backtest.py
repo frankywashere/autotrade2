@@ -2703,6 +2703,13 @@ def run_backtest(
                             ml_stats.setdefault('big_win_regime', 0)
                             ml_stats['big_win_regime'] += 1
 
+                    # Arch 96: Avoid same-direction stacking (reduce if last trade was same direction)
+                    if realistic and trades and trades[-1].direction == sig.action and (bar - trades[-1].exit_bar) < 5:
+                        trade_size *= 0.75
+                        ml_stats.setdefault('same_dir_reduce', 0)
+                        ml_stats['same_dir_reduce'] += 1
+
+
                     # Arch 96: Low MAE regime (clean entries = low adverse excursion)
                     if realistic and len(trades) >= 5:
                         avg_mae = np.mean([t.mae_pct for t in trades[-5:]])
@@ -2726,6 +2733,17 @@ def run_backtest(
                         trade_size *= 0.80
                         ml_stats.setdefault('low_conf_reduce', 0)
                         ml_stats['low_conf_reduce'] += 1
+
+                    # Arch 98: Exposure cap (prevent runaway leverage)
+                    if realistic:
+                        total_open = sum(p.trade_size for p in positions)
+                        cap = equity * 25.0
+                        if total_open + trade_size > cap:
+                            trade_size = max(0, cap - total_open)
+                            if trade_size <= 0:
+                                continue
+                            ml_stats.setdefault('exposure_cap', 0)
+                            ml_stats['exposure_cap'] += 1
 
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
