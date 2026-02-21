@@ -2879,6 +2879,15 @@ def run_backtest(
                             ml_stats.setdefault('hot_zone_boost', 0)
                             ml_stats['hot_zone_boost'] += 1
 
+
+                    # Arch 115: Spring-loaded bounce boost (fast mean reversion + high stored energy)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps115 = analysis.tf_states.get(sig.primary_tf)
+                        if ps115 and ps115.ou_theta > 0.35 and ps115.potential_energy > 0.70:
+                            trade_size *= 1.25
+                            ml_stats.setdefault('spring_bounce_boost', 0)
+                            ml_stats['spring_bounce_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
