@@ -332,7 +332,7 @@ def run_backtest(
     eval_interval: int = 3,     # Check every 3 bars = 15 min
     max_hold_bars: int = 60,    # Max 5 hours (60 * 5min)
     position_size: float = 10000.0,  # $10k per trade
-    min_confidence: float = 0.45,
+    min_confidence: float = 0.15,  # Lowered from 0.45: ultra-tight trail protects, ML penalties informational only
     use_multi_tf: bool = True,  # Use higher TF data for context
     ml_model=None,              # Optional ML model for signal enhancement
     # Pre-loaded data (skip yfinance when provided)
@@ -370,10 +370,25 @@ def run_backtest(
     from v15.core.channel import detect_channels_multi_window, select_best_channel
     from v15.core.channel_surfer import analyze_channels, SIGNAL_TFS, TF_WINDOWS
 
+    # Silent failure tracker — counts errors per category, prints summary at end
+    _error_counts = {}
+    def _track_error(category: str, err: Exception):
+        _error_counts.setdefault(category, {'count': 0, 'first_err': str(err)})
+        _error_counts[category]['count'] += 1
+
     ml_active = ml_model is not None
     quality_scorer = None
     ensemble_model = None
     ensemble_base_models = {}
+    ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0,
+                 'quality_filtered': 0, 'quality_boosted': 0, 'ensemble_filtered': 0,
+                 'conf_below_min': 0, 'not_buy_sell': 0, 'circuit_breaker': 0,
+                 'anti_pyramid': 0, 'anti_double_type': 0, 'low_volume': 0,
+                 'pos_score_weak': 0, 'low_conf_buy_bounce': 0, 'leverage_cap': 0}
+    if not ml_active:
+        print("⚠️  WARNING: ML MODEL NOT LOADED — trading without ML filtering!")
+        print("⚠️  All signals will pass through unfiltered by ML models.")
+        print("⚠️  This is ONLY acceptable for backtesting baseline comparisons.")
     if ml_active:
         from v15.core.surfer_ml import (
             extract_tf_features, extract_cross_tf_features,
@@ -388,8 +403,6 @@ def run_backtest(
         ml_feature_names = get_feature_names()
         ml_history_buffer: List[Dict] = []
         ml_feature_window: List[np.ndarray] = []  # For TrendGBT sliding window
-        ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0,
-                     'quality_filtered': 0, 'quality_boosted': 0, 'ensemble_filtered': 0}
         print(f"[ML] Model loaded with {len(ml_feature_names)} features")
 
         # Try to load quality scorer
@@ -403,8 +416,8 @@ def run_backtest(
             try:
                 quality_scorer = TradeQualityScorer.load(quality_path)
                 print(f"[ML] Quality scorer loaded")
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("model_load", _e)
 
         # Try to load ensemble + base models
         ens_path = _os.path.join(model_dir, 'ensemble_model.pkl')
@@ -422,15 +435,15 @@ def run_backtest(
                 if _os.path.exists(trans_path):
                     try:
                         ensemble_base_models['transformer'] = MultiTFTransformer.load(trans_path)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _track_error("load_transformer", _e)
 
                 surv_path = _os.path.join(model_dir, 'survival_model.pt')
                 if _os.path.exists(surv_path):
                     try:
                         ensemble_base_models['survival'] = SurvivalModel.load(surv_path)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _track_error("load_survival", _e)
 
                 if quality_scorer:
                     ensemble_base_models['quality'] = quality_scorer
@@ -448,8 +461,8 @@ def run_backtest(
                 print(f"[ML] Regime model loaded (regime-augmented)")
                 ml_stats['regime_boosted'] = 0
                 ml_stats['regime_penalized'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_regime", _e)
 
         # Try to load TrendGBT model
         trend_gbt_model = None
@@ -460,8 +473,8 @@ def run_backtest(
                 print(f"[ML] TrendGBT loaded (top-{trend_gbt_model.TOP_K} features + trends)")
                 ml_stats['trend_gbt_confirmed'] = 0
                 ml_stats['trend_gbt_filtered'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_trend_gbt", _e)
 
         # Try to load CV Ensemble model
         cv_ensemble_model = None
@@ -472,8 +485,8 @@ def run_backtest(
                 print(f"[ML] CV Ensemble loaded ({cv_ensemble_model.N_FOLDS}-fold)")
                 ml_stats['cv_high_consensus'] = 0
                 ml_stats['cv_low_consensus'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_cv_ensemble", _e)
 
         # Try to load Physics-Residual model
         residual_model = None
@@ -485,8 +498,8 @@ def run_backtest(
                 ml_stats['residual_boosted'] = 0
                 ml_stats['residual_penalized'] = 0
                 ml_stats['residual_lifetime_adj'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("model_load", _e)
 
         # Try to load Adverse Movement model
         adverse_model = None
@@ -497,8 +510,8 @@ def run_backtest(
                 print(f"[ML] Adverse Movement model loaded")
                 ml_stats['adverse_filtered'] = 0
                 ml_stats['adverse_boosted'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_adverse", _e)
 
         # Try to load Composite Signal Scorer
         composite_model = None
@@ -509,8 +522,8 @@ def run_backtest(
                 print(f"[ML] Composite scorer loaded ({len(composite_model.meta_feature_names or [])} meta-features)")
                 ml_stats['composite_agreed'] = 0
                 ml_stats['composite_filtered'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_composite", _e)
 
         # Try to load Volatility Transition model
         vol_model = None
@@ -522,8 +535,8 @@ def run_backtest(
                 ml_stats['vol_danger_skip'] = 0
                 ml_stats['vol_warning_scale'] = 0
                 ml_stats['vol_calm_boost'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("model_load", _e)
 
         # Try to load Exit Timing model
         exit_timing_model = None
@@ -534,8 +547,8 @@ def run_backtest(
                 print(f"[ML] Exit Timing model loaded")
                 ml_stats['exit_tightened'] = 0
                 ml_stats['exit_early'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_exit_timing", _e)
 
         # Try to load Momentum Exhaustion model
         exhaustion_model = None
@@ -547,8 +560,8 @@ def run_backtest(
                 ml_stats['exh_exhausted_skip'] = 0
                 ml_stats['exh_tiring_scale'] = 0
                 ml_stats['exh_fresh_boost'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("model_load", _e)
 
         # Try to load Cross-Asset Amplifier model
         cross_asset_model = None
@@ -560,8 +573,8 @@ def run_backtest(
                 ml_stats['ca_rotation_boost'] = 0
                 ml_stats['ca_selloff_skip'] = 0
                 ml_stats['ca_scale_applied'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("model_load", _e)
 
         # Try to load Stop Loss Predictor
         stop_loss_model = None
@@ -573,8 +586,8 @@ def run_backtest(
                 ml_stats['sl_danger_skip'] = 0
                 ml_stats['sl_caution_scale'] = 0
                 ml_stats['sl_safe_boost'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("model_load", _e)
 
         # Try to load Dynamic Trail Optimizer
         trail_model = None
@@ -585,8 +598,8 @@ def run_backtest(
                 print(f"[ML] Dynamic Trail Optimizer loaded (AUC 0.700)")
                 ml_stats['trail_tightened'] = 0
                 ml_stats['trail_loosened'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_trail", _e)
 
         # Architecture 21: Intraday Session Model
         session_model = None
@@ -597,8 +610,8 @@ def run_backtest(
                 print(f"[ML] Intraday Session Model loaded (Quality AUC 0.648)")
                 ml_stats['session_boost'] = 0
                 ml_stats['session_penalty'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_session", _e)
 
         # Architecture 22: Channel Maturity Predictor
         maturity_model = None
@@ -609,8 +622,8 @@ def run_backtest(
                 print(f"[ML] Channel Maturity Predictor loaded (AUC 0.677)")
                 ml_stats['maturity_skip'] = 0
                 ml_stats['maturity_boost'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_maturity", _e)
 
         # Architecture 24: Return Asymmetry Predictor
         asymmetry_model = None
@@ -621,8 +634,8 @@ def run_backtest(
                 print(f"[ML] Return Asymmetry Predictor loaded (Spike AUC 0.680)")
                 ml_stats['asym_widen_stop'] = 0
                 ml_stats['asym_tighten_trail'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_asymmetry", _e)
 
         # Architecture 25: Gap Risk Predictor
         gap_risk_model = None
@@ -632,8 +645,8 @@ def run_backtest(
                 gap_risk_model = GapRiskPredictor.load(gap_path)
                 print(f"[ML] Gap Risk Predictor loaded (AUC 0.852)")
                 ml_stats['gap_risk_skip'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_gap_risk", _e)
 
         # Architecture 26: Mean Reversion Speed
         reversion_model = None
@@ -644,8 +657,8 @@ def run_backtest(
                 print(f"[ML] Mean Reversion Speed loaded (AUC 0.873)")
                 ml_stats['rev_fast_boost'] = 0
                 ml_stats['rev_slow_penalty'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_reversion", _e)
 
         # Architecture 27: Liquidity State (slippage risk only)
         liquidity_model = None
@@ -655,8 +668,8 @@ def run_backtest(
                 liquidity_model = LiquidityStateClassifier.load(liq_path)
                 print(f"[ML] Liquidity State loaded (slippage corr 0.499)")
                 ml_stats['liq_high_slippage'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_liquidity", _e)
 
         # Architecture 31: Trade Duration Predictor
         duration_model = None
@@ -667,8 +680,8 @@ def run_backtest(
                 print(f"[ML] Trade Duration loaded (Quick AUC 0.617)")
                 ml_stats['dur_quick_exit'] = 0
                 ml_stats['dur_extend_hold'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_duration", _e)
 
         # Architecture 37: Adversarial Trade Selector
         adversarial_model = None
@@ -679,8 +692,8 @@ def run_backtest(
                 print(f"[ML] Adversarial Selector loaded (AUC 0.605)")
                 ml_stats['adv_favorable_boost'] = 0
                 ml_stats['adv_unfavorable_penalty'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_adversarial", _e)
 
         # Architecture 40: Quantile Risk Estimator
         quantile_risk_model = None
@@ -691,8 +704,8 @@ def run_backtest(
                 print(f"[ML] Quantile Risk loaded (spread corr 0.298)")
                 ml_stats['qr_high_risk_penalty'] = 0
                 ml_stats['qr_favorable_asym'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_quantile_risk", _e)
 
         # Architecture 41: Tail Risk Detector
         tail_risk_model = None
@@ -703,8 +716,8 @@ def run_backtest(
                 print(f"[ML] Tail Risk Detector loaded (AUC 0.743)")
                 ml_stats['tail_bounce_penalty'] = 0
                 ml_stats['tail_break_boost'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_tail_risk", _e)
 
         # Architecture 43: Stop Distance Optimizer
         stop_dist_model = None
@@ -715,8 +728,8 @@ def run_backtest(
                 print(f"[ML] Stop Distance loaded (MAE corr 0.346)")
                 ml_stats['sd_wide_stop'] = 0
                 ml_stats['sd_tight_stop'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_stop_dist", _e)
 
         # Architecture 44: Volatility Clustering
         vol_cluster_model = None
@@ -727,8 +740,8 @@ def run_backtest(
                 print(f"[ML] Vol Clustering loaded (AUC 0.683)")
                 ml_stats['vc_vol_inc_penalty'] = 0
                 ml_stats['vc_vol_dec_boost'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_vol_cluster", _e)
 
         # Architecture 45: Extreme Loser Detector
         extreme_loser_model = None
@@ -739,8 +752,8 @@ def run_backtest(
                 print(f"[ML] Extreme Loser Detector loaded (AUC 0.654)")
                 ml_stats['el_penalty'] = 0
                 ml_stats['el_skip'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_extreme_loser", _e)
 
         # Architecture 49: Drawdown Magnitude Predictor
         drawdown_mag_model = None
@@ -751,8 +764,8 @@ def run_backtest(
                 print(f"[ML] Drawdown Magnitude loaded (P75 corr 0.283)")
                 ml_stats['dm_high_dd_pen'] = 0
                 ml_stats['dm_low_dd_boost'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_drawdown_mag", _e)
 
         # Architecture 50: Win Streak Detector
         win_streak_model = None
@@ -762,8 +775,8 @@ def run_backtest(
                 win_streak_model = WinStreakDetector.load(ws_path)
                 print(f"[ML] Win Streak Detector loaded (AUC 0.620)")
                 ml_stats['ws_boost'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_win_streak", _e)
 
         # Architecture 54: Bounce Loser Detector
         bounce_loser_model = None
@@ -773,8 +786,8 @@ def run_backtest(
                 bounce_loser_model = BounceLoserDetector.load(bl_path)
                 print(f"[ML] Bounce Loser Detector loaded (AUC 0.670)")
                 ml_stats['bl_penalty'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_bounce_loser", _e)
 
         # Architecture 55: Feature Interaction Loser
         feat_int_model = None
@@ -784,8 +797,8 @@ def run_backtest(
                 feat_int_model = FeatureInteractionLoser.load(fi_path)
                 print(f"[ML] Feature Interaction Loser loaded (AUC 0.733)")
                 ml_stats['fi_penalty'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_feat_int", _e)
 
         # Architecture 56: Momentum Reversal Detector
         mom_rev_model = None
@@ -795,8 +808,8 @@ def run_backtest(
                 mom_rev_model = MomentumReversalDetector.load(mr_path)
                 print(f"[ML] Momentum Reversal loaded (AUC 0.663)")
                 ml_stats['mr_penalty'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_mom_rev", _e)
 
         # Architecture 57: Immediate Stop Detector
         imm_stop_model = None
@@ -806,8 +819,8 @@ def run_backtest(
                 imm_stop_model = ImmediateStopDetector.load(is_path)
                 print(f"[ML] Immediate Stop Detector loaded (AUC 0.659)")
                 ml_stats['is_skip'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_imm_stop", _e)
 
         # Architecture 58: Profit Velocity Predictor
         profit_vel_model = None
@@ -816,8 +829,8 @@ def run_backtest(
             try:
                 profit_vel_model = ProfitVelocityPredictor.load(pv_path)
                 print(f"[ML] Profit Velocity Predictor loaded (AUC 0.649)")
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_profit_vel", _e)
 
         # Architecture 59: Breakout Stop Predictor
         breakout_stop_model = None
@@ -828,8 +841,8 @@ def run_backtest(
                 print(f"[ML] Breakout Stop Predictor loaded (AUC 0.794)")
                 ml_stats['bsp_tighten'] = 0
                 ml_stats['bsp_skip'] = 0
-            except Exception:
-                pass
+            except Exception as _e:
+                _track_error("load_breakout_stop", _e)
 
     # Feature capture mode (signal quality model training OR ML position sizing)
     _capture_feature_names = None
@@ -948,7 +961,24 @@ def run_backtest(
         print("Not enough data for backtest")
         return BacktestMetrics(), []
 
+    # Data quality checks — never trade on garbage data silently
+    if spy_df is None:
+        print("⚠️  WARNING: SPY data missing — ML correlation features will be degraded!")
+    elif len(spy_df) < 100:
+        print(f"⚠️  WARNING: SPY data sparse ({len(spy_df)} bars) — correlation features unreliable!")
+    if vix_df is None:
+        print("⚠️  WARNING: VIX data missing — volatility regime features unavailable!")
+    if 'volume' not in tsla.columns or tsla['volume'].sum() == 0:
+        print("⚠️  WARNING: Volume data missing — volume filters disabled!")
+    for _req_tf in ['1h', 'daily']:
+        if _req_tf not in higher_tf_data:
+            print(f"⚠️  WARNING: {_req_tf} timeframe missing — multi-TF analysis degraded!")
+    nan_pct = tsla[['open', 'high', 'low', 'close']].isna().mean().mean() * 100
+    if nan_pct > 1.0:
+        print(f"⚠️  WARNING: {nan_pct:.1f}% NaN values in TSLA OHLC — data may be corrupted!")
+
     closes = tsla['close'].values
+    opens = tsla['open'].values
     highs = tsla['high'].values
     lows = tsla['low'].values
 
@@ -1050,10 +1080,8 @@ def run_backtest(
                                 tighter = entry + (position.stop_price - entry) * 0.7
                                 position.stop_price = min(position.stop_price, tighter)
                             ml_stats['exit_early'] += 1
-                except Exception:
-                    pass
-
-            # Dynamic Trail Optimizer: adjust trail tightness based on ML
+                except Exception as _e:
+                    _track_error("exit_timing_predict", _e)
             if ml_active and trail_model is not None and feature_vec is not None:
                 try:
                     if len(feature_vec) == len(ml_feature_names):
@@ -1080,8 +1108,8 @@ def run_backtest(
                                     ml_stats['trail_tightened'] += 1
                         elif tighten_p < 0.20:
                             ml_stats['trail_loosened'] += 1
-                except Exception:
-                    pass
+                except Exception as _e:
+                    _track_error("trail_optimizer_predict", _e)
 
             result = _check_position_exit(
                 position, bar, current_price, window_high, window_low, eval_interval)
@@ -1284,8 +1312,8 @@ def run_backtest(
                             current_prices_dict[tf_label] = float(tf_recent['close'].iloc[-1])
                             if 'volume' in tf_recent.columns:
                                 volumes_dict[tf_label] = tf_recent['volume'].values
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _track_error("higher_tf_extract", _e)
 
             try:
                 analysis = analyze_channels(
@@ -1305,13 +1333,12 @@ def run_backtest(
                         analysis, tsla, bar, closes, spy_df, vix_df,
                         _capture_feature_names, _capture_history_buffer, eval_interval,
                     )
-                except Exception:
-                    pass
-
-            # --- ML Enhancement ---
+                except Exception as _e:
+                    _track_error("feature_extract", _e)
             ml_prediction = None
-            if ml_active and sig.action in ('BUY', 'SELL'):
+            if sig.action in ('BUY', 'SELL'):
                 ml_stats['total_signals'] += 1
+            if ml_active and sig.action in ('BUY', 'SELL'):
                 try:
                     feature_vec, _ = _extract_signal_features(
                         analysis, tsla, bar, closes, spy_df, vix_df,
@@ -1333,10 +1360,10 @@ def run_backtest(
                         ml_action_id = int(ml_prediction['action'][0])
                         physics_action_id = 1 if sig.action == 'BUY' else 2
 
-                        # If ML says HOLD → filter the signal
+                        # If ML says HOLD → log only, no penalty
+                        # (ultra-tight breakeven trail protects all trades)
                         if ml_action_id == 0:
                             ml_stats['ml_filtered'] += 1
-                            continue
 
                         # If ML agrees with physics → boost confidence
                         if ml_action_id == physics_action_id:
@@ -1390,9 +1417,8 @@ def run_backtest(
                                 ens_action = int(ens_pred['action'][0])
                                 physics_action_id = 1 if sig.action == 'BUY' else 2
 
-                                if ens_action == 0:  # Ensemble says HOLD
+                                if ens_action == 0:  # Ensemble says HOLD → log only
                                     ml_stats['ensemble_filtered'] += 1
-                                    continue
                                 elif ens_action != physics_action_id:
                                     # Ensemble disagrees with physics → penalize
                                     sig.confidence *= 0.70
@@ -1403,8 +1429,8 @@ def run_backtest(
                                 ens_life = float(ens_pred['lifetime'][0])
                                 if ens_life > 3:
                                     ml_max_hold = max(6, int(ens_life * 0.8))
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Regime-conditional adjustment
                     if regime_model is not None:
@@ -1430,8 +1456,8 @@ def run_backtest(
                                 if sig.action == 'SELL':
                                     sig.confidence *= 1.10  # Trend-aligned boost
                                     ml_stats['regime_boosted'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # TrendGBT break direction confirmation
                     if trend_gbt_model is not None and len(ml_feature_window) >= TrendGBTModel.WINDOW_SIZE:
@@ -1455,8 +1481,8 @@ def run_backtest(
                                 # TrendGBT confirms direction
                                 sig.confidence *= 1.15
                                 ml_stats['trend_gbt_confirmed'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # CV Ensemble: consensus-based confidence scaling
                     if cv_ensemble_model is not None:
@@ -1478,8 +1504,8 @@ def run_backtest(
                             elif bd_consensus < 0.6:
                                 sig.confidence *= 0.90  # Mild penalty
                                 ml_stats['cv_low_consensus'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Physics-Residual: correct confidence + lifetime using residuals
                     if residual_model is not None:
@@ -1502,8 +1528,8 @@ def run_backtest(
                                 if corrected_hold != ml_max_hold:
                                     ml_max_hold = corrected_hold
                                     ml_stats['residual_lifetime_adj'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Adverse Movement: filter high stop-out probability trades
                     if adverse_model is not None:
@@ -1526,8 +1552,8 @@ def run_backtest(
                                 viable_p = float(adv_pred['viable_prob'][0])
                                 if viable_p > 0.65:
                                     sig.confidence *= 1.05
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Composite Signal Scorer: learned combination of all model outputs
                     if composite_model is not None:
@@ -1553,8 +1579,8 @@ def run_backtest(
                                 if comp_conf > 0.5:
                                     sig.confidence *= 0.75
                                     ml_stats['composite_filtered'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Volatility Transition: avoid entries during vol spikes
                     if vol_model is not None:
@@ -1575,8 +1601,8 @@ def run_backtest(
                                 # Calm → slight boost (low vol = favorable for channel trading)
                                 sig.confidence *= 1.05
                                 ml_stats['vol_calm_boost'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Momentum Exhaustion: avoid entering exhausted moves
                     if exhaustion_model is not None:
@@ -1593,8 +1619,8 @@ def run_backtest(
                             elif exh_prob < 0.25:
                                 sig.confidence *= 1.03
                                 ml_stats['exh_fresh_boost'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Cross-Asset Amplifier: regime-based confidence scaling
                     if cross_asset_model is not None:
@@ -1610,8 +1636,8 @@ def run_backtest(
                                 ml_stats['ca_selloff_skip'] += 1
 
                             ml_stats['ca_scale_applied'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Intraday Session Model: session quality confidence scaling
                     if session_model is not None:
@@ -1625,8 +1651,8 @@ def run_backtest(
                             elif sess_quality > 0.55:
                                 sig.confidence *= 1.05  # Good session → slight boost
                                 ml_stats['session_boost'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("session", _e)
 
                     # Channel Maturity Predictor: skip mature channels or boost young ones
                     if maturity_model is not None:
@@ -1641,8 +1667,8 @@ def run_backtest(
                             elif mat_prob < 0.20 and rem_life > 50:
                                 sig.confidence *= 1.05  # Young channel → more room
                                 ml_stats['maturity_boost'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Return Asymmetry Predictor: adjust stops/targets based on expected move type
                     if asymmetry_model is not None:
@@ -1657,8 +1683,8 @@ def run_backtest(
                                 ml_stats['asym_widen_stop'] += 1
                             elif spike_prob < 0.10:
                                 ml_stats['asym_tighten_trail'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Gap Risk Predictor: AUC 0.852 but too aggressive at all thresholds
                     # minutes_since_open dominates features → penalizes all late-day entries
@@ -1678,8 +1704,8 @@ def run_backtest(
                             elif fast_rev < 0.15:
                                 sig.confidence *= 0.85  # Slow reversion → less reliable
                                 ml_stats['rev_slow_penalty'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("reversion", _e)
 
                     # Liquidity State: thin market AUC 1.0 (leaky target — volume_ratio < 0.7)
                     # Slippage regressor (corr 0.499) too aggressive, penalizes 13/46 signals
@@ -1702,8 +1728,8 @@ def run_backtest(
                             if risk_ratio > 1.5:
                                 sig.confidence *= 1.05
                                 ml_stats['qr_favorable_asym'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("quantile_risk", _e)
 
                     # Tail Risk: big move coming — good for breaks, bad for bounces
                     tail_prob = 0.0  # Track for TP widening
@@ -1721,8 +1747,8 @@ def run_backtest(
                                     # Big move + breakout = ride the trend
                                     sig.confidence *= 1.10
                                     ml_stats['tail_break_boost'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("ml_predict", _e)
 
                     # Extreme Loser Detector: high loser probability → penalize hard
                     el_loser_prob = 0.0  # Track for stop tightening
@@ -1734,8 +1760,8 @@ def run_backtest(
                             if el_loser_prob > 0.18:
                                 sig.confidence *= 0.80
                                 ml_stats['el_penalty'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("extreme_loser", _e)
 
                     # Drawdown Magnitude (Arch 49): P75 corr 0.283 but compounds with EL
                     # Disabled: too many penalties (41) overlap with Extreme Loser
@@ -1781,8 +1807,8 @@ def run_backtest(
                         try:
                             pv_pred = profit_vel_model.predict(feature_vec.reshape(1, -1))
                             fast_profit_prob = float(pv_pred['fast_profit_prob'][0])
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("profit_vel", _e)
 
                     # Immediate Stop Detector (Arch 57): tighten stop on high-risk entries
                     imm_stop_prob = 0.0
@@ -1793,8 +1819,8 @@ def run_backtest(
                             imm_stop_prob = float(is_pred['immediate_stop_prob'][0])
                             if imm_stop_prob > 0.35:
                                 ml_stats['is_skip'] += 1  # Track triggers
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("imm_stop", _e)
 
                     # Breakout Stop Predictor (Arch 59): AUC 0.794
                     # Stop tightening only — confidence penalty hurts PF
@@ -1805,10 +1831,10 @@ def run_backtest(
                             bsp_prob = float(bsp_pred['breakout_stop_prob'][0])
                             if bsp_prob > 0.20:
                                 ml_stats['bsp_tighten'] += 1
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _track_error("breakout_stop", _e)
 
-                except Exception:
+                except Exception as _ml_err:
                     ml_prediction = None
                     ml_max_hold = None
                     imm_stop_skip = False
@@ -1816,6 +1842,10 @@ def run_backtest(
                     imm_stop_prob = 0.0
                     fast_rev = 0.0
                     bsp_prob = 0.0
+                    ml_stats.setdefault('ml_predict_errors', 0)
+                    ml_stats['ml_predict_errors'] += 1
+                    if ml_stats['ml_predict_errors'] <= 3:
+                        print(f"⚠️  ML PREDICTION FAILED (signal #{ml_stats['total_signals']}): {_ml_err}")
             else:
                 ml_max_hold = None
                 imm_stop_skip = False
@@ -1824,9 +1854,16 @@ def run_backtest(
                 fast_rev = 0.0
                 bsp_prob = 0.0
 
+            # Track signals that fail the confidence gate
+            if sig.action in ('BUY', 'SELL') and sig.confidence < min_confidence:
+                ml_stats['conf_below_min'] += 1
+            elif sig.action not in ('BUY', 'SELL'):
+                ml_stats['not_buy_sell'] += 1
+
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
                 # Daily circuit breaker: stop trading if down $500+ today
                 if daily_breaker_active:
+                    ml_stats['circuit_breaker'] += 1
                     continue
 
                 # 10AM ET skip disabled — testing without in new data window
@@ -1836,8 +1873,10 @@ def run_backtest(
                 existing_dirs = {p.direction for p in positions}
                 existing_types = {p.signal_type for p in positions}
                 if sig.action in existing_dirs:
+                    ml_stats['anti_pyramid'] += 1
                     continue  # No pyramiding
                 if sig.signal_type in existing_types:
+                    ml_stats['anti_double_type'] += 1
                     continue  # No double-bounce or double-break
 
                 # Volume confirmation: skip breakouts on thin volume
@@ -1845,22 +1884,32 @@ def run_backtest(
                     current_vol = tsla['volume'].iloc[bar]
                     avg_vol = tsla['volume'].iloc[max(0, bar-20):bar].mean()
                     if avg_vol > 0 and current_vol < avg_vol * 0.8:
+                        ml_stats['low_volume'] += 1
                         continue  # Below-average volume → weak breakout
 
                 # Quality scorer: predict win probability for this exact trade
                 if quality_scorer is not None and ml_active:
                     try:
-                        base_feats = feature_vec[:len(ml_feature_names)]
-                        qs_features = quality_scorer.feature_names or []
-                        qs_vec = np.zeros(len(qs_features), dtype=np.float32)
-                        qs_vec[:len(ml_feature_names)] = base_feats
-                        n_base = len(ml_feature_names)
-                        qs_vec[n_base + 0] = sig.confidence
-                        qs_vec[n_base + 1] = 1.0 if sig.signal_type == 'bounce' else 0.0
-                        qs_vec[n_base + 2] = 1.0 if sig.action == 'BUY' else 0.0
-                        qs_vec[n_base + 3] = sig.stop_pct if hasattr(sig, 'stop_pct') else 0.005
-                        qs_vec[n_base + 4] = sig.tp_pct if hasattr(sig, 'tp_pct') else 0.012
-                        qs_vec[n_base + 5] = 1.0
+                        from v15.validation.signal_quality_model import _append_signal_meta
+                        class _QSSigProxy:
+                            pass
+                        _qs_sig = _QSSigProxy()
+                        _qs_sig.signal_type = sig.signal_type
+                        _qs_sig.direction = sig.action
+                        _qs_sig.stop_pct = getattr(sig, 'suggested_stop_pct', 0.005)
+                        _qs_sig.tp_pct = getattr(sig, 'suggested_tp_pct', 0.012)
+                        _qs_sig.primary_tf = getattr(sig, 'primary_tf', '')
+                        _qs_sig.entry_time = str(tsla.index[bar]) if bar < len(tsla) else ''
+                        _qs_sig_data = {
+                            'position_score': sig.position_score,
+                            'energy_score': sig.energy_score,
+                            'entropy_score': sig.entropy_score,
+                            'confluence_score': sig.confluence_score,
+                            'timing_score': sig.timing_score,
+                            'channel_health': sig.channel_health,
+                            'confidence': sig.confidence,
+                        }
+                        qs_vec = _append_signal_meta(feature_vec, _qs_sig, _qs_sig_data, extended=True)
 
                         qs_pred = quality_scorer.predict(qs_vec.reshape(1, -1))
                         win_prob = float(qs_pred.get('win_prob', [0.5])[0])
@@ -1874,21 +1923,28 @@ def run_backtest(
                         if win_prob > 0.65:
                             sig.confidence *= 1.15  # 15% boost
                             ml_stats['quality_boosted'] += 1
-                    except Exception:
-                        pass  # Quality scorer failure doesn't block trade
+                    except Exception as _e:
+                        _track_error("quality_scorer_predict", _e)
 
                 # Position score filter: skip breakouts with weak position
                 if sig.signal_type == 'break' and sig.position_score < 0.80:
+                    ml_stats['pos_score_weak'] += 1
                     continue
 
                 # Low-conf bounce filter: BUY bounces with conf < 0.46 lose more
                 if (sig.signal_type == 'bounce' and sig.action == 'BUY'
                         and sig.confidence < 0.46):
+                    ml_stats['low_conf_buy_bounce'] += 1
                     continue
 
 
-                # Enter position
-                entry_price = current_price
+                # Enter position — use next bar's open (no look-ahead bias)
+                # Signal fires at bar N close; order fills at bar N+1 open
+                next_bar = bar + 1
+                if next_bar < total_bars:
+                    entry_price = float(opens[next_bar])
+                else:
+                    continue  # Can't enter on last bar
 
                 # Risk-normalized position sizing
                 if realistic:
@@ -1987,8 +2043,8 @@ def run_backtest(
                         full_vec = _append_signal_meta(current_signal_features, _t, _sig_data, extended=True)
                         pred = signal_quality_model.predict(full_vec)
                         trade_size *= ml_size_fn(pred['quality_score'])
-                    except Exception:
-                        pass  # On failure, use unscaled trade_size
+                    except Exception as _e:
+                        _track_error("ml_sizing_predict", _e)
 
                 if realistic:
                     # Realistic: leverage-based cap, no multiplicative boosts
@@ -2014,6 +2070,7 @@ def run_backtest(
                     # Max exposure check: leverage-based
                     total_exposure = sum(p.trade_size for p in positions)
                     if total_exposure + trade_size > equity * max_leverage:
+                        ml_stats['leverage_cap'] += 1
                         continue
                 else:
                     # Original mode: all multiplicative boosts
@@ -2255,7 +2312,7 @@ def run_backtest(
                     ml_stats['deferred_total'] += 1
                 else:
                     positions.append(OpenPosition(
-                        entry_bar=bar,
+                        entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
                         direction=sig.action,
                         confidence=sig.confidence,
@@ -2339,13 +2396,24 @@ def run_backtest(
     title = "CHANNEL SURFER BACKTEST RESULTS"
     if ml_active:
         title += " [ML-ENHANCED]"
+    else:
+        title += " [NO ML — UNFILTERED]"
     print(title)
     print(f"{'='*70}")
     print(metrics.summary())
 
+    # Always show signal stats — never hide what happened
+    print(f"\n  Signal Stats:")
+    print(f"    Total physics signals: {ml_stats['total_signals']}")
+    print(f"    Trades taken:          {metrics.total_trades}")
+    pass_rate = metrics.total_trades / max(ml_stats['total_signals'], 1)
+    print(f"    Pass-through rate:     {pass_rate:.1%}")
+    if not ml_active:
+        print(f"\n  ⚠️  ML MODELS INACTIVE — all 16 sub-models skipped!")
+        print(f"      Signals passed only physics + confidence filters.")
+        print(f"      This is ONLY valid for baseline comparison.")
     if ml_active:
         print(f"\n  ML Enhancement Stats:")
-        print(f"    Total physics signals: {ml_stats['total_signals']}")
         print(f"    ML filtered (skipped): {ml_stats['ml_filtered']}")
         print(f"    ML agreed (boosted):   {ml_stats['ml_agreed']}")
         filter_rate = ml_stats['ml_filtered'] / max(ml_stats['total_signals'], 1)
@@ -2578,6 +2646,40 @@ def run_backtest(
                     print(f"  {comp:<18s} {np.mean(win_vals):<10.3f} {np.mean(loss_vals):<10.3f} "
                           f"{win_corr:<+10.3f} {pnl_corr:<+10.3f} {flag}")
 
+    # Print filter diagnostics
+    if ml_stats.get('total_signals', 0) > 0:
+        print(f"\n{'='*60}")
+        print(f"SIGNAL FILTER DIAGNOSTICS ({ml_stats['total_signals']} total physics signals)")
+        print(f"{'='*60}")
+        # Sort by count descending, skip zero-count
+        for k, v in sorted(ml_stats.items(), key=lambda x: -x[1] if isinstance(x[1], (int, float)) else 0):
+            if isinstance(v, (int, float)) and v > 0:
+                print(f"  {k:<30s} {v:>6}")
+        print(f"  {'TRADES TAKEN':<30s} {metrics.total_trades:>6}")
+        print(f"{'='*60}\n")
+
+    # Leverage/exposure audit
+    if trades:
+        max_trade_size = max(t.trade_size for t in trades)
+        avg_trade_size = np.mean([t.trade_size for t in trades])
+        max_leverage_used = max_trade_size / initial_equity if initial_equity > 0 else 0
+        if max_leverage_used > 10:
+            print(f"\n⚠️  LEVERAGE AUDIT:")
+            print(f"  Max single trade:  ${max_trade_size:,.0f} ({max_leverage_used:.0f}x equity)")
+            print(f"  Avg trade size:    ${avg_trade_size:,.0f} ({avg_trade_size/initial_equity:.0f}x equity)")
+            print(f"  Headline P&L may be inflated by concentrated leverage.")
+            if not realistic:
+                print(f"  Mode: UNREALISTIC — multiplicative boosts active")
+
+    # Print error summary — never let failures go unnoticed
+    if _error_counts:
+        print(f"\n{'='*60}")
+        print(f"⚠️  ERROR SUMMARY ({sum(v['count'] for v in _error_counts.values())} total failures)")
+        print(f"{'='*60}")
+        for cat, info in sorted(_error_counts.items(), key=lambda x: -x[1]['count']):
+            print(f"  {cat:<30s} {info['count']:>6}x  (first: {info['first_err'][:60]})")
+        print(f"{'='*60}\n")
+
     if capture_features:
         return metrics, trades, equity_curve, trade_features, trade_signals
     return metrics, trades, equity_curve
@@ -2658,7 +2760,7 @@ def main():
     parser.add_argument('--days', type=int, default=30, help='Days of 5min data')
     parser.add_argument('--eval-interval', type=int, default=6, help='Bars between evaluations')
     parser.add_argument('--max-hold', type=int, default=60, help='Max bars to hold')
-    parser.add_argument('--min-conf', type=float, default=0.45, help='Minimum signal confidence')
+    parser.add_argument('--min-conf', type=float, default=0.15, help='Minimum signal confidence (lowered: trail protects)')
     parser.add_argument('--walk-forward', action='store_true', help='Run walk-forward validation')
     parser.add_argument('--ml', type=str, default=None,
                        help='Path to ML model for signal enhancement (e.g. surfer_models/gbt_model.pkl)')
