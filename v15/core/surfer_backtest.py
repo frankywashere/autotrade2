@@ -2813,6 +2813,19 @@ def run_backtest(
                             ml_stats.setdefault('mid_ch_reduce', 0)
                             ml_stats['mid_ch_reduce'] += 1
 
+                    # Arch 109: Slope-aligned bounce boost (bouncing with channel trend)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps109 = analysis.tf_states.get(sig.primary_tf)
+                        if ps109:
+                            aligned = (
+                                (sig.action == 'BUY' and ps109.slope_pct > 0.01) or
+                                (sig.action == 'SELL' and ps109.slope_pct < -0.01)
+                            )
+                            if aligned:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('slope_align_bounce', 0)
+                                ml_stats['slope_align_bounce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
