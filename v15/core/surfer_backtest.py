@@ -2900,6 +2900,16 @@ def run_backtest(
                             ml_stats.setdefault('multi_tf_edge_boost', 0)
                             ml_stats['multi_tf_edge_boost'] += 1
 
+
+                    # Arch 117: Single-TF isolation reduce (only 1 valid TF = weak signal)
+                    if realistic and sig.signal_type == 'bounce':
+                        valid_tf_count = sum(1 for tf_state in analysis.tf_states.values()
+                                           if tf_state and tf_state.valid)
+                        if valid_tf_count <= 1:
+                            trade_size *= 0.75
+                            ml_stats.setdefault('single_tf_reduce', 0)
+                            ml_stats['single_tf_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
