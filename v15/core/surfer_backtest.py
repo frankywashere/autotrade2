@@ -2764,10 +2764,22 @@ def run_backtest(
                                 ml_stats['break_dir_align'] += 1
 
                     # Arch 103: Intraday PnL cap — protect daily gains
-                    if realistic and daily_pnl > equity * 0.02:
-                        trade_size *= 0.50  # Half-size after 2% daily gain
+                    if realistic and daily_pnl > equity * 0.03:
+                        trade_size *= 0.50  # Half-size after 3% daily gain
                         ml_stats.setdefault('daily_pnl_cap', 0)
                         ml_stats['daily_pnl_cap'] += 1
+
+
+                    # DIAG: Count all signals reaching this point
+                    ml_stats.setdefault('_diag_all', 0)
+                    ml_stats['_diag_all'] += 1
+                    if sig.signal_type == 'bounce':
+                        ml_stats.setdefault('_diag_bounce', 0)
+                        ml_stats['_diag_bounce'] += 1
+                        ps_d = analysis.tf_states.get(sig.primary_tf)
+                        if ps_d:
+                            ml_stats.setdefault('_diag_state_ok', 0)
+                            ml_stats['_diag_state_ok'] += 1
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
