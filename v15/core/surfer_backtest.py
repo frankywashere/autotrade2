@@ -2442,14 +2442,19 @@ def run_backtest(
                             trade_size *= 1.4  # Weak channel → breakout more likely real
                             ml_stats.setdefault('ch_break_sizeup', 0)
                             ml_stats['ch_break_sizeup'] += 1
+                        # Arch 70: SELL breaks more reliable (80% vs 77% WR)
+                        if sig.action == 'SELL':
+                            trade_size *= 1.15
+                            ml_stats.setdefault('break_sell_boost', 0)
+                            ml_stats['break_sell_boost'] += 1
 
                     # Arch 69: Momentum confirmation sizing
                     # If recent price action confirms signal direction, size up
                     if realistic and bar >= 5:
                         lookback_ret = (closes[bar] - closes[bar - 5]) / closes[bar - 5]
                         momentum_confirms = (
-                            (sig.action == 'BUY' and lookback_ret > 0.008) or
-                            (sig.action == 'SELL' and lookback_ret < -0.008)
+                            (sig.action == 'BUY' and lookback_ret > 0.002) or
+                            (sig.action == 'SELL' and lookback_ret < -0.002)
                         )
                         if momentum_confirms:
                             trade_size *= 1.3
