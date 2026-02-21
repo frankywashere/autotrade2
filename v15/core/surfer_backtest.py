@@ -2076,12 +2076,19 @@ def run_backtest(
                     ml_stats['narrow_break_skip'] += 1
                     continue
 
+                # Arch 100: Widen TP for high-confidence bounces (let winners run)
+                tp_pct = sig.suggested_tp_pct
+                if sig.signal_type == 'bounce' and sig.confidence > 0.65:
+                    tp_pct *= 1.30
+                    ml_stats.setdefault('wide_tp_bounce', 0)
+                    ml_stats['wide_tp_bounce'] += 1
+
                 if sig.action == 'BUY':
                     stop = entry_price * (1 - adjusted_stop_pct)
-                    tp = entry_price * (1 + sig.suggested_tp_pct)
+                    tp = entry_price * (1 + tp_pct)
                 else:
                     stop = entry_price * (1 + adjusted_stop_pct)
-                    tp = entry_price * (1 - sig.suggested_tp_pct)
+                    tp = entry_price * (1 - tp_pct)
 
                 # Risk-normalized sizing: trade_size = risk_budget / stop_pct
                 # Wider stops → smaller position, tighter stops → larger position
