@@ -2843,6 +2843,15 @@ def run_backtest(
                             ml_stats.setdefault('high_pe_boost', 0)
                             ml_stats['high_pe_boost'] += 1
 
+
+                    # Arch 111: Double-low energy bounce hard reduction (dead zone - no KE + no PE)
+                    if realistic and sig.signal_type == 'bounce':
+                        ps111 = analysis.tf_states.get(sig.primary_tf)
+                        if ps111 and ps111.kinetic_energy < 0.10 and ps111.potential_energy < 0.30:
+                            trade_size *= 0.65
+                            ml_stats.setdefault('dead_zone_reduce', 0)
+                            ml_stats['dead_zone_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
