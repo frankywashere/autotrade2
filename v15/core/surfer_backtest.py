@@ -2680,6 +2680,14 @@ def run_backtest(
                         ml_stats.setdefault('consec_loss_reduce', 0)
                         ml_stats['consec_loss_reduce'] += 1
 
+                    # Arch 93: Rolling win rate regime boost (high recent WR = hot streak)
+                    if realistic and len(trades) >= 10:
+                        recent_wins = sum(1 for t in trades[-10:] if t.pnl > 0)
+                        if recent_wins >= 9:
+                            trade_size *= 1.10
+                            ml_stats.setdefault('hot_streak', 0)
+                            ml_stats['hot_streak'] += 1
+
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
