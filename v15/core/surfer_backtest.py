@@ -2498,6 +2498,18 @@ def run_backtest(
                     last_signal_bar = bar
                     last_signal_dir = sig.action
 
+                    # Arch 74: Equity peak proximity boost
+                    if realistic and peak_equity > 0:
+                        eq_ratio = equity / peak_equity
+                        if eq_ratio >= 0.99:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('peak_boost', 0)
+                            ml_stats['peak_boost'] += 1
+                        elif eq_ratio < 0.95:
+                            trade_size *= 0.8
+                            ml_stats.setdefault('dd_reduce', 0)
+                            ml_stats['dd_reduce'] += 1
+
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
