@@ -2763,6 +2763,12 @@ def run_backtest(
                                 ml_stats.setdefault('break_dir_align', 0)
                                 ml_stats['break_dir_align'] += 1
 
+                    # Arch 103: Intraday PnL cap — protect daily gains
+                    if realistic and daily_pnl > equity * 0.02:
+                        trade_size *= 0.50  # Half-size after 2% daily gain
+                        ml_stats.setdefault('daily_pnl_cap', 0)
+                        ml_stats['daily_pnl_cap'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
