@@ -2443,9 +2443,9 @@ def run_backtest(
                     # SELL bounces: 98% WR → aggressive, BUY bounces: 95% WR → moderate
                     if realistic and sig.signal_type == 'bounce':
                         if sig.action == 'SELL':
-                            trade_size *= 1.2  # SELL bounces
+                            trade_size *= 1.5  # SELL bounces
                         else:
-                            trade_size *= 1.0  # BUY bounces
+                            trade_size *= 1.2  # BUY bounces
                         ml_stats.setdefault('bounce_sized_up', 0)
                         ml_stats['bounce_sized_up'] += 1
                         # Arch 77: Wide-stop bounce boost (98% WR vs 91% for narrow)
