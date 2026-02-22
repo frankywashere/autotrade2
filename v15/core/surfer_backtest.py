@@ -3063,7 +3063,7 @@ def run_backtest(
                                 ed3.append(min(ep, 1.0))
                         if be3:
                             s = (1.0 - sum(be3)/len(be3)) * 0.4 + (sum(pe3)/len(pe3)) * 0.3 + min((sum(th3)/len(th3))/0.50, 1.0) * 0.15 + (sum(ed3)/len(ed3)) * 0.15
-                            mult = 0.5 + 1.0 * (s ** 1.5)
+                            mult = 0.3 + 1.4 * (s ** 3.0)
                             trade_size *= mult
                             ml_stats.setdefault('exp_score', 0)
                             ml_stats['exp_score'] += 1
