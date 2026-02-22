@@ -5519,6 +5519,35 @@ def run_backtest(
                             ml_stats.setdefault('mh_spring', 0)
                             ml_stats['mh_spring'] += 1
 
+
+                    if realistic and sig.signal_type == 'bounce' and 450000 < equity < 600000 and sig.confidence > 0.70:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('q_mh', 0)
+                        ml_stats['q_mh'] += 1
+
+                    # Arch 288c: Late compound zone (1.20x trades 270-350 avg PE*pos>0.30)
+                    if realistic and sig.signal_type == 'bounce' and 270 < len(trades) < 350:
+                        pp_288 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pp_288.append(tf_s.potential_energy * abs(tf_s.position_pct))
+                        if pp_288 and sum(pp_288)/len(pp_288) > 0.30:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('late_compound', 0)
+                            ml_stats['late_compound'] += 1
+
+                    # Arch 288e: Best free spring boost (1.15x max PE*pos*health*(1-BE)>0.15)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_fsp_288 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                fsp = tf_s.potential_energy * abs(tf_s.position_pct) * tf_s.channel_health * (1.0 - tf_s.binding_energy)
+                                max_fsp_288 = max(max_fsp_288, fsp)
+                        if max_fsp_288 > 0.15:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('free_spring', 0)
+                            ml_stats['free_spring'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
