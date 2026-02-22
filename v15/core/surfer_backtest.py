@@ -4494,6 +4494,15 @@ def run_backtest(
                             ml_stats.setdefault('good_regime_bounce', 0)
                             ml_stats['good_regime_bounce'] += 1
 
+
+                    # Arch 224: Good bounce regime boost (1.15x when avg PnL > $500)
+                    if realistic and sig.signal_type == "bounce" and len(trades) >= 10:
+                        avg_pnl_224 = sum(t.pnl for t in trades[-10:]) / 10
+                        if avg_pnl_224 > 500:
+                            trade_size *= 1.15
+                            ml_stats.setdefault("good_regime_bounce", 0)
+                            ml_stats["good_regime_bounce"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
