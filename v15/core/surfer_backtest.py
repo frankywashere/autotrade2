@@ -4792,6 +4792,28 @@ def run_backtest(
                             ml_stats.setdefault('edge_vol', 0)
                             ml_stats['edge_vol'] += 1
 
+
+                    # Arch 246b: When historical GW/GL ratio is extreme = almost no risk
+                    if realistic and sig.signal_type == 'bounce' and len(trades) >= 50:
+                        gw_246 = sum(t.pnl for t in trades if t.pnl > 0)
+                        gl_246 = abs(sum(t.pnl for t in trades if t.pnl <= 0))
+                        if gl_246 > 0 and gw_246 / gl_246 > 5000:
+                            trade_size *= 1.25
+                            ml_stats.setdefault('extreme_gw_gl', 0)
+                            ml_stats['extreme_gw_gl'] += 1
+
+                    # Arch 243b: Best TF position*r_sq*health > 0.40 (1.15x)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_prh_243 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                prh = abs(tf_s.position_pct) * tf_s.r_squared * tf_s.channel_health
+                                max_prh_243 = max(max_prh_243, prh)
+                        if max_prh_243 > 0.40:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('best_prh', 0)
+                            ml_stats['best_prh'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
