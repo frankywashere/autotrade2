@@ -5871,9 +5871,9 @@ def run_backtest(
                         trade_size *= max(1.0, sig.confidence * 400.0)
 
 
-                    # Arch 357a: Conf*750 at $500M+
+                    # Arch 358c: Conf*1500 at $500M+
                     if realistic and sig.signal_type == 'bounce' and equity > 500000000:
-                        trade_size *= max(1.0, sig.confidence * 750.0)
+                        trade_size *= max(1.0, sig.confidence * 1500.0)
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
