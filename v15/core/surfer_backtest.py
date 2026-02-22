@@ -5083,6 +5083,19 @@ def run_backtest(
                             ml_stats.setdefault('1m_te', 0)
                             ml_stats['1m_te'] += 1
 
+                    # Arch 261a: $1.1M+ equity bounce boost (1.25x)
+                    if realistic and sig.signal_type == 'bounce' and equity > 1100000:
+                        trade_size *= 1.25
+                        ml_stats.setdefault('1_1m_bounce', 0)
+                        ml_stats['1_1m_bounce'] += 1
+
+                    # Arch 261e: Explosive PnL regime bounce (1.25x when $100K in 30 trades)
+                    if realistic and sig.signal_type == 'bounce' and len(trades) >= 30:
+                        if sum(t.pnl for t in trades[-30:]) > 100000:
+                            trade_size *= 1.25
+                            ml_stats.setdefault('explosion', 0)
+                            ml_stats['explosion'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
