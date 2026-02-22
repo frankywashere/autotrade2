@@ -4879,6 +4879,23 @@ def run_backtest(
                             ml_stats.setdefault('heavy_bind', 0)
                             ml_stats['heavy_bind'] += 1
 
+                    # Arch 248a: Avoid bounce after timeout loss (0.05x)
+                    if realistic and sig.signal_type == 'bounce' and len(trades) >= 1:
+                        for t in reversed(trades):
+                            if hasattr(t, 'signal_type') and t.signal_type == 'bounce':
+                                if hasattr(t, 'exit_reason') and t.exit_reason == 'ou_timeout':
+                                    trade_size *= 0.05
+                                    ml_stats.setdefault('timeout_avoid', 0)
+                                    ml_stats['timeout_avoid'] += 1
+                                break
+
+                    # Arch 248f: Extreme break energy + position (1.20x)
+                    if realistic and sig.signal_type == 'break':
+                        if sig.energy_score > 0.98 and sig.position_score > 0.90:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('extreme_break', 0)
+                            ml_stats['extreme_break'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
