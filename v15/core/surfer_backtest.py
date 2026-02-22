@@ -4555,6 +4555,15 @@ def run_backtest(
                                 ml_stats.setdefault('bc_tight', 0)
                                 ml_stats['bc_tight'] += 1
 
+
+                    # Arch 228: Lossless regime aggressive sizing (1.30x)
+                    if realistic and len(trades) >= 20:
+                        cum_loss_228 = abs(sum(t.pnl for t in trades if t.pnl < 0))
+                        if cum_loss_228 < 20:
+                            trade_size *= 1.30
+                            ml_stats.setdefault("lossless_regime", 0)
+                            ml_stats["lossless_regime"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
