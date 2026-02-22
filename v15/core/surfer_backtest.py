@@ -5705,6 +5705,13 @@ def run_backtest(
                         if len(_pos_324a) <= 2 and _pos_324a and sum(_pos_324a)/len(_pos_324a) < 0.10:
                             continue
 
+
+                    # Arch 325b: Very tight break trail (0.3x)
+                    # Break trail losers (#77 -$5.73, #48 -$1.72) need tighter trailing
+                    # to lock in gains before reversal.
+                    if realistic and sig.signal_type == 'break':
+                        _trail_width = min(_trail_width, 0.3)
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
