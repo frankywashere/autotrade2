@@ -3348,14 +3348,6 @@ def run_backtest(
                                 ml_stats.setdefault('fm_boost', 0)
                                 ml_stats['fm_boost'] += 1
 
-                    # Arch 137e: High KE break boost (1.20x when KE > 0.70)
-                    # Strong momentum = real breakout, not false break
-                    if realistic and sig.signal_type == 'break':
-                        ps137 = analysis.tf_states.get(sig.primary_tf)
-                        if ps137 and ps137.kinetic_energy > 0.70:
-                            trade_size *= 1.20
-                            ml_stats.setdefault('high_ke_break_boost', 0)
-                            ml_stats['high_ke_break_boost'] += 1
 
                     # Arch 137f: Continuous equity inverse scaling
                     # As equity grows, scale trade_size proportionally to initial/equity
