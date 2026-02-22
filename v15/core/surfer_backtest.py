@@ -3769,6 +3769,22 @@ def run_backtest(
                                 ml_stats.setdefault('big_loss_reduce', 0)
                                 ml_stats['big_loss_reduce'] += 1
 
+
+                    # Arch 184: Exponential win streak compounding (1.02^consecutive_wins)
+                    # Long win streaks compound small boosts: 5 wins = 1.10x, 10 = 1.22x
+                    if realistic and trades:
+                        consec_wins_184 = 0
+                        for t in reversed(trades):
+                            if t.pnl > 0:
+                                consec_wins_184 += 1
+                            else:
+                                break
+                        if consec_wins_184 >= 5:
+                            win_boost_184 = min(1.50, 1.02 ** consec_wins_184)
+                            trade_size *= win_boost_184
+                            ml_stats.setdefault('exp_win_streak', 0)
+                            ml_stats['exp_win_streak'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
