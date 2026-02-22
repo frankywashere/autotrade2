@@ -4690,6 +4690,14 @@ def run_backtest(
                         ml_stats.setdefault("triple_eq", 0)
                         ml_stats["triple_eq"] += 1
 
+
+                    # Arch 235b: Hot momentum bounce boost (1.15x after big win)
+                    if realistic and sig.signal_type == "bounce" and len(trades) >= 1:
+                        if trades[-1].pnl > 2000:
+                            trade_size *= 1.15
+                            ml_stats.setdefault("hot_momentum", 0)
+                            ml_stats["hot_momentum"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
