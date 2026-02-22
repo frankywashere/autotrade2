@@ -3700,6 +3700,16 @@ def run_backtest(
                             ml_stats.setdefault('double_weak', 0)
                             ml_stats["double_weak"] += 1
 
+
+                    # Arch 183: PnL acceleration boost (1.15x when recent trades accelerating)
+                    if realistic and len(trades) >= 20:
+                        avg5_183 = sum(t.pnl for t in trades[-5:]) / 5
+                        avg20_183 = sum(t.pnl for t in trades[-20:]) / 20
+                        if avg5_183 > avg20_183 * 1.5 and avg5_183 > 0:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('pnl_accel_boost', 0)
+                            ml_stats['pnl_accel_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
