@@ -5878,7 +5878,7 @@ def run_backtest(
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
-                        _cap_base = 800.0 if sig.signal_type == "bounce" else 30.0
+                        _cap_base = 850.0 if sig.signal_type == "bounce" else 30.0
                         cap = equity * _cap_base
                         if total_open + trade_size > cap:
                             trade_size = max(0, cap - total_open)
