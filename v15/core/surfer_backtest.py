@@ -4459,6 +4459,21 @@ def run_backtest(
                             ml_stats.setdefault("same_type_loss", 0)
                             ml_stats["same_type_loss"] += 1
 
+
+                    # Arch 221a: Confidence-position product sizing for bounces
+                    if realistic and sig.signal_type == "bounce":
+                        pos_221 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pos_221.append(abs(tf_s.position_pct))
+                        if pos_221:
+                            avg_pos = sum(pos_221) / len(pos_221)
+                            cp_prod = sig.confidence * avg_pos
+                            cp_mult = min(1.30, max(0.40, 0.4 + cp_prod * 2.0))
+                            trade_size *= cp_mult
+                            ml_stats.setdefault("conf_pos_prod", 0)
+                            ml_stats["conf_pos_prod"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
