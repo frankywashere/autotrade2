@@ -4719,6 +4719,12 @@ def run_backtest(
                         ml_stats.setdefault("5x_compound", 0)
                         ml_stats["5x_compound"] += 1
 
+                    # Arch 239e: Very mature system (trade >300) bounce boost
+                    if realistic and sig.signal_type == "bounce" and len(trades) > 300:
+                        trade_size *= 1.20
+                        ml_stats.setdefault("mature_system", 0)
+                        ml_stats["mature_system"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
