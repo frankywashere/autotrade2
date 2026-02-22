@@ -4910,6 +4910,17 @@ def run_backtest(
                             ml_stats.setdefault('eq_surge', 0)
                             ml_stats['eq_surge'] += 1
 
+                    # Arch 250d: All TFs established channels bounce boost (1.15x)
+                    if realistic and sig.signal_type == 'bounce':
+                        min_bc_250 = 99
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                min_bc_250 = min(min_bc_250, tf_s.bounce_count)
+                        if min_bc_250 >= 2:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('all_established', 0)
+                            ml_stats['all_established'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
