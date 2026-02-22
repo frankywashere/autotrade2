@@ -4761,6 +4761,20 @@ def run_backtest(
                             ml_stats.setdefault('sell_all_down', 0)
                             ml_stats['sell_all_down'] += 1
 
+                    # Arch 241c: Geomean(volume * (1-entropy) * position) > 0.15
+                    if realistic and sig.signal_type == 'bounce':
+                        vep_241 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                vep_241.append(max(0.01, tf_s.volume_score * (1.0 - tf_s.entropy) * abs(tf_s.position_pct)))
+                        if vep_241:
+                            import math
+                            geo_vep = math.exp(sum(math.log(x) for x in vep_241) / len(vep_241))
+                            if geo_vep > 0.15:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('geo_vep', 0)
+                                ml_stats['geo_vep'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
