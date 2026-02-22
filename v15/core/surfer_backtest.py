@@ -5663,10 +5663,10 @@ def run_backtest(
                         if equity > 500000:
                             if sig.action == 'BUY':
                                 _s_dist = entry_price - stop
-                                stop = entry_price - _s_dist * 0.70
+                                stop = entry_price - _s_dist * 0.75
                             else:
                                 _s_dist = stop - entry_price
-                                stop = entry_price + _s_dist * 0.70
+                                stop = entry_price + _s_dist * 0.75
                             trade_size *= 1.10
                         ml_stats.setdefault('trail_stop_compound', 0)
                         ml_stats['trail_stop_compound'] += 1
@@ -5678,10 +5678,10 @@ def run_backtest(
                     if realistic and sig.signal_type == 'break':
                         if sig.action == 'BUY':
                             _s_dist = entry_price - stop
-                            stop = entry_price - _s_dist * 0.70
+                            stop = entry_price - _s_dist * 0.75
                         else:
                             _s_dist = stop - entry_price
-                            stop = entry_price + _s_dist * 0.70
+                            stop = entry_price + _s_dist * 0.75
 
 
                     # Arch 314d: Faster OU exit for bounces
