@@ -3181,6 +3181,15 @@ def run_backtest(
                                 ml_stats.setdefault('quad_ke_boost', 0)
                                 ml_stats['quad_ke_boost'] += 1
 
+                    # Arch 131: Momentum turning point penalty (0.70x when momentum is reversing)
+                    # When momentum is turning, bounces are unreliable → reduce position
+                    if realistic and sig.signal_type == 'bounce':
+                        ps131 = analysis.tf_states.get(sig.primary_tf)
+                        if ps131 and hasattr(ps131, 'momentum_is_turning') and ps131.momentum_is_turning:
+                            trade_size *= 0.70
+                            ml_stats.setdefault('mom_turn_reduce', 0)
+                            ml_stats['mom_turn_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
