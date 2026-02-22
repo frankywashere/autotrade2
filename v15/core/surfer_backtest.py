@@ -3509,18 +3509,6 @@ def run_backtest(
                                 ml_stats['weighted_health'] += 1
 
 
-                    # Arch 173: Direction consensus boost (all TFs agree on direction)
-                    if realistic and sig.signal_type == 'bounce':
-                        dirs = []
-                        for tf_n, tf_s in analysis.tf_states.items():
-                            if tf_s and tf_s.valid:
-                                dirs.append(tf_s.channel_direction)
-                        if dirs and len(set(dirs)) == 1:
-                            trade_size *= 1.15
-                            ml_stats.setdefault('dir_consensus', 0)
-                            ml_stats['dir_consensus'] += 1
-
-
                     # Arch 170: Multi-TF direction consensus boost (1.20x when all TFs agree)
                     # Fixed: channel_direction is string (bull/bear/sideways), not int
                     if realistic and sig.signal_type == 'bounce':
@@ -4495,15 +4483,6 @@ def run_backtest(
                             ml_stats['good_regime_bounce'] += 1
 
 
-                    # Arch 224: Good bounce regime boost (1.15x when avg PnL > $500)
-                    if realistic and sig.signal_type == "bounce" and len(trades) >= 10:
-                        avg_pnl_224 = sum(t.pnl for t in trades[-10:]) / 10
-                        if avg_pnl_224 > 500:
-                            trade_size *= 1.15
-                            ml_stats.setdefault("good_regime_bounce", 0)
-                            ml_stats["good_regime_bounce"] += 1
-
-
                     # Arch 225: Near ATH equity boost (1.20x when equity near peak)
                     if realistic and len(trades) >= 5:
                         running_eq_225 = initial_capital
@@ -4712,12 +4691,6 @@ def run_backtest(
                         trade_size *= 1.30
                         ml_stats.setdefault('5x_compound', 0)
                         ml_stats['5x_compound'] += 1
-
-                    # Arch 238c: 5x equity with bounce = aggressive compound
-                    if realistic and sig.signal_type == "bounce" and equity > initial_capital * 5.0:
-                        trade_size *= 1.30
-                        ml_stats.setdefault("5x_compound", 0)
-                        ml_stats["5x_compound"] += 1
 
                     # Arch 239e: Very mature system (trade >300) bounce boost
                     if realistic and sig.signal_type == "bounce" and len(trades) > 300:
@@ -4941,14 +4914,6 @@ def run_backtest(
                         ml_stats.setdefault('1m_push', 0)
                         ml_stats['1m_push'] += 1
 
-                    # Arch 252e: Rapid equity growth acceleration (1.20x when +$50K in 30 trades)
-                    if realistic and len(trades) >= 30:
-                        recent_pnl = sum(t.pnl for t in trades[-30:])
-                        if recent_pnl > 50000:
-                            trade_size *= 1.20
-                            ml_stats.setdefault('rapid_growth', 0)
-                            ml_stats['rapid_growth'] += 1
-
                     # Arch 252a: Final stretch bounce boost (1.25x after 320 trades)
                     if realistic and sig.signal_type == 'bounce' and len(trades) > 320:
                         trade_size *= 1.25
@@ -5128,14 +5093,6 @@ def run_backtest(
                             trade_size *= 1.15
                             ml_stats.setdefault('pe_vol_h', 0)
                             ml_stats['pe_vol_h'] += 1
-
-                    # Arch 262d: $1M + spring loaded bounce (1.20x)
-                    if realistic and sig.signal_type == 'bounce' and equity > 1000000:
-                        pe_sum_262 = sum(tf_s.potential_energy for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
-                        if pe_sum_262 > 1.5:
-                            trade_size *= 1.20
-                            ml_stats.setdefault('1m_spring', 0)
-                            ml_stats['1m_spring'] += 1
 
                     # Arch 262a: High energy + moderate equity bounce (1.20x)
                     if realistic and sig.signal_type == 'bounce' and equity > 300000:
@@ -5549,11 +5506,6 @@ def run_backtest(
                             ml_stats['free_spring'] += 1
 
 
-                    if realistic and sig.signal_type == 'bounce' and 450000 < equity < 600000 and sig.confidence > 0.70:
-                        trade_size *= 1.15
-                        ml_stats.setdefault('q_mh', 0)
-                        ml_stats['q_mh'] += 1
-
                     # Arch 289a: Free spring at edge avg boost (1.15x avg PE*(1-BE)*pos > 0.20)
                     if realistic and sig.signal_type == 'bounce':
                         fspe_289 = []
@@ -5739,23 +5691,6 @@ def run_backtest(
                     # Arch 361e: Penalize medium-conf breaks (0.70-0.90) 0.05x (validated OOS)
                     if realistic and sig.signal_type == 'break' and 0.70 < sig.confidence < 0.90:
                         trade_size *= 0.05
-
-
-                    # Arch 332: Endgame acceleration stack
-                    if realistic and sig.signal_type == 'bounce':
-                        if equity > 7000000:
-                            trade_size *= 1.5
-                            ml_stats.setdefault('eg_7m', 0)
-                            ml_stats['eg_7m'] += 1
-                        elif equity > 5000000:
-                            trade_size *= 1.5
-                            ml_stats.setdefault('eg_5m', 0)
-                            ml_stats['eg_5m'] += 1
-                        if equity > 3000000 and len(trades) >= 5:
-                            if all(t.pnl > 0 for t in trades[-5:]):
-                                trade_size *= 1.15
-                                ml_stats.setdefault('hot5_3m', 0)
-                                ml_stats['hot5_3m'] += 1
 
 
                     # Arch 336: Maximum endgame acceleration — safe because no losers above $3M
