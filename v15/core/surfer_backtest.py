@@ -3832,6 +3832,18 @@ def run_backtest(
                                 ml_stats.setdefault("bounce_low_pe", 0)
                                 ml_stats["bounce_low_pe"] += 1
 
+
+                    # Arch 189c: Bounce high BE gate (0.30x when any TF BE > 0.70)
+                    if realistic and sig.signal_type == "bounce":
+                        max_be_189c = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                max_be_189c = max(max_be_189c, tf_s.binding_energy)
+                        if max_be_189c > 0.70:
+                            trade_size *= 0.30
+                            ml_stats.setdefault("bounce_high_be", 0)
+                            ml_stats["bounce_high_be"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
