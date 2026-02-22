@@ -5788,6 +5788,19 @@ def run_backtest(
                         elif equity > 10000000:
                             trade_size *= 5.0
 
+
+                    # Arch 338f: Heavy break penalty sub-$500K
+                    if realistic and sig.signal_type == 'break' and equity < 500000:
+                        trade_size *= 0.20
+                        ml_stats.setdefault('brk_sub500', 0)
+                        ml_stats['brk_sub500'] += 1
+
+                    # Arch 338h: High-conf bounce acceleration at $1M+ (5x)
+                    if realistic and sig.signal_type == 'bounce' and equity > 1000000 and sig.confidence > 0.70:
+                        trade_size *= 5.0
+                        ml_stats.setdefault('hiconf_mid', 0)
+                        ml_stats['hiconf_mid'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
