@@ -5294,6 +5294,18 @@ def run_backtest(
                             ml_stats.setdefault('all_tf_floor', 0)
                             ml_stats['all_tf_floor'] += 1
 
+
+                    # Arch 268a: Very high average PE = aggressive 1.20x
+                    if realistic and sig.signal_type == 'bounce':
+                        pe_268 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pe_268.append(tf_s.potential_energy)
+                        if pe_268 and sum(pe_268)/len(pe_268) > 0.70:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('very_hi_pe', 0)
+                            ml_stats['very_hi_pe'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
