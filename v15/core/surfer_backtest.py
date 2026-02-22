@@ -3260,6 +3260,21 @@ def run_backtest(
                                 ml_stats.setdefault('p75_be', 0)
                                 ml_stats['p75_be'] += 1
 
+                    # Arch 134: Multi-TF extreme position boost (1.25x when >50% at boundary)
+                    # When most TFs show price at extreme channel positions, boost confidence
+                    if realistic and sig.signal_type == 'bounce':
+                        extreme_count = 0
+                        total = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                total += 1
+                                if tf_s.position_pct < 0.05 or tf_s.position_pct > 0.95:
+                                    extreme_count += 1
+                        if total > 0 and extreme_count / total > 0.50:
+                            trade_size *= 1.25
+                            ml_stats.setdefault('extreme_pos_boost', 0)
+                            ml_stats['extreme_pos_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
