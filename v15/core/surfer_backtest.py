@@ -5774,6 +5774,12 @@ def run_backtest(
                                 ml_stats.setdefault('hot5_3m', 0)
                                 ml_stats['hot5_3m'] += 1
 
+
+                    # Arch 337a: Skip low-conf bounce in DZ ($600K-$700K)
+                    # Targets biggest loser T79 (-$4.97, conf=0.478, ou_timeout)
+                    if realistic and sig.signal_type == 'bounce' and sig.confidence < 0.50 and 600000 < equity < 700000:
+                        continue
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
