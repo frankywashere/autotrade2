@@ -3884,6 +3884,19 @@ def run_backtest(
                                 ml_stats.setdefault("pe_be_ratio", 0)
                                 ml_stats["pe_be_ratio"] += 1
 
+
+                    # Arch 190: Cyclical trade count scaling (1.20x/0.80x per 100-trade cycles)
+                    # Alternate between aggressive and conservative phases to capture
+                    # different market regimes. Reduces over-optimization risk.
+                    if realistic:
+                        cycle_190 = (len(trades) // 100) % 2
+                        if cycle_190 == 0:
+                            trade_size *= 1.20
+                        else:
+                            trade_size *= 0.80
+                        ml_stats.setdefault('cycle_size', 0)
+                        ml_stats['cycle_size'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
