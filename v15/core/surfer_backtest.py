@@ -5622,6 +5622,14 @@ def run_backtest(
                         ml_stats.setdefault('brk_univ', 0)
                         ml_stats['brk_univ'] += 1
 
+                    # Arch 298d: Proven bounce streak at scale (1.25x)
+                    if realistic and sig.signal_type == 'bounce' and equity > 500000:
+                        recent_b = [t for t in trades[-10:] if hasattr(t, 'signal_type') and t.signal_type == 'bounce'][-3:]
+                        if len(recent_b) == 3 and all(t.pnl > 0 for t in recent_b):
+                            trade_size *= 1.25
+                            ml_stats.setdefault('proven_bounce', 0)
+                            ml_stats['proven_bounce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
