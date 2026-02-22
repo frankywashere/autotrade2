@@ -5035,6 +5035,39 @@ def run_backtest(
                             ml_stats.setdefault('spring_eq_400', 0)
                             ml_stats['spring_eq_400'] += 1
 
+                    # Arch 260b: High system energy break
+                    if realistic and sig.signal_type == 'break':
+                        te_sum = sum(tf_s.total_energy for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if te_sum > 4.5:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('high_te_break', 0)
+                            ml_stats['high_te_break'] += 1
+
+                    # Arch 260d: Avg position*health > 0.50 bounce (1.15x high quality edge)
+                    if realistic and sig.signal_type == 'bounce':
+                        ph_260 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                ph_260.append(abs(tf_s.position_pct) * tf_s.channel_health)
+                        if ph_260 and sum(ph_260)/len(ph_260) > 0.50:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('hi_q_edge', 0)
+                            ml_stats['hi_q_edge'] += 1
+
+                    # Arch 260f: Avg PE > 0.55 AND avg position > 0.50 bounce (1.15x spring at edge)
+                    if realistic and sig.signal_type == 'bounce':
+                        pe_260 = []
+                        pos_260 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pe_260.append(tf_s.potential_energy)
+                                pos_260.append(abs(tf_s.position_pct))
+                        if pe_260 and pos_260:
+                            if sum(pe_260)/len(pe_260) > 0.55 and sum(pos_260)/len(pos_260) > 0.50:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('spring_edge', 0)
+                                ml_stats['spring_edge'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
