@@ -5761,7 +5761,7 @@ def run_backtest(
                     # Arch 336: Maximum endgame acceleration — safe because no losers above $3M
                     if realistic and sig.signal_type == 'bounce':
                         if equity > 7000000:
-                            trade_size *= 40.0
+                            trade_size *= 50.0
                             ml_stats.setdefault('eg_7m', 0)
                             ml_stats['eg_7m'] += 1
                         elif equity > 5000000:
@@ -5770,7 +5770,7 @@ def run_backtest(
                             ml_stats['eg_5m'] += 1
                         if equity > 3000000 and len(trades) >= 5:
                             if all(t.pnl > 0 for t in trades[-5:]):
-                                trade_size *= 15.0
+                                trade_size *= 20.0
                                 ml_stats.setdefault('hot5_3m', 0)
                                 ml_stats['hot5_3m'] += 1
 
@@ -5784,7 +5784,7 @@ def run_backtest(
                     # Arch 339: Multi-tier endgame
                     if realistic and sig.signal_type == 'bounce':
                         if equity > 20000000:
-                            trade_size *= 20.0
+                            trade_size *= 30.0
                         elif equity > 10000000:
                             trade_size *= 8.0
 
@@ -5825,7 +5825,7 @@ def run_backtest(
                     # Arch 342d: Confidence-proportional scaling at $1M+
                     # Higher confidence = larger position. conf=0.70 → 10.5x, conf=0.90 → 13.5x
                     if realistic and sig.signal_type == 'bounce' and equity > 1000000:
-                        trade_size *= max(1.0, sig.confidence * 20.0)
+                        trade_size *= max(1.0, sig.confidence * 30.0)
                         ml_stats.setdefault('conf_scale', 0)
                         ml_stats['conf_scale'] += 1
 
@@ -5840,7 +5840,7 @@ def run_backtest(
 
                     # Arch 344e: Double conf-scaling at $10M+ (conf*30)
                     if realistic and sig.signal_type == 'bounce' and equity > 10000000:
-                        trade_size *= max(1.0, sig.confidence * 50.0)
+                        trade_size *= max(1.0, sig.confidence * 80.0)
                         ml_stats.setdefault('conf_scale_10m', 0)
                         ml_stats['conf_scale_10m'] += 1
 
@@ -5864,6 +5864,11 @@ def run_backtest(
                         trade_size *= 0.10
                         ml_stats.setdefault('brk_lowconf', 0)
                         ml_stats['brk_lowconf'] += 1
+
+
+                    # Arch 353c: Conf*100 at $100M+ (biggest tier)
+                    if realistic and sig.signal_type == 'bounce' and equity > 100000000:
+                        trade_size *= max(1.0, sig.confidence * 100.0)
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
