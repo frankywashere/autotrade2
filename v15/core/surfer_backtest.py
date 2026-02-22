@@ -4232,14 +4232,6 @@ def run_backtest(
                             ml_stats.setdefault('loss_cluster', 0)
                             ml_stats['loss_cluster'] += 1
 
-                    # Arch 208c: Post-ou_timeout extreme reduction (0.10x for 2 trades after timeout)
-                    if realistic and len(trades) >= 1:
-                        had_timeout_208 = any(t.exit_reason == 'ou_timeout' for t in trades[-2:])
-                        if had_timeout_208:
-                            trade_size *= 0.10
-                            ml_stats.setdefault('post_timeout', 0)
-                            ml_stats['post_timeout'] += 1
-
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
