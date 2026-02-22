@@ -5365,6 +5365,13 @@ def run_backtest(
                         ml_stats.setdefault('early_conf_brk', 0)
                         ml_stats['early_conf_brk'] += 1
 
+
+                    # Arch 273b: Good timing + equity gate
+                    if realistic and sig.signal_type == 'bounce' and equity > 400000 and sig.timing_score > 0.70:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('timed_eq', 0)
+                        ml_stats['timed_eq'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
