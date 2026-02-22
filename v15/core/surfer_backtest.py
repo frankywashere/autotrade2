@@ -5180,6 +5180,43 @@ def run_backtest(
                             ml_stats.setdefault('hi_avg_pe', 0)
                             ml_stats['hi_avg_pe'] += 1
 
+                    # Arch 265b: TF-weighted geomean PE*health (1.15x when > 0.25)
+                    if realistic and sig.signal_type == 'bounce':
+                        tf_wt = {'5min': 0.5, '15min': 0.6, '30min': 0.7, '1h': 0.8, '2h': 0.85, '3h': 0.9, '4h': 0.95, 'daily': 1.2, 'weekly': 1.5, 'monthly': 2.0}
+                        wph_265 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid and tf_n in tf_wt:
+                                wph_265.append(max(0.01, tf_wt[tf_n] * tf_s.potential_energy * tf_s.channel_health))
+                        if wph_265:
+                            import math
+                            geo_wph = math.exp(sum(math.log(x) for x in wph_265) / len(wph_265))
+                            if geo_wph > 0.25:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('wt_geo_peh', 0)
+                                ml_stats['wt_geo_peh'] += 1
+
+                    # Arch 265d: Max TF PE > 0.80 extreme spring (1.15x)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_pe_265 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                max_pe_265 = max(max_pe_265, tf_s.potential_energy)
+                        if max_pe_265 > 0.80:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('extreme_pe', 0)
+                            ml_stats['extreme_pe'] += 1
+
+                    # Arch 265f: Avg position*(1-entropy) > 0.40 ordered edge (1.15x)
+                    if realistic and sig.signal_type == 'bounce':
+                        pe_265f = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pe_265f.append(abs(tf_s.position_pct) * (1.0 - tf_s.entropy))
+                        if pe_265f and sum(pe_265f)/len(pe_265f) > 0.40:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('ordered_edge_265', 0)
+                            ml_stats['ordered_edge_265'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
