@@ -5430,6 +5430,21 @@ def run_backtest(
                         ml_stats.setdefault('timed_conf', 0)
                         ml_stats['timed_conf'] += 1
 
+
+                    # Arch 281d: Early bounce danger zone
+                    if realistic and sig.signal_type == 'bounce' and 150000 < equity < 200000:
+                        trade_size *= 0.80
+                        ml_stats.setdefault('early_dz', 0)
+                        ml_stats['early_dz'] += 1
+
+                    # Arch 282e: Volume-confirmed displacement boost (1.15x sum vol*pos > 3.0)
+                    if realistic and sig.signal_type == 'bounce':
+                        vp_282 = sum(tf_s.volume_score * abs(tf_s.position_pct) for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if vp_282 > 3.0:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('vol_disp', 0)
+                            ml_stats['vol_disp'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
