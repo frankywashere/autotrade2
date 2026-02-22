@@ -5457,6 +5457,23 @@ def run_backtest(
                             ml_stats.setdefault('brk_spring', 0)
                             ml_stats['brk_spring'] += 1
 
+
+                    if realistic and sig.signal_type == 'bounce' and trade_size > equity:
+                        trade_size *= 0.50
+                        ml_stats.setdefault('lev_cap', 0)
+                        ml_stats['lev_cap'] += 1
+
+                    # Arch 285f: Break-risk + weak position bounce penalty (0.30x max break_prob>0.50 + pos_score<0.60)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_bp_285 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                max_bp_285 = max(max_bp_285, tf_s.break_prob)
+                        if max_bp_285 > 0.50 and sig.position_score < 0.60:
+                            trade_size *= 0.30
+                            ml_stats.setdefault('brk_weak_pos', 0)
+                            ml_stats['brk_weak_pos'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
