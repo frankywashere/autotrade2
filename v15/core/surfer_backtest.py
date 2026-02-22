@@ -5261,6 +5261,39 @@ def run_backtest(
                             ml_stats.setdefault('pe_pos_rev', 0)
                             ml_stats['pe_pos_rev'] += 1
 
+
+                    # Arch 267d: Mid-game and equity near peak = losses recovered, press harder
+                    if realistic and sig.signal_type == 'bounce' and 200000 < equity < 500000:
+                        if equity >= peak_equity * 0.99:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('mid_recovered', 0)
+                            ml_stats['mid_recovered'] += 1
+
+                    # Arch 267c: 4-factor evidence (1.15x when max pos*r_sq*vol*rev > 0.10)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_4ev_267 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                ev4 = abs(tf_s.position_pct) * tf_s.r_squared * tf_s.volume_score * tf_s.ou_reversion_score
+                                max_4ev_267 = max(max_4ev_267, ev4)
+                        if max_4ev_267 > 0.10:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('4f_evidence', 0)
+                            ml_stats['4f_evidence'] += 1
+
+                    # Arch 267f: All-TF floor (1.15x when min pos > 0.30 AND min PE > 0.30)
+                    if realistic and sig.signal_type == 'bounce':
+                        min_pos_267 = 1.0
+                        min_pe_267 = 1.0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                min_pos_267 = min(min_pos_267, abs(tf_s.position_pct))
+                                min_pe_267 = min(min_pe_267, tf_s.potential_energy)
+                        if min_pos_267 > 0.30 and min_pe_267 > 0.30:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('all_tf_floor', 0)
+                            ml_stats['all_tf_floor'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
