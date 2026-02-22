@@ -3294,6 +3294,15 @@ def run_backtest(
                                 ml_stats.setdefault('weighted_ke_boost', 0)
                                 ml_stats['weighted_ke_boost'] += 1
 
+
+                    # Arch 160: TF count penalty (fewer valid TFs = lower confidence)
+                    if realistic and sig.signal_type == 'bounce':
+                        valid_tf_count = sum(1 for tf_state in analysis.tf_states.values() if tf_state and tf_state.valid)
+                        if valid_tf_count <= 2:
+                            trade_size *= 0.70
+                            ml_stats.setdefault('few_tf_reduce', 0)
+                            ml_stats['few_tf_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
