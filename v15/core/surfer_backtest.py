@@ -3068,6 +3068,20 @@ def run_backtest(
                             ml_stats.setdefault('exp_score', 0)
                             ml_stats['exp_score'] += 1
 
+
+                    # Arch 150: Multi-TF minimum PE penalty (no PE anywhere = dead market)
+                    if realistic and sig.signal_type == 'bounce':
+                        pe_min_vals = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                pe_min_vals.append(tf_state.potential_energy)
+                        if pe_min_vals:
+                            min_pe = min(pe_min_vals)
+                            if min_pe < 0.15:
+                                trade_size *= 0.65
+                                ml_stats.setdefault('all_tf_low_pe', 0)
+                                ml_stats['all_tf_low_pe'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
