@@ -183,7 +183,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
                 # Near TP: ultra-tight trail to lock in most of the move
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * 0.005 * twm)
                 effective_stop = max(position.stop_price, trail_from_best)
-            elif profit_ratio >= (0.60 if tight else 0.70):
+            elif profit_ratio >= (0.60 if tight else 0.55):
                 trail_from_best = position.trailing_stop * (1 - initial_stop_dist * (0.02 if tight else 0.02) * twm)
                 effective_stop = max(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.30 if tight else 0.40):
@@ -234,7 +234,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             if profit_ratio >= 0.80:
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * 0.005 * twm)
                 effective_stop = min(position.stop_price, trail_from_best)
-            elif profit_ratio >= (0.60 if tight else 0.70):
+            elif profit_ratio >= (0.60 if tight else 0.55):
                 trail_from_best = position.trailing_stop * (1 + initial_stop_dist * (0.02 if tight else 0.02) * twm)
                 effective_stop = min(position.stop_price, trail_from_best)
             elif profit_ratio >= (0.30 if tight else 0.40):
