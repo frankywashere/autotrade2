@@ -5801,6 +5801,26 @@ def run_backtest(
                         ml_stats.setdefault('hiconf_mid', 0)
                         ml_stats['hiconf_mid'] += 1
 
+
+                    # Arch 340a: Early mid acceleration $500K-$1M (3x)
+                    if realistic and sig.signal_type == 'bounce' and 500000 < equity < 1000000:
+                        trade_size *= 3.0
+                        ml_stats.setdefault('early_mid', 0)
+                        ml_stats['early_mid'] += 1
+
+                    # Arch 340b: Late push 8x at $10M+
+                    if realistic and sig.signal_type == 'bounce' and equity > 10000000:
+                        trade_size *= 8.0
+                        ml_stats.setdefault('late_10m', 0)
+                        ml_stats['late_10m'] += 1
+
+                    # Arch 340f: Momentum 10x at $5M+ (last 3 all winners)
+                    if realistic and sig.signal_type == 'bounce' and equity > 5000000 and len(trades) >= 3:
+                        if all(t.pnl > 0 for t in trades[-3:]):
+                            trade_size *= 10.0
+                            ml_stats.setdefault('mom_5m', 0)
+                            ml_stats['mom_5m'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
