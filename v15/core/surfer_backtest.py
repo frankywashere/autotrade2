@@ -5696,6 +5696,15 @@ def run_backtest(
                         ml_stats.setdefault('late_accel_2m', 0)
                         ml_stats['late_accel_2m'] += 1
 
+
+                    # Arch 324a: Skip near-center 2-TF bounces
+                    # #86 (ou_timeout, -$15, avg_pos=0.091, n=2) is the biggest loser.
+                    # Near-center 2-TF bounces lack directional conviction.
+                    if realistic and sig.signal_type == "bounce":
+                        _pos_324a = [abs(tf_s.position_pct) for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid]
+                        if len(_pos_324a) <= 2 and _pos_324a and sum(_pos_324a)/len(_pos_324a) < 0.10:
+                            continue
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
