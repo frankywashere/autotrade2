@@ -5833,7 +5833,7 @@ def run_backtest(
                     # Arch 345: Extended endgame tiers
                     if realistic and sig.signal_type == 'bounce':
                         if equity > 100000000:
-                            trade_size *= 12.0
+                            trade_size *= 20.0
                         elif equity > 50000000:
                             trade_size *= 5.0
 
@@ -5868,7 +5868,12 @@ def run_backtest(
 
                     # Arch 353c: Conf*100 at $100M+ (biggest tier)
                     if realistic and sig.signal_type == 'bounce' and equity > 100000000:
-                        trade_size *= max(1.0, sig.confidence * 100.0)
+                        trade_size *= max(1.0, sig.confidence * 200.0)
+
+
+                    # Arch 354d: Mega conf at $500M+
+                    if realistic and sig.signal_type == 'bounce' and equity > 500000000:
+                        trade_size *= max(1.0, sig.confidence * 500.0)
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
