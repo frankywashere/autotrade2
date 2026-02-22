@@ -4781,6 +4781,17 @@ def run_backtest(
                         ml_stats.setdefault("ath_500k", 0)
                         ml_stats["ath_500k"] += 1
 
+                    # Arch 242c: Max position*volume > 0.70 (1.15x vol-confirmed edge)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_pv_242 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                max_pv_242 = max(max_pv_242, abs(tf_s.position_pct) * tf_s.volume_score)
+                        if max_pv_242 > 0.70:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('edge_vol', 0)
+                            ml_stats['edge_vol'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
