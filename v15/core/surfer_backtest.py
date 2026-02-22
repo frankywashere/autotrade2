@@ -4725,6 +4725,12 @@ def run_backtest(
                         ml_stats.setdefault("mature_system", 0)
                         ml_stats["mature_system"] += 1
 
+                    # Arch 241a: 7x equity bounce boost (1.25x)
+                    if realistic and sig.signal_type == "bounce" and equity > initial_capital * 7.0:
+                        trade_size *= 1.25
+                        ml_stats.setdefault("7x_bounce", 0)
+                        ml_stats["7x_bounce"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
