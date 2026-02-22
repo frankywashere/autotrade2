@@ -5630,6 +5630,15 @@ def run_backtest(
                             ml_stats.setdefault('proven_bounce', 0)
                             ml_stats['proven_bounce'] += 1
 
+
+                    # Arch 301a: Position + multi-TF bounce boost (zero loser overlap)
+                    if realistic and sig.signal_type == 'bounce':
+                        _pos_301 = [abs(tf_s.position_pct) for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid]
+                        if len(_pos_301) >= 3 and sum(_pos_301)/len(_pos_301) > 0.50:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('pos_n3', 0)
+                            ml_stats['pos_n3'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
