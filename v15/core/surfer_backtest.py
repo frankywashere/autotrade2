@@ -4529,6 +4529,20 @@ def run_backtest(
                                 ml_stats.setdefault("high_rr_ratio", 0)
                                 ml_stats["high_rr_ratio"] += 1
 
+                    # Arch 223d: Break + KE > PE across majority (1.15x momentum-driven break)
+                    if realistic and sig.signal_type == 'break':
+                        ke_gt_pe_223 = 0
+                        total_223 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                total_223 += 1
+                                if tf_s.kinetic_energy > tf_s.potential_energy:
+                                    ke_gt_pe_223 += 1
+                        if total_223 > 0 and ke_gt_pe_223 / total_223 > 0.60:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('momentum_break', 0)
+                            ml_stats['momentum_break'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
