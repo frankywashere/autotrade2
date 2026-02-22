@@ -5844,6 +5844,20 @@ def run_backtest(
                         ml_stats.setdefault('conf_scale_10m', 0)
                         ml_stats['conf_scale_10m'] += 1
 
+
+                    # Arch 345a: Triple conf-scaling at $100M+ (conf*50)
+                    if realistic and sig.signal_type == 'bounce' and equity > 100000000:
+                        trade_size *= max(1.0, sig.confidence * 50.0)
+                        ml_stats.setdefault('conf_scale_100m', 0)
+                        ml_stats['conf_scale_100m'] += 1
+
+                    # Arch 345f: Massive momentum at $50M+ (50x on 3-win streak)
+                    if realistic and sig.signal_type == 'bounce' and equity > 50000000 and len(trades) >= 3:
+                        if all(t.pnl > 0 for t in trades[-3:]):
+                            trade_size *= 50.0
+                            ml_stats.setdefault('mom_50m', 0)
+                            ml_stats['mom_50m'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
