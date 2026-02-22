@@ -5372,8 +5372,32 @@ def run_backtest(
                         ml_stats.setdefault('timed_eq', 0)
                         ml_stats['timed_eq'] += 1
 
+                    # Arch 274c: 6-factor geomean boost (1.15x PE*pos*health*vol*r_sq*(1-ent) geo > 0.01)
+                    if realistic and sig.signal_type == 'bounce':
+                        f6_274 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                f6_274.append(max(0.001, tf_s.potential_energy * abs(tf_s.position_pct) * tf_s.channel_health * tf_s.volume_score * tf_s.r_squared * (1.0 - tf_s.entropy)))
+                        if f6_274:
+                            import math
+                            geo_6f = math.exp(sum(math.log(x) for x in f6_274) / len(f6_274))
+                            if geo_6f > 0.01:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('6f_geo', 0)
+                                ml_stats['6f_geo'] += 1
 
-                    # Arch 274f: All TFs have both good health and good fit
+                    # Arch 274e: Late high-quality spring boost (1.20x equity>700K AND avg PE*pos>0.40)
+                    if realistic and sig.signal_type == 'bounce' and equity > 700000:
+                        pp_274 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pp_274.append(tf_s.potential_energy * abs(tf_s.position_pct))
+                        if pp_274 and sum(pp_274)/len(pp_274) > 0.40:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('late_hq', 0)
+                            ml_stats['late_hq'] += 1
+
+                    # Arch 274f: All-TF quality fit floor boost (1.15x min health*r_sq > 0.15)
                     if realistic and sig.signal_type == 'bounce':
                         min_hr_274 = 1.0
                         cnt_274 = 0
