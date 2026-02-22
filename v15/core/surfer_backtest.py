@@ -4325,6 +4325,18 @@ def run_backtest(
                             ml_stats.setdefault('te_health', 0)
                             ml_stats['te_health'] += 1
 
+
+                    # Arch 216: Breaks in low-reversion regime penalty
+                    if realistic and sig.signal_type == "break":
+                        rev_216 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                rev_216.append(tf_s.ou_reversion_score)
+                        if rev_216 and sum(rev_216)/len(rev_216) < 0.25:
+                            trade_size *= 0.30
+                            ml_stats.setdefault("break_low_rev", 0)
+                            ml_stats["break_low_rev"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
