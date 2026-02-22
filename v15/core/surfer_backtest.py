@@ -3206,6 +3206,23 @@ def run_backtest(
                             ml_stats.setdefault('mom_aligned_boost', 0)
                             ml_stats['mom_aligned_boost'] += 1
 
+
+                    # Arch 157: Median BE penalty (robust to single-TF outliers)
+                    if realistic and sig.signal_type == 'bounce':
+                        be_list157 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be_list157.append(tf_state.binding_energy)
+                        if be_list157:
+                            sorted_be = sorted(be_list157)
+                            n = len(sorted_be)
+                            median_be = sorted_be[n//2] if n % 2 == 1 else (sorted_be[n//2-1] + sorted_be[n//2]) / 2
+                            if median_be > 0.40:
+                                be_mult = max(0.45, 1.0 - (median_be - 0.40) * 1.5)
+                                trade_size *= be_mult
+                                ml_stats.setdefault('median_be', 0)
+                                ml_stats['median_be'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
