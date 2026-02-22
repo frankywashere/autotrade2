@@ -4411,6 +4411,31 @@ def run_backtest(
                             ml_stats.setdefault("long_streak", 0)
                             ml_stats["long_streak"] += 1
 
+                    # Arch 219a: Geometric mean KE (1.15x when all TFs have solid momentum)
+                    if realistic and sig.signal_type == 'bounce':
+                        ke_219 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                ke_219.append(max(0.01, tf_s.kinetic_energy))
+                        if ke_219:
+                            import math
+                            geo_ke = math.exp(sum(math.log(k) for k in ke_219) / len(ke_219))
+                            if geo_ke > 0.40:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('geo_ke', 0)
+                                ml_stats['geo_ke'] += 1
+
+                    # Arch 219f: Volume * health * position triple (1.20x when all confirm edge)
+                    if realistic and sig.signal_type == 'bounce':
+                        vhp_219 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                vhp_219.append(tf_s.volume_score * tf_s.channel_health * abs(tf_s.position_pct))
+                        if vhp_219 and sum(vhp_219)/len(vhp_219) > 0.25:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('vol_health_pos', 0)
+                            ml_stats['vol_health_pos'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
