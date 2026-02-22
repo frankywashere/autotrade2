@@ -3332,6 +3332,23 @@ def run_backtest(
                                 ml_stats.setdefault('p90_be', 0)
                                 ml_stats['p90_be'] += 1
 
+                    # Arch 136d: Break frequency filter (0.50x when >3 breaks in last 20 trades)
+                    # Too many breaks = choppy regime, reduce break sizing
+                    if realistic and sig.signal_type == 'break' and len(trades) >= 20:
+                        recent_breaks = sum(1 for t in trades[-20:] if hasattr(t, 'signal_type') and t.signal_type == 'break')
+                        if recent_breaks >= 3:
+                            trade_size *= 0.50
+                            ml_stats.setdefault('break_freq_reduce', 0)
+                            ml_stats['break_freq_reduce'] += 1
+
+                    # Arch 136f: Anti-cluster timing (0.60x within 2 bars of last trade)
+                    # Rapid re-entry = poor selectivity
+                    if realistic and trades and hasattr(trades[-1], 'exit_bar'):
+                        if bar - trades[-1].exit_bar <= 2:
+                            trade_size *= 0.60
+                            ml_stats.setdefault('anti_cluster', 0)
+                            ml_stats['anti_cluster'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
