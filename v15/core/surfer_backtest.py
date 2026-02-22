@@ -5829,6 +5829,14 @@ def run_backtest(
                         ml_stats.setdefault('conf_scale', 0)
                         ml_stats['conf_scale'] += 1
 
+
+                    # Arch 345: Extended endgame tiers
+                    if realistic and sig.signal_type == 'bounce':
+                        if equity > 100000000:
+                            trade_size *= 3.0
+                        elif equity > 50000000:
+                            trade_size *= 5.0
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
