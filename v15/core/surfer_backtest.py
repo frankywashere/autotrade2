@@ -4474,6 +4474,17 @@ def run_backtest(
                             ml_stats.setdefault("conf_pos_prod", 0)
                             ml_stats["conf_pos_prod"] += 1
 
+
+                    # Arch 222: Low PnL volatility boost (1.15x when consistent returns)
+                    if realistic and len(trades) >= 10:
+                        pnls_222 = [t.pnl for t in trades[-10:]]
+                        avg_222 = sum(pnls_222) / 10
+                        std_222 = (sum((p - avg_222)**2 for p in pnls_222) / 10) ** 0.5
+                        if std_222 < 50 and avg_222 > 0:
+                            trade_size *= 1.15
+                            ml_stats.setdefault("low_pnl_vol", 0)
+                            ml_stats["low_pnl_vol"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
