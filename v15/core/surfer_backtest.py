@@ -3637,7 +3637,7 @@ def run_backtest(
                     # Arch 179: Channel health continuous sizing (healthy = bigger)
                     if realistic and hasattr(sig, 'channel_health'):
                         ch = max(0.0, min(1.0, sig.channel_health))
-                        ch_mult = 0.5 + ch * 1.0
+                        ch_mult = 0.3 + 1.4 * (ch ** 2.0)
                         trade_size *= ch_mult
                         ml_stats.setdefault('ch_health_sizing', 0)
                         ml_stats['ch_health_sizing'] += 1
