@@ -3964,6 +3964,19 @@ def run_backtest(
                             ml_stats.setdefault('w_break_prob', 0)
                             ml_stats['w_break_prob'] += 1
 
+
+                    # Arch 194e: Momentum direction consensus (1.15x when all TFs agree)
+                    if realistic and sig.signal_type == "bounce":
+                        mom_dirs_194 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                mom_dirs_194.append(1 if tf_s.momentum_direction > 0 else -1 if tf_s.momentum_direction < 0 else 0)
+                        nonzero = [d for d in mom_dirs_194 if d != 0]
+                        if nonzero and len(set(nonzero)) <= 1:
+                            trade_size *= 1.15
+                            ml_stats.setdefault("mom_dir_consensus", 0)
+                            ml_stats["mom_dir_consensus"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
