@@ -4868,6 +4868,17 @@ def run_backtest(
                         ml_stats.setdefault('600k_bounce', 0)
                         ml_stats['600k_bounce'] += 1
 
+                    # Arch 245d: Heavy binding energy penalty (0.20x when avg BE > 0.60)
+                    if realistic and sig.signal_type == 'bounce':
+                        be_245 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                be_245.append(tf_s.binding_energy)
+                        if be_245 and sum(be_245)/len(be_245) > 0.60:
+                            trade_size *= 0.20
+                            ml_stats.setdefault('heavy_bind', 0)
+                            ml_stats['heavy_bind'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
