@@ -5784,7 +5784,7 @@ def run_backtest(
                     # Arch 339: Multi-tier endgame
                     if realistic and sig.signal_type == 'bounce':
                         if equity > 20000000:
-                            trade_size *= 15.0
+                            trade_size *= 20.0
                         elif equity > 10000000:
                             trade_size *= 8.0
 
@@ -5825,7 +5825,7 @@ def run_backtest(
                     # Arch 342d: Confidence-proportional scaling at $1M+
                     # Higher confidence = larger position. conf=0.70 → 10.5x, conf=0.90 → 13.5x
                     if realistic and sig.signal_type == 'bounce' and equity > 1000000:
-                        trade_size *= max(1.0, sig.confidence * 15.0)
+                        trade_size *= max(1.0, sig.confidence * 20.0)
                         ml_stats.setdefault('conf_scale', 0)
                         ml_stats['conf_scale'] += 1
 
@@ -5833,14 +5833,14 @@ def run_backtest(
                     # Arch 345: Extended endgame tiers
                     if realistic and sig.signal_type == 'bounce':
                         if equity > 100000000:
-                            trade_size *= 8.0
+                            trade_size *= 12.0
                         elif equity > 50000000:
                             trade_size *= 5.0
 
 
                     # Arch 344e: Double conf-scaling at $10M+ (conf*30)
                     if realistic and sig.signal_type == 'bounce' and equity > 10000000:
-                        trade_size *= max(1.0, sig.confidence * 30.0)
+                        trade_size *= max(1.0, sig.confidence * 50.0)
                         ml_stats.setdefault('conf_scale_10m', 0)
                         ml_stats['conf_scale_10m'] += 1
 
