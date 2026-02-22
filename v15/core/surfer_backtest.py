@@ -5821,6 +5821,14 @@ def run_backtest(
                             ml_stats.setdefault('mom_5m', 0)
                             ml_stats['mom_5m'] += 1
 
+
+                    # Arch 342d: Confidence-proportional scaling at $1M+
+                    # Higher confidence = larger position. conf=0.70 → 10.5x, conf=0.90 → 13.5x
+                    if realistic and sig.signal_type == 'bounce' and equity > 1000000:
+                        trade_size *= max(1.0, sig.confidence * 15.0)
+                        ml_stats.setdefault('conf_scale', 0)
+                        ml_stats['conf_scale'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
