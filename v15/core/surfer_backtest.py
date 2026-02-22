@@ -3537,11 +3537,6 @@ def run_backtest(
                             ml_stats['pnl_accel'] += 1
 
 
-                    # Arch 176: Low confidence reduce (low signal confidence = risky)
-                    if realistic and hasattr(sig, 'confidence') and sig.confidence < 0.50:
-                        trade_size *= 0.60
-                        ml_stats.setdefault('low_conf', 0)
-                        ml_stats['low_conf'] += 1
 
                     # Arch 177: Anti-revenge (reduce after loss if same signal type)
                     if realistic and trades and trades[-1].pnl <= 0:
