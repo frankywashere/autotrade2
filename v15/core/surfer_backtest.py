@@ -4597,6 +4597,13 @@ def run_backtest(
                         ml_stats.setdefault("lo_ent_sig", 0)
                         ml_stats["lo_ent_sig"] += 1
 
+
+                    # Arch 230a: High energy signal boost (1.15x for bounce)
+                    if realistic and sig.signal_type == "bounce" and sig.energy_score > 0.80:
+                        trade_size *= 1.15
+                        ml_stats.setdefault("hi_energy_sig", 0)
+                        ml_stats["hi_energy_sig"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
