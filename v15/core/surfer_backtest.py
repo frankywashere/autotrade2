@@ -3551,6 +3551,21 @@ def run_backtest(
                             ml_stats.setdefault('pnl_trend', 0)
                             ml_stats['pnl_trend'] += 1
 
+
+                    # Arch 174: Sideways direction penalty (most TFs sideways = range-bound)
+                    if realistic and sig.signal_type == 'bounce':
+                        sideways_count = 0
+                        valid_count = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                valid_count += 1
+                                if tf_s.channel_direction == 'sideways':
+                                    sideways_count += 1
+                        if valid_count > 0 and sideways_count / valid_count > 0.50:
+                            trade_size *= 0.75
+                            ml_stats.setdefault('sideways_reduce', 0)
+                            ml_stats['sideways_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
