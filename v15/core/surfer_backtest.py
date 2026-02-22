@@ -4250,6 +4250,28 @@ def run_backtest(
                             ml_stats.setdefault('strong_revert', 0)
                             ml_stats['strong_revert'] += 1
 
+                    # Arch 211c: Channel direction unanimity (1.15x when ALL TFs same direction)
+                    if realistic and sig.signal_type == 'bounce':
+                        dirs_211 = set()
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                dirs_211.add(tf_s.channel_direction)
+                        if len(dirs_211) == 1 and 'sideways' not in dirs_211:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('dir_unanim', 0)
+                            ml_stats['dir_unanim'] += 1
+
+                    # Arch 211b: Safe support bounce (1.15x BUY + low break_prob_down)
+                    if realistic and sig.signal_type == 'bounce' and hasattr(sig, 'action') and sig.action == 'BUY':
+                        bp_dn_211 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                bp_dn_211.append(tf_s.break_prob_down)
+                        if bp_dn_211 and sum(bp_dn_211)/len(bp_dn_211) < 0.20:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('safe_support', 0)
+                            ml_stats['safe_support'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
