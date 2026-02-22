@@ -4564,6 +4564,20 @@ def run_backtest(
                             ml_stats.setdefault("lossless_regime", 0)
                             ml_stats["lossless_regime"] += 1
 
+
+                    # Arch 229d: Full energy bounce boost (1.15x when min PE+KE > 0.40)
+                    if realistic and sig.signal_type == "bounce":
+                        min_pe_229 = 1.0
+                        min_ke_229 = 1.0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                min_pe_229 = min(min_pe_229, tf_s.potential_energy)
+                                min_ke_229 = min(min_ke_229, tf_s.kinetic_energy)
+                        if min_pe_229 > 0.40 and min_ke_229 > 0.40:
+                            trade_size *= 1.15
+                            ml_stats.setdefault("full_energy", 0)
+                            ml_stats["full_energy"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
