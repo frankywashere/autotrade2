@@ -4001,6 +4001,19 @@ def run_backtest(
                             ml_stats.setdefault("pos_extremity", 0)
                             ml_stats["pos_extremity"] += 1
 
+                    # Arch 199b: OU half-life quality (1.15x when optimal reversion speed)
+                    if realistic and sig.signal_type == 'bounce':
+                        hl_199 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid and tf_s.ou_half_life > 0:
+                                hl_199.append(tf_s.ou_half_life)
+                        if hl_199:
+                            avg_hl = sum(hl_199) / len(hl_199)
+                            if 5.0 <= avg_hl <= 50.0:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('good_half_life', 0)
+                                ml_stats['good_half_life'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
