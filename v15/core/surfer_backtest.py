@@ -5719,6 +5719,22 @@ def run_backtest(
                     if realistic and sig.signal_type == 'break' and sig.confidence > 0.90:
                         continue
 
+
+                    # Arch 327d: Break stop tightening to 0.40
+                    # Tighter stops on breaks reduce GL from trail and stop losers.
+                    if realistic and sig.signal_type == 'break':
+                        if sig.action == 'BUY':
+                            _s_dist = entry_price - stop
+                            stop = entry_price - _s_dist * 0.40
+                        else:
+                            _s_dist = stop - entry_price
+                            stop = entry_price + _s_dist * 0.40
+
+                    # Arch 327f: Ultra-tight break trail (0.15x)
+                    # Locks in break gains very close to peak.
+                    if realistic and sig.signal_type == 'break':
+                        _trail_width = min(_trail_width, 0.15)
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
