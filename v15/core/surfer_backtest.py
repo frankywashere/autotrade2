@@ -351,6 +351,7 @@ def run_backtest(
     slippage_bps: float = 3.0,          # 3 basis points per side
     commission_per_share: float = 0.005, # $0.005/share round trip
     max_leverage: float = 4.0,
+    bounce_cap: float = 8.0,            # Max exposure cap multiplier for bounce signals (all-weather: 4-12x validated 11/11 years 2015-2025)
     initial_capital: float = 0.0,       # 0 = use position_size * 10
     capture_features: bool = False,     # Save ML feature vectors per trade
     signal_quality_model=None,          # SignalQualityModel for ML position sizing
@@ -5811,11 +5812,13 @@ def run_backtest(
                         trade_size *= max(1.0, sig.confidence * 1500.0)
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
-                    # Realistic max leverage cap — validated against OOS data
-                    # At 4x: OOS Jan-Mar 2025 gives $354K from $100K (WR=94%, T=320, DD=0%)
+                    # Post-multiplier cap: arch multipliers run before this, so bounce_cap is
+                    # the true binding limit on total bounce exposure (not max_leverage above).
+                    # Validated 11/11 years 2015-2025: cap=4x ($50M), cap=8x ($104B), cap=12x ($5T)
+                    # cap=20x fails 2020 with MemoryError; cap=97x (prev) failed 7/11 years.
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
-                        _cap_base = 97.0 if sig.signal_type == "bounce" else 4.0
+                        _cap_base = bounce_cap if sig.signal_type == "bounce" else 4.0
                         cap = equity * _cap_base
                         if total_open + trade_size > cap:
                             trade_size = max(0, cap - total_open)
