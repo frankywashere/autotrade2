@@ -3844,6 +3844,24 @@ def run_backtest(
                             ml_stats.setdefault("bounce_high_be", 0)
                             ml_stats["bounce_high_be"] += 1
 
+
+                    # Arch 189e: Weighted r-squared boost (1.15x when TF-weighted avg > 0.80)
+                    if realistic and sig.signal_type == "bounce":
+                        tf_w189e = {"5min": 0.5, "15min": 0.6, "30min": 0.7, "1h": 0.8,
+                                   "2h": 0.85, "3h": 0.9, "4h": 0.95, "daily": 1.2, "weekly": 1.5, "monthly": 2.0}
+                        w_rsq, total_w = 0, 0
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid and hasattr(tf_state, "r_squared"):
+                                w = tf_w189e.get(tf_name, 1.0)
+                                w_rsq += tf_state.r_squared * w
+                                total_w += w
+                        if total_w > 0:
+                            avg_rsq = w_rsq / total_w
+                            if avg_rsq > 0.80:
+                                trade_size *= 1.15
+                                ml_stats.setdefault("high_rsq_boost", 0)
+                                ml_stats["high_rsq_boost"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
