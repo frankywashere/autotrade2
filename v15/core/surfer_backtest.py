@@ -3587,6 +3587,17 @@ def run_backtest(
                             ml_stats.setdefault('low_wr_reduce', 0)
                             ml_stats['low_wr_reduce'] += 1
 
+
+                    # Arch 174: PnL acceleration penalty (0.50x when PnL deceleration)
+                    # If sum of last 10 PnL < sum of prior 10, momentum is fading
+                    if realistic and len(trades) >= 20:
+                        r1_174 = sum(t.pnl for t in trades[-10:])
+                        r2_174 = sum(t.pnl for t in trades[-20:-10])
+                        if r1_174 < r2_174 and r2_174 > 0:
+                            trade_size *= 0.50
+                            ml_stats.setdefault('pnl_accel', 0)
+                            ml_stats['pnl_accel'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
