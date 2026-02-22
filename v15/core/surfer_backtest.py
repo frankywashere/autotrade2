@@ -3349,6 +3349,23 @@ def run_backtest(
                             ml_stats.setdefault('anti_cluster', 0)
                             ml_stats['anti_cluster'] += 1
 
+
+                    # Arch 162: Median PE continuous boost (robust PE signal)
+                    if realistic and sig.signal_type == 'bounce':
+                        pe_162 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                pe_162.append(tf_state.potential_energy)
+                        if pe_162:
+                            sorted_pe = sorted(pe_162)
+                            n = len(sorted_pe)
+                            median_pe = sorted_pe[n//2] if n % 2 == 1 else (sorted_pe[n//2-1] + sorted_pe[n//2]) / 2
+                            if median_pe > 0.40:
+                                pe_boost = min(1.25, 0.90 + 0.50 * median_pe)
+                                trade_size *= pe_boost
+                                ml_stats.setdefault('median_pe_boost', 0)
+                                ml_stats['median_pe_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
