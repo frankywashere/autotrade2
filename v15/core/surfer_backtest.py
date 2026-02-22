@@ -3664,6 +3664,19 @@ def run_backtest(
                         ml_stats.setdefault('conf_score_sizing', 0)
                         ml_stats['conf_score_sizing'] += 1
 
+
+                    # Arch 177: Trade efficiency boost (1.20x when recent wins are quick)
+                    # High MFE/hold_bars ratio = strong directional moves, efficient captures
+                    if realistic and len(trades) >= 10:
+                        efficiencies_177 = []
+                        for t in trades[-10:]:
+                            if t.hold_bars > 0 and t.pnl > 0:
+                                efficiencies_177.append(t.mfe_pct / t.hold_bars)
+                        if len(efficiencies_177) >= 5 and sum(efficiencies_177)/len(efficiencies_177) > 0.001:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('trade_eff', 0)
+                            ml_stats['trade_eff'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
