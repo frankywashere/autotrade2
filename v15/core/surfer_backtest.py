@@ -3619,6 +3619,20 @@ def run_backtest(
                         ml_stats.setdefault('break_hard_reduce', 0)
                         ml_stats['break_hard_reduce'] += 1
 
+
+                    # Arch 175: Growing loss size penalty (0.50x when avg loss increasing)
+                    # Losses getting bigger = market regime changing, reduce exposure
+                    if realistic and len(trades) >= 20:
+                        losses_recent_175 = [abs(t.pnl) for t in trades[-10:] if t.pnl < 0]
+                        losses_prev_175 = [abs(t.pnl) for t in trades[-20:-10] if t.pnl < 0]
+                        if losses_recent_175 and losses_prev_175:
+                            avg_recent_loss_175 = sum(losses_recent_175) / len(losses_recent_175)
+                            avg_prev_loss_175 = sum(losses_prev_175) / len(losses_prev_175)
+                            if avg_recent_loss_175 > avg_prev_loss_175 * 1.50:
+                                trade_size *= 0.50
+                                ml_stats.setdefault('loss_growing', 0)
+                                ml_stats['loss_growing'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
