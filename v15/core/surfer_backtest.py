@@ -4198,6 +4198,32 @@ def run_backtest(
                                 ml_stats.setdefault('te_uniform', 0)
                                 ml_stats['te_uniform'] += 1
 
+                    # Arch 206f: Width*theta product (1.15x when wide channel + moderate reversion)
+                    if realistic and sig.signal_type == 'bounce':
+                        wt_206 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                wt_206.append(tf_s.width_pct * tf_s.ou_theta)
+                        if wt_206:
+                            avg_wt = sum(wt_206) / len(wt_206)
+                            if avg_wt > 0.001:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('width_theta', 0)
+                                ml_stats['width_theta'] += 1
+
+                    # Arch 206d: PE*KE*r_sq triple product continuous sizing
+                    if realistic and sig.signal_type == 'bounce':
+                        triple_206 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                triple_206.append(tf_s.potential_energy * tf_s.kinetic_energy * tf_s.r_squared)
+                        if triple_206:
+                            avg_triple = sum(triple_206) / len(triple_206)
+                            t_mult = min(1.30, max(0.50, 0.5 + avg_triple * 5.0))
+                            trade_size *= t_mult
+                            ml_stats.setdefault('triple_qual', 0)
+                            ml_stats['triple_qual'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
