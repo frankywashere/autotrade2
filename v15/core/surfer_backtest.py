@@ -3598,6 +3598,20 @@ def run_backtest(
                             ml_stats.setdefault('pnl_accel', 0)
                             ml_stats['pnl_accel'] += 1
 
+
+                    # Arch 176: Low confidence reduce (low signal confidence = risky)
+                    if realistic and hasattr(sig, 'confidence') and sig.confidence < 0.50:
+                        trade_size *= 0.60
+                        ml_stats.setdefault('low_conf', 0)
+                        ml_stats['low_conf'] += 1
+
+                    # Arch 177: Anti-revenge (reduce after loss if same signal type)
+                    if realistic and trades and trades[-1].pnl <= 0:
+                        if hasattr(trades[-1], 'signal_type') and trades[-1].signal_type == sig.signal_type:
+                            trade_size *= 0.50
+                            ml_stats.setdefault('anti_revenge', 0)
+                            ml_stats['anti_revenge'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
