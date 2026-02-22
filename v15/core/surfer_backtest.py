@@ -3508,6 +3508,18 @@ def run_backtest(
                                 ml_stats.setdefault('weighted_health', 0)
                                 ml_stats['weighted_health'] += 1
 
+
+                    # Arch 173: Direction consensus boost (all TFs agree on direction)
+                    if realistic and sig.signal_type == 'bounce':
+                        dirs = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                dirs.append(tf_s.channel_direction)
+                        if dirs and len(set(dirs)) == 1:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('dir_consensus', 0)
+                            ml_stats['dir_consensus'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
