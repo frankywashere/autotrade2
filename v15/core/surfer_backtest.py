@@ -5639,6 +5639,20 @@ def run_backtest(
                             ml_stats.setdefault('pos_n3', 0)
                             ml_stats['pos_n3'] += 1
 
+                    # Arch 306a: TP narrowing for bounces (66% of original)
+                    # Counterintuitive: narrower TP forces earlier profit-taking.
+                    # Trailing stop already captures big moves; tighter TP grabs
+                    # near-target trades before they reverse into losses.
+                    if realistic and sig.signal_type == 'bounce':
+                        if sig.action == 'BUY':
+                            _tp_dist = tp - entry_price
+                            tp = entry_price + _tp_dist * 0.66
+                        else:
+                            _tp_dist = entry_price - tp
+                            tp = entry_price - _tp_dist * 0.66
+                        ml_stats.setdefault('tp_narrow', 0)
+                        ml_stats['tp_narrow'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
