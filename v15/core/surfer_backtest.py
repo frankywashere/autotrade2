@@ -4969,6 +4969,21 @@ def run_backtest(
                             ml_stats.setdefault('ordered_energy', 0)
                             ml_stats['ordered_energy'] += 1
 
+                    # Arch 255a: High equity + high energy double gate (1.25x)
+                    if realistic and sig.signal_type == 'bounce' and equity > 500000:
+                        sys_te_255 = sum(tf_s.total_energy for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if sys_te_255 > 3.5:
+                            trade_size *= 1.25
+                            ml_stats.setdefault('eq_energy_gate', 0)
+                            ml_stats['eq_energy_gate'] += 1
+
+                    # Arch 255f: Big win momentum bounce (1.20x after $5K+ win)
+                    if realistic and sig.signal_type == 'bounce' and len(trades) >= 1:
+                        if trades[-1].pnl > 5000:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('big_win_mom', 0)
+                            ml_stats['big_win_mom'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
