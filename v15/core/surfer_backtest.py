@@ -5372,6 +5372,20 @@ def run_backtest(
                         ml_stats.setdefault('timed_eq', 0)
                         ml_stats['timed_eq'] += 1
 
+
+                    # Arch 274f: All TFs have both good health and good fit
+                    if realistic and sig.signal_type == 'bounce':
+                        min_hr_274 = 1.0
+                        cnt_274 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                min_hr_274 = min(min_hr_274, tf_s.channel_health * tf_s.r_squared)
+                                cnt_274 += 1
+                        if cnt_274 >= 3 and min_hr_274 > 0.15:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('all_qfit', 0)
+                            ml_stats['all_qfit'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
