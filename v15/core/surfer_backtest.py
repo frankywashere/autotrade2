@@ -5659,7 +5659,7 @@ def run_backtest(
                     # also tighten stop 30% and boost size 1.10x to capitalize
                     # on the reduced risk profile.
                     if realistic and sig.signal_type == 'bounce':
-                        _trail_width = 0.5
+                        _trail_width = 0.7
                         if equity > 500000:
                             if sig.action == 'BUY':
                                 _s_dist = entry_price - stop
