@@ -3935,6 +3935,18 @@ def run_backtest(
                                 ml_stats.setdefault("steep_slope", 0)
                                 ml_stats["steep_slope"] += 1
 
+
+                    # Arch 193: Momentum turning penalty (0.50x when >60% TFs turning)
+                    if realistic and sig.signal_type == "bounce":
+                        turning_193 = sum(1 for tf_n, tf_s in analysis.tf_states.items()
+                                         if tf_s and tf_s.valid and tf_s.momentum_is_turning)
+                        valid_193 = sum(1 for tf_n, tf_s in analysis.tf_states.items()
+                                       if tf_s and tf_s.valid)
+                        if valid_193 > 0 and turning_193 / valid_193 > 0.60:
+                            trade_size *= 0.50
+                            ml_stats.setdefault("mom_turning", 0)
+                            ml_stats["mom_turning"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
