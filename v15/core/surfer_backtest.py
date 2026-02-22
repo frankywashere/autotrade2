@@ -5358,6 +5358,13 @@ def run_backtest(
                             ml_stats.setdefault('4f_q_avg', 0)
                             ml_stats['4f_q_avg'] += 1
 
+
+                    # Arch 272c: Early confident break = worth pressing
+                    if realistic and sig.signal_type == 'break' and equity < 200000 and sig.confidence > 0.75:
+                        trade_size *= 1.20
+                        ml_stats.setdefault('early_conf_brk', 0)
+                        ml_stats['early_conf_brk'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
