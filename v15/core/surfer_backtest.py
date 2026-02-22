@@ -3806,6 +3806,16 @@ def run_backtest(
                             ml_stats.setdefault('amp_decline', 0)
                             ml_stats['amp_decline'] += 1
 
+
+                    # Arch 189d: Trail-loss cluster detection (0.50x after 2+ trail losses in 5)
+                    if realistic and len(trades) >= 5:
+                        trail_losses_189 = sum(1 for t in trades[-5:]
+                                              if t.exit_reason == "trail" and t.pnl < 0)
+                        if trail_losses_189 >= 2:
+                            trade_size *= 0.50
+                            ml_stats.setdefault("trail_loss_cluster", 0)
+                            ml_stats["trail_loss_cluster"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
