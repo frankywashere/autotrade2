@@ -3508,6 +3508,50 @@ def run_backtest(
                                 ml_stats.setdefault('weighted_health', 0)
                                 ml_stats['weighted_health'] += 1
 
+
+                    # Arch 170: Direction consensus boost (all TFs agree on direction)
+                    if realistic and sig.signal_type == 'bounce':
+                        dirs = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                dirs.append(tf_s.channel_direction)
+                        if dirs and len(set(dirs)) == 1:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('dir_consensus', 0)
+                            ml_stats['dir_consensus'] += 1
+
+                    # Arch 171: 75th percentile theta boost (strong reversion in top quartile)
+                    if realistic and sig.signal_type == 'bounce':
+                        th_171 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                th_171.append(tf_state.ou_theta)
+                        if th_171:
+                            sorted_th = sorted(th_171)
+                            idx75 = int(len(sorted_th) * 0.75)
+                            p75_th = sorted_th[min(idx75, len(sorted_th)-1)]
+                            if p75_th > 0.35:
+                                th_boost = min(1.15, 1.0 + (p75_th - 0.35) * 0.30)
+                                trade_size *= th_boost
+                                ml_stats.setdefault('p75_theta', 0)
+                                ml_stats['p75_theta'] += 1
+
+                    # Arch 172: 75th percentile PE boost (top quartile PE high)
+                    if realistic and sig.signal_type == 'bounce':
+                        pe_172 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                pe_172.append(tf_state.potential_energy)
+                        if pe_172:
+                            sorted_pe = sorted(pe_172)
+                            idx75 = int(len(sorted_pe) * 0.75)
+                            p75_pe = sorted_pe[min(idx75, len(sorted_pe)-1)]
+                            if p75_pe > 0.60:
+                                pe_boost = min(1.20, 1.0 + (p75_pe - 0.60) * 0.40)
+                                trade_size *= pe_boost
+                                ml_stats.setdefault('p75_pe', 0)
+                                ml_stats['p75_pe'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
