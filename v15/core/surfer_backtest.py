@@ -5480,6 +5480,24 @@ def run_backtest(
                         ml_stats.setdefault('wide_dz', 0)
                         ml_stats['wide_dz'] += 1
 
+
+                    if realistic and sig.signal_type == 'bounce' and equity > 300000 and len(trades) >= 3:
+                        if all(t.pnl > 500 for t in trades[-3:]):
+                            trade_size *= 1.15
+                            ml_stats.setdefault('q_streak_3', 0)
+                            ml_stats['q_streak_3'] += 1
+
+                    # Arch 287c: Quality at high equity boost (1.20x equity>600K avg PE*health>0.30)
+                    if realistic and sig.signal_type == 'bounce' and equity > 600000:
+                        peh_287 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                peh_287.append(tf_s.potential_energy * tf_s.channel_health)
+                        if peh_287 and sum(peh_287)/len(peh_287) > 0.30:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('q_high_eq', 0)
+                            ml_stats['q_high_eq'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
