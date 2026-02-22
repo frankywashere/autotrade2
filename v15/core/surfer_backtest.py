@@ -5217,6 +5217,18 @@ def run_backtest(
                             ml_stats.setdefault('ordered_edge_265', 0)
                             ml_stats['ordered_edge_265'] += 1
 
+
+                    # Arch 266b: Even stricter ordered edge threshold with bigger boost
+                    if realistic and sig.signal_type == 'bounce':
+                        oe_266 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                oe_266.append(abs(tf_s.position_pct) * (1.0 - tf_s.entropy))
+                        if oe_266 and sum(oe_266)/len(oe_266) > 0.50:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('ultra_ordered_edge', 0)
+                            ml_stats['ultra_ordered_edge'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
