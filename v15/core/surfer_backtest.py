@@ -3441,6 +3441,23 @@ def run_backtest(
                         ml_stats.setdefault('quad_eq_scale', 0)
                         ml_stats['quad_eq_scale'] += 1
 
+
+                    # Arch 166: 25th percentile PE boost (most TFs have good PE)
+                    if realistic and sig.signal_type == 'bounce':
+                        pe_166 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                pe_166.append(tf_state.potential_energy)
+                        if pe_166:
+                            sorted_pe = sorted(pe_166)
+                            idx25 = max(0, int(len(sorted_pe) * 0.25))
+                            p25_pe = sorted_pe[idx25]
+                            if p25_pe > 0.35:
+                                pe_boost = min(1.20, 1.0 + (p25_pe - 0.35) * 0.50)
+                                trade_size *= pe_boost
+                                ml_stats.setdefault('p25_pe', 0)
+                                ml_stats['p25_pe'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
