@@ -5320,6 +5320,33 @@ def run_backtest(
                             ml_stats.setdefault('poor_tf', 0)
                             ml_stats['poor_tf'] += 1
 
+                    # Arch 270b: Chaotic momentum bounce penalty (0.10x when avg KE > 0.60 AND avg entropy > 0.60)
+                    if realistic and sig.signal_type == 'bounce':
+                        ke_270 = []
+                        ent_270b = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                ke_270.append(tf_s.kinetic_energy)
+                                ent_270b.append(tf_s.entropy)
+                        if ke_270 and ent_270b:
+                            if sum(ke_270)/len(ke_270) > 0.60 and sum(ent_270b)/len(ent_270b) > 0.60:
+                                trade_size *= 0.10
+                                ml_stats.setdefault('chaos_mom_bounce', 0)
+                                ml_stats['chaos_mom_bounce'] += 1
+
+                    # Arch 270c: Extreme dual warning penalty (0.05x when max BE > 0.70 AND max entropy > 0.80)
+                    if realistic:
+                        max_be_270 = 0
+                        max_ent_270 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                max_be_270 = max(max_be_270, tf_s.binding_energy)
+                                max_ent_270 = max(max_ent_270, tf_s.entropy)
+                        if max_be_270 > 0.70 and max_ent_270 > 0.80:
+                            trade_size *= 0.05
+                            ml_stats.setdefault('extreme_dual', 0)
+                            ml_stats['extreme_dual'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
