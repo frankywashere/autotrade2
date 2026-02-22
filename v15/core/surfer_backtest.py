@@ -4984,6 +4984,29 @@ def run_backtest(
                             ml_stats.setdefault('big_win_mom', 0)
                             ml_stats['big_win_mom'] += 1
 
+                    # Arch 257a: Millionaire compound
+                    if realistic and sig.signal_type == 'bounce' and equity > 1000000:
+                        trade_size *= 1.50
+                        ml_stats.setdefault('millionaire_bounce', 0)
+                        ml_stats['millionaire_bounce'] += 1
+
+                    # Arch 255d: Mid compound phase boost (1.10x when 5x-10x initial)
+                    if realistic and equity > initial_capital * 5 and equity < initial_capital * 10:
+                        trade_size *= 1.10
+                        ml_stats.setdefault('mid_comp', 0)
+                        ml_stats['mid_comp'] += 1
+
+                    # Arch 256e: All TFs energized floor (1.15x when min total energy > 0.50)
+                    if realistic and sig.signal_type == 'bounce':
+                        min_te_256 = 999
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                min_te_256 = min(min_te_256, tf_s.potential_energy + tf_s.kinetic_energy)
+                        if min_te_256 > 0.50 and min_te_256 < 999:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('all_energized', 0)
+                            ml_stats['all_energized'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
