@@ -3655,6 +3655,15 @@ def run_backtest(
                             ml_stats.setdefault('channel_mature', 0)
                             ml_stats['channel_mature'] += 1
 
+
+                    # Arch 180: Confluence score continuous sizing
+                    if realistic and hasattr(sig, 'confluence_score'):
+                        cs = max(0.0, min(1.0, sig.confluence_score))
+                        cs_mult = 0.5 + cs * 1.0
+                        trade_size *= cs_mult
+                        ml_stats.setdefault('conf_score_sizing', 0)
+                        ml_stats['conf_score_sizing'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
