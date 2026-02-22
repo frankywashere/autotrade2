@@ -5027,6 +5027,14 @@ def run_backtest(
                                 ml_stats.setdefault('free_pe', 0)
                                 ml_stats['free_pe'] += 1
 
+                    # Arch 259f: Spring loaded + equity gate bounce boost (1.15x)
+                    if realistic and sig.signal_type == 'bounce' and equity > 400000:
+                        pe_sum_259 = sum(tf_s.potential_energy for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if pe_sum_259 > 2.0:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('spring_eq_400', 0)
+                            ml_stats['spring_eq_400'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
