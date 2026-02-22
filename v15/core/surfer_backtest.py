@@ -3488,6 +3488,26 @@ def run_backtest(
                                 ml_stats.setdefault('min_ke_penalty', 0)
                                 ml_stats['min_ke_penalty'] += 1
 
+
+                    # Arch 169: TF-weighted health score ((1-BE)*PE weighted by TF importance)
+                    if realistic and sig.signal_type == 'bounce':
+                        tf_w169 = {'5min': 0.5, '15min': 0.6, '30min': 0.7, '1h': 0.8,
+                                   '2h': 0.85, '3h': 0.9, '4h': 0.95, 'daily': 1.2, 'weekly': 1.5, 'monthly': 2.0}
+                        weighted_h, total_w = 0, 0
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                w = tf_w169.get(tf_name, 1.0)
+                                h = (1.0 - tf_state.binding_energy) * max(tf_state.potential_energy, 0.01)
+                                weighted_h += h * w
+                                total_w += w
+                        if total_w > 0:
+                            wh = weighted_h / total_w
+                            if wh > 0.25:
+                                h_boost = min(1.20, 1.0 + (wh - 0.25) * 0.50)
+                                trade_size *= h_boost
+                                ml_stats.setdefault('weighted_health', 0)
+                                ml_stats['weighted_health'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
