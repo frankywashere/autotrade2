@@ -3275,6 +3275,25 @@ def run_backtest(
                             ml_stats.setdefault('extreme_pos_boost', 0)
                             ml_stats['extreme_pos_boost'] += 1
 
+
+                    # Arch 159: TF-weighted KE boost (daily momentum matters more)
+                    if realistic and sig.signal_type == 'bounce':
+                        tf_w159 = {'5min': 0.5, '15min': 0.6, '30min': 0.7, '1h': 0.8,
+                                   '2h': 0.85, '3h': 0.9, '4h': 0.95, 'daily': 1.2, 'weekly': 1.5, 'monthly': 2.0}
+                        weighted_ke, total_w = 0, 0
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                w = tf_w159.get(tf_name, 1.0)
+                                weighted_ke += tf_state.kinetic_energy * w
+                                total_w += w
+                        if total_w > 0:
+                            wke = weighted_ke / total_w
+                            if wke > 0.25:
+                                ke_boost = min(1.30, 1.0 + (wke - 0.25) * 0.60)
+                                trade_size *= ke_boost
+                                ml_stats.setdefault('weighted_ke_boost', 0)
+                                ml_stats['weighted_ke_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
