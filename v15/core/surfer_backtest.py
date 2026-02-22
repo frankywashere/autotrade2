@@ -5145,6 +5145,41 @@ def run_backtest(
                             ml_stats.setdefault('te5_300k', 0)
                             ml_stats['te5_300k'] += 1
 
+                    # Arch 264e: After any bounce hit stop, reduce bounces
+                    if realistic and sig.signal_type == 'bounce' and len(trades) >= 1:
+                        had_bounce_stop = any(
+                            hasattr(t, 'signal_type') and t.signal_type == 'bounce' and
+                            hasattr(t, 'exit_reason') and t.exit_reason == 'stop' and t.pnl < -1
+                            for t in trades[-30:]
+                        )
+                        if had_bounce_stop:
+                            trade_size *= 0.30
+                            ml_stats.setdefault('bounce_stop_pen', 0)
+                            ml_stats['bounce_stop_pen'] += 1
+
+                    # Arch 263a: 5-factor best TF product (1.15x when PE*pos*health*r_sq*vol > 0.05)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_5f_263 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                f5 = tf_s.potential_energy * abs(tf_s.position_pct) * tf_s.channel_health * tf_s.r_squared * tf_s.volume_score
+                                max_5f_263 = max(max_5f_263, f5)
+                        if max_5f_263 > 0.05:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('5f_best', 0)
+                            ml_stats['5f_best'] += 1
+
+                    # Arch 263e: High avg PE bounce (1.15x when avg potential energy > 0.60)
+                    if realistic and sig.signal_type == 'bounce':
+                        pe_263 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pe_263.append(tf_s.potential_energy)
+                        if pe_263 and sum(pe_263)/len(pe_263) > 0.60:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('hi_avg_pe', 0)
+                            ml_stats['hi_avg_pe'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
