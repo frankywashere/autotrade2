@@ -4747,6 +4747,20 @@ def run_backtest(
                             ml_stats.setdefault("sys_total_e", 0)
                             ml_stats["sys_total_e"] += 1
 
+                    # Arch 240d: SELL break in all-downtrend (1.15x all slopes negative)
+                    if realistic and sig.signal_type == 'break' and hasattr(sig, 'action') and sig.action == 'SELL':
+                        all_neg_240 = True
+                        count_240 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                count_240 += 1
+                                if tf_s.slope_pct >= 0:
+                                    all_neg_240 = False
+                        if all_neg_240 and count_240 >= 3:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('sell_all_down', 0)
+                            ml_stats['sell_all_down'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
