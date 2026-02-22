@@ -3816,6 +3816,22 @@ def run_backtest(
                             ml_stats.setdefault("trail_loss_cluster", 0)
                             ml_stats["trail_loss_cluster"] += 1
 
+
+                    # Arch 189f: Bounce low PE penalty (0.40x when median PE < 0.20)
+                    if realistic and sig.signal_type == "bounce":
+                        pes_189f = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pes_189f.append(tf_s.potential_energy)
+                        if pes_189f:
+                            sorted_pe = sorted(pes_189f)
+                            n = len(sorted_pe)
+                            median_pe_189 = sorted_pe[n//2] if n % 2 == 1 else (sorted_pe[n//2-1] + sorted_pe[n//2]) / 2
+                            if median_pe_189 < 0.20:
+                                trade_size *= 0.40
+                                ml_stats.setdefault("bounce_low_pe", 0)
+                                ml_stats["bounce_low_pe"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
