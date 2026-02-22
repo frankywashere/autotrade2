@@ -5129,6 +5129,22 @@ def run_backtest(
                             ml_stats.setdefault('pe_vol_h', 0)
                             ml_stats['pe_vol_h'] += 1
 
+                    # Arch 262d: $1M + spring loaded bounce (1.20x)
+                    if realistic and sig.signal_type == 'bounce' and equity > 1000000:
+                        pe_sum_262 = sum(tf_s.potential_energy for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if pe_sum_262 > 1.5:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('1m_spring', 0)
+                            ml_stats['1m_spring'] += 1
+
+                    # Arch 262a: High energy + moderate equity bounce (1.20x)
+                    if realistic and sig.signal_type == 'bounce' and equity > 300000:
+                        te_sum_262 = sum(tf_s.total_energy for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if te_sum_262 > 5.0:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('te5_300k', 0)
+                            ml_stats['te5_300k'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
