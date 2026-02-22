@@ -4014,6 +4014,28 @@ def run_backtest(
                                 ml_stats.setdefault('good_half_life', 0)
                                 ml_stats['good_half_life'] += 1
 
+                    # Arch 199f: Multi-TF slope consensus (1.15x when all slopes agree)
+                    if realistic and sig.signal_type == 'bounce':
+                        slopes_199 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                slopes_199.append(1 if tf_s.slope_pct > 0 else -1 if tf_s.slope_pct < 0 else 0)
+                        nonzero_199 = [s for s in slopes_199 if s != 0]
+                        if len(nonzero_199) >= 3 and len(set(nonzero_199)) == 1:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('slope_consensus', 0)
+                            ml_stats['slope_consensus'] += 1
+
+                    # Arch 198f: PnL volatility spike penalty (0.50x when std > 3x avg)
+                    if realistic and len(trades) >= 10:
+                        pnls_198 = [t.pnl for t in trades[-10:]]
+                        avg_pnl_198 = sum(pnls_198) / len(pnls_198)
+                        std_pnl_198 = (sum((p - avg_pnl_198)**2 for p in pnls_198) / len(pnls_198)) ** 0.5
+                        if avg_pnl_198 > 0 and std_pnl_198 > avg_pnl_198 * 3.0:
+                            trade_size *= 0.50
+                            ml_stats.setdefault('pnl_vol_spike', 0)
+                            ml_stats['pnl_vol_spike'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
