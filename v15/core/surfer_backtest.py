@@ -3030,7 +3030,7 @@ def run_backtest(
                                 ed2.append(min(ep, 1.0))
                         if be2:
                             s = (1.0 - sum(be2)/len(be2)) * 0.5 + (sum(pe2)/len(pe2)) * 0.25 + min((sum(th2)/len(th2))/0.50, 1.0) * 0.15 + (sum(ed2)/len(ed2)) * 0.10
-                            trade_size *= (0.5 + 1.0 * s)
+                            trade_size *= (0.3 + 1.4 * s)
                             ml_stats.setdefault('comprehensive_v2', 0)
                             ml_stats['comprehensive_v2'] += 1
 
