@@ -5671,6 +5671,25 @@ def run_backtest(
                         ml_stats.setdefault('trail_stop_compound', 0)
                         ml_stats['trail_stop_compound'] += 1
 
+
+                    # Arch 314f: Break stop tightening 30%
+                    # Breaks have wider stops than needed — tighten to reduce
+                    # GL on losing breaks (#49, #80, #140) without affecting winners.
+                    if realistic and sig.signal_type == 'break':
+                        if sig.action == 'BUY':
+                            _s_dist = entry_price - stop
+                            stop = entry_price - _s_dist * 0.70
+                        else:
+                            _s_dist = stop - entry_price
+                            stop = entry_price + _s_dist * 0.70
+
+
+                    # Arch 314d: Faster OU exit for bounces
+                    # Reduces OU half-life 50%, killing #86 (ou_timeout loser -)
+                    # by forcing faster mean-reversion exit.
+                    if realistic and sig.signal_type == 'bounce':
+                        ou_hl = max(2.0, ou_hl * 0.50)
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
