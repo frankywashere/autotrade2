@@ -5654,13 +5654,22 @@ def run_backtest(
                         ml_stats['tp_narrow'] += 1
 
 
-                    # Arch 309d: Trail tightening 0.7x for ALL bounces
-                    # Moderate trail width reduction lets trailing stop lock in
-                    # profits closer to peak, reducing give-back on reversals.
+                    # Arch 311f: Trail + stop + size compound for bounces
+                    # Trail 0.5x locks in profits closer to peak; at $500K+
+                    # also tighten stop 30% and boost size 1.10x to capitalize
+                    # on the reduced risk profile.
                     if realistic and sig.signal_type == 'bounce':
-                        _trail_width = 0.7
-                        ml_stats.setdefault('trail_mod_all', 0)
-                        ml_stats['trail_mod_all'] += 1
+                        _trail_width = 0.5
+                        if equity > 500000:
+                            if sig.action == 'BUY':
+                                _s_dist = entry_price - stop
+                                stop = entry_price - _s_dist * 0.70
+                            else:
+                                _s_dist = stop - entry_price
+                                stop = entry_price + _s_dist * 0.70
+                            trade_size *= 1.10
+                        ml_stats.setdefault('trail_stop_compound', 0)
+                        ml_stats['trail_stop_compound'] += 1
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
