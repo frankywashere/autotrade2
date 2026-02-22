@@ -3109,6 +3109,18 @@ def run_backtest(
                                 ml_stats.setdefault('multi_ke_boost', 0)
                                 ml_stats['multi_ke_boost'] += 1
 
+
+                    # Arch 153: Max theta boost (strong reversion on any TF = better bounce)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_theta = 0
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                max_theta = max(max_theta, tf_state.ou_theta)
+                        if max_theta > 0.40:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('max_theta_boost', 0)
+                            ml_stats['max_theta_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
