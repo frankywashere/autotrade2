@@ -3034,6 +3034,22 @@ def run_backtest(
                             ml_stats.setdefault('comprehensive_v2', 0)
                             ml_stats['comprehensive_v2'] += 1
 
+
+                    # Arch 126: Multi-TF entropy + position penalty (chaotic + mid-channel = bad)
+                    if realistic and sig.signal_type == 'bounce':
+                        ent_vals, pos_vals = [], []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                ent_vals.append(tf_state.entropy)
+                                pos_vals.append(tf_state.position_pct)
+                        if ent_vals:
+                            avg_ent = sum(ent_vals) / len(ent_vals)
+                            avg_pos = sum(pos_vals) / len(pos_vals)
+                            if avg_ent > 0.65 and 0.30 < avg_pos < 0.70:
+                                trade_size *= 0.70
+                                ml_stats.setdefault('ent_pos_penalty', 0)
+                                ml_stats['ent_pos_penalty'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
