@@ -4672,6 +4672,17 @@ def run_backtest(
                             ml_stats.setdefault('all_extreme', 0)
                             ml_stats['all_extreme'] += 1
 
+
+                    # Arch 234f: PnL trend up boost (1.15x when improving)
+                    if realistic and len(trades) >= 20:
+                        recent20_234 = [t.pnl for t in trades[-20:]]
+                        first_half_234 = sum(recent20_234[:10]) / 10
+                        second_half_234 = sum(recent20_234[10:]) / 10
+                        if second_half_234 > first_half_234 * 1.5 and second_half_234 > 0:
+                            trade_size *= 1.15
+                            ml_stats.setdefault("pnl_trend_up", 0)
+                            ml_stats["pnl_trend_up"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
