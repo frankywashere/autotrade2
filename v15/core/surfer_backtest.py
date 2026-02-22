@@ -4661,6 +4661,17 @@ def run_backtest(
                             ml_stats.setdefault('min_health_ok', 0)
                             ml_stats['min_health_ok'] += 1
 
+                    # Arch 230b: All TFs at edge (1.20x when min position > 0.60)
+                    if realistic and sig.signal_type == 'bounce':
+                        min_pos_230 = 1.0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                min_pos_230 = min(min_pos_230, abs(tf_s.position_pct))
+                        if min_pos_230 > 0.60:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('all_extreme', 0)
+                            ml_stats['all_extreme'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
