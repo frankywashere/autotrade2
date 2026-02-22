@@ -3223,6 +3223,26 @@ def run_backtest(
                                 ml_stats.setdefault('median_be', 0)
                                 ml_stats['median_be'] += 1
 
+                    # Arch 133b: Anti-momentum contrarian boost (1.25x)
+                    # Bouncing AGAINST momentum = strong mean-reversion signal
+                    if realistic and sig.signal_type == 'bounce':
+                        ps133 = analysis.tf_states.get(sig.primary_tf)
+                        if ps133:
+                            trade_dir = 1 if sig.action == 'BUY' else -1
+                            if ps133.momentum_direction * trade_dir < 0:
+                                trade_size *= 1.25
+                                ml_stats.setdefault('contrarian_boost', 0)
+                                ml_stats['contrarian_boost'] += 1
+
+                    # Arch 133f: Trade type diversity filter (0.70x when all last 5 same type)
+                    # Prevents overconcentration in one trade type
+                    if realistic and len(trades) >= 5:
+                        last5_types = [t.signal_type for t in trades[-5:] if hasattr(t, 'signal_type')]
+                        if last5_types and len(set(last5_types)) == 1:
+                            trade_size *= 0.70
+                            ml_stats.setdefault('diversity_reduce', 0)
+                            ml_stats['diversity_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
