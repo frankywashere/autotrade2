@@ -3520,6 +3520,37 @@ def run_backtest(
                             ml_stats.setdefault('dir_consensus', 0)
                             ml_stats['dir_consensus'] += 1
 
+
+                    # Arch 170: Multi-TF direction consensus boost (1.20x when all TFs agree)
+                    # Fixed: channel_direction is string (bull/bear/sideways), not int
+                    if realistic and sig.signal_type == 'bounce':
+                        dirs_170 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                dirs_170.append(1 if tf_s.channel_direction == 'bull' else (-1 if tf_s.channel_direction == 'bear' else 0))
+                        if dirs_170 and (all(d >= 0 for d in dirs_170) or all(d <= 0 for d in dirs_170)):
+                            trade_size *= 1.20
+                            ml_stats.setdefault('dir_consensus', 0)
+                            ml_stats['dir_consensus'] += 1
+
+                    # Arch 171: Perfect WR streak boost (1.30x when last 20 all wins)
+                    # 100% WR in recent window = system in optimal regime
+                    if realistic and len(trades) >= 20:
+                        if all(t.pnl > 0 for t in trades[-20:]):
+                            trade_size *= 1.30
+                            ml_stats.setdefault('perfect_wr', 0)
+                            ml_stats['perfect_wr'] += 1
+
+                    # Arch 172: PnL trend penalty (0.60x when recent avg declining vs prior)
+                    # Declining PnL average = market regime shifting, reduce exposure
+                    if realistic and len(trades) >= 20:
+                        recent10_172 = [t.pnl_pct for t in trades[-10:]]
+                        prev10_172 = [t.pnl_pct for t in trades[-20:-10]]
+                        if sum(recent10_172)/10 < sum(prev10_172)/10 * 0.50:
+                            trade_size *= 0.60
+                            ml_stats.setdefault('pnl_trend', 0)
+                            ml_stats['pnl_trend'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
