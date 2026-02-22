@@ -3381,6 +3381,24 @@ def run_backtest(
                                 ml_stats.setdefault('fm_boost', 0)
                                 ml_stats['fm_boost'] += 1
 
+                    # Arch 137e: High KE break boost (1.20x when KE > 0.70)
+                    # Strong momentum = real breakout, not false break
+                    if realistic and sig.signal_type == 'break':
+                        ps137 = analysis.tf_states.get(sig.primary_tf)
+                        if ps137 and ps137.kinetic_energy > 0.70:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('high_ke_break_boost', 0)
+                            ml_stats['high_ke_break_boost'] += 1
+
+                    # Arch 137f: Continuous equity inverse scaling
+                    # As equity grows, scale trade_size proportionally to initial/equity
+                    # Keeps absolute risk per trade approximately constant
+                    if realistic:
+                        eq_scale = min(1.0, initial_capital / equity)
+                        trade_size *= eq_scale
+                        ml_stats.setdefault('eq_scale', 0)
+                        ml_stats['eq_scale'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
