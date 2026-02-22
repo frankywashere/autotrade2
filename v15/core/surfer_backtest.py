@@ -5423,6 +5423,13 @@ def run_backtest(
                         ml_stats.setdefault('endgame_stride', 0)
                         ml_stats['endgame_stride'] += 1
 
+
+                    # Arch 282a: Well-timed and confident bounce
+                    if realistic and sig.signal_type == 'bounce' and sig.timing_score > 0.80 and sig.confidence > 0.80:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('timed_conf', 0)
+                        ml_stats['timed_conf'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
