@@ -5840,7 +5840,7 @@ def run_backtest(
 
                     # Arch 360b: Conf*150 at $10M+
                     if realistic and sig.signal_type == 'bounce' and equity > 10000000:
-                        trade_size *= max(1.0, sig.confidence * 270.0)
+                        trade_size *= max(1.0, sig.confidence * 275.0)
                         ml_stats.setdefault('conf_scale_10m', 0)
                         ml_stats['conf_scale_10m'] += 1
 
