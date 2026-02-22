@@ -4707,6 +4707,12 @@ def run_backtest(
                             ml_stats.setdefault("clean_exit_bounce", 0)
                             ml_stats["clean_exit_bounce"] += 1
 
+                    # Arch 238c: 5x equity with bounce = aggressive compound
+                    if realistic and sig.signal_type == 'bounce' and equity > initial_capital * 5.0:
+                        trade_size *= 1.30
+                        ml_stats.setdefault('5x_compound', 0)
+                        ml_stats['5x_compound'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
