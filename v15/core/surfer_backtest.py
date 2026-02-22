@@ -4366,6 +4366,28 @@ def run_backtest(
                                 ml_stats.setdefault("loss_proximity", 0)
                                 ml_stats["loss_proximity"] += 1
 
+                    # Arch 218a: Max volume confirmation (1.15x when any TF has volume > 0.80)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_vol_218 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                max_vol_218 = max(max_vol_218, tf_s.volume_score)
+                        if max_vol_218 > 0.80:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('max_vol_conf', 0)
+                            ml_stats['max_vol_conf'] += 1
+
+                    # Arch 218d: Ordered momentum (1.15x when KE*(1-entropy) avg > 0.30)
+                    if realistic and sig.signal_type == 'bounce':
+                        oke_218 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                oke_218.append(tf_s.kinetic_energy * (1.0 - tf_s.entropy))
+                        if oke_218 and sum(oke_218)/len(oke_218) > 0.30:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('ordered_ke', 0)
+                            ml_stats['ordered_ke'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
