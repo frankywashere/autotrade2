@@ -5653,6 +5653,15 @@ def run_backtest(
                         ml_stats.setdefault('tp_narrow', 0)
                         ml_stats['tp_narrow'] += 1
 
+
+                    # Arch 309d: Trail tightening 0.7x for ALL bounces
+                    # Moderate trail width reduction lets trailing stop lock in
+                    # profits closer to peak, reducing give-back on reversals.
+                    if realistic and sig.signal_type == 'bounce':
+                        _trail_width = 0.7
+                        ml_stats.setdefault('trail_mod_all', 0)
+                        ml_stats['trail_mod_all'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
