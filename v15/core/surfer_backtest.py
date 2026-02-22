@@ -3862,6 +3862,14 @@ def run_backtest(
                                 ml_stats.setdefault("high_rsq_boost", 0)
                                 ml_stats["high_rsq_boost"] += 1
 
+
+                    # Arch 189b: Equity growth momentum (1.10x when equity > 1.5x initial)
+                    if realistic:
+                        if equity > initial_capital * 1.5:
+                            trade_size *= 1.10
+                            ml_stats.setdefault("eq_growth_mom", 0)
+                            ml_stats["eq_growth_mom"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
