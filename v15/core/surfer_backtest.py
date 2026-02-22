@@ -3082,6 +3082,18 @@ def run_backtest(
                                 ml_stats.setdefault('all_tf_low_pe', 0)
                                 ml_stats['all_tf_low_pe'] += 1
 
+
+                    # Arch 151: Max PE boost (at least one TF has huge PE = explosive bounce)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_pe = 0
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                max_pe = max(max_pe, tf_state.potential_energy)
+                        if max_pe > 0.80:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('max_pe_boost', 0)
+                            ml_stats['max_pe_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
