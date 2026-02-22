@@ -3154,6 +3154,19 @@ def run_backtest(
                                 ml_stats['weighted_be'] += 1
 
 
+                    # Arch 156: Quadratic KE boost (amplify high-KE advantage)
+                    if realistic and sig.signal_type == 'bounce':
+                        ke_vals156 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                ke_vals156.append(tf_state.kinetic_energy)
+                        if ke_vals156:
+                            avg_ke = sum(ke_vals156) / len(ke_vals156)
+                            if avg_ke > 0.25:
+                                ke_boost = min(1.40, 1.0 + ((avg_ke - 0.25) ** 2) * 3.0)
+                                trade_size *= ke_boost
+                                ml_stats.setdefault('quad_ke_boost', 0)
+                                ml_stats['quad_ke_boost'] += 1
 
                     # Arch 131: Momentum turning point penalty (0.70x when momentum is reversing)
                     # When momentum is turning, bounces are unreliable → reduce position
