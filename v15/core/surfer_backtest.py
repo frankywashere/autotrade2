@@ -5770,7 +5770,7 @@ def run_backtest(
                             ml_stats['eg_5m'] += 1
                         if equity > 3000000 and len(trades) >= 5:
                             if all(t.pnl > 0 for t in trades[-5:]):
-                                trade_size *= 5.0
+                                trade_size *= 8.0
                                 ml_stats.setdefault('hot5_3m', 0)
                                 ml_stats['hot5_3m'] += 1
 
