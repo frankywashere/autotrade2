@@ -4543,6 +4543,18 @@ def run_backtest(
                             ml_stats.setdefault('momentum_break', 0)
                             ml_stats['momentum_break'] += 1
 
+                    # Arch 224c: Bounce count range tight (1.15x fractal-like behavior)
+                    if realistic and sig.signal_type == 'bounce':
+                        bc_224 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                bc_224.append(tf_s.bounce_count)
+                        if len(bc_224) >= 3:
+                            if max(bc_224) - min(bc_224) < 5:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('bc_tight', 0)
+                                ml_stats['bc_tight'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
