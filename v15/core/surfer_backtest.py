@@ -5736,9 +5736,9 @@ def run_backtest(
                         _trail_width = min(_trail_width, 0.15)
 
 
-                    # Arch 331g: Penalize medium-conf breaks (0.70-0.90) 0.3x size
+                    # Arch 331g: Penalize medium-conf breaks (0.70-0.90) 0.1x size
                     if realistic and sig.signal_type == 'break' and 0.70 < sig.confidence < 0.90:
-                        trade_size *= 0.20
+                        trade_size *= 0.10
 
 
                     # Arch 332: Endgame acceleration stack
