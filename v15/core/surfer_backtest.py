@@ -3576,6 +3576,17 @@ def run_backtest(
                             ml_stats.setdefault('wr_regime', 0)
                             ml_stats['wr_regime'] += 1
 
+
+                    # Arch 175: Recent win rate sizing (reduce when WR drops)
+                    if realistic and len(trades) >= 20:
+                        recent = trades[-20:]
+                        wins = sum(1 for t in recent if t.pnl > 0)
+                        wr = wins / len(recent)
+                        if wr < 0.80:
+                            trade_size *= 0.60
+                            ml_stats.setdefault('low_wr_reduce', 0)
+                            ml_stats['low_wr_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
