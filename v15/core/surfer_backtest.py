@@ -5659,7 +5659,7 @@ def run_backtest(
                     # also tighten stop 30% and boost size 1.10x to capitalize
                     # on the reduced risk profile.
                     if realistic and sig.signal_type == 'bounce':
-                        _trail_width = 0.5
+                        _trail_width = 0.35
                         if equity > 500000:
                             if sig.action == 'BUY':
                                 _s_dist = entry_price - stop
@@ -5779,6 +5779,14 @@ def run_backtest(
                     # Targets biggest loser T79 (-$4.97, conf=0.478, ou_timeout)
                     if realistic and sig.signal_type == 'bounce' and sig.confidence < 0.50 and 600000 < equity < 700000:
                         continue
+
+
+                    # Arch 339: Multi-tier endgame
+                    if realistic and sig.signal_type == 'bounce':
+                        if equity > 20000000:
+                            trade_size *= 3.0
+                        elif equity > 10000000:
+                            trade_size *= 5.0
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
