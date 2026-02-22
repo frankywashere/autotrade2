@@ -3121,6 +3121,21 @@ def run_backtest(
                             ml_stats.setdefault('max_theta_boost', 0)
                             ml_stats['max_theta_boost'] += 1
 
+
+                    # Arch 154: Quadratic BE penalty (exponentially worse at high BE)
+                    if realistic and sig.signal_type == 'bounce':
+                        be_vals154 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be_vals154.append(tf_state.binding_energy)
+                        if be_vals154:
+                            avg_be = sum(be_vals154) / len(be_vals154)
+                            if avg_be > 0.35:
+                                be_mult = max(0.40, 1.0 - ((avg_be - 0.35) ** 2) * 4.0)
+                                trade_size *= be_mult
+                                ml_stats.setdefault('quad_be', 0)
+                                ml_stats['quad_be'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
