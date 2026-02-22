@@ -4503,6 +4503,19 @@ def run_backtest(
                             ml_stats.setdefault("good_regime_bounce", 0)
                             ml_stats["good_regime_bounce"] += 1
 
+
+                    # Arch 225: Near ATH equity boost (1.20x when equity near peak)
+                    if realistic and len(trades) >= 5:
+                        running_eq_225 = initial_capital
+                        peak_eq_225 = initial_capital
+                        for t in trades:
+                            running_eq_225 += t.pnl
+                            peak_eq_225 = max(peak_eq_225, running_eq_225)
+                        if peak_eq_225 > 0 and running_eq_225 / peak_eq_225 > 0.99:
+                            trade_size *= 1.20
+                            ml_stats.setdefault("near_ath", 0)
+                            ml_stats["near_ath"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
