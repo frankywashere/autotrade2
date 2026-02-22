@@ -4731,6 +4731,14 @@ def run_backtest(
                         ml_stats.setdefault("7x_bounce", 0)
                         ml_stats["7x_bounce"] += 1
 
+                    # Arch 241e: Total PE across all TFs > 2.5 (1.20x spring loaded)
+                    if realistic and sig.signal_type == "bounce":
+                        total_pe_241 = sum(tf_s.potential_energy for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if total_pe_241 > 2.5:
+                            trade_size *= 1.20
+                            ml_stats.setdefault("sys_spring", 0)
+                            ml_stats["sys_spring"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
