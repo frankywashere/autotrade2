@@ -4683,6 +4683,13 @@ def run_backtest(
                             ml_stats.setdefault("pnl_trend_up", 0)
                             ml_stats["pnl_trend_up"] += 1
 
+
+                    # Arch 234a: Equity tripled compound boost (1.15x)
+                    if realistic and equity > initial_capital * 3.0:
+                        trade_size *= 1.15
+                        ml_stats.setdefault("triple_eq", 0)
+                        ml_stats["triple_eq"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
