@@ -3897,6 +3897,16 @@ def run_backtest(
                         ml_stats.setdefault('cycle_size', 0)
                         ml_stats['cycle_size'] += 1
 
+
+                    # Arch 191: Gradual trade count decay (0.999^n, anti-overtrading)
+                    # Subtly reduces position size as total trades grow, preventing
+                    # late-session over-leverage. At 100 trades = 0.90x, 200 = 0.82x, 300 = 0.74x
+                    if realistic:
+                        decay_191 = max(0.30, 0.999 ** len(trades))
+                        trade_size *= decay_191
+                        ml_stats.setdefault('trade_decay', 0)
+                        ml_stats['trade_decay'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
