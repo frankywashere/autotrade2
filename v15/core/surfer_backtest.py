@@ -4921,6 +4921,20 @@ def run_backtest(
                             ml_stats.setdefault('all_established', 0)
                             ml_stats['all_established'] += 1
 
+                    # Arch 252e: Rapid recent equity growth
+                    if realistic and len(trades) >= 30:
+                        recent_pnl = sum(t.pnl for t in trades[-30:])
+                        if recent_pnl > 50000:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('rapid_growth', 0)
+                            ml_stats['rapid_growth'] += 1
+
+                    # Arch 251c: Loss cooldown (0.05x immediately after a loss)
+                    if realistic and len(trades) >= 1 and trades[-1].pnl < 0:
+                        trade_size *= 0.05
+                        ml_stats.setdefault('loss_cooldown', 0)
+                        ml_stats['loss_cooldown'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
