@@ -3458,6 +3458,36 @@ def run_backtest(
                                 ml_stats.setdefault('p25_pe', 0)
                                 ml_stats['p25_pe'] += 1
 
+
+                    # Arch 167: 25th percentile KE boost (most TFs moving)
+                    if realistic and sig.signal_type == 'bounce':
+                        ke_167f = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                ke_167f.append(tf_state.kinetic_energy)
+                        if ke_167f:
+                            sorted_ke = sorted(ke_167f)
+                            idx25 = max(0, int(len(sorted_ke) * 0.25))
+                            p25_ke = sorted_ke[idx25]
+                            if p25_ke > 0.20:
+                                ke_boost = min(1.20, 1.0 + (p25_ke - 0.20) * 0.50)
+                                trade_size *= ke_boost
+                                ml_stats.setdefault('p25_ke', 0)
+                                ml_stats['p25_ke'] += 1
+
+                    # Arch 168: Min KE penalty (all TFs stagnant = dead market)
+                    if realistic and sig.signal_type == 'bounce':
+                        ke_168 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                ke_168.append(tf_state.kinetic_energy)
+                        if ke_168:
+                            min_ke = min(ke_168)
+                            if min_ke < 0.05:
+                                trade_size *= 0.70
+                                ml_stats.setdefault('min_ke_penalty', 0)
+                                ml_stats['min_ke_penalty'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
