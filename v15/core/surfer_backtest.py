@@ -3870,6 +3870,20 @@ def run_backtest(
                             ml_stats.setdefault("eq_growth_mom", 0)
                             ml_stats["eq_growth_mom"] += 1
 
+
+                    # Arch 190: PE/BE ratio boost (1.15x when avg PE/BE > 2.0)
+                    if realistic and sig.signal_type == "bounce":
+                        ratios_190 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid and tf_s.binding_energy > 0.01:
+                                ratios_190.append(tf_s.potential_energy / tf_s.binding_energy)
+                        if ratios_190:
+                            avg_ratio_190 = sum(ratios_190) / len(ratios_190)
+                            if avg_ratio_190 > 2.0:
+                                trade_size *= 1.15
+                                ml_stats.setdefault("pe_be_ratio", 0)
+                                ml_stats["pe_be_ratio"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
