@@ -4012,6 +4012,20 @@ def run_backtest(
                                 ml_stats.setdefault('theta_var', 0)
                                 ml_stats['theta_var'] += 1
 
+
+                    # Arch 196: Position extremity boost (near edge = better bounce, 0.5+|pos|*1.5)
+                    if realistic and sig.signal_type == "bounce":
+                        pos_196 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pos_196.append(abs(tf_s.position_pct))
+                        if pos_196:
+                            avg_pos_196 = sum(pos_196) / len(pos_196)
+                            pos_mult = min(1.50, 0.5 + avg_pos_196 * 1.5)
+                            trade_size *= pos_mult
+                            ml_stats.setdefault("pos_extremity", 0)
+                            ml_stats["pos_extremity"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
