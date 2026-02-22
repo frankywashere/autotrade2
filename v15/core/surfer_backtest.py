@@ -5735,6 +5735,11 @@ def run_backtest(
                     if realistic and sig.signal_type == 'break':
                         _trail_width = min(_trail_width, 0.15)
 
+
+                    # Arch 331g: Penalize medium-conf breaks (0.70-0.90) 0.3x size
+                    if realistic and sig.signal_type == 'break' and 0.70 < sig.confidence < 0.90:
+                        trade_size *= 0.30
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
