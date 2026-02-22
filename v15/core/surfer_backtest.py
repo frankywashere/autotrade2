@@ -5474,6 +5474,12 @@ def run_backtest(
                             ml_stats.setdefault('brk_weak_pos', 0)
                             ml_stats['brk_weak_pos'] += 1
 
+                    # Arch 284f: Wide danger zone bounce penalty (0.75x $250K-$450K)
+                    if realistic and sig.signal_type == 'bounce' and 250000 < equity < 450000:
+                        trade_size *= 0.75
+                        ml_stats.setdefault('wide_dz', 0)
+                        ml_stats['wide_dz'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
