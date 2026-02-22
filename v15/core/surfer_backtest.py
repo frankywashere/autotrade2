@@ -4604,6 +4604,30 @@ def run_backtest(
                         ml_stats.setdefault("hi_energy_sig", 0)
                         ml_stats["hi_energy_sig"] += 1
 
+
+                    # Arch 231: Historical big win = market has opportunity
+                    if realistic and len(trades) >= 10:
+                        max_pnl_231 = max(t.pnl for t in trades)
+                        if max_pnl_231 > 10000:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('big_opp_history', 0)
+                            ml_stats['big_opp_history'] += 1
+
+                    # Arch 227e: Theta decreasing across TFs (1.15x higher TFs more stable)
+                    if realistic and sig.signal_type == 'bounce':
+                        tf_order_227 = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
+                        th_ord = []
+                        for tf_n in tf_order_227:
+                            tf_s = analysis.tf_states.get(tf_n)
+                            if tf_s and tf_s.valid:
+                                th_ord.append(tf_s.ou_theta)
+                        if len(th_ord) >= 3:
+                            decreases = sum(1 for i in range(1, len(th_ord)) if th_ord[i] < th_ord[i-1])
+                            if decreases >= len(th_ord) - 1:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('theta_decr', 0)
+                                ml_stats['theta_decr'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
