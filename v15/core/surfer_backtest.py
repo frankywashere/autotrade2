@@ -3947,6 +3947,23 @@ def run_backtest(
                             ml_stats.setdefault("mom_turning", 0)
                             ml_stats["mom_turning"] += 1
 
+
+                    # Arch 192: Weighted break probability penalty (0.60x when avg > 0.35)
+                    # When higher-TF-weighted break probability is high, channels are fragile
+                    if realistic and sig.signal_type == 'bounce':
+                        tf_w192 = {'5min': 0.3, '15min': 0.4, '30min': 0.5, '1h': 0.7,
+                                   '2h': 0.8, '3h': 0.9, '4h': 1.0, 'daily': 1.5, 'weekly': 2.0, 'monthly': 2.5}
+                        w_bp_192, total_w192 = 0, 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                w = tf_w192.get(tf_n, 1.0)
+                                total_w192 += w
+                                w_bp_192 += tf_s.break_prob * w
+                        if total_w192 > 0 and w_bp_192 / total_w192 > 0.35:
+                            trade_size *= 0.60
+                            ml_stats.setdefault('w_break_prob', 0)
+                            ml_stats['w_break_prob'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
