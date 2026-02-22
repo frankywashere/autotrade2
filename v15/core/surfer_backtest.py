@@ -3710,6 +3710,42 @@ def run_backtest(
                             ml_stats.setdefault('pnl_accel_boost', 0)
                             ml_stats['pnl_accel_boost'] += 1
 
+
+                    # Arch 182c: Multi-TF KE consensus boost (1.20x when >60% TFs have KE > 0.40)
+                    # Most timeframes showing momentum = market actively moving
+                    if realistic and sig.signal_type == 'bounce':
+                        high_ke_count_182 = 0
+                        total_182c = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                total_182c += 1
+                                if tf_s.kinetic_energy > 0.40:
+                                    high_ke_count_182 += 1
+                        if total_182c > 0 and high_ke_count_182 / total_182c > 0.60:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('ke_consensus', 0)
+                            ml_stats['ke_consensus'] += 1
+
+                    # Arch 182f: Weighted energy product (PE*KE*(1-BE) by TF weight)
+                    # Comprehensive signal quality metric: free + energetic + potential
+                    if realistic and sig.signal_type == 'bounce':
+                        tf_w182 = {'5min': 0.3, '15min': 0.4, '30min': 0.5, '1h': 0.7,
+                                   '2h': 0.8, '3h': 0.9, '4h': 1.0, 'daily': 1.5, 'weekly': 2.0, 'monthly': 2.5}
+                        w_energy_182, total_w182 = 0, 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                w = tf_w182.get(tf_n, 1.0)
+                                total_w182 += w
+                                product_182 = tf_s.potential_energy * tf_s.kinetic_energy * (1.0 - tf_s.binding_energy)
+                                w_energy_182 += product_182 * w
+                        if total_w182 > 0:
+                            avg_energy_182 = w_energy_182 / total_w182
+                            if avg_energy_182 > 0.08:
+                                energy_boost_182 = min(1.25, 1.0 + (avg_energy_182 - 0.08) * 2.0)
+                                trade_size *= energy_boost_182
+                                ml_stats.setdefault('w_energy_prod', 0)
+                                ml_stats['w_energy_prod'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
