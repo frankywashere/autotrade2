@@ -3907,6 +3907,20 @@ def run_backtest(
                         ml_stats.setdefault('trade_decay', 0)
                         ml_stats['trade_decay'] += 1
 
+
+                    # Arch 192a: Squeeze score boost (1.15x when avg squeeze > 0.50)
+                    if realistic and sig.signal_type == "bounce":
+                        sq_192 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                sq_192.append(tf_s.squeeze_score)
+                        if sq_192:
+                            avg_sq = sum(sq_192) / len(sq_192)
+                            if avg_sq > 0.50:
+                                trade_size *= 1.15
+                                ml_stats.setdefault("squeeze_boost", 0)
+                                ml_stats["squeeze_boost"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
