@@ -5712,6 +5712,13 @@ def run_backtest(
                     if realistic and sig.signal_type == 'break':
                         _trail_width = min(_trail_width, 0.3)
 
+
+                    # Arch 326a: Skip over-confident breaks (conf > 0.90)
+                    # High-confidence breaks tend to be false breakouts that
+                    # reverse. Lower-confidence breaks have better follow-through.
+                    if realistic and sig.signal_type == 'break' and sig.confidence > 0.90:
+                        continue
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
