@@ -3757,6 +3757,18 @@ def run_backtest(
                                 ml_stats.setdefault('long_hold', 0)
                                 ml_stats['long_hold'] += 1
 
+
+                    # Arch 185: Large recent loss penalty (0.40x when last loss > 2x avg loss)
+                    if realistic and len(trades) >= 5:
+                        losses_185 = [abs(t.pnl) for t in trades if t.pnl < 0]
+                        if losses_185:
+                            avg_loss_185 = sum(losses_185) / len(losses_185)
+                            recent_losses_185 = [abs(t.pnl) for t in trades[-3:] if t.pnl < 0]
+                            if recent_losses_185 and max(recent_losses_185) > avg_loss_185 * 2.0:
+                                trade_size *= 0.40
+                                ml_stats.setdefault('big_loss_reduce', 0)
+                                ml_stats['big_loss_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
