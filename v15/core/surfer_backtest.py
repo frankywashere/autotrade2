@@ -4935,6 +4935,12 @@ def run_backtest(
                         ml_stats.setdefault('loss_cooldown', 0)
                         ml_stats['loss_cooldown'] += 1
 
+                    # Arch 252b: Near $1M equity push (1.30x when equity > 950K bounce)
+                    if realistic and sig.signal_type == 'bounce' and equity > 950000:
+                        trade_size *= 1.30
+                        ml_stats.setdefault('1m_push', 0)
+                        ml_stats['1m_push'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
