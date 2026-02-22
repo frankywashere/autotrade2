@@ -5833,7 +5833,7 @@ def run_backtest(
                     # Arch 345: Extended endgame tiers
                     if realistic and sig.signal_type == 'bounce':
                         if equity > 100000000:
-                            trade_size *= 3.0
+                            trade_size *= 8.0
                         elif equity > 50000000:
                             trade_size *= 5.0
 
