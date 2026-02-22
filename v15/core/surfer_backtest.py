@@ -3795,6 +3795,17 @@ def run_backtest(
                             ml_stats.setdefault('trail_momentum', 0)
                             ml_stats['trail_momentum'] += 1
 
+
+                    # Arch 186: Abs PnL amplitude declining filter (0.40x when moves shrinking)
+                    # When average absolute PnL drops to <50% of prior period, market is stalling
+                    if realistic and len(trades) >= 20:
+                        recent_abs_186 = sum(abs(t.pnl) for t in trades[-10:]) / 10
+                        prev_abs_186 = sum(abs(t.pnl) for t in trades[-20:-10]) / 10
+                        if prev_abs_186 > 0 and recent_abs_186 < prev_abs_186 * 0.50:
+                            trade_size *= 0.40
+                            ml_stats.setdefault('amp_decline', 0)
+                            ml_stats['amp_decline'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
