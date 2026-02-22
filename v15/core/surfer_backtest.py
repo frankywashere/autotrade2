@@ -5068,6 +5068,21 @@ def run_backtest(
                                 ml_stats.setdefault('spring_edge', 0)
                                 ml_stats['spring_edge'] += 1
 
+                    # Arch 260f: Massive win momentum bounce (1.25x after $10K+ win)
+                    if realistic and sig.signal_type == 'bounce' and len(trades) >= 1:
+                        if trades[-1].pnl > 10000:
+                            trade_size *= 1.25
+                            ml_stats.setdefault('massive_mom', 0)
+                            ml_stats['massive_mom'] += 1
+
+                    # Arch 260d: Millionaire + high energy bounce (1.30x)
+                    if realistic and sig.signal_type == 'bounce' and equity > 1000000:
+                        te_sum_260 = sum(tf_s.total_energy for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if te_sum_260 > 3.5:
+                            trade_size *= 1.30
+                            ml_stats.setdefault('1m_te', 0)
+                            ml_stats['1m_te'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
