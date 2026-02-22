@@ -3243,6 +3243,23 @@ def run_backtest(
                             ml_stats.setdefault('diversity_reduce', 0)
                             ml_stats['diversity_reduce'] += 1
 
+
+                    # Arch 158: 75th percentile BE penalty (catches worst BE TFs)
+                    if realistic and sig.signal_type == 'bounce':
+                        be_158d = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be_158d.append(tf_state.binding_energy)
+                        if be_158d:
+                            sorted_be = sorted(be_158d)
+                            idx75 = int(len(sorted_be) * 0.75)
+                            p75_be = sorted_be[min(idx75, len(sorted_be)-1)]
+                            if p75_be > 0.50:
+                                be_mult = max(0.50, 1.0 - (p75_be - 0.50) * 1.5)
+                                trade_size *= be_mult
+                                ml_stats.setdefault('p75_be', 0)
+                                ml_stats['p75_be'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
