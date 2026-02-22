@@ -4516,6 +4516,19 @@ def run_backtest(
                             ml_stats.setdefault("near_ath", 0)
                             ml_stats["near_ath"] += 1
 
+
+                    # Arch 226: High win/loss ratio regime boost (1.15x)
+                    if realistic and len(trades) >= 15:
+                        wins_226 = [t.pnl for t in trades[-15:] if t.pnl > 0]
+                        losses_226 = [abs(t.pnl) for t in trades[-15:] if t.pnl < 0]
+                        if wins_226 and losses_226:
+                            avg_win = sum(wins_226) / len(wins_226)
+                            avg_loss = sum(losses_226) / len(losses_226)
+                            if avg_loss > 0 and avg_win / avg_loss > 3.0:
+                                trade_size *= 1.15
+                                ml_stats.setdefault("high_rr_ratio", 0)
+                                ml_stats["high_rr_ratio"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
