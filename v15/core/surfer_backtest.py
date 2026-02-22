@@ -4079,6 +4079,22 @@ def run_backtest(
                                 ml_stats.setdefault("osc_timing", 0)
                                 ml_stats["osc_timing"] += 1
 
+                    # Arch 200b: Harmonic TF resonance (1.20x when bounce counts synchronized)
+                    if realistic and sig.signal_type == 'bounce':
+                        bc_200 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                bc_200.append(tf_s.bounce_count)
+                        if len(bc_200) >= 3:
+                            avg_bc = sum(bc_200) / len(bc_200)
+                            if avg_bc > 0:
+                                norm_bc = [b / avg_bc for b in bc_200]
+                                variance = sum((n - 1.0)**2 for n in norm_bc) / len(norm_bc)
+                                if variance < 0.15:
+                                    trade_size *= 1.20
+                                    ml_stats.setdefault('harmonic_bounce', 0)
+                                    ml_stats['harmonic_bounce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
