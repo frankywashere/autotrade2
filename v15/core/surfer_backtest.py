@@ -3996,6 +3996,22 @@ def run_backtest(
                             ml_stats.setdefault("composite_q", 0)
                             ml_stats["composite_q"] += 1
 
+
+                    # Arch 193: Theta variance penalty (0.70x when TFs disagree on reversion speed)
+                    # High variance in ou_theta across TFs = inconsistent reversion dynamics
+                    if realistic and sig.signal_type == 'bounce':
+                        thetas_193 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                thetas_193.append(tf_s.ou_theta)
+                        if len(thetas_193) >= 3:
+                            avg_th_193 = sum(thetas_193) / len(thetas_193)
+                            var_th_193 = sum((t - avg_th_193)**2 for t in thetas_193) / len(thetas_193)
+                            if var_th_193 > 0.02:
+                                trade_size *= 0.70
+                                ml_stats.setdefault('theta_var', 0)
+                                ml_stats['theta_var'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
