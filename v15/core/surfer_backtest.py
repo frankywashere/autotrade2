@@ -3977,6 +3977,25 @@ def run_backtest(
                             ml_stats.setdefault("mom_dir_consensus", 0)
                             ml_stats["mom_dir_consensus"] += 1
 
+
+                    # Arch 194c: Composite quality sizing (r_sq * (1-BE) * PE, TF-weighted)
+                    if realistic and sig.signal_type == "bounce":
+                        tf_w194 = {"5min": 0.5, "15min": 0.6, "30min": 0.7, "1h": 0.8,
+                                   "2h": 0.85, "3h": 0.9, "4h": 0.95, "daily": 1.2, "weekly": 1.5, "monthly": 2.0}
+                        w_qual, total_w = 0, 0
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                w = tf_w194.get(tf_name, 1.0)
+                                q = tf_state.r_squared * (1.0 - tf_state.binding_energy) * max(tf_state.potential_energy, 0.01)
+                                w_qual += q * w
+                                total_w += w
+                        if total_w > 0:
+                            avg_qual = w_qual / total_w
+                            q_mult = min(1.30, max(0.50, 0.5 + avg_qual * 2.0))
+                            trade_size *= q_mult
+                            ml_stats.setdefault("composite_q", 0)
+                            ml_stats["composite_q"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
