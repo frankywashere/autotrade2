@@ -5548,6 +5548,29 @@ def run_backtest(
                             ml_stats.setdefault('free_spring', 0)
                             ml_stats['free_spring'] += 1
 
+
+                    if realistic and sig.signal_type == 'bounce' and 450000 < equity < 600000 and sig.confidence > 0.70:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('q_mh', 0)
+                        ml_stats['q_mh'] += 1
+
+                    # Arch 289a: Free spring at edge avg boost (1.15x avg PE*(1-BE)*pos > 0.20)
+                    if realistic and sig.signal_type == 'bounce':
+                        fspe_289 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                fspe_289.append(tf_s.potential_energy * (1.0 - tf_s.binding_energy) * abs(tf_s.position_pct))
+                        if fspe_289 and sum(fspe_289)/len(fspe_289) > 0.20:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('free_spr_edge', 0)
+                            ml_stats['free_spr_edge'] += 1
+
+                    # Arch 289c: Mid-high equity growth zone (1.15x K-K)
+                    if realistic and sig.signal_type == 'bounce' and 500000 < equity < 750000:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('mid_hi_growth', 0)
+                        ml_stats['mid_hi_growth'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
