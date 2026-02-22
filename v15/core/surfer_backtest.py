@@ -5646,10 +5646,10 @@ def run_backtest(
                     if realistic and sig.signal_type == 'bounce':
                         if sig.action == 'BUY':
                             _tp_dist = tp - entry_price
-                            tp = entry_price + _tp_dist * 0.66
+                            tp = entry_price + _tp_dist * 0.40
                         else:
                             _tp_dist = entry_price - tp
-                            tp = entry_price - _tp_dist * 0.66
+                            tp = entry_price - _tp_dist * 0.40
                         ml_stats.setdefault('tp_narrow', 0)
                         ml_stats['tp_narrow'] += 1
 
