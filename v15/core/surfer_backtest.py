@@ -4064,6 +4064,21 @@ def run_backtest(
                                 ml_stats.setdefault('bp_asym_align', 0)
                                 ml_stats['bp_asym_align'] += 1
 
+
+                    # Arch 199: Oscillation timing boost (1.15x when near predicted bounce)
+                    if realistic and sig.signal_type == "bounce":
+                        timing_199 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid and tf_s.oscillation_period > 0:
+                                ratio = tf_s.bars_to_next_bounce / tf_s.oscillation_period
+                                timing_199.append(ratio)
+                        if timing_199:
+                            avg_ratio_199 = sum(timing_199) / len(timing_199)
+                            if avg_ratio_199 < 0.25:
+                                trade_size *= 1.15
+                                ml_stats.setdefault("osc_timing", 0)
+                                ml_stats["osc_timing"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
