@@ -4775,6 +4775,12 @@ def run_backtest(
                                 ml_stats.setdefault('geo_vep', 0)
                                 ml_stats['geo_vep'] += 1
 
+                    # Arch 244f: ATH + large equity bounce boost (1.20x)
+                    if realistic and sig.signal_type == "bounce" and equity >= peak_equity * 0.999 and equity > 500000:
+                        trade_size *= 1.20
+                        ml_stats.setdefault("ath_500k", 0)
+                        ml_stats["ath_500k"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
