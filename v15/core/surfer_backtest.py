@@ -4698,6 +4698,15 @@ def run_backtest(
                             ml_stats.setdefault("hot_momentum", 0)
                             ml_stats["hot_momentum"] += 1
 
+
+                    # Arch 235e: Clean exit bounce boost (1.15x all trail exits)
+                    if realistic and sig.signal_type == "bounce" and len(trades) >= 5:
+                        all_trail_235 = all(t.exit_reason == "trail" for t in trades[-5:])
+                        if all_trail_235:
+                            trade_size *= 1.15
+                            ml_stats.setdefault("clean_exit_bounce", 0)
+                            ml_stats["clean_exit_bounce"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
