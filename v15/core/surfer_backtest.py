@@ -3921,6 +3921,20 @@ def run_backtest(
                                 ml_stats.setdefault("squeeze_boost", 0)
                                 ml_stats["squeeze_boost"] += 1
 
+
+                    # Arch 192e: Steep slope penalty (0.50x when avg |slope| > 1.0%)
+                    if realistic and sig.signal_type == "bounce":
+                        slopes_192 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                slopes_192.append(abs(tf_s.slope_pct))
+                        if slopes_192:
+                            avg_slope_192 = sum(slopes_192) / len(slopes_192)
+                            if avg_slope_192 > 1.0:
+                                trade_size *= 0.50
+                                ml_stats.setdefault("steep_slope", 0)
+                                ml_stats["steep_slope"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
