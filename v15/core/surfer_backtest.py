@@ -3190,6 +3190,22 @@ def run_backtest(
                             ml_stats.setdefault('mom_turn_reduce', 0)
                             ml_stats['mom_turn_reduce'] += 1
 
+                    # Arch 132: Multi-TF momentum alignment boost (1.20x when >80% TFs agree)
+                    # When most TFs have momentum in the trade direction, boost position
+                    if realistic and sig.signal_type == 'bounce':
+                        target_dir = 1 if sig.action == 'BUY' else -1
+                        aligned = 0
+                        total = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                total += 1
+                                if (tf_s.momentum_direction > 0) == (target_dir > 0):
+                                    aligned += 1
+                        if total > 0 and aligned / total > 0.80:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('mom_aligned_boost', 0)
+                            ml_stats['mom_aligned_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
