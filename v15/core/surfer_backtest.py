@@ -3455,6 +3455,18 @@ def run_backtest(
                                 ml_stats.setdefault('p25_ke', 0)
                                 ml_stats['p25_ke'] += 1
 
+                    # Arch 168: Min KE penalty (all TFs stagnant = dead market)
+                    if realistic and sig.signal_type == 'bounce':
+                        ke_168 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                ke_168.append(tf_state.kinetic_energy)
+                        if ke_168:
+                            min_ke = min(ke_168)
+                            if min_ke < 0.05:
+                                trade_size *= 0.70
+                                ml_stats.setdefault('min_ke_penalty', 0)
+                                ml_stats['min_ke_penalty'] += 1
 
 
                     # Arch 169: TF-weighted health score ((1-BE)*PE weighted by TF importance)
