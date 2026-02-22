@@ -3303,6 +3303,18 @@ def run_backtest(
                             ml_stats.setdefault('few_tf_reduce', 0)
                             ml_stats['few_tf_reduce'] += 1
 
+                    # Arch 135: Win/loss parity control (0.60x when ratio > 10x)
+                    # When avg win >> avg loss, leverage is asymmetric → reduce to rebalance
+                    if realistic and len(trades) >= 10:
+                        wins = [t.pnl for t in trades[-20:] if t.pnl > 0]
+                        losses = [abs(t.pnl) for t in trades[-20:] if t.pnl <= 0]
+                        if wins and losses:
+                            ratio = (sum(wins)/len(wins)) / (sum(losses)/len(losses))
+                            if ratio > 10:
+                                trade_size *= 0.60
+                                ml_stats.setdefault('parity_reduce', 0)
+                                ml_stats['parity_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
