@@ -4635,6 +4635,32 @@ def run_backtest(
                         ml_stats.setdefault("extreme_pos_sig", 0)
                         ml_stats["extreme_pos_sig"] += 1
 
+
+                    # Arch 233: High confidence bounce = trusted signal
+                    if realistic and sig.signal_type == 'bounce' and sig.confidence > 0.70:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('hi_conf_bounce', 0)
+                        ml_stats['hi_conf_bounce'] += 1
+
+                    # Arch 228c: Confidence * energy product (1.15x high conviction + energy)
+                    if realistic and sig.signal_type == 'bounce':
+                        ce_prod = sig.confidence * sig.energy_score
+                        if ce_prod > 0.60:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('conf_energy', 0)
+                            ml_stats['conf_energy'] += 1
+
+                    # Arch 228f: Min channel health floor (1.15x when all TFs healthy)
+                    if realistic and sig.signal_type == 'bounce':
+                        min_h_228 = 1.0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                min_h_228 = min(min_h_228, tf_s.channel_health)
+                        if min_h_228 > 0.40:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('min_health_ok', 0)
+                            ml_stats['min_health_ok'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
