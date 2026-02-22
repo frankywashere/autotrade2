@@ -3399,6 +3399,23 @@ def run_backtest(
                         ml_stats.setdefault('eq_scale', 0)
                         ml_stats['eq_scale'] += 1
 
+
+                    # Arch 164: 25th percentile BE penalty (even lower quartile is trapped)
+                    if realistic and sig.signal_type == 'bounce':
+                        be_164 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be_164.append(tf_state.binding_energy)
+                        if be_164:
+                            sorted_be = sorted(be_164)
+                            idx25 = max(0, int(len(sorted_be) * 0.25))
+                            p25_be = sorted_be[idx25]
+                            if p25_be > 0.35:
+                                be_mult = max(0.50, 1.0 - (p25_be - 0.35) * 1.5)
+                                trade_size *= be_mult
+                                ml_stats.setdefault('p25_be', 0)
+                                ml_stats['p25_be'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
