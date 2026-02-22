@@ -2937,7 +2937,7 @@ def run_backtest(
                                 tf_qualities.append(pe_q * 0.4 + theta_q * 0.3 + edge_q * 0.3)
                         if tf_qualities:
                             quality = sum(tf_qualities) / len(tf_qualities)
-                            mult = 0.6 + 0.8 * quality
+                            mult = 0.3 + 1.4 * (quality ** 2.0)
                             trade_size *= mult
                             ml_stats.setdefault('quality_scored', 0)
                             ml_stats['quality_scored'] += 1
