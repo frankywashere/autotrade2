@@ -3012,7 +3012,7 @@ def run_backtest(
                             avg_theta = sum(theta_vals) / len(theta_vals)
                             avg_edge = sum(edge_vals) / len(edge_vals)
                             score = (1.0 - avg_be) * 0.4 + avg_pe * 0.3 + min(avg_theta/0.50, 1.0) * 0.15 + avg_edge * 0.15
-                            mult = 0.5 + 1.0 * score
+                            mult = 0.3 + 1.4 * score
                             trade_size *= mult
                             ml_stats.setdefault('comprehensive_score', 0)
                             ml_stats['comprehensive_score'] += 1
