@@ -3677,6 +3677,15 @@ def run_backtest(
                             ml_stats.setdefault('trade_eff', 0)
                             ml_stats['trade_eff'] += 1
 
+
+                    # Arch 181: Bad exit rate penalty (stops/timeouts = weak signals)
+                    if realistic and len(trades) >= 10:
+                        bad_exits_181 = sum(1 for t in trades[-10:] if t.exit_reason in ('stop', 'ou_timeout'))
+                        if bad_exits_181 / 10 > 0.20:
+                            trade_size *= 0.50
+                            ml_stats.setdefault('bad_exit_rate', 0)
+                            ml_stats['bad_exit_rate'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
