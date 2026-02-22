@@ -3642,6 +3642,19 @@ def run_backtest(
                         ml_stats.setdefault('ch_health_sizing', 0)
                         ml_stats['ch_health_sizing'] += 1
 
+
+                    # Arch 176: Channel maturity boost (1.15x when avg bounce_count > 5)
+                    # Well-tested channels with many bounces are more reliable
+                    if realistic and sig.signal_type == 'bounce':
+                        bc_176 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                bc_176.append(tf_s.bounce_count)
+                        if bc_176 and sum(bc_176)/len(bc_176) > 5:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('channel_mature', 0)
+                            ml_stats['channel_mature'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
