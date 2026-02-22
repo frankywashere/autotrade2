@@ -3147,6 +3147,25 @@ def run_backtest(
                             ml_stats.setdefault('equity_delever', 0)
                             ml_stats['equity_delever'] += 1
 
+
+                    # Arch 155: Higher-TF-weighted BE penalty (daily BE matters more)
+                    if realistic and sig.signal_type == 'bounce':
+                        tf_weights = {'5min': 0.5, '15min': 0.6, '30min': 0.7, '1h': 0.8,
+                                      '2h': 0.85, '3h': 0.9, '4h': 0.95, 'daily': 1.2, 'weekly': 1.5, 'monthly': 2.0}
+                        weighted_be, total_w = 0, 0
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                w = tf_weights.get(tf_name, 1.0)
+                                weighted_be += tf_state.binding_energy * w
+                                total_w += w
+                        if total_w > 0:
+                            wbe = weighted_be / total_w
+                            if wbe > 0.40:
+                                be_mult = max(0.50, 1.0 - (wbe - 0.40) * 1.2)
+                                trade_size *= be_mult
+                                ml_stats.setdefault('weighted_be', 0)
+                                ml_stats['weighted_be'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
