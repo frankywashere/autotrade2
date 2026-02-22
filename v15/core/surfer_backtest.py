@@ -3566,6 +3566,16 @@ def run_backtest(
                             ml_stats.setdefault('sideways_reduce', 0)
                             ml_stats['sideways_reduce'] += 1
 
+
+                    # Arch 173: WR regime shift penalty (0.50x when rolling 10-trade WR < 80%)
+                    # Declining win rate = market regime shifting, reduce exposure
+                    if realistic and len(trades) >= 10:
+                        wr_10_173 = sum(1 for t in trades[-10:] if t.pnl > 0) / 10
+                        if wr_10_173 < 0.80:
+                            trade_size *= 0.50
+                            ml_stats.setdefault('wr_regime', 0)
+                            ml_stats['wr_regime'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
