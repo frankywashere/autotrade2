@@ -4955,6 +4955,13 @@ def run_backtest(
                         ml_stats.setdefault('final_stretch', 0)
                         ml_stats['final_stretch'] += 1
 
+                    # Arch 253d: Hot bounce regime (1.20x when last 10 trades > $20K PnL)
+                    if realistic and sig.signal_type == 'bounce' and len(trades) >= 10:
+                        if sum(t.pnl for t in trades[-10:]) > 20000:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('hot_bounce_10', 0)
+                            ml_stats['hot_bounce_10'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
