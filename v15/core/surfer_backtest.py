@@ -4095,6 +4095,23 @@ def run_backtest(
                                     ml_stats.setdefault('harmonic_bounce', 0)
                                     ml_stats['harmonic_bounce'] += 1
 
+                    # Arch 201e: Theta-PE product boost (1.15x when fast reversion + high potential)
+                    if realistic and sig.signal_type == 'bounce':
+                        tf_w201 = {'5min': 0.5, '15min': 0.6, '30min': 0.7, '1h': 0.8,
+                                   '2h': 0.85, '3h': 0.9, '4h': 0.95, 'daily': 1.2, 'weekly': 1.5, 'monthly': 2.0}
+                        w_tp, total_w = 0, 0
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                w = tf_w201.get(tf_name, 1.0)
+                                w_tp += tf_state.ou_theta * tf_state.potential_energy * w
+                                total_w += w
+                        if total_w > 0:
+                            avg_tp = w_tp / total_w
+                            if avg_tp > 0.10:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('theta_pe_prod', 0)
+                                ml_stats['theta_pe_prod'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
