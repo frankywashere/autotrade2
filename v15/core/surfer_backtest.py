@@ -4350,6 +4350,22 @@ def run_backtest(
                                 ml_stats.setdefault('mom_width', 0)
                                 ml_stats['mom_width'] += 1
 
+
+                    # Arch 218: Recent loss proximity decay (cautious near losses)
+                    if realistic and len(trades) >= 1:
+                        last_loss_bar_218 = None
+                        for t in reversed(trades):
+                            if t.pnl < 0:
+                                last_loss_bar_218 = t.exit_bar if hasattr(t, "exit_bar") else None
+                                break
+                        if last_loss_bar_218 is not None:
+                            bars_since = bar - last_loss_bar_218
+                            if bars_since < 20:
+                                decay_mult = min(1.0, 0.30 + bars_since * 0.035)
+                                trade_size *= decay_mult
+                                ml_stats.setdefault("loss_proximity", 0)
+                                ml_stats["loss_proximity"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
