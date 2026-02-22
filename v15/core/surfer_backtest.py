@@ -4847,6 +4847,12 @@ def run_backtest(
                             ml_stats.setdefault('break_aligned_te', 0)
                             ml_stats['break_aligned_te'] += 1
 
+                    # Arch 247f: ATH + 700K bounce boost (1.25x)
+                    if realistic and sig.signal_type == "bounce" and equity > 700000 and equity >= peak_equity * 0.999:
+                        trade_size *= 1.25
+                        ml_stats.setdefault("ath_700k", 0)
+                        ml_stats["ath_700k"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
