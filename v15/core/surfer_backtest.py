@@ -4896,6 +4896,20 @@ def run_backtest(
                             ml_stats.setdefault('extreme_break', 0)
                             ml_stats['extreme_break'] += 1
 
+                    # Arch 249f: Late established compound (1.20x when 4x eq + 200 trades)
+                    if realistic and equity > initial_capital * 4.0 and len(trades) > 200:
+                        trade_size *= 1.20
+                        ml_stats.setdefault('late_funded', 0)
+                        ml_stats['late_funded'] += 1
+
+                    # Arch 249c: Equity surge acceleration (1.20x when +$100K in 50 trades)
+                    if realistic and len(trades) >= 50:
+                        eq_50_ago = 100000 + sum(t.pnl for t in trades[:-50])
+                        if equity - eq_50_ago > 100000:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('eq_surge', 0)
+                            ml_stats['eq_surge'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
