@@ -5009,33 +5009,23 @@ def run_backtest(
 
                     # Arch 258: Bounce in danger zone
                     if realistic and sig.signal_type == 'bounce' and 250000 < equity < 400000:
-                        trade_size *= 0.6
+                        trade_size *= 0.7
                         ml_stats.setdefault('danger_zone', 0)
                         ml_stats['danger_zone'] += 1
 
-                    # Arch 257c: Ultimate 4-factor TF combo (1.15x when max PE*pos*health*(1-ent) > 0.15)
+                    # Arch 257b: Free potential energy boost (1.15x geomean PE*(1-BE) > 0.25)
                     if realistic and sig.signal_type == 'bounce':
-                        max_ult_257 = 0
+                        pbe_257 = []
                         for tf_n, tf_s in analysis.tf_states.items():
                             if tf_s and tf_s.valid:
-                                ult = tf_s.potential_energy * abs(tf_s.position_pct) * tf_s.channel_health * (1.0 - tf_s.entropy)
-                                max_ult_257 = max(max_ult_257, ult)
-                        if max_ult_257 > 0.15:
-                            trade_size *= 1.15
-                            ml_stats.setdefault('ult_combo', 0)
-                            ml_stats['ult_combo'] += 1
-
-                    # Arch 258e: Volume-confirmed reversion at edge (1.15x when max pos*vol*rev > 0.25)
-                    if realistic and sig.signal_type == 'bounce':
-                        max_pvr_258 = 0
-                        for tf_n, tf_s in analysis.tf_states.items():
-                            if tf_s and tf_s.valid:
-                                pvr = abs(tf_s.position_pct) * tf_s.volume_score * tf_s.ou_reversion_score
-                                max_pvr_258 = max(max_pvr_258, pvr)
-                        if max_pvr_258 > 0.25:
-                            trade_size *= 1.15
-                            ml_stats.setdefault('vol_rev_edge', 0)
-                            ml_stats['vol_rev_edge'] += 1
+                                pbe_257.append(max(0.01, tf_s.potential_energy * (1.0 - tf_s.binding_energy)))
+                        if pbe_257:
+                            import math
+                            geo_pbe = math.exp(sum(math.log(x) for x in pbe_257) / len(pbe_257))
+                            if geo_pbe > 0.25:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('free_pe', 0)
+                                ml_stats['free_pe'] += 1
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
