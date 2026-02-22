@@ -4397,6 +4397,20 @@ def run_backtest(
                             ml_stats.setdefault("break_after_stop", 0)
                             ml_stats["break_after_stop"] += 1
 
+
+                    # Arch 219c: Long win streak regime boost (1.15x when streak > 10)
+                    if realistic and len(trades) >= 10:
+                        streak_219 = 0
+                        for t in reversed(trades):
+                            if t.pnl > 0:
+                                streak_219 += 1
+                            else:
+                                break
+                        if streak_219 > 10:
+                            trade_size *= 1.15
+                            ml_stats.setdefault("long_streak", 0)
+                            ml_stats["long_streak"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
