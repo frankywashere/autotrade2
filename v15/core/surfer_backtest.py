@@ -5498,6 +5498,27 @@ def run_backtest(
                             ml_stats.setdefault('q_high_eq', 0)
                             ml_stats['q_high_eq'] += 1
 
+                    # Arch 286a: Extended hot hand bounce (1.20x 20+ consec wins + $500K+)
+                    if realistic and sig.signal_type == 'bounce' and equity > 500000 and len(trades) >= 20:
+                        consec_286 = 0
+                        for t in reversed(trades):
+                            if t.pnl > 0:
+                                consec_286 += 1
+                            else:
+                                break
+                        if consec_286 >= 20:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('hot20_500k', 0)
+                            ml_stats['hot20_500k'] += 1
+
+                    # Arch 286b: Mid-high spring gate bounce (1.15x $500K-$700K + PE>2.5)
+                    if realistic and sig.signal_type == 'bounce' and 500000 < equity < 700000:
+                        pe_286 = sum(tf_s.potential_energy for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if pe_286 > 2.5:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('mh_spring', 0)
+                            ml_stats['mh_spring'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
