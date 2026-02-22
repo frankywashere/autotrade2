@@ -4388,6 +4388,15 @@ def run_backtest(
                             ml_stats.setdefault('ordered_ke', 0)
                             ml_stats['ordered_ke'] += 1
 
+
+                    # Arch 219a: Break after stop = dangerous regime
+                    if realistic and sig.signal_type == "break" and len(trades) >= 1:
+                        any_stop_219 = any(t.exit_reason == "stop" for t in trades[-5:])
+                        if any_stop_219:
+                            trade_size *= 0.15
+                            ml_stats.setdefault("break_after_stop", 0)
+                            ml_stats["break_after_stop"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
