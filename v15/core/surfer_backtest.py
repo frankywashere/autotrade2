@@ -5229,6 +5229,38 @@ def run_backtest(
                             ml_stats.setdefault('ultra_ordered_edge', 0)
                             ml_stats['ultra_ordered_edge'] += 1
 
+
+                    # Arch 266c: $1.3M equity gate
+                    if realistic and sig.signal_type == 'bounce' and equity > 1300000:
+                        trade_size *= 1.25
+                        ml_stats.setdefault('1_3m', 0)
+                        ml_stats['1_3m'] += 1
+
+                    # Arch 266c: 5-factor geomean (1.15x when PE*pos*health*vol*(1-ent) geo > 0.02)
+                    if realistic and sig.signal_type == 'bounce':
+                        f5_266 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                f5_266.append(max(0.001, tf_s.potential_energy * abs(tf_s.position_pct) * tf_s.channel_health * tf_s.volume_score * (1.0 - tf_s.entropy)))
+                        if f5_266:
+                            import math
+                            geo_5f = math.exp(sum(math.log(x) for x in f5_266) / len(f5_266))
+                            if geo_5f > 0.02:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('5f_geo_full', 0)
+                                ml_stats['5f_geo_full'] += 1
+
+                    # Arch 266f: Avg PE * position * reversion > 0.20 (1.15x spring-reversion-edge)
+                    if realistic and sig.signal_type == 'bounce':
+                        ppr_266 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                ppr_266.append(tf_s.potential_energy * abs(tf_s.position_pct) * tf_s.ou_reversion_score)
+                        if ppr_266 and sum(ppr_266)/len(ppr_266) > 0.20:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('pe_pos_rev', 0)
+                            ml_stats['pe_pos_rev'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
