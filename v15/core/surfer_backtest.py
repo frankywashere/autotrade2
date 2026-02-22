@@ -4168,6 +4168,36 @@ def run_backtest(
                                 ml_stats.setdefault('ke_monotonic', 0)
                                 ml_stats['ke_monotonic'] += 1
 
+                    # Arch 205c: Primary TF is best (1.20x when signal from most reliable channel)
+                    if realistic and sig.signal_type == 'bounce':
+                        best_q_205 = 0
+                        primary_q_205 = 0
+                        ps_205 = analysis.tf_states.get(sig.primary_tf)
+                        if ps_205 and ps_205.valid:
+                            primary_q_205 = ps_205.r_squared * ps_205.channel_health
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                q = tf_s.r_squared * tf_s.channel_health
+                                best_q_205 = max(best_q_205, q)
+                        if primary_q_205 > 0 and primary_q_205 >= best_q_205 * 0.95:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('primary_best', 0)
+                            ml_stats['primary_best'] += 1
+
+                    # Arch 205d: Total energy uniform (1.15x when TFs have similar energy)
+                    if realistic and sig.signal_type == 'bounce':
+                        te_205 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                te_205.append(tf_s.total_energy)
+                        if len(te_205) >= 3:
+                            te_range = max(te_205) - min(te_205)
+                            avg_te = sum(te_205) / len(te_205)
+                            if avg_te > 0 and te_range / avg_te < 0.30:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('te_uniform', 0)
+                                ml_stats['te_uniform'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
