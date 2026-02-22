@@ -3095,6 +3095,19 @@ def run_backtest(
                             ml_stats['max_pe_boost'] += 1
 
 
+                    # Arch 152: Multi-TF KE continuous boost (market moving = better bounces)
+                    if realistic and sig.signal_type == 'bounce':
+                        ke_vals = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                ke_vals.append(tf_state.kinetic_energy)
+                        if ke_vals:
+                            avg_ke = sum(ke_vals) / len(ke_vals)
+                            if avg_ke > 0.30:
+                                ke_boost = min(1.30, 1.0 + (avg_ke - 0.30) * 0.75)
+                                trade_size *= ke_boost
+                                ml_stats.setdefault('multi_ke_boost', 0)
+                                ml_stats['multi_ke_boost'] += 1
 
 
                     # Arch 153: Max theta boost (strong reversion on any TF = better bounce)
