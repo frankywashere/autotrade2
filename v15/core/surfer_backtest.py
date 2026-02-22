@@ -4578,6 +4578,18 @@ def run_backtest(
                             ml_stats.setdefault("full_energy", 0)
                             ml_stats["full_energy"] += 1
 
+
+                    # Arch 229f: Accelerating win sizes boost (1.15x)
+                    if realistic and len(trades) >= 15:
+                        wins_229 = [t.pnl for t in trades if t.pnl > 0]
+                        if len(wins_229) >= 6:
+                            recent_avg = sum(wins_229[-3:]) / 3
+                            older_avg = sum(wins_229[-6:-3]) / 3
+                            if older_avg > 0 and recent_avg > older_avg * 2.0:
+                                trade_size *= 1.15
+                                ml_stats.setdefault("accel_wins", 0)
+                                ml_stats["accel_wins"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
