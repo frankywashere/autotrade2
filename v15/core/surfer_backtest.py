@@ -5445,6 +5445,18 @@ def run_backtest(
                             ml_stats.setdefault('vol_disp', 0)
                             ml_stats['vol_disp'] += 1
 
+
+                    # Arch 284c: Break signal with high PE at significant equity
+                    if realistic and sig.signal_type == 'break' and equity > 500000:
+                        pe_284 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                pe_284.append(tf_s.potential_energy)
+                        if pe_284 and sum(pe_284)/len(pe_284) > 0.50:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('brk_spring', 0)
+                            ml_stats['brk_spring'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
