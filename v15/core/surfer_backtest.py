@@ -4036,6 +4036,34 @@ def run_backtest(
                             ml_stats.setdefault('pnl_vol_spike', 0)
                             ml_stats['pnl_vol_spike'] += 1
 
+                    # Arch 200d: Width-slope product (1.15x when channels wide AND trending)
+                    if realistic and sig.signal_type == 'bounce':
+                        ws_200 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                ws_200.append(tf_s.width_pct * abs(tf_s.slope_pct))
+                        if ws_200:
+                            avg_ws = sum(ws_200) / len(ws_200)
+                            if avg_ws > 0.0001:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('wide_trend', 0)
+                                ml_stats['wide_trend'] += 1
+
+                    # Arch 200e: Break prob asymmetry alignment (1.15x BUY+up or SELL+down)
+                    if realistic and sig.signal_type == 'bounce' and hasattr(sig, 'action'):
+                        bp_up_200, bp_dn_200 = [], []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                bp_up_200.append(tf_s.break_prob_up)
+                                bp_dn_200.append(tf_s.break_prob_down)
+                        if bp_up_200 and bp_dn_200:
+                            avg_up = sum(bp_up_200) / len(bp_up_200)
+                            avg_dn = sum(bp_dn_200) / len(bp_dn_200)
+                            if (sig.action == "BUY" and avg_up > avg_dn * 2.0) or                                (sig.action == "SELL" and avg_dn > avg_up * 2.0):
+                                trade_size *= 1.15
+                                ml_stats.setdefault('bp_asym_align', 0)
+                                ml_stats['bp_asym_align'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
