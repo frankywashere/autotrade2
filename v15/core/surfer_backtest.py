@@ -4303,6 +4303,28 @@ def run_backtest(
                                 ml_stats.setdefault('fast_vs_mature', 0)
                                 ml_stats['fast_vs_mature'] += 1
 
+                    # Arch 216a: Max PE loaded (1.15x when any TF has PE > 0.80 = spring loaded)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_pe_216 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                max_pe_216 = max(max_pe_216, tf_s.potential_energy)
+                        if max_pe_216 > 0.80:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('max_pe_loaded', 0)
+                            ml_stats['max_pe_loaded'] += 1
+
+                    # Arch 216d: TE * health product (1.15x when avg TE*health > 0.35)
+                    if realistic and sig.signal_type == 'bounce':
+                        th_216 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                th_216.append(tf_s.total_energy * tf_s.channel_health)
+                        if th_216 and sum(th_216)/len(th_216) > 0.35:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('te_health', 0)
+                            ml_stats['te_health'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
