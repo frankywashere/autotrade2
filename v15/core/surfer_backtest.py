@@ -5616,6 +5616,12 @@ def run_backtest(
                         ml_stats.setdefault('late_mid_accel', 0)
                         ml_stats['late_mid_accel'] += 1
 
+                    # Arch 295a: Universal break boost (break GL < $12 total)
+                    if realistic and sig.signal_type == 'break':
+                        trade_size *= 1.50
+                        ml_stats.setdefault('brk_univ', 0)
+                        ml_stats['brk_univ'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
