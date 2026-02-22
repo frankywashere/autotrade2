@@ -4153,6 +4153,21 @@ def run_backtest(
                                 ml_stats.setdefault('vol_pos_edge', 0)
                                 ml_stats['vol_pos_edge'] += 1
 
+                    # Arch 204b: KE monotonic increase across TFs (1.20x when KE building up)
+                    if realistic and sig.signal_type == 'bounce':
+                        tf_order_204 = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
+                        ke_ordered = []
+                        for tf_n in tf_order_204:
+                            tf_s = analysis.tf_states.get(tf_n)
+                            if tf_s and tf_s.valid:
+                                ke_ordered.append(tf_s.kinetic_energy)
+                        if len(ke_ordered) >= 3:
+                            increases = sum(1 for i in range(1, len(ke_ordered)) if ke_ordered[i] > ke_ordered[i-1])
+                            if increases >= len(ke_ordered) - 1:
+                                trade_size *= 1.20
+                                ml_stats.setdefault('ke_monotonic', 0)
+                                ml_stats['ke_monotonic'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
