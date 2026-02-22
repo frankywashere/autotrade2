@@ -5306,6 +5306,20 @@ def run_backtest(
                             ml_stats.setdefault('very_hi_pe', 0)
                             ml_stats['very_hi_pe'] += 1
 
+
+                    # Arch 269d: At least one TF has both poor fit and poor health
+                    if realistic and sig.signal_type == 'bounce':
+                        min_r2 = 1.0
+                        min_h = 1.0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                min_r2 = min(min_r2, tf_s.r_squared)
+                                min_h = min(min_h, tf_s.channel_health)
+                        if min_r2 < 0.10 and min_h < 0.30:
+                            trade_size *= 0.10
+                            ml_stats.setdefault('poor_tf', 0)
+                            ml_stats['poor_tf'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
