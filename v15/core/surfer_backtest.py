@@ -4436,6 +4436,16 @@ def run_backtest(
                             ml_stats.setdefault('vol_health_pos', 0)
                             ml_stats['vol_health_pos'] += 1
 
+
+                    # Arch 221d: Equity acceleration boost (1.20x when growth doubling)
+                    if realistic and len(trades) >= 20:
+                        eq_per_trade_recent = sum(t.pnl for t in trades[-10:]) / 10
+                        eq_per_trade_prev = sum(t.pnl for t in trades[-20:-10]) / 10
+                        if eq_per_trade_recent > eq_per_trade_prev * 2.0 and eq_per_trade_recent > 0:
+                            trade_size *= 1.20
+                            ml_stats.setdefault("eq_accel", 0)
+                            ml_stats["eq_accel"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
