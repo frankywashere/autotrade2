@@ -4446,6 +4446,19 @@ def run_backtest(
                             ml_stats.setdefault("eq_accel", 0)
                             ml_stats["eq_accel"] += 1
 
+
+                    # Arch 221b: Same-type consecutive loss avoidance (0.20x)
+                    if realistic and len(trades) >= 3:
+                        same_type_loss_221 = False
+                        for t in trades[-3:]:
+                            if t.pnl < 0 and hasattr(t, "signal_type") and t.signal_type == sig.signal_type:
+                                same_type_loss_221 = True
+                                break
+                        if same_type_loss_221:
+                            trade_size *= 0.20
+                            ml_stats.setdefault("same_type_loss", 0)
+                            ml_stats["same_type_loss"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
