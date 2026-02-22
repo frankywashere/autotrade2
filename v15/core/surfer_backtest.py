@@ -5690,6 +5690,12 @@ def run_backtest(
                     if realistic and sig.signal_type == 'bounce':
                         ou_hl = max(2.0, ou_hl * 0.50)
 
+                    # Arch 324c: Late acceleration — 1.15x boost for bounces at $2M+
+                    if realistic and sig.signal_type == 'bounce' and equity > 2000000:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('late_accel_2m', 0)
+                        ml_stats['late_accel_2m'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
