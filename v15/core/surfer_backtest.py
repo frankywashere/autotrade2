@@ -3315,6 +3315,23 @@ def run_backtest(
                                 ml_stats.setdefault('parity_reduce', 0)
                                 ml_stats['parity_reduce'] += 1
 
+
+                    # Arch 161: 90th percentile BE penalty (worst-decile BE)
+                    if realistic and sig.signal_type == 'bounce':
+                        be_161 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be_161.append(tf_state.binding_energy)
+                        if be_161:
+                            sorted_be = sorted(be_161)
+                            idx90 = int(len(sorted_be) * 0.90)
+                            p90_be = sorted_be[min(idx90, len(sorted_be)-1)]
+                            if p90_be > 0.60:
+                                be_mult = max(0.50, 1.0 - (p90_be - 0.60) * 2.0)
+                                trade_size *= be_mult
+                                ml_stats.setdefault('p90_be', 0)
+                                ml_stats['p90_be'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
