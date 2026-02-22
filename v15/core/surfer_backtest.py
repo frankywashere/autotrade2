@@ -5597,6 +5597,25 @@ def run_backtest(
                             ml_stats.setdefault('4fq_avg', 0)
                             ml_stats['4fq_avg'] += 1
 
+                    # Arch 288a: Premium signal boost (1.15x conf>0.85 + energy>0.70 + pos>0.65)
+                    if realistic and sig.confidence > 0.85 and sig.energy_score > 0.70 and sig.position_score > 0.65:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('premium_sig', 0)
+                        ml_stats['premium_sig'] += 1
+
+                    # Arch 288b: Consistent mid-high bounce (1.15x $500K+ last 10 PnL > $5K)
+                    if realistic and sig.signal_type == 'bounce' and equity > 500000 and len(trades) >= 10:
+                        if sum(t.pnl for t in trades[-10:]) > 5000:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('consist_mh', 0)
+                            ml_stats['consist_mh'] += 1
+
+                    # Arch 288e: Late-mid acceleration bounce (1.15x $450K+ trades 200-300)
+                    if realistic and sig.signal_type == 'bounce' and equity > 450000 and 200 < len(trades) < 300:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('late_mid_accel', 0)
+                        ml_stats['late_mid_accel'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
