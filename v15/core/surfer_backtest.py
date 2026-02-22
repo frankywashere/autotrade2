@@ -3785,6 +3785,16 @@ def run_backtest(
                             ml_stats.setdefault('exp_win_streak', 0)
                             ml_stats['exp_win_streak'] += 1
 
+
+                    # Arch 186: Trailing PnL momentum (1.15x when recent 5 outperform prior 5)
+                    if realistic and len(trades) >= 10:
+                        sum5_186 = sum(t.pnl for t in trades[-5:])
+                        prev5_186 = sum(t.pnl for t in trades[-10:-5])
+                        if sum5_186 > prev5_186 * 1.5 and sum5_186 > 0:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('trail_momentum', 0)
+                            ml_stats['trail_momentum'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
