@@ -5571,6 +5571,32 @@ def run_backtest(
                         ml_stats.setdefault('mid_hi_growth', 0)
                         ml_stats['mid_hi_growth'] += 1
 
+                    # Arch 290b: Millionaire push (1.20x equity > 1M bounce)
+                    if realistic and sig.signal_type == 'bounce' and equity > 1000000:
+                        trade_size *= 1.20
+                        ml_stats.setdefault('mil_push', 0)
+                        ml_stats['mil_push'] += 1
+
+                    # Arch 290c: Ordered spring sum (1.15x sum PE*pos*(1-ent) > 1.5)
+                    if realistic and sig.signal_type == 'bounce':
+                        ops_290 = sum(tf_s.potential_energy * abs(tf_s.position_pct) * (1.0 - tf_s.entropy)
+                                     for tf_n, tf_s in analysis.tf_states.items() if tf_s and tf_s.valid)
+                        if ops_290 > 1.5:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('ord_spr_sum', 0)
+                            ml_stats['ord_spr_sum'] += 1
+
+                    # Arch 290f: 4-factor quality avg (1.15x avg PE*pos*health*r_sq > 0.05)
+                    if realistic and sig.signal_type == 'bounce':
+                        f4q_290 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                f4q_290.append(tf_s.potential_energy * abs(tf_s.position_pct) * tf_s.channel_health * tf_s.r_squared)
+                        if f4q_290 and sum(f4q_290)/len(f4q_290) > 0.05:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('4fq_avg', 0)
+                            ml_stats['4fq_avg'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
