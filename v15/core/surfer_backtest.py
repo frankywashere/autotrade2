@@ -3432,6 +3432,15 @@ def run_backtest(
                                 ml_stats.setdefault('median_edge', 0)
                                 ml_stats['median_edge'] += 1
 
+                    # Arch 138: Quadratic equity inverse scaling
+                    # Even more aggressive than linear: trade_size *= (initial/equity)^2
+                    # At 4x equity → 1/16 size, at 10x → 1/100 size
+                    if realistic:
+                        eq_scale = min(1.0, (initial_capital / equity) ** 2)
+                        trade_size *= eq_scale
+                        ml_stats.setdefault('quad_eq_scale', 0)
+                        ml_stats['quad_eq_scale'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
