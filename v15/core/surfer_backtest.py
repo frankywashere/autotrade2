@@ -4949,6 +4949,12 @@ def run_backtest(
                             ml_stats.setdefault('rapid_growth', 0)
                             ml_stats['rapid_growth'] += 1
 
+                    # Arch 252a: Final stretch bounce boost (1.25x after 320 trades)
+                    if realistic and sig.signal_type == 'bounce' and len(trades) > 320:
+                        trade_size *= 1.25
+                        ml_stats.setdefault('final_stretch', 0)
+                        ml_stats['final_stretch'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
