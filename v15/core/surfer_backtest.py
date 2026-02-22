@@ -4286,6 +4286,23 @@ def run_backtest(
                             ml_stats.setdefault("wsh_sizing", 0)
                             ml_stats["wsh_sizing"] += 1
 
+                    # Arch 215e: Fast reversion relative to maturity (1.15x when HL/BC < 5)
+                    if realistic and sig.signal_type == 'bounce':
+                        hl_215 = []
+                        bc_215 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                if tf_s.ou_half_life > 0:
+                                    hl_215.append(tf_s.ou_half_life)
+                                bc_215.append(max(1, tf_s.bounce_count))
+                        if hl_215 and bc_215:
+                            avg_hl = sum(hl_215) / len(hl_215)
+                            avg_bc = sum(bc_215) / len(bc_215)
+                            if avg_bc > 0 and avg_hl / avg_bc < 5.0:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('fast_vs_mature', 0)
+                                ml_stats['fast_vs_mature'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
