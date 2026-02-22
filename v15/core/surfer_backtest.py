@@ -5347,6 +5347,17 @@ def run_backtest(
                             ml_stats.setdefault('extreme_dual', 0)
                             ml_stats['extreme_dual'] += 1
 
+                    # Arch 271e: 4-factor quality avg (1.15x when avg PE*(1-ent)*health*vol > 0.06)
+                    if realistic and sig.signal_type == 'bounce':
+                        f4_271 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                f4_271.append(tf_s.potential_energy * (1.0 - tf_s.entropy) * tf_s.channel_health * tf_s.volume_score)
+                        if f4_271 and sum(f4_271)/len(f4_271) > 0.06:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('4f_q_avg', 0)
+                            ml_stats['4f_q_avg'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
