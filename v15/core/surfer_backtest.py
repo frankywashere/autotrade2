@@ -3612,6 +3612,13 @@ def run_backtest(
                             ml_stats.setdefault('anti_revenge', 0)
                             ml_stats['anti_revenge'] += 1
 
+
+                    # Arch 178: Break type hard reduce (breaks riskier than bounces)
+                    if realistic and sig.signal_type == 'break':
+                        trade_size *= 0.40
+                        ml_stats.setdefault('break_hard_reduce', 0)
+                        ml_stats['break_hard_reduce'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
