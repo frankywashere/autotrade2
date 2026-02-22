@@ -3366,6 +3366,21 @@ def run_backtest(
                                 ml_stats.setdefault('median_pe_boost', 0)
                                 ml_stats['median_pe_boost'] += 1
 
+
+                    # Arch 163: Freedom-momentum product boost ((1-BE)*KE)
+                    if realistic and sig.signal_type == 'bounce':
+                        fm_vals = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                fm_vals.append((1.0 - tf_state.binding_energy) * tf_state.kinetic_energy)
+                        if fm_vals:
+                            avg_fm = sum(fm_vals) / len(fm_vals)
+                            if avg_fm > 0.20:
+                                fm_boost = min(1.25, 1.0 + (avg_fm - 0.20) * 0.80)
+                                trade_size *= fm_boost
+                                ml_stats.setdefault('fm_boost', 0)
+                                ml_stats['fm_boost'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
