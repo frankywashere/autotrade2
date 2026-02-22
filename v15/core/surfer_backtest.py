@@ -4232,6 +4232,33 @@ def run_backtest(
                             ml_stats.setdefault('loss_cluster', 0)
                             ml_stats['loss_cluster'] += 1
 
+                    # Arch 210d: Total energy low CV (1.15x when energy stable across TFs)
+                    if realistic and sig.signal_type == 'bounce':
+                        te_210 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                te_210.append(tf_s.total_energy)
+                        if len(te_210) >= 3:
+                            avg_te = sum(te_210) / len(te_210)
+                            if avg_te > 0:
+                                std_te = (sum((t - avg_te)**2 for t in te_210) / len(te_210)) ** 0.5
+                                cv = std_te / avg_te
+                                if cv < 0.30:
+                                    trade_size *= 1.15
+                                    ml_stats.setdefault('te_low_cv', 0)
+                                    ml_stats['te_low_cv'] += 1
+
+                    # Arch 210e: Strong reversion signal (1.15x when any TF reversion > 0.80)
+                    if realistic and sig.signal_type == 'bounce':
+                        max_rev_210 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                max_rev_210 = max(max_rev_210, tf_s.ou_reversion_score)
+                        if max_rev_210 > 0.80:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('strong_revert', 0)
+                            ml_stats['strong_revert'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
