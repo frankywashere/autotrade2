@@ -4337,6 +4337,19 @@ def run_backtest(
                             ml_stats.setdefault("break_low_rev", 0)
                             ml_stats["break_low_rev"] += 1
 
+                    # Arch 217d: Momentum * width product (1.15x when strong directional move in wide channels)
+                    if realistic and sig.signal_type == 'bounce':
+                        mw_217 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                mw_217.append(abs(tf_s.momentum_direction) * tf_s.width_pct * 1000)
+                        if mw_217:
+                            avg_mw = sum(mw_217) / len(mw_217)
+                            if avg_mw > 1.0:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('mom_width', 0)
+                                ml_stats['mom_width'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
