@@ -3633,6 +3633,15 @@ def run_backtest(
                                 ml_stats.setdefault('loss_growing', 0)
                                 ml_stats['loss_growing'] += 1
 
+
+                    # Arch 179: Channel health continuous sizing (healthy = bigger)
+                    if realistic and hasattr(sig, 'channel_health'):
+                        ch = max(0.0, min(1.0, sig.channel_health))
+                        ch_mult = 0.5 + ch * 1.0
+                        trade_size *= ch_mult
+                        ml_stats.setdefault('ch_health_sizing', 0)
+                        ml_stats['ch_health_sizing'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
