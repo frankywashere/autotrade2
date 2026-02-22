@@ -5410,6 +5410,19 @@ def run_backtest(
                             ml_stats.setdefault('all_qfit', 0)
                             ml_stats['all_qfit'] += 1
 
+                    # Arch 278c: Clean break regime (1.15x when no loss in last 20 trades)
+                    if realistic and sig.signal_type == "break" and len(trades) >= 20:
+                        if all(t.pnl > 0 for t in trades[-20:]):
+                            trade_size *= 1.15
+                            ml_stats.setdefault("clean_brk_20", 0)
+                            ml_stats["clean_brk_20"] += 1
+
+                    # Arch 278b: Endgame stride boost (1.20x trades 300+ AND equity > 800K)
+                    if realistic and sig.signal_type == 'bounce' and len(trades) >= 300 and equity > 800000:
+                        trade_size *= 1.20
+                        ml_stats.setdefault('endgame_stride', 0)
+                        ml_stats['endgame_stride'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
