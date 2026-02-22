@@ -3686,6 +3686,20 @@ def run_backtest(
                             ml_stats.setdefault('bad_exit_rate', 0)
                             ml_stats['bad_exit_rate'] += 1
 
+
+                    # Arch 182: Double-weak filter (both min PE and min KE below thresholds)
+                    if realistic and sig.signal_type == 'bounce':
+                        min_pe_182 = 1.0
+                        min_ke_182 = 1.0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                min_pe_182 = min(min_pe_182, tf_s.potential_energy)
+                                min_ke_182 = min(min_ke_182, tf_s.kinetic_energy)
+                        if min_pe_182 < 0.15 and min_ke_182 < 0.15:
+                            trade_size *= 0.35
+                            ml_stats.setdefault('double_weak', 0)
+                            ml_stats["double_weak"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
