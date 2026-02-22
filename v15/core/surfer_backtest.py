@@ -4814,6 +4814,39 @@ def run_backtest(
                             ml_stats.setdefault('best_prh', 0)
                             ml_stats['best_prh'] += 1
 
+
+                    # Arch 247d: Very established system on bounce
+                    if realistic and sig.signal_type == 'bounce' and len(trades) > 250:
+                        trade_size *= 1.15
+                        ml_stats.setdefault('late_established', 0)
+                        ml_stats['late_established'] += 1
+
+                    # Arch 244a: BUY bounce + positive momentum consensus (1.15x)
+                    if realistic and sig.signal_type == 'bounce' and hasattr(sig, 'action') and sig.action == 'BUY':
+                        md_244 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                md_244.append(tf_s.momentum_direction)
+                        if md_244 and sum(md_244)/len(md_244) > 0.30:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('buy_bull_mom', 0)
+                            ml_stats['buy_bull_mom'] += 1
+
+                    # Arch 244e: Break + aligned TE*momentum > 0.50 (1.15x)
+                    if realistic and sig.signal_type == 'break' and hasattr(sig, 'action'):
+                        max_tm_244 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                if sig.action == 'BUY':
+                                    tm = tf_s.total_energy * max(0, tf_s.momentum_direction)
+                                else:
+                                    tm = tf_s.total_energy * max(0, -tf_s.momentum_direction)
+                                max_tm_244 = max(max_tm_244, tm)
+                        if max_tm_244 > 0.50:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('break_aligned_te', 0)
+                            ml_stats['break_aligned_te'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
