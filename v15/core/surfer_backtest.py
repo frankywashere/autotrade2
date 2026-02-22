@@ -5840,7 +5840,7 @@ def run_backtest(
 
                     # Arch 360b: Conf*150 at $10M+
                     if realistic and sig.signal_type == 'bounce' and equity > 10000000:
-                        trade_size *= max(1.0, sig.confidence * 150.0)
+                        trade_size *= max(1.0, sig.confidence * 250.0)
                         ml_stats.setdefault('conf_scale_10m', 0)
                         ml_stats['conf_scale_10m'] += 1
 
@@ -5866,9 +5866,9 @@ def run_backtest(
                         ml_stats['brk_lowconf'] += 1
 
 
-                    # Arch 357e: Conf*400 at $100M+
+                    # Arch 368b: Conf*500 at $100M+ (validated OOS)
                     if realistic and sig.signal_type == 'bounce' and equity > 100000000:
-                        trade_size *= max(1.0, sig.confidence * 400.0)
+                        trade_size *= max(1.0, sig.confidence * 500.0)
 
 
                     # Arch 358c: Conf*1500 at $500M+
