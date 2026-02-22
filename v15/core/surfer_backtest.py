@@ -4123,6 +4123,36 @@ def run_backtest(
                             ml_stats.setdefault('mfe_mae_ratio', 0)
                             ml_stats['mfe_mae_ratio'] += 1
 
+                    # Arch 203c: Geometric mean channel health (1.15x when all TFs healthy)
+                    if realistic and sig.signal_type == 'bounce':
+                        healths_203 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                healths_203.append(max(0.01, tf_s.channel_health))
+                        if healths_203:
+                            import math
+                            geo_h = math.exp(sum(math.log(h) for h in healths_203) / len(healths_203))
+                            if geo_h > 0.50:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('geo_health', 0)
+                                ml_stats['geo_health'] += 1
+
+                    # Arch 203e: Volume-weighted position extremity (1.15x when vol confirms edge)
+                    if realistic and sig.signal_type == 'bounce':
+                        vp_203 = 0
+                        total_w203 = 0
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                w = max(0.1, tf_s.volume_score)
+                                vp_203 += abs(tf_s.position_pct) * w
+                                total_w203 += w
+                        if total_w203 > 0:
+                            vol_pos = vp_203 / total_w203
+                            if vol_pos > 0.80:
+                                trade_size *= 1.15
+                                ml_stats.setdefault('vol_pos_edge', 0)
+                                ml_stats['vol_pos_edge'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
