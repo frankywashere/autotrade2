@@ -4112,6 +4112,17 @@ def run_backtest(
                                 ml_stats.setdefault('theta_pe_prod', 0)
                                 ml_stats['theta_pe_prod'] += 1
 
+                    # Arch 202f: MFE/MAE ratio boost (1.15x when recent winners running well)
+                    if realistic and len(trades) >= 10:
+                        mfe_mae_202 = []
+                        for t in trades[-10:]:
+                            if t.pnl > 0 and hasattr(t, 'mae_pct') and t.mae_pct > 0:
+                                mfe_mae_202.append(t.mfe_pct / t.mae_pct)
+                        if len(mfe_mae_202) >= 5 and sum(mfe_mae_202)/len(mfe_mae_202) > 2.0:
+                            trade_size *= 1.15
+                            ml_stats.setdefault('mfe_mae_ratio', 0)
+                            ml_stats['mfe_mae_ratio'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
