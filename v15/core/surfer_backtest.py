@@ -2443,9 +2443,9 @@ def run_backtest(
                     # SELL bounces: 98% WR → aggressive, BUY bounces: 95% WR → moderate
                     if realistic and sig.signal_type == 'bounce':
                         if sig.action == 'SELL':
-                            trade_size *= 1.2  # SELL bounces: optimized from 2.3
+                            trade_size *= 2.3  # SELL bounces: highest WR
                         else:
-                            trade_size *= 1.0  # BUY bounces: optimized from 1.9
+                            trade_size *= 1.9  # BUY bounces: slightly lower WR
                         ml_stats.setdefault('bounce_sized_up', 0)
                         ml_stats['bounce_sized_up'] += 1
                         # Arch 77: Wide-stop bounce boost (98% WR vs 91% for narrow)
@@ -3049,6 +3049,24 @@ def run_backtest(
                                 trade_size *= 0.70
                                 ml_stats.setdefault('ent_pos_penalty', 0)
                                 ml_stats['ent_pos_penalty'] += 1
+
+
+                    # Arch 127: Exponential comprehensive score (amplifies quality differences)
+                    if realistic and sig.signal_type == 'bounce':
+                        be3, pe3, th3, ed3 = [], [], [], []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                be3.append(tf_state.binding_energy)
+                                pe3.append(tf_state.potential_energy)
+                                th3.append(tf_state.ou_theta)
+                                ep = max(0, 1.0 - min(tf_state.position_pct, 1.0 - tf_state.position_pct) / 0.15)
+                                ed3.append(min(ep, 1.0))
+                        if be3:
+                            s = (1.0 - sum(be3)/len(be3)) * 0.4 + (sum(pe3)/len(pe3)) * 0.3 + min((sum(th3)/len(th3))/0.50, 1.0) * 0.15 + (sum(ed3)/len(ed3)) * 0.15
+                            mult = 0.5 + 1.0 * (s ** 1.5)
+                            trade_size *= mult
+                            ml_stats.setdefault('exp_score', 0)
+                            ml_stats['exp_score'] += 1
 
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
