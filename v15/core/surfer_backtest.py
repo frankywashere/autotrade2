@@ -4941,6 +4941,14 @@ def run_backtest(
                         ml_stats.setdefault('1m_push', 0)
                         ml_stats['1m_push'] += 1
 
+                    # Arch 252e: Rapid equity growth acceleration (1.20x when +$50K in 30 trades)
+                    if realistic and len(trades) >= 30:
+                        recent_pnl = sum(t.pnl for t in trades[-30:])
+                        if recent_pnl > 50000:
+                            trade_size *= 1.20
+                            ml_stats.setdefault('rapid_growth', 0)
+                            ml_stats['rapid_growth'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
