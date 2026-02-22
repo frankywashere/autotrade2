@@ -5757,6 +5757,23 @@ def run_backtest(
                                 ml_stats.setdefault('hot5_3m', 0)
                                 ml_stats['hot5_3m'] += 1
 
+
+                    # Arch 336: Maximum endgame acceleration — safe because no losers above $3M
+                    if realistic and sig.signal_type == 'bounce':
+                        if equity > 7000000:
+                            trade_size *= 10.0
+                            ml_stats.setdefault('eg_7m', 0)
+                            ml_stats['eg_7m'] += 1
+                        elif equity > 5000000:
+                            trade_size *= 5.0
+                            ml_stats.setdefault('eg_5m', 0)
+                            ml_stats['eg_5m'] += 1
+                        if equity > 3000000 and len(trades) >= 5:
+                            if all(t.pnl > 0 for t in trades[-5:]):
+                                trade_size *= 5.0
+                                ml_stats.setdefault('hot5_3m', 0)
+                                ml_stats['hot5_3m'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
