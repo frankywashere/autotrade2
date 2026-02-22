@@ -5761,7 +5761,7 @@ def run_backtest(
                     # Arch 336: Maximum endgame acceleration — safe because no losers above $3M
                     if realistic and sig.signal_type == 'bounce':
                         if equity > 7000000:
-                            trade_size *= 20.0
+                            trade_size *= 30.0
                             ml_stats.setdefault('eg_7m', 0)
                             ml_stats['eg_7m'] += 1
                         elif equity > 5000000:
@@ -5784,7 +5784,7 @@ def run_backtest(
                     # Arch 339: Multi-tier endgame
                     if realistic and sig.signal_type == 'bounce':
                         if equity > 20000000:
-                            trade_size *= 10.0
+                            trade_size *= 15.0
                         elif equity > 10000000:
                             trade_size *= 8.0
 
