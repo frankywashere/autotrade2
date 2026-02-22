@@ -5736,9 +5736,9 @@ def run_backtest(
                         _trail_width = min(_trail_width, 0.15)
 
 
-                    # Arch 331g: Penalize medium-conf breaks (0.70-0.90) 0.1x size
+                    # Arch 361e: Penalize medium-conf breaks (0.70-0.90) 0.05x (validated OOS)
                     if realistic and sig.signal_type == 'break' and 0.70 < sig.confidence < 0.90:
-                        trade_size *= 0.10
+                        trade_size *= 0.05
 
 
                     # Arch 332: Endgame acceleration stack
@@ -5859,9 +5859,9 @@ def run_backtest(
                             ml_stats['mom_50m'] += 1
 
 
-                    # Arch 351a: Penalize low-conf breaks (conf<0.70) 0.10x — targets biggest break losers
+                    # Arch 361d: Penalize low-conf breaks (conf<0.70) 0.05x (validated OOS)
                     if realistic and sig.signal_type == 'break' and sig.confidence < 0.70:
-                        trade_size *= 0.10
+                        trade_size *= 0.05
                         ml_stats.setdefault('brk_lowconf', 0)
                         ml_stats['brk_lowconf'] += 1
 
