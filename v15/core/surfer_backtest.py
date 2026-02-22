@@ -5858,6 +5858,13 @@ def run_backtest(
                             ml_stats.setdefault('mom_50m', 0)
                             ml_stats['mom_50m'] += 1
 
+
+                    # Arch 351a: Penalize low-conf breaks (conf<0.70) 0.10x — targets biggest break losers
+                    if realistic and sig.signal_type == 'break' and sig.confidence < 0.70:
+                        trade_size *= 0.10
+                        ml_stats.setdefault('brk_lowconf', 0)
+                        ml_stats['brk_lowconf'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
