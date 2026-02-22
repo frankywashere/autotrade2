@@ -3747,15 +3747,6 @@ def run_backtest(
                                 ml_stats['w_energy_prod'] += 1
 
 
-                    # Arch 184: Long hold penalty (0.60x when avg hold of recent wins > 5 bars)
-                    if realistic and len(trades) >= 10:
-                        holds_184 = [t.hold_bars for t in trades[-10:] if t.pnl > 0 and hasattr(t, 'hold_bars')]
-                        if len(holds_184) >= 5:
-                            avg_hold_184 = sum(holds_184) / len(holds_184)
-                            if avg_hold_184 > 5:
-                                trade_size *= 0.60
-                                ml_stats.setdefault('long_hold', 0)
-                                ml_stats['long_hold'] += 1
 
 
                     # Arch 185: Large recent loss penalty (0.40x when last loss > 2x avg loss)
