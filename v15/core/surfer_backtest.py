@@ -2443,7 +2443,7 @@ def run_backtest(
                     # SELL bounces: 98% WR → aggressive, BUY bounces: 95% WR → moderate
                     if realistic and sig.signal_type == 'bounce':
                         if sig.action == 'SELL':
-                            trade_size *= 2.3  # SELL bounces: highest WR
+                            trade_size *= 2.5  # SELL bounces: highest WR
                         else:
                             trade_size *= 1.5  # BUY bounces: slightly lower WR
                         ml_stats.setdefault('bounce_sized_up', 0)
@@ -5693,7 +5693,7 @@ def run_backtest(
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
-                        _cap_base = 45.0 if sig.signal_type == "bounce" else 25.0
+                        _cap_base = 50.0 if sig.signal_type == "bounce" else 30.0
                         cap = equity * _cap_base
                         if total_open + trade_size > cap:
                             trade_size = max(0, cap - total_open)
