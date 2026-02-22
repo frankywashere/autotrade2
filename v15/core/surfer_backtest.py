@@ -3416,6 +3416,22 @@ def run_backtest(
                                 ml_stats.setdefault('p25_be', 0)
                                 ml_stats['p25_be'] += 1
 
+
+                    # Arch 165: Median position edge boost (most TFs near boundary)
+                    if realistic and sig.signal_type == 'bounce':
+                        pos_165 = []
+                        for tf_name, tf_state in analysis.tf_states.items():
+                            if tf_state and tf_state.valid:
+                                pos_165.append(min(tf_state.position_pct, 1.0 - tf_state.position_pct))
+                        if pos_165:
+                            sorted_pos = sorted(pos_165)
+                            n = len(sorted_pos)
+                            median_edge = sorted_pos[n//2] if n % 2 == 1 else (sorted_pos[n//2-1] + sorted_pos[n//2]) / 2
+                            if median_edge < 0.10:
+                                trade_size *= 1.20
+                                ml_stats.setdefault('median_edge', 0)
+                                ml_stats['median_edge'] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
