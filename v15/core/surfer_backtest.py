@@ -4272,6 +4272,20 @@ def run_backtest(
                             ml_stats.setdefault('safe_support', 0)
                             ml_stats['safe_support'] += 1
 
+
+                    # Arch 215: Wide + trending + healthy channel sizing
+                    if realistic and sig.signal_type == "bounce":
+                        wsh_215 = []
+                        for tf_n, tf_s in analysis.tf_states.items():
+                            if tf_s and tf_s.valid:
+                                wsh_215.append(tf_s.width_pct * 100 * abs(tf_s.slope_pct) * 100 * tf_s.channel_health)
+                        if wsh_215:
+                            avg_wsh = sum(wsh_215) / len(wsh_215)
+                            wsh_mult = min(1.25, max(0.50, 0.5 + avg_wsh * 0.5))
+                            trade_size *= wsh_mult
+                            ml_stats.setdefault("wsh_sizing", 0)
+                            ml_stats["wsh_sizing"] += 1
+
                     # Arch 98: Exposure cap (prevent runaway leverage)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
