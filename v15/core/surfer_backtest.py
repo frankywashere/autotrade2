@@ -5966,20 +5966,20 @@ def run_backtest(
                                 trade_size *= 1.45
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
-                            elif _dow == 0:  # Monday: 1.40x (Arch416: up from 1.35x, closing gap toward Thu 1.45x)
-                                trade_size *= 1.40
+                            elif _dow == 0:  # Monday: 1.35x (Arch415)
+                                trade_size *= 1.35
                                 ml_stats.setdefault('dow_mon_boost', 0)
                                 ml_stats['dow_mon_boost'] += 1
-                            elif _dow == 1:  # Tuesday: 1.40x (Arch416: up from 1.35x, closing gap toward Thu 1.45x)
-                                trade_size *= 1.40
+                            elif _dow == 1:  # Tuesday: 1.35x (Arch415)
+                                trade_size *= 1.35
                                 ml_stats.setdefault('dow_tue_boost', 0)
                                 ml_stats['dow_tue_boost'] += 1
-                            elif _dow == 2:  # Wednesday: 1.40x (Arch416: up from 1.35x, closing gap toward Thu 1.45x)
-                                trade_size *= 1.40
+                            elif _dow == 2:  # Wednesday: 1.35x (Arch415)
+                                trade_size *= 1.35
                                 ml_stats.setdefault('dow_wed_boost', 0)
                                 ml_stats['dow_wed_boost'] += 1
-                            elif _dow == 4:  # Friday: 1.40x (Arch416: up from 1.35x, closing gap toward Thu 1.45x)
-                                trade_size *= 1.40
+                            elif _dow == 4:  # Friday: 1.35x (Arch415)
+                                trade_size *= 1.35
                                 ml_stats.setdefault('dow_fri_boost', 0)
                                 ml_stats['dow_fri_boost'] += 1
 
