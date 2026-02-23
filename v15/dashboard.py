@@ -1751,13 +1751,101 @@ def _play_alert_sound(action: str) -> None:
     )
 
 
+def _play_exit_alert_sound(exit_reason: str) -> None:
+    """Play an audible alert when a position exit triggers."""
+    if exit_reason == 'take_profit':
+        # Celebratory ascending chime: E4 → G#4 → B4
+        js = """(function(){
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                [330, 415, 494].forEach(function(f, i) {
+                    var o = ctx.createOscillator(), g = ctx.createGain();
+                    o.connect(g); g.connect(ctx.destination);
+                    o.type = 'sine'; o.frequency.value = f;
+                    var t = ctx.currentTime + i * 0.18;
+                    g.gain.setValueAtTime(0.35, t);
+                    g.gain.linearRampToValueAtTime(0, t + 0.25);
+                    o.start(t); o.stop(t + 0.25);
+                });
+            } catch(e) {}
+        })();"""
+    elif exit_reason in ('stop_loss', 'trailing_stop'):
+        # Urgent alarm: 3 descending square-wave pulses
+        js = """(function(){
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                [600, 500, 420].forEach(function(f, i) {
+                    var o = ctx.createOscillator(), g = ctx.createGain();
+                    o.connect(g); g.connect(ctx.destination);
+                    o.type = 'square'; o.frequency.value = f;
+                    var t = ctx.currentTime + i * 0.14;
+                    g.gain.setValueAtTime(0.18, t);
+                    g.gain.linearRampToValueAtTime(0, t + 0.12);
+                    o.start(t); o.stop(t + 0.12);
+                });
+            } catch(e) {}
+        })();"""
+    else:
+        # timeout / other: single neutral beep
+        js = """(function(){
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                var o = ctx.createOscillator(), g = ctx.createGain();
+                o.connect(g); g.connect(ctx.destination);
+                o.type = 'sine'; o.frequency.value = 440;
+                g.gain.setValueAtTime(0.2, ctx.currentTime);
+                g.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.4);
+                o.start(ctx.currentTime); o.stop(ctx.currentTime + 0.4);
+            } catch(e) {}
+        })();"""
+    st.markdown(f"<script>{js}</script>", unsafe_allow_html=True)
+
+
+def _render_scanner_exit_alert(ea) -> None:
+    """Render a prominent exit alert banner for a closed position."""
+    if ea.exit_reason == 'take_profit':
+        bg, border, icon, label = '#0a3320', '#00e676', '🎯', 'TAKE PROFIT HIT'
+    elif ea.exit_reason == 'stop_loss':
+        bg, border, icon, label = '#3a0a0a', '#ff1744', '🛑', 'STOP LOSS HIT'
+    elif ea.exit_reason == 'trailing_stop':
+        bg, border, icon, label = '#2a1a0a', '#ff9100', '📉', 'TRAILING STOP HIT'
+    else:
+        bg, border, icon, label = '#1a1a2e', '#888888', '⏱', ea.exit_reason.upper()
+    pnl_color = '#00e676' if ea.pnl >= 0 else '#ff5252'
+    st.markdown(
+        f'<div style="background:{bg};padding:12px 16px;border-radius:8px;margin:6px 0;'
+        f'border:2px solid {border};">'
+        f'<span style="font-size:18px">{icon}</span> '
+        f'<b style="color:{border};font-size:15px"> {label}</b> '
+        f'<span style="color:#aaa">[{ea.pos_id}]</span> @ '
+        f'<b>${ea.price:.2f}</b> — '
+        f'P&L: <b style="color:{pnl_color}">${ea.pnl:+,.0f}</b> ({ea.pnl_pct:+.2%})'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _show_surfer_chart(tsla_df, analysis):
     """Show interactive 5min candlestick chart with channel overlay and signal markers."""
     from v15.core.channel import detect_channels_multi_window, select_best_channel
+    import pytz
 
-    # Show last 200 bars of 5min data
-    n_bars = min(200, len(tsla_df))
-    df_chart = tsla_df.tail(n_bars).copy()
+    # Filter to today's trading session only; fall back to most recent trading day
+    try:
+        et_tz = pytz.timezone('America/New_York')
+        if tsla_df.index.tz is not None:
+            dates_et = tsla_df.index.tz_convert(et_tz).date
+        else:
+            dates_et = tsla_df.index.date
+        today_et = pd.Timestamp.now(tz=et_tz).date()
+        df_today = tsla_df[dates_et == today_et]
+        # If fewer than 5 bars today (market closed / weekend), use most recent trading day
+        if len(df_today) < 5 and len(tsla_df) > 0:
+            most_recent = dates_et[-1]
+            df_today = tsla_df[dates_et == most_recent]
+        df_chart = df_today.copy() if len(df_today) > 0 else tsla_df.tail(100).copy()
+    except Exception:
+        df_chart = tsla_df.tail(100).copy()
 
     # Detect the 5min channel
     windows = [10, 15, 20, 30, 40]
@@ -2023,7 +2111,7 @@ def _show_ml_predictions(analysis, current_tsla, native_tf_data):
 def _get_tod_dow_multipliers(signal_type: str = 'bounce'):
     """
     Compute current TOD + DOW position sizing multipliers for bounce signals.
-    Mirrors the logic in surfer_backtest.py (Arch 406/407 committed values).
+    Mirrors the logic in surfer_backtest.py (Arch 410 + Arch 406 committed values).
     Only bounce signals get TOD/DOW boosts.
     Returns (tod_mult, tod_label, dow_mult, dow_label).
     """
@@ -2036,7 +2124,7 @@ def _get_tod_dow_multipliers(signal_type: str = 'bounce'):
     if signal_type != 'bounce':
         return 1.0, f'N/A (not bounce)', 1.0, 'N/A (not bounce)'
 
-    # TOD table (UTC hour → multiplier, label) — keep in sync with surfer_backtest.py
+    # TOD table (UTC hour → multiplier, label) — keep in sync with surfer_backtest.py (Arch410)
     tod_table = {
         8:  (1.15, '3am ET'),
         9:  (1.15, '4am ET'),
@@ -2044,22 +2132,22 @@ def _get_tod_dow_multipliers(signal_type: str = 'bounce'):
         11: (1.15, '6am ET'),
         12: (1.05, '7am ET'),
         13: (1.50, '8am ET ⭐'),
-        14: (1.30, '9am ET'),
-        15: (1.30, '10am ET'),
-        16: (1.30, '11am ET'),
-        17: (1.30, '12pm ET'),
+        14: (1.40, '9am ET ⭐'),
+        15: (1.40, '10am ET ⭐'),
+        16: (1.40, '11am ET ⭐'),
+        17: (1.40, '12pm ET ⭐'),
         18: (1.50, '1pm ET ⭐'),
         19: (1.50, '2pm ET ⭐'),
-        20: (1.25, '3pm ET'),
-        21: (1.25, '4pm ET'),
+        20: (1.20, '3pm ET'),
+        21: (1.20, '4pm ET'),
     }
-    # DOW table (weekday → multiplier, label) — keep in sync with surfer_backtest.py
+    # DOW table (weekday → multiplier, label) — keep in sync with surfer_backtest.py (Arch414)
     dow_table = {
-        0: (1.25, 'Monday'),
-        1: (1.25, 'Tuesday'),
-        2: (1.25, 'Wednesday'),
+        0: (1.30, 'Monday'),
+        1: (1.30, 'Tuesday'),
+        2: (1.30, 'Wednesday'),
         3: (1.45, 'Thursday ⭐'),
-        4: (1.25, 'Friday'),
+        4: (1.30, 'Friday'),
     }
     tod_mult, tod_label = tod_table.get(hour_utc, (1.0, f'UTC{hour_utc} (no boost)'))
     dow_mult, dow_label = dow_table.get(dow, (1.0, 'Weekend'))
@@ -2118,6 +2206,8 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
         st.session_state['_sq_log'] = log
         for line in log:
             print(f"[SQ] {line}")
+        load_info = '\n'.join(st.session_state.get('_sq_load_log', ['(no load log)']))
+        st.warning(f"ML Signal Quality: model not loaded.\n{load_info}")
         return
 
     # Log the incoming signal
@@ -2237,6 +2327,23 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
     else:
         q_color = '#ff1744'
 
+    # Pre-compute dollar estimate for caption (full sizing block computed below)
+    _base_cap_preview = st.session_state.get('backtest_capital', 100_000.0)
+    _base_trade_preview = _base_cap_preview / 10.0
+    _ml_adj = min(_base_trade_preview * size_mult, 500_000.0)
+    _tod_adj = min(_ml_adj * tod_mult, 500_000.0)
+    _dow_adj = min(_tod_adj * dow_mult, 500_000.0)
+    _exp_dollar_preview = expected_pnl * _dow_adj
+
+    # Plain-text summary line (always visible regardless of HTML rendering)
+    action_icon = '🟢' if sig.action == 'BUY' else '🔴'
+    st.caption(
+        f"**ML Quality** {action_icon} {sig.action} | Win: {win_prob:.0%} | "
+        f"E.PnL: {expected_pnl:+.2%} | Score: {quality_score:.0f}/100 | "
+        f"Size: {size_mult:.1f}x {size_label} | TOD: {tod_mult:.2f}x | DOW: {dow_mult:.2f}x | "
+        f"**Est. $: ${_exp_dollar_preview:+,.0f} on ${_dow_adj:,.0f} trade**"
+    )
+
     st.markdown(
         f"""<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);
         border:1px solid #334;border-radius:8px;padding:12px 16px;margin:8px 0;">
@@ -2283,11 +2390,63 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
     ml_adjusted_usd = min(base_trade_usd * _sq_mult, max_trade_usd)
     tod_adjusted_usd = min(ml_adjusted_usd * tod_mult, max_trade_usd)
     dow_adjusted_usd = min(tod_adjusted_usd * dow_mult, max_trade_usd)
-    # Get current TSLA price for share count estimate
+    # Get current TSLA price for share count estimate (prefer Finnhub real-time over stale bar)
     tsla_price = None
     if current_tsla is not None and len(current_tsla) > 0:
         tsla_price = float(current_tsla['close'].iloc[-1])
+    try:
+        _rt = _get_realtime_prices()
+        if _rt.get('TSLA'):
+            tsla_price = float(_rt['TSLA'])
+    except Exception:
+        pass
     est_shares = int(dow_adjusted_usd / tsla_price) if tsla_price and tsla_price > 0 else None
+
+    # Price targets from signal stop/TP percentages
+    if tsla_price and tsla_price > 0:
+        if sig.action == 'BUY':
+            pt_entry = tsla_price
+            pt_tp = tsla_price * (1 + sig.suggested_tp_pct)
+            pt_sl = tsla_price * (1 - sig.suggested_stop_pct)
+            pt_tp_pct = sig.suggested_tp_pct
+            pt_sl_pct = -sig.suggested_stop_pct
+            pt_entry_label = 'Buy Long @'
+            pt_tp_label = 'Take Profit (sell)'
+            pt_sl_label = 'Stop Loss (sell)'
+        else:
+            pt_entry = tsla_price
+            pt_tp = tsla_price * (1 - sig.suggested_tp_pct)
+            pt_sl = tsla_price * (1 + sig.suggested_stop_pct)
+            pt_tp_pct = -sig.suggested_tp_pct
+            pt_sl_pct = sig.suggested_stop_pct
+            pt_entry_label = 'Sell Short @'
+            pt_tp_label = 'Take Profit (cover)'
+            pt_sl_label = 'Stop Loss (cover)'
+        pt_rr = sig.suggested_tp_pct / max(sig.suggested_stop_pct, 0.001)
+        price_targets_html = (
+            f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #2a4a6a;'
+            f'display:flex;justify-content:center;gap:28px;text-align:center;">'
+            f'<div><div style="font-size:10px;color:#aaa;">{pt_entry_label}</div>'
+            f'<div style="font-size:17px;font-weight:600;color:#ccc;">${pt_entry:.2f}</div></div>'
+            f'<div style="font-size:18px;color:#555;align-self:center;">→</div>'
+            f'<div><div style="font-size:10px;color:#aaa;">{pt_tp_label}</div>'
+            f'<div style="font-size:17px;font-weight:600;color:#00c853;">${pt_tp:.2f}</div>'
+            f'<div style="font-size:10px;color:#666;">{pt_tp_pct:+.2%}</div></div>'
+            f'<div style="font-size:16px;color:#555;align-self:center;">|</div>'
+            f'<div><div style="font-size:10px;color:#aaa;">{pt_sl_label}</div>'
+            f'<div style="font-size:17px;font-weight:600;color:#ff4444;">${pt_sl:.2f}</div>'
+            f'<div style="font-size:10px;color:#666;">{pt_sl_pct:+.2%}</div></div>'
+            f'<div style="font-size:16px;color:#555;align-self:center;">|</div>'
+            f'<div><div style="font-size:10px;color:#aaa;">R:R</div>'
+            f'<div style="font-size:17px;font-weight:600;color:#fff;">{pt_rr:.1f}:1</div></div>'
+            f'</div>'
+        )
+    else:
+        price_targets_html = ''
+
+    # Expected dollar P&L = expected_pnl_pct × estimated trade size
+    expected_dollar = expected_pnl * dow_adjusted_usd
+    expected_dollar_str = f"${expected_dollar:+,.0f}"
 
     tod_color = '#00c853' if tod_mult >= 1.40 else '#ff9800' if tod_mult >= 1.20 else '#888'
     dow_color = '#00c853' if dow_mult >= 1.40 else '#ff9800' if dow_mult >= 1.20 else '#888'
@@ -2329,7 +2488,14 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
                 <div style="font-size:20px;font-weight:700;color:{combined_color};">${dow_adjusted_usd:,.0f}</div>
                 <div style="font-size:10px;color:#888;">{shares_str}</div>
             </div>
+            <div style="font-size:18px;color:#555;align-self:center;">→</div>
+            <div>
+                <div style="font-size:10px;color:#aaa;">Est. Profit</div>
+                <div style="font-size:20px;font-weight:700;color:{'#00c853' if expected_dollar > 0 else '#ff1744'};">{expected_dollar_str}</div>
+                <div style="font-size:10px;color:#888;">{expected_pnl:+.2%} return</div>
+            </div>
         </div>
+        {price_targets_html}
         </div>""",
         unsafe_allow_html=True,
     )
@@ -2376,6 +2542,14 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
     """Render the live scanner panel: positions, alerts, trade history."""
     st.subheader("Live Scanner")
 
+    # Auto-refresh every 60s when positions are open for real-time stop/TP monitoring
+    if scanner.positions:
+        if AUTOREFRESH_AVAILABLE:
+            st_autorefresh(interval=60_000, key="scanner_position_monitor")
+            st.caption("🔄 Auto-checking stop/TP every 60s")
+        else:
+            st.info("Install streamlit-autorefresh for automatic 1-min stop/TP monitoring")
+
     col_cap, col_eq, col_unrealized = st.columns(3)
     unrealized = scanner.get_unrealized_pnl(current_price)
     col_cap.metric("Starting Capital", f"${scanner.config.initial_capital:,.0f}")
@@ -2388,27 +2562,37 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
                        key="surfer_kill_switch")
     scanner.config.kill_switch = kill
 
-    # Evaluate new signal and check exits on each analysis cycle
-    if run_analysis and current_tsla is not None and len(current_tsla) > 0:
-        bar = current_tsla.iloc[-1]
-        bar_high = float(bar.get('high', current_price))
-        bar_low = float(bar.get('low', current_price))
+    # --- Real-time exit monitoring (runs on EVERY render, not just analysis runs) ---
+    if current_tsla is not None and len(current_tsla) > 0:
+        # Get best available price — prefer Finnhub real-time over stale bar
+        rt_price = current_price
+        try:
+            _rt = _get_realtime_prices()
+            if _rt.get('TSLA'):
+                rt_price = float(_rt['TSLA'])
+        except Exception:
+            pass
 
-        # Check exits first (price may have hit stop/TP)
-        exit_alerts = scanner.check_exits(current_price, bar_high, bar_low)
-        for ea in exit_alerts:
-            color = "green" if ea.pnl >= 0 else "red"
-            st.markdown(
-                f'<div style="background:{"#1a3320" if ea.pnl>=0 else "#331a1a"};'
-                f'padding:8px;border-radius:6px;margin:4px 0;">'
-                f'<b style="color:{"#00e676" if ea.pnl>=0 else "#ff5252"}">CLOSED [{ea.pos_id}]</b> '
-                f'P&amp;L: <b>${ea.pnl:+,.0f}</b> ({ea.pnl_pct:+.2%}) — {ea.exit_reason}'
-                f'</div>', unsafe_allow_html=True,
-            )
+        if run_analysis:
+            # Full OHLC bar: catches intrabar wicks
+            bar = current_tsla.iloc[-1]
+            bar_high = float(bar.get('high', rt_price))
+            bar_low = float(bar.get('low', rt_price))
+        else:
+            # Auto-refresh: use single-point current price
+            bar_high = rt_price
+            bar_low = rt_price
 
-        # Evaluate new entry signal
-        if sig.action != 'HOLD':
-            entry_alert = scanner.evaluate_signal(analysis, current_price)
+        # Check exits and fire audible+visual alert on hit
+        if scanner.positions:
+            exit_alerts = scanner.check_exits(rt_price, bar_high, bar_low)
+            for ea in exit_alerts:
+                _render_scanner_exit_alert(ea)
+                _play_exit_alert_sound(ea.exit_reason)
+
+        # Evaluate new entry signal (only on explicit analysis run)
+        if run_analysis and sig.action != 'HOLD':
+            entry_alert = scanner.evaluate_signal(analysis, rt_price)
             if entry_alert and entry_alert.alert_type == 'ENTRY':
                 action_color = "#00e676" if entry_alert.action == 'BUY' else "#ff5252"
                 st.markdown(
@@ -2425,19 +2609,26 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
             elif entry_alert and entry_alert.alert_type == 'RISK_WARNING':
                 st.warning(f"Scanner: {entry_alert.warning_msg}")
 
-    # Open positions
+    # Open positions — show distance to stop and TP
     if scanner.positions:
         st.markdown("**Open Positions**")
         for pos in scanner.positions.values():
             if pos.direction == 'long':
                 upnl = (current_price - pos.entry_price) * pos.shares
+                dist_stop = (current_price - pos.stop_price) / current_price
+                dist_tp = (pos.tp_price - current_price) / current_price
             else:
                 upnl = (pos.entry_price - current_price) * pos.shares
+                dist_stop = (pos.stop_price - current_price) / current_price
+                dist_tp = (current_price - pos.tp_price) / current_price
             upnl_color = "#00e676" if upnl >= 0 else "#ff5252"
+            stop_color = '#ff5252' if dist_stop < 0.003 else ('#ff9800' if dist_stop < 0.01 else '#888')
             st.markdown(
                 f'<div style="background:#1a2233;padding:8px;border-radius:6px;margin:3px 0;">'
                 f'[{pos.pos_id}] <b>{pos.direction.upper()}</b> {pos.shares}sh '
-                f'@ ${pos.entry_price:.2f} | Stop: ${pos.stop_price:.2f} | TP: ${pos.tp_price:.2f} | '
+                f'@ ${pos.entry_price:.2f} | '
+                f'<span style="color:{stop_color}">SL: ${pos.stop_price:.2f} ({dist_stop:.1%} away)</span> | '
+                f'TP: ${pos.tp_price:.2f} ({dist_tp:.1%} away) | '
                 f'Unrealized: <b style="color:{upnl_color}">${upnl:+,.0f}</b>'
                 f'</div>', unsafe_allow_html=True,
             )
@@ -2540,6 +2731,26 @@ def show_channel_surfer_tab(
 
     # --- Section 1: Signal Banner ---
     current_price = float(current_tsla['close'].iloc[-1]) if current_tsla is not None and len(current_tsla) > 0 else 0.0
+
+    # Override with Finnhub real-time price if available (5-min bar may be stale over weekends/gaps)
+    try:
+        _rt_prices = _get_realtime_prices()
+        _rt_tsla = _rt_prices.get('TSLA')
+        if _rt_tsla and _rt_tsla > 0:
+            current_price = float(_rt_tsla)
+            _price_source = "Finnhub"
+        else:
+            _price_source = "bar close"
+    except Exception:
+        _price_source = "bar close"
+
+    # Current price display
+    if current_price > 0:
+        prev_price = float(current_tsla['close'].iloc[-2]) if current_tsla is not None and len(current_tsla) > 1 else current_price
+        price_delta = current_price - prev_price
+        st.metric("TSLA", f"${current_price:.2f}", delta=f"{price_delta:+.2f} ({price_delta/prev_price*100:+.2f}%)",
+                  help=f"Source: {_price_source}")
+
     _render_signal_banner(sig, current_price=current_price)
 
     # --- ML Signal Quality Panel ---

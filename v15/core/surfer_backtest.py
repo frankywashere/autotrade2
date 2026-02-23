@@ -5889,7 +5889,7 @@ def run_backtest(
                                 trade_size *= 1.15
                                 ml_stats.setdefault('tod_6am_boost', 0)
                                 ml_stats['tod_6am_boost'] += 1
-                            elif _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative
+                            elif _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative (Arch411 +1.10x tested — zero effect, too few trades)
                                 trade_size *= 1.05
                                 ml_stats.setdefault('tod_7am_boost', 0)
                                 ml_stats['tod_7am_boost'] += 1
@@ -5897,20 +5897,20 @@ def run_backtest(
                                 trade_size *= 1.50
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
-                            elif _tod_h == 14:  # 9am ET: WR=100%, 115 trades/yr, 1.30x (Arch403: up from 1.25x, ultra-reliable)
-                                trade_size *= 1.30
+                            elif _tod_h == 14:  # 9am ET: WR=100%, 115 trades/yr, 1.40x (Arch410: settled; ×1.45 Arch412 tested +$4K mixed, 2024 -$2.7K, reverted)
+                                trade_size *= 1.40
                                 ml_stats.setdefault('tod_9am_boost', 0)
                                 ml_stats['tod_9am_boost'] += 1
-                            elif _tod_h == 15:  # 10am ET: WR=100%, 83 trades/yr, 1.30x (Arch403: up from 1.25x, matches 9am tier)
-                                trade_size *= 1.30
+                            elif _tod_h == 15:  # 10am ET: WR=100%, 83 trades/yr, 1.40x (Arch410: settled; ×1.45 mixed results)
+                                trade_size *= 1.40
                                 ml_stats.setdefault('tod_10am_boost', 0)
                                 ml_stats['tod_10am_boost'] += 1
-                            elif _tod_h == 16:  # 11am ET: $391/trade avg, WR=99%, 80 trades/yr, 1.30x (Arch404: up from 1.25x, match 9am/10am tier)
-                                trade_size *= 1.30
+                            elif _tod_h == 16:  # 11am ET: $391/trade avg, WR=99%, 80 trades/yr, 1.40x (Arch410: settled; ×1.45 mixed results)
+                                trade_size *= 1.40
                                 ml_stats.setdefault('tod_11am_boost', 0)
                                 ml_stats['tod_11am_boost'] += 1
-                            elif _tod_h == 17:  # 12pm ET: $488/trade avg, WR=96%, 69 trades/yr, 1.30x (Arch404: up from 1.25x, match 11am tier)
-                                trade_size *= 1.30
+                            elif _tod_h == 17:  # 12pm ET: $488/trade avg, WR=96%, 69 trades/yr, 1.40x (Arch410: settled; ×1.45 mixed results)
+                                trade_size *= 1.40
                                 ml_stats.setdefault('tod_noon_boost', 0)
                                 ml_stats['tod_noon_boost'] += 1
                             elif _tod_h == 18:  # 1pm ET: $843/trade avg, WR=99%, 94 trades/yr, 1.50x (Arch401: up from 1.40x, 2nd best hour)
@@ -5921,12 +5921,12 @@ def run_backtest(
                                 trade_size *= 1.50
                                 ml_stats.setdefault('tod_2pm_boost', 0)
                                 ml_stats['tod_2pm_boost'] += 1
-                            elif _tod_h == 20:  # 3pm ET: $340/trade avg, WR=92%, 61 trades/yr, 1.25x (Arch407: up from 1.20x)
-                                trade_size *= 1.25
+                            elif _tod_h == 20:  # 3pm ET: $340/trade avg, WR=92%, 61 trades/yr, 1.20x (×1.25 Arch413 tested -$1.8K 3yr; settled)
+                                trade_size *= 1.20
                                 ml_stats.setdefault('tod_3pm_boost', 0)
                                 ml_stats['tod_3pm_boost'] += 1
-                            elif _tod_h == 21:  # 4pm ET: $388/trade avg, WR=92%, 49 trades/yr, 1.25x (Arch407: up from 1.20x)
-                                trade_size *= 1.25
+                            elif _tod_h == 21:  # 4pm ET: $388/trade avg, WR=92%, 49 trades/yr, 1.20x (settled; afternoon hours capped)
+                                trade_size *= 1.20
                                 ml_stats.setdefault('tod_4pm_boost', 0)
                                 ml_stats['tod_4pm_boost'] += 1
 
@@ -5966,20 +5966,20 @@ def run_backtest(
                                 trade_size *= 1.45
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
-                            elif _dow == 0:  # Monday: 1.25x (Arch406: up from 1.20x, uniform non-Thu upgrade)
-                                trade_size *= 1.25
+                            elif _dow == 0:  # Monday: 1.35x (Arch415: up from 1.30x, uniform non-Thu upgrade)
+                                trade_size *= 1.35
                                 ml_stats.setdefault('dow_mon_boost', 0)
                                 ml_stats['dow_mon_boost'] += 1
-                            elif _dow == 1:  # Tuesday: 1.25x (Arch406: up from 1.20x, uniform non-Thu upgrade)
-                                trade_size *= 1.25
+                            elif _dow == 1:  # Tuesday: 1.35x (Arch415: up from 1.30x, uniform non-Thu upgrade)
+                                trade_size *= 1.35
                                 ml_stats.setdefault('dow_tue_boost', 0)
                                 ml_stats['dow_tue_boost'] += 1
-                            elif _dow == 2:  # Wednesday: 1.25x (Arch406: up from 1.20x, uniform non-Thu upgrade)
-                                trade_size *= 1.25
+                            elif _dow == 2:  # Wednesday: 1.35x (Arch415: up from 1.30x, uniform non-Thu upgrade)
+                                trade_size *= 1.35
                                 ml_stats.setdefault('dow_wed_boost', 0)
                                 ml_stats['dow_wed_boost'] += 1
-                            elif _dow == 4:  # Friday: 1.25x (Arch406: up from 1.20x, uniform non-Thu upgrade)
-                                trade_size *= 1.25
+                            elif _dow == 4:  # Friday: 1.35x (Arch415: up from 1.30x, uniform non-Thu upgrade)
+                                trade_size *= 1.35
                                 ml_stats.setdefault('dow_fri_boost', 0)
                                 ml_stats['dow_fri_boost'] += 1
 
