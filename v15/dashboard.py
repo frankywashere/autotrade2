@@ -1828,10 +1828,24 @@ def _render_scanner_exit_alert(ea) -> None:
 def _show_surfer_chart(tsla_df, analysis):
     """Show interactive 5min candlestick chart with channel overlay and signal markers."""
     from v15.core.channel import detect_channels_multi_window, select_best_channel
+    import pytz
 
-    # Show last 200 bars of 5min data
-    n_bars = min(200, len(tsla_df))
-    df_chart = tsla_df.tail(n_bars).copy()
+    # Filter to today's trading session only; fall back to most recent trading day
+    try:
+        et_tz = pytz.timezone('America/New_York')
+        if tsla_df.index.tz is not None:
+            dates_et = tsla_df.index.tz_convert(et_tz).date
+        else:
+            dates_et = tsla_df.index.date
+        today_et = pd.Timestamp.now(tz=et_tz).date()
+        df_today = tsla_df[dates_et == today_et]
+        # If fewer than 5 bars today (market closed / weekend), use most recent trading day
+        if len(df_today) < 5 and len(tsla_df) > 0:
+            most_recent = dates_et[-1]
+            df_today = tsla_df[dates_et == most_recent]
+        df_chart = df_today.copy() if len(df_today) > 0 else tsla_df.tail(100).copy()
+    except Exception:
+        df_chart = tsla_df.tail(100).copy()
 
     # Detect the 5min channel
     windows = [10, 15, 20, 30, 40]
