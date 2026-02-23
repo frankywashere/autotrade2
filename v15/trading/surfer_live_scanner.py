@@ -2,10 +2,12 @@
 Surfer Live Scanner — Channel Surfer signal evaluation + position tracking.
 
 No auto-trading. No broker integration. Dashboard notifications only.
-Persistence via JSON at ~/.x14/surfer_scanner_state.json.
+Persistence via JSON at ~/.x14/surfer_scanner_state.json (local)
+or GitHub Gist (when GIST_ID + GITHUB_TOKEN are provided, e.g. Streamlit Cloud).
 """
 
 import json
+import urllib.request
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
@@ -14,6 +16,7 @@ from typing import Dict, List, Optional
 
 STATE_PATH = Path.home() / ".x14" / "surfer_scanner_state.json"
 MAX_SIGNAL_HISTORY = 200
+GIST_FILE_NAME = 'surfer_scanner_state.json'
 
 # Slippage + commission assumptions
 SLIPPAGE_PCT = 0.0005     # 0.05% slippage per side
@@ -121,8 +124,10 @@ class SurferLiveScanner:
     TRAILING_STOP_PCT = 0.015   # 1.5% trailing from best price
     TIMEOUT_MINUTES = 300       # 5 hours
 
-    def __init__(self, config: ScannerConfig):
+    def __init__(self, config: ScannerConfig, gist_id: str = '', github_token: str = ''):
         self.config = config
+        self.gist_id = gist_id.strip()
+        self.github_token = github_token.strip()
         self.equity = config.initial_capital
         self.positions: Dict[str, HypotheticalPosition] = {}
         self.closed_trades: List[ClosedTrade] = []
@@ -136,29 +141,75 @@ class SurferLiveScanner:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _load_state(self):
-        if not STATE_PATH.exists():
+    def _gist_headers(self) -> dict:
+        return {
+            'Authorization': f'token {self.github_token}',
+            'Accept': 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json',
+        }
+
+    def _gist_load(self) -> Optional[dict]:
+        """Load state from GitHub Gist. Returns parsed dict or None on failure."""
+        if not self.gist_id or not self.github_token:
+            return None
+        try:
+            url = f'https://api.github.com/gists/{self.gist_id}'
+            req = urllib.request.Request(url, headers=self._gist_headers())
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                gist_data = json.loads(resp.read().decode())
+            content = gist_data.get('files', {}).get(GIST_FILE_NAME, {}).get('content', '')
+            return json.loads(content) if content else None
+        except Exception as e:
+            print(f"[SCANNER] Gist load failed: {e}")
+            return None
+
+    def _gist_save(self, data: dict):
+        """Push state to GitHub Gist (non-blocking best-effort)."""
+        if not self.gist_id or not self.github_token:
             return
         try:
-            data = json.loads(STATE_PATH.read_text())
-            self.equity = data.get('equity', self.equity)
-            self.daily_pnl = data.get('daily_pnl', 0.0)
-            self.daily_trade_count = data.get('daily_trade_count', 0)
-            self._daily_date = data.get('daily_date', '')
-            self.positions = {
-                k: HypotheticalPosition.from_dict(v)
-                for k, v in data.get('positions', {}).items()
-            }
-            self.closed_trades = [
-                ClosedTrade.from_dict(t)
-                for t in data.get('closed_trades', [])
-            ]
-            self.signal_history = data.get('signal_history', [])
+            url = f'https://api.github.com/gists/{self.gist_id}'
+            payload = json.dumps({
+                'files': {GIST_FILE_NAME: {'content': json.dumps(data, indent=2)}}
+            }).encode()
+            req = urllib.request.Request(
+                url, data=payload, headers=self._gist_headers(), method='PATCH'
+            )
+            with urllib.request.urlopen(req, timeout=8):
+                pass
         except Exception as e:
-            print(f"[SCANNER] Failed to load state: {e}")
+            print(f"[SCANNER] Gist save failed: {e}")
+
+    def _apply_state(self, data: dict):
+        self.equity = data.get('equity', self.equity)
+        self.daily_pnl = data.get('daily_pnl', 0.0)
+        self.daily_trade_count = data.get('daily_trade_count', 0)
+        self._daily_date = data.get('daily_date', '')
+        self.positions = {
+            k: HypotheticalPosition.from_dict(v)
+            for k, v in data.get('positions', {}).items()
+        }
+        self.closed_trades = [
+            ClosedTrade.from_dict(t)
+            for t in data.get('closed_trades', [])
+        ]
+        self.signal_history = data.get('signal_history', [])
+
+    def _load_state(self):
+        # Try Gist first (authoritative on Streamlit Cloud), fall back to local
+        data = self._gist_load()
+        if data is None and STATE_PATH.exists():
+            try:
+                data = json.loads(STATE_PATH.read_text())
+            except Exception as e:
+                print(f"[SCANNER] Failed to load local state: {e}")
+        if data:
+            try:
+                self._apply_state(data)
+            except Exception as e:
+                print(f"[SCANNER] Failed to apply state: {e}")
 
     def _save_state(self):
-        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         data = {
             'equity': self.equity,
             'daily_pnl': self.daily_pnl,
@@ -168,7 +219,14 @@ class SurferLiveScanner:
             'closed_trades': [t.to_dict() for t in self.closed_trades[-200:]],
             'signal_history': self.signal_history[-MAX_SIGNAL_HISTORY:],
         }
-        STATE_PATH.write_text(json.dumps(data, indent=2))
+        # Always save locally
+        try:
+            STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            STATE_PATH.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            print(f"[SCANNER] Local save failed: {e}")
+        # Also push to Gist if configured
+        self._gist_save(data)
 
     def _reset_daily_if_needed(self):
         today = datetime.now().strftime('%Y-%m-%d')
