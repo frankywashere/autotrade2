@@ -5817,6 +5817,12 @@ def run_backtest(
                     # the true binding limit on total bounce exposure (not max_leverage above).
                     # Validated 11/11 years 2015-2025: cap=4x ($50M), cap=8x ($104B), cap=12x ($5T)
                     # cap=20x fails 2020 with MemoryError; cap=97x (prev) failed 7/11 years.
+                    #
+                    # USD cap sweep (bounce_cap=8x, Arch 375): all 11/11 profitable at every cap
+                    #   $250K/trade: Sharpe 3.39, avg $226K/yr   | $500K: Sharpe 2.95, avg $363K/yr
+                    #   $1M/trade:  Sharpe 2.32, avg $649K/yr    | $2M:   Sharpe 2.13, avg $1.28M/yr
+                    #   $5M/trade:  Sharpe 1.75, avg $2.86M/yr   | unlim: Sharpe 0.36 (2020/2022 OOM)
+                    # Higher cap → more raw P&L but lower Sharpe (volatile outlier years dominate)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
                         _cap_base = bounce_cap if sig.signal_type == "bounce" else 4.0
