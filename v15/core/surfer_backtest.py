@@ -5854,41 +5854,46 @@ def run_backtest(
                         #           UTC20 (3pm ET) added — 8yr avg $310/trade, min $129 (all positive)
                         # Mid-morning: continuation momentum; noon: lunchtime reversal setups; 3pm: close setup
                         # Arch 380: UTC12 (7am ET) added — 7/8yr positive, avg $263/trade (2016 flat +$5), 1.05x conservative
+                        # Arch 382: Reorder TOD multipliers to match avg P&L performance ranking:
+                        #   Tier 1 (×1.30): UTC13=8amET $511, UTC18=1pmET $595
+                        #   Tier 2 (×1.25): UTC19=2pmET $429 (up from 1.20x), UTC16=11amET $391 (up from 1.15x)
+                        #   Tier 3 (×1.20): UTC14=9amET $350 (down from 1.25x), UTC15=10amET $373 avg
+                        #   Tier 4 (×1.15): UTC17=12pmET $332, UTC20=3pmET $310
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
                             if _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative
                                 trade_size *= 1.05
                                 ml_stats.setdefault('tod_7am_boost', 0)
                                 ml_stats['tod_7am_boost'] += 1
-                            elif _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.30x
+                            elif _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.30x tier-1
                                 trade_size *= 1.30
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
-                            elif _tod_h == 14:  # 9am ET: $350/trade avg, 1.25x
-                                trade_size *= 1.25
+                            elif _tod_h == 14:  # 9am ET: $350/trade avg, 1.20x tier-3 (Arch382: down from 1.25x)
+                                trade_size *= 1.20
                                 ml_stats.setdefault('tod_9am_boost', 0)
                                 ml_stats['tod_9am_boost'] += 1
-                            elif _tod_h == 15:  # 10am ET: $454/trade avg (2015), 1.20x
+                            elif _tod_h == 15:  # 10am ET: $373/trade avg (2015+2025), 1.20x tier-3
                                 trade_size *= 1.20
                                 ml_stats.setdefault('tod_10am_boost', 0)
                                 ml_stats['tod_10am_boost'] += 1
-                            elif _tod_h == 16:  # 11am ET: $391/trade avg (8yr), 1.15x
-                                trade_size *= 1.15
+                            elif _tod_h == 16:  # 11am ET: $391/trade avg (8yr), 1.25x tier-2 (Arch382: up from 1.15x)
+                                trade_size *= 1.25
                                 ml_stats.setdefault('tod_11am_boost', 0)
                                 ml_stats['tod_11am_boost'] += 1
-                            elif _tod_h == 17:  # 12pm ET: $332/trade avg (8yr), 1.15x
+                            elif _tod_h == 17:  # 12pm ET: $332/trade avg (8yr), 1.15x tier-4
                                 trade_size *= 1.15
                                 ml_stats.setdefault('tod_noon_boost', 0)
                                 ml_stats['tod_noon_boost'] += 1
-                            elif _tod_h == 18:  # 1pm ET: $595/trade avg (2025), 1.30x
+                            elif _tod_h == 18:  # 1pm ET: $595/trade avg (2025), 1.30x tier-1
                                 trade_size *= 1.30
                                 ml_stats.setdefault('tod_pm_boost', 0)
                                 ml_stats['tod_pm_boost'] += 1
-                            elif _tod_h == 19:  # 2pm ET: $429/trade avg (2025), 1.20x
-                                trade_size *= 1.20
+                            elif _tod_h == 19:  # 2pm ET: $429/trade avg (2025), 1.25x tier-2 (Arch382: up from 1.20x)
+                                trade_size *= 1.25
                                 ml_stats.setdefault('tod_2pm_boost', 0)
                                 ml_stats['tod_2pm_boost'] += 1
-                            elif _tod_h == 20:  # 3pm ET: $310/trade avg (8yr), 1.15x
+                            elif _tod_h == 20:  # 3pm ET: $310/trade avg (8yr), 1.15x tier-4
                                 trade_size *= 1.15
                                 ml_stats.setdefault('tod_3pm_boost', 0)
                                 ml_stats['tod_3pm_boost'] += 1
@@ -5896,13 +5901,14 @@ def run_backtest(
                         # Arch 380: Thursday DOW boost for bounces (independent of TOD, compounds)
                         # Thu avg: $451/trade (2015), $464/trade (2025) vs $278/$325 overall — +40%
                         # Effect: consistent economic data release day + end-of-week positioning
-                        # Applied AFTER TOD — a Thu 8am ET bounce gets 1.30x × 1.20x = 1.56x
+                        # Applied AFTER TOD — a Thu 8am ET bounce gets 1.30x × 1.25x = 1.625x
                         # Arch 381: Tue/Wed moderate DOW boost (consistent above-Monday performance)
                         # Tue avg: $250-$282/trade; Wed avg: $267-$268/trade (above Mon $225-$263)
+                        # Arch 382: Thu upgraded 1.20x → 1.25x (natural $490/trade justifies top-tier DOW boost)
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
-                            if _dow == 3:  # Thursday: 1.20x
-                                trade_size *= 1.20
+                            if _dow == 3:  # Thursday: 1.25x (Arch382: upgraded from 1.20x)
+                                trade_size *= 1.25
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
                             elif _dow == 1:  # Tuesday: 1.08x
