@@ -2110,6 +2110,8 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
         st.session_state['_sq_log'] = log
         for line in log:
             print(f"[SQ] {line}")
+        load_info = '\n'.join(st.session_state.get('_sq_load_log', ['(no load log)']))
+        st.warning(f"ML Signal Quality: model not loaded.\n{load_info}")
         return
 
     # Log the incoming signal
@@ -2228,6 +2230,14 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
         q_color = '#ff9800'
     else:
         q_color = '#ff1744'
+
+    # Plain-text summary line (always visible regardless of HTML rendering)
+    action_icon = '🟢' if sig.action == 'BUY' else '🔴'
+    st.caption(
+        f"**ML Quality** {action_icon} {sig.action} | Win: {win_prob:.0%} | "
+        f"E.PnL: {expected_pnl:+.2%} | Score: {quality_score:.0f}/100 | "
+        f"Size: {size_mult:.1f}x {size_label} | TOD: {tod_mult:.2f}x | DOW: {dow_mult:.2f}x"
+    )
 
     st.markdown(
         f"""<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);
