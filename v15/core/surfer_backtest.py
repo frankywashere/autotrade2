@@ -5849,6 +5849,10 @@ def run_backtest(
                         # Arch 378: UTC15 (10am ET) added — 2015 $454/trade, 2025 $292/trade, 84-104 trades/yr
                         #           UTC19 (2pm ET) added — 2015 $280/trade, 2025 $429/trade, 93-104 trades/yr
                         # 9am-10am: open institutional flow; 2pm: post-lunch VWAP algo activity
+                        # Arch 379: UTC16 (11am ET) added — 8yr avg $391/trade, min $214 (all positive)
+                        #           UTC17 (12pm ET) added — 8yr avg $332/trade, min $164 (all positive)
+                        #           UTC20 (3pm ET) added — 8yr avg $310/trade, min $129 (all positive)
+                        # Mid-morning: continuation momentum; noon: lunchtime reversal setups; 3pm: close setup
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
                             if _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.30x
@@ -5863,6 +5867,14 @@ def run_backtest(
                                 trade_size *= 1.20
                                 ml_stats.setdefault('tod_10am_boost', 0)
                                 ml_stats['tod_10am_boost'] += 1
+                            elif _tod_h == 16:  # 11am ET: $391/trade avg (8yr), 1.15x
+                                trade_size *= 1.15
+                                ml_stats.setdefault('tod_11am_boost', 0)
+                                ml_stats['tod_11am_boost'] += 1
+                            elif _tod_h == 17:  # 12pm ET: $332/trade avg (8yr), 1.15x
+                                trade_size *= 1.15
+                                ml_stats.setdefault('tod_noon_boost', 0)
+                                ml_stats['tod_noon_boost'] += 1
                             elif _tod_h == 18:  # 1pm ET: $595/trade avg (2025), 1.30x
                                 trade_size *= 1.30
                                 ml_stats.setdefault('tod_pm_boost', 0)
@@ -5871,6 +5883,10 @@ def run_backtest(
                                 trade_size *= 1.20
                                 ml_stats.setdefault('tod_2pm_boost', 0)
                                 ml_stats['tod_2pm_boost'] += 1
+                            elif _tod_h == 20:  # 3pm ET: $310/trade avg (8yr), 1.15x
+                                trade_size *= 1.15
+                                ml_stats.setdefault('tod_3pm_boost', 0)
+                                ml_stats['tod_3pm_boost'] += 1
 
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
