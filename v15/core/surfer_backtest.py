@@ -5905,12 +5905,18 @@ def run_backtest(
                         # Arch 381: Tue/Wed moderate DOW boost (consistent above-Monday performance)
                         # Tue avg: $250-$282/trade; Wed avg: $267-$268/trade (above Mon $225-$263)
                         # Arch 382: Thu upgraded 1.20x → 1.25x (natural $490/trade justifies top-tier DOW boost)
+                        # Arch 383: Monday 1.05x (natural $283/trade > overall avg $260; Mon gap-fills
+                        #   from weekend news provide consistent directional context for bounce entries)
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
                             if _dow == 3:  # Thursday: 1.25x (Arch382: upgraded from 1.20x)
                                 trade_size *= 1.25
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
+                            elif _dow == 0:  # Monday: 1.05x (Arch383: natural $283 > avg $260)
+                                trade_size *= 1.05
+                                ml_stats.setdefault('dow_mon_boost', 0)
+                                ml_stats['dow_mon_boost'] += 1
                             elif _dow == 1:  # Tuesday: 1.08x
                                 trade_size *= 1.08
                                 ml_stats.setdefault('dow_tue_boost', 0)
