@@ -3231,8 +3231,8 @@ def main():
     if is_live:
         st.session_state['last_update'] = datetime.now()
 
-    # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    # Tab navigation — stored in session_state so it survives auto-refresh reruns
+    _TAB_NAMES = [
         "Live Prediction",
         "Channel Visualization",
         "Window Selection",
@@ -3241,7 +3241,19 @@ def main():
         "Data Explorer",
         "Trading Monitor",
         "Channel Surfer",
-    ])
+    ]
+    if 'active_tab' not in st.session_state:
+        st.session_state['active_tab'] = _TAB_NAMES[0]
+    selected_tab = st.radio(
+        "Navigation",
+        _TAB_NAMES,
+        index=_TAB_NAMES.index(st.session_state.get('active_tab', _TAB_NAMES[0])),
+        horizontal=True,
+        label_visibility='collapsed',
+        key='main_tab_selector',
+    )
+    st.session_state['active_tab'] = selected_tab
+    st.divider()
 
     # Validate native TF data completeness (shared across tabs)
     missing_tfs = []
@@ -3256,7 +3268,7 @@ def main():
                 if tf_df is None or len(tf_df) < 10:
                     missing_tfs.append(f"{sym} {tf}")
 
-    with tab1:
+    if selected_tab == "Live Prediction":
         st.header("Live Prediction")
 
         # Show data status
@@ -3618,7 +3630,7 @@ def main():
                         st.error(f"Prediction failed: {e}")
                         logger.exception("Prediction error")
 
-    with tab2:
+    if selected_tab == "Channel Visualization":
         # Channel Visualization tab
         prediction = st.session_state.get('last_prediction')
         pred_data = st.session_state.get('prediction_data')
@@ -3630,7 +3642,7 @@ def main():
         else:
             show_channel_visualization_tab(current_tsla, None, native_bars_by_tf=native_tf)
 
-    with tab3:
+    if selected_tab == "Window Selection":
         st.header("Window Selection Analysis")
 
         st.markdown("""
@@ -3748,7 +3760,7 @@ def main():
         else:
             st.info("Click 'Analyze Windows' to run the window selection analysis")
 
-    with tab4:
+    if selected_tab == "Feature Analysis":
         st.header("Feature Analysis")
 
         if predictor is not None:
@@ -3757,7 +3769,7 @@ def main():
         else:
             st.info("Load a model to see feature importance")
 
-    with tab5:
+    if selected_tab == "Model Info":
         st.header("Model Information")
 
         if predictor is not None:
@@ -3828,7 +3840,7 @@ def main():
         else:
             st.info("Load a model to see information")
 
-    with tab6:
+    if selected_tab == "Data Explorer":
         st.header("Data Explorer")
 
         # Show data status
@@ -3848,7 +3860,7 @@ def main():
         else:
             st.info("No TSLA data available")
 
-    with tab7:
+    if selected_tab == "Trading Monitor":
         show_trading_monitor_tab(
             predictor=predictor,
             current_tsla=current_tsla,
@@ -3860,7 +3872,7 @@ def main():
             missing_tfs=missing_tfs,
         )
 
-    with tab8:
+    if selected_tab == "Channel Surfer":
         show_channel_surfer_tab(
             current_tsla=current_tsla,
             native_tf_data=native_tf_data,
