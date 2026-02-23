@@ -94,8 +94,8 @@ def main():
     parser.add_argument('--capital', type=float, default=100_000.0)
     parser.add_argument('--bounce-cap', type=float, default=12.0,
                         help='Max exposure cap multiplier for bounce signals (default: 12.0, Arch384)')
-    parser.add_argument('--max-trade-usd', type=float, default=500_000.0,
-                        help='Hard dollar cap per trade, 0=unlimited (default: 500000)')
+    parser.add_argument('--max-trade-usd', type=float, default=1_000_000.0,
+                        help='Hard dollar cap per trade, 0=unlimited (default: 1000000, Arch418)')
     args = parser.parse_args()
 
     # Parse year range
