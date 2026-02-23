@@ -165,6 +165,10 @@ def main():
     parser.add_argument('--output', type=str,
                         default='v15/validation/tuned_params.json',
                         help='Output path for best params JSON')
+    parser.add_argument('--bounce-cap', type=float, default=12.0,
+                        help='Max exposure cap multiplier for bounce signals (default: 12.0, c9/Arch418)')
+    parser.add_argument('--max-trade-usd', type=float, default=1_000_000.0,
+                        help='Hard dollar cap per trade (default: 1000000, Arch418)')
     args = parser.parse_args()
 
     # Parse year range
@@ -181,6 +185,8 @@ def main():
         eval_interval=args.eval_interval,
         min_confidence=args.min_confidence,
         capital=args.capital,
+        bounce_cap=args.bounce_cap,
+        max_trade_usd=args.max_trade_usd,
     )
 
     if len(snapshots) < 100:

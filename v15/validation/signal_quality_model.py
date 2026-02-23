@@ -155,10 +155,13 @@ def build_dataset(
     capital: float = 100_000.0,
     verbose: bool = True,
     extended_features: bool = True,
+    bounce_cap: float = 12.0,
+    max_trade_usd: float = 1_000_000.0,
 ) -> List[TradeSnapshot]:
     """
     Run year-by-year backtests with capture_features=True, no ML model.
     Returns list of TradeSnapshot with feature vectors and outcomes.
+    bounce_cap and max_trade_usd should match the arch being trained on.
     """
     from v15.core.historical_data import prepare_backtest_data, prepare_year_data
     from v15.core.surfer_backtest import run_backtest
@@ -220,6 +223,8 @@ def build_dataset(
             commission_per_share=0.005,
             max_leverage=4.0,
             initial_capital=capital,
+            bounce_cap=bounce_cap,
+            max_trade_usd=max_trade_usd,
             capture_features=True,
         )
 
@@ -673,6 +678,10 @@ def main():
                         help='Path to tuned_params.json from Optuna')
     parser.add_argument('--no-extended', action='store_true',
                         help='Disable extended features (use original 9 meta)')
+    parser.add_argument('--bounce-cap', type=float, default=12.0,
+                        help='Max exposure cap multiplier for bounce signals (default: 12.0, c9/Arch418)')
+    parser.add_argument('--max-trade-usd', type=float, default=1_000_000.0,
+                        help='Hard dollar cap per trade (default: 1000000, Arch418)')
     args = parser.parse_args()
 
     # Parse year range
@@ -707,6 +716,8 @@ def main():
         min_confidence=args.min_confidence,
         capital=args.capital,
         extended_features=extended,
+        bounce_cap=args.bounce_cap,
+        max_trade_usd=args.max_trade_usd,
     )
 
     if len(snapshots) < 100:

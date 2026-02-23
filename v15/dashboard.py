@@ -1625,6 +1625,78 @@ def _render_position_gauge(position_pct: float, width_px: int = 300) -> str:
     """
 
 
+def _render_market_insights(analysis) -> None:
+    """Render rules-based market insights derived from channel analysis fields.
+
+    Translates raw numeric fields (momentum_is_turning, position_pct, ou_half_life,
+    break_prob, channel_health) into plain-English observations. No LLM needed.
+    """
+    insights = []
+
+    tf_hours = {'5min': 1/12, '15min': 0.25, '30min': 0.5, '1h': 1, '2h': 2, '3h': 3,
+                '4h': 4, 'daily': 24, 'weekly': 168, 'monthly': 720}
+
+    for tf, state in analysis.tf_states.items():
+        if not state.valid:
+            continue
+        hrs = tf_hours.get(tf, 1)
+
+        # Momentum exhaustion / turning
+        if getattr(state, 'momentum_is_turning', False):
+            direction = 'sell-off' if getattr(state, 'momentum_direction', 0) < 0 else 'rally'
+            insights.append(('⚠️', tf, f'{tf} momentum turning — {direction} may be near exhaustion'))
+
+        # At channel boundary
+        pos = getattr(state, 'position_pct', 0.5)
+        if pos is not None:
+            pos_f = float(pos)
+            if pos_f <= 0.05:
+                hl = getattr(state, 'ou_half_life', None)
+                rs = getattr(state, 'ou_reversion_score', 0)
+                hl_str = f', bounce expected ~{hl * hrs:.0f}h' if hl is not None and rs > 0.2 else ''
+                insights.append(('📍', tf, f'{tf} price AT channel bottom (position={pos_f:.1%}){hl_str}'))
+            elif pos_f >= 0.95:
+                hl = getattr(state, 'ou_half_life', None)
+                rs = getattr(state, 'ou_reversion_score', 0)
+                hl_str = f', pullback expected ~{hl * hrs:.0f}h' if hl is not None and rs > 0.2 else ''
+                insights.append(('📍', tf, f'{tf} price AT channel top (position={pos_f:.1%}){hl_str}'))
+
+        # High break probability
+        bp_dn = getattr(state, 'break_prob_down', 0)
+        bp_up = getattr(state, 'break_prob_up', 0)
+        if float(bp_dn) > 0.55:
+            insights.append(('🔴', tf, f'{tf} high breakdown probability: {float(bp_dn):.0%}'))
+        elif float(bp_up) > 0.55:
+            insights.append(('🟢', tf, f'{tf} high breakout probability: {float(bp_up):.0%}'))
+
+        # Weak channel health
+        ch = getattr(state, 'channel_health', 1.0)
+        if float(ch) < 0.35:
+            insights.append(('🟡', tf, f'{tf} channel health weak ({float(ch):.2f}) — signal less reliable'))
+
+        # High total energy (channel about to break)
+        te = getattr(state, 'total_energy', 0)
+        be = getattr(state, 'binding_energy', 1)
+        if float(be) > 0 and float(te) / float(be) > 2.5:
+            insights.append(('⚡', tf, f'{tf} energy ratio {float(te)/float(be):.1f}x — channel under stress'))
+
+    # Confluence note
+    cf = getattr(analysis, 'confluence_matrix', {})
+    if cf:
+        all_agree = all(abs(v - list(cf.values())[0]) < 0.01 for v in cf.values())
+        if all_agree and len(cf) >= 3:
+            first_v = list(cf.values())[0]
+            direction = 'bearish' if getattr(analysis.signal, 'action', '') == 'SELL' else 'bullish'
+            insights.append(('✅', 'all TFs', f'All {len(cf)} timeframes in full consensus ({direction}) — high conviction signal'))
+
+    if not insights:
+        return
+
+    with st.expander('Market Insights', expanded=True):
+        for icon, tf, msg in insights:
+            st.markdown(f'{icon} {msg}')
+
+
 def _render_signal_banner(signal, current_price: float = 0.0) -> None:
     """Render a prominent BUY/SELL/HOLD banner with signal type indicator."""
     sig_type = getattr(signal, 'signal_type', 'bounce')
@@ -2141,13 +2213,13 @@ def _get_tod_dow_multipliers(signal_type: str = 'bounce'):
         20: (1.20, '3pm ET'),
         21: (1.20, '4pm ET'),
     }
-    # DOW table (weekday → multiplier, label) — keep in sync with surfer_backtest.py (Arch414)
+    # DOW table (weekday → multiplier, label) — keep in sync with surfer_backtest.py (Arch415)
     dow_table = {
-        0: (1.30, 'Monday'),
-        1: (1.30, 'Tuesday'),
-        2: (1.30, 'Wednesday'),
+        0: (1.35, 'Monday'),
+        1: (1.35, 'Tuesday'),
+        2: (1.35, 'Wednesday'),
         3: (1.45, 'Thursday ⭐'),
-        4: (1.30, 'Friday'),
+        4: (1.35, 'Friday'),
     }
     tod_mult, tod_label = tod_table.get(hour_utc, (1.0, f'UTC{hour_utc} (no boost)'))
     dow_mult, dow_label = dow_table.get(dow, (1.0, 'Weekend'))
@@ -2284,14 +2356,38 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
     sig_type = getattr(sig, 'signal_type', 'bounce')
     tod_mult, tod_label, dow_mult, dow_label = _get_tod_dow_multipliers(sig_type)
 
+    # Compute VIX regime boost (Arch417: VIX≥20 ×1.10, VIX≥30 ×1.25, bounces only)
+    vix_mult = 1.0
+    vix_label = 'N/A'
+    if sig_type == 'bounce' and vix_df is not None:
+        try:
+            import datetime as _dt2
+            _vix_ts = _dt2.datetime.now()
+            _vix_avail = vix_df[vix_df.index <= _vix_ts]
+            if len(_vix_avail) > 0:
+                _vix_val = float(_vix_avail['close'].iloc[-1])
+                if _vix_val >= 30:
+                    vix_mult = 1.25
+                    vix_label = f'VIX={_vix_val:.0f} (HIGH ×1.25)'
+                elif _vix_val >= 20:
+                    vix_mult = 1.10
+                    vix_label = f'VIX={_vix_val:.0f} (MID ×1.10)'
+                else:
+                    vix_label = f'VIX={_vix_val:.0f} (LOW, no boost)'
+        except Exception:
+            pass
+    elif sig_type != 'bounce':
+        vix_label = 'N/A (not bounce)'
+
     # Log prediction results
     _sq_size = ('FULL+' if quality_score >= 80 else 'FULL' if quality_score >= 60
                 else 'REDUCED' if quality_score >= 40 else 'MINIMAL')
     _sq_mult = 1.3 if quality_score >= 80 else 1.0 if quality_score >= 60 else 0.7 if quality_score >= 40 else 0.4
-    combined_mult = _sq_mult * tod_mult * dow_mult
+    combined_mult = _sq_mult * tod_mult * dow_mult * vix_mult
     log.append(f"Result: win={win_prob:.0%} pnl={expected_pnl:+.2%} quality={quality_score:.0f} "
                f"risk={risk_rating} → ML={_sq_mult:.2f}x × TOD={tod_mult:.2f}x ({tod_label}) "
-               f"× DOW={dow_mult:.2f}x ({dow_label}) = {combined_mult:.2f}x combined")
+               f"× DOW={dow_mult:.2f}x ({dow_label}) × VIX={vix_mult:.2f}x ({vix_label}) "
+               f"= {combined_mult:.2f}x combined")
     st.session_state['_sq_log'] = log
     # Print to terminal
     for line in log:
@@ -2330,18 +2426,19 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
     # Pre-compute dollar estimate for caption (full sizing block computed below)
     _base_cap_preview = st.session_state.get('backtest_capital', 100_000.0)
     _base_trade_preview = _base_cap_preview / 10.0
-    _ml_adj = min(_base_trade_preview * size_mult, 500_000.0)
-    _tod_adj = min(_ml_adj * tod_mult, 500_000.0)
-    _dow_adj = min(_tod_adj * dow_mult, 500_000.0)
+    _ml_adj = min(_base_trade_preview * size_mult, 1_000_000.0)
+    _tod_adj = min(_ml_adj * tod_mult, 1_000_000.0)
+    _dow_adj = min(_tod_adj * dow_mult * vix_mult, 1_000_000.0)
     _exp_dollar_preview = expected_pnl * _dow_adj
 
     # Plain-text summary line (always visible regardless of HTML rendering)
     action_icon = '🟢' if sig.action == 'BUY' else '🔴'
+    vix_str = f" | VIX: {vix_mult:.2f}x" if vix_mult != 1.0 else ""
     st.caption(
         f"**ML Quality** {action_icon} {sig.action} | Win: {win_prob:.0%} | "
         f"E.PnL: {expected_pnl:+.2%} | Score: {quality_score:.0f}/100 | "
-        f"Size: {size_mult:.1f}x {size_label} | TOD: {tod_mult:.2f}x | DOW: {dow_mult:.2f}x | "
-        f"**Est. $: ${_exp_dollar_preview:+,.0f} on ${_dow_adj:,.0f} trade**"
+        f"Size: {size_mult:.1f}x {size_label} | TOD: {tod_mult:.2f}x | DOW: {dow_mult:.2f}x{vix_str} | "
+        f"**Combined: {combined_mult:.2f}x | Est. $: ${_exp_dollar_preview:+,.0f} on ${_dow_adj:,.0f} trade**"
     )
 
     st.markdown(
@@ -2381,15 +2478,15 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
         unsafe_allow_html=True,
     )
 
-    # Position Sizing Breakdown panel (TOD + DOW + ML combined)
+    # Position Sizing Breakdown panel (TOD + DOW + VIX + ML combined, Arch418)
     base_capital = st.session_state.get('backtest_capital', 100_000.0)
     base_trade_usd = base_capital / 10.0  # Standard: capital/10
-    max_trade_usd = 500_000.0
+    max_trade_usd = 1_000_000.0  # Arch418: $1M cap
     # After bounce_cap (12x), base could range up to 12x. Use base_trade_usd as floor.
-    # TOD/DOW applied post-cap, so multiply against max_trade_usd for worst case
+    # TOD/DOW/VIX applied post-cap, so multiply against max_trade_usd for worst case
     ml_adjusted_usd = min(base_trade_usd * _sq_mult, max_trade_usd)
     tod_adjusted_usd = min(ml_adjusted_usd * tod_mult, max_trade_usd)
-    dow_adjusted_usd = min(tod_adjusted_usd * dow_mult, max_trade_usd)
+    dow_adjusted_usd = min(tod_adjusted_usd * dow_mult * vix_mult, max_trade_usd)
     # Get current TSLA price for share count estimate (prefer Finnhub real-time over stale bar)
     tsla_price = None
     if current_tsla is not None and len(current_tsla) > 0:
@@ -2450,6 +2547,7 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
 
     tod_color = '#00c853' if tod_mult >= 1.40 else '#ff9800' if tod_mult >= 1.20 else '#888'
     dow_color = '#00c853' if dow_mult >= 1.40 else '#ff9800' if dow_mult >= 1.20 else '#888'
+    vix_color = '#00c853' if vix_mult >= 1.20 else '#ff9800' if vix_mult > 1.0 else '#888'
     combined_color = '#00c853' if combined_mult >= 1.5 else '#ff9800' if combined_mult >= 1.2 else '#888'
     shares_str = f"~{est_shares:,} shares @ ${tsla_price:.0f}" if est_shares else "N/A"
 
@@ -2481,6 +2579,12 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
                 <div style="font-size:10px;color:#aaa;">DOW Boost</div>
                 <div style="font-size:20px;font-weight:600;color:{dow_color};">{dow_mult:.2f}x</div>
                 <div style="font-size:10px;color:#666;">{dow_label}</div>
+            </div>
+            <div style="font-size:18px;color:#555;align-self:center;">×</div>
+            <div>
+                <div style="font-size:10px;color:#aaa;">VIX Boost</div>
+                <div style="font-size:20px;font-weight:600;color:{vix_color};">{vix_mult:.2f}x</div>
+                <div style="font-size:10px;color:#666;">{vix_label}</div>
             </div>
             <div style="font-size:18px;color:#555;align-self:center;">=</div>
             <div>
@@ -2763,6 +2867,12 @@ def show_channel_surfer_tab(
                   help=f"Source: {_price_source}")
 
     _render_signal_banner(sig, current_price=current_price)
+
+    # --- Market Insights Panel ---
+    try:
+        _render_market_insights(analysis)
+    except Exception:
+        pass
 
     # --- ML Signal Quality Panel ---
     _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=current_spy, vix_df=current_vix)

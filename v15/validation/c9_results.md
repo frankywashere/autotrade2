@@ -72,3 +72,10 @@ Based on sensitivity sweep 3: $1M cap = best Sharpe (14.87 vs 8.56) + 97% more P
 
 **MaxDD 3.8%** (vs Arch417 3.5%) — small increase, acceptable
 **Note**: $1M trade cap puts avg trade size at $328K (3x equity). Max single trade = $2.5M (25x equity — concentrated but within strategy design).
+
+## Arch419 — TOD Recalibration (FAILED ✗, REVERTED)
+**Hypothesis**: 11yr regime analysis showed 12pm ET averaging $4,185/trade (×1.65 optimal) but only boosted ×1.40; 8am ET only $1,150/trade (×0.45 optimal) but boosted ×1.50. Recalibrate.
+**Changes**: UTC17 (12pm ET) ×1.40 → ×1.65, UTC13 (8am ET) ×1.50 → ×1.25
+**Result**: $16,270,375 vs $16,552,438 (-$282K, -1.7%) — WORSE
+**Why it failed**: 12pm trades already at $1M cap — extra multiplier has zero effect. 8am reduction actively hurts the best early-morning hour.
+**Status**: Fully reverted to Arch418 state (UTC17 back to ×1.40, UTC13 back to ×1.50)
