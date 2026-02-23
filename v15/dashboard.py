@@ -2605,6 +2605,13 @@ def show_channel_surfer_tab(
 
     # --- Section 1: Signal Banner ---
     current_price = float(current_tsla['close'].iloc[-1]) if current_tsla is not None and len(current_tsla) > 0 else 0.0
+
+    # Current price display
+    if current_price > 0:
+        prev_price = float(current_tsla['close'].iloc[-2]) if current_tsla is not None and len(current_tsla) > 1 else current_price
+        price_delta = current_price - prev_price
+        st.metric("TSLA", f"${current_price:.2f}", delta=f"{price_delta:+.2f} ({price_delta/prev_price*100:+.2f}%)")
+
     _render_signal_banner(sig, current_price=current_price)
 
     # --- ML Signal Quality Panel ---
