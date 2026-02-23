@@ -5860,14 +5860,15 @@ def run_backtest(
                         #   Tier 3 (×1.20): UTC14=9amET $350 (down from 1.25x), UTC15=10amET $373 avg
                         #   Tier 4 (×1.15): UTC17=12pmET $332, UTC20=3pmET $310
                         # Arch 386: 1pmET ×1.30→×1.35 ($595 pre-boost = top TOD performer) + Thu ×1.30→×1.35
+                        # Arch 387: 8amET ×1.30→×1.35 (2nd-best hour $511, now matches 1pm tier) + 2pmET ×1.25→×1.30 ($429>11am $391)
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
                             if _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative
                                 trade_size *= 1.05
                                 ml_stats.setdefault('tod_7am_boost', 0)
                                 ml_stats['tod_7am_boost'] += 1
-                            elif _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.30x tier-1
-                                trade_size *= 1.30
+                            elif _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.35x (Arch387: up from 1.30x, matches 1pm tier)
+                                trade_size *= 1.35
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
                             elif _tod_h == 14:  # 9am ET: $350/trade avg, 1.20x tier-3 (Arch382: down from 1.25x)
@@ -5890,8 +5891,8 @@ def run_backtest(
                                 trade_size *= 1.35
                                 ml_stats.setdefault('tod_pm_boost', 0)
                                 ml_stats['tod_pm_boost'] += 1
-                            elif _tod_h == 19:  # 2pm ET: $429/trade avg (2025), 1.25x tier-2 (Arch382: up from 1.20x)
-                                trade_size *= 1.25
+                            elif _tod_h == 19:  # 2pm ET: $429/trade avg (2025), 1.30x (Arch387: up from 1.25x, $429>11am $391)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('tod_2pm_boost', 0)
                                 ml_stats['tod_2pm_boost'] += 1
                             elif _tod_h == 20:  # 3pm ET: $310/trade avg (8yr), 1.15x tier-4
