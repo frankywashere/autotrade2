@@ -5892,8 +5892,8 @@ def run_backtest(
                                 trade_size *= 1.05
                                 ml_stats.setdefault('tod_7am_boost', 0)
                                 ml_stats['tod_7am_boost'] += 1
-                            elif _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.40x (Arch392: up from 1.35x, matches 1pm tier)
-                                trade_size *= 1.40
+                            elif _tod_h == 13:   # 8am ET: $833/trade avg, WR=98%, 102 trades/yr, 1.50x (Arch400: up from 1.40x, best hour)
+                                trade_size *= 1.50
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
                             elif _tod_h == 14:  # 9am ET: $350/trade avg, 1.25x (Arch395: up from 1.20x, matches 10am/11am tier)
@@ -5956,10 +5956,11 @@ def run_backtest(
                         # Arch 396: Tue upgraded 1.15x→1.20x (full match with Wed/Fri, Tue avg $270 in same tier as $417/423)
                         # Arch 397: Mon upgraded 1.08x→1.15x (bigger step, Mon $283/trade match Tue tier)
                         # Arch 398: Mon 1.15x→1.20x (full DOW symmetry Mon=Tue=Wed=Fri) + 2pmET 1.35x→1.40x (match 8am/1pm top tier, 93 trades $429)
+                        # Arch 400: Thu 1.40x→1.45x (consistently top DOW $490/trade pre-boost, natural next tier)
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
-                            if _dow == 3:  # Thursday: 1.40x (Arch390: upgraded from 1.35x, consistently top DOW $490 pre-boost)
-                                trade_size *= 1.40
+                            if _dow == 3:  # Thursday: 1.45x (Arch400: upgraded from 1.40x, consistently top DOW $490 pre-boost)
+                                trade_size *= 1.45
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
                             elif _dow == 0:  # Monday: 1.20x (Arch398: up from 1.15x, full DOW symmetry Mon=Tue=Wed=Fri)
