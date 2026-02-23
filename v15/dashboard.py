@@ -2244,7 +2244,8 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
     st.caption(
         f"**ML Quality** {action_icon} {sig.action} | Win: {win_prob:.0%} | "
         f"E.PnL: {expected_pnl:+.2%} | Score: {quality_score:.0f}/100 | "
-        f"Size: {size_mult:.1f}x {size_label} | TOD: {tod_mult:.2f}x | DOW: {dow_mult:.2f}x"
+        f"Size: {size_mult:.1f}x {size_label} | TOD: {tod_mult:.2f}x | DOW: {dow_mult:.2f}x | "
+        f"**Est. $: {expected_dollar_str} on ${dow_adjusted_usd:,.0f} trade**"
     )
 
     st.markdown(
@@ -2299,6 +2300,10 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
         tsla_price = float(current_tsla['close'].iloc[-1])
     est_shares = int(dow_adjusted_usd / tsla_price) if tsla_price and tsla_price > 0 else None
 
+    # Expected dollar P&L = expected_pnl_pct × estimated trade size
+    expected_dollar = expected_pnl * dow_adjusted_usd
+    expected_dollar_str = f"${expected_dollar:+,.0f}"
+
     tod_color = '#00c853' if tod_mult >= 1.40 else '#ff9800' if tod_mult >= 1.20 else '#888'
     dow_color = '#00c853' if dow_mult >= 1.40 else '#ff9800' if dow_mult >= 1.20 else '#888'
     combined_color = '#00c853' if combined_mult >= 1.5 else '#ff9800' if combined_mult >= 1.2 else '#888'
@@ -2338,6 +2343,12 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
                 <div style="font-size:10px;color:#aaa;">Est. Trade Size</div>
                 <div style="font-size:20px;font-weight:700;color:{combined_color};">${dow_adjusted_usd:,.0f}</div>
                 <div style="font-size:10px;color:#888;">{shares_str}</div>
+            </div>
+            <div style="font-size:18px;color:#555;align-self:center;">→</div>
+            <div>
+                <div style="font-size:10px;color:#aaa;">Est. Profit</div>
+                <div style="font-size:20px;font-weight:700;color:{'#00c853' if expected_dollar > 0 else '#ff1744'};">{expected_dollar_str}</div>
+                <div style="font-size:10px;color:#888;">{expected_pnl:+.2%} return</div>
             </div>
         </div>
         </div>""",
