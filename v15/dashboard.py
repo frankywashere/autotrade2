@@ -2053,13 +2053,13 @@ def _get_tod_dow_multipliers(signal_type: str = 'bounce'):
         20: (1.20, '3pm ET'),
         21: (1.20, '4pm ET'),
     }
-    # DOW table (weekday → multiplier, label) — keep in sync with surfer_backtest.py (Arch406)
+    # DOW table (weekday → multiplier, label) — keep in sync with surfer_backtest.py (Arch414)
     dow_table = {
-        0: (1.25, 'Monday'),
-        1: (1.25, 'Tuesday'),
-        2: (1.25, 'Wednesday'),
+        0: (1.30, 'Monday'),
+        1: (1.30, 'Tuesday'),
+        2: (1.30, 'Wednesday'),
         3: (1.45, 'Thursday ⭐'),
-        4: (1.25, 'Friday'),
+        4: (1.30, 'Friday'),
     }
     tod_mult, tod_label = tod_table.get(hour_utc, (1.0, f'UTC{hour_utc} (no boost)'))
     dow_mult, dow_label = dow_table.get(dow, (1.0, 'Weekend'))
