@@ -2023,7 +2023,7 @@ def _show_ml_predictions(analysis, current_tsla, native_tf_data):
 def _get_tod_dow_multipliers(signal_type: str = 'bounce'):
     """
     Compute current TOD + DOW position sizing multipliers for bounce signals.
-    Mirrors the logic in surfer_backtest.py (Arch 404 committed values).
+    Mirrors the logic in surfer_backtest.py (Arch 410 + Arch 406 committed values).
     Only bounce signals get TOD/DOW boosts.
     Returns (tod_mult, tod_label, dow_mult, dow_label).
     """
@@ -2036,7 +2036,7 @@ def _get_tod_dow_multipliers(signal_type: str = 'bounce'):
     if signal_type != 'bounce':
         return 1.0, f'N/A (not bounce)', 1.0, 'N/A (not bounce)'
 
-    # TOD table (UTC hour → multiplier, label) — keep in sync with surfer_backtest.py
+    # TOD table (UTC hour → multiplier, label) — keep in sync with surfer_backtest.py (Arch410)
     tod_table = {
         8:  (1.15, '3am ET'),
         9:  (1.15, '4am ET'),
@@ -2044,22 +2044,22 @@ def _get_tod_dow_multipliers(signal_type: str = 'bounce'):
         11: (1.15, '6am ET'),
         12: (1.05, '7am ET'),
         13: (1.50, '8am ET ⭐'),
-        14: (1.30, '9am ET'),
-        15: (1.30, '10am ET'),
-        16: (1.30, '11am ET'),
-        17: (1.30, '12pm ET'),
+        14: (1.40, '9am ET ⭐'),
+        15: (1.40, '10am ET ⭐'),
+        16: (1.40, '11am ET ⭐'),
+        17: (1.40, '12pm ET ⭐'),
         18: (1.50, '1pm ET ⭐'),
         19: (1.50, '2pm ET ⭐'),
         20: (1.20, '3pm ET'),
         21: (1.20, '4pm ET'),
     }
-    # DOW table (weekday → multiplier, label) — keep in sync with surfer_backtest.py
+    # DOW table (weekday → multiplier, label) — keep in sync with surfer_backtest.py (Arch406)
     dow_table = {
-        0: (1.20, 'Monday'),
-        1: (1.20, 'Tuesday'),
-        2: (1.20, 'Wednesday'),
+        0: (1.25, 'Monday'),
+        1: (1.25, 'Tuesday'),
+        2: (1.25, 'Wednesday'),
         3: (1.45, 'Thursday ⭐'),
-        4: (1.20, 'Friday'),
+        4: (1.25, 'Friday'),
     }
     tod_mult, tod_label = tod_table.get(hour_utc, (1.0, f'UTC{hour_utc} (no boost)'))
     dow_mult, dow_label = dow_table.get(dow, (1.0, 'Weekend'))
