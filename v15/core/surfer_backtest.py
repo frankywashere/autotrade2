@@ -5889,8 +5889,8 @@ def run_backtest(
                                 trade_size *= 1.15
                                 ml_stats.setdefault('tod_6am_boost', 0)
                                 ml_stats['tod_6am_boost'] += 1
-                            elif _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative
-                                trade_size *= 1.05
+                            elif _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.10x (Arch411: from 1.05x)
+                                trade_size *= 1.10
                                 ml_stats.setdefault('tod_7am_boost', 0)
                                 ml_stats['tod_7am_boost'] += 1
                             elif _tod_h == 13:   # 8am ET: $833/trade avg, WR=98%, 102 trades/yr, 1.50x (Arch400: up from 1.40x, best hour)
