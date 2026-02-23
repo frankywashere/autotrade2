@@ -2533,7 +2533,18 @@ def _get_surfer_scanner(initial_capital: float = 100_000.0) -> 'SurferLiveScanne
     key = 'surfer_live_scanner'
     if key not in st.session_state:
         config = ScannerConfig(initial_capital=initial_capital)
-        st.session_state[key] = SurferLiveScanner(config)
+        # Read Gist credentials for cloud persistence (Streamlit secrets or env vars)
+        gist_id, github_token = '', ''
+        try:
+            gist_id = st.secrets.get('GIST_ID', '')
+            github_token = st.secrets.get('GITHUB_TOKEN', '')
+        except Exception:
+            pass
+        if not gist_id:
+            import os
+            gist_id = os.environ.get('GIST_ID', '')
+            github_token = os.environ.get('GITHUB_TOKEN', '')
+        st.session_state[key] = SurferLiveScanner(config, gist_id=gist_id, github_token=github_token)
     return st.session_state[key]
 
 
