@@ -118,6 +118,14 @@ except ImportError:
     AUTOREFRESH_AVAILABLE = False
     logger.info("streamlit-autorefresh not available - using manual refresh")
 
+# Channel Surfer live scanner
+try:
+    from v15.trading.surfer_live_scanner import SurferLiveScanner, ScannerConfig, ScannerAlert
+    SURFER_SCANNER_AVAILABLE = True
+except ImportError:
+    SURFER_SCANNER_AVAILABLE = False
+    logger.warning("SurferLiveScanner not available")
+
 
 # =============================================================================
 # Window Selection Analysis Functions
@@ -2242,6 +2250,116 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
             st.code('\n'.join(log), language='text')
 
 
+def _get_surfer_scanner(initial_capital: float = 100_000.0) -> 'SurferLiveScanner':
+    """Get or create the SurferLiveScanner instance (persisted in session state)."""
+    key = 'surfer_live_scanner'
+    if key not in st.session_state:
+        config = ScannerConfig(initial_capital=initial_capital)
+        st.session_state[key] = SurferLiveScanner(config)
+    return st.session_state[key]
+
+
+def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
+                                 current_tsla, run_analysis: bool):
+    """Render the live scanner panel: positions, alerts, trade history."""
+    st.subheader("Live Scanner")
+
+    col_cap, col_eq, col_unrealized = st.columns(3)
+    unrealized = scanner.get_unrealized_pnl(current_price)
+    col_cap.metric("Starting Capital", f"${scanner.config.initial_capital:,.0f}")
+    col_eq.metric("Equity", f"${scanner.equity:,.0f}",
+                  delta=f"${scanner.equity - scanner.config.initial_capital:+,.0f}")
+    col_unrealized.metric("Unrealized P&L", f"${unrealized:+,.0f}")
+
+    # Kill switch
+    kill = st.checkbox("Kill Switch (suppress all entries)", value=scanner.config.kill_switch,
+                       key="surfer_kill_switch")
+    scanner.config.kill_switch = kill
+
+    # Evaluate new signal and check exits on each analysis cycle
+    if run_analysis and current_tsla is not None and len(current_tsla) > 0:
+        bar = current_tsla.iloc[-1]
+        bar_high = float(bar.get('high', current_price))
+        bar_low = float(bar.get('low', current_price))
+
+        # Check exits first (price may have hit stop/TP)
+        exit_alerts = scanner.check_exits(current_price, bar_high, bar_low)
+        for ea in exit_alerts:
+            color = "green" if ea.pnl >= 0 else "red"
+            st.markdown(
+                f'<div style="background:{"#1a3320" if ea.pnl>=0 else "#331a1a"};'
+                f'padding:8px;border-radius:6px;margin:4px 0;">'
+                f'<b style="color:{"#00e676" if ea.pnl>=0 else "#ff5252"}">CLOSED [{ea.pos_id}]</b> '
+                f'P&amp;L: <b>${ea.pnl:+,.0f}</b> ({ea.pnl_pct:+.2%}) — {ea.exit_reason}'
+                f'</div>', unsafe_allow_html=True,
+            )
+
+        # Evaluate new entry signal
+        if sig.action != 'HOLD':
+            entry_alert = scanner.evaluate_signal(analysis, current_price)
+            if entry_alert and entry_alert.alert_type == 'ENTRY':
+                action_color = "#00e676" if entry_alert.action == 'BUY' else "#ff5252"
+                st.markdown(
+                    f'<div style="background:#1a2233;padding:10px;border-radius:6px;margin:4px 0;'
+                    f'border:2px solid {action_color};">'
+                    f'<b style="color:{action_color};font-size:16px">'
+                    f'{entry_alert.action} ENTRY [{entry_alert.pos_id}]</b>  '
+                    f'{entry_alert.shares} shares @ ${entry_alert.price:.2f} | '
+                    f'Stop: ${entry_alert.stop_price:.2f} | '
+                    f'TP: ${entry_alert.tp_price:.2f} | '
+                    f'Notional: ${entry_alert.notional:,.0f}'
+                    f'</div>', unsafe_allow_html=True,
+                )
+            elif entry_alert and entry_alert.alert_type == 'RISK_WARNING':
+                st.warning(f"Scanner: {entry_alert.warning_msg}")
+
+    # Open positions
+    if scanner.positions:
+        st.markdown("**Open Positions**")
+        for pos in scanner.positions.values():
+            if pos.direction == 'long':
+                upnl = (current_price - pos.entry_price) * pos.shares
+            else:
+                upnl = (pos.entry_price - current_price) * pos.shares
+            upnl_color = "#00e676" if upnl >= 0 else "#ff5252"
+            st.markdown(
+                f'<div style="background:#1a2233;padding:8px;border-radius:6px;margin:3px 0;">'
+                f'[{pos.pos_id}] <b>{pos.direction.upper()}</b> {pos.shares}sh '
+                f'@ ${pos.entry_price:.2f} | Stop: ${pos.stop_price:.2f} | TP: ${pos.tp_price:.2f} | '
+                f'Unrealized: <b style="color:{upnl_color}">${upnl:+,.0f}</b>'
+                f'</div>', unsafe_allow_html=True,
+            )
+    else:
+        st.caption("No open positions.")
+
+    # Closed trade history
+    if scanner.closed_trades:
+        total_trades = len(scanner.closed_trades)
+        total_pnl = sum(t.pnl for t in scanner.closed_trades)
+        wins = sum(1 for t in scanner.closed_trades if t.pnl > 0)
+        wr = wins / total_trades if total_trades > 0 else 0
+        with st.expander(
+            f"Trade History: {total_trades} trades | WR {wr:.0%} | Total P&L ${total_pnl:+,.0f}",
+            expanded=False
+        ):
+            hist_rows = [{
+                'ID': t.pos_id,
+                'Dir': t.direction.upper(),
+                'Entry $': f"${t.entry_price:.2f}",
+                'Exit $': f"${t.exit_price:.2f}",
+                'Shares': t.shares,
+                'P&L': f"${t.pnl:+.0f}",
+                'Hold (min)': f"{t.hold_minutes:.0f}",
+                'Reason': t.exit_reason,
+            } for t in reversed(scanner.closed_trades[-50:])]
+            st.dataframe(pd.DataFrame(hist_rows), hide_index=True, use_container_width=True)
+
+    # Reset button
+    if st.button("Reset Scanner (clear all positions/history)", key="surfer_scanner_reset"):
+        scanner.reset()
+        st.rerun()
+
+
 def show_channel_surfer_tab(
     current_tsla,
     native_tf_data,
@@ -2305,6 +2423,24 @@ def show_channel_surfer_tab(
 
     # --- ML Signal Quality Panel ---
     _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=current_spy, vix_df=current_vix)
+
+    # --- Live Scanner Panel ---
+    if SURFER_SCANNER_AVAILABLE:
+        scanner_capital = st.number_input(
+            "Scanner capital ($)", value=100_000, step=10_000,
+            min_value=10_000, key="surfer_scanner_capital",
+            help="Starting capital for hypothetical position tracking",
+        )
+        scanner = _get_surfer_scanner(initial_capital=float(scanner_capital))
+        _render_surfer_live_section(
+            scanner=scanner,
+            analysis=analysis,
+            sig=sig,
+            current_price=current_price,
+            current_tsla=current_tsla,
+            run_analysis=run_analysis,
+        )
+        st.divider()
 
     # Play audio for BUY/SELL signals (only if new)
     prev_action = st.session_state.get('surfer_prev_action', 'HOLD')
