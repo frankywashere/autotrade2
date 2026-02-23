@@ -5870,6 +5870,7 @@ def run_backtest(
                         # Arch 394: 3pmET ×1.15→×1.20 ($340/trade, 61 trades, promote tier-4→tier-3) + Tue ×1.10→×1.15 (Tue→Wed/Fri level)
                         # Arch 395: 4pmET (UTC21) ×1.0→×1.20 (NEW hour, 49 trades, $388/trade, after-hours strong = tier-3)
                         # Arch 399: pre-market UTC8-11 (3am-6am ET) ×1.15 (156 trades/yr, WR=91-98%, avg $231-314/trade)
+                        # Arch 404: 11amET+12pmET ×1.25→×1.30 (promote midday to 9am/10am tier; 11am WR=99% $391, 12pm WR=96% $488)
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
                             if _tod_h == 8:    # 3am ET: $314/trade avg, WR=97%, 29 trades/yr, 1.15x (Arch399: pre-market boost)
@@ -5904,12 +5905,12 @@ def run_backtest(
                                 trade_size *= 1.30
                                 ml_stats.setdefault('tod_10am_boost', 0)
                                 ml_stats['tod_10am_boost'] += 1
-                            elif _tod_h == 16:  # 11am ET: $391/trade avg (8yr), 1.25x tier-2 (Arch382: up from 1.15x)
-                                trade_size *= 1.25
+                            elif _tod_h == 16:  # 11am ET: $391/trade avg, WR=99%, 80 trades/yr, 1.30x (Arch404: up from 1.25x, match 9am/10am tier)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('tod_11am_boost', 0)
                                 ml_stats['tod_11am_boost'] += 1
-                            elif _tod_h == 17:  # 12pm ET: $488/trade avg (with boost), 1.25x (Arch393: up from 1.15x, matches 11am tier)
-                                trade_size *= 1.25
+                            elif _tod_h == 17:  # 12pm ET: $488/trade avg, WR=96%, 69 trades/yr, 1.30x (Arch404: up from 1.25x, match 11am tier)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('tod_noon_boost', 0)
                                 ml_stats['tod_noon_boost'] += 1
                             elif _tod_h == 18:  # 1pm ET: $843/trade avg, WR=99%, 94 trades/yr, 1.50x (Arch401: up from 1.40x, 2nd best hour)
