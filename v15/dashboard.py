@@ -2302,10 +2302,16 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
     ml_adjusted_usd = min(base_trade_usd * _sq_mult, max_trade_usd)
     tod_adjusted_usd = min(ml_adjusted_usd * tod_mult, max_trade_usd)
     dow_adjusted_usd = min(tod_adjusted_usd * dow_mult, max_trade_usd)
-    # Get current TSLA price for share count estimate
+    # Get current TSLA price for share count estimate (prefer Finnhub real-time over stale bar)
     tsla_price = None
     if current_tsla is not None and len(current_tsla) > 0:
         tsla_price = float(current_tsla['close'].iloc[-1])
+    try:
+        _rt = _get_realtime_prices()
+        if _rt.get('TSLA'):
+            tsla_price = float(_rt['TSLA'])
+    except Exception:
+        pass
     est_shares = int(dow_adjusted_usd / tsla_price) if tsla_price and tsla_price > 0 else None
 
     # Price targets from signal stop/TP percentages
@@ -2606,11 +2612,24 @@ def show_channel_surfer_tab(
     # --- Section 1: Signal Banner ---
     current_price = float(current_tsla['close'].iloc[-1]) if current_tsla is not None and len(current_tsla) > 0 else 0.0
 
+    # Override with Finnhub real-time price if available (5-min bar may be stale over weekends/gaps)
+    try:
+        _rt_prices = _get_realtime_prices()
+        _rt_tsla = _rt_prices.get('TSLA')
+        if _rt_tsla and _rt_tsla > 0:
+            current_price = float(_rt_tsla)
+            _price_source = "Finnhub"
+        else:
+            _price_source = "bar close"
+    except Exception:
+        _price_source = "bar close"
+
     # Current price display
     if current_price > 0:
         prev_price = float(current_tsla['close'].iloc[-2]) if current_tsla is not None and len(current_tsla) > 1 else current_price
         price_delta = current_price - prev_price
-        st.metric("TSLA", f"${current_price:.2f}", delta=f"{price_delta:+.2f} ({price_delta/prev_price*100:+.2f}%)")
+        st.metric("TSLA", f"${current_price:.2f}", delta=f"{price_delta:+.2f} ({price_delta/prev_price*100:+.2f}%)",
+                  help=f"Source: {_price_source}")
 
     _render_signal_banner(sig, current_price=current_price)
 
