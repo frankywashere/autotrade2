@@ -5936,14 +5936,15 @@ def run_backtest(
                         # Arch 393: 12pmET upgraded 1.15x→1.25x (12pm $488/trade matches 11am $478 tier-2)
                         # Arch 394: Tue upgraded 1.10x→1.15x (Tue $270/trade, step toward Wed/Fri ×1.20)
                         # Arch 396: Tue upgraded 1.15x→1.20x (full match with Wed/Fri, Tue avg $270 in same tier as $417/423)
+                        # Arch 397: Mon upgraded 1.08x→1.15x (bigger step, Mon $283/trade match Tue tier)
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
                             if _dow == 3:  # Thursday: 1.40x (Arch390: upgraded from 1.35x, consistently top DOW $490 pre-boost)
                                 trade_size *= 1.40
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
-                            elif _dow == 0:  # Monday: 1.08x (Arch391: up from 1.05x, align with Tue start)
-                                trade_size *= 1.08
+                            elif _dow == 0:  # Monday: 1.15x (Arch397: up from 1.08x, match Tue/Wed/Fri tier, Mon $283/trade)
+                                trade_size *= 1.15
                                 ml_stats.setdefault('dow_mon_boost', 0)
                                 ml_stats['dow_mon_boost'] += 1
                             elif _dow == 1:  # Tuesday: 1.20x (Arch396: up from 1.15x, full match with Wed/Fri ×1.20)
