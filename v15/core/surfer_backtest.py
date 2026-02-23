@@ -5865,6 +5865,7 @@ def run_backtest(
                         # Arch 391: 10amET ×1.20→×1.25 ($373 > 9amET $350, promotes to 11am tier) + Mon ×1.05→×1.08 (align with Tue)
                         # Arch 392: 8amET ×1.35→×1.40 (match 1pm tier, 2nd-best $511) + Tue ×1.08→×1.10 (Wed/Fri $417/$423 vs Tue $270)
                         # Arch 393: 12pmET ×1.15→×1.25 (12pm $488/trade = 11am $478 tier, promotes from tier-4 to tier-2)
+                        # Arch 394: 3pmET ×1.15→×1.20 ($340/trade, 61 trades, promote tier-4→tier-3) + Tue ×1.10→×1.15 (Tue→Wed/Fri level)
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
                             if _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative
@@ -5899,8 +5900,8 @@ def run_backtest(
                                 trade_size *= 1.30
                                 ml_stats.setdefault('tod_2pm_boost', 0)
                                 ml_stats['tod_2pm_boost'] += 1
-                            elif _tod_h == 20:  # 3pm ET: $310/trade avg (8yr), 1.15x tier-4
-                                trade_size *= 1.15
+                            elif _tod_h == 20:  # 3pm ET: $340/trade avg, 1.20x (Arch394: up from 1.15x, tier-4→tier-3)
+                                trade_size *= 1.20
                                 ml_stats.setdefault('tod_3pm_boost', 0)
                                 ml_stats['tod_3pm_boost'] += 1
 
