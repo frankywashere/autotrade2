@@ -187,7 +187,9 @@ def main():
         if not t.entry_time:
             continue
         ts = pd.Timestamp(t.entry_time)
-        dow = ts.dayofweek                  # 0=Mon ... 4=Fri
+        dow = ts.dayofweek                  # 0=Mon ... 6=Sun
+        if dow > 4:
+            continue  # skip weekend bars (pre/post-market edge cases)
         utc_hour = ts.hour if ts.tzinfo is None else ts.tz_convert('UTC').hour
         et_hour = (utc_hour - 5) % 24
 
