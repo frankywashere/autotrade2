@@ -5896,12 +5896,12 @@ def run_backtest(
                                 trade_size *= 1.50
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
-                            elif _tod_h == 14:  # 9am ET: $350/trade avg, 1.25x (Arch395: up from 1.20x, matches 10am/11am tier)
-                                trade_size *= 1.25
+                            elif _tod_h == 14:  # 9am ET: WR=100%, 115 trades/yr, 1.30x (Arch403: up from 1.25x, ultra-reliable)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('tod_9am_boost', 0)
                                 ml_stats['tod_9am_boost'] += 1
-                            elif _tod_h == 15:  # 10am ET: $373/trade avg (2015+2025), 1.25x (Arch391: up from 1.20x, matches 11am tier)
-                                trade_size *= 1.25
+                            elif _tod_h == 15:  # 10am ET: WR=100%, 83 trades/yr, 1.30x (Arch403: up from 1.25x, matches 9am tier)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('tod_10am_boost', 0)
                                 ml_stats['tod_10am_boost'] += 1
                             elif _tod_h == 16:  # 11am ET: $391/trade avg (8yr), 1.25x tier-2 (Arch382: up from 1.15x)
