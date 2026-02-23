@@ -5966,20 +5966,20 @@ def run_backtest(
                                 trade_size *= 1.45
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
-                            elif _dow == 0:  # Monday: 1.25x (Arch406: up from 1.20x, uniform non-Thu upgrade)
-                                trade_size *= 1.25
+                            elif _dow == 0:  # Monday: 1.30x (Arch414: up from 1.25x, uniform non-Thu upgrade)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('dow_mon_boost', 0)
                                 ml_stats['dow_mon_boost'] += 1
-                            elif _dow == 1:  # Tuesday: 1.25x (Arch406: up from 1.20x, uniform non-Thu upgrade)
-                                trade_size *= 1.25
+                            elif _dow == 1:  # Tuesday: 1.30x (Arch414: up from 1.25x, uniform non-Thu upgrade)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('dow_tue_boost', 0)
                                 ml_stats['dow_tue_boost'] += 1
-                            elif _dow == 2:  # Wednesday: 1.25x (Arch406: up from 1.20x, uniform non-Thu upgrade)
-                                trade_size *= 1.25
+                            elif _dow == 2:  # Wednesday: 1.30x (Arch414: up from 1.25x, uniform non-Thu upgrade)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('dow_wed_boost', 0)
                                 ml_stats['dow_wed_boost'] += 1
-                            elif _dow == 4:  # Friday: 1.25x (Arch406: up from 1.20x, uniform non-Thu upgrade)
-                                trade_size *= 1.25
+                            elif _dow == 4:  # Friday: 1.30x (Arch414: up from 1.25x, uniform non-Thu upgrade)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('dow_fri_boost', 0)
                                 ml_stats['dow_fri_boost'] += 1
 
