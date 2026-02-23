@@ -5897,12 +5897,22 @@ def run_backtest(
                         # Thu avg: $451/trade (2015), $464/trade (2025) vs $278/$325 overall — +40%
                         # Effect: consistent economic data release day + end-of-week positioning
                         # Applied AFTER TOD — a Thu 8am ET bounce gets 1.30x × 1.20x = 1.56x
+                        # Arch 381: Tue/Wed moderate DOW boost (consistent above-Monday performance)
+                        # Tue avg: $250-$282/trade; Wed avg: $267-$268/trade (above Mon $225-$263)
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
                             if _dow == 3:  # Thursday: 1.20x
                                 trade_size *= 1.20
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
+                            elif _dow == 1:  # Tuesday: 1.08x
+                                trade_size *= 1.08
+                                ml_stats.setdefault('dow_tue_boost', 0)
+                                ml_stats['dow_tue_boost'] += 1
+                            elif _dow == 2:  # Wednesday: 1.10x
+                                trade_size *= 1.10
+                                ml_stats.setdefault('dow_wed_boost', 0)
+                                ml_stats['dow_wed_boost'] += 1
 
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
