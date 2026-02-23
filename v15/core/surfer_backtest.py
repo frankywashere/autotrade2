@@ -5865,7 +5865,8 @@ def run_backtest(
                         # Arch 391: 10amET ×1.20→×1.25 ($373 > 9amET $350, promotes to 11am tier) + Mon ×1.05→×1.08 (align with Tue)
                         # Arch 392: 8amET ×1.35→×1.40 (match 1pm tier, 2nd-best $511) + Tue ×1.08→×1.10 (Wed/Fri $417/$423 vs Tue $270)
                         # Arch 393: 12pmET ×1.15→×1.25 (12pm $488/trade = 11am $478 tier, promotes from tier-4 to tier-2)
-                        # Arch 395: 9amET ×1.20→×1.25 ($350/trade < 10amET $373, but promotes to same tier) + 2pmET ×1.30→×1.35 ($429 deserves own tier above 11am $391)
+                        # Arch 395: 9amET ×1.20→×1.25 + 2pmET ×1.30→×1.35 + 4pmET NEW ×1.20 (all three in same commit)
+                        # Arch 398: 2pmET ×1.35→×1.40 (match 8am/1pm top tier; 93 trades $429/trade)
                         # Arch 394: 3pmET ×1.15→×1.20 ($340/trade, 61 trades, promote tier-4→tier-3) + Tue ×1.10→×1.15 (Tue→Wed/Fri level)
                         # Arch 395: 4pmET (UTC21) ×1.0→×1.20 (NEW hour, 49 trades, $388/trade, after-hours strong = tier-3)
                         if sig.signal_type == 'bounce':
@@ -5898,8 +5899,8 @@ def run_backtest(
                                 trade_size *= 1.40
                                 ml_stats.setdefault('tod_pm_boost', 0)
                                 ml_stats['tod_pm_boost'] += 1
-                            elif _tod_h == 19:  # 2pm ET: $429/trade avg (2025), 1.35x (Arch395: up from 1.30x, 2nd tier above 11am)
-                                trade_size *= 1.35
+                            elif _tod_h == 19:  # 2pm ET: $429/trade avg (2025), 1.40x (Arch398: up from 1.35x, match 8am/1pm top tier)
+                                trade_size *= 1.40
                                 ml_stats.setdefault('tod_2pm_boost', 0)
                                 ml_stats['tod_2pm_boost'] += 1
                             elif _tod_h == 20:  # 3pm ET: $340/trade avg, 1.20x (Arch394: up from 1.15x, tier-4→tier-3)
@@ -5937,14 +5938,15 @@ def run_backtest(
                         # Arch 394: Tue upgraded 1.10x→1.15x (Tue $270/trade, step toward Wed/Fri ×1.20)
                         # Arch 396: Tue upgraded 1.15x→1.20x (full match with Wed/Fri, Tue avg $270 in same tier as $417/423)
                         # Arch 397: Mon upgraded 1.08x→1.15x (bigger step, Mon $283/trade match Tue tier)
+                        # Arch 398: Mon 1.15x→1.20x (full DOW symmetry Mon=Tue=Wed=Fri) + 2pmET 1.35x→1.40x (match 8am/1pm top tier, 93 trades $429)
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
                             if _dow == 3:  # Thursday: 1.40x (Arch390: upgraded from 1.35x, consistently top DOW $490 pre-boost)
                                 trade_size *= 1.40
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
-                            elif _dow == 0:  # Monday: 1.15x (Arch397: up from 1.08x, match Tue/Wed/Fri tier, Mon $283/trade)
-                                trade_size *= 1.15
+                            elif _dow == 0:  # Monday: 1.20x (Arch398: up from 1.15x, full DOW symmetry Mon=Tue=Wed=Fri)
+                                trade_size *= 1.20
                                 ml_stats.setdefault('dow_mon_boost', 0)
                                 ml_stats['dow_mon_boost'] += 1
                             elif _dow == 1:  # Tuesday: 1.20x (Arch396: up from 1.15x, full match with Wed/Fri ×1.20)
