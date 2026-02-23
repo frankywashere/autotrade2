@@ -2012,6 +2012,52 @@ def _show_ml_predictions(analysis, current_tsla, native_tf_data):
         st.info(f"ML sees opportunity: {ml_action} (but physics says HOLD)")
 
 
+def _get_tod_dow_multipliers(signal_type: str = 'bounce'):
+    """
+    Compute current TOD + DOW position sizing multipliers for bounce signals.
+    Mirrors the logic in surfer_backtest.py (Arch 404 committed values).
+    Only bounce signals get TOD/DOW boosts.
+    Returns (tod_mult, tod_label, dow_mult, dow_label).
+    """
+    import datetime as _dt
+    import pytz
+    now_utc = _dt.datetime.now(_dt.timezone.utc)
+    hour_utc = now_utc.hour
+    dow = now_utc.weekday()  # 0=Mon, 4=Fri, 5/6=Weekend
+
+    if signal_type != 'bounce':
+        return 1.0, f'N/A (not bounce)', 1.0, 'N/A (not bounce)'
+
+    # TOD table (UTC hour → multiplier, label) — keep in sync with surfer_backtest.py
+    tod_table = {
+        8:  (1.15, '3am ET'),
+        9:  (1.15, '4am ET'),
+        10: (1.15, '5am ET'),
+        11: (1.15, '6am ET'),
+        12: (1.05, '7am ET'),
+        13: (1.50, '8am ET ⭐'),
+        14: (1.30, '9am ET'),
+        15: (1.30, '10am ET'),
+        16: (1.30, '11am ET'),
+        17: (1.30, '12pm ET'),
+        18: (1.50, '1pm ET ⭐'),
+        19: (1.50, '2pm ET ⭐'),
+        20: (1.20, '3pm ET'),
+        21: (1.20, '4pm ET'),
+    }
+    # DOW table (weekday → multiplier, label) — keep in sync with surfer_backtest.py
+    dow_table = {
+        0: (1.20, 'Monday'),
+        1: (1.20, 'Tuesday'),
+        2: (1.20, 'Wednesday'),
+        3: (1.45, 'Thursday ⭐'),
+        4: (1.20, 'Friday'),
+    }
+    tod_mult, tod_label = tod_table.get(hour_utc, (1.0, f'UTC{hour_utc} (no boost)'))
+    dow_mult, dow_label = dow_table.get(dow, (1.0, 'Weekend'))
+    return tod_mult, tod_label, dow_mult, dow_label
+
+
 def _load_signal_quality_model():
     """Load the signal quality model into session state (once)."""
     if 'signal_quality_model' not in st.session_state:
@@ -2136,12 +2182,18 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
     quality_score = pred['quality_score']
     risk_rating = pred['risk_rating']
 
+    # Compute TOD/DOW multipliers for the current time
+    sig_type = getattr(sig, 'signal_type', 'bounce')
+    tod_mult, tod_label, dow_mult, dow_label = _get_tod_dow_multipliers(sig_type)
+
     # Log prediction results
     _sq_size = ('FULL+' if quality_score >= 80 else 'FULL' if quality_score >= 60
                 else 'REDUCED' if quality_score >= 40 else 'MINIMAL')
     _sq_mult = 1.3 if quality_score >= 80 else 1.0 if quality_score >= 60 else 0.7 if quality_score >= 40 else 0.4
+    combined_mult = _sq_mult * tod_mult * dow_mult
     log.append(f"Result: win={win_prob:.0%} pnl={expected_pnl:+.2%} quality={quality_score:.0f} "
-               f"risk={risk_rating} → {_sq_mult:.1f}x {_sq_size}")
+               f"risk={risk_rating} → ML={_sq_mult:.2f}x × TOD={tod_mult:.2f}x ({tod_label}) "
+               f"× DOW={dow_mult:.2f}x ({dow_label}) = {combined_mult:.2f}x combined")
     st.session_state['_sq_log'] = log
     # Print to terminal
     for line in log:
@@ -2214,6 +2266,66 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
         unsafe_allow_html=True,
     )
 
+    # Position Sizing Breakdown panel (TOD + DOW + ML combined)
+    base_capital = st.session_state.get('backtest_capital', 100_000.0)
+    base_trade_usd = base_capital / 10.0  # Standard: capital/10
+    max_trade_usd = 500_000.0
+    # After bounce_cap (12x), base could range up to 12x. Use base_trade_usd as floor.
+    # TOD/DOW applied post-cap, so multiply against max_trade_usd for worst case
+    ml_adjusted_usd = min(base_trade_usd * _sq_mult, max_trade_usd)
+    tod_adjusted_usd = min(ml_adjusted_usd * tod_mult, max_trade_usd)
+    dow_adjusted_usd = min(tod_adjusted_usd * dow_mult, max_trade_usd)
+    # Get current TSLA price for share count estimate
+    tsla_price = None
+    if current_tsla is not None and len(current_tsla) > 0:
+        tsla_price = float(current_tsla['close'].iloc[-1])
+    est_shares = int(dow_adjusted_usd / tsla_price) if tsla_price and tsla_price > 0 else None
+
+    tod_color = '#00c853' if tod_mult >= 1.40 else '#ff9800' if tod_mult >= 1.20 else '#888'
+    dow_color = '#00c853' if dow_mult >= 1.40 else '#ff9800' if dow_mult >= 1.20 else '#888'
+    combined_color = '#00c853' if combined_mult >= 1.5 else '#ff9800' if combined_mult >= 1.2 else '#888'
+    shares_str = f"~{est_shares:,} shares @ ${tsla_price:.0f}" if est_shares else "N/A"
+
+    st.markdown(
+        f"""<div style="background:linear-gradient(135deg,#0d1b2a,#1b2838);
+        border:1px solid #2a4a6a;border-radius:8px;padding:12px 16px;margin:4px 0;">
+        <div style="text-align:center;font-size:12px;color:#888;letter-spacing:1px;margin-bottom:8px;">
+        POSITION SIZING BREAKDOWN</div>
+        <div style="display:flex;justify-content:space-around;text-align:center;flex-wrap:wrap;gap:8px;">
+            <div>
+                <div style="font-size:10px;color:#aaa;">Base Trade</div>
+                <div style="font-size:20px;font-weight:600;color:#ccc;">${base_trade_usd:,.0f}</div>
+                <div style="font-size:10px;color:#666;">capital÷10</div>
+            </div>
+            <div style="font-size:18px;color:#555;align-self:center;">×</div>
+            <div>
+                <div style="font-size:10px;color:#aaa;">ML Score</div>
+                <div style="font-size:20px;font-weight:600;color:{size_color};">{_sq_mult:.2f}x</div>
+                <div style="font-size:10px;color:#666;">{_sq_size}</div>
+            </div>
+            <div style="font-size:18px;color:#555;align-self:center;">×</div>
+            <div>
+                <div style="font-size:10px;color:#aaa;">TOD Boost</div>
+                <div style="font-size:20px;font-weight:600;color:{tod_color};">{tod_mult:.2f}x</div>
+                <div style="font-size:10px;color:#666;">{tod_label}</div>
+            </div>
+            <div style="font-size:18px;color:#555;align-self:center;">×</div>
+            <div>
+                <div style="font-size:10px;color:#aaa;">DOW Boost</div>
+                <div style="font-size:20px;font-weight:600;color:{dow_color};">{dow_mult:.2f}x</div>
+                <div style="font-size:10px;color:#666;">{dow_label}</div>
+            </div>
+            <div style="font-size:18px;color:#555;align-self:center;">=</div>
+            <div>
+                <div style="font-size:10px;color:#aaa;">Est. Trade Size</div>
+                <div style="font-size:20px;font-weight:700;color:{combined_color};">${dow_adjusted_usd:,.0f}</div>
+                <div style="font-size:10px;color:#888;">{shares_str}</div>
+            </div>
+        </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
     # Expandable CV performance
     cv = model.cv_metrics
     if cv:
@@ -2256,6 +2368,15 @@ def show_channel_surfer_tab(
     if not CHANNEL_SURFER_AVAILABLE:
         st.error("Channel Surfer module not available. Check v15/core/channel_surfer.py")
         return
+
+    # yfinance pull log (sidebar expander for data transparency)
+    try:
+        from v15.data.native_tf import PULL_LOG as _yf_pull_log
+        if _yf_pull_log:
+            with st.sidebar.expander("yfinance Pull Log", expanded=False):
+                st.code('\n'.join(list(_yf_pull_log)[-20:]), language='text')
+    except Exception:
+        pass
 
     # Auto-run or manual analysis
     auto_refresh = live_config.get('auto_refresh', False)

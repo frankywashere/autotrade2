@@ -39,6 +39,22 @@ from ..exceptions import DataLoadError
 # Configure logging
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# Pull Log (ring buffer for dashboard visibility)
+# =============================================================================
+import collections as _collections
+
+PULL_LOG: _collections.deque = _collections.deque(maxlen=50)  # Last 50 yfinance events
+
+
+def _pull_log(msg: str) -> None:
+    """Append timestamped message to PULL_LOG and logger."""
+    import datetime as _dt
+    ts = _dt.datetime.now().strftime('%H:%M:%S')
+    entry = f"[{ts}] {msg}"
+    PULL_LOG.append(entry)
+    logger.info(msg)
+
 
 # =============================================================================
 # Timeframe Mappings
@@ -129,15 +145,18 @@ def _load_from_cache(cache_path: Path, max_age_hours: int = 24) -> Optional[pd.D
 
     if age_hours > max_age_hours:
         logger.debug(f"Cache stale: {cache_path.name} is {age_hours:.1f}h old")
+        _pull_log(f"CACHE STALE {cache_path.name} ({age_hours:.1f}h old) — will re-fetch")
         return None
 
     try:
         with open(cache_path, 'rb') as f:
             data = pickle.load(f)
         logger.debug(f"Cache hit: {cache_path.name}")
+        _pull_log(f"CACHE HIT {cache_path.name} ({len(data) if hasattr(data, '__len__') else '?'} rows, {age_hours:.1f}h old)")
         return data
     except Exception as e:
         logger.warning(f"Failed to load cache {cache_path}: {e}")
+        _pull_log(f"CACHE ERROR {cache_path.name}: {type(e).__name__}: {e}")
         return None
 
 
@@ -185,6 +204,7 @@ def _fetch_yfinance_data(
     """
     ticker = yf.Ticker(symbol)
     last_error = None
+    _pull_log(f"FETCH {symbol} {interval} {start_date}→{end_date} (max_retries={max_retries})")
 
     for attempt in range(max_retries):
         try:
@@ -234,10 +254,13 @@ def _fetch_yfinance_data(
             # Remove duplicates
             df = df[~df.index.duplicated(keep='first')]
 
+            _pull_log(f"  OK {symbol} {interval}: {len(df)} bars "
+                      f"({df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')})")
             return df
 
         except Exception as e:
             last_error = e
+            _pull_log(f"  WARN {symbol} {interval} attempt {attempt+1}/{max_retries}: {type(e).__name__}: {e}")
             if attempt < max_retries - 1:
                 logger.warning(
                     f"Attempt {attempt + 1}/{max_retries} failed for "
