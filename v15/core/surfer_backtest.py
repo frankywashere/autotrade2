@@ -5958,9 +5958,10 @@ def run_backtest(
                         # Arch 397: Mon upgraded 1.08x→1.15x (bigger step, Mon $283/trade match Tue tier)
                         # Arch 398: Mon 1.15x→1.20x (full DOW symmetry Mon=Tue=Wed=Fri) + 2pmET 1.35x→1.40x (match 8am/1pm top tier, 93 trades $429)
                         # Arch 400: Thu 1.40x→1.45x (consistently top DOW $490/trade pre-boost, natural next tier)
+                        # NOTE: Thu ×1.45→×1.50 tested (Arch405) — ZERO EFFECT; all 3 years identical. DOW boost beyond 1.45x capped by max_trade_usd
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
-                            if _dow == 3:  # Thursday: 1.45x (Arch400: upgraded from 1.40x, consistently top DOW $490 pre-boost)
+                            if _dow == 3:  # Thursday: 1.45x (Arch400: settled here; ×1.50 tested, zero effect)
                                 trade_size *= 1.45
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
