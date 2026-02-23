@@ -1751,6 +1751,80 @@ def _play_alert_sound(action: str) -> None:
     )
 
 
+def _play_exit_alert_sound(exit_reason: str) -> None:
+    """Play an audible alert when a position exit triggers."""
+    if exit_reason == 'take_profit':
+        # Celebratory ascending chime: E4 → G#4 → B4
+        js = """(function(){
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                [330, 415, 494].forEach(function(f, i) {
+                    var o = ctx.createOscillator(), g = ctx.createGain();
+                    o.connect(g); g.connect(ctx.destination);
+                    o.type = 'sine'; o.frequency.value = f;
+                    var t = ctx.currentTime + i * 0.18;
+                    g.gain.setValueAtTime(0.35, t);
+                    g.gain.linearRampToValueAtTime(0, t + 0.25);
+                    o.start(t); o.stop(t + 0.25);
+                });
+            } catch(e) {}
+        })();"""
+    elif exit_reason in ('stop_loss', 'trailing_stop'):
+        # Urgent alarm: 3 descending square-wave pulses
+        js = """(function(){
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                [600, 500, 420].forEach(function(f, i) {
+                    var o = ctx.createOscillator(), g = ctx.createGain();
+                    o.connect(g); g.connect(ctx.destination);
+                    o.type = 'square'; o.frequency.value = f;
+                    var t = ctx.currentTime + i * 0.14;
+                    g.gain.setValueAtTime(0.18, t);
+                    g.gain.linearRampToValueAtTime(0, t + 0.12);
+                    o.start(t); o.stop(t + 0.12);
+                });
+            } catch(e) {}
+        })();"""
+    else:
+        # timeout / other: single neutral beep
+        js = """(function(){
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                var o = ctx.createOscillator(), g = ctx.createGain();
+                o.connect(g); g.connect(ctx.destination);
+                o.type = 'sine'; o.frequency.value = 440;
+                g.gain.setValueAtTime(0.2, ctx.currentTime);
+                g.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.4);
+                o.start(ctx.currentTime); o.stop(ctx.currentTime + 0.4);
+            } catch(e) {}
+        })();"""
+    st.markdown(f"<script>{js}</script>", unsafe_allow_html=True)
+
+
+def _render_scanner_exit_alert(ea) -> None:
+    """Render a prominent exit alert banner for a closed position."""
+    if ea.exit_reason == 'take_profit':
+        bg, border, icon, label = '#0a3320', '#00e676', '🎯', 'TAKE PROFIT HIT'
+    elif ea.exit_reason == 'stop_loss':
+        bg, border, icon, label = '#3a0a0a', '#ff1744', '🛑', 'STOP LOSS HIT'
+    elif ea.exit_reason == 'trailing_stop':
+        bg, border, icon, label = '#2a1a0a', '#ff9100', '📉', 'TRAILING STOP HIT'
+    else:
+        bg, border, icon, label = '#1a1a2e', '#888888', '⏱', ea.exit_reason.upper()
+    pnl_color = '#00e676' if ea.pnl >= 0 else '#ff5252'
+    st.markdown(
+        f'<div style="background:{bg};padding:12px 16px;border-radius:8px;margin:6px 0;'
+        f'border:2px solid {border};">'
+        f'<span style="font-size:18px">{icon}</span> '
+        f'<b style="color:{border};font-size:15px"> {label}</b> '
+        f'<span style="color:#aaa">[{ea.pos_id}]</span> @ '
+        f'<b>${ea.price:.2f}</b> — '
+        f'P&L: <b style="color:{pnl_color}">${ea.pnl:+,.0f}</b> ({ea.pnl_pct:+.2%})'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _show_surfer_chart(tsla_df, analysis):
     """Show interactive 5min candlestick chart with channel overlay and signal markers."""
     from v15.core.channel import detect_channels_multi_window, select_best_channel
@@ -2454,6 +2528,14 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
     """Render the live scanner panel: positions, alerts, trade history."""
     st.subheader("Live Scanner")
 
+    # Auto-refresh every 60s when positions are open for real-time stop/TP monitoring
+    if scanner.positions:
+        if AUTOREFRESH_AVAILABLE:
+            st_autorefresh(interval=60_000, key="scanner_position_monitor")
+            st.caption("🔄 Auto-checking stop/TP every 60s")
+        else:
+            st.info("Install streamlit-autorefresh for automatic 1-min stop/TP monitoring")
+
     col_cap, col_eq, col_unrealized = st.columns(3)
     unrealized = scanner.get_unrealized_pnl(current_price)
     col_cap.metric("Starting Capital", f"${scanner.config.initial_capital:,.0f}")
@@ -2466,26 +2548,37 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
                        key="surfer_kill_switch")
     scanner.config.kill_switch = kill
 
-    # Evaluate new signal and check exits on each analysis cycle
-    if run_analysis and current_tsla is not None and len(current_tsla) > 0:
-        bar = current_tsla.iloc[-1]
-        bar_high = float(bar.get('high', current_price))
-        bar_low = float(bar.get('low', current_price))
+    # --- Real-time exit monitoring (runs on EVERY render, not just analysis runs) ---
+    if current_tsla is not None and len(current_tsla) > 0:
+        # Get best available price — prefer Finnhub real-time over stale bar
+        rt_price = current_price
+        try:
+            _rt = _get_realtime_prices()
+            if _rt.get('TSLA'):
+                rt_price = float(_rt['TSLA'])
+        except Exception:
+            pass
 
-        # Check exits first (price may have hit stop/TP)
-        exit_alerts = scanner.check_exits(current_price, bar_high, bar_low)
-        for ea in exit_alerts:
-            st.markdown(
-                f'<div style="background:{"#1a3320" if ea.pnl>=0 else "#331a1a"};'
-                f'padding:8px;border-radius:6px;margin:4px 0;">'
-                f'<b style="color:{"#00e676" if ea.pnl>=0 else "#ff5252"}">CLOSED [{ea.pos_id}]</b> '
-                f'P&amp;L: <b>${ea.pnl:+,.0f}</b> ({ea.pnl_pct:+.2%}) — {ea.exit_reason}'
-                f'</div>', unsafe_allow_html=True,
-            )
+        if run_analysis:
+            # Full OHLC bar: catches intrabar wicks
+            bar = current_tsla.iloc[-1]
+            bar_high = float(bar.get('high', rt_price))
+            bar_low = float(bar.get('low', rt_price))
+        else:
+            # Auto-refresh: use single-point current price
+            bar_high = rt_price
+            bar_low = rt_price
 
-        # Evaluate new entry signal
-        if sig.action != 'HOLD':
-            entry_alert = scanner.evaluate_signal(analysis, current_price)
+        # Check exits and fire audible+visual alert on hit
+        if scanner.positions:
+            exit_alerts = scanner.check_exits(rt_price, bar_high, bar_low)
+            for ea in exit_alerts:
+                _render_scanner_exit_alert(ea)
+                _play_exit_alert_sound(ea.exit_reason)
+
+        # Evaluate new entry signal (only on explicit analysis run)
+        if run_analysis and sig.action != 'HOLD':
+            entry_alert = scanner.evaluate_signal(analysis, rt_price)
             if entry_alert and entry_alert.alert_type == 'ENTRY':
                 action_color = "#00e676" if entry_alert.action == 'BUY' else "#ff5252"
                 st.markdown(
@@ -2502,19 +2595,26 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
             elif entry_alert and entry_alert.alert_type == 'RISK_WARNING':
                 st.warning(f"Scanner: {entry_alert.warning_msg}")
 
-    # Open positions
+    # Open positions — show distance to stop and TP
     if scanner.positions:
         st.markdown("**Open Positions**")
         for pos in scanner.positions.values():
             if pos.direction == 'long':
                 upnl = (current_price - pos.entry_price) * pos.shares
+                dist_stop = (current_price - pos.stop_price) / current_price
+                dist_tp = (pos.tp_price - current_price) / current_price
             else:
                 upnl = (pos.entry_price - current_price) * pos.shares
+                dist_stop = (pos.stop_price - current_price) / current_price
+                dist_tp = (current_price - pos.tp_price) / current_price
             upnl_color = "#00e676" if upnl >= 0 else "#ff5252"
+            stop_color = '#ff5252' if dist_stop < 0.003 else ('#ff9800' if dist_stop < 0.01 else '#888')
             st.markdown(
                 f'<div style="background:#1a2233;padding:8px;border-radius:6px;margin:3px 0;">'
                 f'[{pos.pos_id}] <b>{pos.direction.upper()}</b> {pos.shares}sh '
-                f'@ ${pos.entry_price:.2f} | Stop: ${pos.stop_price:.2f} | TP: ${pos.tp_price:.2f} | '
+                f'@ ${pos.entry_price:.2f} | '
+                f'<span style="color:{stop_color}">SL: ${pos.stop_price:.2f} ({dist_stop:.1%} away)</span> | '
+                f'TP: ${pos.tp_price:.2f} ({dist_tp:.1%} away) | '
                 f'Unrealized: <b style="color:{upnl_color}">${upnl:+,.0f}</b>'
                 f'</div>', unsafe_allow_html=True,
             )
