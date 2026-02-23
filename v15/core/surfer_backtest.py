@@ -5889,28 +5889,28 @@ def run_backtest(
                                 trade_size *= 1.15
                                 ml_stats.setdefault('tod_6am_boost', 0)
                                 ml_stats['tod_6am_boost'] += 1
-                            elif _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.10x (Arch411: from 1.05x)
-                                trade_size *= 1.10
+                            elif _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative (Arch411 +1.10x tested — zero effect, too few trades)
+                                trade_size *= 1.05
                                 ml_stats.setdefault('tod_7am_boost', 0)
                                 ml_stats['tod_7am_boost'] += 1
                             elif _tod_h == 13:   # 8am ET: $833/trade avg, WR=98%, 102 trades/yr, 1.50x (Arch400: up from 1.40x, best hour)
                                 trade_size *= 1.50
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
-                            elif _tod_h == 14:  # 9am ET: WR=100%, 115 trades/yr, 1.40x (Arch410: up from 1.35x, ultra-reliable open → top tier)
-                                trade_size *= 1.40
+                            elif _tod_h == 14:  # 9am ET: WR=100%, 115 trades/yr, 1.45x (Arch412: up from 1.40x, open-hour premium)
+                                trade_size *= 1.45
                                 ml_stats.setdefault('tod_9am_boost', 0)
                                 ml_stats['tod_9am_boost'] += 1
-                            elif _tod_h == 15:  # 10am ET: WR=100%, 83 trades/yr, 1.40x (Arch410: up from 1.35x, matches 9am tier)
-                                trade_size *= 1.40
+                            elif _tod_h == 15:  # 10am ET: WR=100%, 83 trades/yr, 1.45x (Arch412: up from 1.40x, matches 9am tier)
+                                trade_size *= 1.45
                                 ml_stats.setdefault('tod_10am_boost', 0)
                                 ml_stats['tod_10am_boost'] += 1
-                            elif _tod_h == 16:  # 11am ET: $391/trade avg, WR=99%, 80 trades/yr, 1.40x (Arch410: up from 1.35x, uniform mid-day upgrade)
-                                trade_size *= 1.40
+                            elif _tod_h == 16:  # 11am ET: $391/trade avg, WR=99%, 80 trades/yr, 1.45x (Arch412: up from 1.40x, uniform mid-day upgrade)
+                                trade_size *= 1.45
                                 ml_stats.setdefault('tod_11am_boost', 0)
                                 ml_stats['tod_11am_boost'] += 1
-                            elif _tod_h == 17:  # 12pm ET: $488/trade avg, WR=96%, 69 trades/yr, 1.40x (Arch410: up from 1.35x, match mid-day tier)
-                                trade_size *= 1.40
+                            elif _tod_h == 17:  # 12pm ET: $488/trade avg, WR=96%, 69 trades/yr, 1.45x (Arch412: up from 1.40x, match mid-day tier)
+                                trade_size *= 1.45
                                 ml_stats.setdefault('tod_noon_boost', 0)
                                 ml_stats['tod_noon_boost'] += 1
                             elif _tod_h == 18:  # 1pm ET: $843/trade avg, WR=99%, 94 trades/yr, 1.50x (Arch401: up from 1.40x, 2nd best hour)
