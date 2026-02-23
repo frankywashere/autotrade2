@@ -79,3 +79,14 @@ Based on sensitivity sweep 3: $1M cap = best Sharpe (14.87 vs 8.56) + 97% more P
 **Result**: $16,270,375 vs $16,552,438 (-$282K, -1.7%) — WORSE
 **Why it failed**: 12pm trades already at $1M cap — extra multiplier has zero effect. 8am reduction actively hurts the best early-morning hour.
 **Status**: Fully reverted to Arch418 state (UTC17 back to ×1.40, UTC13 back to ×1.50)
+
+## ML Signal Quality Model — c9/Arch418 Retrain (CONFIRMED ✓)
+**Previous model (c7/c8 era)**: AUC=0.776, trained on ~9,556 trades, old arch params
+**New model (c9/Arch418)**: AUC=0.813 (+4.7%), trained on 10,604 trades, bounce_cap=12x, max_trade=$1M
+**Calibrated Brier**: 0.050 (excellent calibration — 50% reduction from raw 0.106)
+**Training**: 2015-2024, leave-one-year-out CV, reused existing Optuna tuned params
+**Per-year AUC**: 0.742 (2015), 0.749 (2016), 0.787 (2017), 0.803 (2018), 0.824 (2019),
+                  0.863 (2020), 0.812 (2021), 0.819 (2022), 0.865 (2023), 0.819 (2024)
+**Top features**: close_position_in_bar, atr_pct, volume_ratio_20, bar_range_pct, sig_stop_pct,
+                  sig_rr_ratio, minutes_since_open, vix_level, 5min_volume_score
+**File**: v15/validation/signal_quality_model_tuned.pkl (3.5MB, replaced in-place)
