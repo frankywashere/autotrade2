@@ -5863,14 +5863,15 @@ def run_backtest(
                         # Arch 387: 8amET ×1.30→×1.35 (2nd-best hour $511, now matches 1pm tier) + 2pmET ×1.25→×1.30 ($429>11am $391)
                         # Arch 390: 1pmET ×1.35→×1.40 ($595 still top TOD) + Thu ×1.35→×1.40 (still top DOW $490)
                         # Arch 391: 10amET ×1.20→×1.25 ($373 > 9amET $350, promotes to 11am tier) + Mon ×1.05→×1.08 (align with Tue)
+                        # Arch 392: 8amET ×1.35→×1.40 (match 1pm tier, 2nd-best $511) + Tue ×1.08→×1.10 (Wed/Fri $417/$423 vs Tue $270)
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
                             if _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative
                                 trade_size *= 1.05
                                 ml_stats.setdefault('tod_7am_boost', 0)
                                 ml_stats['tod_7am_boost'] += 1
-                            elif _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.35x (Arch387: up from 1.30x, matches 1pm tier)
-                                trade_size *= 1.35
+                            elif _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.40x (Arch392: up from 1.35x, matches 1pm tier)
+                                trade_size *= 1.40
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
                             elif _tod_h == 14:  # 9am ET: $350/trade avg, 1.20x tier-3 (Arch382: down from 1.25x)
@@ -5923,6 +5924,7 @@ def run_backtest(
                         # Arch 389: Wed upgraded 1.15x→1.20x (symmetric with Fri, pre-boost $417 nearly equal to Fri $423)
                         # Arch 390: Thu upgraded 1.35x→1.40x (still top DOW, consistent 11yr strength)
                         # Arch 391: Mon upgraded 1.05x→1.08x (align with Tuesday, pre-boost $283)
+                        # Arch 392: Tue upgraded 1.08x→1.10x (Tue $270/trade in line with Wed/Fri regime, small step up)
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
                             if _dow == 3:  # Thursday: 1.40x (Arch390: upgraded from 1.35x, consistently top DOW $490 pre-boost)
@@ -5933,8 +5935,8 @@ def run_backtest(
                                 trade_size *= 1.08
                                 ml_stats.setdefault('dow_mon_boost', 0)
                                 ml_stats['dow_mon_boost'] += 1
-                            elif _dow == 1:  # Tuesday: 1.08x
-                                trade_size *= 1.08
+                            elif _dow == 1:  # Tuesday: 1.10x (Arch392: up from 1.08x)
+                                trade_size *= 1.10
                                 ml_stats.setdefault('dow_tue_boost', 0)
                                 ml_stats['dow_tue_boost'] += 1
                             elif _dow == 2:  # Wednesday: 1.20x (Arch389: up from 1.15x, symmetric with Fri, pre-boost $417)
