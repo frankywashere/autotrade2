@@ -5905,12 +5905,15 @@ def run_backtest(
                         # Arch 381: Tue/Wed moderate DOW boost (consistent above-Monday performance)
                         # Tue avg: $250-$282/trade; Wed avg: $267-$268/trade (above Mon $225-$263)
                         # Arch 382: Thu upgraded 1.20x → 1.25x (natural $490/trade justifies top-tier DOW boost)
-                        # Arch 383: Monday 1.05x (natural $283/trade > overall avg $260; Mon gap-fills
-                        #   from weekend news provide consistent directional context for bounce entries)
+                        # Arch 383: Mon 1.05x; Thu upgraded 1.25x → 1.30x
+                        #   Thu natural $490/trade = 2x Mon ($269); top-tier with 8am bounce: 1.30x×1.30x=1.69x
+                        # Arch 384: Fri 1.10x — 11yr avg $429/trade (no boost prev), recent 7yr avg $521/trade
+                        #   2015-2017 weak ($177-$193) caused earlier oversight; 2019-2025 consistently strong
+                        #   Wed ×1.10 with $417 pre-boost; Fri $429 without boost = Fri justifies ×1.10+
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
-                            if _dow == 3:  # Thursday: 1.25x (Arch382: upgraded from 1.20x)
-                                trade_size *= 1.25
+                            if _dow == 3:  # Thursday: 1.30x (Arch383: upgraded from 1.25x)
+                                trade_size *= 1.30
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
                             elif _dow == 0:  # Monday: 1.05x (Arch383: natural $283 > avg $260)
@@ -5925,6 +5928,10 @@ def run_backtest(
                                 trade_size *= 1.10
                                 ml_stats.setdefault('dow_wed_boost', 0)
                                 ml_stats['dow_wed_boost'] += 1
+                            elif _dow == 4:  # Friday: 1.10x (Arch384: 11yr avg $429 vs Wed $417 pre-boost)
+                                trade_size *= 1.10
+                                ml_stats.setdefault('dow_fri_boost', 0)
+                                ml_stats['dow_fri_boost'] += 1
 
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
