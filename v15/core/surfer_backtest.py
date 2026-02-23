@@ -5869,9 +5869,26 @@ def run_backtest(
                         # Arch 398: 2pmET ×1.35→×1.40 (match 8am/1pm top tier; 93 trades $429/trade)
                         # Arch 394: 3pmET ×1.15→×1.20 ($340/trade, 61 trades, promote tier-4→tier-3) + Tue ×1.10→×1.15 (Tue→Wed/Fri level)
                         # Arch 395: 4pmET (UTC21) ×1.0→×1.20 (NEW hour, 49 trades, $388/trade, after-hours strong = tier-3)
+                        # Arch 399: pre-market UTC8-11 (3am-6am ET) ×1.15 (156 trades/yr, WR=91-98%, avg $231-314/trade)
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
-                            if _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative
+                            if _tod_h == 8:    # 3am ET: $314/trade avg, WR=97%, 29 trades/yr, 1.15x (Arch399: pre-market boost)
+                                trade_size *= 1.15
+                                ml_stats.setdefault('tod_3am_boost', 0)
+                                ml_stats['tod_3am_boost'] += 1
+                            elif _tod_h == 9:  # 4am ET: $256/trade avg, WR=97%, 33 trades/yr, 1.15x (Arch399: pre-market boost)
+                                trade_size *= 1.15
+                                ml_stats.setdefault('tod_4am_boost', 0)
+                                ml_stats['tod_4am_boost'] += 1
+                            elif _tod_h == 10: # 5am ET: $266/trade avg, WR=91%, 46 trades/yr, 1.15x (Arch399: pre-market boost)
+                                trade_size *= 1.15
+                                ml_stats.setdefault('tod_5am_boost', 0)
+                                ml_stats['tod_5am_boost'] += 1
+                            elif _tod_h == 11: # 6am ET: $231/trade avg, WR=98%, 48 trades/yr, 1.15x (Arch399: pre-market boost)
+                                trade_size *= 1.15
+                                ml_stats.setdefault('tod_6am_boost', 0)
+                                ml_stats['tod_6am_boost'] += 1
+                            elif _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative
                                 trade_size *= 1.05
                                 ml_stats.setdefault('tod_7am_boost', 0)
                                 ml_stats['tod_7am_boost'] += 1
