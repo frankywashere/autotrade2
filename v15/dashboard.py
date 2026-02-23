@@ -2553,13 +2553,9 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
     """Render the live scanner panel: positions, alerts, trade history."""
     st.subheader("Live Scanner")
 
-    # Auto-refresh every 60s when positions are open for real-time stop/TP monitoring
+    # Position monitoring caption (autorefresh is unconditional at tab level)
     if scanner.positions:
-        if AUTOREFRESH_AVAILABLE:
-            st_autorefresh(interval=60_000, key="scanner_position_monitor")
-            st.caption("🔄 Auto-checking stop/TP every 60s")
-        else:
-            st.info("Install streamlit-autorefresh for automatic 1-min stop/TP monitoring")
+        st.caption("🔄 Auto-checking stop/TP every 60s")
 
     col_cap, col_eq, col_unrealized = st.columns(3)
     unrealized = scanner.get_unrealized_pnl(current_price)
@@ -2689,6 +2685,11 @@ def show_channel_surfer_tab(
         st.error("Channel Surfer module not available. Check v15/core/channel_surfer.py")
         return
 
+    # Always refresh every 60s on Channel Surfer tab — keeps price live and
+    # monitors open positions regardless of sidebar auto-refresh checkbox.
+    if AUTOREFRESH_AVAILABLE:
+        st_autorefresh(interval=60_000, key="channel_surfer_price_monitor")
+
     # yfinance pull log (sidebar expander for data transparency)
     try:
         from v15.data.native_tf import PULL_LOG as _yf_pull_log
@@ -2759,8 +2760,10 @@ def show_channel_surfer_tab(
     if current_price > 0:
         prev_price = float(current_tsla['close'].iloc[-2]) if current_tsla is not None and len(current_tsla) > 1 else current_price
         price_delta = current_price - prev_price
+        _price_time = datetime.now().strftime('%H:%M:%S')
         st.metric("TSLA", f"${current_price:.2f}", delta=f"{price_delta:+.2f} ({price_delta/prev_price*100:+.2f}%)",
-                  help=f"Source: {_price_source}")
+                  help=f"Source: {_price_source} | Updated: {_price_time}")
+        st.caption(f"Price updated: {_price_time} ({_price_source})")
 
     _render_signal_banner(sig, current_price=current_price)
 
