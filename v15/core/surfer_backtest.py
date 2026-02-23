@@ -5839,6 +5839,23 @@ def run_backtest(
                             ml_stats.setdefault('trade_usd_cap', 0)
                             ml_stats['trade_usd_cap'] += 1
 
+                        # Arch 376: Time-of-day boost applied AFTER all caps (so it actually fires)
+                        # All pre-cap arch multipliers push bounces well above any reasonable cap,
+                        # so TOD boost must come after caps to have real effect.
+                        # Timestamps in index are UTC. Display code uses (utc.hour - 5) % 24 for ET.
+                        # OOS 2025 top hours: UTC13=8amET $511/trade, UTC18=1pmET $595/trade (+57/83%)
+                        # vs $325 overall avg. Prime hours have larger moves → justify extra size.
+                        if sig.signal_type == 'bounce':
+                            _tod_h = tsla.index[bar].hour  # UTC hour
+                            if _tod_h == 13:   # 8am ET (display "8:00"): $511/trade, 102 trades
+                                trade_size *= 1.30
+                                ml_stats.setdefault('tod_am_boost', 0)
+                                ml_stats['tod_am_boost'] += 1
+                            elif _tod_h == 18:  # 1pm ET (display "13:00"): $595/trade, 95 trades
+                                trade_size *= 1.30
+                                ml_stats.setdefault('tod_pm_boost', 0)
+                                ml_stats['tod_pm_boost'] += 1
+
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
                         entry_price=entry_price,
