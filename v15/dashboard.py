@@ -2322,24 +2322,30 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
             pt_sl = tsla_price * (1 - sig.suggested_stop_pct)
             pt_tp_pct = sig.suggested_tp_pct
             pt_sl_pct = -sig.suggested_stop_pct
+            pt_entry_label = 'Buy Long @'
+            pt_tp_label = 'Take Profit (sell)'
+            pt_sl_label = 'Stop Loss (sell)'
         else:
             pt_entry = tsla_price
             pt_tp = tsla_price * (1 - sig.suggested_tp_pct)
             pt_sl = tsla_price * (1 + sig.suggested_stop_pct)
             pt_tp_pct = -sig.suggested_tp_pct
             pt_sl_pct = sig.suggested_stop_pct
+            pt_entry_label = 'Sell Short @'
+            pt_tp_label = 'Take Profit (cover)'
+            pt_sl_label = 'Stop Loss (cover)'
         pt_rr = sig.suggested_tp_pct / max(sig.suggested_stop_pct, 0.001)
         price_targets_html = (
             f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #2a4a6a;'
             f'display:flex;justify-content:center;gap:28px;text-align:center;">'
-            f'<div><div style="font-size:10px;color:#aaa;">Entry</div>'
+            f'<div><div style="font-size:10px;color:#aaa;">{pt_entry_label}</div>'
             f'<div style="font-size:17px;font-weight:600;color:#ccc;">${pt_entry:.2f}</div></div>'
             f'<div style="font-size:18px;color:#555;align-self:center;">→</div>'
-            f'<div><div style="font-size:10px;color:#aaa;">Take Profit</div>'
+            f'<div><div style="font-size:10px;color:#aaa;">{pt_tp_label}</div>'
             f'<div style="font-size:17px;font-weight:600;color:#00c853;">${pt_tp:.2f}</div>'
             f'<div style="font-size:10px;color:#666;">{pt_tp_pct:+.2%}</div></div>'
             f'<div style="font-size:16px;color:#555;align-self:center;">|</div>'
-            f'<div><div style="font-size:10px;color:#aaa;">Stop Loss</div>'
+            f'<div><div style="font-size:10px;color:#aaa;">{pt_sl_label}</div>'
             f'<div style="font-size:17px;font-weight:600;color:#ff4444;">${pt_sl:.2f}</div>'
             f'<div style="font-size:10px;color:#666;">{pt_sl_pct:+.2%}</div></div>'
             f'<div style="font-size:16px;color:#555;align-self:center;">|</div>'
