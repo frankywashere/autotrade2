@@ -5853,9 +5853,14 @@ def run_backtest(
                         #           UTC17 (12pm ET) added — 8yr avg $332/trade, min $164 (all positive)
                         #           UTC20 (3pm ET) added — 8yr avg $310/trade, min $129 (all positive)
                         # Mid-morning: continuation momentum; noon: lunchtime reversal setups; 3pm: close setup
+                        # Arch 380: UTC12 (7am ET) added — 7/8yr positive, avg $263/trade (2016 flat +$5), 1.05x conservative
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
-                            if _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.30x
+                            if _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative
+                                trade_size *= 1.05
+                                ml_stats.setdefault('tod_7am_boost', 0)
+                                ml_stats['tod_7am_boost'] += 1
+                            elif _tod_h == 13:   # 8am ET: $511/trade avg (2025), 1.30x
                                 trade_size *= 1.30
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
@@ -5887,6 +5892,17 @@ def run_backtest(
                                 trade_size *= 1.15
                                 ml_stats.setdefault('tod_3pm_boost', 0)
                                 ml_stats['tod_3pm_boost'] += 1
+
+                        # Arch 380: Thursday DOW boost for bounces (independent of TOD, compounds)
+                        # Thu avg: $451/trade (2015), $464/trade (2025) vs $278/$325 overall — +40%
+                        # Effect: consistent economic data release day + end-of-week positioning
+                        # Applied AFTER TOD — a Thu 8am ET bounce gets 1.30x × 1.20x = 1.56x
+                        if sig.signal_type == 'bounce':
+                            _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
+                            if _dow == 3:  # Thursday: 1.20x
+                                trade_size *= 1.20
+                                ml_stats.setdefault('dow_thu_boost', 0)
+                                ml_stats['dow_thu_boost'] += 1
 
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
