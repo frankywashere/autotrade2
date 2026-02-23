@@ -5910,6 +5910,9 @@ def run_backtest(
                         # Arch 384: Fri 1.10x — 11yr avg $429/trade (no boost prev), recent 7yr avg $521/trade
                         #   2015-2017 weak ($177-$193) caused earlier oversight; 2019-2025 consistently strong
                         #   Wed ×1.10 with $417 pre-boost; Fri $429 without boost = Fri justifies ×1.10+
+                        # Arch 385: Fri upgraded 1.10x→1.15x; Wed upgraded 1.10x→1.15x
+                        #   Fri post-boost $423/trade pre-boost (>Wed $417) + 2020-2025 avg $630 justifies upgrade
+                        #   Wed consistent $314-559 pre-boost range (×1.10→×1.15 both days for symmetry)
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
                             if _dow == 3:  # Thursday: 1.30x (Arch383: upgraded from 1.25x)
@@ -5924,12 +5927,12 @@ def run_backtest(
                                 trade_size *= 1.08
                                 ml_stats.setdefault('dow_tue_boost', 0)
                                 ml_stats['dow_tue_boost'] += 1
-                            elif _dow == 2:  # Wednesday: 1.10x
-                                trade_size *= 1.10
+                            elif _dow == 2:  # Wednesday: 1.15x (Arch385: up from 1.10x, pre-boost $417)
+                                trade_size *= 1.15
                                 ml_stats.setdefault('dow_wed_boost', 0)
                                 ml_stats['dow_wed_boost'] += 1
-                            elif _dow == 4:  # Friday: 1.10x (Arch384: 11yr avg $429 vs Wed $417 pre-boost)
-                                trade_size *= 1.10
+                            elif _dow == 4:  # Friday: 1.15x (Arch385: up from 1.10x, pre-boost $423)
+                                trade_size *= 1.15
                                 ml_stats.setdefault('dow_fri_boost', 0)
                                 ml_stats['dow_fri_boost'] += 1
 
