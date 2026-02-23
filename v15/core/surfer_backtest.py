@@ -5845,12 +5845,19 @@ def run_backtest(
                         # Timestamps in index are UTC. Display code uses (utc.hour - 5) % 24 for ET.
                         # OOS 2025 top hours: UTC13=8amET $511/trade, UTC18=1pmET $595/trade (+57/83%)
                         # vs $325 overall avg. Prime hours have larger moves → justify extra size.
+                        # Arch 377: UTC14 (9am ET) added — 4yr avg $350/trade (2nd best untapped hour)
+                        # 9am ET = first 30min of regular session, high institutional flow,
+                        # consistent 100-116 trades/yr. Slightly smaller boost than 8am (less extreme).
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
                             if _tod_h == 13:   # 8am ET (display "8:00"): $511/trade, 102 trades
                                 trade_size *= 1.30
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
+                            elif _tod_h == 14:  # 9am ET (display "9:00"): $350/trade avg, 104-116 trades
+                                trade_size *= 1.25
+                                ml_stats.setdefault('tod_9am_boost', 0)
+                                ml_stats['tod_9am_boost'] += 1
                             elif _tod_h == 18:  # 1pm ET (display "13:00"): $595/trade, 95 trades
                                 trade_size *= 1.30
                                 ml_stats.setdefault('tod_pm_boost', 0)
