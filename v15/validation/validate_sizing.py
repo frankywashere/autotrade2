@@ -50,7 +50,7 @@ def ml_size_uponly(q: float) -> float:
 
 
 def run_year_backtest(year_data, year, capital, vix_df, signal_quality_model=None, ml_size_fn=None,
-                      bounce_cap=8.0, max_trade_usd=500_000.0):
+                      bounce_cap=12.0, max_trade_usd=500_000.0):
     """Run a single year backtest, return (metrics, trades, equity_curve)."""
     from v15.core.surfer_backtest import run_backtest
 
@@ -92,8 +92,8 @@ def main():
     parser.add_argument('--model', type=str, default='v15/validation/signal_quality_model_tuned.pkl')
     parser.add_argument('--years', type=str, default='2015-2025')
     parser.add_argument('--capital', type=float, default=100_000.0)
-    parser.add_argument('--bounce-cap', type=float, default=8.0,
-                        help='Max exposure cap multiplier for bounce signals (default: 8.0, matches run_backtest)')
+    parser.add_argument('--bounce-cap', type=float, default=12.0,
+                        help='Max exposure cap multiplier for bounce signals (default: 12.0, Arch384)')
     parser.add_argument('--max-trade-usd', type=float, default=500_000.0,
                         help='Hard dollar cap per trade, 0=unlimited (default: 500000)')
     args = parser.parse_args()

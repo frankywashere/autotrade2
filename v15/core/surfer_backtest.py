@@ -351,7 +351,7 @@ def run_backtest(
     slippage_bps: float = 3.0,          # 3 basis points per side
     commission_per_share: float = 0.005, # $0.005/share round trip
     max_leverage: float = 4.0,
-    bounce_cap: float = 8.0,            # Max exposure cap multiplier for bounce signals (all-weather: 4-12x validated 11/11 years 2015-2025)
+    bounce_cap: float = 12.0,           # Max exposure cap multiplier for bounce signals (all-weather: 4-12x validated 11/11 years 2015-2025; Arch384: 8x→12x +$160K est 11yr)
     max_trade_usd: float = 0.0,         # Hard dollar cap per trade (0 = unlimited). Set to e.g. 1e6 for realistic market-capacity simulation.
     initial_capital: float = 0.0,       # 0 = use position_size * 10
     capture_features: bool = False,     # Save ML feature vectors per trade
