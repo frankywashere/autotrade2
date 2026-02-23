@@ -2308,6 +2308,42 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
         tsla_price = float(current_tsla['close'].iloc[-1])
     est_shares = int(dow_adjusted_usd / tsla_price) if tsla_price and tsla_price > 0 else None
 
+    # Price targets from signal stop/TP percentages
+    if tsla_price and tsla_price > 0:
+        if sig.action == 'BUY':
+            pt_entry = tsla_price
+            pt_tp = tsla_price * (1 + sig.suggested_tp_pct)
+            pt_sl = tsla_price * (1 - sig.suggested_stop_pct)
+            pt_tp_pct = sig.suggested_tp_pct
+            pt_sl_pct = -sig.suggested_stop_pct
+        else:
+            pt_entry = tsla_price
+            pt_tp = tsla_price * (1 - sig.suggested_tp_pct)
+            pt_sl = tsla_price * (1 + sig.suggested_stop_pct)
+            pt_tp_pct = -sig.suggested_tp_pct
+            pt_sl_pct = sig.suggested_stop_pct
+        pt_rr = sig.suggested_tp_pct / max(sig.suggested_stop_pct, 0.001)
+        price_targets_html = (
+            f'<div style="margin-top:10px;padding-top:8px;border-top:1px solid #2a4a6a;'
+            f'display:flex;justify-content:center;gap:28px;text-align:center;">'
+            f'<div><div style="font-size:10px;color:#aaa;">Entry</div>'
+            f'<div style="font-size:17px;font-weight:600;color:#ccc;">${pt_entry:.2f}</div></div>'
+            f'<div style="font-size:18px;color:#555;align-self:center;">→</div>'
+            f'<div><div style="font-size:10px;color:#aaa;">Take Profit</div>'
+            f'<div style="font-size:17px;font-weight:600;color:#00c853;">${pt_tp:.2f}</div>'
+            f'<div style="font-size:10px;color:#666;">{pt_tp_pct:+.2%}</div></div>'
+            f'<div style="font-size:16px;color:#555;align-self:center;">|</div>'
+            f'<div><div style="font-size:10px;color:#aaa;">Stop Loss</div>'
+            f'<div style="font-size:17px;font-weight:600;color:#ff4444;">${pt_sl:.2f}</div>'
+            f'<div style="font-size:10px;color:#666;">{pt_sl_pct:+.2%}</div></div>'
+            f'<div style="font-size:16px;color:#555;align-self:center;">|</div>'
+            f'<div><div style="font-size:10px;color:#aaa;">R:R</div>'
+            f'<div style="font-size:17px;font-weight:600;color:#fff;">{pt_rr:.1f}:1</div></div>'
+            f'</div>'
+        )
+    else:
+        price_targets_html = ''
+
     # Expected dollar P&L = expected_pnl_pct × estimated trade size
     expected_dollar = expected_pnl * dow_adjusted_usd
     expected_dollar_str = f"${expected_dollar:+,.0f}"
@@ -2359,6 +2395,7 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
                 <div style="font-size:10px;color:#888;">{expected_pnl:+.2%} return</div>
             </div>
         </div>
+        {price_targets_html}
         </div>""",
         unsafe_allow_html=True,
     )
