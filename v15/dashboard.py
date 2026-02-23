@@ -2239,13 +2239,21 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
     else:
         q_color = '#ff1744'
 
+    # Pre-compute dollar estimate for caption (full sizing block computed below)
+    _base_cap_preview = st.session_state.get('backtest_capital', 100_000.0)
+    _base_trade_preview = _base_cap_preview / 10.0
+    _ml_adj = min(_base_trade_preview * size_mult, 500_000.0)
+    _tod_adj = min(_ml_adj * tod_mult, 500_000.0)
+    _dow_adj = min(_tod_adj * dow_mult, 500_000.0)
+    _exp_dollar_preview = expected_pnl * _dow_adj
+
     # Plain-text summary line (always visible regardless of HTML rendering)
     action_icon = '🟢' if sig.action == 'BUY' else '🔴'
     st.caption(
         f"**ML Quality** {action_icon} {sig.action} | Win: {win_prob:.0%} | "
         f"E.PnL: {expected_pnl:+.2%} | Score: {quality_score:.0f}/100 | "
         f"Size: {size_mult:.1f}x {size_label} | TOD: {tod_mult:.2f}x | DOW: {dow_mult:.2f}x | "
-        f"**Est. $: {expected_dollar_str} on ${dow_adjusted_usd:,.0f} trade**"
+        f"**Est. $: ${_exp_dollar_preview:+,.0f} on ${_dow_adj:,.0f} trade**"
     )
 
     st.markdown(
