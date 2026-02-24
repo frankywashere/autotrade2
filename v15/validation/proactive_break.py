@@ -391,6 +391,16 @@ TIMING_FEATURES = [
     # Temporal
     'day_of_week',
     'month',
+    # ATR regime (key S91 discovery: ATR extremes predict snap-back quality)
+    'atr_5_vs_20',      # ATR_5 / ATR_20 — <0.75 compressed, >1.30 expanding
+    'atr_3_vs_20',      # ATR_3 / ATR_20 — even shorter-term expansion
+    # Accumulation/distribution proxies
+    'buy_pressure_3d',  # avg (Close-Low)/(High-Low) over 3 bars — buyer control
+    'signed_vol_5d',    # cumulative signed volume 5d (positive = accumulation)
+    # IV proxy (already in direction, now in timing too)
+    'iv_proxy',         # atr_5/atr_20 — local vol vs baseline vol
+    # Short interest proxy
+    'up_vol_ratio',     # fraction of volume on up days (>0.6 = buying pressure)
 ]
 N_TIMING_FEATURES = len(TIMING_FEATURES)
 
@@ -675,6 +685,31 @@ def extract_enhanced_features(i: int,
         assert len(vec) == N_DIR_FEATURES, f"{len(vec)} vs {N_DIR_FEATURES}"
         return np.array(vec, dtype=float)
     else:  # timing
+        # Compute ATR-ratio features (key S91 discovery: ATR extremes predict snap-backs)
+        atr_3 = float(_atr(tsla.iloc[max(0,i-5):i+1], period=3).iloc[-1]) if i >= 5 else atr_val
+        atr_5_ratio = atr_5 / max(atr_20, 1e-8)   # same as iv_proxy_val
+        atr_3_ratio = atr_3 / max(atr_20, 1e-8)
+        # Buy pressure: (close-low)/(high-low) averaged over 3 bars
+        bp_sum = 0.0
+        bp_count = 0
+        for jj in range(max(0, i-2), i+1):
+            hh = float(tsla['high'].iloc[jj])
+            ll = float(tsla['low'].iloc[jj])
+            cc = float(tsla['close'].iloc[jj])
+            if hh > ll:
+                bp_sum += (cc - ll) / (hh - ll)
+                bp_count += 1
+        buy_pressure = bp_sum / bp_count if bp_count > 0 else 0.5
+        # Signed volume 5d (Weis Wave proxy)
+        s_vol = 0.0
+        for jj in range(max(1, i-4), i+1):
+            oo = float(tsla['open'].iloc[jj])
+            cc = float(tsla['close'].iloc[jj])
+            vv = float(tsla['volume'].iloc[jj])
+            s_vol += vv * (1 if cc >= oo else -1)
+        avg_vol_5d = float(tsla['volume'].iloc[max(0,i-4):i+1].mean())
+        signed_vol_norm = s_vol / max(avg_vol_5d * 5, 1e-8)  # normalized to ±1 range
+
         vec = [
             dist_to_upper, dist_to_lower, channel_pos,
             float(toward_upper_raw),
@@ -688,6 +723,10 @@ def extract_enhanced_features(i: int,
             wick_up, wick_dn,
             vol_ratio, atr_norm,
             dow, month,
+            # ATR regime (S91 discovery)
+            atr_5_ratio, atr_3_ratio,
+            buy_pressure, signed_vol_norm,
+            iv_proxy_val, up_vol_ratio,
         ]
         assert len(vec) == N_TIMING_FEATURES, f"{len(vec)} vs {N_TIMING_FEATURES}"
         return np.array(vec, dtype=float)

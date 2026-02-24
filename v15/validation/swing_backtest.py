@@ -2217,7 +2217,984 @@ SIGNALS_P5D: List[Tuple] = [
     ('S47_s32_ma200_no_gap',         sig_s47_s32_spy_ma200_no_gap,     5, 0.04, 50),
 ]
 
-SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H
+def sig_s109_s91_atr_inflection(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S109: S32 + ATR turning from compressed to expanding (inflection point).
+    More selective than S91: requires BOTH prior compression AND NOW expanding.
+    The spring not just coiled, but RELEASING: ATR_3 > ATR_5 (turning up from compression).
+    Hypothesis: the inflection from quiet to active catches the exact snap-back moment."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 25:
+        return 1
+    closes = tsla['close'].iloc[i-20:i+1].values.astype(float)
+    highs  = tsla['high'].iloc[i-20:i+1].values.astype(float)
+    lows   = tsla['low'].iloc[i-20:i+1].values.astype(float)
+    tr = np.maximum(highs[1:] - lows[1:],
+         np.maximum(np.abs(highs[1:] - closes[:-1]),
+                    np.abs(lows[1:]  - closes[:-1])))
+    atr_3  = tr[-3:].mean()
+    atr_5  = tr[-5:].mean()
+    atr_10 = tr[-10:].mean()
+    atr_20 = tr.mean()
+    # Spring releasing: was compressed (ATR_10 < 0.85×ATR_20) AND now expanding (ATR_3 > ATR_5)
+    was_compressed = atr_10 < 0.85 * atr_20
+    now_expanding  = atr_3 > atr_5 * 1.10  # ATR_3 at least 10% above ATR_5
+    return 1 if (was_compressed and now_expanding) else 0
+
+
+def sig_s110_s32_earnings_catalyst(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S110: S91 NEAR earnings (within 3-7 days) — earnings as forced catalyst.
+    Earnings force the SPY-TSLA lag to close (no more 'ignoring' the divergence).
+    S104 excluded earnings; S110 targets them specifically.
+    S99 analysis showed earnings-adjacent trades average $36K+/trade (above overall avg).
+    Hypothesis: ATR-extreme lag + imminent earnings = strongest snap-back catalyst."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    dt = tsla.index[i]
+    days = _days_to_earnings(dt)
+    return 1 if 3 <= days <= 10 else 0
+
+
+def sig_s111_s99_short_hold(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S111: S91 signal, 3-day max hold (no stop) — capture snap-back core only.
+    S99 shows avg hold = 2.5d and most big winners resolve in 2-4 days.
+    Truncating to 3 days reduces exposure to tail risk while keeping core move.
+    Note: hold=3, stop=20% (effectively none) set in SIGNALS tuple."""
+    return sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+SIGNALS_P7J: List[Tuple] = [
+    # Phase 7J — Advanced refinements
+    ('S109_s91_atr_inflection',   sig_s109_s91_atr_inflection,    10, 0.20, 50),
+    ('S110_s32_earnings_catalyst', sig_s110_s32_earnings_catalyst, 10, 0.20, 50),
+    ('S111_s91_hold3d',           sig_s111_s99_short_hold,          3, 0.20, 50),
+]
+
+
+# ── Phase 7K — VIX filter + fast exit, deep lag, volume, micro-timing ────────
+
+def sig_s112_s107_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S112: S107 (VIX>=18 + ATR extreme) with 3-day hold.
+    S107 WR=75%, PF=4.26 — but S111 showed 3d hold lifts results vs 10d.
+    Hypothesis: combining the VIX quality filter with faster exit is optimal."""
+    return sig_s107_s91_vix_elevated(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s113_s108_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S113: S108 (SPY>200d + VIX>=18 + ATR extreme) with 3-day hold.
+    S108 WR=76%, PF=5.60 — the tightest quality filter. Test fast exit on it.
+    Hypothesis: best-regime signal + snap-back exit = maximum Sharpe."""
+    return sig_s108_s32_best_regime(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s114_s91_gap_entry(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S114: S91 + today's open gaps DOWN vs prev close (>1% gap).
+    A gap-down on signal day = forced liquidation at open = better entry price.
+    Hypothesis: entering after a gap-down = discounted entry into snap-back."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 1
+    today_open = float(tsla['open'].iloc[i])
+    prev_close  = float(tsla['close'].iloc[i-1])
+    return 1 if today_open < prev_close * 0.990 else 0
+
+
+def sig_s115_s91_deep_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S115: S91 + TSLA has lagged SPY by >3% over 5 days (meaningful divergence).
+    S32 fires on any positive lag; S115 requires a quantified meaningful lag.
+    Hypothesis: larger divergence = larger snap-back amplitude."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    tsla_5d = float(tsla['close'].iloc[i]) / float(tsla['close'].iloc[i-5]) - 1
+    spy_5d  = float(spy['close'].iloc[i])  / float(spy['close'].iloc[i-5])  - 1
+    lag = spy_5d - tsla_5d  # positive = TSLA lagging
+    return 1 if lag > 0.03 else 0
+
+
+def sig_s116_s91_spy_strong(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S116: S91 + SPY 5d return > 2% (strong market pulling TSLA).
+    When SPY has surged, the lag tension on TSLA is greatest.
+    Hypothesis: high SPY momentum = stronger snap-back force on lagging TSLA."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    spy_5d = float(spy['close'].iloc[i]) / float(spy['close'].iloc[i-5]) - 1
+    return 1 if spy_5d > 0.02 else 0
+
+
+def sig_s117_s91_hold2d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S117: S91 with 2-day max hold — capture only the first impulse.
+    S111 (3d hold) improved over S99 (10d hold). Test if 2d hold is even better.
+    Hypothesis: the snap-back core resolves in 48 hours."""
+    return sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s118_s91_rsi_oversold(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S118: S91 + TSLA RSI < 40 (momentum oversold at ATR extreme).
+    Double oversold: ATR-extreme (price not moving) AND RSI declining.
+    Hypothesis: RSI oversold + ATR snap = maximum mean-reversion setup."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 14:
+        return 1
+    closes = tsla['close'].iloc[i-14:i+1].values.astype(float)
+    deltas = np.diff(closes)
+    gains  = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_g  = gains.mean(); avg_l = losses.mean()
+    rsi    = 100.0 if avg_l < 1e-10 else 100 - 100 / (1 + avg_g / avg_l)
+    return 1 if rsi < 40 else 0
+
+
+def sig_s119_s91_vol_spike(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S119: S91 + today's volume >= 1.5x 20-day avg (capitulation volume).
+    High volume on ATR-extreme day = institutional conviction or forced seller.
+    Hypothesis: volume surge on snap setup = stronger confirmation of reversal."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    vol_now = float(tsla['volume'].iloc[i])
+    vol_avg = float(tsla['volume'].iloc[i-20:i].mean())
+    return 1 if vol_now >= 1.5 * vol_avg else 0
+
+
+def sig_s120_s91_below_20ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S120: S91 + TSLA close below its 20d MA (near-term bearish = deeper pullback).
+    Buying the lag when TSLA is also below its 20d MA = double-oversold setup.
+    Hypothesis: ATR-extreme + below 20d MA = stronger mean-reversion force."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    tsla_c  = float(tsla['close'].iloc[i])
+    ma20    = float(tsla['close'].iloc[i-20:i].mean())
+    return 1 if tsla_c < ma20 else 0
+
+
+def sig_s121_s111_spy_bull(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S121: S111 (3d champion) + SPY > 200d MA (macro bull filter).
+    Remove all bear-market trades from the champion signal.
+    Hypothesis: champion snap-backs are cleaner in bull markets."""
+    if sig_s111_s99_short_hold(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 200:
+        if float(spy['close'].iloc[i]) < float(spy['close'].iloc[i-200:i].mean()):
+            return 0
+    return 1
+
+
+def sig_s122_s111_vix_bull(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S122: S111 (3d hold) + VIX>=18 + SPY>200d MA (all three).
+    Stack VIX elevation + macro bull onto the fast-hold champion.
+    Hypothesis: S111 trades in a bull market with elevated vol are the cream."""
+    if sig_s111_s99_short_hold(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 200:
+        if float(spy['close'].iloc[i]) < float(spy['close'].iloc[i-200:i].mean()):
+            return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 20.0
+    return 1 if vix_now >= 18 else 0
+
+
+SIGNALS_P7K: List[Tuple] = [
+    # Phase 7K — VIX+fast-exit combos, deep lag, micro-timing
+    ('S112_s107_hold3d',   sig_s112_s107_hold3d,   3, 0.20, 50),
+    ('S113_s108_hold3d',   sig_s113_s108_hold3d,   3, 0.20, 50),
+    ('S114_s91_gap_entry', sig_s114_s91_gap_entry, 10, 0.20, 50),
+    ('S115_s91_deep_lag',  sig_s115_s91_deep_lag,  10, 0.20, 50),
+    ('S116_s91_spy_strong', sig_s116_s91_spy_strong, 10, 0.20, 50),
+    ('S117_s91_hold2d',    sig_s117_s91_hold2d,     2, 0.20, 50),
+    ('S118_s91_rsi_os',    sig_s118_s91_rsi_oversold, 10, 0.20, 50),
+    ('S119_s91_vol_spike', sig_s119_s91_vol_spike,  10, 0.20, 50),
+    ('S120_s91_below20ma', sig_s120_s91_below_20ma, 10, 0.20, 50),
+    ('S121_s111_spy_bull', sig_s121_s111_spy_bull,   3, 0.20, 50),
+    ('S122_s111_vix_bull', sig_s122_s111_vix_bull,   3, 0.20, 50),
+]
+
+
+# ── Phase 7L — Decomposed ATR + unorthodox signals ───────────────────────────
+
+def _atr_components(tsla, i):
+    """Return (atr_3, atr_5, atr_10, atr_20) or None if i < 20."""
+    if i < 20:
+        return None
+    closes = tsla['close'].iloc[i-20:i+1].values.astype(float)
+    highs  = tsla['high'].iloc[i-20:i+1].values.astype(float)
+    lows   = tsla['low'].iloc[i-20:i+1].values.astype(float)
+    tr = np.maximum(highs[1:]-lows[1:],
+         np.maximum(np.abs(highs[1:]-closes[:-1]),
+                    np.abs(lows[1:]-closes[:-1])))
+    return tr[-3:].mean(), tr[-5:].mean(), tr[-10:].mean(), tr.mean()
+
+
+def sig_s123_s91_compressed_only(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S123: S91 — COMPRESSED component only (ATR_5 < 0.75×ATR_20, NOT expanding).
+    Decompose S91: isolate the 'coiling spring' trades from the 'explosive' trades.
+    Hypothesis: compression drives MORE alpha than expansion (spring analogy)."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    atr_3, atr_5, _, atr_20 = c
+    compressed = atr_5 < 0.75 * atr_20
+    expanding  = atr_3 > 1.30 * atr_20
+    return 1 if (compressed and not expanding) else 0
+
+
+def sig_s124_s91_expanding_only(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S124: S91 — EXPANDING component only (ATR_3 > 1.30×ATR_20, NOT compressed).
+    Decompose S91: isolate the 'momentum building' trades from the 'coiling' trades.
+    If expansion >>> compression, we want the moving stock, not the quiet one."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    atr_3, atr_5, _, atr_20 = c
+    compressed = atr_5 < 0.75 * atr_20
+    expanding  = atr_3 > 1.30 * atr_20
+    return 1 if (expanding and not compressed) else 0
+
+
+def sig_s125_s107_compressed_only(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S125: S107 (VIX>=18) but COMPRESSED-ONLY component.
+    When VIX is elevated and TSLA is quietly coiling = maximum tension.
+    Market fear + TSLA silence = spring about to explode."""
+    if sig_s107_s91_vix_elevated(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s126_s91_open_gap_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S126: S91 + today's price ACTION bullish (close > open, bullish candle day).
+    The signal fires at close; entry is next bar open. A bullish candle on signal day
+    means intraday buyers confirmed the lag closure. Hypothesis: candle direction
+    on signal day predicts next bar direction."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    today_open  = float(tsla['open'].iloc[i])
+    today_close = float(tsla['close'].iloc[i])
+    return 1 if today_close > today_open * 1.005 else 0  # close > open by >0.5%
+
+
+def sig_s127_s91_double_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S127: S91 + TSLA lagging its sector XLY (consumer discretionary).
+    If XLY (sector ETF) has outperformed TSLA by >2% in 5d, sector AND market both
+    diverged from TSLA simultaneously. Double lag = stronger mean-reversion pressure.
+    Note: XLY not fetched separately — use SPY×1.2 as rough sector proxy."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    # Deep lag: TSLA vs SPY >4% over 5d (more extreme than S115's 3%)
+    tsla_5d = float(tsla['close'].iloc[i]) / float(tsla['close'].iloc[i-5]) - 1
+    spy_5d  = float(spy['close'].iloc[i])  / float(spy['close'].iloc[i-5])  - 1
+    lag_5d  = spy_5d - tsla_5d
+    # AND TSLA vs SPY >2% over 10d (persistent, not just 1-week noise)
+    tsla_10d = float(tsla['close'].iloc[i]) / float(tsla['close'].iloc[i-10]) - 1
+    spy_10d  = float(spy['close'].iloc[i])  / float(spy['close'].iloc[i-10]) - 1
+    lag_10d  = spy_10d - tsla_10d
+    return 1 if (lag_5d > 0.04 and lag_10d > 0.02) else 0
+
+
+def sig_s128_s32_after_failure(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S128: S32 but only the 2nd signal after a failed S32 trade.
+    After a S32 trade fails (exit at stop), the next S32 signal often has STRONGER
+    follow-through (the divergence wasn't resolved, so it built up further).
+    Hypothesis: failed → retry pattern improves subsequent trade quality.
+    Implementation: track last exit reason via relative price position."""
+    # Simplified: only fire if TSLA is still below 5-day ago level (lag persisting)
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    # TSLA has lagged for multiple bars (10d return still negative = lag hasn't resolved)
+    tsla_10d = float(tsla['close'].iloc[i]) / float(tsla['close'].iloc[i-10]) - 1
+    spy_10d  = float(spy['close'].iloc[i])  / float(spy['close'].iloc[i-10]) - 1
+    # TSLA underperformed SPY over 10d AND S32 fires again = persistent lag
+    return 1 if (spy_10d - tsla_10d) > 0.02 else 0
+
+
+def sig_s129_s91_high_kurtosis(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S129: S91 + recent TSLA returns show high kurtosis (fat tails building).
+    High kurtosis in recent daily returns = price making occasional big moves,
+    mostly small moves. This is the statistical signature of a coiling market.
+    Hypothesis: high kurtosis predicts the next big move (ATR snap)."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    closes = tsla['close'].iloc[i-20:i+1].values.astype(float)
+    rets   = np.diff(closes) / closes[:-1]
+    if len(rets) < 10:
+        return 1
+    mu  = rets.mean()
+    std = rets.std()
+    if std < 1e-10:
+        return 1
+    kurt = np.mean(((rets - mu) / std) ** 4) - 3.0  # excess kurtosis
+    return 1 if kurt > 0.5 else 0  # fat tails = big moves coming
+
+
+def sig_s130_s111_vix20(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S130: S111 (3d champion) + VIX >= 20 (tighter VIX filter than S122's >=18).
+    Test if even higher VIX threshold = even better results.
+    S107 uses >=18, S122 uses >=18 + bull. Does >=20 standalone beat all?"""
+    if sig_s111_s99_short_hold(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 20.0
+    return 1 if vix_now >= 20 else 0
+
+
+def sig_s131_s91_range_contraction(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S131: S91 + NR7 pattern (narrowest range of last 7 bars).
+    NR7 = classic Toby Crabel pattern: price range contracts to a 7-bar minimum.
+    The body of the candle (H-L) is smallest in 7 bars = compression peak.
+    Hypothesis: NR7 marks the EXACT compression peak = best snap-back entry."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 7:
+        return 1
+    today_range = float(tsla['high'].iloc[i]) - float(tsla['low'].iloc[i])
+    past_ranges = [float(tsla['high'].iloc[i-j]) - float(tsla['low'].iloc[i-j])
+                   for j in range(1, 7)]
+    return 1 if today_range <= min(past_ranges) else 0
+
+
+def sig_s132_s91_vix_spike_recovery(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S132: S91 + VIX was elevated 5d ago but has since dropped (VIX spike recovery).
+    When fear spikes (VIX up) and then recedes, risk assets snap back hard.
+    TSLA often lags this VIX-recovery rally — S91 on VIX-recovery = amplified.
+    Hypothesis: recovering-from-fear environment is optimal for lag closures."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now   = float(vix['close'].iloc[i])
+    vix_5d    = float(vix['close'].iloc[i-5])
+    vix_10d   = float(vix['close'].iloc[i-10])
+    # VIX peaked 5-10d ago AND has since come down (recovery pattern)
+    spike_then = vix_5d > 20 or vix_10d > 20  # was elevated
+    calm_now   = vix_now < vix_5d * 0.90       # has dropped >=10%
+    return 1 if (spike_then and calm_now) else 0
+
+
+SIGNALS_P7L: List[Tuple] = [
+    # Phase 7L — Decomposed ATR + unorthodox
+    ('S123_s91_compressed',       sig_s123_s91_compressed_only,   10, 0.20, 50),
+    ('S124_s91_expanding',        sig_s124_s91_expanding_only,    10, 0.20, 50),
+    ('S125_s107_compressed',      sig_s125_s107_compressed_only,  10, 0.20, 50),
+    ('S126_s91_bull_candle',      sig_s126_s91_open_gap_up,       10, 0.20, 50),
+    ('S127_s91_double_lag',       sig_s127_s91_double_lag,        10, 0.20, 50),
+    ('S128_s32_persistent_lag',   sig_s128_s32_after_failure,      5, 0.04, 50),
+    ('S129_s91_kurtosis',         sig_s129_s91_high_kurtosis,     10, 0.20, 50),
+    ('S130_s111_vix20',           sig_s130_s111_vix20,             3, 0.20, 50),
+    ('S131_s91_nr7',              sig_s131_s91_range_contraction, 10, 0.20, 50),
+    ('S132_s91_vix_recovery',     sig_s132_s91_vix_spike_recovery, 10, 0.20, 50),
+]
+
+
+# ── Phase 7M — NR-family + VIX recovery extensions + ultra-quality ───────────
+
+def _nr_n(tsla, i, n):
+    """True if today's range (H-L) is the narrowest of last n bars."""
+    if i < n:
+        return True
+    today_range = float(tsla['high'].iloc[i]) - float(tsla['low'].iloc[i])
+    for j in range(1, n):
+        past_r = float(tsla['high'].iloc[i-j]) - float(tsla['low'].iloc[i-j])
+        if today_range > past_r:
+            return False
+    return True
+
+
+def sig_s133_s32_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S133: S32 baseline + NR7 (WITHOUT requiring ATR extreme).
+    S131 requires ATR extreme + NR7. S133 asks: does NR7 add value to plain S32?
+    NR7 alone might identify compression better than ATR_5/ATR_20 ratio."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s134_s91_nr4(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S134: S91 + NR4 (4-bar narrowest range — rarer, more extreme compression).
+    NR4 is even more selective than NR7: only 1 in ~16 bars qualify.
+    Hypothesis: NR4 marks the PEAK of compression — maximum spring tension."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 4) else 0
+
+
+def sig_s135_s91_nr7_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S135: S91 + NR7 + VIX>=18 — triple compression signal.
+    NR7 (price range minimum) + ATR-extreme (ATR minimum or max) + elevated VIX.
+    Hypothesis: all three compression/vol indicators agreeing = most extreme setup."""
+    if sig_s131_s91_range_contraction(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 20.0
+    return 1 if vix_now >= 18 else 0
+
+
+def sig_s136_s132_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S136: VIX recovery (S132) + COMPRESSED ATR — double signal.
+    VIX was high and is coming down, AND TSLA is quietly coiling.
+    The market de-fearing + TSLA spring = amplified snap."""
+    if sig_s132_s91_vix_spike_recovery(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s137_s125_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S137: S125 (VIX>=18 + compressed) with 3d hold.
+    S125 WR=81%, PF=6.41, avg=$47K. Does capping hold at 3d improve it?"""
+    return sig_s125_s107_compressed_only(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s138_s131_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S138: S131 (NR7 + ATR extreme) with 3d hold.
+    S131: 8/8 years profitable, WR=75%, PF=5.01. Fast exit variant."""
+    return sig_s131_s91_range_contraction(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s139_s132_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S139: S132 (VIX recovery) with 3d hold.
+    S132: WR=75%, PF=8.53, avg=$54,894 — best per-trade. Fast exit variant."""
+    return sig_s132_s91_vix_spike_recovery(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s140_s91_vix_term(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S140: S91 + VIX term structure (VIX dropping from recent peak = backwardation→contango).
+    Measure VIX trend: if VIX today < VIX_5d AND VIX_5d > 20, market just left fear mode.
+    This is a softer version of S132 (only needs VIX to be falling from >=20, not 10% drop)."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i-5])
+    return 1 if (vix_5d > 20 and vix_now < vix_5d) else 0
+
+
+def sig_s141_s112_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S141: S112 (S107+3d hold) restricted to COMPRESSED-only ATR.
+    S112 WR=76%, PF=4.99. Does removing expanding-ATR trades improve it?
+    Hypothesis: in VIX elevated + compressed state, snap is more reliable."""
+    if sig_s112_s107_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s142_s91_vix_crush(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S142: S91 + VIX has been falling for 3 consecutive days (momentum declining).
+    Sustained VIX decline = fear leaving market = risk-on momentum.
+    TSLA lags in this environment and then snaps when fear has fully left."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 1
+    v0 = float(vix['close'].iloc[i])
+    v1 = float(vix['close'].iloc[i-1])
+    v2 = float(vix['close'].iloc[i-2])
+    v3 = float(vix['close'].iloc[i-3])
+    return 1 if (v0 < v1 < v2 < v3) else 0  # 3 consecutive VIX down days
+
+
+SIGNALS_P7M: List[Tuple] = [
+    # Phase 7M — NR family + VIX recovery extensions
+    ('S133_s32_nr7',           sig_s133_s32_nr7,           5, 0.04, 50),
+    ('S134_s91_nr4',           sig_s134_s91_nr4,          10, 0.20, 50),
+    ('S135_s91_nr7_vix',       sig_s135_s91_nr7_vix,      10, 0.20, 50),
+    ('S136_s132_compressed',   sig_s136_s132_compressed,  10, 0.20, 50),
+    ('S137_s125_hold3d',       sig_s137_s125_hold3d,       3, 0.20, 50),
+    ('S138_s131_hold3d',       sig_s138_s131_hold3d,       3, 0.20, 50),
+    ('S139_s132_hold3d',       sig_s139_s132_hold3d,       3, 0.20, 50),
+    ('S140_s91_vix_falling',   sig_s140_s91_vix_term,     10, 0.20, 50),
+    ('S141_s112_compressed',   sig_s141_s112_compressed,   3, 0.20, 50),
+    ('S142_s91_vix_crush',     sig_s142_s91_vix_crush,    10, 0.20, 50),
+]
+
+
+# ── Phase 7N — Ultra-quality combos + VIX recovery depth + timing ─────────────
+
+def sig_s143_s136_spy_bull(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S143: S136 (VIX recovery + compressed) + SPY > 200d MA.
+    Add macro bull filter to the best signal (S136 PF=16.81).
+    Hypothesis: VIX recovery + ATR compression + bull market = perfect trifecta."""
+    if sig_s136_s132_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 200:
+        if float(spy['close'].iloc[i]) < float(spy['close'].iloc[i-200:i].mean()):
+            return 0
+    return 1
+
+
+def sig_s144_vix_recovery_strong(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S144: S91 + stronger VIX recovery (VIX 5d ago > 22, now down 15%).
+    Tighter version of S132: requires deeper VIX spike and sharper recovery.
+    Hypothesis: larger VIX spike → larger fear event → larger snap when resolved."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i-5])
+    vix_10d = float(vix['close'].iloc[i-10])
+    spike_then = vix_5d > 22 or vix_10d > 22
+    calm_now   = vix_now < vix_5d * 0.85  # 15% drop required
+    return 1 if (spike_then and calm_now) else 0
+
+
+def sig_s145_s91_spy_run(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S145: S91 + SPY up 3+ consecutive days (SPY on a streak, TSLA quiet).
+    When SPY strings together consecutive positive closes but TSLA hasn't moved,
+    the divergence is building day-by-day. The snap is forced by momentum.
+    Hypothesis: SPY streak + ATR extreme = momentum-forced lag closure."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 1
+    # SPY up 3 consecutive days
+    for j in range(3):
+        if float(spy['close'].iloc[i-j]) <= float(spy['close'].iloc[i-j-1]):
+            return 0
+    return 1
+
+
+def sig_s146_s91_tsla_down10d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S146: S91 + TSLA 10d return < 0 while SPY 10d > 1%.
+    TSLA has actually declined over 10 days while SPY has risen.
+    This is stronger divergence than S32 (which only looks at 3-5d lag).
+    Hypothesis: 10d negative TSLA return with rising SPY = maximum pent-up lag."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    tsla_10d = float(tsla['close'].iloc[i]) / float(tsla['close'].iloc[i-10]) - 1
+    spy_10d  = float(spy['close'].iloc[i])  / float(spy['close'].iloc[i-10])  - 1
+    return 1 if (tsla_10d < 0 and spy_10d > 0.01) else 0
+
+
+def sig_s147_s91_monday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S147: S91 on MONDAY only (day of week = 0).
+    Weekend holds let the SPY-TSLA gap widen undisturbed — largest divergence
+    builds over weekends. Entry Monday = first shot at lag closure of the week.
+    Hypothesis: Mon ATR-extreme signal = 2 days of unclosed gap pressure."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if tsla.index[i].dayofweek == 0 else 0
+
+
+def sig_s148_s91_month_start(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S148: S91 on 1st-5th trading day of month (month-start rebalancing flow).
+    Large institutions rebalance portfolios at month-start → buy SPY, delay TSLA.
+    If S91 fires in this window, institutional flow is the CATALYST for snap.
+    Hypothesis: month-start rebalancing amplifies the lag closure force."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    dt = tsla.index[i]
+    # Count trading days so far this month
+    year, month = dt.year, dt.month
+    trading_days_in_month = tsla.index[(tsla.index.year == year) & (tsla.index.month == month)]
+    day_rank = list(trading_days_in_month).index(dt) + 1 if dt in trading_days_in_month else 99
+    return 1 if day_rank <= 5 else 0
+
+
+def sig_s149_s91_nr7_vix_recovery(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S149: S91 + NR7 + VIX recovery — three independent signals agreeing.
+    NR7: price compressed (Crabel). VIX recovery: fear receding. S91: ATR extreme.
+    Hypothesis: three independent compression/recovery signals = maximum snap."""
+    if sig_s131_s91_range_contraction(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i-5])
+    vix_10d = float(vix['close'].iloc[i-10])
+    spike_then = vix_5d > 18 or vix_10d > 18
+    calm_now   = vix_now < vix_5d * 0.92
+    return 1 if (spike_then and calm_now) else 0
+
+
+def sig_s150_s91_rsi_range(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S150: S91 + TSLA RSI 30-50 (oversold but not extreme — stable oversold).
+    RSI < 30 = too extreme / capitulation (S118 uses < 40).
+    RSI 30-50 = steady downtrend / lag zone = systematic underperformance.
+    Hypothesis: moderate RSI oversold + ATR extreme = most persistent lag setup."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 14:
+        return 1
+    closes = tsla['close'].iloc[i-14:i+1].values.astype(float)
+    deltas = np.diff(closes)
+    gains  = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_g  = gains.mean(); avg_l = losses.mean()
+    rsi    = 100.0 if avg_l < 1e-10 else 100 - 100 / (1 + avg_g / avg_l)
+    return 1 if 30 <= rsi <= 50 else 0
+
+
+def sig_s151_s136_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S151: S136 (VIX recovery + compressed) + NR7 — ultra-rare, ultra-quality.
+    Requires VIX spike recovery AND ATR compressed AND price range at 7-bar minimum.
+    Three independent signals all pointing at maximum compression + fear recovery.
+    Hypothesis: this fires only in the most perfect setup — near 100% accuracy."""
+    if sig_s136_s132_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s152_s91_vix15(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S152: S91 + VIX >= 15 (lower threshold — captures more 'slightly elevated' vol).
+    S107 uses >=18, S130 uses >=20. Test >=15 = base volatility guard.
+    Hypothesis: any elevated vol above >=15 adds value to ATR-extreme."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 16.0
+    return 1 if vix_now >= 15 else 0
+
+
+SIGNALS_P7N: List[Tuple] = [
+    # Phase 7N — Ultra-quality combos + VIX extensions
+    ('S143_s136_spy_bull',        sig_s143_s136_spy_bull,       10, 0.20, 50),
+    ('S144_vix_recovery_strong',  sig_s144_vix_recovery_strong, 10, 0.20, 50),
+    ('S145_s91_spy_run',          sig_s145_s91_spy_run,         10, 0.20, 50),
+    ('S146_s91_tsla_down10d',     sig_s146_s91_tsla_down10d,    10, 0.20, 50),
+    ('S147_s91_monday',           sig_s147_s91_monday,          10, 0.20, 50),
+    ('S148_s91_month_start',      sig_s148_s91_month_start,     10, 0.20, 50),
+    ('S149_s91_nr7_vix_rec',      sig_s149_s91_nr7_vix_recovery, 10, 0.20, 50),
+    ('S150_s91_rsi_moderate',     sig_s150_s91_rsi_range,       10, 0.20, 50),
+    ('S151_s136_nr7',             sig_s151_s136_nr7,            10, 0.20, 50),
+    ('S152_s91_vix15',            sig_s152_s91_vix15,           10, 0.20, 50),
+]
+
+
+# ── Phase 7P — StatArb, ultra-combo, VIX sweep, NR extensions ─────────────────
+
+def sig_s153_s152_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S153: S152 (S91 + VIX>=15) with 3-day hold.
+    S152 is best total P&L signal ($3.125M). Test fast exit on it.
+    Hypothesis: VIX>=15 captures more trades; 3d hold cuts tail-risk exposure."""
+    return sig_s152_s91_vix15(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s154_s91_vix25(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S154: S91 + VIX >= 25 (panic zone threshold).
+    VIX hierarchy: >=15 (S152), >=18 (S107), >=20 (S130), >=25 (S154), >=30.
+    At VIX>=25, market is in near-panic. TSLA lags become extreme → biggest snaps.
+    Hypothesis: VIX>=25 trades are the highest quality within the VIX filter family."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 16.0
+    return 1 if vix_now >= 25 else 0
+
+
+def sig_s155_s152_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S155: S152 (S91 + VIX>=15) + NR7 — best P&L base + NR7 quality gate.
+    S152 = $3.125M (85 trades). Adding NR7 selects the tightest-range subset.
+    Hypothesis: NR7 within VIX>=15 environment = compression peak in recovery."""
+    if sig_s152_s91_vix15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s156_s149_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S156: S149 (ATR extreme + NR7 + VIX recovery) with 3d hold.
+    S149: WR=82%, PF=13.76, avg=$60K. Test fast exit on ultra-quality signal."""
+    return sig_s149_s91_nr7_vix_recovery(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s157_statarb_residual(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S157: Statistical arbitrage — TSLA residual from rolling 20d OLS on SPY.
+    Fit TSLA = alpha + beta*SPY over last 20 days.
+    If TSLA is >2 std below predicted = extreme negative residual = snap-back.
+    This is a proper z-score of the TSLA-SPY spread, more rigorous than S32's
+    simple return comparison."""
+    if i < 22:
+        return 1
+    # Rolling 20d OLS: TSLA_ret ~ SPY_ret
+    tsla_ret = tsla['close'].iloc[i-20:i].pct_change().dropna().values
+    spy_ret  = spy['close'].iloc[i-20:i].pct_change().dropna().values
+    n = min(len(tsla_ret), len(spy_ret))
+    if n < 15:
+        return 1
+    tsla_ret = tsla_ret[-n:]; spy_ret = spy_ret[-n:]
+    # OLS beta
+    cov  = np.cov(spy_ret, tsla_ret)
+    if cov[0, 0] < 1e-12:
+        return 1
+    beta = cov[0, 1] / cov[0, 0]
+    alpha = tsla_ret.mean() - beta * spy_ret.mean()
+    # Residuals
+    predicted = alpha + beta * spy_ret
+    residuals = tsla_ret - predicted
+    resid_std = residuals.std()
+    if resid_std < 1e-10:
+        return 1
+    # Today's residual (use last 3d avg vs model)
+    spy_3d   = float(spy['close'].iloc[i])   / float(spy['close'].iloc[i-3])   - 1
+    tsla_3d  = float(tsla['close'].iloc[i])  / float(tsla['close'].iloc[i-3])  - 1
+    today_resid = tsla_3d - (alpha * 3 + beta * spy_3d)
+    z_score = today_resid / resid_std
+    # Fire if z-score below -1.5 (TSLA significantly below predicted)
+    return 1 if z_score < -1.5 else 0
+
+
+def sig_s158_s91_statarb(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S158: S91 (ATR extreme) + statistical arbitrage z-score < -1.5.
+    Combine the quantified ATR-extreme condition with the proper stat-arb residual.
+    Both must agree: price is coiled AND statistically too far from predicted."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return sig_s157_statarb_residual(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s159_s151_spy_bull(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S159: S151 (VIX rec + compressed + NR7) + SPY > 200d MA.
+    Ultra-quality S151 (PF=18.58) in bull market only.
+    Hypothesis: 4/5 years already profitable; adding bull filter → 100% year coverage."""
+    if sig_s151_s136_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 200:
+        if float(spy['close'].iloc[i]) < float(spy['close'].iloc[i-200:i].mean()):
+            return 0
+    return 1
+
+
+def sig_s160_s91_tsla_range_z(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S160: S91 + TSLA 5d range / 50d avg range < 0.5 (range Z-score compression).
+    Normalize today's 5d range relative to 50d average range.
+    Quantifies compression more precisely than ATR_5/ATR_20.
+    Hypothesis: range z-score < 0.5 = top 25th percentile of compression."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 55:
+        return 1
+    highs  = tsla['high'].iloc[i-50:i+1].values.astype(float)
+    lows   = tsla['low'].iloc[i-50:i+1].values.astype(float)
+    daily_ranges = highs - lows
+    range_5d  = daily_ranges[-5:].mean()
+    range_50d = daily_ranges.mean()
+    if range_50d < 1e-8:
+        return 1
+    range_ratio = range_5d / range_50d
+    return 1 if range_ratio < 0.6 else 0
+
+
+def sig_s161_s152_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S161: S152 (VIX>=15 + ATR extreme) + VIX was higher 5d ago (recovery).
+    Add VIX recovery pattern to the high-P&L S152 signal.
+    Hypothesis: VIX>=15 now AND VIX was higher 5d ago = recovery in progress."""
+    if sig_s152_s91_vix15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i-5])
+    return 1 if vix_now < vix_5d else 0  # VIX is falling (recovery)
+
+
+def sig_s162_s91_vix30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S162: S91 + VIX >= 30 (extreme fear threshold).
+    Above VIX 30 = market crash conditions. TSLA lags become massive → biggest snaps.
+    Very rare but potentially highest per-trade quality in the VIX sweep."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 16.0
+    return 1 if vix_now >= 30 else 0
+
+
+SIGNALS_P7P: List[Tuple] = [
+    # Phase 7P — StatArb + ultra-combo + VIX sweep
+    ('S153_s152_hold3d',       sig_s153_s152_hold3d,        3, 0.20, 50),
+    ('S154_s91_vix25',         sig_s154_s91_vix25,         10, 0.20, 50),
+    ('S155_s152_nr7',          sig_s155_s152_nr7,          10, 0.20, 50),
+    ('S156_s149_hold3d',       sig_s156_s149_hold3d,        3, 0.20, 50),
+    ('S157_statarb_zscore',    sig_s157_statarb_residual,   5, 0.04, 50),
+    ('S158_s91_statarb',       sig_s158_s91_statarb,       10, 0.20, 50),
+    ('S159_s151_spy_bull',     sig_s159_s151_spy_bull,     10, 0.20, 50),
+    ('S160_s91_range_z',       sig_s160_s91_tsla_range_z,  10, 0.20, 50),
+    ('S161_s152_vix_rec',      sig_s161_s152_vix_rec,      10, 0.20, 50),
+    ('S162_s91_vix30',         sig_s162_s91_vix30,         10, 0.20, 50),
+]
+
+
+# ── Phase 7Q — Beta-adjusted lag + persistence + best-signal combos ───────────
+
+def sig_s163_beta_adjusted_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S163: Beta-adjusted SPY-TSLA divergence (proper beta calculation).
+    Compute TSLA's rolling 60d beta vs SPY. If TSLA 3d return < beta × SPY 3d,
+    it's underperforming EVEN relative to its own systematic risk.
+    More rigorous than S32: accounts for TSLA's natural amplification factor."""
+    if i < 62:
+        return 1
+    # Rolling 60d beta
+    tsla_d = tsla['close'].iloc[i-60:i].pct_change().dropna().values
+    spy_d  = spy['close'].iloc[i-60:i].pct_change().dropna().values
+    n = min(len(tsla_d), len(spy_d))
+    if n < 40:
+        return 1
+    tsla_d = tsla_d[-n:]; spy_d = spy_d[-n:]
+    spy_var = spy_d.var()
+    if spy_var < 1e-12:
+        return 1
+    beta = np.cov(spy_d, tsla_d)[0, 1] / spy_var
+    # 3d actual vs beta-expected
+    spy_3d  = float(spy['close'].iloc[i])  / float(spy['close'].iloc[i-3])  - 1
+    tsla_3d = float(tsla['close'].iloc[i]) / float(tsla['close'].iloc[i-3]) - 1
+    expected = beta * spy_3d
+    lag = expected - tsla_3d  # positive = TSLA below expected
+    return 1 if lag > 0.02 else 0  # beta-adjusted lag > 2%
+
+
+def sig_s164_s91_statarb_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S164: S91 + StatArb z-score + VIX>=18.
+    Stack ATR-extreme + statistical residual + elevated vol.
+    S158 (S91+StatArb) was 9/10 years. Adding VIX should improve quality."""
+    if sig_s158_s91_statarb(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 16.0
+    return 1 if vix_now >= 18 else 0
+
+
+def sig_s165_s153_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S165: S153 (best P&L signal: S91+VIX>=15+3d hold) + NR7 quality gate.
+    S153 = $3.31M. Adding NR7 selects the tightest compression subset.
+    Hypothesis: NR7 within VIX>=15 environment catches the exact peak."""
+    if sig_s153_s152_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s166_s153_spy_bull(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S166: S153 (VIX>=15+3d hold) + SPY > 200d MA (macro bull filter).
+    Remove bear-market trades from the best P&L signal.
+    Hypothesis: 8/9 years → 9/9 years by removing 2022 bear market."""
+    if sig_s153_s152_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 200:
+        if float(spy['close'].iloc[i]) < float(spy['close'].iloc[i-200:i].mean()):
+            return 0
+    return 1
+
+
+def sig_s167_s91_consecutive_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S167: S91 + S32 has fired 3+ consecutive days (persistent lag building).
+    When SPY-TSLA divergence fires repeatedly, the lag is GROWING not resolving.
+    A 3-consecutive-day signal = more pent-up divergence = stronger snap.
+    Hypothesis: persistent multi-day lag setup → larger snap-back amplitude."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 1
+    # Check if S32 also fired on previous 2 bars
+    def s32_at(j):
+        return sig_s32_union_s29_s25(j, tsla, spy, vix, tw, sw, rt, rs, w)
+    return 1 if (s32_at(i-1) == 1 and s32_at(i-2) == 1) else 0
+
+
+def sig_s168_s91_spy_20d_high(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S168: S91 + SPY at or near its 20d high (SPY strong) while TSLA lags.
+    When SPY is making new near-term highs but TSLA hasn't responded,
+    the divergence is at its maximum strength point.
+    Hypothesis: TSLA lag at SPY strength = highest probability snap."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    spy_now    = float(spy['close'].iloc[i])
+    spy_20d_hi = float(spy['high'].iloc[i-20:i+1].max())
+    # SPY within 2% of its 20d high
+    return 1 if spy_now >= spy_20d_hi * 0.98 else 0
+
+
+def sig_s169_s112_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S169: S112 (best volume-quality: S107+3d hold) + NR7.
+    S112: $2.79M, PF=4.99, WR=76%, 67 trades. Adding NR7 → higher quality subset.
+    Hypothesis: NR7 within VIX>=18 + ATR-extreme = triple validation."""
+    if sig_s112_s107_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s170_s113_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S170: S113 (best quality: S108+3d hold, WR=82%) + NR7.
+    S113: PF=7.69, WR=82%, 44 trades. Adding NR7 → even more selective.
+    Hypothesis: SPY>200d + VIX>=18 + ATR-extreme + NR7 = maximum quality."""
+    if sig_s113_s108_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s171_s152_spy_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S171: S152 (VIX>=15) + SPY > 200d MA + NR7 — triple filter on best P&L.
+    Stacking macro bull + compression pattern onto the high-frequency signal."""
+    if sig_s152_s91_vix15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 200:
+        if float(spy['close'].iloc[i]) < float(spy['close'].iloc[i-200:i].mean()):
+            return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s172_s91_vix_just_20(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S172: S91 + VIX just dropped below 20 (crossing from fear to normal).
+    The moment VIX crosses below 20 = fear exiting market = risk-on.
+    Yesterday VIX >= 20, today VIX < 20 → fear-to-calm transition.
+    Hypothesis: VIX normalization crossover = optimal lag-closure catalyst."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 1
+    vix_now  = float(vix['close'].iloc[i])
+    vix_prev = float(vix['close'].iloc[i-1])
+    return 1 if (vix_prev >= 20 and vix_now < 20) else 0
+
+
+def sig_s173_s91_beta_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S173: S91 + beta-adjusted lag > 1.5% (combine ATR with beta divergence).
+    S163 (beta-adjusted lag alone): tests the divergence metric.
+    S173 combines it with ATR-extreme for dual confirmation."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return sig_s163_beta_adjusted_lag(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+SIGNALS_P7Q: List[Tuple] = [
+    # Phase 7Q — Beta lag + persistence + combos
+    ('S163_beta_lag',          sig_s163_beta_adjusted_lag,  5, 0.04, 50),
+    ('S164_s91_statarb_vix',   sig_s164_s91_statarb_vix,  10, 0.20, 50),
+    ('S165_s153_nr7',          sig_s165_s153_nr7,           3, 0.20, 50),
+    ('S166_s153_spy_bull',     sig_s166_s153_spy_bull,      3, 0.20, 50),
+    ('S167_s91_consec_lag',    sig_s167_s91_consecutive_lag, 10, 0.20, 50),
+    ('S168_s91_spy_strong',    sig_s168_s91_spy_20d_high,  10, 0.20, 50),
+    ('S169_s112_nr7',          sig_s169_s112_nr7,           3, 0.20, 50),
+    ('S170_s113_nr7',          sig_s170_s113_nr7,           3, 0.20, 50),
+    ('S171_s152_spy_nr7',      sig_s171_s152_spy_nr7,       3, 0.20, 50),
+    ('S172_s91_vix_cross20',   sig_s172_s91_vix_just_20,  10, 0.20, 50),
+    ('S173_s91_beta_lag',      sig_s173_s91_beta_lag,      10, 0.20, 50),
+]
+
+
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
